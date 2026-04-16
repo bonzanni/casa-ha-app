@@ -40,10 +40,9 @@ http {
         }
 NGINX
 
-# Conditionally add ttyd terminal location
+# Terminal location
 if bashio::config.true 'enable_terminal'; then
     cat >> /etc/nginx/nginx.conf <<NGINX
-        # ttyd web terminal
         location /terminal/ {
             proxy_pass http://127.0.0.1:7681/terminal/;
             proxy_http_version 1.1;
@@ -51,6 +50,28 @@ if bashio::config.true 'enable_terminal'; then
             proxy_set_header Connection \$connection_upgrade;
             proxy_read_timeout 86400;
             proxy_send_timeout 86400;
+        }
+NGINX
+else
+    cat >> /etc/nginx/nginx.conf <<'NGINX'
+        location /terminal/ {
+            default_type text/html;
+            return 200 '<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Casa Terminal</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; display: flex;
+         justify-content: center; align-items: center; min-height: 80vh;
+         margin: 0; background: #1e293b; color: #e2e8f0; }
+  .card { text-align: center; max-width: 420px; padding: 2rem; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.5rem; }
+  p { color: #94a3b8; line-height: 1.6; }
+  code { background: #334155; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+</style></head>
+<body><div class="card">
+  <h1>Web Terminal is disabled</h1>
+  <p>To enable it, go to <strong>Settings &rarr; Add-ons &rarr; Casa Agent &rarr; Configuration</strong>
+     and set <code>Enable Web Terminal</code> to on, then restart the add-on.</p>
+</div></body></html>';
         }
 NGINX
 fi
