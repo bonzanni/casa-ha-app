@@ -12,6 +12,12 @@ configuration:
     name: Telegram Chat ID
     description: >-
       Restrict Telegram messages to this chat ID. Leave empty to accept all.
+  telegram_webhook_url:
+    name: Telegram Webhook URL
+    description: >-
+      Public URL for Telegram webhook mode (e.g. https://your-ha.duckdns.org:8080).
+      When set, Telegram pushes updates instead of polling. Lower latency, zero
+      idle requests. Leave empty to use polling (works behind NAT).
   honcho_api_url:
     name: Honcho API URL
     description: >-
