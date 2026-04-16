@@ -1,4 +1,11 @@
 configuration:
+  public_url:
+    name: Public URL
+    description: >-
+      The public-facing base URL for this add-on (e.g. https://your-ha.duckdns.org:18065).
+      Required for Telegram webhook mode and future callback integrations.
+      Enable the external port (18065) and set up port forwarding first.
+      Leave empty if the add-on is only accessed via the HA UI.
   claude_oauth_token:
     name: Claude OAuth Token
     description: >-
@@ -12,12 +19,12 @@ configuration:
     name: Telegram Chat ID
     description: >-
       Restrict Telegram messages to this chat ID. Leave empty to accept all.
-  telegram_webhook_url:
-    name: Telegram Webhook URL
+  telegram_transport:
+    name: Telegram Transport
     description: >-
-      Public URL for Telegram webhook mode (e.g. https://your-ha.duckdns.org:8080).
-      When set, Telegram pushes updates instead of polling. Lower latency, zero
-      idle requests. Leave empty to use polling (works behind NAT).
+      How the bot receives messages. "polling" works behind NAT (default).
+      "webhook" requires a public_url and has lower latency. If webhook is
+      selected but public_url is not set, falls back to polling.
   telegram_delivery_mode:
     name: Telegram Delivery Mode
     description: >-

@@ -262,28 +262,39 @@ async def main() -> None:
         logger.info("Webhook secret loaded (%d chars)", len(webhook_secret))
 
     # 10. Telegram channel
+    public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
     telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     telegram_channel = None
     if telegram_token:
         from channels.telegram import TelegramChannel
 
         telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-        telegram_webhook_url = os.environ.get("TELEGRAM_WEBHOOK_URL", "")
         telegram_delivery = os.environ.get("TELEGRAM_DELIVERY_MODE", "stream")
+
+        # Derive transport: webhook only possible when public_url is set
+        telegram_transport = os.environ.get("TELEGRAM_TRANSPORT", "polling")
+        if telegram_transport == "webhook" and not public_url:
+            logger.warning(
+                "telegram_transport is 'webhook' but public_url is not set; "
+                "falling back to polling"
+            )
+            telegram_transport = "polling"
+
+        webhook_url = f"{public_url}/telegram/update" if telegram_transport == "webhook" else ""
+
         telegram_channel = TelegramChannel(
             bot_token=telegram_token,
             chat_id=telegram_chat_id,
             default_agent=ellen_name,
             bus=bus,
-            webhook_url=telegram_webhook_url,
+            webhook_url=webhook_url,
             delivery_mode=telegram_delivery,
             webhook_secret=webhook_secret,
         )
         channel_manager.register(telegram_channel)
-        transport = "webhook" if telegram_webhook_url else "polling"
         logger.info(
             "Telegram channel registered (transport=%s, delivery=%s, chat_id=%s)",
-            transport,
+            telegram_transport,
             telegram_delivery,
             telegram_chat_id,
         )
@@ -403,6 +414,10 @@ async def main() -> None:
 
         # System rows
         system_rows = ""
+        if public_url:
+            system_rows += _row("Public URL", public_url, "on")
+        else:
+            system_rows += _row("Public URL", "not set", "off")
         mem_type = "Honcho" if os.environ.get("HONCHO_API_KEY") else "none"
         system_rows += _row("Memory", mem_type, "on" if mem_type != "none" else "off")
         system_rows += _row("Webhook auth", "enabled" if webhook_secret else "disabled",
