@@ -102,7 +102,7 @@ curl -X POST http://homeassistant.local:8080/invoke/ellen \
 
 Agent YAML files are stored in `/addon_configs/casa-agent/agents/`. Default configs are created on first boot and never overwritten. You can edit them freely.
 
-Each agent config supports: `name`, `role`, `model`, `personality`, `tools`, `mcp_server_names`, `memory`, `session`, `channels`, and `cwd`. See the default `ellen.yaml` for a full example.
+Each agent config supports: `name`, `role`, `model`, `personality`, `tools`, `mcp_server_names`, `memory`, `session`, `channels`, and `cwd`. See the default `assistant.yaml` for a full example.
 
 ## Web terminal
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.22
+
+- Role-based agent refactor. Agent YAML filenames and internal identifiers
+  now use structural roles (`assistant`, `butler`) instead of display names
+  (Ellen, Tina). Display names remain configurable via
+  `primary_agent_name` / `voice_agent_name` and are used for personality
+  text and the dashboard.
+- Session keys formalised as `{channel}:{scope_id}` via
+  `build_session_key()`.
+- One-shot migration on boot: `agents/ellen.yaml` -> `agents/assistant.yaml`
+  (with `role: main` -> `role: assistant` and `peer_name` update);
+  `agents/tina.yaml` -> `agents/butler.yaml`.
+
 ## 0.1.3
 
 - Add Tina (voice agent) wiring in core startup
