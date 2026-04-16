@@ -1,0 +1,19 @@
+#!/usr/bin/with-contenv bashio
+# /etc/services.d/casa/run
+
+export CLAUDE_CODE_OAUTH_TOKEN="$(bashio::config 'claude_oauth_token')"
+export HONCHO_API_KEY="$(bashio::config 'honcho_api_key')"
+export HONCHO_API_URL="$(bashio::config 'honcho_api_url')"
+export TELEGRAM_BOT_TOKEN="$(bashio::config 'telegram_bot_token')"
+export TELEGRAM_CHAT_ID="$(bashio::config 'telegram_chat_id')"
+export WEBHOOK_SECRET="$(bashio::config 'webhook_secret')"
+export PRIMARY_AGENT_NAME="$(bashio::config 'primary_agent_name')"
+export VOICE_AGENT_NAME="$(bashio::config 'voice_agent_name')"
+export PRIMARY_AGENT_MODEL="$(bashio::config 'primary_agent_model')"
+export VOICE_AGENT_MODEL="$(bashio::config 'voice_agent_model')"
+export SUBAGENT_MODEL="$(bashio::config 'subagent_model')"
+
+# SUPERVISOR_TOKEN is injected automatically by HA Supervisor
+# when homeassistant_api: true is set. Python reads it via os.environ.
+
+exec python3 /opt/casa/casa_core.py

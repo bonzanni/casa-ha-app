@@ -1,0 +1,50 @@
+#include <tunables/global>
+
+profile casa-agent flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # S6-overlay v3
+  /init ix,
+  /bin/** ix,
+  /usr/bin/** ix,
+  /usr/sbin/** ix,
+  /usr/local/bin/** ix,
+  /run/{s6,s6-rc*,service}/** ix,
+  /package/** ix,
+  /command/** ix,
+  /etc/services.d/** rwix,
+  /etc/cont-init.d/** rwix,
+
+  # Python runtime
+  /usr/lib/python3*/** r,
+  /usr/local/lib/python3*/** r,
+
+  # Bashio
+  /usr/lib/bashio/** r,
+
+  # Network (TCP, UDP for DNS, netlink)
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+  network netlink raw,
+
+  # DNS and host resolution
+  /etc/resolv.conf r,
+  /etc/hosts r,
+  /etc/nsswitch.conf r,
+  /proc/sys/net/** r,
+
+  # nginx
+  /etc/nginx/** rw,
+  /var/log/nginx/** rw,
+  /var/lib/nginx/** rw,
+  /tmp/nginx.pid rw,
+
+  # File access
+  /addon_configs/casa-agent/** rwk,
+  /data/** rwk,
+  /config/** r,
+  /tmp/** rwk,
+  /proc/** r,
+}

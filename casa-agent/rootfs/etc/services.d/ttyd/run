@@ -1,0 +1,16 @@
+#!/usr/bin/with-contenv bashio
+# /etc/services.d/ttyd/run
+
+if ! bashio::config.true 'enable_terminal'; then
+    bashio::log.info "Web terminal is disabled."
+    exec sleep infinity
+fi
+
+bashio::log.info "Starting ttyd web terminal..."
+exec ttyd \
+    --writable \
+    --interface 127.0.0.1 \
+    --port 7681 \
+    --base-path /terminal \
+    --cwd /addon_configs/casa-agent \
+    bash

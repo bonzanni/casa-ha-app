@@ -1,0 +1,114 @@
+"""Lightweight async message bus for inter-agent communication."""
+
+from __future__ import annotations
+
+import asyncio
+import collections
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Callable, Coroutine
+
+
+class MessageType(Enum):
+    REQUEST = "request"
+    RESPONSE = "response"
+    NOTIFICATION = "notification"
+    CHANNEL_IN = "channel_in"
+    CHANNEL_OUT = "channel_out"
+    SCHEDULED = "scheduled"
+
+
+@dataclass
+class BusMessage:
+    type: MessageType
+    source: str
+    target: str
+    content: Any
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    reply_to: str = ""
+    channel: str = ""
+    context: dict[str, Any] = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    priority: int = 1
+
+
+# Type alias for handler callbacks
+Handler = Callable[[BusMessage], Coroutine[Any, Any, BusMessage | None]]
+
+
+class MessageBus:
+    """Simple priority-queue-based message bus."""
+
+    def __init__(self, max_log_size: int = 10000) -> None:
+        self.queues: dict[str, asyncio.PriorityQueue] = {}
+        self.pending: dict[str, asyncio.Future] = {}
+        self.handlers: dict[str, Handler | None] = {}
+        self._log: collections.deque[BusMessage] = collections.deque(
+            maxlen=max_log_size
+        )
+        self._seq: int = 0
+
+    def register(self, name: str, handler: Handler | None = None) -> None:
+        """Register an agent (queue + optional handler)."""
+        self.queues[name] = asyncio.PriorityQueue()
+        self.handlers[name] = handler
+
+    async def send(self, msg: BusMessage) -> None:
+        """Send a message to msg.target's queue."""
+        if msg.target not in self.queues:
+            return  # silently drop for unknown targets
+        self._log.append(msg)
+        self._seq += 1
+        await self.queues[msg.target].put((msg.priority, self._seq, msg))
+
+    async def request(
+        self, msg: BusMessage, timeout: float = 300
+    ) -> BusMessage:
+        """Send a REQUEST and await the response (or timeout)."""
+        msg.type = MessageType.REQUEST
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[BusMessage] = loop.create_future()
+        self.pending[msg.id] = fut
+        await self.send(msg)
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self.pending.pop(msg.id, None)
+            raise
+
+    async def respond(self, original_id: str, response: BusMessage) -> None:
+        """Complete a pending request future."""
+        fut = self.pending.pop(original_id, None)
+        if fut and not fut.done():
+            fut.set_result(response)
+
+    async def notify(self, msg: BusMessage) -> None:
+        """Send a NOTIFICATION (fire-and-forget)."""
+        msg.type = MessageType.NOTIFICATION
+        await self.send(msg)
+
+    async def run_agent_loop(self, agent_name: str) -> None:
+        """Pull messages from the agent's queue and dispatch to its handler.
+
+        Runs until the current task is cancelled.
+        """
+        queue = self.queues[agent_name]
+        handler = self.handlers.get(agent_name)
+
+        while True:
+            _priority, _seq, msg = await queue.get()
+            if handler is not None:
+                result = await handler(msg)
+                # Auto-respond to REQUESTs if handler returned something
+                if msg.type == MessageType.REQUEST and result is not None:
+                    result.reply_to = msg.id
+                    result.type = MessageType.RESPONSE
+                    await self.respond(msg.id, result)
+            queue.task_done()
+
+    def get_log(self, last_n: int = 50) -> list[BusMessage]:
+        """Return the last *last_n* log entries."""
+        items = list(self._log)
+        return items[-last_n:]
