@@ -70,8 +70,8 @@ async def test_block_curl_post():
 # ------------------------------------------------------------------
 
 
-async def test_path_allowed_read_for_main():
-    hook = make_path_scope_hook("main")
+async def test_path_allowed_read_for_assistant():
+    hook = make_path_scope_hook("assistant")
     data = {
         "tool_name": "Read",
         "tool_input": {"file_path": "addon_configs/casa/agents/ellen.yaml"},
@@ -79,8 +79,8 @@ async def test_path_allowed_read_for_main():
     assert await hook(data, "tid-10", CTX) is None
 
 
-async def test_path_denied_write_for_main_to_config():
-    hook = make_path_scope_hook("main")
+async def test_path_denied_write_for_assistant_to_config():
+    hook = make_path_scope_hook("assistant")
     data = {
         "tool_name": "Write",
         "tool_input": {"file_path": "/config/configuration.yaml"},
@@ -102,8 +102,8 @@ async def test_path_traversal_blocked():
     assert _decision(result) == "deny"
 
 
-async def test_path_allowed_write_workspace_for_main():
-    hook = make_path_scope_hook("main")
+async def test_path_allowed_write_workspace_for_assistant():
+    hook = make_path_scope_hook("assistant")
     data = {"tool_name": "Write", "tool_input": {"file_path": "workspace/notes.txt"}}
     assert await hook(data, "tid-13", CTX) is None
 

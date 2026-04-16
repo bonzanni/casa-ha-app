@@ -34,7 +34,7 @@ FORBIDDEN_PATTERNS: list[re.Pattern[str]] = [
 # ---------------------------------------------------------------------------
 
 AGENT_PATH_RULES: dict[str, list[tuple[frozenset[str], str]]] = {
-    "main": [
+    "assistant": [
         (frozenset({"Read"}), "addon_configs/"),
         (frozenset({"Read"}), "/config/"),
         (frozenset({"Write"}), "workspace/"),
