@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from enum import Enum
 from typing import Any
 
 from claude_agent_sdk import (
@@ -14,7 +16,7 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
-from bus import BusMessage, MessageType
+from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig
 from hooks import block_dangerous_commands, enforce_path_scope
@@ -23,6 +25,51 @@ from memory import MemoryProvider
 from session_registry import SessionRegistry
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Error classification
+# ---------------------------------------------------------------------------
+
+
+class ErrorKind(Enum):
+    TIMEOUT = "timeout"
+    RATE_LIMIT = "rate_limit"
+    SDK_ERROR = "sdk_error"
+    MEMORY_ERROR = "memory_error"
+    CHANNEL_ERROR = "channel_error"
+    UNKNOWN = "unknown"
+
+
+_USER_MESSAGES: dict[ErrorKind, str] = {
+    ErrorKind.TIMEOUT: "The request timed out. Try again in a moment.",
+    ErrorKind.RATE_LIMIT: "Rate limited by the API. Please wait a minute and try again.",
+    ErrorKind.SDK_ERROR: "There was an issue communicating with Claude. Please try again.",
+    ErrorKind.MEMORY_ERROR: "Memory service is unavailable, but I can still respond without context.",
+    ErrorKind.CHANNEL_ERROR: "There was an issue sending the response.",
+    ErrorKind.UNKNOWN: "Sorry, something went wrong while processing your request.",
+}
+
+
+def _classify_error(exc: Exception) -> ErrorKind:
+    """Classify an exception into an ErrorKind for routing recovery."""
+    if isinstance(exc, asyncio.TimeoutError):
+        return ErrorKind.TIMEOUT
+
+    msg = str(exc).lower()
+    if "rate" in msg and "limit" in msg:
+        return ErrorKind.RATE_LIMIT
+    if "429" in msg:
+        return ErrorKind.RATE_LIMIT
+    if "timeout" in msg or "timed out" in msg:
+        return ErrorKind.TIMEOUT
+
+    # Check exception type names for SDK-specific errors
+    exc_type = type(exc).__name__
+    if "CLI" in exc_type or "SDK" in exc_type or "Connection" in exc_type:
+        return ErrorKind.SDK_ERROR
+
+    return ErrorKind.UNKNOWN
 
 
 class Agent:
@@ -46,17 +93,37 @@ class Agent:
     # Public entry point (used as bus handler)
     # ------------------------------------------------------------------
 
-    async def handle_message(self, msg: BusMessage) -> str | None:
-        """Process an inbound message and return the agent reply text.
+    async def handle_message(self, msg: BusMessage) -> BusMessage | None:
+        """Process an inbound message and return a response BusMessage.
 
         This is designed to be registered as a bus handler via
         ``bus.register(agent_name, agent.handle_message)``.
         """
         try:
-            return await self._process(msg)
-        except Exception:
-            logger.exception("Agent '%s' failed to handle message", self.config.name)
-            return "Sorry, something went wrong while processing your request."
+            text = await self._process(msg)
+        except Exception as exc:
+            kind = _classify_error(exc)
+            logger.error(
+                "Agent '%s' error [%s]: %s",
+                self.config.name,
+                kind.value,
+                exc,
+                exc_info=(kind == ErrorKind.UNKNOWN),
+            )
+            text = _USER_MESSAGES[kind]
+
+        if text is None:
+            return None
+
+        return BusMessage(
+            type=MessageType.RESPONSE,
+            source=self.config.name.lower(),
+            target=msg.source,
+            content=text,
+            reply_to=msg.id,
+            channel=msg.channel,
+            context=msg.context,
+        )
 
     # ------------------------------------------------------------------
     # Internal processing pipeline
@@ -101,7 +168,7 @@ class Agent:
         resume_session_id: str | None = None
         if existing:
             resume_session_id = existing.get("sdk_session_id")
-            self._session_registry.touch(channel_key)
+            await self._session_registry.touch(channel_key)
 
         options = ClaudeAgentOptions(
             model=self.config.model,
@@ -117,20 +184,20 @@ class Agent:
         )
 
         # 5. Query the SDK -------------------------------------------------
-        client = ClaudeSDKClient(options)
-        await client.query(user_text)
-
         response_text = ""
         sdk_session_id: str | None = resume_session_id
 
-        async for sdk_msg in client.receive_response():
-            if isinstance(sdk_msg, SystemMessage):
-                if getattr(sdk_msg, "subtype", None) == "init":
-                    sdk_session_id = getattr(sdk_msg, "session_id", sdk_session_id)
-            elif isinstance(sdk_msg, AssistantMessage):
-                for block in getattr(sdk_msg, "content", []):
-                    if isinstance(block, TextBlock):
-                        response_text += block.text
+        async with ClaudeSDKClient(options) as client:
+            await client.query(user_text)
+
+            async for sdk_msg in client.receive_response():
+                if isinstance(sdk_msg, SystemMessage):
+                    if getattr(sdk_msg, "subtype", None) == "init":
+                        sdk_session_id = getattr(sdk_msg, "session_id", sdk_session_id)
+                elif isinstance(sdk_msg, AssistantMessage):
+                    for block in getattr(sdk_msg, "content", []):
+                        if isinstance(block, TextBlock):
+                            response_text += block.text
 
         # 6. Store in memory -----------------------------------------------
         memory_session_id: str | None = None
@@ -160,7 +227,7 @@ class Agent:
 
         # 7. Update session registry ---------------------------------------
         if sdk_session_id:
-            self._session_registry.register(
+            await self._session_registry.register(
                 channel_key=channel_key,
                 agent=self.config.name,
                 sdk_session_id=sdk_session_id,
