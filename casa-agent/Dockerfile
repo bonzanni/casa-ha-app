@@ -2,8 +2,10 @@ ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
 # Base: ghcr.io/home-assistant/{arch}-base-python:3.12-alpine3.22
-# Node.js required by Claude Agent SDK (bundles Claude Code CLI)
-RUN apk add --no-cache nodejs git nginx jq curl
+# Node.js + npm required by Claude Agent SDK (wraps the Claude Code CLI)
+RUN apk add --no-cache nodejs npm git nginx jq curl \
+    && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force
 
 # Install ttyd (not packaged in Alpine)
 ARG TTYD_VERSION=1.7.7
