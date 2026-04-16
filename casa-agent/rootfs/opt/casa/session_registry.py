@@ -9,6 +9,19 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+def build_session_key(channel: str, scope_id: str | None) -> str:
+    """Build a canonical session key of the form ``{channel}:{scope_id}``.
+
+    The format is project-wide (Telegram, voice, webhooks, scheduled).
+    ``scope_id`` may contain colons; they are preserved verbatim.
+    Empty or ``None`` scope IDs become ``"default"``.
+    """
+    if not channel:
+        raise ValueError("channel is required")
+    sid = scope_id if scope_id else "default"
+    return f"{channel}:{sid}"
+
+
 class SessionRegistry:
     """Maps channel keys to session metadata and persists to disk.
 
