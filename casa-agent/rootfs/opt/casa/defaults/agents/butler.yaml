@@ -21,7 +21,7 @@ tools:
 mcp_server_names:
   - homeassistant
 memory:
-  peer_name: tina
+  peer_name: butler
   token_budget: 2000
   exclude_tags: [financial, health, business-strategy, private]
 channels:
