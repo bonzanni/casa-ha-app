@@ -78,6 +78,16 @@ async def healthz(_request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
+async def ingress_root(request: web.Request) -> web.Response:
+    """Redirect the ingress panel root to /terminal/.
+
+    HA ingress proxies under a path prefix, so we use a relative redirect.
+    """
+    # X-Ingress-Path is set by the HA Supervisor ingress proxy
+    ingress_path = request.headers.get("X-Ingress-Path", "")
+    return web.HTTPFound(f"{ingress_path}/terminal/")
+
+
 # ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
@@ -311,6 +321,7 @@ async def main() -> None:
 
     # 12. aiohttp app
     app = web.Application()
+    app.router.add_get("/", ingress_root)
     app.router.add_get("/healthz", healthz)
     app.router.add_post("/webhook/{name}", webhook_handler)
     app.router.add_post("/invoke/{agent}", invoke_handler)
