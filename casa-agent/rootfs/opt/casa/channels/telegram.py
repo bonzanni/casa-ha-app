@@ -110,13 +110,26 @@ class TelegramChannel(Channel):
             kwargs: dict[str, Any] = {"url": full_url}
             if self._webhook_secret:
                 kwargs["secret_token"] = self._webhook_secret
-            await self._app.bot.set_webhook(**kwargs)
-            logger.info(
-                "Telegram started (webhook, delivery=%s, url=%s, secret=%s)",
-                self._delivery_mode,
-                full_url,
-                "yes" if self._webhook_secret else "no",
-            )
+            try:
+                await self._app.bot.set_webhook(**kwargs)
+                logger.info(
+                    "Telegram started (webhook, delivery=%s, url=%s, secret=%s)",
+                    self._delivery_mode,
+                    full_url,
+                    "yes" if self._webhook_secret else "no",
+                )
+            except TelegramError as exc:
+                logger.error(
+                    "Failed to set Telegram webhook (%s); falling back to polling",
+                    exc,
+                )
+                await self._app.updater.start_polling()  # type: ignore[union-attr]
+                self._webhook_url = ""  # mark as polling for status display
+                logger.info(
+                    "Telegram started (polling fallback, delivery=%s, chat_id=%s)",
+                    self._delivery_mode,
+                    self.chat_id,
+                )
         else:
             await self._app.updater.start_polling()  # type: ignore[union-attr]
             self._last_poll_ts = time.monotonic()

@@ -284,7 +284,7 @@ async def main() -> None:
             )
             telegram_transport = "polling"
 
-        webhook_url = f"{public_url}/telegram/update" if telegram_transport == "webhook" else ""
+        webhook_url = public_url if telegram_transport == "webhook" else ""
 
         telegram_channel = TelegramChannel(
             bot_token=telegram_token,
