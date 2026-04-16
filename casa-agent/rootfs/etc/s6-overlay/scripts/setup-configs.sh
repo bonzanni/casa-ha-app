@@ -26,14 +26,20 @@ if [ ! -f "$DATA_DIR/sessions.json" ]; then
     echo '{}' > "$DATA_DIR/sessions.json"
 fi
 
-# Auto-generate webhook secret if not set by user
+# Auto-generate webhook secret if auth is enabled and no secret is set
 SECRET_FILE="$DATA_DIR/webhook_secret"
-USER_SECRET=$(bashio::config 'webhook_secret')
-if [ -n "$USER_SECRET" ]; then
-    printf '%s' "$USER_SECRET" > "$SECRET_FILE"
-elif [ ! -f "$SECRET_FILE" ]; then
-    head -c 32 /dev/urandom | base64 | tr -d '=/+' | head -c 48 > "$SECRET_FILE"
-    bashio::log.info "Auto-generated webhook secret (see /data/webhook_secret)"
+if bashio::config.true 'webhook_auth_enabled'; then
+    USER_SECRET=$(bashio::config 'webhook_secret')
+    if [ -n "$USER_SECRET" ]; then
+        printf '%s' "$USER_SECRET" > "$SECRET_FILE"
+    elif [ ! -f "$SECRET_FILE" ]; then
+        head -c 32 /dev/urandom | base64 | tr -d '=/+' | head -c 48 > "$SECRET_FILE"
+        bashio::log.info "Auto-generated webhook secret (see /data/webhook_secret)"
+    fi
+    bashio::log.info "Webhook authentication enabled."
+else
+    # Auth disabled — remove stale secret file so Python doesn't load it
+    rm -f "$SECRET_FILE"
 fi
 
 bashio::log.info "Configuration setup complete."

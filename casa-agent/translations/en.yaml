@@ -32,12 +32,18 @@ configuration:
     name: Honcho API Key
     description: >-
       API key for Honcho. When set, enables persistent cross-session memory.
-  webhook_secret:
-    name: Webhook Secret
+  webhook_auth_enabled:
+    name: Enable Webhook Authentication
     description: >-
-      Secret for authenticating webhook, invoke, and Telegram webhook requests.
-      Leave empty to auto-generate one on first boot (stored in /data/webhook_secret).
-      Used as HMAC key for Casa webhooks and as Telegram's secret_token.
+      When enabled, all webhook, invoke, and Telegram webhook requests require
+      authentication. A secret is auto-generated on first enable if none is set.
+      Retrieve it from /data/webhook_secret via the web terminal.
+  webhook_secret:
+    name: Webhook Secret (override)
+    description: >-
+      Optional manual override for the webhook secret. Leave empty to use the
+      auto-generated one. Used as HMAC key for Casa webhooks and as Telegram's
+      secret_token for webhook mode.
   primary_agent_name:
     name: Primary Agent Name
     description: >-
