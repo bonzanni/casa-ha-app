@@ -1,10 +1,10 @@
 {
-  "claude_oauth_token": "test-token-not-real",
+  "claude_oauth_token": "YOUR_TOKEN_HERE",
   "telegram_bot_token": "",
   "telegram_chat_id": "",
   "honcho_api_url": "https://api.honcho.dev",
   "honcho_api_key": "",
-  "webhook_secret": "test-secret",
+  "webhook_secret": "",
   "primary_agent_name": "Ellen",
   "voice_agent_name": "Tina",
   "primary_agent_model": "opus",
@@ -12,6 +12,6 @@
   "subagent_model": "sonnet",
   "heartbeat_enabled": false,
   "heartbeat_interval_minutes": 60,
-  "enable_terminal": true,
+  "enable_terminal": false,
   "repos": []
 }
