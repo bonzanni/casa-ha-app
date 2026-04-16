@@ -2,7 +2,6 @@
 
 INGRESS_PORT=$(bashio::addon.ingress_port)
 
-# Base nginx config
 cat > /etc/nginx/nginx.conf <<NGINX
 worker_processes 1;
 error_log /dev/stdout info;
@@ -16,21 +15,20 @@ http {
         ''      close;
     }
 
+    # --- Ingress server (HA-authenticated) ---
     server {
         listen ${INGRESS_PORT} default_server;
-        listen 18065;
         server_name _;
 
-        # Casa API (aiohttp)
         location / {
             proxy_pass http://127.0.0.1:8099;
             proxy_http_version 1.1;
             proxy_set_header Host \$host;
             proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Ingress-Path \$http_x_ingress_path;
             proxy_read_timeout 300;
         }
 
-        # WebSocket support for future streaming
         location /ws {
             proxy_pass http://127.0.0.1:8099/ws;
             proxy_http_version 1.1;
@@ -40,7 +38,7 @@ http {
         }
 NGINX
 
-# Terminal location
+# Terminal on ingress
 if bashio::config.true 'enable_terminal'; then
     cat >> /etc/nginx/nginx.conf <<NGINX
         location /terminal/ {
@@ -76,8 +74,34 @@ else
 NGINX
 fi
 
-# Close server and http blocks
-cat >> /etc/nginx/nginx.conf <<NGINX
+# Close ingress server block
+cat >> /etc/nginx/nginx.conf <<'NGINX'
+    }
+
+    # --- External API server (no terminal) ---
+    server {
+        listen 18065;
+        server_name _;
+
+        location / {
+            proxy_pass http://127.0.0.1:8099;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_read_timeout 300;
+        }
+
+        location /ws {
+            proxy_pass http://127.0.0.1:8099/ws;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 86400;
+        }
+
+        location /terminal/ {
+            return 404;
+        }
     }
 }
 NGINX
