@@ -12,6 +12,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookMatcher,
+    ResultMessage,
     SystemMessage,
     TextBlock,
 )
@@ -213,13 +214,28 @@ class Agent:
             async for sdk_msg in client.receive_response():
                 if isinstance(sdk_msg, SystemMessage):
                     if getattr(sdk_msg, "subtype", None) == "init":
-                        sdk_session_id = getattr(sdk_msg, "session_id", sdk_session_id)
+                        # Session ID is in the data dict, not a top-level attr
+                        data = getattr(sdk_msg, "data", {}) or {}
+                        if "session_id" in data:
+                            sdk_session_id = data["session_id"]
+                elif isinstance(sdk_msg, ResultMessage):
+                    # ResultMessage reliably carries the session_id
+                    sid = getattr(sdk_msg, "session_id", None)
+                    if sid:
+                        sdk_session_id = sid
                 elif isinstance(sdk_msg, AssistantMessage):
                     for block in getattr(sdk_msg, "content", []):
                         if isinstance(block, TextBlock):
                             response_text += block.text
                             if on_token is not None:
                                 await on_token(response_text)
+
+        if sdk_session_id and sdk_session_id != resume_session_id:
+            logger.info(
+                "SDK session for '%s': %s",
+                self.config.name,
+                sdk_session_id,
+            )
 
         # 6. Store in memory -----------------------------------------------
         memory_session_id: str | None = None
