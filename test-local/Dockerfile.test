@@ -1,0 +1,63 @@
+# Test Dockerfile that layers the mock supervisor on top of the add-on image.
+# Allows local testing without HA Supervisor.
+#
+# Build: docker build -f test-local/Dockerfile.test -t casa-test .
+# Run:   docker run --rm -p 8080:8080 casa-test
+
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.22
+FROM ${BUILD_FROM}
+
+# --- Same as casa-agent/Dockerfile ---
+RUN apk add --no-cache nodejs git nginx jq curl
+
+ARG TTYD_VERSION=1.7.7
+ARG TARGETARCH=amd64
+RUN case "${TARGETARCH}" in \
+        amd64) TTYD_ARCH="x86_64" ;; \
+        arm64) TTYD_ARCH="aarch64" ;; \
+        *) echo "Unsupported arch: ${TARGETARCH}" && exit 1 ;; \
+    esac \
+    && curl -fsSL \
+       "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.${TTYD_ARCH}" \
+       -o /usr/bin/ttyd \
+    && chmod +x /usr/bin/ttyd
+
+COPY casa-agent/requirements.txt /tmp/
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+
+COPY casa-agent/rootfs /
+
+RUN chmod +x /etc/cont-init.d/*.sh \
+    && chmod +x /etc/services.d/*/run \
+    && chmod +x /etc/services.d/*/finish \
+    && chmod +x /opt/casa/scripts/*.sh
+
+# --- Test layer: mock supervisor + options ---
+COPY test-local/options.json /data/options.json
+
+# Create addon_configs directory structure
+RUN mkdir -p /addon_configs/casa-agent /data/sdk-sessions
+
+# Bashio reads from http://supervisor which doesn't exist outside HA.
+# Replace the init scripts with simplified versions that read options.json directly.
+COPY test-local/init-overrides/ /etc/cont-init.d/
+
+RUN chmod +x /etc/cont-init.d/*.sh
+
+# Override the casa service run script: use with-contenv to pick up
+# env vars written by 03-export-env.sh to /var/run/s6/container_environment/
+RUN printf '#!/command/with-contenv sh\nexec python3 /opt/casa/casa_core.py\n' \
+    > /etc/services.d/casa/run \
+    && chmod +x /etc/services.d/casa/run
+
+# Override ttyd to read from options.json instead of bashio
+RUN printf '#!/bin/sh\nENABLED=$(jq -r ".enable_terminal // false" /data/options.json)\nif [ "$ENABLED" != "true" ]; then\n  echo "[INFO] Web terminal disabled."\n  exec sleep infinity\nfi\nexec ttyd --writable --interface 127.0.0.1 --port 7681 --base-path /terminal --cwd /addon_configs/casa-agent bash\n' \
+    > /etc/services.d/ttyd/run \
+    && chmod +x /etc/services.d/ttyd/run
+
+# Override nginx to not use bashio::net.wait_for
+RUN printf '#!/bin/sh\n# Wait for aiohttp\nfor i in $(seq 1 30); do\n  nc -z 127.0.0.1 8099 2>/dev/null && break\n  sleep 1\ndone\nexec nginx -g "daemon off;"\n' \
+    > /etc/services.d/nginx/run \
+    && chmod +x /etc/services.d/nginx/run
+
+ENV SUPERVISOR_TOKEN=mock-token-for-testing

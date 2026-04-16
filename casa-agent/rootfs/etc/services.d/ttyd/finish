@@ -1,0 +1,8 @@
+#!/usr/bin/with-contenv bashio
+# /etc/services.d/ttyd/finish
+
+if ! bashio::config.true 'enable_terminal'; then
+    exit 256
+fi
+
+bashio::log.warning "ttyd exited with code ${1}"

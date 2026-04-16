@@ -1,0 +1,63 @@
+name: "Casa Agent"
+description: "Personal AI agent framework powered by Claude"
+version: "0.1.1"
+slug: casa-agent
+init: false
+startup: application
+timeout: 120
+arch:
+  - amd64
+homeassistant_api: true
+hassio_api: true
+ingress: true
+ingress_port: 8080
+map:
+  - addon_config:rw
+  - config:ro
+options:
+  # Secrets
+  claude_oauth_token: ""
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+  honcho_api_url: "https://api.honcho.dev"
+  honcho_api_key: ""
+  webhook_secret: ""
+
+  # Agent identity (injected into personality prompts)
+  primary_agent_name: "Ellen"
+  voice_agent_name: "Tina"
+
+  # Model selection
+  primary_agent_model: "opus"
+  voice_agent_model: "haiku"
+  subagent_model: "sonnet"
+
+  # Heartbeat
+  heartbeat_enabled: true
+  heartbeat_interval_minutes: 60
+
+  # Web terminal
+  enable_terminal: false
+
+  # Workspace repos
+  repos: []
+
+schema:
+  claude_oauth_token: password
+  telegram_bot_token: password?
+  telegram_chat_id: str?
+  honcho_api_url: url?
+  honcho_api_key: password?
+  webhook_secret: password?
+  primary_agent_name: str?
+  voice_agent_name: str?
+  primary_agent_model: "list(opus|sonnet|haiku)?"
+  voice_agent_model: "list(opus|sonnet|haiku)?"
+  subagent_model: "list(opus|sonnet|haiku)?"
+  heartbeat_enabled: bool?
+  heartbeat_interval_minutes: "int(15,1440)?"
+  enable_terminal: bool?
+  repos:
+    - url: url
+      path: str
+      branch: str?

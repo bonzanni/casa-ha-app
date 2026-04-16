@@ -1,0 +1,9 @@
+# Force LF line endings for all files that end up in the container
+# Windows CRLF breaks shell shebangs and s6-overlay
+*.sh text eol=lf
+Dockerfile text eol=lf
+casa-agent/rootfs/**/* text eol=lf
+casa-agent/apparmor.txt text eol=lf
+casa-agent/config.yaml text eol=lf
+casa-agent/build.yaml text eol=lf
+casa-agent/requirements.txt text eol=lf
