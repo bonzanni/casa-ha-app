@@ -145,6 +145,50 @@ def _row(label: str, value: str, css: str = "") -> str:
 
 
 # ------------------------------------------------------------------
+# Agent loader
+# ------------------------------------------------------------------
+
+
+def _load_agents_by_role(agents_dir: str) -> dict[str, AgentConfig]:
+    """Scan *agents_dir* and return a dict keyed on role.
+
+    Ignores ``subagents.yaml`` (multi-agent file for on-demand subagents;
+    Phase 3+). Logs and skips files whose role is neither ``assistant``
+    nor ``butler`` (Phase 4 will handle user-defined agents).
+    """
+    allowed_roles = {"assistant", "butler"}
+    found: dict[str, AgentConfig] = {}
+    if not os.path.isdir(agents_dir):
+        return found
+    for entry in sorted(os.listdir(agents_dir)):
+        if not entry.endswith(".yaml") or entry == "subagents.yaml":
+            continue
+        path = os.path.join(agents_dir, entry)
+        try:
+            cfg = load_agent_config(path)
+        except Exception as exc:
+            logger.error("Failed to load %s: %s", path, exc)
+            continue
+        if cfg.role not in allowed_roles:
+            logger.info(
+                "Skipping %s (role=%r not in always-on set %s)",
+                entry,
+                cfg.role,
+                sorted(allowed_roles),
+            )
+            continue
+        if cfg.role in found:
+            logger.error(
+                "Duplicate role %r in %s (first seen earlier); skipping",
+                cfg.role,
+                entry,
+            )
+            continue
+        found[cfg.role] = cfg
+    return found
+
+
+# ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
 
@@ -209,47 +253,40 @@ async def main() -> None:
     mcp_registry.register_sdk("casa-framework", casa_tools_config)
     logger.info("Registered casa-framework MCP tools")
 
-    # 8. Load agent configs
+    # 8. Load agent configs by role
     from agent import Agent
+
+    agents_dir = os.path.join(CONFIG_DIR, "agents")
+    role_configs = _load_agents_by_role(agents_dir)
+
+    if "assistant" not in role_configs:
+        raise RuntimeError(
+            f"No agent with role 'assistant' found in {agents_dir}. "
+            "Casa cannot start without a primary assistant. Check that "
+            "assistant.yaml exists and its YAML includes `role: assistant`."
+        )
 
     agents: dict[str, Agent] = {}
     loop_tasks: list[asyncio.Task] = []
 
-    # -- Ellen (primary agent) --
-    ellen_config_path = os.path.join(CONFIG_DIR, "agents", "ellen.yaml")
-    ellen_config: AgentConfig = load_agent_config(ellen_config_path)
-    ellen_name = ellen_config.name.lower()
-
-    ellen = Agent(
-        config=ellen_config,
-        memory=memory,
-        session_registry=session_registry,
-        mcp_registry=mcp_registry,
-        channel_manager=channel_manager,
-    )
-    bus.register(ellen_name, ellen.handle_message)
-    agents[ellen_name] = ellen
-    logger.info("Agent '%s' registered on bus (model=%s)", ellen_name, ellen_config.model)
-
-    # -- Tina (voice agent) --
-    tina_config_path = os.path.join(CONFIG_DIR, "agents", "tina.yaml")
-    if os.path.exists(tina_config_path):
-        tina_config: AgentConfig = load_agent_config(tina_config_path)
-        tina_name = tina_config.name.lower()
-
-        tina = Agent(
-            config=tina_config,
+    for role, cfg in role_configs.items():
+        agent = Agent(
+            config=cfg,
             memory=memory,
             session_registry=session_registry,
             mcp_registry=mcp_registry,
             channel_manager=channel_manager,
         )
-        bus.register(tina_name, tina.handle_message)
-        agents[tina_name] = tina
-        logger.info("Agent '%s' registered on bus (model=%s)", tina_name, tina_config.model)
-    else:
-        tina_name = None
-        logger.info("No tina.yaml found; voice agent not started")
+        bus.register(role, agent.handle_message)
+        agents[role] = agent
+        logger.info(
+            "Agent '%s' registered (name=%s, model=%s)",
+            role,
+            cfg.name,
+            cfg.model,
+        )
+
+    assistant_role = "assistant"
 
     # 9. Webhook secret (auto-generated if auth enabled, see setup-configs.sh)
     webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
@@ -289,7 +326,7 @@ async def main() -> None:
         telegram_channel = TelegramChannel(
             bot_token=telegram_token,
             chat_id=telegram_chat_id,
-            default_agent=ellen_name,
+            default_agent=assistant_role,
             bus=bus,
             webhook_url=webhook_url,
             delivery_mode=telegram_delivery,
@@ -338,7 +375,7 @@ async def main() -> None:
         msg = BusMessage(
             type=MessageType.SCHEDULED,
             source="webhook",
-            target=ellen_name,
+            target=assistant_role,
             content=f"Webhook '{name}' triggered with payload: {payload}",
             channel="webhook",
             context={"webhook_name": name},
@@ -352,7 +389,7 @@ async def main() -> None:
         if not _verify_webhook(request, body):
             return web.json_response({"error": "invalid signature"}, status=401)
 
-        agent_name = request.match_info.get("agent", ellen_name)
+        agent_role = request.match_info.get("agent", assistant_role)
         try:
             payload = await request.json()
         except Exception:
@@ -365,7 +402,7 @@ async def main() -> None:
         msg = BusMessage(
             type=MessageType.REQUEST,
             source="webhook",
-            target=agent_name,
+            target=agent_role,
             content=prompt,
             channel="webhook",
             context=payload.get("context", {}),
@@ -399,13 +436,13 @@ async def main() -> None:
 
         # Agent rows
         agent_rows = ""
-        for name, agent in agents.items():
-            # "claude-opus-4-6" → "Opus 4.6"
+        for role, agent in agents.items():
             model = agent.config.model.replace("claude-", "")
             parts = model.split("-")
             if len(parts) >= 3:
                 model = f"{parts[0].capitalize()} {parts[1]}.{parts[2]}"
-            agent_rows += _row(name.capitalize(), model)
+            display = agent.config.name or role.capitalize()
+            agent_rows += _row(display, model)
 
         # Channel rows
         channel_rows = ""
@@ -476,10 +513,10 @@ async def main() -> None:
         hb = schedules_data.get("heartbeat", {})
         heartbeat_enabled = hb.get("enabled", heartbeat_enabled)
         heartbeat_interval = hb.get("interval_minutes", heartbeat_interval)
-        heartbeat_agent = hb.get("agent", ellen_name)
+        heartbeat_agent = hb.get("agent", assistant_role)
         heartbeat_prompt = hb.get("prompt", "Heartbeat: check for pending tasks.")
     else:
-        heartbeat_agent = ellen_name
+        heartbeat_agent = assistant_role
         heartbeat_prompt = "Heartbeat: check for pending tasks."
 
     if heartbeat_enabled and heartbeat_agent in agents:
