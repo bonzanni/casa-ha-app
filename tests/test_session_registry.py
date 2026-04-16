@@ -14,11 +14,11 @@ class TestSessionRegistry:
     async def test_register_and_get(self, tmp_path):
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
-        await reg.register("tg:123", "ellen", "sdk-1", "mem-1")
+        await reg.register("tg:123", "assistant", "sdk-1", "mem-1")
 
         entry = reg.get("tg:123")
         assert entry is not None
-        assert entry["agent"] == "ellen"
+        assert entry["agent"] == "assistant"
         assert entry["sdk_session_id"] == "sdk-1"
         assert entry["memory_session_id"] == "mem-1"
         assert "last_active" in entry
@@ -31,7 +31,7 @@ class TestSessionRegistry:
     async def test_touch_updates_last_active(self, tmp_path):
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
-        await reg.register("tg:123", "ellen", "sdk-1", "mem-1")
+        await reg.register("tg:123", "assistant", "sdk-1", "mem-1")
 
         ts1 = reg.get("tg:123")["last_active"]
         await asyncio.sleep(0.05)
@@ -45,17 +45,17 @@ class TestSessionRegistry:
         path = str(tmp_path / "sessions.json")
 
         r1 = SessionRegistry(path)
-        await r1.register("tg:42", "tina", "sdk-2", "mem-2")
+        await r1.register("tg:42", "butler", "sdk-2", "mem-2")
 
         r2 = SessionRegistry(path)
         entry = r2.get("tg:42")
         assert entry is not None
-        assert entry["agent"] == "tina"
+        assert entry["agent"] == "butler"
 
     async def test_remove(self, tmp_path):
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
-        await reg.register("tg:99", "ellen", "sdk-3", "mem-3")
+        await reg.register("tg:99", "assistant", "sdk-3", "mem-3")
         assert reg.get("tg:99") is not None
 
         await reg.remove("tg:99")
@@ -64,8 +64,8 @@ class TestSessionRegistry:
     async def test_all_entries(self, tmp_path):
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
-        await reg.register("a", "ellen", "s1", "m1")
-        await reg.register("b", "tina", "s2", "m2")
+        await reg.register("a", "assistant", "s1", "m1")
+        await reg.register("b", "butler", "s2", "m2")
 
         entries = reg.all_entries()
         assert set(entries.keys()) == {"a", "b"}

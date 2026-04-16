@@ -3,7 +3,7 @@ tasks: []
 heartbeat:
   enabled: true
   interval_minutes: 60
-  agent: ellen
+  agent: assistant
   channel: telegram
   prompt: |
     This is your periodic heartbeat. Reflect on your current state:
