@@ -16,6 +16,7 @@ for _name in [
     "ClaudeAgentOptions",
     "ClaudeSDKClient",
     "HookMatcher",
+    "ResultMessage",
     "SystemMessage",
     "TextBlock",
     "create_sdk_mcp_server",

@@ -20,7 +20,7 @@ from claude_agent_sdk import (
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig
-from hooks import block_dangerous_commands, enforce_path_scope
+from hooks import block_dangerous_commands, make_path_scope_hook
 from mcp_registry import McpServerRegistry
 from memory import MemoryProvider
 from session_registry import SessionRegistry
@@ -178,10 +178,15 @@ class Agent:
         mcp_servers = self._mcp_registry.resolve(self.config.mcp_server_names)
 
         # 4. Build SDK options ---------------------------------------------
+        # HookContext carries no agent identity, so path-scope enforcement
+        # must capture the role in a closure at registration time.
         hooks = {
             "PreToolUse": [
                 HookMatcher(matcher="Bash", hooks=[block_dangerous_commands]),
-                HookMatcher(matcher="Read|Write|Edit", hooks=[enforce_path_scope]),
+                HookMatcher(
+                    matcher="Read|Write|Edit",
+                    hooks=[make_path_scope_hook(self.config.role)],
+                ),
             ],
         }
 
@@ -202,6 +207,9 @@ class Agent:
             hooks=hooks,
             cwd=self.config.cwd or None,
             resume=resume_session_id,
+            # Load skills + CLAUDE.md from `{cwd}/.claude/`. Without this, the
+            # workspace/casa-skills/.claude/skills/ tree is silently ignored.
+            setting_sources=["project"],
         )
 
         # 5. Query the SDK (stream tokens to callback) ---------------------
