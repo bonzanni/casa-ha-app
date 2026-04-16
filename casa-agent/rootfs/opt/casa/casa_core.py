@@ -262,7 +262,11 @@ async def main() -> None:
         logger.info("Webhook secret loaded (%d chars)", len(webhook_secret))
 
     # 10. Telegram channel
-    public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
+    public_url = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
+    if public_url in ("null", "None"):
+        public_url = ""
+    if public_url:
+        logger.info("Public URL: %s", public_url)
     telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     telegram_channel = None
     if telegram_token:

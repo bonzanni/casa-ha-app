@@ -1,12 +1,19 @@
 #!/command/with-contenv bashio
 
-export PUBLIC_URL="$(bashio::config 'public_url')"
+# bashio::config returns "null" for empty optional strings; normalize to empty
+_public_url="$(bashio::config 'public_url')"
+if [ "$_public_url" = "null" ] || [ -z "$_public_url" ]; then
+    export PUBLIC_URL=""
+else
+    export PUBLIC_URL="$_public_url"
+fi
 export CLAUDE_CODE_OAUTH_TOKEN="$(bashio::config 'claude_oauth_token')"
 export HONCHO_API_KEY="$(bashio::config 'honcho_api_key')"
 export HONCHO_API_URL="$(bashio::config 'honcho_api_url')"
 export TELEGRAM_BOT_TOKEN="$(bashio::config 'telegram_bot_token')"
 export TELEGRAM_CHAT_ID="$(bashio::config 'telegram_chat_id')"
-export TELEGRAM_TRANSPORT="$(bashio::config 'telegram_transport')"
+_tg_transport="$(bashio::config 'telegram_transport')"
+export TELEGRAM_TRANSPORT="${_tg_transport:-polling}"
 export TELEGRAM_DELIVERY_MODE="$(bashio::config 'telegram_delivery_mode')"
 export WEBHOOK_SECRET="$(bashio::config 'webhook_secret')"
 export PRIMARY_AGENT_NAME="$(bashio::config 'primary_agent_name')"
