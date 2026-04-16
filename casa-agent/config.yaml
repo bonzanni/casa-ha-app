@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.1.14"
+version: "0.1.15"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 init: false
