@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -9,11 +10,42 @@ from typing import Any
 
 import yaml
 
+logger = logging.getLogger(__name__)
+
 MODEL_MAP: dict[str, str] = {
     "opus": "claude-opus-4-6",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5",
 }
+
+# Deprecated role name -> canonical role. Logged at WARNING on load.
+ROLE_ALIASES: dict[str, str] = {
+    "main": "assistant",
+}
+
+
+def _normalize_role(raw: str, source: str) -> str:
+    """Validate and normalize a role value.
+
+    Empty string raises ValueError. Deprecated aliases (e.g. ``main``)
+    are mapped to their canonical form with a warning.
+    """
+    if not raw:
+        raise ValueError(
+            f"Missing required 'role' field in agent config {source!r}. "
+            "Add 'role: assistant' (primary) or 'role: butler' (voice)."
+        )
+    if raw in ROLE_ALIASES:
+        canonical = ROLE_ALIASES[raw]
+        logger.warning(
+            "Agent config %s uses deprecated role '%s'; treating as '%s'. "
+            "Update the YAML to silence this warning.",
+            source,
+            raw,
+            canonical,
+        )
+        return canonical
+    return raw
 
 
 def resolve_model(shortname: str) -> str:
@@ -138,7 +170,7 @@ def load_agent_config(path: str) -> AgentConfig:
 
     return AgentConfig(
         name=data.get("name", ""),
-        role=data.get("role", ""),
+        role=_normalize_role(data.get("role", ""), path),
         model=resolve_model(data.get("model", "")),
         personality=data.get("personality", ""),
         description=data.get("description", ""),

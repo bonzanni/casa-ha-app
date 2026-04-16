@@ -122,3 +122,45 @@ class TestLoadAgentConfig:
         assert cfg.name == "Ellen"
         assert cfg.model == "claude-opus-4-6"
         assert "Ellen" in cfg.personality
+
+
+def test_missing_role_raises(tmp_path):
+    p = tmp_path / "bad.yaml"
+    p.write_text(
+        "name: Test\n"
+        "model: opus\n"
+        "personality: hi\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="role"):
+        load_agent_config(str(p))
+
+
+def test_legacy_main_role_normalized(tmp_path, caplog):
+    import logging
+
+    p = tmp_path / "legacy.yaml"
+    p.write_text(
+        "name: Test\n"
+        "role: main\n"
+        "model: opus\n"
+        "personality: hi\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING):
+        cfg = load_agent_config(str(p))
+    assert cfg.role == "assistant"
+    assert any("deprecated" in r.message.lower() for r in caplog.records)
+
+
+def test_role_assistant_accepted(tmp_path):
+    p = tmp_path / "new.yaml"
+    p.write_text(
+        "name: Test\n"
+        "role: assistant\n"
+        "model: opus\n"
+        "personality: hi\n",
+        encoding="utf-8",
+    )
+    cfg = load_agent_config(str(p))
+    assert cfg.role == "assistant"
