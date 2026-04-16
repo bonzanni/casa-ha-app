@@ -33,3 +33,10 @@ def test_missing_scope_id_none_uses_default():
 def test_channel_required():
     with pytest.raises(ValueError, match="channel is required"):
         build_session_key("", "1234")
+
+
+def test_telegram_key_matches_legacy_format():
+    """The new helper must produce byte-identical keys for Telegram,
+    so existing sessions.json entries still resolve after deploy."""
+    legacy = f"telegram:{1197017861}"
+    assert build_session_key("telegram", "1197017861") == legacy

@@ -23,7 +23,7 @@ from config import AgentConfig
 from hooks import block_dangerous_commands, make_path_scope_hook
 from mcp_registry import McpServerRegistry
 from memory import MemoryProvider
-from session_registry import SessionRegistry
+from session_registry import SessionRegistry, build_session_key
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +152,10 @@ class Agent:
         msg: BusMessage,
         on_token: OnTokenCallback | None = None,
     ) -> str | None:
-        channel_key = f"{msg.channel}:{msg.context.get('chat_id', 'default')}"
+        channel_key = build_session_key(
+            msg.channel,
+            msg.context.get("chat_id"),
+        )
         user_text = str(msg.content)
 
         # 1. Memory context ------------------------------------------------
