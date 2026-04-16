@@ -2,6 +2,8 @@
   "claude_oauth_token": "YOUR_TOKEN_HERE",
   "telegram_bot_token": "",
   "telegram_chat_id": "",
+  "telegram_webhook_url": "",
+  "telegram_delivery_mode": "stream",
   "honcho_api_url": "https://api.honcho.dev",
   "honcho_api_key": "",
   "webhook_secret": "",

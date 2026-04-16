@@ -15,6 +15,9 @@ _telegram_stub.Update = MagicMock()
 _telegram_constants = types.ModuleType("telegram.constants")
 _telegram_constants.ChatAction = MagicMock()
 _telegram_stub.constants = _telegram_constants
+_telegram_error = types.ModuleType("telegram.error")
+_telegram_error.TelegramError = type("TelegramError", (Exception,), {})
+_telegram_stub.error = _telegram_error
 _telegram_ext = types.ModuleType("telegram.ext")
 _telegram_ext.Application = MagicMock()
 _telegram_ext.ContextTypes = MagicMock()
@@ -23,6 +26,7 @@ _telegram_ext.filters = MagicMock()
 _telegram_stub.ext = _telegram_ext
 sys.modules.setdefault("telegram", _telegram_stub)
 sys.modules.setdefault("telegram.constants", _telegram_constants)
+sys.modules.setdefault("telegram.error", _telegram_error)
 sys.modules.setdefault("telegram.ext", _telegram_ext)
 
 from channels.telegram import _split_message, _TG_MAX_LENGTH

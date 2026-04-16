@@ -193,16 +193,23 @@ async def main() -> None:
 
         telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
         telegram_webhook_url = os.environ.get("TELEGRAM_WEBHOOK_URL", "")
+        telegram_delivery = os.environ.get("TELEGRAM_DELIVERY_MODE", "stream")
         telegram_channel = TelegramChannel(
             bot_token=telegram_token,
             chat_id=telegram_chat_id,
             default_agent=ellen_name,
             bus=bus,
             webhook_url=telegram_webhook_url,
+            delivery_mode=telegram_delivery,
         )
         channel_manager.register(telegram_channel)
-        mode = "webhook" if telegram_webhook_url else "polling"
-        logger.info("Telegram channel registered (%s, chat_id=%s)", mode, telegram_chat_id)
+        transport = "webhook" if telegram_webhook_url else "polling"
+        logger.info(
+            "Telegram channel registered (transport=%s, delivery=%s, chat_id=%s)",
+            transport,
+            telegram_delivery,
+            telegram_chat_id,
+        )
 
     # Register "telegram" as a bus target for outbound routing
     async def _telegram_outbound(msg: BusMessage) -> None:

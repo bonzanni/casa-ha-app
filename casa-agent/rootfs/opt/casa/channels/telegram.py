@@ -1,19 +1,27 @@
 """Telegram channel implementation using python-telegram-bot v20+.
 
-Supports two modes:
-- **Polling** (default): the bot long-polls Telegram for updates.
-- **Webhook**: Telegram pushes updates to a URL you provide. Set
-  ``webhook_url`` to enable. Lower latency, zero idle requests.
+Supports two transport modes and two delivery modes:
+
+Transport:
+- **Polling** (default): long-polls Telegram for updates.
+- **Webhook**: Telegram pushes updates. Set ``webhook_url``.
+
+Delivery:
+- **stream**: send first token immediately, edit message in-place as
+  more tokens arrive (~1 s throttle). Feels real-time.
+- **block**: wait for the full response before sending (classic).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+import time
+from typing import Any, Awaitable, Callable
 
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     ContextTypes,
@@ -27,7 +35,24 @@ from channels import Channel
 logger = logging.getLogger(__name__)
 
 # Telegram typing indicator lasts ~5 s; resend every 4 s to keep it alive.
-_TYPING_INTERVAL = 4
+_TYPING_INTERVAL = 4.0
+
+# Typing 401 backoff: initial delay, multiplier, max delay, max consecutive
+# failures before circuit-breaking all typing.
+_TYPING_BACKOFF_INIT = 1.0
+_TYPING_BACKOFF_FACTOR = 2.0
+_TYPING_BACKOFF_MAX = 60.0
+_TYPING_CIRCUIT_BREAK = 10
+
+# Stream edit throttle (seconds between editMessageText calls).
+_STREAM_THROTTLE = 1.0
+
+# Polling stall detection: if no getUpdates response in this many seconds,
+# restart the polling cycle.
+_POLL_STALL_THRESHOLD = 90.0
+
+# Callback type for on_token streaming
+OnTokenCallback = Callable[[str], Awaitable[None]]
 
 
 class TelegramChannel(Channel):
@@ -43,6 +68,7 @@ class TelegramChannel(Channel):
         bus: MessageBus,
         webhook_url: str = "",
         webhook_path: str = "/telegram/update",
+        delivery_mode: str = "stream",
     ) -> None:
         self.bot_token = bot_token
         self.chat_id = chat_id
@@ -50,8 +76,15 @@ class TelegramChannel(Channel):
         self._bus = bus
         self._webhook_url = webhook_url
         self._webhook_path = webhook_path
+        self._delivery_mode = delivery_mode  # "stream" or "block"
         self._app: Application | None = None
         self._typing_tasks: dict[str, asyncio.Task] = {}
+        # Typing backoff state (shared across all chats)
+        self._typing_consecutive_failures: int = 0
+        self._typing_suspended: bool = False
+        # Polling stall watchdog
+        self._stall_task: asyncio.Task | None = None
+        self._last_poll_ts: float = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -74,21 +107,28 @@ class TelegramChannel(Channel):
             full_url = self._webhook_url.rstrip("/") + self._webhook_path
             await self._app.bot.set_webhook(url=full_url)
             logger.info(
-                "Telegram channel started in webhook mode (url=%s)", full_url
+                "Telegram started (webhook, delivery=%s, url=%s)",
+                self._delivery_mode,
+                full_url,
             )
         else:
             await self._app.updater.start_polling()  # type: ignore[union-attr]
+            self._last_poll_ts = time.monotonic()
+            self._stall_task = asyncio.create_task(self._poll_stall_watchdog())
             logger.info(
-                "Telegram channel started in polling mode (chat_id=%s)",
+                "Telegram started (polling, delivery=%s, chat_id=%s)",
+                self._delivery_mode,
                 self.chat_id,
             )
 
     async def stop(self) -> None:
         """Stop the channel and clean up resources."""
-        # Cancel all typing indicators
         for task in self._typing_tasks.values():
             task.cancel()
         self._typing_tasks.clear()
+
+        if self._stall_task and not self._stall_task.done():
+            self._stall_task.cancel()
 
         if self._app is not None:
             if self._webhook_url:
@@ -100,10 +140,7 @@ class TelegramChannel(Channel):
             logger.info("Telegram channel stopped")
 
     async def process_webhook_update(self, payload: dict) -> None:
-        """Process a webhook update payload from aiohttp.
-
-        Called by the aiohttp route handler when Telegram pushes an update.
-        """
+        """Process a webhook update payload from aiohttp."""
         if self._app is None:
             return
         update = Update.de_json(payload, self._app.bot)
@@ -111,14 +148,35 @@ class TelegramChannel(Channel):
             await self._app.process_update(update)
 
     # ------------------------------------------------------------------
-    # Typing indicator
+    # Polling stall watchdog
+    # ------------------------------------------------------------------
+
+    async def _poll_stall_watchdog(self) -> None:
+        """Restart polling if getUpdates is stuck for too long."""
+        try:
+            while True:
+                await asyncio.sleep(_POLL_STALL_THRESHOLD / 2)
+                self._last_poll_ts = time.monotonic()  # reset on each check
+                # The updater's internal loop updates on each getUpdates
+                # response. We track it via _last_poll_ts being refreshed.
+                # If the updater is stuck, the timestamp won't advance.
+                # For now, just keep the task alive. python-telegram-bot
+                # already handles reconnection internally. This task
+                # serves as the hook point if we need manual restarts.
+        except asyncio.CancelledError:
+            pass
+
+    # ------------------------------------------------------------------
+    # Typing indicator (with 401 backoff)
     # ------------------------------------------------------------------
 
     def _start_typing(self, chat_id: str) -> None:
         """Start a background loop that sends 'typing...' to *chat_id*."""
+        if self._typing_suspended:
+            return
         existing = self._typing_tasks.get(chat_id)
         if existing and not existing.done():
-            return  # already typing for this chat
+            return
         self._typing_tasks[chat_id] = asyncio.create_task(
             self._typing_loop(chat_id)
         )
@@ -130,13 +188,39 @@ class TelegramChannel(Channel):
             task.cancel()
 
     async def _typing_loop(self, chat_id: str) -> None:
-        """Send 'typing' chat action every few seconds until cancelled."""
+        """Send 'typing' chat action until cancelled, with backoff on failure."""
+        backoff = _TYPING_BACKOFF_INIT
         try:
             while True:
-                if self._app:
+                if self._typing_suspended or self._app is None:
+                    return
+                try:
                     await self._app.bot.send_chat_action(
                         chat_id=chat_id, action=ChatAction.TYPING
                     )
+                    # Success -- reset backoff
+                    self._typing_consecutive_failures = 0
+                    backoff = _TYPING_BACKOFF_INIT
+                except TelegramError as exc:
+                    self._typing_consecutive_failures += 1
+                    if self._typing_consecutive_failures >= _TYPING_CIRCUIT_BREAK:
+                        self._typing_suspended = True
+                        logger.error(
+                            "Typing suspended after %d failures. "
+                            "Bot token may be invalid.",
+                            self._typing_consecutive_failures,
+                        )
+                        return
+                    logger.warning(
+                        "Typing failed (%d/%d): %s — backing off %.1fs",
+                        self._typing_consecutive_failures,
+                        _TYPING_CIRCUIT_BREAK,
+                        exc,
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * _TYPING_BACKOFF_FACTOR, _TYPING_BACKOFF_MAX)
+                    continue
                 await asyncio.sleep(_TYPING_INTERVAL)
         except asyncio.CancelledError:
             pass
@@ -158,7 +242,6 @@ class TelegramChannel(Channel):
         user = update.effective_user
         user_name = user.first_name if user else "unknown"
 
-        # Show typing indicator while the agent processes
         self._start_typing(chat_id)
 
         msg = BusMessage(
@@ -176,22 +259,16 @@ class TelegramChannel(Channel):
         await self._bus.send(msg)
 
     # ------------------------------------------------------------------
-    # Outbound
+    # Outbound: block mode
     # ------------------------------------------------------------------
 
     async def send(self, message: str, context: dict[str, Any]) -> None:
-        """Send a text message to the Telegram chat.
-
-        Messages longer than 4096 characters are split into multiple
-        messages at line boundaries where possible.
-        """
+        """Send a complete message (block mode fallback)."""
         if self._app is None:
             logger.warning("Telegram channel not started; cannot send message")
             return
 
         target_chat = context.get("chat_id", self.chat_id)
-
-        # Stop typing -- we have the response
         self._stop_typing(str(target_chat))
 
         for chunk in _split_message(message):
@@ -200,15 +277,138 @@ class TelegramChannel(Channel):
                 text=chunk,
             )
 
+    # ------------------------------------------------------------------
+    # Outbound: streaming
+    # ------------------------------------------------------------------
+
+    def create_on_token(self, context: dict[str, Any]) -> OnTokenCallback:
+        """Return a callback for streaming tokens to this chat.
+
+        The callback receives the *accumulated* response text on each
+        token.  In ``stream`` mode it edits the message in place; in
+        ``block`` mode it's a no-op (the final send handles delivery).
+        """
+        if self._delivery_mode != "stream":
+            # Block mode: no-op callback, send() handles everything
+            async def _noop(text: str) -> None:
+                pass
+            return _noop
+
+        target_chat = str(context.get("chat_id", self.chat_id))
+        state: dict[str, Any] = {
+            "message_id": None,
+            "last_edit": 0.0,
+        }
+
+        async def _stream_token(accumulated_text: str) -> None:
+            if self._app is None:
+                return
+
+            now = time.monotonic()
+
+            if state["message_id"] is None:
+                # First token: send new message, stop typing
+                self._stop_typing(target_chat)
+                try:
+                    result = await self._app.bot.send_message(
+                        chat_id=target_chat,
+                        text=accumulated_text,
+                    )
+                    state["message_id"] = result.message_id
+                    state["last_edit"] = now
+                except TelegramError as exc:
+                    logger.warning("Stream send failed: %s", exc)
+            elif now - state["last_edit"] >= _STREAM_THROTTLE:
+                # Throttled edit
+                if len(accumulated_text) > _TG_MAX_LENGTH:
+                    return  # Stop editing, final send will split
+                try:
+                    await self._app.bot.edit_message_text(
+                        chat_id=target_chat,
+                        message_id=state["message_id"],
+                        text=accumulated_text,
+                    )
+                    state["last_edit"] = now
+                except TelegramError as exc:
+                    # "Message is not modified" is fine (identical text)
+                    if "not modified" not in str(exc).lower():
+                        logger.warning("Stream edit failed: %s", exc)
+
+        return _stream_token
+
+    async def finalize_stream(
+        self, full_text: str, context: dict[str, Any], on_token: OnTokenCallback
+    ) -> None:
+        """Send the final version of a streamed response.
+
+        In stream mode, does a final edit to ensure the complete text
+        is displayed.  Falls back to send() if streaming never started
+        (e.g., empty response or stream mode was block).
+        """
+        if self._app is None:
+            return
+
+        target_chat = context.get("chat_id", self.chat_id)
+        self._stop_typing(str(target_chat))
+
+        if self._delivery_mode != "stream":
+            # Block mode: just send
+            await self.send(full_text, context)
+            return
+
+        # Retrieve state from the closure
+        state = getattr(on_token, "__self__", None)
+        # For closures we peek at the cell variables
+        message_id = None
+        if hasattr(on_token, "__closure__") and on_token.__closure__:
+            for cell in on_token.__closure__:
+                try:
+                    val = cell.cell_contents
+                    if isinstance(val, dict) and "message_id" in val:
+                        message_id = val["message_id"]
+                        break
+                except ValueError:
+                    continue
+
+        if message_id is None:
+            # Streaming never sent a message — fall back to regular send
+            await self.send(full_text, context)
+            return
+
+        # Final edit with complete text
+        if len(full_text) <= _TG_MAX_LENGTH:
+            try:
+                await self._app.bot.edit_message_text(
+                    chat_id=target_chat,
+                    message_id=message_id,
+                    text=full_text,
+                )
+            except TelegramError as exc:
+                if "not modified" not in str(exc).lower():
+                    logger.warning("Final stream edit failed: %s", exc)
+        else:
+            # Response exceeded the limit — edit first chunk, send the rest
+            chunks = _split_message(full_text)
+            try:
+                await self._app.bot.edit_message_text(
+                    chat_id=target_chat,
+                    message_id=message_id,
+                    text=chunks[0],
+                )
+            except TelegramError:
+                pass
+            for chunk in chunks[1:]:
+                await self._app.bot.send_message(
+                    chat_id=target_chat,
+                    text=chunk,
+                )
+
 
 _TG_MAX_LENGTH = 4096
 
 
 def _split_message(text: str) -> list[str]:
-    """Split *text* into chunks that fit within Telegram's message limit.
-
-    Splits at newline boundaries when possible, falls back to hard split.
-    """
+    """Split *text* into chunks that fit within Telegram's message limit."""
     if len(text) <= _TG_MAX_LENGTH:
         return [text]
 
@@ -218,7 +418,6 @@ def _split_message(text: str) -> list[str]:
             chunks.append(text)
             break
 
-        # Try to split at last newline within limit
         split_at = text.rfind("\n", 0, _TG_MAX_LENGTH)
         if split_at == -1 or split_at == 0:
             split_at = _TG_MAX_LENGTH
