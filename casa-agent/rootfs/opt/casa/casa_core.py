@@ -441,7 +441,11 @@ async def main() -> None:
             parts = model.split("-")
             if len(parts) >= 3:
                 model = f"{parts[0].capitalize()} {parts[1]}.{parts[2]}"
-            display = agent.config.name or role.capitalize()
+            display = (
+                agent.config.name
+                if agent.config.name and not agent.config.name.startswith("${")
+                else role.capitalize()
+            )
             agent_rows += _row(display, model)
 
         # Channel rows
