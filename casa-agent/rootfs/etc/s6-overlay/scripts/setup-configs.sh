@@ -26,4 +26,14 @@ if [ ! -f "$DATA_DIR/sessions.json" ]; then
     echo '{}' > "$DATA_DIR/sessions.json"
 fi
 
+# Auto-generate webhook secret if not set by user
+SECRET_FILE="$DATA_DIR/webhook_secret"
+USER_SECRET=$(bashio::config 'webhook_secret')
+if [ -n "$USER_SECRET" ]; then
+    printf '%s' "$USER_SECRET" > "$SECRET_FILE"
+elif [ ! -f "$SECRET_FILE" ]; then
+    head -c 32 /dev/urandom | base64 | tr -d '=/+' | head -c 48 > "$SECRET_FILE"
+    bashio::log.info "Auto-generated webhook secret (see /data/webhook_secret)"
+fi
+
 bashio::log.info "Configuration setup complete."

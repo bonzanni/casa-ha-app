@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.1.10"
+version: "0.1.11"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 init: false
@@ -13,6 +13,10 @@ hassio_api: true
 ingress: true
 ingress_port: 8080
 apparmor: true
+ports:
+  "18065/tcp": null
+ports_description:
+  "18065/tcp": "External API (webhooks, invoke, Telegram webhook)"
 map:
   - addon_config:rw
   - config:ro

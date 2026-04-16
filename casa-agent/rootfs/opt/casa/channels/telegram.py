@@ -69,6 +69,7 @@ class TelegramChannel(Channel):
         webhook_url: str = "",
         webhook_path: str = "/telegram/update",
         delivery_mode: str = "stream",
+        webhook_secret: str = "",
     ) -> None:
         self.bot_token = bot_token
         self.chat_id = chat_id
@@ -77,6 +78,7 @@ class TelegramChannel(Channel):
         self._webhook_url = webhook_url
         self._webhook_path = webhook_path
         self._delivery_mode = delivery_mode  # "stream" or "block"
+        self._webhook_secret = webhook_secret
         self._app: Application | None = None
         self._typing_tasks: dict[str, asyncio.Task] = {}
         # Typing backoff state (shared across all chats)
@@ -105,11 +107,15 @@ class TelegramChannel(Channel):
 
         if self._webhook_url:
             full_url = self._webhook_url.rstrip("/") + self._webhook_path
-            await self._app.bot.set_webhook(url=full_url)
+            kwargs: dict[str, Any] = {"url": full_url}
+            if self._webhook_secret:
+                kwargs["secret_token"] = self._webhook_secret
+            await self._app.bot.set_webhook(**kwargs)
             logger.info(
-                "Telegram started (webhook, delivery=%s, url=%s)",
+                "Telegram started (webhook, delivery=%s, url=%s, secret=%s)",
                 self._delivery_mode,
                 full_url,
+                "yes" if self._webhook_secret else "no",
             )
         else:
             await self._app.updater.start_polling()  # type: ignore[union-attr]

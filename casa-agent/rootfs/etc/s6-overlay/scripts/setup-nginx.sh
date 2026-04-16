@@ -18,6 +18,7 @@ http {
 
     server {
         listen ${INGRESS_PORT} default_server;
+        listen 18065;
         server_name _;
 
         # Casa API (aiohttp)
