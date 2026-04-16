@@ -135,7 +135,7 @@ class Agent:
 
         return BusMessage(
             type=MessageType.RESPONSE,
-            source=self.config.name.lower(),
+            source=self.config.role,
             target=msg.source,
             content=text,
             reply_to=msg.id,
@@ -244,7 +244,7 @@ class Agent:
         if sdk_session_id and sdk_session_id != resume_session_id:
             logger.info(
                 "SDK session for '%s': %s",
-                self.config.name,
+                self.config.role,
                 sdk_session_id,
             )
 
@@ -278,7 +278,7 @@ class Agent:
         if sdk_session_id:
             await self._session_registry.register(
                 channel_key=channel_key,
-                agent=self.config.name,
+                agent=self.config.role,
                 sdk_session_id=sdk_session_id,
                 memory_session_id=memory_session_id or "",
             )
