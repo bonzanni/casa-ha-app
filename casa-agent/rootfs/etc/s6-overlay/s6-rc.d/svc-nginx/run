@@ -1,7 +1,6 @@
-#!/usr/bin/with-contenv bashio
-# /etc/services.d/nginx/run
+#!/command/with-contenv bashio
 
 # Wait for aiohttp to be ready before proxying (prevents 502 on startup)
-bashio::net.wait_for 8099 127.0.0.1 30
+bashio::net.wait_for 8099 127.0.0.1 60
 
 exec nginx -g 'daemon off;'

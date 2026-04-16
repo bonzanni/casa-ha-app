@@ -27,8 +27,7 @@ RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
 # Copy application
 COPY rootfs /
 
-# Set permissions for s6 services and init scripts
-RUN chmod +x /etc/cont-init.d/*.sh \
-    && chmod +x /etc/services.d/*/run \
-    && chmod +x /etc/services.d/*/finish \
+# Set permissions for s6-rc services and scripts
+RUN find /etc/s6-overlay/s6-rc.d -name 'up' -o -name 'run' -o -name 'finish' \
+    | xargs chmod +x \
     && chmod +x /opt/casa/scripts/*.sh

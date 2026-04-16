@@ -1,5 +1,4 @@
-#!/usr/bin/with-contenv bashio
-# /etc/cont-init.d/01-setup-configs.sh
+#!/command/with-contenv bashio
 
 CONFIG_DIR="/addon_configs/casa-agent"
 DATA_DIR="/data"

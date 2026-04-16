@@ -1,5 +1,4 @@
-#!/usr/bin/with-contenv bashio
-# /etc/services.d/casa/finish
+#!/command/with-contenv bashio
 
 if [ "${1}" -ne 0 ] && [ "${1}" -ne 256 ]; then
     bashio::log.error "Casa crashed with exit code ${1}"

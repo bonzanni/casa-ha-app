@@ -29,37 +29,64 @@ RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
 
 COPY casa-agent/rootfs /
 
-RUN chmod +x /etc/cont-init.d/*.sh \
-    && chmod +x /etc/services.d/*/run \
-    && chmod +x /etc/services.d/*/finish \
+RUN find /etc/s6-overlay/s6-rc.d -name 'up' -o -name 'run' -o -name 'finish' \
+    | xargs chmod +x \
     && chmod +x /opt/casa/scripts/*.sh
 
 # --- Test layer: mock supervisor + options ---
 COPY test-local/options.json /data/options.json
 
-# Create addon_configs directory structure
-RUN mkdir -p /addon_configs/casa-agent /data/sdk-sessions
+RUN mkdir -p /addon_configs/casa-agent /data/sdk-sessions \
+             /etc/s6-overlay/scripts
 
-# Bashio reads from http://supervisor which doesn't exist outside HA.
-# Replace the init scripts with simplified versions that read options.json directly.
-COPY test-local/init-overrides/ /etc/cont-init.d/
+# --- Override oneshot init scripts (no bashio in test mode) ---
+# s6-rc oneshot 'up' files default to execline. We write shell scripts
+# and point 'up' to them via: /bin/sh /path/to/script.sh
 
-RUN chmod +x /etc/cont-init.d/*.sh
+# init-validate-config
+COPY test-local/init-overrides/validate-config-test.sh /etc/s6-overlay/scripts/
+RUN printf '/bin/sh /etc/s6-overlay/scripts/validate-config-test.sh\n' \
+    > /etc/s6-overlay/s6-rc.d/init-validate-config/up
 
-# Override the casa service run script: use with-contenv to pick up
-# env vars written by 03-export-env.sh to /var/run/s6/container_environment/
+# init-setup-configs
+COPY test-local/init-overrides/01-setup-configs.sh /etc/s6-overlay/scripts/setup-configs-test.sh
+RUN printf '/bin/sh /etc/s6-overlay/scripts/setup-configs-test.sh\n' \
+    > /etc/s6-overlay/s6-rc.d/init-setup-configs/up
+
+# init-setup-nginx
+COPY test-local/init-overrides/02-setup-nginx.sh /etc/s6-overlay/scripts/setup-nginx-test.sh
+RUN printf '/bin/sh /etc/s6-overlay/scripts/setup-nginx-test.sh\n' \
+    > /etc/s6-overlay/s6-rc.d/init-setup-nginx/up
+
+# init-export-env: exports options.json to s6 container env vars
+RUN mkdir -p /etc/s6-overlay/s6-rc.d/init-export-env/dependencies.d \
+    && printf 'oneshot\n' > /etc/s6-overlay/s6-rc.d/init-export-env/type \
+    && touch /etc/s6-overlay/s6-rc.d/init-export-env/dependencies.d/init-setup-configs \
+    && touch /etc/s6-overlay/s6-rc.d/user/contents.d/init-export-env
+COPY test-local/init-overrides/03-export-env.sh /etc/s6-overlay/scripts/export-env-test.sh
+RUN printf '/bin/sh /etc/s6-overlay/scripts/export-env-test.sh\n' \
+    > /etc/s6-overlay/s6-rc.d/init-export-env/up
+
+# svc-casa depends on init-export-env in test mode
+RUN touch /etc/s6-overlay/s6-rc.d/svc-casa/dependencies.d/init-export-env
+
+# --- Override longrun service scripts ---
+
+# svc-casa: use with-contenv (reads s6 container env, no bashio)
 RUN printf '#!/command/with-contenv sh\nexec python3 /opt/casa/casa_core.py\n' \
-    > /etc/services.d/casa/run \
-    && chmod +x /etc/services.d/casa/run
+    > /etc/s6-overlay/s6-rc.d/svc-casa/run \
+    && chmod +x /etc/s6-overlay/s6-rc.d/svc-casa/run
 
-# Override ttyd to read from options.json instead of bashio
+# svc-nginx: wait without bashio
+RUN printf '#!/bin/sh\nfor i in $(seq 1 60); do\n  nc -z 127.0.0.1 8099 2>/dev/null && break\n  sleep 1\ndone\nexec nginx -g "daemon off;"\n' \
+    > /etc/s6-overlay/s6-rc.d/svc-nginx/run \
+    && chmod +x /etc/s6-overlay/s6-rc.d/svc-nginx/run
+
+# svc-ttyd: read from options.json instead of bashio
 RUN printf '#!/bin/sh\nENABLED=$(jq -r ".enable_terminal // false" /data/options.json)\nif [ "$ENABLED" != "true" ]; then\n  echo "[INFO] Web terminal disabled."\n  exec sleep infinity\nfi\nexec ttyd --writable --interface 127.0.0.1 --port 7681 --base-path /terminal --cwd /addon_configs/casa-agent bash\n' \
-    > /etc/services.d/ttyd/run \
-    && chmod +x /etc/services.d/ttyd/run
+    > /etc/s6-overlay/s6-rc.d/svc-ttyd/run \
+    && chmod +x /etc/s6-overlay/s6-rc.d/svc-ttyd/run
 
-# Override nginx to not use bashio::net.wait_for
-RUN printf '#!/bin/sh\n# Wait for aiohttp\nfor i in $(seq 1 30); do\n  nc -z 127.0.0.1 8099 2>/dev/null && break\n  sleep 1\ndone\nexec nginx -g "daemon off;"\n' \
-    > /etc/services.d/nginx/run \
-    && chmod +x /etc/services.d/nginx/run
+RUN chmod +x /etc/s6-overlay/scripts/*.sh
 
 ENV SUPERVISOR_TOKEN=mock-token-for-testing

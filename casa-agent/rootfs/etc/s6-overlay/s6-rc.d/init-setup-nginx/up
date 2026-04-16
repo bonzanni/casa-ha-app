@@ -1,9 +1,8 @@
-#!/usr/bin/with-contenv bashio
-# /etc/cont-init.d/02-setup-nginx.sh
+#!/command/with-contenv bashio
 
 INGRESS_PORT=$(bashio::addon.ingress_port)
 
-# Base nginx config (no template engine needed)
+# Base nginx config
 cat > /etc/nginx/nginx.conf <<NGINX
 worker_processes 1;
 error_log /dev/stdout info;
