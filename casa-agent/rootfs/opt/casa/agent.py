@@ -89,24 +89,12 @@ class Agent:
         mcp_servers = self._mcp_registry.resolve(self.config.mcp_server_names)
 
         # 4. Build SDK options ---------------------------------------------
-        hooks: list[dict[str, Any]] = [
-            {
-                "matcher": HookMatcher(tool_name="Bash"),
-                "callback": block_dangerous_commands,
-            },
-            {
-                "matcher": HookMatcher(tool_name="Read"),
-                "callback": enforce_path_scope,
-            },
-            {
-                "matcher": HookMatcher(tool_name="Write"),
-                "callback": enforce_path_scope,
-            },
-            {
-                "matcher": HookMatcher(tool_name="Edit"),
-                "callback": enforce_path_scope,
-            },
-        ]
+        hooks = {
+            "PreToolUse": [
+                HookMatcher(matcher="Bash", hooks=[block_dangerous_commands]),
+                HookMatcher(matcher="Read|Write|Edit", hooks=[enforce_path_scope]),
+            ],
+        }
 
         # Check for an existing session to resume
         existing = self._session_registry.get(channel_key)
@@ -118,15 +106,14 @@ class Agent:
         options = ClaudeAgentOptions(
             model=self.config.model,
             system_prompt=system_prompt,
-            tools=self.config.tools.allowed,
+            allowed_tools=self.config.tools.allowed,
             disallowed_tools=self.config.tools.disallowed,
             permission_mode=self.config.tools.permission_mode or "acceptEdits",
             max_turns=self.config.tools.max_turns,
-            mcp_servers=mcp_servers,
+            mcp_servers=mcp_servers if mcp_servers else {},
             hooks=hooks,
             cwd=self.config.cwd or None,
-            session_id=resume_session_id,
-            context={"agent_name": self.config.name.lower()},
+            resume=resume_session_id,
         )
 
         # 5. Query the SDK -------------------------------------------------
