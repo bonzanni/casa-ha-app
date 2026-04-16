@@ -1,4 +1,0 @@
-#!/usr/bin/with-contenv bashio
-# /etc/services.d/nginx/finish
-
-bashio::log.warning "Nginx exited with code ${1}"

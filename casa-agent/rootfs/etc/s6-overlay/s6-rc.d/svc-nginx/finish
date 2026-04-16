@@ -1,0 +1,3 @@
+#!/command/with-contenv bashio
+
+bashio::log.warning "Nginx exited with code ${1}"

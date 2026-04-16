@@ -1,5 +1,4 @@
-#!/usr/bin/with-contenv bashio
-# /etc/services.d/ttyd/run
+#!/command/with-contenv bashio
 
 if ! bashio::config.true 'enable_terminal'; then
     bashio::log.info "Web terminal is disabled."

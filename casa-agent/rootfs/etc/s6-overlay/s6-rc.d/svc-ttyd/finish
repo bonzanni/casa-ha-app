@@ -1,5 +1,4 @@
-#!/usr/bin/with-contenv bashio
-# /etc/services.d/ttyd/finish
+#!/command/with-contenv bashio
 
 if ! bashio::config.true 'enable_terminal'; then
     exit 256
