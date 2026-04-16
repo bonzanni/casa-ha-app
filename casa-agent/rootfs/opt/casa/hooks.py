@@ -1,10 +1,18 @@
-"""Safety hooks: command blocking and path-scope enforcement."""
+"""Safety hooks: command blocking and per-role path-scope enforcement.
+
+The Claude Agent SDK's `HookContext` carries no agent identity (only a reserved
+`signal` field). Per-role rules must therefore be bound at hook-registration
+time via a closure; see :func:`make_path_scope_hook`.
+
+Payload shape follows the SDK's `PreToolUseHookSpecificOutput`:
+``hookEventName`` + ``permissionDecision`` (allow | deny | ask) + reason.
+"""
 
 from __future__ import annotations
 
 import re
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 # ---------------------------------------------------------------------------
 # Forbidden shell patterns
@@ -22,20 +30,17 @@ FORBIDDEN_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Per-agent path rules
+# Per-role path rules (keyed on AgentConfig.role, not display name)
 # ---------------------------------------------------------------------------
 
-# Each entry maps an agent name to a list of (permission_set, path_prefix) tuples.
-# permission_set is a frozenset of tool names (Read, Write, Edit).
 AGENT_PATH_RULES: dict[str, list[tuple[frozenset[str], str]]] = {
-    "tina": [
-        (frozenset({"Read"}), "agents/tina/"),
-        (frozenset({"Read"}), "workspace/"),
-    ],
-    "ellen": [
+    "main": [
         (frozenset({"Read"}), "addon_configs/"),
         (frozenset({"Read"}), "/config/"),
         (frozenset({"Write"}), "workspace/"),
+    ],
+    "butler": [
+        (frozenset({"Read"}), "workspace/"),
     ],
     "plugin-builder": [
         (frozenset({"Read", "Write"}), "workspace/"),
@@ -43,17 +48,30 @@ AGENT_PATH_RULES: dict[str, list[tuple[frozenset[str], str]]] = {
 }
 
 
+HookCallback = Callable[
+    [dict[str, Any], str | None, dict[str, Any]],
+    Awaitable[dict[str, Any] | None],
+]
+
+
 def _deny(reason: str) -> dict[str, Any]:
-    """Return a hook-specific output dict that denies the tool call."""
-    return {"hookSpecificOutput": {"decision": "deny", "reason": reason}}
+    """Return a PreToolUse payload that denies the tool call.
+
+    Shape is defined by the SDK's ``PreToolUseHookSpecificOutput``. The older
+    ``{"decision": "deny"}`` shape is silently ignored by the CLI Zod
+    validator, which is why per-role enforcement appeared broken.
+    """
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
 
 
 def _normalize_path(raw: str) -> str:
-    """Resolve ``..`` segments using PurePosixPath splitting (no OS calls).
-
-    Returns the normalized path string without a leading ``/`` unless the
-    original path was absolute.
-    """
+    """Resolve ``..`` segments using PurePosixPath splitting (no OS calls)."""
     parts = PurePosixPath(raw).parts
     resolved: list[str] = []
     for part in parts:
@@ -72,14 +90,10 @@ def _normalize_path(raw: str) -> str:
 
 async def block_dangerous_commands(
     input_data: dict[str, Any],
-    tool_use_id: str,
+    tool_use_id: str | None,
     context: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Block shell commands that match FORBIDDEN_PATTERNS.
-
-    Returns a deny dict if the command is dangerous, else ``None``.
-    Only inspects tools named ``Bash``.
-    """
+    """Block Bash commands that match FORBIDDEN_PATTERNS."""
     tool_name = input_data.get("tool_name", "")
     if tool_name != "Bash":
         return None
@@ -91,24 +105,18 @@ async def block_dangerous_commands(
     return None
 
 
-async def enforce_path_scope(
+async def _check_path_scope(
+    role: str,
     input_data: dict[str, Any],
-    tool_use_id: str,
-    context: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Enforce per-agent file-path restrictions.
-
-    Checks Read / Write / Edit tool calls against AGENT_PATH_RULES.
-    Returns a deny dict if the path is out of scope, else ``None``.
-    """
+    """Check a Read/Write/Edit call against AGENT_PATH_RULES for *role*."""
     tool_name = input_data.get("tool_name", "")
     if tool_name not in ("Read", "Write", "Edit"):
         return None
 
-    agent_name = context.get("agent_name", "")
-    rules = AGENT_PATH_RULES.get(agent_name)
+    rules = AGENT_PATH_RULES.get(role)
     if rules is None:
-        # No rules defined for this agent -- allow by default
+        # Unknown role -- allow by default. Phase 2 may invert this.
         return None
 
     raw_path = input_data.get("tool_input", {}).get("file_path", "")
@@ -116,8 +124,25 @@ async def enforce_path_scope(
 
     for perms, prefix in rules:
         if tool_name in perms and norm.startswith(prefix):
-            return None  # allowed
+            return None
 
     return _deny(
-        f"Agent '{agent_name}' is not allowed to {tool_name} path '{raw_path}'"
+        f"Role '{role}' is not allowed to {tool_name} path '{raw_path}'"
     )
+
+
+def make_path_scope_hook(role: str) -> HookCallback:
+    """Return a PreToolUse hook callback bound to *role*.
+
+    The SDK provides no agent identity inside the hook context, so the role
+    must be captured in a closure at registration time.
+    """
+
+    async def _hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        return await _check_path_scope(role, input_data)
+
+    return _hook

