@@ -185,7 +185,17 @@ async def main() -> None:
         tina_name = None
         logger.info("No tina.yaml found; voice agent not started")
 
-    # 9. Telegram channel
+    # 9. Webhook secret (auto-generated if auth enabled, see setup-configs.sh)
+    webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
+    if not webhook_secret:
+        secret_path = os.path.join(DATA_DIR, "webhook_secret")
+        if os.path.exists(secret_path):
+            with open(secret_path, "r", encoding="utf-8") as fh:
+                webhook_secret = fh.read().strip()
+    if webhook_secret:
+        logger.info("Webhook secret loaded (%d chars)", len(webhook_secret))
+
+    # 10. Telegram channel
     telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     telegram_channel = None
     if telegram_token:
@@ -220,15 +230,7 @@ async def main() -> None:
 
     bus.register("telegram", _telegram_outbound)
 
-    # 10. Webhook secret (auto-generated if not set by user)
-    webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
-    if not webhook_secret:
-        secret_path = os.path.join(DATA_DIR, "webhook_secret")
-        if os.path.exists(secret_path):
-            with open(secret_path, "r", encoding="utf-8") as fh:
-                webhook_secret = fh.read().strip()
-    if webhook_secret:
-        logger.info("Webhook secret loaded (%d chars)", len(webhook_secret))
+    # 11. Webhook endpoints
 
     def _verify_webhook(request: web.Request, body: bytes) -> bool:
         """Verify HMAC-SHA256 signature if a webhook secret is configured."""
