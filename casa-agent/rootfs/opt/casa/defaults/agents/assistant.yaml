@@ -1,5 +1,5 @@
 name: "${PRIMARY_AGENT_NAME}"
-role: main
+role: assistant
 description: >
   Primary assistant and orchestrator. Handles general queries, delegates to
   specialized subagents for development and domain tasks.
@@ -33,7 +33,7 @@ mcp_server_names:
   - homeassistant
   - casa-framework
 memory:
-  peer_name: ellen
+  peer_name: assistant
   token_budget: 8000
 channels:
   - telegram
