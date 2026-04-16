@@ -17,6 +17,7 @@ http {
         ''      close;
     }
 
+    # --- Ingress server ---
     server {
         listen ${INGRESS_PORT} default_server;
         server_name _;
@@ -73,7 +74,34 @@ else
 NGINX
 fi
 
-cat >> /etc/nginx/nginx.conf <<NGINX
+# Close ingress server, add external API server, close http
+cat >> /etc/nginx/nginx.conf <<'NGINX'
+    }
+
+    # --- External API server (no terminal) ---
+    server {
+        listen 18065;
+        server_name _;
+
+        location / {
+            proxy_pass http://127.0.0.1:8099;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_read_timeout 300;
+        }
+
+        location /ws {
+            proxy_pass http://127.0.0.1:8099/ws;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 86400;
+        }
+
+        location /terminal/ {
+            return 404;
+        }
     }
 }
 NGINX
