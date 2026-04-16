@@ -3,17 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
 import signal
 import sys
+from pathlib import Path
 from typing import Any
 
+# Ensure the Casa package root is on sys.path regardless of cwd
+_CASA_ROOT = str(Path(__file__).resolve().parent)
+if _CASA_ROOT not in sys.path:
+    sys.path.insert(0, _CASA_ROOT)
+
+import yaml
 from aiohttp import web
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig, load_agent_config
+from log_redact import RedactingFilter
 from mcp_registry import McpServerRegistry
 from memory import HonchoMemoryProvider, MemoryProvider
 from session_registry import SessionRegistry
@@ -75,12 +86,13 @@ async def healthz(_request: web.Request) -> web.Response:
 async def main() -> None:
     """Async entry point for the Casa add-on."""
 
-    # 1. Logging
+    # 1. Logging (with secret redaction)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stdout,
     )
+    logging.getLogger().addFilter(RedactingFilter())
     logger.info("Casa core starting up")
 
     # 2. Memory
@@ -129,26 +141,49 @@ async def main() -> None:
     mcp_registry.register_sdk("casa-framework", casa_tools_config)
     logger.info("Registered casa-framework MCP tools")
 
-    # 8. Load Ellen config
-    ellen_config_path = os.path.join(CONFIG_DIR, "agents", "ellen.yaml")
-    ellen_config: AgentConfig = load_agent_config(ellen_config_path)
-    logger.info("Loaded agent config: %s", ellen_config.name)
-
-    # 9. Create agent and register on bus
+    # 8. Load agent configs
     from agent import Agent
 
-    agent = Agent(
+    agents: dict[str, Agent] = {}
+    loop_tasks: list[asyncio.Task] = []
+
+    # -- Ellen (primary agent) --
+    ellen_config_path = os.path.join(CONFIG_DIR, "agents", "ellen.yaml")
+    ellen_config: AgentConfig = load_agent_config(ellen_config_path)
+    ellen_name = ellen_config.name.lower()
+
+    ellen = Agent(
         config=ellen_config,
         memory=memory,
         session_registry=session_registry,
         mcp_registry=mcp_registry,
         channel_manager=channel_manager,
     )
-    agent_name = ellen_config.name.lower()
-    bus.register(agent_name, agent.handle_message)
-    logger.info("Agent '%s' registered on bus", agent_name)
+    bus.register(ellen_name, ellen.handle_message)
+    agents[ellen_name] = ellen
+    logger.info("Agent '%s' registered on bus (model=%s)", ellen_name, ellen_config.model)
 
-    # 10. Telegram channel
+    # -- Tina (voice agent) --
+    tina_config_path = os.path.join(CONFIG_DIR, "agents", "tina.yaml")
+    if os.path.exists(tina_config_path):
+        tina_config: AgentConfig = load_agent_config(tina_config_path)
+        tina_name = tina_config.name.lower()
+
+        tina = Agent(
+            config=tina_config,
+            memory=memory,
+            session_registry=session_registry,
+            mcp_registry=mcp_registry,
+            channel_manager=channel_manager,
+        )
+        bus.register(tina_name, tina.handle_message)
+        agents[tina_name] = tina
+        logger.info("Agent '%s' registered on bus (model=%s)", tina_name, tina_config.model)
+    else:
+        tina_name = None
+        logger.info("No tina.yaml found; voice agent not started")
+
+    # 9. Telegram channel
     telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     if telegram_token:
         from channels.telegram import TelegramChannel
@@ -157,13 +192,13 @@ async def main() -> None:
         telegram_channel = TelegramChannel(
             bot_token=telegram_token,
             chat_id=telegram_chat_id,
-            default_agent=agent_name,
+            default_agent=ellen_name,
             bus=bus,
         )
         channel_manager.register(telegram_channel)
         logger.info("Telegram channel registered (chat_id=%s)", telegram_chat_id)
 
-    # 11. Register "telegram" as a bus target for outbound routing
+    # Register "telegram" as a bus target for outbound routing
     async def _telegram_outbound(msg: BusMessage) -> None:
         ch = channel_manager.get("telegram")
         if ch is not None:
@@ -171,9 +206,77 @@ async def main() -> None:
 
     bus.register("telegram", _telegram_outbound)
 
-    # 12-13. aiohttp app + start on 0.0.0.0:8099
+    # 10. Webhook endpoints
+    webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
+
+    def _verify_webhook(request: web.Request, body: bytes) -> bool:
+        """Verify HMAC-SHA256 signature if a webhook secret is configured."""
+        if not webhook_secret:
+            return True
+        sig = request.headers.get("X-Webhook-Signature", "")
+        expected = hmac.new(
+            webhook_secret.encode(), body, hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(sig, expected)
+
+    async def webhook_handler(request: web.Request) -> web.Response:
+        """Handle named webhook invocations (POST /webhook/{name})."""
+        body = await request.read()
+        if not _verify_webhook(request, body):
+            return web.json_response({"error": "invalid signature"}, status=401)
+
+        name = request.match_info.get("name", "")
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = body.decode("utf-8", errors="replace")
+
+        msg = BusMessage(
+            type=MessageType.SCHEDULED,
+            source="webhook",
+            target=ellen_name,
+            content=f"Webhook '{name}' triggered with payload: {payload}",
+            channel="webhook",
+            context={"webhook_name": name},
+        )
+        await bus.send(msg)
+        return web.json_response({"status": "accepted"})
+
+    async def invoke_handler(request: web.Request) -> web.Response:
+        """Direct agent invocation (POST /invoke/{agent})."""
+        body = await request.read()
+        if not _verify_webhook(request, body):
+            return web.json_response({"error": "invalid signature"}, status=401)
+
+        agent_name = request.match_info.get("agent", ellen_name)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+
+        prompt = payload.get("prompt", "")
+        if not prompt:
+            return web.json_response({"error": "missing 'prompt' field"}, status=400)
+
+        msg = BusMessage(
+            type=MessageType.REQUEST,
+            source="webhook",
+            target=agent_name,
+            content=prompt,
+            channel="webhook",
+            context=payload.get("context", {}),
+        )
+        try:
+            result = await bus.request(msg, timeout=300)
+            return web.json_response({"response": str(result.content)})
+        except asyncio.TimeoutError:
+            return web.json_response({"error": "timeout"}, status=504)
+
+    # 11. aiohttp app
     app = web.Application()
     app.router.add_get("/healthz", healthz)
+    app.router.add_post("/webhook/{name}", webhook_handler)
+    app.router.add_post("/invoke/{agent}", invoke_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -181,15 +284,61 @@ async def main() -> None:
     await site.start()
     logger.info("HTTP server listening on 0.0.0.0:8099")
 
-    # 14. Start all channels
+    # 12. Start all channels
     await channel_manager.start_all()
 
-    # 15. Agent loop tasks
-    loop_tasks: list[asyncio.Task] = []
-    loop_tasks.append(asyncio.create_task(bus.run_agent_loop(agent_name)))
-    loop_tasks.append(asyncio.create_task(bus.run_agent_loop("telegram")))
+    # 13. Agent loop tasks
+    for name in list(agents.keys()) + ["telegram"]:
+        if name in bus.queues:
+            loop_tasks.append(asyncio.create_task(bus.run_agent_loop(name)))
 
-    # 16. Graceful shutdown
+    # 14. APScheduler heartbeat
+    scheduler = AsyncIOScheduler()
+
+    schedules_path = os.path.join(CONFIG_DIR, "schedules.yaml")
+    heartbeat_enabled = os.environ.get("HEARTBEAT_ENABLED", "true").lower() == "true"
+    heartbeat_interval = int(os.environ.get("HEARTBEAT_INTERVAL_MINUTES", "60"))
+
+    if os.path.exists(schedules_path):
+        with open(schedules_path, "r", encoding="utf-8") as fh:
+            schedules_data = yaml.safe_load(fh) or {}
+        hb = schedules_data.get("heartbeat", {})
+        heartbeat_enabled = hb.get("enabled", heartbeat_enabled)
+        heartbeat_interval = hb.get("interval_minutes", heartbeat_interval)
+        heartbeat_agent = hb.get("agent", ellen_name)
+        heartbeat_prompt = hb.get("prompt", "Heartbeat: check for pending tasks.")
+    else:
+        heartbeat_agent = ellen_name
+        heartbeat_prompt = "Heartbeat: check for pending tasks."
+
+    if heartbeat_enabled and heartbeat_agent in agents:
+        async def _heartbeat_tick() -> None:
+            logger.info("Heartbeat firing for agent '%s'", heartbeat_agent)
+            msg = BusMessage(
+                type=MessageType.SCHEDULED,
+                source="scheduler",
+                target=heartbeat_agent,
+                content=heartbeat_prompt,
+                channel="",
+                context={"trigger": "heartbeat"},
+            )
+            await bus.send(msg)
+
+        scheduler.add_job(
+            _heartbeat_tick,
+            "interval",
+            minutes=heartbeat_interval,
+            id="heartbeat",
+        )
+        logger.info(
+            "Heartbeat scheduled: every %d min -> %s",
+            heartbeat_interval,
+            heartbeat_agent,
+        )
+
+    scheduler.start()
+
+    # 15. Graceful shutdown
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -197,20 +346,20 @@ async def main() -> None:
         logger.info("Shutdown signal received")
         stop_event.set()
 
-    # On Windows, signal handlers are limited; wrap in try/except
     try:
         loop.add_signal_handler(signal.SIGTERM, _signal_handler)
         loop.add_signal_handler(signal.SIGINT, _signal_handler)
     except NotImplementedError:
-        # Windows does not support add_signal_handler for SIGTERM
         logger.warning("Signal handlers not supported on this platform")
 
-    # 17. Wait for stop
+    # 16. Wait for stop
     logger.info("Casa core running -- waiting for shutdown signal")
     await stop_event.wait()
 
-    # 18. Cleanup
+    # 17. Cleanup
     logger.info("Shutting down...")
+    scheduler.shutdown(wait=False)
+
     for task in loop_tasks:
         task.cancel()
     await asyncio.gather(*loop_tasks, return_exceptions=True)

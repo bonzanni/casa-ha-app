@@ -1,7 +1,8 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.1.3"
+version: "0.1.4"
 slug: casa-agent
+url: https://github.com/bonzanni/casa-ha-app
 init: false
 startup: application
 timeout: 120
@@ -11,6 +12,7 @@ homeassistant_api: true
 hassio_api: true
 ingress: true
 ingress_port: 8080
+apparmor: true
 map:
   - addon_config:rw
   - config:ro

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import datetime, timezone
@@ -9,7 +10,11 @@ from typing import Any
 
 
 class SessionRegistry:
-    """Maps channel keys to session metadata and persists to disk."""
+    """Maps channel keys to session metadata and persists to disk.
+
+    All disk I/O is offloaded to a thread via :func:`asyncio.to_thread`
+    to avoid blocking the event loop.
+    """
 
     def __init__(self, path: str) -> None:
         self._path = path
@@ -18,7 +23,7 @@ class SessionRegistry:
             with open(path, "r", encoding="utf-8") as fh:
                 self._data = json.load(fh)
 
-    def register(
+    async def register(
         self,
         channel_key: str,
         agent: str,
@@ -32,28 +37,33 @@ class SessionRegistry:
             "memory_session_id": memory_session_id,
             "last_active": datetime.now(timezone.utc).isoformat(),
         }
-        self.save()
+        await self.save()
 
     def get(self, channel_key: str) -> dict[str, Any] | None:
         """Return the entry for *channel_key*, or ``None``."""
         return self._data.get(channel_key)
 
-    def touch(self, channel_key: str) -> None:
+    async def touch(self, channel_key: str) -> None:
         """Update ``last_active`` for an existing entry and persist."""
         entry = self._data.get(channel_key)
         if entry is not None:
             entry["last_active"] = datetime.now(timezone.utc).isoformat()
-            self.save()
+            await self.save()
 
-    def remove(self, channel_key: str) -> None:
+    async def remove(self, channel_key: str) -> None:
         """Remove an entry and persist."""
         self._data.pop(channel_key, None)
-        self.save()
+        await self.save()
 
-    def save(self) -> None:
-        """Write the current data to the JSON file."""
+    async def save(self) -> None:
+        """Write the current data to the JSON file (off-thread)."""
+        data = dict(self._data)  # snapshot for thread safety
+        await asyncio.to_thread(self._write, data)
+
+    def _write(self, data: dict[str, dict[str, Any]]) -> None:
+        """Synchronous write helper, runs in thread pool."""
         with open(self._path, "w", encoding="utf-8") as fh:
-            json.dump(self._data, fh, indent=2)
+            json.dump(data, fh, indent=2)
 
     def all_entries(self) -> dict[str, dict[str, Any]]:
         """Return a shallow copy of all entries."""

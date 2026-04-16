@@ -1,0 +1,63 @@
+configuration:
+  claude_oauth_token:
+    name: Claude OAuth Token
+    description: >-
+      OAuth token for the Claude Agent SDK. Run "claude setup-token" on your
+      local machine to obtain one. Required.
+  telegram_bot_token:
+    name: Telegram Bot Token
+    description: >-
+      Bot token from Telegram @BotFather. Enables the Telegram channel.
+  telegram_chat_id:
+    name: Telegram Chat ID
+    description: >-
+      Restrict Telegram messages to this chat ID. Leave empty to accept all.
+  honcho_api_url:
+    name: Honcho API URL
+    description: >-
+      URL for the Honcho memory service. Defaults to the managed service.
+  honcho_api_key:
+    name: Honcho API Key
+    description: >-
+      API key for Honcho. When set, enables persistent cross-session memory.
+  webhook_secret:
+    name: Webhook Secret
+    description: >-
+      HMAC-SHA256 secret for authenticating webhook and invoke requests.
+      Leave empty to skip signature verification.
+  primary_agent_name:
+    name: Primary Agent Name
+    description: >-
+      Display name for the primary agent. Injected into its personality prompt.
+  voice_agent_name:
+    name: Voice Agent Name
+    description: >-
+      Display name for the voice agent. Injected into its personality prompt.
+  primary_agent_model:
+    name: Primary Agent Model
+    description: >-
+      Claude model for the primary agent. Opus is most capable, Haiku is fastest.
+  voice_agent_model:
+    name: Voice Agent Model
+    description: >-
+      Claude model for the voice agent. Haiku recommended for low latency.
+  subagent_model:
+    name: Subagent Model
+    description: >-
+      Claude model used by on-demand subagents (automation-builder, plugin-builder, etc.).
+  heartbeat_enabled:
+    name: Enable Heartbeat
+    description: >-
+      Periodically prompt the primary agent to check for pending tasks and events.
+  heartbeat_interval_minutes:
+    name: Heartbeat Interval (minutes)
+    description: >-
+      How often the heartbeat fires, in minutes. Range: 15 to 1440.
+  enable_terminal:
+    name: Enable Web Terminal
+    description: >-
+      Expose a web terminal in the ingress panel for shell access to the container.
+  repos:
+    name: Workspace Repositories
+    description: >-
+      Git repositories to clone into the workspace. Cloned on first boot, pulled on restart.

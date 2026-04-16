@@ -1,0 +1,39 @@
+# Changelog
+
+## 0.1.3
+
+- Add Tina (voice agent) wiring in core startup
+- Add APScheduler heartbeat with configurable interval
+- Add webhook endpoints (`/webhook/{name}`, `/invoke/{agent}`) with HMAC verification
+- Add Telegram message splitting for responses over 4096 characters
+- Add error classification with structured user-facing messages
+- Add log redaction filter for secrets and tokens
+- Make SessionRegistry I/O async (non-blocking)
+- Add explicit sys.path management for reliable imports
+- Add `apparmor: true` and `url` to config.yaml
+- Add store assets: DOCS.md, CHANGELOG.md, translations, icons
+
+## 0.1.2
+
+- Add safety hooks: dangerous command blocking and per-agent path scope enforcement
+- Add Honcho memory provider with async SDK wrapper
+- Add MCP server registry (HTTP and SDK-based servers)
+- Add session registry with JSON persistence
+- Add unit tests for all core modules
+
+## 0.1.1
+
+- Add asyncio message bus with priority queues and request/response pattern
+- Add channel abstraction with Telegram implementation (python-telegram-bot v20+)
+- Add agent config loading with YAML, env var substitution, and model resolution
+- Add Ellen agent config with personality prompt and tool permissions
+
+## 0.1.0
+
+- Initial add-on scaffold
+- Dockerfile with Python 3.12 Alpine base, Node.js, nginx, ttyd
+- S6-overlay init scripts: config validation, default setup, nginx generation
+- S6 services: casa (Python core), nginx (ingress proxy), ttyd (web terminal)
+- AppArmor profile
+- Multi-repo workspace sync script
+- Local Docker testing setup with mock Supervisor

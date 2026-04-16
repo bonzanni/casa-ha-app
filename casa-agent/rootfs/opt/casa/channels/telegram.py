@@ -101,13 +101,46 @@ class TelegramChannel(Channel):
     # ------------------------------------------------------------------
 
     async def send(self, message: str, context: dict[str, Any]) -> None:
-        """Send a text message to the Telegram chat."""
+        """Send a text message to the Telegram chat.
+
+        Messages longer than 4096 characters are split into multiple
+        messages at line boundaries where possible.
+        """
         if self._app is None:
             logger.warning("Telegram channel not started; cannot send message")
             return
 
         target_chat = context.get("chat_id", self.chat_id)
-        await self._app.bot.send_message(
-            chat_id=target_chat,
-            text=message,
-        )
+        for chunk in _split_message(message):
+            await self._app.bot.send_message(
+                chat_id=target_chat,
+                text=chunk,
+            )
+
+
+_TG_MAX_LENGTH = 4096
+
+
+def _split_message(text: str) -> list[str]:
+    """Split *text* into chunks that fit within Telegram's message limit.
+
+    Splits at newline boundaries when possible, falls back to hard split.
+    """
+    if len(text) <= _TG_MAX_LENGTH:
+        return [text]
+
+    chunks: list[str] = []
+    while text:
+        if len(text) <= _TG_MAX_LENGTH:
+            chunks.append(text)
+            break
+
+        # Try to split at last newline within limit
+        split_at = text.rfind("\n", 0, _TG_MAX_LENGTH)
+        if split_at == -1 or split_at == 0:
+            split_at = _TG_MAX_LENGTH
+
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+
+    return chunks
