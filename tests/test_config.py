@@ -132,7 +132,7 @@ def test_missing_role_raises(tmp_path):
         "personality: hi\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="role"):
+    with pytest.raises(ValueError, match="Missing required 'role' field"):
         load_agent_config(str(p))
 
 
