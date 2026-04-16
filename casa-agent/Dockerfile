@@ -28,6 +28,7 @@ RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
 COPY rootfs /
 
 # Set permissions for s6-rc services and scripts
-RUN find /etc/s6-overlay/s6-rc.d -name 'up' -o -name 'run' -o -name 'finish' \
+RUN chmod +x /etc/s6-overlay/scripts/*.sh \
+    && find /etc/s6-overlay/s6-rc.d -name 'run' -o -name 'finish' \
     | xargs chmod +x \
     && chmod +x /opt/casa/scripts/*.sh
