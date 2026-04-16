@@ -9,7 +9,7 @@ mkdir -p "$S6_ENV"
 
 # Export each option as an s6 container env var
 for key in telegram_bot_token telegram_chat_id telegram_webhook_url telegram_delivery_mode \
-           honcho_api_url honcho_api_key webhook_secret \
+           honcho_api_url honcho_api_key webhook_secret enable_terminal \
            primary_agent_name voice_agent_name \
            primary_agent_model voice_agent_model subagent_model; do
     val=$(jq -r ".${key} // empty" "$OPTIONS")
@@ -25,5 +25,8 @@ val=$(jq -r '.claude_oauth_token // empty' "$OPTIONS")
 if [ -n "$val" ]; then
     printf '%s' "$val" > "${S6_ENV}/CLAUDE_CODE_OAUTH_TOKEN"
 fi
+
+# Static version for test mode
+printf 'dev' > "${S6_ENV}/CASA_VERSION"
 
 echo "[INFO] Environment exported from options.json (local test mode)."

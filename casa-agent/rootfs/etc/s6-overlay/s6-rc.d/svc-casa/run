@@ -13,6 +13,8 @@ export VOICE_AGENT_NAME="$(bashio::config 'voice_agent_name')"
 export PRIMARY_AGENT_MODEL="$(bashio::config 'primary_agent_model')"
 export VOICE_AGENT_MODEL="$(bashio::config 'voice_agent_model')"
 export SUBAGENT_MODEL="$(bashio::config 'subagent_model')"
+export ENABLE_TERMINAL="$(bashio::config 'enable_terminal')"
+export CASA_VERSION="$(bashio::addon.version)"
 
 # SUPERVISOR_TOKEN is injected automatically by the HA Supervisor.
 

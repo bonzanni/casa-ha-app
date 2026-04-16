@@ -78,14 +78,70 @@ async def healthz(_request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
-async def ingress_root(request: web.Request) -> web.Response:
-    """Redirect the ingress panel root to /terminal/.
+_STATUS_PAGE = """\
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>Casa Agent</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, system-ui, sans-serif;
+         background: #0f172a; color: #e2e8f0; padding: 2rem; }}
+  .container {{ max-width: 480px; margin: 0 auto; }}
+  h1 {{ font-size: 1.5rem; margin-bottom: 1.5rem; color: #f8fafc; }}
+  h1 span {{ color: #3b82f6; }}
+  .card {{ background: #1e293b; border-radius: 12px; padding: 1.25rem;
+           margin-bottom: 1rem; }}
+  .card h2 {{ font-size: 0.75rem; text-transform: uppercase;
+              letter-spacing: 0.05em; color: #64748b; margin-bottom: 0.75rem; }}
+  .row {{ display: flex; justify-content: space-between; padding: 0.35rem 0;
+          border-bottom: 1px solid #334155; }}
+  .row:last-child {{ border-bottom: none; }}
+  .label {{ color: #94a3b8; }}
+  .value {{ color: #f1f5f9; font-weight: 500; }}
+  .value.on {{ color: #4ade80; }}
+  .value.off {{ color: #64748b; }}
+  .actions {{ display: flex; gap: 0.75rem; margin-top: 1.5rem; }}
+  a.btn {{ display: inline-block; padding: 0.6rem 1.2rem; border-radius: 8px;
+           text-decoration: none; font-weight: 500; font-size: 0.9rem;
+           transition: opacity 0.15s; }}
+  a.btn:hover {{ opacity: 0.85; }}
+  a.btn.primary {{ background: #3b82f6; color: #fff; }}
+  a.btn.disabled {{ background: #334155; color: #64748b;
+                    pointer-events: none; cursor: default; }}
+  .footer {{ margin-top: 2rem; font-size: 0.75rem; color: #475569; text-align: center; }}
+</style>
+</head><body>
+<div class="container">
+  <h1><span>Casa</span> Agent</h1>
 
-    HA ingress proxies under a path prefix, so we use a relative redirect.
-    """
-    # X-Ingress-Path is set by the HA Supervisor ingress proxy
-    ingress_path = request.headers.get("X-Ingress-Path", "")
-    return web.HTTPFound(f"{ingress_path}/terminal/")
+  <div class="card">
+    <h2>Agents</h2>
+    {agent_rows}
+  </div>
+
+  <div class="card">
+    <h2>Channels</h2>
+    {channel_rows}
+  </div>
+
+  <div class="card">
+    <h2>System</h2>
+    {system_rows}
+  </div>
+
+  <div class="actions">
+    <a class="btn {terminal_class}" href="{ingress_path}/terminal/">Terminal</a>
+    <a class="btn primary" href="{ingress_path}/healthz">Health Check</a>
+  </div>
+
+  <div class="footer">Casa Agent v{version}</div>
+</div>
+</body></html>"""
+
+
+def _row(label: str, value: str, css: str = "") -> str:
+    cls = f' class="value {css}"' if css else ' class="value"'
+    return f'<div class="row"><span class="label">{label}</span><span{cls}>{value}</span></div>'
 
 
 # ------------------------------------------------------------------
@@ -319,9 +375,56 @@ async def main() -> None:
         await telegram_channel.process_webhook_update(payload)
         return web.Response(status=200)
 
-    # 12. aiohttp app
+    # 12. Status dashboard
+    terminal_enabled = os.environ.get("ENABLE_TERMINAL", "false").lower() == "true"
+    version = os.environ.get("CASA_VERSION", "dev")
+
+    async def dashboard(request: web.Request) -> web.Response:
+        ingress_path = request.headers.get("X-Ingress-Path", "")
+
+        # Agent rows
+        agent_rows = ""
+        for name, agent in agents.items():
+            # "claude-opus-4-6" → "Opus 4.6"
+            model = agent.config.model.replace("claude-", "")
+            parts = model.split("-")
+            if len(parts) >= 3:
+                model = f"{parts[0].capitalize()} {parts[1]}.{parts[2]}"
+            agent_rows += _row(name.capitalize(), model)
+
+        # Channel rows
+        channel_rows = ""
+        if telegram_channel is not None:
+            tg_mode = "webhook" if telegram_channel._webhook_url else "polling"
+            tg_delivery = telegram_channel._delivery_mode
+            channel_rows += _row("Telegram", f"{tg_mode}, {tg_delivery}", "on")
+        else:
+            channel_rows += _row("Telegram", "not configured", "off")
+
+        # System rows
+        system_rows = ""
+        mem_type = "Honcho" if os.environ.get("HONCHO_API_KEY") else "none"
+        system_rows += _row("Memory", mem_type, "on" if mem_type != "none" else "off")
+        system_rows += _row("Webhook auth", "enabled" if webhook_secret else "disabled",
+                            "on" if webhook_secret else "off")
+        hb_label = f"every {heartbeat_interval} min" if heartbeat_enabled else "disabled"
+        system_rows += _row("Heartbeat", hb_label, "on" if heartbeat_enabled else "off")
+        system_rows += _row("Terminal", "enabled" if terminal_enabled else "disabled",
+                            "on" if terminal_enabled else "off")
+
+        html = _STATUS_PAGE.format(
+            agent_rows=agent_rows,
+            channel_rows=channel_rows,
+            system_rows=system_rows,
+            terminal_class="primary" if terminal_enabled else "disabled",
+            ingress_path=ingress_path,
+            version=version,
+        )
+        return web.Response(text=html, content_type="text/html")
+
+    # 13. aiohttp app
     app = web.Application()
-    app.router.add_get("/", ingress_root)
+    app.router.add_get("/", dashboard)
     app.router.add_get("/healthz", healthz)
     app.router.add_post("/webhook/{name}", webhook_handler)
     app.router.add_post("/invoke/{agent}", invoke_handler)
