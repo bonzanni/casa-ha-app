@@ -35,8 +35,9 @@ configuration:
   webhook_secret:
     name: Webhook Secret
     description: >-
-      HMAC-SHA256 secret for authenticating webhook and invoke requests.
-      Leave empty to skip signature verification.
+      Secret for authenticating webhook, invoke, and Telegram webhook requests.
+      Leave empty to auto-generate one on first boot (stored in /data/webhook_secret).
+      Used as HMAC key for Casa webhooks and as Telegram's secret_token.
   primary_agent_name:
     name: Primary Agent Name
     description: >-

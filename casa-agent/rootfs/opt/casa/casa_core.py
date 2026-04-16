@@ -201,6 +201,7 @@ async def main() -> None:
             bus=bus,
             webhook_url=telegram_webhook_url,
             delivery_mode=telegram_delivery,
+            webhook_secret=webhook_secret,
         )
         channel_manager.register(telegram_channel)
         transport = "webhook" if telegram_webhook_url else "polling"
@@ -219,8 +220,15 @@ async def main() -> None:
 
     bus.register("telegram", _telegram_outbound)
 
-    # 10. Webhook endpoints
+    # 10. Webhook secret (auto-generated if not set by user)
     webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
+    if not webhook_secret:
+        secret_path = os.path.join(DATA_DIR, "webhook_secret")
+        if os.path.exists(secret_path):
+            with open(secret_path, "r", encoding="utf-8") as fh:
+                webhook_secret = fh.read().strip()
+    if webhook_secret:
+        logger.info("Webhook secret loaded (%d chars)", len(webhook_secret))
 
     def _verify_webhook(request: web.Request, body: bytes) -> bool:
         """Verify HMAC-SHA256 signature if a webhook secret is configured."""
@@ -290,6 +298,11 @@ async def main() -> None:
         """Receive Telegram updates pushed via webhook."""
         if telegram_channel is None:
             return web.json_response({"error": "telegram not configured"}, status=404)
+        # Verify Telegram's secret token header
+        if webhook_secret:
+            token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if token != webhook_secret:
+                return web.Response(status=403)
         payload = await request.json()
         await telegram_channel.process_webhook_update(payload)
         return web.Response(status=200)
