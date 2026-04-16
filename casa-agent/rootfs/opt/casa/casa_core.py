@@ -93,6 +93,8 @@ async def main() -> None:
         stream=sys.stdout,
     )
     logging.getLogger().addFilter(RedactingFilter())
+    # Quiet the httpx logger (Telegram polling produces a line every ~10s)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     logger.info("Casa core starting up")
 
     # 2. Memory
@@ -185,18 +187,22 @@ async def main() -> None:
 
     # 9. Telegram channel
     telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    telegram_channel = None
     if telegram_token:
         from channels.telegram import TelegramChannel
 
         telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+        telegram_webhook_url = os.environ.get("TELEGRAM_WEBHOOK_URL", "")
         telegram_channel = TelegramChannel(
             bot_token=telegram_token,
             chat_id=telegram_chat_id,
             default_agent=ellen_name,
             bus=bus,
+            webhook_url=telegram_webhook_url,
         )
         channel_manager.register(telegram_channel)
-        logger.info("Telegram channel registered (chat_id=%s)", telegram_chat_id)
+        mode = "webhook" if telegram_webhook_url else "polling"
+        logger.info("Telegram channel registered (%s, chat_id=%s)", mode, telegram_chat_id)
 
     # Register "telegram" as a bus target for outbound routing
     async def _telegram_outbound(msg: BusMessage) -> None:
@@ -272,11 +278,21 @@ async def main() -> None:
         except asyncio.TimeoutError:
             return web.json_response({"error": "timeout"}, status=504)
 
-    # 11. aiohttp app
+    # 11. Telegram webhook route (only used when webhook_url is set)
+    async def telegram_update_handler(request: web.Request) -> web.Response:
+        """Receive Telegram updates pushed via webhook."""
+        if telegram_channel is None:
+            return web.json_response({"error": "telegram not configured"}, status=404)
+        payload = await request.json()
+        await telegram_channel.process_webhook_update(payload)
+        return web.Response(status=200)
+
+    # 12. aiohttp app
     app = web.Application()
     app.router.add_get("/healthz", healthz)
     app.router.add_post("/webhook/{name}", webhook_handler)
     app.router.add_post("/invoke/{agent}", invoke_handler)
+    app.router.add_post("/telegram/update", telegram_update_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()

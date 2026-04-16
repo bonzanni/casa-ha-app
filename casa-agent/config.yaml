@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.1.5"
+version: "0.1.6"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 init: false
@@ -21,6 +21,7 @@ options:
   claude_oauth_token: ""
   telegram_bot_token: ""
   telegram_chat_id: ""
+  telegram_webhook_url: ""
   honcho_api_url: "https://api.honcho.dev"
   honcho_api_key: ""
   webhook_secret: ""
@@ -48,6 +49,7 @@ schema:
   claude_oauth_token: password
   telegram_bot_token: password?
   telegram_chat_id: str?
+  telegram_webhook_url: url?
   honcho_api_url: url?
   honcho_api_key: password?
   webhook_secret: password?
