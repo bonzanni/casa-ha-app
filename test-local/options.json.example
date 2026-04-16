@@ -6,6 +6,7 @@
   "telegram_delivery_mode": "stream",
   "honcho_api_url": "https://api.honcho.dev",
   "honcho_api_key": "",
+  "webhook_auth_enabled": false,
   "webhook_secret": "",
   "primary_agent_name": "Ellen",
   "voice_agent_name": "Tina",
