@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from enum import Enum
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -25,6 +25,9 @@ from memory import MemoryProvider
 from session_registry import SessionRegistry
 
 logger = logging.getLogger(__name__)
+
+# Type alias for the streaming callback
+OnTokenCallback = Callable[[str], Awaitable[None]]
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +67,6 @@ def _classify_error(exc: Exception) -> ErrorKind:
     if "timeout" in msg or "timed out" in msg:
         return ErrorKind.TIMEOUT
 
-    # Check exception type names for SDK-specific errors
     exc_type = type(exc).__name__
     if "CLI" in exc_type or "SDK" in exc_type or "Connection" in exc_type:
         return ErrorKind.SDK_ERROR
@@ -96,11 +98,19 @@ class Agent:
     async def handle_message(self, msg: BusMessage) -> BusMessage | None:
         """Process an inbound message and return a response BusMessage.
 
-        This is designed to be registered as a bus handler via
-        ``bus.register(agent_name, agent.handle_message)``.
+        If the channel supports streaming, tokens are delivered
+        incrementally via ``on_token``.  The full response is sent or
+        finalized after the SDK completes.
         """
+        # Obtain a streaming callback from the channel (if available)
+        on_token: OnTokenCallback | None = None
+        channel = self._channel_manager.get(msg.channel) if msg.channel else None
+
+        if channel is not None and hasattr(channel, "create_on_token"):
+            on_token = channel.create_on_token(msg.context)
+
         try:
-            text = await self._process(msg)
+            text = await self._process(msg, on_token=on_token)
         except Exception as exc:
             kind = _classify_error(exc)
             logger.error(
@@ -111,6 +121,13 @@ class Agent:
                 exc_info=(kind == ErrorKind.UNKNOWN),
             )
             text = _USER_MESSAGES[kind]
+
+        # Deliver final response via the channel
+        if text and channel is not None:
+            if on_token is not None and hasattr(channel, "finalize_stream"):
+                await channel.finalize_stream(text, msg.context, on_token)
+            else:
+                await channel.send(text, msg.context)
 
         if text is None:
             return None
@@ -129,7 +146,11 @@ class Agent:
     # Internal processing pipeline
     # ------------------------------------------------------------------
 
-    async def _process(self, msg: BusMessage) -> str | None:
+    async def _process(
+        self,
+        msg: BusMessage,
+        on_token: OnTokenCallback | None = None,
+    ) -> str | None:
         channel_key = f"{msg.channel}:{msg.context.get('chat_id', 'default')}"
         user_text = str(msg.content)
 
@@ -163,7 +184,6 @@ class Agent:
             ],
         }
 
-        # Check for an existing session to resume
         existing = self._session_registry.get(channel_key)
         resume_session_id: str | None = None
         if existing:
@@ -183,7 +203,7 @@ class Agent:
             resume=resume_session_id,
         )
 
-        # 5. Query the SDK -------------------------------------------------
+        # 5. Query the SDK (stream tokens to callback) ---------------------
         response_text = ""
         sdk_session_id: str | None = resume_session_id
 
@@ -198,6 +218,8 @@ class Agent:
                     for block in getattr(sdk_msg, "content", []):
                         if isinstance(block, TextBlock):
                             response_text += block.text
+                            if on_token is not None:
+                                await on_token(response_text)
 
         # 6. Store in memory -----------------------------------------------
         memory_session_id: str | None = None
@@ -234,10 +256,5 @@ class Agent:
                 memory_session_id=memory_session_id or "",
             )
 
-        # 8. Send response via channel ------------------------------------
-        if response_text and msg.channel:
-            channel = self._channel_manager.get(msg.channel)
-            if channel is not None:
-                await channel.send(response_text, msg.context)
-
+        # NOTE: channel send is handled by handle_message, not here.
         return response_text or None

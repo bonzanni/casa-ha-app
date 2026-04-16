@@ -18,6 +18,12 @@ configuration:
       Public URL for Telegram webhook mode (e.g. https://your-ha.duckdns.org:8080).
       When set, Telegram pushes updates instead of polling. Lower latency, zero
       idle requests. Leave empty to use polling (works behind NAT).
+  telegram_delivery_mode:
+    name: Telegram Delivery Mode
+    description: >-
+      How responses are displayed in Telegram.
+      "stream" shows the response building in real-time (edit-in-place).
+      "block" waits for the full response before sending.
   honcho_api_url:
     name: Honcho API URL
     description: >-
