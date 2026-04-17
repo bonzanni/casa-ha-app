@@ -1,6 +1,6 @@
-claude-agent-sdk>=0.1.48
-honcho-ai>=2.0.0
-python-telegram-bot>=20.0
-aiohttp>=3.9
-apscheduler>=3.10
-pyyaml>=6.0
+claude-agent-sdk==0.1.61
+honcho-ai==2.1.1
+python-telegram-bot==22.7
+aiohttp==3.13.5
+apscheduler==3.11.2
+pyyaml==6.0.3
