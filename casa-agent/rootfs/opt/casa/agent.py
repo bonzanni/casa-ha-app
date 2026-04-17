@@ -22,6 +22,7 @@ from channels import ChannelManager
 from config import AgentConfig
 from hooks import block_dangerous_commands, make_path_scope_hook
 from mcp_registry import McpServerRegistry
+from channel_trust import channel_trust, user_peer_for_channel
 from memory import MemoryProvider
 from session_registry import SessionRegistry, build_session_key
 
@@ -156,33 +157,55 @@ class Agent:
             msg.channel,
             msg.context.get("chat_id"),
         )
+        session_id = f"{channel_key}:{self.config.role}"
+        user_peer = user_peer_for_channel(msg.channel)
         user_text = str(msg.content)
 
-        # 1. Memory context ------------------------------------------------
+        # 1. Ensure session + peers (idempotent, cheap when warm). ----------
+        try:
+            await self._memory.ensure_session(
+                session_id=session_id,
+                agent_role=self.config.role,
+                user_peer=user_peer,
+            )
+        except Exception:
+            logger.warning(
+                "Memory ensure_session failed; continuing without memory",
+            )
+
+        # 2. Retrieve memory digest. ---------------------------------------
         memory_context = ""
         try:
             memory_context = await self._memory.get_context(
-                peer_id=self.config.memory.peer_name,
-                token_budget=self.config.memory.token_budget,
-                exclude_tags=self.config.memory.exclude_tags or None,
+                session_id=session_id,
+                agent_role=self.config.role,
+                tokens=self.config.memory.token_budget,
+                search_query=user_text,
+                user_peer=user_peer,
             )
         except Exception:
-            logger.warning("Memory retrieval failed; proceeding without context")
+            logger.warning(
+                "Memory retrieval failed; proceeding without context",
+            )
 
-        # 2. System prompt -------------------------------------------------
+        # 3. System prompt = personality + <memory_context>? + <channel_context>.
         system_parts = [self.config.personality]
         if memory_context:
             system_parts.append(
                 f"\n<memory_context>\n{memory_context}\n</memory_context>"
             )
+        system_parts.append(
+            "\n<channel_context>\n"
+            f"channel: {msg.channel}\n"
+            f"trust: {channel_trust(msg.channel)}\n"
+            "</channel_context>"
+        )
         system_prompt = "\n".join(system_parts)
 
-        # 3. MCP servers ---------------------------------------------------
+        # 4. MCP servers ---------------------------------------------------
         mcp_servers = self._mcp_registry.resolve(self.config.mcp_server_names)
 
-        # 4. Build SDK options ---------------------------------------------
-        # HookContext carries no agent identity, so path-scope enforcement
-        # must capture the role in a closure at registration time.
+        # 5. Hooks (agent-identity captured in closures). ------------------
         hooks = {
             "PreToolUse": [
                 HookMatcher(matcher="Bash", hooks=[block_dangerous_commands]),
@@ -193,6 +216,7 @@ class Agent:
             ],
         }
 
+        # 6. SDK resume --------------------------------------------------
         existing = self._session_registry.get(channel_key)
         resume_session_id: str | None = None
         if existing:
@@ -210,27 +234,22 @@ class Agent:
             hooks=hooks,
             cwd=self.config.cwd or None,
             resume=resume_session_id,
-            # Load skills + CLAUDE.md from `{cwd}/.claude/`. Without this, the
-            # workspace/casa-skills/.claude/skills/ tree is silently ignored.
             setting_sources=["project"],
         )
 
-        # 5. Query the SDK (stream tokens to callback) ---------------------
+        # 7. Query the SDK. ------------------------------------------------
         response_text = ""
         sdk_session_id: str | None = resume_session_id
 
         async with ClaudeSDKClient(options) as client:
             await client.query(user_text)
-
             async for sdk_msg in client.receive_response():
                 if isinstance(sdk_msg, SystemMessage):
                     if getattr(sdk_msg, "subtype", None) == "init":
-                        # Session ID is in the data dict, not a top-level attr
                         data = getattr(sdk_msg, "data", {}) or {}
                         if "session_id" in data:
                             sdk_session_id = data["session_id"]
                 elif isinstance(sdk_msg, ResultMessage):
-                    # ResultMessage reliably carries the session_id
                     sid = getattr(sdk_msg, "session_id", None)
                     if sid:
                         sdk_session_id = sid
@@ -248,40 +267,23 @@ class Agent:
                 sdk_session_id,
             )
 
-        # 6. Store in memory -----------------------------------------------
-        memory_session_id: str | None = None
-        if existing:
-            memory_session_id = existing.get("memory_session_id")
+        # 8. Persist — off the critical path. Storage is unconditional. ---
+        #    Session+peer topology already scopes visibility (spec §4.3).
+        if response_text:
+            asyncio.create_task(self._memory.add_turn(
+                session_id=session_id,
+                agent_role=self.config.role,
+                user_text=user_text,
+                assistant_text=response_text,
+                user_peer=user_peer,
+            ))
 
-        try:
-            if not memory_session_id:
-                memory_session_id = await self._memory.create_session(
-                    self.config.memory.peer_name
-                )
-            await self._memory.store_message(
-                session_id=memory_session_id,
-                peer_id=self.config.memory.peer_name,
-                content=user_text,
-                role="user",
-            )
-            if response_text:
-                await self._memory.store_message(
-                    session_id=memory_session_id,
-                    peer_id=self.config.memory.peer_name,
-                    content=response_text,
-                    role="assistant",
-                )
-        except Exception:
-            logger.warning("Memory storage failed; response still delivered")
-
-        # 7. Update session registry ---------------------------------------
+        # 9. SessionRegistry — only SDK session id now. --------------------
         if sdk_session_id:
             await self._session_registry.register(
                 channel_key=channel_key,
                 agent=self.config.role,
                 sdk_session_id=sdk_session_id,
-                memory_session_id=memory_session_id or "",
             )
 
-        # NOTE: channel send is handled by handle_message, not here.
         return response_text or None
