@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.3.0 — 2026-04-17 — Phase 2.3: voice pipeline
+
+### Added
+- `VoiceChannel` — dual ingress: generic SSE at `POST /api/converse`
+  and HA-optimised WebSocket at `/api/converse/ws`. Both default on.
+  Toggle with `VOICE_SSE_ENABLED` / `VOICE_WS_ENABLED`; paths override
+  with `VOICE_SSE_PATH` / `VOICE_WS_PATH`. Idle eviction via
+  `VOICE_IDLE_TIMEOUT_SECONDS` (defaults to `butler.session.idle_timeout`).
+- `ProsodicSplitter` — delta-fed, tag-opaque sentence splitter that
+  treats `[…] (…) {…} <…>` as atomic. Flushes on `.`, `!`, `?`, `…`,
+  paragraph break. Safety-caps at 1.5 s / 200 chars with rightmost-
+  clause-mark fallback (`,`, `;`, em-dash).
+- `TagDialectAdapter` — canonical `[tag]` rewriter for three dialects:
+  `square_brackets` (identity), `parens` (global `[tag]→(tag)`),
+  `none` (strips leading tag atoms). Agents stay in canonical form;
+  rewriting happens at the transport edge.
+- `VoiceSessionPool` — process-local pool keyed on `scope_id`.
+  Background sweeper evicts idle sessions every 30 s at
+  `butler.session.idle_timeout`. `MAX_CONCURRENT_VOICE` gate seam
+  reserved (defaults to 10 slots; 5.x hardening flips to 1).
+- `stt_start` WebSocket prewarm hook — calls `memory.ensure_session`
+  + `memory.get_context` on `CachedMemoryProvider` so the first
+  utterance lands on a warm cache. Dedup'd against repeated
+  `stt_start` frames for the same scope.
+- Persona-voice error lines per `ErrorKind` in `butler.yaml`
+  (`voice_errors:` block with `timeout`, `rate_limit`, `sdk_error`,
+  `memory_error`, `channel_error`, `unknown`). Rendered through
+  `TagDialectAdapter`. Empty string = silent degrade.
+- Channel-supplied error hook: `channel.emit_error_line(kind, context,
+  cfg)` duck-typed method. `Agent.handle_message`'s error branch
+  prefers it over plain-text delivery when present. Non-voice
+  channels (Telegram) unchanged.
+- `TTSConfig` on `AgentConfig` (`tts.tag_dialect`, default
+  `square_brackets`).
+- Dashboard row for Voice channel status (transports + on/off).
+
+### Changed
+- `MessageBus.request()` now propagates caller cancellation to the
+  dispatch task (previously: only the caller's future was cancelled,
+  and downstream handlers kept running). Required for voice cancel /
+  barge-in semantics (spec §10.2). Backward-compatible — all existing
+  bus tests still green.
+- `MessageBus._dispatch` resolves the handler per-message from
+  `self.handlers[name]` rather than capturing it at `run_agent_loop`
+  startup. Enables dynamic handler reconfiguration at the cost of a
+  dict lookup per dispatch; same-loop asyncio keeps the lookup safe.
+
+### Migration
+- `setup-configs.sh` one-shot: injects `tts:` and `voice_errors:`
+  blocks into existing `butler.yaml` if absent. Idempotent. Mirrored
+  in `test-local/init-overrides/`.
+
+### Deferred to 5.x hardening
+- `MAX_CONCURRENT_VOICE=1` enforcement (seam reserved via
+  `VoiceSession.gate`).
+- Voice-ID promotion (`voice_speaker → nicola` peer when HA voice-ID
+  matures).
+- Personality hot-reload.
+- Concurrent-cold-key dedup in `CachedMemoryProvider`.
+
+### Tests
+- 62 new unit/integration tests (config, migration, splitter, adapter,
+  pool, SSE, WS) + 2 new E2E scenarios (SSE smoke + WS smoke under
+  Docker). Full voice+agent suite: 192 passed at merge.
+
 ## 0.2.2 — 2026-04-17 — Phase 2.2a: Honcho v3 memory redesign
 
 ### Changed (breaking for pre-release users)
