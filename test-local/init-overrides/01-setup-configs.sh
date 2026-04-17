@@ -8,6 +8,32 @@ mkdir -p "$CONFIG_DIR/agents" "$CONFIG_DIR/workspace/.claude/skills" \
          "$CONFIG_DIR/workspace/plugins" "$CONFIG_DIR/workspace/mcp-servers" \
          "$DATA_DIR/sdk-sessions"
 
+# ------------------------------------------------------------------
+# One-shot migration: rename legacy display-name YAMLs to role-based.
+# Mirrors the production migrate_rename logic in setup-configs.sh
+# (without bashio; uses plain echo instead).
+# ------------------------------------------------------------------
+migrate_rename() {
+    local old="$1"
+    local new="$2"
+    local canonical_role="$3"
+    local old_peer="$4"
+    local new_peer="$5"
+
+    if [ -f "$CONFIG_DIR/agents/$old" ] && [ ! -f "$CONFIG_DIR/agents/$new" ]; then
+        mv "$CONFIG_DIR/agents/$old" "$CONFIG_DIR/agents/$new"
+        sed -i 's/\r$//' "$CONFIG_DIR/agents/$new"
+        sed -i "s/^role:[[:space:]]*.*$/role: ${canonical_role}/" \
+            "$CONFIG_DIR/agents/$new"
+        sed -i "s/^  peer_name:[[:space:]]*${old_peer}[[:space:]]*$/  peer_name: ${new_peer}/" \
+            "$CONFIG_DIR/agents/$new"
+        echo "[INFO] Migrated $old -> $new"
+    fi
+}
+
+migrate_rename "ellen.yaml" "assistant.yaml" "assistant" "ellen" "assistant"
+migrate_rename "tina.yaml"  "butler.yaml"    "butler"    "tina"  "butler"
+
 for f in agents/assistant.yaml agents/butler.yaml agents/subagents.yaml \
          schedules.yaml webhooks.yaml; do
     if [ ! -f "$CONFIG_DIR/$f" ]; then
