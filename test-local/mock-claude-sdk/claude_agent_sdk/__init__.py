@@ -115,6 +115,22 @@ class ClaudeSDKClient:
         yield ResultMessage(session_id=self._session_id)
 
 
+def tool(name: str, description: str, params: dict[str, Any]) -> Any:
+    """Mock decorator for @tool. Just returns the wrapped function unchanged."""
+    def decorator(func):
+        return func
+    return decorator
+
+
+def create_sdk_mcp_server(name: str = "", tools: list[Any] | None = None) -> dict[str, Any]:
+    """Mock MCP server factory. Returns a minimal config dict."""
+    return {
+        "type": "stdio",
+        "command": "echo",
+        "args": ["mock"],
+    }
+
+
 __all__ = [
     "AssistantMessage",
     "ClaudeAgentOptions",
@@ -123,4 +139,6 @@ __all__ = [
     "ResultMessage",
     "SystemMessage",
     "TextBlock",
+    "tool",
+    "create_sdk_mcp_server",
 ]

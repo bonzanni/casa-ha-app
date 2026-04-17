@@ -27,6 +27,11 @@ RUN case "${TARGETARCH}" in \
 COPY casa-agent/requirements.txt /tmp/
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
 
+# E2E: swap the real Claude Agent SDK for the offline mock.
+COPY test-local/mock-claude-sdk /tmp/mock-claude-sdk
+RUN pip3 install --no-cache-dir --force-reinstall --no-deps /tmp/mock-claude-sdk \
+ && python3 -c "from claude_agent_sdk import ClaudeSDKClient; print('mock SDK active')"
+
 COPY casa-agent/rootfs /
 
 RUN find /etc/s6-overlay/s6-rc.d -name 'up' -o -name 'run' -o -name 'finish' \
