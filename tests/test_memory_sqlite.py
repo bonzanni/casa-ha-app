@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import sqlite3
 
 import pytest
@@ -62,20 +61,45 @@ async def test_journal_mode_wal_on_disk(tmp_path):
     assert mode.lower() == "wal"
 
 
-async def test_reopen_existing_db_is_idempotent(tmp_path):
-    """Re-opening an existing file does not clobber rows."""
+async def test_reopen_existing_db_preserves_data_and_schema(tmp_path):
+    """Re-opening an existing file must not clobber rows, and
+    schema_version must not be re-seeded (INSERT OR IGNORE)."""
     from memory import SqliteMemoryProvider
 
     path = str(tmp_path / "mem.sqlite")
     p1 = SqliteMemoryProvider(path)
-    await p1.ensure_session("s1", "assistant")
+    # Seed a row via raw SQL — Task 1 does not yet implement add_turn.
+    p1._conn.execute(
+        "INSERT INTO messages (session_id, peer_name, content, ts) "
+        "VALUES (?, ?, ?, ?)",
+        ("s1", "nicola", "hello", 1.0),
+    )
+    p1._conn.execute(
+        "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+        ("1",),
+    )
+    p1._conn.commit()
     p1._conn.close()
 
     p2 = SqliteMemoryProvider(path)
     row = p2._conn.execute(
-        "SELECT session_id FROM sessions WHERE session_id='s1'"
+        "SELECT content FROM messages WHERE session_id = 's1'"
     ).fetchone()
     assert row is not None
+    assert row[0] == "hello"
+
+    version = p2._conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+    ).fetchone()[0]
+    assert version == "1"
+
+    # All four tables must still be present (sanity).
+    tables = {
+        r[0] for r in p2._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert {"messages", "sessions", "peer_cards", "schema_meta"} <= tables
 
 
 async def test_parent_directory_created(tmp_path):
