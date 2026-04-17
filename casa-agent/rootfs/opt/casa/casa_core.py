@@ -662,8 +662,14 @@ async def main() -> None:
             system_rows += _row("Public URL", public_url, "on")
         else:
             system_rows += _row("Public URL", "not set", "off")
-        mem_type = "Honcho" if os.environ.get("HONCHO_API_KEY") else "none"
-        system_rows += _row("Memory", mem_type, "on" if mem_type != "none" else "off")
+        mem_type = {
+            "honcho": "Honcho",
+            "sqlite": "SQLite",
+            "noop": "none",
+        }[mem_choice.backend]
+        system_rows += _row(
+            "Memory", mem_type, "on" if mem_choice.backend != "noop" else "off",
+        )
         system_rows += _row("Webhook auth", "enabled" if webhook_secret else "disabled",
                             "on" if webhook_secret else "off")
         hb_label = f"every {heartbeat_interval} min" if heartbeat_enabled else "disabled"
