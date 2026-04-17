@@ -78,7 +78,15 @@ inspect_and_stop() {
     [ -f "$butler" ]    && head -3 "$butler"    || true
 
     stop_container "$name"
-    rm -rf "$tmp"
+    # The container wrote files inside the volume as root (workspace/.claude,
+    # workspace/plugins, ...). On Linux CI the runner user can't remove them,
+    # so do the cleanup inside a throwaway root container before the host rm.
+    # Any residual failure is ignored — the whole tmp tree dies with the
+    # ephemeral runner anyway.
+    docker run --rm -v "${tmp}:/target" --entrypoint sh "$IMAGE" \
+        -c 'rm -rf /target/workspace /target/data /target/agents' \
+        >/dev/null 2>&1 || true
+    rm -rf "$tmp" 2>/dev/null || true
 }
 
 log "B-1: ellen.yaml -> assistant.yaml with role patch"
