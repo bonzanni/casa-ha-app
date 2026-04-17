@@ -323,3 +323,115 @@ class CachedMemoryProvider(MemoryProvider):
                     "CachedMemoryProvider refresh failed for %s/%s: %s",
                     session_id, agent_role, exc,
                 )
+
+
+# ---------------------------------------------------------------------------
+# SqliteMemoryProvider (spec: 2026-04-17-sqlite-memory-2.2b)
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+import sqlite3  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
+
+
+_SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    peer_name   TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    ts          REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_session_id_id
+    ON messages(session_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id   TEXT PRIMARY KEY,
+    agent_role   TEXT NOT NULL,
+    user_peer    TEXT NOT NULL,
+    created_ts   REAL NOT NULL,
+    last_active  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS peer_cards (
+    peer_name    TEXT NOT NULL,
+    bullet       TEXT NOT NULL,
+    created_ts   REAL NOT NULL,
+    PRIMARY KEY (peer_name, bullet)
+);
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
+"""
+
+
+@dataclass
+class _SqliteMsg:
+    peer_name: str
+    content: str
+
+
+@dataclass
+class _SqliteCtx:
+    """Duck-typed shape consumed by ``_render``.
+
+    ``summary`` and ``peer_representation`` are always ``None`` on SQLite
+    (no summariser in 2.2b, no dialectic retrieval — spec §5). The 2.2c
+    summariser seam sets ``summary`` once it ships.
+    """
+    messages: list[_SqliteMsg] = field(default_factory=list)
+    peer_card: list[str] = field(default_factory=list)
+    summary: None = None
+    peer_representation: None = None
+
+
+class SqliteMemoryProvider(MemoryProvider):
+    """Durable local-storage memory backend.
+
+    Single connection held for process lifetime (spec §3). ``sqlite3``
+    is synchronous — every call is wrapped in ``asyncio.to_thread``.
+    ``check_same_thread=False`` lets the connection be reused from the
+    thread-pool; SQLite's own locking + ``busy_timeout=5000`` covers
+    any transient collision.
+    """
+
+    def __init__(self, db_path: str) -> None:
+        self._path = db_path
+        if db_path != ":memory:":
+            parent = os.path.dirname(db_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._apply_pragmas()
+        self._conn.executescript(_SQLITE_SCHEMA)
+        self._conn.execute(
+            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?, ?)",
+            ("schema_version", "1"),
+        )
+        self._conn.commit()
+
+    def _apply_pragmas(self) -> None:
+        self._conn.execute("PRAGMA journal_mode = WAL")
+        self._conn.execute("PRAGMA synchronous = NORMAL")
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+
+    # Method stubs — filled in by Tasks 2–4.
+    async def ensure_session(
+        self, session_id: str, agent_role: str, user_peer: str = "nicola",
+    ) -> None:
+        raise NotImplementedError  # pragma: no cover
+
+    async def get_context(
+        self, session_id: str, agent_role: str, tokens: int,
+        search_query: str | None = None, user_peer: str = "nicola",
+    ) -> str:
+        raise NotImplementedError  # pragma: no cover
+
+    async def add_turn(
+        self, session_id: str, agent_role: str,
+        user_text: str, assistant_text: str, user_peer: str = "nicola",
+    ) -> None:
+        raise NotImplementedError  # pragma: no cover
