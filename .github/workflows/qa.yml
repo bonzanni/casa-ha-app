@@ -32,6 +32,12 @@ jobs:
         run: bash test-local/e2e/test_invoke_sessions.sh
       - name: Concurrency
         run: bash test-local/e2e/test_concurrency.sh
+      - name: Voice SSE
+        run: bash test-local/e2e/test_voice_sse.sh
+      - name: Voice WS
+        run: |
+          pip install aiohttp
+          bash test-local/e2e/test_voice_ws.sh
 
   e2e-slow:
     if: github.event_name == 'schedule'
