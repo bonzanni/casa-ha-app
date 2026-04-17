@@ -102,7 +102,52 @@ curl -X POST http://homeassistant.local:8080/invoke/ellen \
 
 Agent YAML files are stored in `/addon_configs/casa-agent/agents/`. Default configs are created on first boot and never overwritten. You can edit them freely.
 
-Each agent config supports: `name`, `role`, `model`, `personality`, `tools`, `mcp_server_names`, `memory`, `session`, `channels`, and `cwd`. See the default `assistant.yaml` for a full example.
+Each agent config supports: `name`, `role`, `model`, `personality`, `tools`, `mcp_server_names`, `memory`, `session`, `channels`, `tts`, `voice_errors`, and `cwd`. See the default `assistant.yaml` for a full example.
+
+## Voice pipeline
+
+Casa exposes two transports for Home Assistant voice / generic voice clients. The HA-side integration that consumes them ships separately in `casa-ha-integration` (phase 2.4).
+
+- `POST /api/converse` — Server-Sent Events, per-request. Body:
+  `{"prompt", "agent_role", "scope_id", "context"}`. Stream: `event:
+  block` frames then `event: done`. HMAC via `X-Webhook-Signature`
+  (same scheme as `/invoke`).
+- `/api/converse/ws` — persistent WebSocket. Inbound frames:
+  `stt_start`, `utterance`, `stage`, `cancel`. Outbound: `block`,
+  `done`, `error`. On `stt_start`, Casa prewarms the voice session's
+  memory cache so first-utterance latency is bounded.
+
+Toggle the transports via environment variables on the add-on:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VOICE_SSE_ENABLED` | `true` | Enable `POST /api/converse` |
+| `VOICE_WS_ENABLED`  | `true` | Enable `/api/converse/ws` |
+| `VOICE_SSE_PATH`    | `/api/converse` | Override SSE path |
+| `VOICE_WS_PATH`     | `/api/converse/ws` | Override WS path |
+| `VOICE_IDLE_TIMEOUT_SECONDS` | (butler.session.idle_timeout, 300) | Session pool eviction timeout |
+
+Per-agent voice config (`butler.yaml`):
+
+```yaml
+tts:
+  tag_dialect: square_brackets   # square_brackets | parens | none
+
+voice_errors:
+  timeout:       "[apologetic] Hm, that took too long. Try again?"
+  rate_limit:    "[flat] My brain is busy — give me a minute."
+  sdk_error:     "[apologetic] I couldn't reach my brain. Try again?"
+  memory_error:  ""                    # silent degrade
+  channel_error: "[flat] Something went wrong sending that."
+  unknown:       "[flat] Sorry, something went wrong."
+```
+
+`tag_dialect` selects how inline emotion tags (`[confident]`, `[warm]`,
+etc.) are rendered before Casa hands text off to HA's TTS. Use
+`parens` for engines that expect `(tag)` and `none` to strip tags
+entirely for plain-TTS providers like Piper. Voice and engine
+selection itself is Home Assistant pipeline config — Casa does not
+override it.
 
 ## Web terminal
 
