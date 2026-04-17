@@ -111,7 +111,7 @@ async def broken_voice_app(monkeypatch):
 
 
 @pytest.fixture
-async def agent_error_voice_app():
+async def agent_error_voice_app(tmp_path):
     """Wire up a real Agent whose _process raises an UNKNOWN error, + a real
     VoiceChannel. Exercises the natural production path:
     Agent.handle_message catches → error_kind set → emit_error_line called →
@@ -154,7 +154,7 @@ async def agent_error_voice_app():
     agent = Agent(
         config=cfg,
         memory=_DummyMemory(),
-        session_registry=SessionRegistry("/tmp/_test_voice_sessions.json"),
+        session_registry=SessionRegistry(str(tmp_path / "sessions.json")),
         mcp_registry=McpServerRegistry(),
         channel_manager=channel_manager,
     )
