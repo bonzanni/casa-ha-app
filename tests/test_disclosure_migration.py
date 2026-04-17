@@ -66,6 +66,7 @@ def _run_migration(tmp_path: Path) -> subprocess.CompletedProcess:
     end = text.index("\n}\n", start) + 3
     func = text[start:end]
     script = textwrap.dedent(f"""\
+        bashio::log.info() {{ echo "[INFO] $*"; }}
         {func}
         migrate_disclosure_clause "{(tmp_path / "butler.yaml").as_posix()}"
     """)
