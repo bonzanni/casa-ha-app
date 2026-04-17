@@ -1,31 +1,56 @@
 # Local Testing
 
-Test the Casa add-on locally without Home Assistant.
+Test the Casa add-on locally in Docker. The real Claude Agent SDK is swapped
+for an offline mock so runtime tests need no OAuth token.
 
-## Build
-
-```bash
-docker build -f test-local/Dockerfile.test -t casa-test .
-```
-
-## Run
+## Quick start
 
 ```bash
-docker run --rm -p 8080:8080 casa-test
+make -C test-local test          # smoke + migration + runtime, ~3 min
+make -C test-local test-slow     # adds the ~90s heartbeat test
+make -C test-local clean         # remove leftover containers
 ```
 
-## What it does
+Windows Git Bash typically ships without GNU Make. Either install it
+(`scoop install make` or `choco install make`) or run the scripts
+directly — each is self-contained and builds the image on demand:
 
-- Runs a mock Supervisor API that serves `options.json` on port 80 inside the container
-- Bashio reads config from this mock API instead of the real HA Supervisor
-- All s6 init scripts and services start normally
-- nginx serves on port 8080 (mapped to host)
+```bash
+bash test-local/e2e/test_smoke.sh
+bash test-local/e2e/test_migration.sh
+bash test-local/e2e/test_invoke_sessions.sh
+bash test-local/e2e/test_concurrency.sh
+bash test-local/e2e/test_heartbeat.sh    # slow, ~90s
+```
 
-## Test endpoints
+## What the E2E suite covers
 
-- `http://localhost:8080/healthz` -- aiohttp health check
-- `http://localhost:8080/terminal/` -- ttyd web terminal (if enable_terminal is true)
+| Script | Covers |
+|---|---|
+| `e2e/test_smoke.sh` | build, `/healthz`, dashboard startup race (BUG-D1) |
+| `e2e/test_migration.sh` | role-based rename, CRLF handling (BUG-M1/M2), re-run idempotency |
+| `e2e/test_invoke_sessions.sh` | per-invoke session isolation (BUG-I1) |
+| `e2e/test_heartbeat.sh` | scheduled tick actually reaches the agent (BUG-H1) |
+| `e2e/test_concurrency.sh` | parallel invokes with simulated SDK latency |
 
-## Customize
+## Manually running with real credentials
 
-Edit `test-local/options.json` to change add-on options (agent names, tokens, etc.).
+Copy `options.json.example` to `options.json` and fill in real tokens. The
+file is gitignored. Build and run without the mock by using the production
+Dockerfile directly:
+
+```bash
+docker build -f casa-agent/Dockerfile -t casa-live .
+docker run --rm -p 8080:8080 -v $(pwd)/test-local/options.json:/data/options.json casa-live
+```
+
+Endpoints:
+
+- `http://localhost:8080/healthz` — aiohttp health check
+- `http://localhost:8080/` — status dashboard
+- `http://localhost:8080/terminal/` — ttyd web terminal (if enabled)
+
+## Editing options
+
+Edit `test-local/options.json` (untracked) to change agent names, tokens,
+heartbeat interval, etc.
