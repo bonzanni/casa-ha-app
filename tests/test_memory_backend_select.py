@@ -82,27 +82,9 @@ def test_wrap_for_strategy_cached_on_honcho_returns_cached(caplog):
     import logging
 
     from casa_core import _wrap_memory_for_strategy
-    from memory import (
-        CachedMemoryProvider,
-        HonchoMemoryProvider,
-    )
+    from memory import CachedMemoryProvider, NoOpMemory
 
-    # Use a dummy instance — we don't call any methods.
-    class _Dummy:
-        pass
-
-    backend = _Dummy()
-    # NOTE: The plan text assigns backend.__class__ to the MemoryProvider ABC
-    # as a dummy shim, but ABCs reject __class__ assignment for classes with
-    # different object layouts. The assignment is dead code — the actual
-    # assertion below uses the NoOpMemory stand_in — so we swallow the
-    # expected TypeError here to preserve the plan's literal scaffolding.
-    try:
-        backend.__class__ = HonchoMemoryProvider.__mro__[1]  # MemoryProvider ABC is 2nd; use dummy shim
-    except TypeError:
-        pass
-    # Simpler: just pass a bare stand-in object that is not a SqliteMemoryProvider.
-    from memory import NoOpMemory
+    # Any non-SQLite backend exercises the Cached-wrap path.
     stand_in = NoOpMemory()
 
     with caplog.at_level(logging.INFO):
