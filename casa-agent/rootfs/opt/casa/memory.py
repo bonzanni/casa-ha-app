@@ -1,122 +1,325 @@
-"""Memory provider abstraction for Casa agents."""
+"""Memory provider abstraction for Casa agents (Honcho v3 topology).
+
+See docs/superpowers/specs/2026-04-17-honcho-v3-memory-design.md for
+the peer/session model and the rationale behind the 3-method surface.
+"""
 
 from __future__ import annotations
 
-import asyncio
 from abc import ABC, abstractmethod
-from typing import Any
 
 
 class MemoryProvider(ABC):
-    """Abstract base class for memory backends."""
+    """Abstract memory backend.
+
+    Three methods:
+      * ``ensure_session`` — idempotent session + peer setup.
+      * ``get_context``    — rendered memory digest for the system prompt.
+      * ``add_turn``       — persist one user→assistant turn unconditionally.
+
+    Storage is never filtered; write-scoping is a structural property of
+    ``session_id`` + peer topology (spec §4.3). Disclosure decisions
+    happen on the output side, not here.
+    """
+
+    @abstractmethod
+    async def ensure_session(
+        self,
+        session_id: str,
+        agent_role: str,
+        user_peer: str = "nicola",
+    ) -> None:
+        """Ensure the session exists with peers ``[user_peer, agent_role]``
+        and ``observe_others=True`` on ``agent_role``.
+
+        Cheap when already set up. Safe to call every turn."""
 
     @abstractmethod
     async def get_context(
         self,
-        peer_id: str,
-        token_budget: int,
-        exclude_tags: list[str] | None = None,
+        session_id: str,
+        agent_role: str,
+        tokens: int,
+        search_query: str | None = None,
+        user_peer: str = "nicola",
     ) -> str:
-        """Retrieve relevant context for a peer within a token budget."""
+        """Return a rendered memory digest for the system prompt.
+
+        Empty string if the session has no relevant content yet.
+        ``search_query`` is the current user utterance (used by Honcho
+        for semantic retrieval). ``user_peer`` is the peer whose
+        perspective to target."""
 
     @abstractmethod
-    async def store_message(
+    async def add_turn(
         self,
         session_id: str,
-        peer_id: str,
-        content: str,
-        role: str = "user",
-        tags: list[str] | None = None,
+        agent_role: str,
+        user_text: str,
+        assistant_text: str,
+        user_peer: str = "nicola",
     ) -> None:
-        """Store a message in the memory backend."""
+        """Persist one user→assistant turn. ``user_text`` → ``user_peer``;
+        ``assistant_text`` → ``agent_role``. Never filtered."""
 
-    @abstractmethod
-    async def create_session(self, peer_id: str) -> str:
-        """Create a new session for a peer and return the session ID."""
 
-    @abstractmethod
-    async def close_session(self, session_id: str) -> None:
-        """Close / finalize a session."""
+class NoOpMemory(MemoryProvider):
+    """Stub provider when ``HONCHO_API_KEY`` is not configured."""
+
+    async def ensure_session(
+        self, session_id: str, agent_role: str, user_peer: str = "nicola",
+    ) -> None:
+        return None
+
+    async def get_context(
+        self,
+        session_id: str,
+        agent_role: str,
+        tokens: int,
+        search_query: str | None = None,
+        user_peer: str = "nicola",
+    ) -> str:
+        return ""
+
+    async def add_turn(
+        self,
+        session_id: str,
+        agent_role: str,
+        user_text: str,
+        assistant_text: str,
+        user_peer: str = "nicola",
+    ) -> None:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+def _render(context: object) -> str:
+    """Assemble a SessionContext into the markdown digest consumed by the
+    system prompt. Empty/missing sections are silently omitted — no
+    placeholder lines.
+
+    ``context`` is duck-typed: we read ``messages``, ``summary``,
+    ``peer_representation``, ``peer_card`` if present. Keeps the test
+    surface decoupled from the Honcho SDK types.
+    """
+    sections: list[str] = []
+
+    peer_card = getattr(context, "peer_card", None)
+    if peer_card:
+        lines = ["## What I know about you"]
+        lines.extend(f"- {item}" for item in peer_card)
+        sections.append("\n".join(lines))
+
+    summary = getattr(context, "summary", None)
+    summary_content = getattr(summary, "content", None) if summary else None
+    if summary_content:
+        sections.append(f"## Summary so far\n{summary_content}")
+
+    peer_repr = getattr(context, "peer_representation", None)
+    if peer_repr:
+        sections.append(f"## My perspective\n{peer_repr}")
+
+    messages = getattr(context, "messages", None) or []
+    if messages:
+        lines = ["## Recent exchanges"]
+        for m in messages:
+            lines.append(f"[{m.peer_name}] {m.content}")
+        sections.append("\n".join(lines))
+
+    return "\n\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
+# HonchoMemoryProvider (v3)
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402  (kept near the usage site for clarity)
+import logging  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+# Lazy-import so import of this module does not fail when honcho-ai is
+# absent (e.g. a test run without the dep). The NoOpMemory path needs
+# nothing. Both symbols are resolved at class-instantiation time, so
+# tests can monkeypatch them on the module.
+try:
+    from honcho import Honcho  # type: ignore[import-untyped]
+    from honcho.api_types import SessionPeerConfig  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover — exercised in NoOpMemory-only installs
+    Honcho = None  # type: ignore[assignment]
+    SessionPeerConfig = None  # type: ignore[assignment]
+
+
+async def _to_thread(func, /, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 class HonchoMemoryProvider(MemoryProvider):
-    """Memory provider backed by the Honcho SDK.
+    """Honcho v3 backed memory provider.
 
-    All SDK calls are wrapped with ``asyncio.to_thread`` so they do not
-    block the event loop.
+    All SDK calls are offloaded to a thread. Peers and sessions are
+    lazy in v3 — no API calls fire until a method that hits the server
+    is invoked.
     """
 
     def __init__(
         self,
         api_url: str,
         api_key: str,
-        workspace_name: str = "casa",
+        workspace_id: str = "casa",
     ) -> None:
-        # Lazy import to avoid hard failure when honcho-ai is not installed
-        from honcho import Honcho  # type: ignore[import-untyped]
+        if Honcho is None:
+            raise RuntimeError(
+                "honcho-ai is not installed; cannot construct "
+                "HonchoMemoryProvider. Install honcho-ai>=2.1.1."
+            )
+        self._client = Honcho(
+            api_key=api_key, base_url=api_url, workspace_id=workspace_id,
+        )
 
-        self._client = Honcho(api_key=api_key, base_url=api_url)
-        self._workspace_name = workspace_name
-        self._workspace: Any = None
-
-    async def initialize(self) -> None:
-        """Create or retrieve the workspace."""
-        self._workspace = await asyncio.to_thread(
-            self._client.apps.get_or_create, name=self._workspace_name
+    async def ensure_session(
+        self,
+        session_id: str,
+        agent_role: str,
+        user_peer: str = "nicola",
+    ) -> None:
+        session = await _to_thread(self._client.session, session_id)
+        user = await _to_thread(self._client.peer, user_peer)
+        agent = await _to_thread(self._client.peer, agent_role)
+        await _to_thread(
+            session.add_peers,
+            [
+                (user, SessionPeerConfig(
+                    observe_me=True, observe_others=False,
+                )),
+                (agent, SessionPeerConfig(
+                    observe_me=False, observe_others=True,
+                )),
+            ],
         )
 
     async def get_context(
         self,
-        peer_id: str,
-        token_budget: int,
-        exclude_tags: list[str] | None = None,
+        session_id: str,
+        agent_role: str,
+        tokens: int,
+        search_query: str | None = None,
+        user_peer: str = "nicola",
     ) -> str:
-        filters: dict[str, Any] = {}
-        if exclude_tags:
-            filters["tags"] = {"$nin": exclude_tags}
-
-        result = await asyncio.to_thread(
-            self._client.apps.users.sessions.chat,
-            app_id=self._workspace.id,
-            user_id=peer_id,
-            query=f"token_budget={token_budget}",
-            filter=filters if filters else None,
+        session = await _to_thread(self._client.session, session_id)
+        ctx = await _to_thread(
+            session.context,
+            tokens=tokens,
+            peer_target=user_peer,
+            peer_perspective=agent_role,
+            search_query=search_query,
         )
-        return str(result)
+        return _render(ctx)
 
-    async def store_message(
+    async def add_turn(
         self,
         session_id: str,
-        peer_id: str,
-        content: str,
-        role: str = "user",
-        tags: list[str] | None = None,
+        agent_role: str,
+        user_text: str,
+        assistant_text: str,
+        user_peer: str = "nicola",
     ) -> None:
-        metadata: dict[str, Any] = {}
-        if tags:
-            metadata["tags"] = tags
+        session = await _to_thread(self._client.session, session_id)
+        user = await _to_thread(self._client.peer, user_peer)
+        agent = await _to_thread(self._client.peer, agent_role)
+        await _to_thread(session.add_messages, [
+            user.message(user_text),
+            agent.message(assistant_text),
+        ])
 
-        await asyncio.to_thread(
-            self._client.apps.users.sessions.messages.create,
-            app_id=self._workspace.id,
-            user_id=peer_id,
-            session_id=session_id,
-            content=content,
-            is_user=(role == "user"),
-            metadata=metadata,
-        )
 
-    async def create_session(self, peer_id: str) -> str:
-        session = await asyncio.to_thread(
-            self._client.apps.users.sessions.create,
-            app_id=self._workspace.id,
-            user_id=peer_id,
-        )
-        return str(session.id)
+# ---------------------------------------------------------------------------
+# CachedMemoryProvider (voice latency strategy S1)
+# ---------------------------------------------------------------------------
 
-    async def close_session(self, session_id: str) -> None:
-        await asyncio.to_thread(
-            self._client.apps.users.sessions.delete,
-            app_id=self._workspace.id,
-            session_id=session_id,
+
+class CachedMemoryProvider(MemoryProvider):
+    """Warm-cache + background-refresh wrapper around a concrete provider.
+
+    First call for a given ``(session_id, agent_role, tokens)`` key
+    fetches synchronously and caches the rendered string. Subsequent
+    calls return the cached value immediately. ``add_turn`` writes
+    through and fires a background refresh so the next read already
+    reflects the new turn — without blocking the caller.
+
+    ``search_query`` is intentionally not part of the cache key: the
+    cache is for low-latency paths (butler voice), which trade
+    per-turn semantic retrieval for speed (spec §7 S1).
+    """
+
+    def __init__(self, backend: "MemoryProvider") -> None:
+        self._backend = backend
+        self._cache: dict[tuple[str, str, int], str] = {}
+        self._bg_tasks: set[asyncio.Task] = set()
+
+    async def ensure_session(
+        self, session_id: str, agent_role: str, user_peer: str = "nicola",
+    ) -> None:
+        await self._backend.ensure_session(session_id, agent_role, user_peer)
+
+    async def get_context(
+        self,
+        session_id: str,
+        agent_role: str,
+        tokens: int,
+        search_query: str | None = None,
+        user_peer: str = "nicola",
+    ) -> str:
+        key = (session_id, agent_role, tokens)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        fresh = await self._backend.get_context(
+            session_id, agent_role, tokens,
+            search_query=search_query, user_peer=user_peer,
         )
+        self._cache[key] = fresh
+        return fresh
+
+    async def add_turn(
+        self,
+        session_id: str,
+        agent_role: str,
+        user_text: str,
+        assistant_text: str,
+        user_peer: str = "nicola",
+    ) -> None:
+        await self._backend.add_turn(
+            session_id, agent_role, user_text, assistant_text, user_peer,
+        )
+        task = asyncio.create_task(
+            self._refresh(session_id, agent_role, user_peer),
+        )
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _refresh(
+        self, session_id: str, agent_role: str, user_peer: str,
+    ) -> None:
+        # Refresh every (session_id, agent_role, tokens) entry we've
+        # already cached. Token-budget variations are uncommon in
+        # practice but we keep the cache coherent either way.
+        keys = [k for k in self._cache if k[0] == session_id
+                                       and k[1] == agent_role]
+        for key in keys:
+            _, _, tokens = key
+            try:
+                fresh = await self._backend.get_context(
+                    session_id, agent_role, tokens,
+                    search_query=None, user_peer=user_peer,
+                )
+                self._cache[key] = fresh
+            except Exception as exc:
+                logger.warning(
+                    "CachedMemoryProvider refresh failed for %s/%s: %s",
+                    session_id, agent_role, exc,
+                )

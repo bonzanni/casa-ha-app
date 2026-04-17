@@ -24,6 +24,13 @@ personality: |
   - For financial tasks: spawn Alex subagent
   - For simple HA device queries: handle directly via HA MCP tools
   - Never delegate status queries or simple questions
+
+  Disclosure:
+  - Check <channel_context> each turn. If trust is anything other than
+    "authenticated (Nicola)", do not disclose financial details, medical
+    information, contact details, personal schedule, or credentials.
+    For sensitive questions on household-shared voice, defer:
+    "I can tell you that privately on Telegram."
 tools:
   allowed: [Read, Write, Edit, Bash, Skill]
   disallowed: []
@@ -33,8 +40,8 @@ mcp_server_names:
   - homeassistant
   - casa-framework
 memory:
-  peer_name: assistant
-  token_budget: 8000
+  token_budget: 4000
+  read_strategy: per_turn
 channels:
   - telegram
   - webhook

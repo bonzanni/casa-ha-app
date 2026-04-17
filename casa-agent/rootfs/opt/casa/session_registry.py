@@ -41,13 +41,17 @@ class SessionRegistry:
         channel_key: str,
         agent: str,
         sdk_session_id: str,
-        memory_session_id: str,
     ) -> None:
-        """Register (or overwrite) a session entry and persist."""
+        """Register (or overwrite) a session entry and persist.
+
+        The Honcho session ID is *not* tracked here in the 2.2a
+        topology: it is derived at call time as
+        ``f"{channel_key}:{agent}"``. If a legacy entry on disk has a
+        ``memory_session_id`` field, it is dropped on first write.
+        """
         self._data[channel_key] = {
             "agent": agent,
             "sdk_session_id": sdk_session_id,
-            "memory_session_id": memory_session_id,
             "last_active": datetime.now(timezone.utc).isoformat(),
         }
         await self.save()
@@ -57,9 +61,14 @@ class SessionRegistry:
         return self._data.get(channel_key)
 
     async def touch(self, channel_key: str) -> None:
-        """Update ``last_active`` for an existing entry and persist."""
+        """Update ``last_active`` for an existing entry and persist.
+
+        Also drops any obsolete ``memory_session_id`` field from a
+        pre-2.2a entry — lazy migration, safe to re-run.
+        """
         entry = self._data.get(channel_key)
         if entry is not None:
+            entry.pop("memory_session_id", None)
             entry["last_active"] = datetime.now(timezone.utc).isoformat()
             await self.save()
 

@@ -93,11 +93,13 @@ class ToolsConfig:
     max_turns: int = 10
 
 
+_VALID_READ_STRATEGIES = ("per_turn", "cached", "card_only")
+
+
 @dataclass
 class MemoryConfig:
-    peer_name: str = ""
     token_budget: int = 4000
-    exclude_tags: list[str] = field(default_factory=list)
+    read_strategy: str = "per_turn"
 
 
 @dataclass
@@ -140,10 +142,15 @@ def _build_tools_config(raw: dict[str, Any] | None) -> ToolsConfig:
 def _build_memory_config(raw: dict[str, Any] | None) -> MemoryConfig:
     if not raw:
         return MemoryConfig()
+    strategy = raw.get("read_strategy", "per_turn")
+    if strategy not in _VALID_READ_STRATEGIES:
+        raise ValueError(
+            f"Invalid memory.read_strategy {strategy!r}; "
+            f"must be one of {_VALID_READ_STRATEGIES}"
+        )
     return MemoryConfig(
-        peer_name=raw.get("peer_name", ""),
         token_budget=raw.get("token_budget", 4000),
-        exclude_tags=raw.get("exclude_tags", []),
+        read_strategy=strategy,
     )
 
 
