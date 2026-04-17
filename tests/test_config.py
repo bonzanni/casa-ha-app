@@ -61,9 +61,8 @@ class TestLoadAgentConfig:
             mcp_server_names:
               - homeassistant
             memory:
-              peer_name: test-peer
               token_budget: 5000
-              exclude_tags: [private]
+              read_strategy: cached
             session:
               strategy: persistent
               idle_timeout: 600
@@ -93,9 +92,8 @@ class TestLoadAgentConfig:
         assert cfg.mcp_server_names == ["homeassistant"]
 
         assert isinstance(cfg.memory, MemoryConfig)
-        assert cfg.memory.peer_name == "test-peer"
         assert cfg.memory.token_budget == 5000
-        assert cfg.memory.exclude_tags == ["private"]
+        assert cfg.memory.read_strategy == "cached"
 
         assert isinstance(cfg.session, SessionConfig)
         assert cfg.session.strategy == "persistent"
@@ -164,3 +162,18 @@ def test_role_assistant_accepted(tmp_path):
     )
     cfg = load_agent_config(str(p))
     assert cfg.role == "assistant"
+
+
+def test_unknown_read_strategy_raises(tmp_path):
+    p = tmp_path / "bad.yaml"
+    p.write_text(
+        "name: T\n"
+        "role: assistant\n"
+        "model: opus\n"
+        "personality: x\n"
+        "memory:\n"
+        "  read_strategy: telepathy\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="read_strategy"):
+        load_agent_config(str(p))
