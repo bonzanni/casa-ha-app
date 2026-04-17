@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Coroutine
+
+logger = logging.getLogger(__name__)
 
 
 class MessageType(Enum):
@@ -92,21 +95,45 @@ class MessageBus:
     async def run_agent_loop(self, agent_name: str) -> None:
         """Pull messages from the agent's queue and dispatch to its handler.
 
-        Runs until the current task is cancelled.
+        Each message is dispatched as an independent asyncio task so that
+        multiple concurrent messages are processed in parallel (no implicit
+        serialisation at the bus level).  Runs until the current task is
+        cancelled.
         """
         queue = self.queues[agent_name]
         handler = self.handlers.get(agent_name)
 
+        async def _dispatch(msg: BusMessage) -> None:
+            try:
+                if handler is not None:
+                    result = await handler(msg)
+                    # Auto-respond to REQUESTs if handler returned something
+                    if msg.type == MessageType.REQUEST and result is not None:
+                        result.reply_to = msg.id
+                        result.type = MessageType.RESPONSE
+                        await self.respond(msg.id, result)
+            except Exception:
+                logger.exception(
+                    "Bus handler for target=%r raised on msg id=%s",
+                    msg.target,
+                    msg.id,
+                )
+                # Unblock REQUEST callers so they don't wait for the full timeout.
+                if msg.type == MessageType.REQUEST:
+                    error_resp = BusMessage(
+                        type=MessageType.RESPONSE,
+                        source=msg.target,
+                        target=msg.source,
+                        content=f"handler error: {msg.id}",
+                        reply_to=msg.id,
+                    )
+                    await self.respond(msg.id, error_resp)
+            finally:
+                queue.task_done()
+
         while True:
             _priority, _seq, msg = await queue.get()
-            if handler is not None:
-                result = await handler(msg)
-                # Auto-respond to REQUESTs if handler returned something
-                if msg.type == MessageType.REQUEST and result is not None:
-                    result.reply_to = msg.id
-                    result.type = MessageType.RESPONSE
-                    await self.respond(msg.id, result)
-            queue.task_done()
+            asyncio.create_task(_dispatch(msg))
 
     def get_log(self, last_n: int = 50) -> list[BusMessage]:
         """Return the last *last_n* log entries."""
