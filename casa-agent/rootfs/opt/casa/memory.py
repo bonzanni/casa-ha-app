@@ -259,6 +259,7 @@ class CachedMemoryProvider(MemoryProvider):
     def __init__(self, backend: "MemoryProvider") -> None:
         self._backend = backend
         self._cache: dict[tuple[str, str, int], str] = {}
+        self._locks: dict[tuple[str, str, int], asyncio.Lock] = {}
         self._bg_tasks: set[asyncio.Task] = set()
 
     async def ensure_session(
@@ -278,11 +279,16 @@ class CachedMemoryProvider(MemoryProvider):
         cached = self._cache.get(key)
         if cached is not None:
             return cached
-        fresh = await self._backend.get_context(
-            session_id, agent_role, tokens,
-            search_query=search_query, user_peer=user_peer,
-        )
-        self._cache[key] = fresh
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            cached = self._cache.get(key)  # re-check after acquire
+            if cached is not None:
+                return cached
+            fresh = await self._backend.get_context(
+                session_id, agent_role, tokens,
+                search_query=search_query, user_peer=user_peer,
+            )
+            self._cache[key] = fresh
         return fresh
 
     async def add_turn(
