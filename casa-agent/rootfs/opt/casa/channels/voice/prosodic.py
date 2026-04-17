@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 
 _SENTENCE_MARKS = ".!?…"
-_CLAUSE_MARKS = ",;"
+_CLAUSE_MARKS = ",;—"
 _OPEN = {"[": "]", "(": ")", "{": "}", "<": ">"}
 _CHAR_CAP = 200
 _TIME_CAP = 1.5  # seconds since last flush
@@ -24,6 +24,8 @@ class ProsodicSplitter:
     # --- public -------------------------------------------------------
 
     def feed(self, delta: str) -> list[str]:
+        if delta and not self._buf:
+            self._last_flush = time.monotonic()
         self._buf += delta
         return self._drain()
 
