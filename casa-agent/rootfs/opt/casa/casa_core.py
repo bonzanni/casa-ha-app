@@ -27,46 +27,13 @@ from channels import ChannelManager
 from config import AgentConfig, load_agent_config
 from log_redact import RedactingFilter
 from mcp_registry import McpServerRegistry
-from memory import HonchoMemoryProvider, MemoryProvider
+from memory import HonchoMemoryProvider, MemoryProvider, NoOpMemory
 from session_registry import SessionRegistry
 
 logger = logging.getLogger(__name__)
 
 CONFIG_DIR = "/addon_configs/casa-agent"
 DATA_DIR = "/data"
-
-
-# ------------------------------------------------------------------
-# NoOp memory for when Honcho is not configured
-# ------------------------------------------------------------------
-
-
-class NoOpMemory(MemoryProvider):
-    """Stub memory provider that does nothing."""
-
-    async def get_context(
-        self,
-        peer_id: str,
-        token_budget: int,
-        exclude_tags: list[str] | None = None,
-    ) -> str:
-        return ""
-
-    async def store_message(
-        self,
-        session_id: str,
-        peer_id: str,
-        content: str,
-        role: str = "user",
-        tags: list[str] | None = None,
-    ) -> None:
-        pass
-
-    async def create_session(self, peer_id: str) -> str:
-        return "noop"
-
-    async def close_session(self, session_id: str) -> None:
-        pass
 
 
 # ------------------------------------------------------------------
