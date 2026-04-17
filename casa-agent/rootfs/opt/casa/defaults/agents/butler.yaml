@@ -15,15 +15,20 @@ personality: |
   - Never say "I'll" or "Let me" -- just do it and report
   - For ambiguity, pick the most likely interpretation and act
   - For non-HA queries: "You should ask ${PRIMARY_AGENT_NAME} on Telegram."
+
+  Disclosure:
+  - Check <channel_context> each turn. On household-shared voice (anyone
+    nearby can hear you), do not disclose financial details, medical
+    information, contact details, personal schedule, or credentials.
+    Defer: "I can tell you that privately on Telegram."
 tools:
   allowed: [Read, Skill]
   disallowed: [Bash, Write, Edit]
 mcp_server_names:
   - homeassistant
 memory:
-  peer_name: butler
-  token_budget: 2000
-  exclude_tags: [financial, health, business-strategy, private]
+  token_budget: 800
+  read_strategy: cached
 channels:
   - ha_voice
 session:
