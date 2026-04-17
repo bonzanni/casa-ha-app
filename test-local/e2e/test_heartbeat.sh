@@ -43,11 +43,17 @@ tmp="${TMPBASE}/casa-hb-$$"
 mkdir -p "$tmp/data"
 mkdir -p "$tmp/config/agents"
 
-# python3 on Windows is native and needs Windows-style paths.
-# cygpath -w converts /c/Users/... → C:\Users\...
-WIN_SRC="$(cygpath -w "${REPO_ROOT}/test-local/options.json.example")"
-WIN_DST="$(cygpath -w "${tmp}/data/options.json")"
-python3 - "$WIN_SRC" "$WIN_DST" <<'PYEOF'
+# python3 on Windows Git Bash is native and needs Windows-style paths;
+# cygpath -w converts /c/Users/... → C:\Users\...  On Linux CI, use
+# POSIX paths as-is.
+if command -v cygpath >/dev/null 2>&1; then
+    SRC_PATH="$(cygpath -w "${REPO_ROOT}/test-local/options.json.example")"
+    DST_PATH="$(cygpath -w "${tmp}/data/options.json")"
+else
+    SRC_PATH="${REPO_ROOT}/test-local/options.json.example"
+    DST_PATH="${tmp}/data/options.json"
+fi
+python3 - "$SRC_PATH" "$DST_PATH" <<'PYEOF'
 import json, sys
 src, dst = sys.argv[1], sys.argv[2]
 with open(src) as f:
