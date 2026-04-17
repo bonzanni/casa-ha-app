@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.2 — 2026-04-17 — Phase 2.2a: Honcho v3 memory redesign
+
+### Changed (breaking for pre-release users)
+- `MemoryProvider` is now a 3-method ABC: `ensure_session`, `get_context`,
+  `add_turn`. The pre-v3 `store_message` / `create_session` /
+  `close_session` surface is removed.
+- `HonchoMemoryProvider` rewritten for the honcho-ai 2.1.x peer/session
+  model. The pre-v3 apps/users API is gone; `.initialize()` is no
+  longer needed (v3 is lazy).
+- Agent YAML `memory` block: `peer_name` and `exclude_tags` are
+  removed; `read_strategy` (`per_turn` | `cached` | `card_only`) is
+  added. Existing user YAMLs are migrated on first boot.
+- `SessionRegistry.register()` no longer takes `memory_session_id`
+  (the Honcho session is derived from `{channel_key}:{role}`).
+  Existing `sessions.json` entries are migrated on first write.
+
+### Added
+- `CachedMemoryProvider` — warm cache + background refresh wrapper for
+  the voice path; default `read_strategy` for `butler`.
+- `<channel_context>` block in every system prompt, so agents can
+  condition disclosure on the ingress channel's trust level.
+- Personality baselines for `assistant` and `butler` include a
+  disclosure clause referencing `<channel_context>`.
+
+### Internal
+- `voice_speaker` peer for unauthenticated voice ingress; `nicola`
+  peer for authenticated channels (Telegram, webhook). Future
+  voice-ID can upgrade a recognised speaker's attribution without
+  touching agent code.
+- Storage is unconditional: write-side filtering is gone (spec §4.3).
+  Visibility is enforced by session/peer topology; disclosure is
+  enforced by the agent on the output side.
+
 ## 0.2.1
 
 - Fix bus serialisation: `MessageBus.run_agent_loop` no longer awaits
