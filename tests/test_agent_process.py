@@ -246,3 +246,16 @@ async def test_add_turn_failure_logs_warning(tmp_path, caplog):
     assert any(
         "add_turn" in r.message.lower() for r in caplog.records
     )
+
+
+async def test_agent_retains_add_turn_task_strong_reference(tmp_path):
+    mem = FakeMemory()
+    agent = _make_agent(mem, tmp_path, role="assistant")
+    with patch("agent.ClaudeSDKClient", FakeClient):
+        await agent._process(_msg("telegram", "123", "hi"))
+
+    # Task completed and callback fired, set is now empty.
+    # The strong reference ensures the task didn't GC while pending.
+    assert len(agent._bg_tasks) == 0
+    # Confirm the add_turn was persisted (proves the task ran).
+    assert len(mem.add) == 1

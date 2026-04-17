@@ -92,6 +92,7 @@ class Agent:
         self._session_registry = session_registry
         self._mcp_registry = mcp_registry
         self._channel_manager = channel_manager
+        self._bg_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # Public entry point (used as bus handler)
@@ -270,9 +271,11 @@ class Agent:
         # 8. Persist — off the critical path. Storage is unconditional. ---
         #    Session+peer topology already scopes visibility (spec §4.3).
         if response_text:
-            asyncio.create_task(self._add_turn_bg(
+            task = asyncio.create_task(self._add_turn_bg(
                 session_id, self.config.role, user_text, response_text, user_peer,
             ))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
 
         # 9. SessionRegistry — only SDK session id now. --------------------
         if sdk_session_id:

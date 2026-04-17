@@ -259,6 +259,7 @@ class CachedMemoryProvider(MemoryProvider):
     def __init__(self, backend: "MemoryProvider") -> None:
         self._backend = backend
         self._cache: dict[tuple[str, str, int], str] = {}
+        self._bg_tasks: set[asyncio.Task] = set()
 
     async def ensure_session(
         self, session_id: str, agent_role: str, user_peer: str = "nicola",
@@ -295,9 +296,11 @@ class CachedMemoryProvider(MemoryProvider):
         await self._backend.add_turn(
             session_id, agent_role, user_text, assistant_text, user_peer,
         )
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._refresh(session_id, agent_role, user_peer),
         )
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     async def _refresh(
         self, session_id: str, agent_role: str, user_peer: str,

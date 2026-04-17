@@ -134,3 +134,18 @@ async def test_add_turn_passes_through():
     await cached.add_turn("s", "assistant", "u", "a")
     await _drain()
     assert backend.add_calls == 1
+
+
+async def test_background_task_strongly_retained_during_flight():
+    backend = RecordingProvider()
+    backend.queue("v1")
+    cached = CachedMemoryProvider(backend)
+    await cached.get_context("s", "assistant", 100)
+
+    # Trigger refresh
+    await cached.add_turn("s", "assistant", "u", "a")
+    # Before draining, the set holds the task.
+    assert len(cached._bg_tasks) == 1
+    await _drain()
+    # Done callback removed it.
+    assert len(cached._bg_tasks) == 0
