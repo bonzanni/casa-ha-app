@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable, Mapping
 
 from aiohttp import web
 
-from agent import ErrorKind, _classify_error  # noqa: F401 — classifier re-used
+from agent import _classify_error
 from bus import BusMessage, MessageBus, MessageType
 from channels import Channel
 from channels.voice.prosodic import ProsodicSplitter
@@ -144,6 +144,8 @@ class VoiceChannel(Channel):
             return web.json_response({"error": "unknown agent_role"}, status=404)
 
         scope_id = self._resolve_scope_id(payload)
+        self.pool.ensure(scope_id)
+        self.pool.touch(scope_id)
         utterance_id = str(uuid.uuid4())
 
         response = web.StreamResponse(
@@ -193,6 +195,10 @@ class VoiceChannel(Channel):
                     "final": True,
                 })
             await _write_sse(response, "done", {})
+        except asyncio.CancelledError:
+            # Client disconnect mid-stream — do NOT emit `event: done`.
+            # Pool entry already created above, stays alive per spec §10.3.
+            raise
         except Exception as exc:
             line = self._error_line(cfg, exc)
             await _write_sse(response, "error", {
@@ -200,8 +206,6 @@ class VoiceChannel(Channel):
                 "spoken": adapter.render(line) if line else "",
             })
 
-        self.pool.ensure(scope_id)
-        self.pool.touch(scope_id)
         return response
 
     # --- helpers ------------------------------------------------------
