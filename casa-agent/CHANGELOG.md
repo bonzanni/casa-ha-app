@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.1
+
+- Fix bus serialisation: `MessageBus.run_agent_loop` no longer awaits
+  each handler inline. Each message is now dispatched via
+  `asyncio.create_task`, so concurrent `/invoke` calls to a single agent
+  run in parallel instead of queuing behind one another. Handler
+  exceptions are logged and REQUEST callers receive an error response
+  instead of hanging until the 300 s timeout.
+- Test-only: added offline mock `claude_agent_sdk` package and
+  Dockerized E2E suite under `test-local/e2e/`. The mock replaces the
+  real SDK inside the test image so runtime tests can run without an
+  OAuth token. E2E suite covers smoke, YAML migration scenarios,
+  `/invoke/{agent}` session isolation, heartbeat delivery, and
+  concurrent dispatch.
+
 ## 0.2.0
 
 - Fix heartbeat silent failure: scheduled ticks now use `channel: scheduler`
