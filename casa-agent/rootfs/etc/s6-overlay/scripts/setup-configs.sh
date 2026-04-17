@@ -18,25 +18,27 @@ mkdir -p "$CONFIG_DIR/agents" "$CONFIG_DIR/workspace/.claude/skills" \
 migrate_rename() {
     local old="$1"
     local new="$2"
-    local old_role="$3"
-    local new_role="$4"
-    local old_peer="$5"
-    local new_peer="$6"
+    local canonical_role="$3"
+    local old_peer="$4"
+    local new_peer="$5"
 
     if [ -f "$CONFIG_DIR/agents/$old" ] && [ ! -f "$CONFIG_DIR/agents/$new" ]; then
         mv "$CONFIG_DIR/agents/$old" "$CONFIG_DIR/agents/$new"
-        if [ -n "$old_role" ] && [ -n "$new_role" ]; then
-            sed -i "s/^role:[[:space:]]*${old_role}[[:space:]]*$/role: ${new_role}/" \
-                "$CONFIG_DIR/agents/$new"
-        fi
+        # Strip CR so a Windows-edited YAML (\r\n) still matches our anchors.
+        sed -i 's/\r$//' "$CONFIG_DIR/agents/$new"
+        # Force the role line to the canonical value for this filename, whatever
+        # the user (or the legacy default) had there. The filename is the
+        # source of truth after Phase 2.1.
+        sed -i "s/^role:[[:space:]]*.*$/role: ${canonical_role}/" \
+            "$CONFIG_DIR/agents/$new"
         sed -i "s/^  peer_name:[[:space:]]*${old_peer}[[:space:]]*$/  peer_name: ${new_peer}/" \
             "$CONFIG_DIR/agents/$new"
         bashio::log.info "Migrated $old -> $new"
     fi
 }
 
-migrate_rename "ellen.yaml" "assistant.yaml" "main" "assistant" "ellen" "assistant"
-migrate_rename "tina.yaml"  "butler.yaml"    ""     ""          "tina"  "butler"
+migrate_rename "ellen.yaml" "assistant.yaml" "assistant" "ellen" "assistant"
+migrate_rename "tina.yaml"  "butler.yaml"    "butler"    "tina"  "butler"
 
 # ------------------------------------------------------------------
 # Copy defaults ONLY if not already present (first boot or new files)
