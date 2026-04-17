@@ -453,4 +453,29 @@ class SqliteMemoryProvider(MemoryProvider):
         self, session_id: str, agent_role: str,
         user_text: str, assistant_text: str, user_peer: str = "nicola",
     ) -> None:
-        raise NotImplementedError  # pragma: no cover
+        await asyncio.to_thread(
+            self._add_turn_sync,
+            session_id, agent_role, user_text, assistant_text, user_peer,
+        )
+
+    def _add_turn_sync(
+        self, session_id: str, agent_role: str,
+        user_text: str, assistant_text: str, user_peer: str,
+    ) -> None:
+        import time
+        now = time.time()
+        with self._conn:  # rolls back automatically on exception
+            self._conn.execute(
+                "INSERT INTO messages "
+                "(session_id, peer_name, content, ts) VALUES (?, ?, ?, ?)",
+                (session_id, user_peer, user_text, now),
+            )
+            self._conn.execute(
+                "INSERT INTO messages "
+                "(session_id, peer_name, content, ts) VALUES (?, ?, ?, ?)",
+                (session_id, agent_role, assistant_text, now),
+            )
+            self._conn.execute(
+                "UPDATE sessions SET last_active = ? WHERE session_id = ?",
+                (now, session_id),
+            )
