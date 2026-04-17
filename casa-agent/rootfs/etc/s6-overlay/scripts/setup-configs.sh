@@ -94,6 +94,43 @@ migrate_memory_fields "$CONFIG_DIR/agents/assistant.yaml" "per_turn"
 migrate_memory_fields "$CONFIG_DIR/agents/butler.yaml"    "cached"
 
 # ------------------------------------------------------------------
+# One-shot 2.3 migration: inject tts.tag_dialect and voice_errors
+# into butler.yaml if absent. Idempotent on re-runs.
+# ------------------------------------------------------------------
+
+migrate_voice_fields() {
+    local file="$1"
+
+    [ -f "$file" ] || return 0
+
+    sed -i 's/\r$//' "$file"
+
+    if ! grep -qE '^tts:' "$file"; then
+        cat >> "$file" <<'YAML'
+tts:
+  tag_dialect: square_brackets
+YAML
+        # bashio may not be in scope for tests; use echo-fallback
+        echo "Injected tts block into $(basename "$file")"
+    fi
+
+    if ! grep -qE '^voice_errors:' "$file"; then
+        cat >> "$file" <<'YAML'
+voice_errors:
+  timeout:       "[apologetic] Hm, that took too long. Try again?"
+  rate_limit:    "[flat] My brain is busy — give me a minute."
+  sdk_error:     "[apologetic] I couldn't reach my brain. Try again?"
+  memory_error:  ""
+  channel_error: "[flat] Something went wrong sending that."
+  unknown:       "[flat] Sorry, something went wrong."
+YAML
+        echo "Injected voice_errors block into $(basename "$file")"
+    fi
+}
+
+migrate_voice_fields "$CONFIG_DIR/agents/butler.yaml"
+
+# ------------------------------------------------------------------
 # One-shot: drop obsolete memory_session_id field from sessions.json.
 # Lazy migration in SessionRegistry.touch() also handles this, but
 # doing it at setup time keeps the on-disk schema current immediately.

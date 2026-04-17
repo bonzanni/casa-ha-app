@@ -108,6 +108,21 @@ class SessionConfig:
     idle_timeout: int = 300
 
 
+_VALID_TAG_DIALECTS = ("square_brackets", "parens", "none")
+
+
+@dataclass
+class TTSConfig:
+    tag_dialect: str = "square_brackets"
+
+    def __post_init__(self) -> None:
+        if self.tag_dialect not in _VALID_TAG_DIALECTS:
+            raise ValueError(
+                f"Invalid tts.tag_dialect {self.tag_dialect!r}; "
+                f"must be one of {_VALID_TAG_DIALECTS}"
+            )
+
+
 @dataclass
 class AgentConfig:
     name: str = ""
@@ -119,6 +134,8 @@ class AgentConfig:
     mcp_server_names: list[str] = field(default_factory=list)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
+    tts: TTSConfig = field(default_factory=TTSConfig)
+    voice_errors: dict[str, str] = field(default_factory=dict)
     channels: list[str] = field(default_factory=list)
     cwd: str = ""
 
@@ -163,6 +180,12 @@ def _build_session_config(raw: dict[str, Any] | None) -> SessionConfig:
     )
 
 
+def _build_tts_config(raw: dict[str, Any] | None) -> TTSConfig:
+    if not raw:
+        return TTSConfig()
+    return TTSConfig(tag_dialect=raw.get("tag_dialect", "square_brackets"))
+
+
 def load_agent_config(path: str) -> AgentConfig:
     """Load an agent configuration from a YAML file.
 
@@ -185,6 +208,8 @@ def load_agent_config(path: str) -> AgentConfig:
         mcp_server_names=data.get("mcp_server_names", []),
         memory=_build_memory_config(data.get("memory")),
         session=_build_session_config(data.get("session")),
+        tts=_build_tts_config(data.get("tts")),
+        voice_errors=data.get("voice_errors", {}) or {},
         channels=data.get("channels", []),
         cwd=data.get("cwd", ""),
     )
