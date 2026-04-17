@@ -32,6 +32,7 @@ from memory import (
     HonchoMemoryProvider,
     MemoryProvider,
     NoOpMemory,
+    SqliteMemoryProvider,
 )
 from session_registry import SessionRegistry
 
@@ -305,17 +306,21 @@ async def main() -> None:
 
     # 2. Memory
     base_memory: MemoryProvider
-    honcho_key = os.environ.get("HONCHO_API_KEY", "")
-    if honcho_key:
-        honcho_url = os.environ.get("HONCHO_API_URL", "https://api.honcho.dev")
+    mem_choice = resolve_memory_backend_choice(dict(os.environ))
+    if mem_choice.backend == "honcho":
         base_memory = HonchoMemoryProvider(
-            api_url=honcho_url,
-            api_key=honcho_key,
+            api_url=mem_choice.honcho_api_url,
+            api_key=mem_choice.honcho_api_key,
         )
         logger.info("Honcho v3 memory provider initialized")
-    else:
+    elif mem_choice.backend == "sqlite":
+        base_memory = SqliteMemoryProvider(mem_choice.db_path)
+        logger.info(
+            "SQLite memory provider initialized (path=%s)", mem_choice.db_path,
+        )
+    else:  # noop
         base_memory = NoOpMemory()
-        logger.info("No HONCHO_API_KEY set; using no-op memory")
+        logger.info("MEMORY_BACKEND=noop; using no-op memory")
 
     # 3. Message bus
     bus = MessageBus()
