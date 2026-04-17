@@ -103,6 +103,36 @@ class TestSafetyCap:
         # Expect a safety flush on the rightmost clause mark.
         assert out
 
+    def test_time_cap_not_tripped_by_construction_delay(self, monkeypatch):
+        """Creating a splitter then waiting for first token must not
+        pre-arm the time cap. The 1.5 s window starts when the buffer
+        first fills, not at construction.
+        """
+        clock = [0.0]
+        monkeypatch.setattr(
+            "channels.voice.prosodic.time.monotonic", lambda: clock[0],
+        )
+        s = ProsodicSplitter()
+        clock[0] = 2.0  # SDK-first-token delay past the cap
+        # First real delta arrives. Must NOT immediately emit a cap block.
+        assert s.feed("Hello ") == []
+        # Now advance another 2 s — cap should fire on the next delta
+        # because the buffer has been filling for 2 s.
+        clock[0] = 4.0
+        out = s.feed("there, more")
+        assert out  # the clause-mark-based safety flush fires now
+
+    def test_char_cap_breaks_on_em_dash_when_no_comma(self):
+        """Spec §5.1: safety-cap fallback clause marks are `,` `;` and em-dash."""
+        s = ProsodicSplitter()
+        # 190 chars of 'a', then em-dash+space, then more — char cap at 200.
+        blob = ("a" * 190) + " — more continuation padding padding"
+        out = s.feed(blob)
+        assert out
+        # Should break at the em-dash region, not hard-cut
+        assert out[0].rstrip().endswith("—") or out[0].rstrip().endswith("— ") \
+            or out[0].rstrip().endswith("—")
+
 
 class TestFinalFlush:
     def test_flush_tail_emits_remainder(self):
