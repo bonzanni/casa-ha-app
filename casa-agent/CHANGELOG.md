@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.4.0 — 2026-04-17 — Phase 2.2b: SQLite memory drop-in
+
+### Added
+- `SqliteMemoryProvider` — durable local-storage backend for the
+  3-method `MemoryProvider` ABC. Single `sqlite3` connection, WAL
+  journal mode, schema versioned at `1`. Stores a thin log
+  (`messages`, `sessions`, `peer_cards`); no summariser, no dialectic
+  (spec §3 / S1).
+- `_SqliteCtx` duck-typed wrapper so the existing `_render` produces
+  `## What I know about you` + `## Recent exchanges` for SQLite without
+  a second rendering code path.
+- `MEMORY_BACKEND` env var — `honcho` / `sqlite` / `noop`. Resolution:
+  explicit value wins; else `HONCHO_API_KEY` → honcho; else sqlite.
+  Invalid values fail fast at startup. `MEMORY_BACKEND=honcho` without
+  an API key also fails fast.
+- `MEMORY_DB_PATH` env var — SQLite file location, default
+  `/data/memory.sqlite`. Parent directory is created if missing.
+- Dashboard "Memory" row now renders SQLite / Honcho / none.
+- `casa_core.resolve_memory_backend_choice()` + `_wrap_memory_for_strategy()` — pure helpers lifted out of `main()` and unit-tested.
+
+### Changed (behaviour change — documented fallout)
+- Fresh installs without `HONCHO_API_KEY` now persist memory to
+  `/data/memory.sqlite` by default. Previously: no memory at all. Opt
+  out with `MEMORY_BACKEND=noop`.
+- `CachedMemoryProvider` wrap is skipped when the backend is SQLite
+  (native reads are ~1 ms; caching adds staleness and a background
+  task for no measurable benefit). Butler YAMLs keep
+  `read_strategy: cached` unchanged — the selector silently degrades
+  to bare with a one-time INFO log at startup (spec §2 / S5).
+
+### Migration
+- None. No schema changes; no YAML changes. SQLite initialises itself
+  on first open via `CREATE TABLE IF NOT EXISTS`. Switching backends
+  = fresh start in the new backend (spec §7 / S7).
+
+### Deferred
+- LLM summariser (2.2c seam reserved: `_SqliteCtx.summary=None`).
+- `remember_fact` tool writing to `peer_cards` (4.x).
+- Export/import CLI between backends.
+- Retention / pruning policy.
+
+### Tests
+- New: `tests/test_memory_sqlite.py` (schema, ensure_session, add_turn
+  transactional, get_context rendering, peer_card scoping, topology
+  visibility), `tests/test_memory_backend_select.py`
+  (resolve + wrap policy), `tests/test_agent_process_sqlite.py`
+  (`Agent._process` loop integration), `test-local/e2e/test_sqlite_memory.sh`
+  (persistence across restart).
+- Existing Honcho unit + integration tests still green (regression
+  coverage for 2.2a).
+
 ## 0.3.0 — 2026-04-17 — Phase 2.3: voice pipeline
 
 ### Added

@@ -29,10 +29,24 @@ Casa runs always-on AI agents inside your Home Assistant instance. The primary a
 
 ### Optional -- Memory
 
+By default, Casa persists conversation history to a local SQLite
+database at `/data/memory.sqlite`. Set `HONCHO_API_KEY` to use the
+Honcho cloud backend instead (adds semantic retrieval + peer
+representations). Set `MEMORY_BACKEND=noop` if you want no memory at
+all.
+
 | Option | Description |
 |--------|-------------|
 | `honcho_api_url` | Honcho API URL. Defaults to `https://api.honcho.dev`. |
-| `honcho_api_key` | Honcho API key. When set, enables persistent cross-session memory. |
+| `honcho_api_key` | Honcho API key. When set, enables the Honcho cloud backend (overrides SQLite default). |
+
+The following env vars can be set via the add-on environment (not the
+options panel) for finer control:
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `MEMORY_BACKEND` | Force a specific backend (`honcho` / `sqlite` / `noop`). Fails fast on typos. | unset (auto-resolves) |
+| `MEMORY_DB_PATH` | SQLite file location. | `/data/memory.sqlite` |
 
 ### Optional -- Agents
 
