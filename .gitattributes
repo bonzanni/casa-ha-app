@@ -7,3 +7,6 @@ casa-agent/apparmor.txt text eol=lf
 casa-agent/config.yaml text eol=lf
 casa-agent/build.yaml text eol=lf
 casa-agent/requirements.txt text eol=lf
+
+# Preserve CRLF for legacy-crlf fixture (migration test fixture)
+test-local/fixtures/legacy-crlf/** -text
