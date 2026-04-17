@@ -447,7 +447,34 @@ class SqliteMemoryProvider(MemoryProvider):
         self, session_id: str, agent_role: str, tokens: int,
         search_query: str | None = None, user_peer: str = "nicola",
     ) -> str:
-        raise NotImplementedError  # pragma: no cover
+        # search_query is ignored on SQLite (no semantic retrieval).
+        return await asyncio.to_thread(
+            self._get_context_sync, session_id, tokens, user_peer,
+        )
+
+    def _get_context_sync(
+        self, session_id: str, tokens: int, user_peer: str,
+    ) -> str:
+        last_n = max(1, tokens // 40)
+        msg_rows = self._conn.execute(
+            "SELECT peer_name, content FROM messages "
+            "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            (session_id, last_n),
+        ).fetchall()
+        messages = [
+            _SqliteMsg(peer_name=r[0], content=r[1])
+            for r in reversed(msg_rows)
+        ]
+
+        card_rows = self._conn.execute(
+            "SELECT bullet FROM peer_cards "
+            "WHERE peer_name = ? ORDER BY created_ts ASC",
+            (user_peer,),
+        ).fetchall()
+        peer_card = [r[0] for r in card_rows]
+
+        ctx = _SqliteCtx(messages=messages, peer_card=peer_card)
+        return _render(ctx)
 
     async def add_turn(
         self, session_id: str, agent_role: str,
