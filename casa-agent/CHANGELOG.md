@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0
+
+- Fix heartbeat silent failure: scheduled ticks now use `channel: scheduler`
+  and resolve to a valid session key (`build_session_key` rejects empty
+  channels, which previously swallowed every tick).
+- Fix dashboard startup race: a request landing on `/` between HTTP server
+  start and scheduler init no longer raises `UnboundLocalError` on
+  `heartbeat_enabled` / `heartbeat_interval`.
+- Fix `/invoke/{agent}` session collision: each invocation gets a distinct
+  `chat_id` (caller-supplied via `context.chat_id` or a fresh UUID),
+  replacing the shared `webhook:default` session key.
+- Harden agent-YAML migration: the migration script now force-sets the
+  canonical role on rename (no longer assumes the legacy role value) and
+  strips CR first so YAMLs saved with CRLF line endings migrate cleanly.
+- Pin Python runtime dependencies.
+
 ## 0.1.22
 
 - Role-based agent refactor. Agent YAML filenames and internal identifiers

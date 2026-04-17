@@ -9,6 +9,7 @@ import logging
 import os
 import signal
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +143,71 @@ _STATUS_PAGE = """\
 def _row(label: str, value: str, css: str = "") -> str:
     cls = f' class="value {css}"' if css else ' class="value"'
     return f'<div class="row"><span class="label">{label}</span><span{cls}>{value}</span></div>'
+
+
+# ------------------------------------------------------------------
+# Pure helpers (extracted for testability; see tests/test_casa_core_helpers.py)
+# ------------------------------------------------------------------
+
+
+def init_heartbeat_defaults(env: dict[str, str] | None = None) -> tuple[bool, int]:
+    """Resolve heartbeat defaults from env. Never raises.
+
+    Returns ``(enabled, interval_minutes)``. Called before the HTTP server
+    starts so the dashboard closure has concrete bindings — otherwise a
+    request landing between ``site.start()`` and the scheduler block raises
+    ``UnboundLocalError`` on ``heartbeat_enabled`` / ``heartbeat_interval``.
+    """
+    env = env if env is not None else os.environ
+    enabled = env.get("HEARTBEAT_ENABLED", "true").lower() == "true"
+    try:
+        interval = int(env.get("HEARTBEAT_INTERVAL_MINUTES", "60"))
+    except ValueError:
+        interval = 60
+    if interval < 1:
+        interval = 60
+    return enabled, interval
+
+
+def build_heartbeat_message(agent: str, prompt: str) -> BusMessage:
+    """Build a scheduled heartbeat BusMessage.
+
+    ``channel`` must be non-empty: ``Agent._process`` calls
+    ``build_session_key(msg.channel, ...)`` which rejects empty channels.
+    """
+    return BusMessage(
+        type=MessageType.SCHEDULED,
+        source="scheduler",
+        target=agent,
+        content=prompt,
+        channel="scheduler",
+        context={"chat_id": "heartbeat", "trigger": "heartbeat"},
+    )
+
+
+def build_invoke_message(
+    agent_role: str,
+    prompt: str,
+    payload: dict[str, Any],
+) -> BusMessage:
+    """Build a webhook invoke BusMessage with a guaranteed-unique session key.
+
+    Callers may pass ``context.chat_id`` in the payload to pin the session
+    (e.g. to continue a prior conversation). Otherwise a fresh UUID is
+    assigned so two concurrent invocations do not collide on
+    ``webhook:default``.
+    """
+    context = dict(payload.get("context") or {})
+    if not context.get("chat_id"):
+        context["chat_id"] = str(uuid.uuid4())
+    return BusMessage(
+        type=MessageType.REQUEST,
+        source="webhook",
+        target=agent_role,
+        content=prompt,
+        channel="webhook",
+        context=context,
+    )
 
 
 # ------------------------------------------------------------------
@@ -399,14 +465,7 @@ async def main() -> None:
         if not prompt:
             return web.json_response({"error": "missing 'prompt' field"}, status=400)
 
-        msg = BusMessage(
-            type=MessageType.REQUEST,
-            source="webhook",
-            target=agent_role,
-            content=prompt,
-            channel="webhook",
-            context=payload.get("context", {}),
-        )
+        msg = build_invoke_message(agent_role, prompt, payload)
         try:
             result = await bus.request(msg, timeout=300)
             return web.json_response({"response": str(result.content)})
@@ -430,6 +489,15 @@ async def main() -> None:
     # 12. Status dashboard
     terminal_enabled = os.environ.get("ENABLE_TERMINAL", "false").lower() == "true"
     version = os.environ.get("CASA_VERSION", "dev")
+
+    # Heartbeat defaults must be resolved before `dashboard` is defined:
+    # the HTTP server starts below before the scheduler block, and a
+    # request landing in between would otherwise hit UnboundLocalError on
+    # these closure variables. The scheduler block may still override them
+    # from schedules.yaml.
+    heartbeat_enabled, heartbeat_interval = init_heartbeat_defaults()
+    heartbeat_agent = assistant_role
+    heartbeat_prompt = "Heartbeat: check for pending tasks."
 
     async def dashboard(request: web.Request) -> web.Response:
         ingress_path = request.headers.get("X-Ingress-Path", "")
@@ -508,32 +576,19 @@ async def main() -> None:
     scheduler = AsyncIOScheduler()
 
     schedules_path = os.path.join(CONFIG_DIR, "schedules.yaml")
-    heartbeat_enabled = os.environ.get("HEARTBEAT_ENABLED", "true").lower() == "true"
-    heartbeat_interval = int(os.environ.get("HEARTBEAT_INTERVAL_MINUTES", "60"))
-
     if os.path.exists(schedules_path):
         with open(schedules_path, "r", encoding="utf-8") as fh:
             schedules_data = yaml.safe_load(fh) or {}
         hb = schedules_data.get("heartbeat", {})
         heartbeat_enabled = hb.get("enabled", heartbeat_enabled)
         heartbeat_interval = hb.get("interval_minutes", heartbeat_interval)
-        heartbeat_agent = hb.get("agent", assistant_role)
-        heartbeat_prompt = hb.get("prompt", "Heartbeat: check for pending tasks.")
-    else:
-        heartbeat_agent = assistant_role
-        heartbeat_prompt = "Heartbeat: check for pending tasks."
+        heartbeat_agent = hb.get("agent", heartbeat_agent)
+        heartbeat_prompt = hb.get("prompt", heartbeat_prompt)
 
     if heartbeat_enabled and heartbeat_agent in agents:
         async def _heartbeat_tick() -> None:
             logger.info("Heartbeat firing for agent '%s'", heartbeat_agent)
-            msg = BusMessage(
-                type=MessageType.SCHEDULED,
-                source="scheduler",
-                target=heartbeat_agent,
-                content=heartbeat_prompt,
-                channel="",
-                context={"trigger": "heartbeat"},
-            )
+            msg = build_heartbeat_message(heartbeat_agent, heartbeat_prompt)
             await bus.send(msg)
 
         scheduler.add_job(
