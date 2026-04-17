@@ -3,7 +3,9 @@
 set -euo pipefail
 
 IMAGE="${IMAGE:-casa-test}"
-HOST_PORT="${HOST_PORT:-18080}"
+# Randomise the host port per-script run so back-to-back suites don't clash
+# on a port Docker has not yet released (1-2s after docker stop).
+HOST_PORT="${HOST_PORT:-$((18080 + RANDOM % 1000))}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-30}"
 
 log()  { printf '[e2e] %s\n' "$*" >&2; }
