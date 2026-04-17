@@ -10,3 +10,5 @@ build/
 docs/
 .env
 test-local/options.json
+test-local/fixtures/**/workspace/
+test-local/fixtures/**/data/
