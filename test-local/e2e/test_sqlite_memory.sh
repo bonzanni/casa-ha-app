@@ -30,13 +30,18 @@ NAME="casa-sqlite-$$"
 cleanup() {
     stop_container "$NAME" || true
     docker run --rm -v "${DATA_DIR}:/target" --entrypoint sh "$IMAGE" \
-        -c 'rm -rf /target/memory.sqlite /target/memory.sqlite-wal /target/memory.sqlite-shm /target/sessions.json /target/sdk-sessions' \
+        -c 'rm -rf /target/memory.sqlite /target/memory.sqlite-wal /target/memory.sqlite-shm /target/sessions.json /target/sdk-sessions /target/options.json /target/webhook_secret' \
         >/dev/null 2>&1 || true
     rm -rf "$DATA_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 build_image
+
+# The test image bakes options.json into /data; a bind-mount would
+# shadow it and crash setup-configs. Pre-populate options.json in the
+# host dir from the repo fixture, then mount it.
+cp "${REPO_ROOT}/test-local/options.json.example" "${DATA_DIR}/options.json"
 
 log "Starting container $NAME with volume-mounted /data (no HONCHO_API_KEY)"
 # Empty HONCHO_API_KEY → spec §2 step 3 picks SQLite.
