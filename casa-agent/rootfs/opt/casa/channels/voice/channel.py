@@ -263,10 +263,156 @@ class VoiceChannel(Channel):
         await sink(kind, spoken)
         return True
 
-    # --- WS (stub — filled in Step Group E) ---------------------------
+    # --- WS ------------------------------------------------------------
 
     async def _ws_handler(self, request: web.Request) -> web.WebSocketResponse:
-        raise NotImplementedError("Implemented in step E1")
+        if not self._verify(request, b""):
+            return web.json_response({"error": "invalid signature"}, status=401)
+
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        # Per-utterance task map so `cancel` frames can target them.
+        tasks: dict[str, asyncio.Task] = {}
+
+        async for msg in ws:
+            if msg.type.name != "TEXT":
+                continue
+            try:
+                frame = json.loads(msg.data)
+            except Exception:
+                continue
+            t = frame.get("type")
+
+            if t == "stt_start":
+                scope_id = frame.get("scope_id") or "anon"
+                self.pool.schedule_prewarm(
+                    scope_id, lambda s=scope_id: self._prewarm(s),
+                )
+                continue
+
+            if t == "stage":
+                # Hints only — no-op in 2.3.
+                continue
+
+            if t == "cancel":
+                uid = frame.get("utterance_id")
+                task = tasks.get(uid) if uid else None
+                if task is not None and not task.done():
+                    task.cancel()
+                continue
+
+            if t == "utterance":
+                uid = frame.get("utterance_id") or str(uuid.uuid4())
+                tasks[uid] = asyncio.create_task(
+                    self._run_ws_utterance(ws, frame, uid),
+                )
+                continue
+
+        # Clean up dangling tasks on WS close.
+        for task in tasks.values():
+            if not task.done():
+                task.cancel()
+        return ws
+
+    async def _run_ws_utterance(
+        self, ws: web.WebSocketResponse, frame: dict, uid: str,
+    ) -> None:
+        agent_role = frame.get("agent_role", self.default_agent)
+        cfg = self._agent_configs.get(agent_role)
+        if cfg is None:
+            await ws.send_json({
+                "type": "error", "utterance_id": uid,
+                "kind": "unknown", "spoken": "",
+            })
+            return
+
+        scope_id = self._resolve_scope_id({
+            "scope_id": frame.get("scope_id"),
+            "context": frame.get("context") or {},
+        })
+        self.pool.ensure(scope_id)
+        self.pool.touch(scope_id)
+
+        splitter = ProsodicSplitter()
+        adapter = TagDialectAdapter(cfg.tts.tag_dialect)
+        last_text = ""
+        error_emitted = False
+
+        async def on_token(accumulated: str) -> None:
+            nonlocal last_text
+            delta = accumulated[len(last_text):]
+            last_text = accumulated
+            for block in splitter.feed(delta):
+                await ws.send_json({
+                    "type": "block", "utterance_id": uid,
+                    "text": adapter.render(block), "final": False,
+                })
+
+        async def _error_sink(kind: str, spoken: str) -> None:
+            nonlocal error_emitted
+            await ws.send_json({
+                "type": "error", "utterance_id": uid,
+                "kind": kind, "spoken": spoken,
+            })
+            error_emitted = True
+
+        bus_msg = BusMessage(
+            type=MessageType.REQUEST, source="voice", target=agent_role,
+            content=frame.get("text", ""),
+            channel="voice",
+            context={
+                "chat_id": scope_id, "utterance_id": uid,
+                **(frame.get("context") or {}),
+                "_on_token": on_token,
+                "_error_sink": _error_sink,
+            },
+        )
+
+        try:
+            await self._bus.request(bus_msg, timeout=300)
+            if error_emitted:
+                return
+            tail = splitter.flush_tail()
+            if tail:
+                await ws.send_json({
+                    "type": "block", "utterance_id": uid,
+                    "text": adapter.render(tail), "final": True,
+                })
+            await ws.send_json({"type": "done", "utterance_id": uid})
+        except asyncio.CancelledError:
+            # Cancellation from a `cancel` frame — drop partial state; do
+            # not emit `done`. Pool stays alive per spec §10.3.
+            raise
+        except Exception as exc:
+            line = self._error_line(cfg, exc)
+            await ws.send_json({
+                "type": "error", "utterance_id": uid,
+                "kind": _classify_error(exc).value,
+                "spoken": adapter.render(line) if line else "",
+            })
+
+    async def _prewarm(self, scope_id: str) -> None:
+        session_id = f"voice:{scope_id}:{self.default_agent}"
+        try:
+            await self._memory.ensure_session(
+                session_id=session_id,
+                agent_role=self.default_agent,
+                user_peer="voice_speaker",
+            )
+            cfg = self._agent_configs.get(self.default_agent)
+            tokens = getattr(
+                getattr(cfg, "memory", None), "token_budget", 800,
+            )
+            await self._memory.get_context(
+                session_id=session_id,
+                agent_role=self.default_agent,
+                tokens=tokens,
+                search_query=None,
+                user_peer="voice_speaker",
+            )
+        except Exception as exc:
+            logger.warning("Voice prewarm failed for %s: %s", scope_id, exc)
 
 
 async def _write_sse(response: web.StreamResponse, event: str, data: dict) -> None:
