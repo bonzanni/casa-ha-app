@@ -29,10 +29,24 @@ Casa runs always-on AI agents inside your Home Assistant instance. The primary a
 
 ### Optional -- Memory
 
+By default, Casa persists conversation history to a local SQLite
+database at `/data/memory.sqlite`. Set `HONCHO_API_KEY` to use the
+Honcho cloud backend instead (adds semantic retrieval + peer
+representations). Set `MEMORY_BACKEND=noop` if you want no memory at
+all.
+
 | Option | Description |
 |--------|-------------|
 | `honcho_api_url` | Honcho API URL. Defaults to `https://api.honcho.dev`. |
-| `honcho_api_key` | Honcho API key. When set, enables persistent cross-session memory. |
+| `honcho_api_key` | Honcho API key. When set, enables the Honcho cloud backend (overrides SQLite default). |
+
+The following env vars can be set via the add-on environment (not the
+options panel) for finer control:
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `MEMORY_BACKEND` | Force a specific backend (`honcho` / `sqlite` / `noop`). Fails fast on typos. | unset (auto-resolves) |
+| `MEMORY_DB_PATH` | SQLite file location. | `/data/memory.sqlite` |
 
 ### Optional -- Agents
 
@@ -157,5 +171,5 @@ When `enable_terminal` is enabled, a web terminal is available at the `/terminal
 
 - **Add-on won't start**: Check the log for "claude_oauth_token is required". You must set the token before starting.
 - **No Telegram messages**: Verify `telegram_bot_token` and `telegram_chat_id` are correct. The bot must have been started (`/start` in Telegram).
-- **Memory not working**: Honcho memory requires both `honcho_api_url` and `honcho_api_key`. Without them, agents run without persistent memory (conversation context is ephemeral).
+- **Memory not working**: By default, memory persists to `/data/memory.sqlite` (SQLite backend). If `HONCHO_API_KEY` is set but memory still appears empty, check container logs for `SQLite memory init failed` or Honcho connection errors. To disable memory entirely, set `MEMORY_BACKEND=noop`.
 - **502 errors on ingress**: The Python process may still be starting. Wait up to 60 seconds after add-on start.
