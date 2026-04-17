@@ -8,6 +8,7 @@ build/
 .eggs/
 .claude/
 docs/
+.worktrees/
 .env
 test-local/options.json
 test-local/fixtures/**/workspace/
