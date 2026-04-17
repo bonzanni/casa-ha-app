@@ -422,7 +422,26 @@ class SqliteMemoryProvider(MemoryProvider):
     async def ensure_session(
         self, session_id: str, agent_role: str, user_peer: str = "nicola",
     ) -> None:
-        raise NotImplementedError  # pragma: no cover
+        await asyncio.to_thread(
+            self._ensure_session_sync, session_id, agent_role, user_peer,
+        )
+
+    def _ensure_session_sync(
+        self, session_id: str, agent_role: str, user_peer: str,
+    ) -> None:
+        import time
+        now = time.time()
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO sessions "
+                "(session_id, agent_role, user_peer, created_ts, last_active) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, agent_role, user_peer, now, now),
+            )
+            self._conn.execute(
+                "UPDATE sessions SET last_active = ? WHERE session_id = ?",
+                (now, session_id),
+            )
 
     async def get_context(
         self, session_id: str, agent_role: str, tokens: int,
