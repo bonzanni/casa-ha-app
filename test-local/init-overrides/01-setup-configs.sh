@@ -8,7 +8,7 @@ mkdir -p "$CONFIG_DIR/agents" "$CONFIG_DIR/workspace/.claude/skills" \
          "$CONFIG_DIR/workspace/plugins" "$CONFIG_DIR/workspace/mcp-servers" \
          "$DATA_DIR/sdk-sessions"
 
-for f in agents/ellen.yaml agents/tina.yaml agents/subagents.yaml \
+for f in agents/assistant.yaml agents/butler.yaml agents/subagents.yaml \
          schedules.yaml webhooks.yaml; do
     if [ ! -f "$CONFIG_DIR/$f" ]; then
         cp "$DEFAULTS_DIR/$f" "$CONFIG_DIR/$f"
