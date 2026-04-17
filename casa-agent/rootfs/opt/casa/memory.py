@@ -90,3 +90,44 @@ class NoOpMemory(MemoryProvider):
         user_peer: str = "nicola",
     ) -> None:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+def _render(context: object) -> str:
+    """Assemble a SessionContext into the markdown digest consumed by the
+    system prompt. Empty/missing sections are silently omitted — no
+    placeholder lines.
+
+    ``context`` is duck-typed: we read ``messages``, ``summary``,
+    ``peer_representation``, ``peer_card`` if present. Keeps the test
+    surface decoupled from the Honcho SDK types.
+    """
+    sections: list[str] = []
+
+    peer_card = getattr(context, "peer_card", None)
+    if peer_card:
+        lines = ["## What I know about you"]
+        lines.extend(f"- {item}" for item in peer_card)
+        sections.append("\n".join(lines))
+
+    summary = getattr(context, "summary", None)
+    summary_content = getattr(summary, "content", None) if summary else None
+    if summary_content:
+        sections.append(f"## Summary so far\n{summary_content}")
+
+    peer_repr = getattr(context, "peer_representation", None)
+    if peer_repr:
+        sections.append(f"## My perspective\n{peer_repr}")
+
+    messages = getattr(context, "messages", None) or []
+    if messages:
+        lines = ["## Recent exchanges"]
+        for m in messages:
+            lines.append(f"[{m.peer_name}] {m.content}")
+        sections.append("\n".join(lines))
+
+    return "\n\n".join(sections)
