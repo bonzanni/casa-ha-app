@@ -403,6 +403,46 @@ async def main() -> None:
 
     bus.register("telegram", _telegram_outbound)
 
+    # 10b. Voice channel
+    voice_sse_enabled = os.environ.get(
+        "VOICE_SSE_ENABLED", "true",
+    ).lower() == "true"
+    voice_ws_enabled = os.environ.get(
+        "VOICE_WS_ENABLED", "true",
+    ).lower() == "true"
+    voice_sse_path = os.environ.get("VOICE_SSE_PATH", "/api/converse")
+    voice_ws_path = os.environ.get("VOICE_WS_PATH", "/api/converse/ws")
+    _default_voice_idle = (
+        role_configs["butler"].session.idle_timeout
+        if "butler" in role_configs
+        else 300
+    )
+    voice_idle_timeout = int(os.environ.get(
+        "VOICE_IDLE_TIMEOUT_SECONDS", str(_default_voice_idle),
+    ))
+
+    voice_channel = None
+    if voice_sse_enabled or voice_ws_enabled:
+        from channels.voice import VoiceChannel
+
+        voice_channel = VoiceChannel(
+            bus=bus,
+            default_agent="butler" if "butler" in role_configs else assistant_role,
+            webhook_secret=webhook_secret,
+            sse_path=voice_sse_path,
+            ws_path=voice_ws_path,
+            agent_configs=role_configs,
+            memory=base_memory,
+            idle_timeout=voice_idle_timeout,
+            sse_enabled=voice_sse_enabled,
+            ws_enabled=voice_ws_enabled,
+        )
+        channel_manager.register(voice_channel)
+        logger.info(
+            "Voice channel registered (sse=%s, ws=%s, idle=%ss)",
+            voice_sse_enabled, voice_ws_enabled, voice_idle_timeout,
+        )
+
     # 11. Webhook endpoints
 
     def _verify_webhook(request: web.Request, body: bytes) -> bool:
@@ -514,6 +554,19 @@ async def main() -> None:
         else:
             channel_rows += _row("Telegram", "not configured", "off")
 
+        if voice_channel is not None:
+            transports = []
+            if voice_sse_enabled:
+                transports.append("SSE")
+            if voice_ws_enabled:
+                transports.append("WS")
+            channel_rows += _row(
+                "Voice", ", ".join(transports) or "disabled",
+                "on" if transports else "off",
+            )
+        else:
+            channel_rows += _row("Voice", "not configured", "off")
+
         # System rows
         system_rows = ""
         if public_url:
@@ -541,6 +594,8 @@ async def main() -> None:
 
     # 13. aiohttp app
     app = web.Application()
+    if voice_channel is not None:
+        voice_channel.register_routes(app)
     app.router.add_get("/", dashboard)
     app.router.add_get("/healthz", healthz)
     app.router.add_post("/webhook/{name}", webhook_handler)
