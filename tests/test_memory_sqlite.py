@@ -167,3 +167,126 @@ async def test_ensure_session_preserves_topology_across_calls():
     ).fetchone()
     assert row[0] == "butler"
     assert row[1] == "voice_speaker"
+
+
+# --- add_turn --------------------------------------------------------------
+
+
+async def test_add_turn_writes_user_and_assistant_rows():
+    from memory import SqliteMemoryProvider
+
+    p = SqliteMemoryProvider(":memory:")
+    await p.ensure_session("telegram:1:assistant", "assistant")
+    await p.add_turn(
+        "telegram:1:assistant", "assistant",
+        user_text="hi", assistant_text="hello",
+    )
+
+    rows = p._conn.execute(
+        "SELECT peer_name, content FROM messages "
+        "WHERE session_id=? ORDER BY id ASC",
+        ("telegram:1:assistant",),
+    ).fetchall()
+    assert rows == [("nicola", "hi"), ("assistant", "hello")]
+
+
+async def test_add_turn_voice_uses_voice_speaker():
+    from memory import SqliteMemoryProvider
+
+    p = SqliteMemoryProvider(":memory:")
+    await p.ensure_session("voice:lr:butler", "butler", user_peer="voice_speaker")
+    await p.add_turn(
+        "voice:lr:butler", "butler",
+        user_text="lights on", assistant_text="ok",
+        user_peer="voice_speaker",
+    )
+
+    rows = p._conn.execute(
+        "SELECT peer_name FROM messages "
+        "WHERE session_id=? ORDER BY id ASC",
+        ("voice:lr:butler",),
+    ).fetchall()
+    assert [r[0] for r in rows] == ["voice_speaker", "butler"]
+
+
+async def test_add_turn_bumps_last_active():
+    from memory import SqliteMemoryProvider
+
+    p = SqliteMemoryProvider(":memory:")
+    await p.ensure_session("s", "assistant")
+    before = p._conn.execute(
+        "SELECT last_active FROM sessions WHERE session_id='s'",
+    ).fetchone()[0]
+
+    await asyncio.sleep(0.02)
+    await p.add_turn("s", "assistant", "u", "a")
+    after = p._conn.execute(
+        "SELECT last_active FROM sessions WHERE session_id='s'",
+    ).fetchone()[0]
+    assert after > before
+
+
+async def test_add_turn_is_transactional_on_failure():
+    """Mid-transaction failure must leave zero rows, not one."""
+    from memory import SqliteMemoryProvider
+
+    p = SqliteMemoryProvider(":memory:")
+    await p.ensure_session("s", "assistant")
+
+    real_conn = p._conn
+    call_count = {"n": 0}
+
+    class FlakyConn:
+        """Proxy that injects an error on the 2nd INSERT INTO messages."""
+
+        def __enter__(self):
+            return real_conn.__enter__()
+
+        def __exit__(self, *exc):
+            return real_conn.__exit__(*exc)
+
+        def execute(self, sql, *args, **kwargs):
+            if sql.lstrip().upper().startswith("INSERT INTO MESSAGES"):
+                call_count["n"] += 1
+                if call_count["n"] == 2:
+                    raise sqlite3.OperationalError(
+                        "simulated failure on 2nd insert"
+                    )
+            return real_conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(real_conn, name)
+
+    p._conn = FlakyConn()
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            await p.add_turn("s", "assistant", "u", "a")
+    finally:
+        p._conn = real_conn
+
+    rows = real_conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id='s'",
+    ).fetchone()[0]
+    assert rows == 0
+
+
+async def test_add_turn_ordering_preserved_on_identical_ts(monkeypatch):
+    """Rapid-fire add_turns with the same ts must still sort by id."""
+    from memory import SqliteMemoryProvider
+    import time as builtin_time
+
+    p = SqliteMemoryProvider(":memory:")
+    await p.ensure_session("s", "assistant")
+
+    fixed = builtin_time.time()
+    # memory.py imports time at function scope inside _add_turn_sync, so
+    # patching time.time on the time module itself is what takes effect.
+    monkeypatch.setattr(builtin_time, "time", lambda: fixed)
+
+    await p.add_turn("s", "assistant", "u1", "a1")
+    await p.add_turn("s", "assistant", "u2", "a2")
+
+    rows = p._conn.execute(
+        "SELECT content FROM messages WHERE session_id='s' ORDER BY id ASC",
+    ).fetchall()
+    assert [r[0] for r in rows] == ["u1", "a1", "u2", "a2"]
