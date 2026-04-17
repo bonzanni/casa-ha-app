@@ -241,6 +241,41 @@ def resolve_memory_backend_choice(env: dict[str, str]) -> _MemoryChoice:
     return _MemoryChoice(backend="sqlite", db_path=db_path)
 
 
+def _wrap_memory_for_strategy(
+    backend: MemoryProvider,
+    role: str,
+    strategy: str,
+    sqlite_warning_emitted: list[bool],
+) -> MemoryProvider:
+    """Apply the per-agent ``read_strategy`` to *backend*.
+
+    ``sqlite_warning_emitted`` is a one-element mutable flag used to
+    emit the "SQLite backend — caching not applied" line at most once
+    per process start (spec §2).
+    """
+    if strategy == "cached":
+        if isinstance(backend, SqliteMemoryProvider):
+            if not sqlite_warning_emitted[0]:
+                logger.info(
+                    "SQLite backend — caching not applied "
+                    "(native reads are <1 ms)"
+                )
+                sqlite_warning_emitted[0] = True
+            return backend
+        return CachedMemoryProvider(backend)
+
+    if strategy == "card_only":
+        logger.warning(
+            "Agent '%s' requests read_strategy=card_only which is not "
+            "implemented in 2.2a; falling back to per_turn",
+            role,
+        )
+        return backend
+
+    # per_turn
+    return backend
+
+
 # ------------------------------------------------------------------
 # Agent loader
 # ------------------------------------------------------------------
@@ -368,24 +403,15 @@ async def main() -> None:
     agents: dict[str, Agent] = {}
     loop_tasks: list[asyncio.Task] = []
 
+    sqlite_warning_emitted = [False]
+
     for role, cfg in role_configs.items():
-        # Per-agent memory wrapper. 'cached' wraps the concrete provider
-        # in CachedMemoryProvider (voice latency). 'card_only' is
-        # reserved for a future read-strategy that returns peer-card
-        # only — not implemented in 2.2a; falls back to per_turn with
-        # a warning.
-        strategy = cfg.memory.read_strategy
-        if strategy == "cached":
-            agent_memory: MemoryProvider = CachedMemoryProvider(base_memory)
-        elif strategy == "card_only":
-            logger.warning(
-                "Agent '%s' requests read_strategy=card_only which is not "
-                "implemented in 2.2a; falling back to per_turn",
-                role,
-            )
-            agent_memory = base_memory
-        else:  # per_turn
-            agent_memory = base_memory
+        agent_memory = _wrap_memory_for_strategy(
+            base_memory,
+            role=role,
+            strategy=cfg.memory.read_strategy,
+            sqlite_warning_emitted=sqlite_warning_emitted,
+        )
 
         agent = Agent(
             config=cfg,
@@ -401,7 +427,7 @@ async def main() -> None:
             role,
             cfg.name,
             cfg.model,
-            strategy,
+            cfg.memory.read_strategy,
         )
 
     assistant_role = "assistant"
