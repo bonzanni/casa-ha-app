@@ -34,6 +34,73 @@ migrate_rename() {
 migrate_rename "ellen.yaml" "assistant.yaml" "assistant" "ellen" "assistant"
 migrate_rename "tina.yaml"  "butler.yaml"    "butler"    "tina"  "butler"
 
+# ------------------------------------------------------------------
+# One-shot 2.2a migration: strip obsolete memory.peer_name and
+# memory.exclude_tags from user YAMLs; inject memory.read_strategy
+# if missing. Mirrors the production migrate_memory_fields block
+# (test variant uses plain echo instead of bashio::log.info).
+# ------------------------------------------------------------------
+
+migrate_memory_fields() {
+    local file="$1"
+    local default_strategy="$2"
+
+    [ -f "$file" ] || return 0
+
+    sed -i 's/\r$//' "$file"
+    sed -i '/^  peer_name:/d' "$file"
+    sed -i '/^  exclude_tags:[[:space:]]*\[.*\]$/d' "$file"
+
+    python3 - "$file" <<'PY'
+import sys, re, pathlib
+
+p = pathlib.Path(sys.argv[1])
+lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+out = []
+i = 0
+while i < len(lines):
+    line = lines[i]
+    if re.match(r"^  exclude_tags:[ \t]*$", line):
+        i += 1
+        while i < len(lines) and re.match(r"^    - ", lines[i]):
+            i += 1
+        continue
+    out.append(line)
+    i += 1
+p.write_text("".join(out), encoding="utf-8")
+PY
+
+    if ! grep -qE '^  read_strategy:' "$file"; then
+        if grep -qE '^memory:' "$file"; then
+            sed -i "/^memory:/a\\  read_strategy: ${default_strategy}" "$file"
+            echo "[INFO] Injected read_strategy=${default_strategy} into $(basename "$file")"
+        fi
+    fi
+}
+
+migrate_memory_fields "$CONFIG_DIR/agents/assistant.yaml" "per_turn"
+migrate_memory_fields "$CONFIG_DIR/agents/butler.yaml"    "cached"
+
+if [ -f "$DATA_DIR/sessions.json" ]; then
+    python3 - "$DATA_DIR/sessions.json" <<'PY'
+import json, pathlib, sys
+
+p = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(p.read_text() or "{}")
+except json.JSONDecodeError:
+    sys.exit(0)
+dirty = False
+for entry in data.values():
+    if isinstance(entry, dict) and "memory_session_id" in entry:
+        entry.pop("memory_session_id", None)
+        dirty = True
+if dirty:
+    p.write_text(json.dumps(data, indent=2))
+    print("[INFO] Migrated sessions.json: dropped memory_session_id")
+PY
+fi
+
 for f in agents/assistant.yaml agents/butler.yaml agents/subagents.yaml \
          schedules.yaml webhooks.yaml; do
     if [ ! -f "$CONFIG_DIR/$f" ]; then
