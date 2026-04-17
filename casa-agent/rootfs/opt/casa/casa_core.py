@@ -8,6 +8,7 @@ import hmac
 import logging
 import os
 import signal
+import sqlite3
 import sys
 import uuid
 from pathlib import Path
@@ -349,10 +350,17 @@ async def main() -> None:
         )
         logger.info("Honcho v3 memory provider initialized")
     elif mem_choice.backend == "sqlite":
-        base_memory = SqliteMemoryProvider(mem_choice.db_path)
-        logger.info(
-            "SQLite memory provider initialized (path=%s)", mem_choice.db_path,
-        )
+        try:
+            base_memory = SqliteMemoryProvider(mem_choice.db_path)
+            logger.info(
+                "SQLite memory provider initialized (path=%s)", mem_choice.db_path,
+            )
+        except (sqlite3.OperationalError, OSError) as exc:
+            logger.error(
+                "SQLite memory init failed (path=%s): %s — degrading to no-op",
+                mem_choice.db_path, exc,
+            )
+            base_memory = NoOpMemory()
     else:  # noop
         base_memory = NoOpMemory()
         logger.info("MEMORY_BACKEND=noop; using no-op memory")

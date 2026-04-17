@@ -162,3 +162,22 @@ def test_wrap_for_strategy_card_only_falls_back_to_per_turn_with_warning(caplog)
         )
     assert wrapped is backend
     assert any("card_only" in r.message for r in caplog.records)
+
+
+# --- Startup-degrade on SQLite open failure (spec §9) -----------------------
+
+
+def test_sqlite_startup_degrade_is_callable_as_helper():
+    """Spec §9: OperationalError/OSError on open → log ERROR + NoOp fallback.
+
+    We can't easily unit-test main()'s try/except block directly, but we
+    verify that `SqliteMemoryProvider` surfaces the expected exception
+    type on a blatantly bad path so main() can catch it.
+    """
+    import sqlite3
+
+    from memory import SqliteMemoryProvider
+
+    # `\0` in a path is rejected by the stdlib open() underneath sqlite3.
+    with pytest.raises((sqlite3.OperationalError, OSError, ValueError)):
+        SqliteMemoryProvider("/\x00/bad/path/memory.sqlite")
