@@ -226,3 +226,23 @@ async def test_memory_failure_does_not_break_response(tmp_path, caplog):
     prompt = FakeClient.captured_options.system_prompt
     assert "<memory_context>" not in prompt
     assert "<channel_context>" in prompt
+
+
+async def test_add_turn_failure_logs_warning(tmp_path, caplog):
+    import logging
+
+    class BrokenAdd(FakeMemory):
+        async def add_turn(self, *a, **kw):
+            raise RuntimeError("honcho write down")
+
+    mem = BrokenAdd()
+    agent = _make_agent(mem, tmp_path, role="assistant")
+    with patch("agent.ClaudeSDKClient", FakeClient):
+        with caplog.at_level(logging.WARNING):
+            out = await agent._process(_msg("telegram", "123", "hi"))
+    assert out == "pong"
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert any(
+        "add_turn" in r.message.lower() for r in caplog.records
+    )

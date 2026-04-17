@@ -270,12 +270,8 @@ class Agent:
         # 8. Persist — off the critical path. Storage is unconditional. ---
         #    Session+peer topology already scopes visibility (spec §4.3).
         if response_text:
-            asyncio.create_task(self._memory.add_turn(
-                session_id=session_id,
-                agent_role=self.config.role,
-                user_text=user_text,
-                assistant_text=response_text,
-                user_peer=user_peer,
+            asyncio.create_task(self._add_turn_bg(
+                session_id, self.config.role, user_text, response_text, user_peer,
             ))
 
         # 9. SessionRegistry — only SDK session id now. --------------------
@@ -287,3 +283,27 @@ class Agent:
             )
 
         return response_text or None
+
+    async def _add_turn_bg(
+        self,
+        session_id: str,
+        agent_role: str,
+        user_text: str,
+        assistant_text: str,
+        user_peer: str,
+    ) -> None:
+        """Persist a turn in the background. Exceptions are caught and
+        logged — never surfaced to the user (the response has already
+        been delivered). Spec §11."""
+        try:
+            await self._memory.add_turn(
+                session_id=session_id,
+                agent_role=agent_role,
+                user_text=user_text,
+                assistant_text=assistant_text,
+                user_peer=user_peer,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Memory add_turn failed in background: %s", exc,
+            )
