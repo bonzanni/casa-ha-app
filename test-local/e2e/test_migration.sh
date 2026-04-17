@@ -206,3 +206,44 @@ sha_b2=$(sha1sum "${TMP}/agents/butler.yaml"    | awk '{print $1}')
 
 inspect_and_stop "$NAME" "$TMP"
 pass "B-5 pre-2.2a memory migration + idempotency"
+
+log "B-6: pre-5.1 butler gets disclosure v2 + idempotency"
+read NAME TMP < <(run_scenario legacy-pre51)
+
+# v2 block present; v1 single-line clause gone.
+grep -q 'Disclosure (on untrusted channels):' "${TMP}/agents/butler.yaml" \
+    || fail "butler.yaml missing disclosure v2 heading"
+grep -q 'Credentials — API keys, passwords, door codes, Wi-Fi passwords' \
+    "${TMP}/agents/butler.yaml" \
+    || fail "butler.yaml missing credentials bullet from v2"
+grep -q "I'll tell you that on Telegram" "${TMP}/agents/butler.yaml" \
+    || fail "butler.yaml missing v2 deflection phrasing"
+! grep -q 'I can tell you that privately on Telegram' "${TMP}/agents/butler.yaml" \
+    || fail "v1 disclosure phrasing survived the migration"
+
+# Marker written exactly once.
+marker_count=$(grep -c '^# casa: disclosure v2$' "${TMP}/agents/butler.yaml")
+[ "$marker_count" = "1" ] \
+    || fail "expected exactly 1 disclosure marker, got $marker_count"
+
+# Idempotency: restart; butler.yaml must be byte-identical.
+sha_b1=$(sha1sum "${TMP}/agents/butler.yaml" | awk '{print $1}')
+docker restart "$NAME" >/dev/null
+wait_healthy "$NAME"
+sha_b2=$(sha1sum "${TMP}/agents/butler.yaml" | awk '{print $1}')
+[ "$sha_b1" = "$sha_b2" ] \
+    || fail "butler.yaml changed on second boot (migration not idempotent)"
+
+# Loader still accepts the migrated file (no YAML parse regression).
+docker exec "$NAME" python3 -c "
+import sys
+sys.path.insert(0, '/opt/casa')
+from config import load_agent_config
+cfg = load_agent_config('/addon_configs/casa-agent/agents/butler.yaml')
+assert cfg.role == 'butler', cfg.role
+assert 'Disclosure (on untrusted channels)' in cfg.personality
+print('OK')
+" | grep -q '^OK$' || fail "loader failed to parse migrated butler.yaml"
+
+inspect_and_stop "$NAME" "$TMP"
+pass "B-6 disclosure v2 migration + idempotency"

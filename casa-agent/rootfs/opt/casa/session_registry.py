@@ -26,12 +26,15 @@ class SessionRegistry:
     """Maps channel keys to session metadata and persists to disk.
 
     All disk I/O is offloaded to a thread via :func:`asyncio.to_thread`
-    to avoid blocking the event loop.
+    to avoid blocking the event loop. A single :class:`asyncio.Lock`
+    serialises every mutate+save so concurrent bus tasks cannot clobber
+    each other's writes (spec 5.1 §3).
     """
 
     def __init__(self, path: str) -> None:
         self._path = path
         self._data: dict[str, dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as fh:
                 self._data = json.load(fh)
@@ -49,12 +52,13 @@ class SessionRegistry:
         ``f"{channel_key}:{agent}"``. If a legacy entry on disk has a
         ``memory_session_id`` field, it is dropped on first write.
         """
-        self._data[channel_key] = {
-            "agent": agent,
-            "sdk_session_id": sdk_session_id,
-            "last_active": datetime.now(timezone.utc).isoformat(),
-        }
-        await self.save()
+        async with self._lock:
+            self._data[channel_key] = {
+                "agent": agent,
+                "sdk_session_id": sdk_session_id,
+                "last_active": datetime.now(timezone.utc).isoformat(),
+            }
+            await self._save_locked()
 
     def get(self, channel_key: str) -> dict[str, Any] | None:
         """Return the entry for *channel_key*, or ``None``."""
@@ -66,19 +70,31 @@ class SessionRegistry:
         Also drops any obsolete ``memory_session_id`` field from a
         pre-2.2a entry — lazy migration, safe to re-run.
         """
-        entry = self._data.get(channel_key)
-        if entry is not None:
-            entry.pop("memory_session_id", None)
-            entry["last_active"] = datetime.now(timezone.utc).isoformat()
-            await self.save()
+        async with self._lock:
+            entry = self._data.get(channel_key)
+            if entry is not None:
+                entry.pop("memory_session_id", None)
+                entry["last_active"] = datetime.now(timezone.utc).isoformat()
+                await self._save_locked()
 
     async def remove(self, channel_key: str) -> None:
         """Remove an entry and persist."""
-        self._data.pop(channel_key, None)
-        await self.save()
+        async with self._lock:
+            self._data.pop(channel_key, None)
+            await self._save_locked()
 
     async def save(self) -> None:
-        """Write the current data to the JSON file (off-thread)."""
+        """Public save: acquires the lock.
+
+        For out-of-band callers (tests, future background snapshotters).
+        Internal mutators call :meth:`_save_locked` while already
+        holding the lock.
+        """
+        async with self._lock:
+            await self._save_locked()
+
+    async def _save_locked(self) -> None:
+        """Persist current data. Caller MUST hold ``self._lock``."""
         data = dict(self._data)  # snapshot for thread safety
         await asyncio.to_thread(self._write, data)
 

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.0 — 2026-04-18 — Phase 5.1: Concurrency correctness + disclosure v2
+
+### Fixed
+- `SessionRegistry` — mutate+save serialised via a single `asyncio.Lock`.
+  Closes the lost-register / torn-touch race reachable since v0.2.1's
+  concurrent bus dispatch. Public `save()` acquires; new internal
+  `_save_locked()` assumes the lock is held. Spec 5.1 §3.
+- `CachedMemoryProvider` — per-key `asyncio.Lock` with double-checked
+  cache in the miss path. Concurrent cold reads on the same key now
+  collapse to a single backend call; cache hits remain lock-free.
+  Spec 5.1 §4.
+
+### Changed
+- `butler.yaml` default personality — layer-1 `Disclosure:` clause
+  tightened with concrete per-category examples, stronger deflection
+  wording aligned to the `<channel_context>` trust prefix, and an
+  explicit positive list of topics safe on any channel. Spec 5.1 §5.
+
+### Migration
+- `migrate_disclosure_clause` one-shot in `setup-configs.sh` replaces
+  the v1 disclosure block in existing `butler.yaml` files on upgrade.
+  Gated by the trailing marker comment `# casa: disclosure v2`;
+  idempotent. Mirrored into `test-local/init-overrides/01-setup-configs.sh`.
+- No code-level migration for 5.1 Items A and B — the asyncio locks
+  are in-memory only and take effect on next process start.
+
+### Deferred
+- `MAX_CONCURRENT_AGENTS` / `MAX_CONCURRENT_VOICE` caps — seams
+  preserved (`VoiceSession.gate: Semaphore(10)`, architecture §3).
+  Spec 5.1 §6.
+- Layer-2 post-response disclosure backstop — beyond 5.x per spec 5.1
+  §9 C7.
+
 ## 0.4.0 — 2026-04-17 — Phase 2.2b: SQLite memory drop-in
 
 ### Added
