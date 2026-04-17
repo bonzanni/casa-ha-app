@@ -38,6 +38,8 @@ jobs:
         run: |
           pip install aiohttp
           bash test-local/e2e/test_voice_ws.sh
+      - name: SQLite memory
+        run: bash test-local/e2e/test_sqlite_memory.sh
 
   e2e-slow:
     if: github.event_name == 'schedule'
