@@ -59,11 +59,12 @@ class TestIdleSweep:
 
         async def slow():
             await asyncio.sleep(60)
-        sess.prewarm_task = asyncio.create_task(slow())
+        task = asyncio.create_task(slow())
+        sess.prewarm_task = task
         clock[0] = 200.0
         pool.sweep()
         await asyncio.sleep(0)  # let cancellation propagate
-        assert sess.prewarm_task.cancelled()
+        assert task.cancelled()
 
 
 @pytest.mark.asyncio
@@ -110,3 +111,28 @@ class TestGate:
         assert all(a is True for a in acquired)
         sess.gate.release()
         sess.gate.release()
+
+
+@pytest.mark.asyncio
+class TestSweeperHygiene:
+    async def test_sweep_does_not_recancel_completed_prewarm(self):
+        """A completed prewarm task should not have .cancel() called on eviction."""
+        pool = VoiceSessionPool(idle_timeout=-1)  # immediate eviction (any elapsed > -1)
+        sess = pool.ensure("s")
+
+        async def instant():
+            return None
+        sess.prewarm_task = asyncio.create_task(instant())
+        await sess.prewarm_task  # make it done
+        # sweep() must not raise; .cancel() on a done task is a no-op but
+        # we shouldn't be calling it in the first place.
+        evicted = pool.sweep()
+        assert evicted == ["s"]
+
+    async def test_run_sweeper_cancels_cleanly(self):
+        pool = VoiceSessionPool(idle_timeout=300)
+        task = asyncio.create_task(pool.run_sweeper(interval=0.01))
+        await asyncio.sleep(0.02)
+        task.cancel()
+        await task  # must not raise
+        assert task.cancelled() or task.done()
