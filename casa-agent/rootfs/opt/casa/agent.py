@@ -112,34 +112,50 @@ class Agent:
         if channel is not None and hasattr(channel, "create_on_token"):
             on_token = channel.create_on_token(msg.context)
 
+        error_kind: ErrorKind | None = None
         try:
             text = await self._process(msg, on_token=on_token)
         except Exception as exc:
-            kind = _classify_error(exc)
+            error_kind = _classify_error(exc)
             logger.error(
                 "Agent '%s' error [%s]: %s",
                 self.config.name,
-                kind.value,
+                error_kind.value,
                 exc,
-                exc_info=(kind == ErrorKind.UNKNOWN),
+                exc_info=(error_kind == ErrorKind.UNKNOWN),
             )
-            text = _USER_MESSAGES[kind]
+            text = _USER_MESSAGES[error_kind]
 
-        # Deliver final response via the channel
+        # Deliver the response via the channel.
+        # For voice (or any channel that supplies emit_error_line), prefer
+        # the persona-voice error pipeline on error paths. Otherwise fall
+        # through to the existing text-based finalize_stream / send flow.
+        if error_kind is not None and channel is not None \
+                and hasattr(channel, "emit_error_line"):
+            try:
+                handled = await channel.emit_error_line(
+                    error_kind.value, msg.context, self.config,
+                )
+            except Exception:
+                logger.exception("emit_error_line raised; falling back to text")
+                handled = False
+            if handled:
+                text = ""  # suppress normal text delivery below
+
         if text and channel is not None:
             if on_token is not None and hasattr(channel, "finalize_stream"):
                 await channel.finalize_stream(text, msg.context, on_token)
             else:
                 await channel.send(text, msg.context)
 
-        if text is None:
+        if not text and error_kind is None:
             return None
 
         return BusMessage(
             type=MessageType.RESPONSE,
             source=self.config.role,
             target=msg.source,
-            content=text,
+            content=text or "",
             reply_to=msg.id,
             channel=msg.channel,
             context=msg.context,

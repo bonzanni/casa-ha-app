@@ -172,6 +172,15 @@ class VoiceChannel(Channel):
                     "final": False,
                 })
 
+        error_emitted = False
+
+        async def _error_sink(kind: str, spoken: str) -> None:
+            nonlocal error_emitted
+            await _write_sse(response, "error", {
+                "kind": kind, "spoken": spoken,
+            })
+            error_emitted = True
+
         msg = BusMessage(
             type=MessageType.REQUEST,
             source="voice",
@@ -183,11 +192,14 @@ class VoiceChannel(Channel):
                 "utterance_id": utterance_id,
                 **(payload.get("context") or {}),
                 "_on_token": on_token,
+                "_error_sink": _error_sink,
             },
         )
 
         try:
             result = await self._bus.request(msg, timeout=300)
+            if error_emitted:
+                return response
             tail = splitter.flush_tail()
             if tail:
                 await _write_sse(response, "block", {
@@ -225,8 +237,31 @@ class VoiceChannel(Channel):
     @staticmethod
     def _error_line(cfg: Any, exc: Exception) -> str:
         kind = _classify_error(exc).value
+        return VoiceChannel._error_line_for_kind(cfg, kind)
+
+    @staticmethod
+    def _error_line_for_kind(cfg: Any, kind: str) -> str:
         lines = getattr(cfg, "voice_errors", {}) or {}
         return lines.get(kind) or _DEFAULT_ERROR_LINES.get(kind, "")
+
+    async def emit_error_line(
+        self, kind: str, context: dict, agent_cfg: Any,
+    ) -> bool:
+        """Emit a persona-voice error line via the per-request sink.
+
+        Called by Agent.handle_message's error branch. Returns True if
+        the error was delivered to the client (caller should suppress
+        normal text delivery). Returns False if no sink is present
+        (e.g. this was called outside a live SSE/WS request).
+        """
+        sink = context.get("_error_sink")
+        if sink is None:
+            return False
+        line = VoiceChannel._error_line_for_kind(agent_cfg, kind)
+        adapter = TagDialectAdapter(agent_cfg.tts.tag_dialect)
+        spoken = adapter.render(line) if line else ""
+        await sink(kind, spoken)
+        return True
 
     # --- WS (stub — filled in Step Group E) ---------------------------
 

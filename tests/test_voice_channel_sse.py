@@ -110,6 +110,70 @@ async def broken_voice_app(monkeypatch):
         yield client, bus
 
 
+@pytest.fixture
+async def agent_error_voice_app():
+    """Wire up a real Agent whose _process raises an UNKNOWN error, + a real
+    VoiceChannel. Exercises the natural production path:
+    Agent.handle_message catches → error_kind set → emit_error_line called →
+    _error_sink fires event: error → SSE skips event: done.
+    """
+    from agent import Agent
+    from config import AgentConfig, MemoryConfig, SessionConfig, ToolsConfig, TTSConfig
+    from mcp_registry import McpServerRegistry
+    from session_registry import SessionRegistry
+    from channels import ChannelManager
+
+    bus = MessageBus()
+
+    cfg = AgentConfig(
+        name="Tina",
+        role="butler",
+        model="claude-haiku-4-5",
+        personality="Butler.",
+        tools=ToolsConfig(),
+        memory=MemoryConfig(token_budget=800, read_strategy="cached"),
+        session=SessionConfig(strategy="pooled", idle_timeout=300),
+        tts=TTSConfig(tag_dialect="square_brackets"),
+        # RuntimeError classifies as UNKNOWN → this key is used.
+        voice_errors={"unknown": "[apologetic] Natural-path Tina voice failure."},
+    )
+
+    channel_manager = ChannelManager()
+    voice_channel = VoiceChannel(
+        bus=bus,
+        default_agent="butler",
+        webhook_secret="",
+        sse_path="/api/converse",
+        ws_path="/api/converse/ws",
+        agent_configs={"butler": cfg},
+        memory=_DummyMemory(),
+        idle_timeout=300,
+    )
+    channel_manager.register(voice_channel)
+
+    agent = Agent(
+        config=cfg,
+        memory=_DummyMemory(),
+        session_registry=SessionRegistry("/tmp/_test_voice_sessions.json"),
+        mcp_registry=McpServerRegistry(),
+        channel_manager=channel_manager,
+    )
+
+    async def _raise(*args, **kwargs):
+        raise RuntimeError("SDK-style failure")
+
+    agent._process = _raise  # type: ignore[assignment]
+
+    bus.register("butler", agent.handle_message)
+    loop_task = asyncio.create_task(bus.run_agent_loop("butler"))
+
+    app = web.Application()
+    voice_channel.register_routes(app)
+    async with TestClient(TestServer(app)) as client:
+        yield client
+    loop_task.cancel()
+
+
 @pytest.mark.asyncio
 class TestSSE:
     async def test_full_turn_emits_blocks_then_done(self, voice_app):
@@ -164,3 +228,20 @@ class TestSSE:
         text = body.decode("utf-8")
         assert "event: error" in text
         assert "Tina-voice failure" in text
+
+    async def test_agent_sdk_error_routes_through_emit_error_line(
+        self, agent_error_voice_app,
+    ):
+        """Spec §7 end-to-end: agent catches SDK error, VoiceChannel emits
+        event: error with persona line, no event: done is sent."""
+        client = agent_error_voice_app
+        resp = await client.post(
+            "/api/converse",
+            json={"prompt": "hi", "agent_role": "butler", "scope_id": "s"},
+        )
+        assert resp.status == 200
+        body = (await resp.read()).decode("utf-8")
+        assert "event: error" in body
+        assert "Natural-path Tina voice failure" in body
+        # Crucially: done MUST NOT be emitted after error.
+        assert "event: done" not in body
