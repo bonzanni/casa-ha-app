@@ -290,3 +290,85 @@ async def test_add_turn_ordering_preserved_on_identical_ts(monkeypatch):
         "SELECT content FROM messages WHERE session_id='s' ORDER BY id ASC",
     ).fetchall()
     assert [r[0] for r in rows] == ["u1", "a1", "u2", "a2"]
+
+
+# --- get_context -----------------------------------------------------------
+
+
+async def test_get_context_empty_returns_empty_string():
+    from memory import SqliteMemoryProvider
+
+    p = SqliteMemoryProvider(":memory:")
+    await p.ensure_session("s", "assistant")
+    out = await p.get_context("s", "assistant", tokens=4000)
+    assert out == ""
+
+
+async def test_get_context_renders_recent_exchanges_chronologically():
+    from memory import SqliteMemoryProvider
+
+    p = SqliteMemoryProvider(":memory:")
+    await p.ensure_session("s", "assistant")
+    await p.add_turn("s", "assistant", "q1", "a1")
+    await p.add_turn("s", "assistant", "q2", "a2")
+
+    out = await p.get_context("s", "assistant", tokens=4000)
+    assert "## Recent exchanges" in out
+    # Oldest first after chronological reverse.
+    q1_pos = out.index("[nicola] q1")
+    a2_pos = out.index("[assistant] a2")
+    assert q1_pos < a2_pos
+
+
+async def test_get_context_truncates_by_token_budget():
+    """tokens=40 → last_n = max(1, 40//40) = 1 row. One add_turn writes
+    two rows (user + assistant), so LIMIT 1 returns only the newest
+    (assistant) row."""
+    from memory import SqliteMemoryProvider
+
+    p = SqliteMemoryProvider(":memory:")
+    await p.ensure_session("s", "assistant")
+    await p.add_turn("s", "assistant", "q1", "a1")
+    out = await p.get_context("s", "assistant", tokens=40)
+    assert "[assistant] a1" in out
+    assert "[nicola] q1" not in out
+
+
+async def test_get_context_minimum_one_row_when_budget_is_zero():
+    from memory import SqliteMemoryProvider
+
+    p = SqliteMemoryProvider(":memory:")
+    await p.ensure_session("s", "assistant")
+    await p.add_turn("s", "assistant", "q1", "a1")
+    out = await p.get_context("s", "assistant", tokens=0)
+    # max(1, 0) = 1 — we still see the most recent row.
+    assert "[assistant] a1" in out
+
+
+async def test_get_context_search_query_ignored():
+    """Passing a search_query must not alter the output — SQLite has no
+    semantic retrieval (spec §6 / S9)."""
+    from memory import SqliteMemoryProvider
+
+    p = SqliteMemoryProvider(":memory:")
+    await p.ensure_session("s", "assistant")
+    await p.add_turn("s", "assistant", "q1", "a1")
+
+    plain = await p.get_context("s", "assistant", tokens=4000)
+    with_query = await p.get_context(
+        "s", "assistant", tokens=4000, search_query="anything",
+    )
+    assert plain == with_query
+
+
+async def test_get_context_no_summary_or_perspective_sections():
+    """SQLite never emits ``## Summary so far`` or ``## My perspective``
+    (spec §5)."""
+    from memory import SqliteMemoryProvider
+
+    p = SqliteMemoryProvider(":memory:")
+    await p.ensure_session("s", "assistant")
+    await p.add_turn("s", "assistant", "q1", "a1")
+    out = await p.get_context("s", "assistant", tokens=4000)
+    assert "## Summary so far" not in out
+    assert "## My perspective" not in out
