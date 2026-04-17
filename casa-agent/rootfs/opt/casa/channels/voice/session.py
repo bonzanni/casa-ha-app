@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from session_registry import build_session_key
@@ -23,9 +23,9 @@ class VoiceSession:
     scope_id: str
     session_key: str
     last_activity: float
+    gate: asyncio.Semaphore
     prewarm_task: asyncio.Task | None = None
     in_flight: str | None = None
-    gate: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(10))
 
 
 class VoiceSessionPool:
@@ -65,6 +65,7 @@ class VoiceSessionPool:
             if now - sess.last_activity > self._idle_timeout:
                 if sess.prewarm_task is not None and not sess.prewarm_task.done():
                     sess.prewarm_task.cancel()
+                    sess.prewarm_task = None
                 self._sessions.pop(scope_id, None)
                 evicted.append(scope_id)
         if evicted:
