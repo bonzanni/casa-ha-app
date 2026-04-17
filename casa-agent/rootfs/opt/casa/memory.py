@@ -235,3 +235,88 @@ class HonchoMemoryProvider(MemoryProvider):
             user.message(user_text),
             agent.message(assistant_text),
         ])
+
+
+# ---------------------------------------------------------------------------
+# CachedMemoryProvider (voice latency strategy S1)
+# ---------------------------------------------------------------------------
+
+
+class CachedMemoryProvider(MemoryProvider):
+    """Warm-cache + background-refresh wrapper around a concrete provider.
+
+    First call for a given ``(session_id, agent_role, tokens)`` key
+    fetches synchronously and caches the rendered string. Subsequent
+    calls return the cached value immediately. ``add_turn`` writes
+    through and fires a background refresh so the next read already
+    reflects the new turn — without blocking the caller.
+
+    ``search_query`` is intentionally not part of the cache key: the
+    cache is for low-latency paths (butler voice), which trade
+    per-turn semantic retrieval for speed (spec §7 S1).
+    """
+
+    def __init__(self, backend: "MemoryProvider") -> None:
+        self._backend = backend
+        self._cache: dict[tuple[str, str, int], str] = {}
+
+    async def ensure_session(
+        self, session_id: str, agent_role: str, user_peer: str = "nicola",
+    ) -> None:
+        await self._backend.ensure_session(session_id, agent_role, user_peer)
+
+    async def get_context(
+        self,
+        session_id: str,
+        agent_role: str,
+        tokens: int,
+        search_query: str | None = None,
+        user_peer: str = "nicola",
+    ) -> str:
+        key = (session_id, agent_role, tokens)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        fresh = await self._backend.get_context(
+            session_id, agent_role, tokens,
+            search_query=search_query, user_peer=user_peer,
+        )
+        self._cache[key] = fresh
+        return fresh
+
+    async def add_turn(
+        self,
+        session_id: str,
+        agent_role: str,
+        user_text: str,
+        assistant_text: str,
+        user_peer: str = "nicola",
+    ) -> None:
+        await self._backend.add_turn(
+            session_id, agent_role, user_text, assistant_text, user_peer,
+        )
+        asyncio.create_task(
+            self._refresh(session_id, agent_role, user_peer),
+        )
+
+    async def _refresh(
+        self, session_id: str, agent_role: str, user_peer: str,
+    ) -> None:
+        # Refresh every (session_id, agent_role, tokens) entry we've
+        # already cached. Token-budget variations are uncommon in
+        # practice but we keep the cache coherent either way.
+        keys = [k for k in self._cache if k[0] == session_id
+                                       and k[1] == agent_role]
+        for key in keys:
+            _, _, tokens = key
+            try:
+                fresh = await self._backend.get_context(
+                    session_id, agent_role, tokens,
+                    search_query=None, user_peer=user_peer,
+                )
+                self._cache[key] = fresh
+            except Exception as exc:
+                logger.warning(
+                    "CachedMemoryProvider refresh failed for %s/%s: %s",
+                    session_id, agent_role, exc,
+                )
