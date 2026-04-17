@@ -8,6 +8,7 @@ import hmac
 import logging
 import os
 import signal
+import sqlite3
 import sys
 import uuid
 from pathlib import Path
@@ -32,6 +33,7 @@ from memory import (
     HonchoMemoryProvider,
     MemoryProvider,
     NoOpMemory,
+    SqliteMemoryProvider,
 )
 from session_registry import SessionRegistry
 
@@ -183,6 +185,99 @@ def build_invoke_message(
 
 
 # ------------------------------------------------------------------
+# Memory backend selection (spec 2.2b §2)
+# ------------------------------------------------------------------
+
+_VALID_MEMORY_BACKENDS = ("honcho", "sqlite", "noop")
+
+
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class _MemoryChoice:
+    """Declarative memory-backend pick. ``main()`` turns this into a
+    concrete ``MemoryProvider`` instance."""
+    backend: str                       # honcho | sqlite | noop
+    db_path: str = "/data/memory.sqlite"
+    honcho_api_key: str = ""
+    honcho_api_url: str = "https://api.honcho.dev"
+
+
+def resolve_memory_backend_choice(env: dict[str, str]) -> _MemoryChoice:
+    """Resolve ``MEMORY_BACKEND`` + keys into a backend choice.
+
+    Order:
+      1. Explicit ``MEMORY_BACKEND`` wins. ``honcho`` without
+         ``HONCHO_API_KEY`` raises. Invalid values raise.
+      2. Else ``HONCHO_API_KEY`` → ``honcho``.
+      3. Else ``sqlite`` (fresh-install default).
+    """
+    backend = env.get("MEMORY_BACKEND", "").strip().lower()
+    api_key = env.get("HONCHO_API_KEY", "")
+    api_url = env.get("HONCHO_API_URL", "https://api.honcho.dev")
+    db_path = env.get("MEMORY_DB_PATH", "/data/memory.sqlite")
+
+    if backend:
+        if backend not in _VALID_MEMORY_BACKENDS:
+            raise ValueError(
+                f"Invalid MEMORY_BACKEND={backend!r}; "
+                f"must be one of {_VALID_MEMORY_BACKENDS}"
+            )
+        if backend == "honcho" and not api_key:
+            raise ValueError(
+                "MEMORY_BACKEND=honcho requires HONCHO_API_KEY to be set"
+            )
+        return _MemoryChoice(
+            backend=backend, db_path=db_path,
+            honcho_api_key=api_key, honcho_api_url=api_url,
+        )
+
+    if api_key:
+        return _MemoryChoice(
+            backend="honcho", db_path=db_path,
+            honcho_api_key=api_key, honcho_api_url=api_url,
+        )
+
+    return _MemoryChoice(backend="sqlite", db_path=db_path)
+
+
+def _wrap_memory_for_strategy(
+    backend: MemoryProvider,
+    role: str,
+    strategy: str,
+    sqlite_warning_emitted: list[bool],
+) -> MemoryProvider:
+    """Apply the per-agent ``read_strategy`` to *backend*.
+
+    ``sqlite_warning_emitted`` is a one-element mutable flag used to
+    emit the "SQLite backend — caching not applied" line at most once
+    per process start (spec §2).
+    """
+    if strategy == "cached":
+        if isinstance(backend, SqliteMemoryProvider):
+            if not sqlite_warning_emitted[0]:
+                logger.info(
+                    "SQLite backend — caching not applied "
+                    "(native reads are <1 ms)"
+                )
+                sqlite_warning_emitted[0] = True
+            return backend
+        return CachedMemoryProvider(backend)
+
+    if strategy == "card_only":
+        logger.warning(
+            "Agent '%s' requests read_strategy=card_only which is not "
+            "implemented in 2.2a; falling back to per_turn",
+            role,
+        )
+        return backend
+
+    # per_turn
+    return backend
+
+
+# ------------------------------------------------------------------
 # Agent loader
 # ------------------------------------------------------------------
 
@@ -247,17 +342,28 @@ async def main() -> None:
 
     # 2. Memory
     base_memory: MemoryProvider
-    honcho_key = os.environ.get("HONCHO_API_KEY", "")
-    if honcho_key:
-        honcho_url = os.environ.get("HONCHO_API_URL", "https://api.honcho.dev")
+    mem_choice = resolve_memory_backend_choice(dict(os.environ))
+    if mem_choice.backend == "honcho":
         base_memory = HonchoMemoryProvider(
-            api_url=honcho_url,
-            api_key=honcho_key,
+            api_url=mem_choice.honcho_api_url,
+            api_key=mem_choice.honcho_api_key,
         )
         logger.info("Honcho v3 memory provider initialized")
-    else:
+    elif mem_choice.backend == "sqlite":
+        try:
+            base_memory = SqliteMemoryProvider(mem_choice.db_path)
+            logger.info(
+                "SQLite memory provider initialized (path=%s)", mem_choice.db_path,
+            )
+        except (sqlite3.OperationalError, OSError) as exc:
+            logger.error(
+                "SQLite memory init failed (path=%s): %s — degrading to no-op",
+                mem_choice.db_path, exc,
+            )
+            base_memory = NoOpMemory()
+    else:  # noop
         base_memory = NoOpMemory()
-        logger.info("No HONCHO_API_KEY set; using no-op memory")
+        logger.info("MEMORY_BACKEND=noop; using no-op memory")
 
     # 3. Message bus
     bus = MessageBus()
@@ -305,24 +411,15 @@ async def main() -> None:
     agents: dict[str, Agent] = {}
     loop_tasks: list[asyncio.Task] = []
 
+    sqlite_warning_emitted = [False]
+
     for role, cfg in role_configs.items():
-        # Per-agent memory wrapper. 'cached' wraps the concrete provider
-        # in CachedMemoryProvider (voice latency). 'card_only' is
-        # reserved for a future read-strategy that returns peer-card
-        # only — not implemented in 2.2a; falls back to per_turn with
-        # a warning.
-        strategy = cfg.memory.read_strategy
-        if strategy == "cached":
-            agent_memory: MemoryProvider = CachedMemoryProvider(base_memory)
-        elif strategy == "card_only":
-            logger.warning(
-                "Agent '%s' requests read_strategy=card_only which is not "
-                "implemented in 2.2a; falling back to per_turn",
-                role,
-            )
-            agent_memory = base_memory
-        else:  # per_turn
-            agent_memory = base_memory
+        agent_memory = _wrap_memory_for_strategy(
+            base_memory,
+            role=role,
+            strategy=cfg.memory.read_strategy,
+            sqlite_warning_emitted=sqlite_warning_emitted,
+        )
 
         agent = Agent(
             config=cfg,
@@ -338,7 +435,7 @@ async def main() -> None:
             role,
             cfg.name,
             cfg.model,
-            strategy,
+            cfg.memory.read_strategy,
         )
 
     assistant_role = "assistant"
@@ -573,8 +670,14 @@ async def main() -> None:
             system_rows += _row("Public URL", public_url, "on")
         else:
             system_rows += _row("Public URL", "not set", "off")
-        mem_type = "Honcho" if os.environ.get("HONCHO_API_KEY") else "none"
-        system_rows += _row("Memory", mem_type, "on" if mem_type != "none" else "off")
+        mem_type = {
+            "honcho": "Honcho",
+            "sqlite": "SQLite",
+            "noop": "none",
+        }[mem_choice.backend]
+        system_rows += _row(
+            "Memory", mem_type, "on" if mem_choice.backend != "noop" else "off",
+        )
         system_rows += _row("Webhook auth", "enabled" if webhook_secret else "disabled",
                             "on" if webhook_secret else "off")
         hb_label = f"every {heartbeat_interval} min" if heartbeat_enabled else "disabled"
