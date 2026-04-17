@@ -171,5 +171,5 @@ When `enable_terminal` is enabled, a web terminal is available at the `/terminal
 
 - **Add-on won't start**: Check the log for "claude_oauth_token is required". You must set the token before starting.
 - **No Telegram messages**: Verify `telegram_bot_token` and `telegram_chat_id` are correct. The bot must have been started (`/start` in Telegram).
-- **Memory not working**: Honcho memory requires both `honcho_api_url` and `honcho_api_key`. Without them, agents run without persistent memory (conversation context is ephemeral).
+- **Memory not working**: By default, memory persists to `/data/memory.sqlite` (SQLite backend). If `HONCHO_API_KEY` is set but memory still appears empty, check container logs for `SQLite memory init failed` or Honcho connection errors. To disable memory entirely, set `MEMORY_BACKEND=noop`.
 - **502 errors on ingress**: The Python process may still be starting. Wait up to 60 seconds after add-on start.
