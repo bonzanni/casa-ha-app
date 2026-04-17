@@ -1,17 +1,12 @@
-"""Tests for memory.py -- memory provider abstraction."""
+"""Tests for memory.py — MemoryProvider ABC and NoOpMemory."""
 
 from __future__ import annotations
 
-import uuid
-from typing import Any
-
 import pytest
 
-from memory import MemoryProvider
+from memory import MemoryProvider, NoOpMemory
 
-# ------------------------------------------------------------------
-# ABC enforcement
-# ------------------------------------------------------------------
+pytestmark = pytest.mark.asyncio
 
 
 def test_cannot_instantiate_abc():
@@ -20,97 +15,75 @@ def test_cannot_instantiate_abc():
         MemoryProvider()  # type: ignore[abstract]
 
 
-# ------------------------------------------------------------------
-# Fake in-memory implementation for testing
-# ------------------------------------------------------------------
-
-
 class FakeMemoryProvider(MemoryProvider):
-    """Simple dict-backed memory provider for unit tests."""
+    """Minimal concrete provider used to exercise the 3-method surface."""
 
     def __init__(self) -> None:
-        self._sessions: dict[str, str] = {}  # session_id -> peer_id
-        self._messages: list[dict[str, Any]] = []
+        self.ensure_calls: list[tuple[str, str, str]] = []
+        self.get_calls: list[tuple[str, str, int, str | None, str]] = []
+        self.add_calls: list[tuple[str, str, str, str, str]] = []
+
+    async def ensure_session(
+        self, session_id, agent_role, user_peer="nicola",
+    ):
+        self.ensure_calls.append((session_id, agent_role, user_peer))
 
     async def get_context(
-        self,
-        peer_id: str,
-        token_budget: int,
-        exclude_tags: list[str] | None = None,
-    ) -> str:
-        exclude = set(exclude_tags or [])
-        parts: list[str] = []
-        budget_used = 0
-        for msg in self._messages:
-            if msg["peer_id"] != peer_id:
-                continue
-            msg_tags = set(msg.get("tags") or [])
-            if msg_tags & exclude:
-                continue
-            text = msg["content"]
-            # Very rough token estimate: 1 token ~ 4 chars
-            cost = len(text) // 4 + 1
-            if budget_used + cost > token_budget:
-                break
-            parts.append(text)
-            budget_used += cost
-        return "\n".join(parts)
+        self, session_id, agent_role, tokens,
+        search_query=None, user_peer="nicola",
+    ):
+        self.get_calls.append(
+            (session_id, agent_role, tokens, search_query, user_peer)
+        )
+        return f"ctx({session_id},{agent_role},{user_peer})"
 
-    async def store_message(
-        self,
-        session_id: str,
-        peer_id: str,
-        content: str,
-        role: str = "user",
-        tags: list[str] | None = None,
-    ) -> None:
-        self._messages.append(
-            {
-                "session_id": session_id,
-                "peer_id": peer_id,
-                "content": content,
-                "role": role,
-                "tags": tags,
-            }
+    async def add_turn(
+        self, session_id, agent_role, user_text, assistant_text,
+        user_peer="nicola",
+    ):
+        self.add_calls.append(
+            (session_id, agent_role, user_text, assistant_text, user_peer)
         )
 
-    async def create_session(self, peer_id: str) -> str:
-        sid = str(uuid.uuid4())
-        self._sessions[sid] = peer_id
-        return sid
 
-    async def close_session(self, session_id: str) -> None:
-        self._sessions.pop(session_id, None)
-
-
-# ------------------------------------------------------------------
-# Roundtrip tests
-# ------------------------------------------------------------------
-
-
-async def test_roundtrip():
-    """Create session, store a message, retrieve context."""
+async def test_fake_roundtrip_threads_user_peer():
     mem = FakeMemoryProvider()
-    sid = await mem.create_session("alice")
-    await mem.store_message(sid, "alice", "Hello world", role="user")
-
-    ctx = await mem.get_context("alice", token_budget=4000)
-    assert "Hello world" in ctx
-
-
-async def test_tag_filtering():
-    """Excluded tags are omitted from context."""
-    mem = FakeMemoryProvider()
-    sid = await mem.create_session("bob")
-    await mem.store_message(sid, "bob", "public info", tags=["general"])
-    await mem.store_message(sid, "bob", "secret stuff", tags=["private"])
-
-    ctx_all = await mem.get_context("bob", token_budget=4000)
-    assert "public info" in ctx_all
-    assert "secret stuff" in ctx_all
-
-    ctx_filtered = await mem.get_context(
-        "bob", token_budget=4000, exclude_tags=["private"]
+    await mem.ensure_session("telegram:1:assistant", "assistant")
+    ctx = await mem.get_context(
+        "telegram:1:assistant", "assistant", tokens=4000, search_query="hi",
     )
-    assert "public info" in ctx_filtered
-    assert "secret stuff" not in ctx_filtered
+    await mem.add_turn(
+        "telegram:1:assistant", "assistant", "hi", "hello",
+    )
+
+    assert mem.ensure_calls == [
+        ("telegram:1:assistant", "assistant", "nicola"),
+    ]
+    assert mem.get_calls == [
+        ("telegram:1:assistant", "assistant", 4000, "hi", "nicola"),
+    ]
+    assert mem.add_calls == [
+        ("telegram:1:assistant", "assistant", "hi", "hello", "nicola"),
+    ]
+    assert ctx == "ctx(telegram:1:assistant,assistant,nicola)"
+
+
+async def test_fake_voice_user_peer_override():
+    mem = FakeMemoryProvider()
+    await mem.ensure_session(
+        "voice:lr:butler", "butler", user_peer="voice_speaker",
+    )
+    await mem.add_turn(
+        "voice:lr:butler", "butler", "lights on", "ok",
+        user_peer="voice_speaker",
+    )
+    assert mem.ensure_calls[0][2] == "voice_speaker"
+    assert mem.add_calls[0][4] == "voice_speaker"
+
+
+async def test_noop_memory_returns_empty_and_stores_nothing():
+    mem = NoOpMemory()
+    await mem.ensure_session("any", "assistant")
+    ctx = await mem.get_context("any", "assistant", tokens=4000)
+    await mem.add_turn("any", "assistant", "u", "a")
+    assert ctx == ""

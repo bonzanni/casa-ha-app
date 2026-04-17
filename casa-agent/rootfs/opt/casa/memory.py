@@ -1,122 +1,92 @@
-"""Memory provider abstraction for Casa agents."""
+"""Memory provider abstraction for Casa agents (Honcho v3 topology).
+
+See docs/superpowers/specs/2026-04-17-honcho-v3-memory-design.md for
+the peer/session model and the rationale behind the 3-method surface.
+"""
 
 from __future__ import annotations
 
-import asyncio
 from abc import ABC, abstractmethod
-from typing import Any
 
 
 class MemoryProvider(ABC):
-    """Abstract base class for memory backends."""
+    """Abstract memory backend.
 
-    @abstractmethod
-    async def get_context(
-        self,
-        peer_id: str,
-        token_budget: int,
-        exclude_tags: list[str] | None = None,
-    ) -> str:
-        """Retrieve relevant context for a peer within a token budget."""
+    Three methods:
+      * ``ensure_session`` — idempotent session + peer setup.
+      * ``get_context``    — rendered memory digest for the system prompt.
+      * ``add_turn``       — persist one user→assistant turn unconditionally.
 
-    @abstractmethod
-    async def store_message(
-        self,
-        session_id: str,
-        peer_id: str,
-        content: str,
-        role: str = "user",
-        tags: list[str] | None = None,
-    ) -> None:
-        """Store a message in the memory backend."""
-
-    @abstractmethod
-    async def create_session(self, peer_id: str) -> str:
-        """Create a new session for a peer and return the session ID."""
-
-    @abstractmethod
-    async def close_session(self, session_id: str) -> None:
-        """Close / finalize a session."""
-
-
-class HonchoMemoryProvider(MemoryProvider):
-    """Memory provider backed by the Honcho SDK.
-
-    All SDK calls are wrapped with ``asyncio.to_thread`` so they do not
-    block the event loop.
+    Storage is never filtered; write-scoping is a structural property of
+    ``session_id`` + peer topology (spec §4.3). Disclosure decisions
+    happen on the output side, not here.
     """
 
-    def __init__(
+    @abstractmethod
+    async def ensure_session(
         self,
-        api_url: str,
-        api_key: str,
-        workspace_name: str = "casa",
+        session_id: str,
+        agent_role: str,
+        user_peer: str = "nicola",
     ) -> None:
-        # Lazy import to avoid hard failure when honcho-ai is not installed
-        from honcho import Honcho  # type: ignore[import-untyped]
+        """Ensure the session exists with peers ``[user_peer, agent_role]``
+        and ``observe_others=True`` on ``agent_role``.
 
-        self._client = Honcho(api_key=api_key, base_url=api_url)
-        self._workspace_name = workspace_name
-        self._workspace: Any = None
+        Cheap when already set up. Safe to call every turn."""
 
-    async def initialize(self) -> None:
-        """Create or retrieve the workspace."""
-        self._workspace = await asyncio.to_thread(
-            self._client.apps.get_or_create, name=self._workspace_name
-        )
+    @abstractmethod
+    async def get_context(
+        self,
+        session_id: str,
+        agent_role: str,
+        tokens: int,
+        search_query: str | None = None,
+        user_peer: str = "nicola",
+    ) -> str:
+        """Return a rendered memory digest for the system prompt.
+
+        Empty string if the session has no relevant content yet.
+        ``search_query`` is the current user utterance (used by Honcho
+        for semantic retrieval). ``user_peer`` is the peer whose
+        perspective to target."""
+
+    @abstractmethod
+    async def add_turn(
+        self,
+        session_id: str,
+        agent_role: str,
+        user_text: str,
+        assistant_text: str,
+        user_peer: str = "nicola",
+    ) -> None:
+        """Persist one user→assistant turn. ``user_text`` → ``user_peer``;
+        ``assistant_text`` → ``agent_role``. Never filtered."""
+
+
+class NoOpMemory(MemoryProvider):
+    """Stub provider when ``HONCHO_API_KEY`` is not configured."""
+
+    async def ensure_session(
+        self, session_id: str, agent_role: str, user_peer: str = "nicola",
+    ) -> None:
+        return None
 
     async def get_context(
         self,
-        peer_id: str,
-        token_budget: int,
-        exclude_tags: list[str] | None = None,
+        session_id: str,
+        agent_role: str,
+        tokens: int,
+        search_query: str | None = None,
+        user_peer: str = "nicola",
     ) -> str:
-        filters: dict[str, Any] = {}
-        if exclude_tags:
-            filters["tags"] = {"$nin": exclude_tags}
+        return ""
 
-        result = await asyncio.to_thread(
-            self._client.apps.users.sessions.chat,
-            app_id=self._workspace.id,
-            user_id=peer_id,
-            query=f"token_budget={token_budget}",
-            filter=filters if filters else None,
-        )
-        return str(result)
-
-    async def store_message(
+    async def add_turn(
         self,
         session_id: str,
-        peer_id: str,
-        content: str,
-        role: str = "user",
-        tags: list[str] | None = None,
+        agent_role: str,
+        user_text: str,
+        assistant_text: str,
+        user_peer: str = "nicola",
     ) -> None:
-        metadata: dict[str, Any] = {}
-        if tags:
-            metadata["tags"] = tags
-
-        await asyncio.to_thread(
-            self._client.apps.users.sessions.messages.create,
-            app_id=self._workspace.id,
-            user_id=peer_id,
-            session_id=session_id,
-            content=content,
-            is_user=(role == "user"),
-            metadata=metadata,
-        )
-
-    async def create_session(self, peer_id: str) -> str:
-        session = await asyncio.to_thread(
-            self._client.apps.users.sessions.create,
-            app_id=self._workspace.id,
-            user_id=peer_id,
-        )
-        return str(session.id)
-
-    async def close_session(self, session_id: str) -> None:
-        await asyncio.to_thread(
-            self._client.apps.users.sessions.delete,
-            app_id=self._workspace.id,
-            session_id=session_id,
-        )
+        return None
