@@ -118,6 +118,94 @@ YAML
 
 migrate_voice_fields "$CONFIG_DIR/agents/butler.yaml"
 
+# ------------------------------------------------------------------
+# One-shot 5.1 migration: replace layer-1 Disclosure clause with v2.
+# Mirrors migrate_disclosure_clause in setup-configs.sh (bashio →
+# plain echo). Idempotent; gated by marker `# casa: disclosure v2`.
+# ------------------------------------------------------------------
+
+migrate_disclosure_clause() {
+    local file="$1"
+
+    [ -f "$file" ] || return 0
+
+    sed -i 's/\r$//' "$file"
+
+    if grep -qE '^# casa: disclosure v2$' "$file"; then
+        return 0
+    fi
+
+    python3 - "$file" <<'PY'
+import pathlib, re, sys
+
+p = pathlib.Path(sys.argv[1])
+text = p.read_text(encoding="utf-8")
+
+NEW_BLOCK = """\
+  Disclosure (on untrusted channels):
+  - The <channel_context> block names the current channel's trust.
+    If trust starts with "household-shared" or "public", anyone
+    nearby can hear you. Treat Nicola's personal data as confidential
+    on those channels.
+  - Confidential on untrusted channels (do NOT say out loud):
+    * Financial — bank names, account or card numbers, balances,
+      amounts of recent payments, names of specific vendors Nicola
+      pays.
+    * Medical — conditions, medications, doctor or clinic names,
+      appointment times, therapy topics.
+    * Contacts — phone numbers, email addresses, physical addresses,
+      full names of people not already public in this conversation.
+    * Schedule — specific times, dates, or locations of Nicola's
+      upcoming personal events (meetings, trips, appointments).
+    * Credentials — API keys, passwords, door codes, Wi-Fi passwords.
+  - When asked about any of the above on an untrusted channel:
+    * Do not hedge. Do not invent. Do not partial-disclose.
+    * Deflect crisply: "I'll tell you that on Telegram." or
+      "That's private — check Telegram."
+    * Then continue the conversation normally.
+  - Safe on any channel: device control (lights, heating, locks),
+    sensor state ("it's 22 degrees in the kitchen"), general
+    knowledge answers, public information already said aloud in
+    this session.
+"""
+
+lines = text.splitlines(keepends=True)
+out, i, replaced = [], 0, False
+while i < len(lines):
+    line = lines[i]
+    # Disclosure heading lives at 2-space indent inside the personality
+    # block scalar. Match it exactly.
+    if not replaced and re.match(r"^  Disclosure:[ \t]*\n?$", line):
+        # Skip the heading + every following line that belongs to the
+        # block: the continuation lines start with "  -" (bullet) or
+        # "    " (4-space continuation). Stop at the first line that
+        # does not, which is the boundary back to the block scalar's
+        # surrounding prose or to an outdented top-level key.
+        i += 1
+        while i < len(lines):
+            nxt = lines[i]
+            if nxt.startswith("  -") or nxt.startswith("    "):
+                i += 1
+                continue
+            break
+        out.append(NEW_BLOCK)
+        replaced = True
+        continue
+    out.append(line)
+    i += 1
+
+new_text = "".join(out)
+if not new_text.endswith("\n"):
+    new_text += "\n"
+new_text += "# casa: disclosure v2\n"
+p.write_text(new_text, encoding="utf-8")
+PY
+
+    echo "[INFO] Migrated disclosure clause to v2 in $(basename "$file")"
+}
+
+migrate_disclosure_clause "$CONFIG_DIR/agents/butler.yaml"
+
 if [ -f "$DATA_DIR/sessions.json" ]; then
     python3 - "$DATA_DIR/sessions.json" <<'PY'
 import json, pathlib, sys
