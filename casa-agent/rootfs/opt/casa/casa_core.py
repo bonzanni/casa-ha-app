@@ -183,6 +183,64 @@ def build_invoke_message(
 
 
 # ------------------------------------------------------------------
+# Memory backend selection (spec 2.2b §2)
+# ------------------------------------------------------------------
+
+_VALID_MEMORY_BACKENDS = ("honcho", "sqlite", "noop")
+
+
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class _MemoryChoice:
+    """Declarative memory-backend pick. ``main()`` turns this into a
+    concrete ``MemoryProvider`` instance."""
+    backend: str                       # honcho | sqlite | noop
+    db_path: str = "/data/memory.sqlite"
+    honcho_api_key: str = ""
+    honcho_api_url: str = "https://api.honcho.dev"
+
+
+def resolve_memory_backend_choice(env: dict[str, str]) -> _MemoryChoice:
+    """Resolve ``MEMORY_BACKEND`` + keys into a backend choice.
+
+    Order:
+      1. Explicit ``MEMORY_BACKEND`` wins. ``honcho`` without
+         ``HONCHO_API_KEY`` raises. Invalid values raise.
+      2. Else ``HONCHO_API_KEY`` → ``honcho``.
+      3. Else ``sqlite`` (fresh-install default).
+    """
+    backend = env.get("MEMORY_BACKEND", "").strip().lower()
+    api_key = env.get("HONCHO_API_KEY", "")
+    api_url = env.get("HONCHO_API_URL", "https://api.honcho.dev")
+    db_path = env.get("MEMORY_DB_PATH", "/data/memory.sqlite")
+
+    if backend:
+        if backend not in _VALID_MEMORY_BACKENDS:
+            raise ValueError(
+                f"Invalid MEMORY_BACKEND={backend!r}; "
+                f"must be one of {_VALID_MEMORY_BACKENDS}"
+            )
+        if backend == "honcho" and not api_key:
+            raise ValueError(
+                "MEMORY_BACKEND=honcho requires HONCHO_API_KEY to be set"
+            )
+        return _MemoryChoice(
+            backend=backend, db_path=db_path,
+            honcho_api_key=api_key, honcho_api_url=api_url,
+        )
+
+    if api_key:
+        return _MemoryChoice(
+            backend="honcho", db_path=db_path,
+            honcho_api_key=api_key, honcho_api_url=api_url,
+        )
+
+    return _MemoryChoice(backend="sqlite", db_path=db_path)
+
+
+# ------------------------------------------------------------------
 # Agent loader
 # ------------------------------------------------------------------
 
