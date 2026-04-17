@@ -78,6 +78,38 @@ async def voice_app():
     loop_task.cancel()
 
 
+@pytest.fixture
+async def broken_voice_app(monkeypatch):
+    """Fixture with monkeypatched bus.request that raises to trigger error handler."""
+    bus = MessageBus()
+    bus.register("butler", None)
+
+    butler_cfg = _FakeAgentConfig()
+    butler_cfg.voice_errors = {"unknown": "[flat] Tina-voice failure."}
+
+    channel = VoiceChannel(
+        bus=bus,
+        default_agent="butler",
+        webhook_secret="",
+        sse_path="/api/converse",
+        ws_path="/api/converse/ws",
+        agent_configs={"butler": butler_cfg},
+        memory=_DummyMemory(),
+        idle_timeout=300,
+    )
+
+    async def fake_request(msg, timeout=300):
+        raise RuntimeError("simulated SDK failure")
+
+    # Replace the channel's bus.request method to raise unconditionally
+    monkeypatch.setattr(channel._bus, "request", fake_request)
+
+    app = web.Application()
+    channel.register_routes(app)
+    async with TestClient(TestServer(app)) as client:
+        yield client, bus
+
+
 @pytest.mark.asyncio
 class TestSSE:
     async def test_full_turn_emits_blocks_then_done(self, voice_app):
@@ -120,3 +152,15 @@ class TestSSE:
         client, _ = voice_app
         resp = await client.post("/api/converse", json={"scope_id": "s"})
         assert resp.status == 400
+
+    async def test_error_frame_carries_persona_line(self, broken_voice_app):
+        client, _ = broken_voice_app
+        resp = await client.post(
+            "/api/converse",
+            json={"prompt": "hi", "agent_role": "butler", "scope_id": "s"},
+        )
+        assert resp.status == 200
+        body = await resp.read()
+        text = body.decode("utf-8")
+        assert "event: error" in text
+        assert "Tina-voice failure" in text
