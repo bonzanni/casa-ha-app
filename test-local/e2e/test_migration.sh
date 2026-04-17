@@ -95,8 +95,10 @@ read NAME TMP < <(run_scenario legacy-ellen)
 [ -f "${TMP}/agents/assistant.yaml" ] || fail "assistant.yaml was not created"
 grep -q '^role: assistant$' "${TMP}/agents/assistant.yaml" \
     || fail "role was not patched to 'assistant'"
-grep -q '^  peer_name: assistant$' "${TMP}/agents/assistant.yaml" \
-    || fail "peer_name was not patched to 'assistant'"
+# peer_name was renormalised by the 2.1 migration and then stripped by
+# the 2.2a memory-field migration. Post-2.2a, no peer_name line.
+! grep -q '^  peer_name:' "${TMP}/agents/assistant.yaml" \
+    || fail "peer_name survived the 2.2a migration"
 inspect_and_stop "$NAME" "$TMP"
 pass "B-1 ellen migration"
 
@@ -106,8 +108,8 @@ read NAME TMP < <(run_scenario legacy-tina)
 [ -f "${TMP}/agents/butler.yaml" ] || fail "butler.yaml was not created"
 grep -q '^role: butler$' "${TMP}/agents/butler.yaml" \
     || fail "role was not 'butler' on migrated butler.yaml"
-grep -q '^  peer_name: butler$' "${TMP}/agents/butler.yaml" \
-    || fail "peer_name was not patched to 'butler'"
+! grep -q '^  peer_name:' "${TMP}/agents/butler.yaml" \
+    || fail "peer_name survived the 2.2a migration"
 inspect_and_stop "$NAME" "$TMP"
 pass "B-2 tina migration"
 
@@ -142,3 +144,65 @@ sha1_after=$(sha1sum "${TMP}/agents/assistant.yaml" | awk '{print $1}')
     || fail "migration re-run mutated assistant.yaml"
 inspect_and_stop "$NAME" "$TMP"
 pass "B-4 idempotency"
+
+log "B-5: pre-2.2a YAMLs lose peer_name + exclude_tags, gain read_strategy"
+read NAME TMP < <(run_scenario legacy-pre22a)
+
+# Assistant: peer_name removed, block-form exclude_tags removed,
+# read_strategy: per_turn injected, token_budget preserved.
+! grep -q '^  peer_name:' "${TMP}/agents/assistant.yaml" \
+    || fail "assistant.yaml still has peer_name"
+! grep -q '^  exclude_tags:' "${TMP}/agents/assistant.yaml" \
+    || fail "assistant.yaml still has exclude_tags"
+! grep -qE '^    - (private|financial)$' "${TMP}/agents/assistant.yaml" \
+    || fail "assistant.yaml still has orphan exclude_tags list items"
+grep -q '^  read_strategy: per_turn$' "${TMP}/agents/assistant.yaml" \
+    || fail "assistant.yaml missing read_strategy: per_turn"
+grep -q '^  token_budget: 4000$' "${TMP}/agents/assistant.yaml" \
+    || fail "assistant.yaml lost its token_budget"
+
+# Butler: peer_name removed, single-line exclude_tags removed,
+# read_strategy: cached injected, token_budget preserved.
+! grep -q '^  peer_name:' "${TMP}/agents/butler.yaml" \
+    || fail "butler.yaml still has peer_name"
+! grep -q '^  exclude_tags:' "${TMP}/agents/butler.yaml" \
+    || fail "butler.yaml still has exclude_tags"
+grep -q '^  read_strategy: cached$' "${TMP}/agents/butler.yaml" \
+    || fail "butler.yaml missing read_strategy: cached"
+grep -q '^  token_budget: 2000$' "${TMP}/agents/butler.yaml" \
+    || fail "butler.yaml lost its token_budget"
+
+# The migrated files must parse as valid 0.2.2 configs via the loader
+# (it raises on unknown read_strategy; peer_name / exclude_tags are
+# silently ignored since the dataclass no longer exposes them).
+docker exec "$NAME" python3 -c "
+import sys
+sys.path.insert(0, '/opt/casa')
+from config import load_agent_config
+for f in ['/addon_configs/casa-agent/agents/assistant.yaml',
+          '/addon_configs/casa-agent/agents/butler.yaml']:
+    cfg = load_agent_config(f)
+    print(cfg.role, cfg.memory.token_budget, cfg.memory.read_strategy)
+" | tee /tmp/casa-pre22a-load.$$
+grep -q '^assistant 4000 per_turn$' /tmp/casa-pre22a-load.$$ \
+    || fail "assistant.yaml did not round-trip through load_agent_config"
+grep -q '^butler 2000 cached$' /tmp/casa-pre22a-load.$$ \
+    || fail "butler.yaml did not round-trip through load_agent_config"
+rm -f /tmp/casa-pre22a-load.$$
+
+# Idempotency: restart the container; migration must not duplicate lines.
+sha_a1=$(sha1sum "${TMP}/agents/assistant.yaml" | awk '{print $1}')
+sha_b1=$(sha1sum "${TMP}/agents/butler.yaml"    | awk '{print $1}')
+docker restart "$NAME" >/dev/null
+wait_healthy "$NAME"
+sha_a2=$(sha1sum "${TMP}/agents/assistant.yaml" | awk '{print $1}')
+sha_b2=$(sha1sum "${TMP}/agents/butler.yaml"    | awk '{print $1}')
+[ "$sha_a1" = "$sha_a2" ] || fail "assistant.yaml changed on migration re-run"
+[ "$sha_b1" = "$sha_b2" ] || fail "butler.yaml changed on migration re-run"
+[ "$(grep -c '^  read_strategy:' "${TMP}/agents/assistant.yaml")" = "1" ] \
+    || fail "assistant.yaml has duplicate read_strategy lines after re-run"
+[ "$(grep -c '^  read_strategy:' "${TMP}/agents/butler.yaml")" = "1" ] \
+    || fail "butler.yaml has duplicate read_strategy lines after re-run"
+
+inspect_and_stop "$NAME" "$TMP"
+pass "B-5 pre-2.2a memory migration + idempotency"
