@@ -27,7 +27,12 @@ from channels import ChannelManager
 from config import AgentConfig, load_agent_config
 from log_redact import RedactingFilter
 from mcp_registry import McpServerRegistry
-from memory import HonchoMemoryProvider, MemoryProvider, NoOpMemory
+from memory import (
+    CachedMemoryProvider,
+    HonchoMemoryProvider,
+    MemoryProvider,
+    NoOpMemory,
+)
 from session_registry import SessionRegistry
 
 logger = logging.getLogger(__name__)
@@ -241,19 +246,17 @@ async def main() -> None:
     logger.info("Casa core starting up")
 
     # 2. Memory
-    memory: MemoryProvider
+    base_memory: MemoryProvider
     honcho_key = os.environ.get("HONCHO_API_KEY", "")
     if honcho_key:
         honcho_url = os.environ.get("HONCHO_API_URL", "https://api.honcho.dev")
-        honcho = HonchoMemoryProvider(
+        base_memory = HonchoMemoryProvider(
             api_url=honcho_url,
             api_key=honcho_key,
         )
-        await honcho.initialize()
-        memory = honcho
-        logger.info("Honcho memory provider initialized")
+        logger.info("Honcho v3 memory provider initialized")
     else:
-        memory = NoOpMemory()
+        base_memory = NoOpMemory()
         logger.info("No HONCHO_API_KEY set; using no-op memory")
 
     # 3. Message bus
@@ -303,9 +306,27 @@ async def main() -> None:
     loop_tasks: list[asyncio.Task] = []
 
     for role, cfg in role_configs.items():
+        # Per-agent memory wrapper. 'cached' wraps the concrete provider
+        # in CachedMemoryProvider (voice latency). 'card_only' is
+        # reserved for a future read-strategy that returns peer-card
+        # only — not implemented in 2.2a; falls back to per_turn with
+        # a warning.
+        strategy = cfg.memory.read_strategy
+        if strategy == "cached":
+            agent_memory: MemoryProvider = CachedMemoryProvider(base_memory)
+        elif strategy == "card_only":
+            logger.warning(
+                "Agent '%s' requests read_strategy=card_only which is not "
+                "implemented in 2.2a; falling back to per_turn",
+                role,
+            )
+            agent_memory = base_memory
+        else:  # per_turn
+            agent_memory = base_memory
+
         agent = Agent(
             config=cfg,
-            memory=memory,
+            memory=agent_memory,
             session_registry=session_registry,
             mcp_registry=mcp_registry,
             channel_manager=channel_manager,
@@ -313,10 +334,11 @@ async def main() -> None:
         bus.register(role, agent.handle_message)
         agents[role] = agent
         logger.info(
-            "Agent '%s' registered (name=%s, model=%s)",
+            "Agent '%s' registered (name=%s, model=%s, memory=%s)",
             role,
             cfg.name,
             cfg.model,
+            strategy,
         )
 
     assistant_role = "assistant"
