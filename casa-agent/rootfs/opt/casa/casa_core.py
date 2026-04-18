@@ -36,6 +36,7 @@ from memory import (
     SqliteMemoryProvider,
 )
 from session_registry import SessionRegistry
+from session_sweeper import SessionSweeper
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,33 @@ def _row(label: str, value: str, css: str = "") -> str:
 # ------------------------------------------------------------------
 # Pure helpers (extracted for testability; see tests/test_casa_core_helpers.py)
 # ------------------------------------------------------------------
+
+
+def _env_int_or(name: str, default: int, *, min_value: int = 0,
+                env: dict[str, str] | None = None) -> int:
+    """Read a non-negative int from env; fall back to *default* on bad input.
+
+    Extracted as a module-level helper so future items that need the same
+    shape (spec 5.2 §9.3 has more env vars coming in item I) can reuse
+    it. Mirrors retry._env_int but stays on casa_core until a second
+    caller appears — then promote to a shared `env.py` module.
+    """
+    env = env if env is not None else os.environ
+    raw = env.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %d", name, raw, default)
+        return default
+    if value < min_value:
+        logger.warning(
+            "%s=%d below minimum %d; using %d",
+            name, value, min_value, min_value,
+        )
+        return min_value
+    return value
 
 
 def init_heartbeat_defaults(env: dict[str, str] | None = None) -> tuple[bool, int]:
@@ -373,9 +401,16 @@ async def main() -> None:
     # 3. Message bus
     bus = MessageBus()
 
-    # 4. Session registry
+    # 4. Session registry + TTL sweeper (spec 5.2 §6)
     sessions_path = os.path.join(DATA_DIR, "sessions.json")
     session_registry = SessionRegistry(sessions_path)
+    session_sweeper = SessionSweeper(
+        registry=session_registry,
+        session_ttl_days=_env_int_or("SESSION_TTL_DAYS", 30, min_value=1),
+        webhook_session_ttl_days=_env_int_or(
+            "WEBHOOK_SESSION_TTL_DAYS", 1, min_value=1,
+        ),
+    )
 
     # 5. MCP server registry
     mcp_registry = McpServerRegistry()
@@ -755,6 +790,7 @@ async def main() -> None:
             heartbeat_agent,
         )
 
+    session_sweeper.start()
     scheduler.start()
 
     # 15. Graceful shutdown
@@ -778,6 +814,7 @@ async def main() -> None:
     # 17. Cleanup
     logger.info("Shutting down...")
     scheduler.shutdown(wait=False)
+    await session_sweeper.stop()
 
     for task in loop_tasks:
         task.cancel()
