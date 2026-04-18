@@ -148,6 +148,23 @@ def format_turn_summary(
 ) -> str:
     """Render the per-turn ``turn_done`` log line.
 
-    Implemented in Task 8; stub raises.
+    Format::
+
+        turn_done role=<role> channel=<channel> \
+            input=<n> output=<n> cache_read=<n> cache_write=<n>
+
+    ``cache_read`` and ``cache_write`` are split (not aggregated):
+    cache_read reflects prompt-cache hits (cheap, fast); cache_write
+    reflects first-time cache population for the next turn's prefix.
+    Tracking them separately surfaces a stable-prefix regression
+    (``cache_write > 0`` every turn means our prompt prefix is changing
+    each turn and the cache is never paying off).
     """
-    raise NotImplementedError("implemented in Task 8")
+    inp = int(usage.get("input_tokens", 0) or 0)
+    out = int(usage.get("output_tokens", 0) or 0)
+    cr = int(usage.get("cache_read_input_tokens", 0) or 0)
+    cw = int(usage.get("cache_creation_input_tokens", 0) or 0)
+    return (
+        f"turn_done role={role} channel={channel} "
+        f"input={inp} output={out} cache_read={cr} cache_write={cw}"
+    )
