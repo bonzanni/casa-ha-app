@@ -45,6 +45,9 @@ class AssistantMessage:
 class ResultMessage:
     session_id: str
     subtype: str = "result"
+    # Optional spec 5.2 §5 usage fields. Default empty so historical
+    # E2E scenarios (no MOCK_SDK_USAGE_* env) keep working.
+    usage: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -112,7 +115,19 @@ class ClaudeSDKClient:
 
         yield SystemMessage(subtype="init", data={"session_id": self._session_id})
         yield AssistantMessage(content=[TextBlock(text=reply)])
-        yield ResultMessage(session_id=self._session_id)
+        yield ResultMessage(
+            session_id=self._session_id,
+            usage={
+                "input_tokens": int(os.environ.get("MOCK_SDK_USAGE_INPUT", "0") or "0"),
+                "output_tokens": int(os.environ.get("MOCK_SDK_USAGE_OUTPUT", "0") or "0"),
+                "cache_read_input_tokens": int(
+                    os.environ.get("MOCK_SDK_USAGE_CACHE_READ", "0") or "0"
+                ),
+                "cache_creation_input_tokens": int(
+                    os.environ.get("MOCK_SDK_USAGE_CACHE_WRITE", "0") or "0"
+                ),
+            },
+        )
 
 
 def tool(name: str, description: str, params: dict[str, Any]) -> Any:
