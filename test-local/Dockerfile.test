@@ -4,7 +4,14 @@
 # Build: docker build -f test-local/Dockerfile.test -t casa-test .
 # Run:   docker run --rm -p 8080:8080 casa-test
 
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.22
+# Base: ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.22
+# Digest pinned 2026-04-18 (HA base 2026.04.0). Refresh deliberately:
+#   docker buildx imagetools inspect \
+#     ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.22 \
+#     --format '{{ json . }}' | jq -r '.manifest.digest'
+# Rationale: floating tags let a silent base-image update change
+# test behaviour with no record in this repo. See 5.3 spec §4.
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-python@sha256:cb37b54194179d8af605d3a35c28daa4d65a9bfc9bd3d7bbe19a62fcaff0fbce
 FROM ${BUILD_FROM}
 
 # --- Same as casa-agent/Dockerfile ---
