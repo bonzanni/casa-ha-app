@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.5.4 — 2026-04-18 — Phase 5.2 item E: Telegram reconnect with backoff
+
+### Added
+- `channels/telegram_supervisor.py` — `ReconnectSupervisor`: pure async
+  policy module that wraps a rebuild callback with 1s → 60s jittered
+  exponential backoff (reuses `retry.compute_backoff_ms`). Retries
+  forever per spec §4.2. Logs exactly one `ERROR` per outage and one
+  `INFO` on recovery — not one line per attempt. Coalesces concurrent
+  triggers (single-task design); idempotent `start()`; clean `stop()`.
+- `TelegramChannel._rebuild()` — idempotent build-and-handshake: tears
+  down any existing `Application` (best-effort; exceptions swallowed)
+  then constructs, initializes, starts, and registers webhook or
+  polling. Replaces the inline block that used to live in `start()`.
+- `TelegramChannel._health_probe_loop()` — periodic `bot.get_me()`
+  probe (`_PROBE_INTERVAL = 45s`, `_PROBE_TIMEOUT = 10s`). On
+  `NetworkError` / `TimedOut` / `asyncio.TimeoutError`, triggers the
+  supervisor. Non-transport exceptions are logged at DEBUG and the
+  probe continues.
+- `TelegramChannel._on_ptb_error` — registered via
+  `Application.add_error_handler`. Routes `NetworkError` and
+  `TimedOut` to the supervisor; other handler errors are logged at
+  WARNING without triggering a rebuild.
+
+### Changed
+- `TelegramChannel.start()` no longer silently falls back from webhook
+  to polling on `set_webhook` failure (that path was dead once the
+  supervisor retries forever; it also downgraded a user who explicitly
+  configured webhook). On `NetworkError` / `TimedOut` during initial
+  bring-up, the supervisor takes over.
+- `TelegramChannel.stop()` cancels the probe task and stops the
+  supervisor in addition to the existing cleanup.
+
+### Removed
+- `_POLL_STALL_THRESHOLD` constant and `_poll_stall_watchdog` method —
+  the old "watchdog" only refreshed its own timestamp and performed no
+  actual detection. Replaced by `_health_probe_loop`.
+
+### Tests
+- `tests/test_telegram_supervisor.py` — 11 pure-asyncio tests for
+  `ReconnectSupervisor` covering trigger/no-trigger, backoff on
+  failure, unbounded retry, single error log per outage, single info
+  log on recovery, state reset between outages, clean stop before and
+  after start, idempotent start.
+- `tests/test_telegram_reconnect.py` — 6 integration tests using the
+  same `telegram.*` stub pattern as `test_telegram_split.py`. Covers
+  initial `set_webhook` failure, probe failure, PTB error handler
+  routing, non-transport errors ignored, full-cycle teardown, and
+  log-once semantics at channel level.
+- `tests/test_telegram_split.py` — stub module extended with
+  `NetworkError` / `TimedOut` symbols (required by the new imports in
+  `channels/telegram.py`).
+
+### Not changed
+- `_TYPING_BACKOFF_*` and `_TYPING_CIRCUIT_BREAK` remain as-is —
+  orthogonal to reconnect (spec §4.3).
+- No new env vars — reconnect schedule is hard-coded per spec §9.3.
+
 ## 0.5.3 — 2026-04-18 — Phase 5.2 item F: token budget monitoring (descoped — no cost estimate under Max)
 
 ### Added
