@@ -98,6 +98,22 @@ class TestExtractUsage:
         assert out["input_tokens"] == 42
         assert out["output_tokens"] == 0
 
+    def test_usage_as_object_with_attributes(self):
+        # Defensive: real SDK could ship Usage as a dataclass with
+        # attributes instead of a dict. The getattr-branch must work.
+        class UsageObj:
+            input_tokens = 50
+            output_tokens = 10
+            cache_read_input_tokens = 200
+            cache_creation_input_tokens = 5
+        class FakeResult:
+            usage = UsageObj()
+        out = extract_usage(FakeResult())
+        assert out["input_tokens"] == 50
+        assert out["output_tokens"] == 10
+        assert out["cache_read_input_tokens"] == 200
+        assert out["cache_creation_input_tokens"] == 5
+
 
 # ---------------------------------------------------------------------------
 # BudgetTracker
@@ -189,6 +205,15 @@ class TestBudgetTracker:
         t = BudgetTracker()
         for _ in range(10):
             t.record("sess-A", used_tokens=100, budget=0)
+        assert self._records_for(caplog, "sess-A") == []
+
+    def test_negative_budget_never_warns(self, caplog):
+        # Defensive: a typo in memory.token_budget YAML producing -1
+        # must not cascade into per-turn WARNINGS.
+        caplog.set_level(logging.WARNING, logger="tokens")
+        t = BudgetTracker()
+        for _ in range(10):
+            t.record("sess-A", used_tokens=100, budget=-1)
         assert self._records_for(caplog, "sess-A") == []
 
 
