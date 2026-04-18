@@ -8,8 +8,6 @@ import re
 import sys
 from io import StringIO
 
-import pytest
-
 from log_cid import (
     CidFilter,
     JsonFormatter,
@@ -147,6 +145,18 @@ class TestInstallLogging:
             if getattr(h, "_casa_owned", False)
         ]
 
+    def _cleanup_casa(self) -> None:
+        """Strip both Casa-owned handlers and filters from the root logger
+        so one test cannot contaminate the next (e.g. double-attached
+        CidFilter hiding an install_logging idempotency bug)."""
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            if getattr(h, "_casa_owned", False):
+                root.removeHandler(h)
+        for f in list(root.filters):
+            if getattr(f, "_casa_owned", False):
+                root.removeFilter(f)
+
     def test_human_format_default(self, monkeypatch):
         monkeypatch.delenv("LOG_FORMAT", raising=False)
         buf = StringIO()
@@ -159,8 +169,7 @@ class TestInstallLogging:
             finally:
                 cid_var.reset(token)
         finally:
-            for h in self._casa_handlers():
-                logging.getLogger().removeHandler(h)
+            self._cleanup_casa()
 
         line = buf.getvalue().strip()
         # Spec §7.2 format: ts [LEVEL] name cid=XX: msg
@@ -183,8 +192,7 @@ class TestInstallLogging:
             finally:
                 cid_var.reset(token)
         finally:
-            for h in self._casa_handlers():
-                logging.getLogger().removeHandler(h)
+            self._cleanup_casa()
             monkeypatch.delenv("LOG_FORMAT", raising=False)
 
         line = buf.getvalue().strip()
@@ -202,8 +210,7 @@ class TestInstallLogging:
             install_logging(stream=buf)
             assert len(self._casa_handlers()) == 1
         finally:
-            for h in self._casa_handlers():
-                logging.getLogger().removeHandler(h)
+            self._cleanup_casa()
 
     def test_redaction_still_applied(self, monkeypatch):
         monkeypatch.delenv("LOG_FORMAT", raising=False)
@@ -214,9 +221,9 @@ class TestInstallLogging:
                 "token: sk-abcdefghijklmnopqrstuvwxyz1234567890",
             )
         finally:
-            for h in self._casa_handlers():
-                logging.getLogger().removeHandler(h)
+            self._cleanup_casa()
 
         line = buf.getvalue()
         assert "sk-abcdefghijklmnopqrst" in line
         assert "uvwxyz1234567890" not in line
+        assert "***" in line  # redaction marker present, not just truncation
