@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.5.1 — 2026-04-18 — Phase 5.2 item D: SDK retry + backoff
+
+### Added
+- `retry.py` — pure policy module. `RETRY_KINDS` (TIMEOUT, RATE_LIMIT,
+  SDK_ERROR), `compute_backoff_ms()` jittered exponential backoff,
+  `parse_retry_after_ms()` for server-supplied Retry-After hints,
+  `retry_sdk_call()` async coroutine runner. Spec 5.2 §3.
+- Env vars `SDK_RETRY_MAX_ATTEMPTS` (default 3), `SDK_RETRY_INITIAL_MS`
+  (500), `SDK_RETRY_CAP_MS` (8000). Read at import time — adjust via
+  add-on options + restart. Malformed or below-minimum values are
+  logged and clamped, never crash module import.
+- Server-supplied `Retry-After` hints are clamped at `10 * CAP_MS`
+  (default 80 s) to prevent a misbehaving upstream from parking the
+  worker indefinitely.
+
+### Changed
+- `Agent._process` — the `ClaudeSDKClient` turn is now wrapped in
+  `retry_sdk_call`. Each attempt builds a fresh client and resets
+  the streaming accumulator, so `on_token` replays cumulative text
+  from scratch on retry. Cancellation (e.g. voice barge-in) bypasses
+  the retry loop. Non-retryable exceptions (MEMORY_ERROR,
+  CHANNEL_ERROR, UNKNOWN) surface unchanged. Spec 5.2 §3.2–§3.3.
+- One `logger.warning` per retry attempt emitted via the new
+  `Agent._log_retry` hook; log line carries role, attempt number,
+  kind, delay_ms, exc repr.
+- Internal refactor: `ErrorKind`, `_classify_error`, and
+  `_USER_MESSAGES` moved from `agent.py` to a new `error_kinds.py`
+  module to break an `agent ↔ retry` import cycle. `agent.py`
+  re-exports them so `from agent import ErrorKind` continues to
+  work unchanged for all existing consumers.
+
+### Not changed
+- Memory path is still silent-degrade (spec 2.2a §11 retained — no
+  retry wrapper there per spec 5.2 §2).
+- Channel modules untouched; retry is strictly at the SDK layer.
+- `MAX_CONCURRENT_AGENTS` / `MAX_CONCURRENT_VOICE` seams untouched.
+
 ## 0.5.0 — 2026-04-18 — Phase 5.1: Concurrency correctness + disclosure v2
 
 ### Fixed
