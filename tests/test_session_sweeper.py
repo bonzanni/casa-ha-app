@@ -472,7 +472,7 @@ class TestLifecycle:
             registry=reg,
             session_ttl_days=30,
             webhook_session_ttl_days=1,
-            sweep_interval_hours=20 / 3600,  # ≈ 20 ms
+            sweep_interval_hours=0.02 / 3600,  # ≈ 20 ms
             now=lambda: now[0],
         )
         sweeper.start()
