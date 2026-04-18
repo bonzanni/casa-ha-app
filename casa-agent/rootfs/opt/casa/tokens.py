@@ -78,18 +78,62 @@ def extract_usage(result_msg: object) -> dict[str, int]:
 # Budget tracker — implemented in Task 6
 # ---------------------------------------------------------------------------
 
+# Streak threshold for the over-budget WARNING (spec §5.2: "three turns
+# in a row"). Module-level so tests can read it; not env-tunable per
+# spec §9.3 (no env var allocated to item F).
+_OVERRUN_STREAK_THRESHOLD = 3
+# 10% slack — spec §5.2 ("token_budget * 1.1"). Strict-greater-than so
+# exactly 1.1× does not count as overrun.
+_OVERRUN_FACTOR = 1.1
+
 
 class BudgetTracker:
     """Per-session consecutive-overrun streak detector.
 
-    Implemented in Task 6; stub instantiates so imports succeed.
+    Holds two dicts keyed on ``session_id``:
+
+    * ``_streak`` — current consecutive-overrun count. Resets to 0 when
+      a turn comes in under the threshold.
+    * ``_warned`` — set of session_ids that have already emitted the
+      WARNING. Once warned, suppresses further warnings for that
+      session for the rest of the process lifetime; spec §5.2 wants
+      "once per (session_id, role) per run".
+
+    Instances are typically held by ``Agent``: one tracker per agent
+    role keeps assistant (4000-budget) and butler (800-budget) state
+    isolated, even when both serve the same channel concurrently.
     """
 
     def __init__(self) -> None:
-        raise NotImplementedError("implemented in Task 6")
+        self._streak: dict[str, int] = {}
+        self._warned: set[str] = set()
 
     def record(self, session_id: str, used_tokens: int, budget: int) -> None:
-        raise NotImplementedError("implemented in Task 6")
+        # Defensive: misconfigured agent with no/negative budget would
+        # otherwise trip every turn forever.
+        if budget <= 0:
+            return
+
+        threshold = budget * _OVERRUN_FACTOR
+        if used_tokens > threshold:
+            new_streak = self._streak.get(session_id, 0) + 1
+            self._streak[session_id] = new_streak
+            if (
+                new_streak >= _OVERRUN_STREAK_THRESHOLD
+                and session_id not in self._warned
+            ):
+                self._warned.add(session_id)
+                logger.warning(
+                    "Memory digest over budget for session %s: "
+                    "used=%d budget=%d (>1.1x for %d turns). "
+                    "Investigate the memory backend.",
+                    session_id,
+                    used_tokens,
+                    budget,
+                    new_streak,
+                )
+        else:
+            self._streak[session_id] = 0
 
 
 # ---------------------------------------------------------------------------
