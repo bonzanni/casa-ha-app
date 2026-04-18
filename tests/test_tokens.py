@@ -97,3 +97,96 @@ class TestExtractUsage:
         out = extract_usage(FakeResult())
         assert out["input_tokens"] == 42
         assert out["output_tokens"] == 0
+
+
+# ---------------------------------------------------------------------------
+# BudgetTracker
+# ---------------------------------------------------------------------------
+
+
+class TestBudgetTracker:
+    """Spec §5.2: warn once per (session_id, role) when used > budget * 1.1
+    for three turns in a row. Within-budget turns reset the streak."""
+
+    def _records_for(self, caplog, session_id):
+        return [r for r in caplog.records if session_id in r.getMessage()]
+
+    def test_under_budget_never_warns(self, caplog):
+        caplog.set_level(logging.WARNING, logger="tokens")
+        t = BudgetTracker()
+        for _ in range(10):
+            t.record("sess-A", used_tokens=100, budget=4000)
+        assert self._records_for(caplog, "sess-A") == []
+
+    def test_one_overrun_does_not_warn(self, caplog):
+        caplog.set_level(logging.WARNING, logger="tokens")
+        t = BudgetTracker()
+        # 4500 > 4000 * 1.1 = 4400 → counts as overrun, but only once.
+        t.record("sess-A", used_tokens=4500, budget=4000)
+        assert self._records_for(caplog, "sess-A") == []
+
+    def test_two_consecutive_overruns_do_not_warn(self, caplog):
+        caplog.set_level(logging.WARNING, logger="tokens")
+        t = BudgetTracker()
+        t.record("sess-A", used_tokens=4500, budget=4000)
+        t.record("sess-A", used_tokens=4500, budget=4000)
+        assert self._records_for(caplog, "sess-A") == []
+
+    def test_three_consecutive_overruns_warn_once(self, caplog):
+        caplog.set_level(logging.WARNING, logger="tokens")
+        t = BudgetTracker()
+        for _ in range(3):
+            t.record("sess-A", used_tokens=4500, budget=4000)
+        rows = self._records_for(caplog, "sess-A")
+        assert len(rows) == 1
+        msg = rows[0].getMessage()
+        assert "4500" in msg
+        assert "4000" in msg
+
+    def test_warning_suppressed_for_subsequent_overruns_same_session(
+        self, caplog,
+    ):
+        caplog.set_level(logging.WARNING, logger="tokens")
+        t = BudgetTracker()
+        for _ in range(10):
+            t.record("sess-A", used_tokens=5000, budget=4000)
+        rows = self._records_for(caplog, "sess-A")
+        assert len(rows) == 1, [r.getMessage() for r in rows]
+
+    def test_under_budget_resets_streak(self, caplog):
+        caplog.set_level(logging.WARNING, logger="tokens")
+        t = BudgetTracker()
+        # Two overruns → under budget → two more overruns; streak never
+        # reaches 3 → no warning.
+        t.record("sess-A", used_tokens=4500, budget=4000)
+        t.record("sess-A", used_tokens=4500, budget=4000)
+        t.record("sess-A", used_tokens=100, budget=4000)
+        t.record("sess-A", used_tokens=4500, budget=4000)
+        t.record("sess-A", used_tokens=4500, budget=4000)
+        assert self._records_for(caplog, "sess-A") == []
+
+    def test_threshold_is_strict_greater_than_one_point_one_x(self, caplog):
+        caplog.set_level(logging.WARNING, logger="tokens")
+        t = BudgetTracker()
+        # Exactly 1.1× must NOT count as overrun (spec wording: 'exceeds').
+        for _ in range(3):
+            t.record("sess-A", used_tokens=4400, budget=4000)
+        assert self._records_for(caplog, "sess-A") == []
+
+    def test_separate_sessions_track_independently(self, caplog):
+        caplog.set_level(logging.WARNING, logger="tokens")
+        t = BudgetTracker()
+        for _ in range(3):
+            t.record("sess-A", used_tokens=5000, budget=4000)
+            t.record("sess-B", used_tokens=5000, budget=4000)
+        assert len(self._records_for(caplog, "sess-A")) == 1
+        assert len(self._records_for(caplog, "sess-B")) == 1
+
+    def test_zero_or_negative_budget_never_warns(self, caplog):
+        # Defensive: a misconfigured agent (memory.token_budget=0) would
+        # otherwise trip the warning on every turn forever.
+        caplog.set_level(logging.WARNING, logger="tokens")
+        t = BudgetTracker()
+        for _ in range(10):
+            t.record("sess-A", used_tokens=100, budget=0)
+        assert self._records_for(caplog, "sess-A") == []
