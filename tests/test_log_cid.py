@@ -146,13 +146,18 @@ class TestInstallLogging:
         ]
 
     def _cleanup_casa(self) -> None:
-        """Strip both Casa-owned handlers and filters from the root logger
-        so one test cannot contaminate the next (e.g. double-attached
-        CidFilter hiding an install_logging idempotency bug)."""
+        """Restore the process-global logging state so one test cannot
+        contaminate the next: drop Casa-owned handlers, restore the
+        original LogRecord factory if install_logging wrapped it, and
+        (belt-and-braces) strip any Casa-owned root filters left by
+        earlier plan iterations."""
         root = logging.getLogger()
         for h in list(root.handlers):
             if getattr(h, "_casa_owned", False):
                 root.removeHandler(h)
+        factory = logging.getLogRecordFactory()
+        if getattr(factory, "_casa_owned", False):
+            logging.setLogRecordFactory(factory._wrapped)
         for f in list(root.filters):
             if getattr(f, "_casa_owned", False):
                 root.removeFilter(f)
@@ -218,7 +223,7 @@ class TestInstallLogging:
         install_logging(stream=buf)
         try:
             logging.getLogger("unit").info(
-                "token: sk-abcdefghijklmnopqrstuvwxyz1234567890",
+                "Raw sk-abcdefghijklmnopqrstuvwxyz1234567890",
             )
         finally:
             self._cleanup_casa()
