@@ -1,15 +1,24 @@
 # ha-prod-console project config for casa-ha-app.
-# Schema: C:/Users/nicol/Projects/ha-prod-console/docs/project-config.md
+# Schema reference: ~/Projects/ha-prod-console/docs/project-config.md
+# Template:         ~/Projects/ha-prod-console/example-ha-prod-console.yml
+
+# ════════════════════════════════════════════════════════════════════
+#  Group A — HA addon lifecycle (required)
+# ════════════════════════════════════════════════════════════════════
 
 host: n150-ha
-base_url: https://agent.oudekamp.bonzanni.casa
 addon_slug: c071ea9c_casa-agent
 container: addon_c071ea9c_casa-agent
 
 # The HA "SSH & Web Terminal" addon runs as unprivileged hassio (uid 1000).
-# Docker socket ops require passwordless sudo; every remote command is
-# prefixed accordingly.
+# Docker-socket ops need passwordless sudo; prefix every remote command.
 ssh_prefix: "sudo -n "
+
+# ════════════════════════════════════════════════════════════════════
+#  Group B — HMAC-signed app probes (webhook smoke/regression)
+# ════════════════════════════════════════════════════════════════════
+
+base_url: https://agent.oudekamp.bonzanni.casa
 
 # Casa uses X-Webhook-Signature with a bare hex digest (no `sha256=` prefix),
 # per casa_core.py _verify_webhook. Default is GitHub-style X-Hub-Signature-256.
