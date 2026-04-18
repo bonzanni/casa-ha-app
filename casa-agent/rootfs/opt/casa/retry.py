@@ -14,7 +14,7 @@ import random
 import re
 from typing import Awaitable, Callable, TypeVar
 
-from agent import ErrorKind, _classify_error
+from error_kinds import ErrorKind, _classify_error
 
 T = TypeVar("T")
 

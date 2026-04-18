@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from enum import Enum
 from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import (
@@ -25,55 +24,13 @@ from mcp_registry import McpServerRegistry
 from channel_trust import channel_trust, user_peer_for_channel
 from memory import MemoryProvider
 from session_registry import SessionRegistry, build_session_key
+from retry import retry_sdk_call
+from error_kinds import ErrorKind, _classify_error, _USER_MESSAGES  # noqa: F401 — re-exported
 
 logger = logging.getLogger(__name__)
 
 # Type alias for the streaming callback
 OnTokenCallback = Callable[[str], Awaitable[None]]
-
-
-# ---------------------------------------------------------------------------
-# Error classification
-# ---------------------------------------------------------------------------
-
-
-class ErrorKind(Enum):
-    TIMEOUT = "timeout"
-    RATE_LIMIT = "rate_limit"
-    SDK_ERROR = "sdk_error"
-    MEMORY_ERROR = "memory_error"
-    CHANNEL_ERROR = "channel_error"
-    UNKNOWN = "unknown"
-
-
-_USER_MESSAGES: dict[ErrorKind, str] = {
-    ErrorKind.TIMEOUT: "The request timed out. Try again in a moment.",
-    ErrorKind.RATE_LIMIT: "Rate limited by the API. Please wait a minute and try again.",
-    ErrorKind.SDK_ERROR: "There was an issue communicating with Claude. Please try again.",
-    ErrorKind.MEMORY_ERROR: "Memory service is unavailable, but I can still respond without context.",
-    ErrorKind.CHANNEL_ERROR: "There was an issue sending the response.",
-    ErrorKind.UNKNOWN: "Sorry, something went wrong while processing your request.",
-}
-
-
-def _classify_error(exc: Exception) -> ErrorKind:
-    """Classify an exception into an ErrorKind for routing recovery."""
-    if isinstance(exc, asyncio.TimeoutError):
-        return ErrorKind.TIMEOUT
-
-    msg = str(exc).lower()
-    if "rate" in msg and "limit" in msg:
-        return ErrorKind.RATE_LIMIT
-    if "429" in msg:
-        return ErrorKind.RATE_LIMIT
-    if "timeout" in msg or "timed out" in msg:
-        return ErrorKind.TIMEOUT
-
-    exc_type = type(exc).__name__
-    if "CLI" in exc_type or "SDK" in exc_type or "Connection" in exc_type:
-        return ErrorKind.SDK_ERROR
-
-    return ErrorKind.UNKNOWN
 
 
 class Agent:
@@ -254,28 +211,36 @@ class Agent:
             setting_sources=["project"],
         )
 
-        # 7. Query the SDK. ------------------------------------------------
-        response_text = ""
-        sdk_session_id: str | None = resume_session_id
+        # 7. Query the SDK — retry transient faults (spec 5.2 §3). --------
+        async def _attempt_sdk_turn() -> tuple[str, str | None]:
+            """Run one end-to-end SDK turn. Each attempt resets the
+            streaming accumulator so ``on_token`` delivers cumulative
+            text from scratch if an earlier attempt failed mid-turn."""
+            attempt_text = ""
+            attempt_sid: str | None = resume_session_id
+            async with ClaudeSDKClient(options) as client:
+                await client.query(user_text)
+                async for sdk_msg in client.receive_response():
+                    if isinstance(sdk_msg, SystemMessage):
+                        if getattr(sdk_msg, "subtype", None) == "init":
+                            data = getattr(sdk_msg, "data", {}) or {}
+                            if "session_id" in data:
+                                attempt_sid = data["session_id"]
+                    elif isinstance(sdk_msg, ResultMessage):
+                        sid = getattr(sdk_msg, "session_id", None)
+                        if sid:
+                            attempt_sid = sid
+                    elif isinstance(sdk_msg, AssistantMessage):
+                        for block in getattr(sdk_msg, "content", []):
+                            if isinstance(block, TextBlock):
+                                attempt_text += block.text
+                                if on_token is not None:
+                                    await on_token(attempt_text)
+            return attempt_text, attempt_sid
 
-        async with ClaudeSDKClient(options) as client:
-            await client.query(user_text)
-            async for sdk_msg in client.receive_response():
-                if isinstance(sdk_msg, SystemMessage):
-                    if getattr(sdk_msg, "subtype", None) == "init":
-                        data = getattr(sdk_msg, "data", {}) or {}
-                        if "session_id" in data:
-                            sdk_session_id = data["session_id"]
-                elif isinstance(sdk_msg, ResultMessage):
-                    sid = getattr(sdk_msg, "session_id", None)
-                    if sid:
-                        sdk_session_id = sid
-                elif isinstance(sdk_msg, AssistantMessage):
-                    for block in getattr(sdk_msg, "content", []):
-                        if isinstance(block, TextBlock):
-                            response_text += block.text
-                            if on_token is not None:
-                                await on_token(response_text)
+        response_text, sdk_session_id = await retry_sdk_call(
+            _attempt_sdk_turn, on_retry=self._log_retry,
+        )
 
         if sdk_session_id and sdk_session_id != resume_session_id:
             logger.info(
@@ -326,3 +291,11 @@ class Agent:
             logger.warning(
                 "Memory add_turn failed in background: %s", exc,
             )
+
+    def _log_retry(self, attempt: int, exc: Exception, delay_ms: int) -> None:
+        """Emit a single WARNING per retry event (spec 5.2 §3.2)."""
+        kind = _classify_error(exc)
+        logger.warning(
+            "SDK retry: role=%s attempt=%d kind=%s delay_ms=%d exc=%r",
+            self.config.role, attempt + 1, kind.value, delay_ms, exc,
+        )
