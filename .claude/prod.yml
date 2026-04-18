@@ -1,0 +1,42 @@
+# ha-prod-console project config for casa-ha-app.
+# Schema: C:/Users/nicol/Projects/ha-prod-console/docs/project-config.md
+
+host: n150-ha
+base_url: https://agent.oudekamp.bonzanni.casa
+addon_slug: local_casa-agent              # CONFIRM exact slug once SSH is up
+container: addon_local_casa-agent         # CONFIRM exact name once SSH is up
+
+secret_source:
+  type: ssh-docker-exec
+  container: addon_local_casa-agent
+  command: cat /data/webhook_secret
+  cache_ttl_minutes: 60
+
+probes:
+  healthz:
+    method: GET
+    path: /healthz
+    expect_status: 200
+
+  turn-assistant:
+    method: POST
+    path: /invoke/assistant
+    sign: hmac
+    body_json: { prompt: "say 'probe ok'" }
+    expect_status: 200
+    expect_body_contains: probe ok
+
+  voice-sse:
+    method: POST
+    path: /api/converse
+    sign: hmac
+    sse: true
+    body_json: { text: "probe", scope_id: "probe-scope" }
+    expect_events: [token, done]
+
+smoke: [healthz, turn-assistant, voice-sse]
+
+regression:
+  - healthz
+  - turn-assistant
+  - voice-sse
