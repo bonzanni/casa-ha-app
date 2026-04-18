@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable
 
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.error import TelegramError
+from telegram.error import NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ContextTypes,
@@ -31,6 +31,7 @@ from telegram.ext import (
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import Channel
+from channels.telegram_supervisor import ReconnectSupervisor
 from log_cid import new_cid
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,8 @@ logger = logging.getLogger(__name__)
 _TYPING_INTERVAL = 4.0
 
 # Typing 401 backoff: initial delay, multiplier, max delay, max consecutive
-# failures before circuit-breaking all typing.
+# failures before circuit-breaking all typing. (Orthogonal to reconnect —
+# spec 5.2 §4.3. Do not fold into the supervisor.)
 _TYPING_BACKOFF_INIT = 1.0
 _TYPING_BACKOFF_FACTOR = 2.0
 _TYPING_BACKOFF_MAX = 60.0
@@ -48,9 +50,18 @@ _TYPING_CIRCUIT_BREAK = 10
 # Stream edit throttle (seconds between editMessageText calls).
 _STREAM_THROTTLE = 1.0
 
-# Polling stall detection: if no getUpdates response in this many seconds,
-# restart the polling cycle.
-_POLL_STALL_THRESHOLD = 90.0
+# Reconnect supervisor backoff schedule (spec 5.2 §4.2): 1s, 2s, 4s, 8s,
+# 16s, cap 60s, unbounded. Reuses retry.compute_backoff_ms via
+# ReconnectSupervisor. Module-level so tests can monkey-patch short
+# values; do not expose as env vars (spec §9.3).
+_RECONNECT_INITIAL_MS = 1000
+_RECONNECT_CAP_MS = 60_000
+
+# Health probe: every _PROBE_INTERVAL seconds, call bot.get_me() with
+# _PROBE_TIMEOUT. Replaces the v0.5.x _POLL_STALL_THRESHOLD placeholder
+# (which only refreshed its own timestamp — no real detection).
+_PROBE_INTERVAL = 45.0
+_PROBE_TIMEOUT = 10.0
 
 # Callback type for on_token streaming
 OnTokenCallback = Callable[[str], Awaitable[None]]
@@ -82,64 +93,38 @@ class TelegramChannel(Channel):
         self._webhook_secret = webhook_secret
         self._app: Application | None = None
         self._typing_tasks: dict[str, asyncio.Task] = {}
-        # Typing backoff state (shared across all chats)
+        # Typing backoff state (shared across all chats) — item-E-orthogonal.
         self._typing_consecutive_failures: int = 0
         self._typing_suspended: bool = False
-        # Polling stall watchdog
-        self._stall_task: asyncio.Task | None = None
-        self._last_poll_ts: float = 0.0
+        # Reconnect supervisor + health probe task.
+        self._supervisor: ReconnectSupervisor | None = None
+        self._probe_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Build the application, register handlers, and start."""
-        self._app = (
-            Application.builder()
-            .token(self.bot_token)
-            .build()
+        """Initial bring-up. Starts the supervisor, runs one rebuild,
+        then launches the health probe loop.
+        """
+        self._supervisor = ReconnectSupervisor(
+            rebuild_fn=self._rebuild,
+            logger=logger,
+            initial_ms=_RECONNECT_INITIAL_MS,
+            cap_ms=_RECONNECT_CAP_MS,
         )
-        self._app.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle)
-        )
-        await self._app.initialize()
-        await self._app.start()
-
-        if self._webhook_url:
-            full_url = self._webhook_url.rstrip("/") + self._webhook_path
-            kwargs: dict[str, Any] = {"url": full_url}
-            if self._webhook_secret:
-                kwargs["secret_token"] = self._webhook_secret
-            try:
-                await self._app.bot.set_webhook(**kwargs)
-                logger.info(
-                    "Telegram started (webhook, delivery=%s, url=%s, secret=%s)",
-                    self._delivery_mode,
-                    full_url,
-                    "yes" if self._webhook_secret else "no",
-                )
-            except TelegramError as exc:
-                logger.error(
-                    "Failed to set Telegram webhook (%s); falling back to polling",
-                    exc,
-                )
-                await self._app.updater.start_polling()  # type: ignore[union-attr]
-                self._webhook_url = ""  # mark as polling for status display
-                logger.info(
-                    "Telegram started (polling fallback, delivery=%s, chat_id=%s)",
-                    self._delivery_mode,
-                    self.chat_id,
-                )
-        else:
-            await self._app.updater.start_polling()  # type: ignore[union-attr]
-            self._last_poll_ts = time.monotonic()
-            self._stall_task = asyncio.create_task(self._poll_stall_watchdog())
-            logger.info(
-                "Telegram started (polling, delivery=%s, chat_id=%s)",
-                self._delivery_mode,
-                self.chat_id,
+        self._supervisor.start()
+        try:
+            await self._rebuild()
+        except (NetworkError, TimedOut) as exc:
+            # Transient failure on first bring-up — hand off to supervisor.
+            logger.error(
+                "Telegram initial bring-up failed (%s); handing off to supervisor",
+                exc,
             )
+            self._supervisor.trigger(f"initial_bringup: {exc!r}")
+        self._probe_task = asyncio.create_task(self._health_probe_loop())
 
     async def stop(self) -> None:
         """Stop the channel and clean up resources."""
@@ -147,17 +132,140 @@ class TelegramChannel(Channel):
             task.cancel()
         self._typing_tasks.clear()
 
-        if self._stall_task and not self._stall_task.done():
-            self._stall_task.cancel()
+        if self._probe_task and not self._probe_task.done():
+            self._probe_task.cancel()
+            try:
+                await self._probe_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
-        if self._app is not None:
+        if self._supervisor is not None:
+            await self._supervisor.stop()
+            self._supervisor = None
+
+        await self._teardown_app()
+        logger.info("Telegram channel stopped")
+
+    async def _teardown_app(self) -> None:
+        """Best-effort teardown of the current Application.
+
+        Called both on `stop()` and as the first step of `_rebuild()`.
+        Swallows exceptions — a failing teardown must not block the
+        rebuild that follows.
+        """
+        app = self._app
+        if app is None:
+            return
+        try:
             if self._webhook_url:
-                await self._app.bot.delete_webhook()
-            elif self._app.updater is not None:
-                await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
-            logger.info("Telegram channel stopped")
+                await app.bot.delete_webhook()
+            elif app.updater is not None:
+                await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.debug("Telegram teardown swallowed exception: %s", exc)
+        finally:
+            self._app = None
+
+    async def _rebuild(self) -> None:
+        """Build (or rebuild) the Application, register handlers, start it.
+
+        Idempotent — if called while an Application exists, it is torn
+        down first. Raises on bring-up failure so the supervisor can
+        catch and schedule a retry; callers on the happy path do not
+        expect this to raise.
+        """
+        await self._teardown_app()
+
+        app = (
+            Application.builder()
+            .token(self.bot_token)
+            .build()
+        )
+        app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle)
+        )
+        app.add_error_handler(self._on_ptb_error)
+        await app.initialize()
+        await app.start()
+
+        if self._webhook_url:
+            full_url = self._webhook_url.rstrip("/") + self._webhook_path
+            kwargs: dict[str, Any] = {"url": full_url}
+            if self._webhook_secret:
+                kwargs["secret_token"] = self._webhook_secret
+            await app.bot.set_webhook(**kwargs)
+            logger.info(
+                "Telegram started (webhook, delivery=%s, url=%s, secret=%s)",
+                self._delivery_mode, full_url,
+                "yes" if self._webhook_secret else "no",
+            )
+        else:
+            await app.updater.start_polling()  # type: ignore[union-attr]
+            logger.info(
+                "Telegram started (polling, delivery=%s, chat_id=%s)",
+                self._delivery_mode, self.chat_id,
+            )
+
+        # Publish the rebuilt app atomically.
+        self._app = app
+
+    # ------------------------------------------------------------------
+    # Health probe + PTB error handler (spec 5.2 §4.2)
+    # ------------------------------------------------------------------
+
+    async def _health_probe_loop(self) -> None:
+        """Periodic liveness probe against the Bot API.
+
+        Every `_PROBE_INTERVAL` seconds, call `bot.get_me()` with a
+        `_PROBE_TIMEOUT` ceiling. On success: quiet. On timeout or
+        transport exception: trigger the supervisor. Replaces the
+        v0.5.x `_poll_stall_watchdog` placeholder.
+        """
+        try:
+            while True:
+                await asyncio.sleep(_PROBE_INTERVAL)
+                app = self._app
+                supervisor = self._supervisor
+                if app is None or supervisor is None:
+                    continue  # reconnect in progress — supervisor owns it
+                try:
+                    await asyncio.wait_for(
+                        app.bot.get_me(), timeout=_PROBE_TIMEOUT,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except (NetworkError, TimedOut, asyncio.TimeoutError) as exc:
+                    supervisor.trigger(f"probe_failed: {exc!r}")
+                except Exception as exc:  # noqa: BLE001 — diagnostic only
+                    # Non-transport exceptions: log and keep probing.
+                    # Supervisor rebuild would not help.
+                    logger.debug(
+                        "Telegram health probe non-transport error: %s", exc,
+                    )
+        except asyncio.CancelledError:
+            return
+
+    async def _on_ptb_error(
+        self,
+        update: object,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """PTB error handler. Routes transport errors to the supervisor.
+
+        Registered via `Application.add_error_handler`. Non-transport
+        errors (handler bugs, ValueError, etc.) are logged but do NOT
+        trigger a reconnect — rebuilding the Application would not fix
+        them.
+        """
+        exc = getattr(context, "error", None)
+        if isinstance(exc, (NetworkError, TimedOut)):
+            if self._supervisor is not None:
+                self._supervisor.trigger(f"ptb_error: {type(exc).__name__}: {exc}")
+            return
+        if exc is not None:
+            logger.warning("Telegram handler error (not retryable): %s", exc)
 
     async def process_webhook_update(self, payload: dict) -> None:
         """Process a webhook update payload from aiohttp."""
@@ -166,25 +274,6 @@ class TelegramChannel(Channel):
         update = Update.de_json(payload, self._app.bot)
         if update:
             await self._app.process_update(update)
-
-    # ------------------------------------------------------------------
-    # Polling stall watchdog
-    # ------------------------------------------------------------------
-
-    async def _poll_stall_watchdog(self) -> None:
-        """Restart polling if getUpdates is stuck for too long."""
-        try:
-            while True:
-                await asyncio.sleep(_POLL_STALL_THRESHOLD / 2)
-                self._last_poll_ts = time.monotonic()  # reset on each check
-                # The updater's internal loop updates on each getUpdates
-                # response. We track it via _last_poll_ts being refreshed.
-                # If the updater is stuck, the timestamp won't advance.
-                # For now, just keep the task alive. python-telegram-bot
-                # already handles reconnection internally. This task
-                # serves as the hook point if we need manual restarts.
-        except asyncio.CancelledError:
-            pass
 
     # ------------------------------------------------------------------
     # Typing indicator (with 401 backoff)
