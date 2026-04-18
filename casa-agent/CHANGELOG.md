@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.5.5 — 2026-04-18 — Phase 5.2 item G: session rotation + cleanup
+
+### Added
+- `session_sweeper.py` — `SessionSweeper`: pure async policy module
+  that runs a periodic TTL sweep over `SessionRegistry`. Every 6 h
+  (hard-coded per spec R5) it iterates `_data` under the 5.1 lock,
+  drops entries whose `last_active` is older than
+  `SESSION_TTL_DAYS` (default 30), and — for `webhook:*` entries
+  whose scope_id parses as a UUID (the one-shot pattern fabricated
+  by `build_invoke_message`) — applies the shorter
+  `WEBHOOK_SESSION_TTL_DAYS` (default 1). Non-UUID webhook scopes
+  (e.g. deliberately-pinned `webhook:ha-automation-daily`) keep the
+  standard TTL. Unparseable / missing `last_active` is treated as
+  garbage and evicted.
+- `_prune_sdk_session()` helper — forward-compat seam: `getattr`
+  lookup of `claude_agent_sdk.delete_session`; no-op when absent
+  (today), one-line flip when Anthropic's SDK grows it. Exceptions
+  swallowed at DEBUG — the local eviction is source of truth.
+- `casa_core._env_int_or` — clamping int-from-env helper matching
+  `retry._env_int`'s shape; kept local until a second caller
+  appears (item I will reuse it — §9.3), then promote to `env.py`.
+
+### Changed
+- `casa_core.main()` constructs a `SessionSweeper` immediately after
+  the `SessionRegistry`, using env vars `SESSION_TTL_DAYS` and
+  `WEBHOOK_SESSION_TTL_DAYS`. Sweeper starts alongside the
+  APScheduler and stops during the shutdown sequence — before
+  `channel_manager.stop_all()` — so any in-flight sweep completes
+  before the registry quiesces.
+
+### Tests
+- `tests/test_session_sweeper.py` — 18 async tests across four
+  classes. `TestEvictionPolicy` (9): active survive, expired
+  evicted, inclusive-keep boundary, webhook UUID → short TTL,
+  webhook non-UUID → standard TTL, non-webhook ignores webhook TTL,
+  unparseable `last_active` evicted, no-evictions = no-save,
+  one-info-log-per-pass-with-count. `TestConcurrency` (2):
+  sweep + concurrent register preserves both; lock is genuinely
+  held during the eviction critical section. `TestSdkSessionPrune`
+  (3): forward-compat seam called when method present, no-op when
+  absent, resilient to SDK exceptions. `TestLifecycle` (4): start
+  schedules recurring sweeps, stop-before-start is safe, double
+  start is idempotent, stop cleanly cancels the task.
+
+### Not changed
+- `SessionRegistry` public API is untouched. The sweeper uses
+  underscore-prefixed attributes (`_lock`, `_data`, `_save_locked`)
+  by design — the 5.1 internal-consumer seams.
+- Sweep cadence is not on the env-var surface. Spec §9.3 lists
+  only the two TTL knobs; the 6-h interval is hard-coded (R5: one
+  pass over < 100 entries is cheap; adding a knob expands the
+  support matrix for no operator benefit).
+- No E2E shell scenario — a real TTL pass is days-scale; faking
+  wall-clock from the harness is out of proportion. Matches item
+  E / item H precedent.
+
 ## 0.5.4 — 2026-04-18 — Phase 5.2 item E: Telegram reconnect with backoff
 
 ### Added
