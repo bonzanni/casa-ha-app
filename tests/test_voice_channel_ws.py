@@ -131,3 +131,110 @@ class TestWSTurn:
             await asyncio.wait_for(started.wait(), timeout=2.0)
             await ws.send_json({"type": "cancel", "utterance_id": "u1"})
             await asyncio.wait_for(cancelled.wait(), timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting — per-scope_id (spec 5.2 §8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def voice_ws_app_with_limiter(request):
+    from rate_limit import RateLimiter
+
+    capacity = getattr(request, "param", 2)
+
+    bus = MessageBus()
+    agent = _StreamingAgent(bus, "butler")
+    bus.register("butler", agent.handle_message)
+    loop_task = asyncio.create_task(bus.run_agent_loop("butler"))
+
+    memory = AsyncMock()
+    memory.ensure_session = AsyncMock(return_value=None)
+    memory.get_context = AsyncMock(return_value="")
+    memory.add_turn = AsyncMock(return_value=None)
+
+    limiter = RateLimiter(capacity=capacity, window_s=60.0)
+
+    channel = VoiceChannel(
+        bus=bus, default_agent="butler", webhook_secret="",
+        sse_path="/api/converse", ws_path="/api/converse/ws",
+        agent_configs={"butler": _FakeCfg()},
+        memory=memory, idle_timeout=300,
+        rate_limiter=limiter,
+    )
+
+    app = web.Application()
+    channel.register_routes(app)
+    async with TestClient(TestServer(app)) as client:
+        yield client
+    loop_task.cancel()
+
+
+@pytest.mark.asyncio
+class TestRateLimit:
+    @pytest.mark.parametrize("voice_ws_app_with_limiter", [1], indirect=True)
+    async def test_ws_rate_limit_emits_error_frame(
+        self, voice_ws_app_with_limiter,
+    ):
+        client = voice_ws_app_with_limiter
+        async with client.ws_connect("/api/converse/ws") as ws:
+            # First utterance admitted.
+            await ws.send_json({
+                "type": "utterance", "utterance_id": "u1",
+                "scope_id": "user-w", "agent_role": "butler",
+                "text": "hi",
+            })
+
+            got_done_u1 = False
+            got_rate_limit_u2 = False
+            sent_second = False
+
+            async for msg in ws:
+                if msg.type != WSMsgType.TEXT:
+                    continue
+                data = json.loads(msg.data)
+                if data.get("type") == "done" and data.get("utterance_id") == "u1":
+                    got_done_u1 = True
+                    # Fire the second utterance — bucket is exhausted.
+                    await ws.send_json({
+                        "type": "utterance", "utterance_id": "u2",
+                        "scope_id": "user-w", "agent_role": "butler",
+                        "text": "hello again",
+                    })
+                    sent_second = True
+                elif (
+                    data.get("type") == "error"
+                    and data.get("utterance_id") == "u2"
+                    and data.get("kind") == "rate_limit"
+                ):
+                    got_rate_limit_u2 = True
+                    break
+
+            assert got_done_u1, "first utterance must complete"
+            assert sent_second
+            assert got_rate_limit_u2, "second utterance must get kind=rate_limit"
+
+    @pytest.mark.parametrize("voice_ws_app_with_limiter", [0], indirect=True)
+    async def test_ws_capacity_zero_is_unlimited(
+        self, voice_ws_app_with_limiter,
+    ):
+        client = voice_ws_app_with_limiter
+        async with client.ws_connect("/api/converse/ws") as ws:
+            for i in range(5):
+                uid = f"u{i}"
+                await ws.send_json({
+                    "type": "utterance", "utterance_id": uid,
+                    "scope_id": "u", "agent_role": "butler",
+                    "text": f"msg-{i}",
+                })
+            done_ids: set[str] = set()
+            async for msg in ws:
+                if msg.type != WSMsgType.TEXT:
+                    continue
+                data = json.loads(msg.data)
+                if data.get("type") == "done":
+                    done_ids.add(data["utterance_id"])
+                if len(done_ids) == 5:
+                    break
+            assert done_ids == {f"u{i}" for i in range(5)}
