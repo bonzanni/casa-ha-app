@@ -190,3 +190,57 @@ class TestBudgetTracker:
         for _ in range(10):
             t.record("sess-A", used_tokens=100, budget=0)
         assert self._records_for(caplog, "sess-A") == []
+
+
+# ---------------------------------------------------------------------------
+# format_turn_summary
+# ---------------------------------------------------------------------------
+
+
+class TestFormatTurnSummary:
+    """One-line per-turn telemetry. No cost field (Max subscription —
+    USD pricing would be theatre against list rates we don't pay)."""
+
+    def test_canonical_line(self):
+        usage = {
+            "input_tokens": 1203,
+            "output_tokens": 82,
+            "cache_read_input_tokens": 8021,
+            "cache_creation_input_tokens": 0,
+        }
+        line = format_turn_summary("butler", "voice", usage)
+        assert line == (
+            "turn_done role=butler channel=voice "
+            "input=1203 output=82 cache_read=8021 cache_write=0"
+        )
+
+    def test_cache_fields_kept_separate(self):
+        usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 100,
+            "cache_creation_input_tokens": 50,
+        }
+        line = format_turn_summary("assistant", "telegram", usage)
+        # Both kinds visible — cache_write signals first-population cost
+        # for the next turn's prompt prefix.
+        assert "cache_read=100" in line
+        assert "cache_write=50" in line
+
+    def test_missing_channel_renders_dash(self):
+        # Agent._process passes ``msg.channel or "-"`` so an empty channel
+        # lands as "-", matching the cid="-" convention from log_cid.
+        usage = {
+            "input_tokens": 1, "output_tokens": 1,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+        }
+        line = format_turn_summary("assistant", "-", usage)
+        assert "channel=-" in line
+
+    def test_missing_usage_keys_render_zero(self):
+        # extract_usage always fills the four keys, but be defensive.
+        line = format_turn_summary("assistant", "telegram", {})
+        assert line == (
+            "turn_done role=assistant channel=telegram "
+            "input=0 output=0 cache_read=0 cache_write=0"
+        )
