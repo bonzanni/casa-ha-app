@@ -17,20 +17,19 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# telegram.* module stubs — must be installed before importing channels.telegram
+# telegram.* module stubs — installed by tests/conftest.py at session start
+# so all test files share the same NetworkError / TimedOut / TelegramError
+# class identities (see conftest.py docstring). We ALIAS the local
+# `_FakeNetworkError` names to whatever conftest registered in
+# sys.modules["telegram.error"], ensuring that the exceptions raised in
+# our AsyncMock side_effects are the same class objects that
+# channels.telegram's `except NetworkError:` clauses catch.
 # ---------------------------------------------------------------------------
 
 
-class _FakeNetworkError(Exception):
-    pass
-
-
-class _FakeTimedOut(Exception):
-    pass
-
-
-class _FakeTelegramError(Exception):
-    pass
+_FakeNetworkError = sys.modules["telegram.error"].NetworkError
+_FakeTimedOut = sys.modules["telegram.error"].TimedOut
+_FakeTelegramError = sys.modules["telegram.error"].TelegramError
 
 
 def _install_telegram_stubs() -> None:
