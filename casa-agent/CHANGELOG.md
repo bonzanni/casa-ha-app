@@ -1,5 +1,121 @@
 # Changelog
 
+## 0.5.6 — 2026-04-18 — Phase 5.2 item I: inbound rate limiting
+
+### Added
+- `rate_limit.py` — pure policy module. `TokenBucket`: single-key
+  refill-on-check bucket with an injectable clock; `capacity<=0`
+  short-circuits every `check()` to allowed. `RateLimiter`:
+  `dict[str, TokenBucket]` with lazy bucket creation AND a
+  disabled-state short-circuit so disabled limiters never grow the
+  per-key dict. `RateDecision` (frozen dataclass): `allowed`,
+  `should_notify` (fires on the FIRST reject after any allow — the
+  signal Telegram uses for its reply-once-per-streak semantic),
+  `retry_after_s`. `rate_limit_response(limiter, key)` — aiohttp 429
+  helper returning `None` (allowed) or a `web.Response` with
+  `Retry-After` integer-seconds header rounded up from the underlying
+  bucket's `retry_after_s`.
+- Three `RateLimiter` instances constructed in `casa_core.main()`:
+  `TELEGRAM_RATE_PER_MIN` (default 30) keyed on `chat_id`,
+  `VOICE_RATE_PER_MIN` (default 20) keyed on `scope_id`,
+  `WEBHOOK_RATE_PER_MIN` (default 60) on a single shared `"global"`
+  key across `/webhook/{name}` + `/invoke/{agent}` per spec §8.2.
+  All three env vars via the `_env_int_or` helper from item G with
+  `min_value=0`; setting the value to 0 disables the limit.
+- Startup log line `Rate limits: telegram=30/min, voice=20/min,
+  webhook=60/min` (values rendered as `off` when the channel's limit
+  is disabled).
+- Centralised `telegram.*` stub install in `tests/conftest.py` with
+  canonical `_FakeNetworkError` / `_FakeTimedOut` / `_FakeTelegramError`
+  classes. Previously `tests/test_telegram_reconnect.py` and
+  `tests/test_telegram_split.py` each installed their own stubs with
+  locally-defined exception classes — pytest's alphabetical discovery
+  could let one file's classes "win" and diverge from what production
+  code would catch. Now all Telegram-adjacent test files share the
+  same class identities regardless of load order.
+
+### Changed
+- `TelegramChannel.__init__` gains an optional
+  `rate_limiter: RateLimiter | None = None` kwarg. In `_handle`,
+  immediately after deriving `chat_id` (and before `_start_typing`),
+  the channel consults the limiter. On reject it drops the message
+  and — only on `should_notify=True` — sends one
+  `"Slow down — try again in a minute."` reply via
+  `bot.send_message` (wrapped in a try/except that logs at DEBUG and
+  does not raise). Pre-existing callers that don't pass a limiter
+  keep unlimited behaviour.
+- `VoiceChannel.__init__` gains the same `rate_limiter` kwarg. On
+  SSE the handler opens a 200 SSE stream and writes one
+  `event: error` with `kind=rate_limit` + persona line from
+  `voice_errors["rate_limit"]` (falls back to `_DEFAULT_ERROR_LINES`);
+  no `event: done` is emitted. On WS `_run_ws_utterance` sends one
+  `{type:"error", utterance_id, kind:"rate_limit", spoken:…}` and
+  returns — no `bus.request`, no stream open.
+- `casa_core.webhook_handler` and `casa_core.invoke_handler` each
+  call `rate_limit_response(webhook_rate_limiter, "global")` as the
+  FIRST step (before HMAC verification). On reject returns 429 with
+  JSON body `{"error": "rate_limited"}` + `Retry-After` integer
+  seconds. Rationale for before-HMAC: an unauthenticated flood still
+  burns zero Claude quota (the real protection) and gets throttled
+  cheaply without the HMAC hash.
+- `tests/test_telegram_reconnect.py` aliases its local
+  `_FakeNetworkError` / `_FakeTimedOut` / `_FakeTelegramError` names
+  from `sys.modules["telegram.error"]` so the exceptions it raises
+  via AsyncMock `side_effect=` match the class `channels.telegram`'s
+  `except NetworkError:` catches, regardless of whether its own stub
+  install ran first or conftest's did.
+
+### Tests
+- `tests/test_rate_limit.py` — 16 unit tests across
+  `TestTokenBucket` (8), `TestRateLimiter` (5), `TestRateLimitResponse` (3).
+- `tests/test_telegram_rate_limit.py` — 6 integration tests driving
+  `TelegramChannel._handle` against a fake Update: burst under cap
+  reaches bus; reject emits exactly ONE reply then drops silently;
+  per-`chat_id` isolation; `capacity=0` disables; pre-existing
+  no-limiter callers unaffected; rejected messages don't start the
+  typing indicator.
+- `tests/test_voice_channel_sse.py::TestRateLimit` — 3 tests
+  (exhaust+reject emits `event: error kind=rate_limit` with no
+  `event: done`; `capacity=0` is unlimited; per-`scope_id` isolation).
+- `tests/test_voice_channel_ws.py::TestRateLimit` — 2 tests
+  (exhaust+reject emits `type:error kind=rate_limit` on the socket
+  with no `type:done`; `capacity=0` is unlimited).
+- `tests/test_casa_core_helpers.py::TestWebhookRateLimit` — 4 tests
+  (burst-then-429 with integer `Retry-After`, global bucket shared
+  across `/webhook/*` and `/invoke/*`, `capacity=0` disables, 429
+  body shape).
+- 403 unit/integration tests green. E2E smoke, invoke-sessions, and
+  concurrency scenarios still green; "Rate limits: …" startup line
+  verified in a standalone container for both the default and
+  all-off paths.
+
+### Not changed
+- Bus, agent, retry, memory, session_registry, session_sweeper,
+  log_cid, log_redact, mcp_registry, config, tools, channel_trust,
+  telegram_supervisor, voice/{session,prosodic,tts_adapter} — all
+  untouched. Rate limiting is a pre-filter at each ingress; nothing
+  downstream of the bus sees the reject path.
+- No dashboard row, no `/metrics` endpoint (spec §5.3 precedent
+  carries to §8). Logs + HTTP status codes + the Telegram reply
+  text are the operator-facing surface.
+- No per-agent-role override on the webhook bucket (spec §8.2 is
+  explicit: "all names and agents share one bucket").
+- No persistence of bucket state across restarts. A restart resets
+  all three buckets to full capacity; this is intentional —
+  webhook also requires valid HMAC as primary authN; rate limit is
+  defense-in-depth against accidental self-DoS + a flooded
+  leaked-secret.
+- No eviction of idle buckets from the per-key dict. On a
+  single-user Casa the set of unique keys is bounded by real
+  Telegram chats + voice devices + 1 (global webhook). Add an
+  idle-bucket sweep only if the dict footprint becomes a concern.
+- No E2E shell scenario. The webhook 429 path is trivially
+  reproducible (`for i in $(seq 1 61); do curl -X POST …/webhook/t; done`
+  → last response is 429) but faithfully replaying per-chat_id
+  Telegram rate limits or per-scope_id voice rate limits from a
+  shell harness is out of proportion to value. Matches item D/E/G
+  precedent.
+
 ## 0.5.5 — 2026-04-18 — Phase 5.2 item G: session rotation + cleanup
 
 ### Added
