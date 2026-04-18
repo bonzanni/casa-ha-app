@@ -94,8 +94,41 @@ async def retry_sdk_call(
     *,
     on_retry: Callable[[int, Exception, int], None] | None = None,
 ) -> T:
-    """Run ``fn`` with retry + backoff on transient SDK classes.
+    """Run ``fn`` with exponential-backoff retry on transient SDK faults.
 
-    Implemented in Task 4 — this stub lets Task 2 tests compile.
+    Retries only exceptions classified as TIMEOUT, RATE_LIMIT, or
+    SDK_ERROR (via ``agent._classify_error``). Honours a
+    ``Retry-After`` hint if the exception message carries one; falls
+    back to jittered exponential backoff otherwise.
+
+    ``asyncio.CancelledError`` is re-raised immediately without
+    counting as an attempt; a retry loop must not swallow caller
+    cancellation (spec 5.2 §3.2 — voice barge-in).
     """
-    raise NotImplementedError("implemented in Task 4")
+    last_exc: BaseException | None = None
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            return await fn()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — retry classifies below
+            kind = _classify_error(exc)
+            if kind not in RETRY_KINDS:
+                raise
+            last_exc = exc
+            is_last = attempt == MAX_ATTEMPTS - 1
+            if is_last:
+                raise
+            hinted = parse_retry_after_ms(exc)
+            if hinted is not None:
+                delay_ms = hinted
+            else:
+                delay_ms = compute_backoff_ms(
+                    attempt, initial_ms=INITIAL_MS, cap_ms=CAP_MS,
+                )
+            if on_retry is not None:
+                on_retry(attempt, exc, delay_ms)
+            await asyncio.sleep(delay_ms / 1000.0)
+    # Unreachable: the loop either returns or raises.
+    assert last_exc is not None
+    raise last_exc
