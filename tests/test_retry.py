@@ -100,3 +100,145 @@ class TestRetryKinds:
 
     def test_channel_error_is_not_retryable(self):
         assert ErrorKind.CHANNEL_ERROR not in RETRY_KINDS
+
+
+# ---------------------------------------------------------------------------
+# retry_sdk_call
+# ---------------------------------------------------------------------------
+
+
+def _sdk_timeout() -> asyncio.TimeoutError:
+    return asyncio.TimeoutError()
+
+
+def _sdk_error() -> RuntimeError:
+    # Exception type name contains "CLI" → _classify_error → SDK_ERROR
+    CLIConnectionError = type("CLIConnectionError", (RuntimeError,), {})
+    return CLIConnectionError("upstream reset")
+
+
+def _rate_limit(retry_after: str | None = None) -> RuntimeError:
+    if retry_after is None:
+        return RuntimeError("429 rate limit exceeded")
+    return RuntimeError(f"429 rate limit. Retry-After: {retry_after}")
+
+
+def _unknown() -> ValueError:
+    return ValueError("bad input — not retryable")
+
+
+class TestRetrySdkCall:
+    async def test_success_on_first_attempt_returns_value(self):
+        async def fn():
+            return "ok"
+
+        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+            result = await retry_sdk_call(fn)
+
+        assert result == "ok"
+        sleep.assert_not_awaited()
+
+    async def test_transient_sdk_error_retries_until_success(self):
+        calls = iter([_sdk_error(), _sdk_error(), "ok"])
+
+        async def fn():
+            nxt = next(calls)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+
+        with patch("retry.asyncio.sleep", new=AsyncMock()):
+            result = await retry_sdk_call(fn)
+        assert result == "ok"
+
+    async def test_exhausts_max_attempts_then_raises(self):
+        # Three attempts total, all failing → the last exception surfaces.
+        async def fn():
+            raise _sdk_error()
+
+        with patch("retry.asyncio.sleep", new=AsyncMock()), \
+             patch("retry.MAX_ATTEMPTS", 3):
+            with pytest.raises(Exception) as excinfo:
+                await retry_sdk_call(fn)
+        assert "CLIConnectionError" in type(excinfo.value).__name__
+
+    async def test_unknown_exception_does_not_retry(self):
+        async def fn():
+            raise _unknown()
+
+        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+            with pytest.raises(ValueError):
+                await retry_sdk_call(fn)
+        sleep.assert_not_awaited()
+
+    async def test_rate_limit_with_retry_after_uses_parsed_delay(self):
+        attempts = {"n": 0}
+
+        async def fn():
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise _rate_limit("7")
+            return "ok"
+
+        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+            result = await retry_sdk_call(fn)
+
+        assert result == "ok"
+        # One retry fired; sleep was awaited once with the parsed delay
+        # (7s = 7.0 as seconds argument), not the jittered backoff.
+        sleep.assert_awaited_once_with(7.0)
+
+    async def test_rate_limit_without_retry_after_uses_backoff(self):
+        attempts = {"n": 0}
+
+        async def fn():
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise _rate_limit(None)
+            return "ok"
+
+        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+            result = await retry_sdk_call(fn)
+        assert result == "ok"
+        # Delay is a jittered backoff (0.25–0.5s for attempt 0 with
+        # defaults), not a specific retry-after.
+        assert sleep.await_count == 1
+        delay = sleep.await_args.args[0]
+        assert 0.25 <= delay <= 0.5
+
+    async def test_on_retry_callback_is_invoked(self):
+        attempts = {"n": 0}
+
+        async def fn():
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise _sdk_error()
+            return "ok"
+
+        seen: list[tuple[int, str, int]] = []
+
+        def on_retry(attempt: int, exc: Exception, delay_ms: int) -> None:
+            seen.append((attempt, type(exc).__name__, delay_ms))
+
+        with patch("retry.asyncio.sleep", new=AsyncMock()):
+            await retry_sdk_call(fn, on_retry=on_retry)
+
+        assert len(seen) == 1
+        attempt, name, delay_ms = seen[0]
+        assert attempt == 0
+        assert "CLIConnectionError" in name
+        assert 250 <= delay_ms <= 500
+
+    async def test_cancelled_error_propagates_immediately(self):
+        attempts = {"n": 0}
+
+        async def fn():
+            attempts["n"] += 1
+            raise asyncio.CancelledError()
+
+        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+            with pytest.raises(asyncio.CancelledError):
+                await retry_sdk_call(fn)
+        # CancelledError is not retryable; no sleep should have run.
+        sleep.assert_not_awaited()
+        assert attempts["n"] == 1
