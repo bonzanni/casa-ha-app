@@ -1,0 +1,399 @@
+"""Integration tests for Telegram reconnect wiring (spec 5.2 §4).
+
+We stub the telegram package so channels.telegram imports cleanly
+without python-telegram-bot installed. Mirrors the pattern used by
+test_telegram_split.py.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+import types
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# telegram.* module stubs — must be installed before importing channels.telegram
+# ---------------------------------------------------------------------------
+
+
+class _FakeNetworkError(Exception):
+    pass
+
+
+class _FakeTimedOut(Exception):
+    pass
+
+
+class _FakeTelegramError(Exception):
+    pass
+
+
+def _install_telegram_stubs() -> None:
+    """Idempotently install fake telegram.* modules."""
+    if "telegram" in sys.modules and getattr(
+        sys.modules["telegram"], "_casa_stub", False,
+    ):
+        return
+
+    tg = types.ModuleType("telegram")
+    tg._casa_stub = True  # type: ignore[attr-defined]
+    tg.Update = MagicMock()
+
+    tg_const = types.ModuleType("telegram.constants")
+    tg_const.ChatAction = MagicMock()
+    tg.constants = tg_const
+
+    tg_err = types.ModuleType("telegram.error")
+    tg_err.TelegramError = _FakeTelegramError
+    tg_err.NetworkError = _FakeNetworkError
+    tg_err.TimedOut = _FakeTimedOut
+    tg.error = tg_err
+
+    tg_ext = types.ModuleType("telegram.ext")
+    tg_ext.Application = MagicMock()
+    tg_ext.ContextTypes = MagicMock()
+    tg_ext.MessageHandler = MagicMock()
+    tg_ext.filters = MagicMock()
+    tg.ext = tg_ext
+
+    sys.modules["telegram"] = tg
+    sys.modules["telegram.constants"] = tg_const
+    sys.modules["telegram.error"] = tg_err
+    sys.modules["telegram.ext"] = tg_ext
+
+
+_install_telegram_stubs()
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_application() -> MagicMock:
+    """Return a MagicMock that shape-matches telegram.ext.Application."""
+    app = MagicMock()
+    app.initialize = AsyncMock()
+    app.start = AsyncMock()
+    app.stop = AsyncMock()
+    app.shutdown = AsyncMock()
+    app.add_handler = MagicMock()
+    app.add_error_handler = MagicMock()
+    app.process_update = AsyncMock()
+
+    app.bot = MagicMock()
+    app.bot.set_webhook = AsyncMock()
+    app.bot.delete_webhook = AsyncMock()
+    app.bot.get_me = AsyncMock(return_value=MagicMock(username="casabot"))
+    app.bot.send_message = AsyncMock()
+    app.bot.edit_message_text = AsyncMock()
+    app.bot.send_chat_action = AsyncMock()
+
+    app.updater = MagicMock()
+    app.updater.start_polling = AsyncMock()
+    app.updater.stop = AsyncMock()
+
+    return app
+
+
+@pytest.fixture
+def patched_application_builder(monkeypatch):
+    """Patch telegram.ext.Application.builder() to return fresh fakes.
+
+    Yields a list; each call to builder() appends a new fake to it, so
+    the test can assert how many Applications were built (e.g., after
+    a rebuild).
+    """
+    from telegram.ext import Application  # the stub we installed above
+
+    built: list[MagicMock] = []
+
+    def fake_builder():
+        chain = MagicMock()
+        chain.token = MagicMock(return_value=chain)
+
+        def build_once():
+            app = _make_fake_application()
+            built.append(app)
+            return app
+
+        chain.build = build_once
+        return chain
+
+    monkeypatch.setattr(Application, "builder", fake_builder)
+    return built
+
+
+@pytest.fixture
+def mock_bus():
+    bus = MagicMock()
+    bus.send = AsyncMock()
+    bus.request = AsyncMock()
+    return bus
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+pytestmark = pytest.mark.asyncio
+
+
+class TestInitialSetWebhookFailure:
+    async def test_network_error_on_initial_set_webhook_triggers_supervisor(
+        self, patched_application_builder, mock_bus, caplog,
+    ):
+        caplog.set_level(logging.DEBUG)
+        from channels.telegram import TelegramChannel
+
+        # First application: set_webhook raises NetworkError.
+        # Second application (after rebuild): set_webhook succeeds.
+        def builder_override():
+            chain = MagicMock()
+            chain.token = MagicMock(return_value=chain)
+
+            def build_once():
+                app = _make_fake_application()
+                if len(patched_application_builder) == 0:
+                    app.bot.set_webhook = AsyncMock(
+                        side_effect=_FakeNetworkError("dns lookup failed"),
+                    )
+                patched_application_builder.append(app)
+                return app
+
+            chain.build = build_once
+            return chain
+
+        from telegram.ext import Application
+        Application.builder = builder_override  # type: ignore[assignment]
+
+        ch = TelegramChannel(
+            bot_token="t",
+            chat_id="123",
+            default_agent="assistant",
+            bus=mock_bus,
+            webhook_url="https://casa.example",
+        )
+        # Short backoff for the test.
+        import channels.telegram as telegram_mod
+        telegram_mod._RECONNECT_INITIAL_MS = 1
+        telegram_mod._RECONNECT_CAP_MS = 4
+
+        await ch.start()
+        # Let the supervisor complete one retry cycle.
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if len(patched_application_builder) >= 2:
+                break
+        await ch.stop()
+
+        assert len(patched_application_builder) >= 2, \
+            "supervisor should have rebuilt the Application at least once"
+        # First app's set_webhook was called once (failed). Second app's
+        # set_webhook was called once (succeeded).
+        assert patched_application_builder[0].bot.set_webhook.await_count == 1
+        assert patched_application_builder[1].bot.set_webhook.await_count == 1
+
+
+class TestHealthProbeLoop:
+    async def test_probe_failure_triggers_supervisor(
+        self, patched_application_builder, mock_bus,
+    ):
+        from channels.telegram import TelegramChannel
+        import channels.telegram as telegram_mod
+        telegram_mod._RECONNECT_INITIAL_MS = 1
+        telegram_mod._RECONNECT_CAP_MS = 4
+        telegram_mod._PROBE_INTERVAL = 0.05
+        telegram_mod._PROBE_TIMEOUT = 0.05
+
+        ch = TelegramChannel(
+            bot_token="t", chat_id="123",
+            default_agent="assistant", bus=mock_bus,
+        )
+        await ch.start()
+
+        # First app: get_me raises NetworkError on the next probe.
+        first_app = patched_application_builder[0]
+        first_app.bot.get_me = AsyncMock(
+            side_effect=_FakeNetworkError("connection reset"),
+        )
+
+        # Wait for probe → trigger → rebuild.
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if len(patched_application_builder) >= 2:
+                break
+
+        await ch.stop()
+        assert len(patched_application_builder) >= 2
+
+
+class TestPtbErrorHandler:
+    async def test_network_error_surfaced_via_error_handler_triggers_supervisor(
+        self, patched_application_builder, mock_bus,
+    ):
+        from channels.telegram import TelegramChannel
+        import channels.telegram as telegram_mod
+        telegram_mod._RECONNECT_INITIAL_MS = 1
+        telegram_mod._RECONNECT_CAP_MS = 4
+
+        ch = TelegramChannel(
+            bot_token="t", chat_id="123",
+            default_agent="assistant", bus=mock_bus,
+        )
+        await ch.start()
+
+        # add_error_handler was called with the channel's handler.
+        first_app = patched_application_builder[0]
+        handler = first_app.add_error_handler.call_args[0][0]
+
+        # Simulate PTB calling the handler with a NetworkError.
+        ctx = MagicMock()
+        ctx.error = _FakeNetworkError("upstream 502")
+        await handler(update=None, context=ctx)
+
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if len(patched_application_builder) >= 2:
+                break
+
+        await ch.stop()
+        assert len(patched_application_builder) >= 2
+
+    async def test_non_network_error_does_not_trigger_supervisor(
+        self, patched_application_builder, mock_bus,
+    ):
+        from channels.telegram import TelegramChannel
+        import channels.telegram as telegram_mod
+        telegram_mod._RECONNECT_INITIAL_MS = 1
+        telegram_mod._RECONNECT_CAP_MS = 4
+
+        ch = TelegramChannel(
+            bot_token="t", chat_id="123",
+            default_agent="assistant", bus=mock_bus,
+        )
+        await ch.start()
+
+        first_app = patched_application_builder[0]
+        handler = first_app.add_error_handler.call_args[0][0]
+
+        # ValueError is not a transport concern — must NOT trigger rebuild.
+        ctx = MagicMock()
+        ctx.error = ValueError("some handler bug")
+        await handler(update=None, context=ctx)
+
+        await asyncio.sleep(0.1)
+        await ch.stop()
+        # No rebuild — only the initial Application was built.
+        assert len(patched_application_builder) == 1
+
+
+class TestTeardownOnRebuild:
+    async def test_old_application_is_torn_down_before_new_one_is_built(
+        self, patched_application_builder, mock_bus,
+    ):
+        from channels.telegram import TelegramChannel
+        import channels.telegram as telegram_mod
+        telegram_mod._RECONNECT_INITIAL_MS = 1
+        telegram_mod._RECONNECT_CAP_MS = 4
+
+        ch = TelegramChannel(
+            bot_token="t", chat_id="123",
+            default_agent="assistant", bus=mock_bus,
+        )
+        await ch.start()
+
+        first_app = patched_application_builder[0]
+        # Trigger via error handler.
+        handler = first_app.add_error_handler.call_args[0][0]
+        ctx = MagicMock()
+        ctx.error = _FakeNetworkError("blip")
+        await handler(update=None, context=ctx)
+
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if len(patched_application_builder) >= 2:
+                break
+
+        await ch.stop()
+
+        # First app was stopped + shut down.
+        assert first_app.updater.stop.await_count >= 1
+        assert first_app.stop.await_count >= 1
+        assert first_app.shutdown.await_count >= 1
+
+
+class TestLogOnceAtChannelLevel:
+    async def test_outage_then_recovery_emits_exactly_one_error_and_one_info(
+        self, patched_application_builder, mock_bus, caplog,
+    ):
+        caplog.set_level(logging.DEBUG, logger="channels.telegram")
+        from channels.telegram import TelegramChannel
+        import channels.telegram as telegram_mod
+        telegram_mod._RECONNECT_INITIAL_MS = 1
+        telegram_mod._RECONNECT_CAP_MS = 4
+
+        ch = TelegramChannel(
+            bot_token="t", chat_id="123",
+            default_agent="assistant", bus=mock_bus,
+        )
+        await ch.start()
+
+        first_app = patched_application_builder[0]
+        # First rebuild attempt fails, second succeeds — accomplished by
+        # making the NEXT builder produce an app whose initialize raises.
+        original_builder = telegram_mod.Application.builder
+        call_count = [0]
+
+        def fail_once_builder():
+            chain = MagicMock()
+            chain.token = MagicMock(return_value=chain)
+
+            def build_once():
+                app = _make_fake_application()
+                call_count[0] += 1
+                if call_count[0] == 1:  # first rebuild fails
+                    app.initialize = AsyncMock(
+                        side_effect=_FakeNetworkError("first-retry-fails"),
+                    )
+                patched_application_builder.append(app)
+                return app
+
+            chain.build = build_once
+            return chain
+
+        telegram_mod.Application.builder = fail_once_builder
+
+        # Trigger the outage.
+        handler = first_app.add_error_handler.call_args[0][0]
+        ctx = MagicMock()
+        ctx.error = _FakeNetworkError("outage")
+        await handler(update=None, context=ctx)
+
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            if call_count[0] >= 2:
+                break
+
+        # Restore builder, stop channel.
+        telegram_mod.Application.builder = original_builder
+        await ch.stop()
+
+        channel_logger = "channels.telegram"
+        errors = [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR and r.name == channel_logger
+        ]
+        infos = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and r.name == channel_logger
+            and "recover" in r.message.lower()
+        ]
+        assert len(errors) == 1, [r.message for r in errors]
+        assert len(infos) == 1, [r.message for r in infos]
