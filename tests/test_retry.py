@@ -326,3 +326,34 @@ class TestEnvValidation:
         finally:
             monkeypatch.delenv("SDK_RETRY_MAX_ATTEMPTS", raising=False)
             importlib.reload(_retry)
+
+
+class TestEnvConfig:
+    def test_module_level_defaults_match_spec(self):
+        import retry
+        # Defaults per spec 5.2 §9.3.
+        assert retry.MAX_ATTEMPTS == 3
+        assert retry.INITIAL_MS == 500
+        assert retry.CAP_MS == 8000
+
+    def test_env_override_reloads(self, monkeypatch):
+        """Users reconfigure via env + addon restart. A module reload
+        mimics the restart-time binding."""
+        import importlib
+        import retry as _retry
+
+        monkeypatch.setenv("SDK_RETRY_MAX_ATTEMPTS", "5")
+        monkeypatch.setenv("SDK_RETRY_INITIAL_MS", "100")
+        monkeypatch.setenv("SDK_RETRY_CAP_MS", "4000")
+
+        reloaded = importlib.reload(_retry)
+        try:
+            assert reloaded.MAX_ATTEMPTS == 5
+            assert reloaded.INITIAL_MS == 100
+            assert reloaded.CAP_MS == 4000
+        finally:
+            # Restore — other tests assume defaults.
+            monkeypatch.delenv("SDK_RETRY_MAX_ATTEMPTS", raising=False)
+            monkeypatch.delenv("SDK_RETRY_INITIAL_MS", raising=False)
+            monkeypatch.delenv("SDK_RETRY_CAP_MS", raising=False)
+            importlib.reload(_retry)
