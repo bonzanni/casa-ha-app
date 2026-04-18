@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -242,3 +243,86 @@ class TestRetrySdkCall:
         # CancelledError is not retryable; no sleep should have run.
         sleep.assert_not_awaited()
         assert attempts["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Hardening: retry-after cap + env validation
+# ---------------------------------------------------------------------------
+
+
+class TestRetryAfterCap:
+    async def test_large_retry_after_is_capped_at_10x_cap_ms(self):
+        """Server-supplied Retry-After: 3600 must not block the worker
+        for an hour. Cap at 10 * CAP_MS (80 s with defaults)."""
+        calls = {"n": 0}
+
+        async def fn():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("429 rate limit. Retry-After: 3600")
+            return "ok"
+
+        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+            result = await retry_sdk_call(fn)
+        assert result == "ok"
+        # 10 * 8000 ms = 80 s — the hint was clamped.
+        sleep.assert_awaited_once_with(80.0)
+
+    async def test_small_retry_after_passes_through(self):
+        """Retry-After: 5 is under the cap; delivered as-is."""
+        calls = {"n": 0}
+
+        async def fn():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("429 rate limit. Retry-After: 5")
+            return "ok"
+
+        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+            await retry_sdk_call(fn)
+        sleep.assert_awaited_once_with(5.0)
+
+
+class TestEnvValidation:
+    def test_missing_env_uses_default(self, monkeypatch):
+        monkeypatch.delenv("SDK_RETRY_MAX_ATTEMPTS", raising=False)
+        import importlib
+        import retry as _retry
+        reloaded = importlib.reload(_retry)
+        try:
+            assert reloaded.MAX_ATTEMPTS == 3
+        finally:
+            importlib.reload(_retry)
+
+    def test_malformed_env_logs_warning_and_uses_default(
+        self, monkeypatch, caplog,
+    ):
+        monkeypatch.setenv("SDK_RETRY_MAX_ATTEMPTS", "not-a-number")
+        import importlib
+        import retry as _retry
+        with caplog.at_level(logging.WARNING, logger="retry"):
+            reloaded = importlib.reload(_retry)
+        try:
+            assert reloaded.MAX_ATTEMPTS == 3
+            assert any(
+                "Invalid SDK_RETRY_MAX_ATTEMPTS" in r.message
+                for r in caplog.records
+            ), [r.message for r in caplog.records]
+        finally:
+            monkeypatch.delenv("SDK_RETRY_MAX_ATTEMPTS", raising=False)
+            importlib.reload(_retry)
+
+    def test_zero_env_is_clamped_to_one(self, monkeypatch, caplog):
+        monkeypatch.setenv("SDK_RETRY_MAX_ATTEMPTS", "0")
+        import importlib
+        import retry as _retry
+        with caplog.at_level(logging.WARNING, logger="retry"):
+            reloaded = importlib.reload(_retry)
+        try:
+            assert reloaded.MAX_ATTEMPTS == 1
+            assert any(
+                "below minimum" in r.message for r in caplog.records
+            )
+        finally:
+            monkeypatch.delenv("SDK_RETRY_MAX_ATTEMPTS", raising=False)
+            importlib.reload(_retry)
