@@ -42,9 +42,11 @@ def _mk_assistant(text: str) -> _SDKAssistantMessage:
         return m
 
 
-def _mk_result(sid: str) -> _SDKResultMessage:
+def _mk_result(sid: str, usage: dict[str, int] | None = None) -> _SDKResultMessage:
     m = _SDKResultMessage.__new__(_SDKResultMessage)
     m.session_id = sid  # type: ignore[attr-defined]
+    if usage is not None:
+        m.usage = usage  # type: ignore[attr-defined]
     return m
 
 
@@ -89,6 +91,7 @@ class FakeClient:
     response_text: str = "pong"
     failure_schedule: list[Exception | None] = []
     attempts: int = 0
+    usage: dict[str, int] | None = None
 
     @classmethod
     def reset(cls) -> None:
@@ -96,6 +99,7 @@ class FakeClient:
         cls.response_text = "pong"
         cls.failure_schedule = []
         cls.attempts = 0
+        cls.usage = None
 
     def __init__(self, options):
         FakeClient.captured_options = options
@@ -119,7 +123,7 @@ class FakeClient:
 
     async def receive_response(self):
         yield _mk_assistant(FakeClient.response_text)
-        yield _mk_result("sdk-sid-1")
+        yield _mk_result("sdk-sid-1", usage=FakeClient.usage)
 
 
 def _make_agent(
@@ -508,3 +512,158 @@ class TestCorrelationId:
         # Both turns emitted at least one cid-tagged record.
         assert "aaaa1111" in cids_seen
         assert "bbbb2222" in cids_seen
+
+
+# ---------------------------------------------------------------------------
+# Token budget monitoring (spec 5.2 §5)
+# ---------------------------------------------------------------------------
+
+
+class TestTokenBudgetMonitoring:
+    """End-to-end: Agent._process drives the BudgetTracker after
+    get_context and emits the per-turn summary log line after the SDK
+    call returns."""
+
+    async def test_memory_recorder_called_on_each_successful_turn(
+        self, tmp_path,
+    ):
+        """The recorder should see one call per turn with the digest
+        size estimated from the memory_context return value."""
+        FakeClient.reset()
+        FakeClient.usage = {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
+        # 8000 chars → 2000 token-estimate, well under the 1000 budget
+        # (so we get the recorder call without tripping the warning yet).
+        mem = FakeMemory(context="x" * 8000)
+        agent = _make_agent(mem, tmp_path, role="assistant")
+
+        observed: list[tuple[str, int, int]] = []
+        original_record = agent._budget_tracker.record
+        def _spy(session_id, used_tokens, budget):
+            observed.append((session_id, used_tokens, budget))
+            original_record(session_id, used_tokens, budget)
+        agent._budget_tracker.record = _spy  # type: ignore[method-assign]
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            await agent._process(_msg("telegram", "123", "hi"))
+
+        assert observed == [("telegram:123:assistant", 2000, 1000)]
+
+    async def test_broken_memory_skips_recorder(self, tmp_path):
+        """When get_context raises, we proceed without memory and must
+        NOT call record (no digest to measure)."""
+        class BrokenMemory(FakeMemory):
+            async def get_context(self, *a, **kw):
+                raise RuntimeError("honcho down")
+
+        FakeClient.reset()
+        FakeClient.usage = {
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+        }
+        agent = _make_agent(BrokenMemory(), tmp_path, role="assistant")
+        observed: list[tuple] = []
+        agent._budget_tracker.record = lambda *a: observed.append(a)  # type: ignore[method-assign]
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            out = await agent._process(_msg("telegram", "123", "hi"))
+
+        assert out == "pong"
+        assert observed == []
+
+    async def test_three_consecutive_overruns_emit_one_warning(
+        self, tmp_path, caplog,
+    ):
+        """Spec §5.2: warn after three consecutive overruns; suppress
+        thereafter for that session."""
+        import logging as _logging
+        FakeClient.reset()
+        FakeClient.usage = {
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+        }
+        # 5000-token estimate vs 1000 budget → overrun.
+        mem = FakeMemory(context="x" * 20000)
+        agent = _make_agent(mem, tmp_path, role="assistant")
+
+        caplog.set_level(_logging.WARNING, logger="tokens")
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            for _ in range(5):
+                await agent._process(_msg("telegram", "123", "hi"))
+
+        rows = [
+            r for r in caplog.records
+            if r.name == "tokens" and "telegram:123:assistant" in r.getMessage()
+        ]
+        assert len(rows) == 1, [r.getMessage() for r in rows]
+
+    async def test_turn_done_log_carries_usage_fields(
+        self, tmp_path, caplog,
+    ):
+        """One INFO-level turn_done line per successful _process call,
+        with the usage fields the SDK reported. No cost field."""
+        import logging as _logging
+        FakeClient.reset()
+        FakeClient.usage = {
+            "input_tokens": 1203,
+            "output_tokens": 82,
+            "cache_read_input_tokens": 5021,
+            "cache_creation_input_tokens": 3000,
+        }
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="butler")
+
+        caplog.set_level(_logging.INFO, logger="agent")
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            await agent._process(_msg("voice", "lr", "lights on"))
+
+        rows = [r for r in caplog.records if "turn_done" in r.getMessage()]
+        assert len(rows) == 1
+        msg = rows[0].getMessage()
+        assert "role=butler" in msg
+        assert "channel=voice" in msg
+        assert "input=1203" in msg
+        assert "output=82" in msg
+        assert "cache_read=5021" in msg
+        assert "cache_write=3000" in msg
+        # Explicit anti-assertion: no cost field under Max.
+        assert "cost_est" not in msg
+        assert "cost=" not in msg
+
+    async def test_usage_resets_between_retry_attempts(
+        self, tmp_path, caplog,
+    ):
+        """Spec §3 + §5: streaming accumulator resets per attempt; the
+        turn_done line reflects only the final attempt's usage."""
+        import logging as _logging
+        FakeClient.reset()
+        FakeClient.usage = {
+            "input_tokens": 999,
+            "output_tokens": 11,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
+        CLIConnectionError = type("CLIConnectionError", (RuntimeError,), {})
+        FakeClient.failure_schedule = [
+            CLIConnectionError("upstream reset"), None,
+        ]
+
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+
+        caplog.set_level(_logging.INFO, logger="agent")
+        with patch("agent.ClaudeSDKClient", FakeClient), \
+             patch("retry.asyncio.sleep", new=AsyncMock()):
+            await agent._process(_msg("telegram", "123", "hi"))
+
+        assert FakeClient.attempts == 2
+        rows = [r for r in caplog.records if "turn_done" in r.getMessage()]
+        assert len(rows) == 1
+        msg = rows[0].getMessage()
+        # Only the second attempt's usage is in the line.
+        assert "input=999" in msg
+        assert "output=11" in msg
