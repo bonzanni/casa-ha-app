@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.5.2 — 2026-04-18 — Phase 5.2 item H: structured logging with correlation IDs
+
+### Added
+- `log_cid.py` — pure logging module. `cid_var` (contextvars), `new_cid()`
+  (8-char hex), `CidFilter` (standalone utility: injects `record.cid`
+  from the current context var — not auto-attached by `install_logging`,
+  kept for callers that construct records manually), `JsonFormatter`
+  (one-line JSON with `ts/level/logger/cid/msg[/exc]` fields),
+  `_human_formatter()` (ISO UTC human format `... cid=X: msg`), and
+  `install_logging()` — idempotent root-logger setup that (a) installs
+  a `logging.setLogRecordFactory` wrapper which tags every record with
+  `record.cid = cid_var.get()` at creation time (works for all
+  loggers, including caplog, because the factory runs inside
+  `Logger.makeRecord`), (b) attaches a single Casa-owned StreamHandler
+  with `RedactingFilter` on the handler (not root — root-level filters
+  do not fire for records from descendants). Spec 5.2 §7.
+- Every ingress-built `BusMessage` carries a fresh `context["cid"]`:
+  Telegram `_handle`, voice SSE + WS, webhook `/webhook/{name}`,
+  `/invoke/{agent}` (`build_invoke_message`), and scheduler heartbeat
+  (`build_heartbeat_message`). Caller-supplied `context.cid` in
+  payloads wins so external systems can thread their own trace ids.
+- Env var `LOG_FORMAT` — `json` switches root formatter to one-line
+  JSON; anything else (incl. unset) uses the human format. Read at
+  `install_logging()` call time.
+
+### Changed
+- `MessageBus._dispatch` sets `log_cid.cid_var` from
+  `msg.context["cid"]` with a scoped token before invoking the
+  handler and resets it in `finally`. Cross-task contamination is
+  impossible: each dispatch runs in its own `asyncio.create_task`
+  whose context is a snapshot. Messages without a cid in their
+  context read as `cid=-` (backward-compat).
+- `casa_core.main` logging setup — a single `install_logging()` call
+  replaces the prior `logging.basicConfig(...)` +
+  `addFilter(RedactingFilter())` +
+  `getLogger("httpx").setLevel(WARNING)` sequence. Behaviour parity
+  for the single-handler case Casa ships today: same stdout stream,
+  same level, same redaction, same httpx quieting. Log format gains a
+  `cid=XX` field per record. Note: `RedactingFilter` now lives on
+  Casa's StreamHandler rather than the root logger (which was a
+  pre-existing no-op for records from descendant loggers); future
+  handlers that want redaction must attach it themselves.
+- Timestamps are now ISO-UTC with `Z` suffix
+  (`2026-04-18T14:32:01Z`), not the previous
+  `2026-04-18 14:32:01,123`. Downstream log tooling that parses the
+  old format may need an update.
+
+### Not changed
+- `Agent._process`, `retry.py`, and the memory path are untouched —
+  item H is strictly a logging-layer change.
+- `RedactingFilter` logic unchanged; it is re-attached to Casa's
+  StreamHandler via `install_logging` alongside the new factory.
+- No new dependency: `json`, `uuid`, and `contextvars` are stdlib.
+
 ## 0.5.1 — 2026-04-18 — Phase 5.2 item D: SDK retry + backoff
 
 ### Added

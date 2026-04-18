@@ -115,3 +115,49 @@ def test_init_heartbeat_defaults_invalid_interval_falls_back():
         env={"HEARTBEAT_INTERVAL_MINUTES": "not-a-number"}
     )
     assert interval >= 1
+
+
+# ---------------------------------------------------------------------------
+# Correlation id — builders attach fresh cid per message (spec 5.2 §7.2)
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+
+def test_build_heartbeat_message_attaches_cid():
+    from casa_core import build_heartbeat_message
+
+    msg = build_heartbeat_message(agent="assistant", prompt="ping")
+    cid = msg.context.get("cid")
+    assert isinstance(cid, str)
+    assert _re.fullmatch(r"[0-9a-f]{8}", cid), cid
+
+
+def test_build_heartbeat_message_cid_is_unique_per_call():
+    from casa_core import build_heartbeat_message
+
+    a = build_heartbeat_message(agent="assistant", prompt="ping")
+    b = build_heartbeat_message(agent="assistant", prompt="ping")
+    assert a.context["cid"] != b.context["cid"]
+
+
+def test_build_invoke_message_attaches_cid():
+    from casa_core import build_invoke_message
+
+    msg = build_invoke_message(
+        agent_role="butler", prompt="hi",
+        payload={"context": {"chat_id": "user-A"}},
+    )
+    cid = msg.context.get("cid")
+    assert isinstance(cid, str)
+    assert _re.fullmatch(r"[0-9a-f]{8}", cid), cid
+    # Payload-supplied fields continue to round-trip.
+    assert msg.context["chat_id"] == "user-A"
+
+
+def test_build_invoke_message_cid_is_unique_per_call():
+    from casa_core import build_invoke_message
+
+    a = build_invoke_message(agent_role="assistant", prompt="hi", payload={})
+    b = build_invoke_message(agent_role="assistant", prompt="hi", payload={})
+    assert a.context["cid"] != b.context["cid"]
