@@ -211,6 +211,62 @@ class TelegramChannel(Channel):
         # Publish the rebuilt app atomically.
         self._app = app
 
+    # ------------------------------------------------------------------
+    # Health probe + PTB error handler (spec 5.2 §4.2)
+    # ------------------------------------------------------------------
+
+    async def _health_probe_loop(self) -> None:
+        """Periodic liveness probe against the Bot API.
+
+        Every `_PROBE_INTERVAL` seconds, call `bot.get_me()` with a
+        `_PROBE_TIMEOUT` ceiling. On success: quiet. On timeout or
+        transport exception: trigger the supervisor. Replaces the
+        v0.5.x `_poll_stall_watchdog` placeholder.
+        """
+        try:
+            while True:
+                await asyncio.sleep(_PROBE_INTERVAL)
+                app = self._app
+                supervisor = self._supervisor
+                if app is None or supervisor is None:
+                    continue  # reconnect in progress — supervisor owns it
+                try:
+                    await asyncio.wait_for(
+                        app.bot.get_me(), timeout=_PROBE_TIMEOUT,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except (NetworkError, TimedOut, asyncio.TimeoutError) as exc:
+                    supervisor.trigger(f"probe_failed: {exc!r}")
+                except Exception as exc:  # noqa: BLE001 — diagnostic only
+                    # Non-transport exceptions: log and keep probing.
+                    # Supervisor rebuild would not help.
+                    logger.debug(
+                        "Telegram health probe non-transport error: %s", exc,
+                    )
+        except asyncio.CancelledError:
+            return
+
+    async def _on_ptb_error(
+        self,
+        update: object,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """PTB error handler. Routes transport errors to the supervisor.
+
+        Registered via `Application.add_error_handler`. Non-transport
+        errors (handler bugs, ValueError, etc.) are logged but do NOT
+        trigger a reconnect — rebuilding the Application would not fix
+        them.
+        """
+        exc = getattr(context, "error", None)
+        if isinstance(exc, (NetworkError, TimedOut)):
+            if self._supervisor is not None:
+                self._supervisor.trigger(f"ptb_error: {type(exc).__name__}: {exc}")
+            return
+        if exc is not None:
+            logger.warning("Telegram handler error (not retryable): %s", exc)
+
     async def process_webhook_update(self, payload: dict) -> None:
         """Process a webhook update payload from aiohttp."""
         if self._app is None:
