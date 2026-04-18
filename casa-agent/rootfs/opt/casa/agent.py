@@ -25,6 +25,12 @@ from channel_trust import channel_trust, user_peer_for_channel
 from memory import MemoryProvider
 from session_registry import SessionRegistry, build_session_key
 from retry import retry_sdk_call
+from tokens import (
+    BudgetTracker,
+    estimate_tokens,
+    extract_usage,
+    format_turn_summary,
+)
 from error_kinds import ErrorKind, _classify_error, _USER_MESSAGES  # noqa: F401 — re-exported
 
 logger = logging.getLogger(__name__)
@@ -50,6 +56,10 @@ class Agent:
         self._mcp_registry = mcp_registry
         self._channel_manager = channel_manager
         self._bg_tasks: set[asyncio.Task] = set()
+        # Per-(session_id) over-budget streak tracker (spec 5.2 §5.2).
+        # Per-instance so assistant (4000) and butler (800) budgets stay
+        # isolated even when the same channel serves both roles.
+        self._budget_tracker = BudgetTracker()
 
     # ------------------------------------------------------------------
     # Public entry point (used as bus handler)
@@ -147,7 +157,7 @@ class Agent:
                 "Memory ensure_session failed; continuing without memory",
             )
 
-        # 2. Retrieve memory digest. ---------------------------------------
+        # 2. Retrieve memory digest + record budget usage (spec 5.2 §5.2).
         memory_context = ""
         try:
             memory_context = await self._memory.get_context(
@@ -160,6 +170,14 @@ class Agent:
         except Exception:
             logger.warning(
                 "Memory retrieval failed; proceeding without context",
+            )
+        else:
+            # Only on success: a failed memory call gives us nothing to
+            # measure. The tracker is no-op when budget <= 0.
+            self._budget_tracker.record(
+                session_id,
+                estimate_tokens(memory_context),
+                self.config.memory.token_budget,
             )
 
         # 3. System prompt = personality + <memory_context>? + <channel_context>.
@@ -212,12 +230,16 @@ class Agent:
         )
 
         # 7. Query the SDK — retry transient faults (spec 5.2 §3). --------
-        async def _attempt_sdk_turn() -> tuple[str, str | None]:
+        async def _attempt_sdk_turn() -> tuple[str, str | None, dict[str, int]]:
             """Run one end-to-end SDK turn. Each attempt resets the
             streaming accumulator so ``on_token`` delivers cumulative
-            text from scratch if an earlier attempt failed mid-turn."""
+            text from scratch if an earlier attempt failed mid-turn.
+            ``attempt_usage`` resets per attempt so a failed attempt's
+            partial usage cannot leak into the turn_done summary
+            (spec 5.2 §5.2)."""
             attempt_text = ""
             attempt_sid: str | None = resume_session_id
+            attempt_usage: dict[str, int] = {}
             async with ClaudeSDKClient(options) as client:
                 await client.query(user_text)
                 async for sdk_msg in client.receive_response():
@@ -230,16 +252,29 @@ class Agent:
                         sid = getattr(sdk_msg, "session_id", None)
                         if sid:
                             attempt_sid = sid
+                        attempt_usage = extract_usage(sdk_msg)
                     elif isinstance(sdk_msg, AssistantMessage):
                         for block in getattr(sdk_msg, "content", []):
                             if isinstance(block, TextBlock):
                                 attempt_text += block.text
                                 if on_token is not None:
                                     await on_token(attempt_text)
-            return attempt_text, attempt_sid
+            return attempt_text, attempt_sid, attempt_usage
 
-        response_text, sdk_session_id = await retry_sdk_call(
+        response_text, sdk_session_id, usage = await retry_sdk_call(
             _attempt_sdk_turn, on_retry=self._log_retry,
+        )
+
+        # Per-turn telemetry (spec 5.2 §5.2). Microsecond cost — string
+        # format + one logger.info — and runs after streaming has
+        # already flushed via on_token, so it is not on the voice
+        # critical path.
+        logger.info(
+            format_turn_summary(
+                self.config.role,
+                msg.channel or "-",
+                usage,
+            ),
         )
 
         if sdk_session_id and sdk_session_id != resume_session_id:
