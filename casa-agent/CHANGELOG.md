@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.5.3 — 2026-04-18 — Phase 5.2 item F: token budget monitoring (descoped — no cost estimate under Max)
+
+### Added
+- `tokens.py` — pure accounting module. Exports `estimate_tokens(text)`
+  (`len(text) // 4`, treats `None`/`""` as 0), `extract_usage(result_msg)`
+  (defensive read of `input_tokens / output_tokens / cache_read_input_tokens /
+  cache_creation_input_tokens` off the SDK `ResultMessage`; missing or
+  non-numeric values default to 0), `BudgetTracker` (per-`session_id`
+  consecutive-overrun streak; emits one WARNING per session_id per
+  process lifetime when the digest exceeds `token_budget * 1.1` for
+  three turns in a row; under-budget turns reset the streak;
+  `budget <= 0` short-circuits), and `format_turn_summary(role, channel,
+  usage)` (renders `turn_done role=… channel=… input=… output=…
+  cache_read=… cache_write=…`; cache fields kept separate so a
+  `cache_write > 0` per-turn pattern surfaces as a stable-prefix
+  regression).
+- `Agent` instantiates a per-instance `BudgetTracker` in `__init__` so
+  assistant (4000-budget) and butler (800-budget) keep independent
+  warning state. After `memory.get_context` returns successfully,
+  `Agent._process` records the digest size; the broken-memory branch is
+  silent (no digest to measure).
+- `Agent._process._attempt_sdk_turn` now captures `ResultMessage.usage`
+  via `extract_usage` (resets per attempt — partial usage from a failed
+  attempt cannot leak into the summary); after `retry_sdk_call`
+  returns, emits one `turn_done` INFO line carrying the role, channel
+  (or `-` when missing), and input/output/cache_read/cache_write token
+  counts.
+- `test-local/mock-claude-sdk` — `ResultMessage` gains an optional
+  `usage: dict[str, int]` field populated from `MOCK_SDK_USAGE_INPUT`,
+  `MOCK_SDK_USAGE_OUTPUT`, `MOCK_SDK_USAGE_CACHE_READ`,
+  `MOCK_SDK_USAGE_CACHE_WRITE` (each defaults to 0). The `build/lib`
+  copy is gitignored and regenerates from `setup.py`; only the
+  source-tree mock is tracked.
+
+### Descoped from spec
+- **No `cost_estimate` and no `MODEL_PRICES` table.** Casa runs on a
+  Claude Max subscription — Anthropic does not bill per token, so a
+  USD `cost_est` log line would be theatre against list prices we
+  don't pay. Operators wanting spend modelling can do it out-of-band
+  against the same `turn_done` line. Spec §5.2 wording around cost is
+  therefore not implemented.
+
+### Changed
+- (none — purely additive instrumentation; no env vars new per spec
+  §9.3, no dashboard surface per spec §5.3.)
+
+### Tests
+- `test_tokens.py` — 23 unit tests across 4 classes (`TestEstimateTokens`,
+  `TestExtractUsage`, `TestBudgetTracker`, `TestFormatTurnSummary`).
+- `test_agent_process.py::TestTokenBudgetMonitoring` — 5 integration
+  tests (memory recorder per turn, broken-memory skip, three-turn
+  warning fires once, turn_done line carries usage, usage resets across
+  retries).
+- Full unit suite: 335 passed.
+
 ## 0.5.2 — 2026-04-18 — Phase 5.2 item H: structured logging with correlation IDs
 
 ### Added
