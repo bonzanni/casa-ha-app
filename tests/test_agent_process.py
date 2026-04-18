@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -77,13 +77,34 @@ class FakeMemory(MemoryProvider):
 
 
 class FakeClient:
-    """Minimal ClaudeSDKClient substitute."""
+    """Minimal ClaudeSDKClient substitute with per-attempt behaviour.
+
+    ``failure_schedule``: list of exceptions (or None) consumed one per
+    construction. A None entry means "this attempt succeeds and yields
+    the usual response". Reset before each test via
+    ``FakeClient.reset()``.
+    """
 
     captured_options = None
     response_text: str = "pong"
+    failure_schedule: list[Exception | None] = []
+    attempts: int = 0
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.captured_options = None
+        cls.response_text = "pong"
+        cls.failure_schedule = []
+        cls.attempts = 0
 
     def __init__(self, options):
         FakeClient.captured_options = options
+        FakeClient.attempts += 1
+        # The exception (if any) for this attempt is popped in query().
+        if FakeClient.failure_schedule:
+            self._scheduled = FakeClient.failure_schedule.pop(0)
+        else:
+            self._scheduled = None
 
     async def __aenter__(self):
         return self
@@ -93,6 +114,8 @@ class FakeClient:
 
     async def query(self, text):
         self._last = text
+        if self._scheduled is not None:
+            raise self._scheduled
 
     async def receive_response(self):
         yield _mk_assistant(FakeClient.response_text)
@@ -259,3 +282,88 @@ async def test_agent_retains_add_turn_task_strong_reference(tmp_path):
     assert len(agent._bg_tasks) == 0
     # Confirm the add_turn was persisted (proves the task ran).
     assert len(mem.add) == 1
+
+
+class TestRetryIntegration:
+    async def test_transient_sdk_error_retries_then_succeeds(
+        self, tmp_path, caplog,
+    ):
+        FakeClient.reset()
+        # Dynamic subclass so type name contains "CLI" → SDK_ERROR class.
+        CLIConnectionError = type("CLIConnectionError", (RuntimeError,), {})
+        exc = CLIConnectionError("upstream reset")
+        # Fail first attempt; succeed second.
+        FakeClient.failure_schedule = [exc, None]
+
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+        with patch("agent.ClaudeSDKClient", FakeClient), \
+             patch("retry.asyncio.sleep", new=AsyncMock()):
+            text = await agent._process(_msg("telegram", "123", "hi"))
+
+        assert text == "pong"
+        assert FakeClient.attempts == 2
+
+    async def test_one_rate_limit_then_success(self, tmp_path):
+        FakeClient.reset()
+        FakeClient.failure_schedule = [
+            RuntimeError("429 rate limit"),
+            None,
+        ]
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+        with patch("agent.ClaudeSDKClient", FakeClient), \
+             patch("retry.asyncio.sleep", new=AsyncMock()):
+            text = await agent._process(_msg("telegram", "123", "hi"))
+        assert text == "pong"
+        assert FakeClient.attempts == 2
+
+    async def test_unknown_exception_does_not_retry(self, tmp_path):
+        FakeClient.reset()
+        FakeClient.failure_schedule = [ValueError("bad input")]
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+        with patch("agent.ClaudeSDKClient", FakeClient), \
+             patch("retry.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(ValueError):
+                await agent._process(_msg("telegram", "123", "hi"))
+        assert FakeClient.attempts == 1
+
+    async def test_cancellation_propagates_without_retry(self, tmp_path):
+        FakeClient.reset()
+        FakeClient.failure_schedule = [asyncio.CancelledError()]
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+        with patch("agent.ClaudeSDKClient", FakeClient), \
+             patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+            with pytest.raises(asyncio.CancelledError):
+                await agent._process(_msg("telegram", "123", "hi"))
+        assert FakeClient.attempts == 1
+        sleep.assert_not_awaited()
+
+    async def test_on_token_replays_final_text_after_retry(self, tmp_path):
+        """Spec §3.2: first attempt's tokens are discarded; on_token
+        sees the cumulative final text from the successful attempt."""
+        FakeClient.reset()
+        CLIConnectionError = type("CLIConnectionError", (RuntimeError,), {})
+        exc = CLIConnectionError("upstream reset")
+        FakeClient.failure_schedule = [exc, None]
+
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="butler")
+
+        seen_tokens: list[str] = []
+        async def on_token(txt: str) -> None:
+            seen_tokens.append(txt)
+
+        with patch("agent.ClaudeSDKClient", FakeClient), \
+             patch("retry.asyncio.sleep", new=AsyncMock()):
+            msg = _msg("voice", "lr", "status?")
+            await agent._process(msg, on_token=on_token)
+
+        # The final attempt emitted "pong" once via on_token. Because
+        # our FakeClient raises during query() before streaming, no
+        # partial tokens leaked from the failed attempt. The caller
+        # sees the cumulative final text at least at the end.
+        assert seen_tokens[-1] == "pong"
+        assert FakeClient.attempts == 2
