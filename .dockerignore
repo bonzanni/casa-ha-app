@@ -1,0 +1,31 @@
+# Host-side build artifacts that can poison the Docker image.
+# Symptom: E2E fails with errors that look like product bugs but are
+# stale pip-install output COPYd in from the build context (Docker
+# does NOT honor .gitignore). See docs/superpowers specs 5.3 / 5.2-F.
+**/build/
+**/*.egg-info/
+**/.eggs/
+**/dist/
+
+# Python / test cache
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Local virtualenvs
+.spike-venv/
+.venv/
+venv/
+
+# Git + worktrees + docs (Docker ignores .gitignore, so be explicit)
+.git/
+.worktrees/
+docs/
+.claude/
+
+# Secrets + local options
+.env
+.env.*
+test-local/options.json
