@@ -37,6 +37,7 @@ from memory import (
 )
 from session_registry import SessionRegistry
 from session_sweeper import SessionSweeper
+from rate_limit import RateLimiter, rate_limit_response
 
 logger = logging.getLogger(__name__)
 
@@ -490,6 +491,20 @@ async def main() -> None:
     if webhook_secret:
         logger.info("Webhook secret loaded (%d chars)", len(webhook_secret))
 
+    # 9b. Rate limiters (spec 5.2 §8). capacity=0 disables for a channel.
+    _telegram_rate_cap = _env_int_or("TELEGRAM_RATE_PER_MIN", 30, min_value=0)
+    _voice_rate_cap = _env_int_or("VOICE_RATE_PER_MIN", 20, min_value=0)
+    _webhook_rate_cap = _env_int_or("WEBHOOK_RATE_PER_MIN", 60, min_value=0)
+    telegram_rate_limiter = RateLimiter(capacity=_telegram_rate_cap, window_s=60.0)
+    voice_rate_limiter = RateLimiter(capacity=_voice_rate_cap, window_s=60.0)
+    webhook_rate_limiter = RateLimiter(capacity=_webhook_rate_cap, window_s=60.0)
+    logger.info(
+        "Rate limits: telegram=%s, voice=%s, webhook=%s",
+        f"{_telegram_rate_cap}/min" if telegram_rate_limiter.enabled else "off",
+        f"{_voice_rate_cap}/min" if voice_rate_limiter.enabled else "off",
+        f"{_webhook_rate_cap}/min" if webhook_rate_limiter.enabled else "off",
+    )
+
     # 10. Telegram channel
     public_url = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
     if public_url in ("null", "None"):
@@ -523,6 +538,7 @@ async def main() -> None:
             webhook_url=webhook_url,
             delivery_mode=telegram_delivery,
             webhook_secret=webhook_secret,
+            rate_limiter=telegram_rate_limiter,
         )
         channel_manager.register(telegram_channel)
         logger.info(
@@ -573,6 +589,7 @@ async def main() -> None:
             idle_timeout=voice_idle_timeout,
             sse_enabled=voice_sse_enabled,
             ws_enabled=voice_ws_enabled,
+            rate_limiter=voice_rate_limiter,
         )
         channel_manager.register(voice_channel)
         logger.info(
@@ -594,6 +611,10 @@ async def main() -> None:
 
     async def webhook_handler(request: web.Request) -> web.Response:
         """Handle named webhook invocations (POST /webhook/{name})."""
+        limited = rate_limit_response(webhook_rate_limiter, "global")
+        if limited is not None:
+            return limited
+
         body = await request.read()
         if not _verify_webhook(request, body):
             return web.json_response({"error": "invalid signature"}, status=401)
@@ -617,6 +638,10 @@ async def main() -> None:
 
     async def invoke_handler(request: web.Request) -> web.Response:
         """Direct agent invocation (POST /invoke/{agent})."""
+        limited = rate_limit_response(webhook_rate_limiter, "global")
+        if limited is not None:
+            return limited
+
         body = await request.read()
         if not _verify_webhook(request, body):
             return web.json_response({"error": "invalid signature"}, status=401)

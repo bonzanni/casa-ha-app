@@ -21,6 +21,7 @@ from agent import _classify_error
 from bus import BusMessage, MessageBus, MessageType
 from channels import Channel
 from log_cid import new_cid
+from rate_limit import RateLimiter
 from channels.voice.prosodic import ProsodicSplitter
 from channels.voice.session import VoiceSessionPool
 from channels.voice.tts_adapter import TagDialectAdapter
@@ -53,6 +54,7 @@ class VoiceChannel(Channel):
         idle_timeout: int,
         sse_enabled: bool = True,
         ws_enabled: bool = True,
+        rate_limiter: RateLimiter | None = None,
     ) -> None:
         self._bus = bus
         self.default_agent = default_agent
@@ -65,6 +67,8 @@ class VoiceChannel(Channel):
         self._memory = memory
         self.pool = VoiceSessionPool(idle_timeout=idle_timeout)
         self._sweeper: asyncio.Task | None = None
+        # Per-scope_id rate limit (spec 5.2 §8). None = unlimited.
+        self._rate_limiter = rate_limiter
 
     # --- Channel ABC --------------------------------------------------
 
@@ -147,6 +151,31 @@ class VoiceChannel(Channel):
         scope_id = self._resolve_scope_id(payload)
         self.pool.ensure(scope_id)
         self.pool.touch(scope_id)
+
+        # Rate limit BEFORE opening the SSE stream (spec 5.2 §8).
+        if self._rate_limiter is not None and self._rate_limiter.enabled:
+            decision = self._rate_limiter.check(scope_id)
+            if not decision.allowed:
+                logger.info(
+                    "Voice SSE rate limit hit for scope_id=%s", scope_id,
+                )
+                response = web.StreamResponse(
+                    status=200,
+                    headers={
+                        "Content-Type": "text/event-stream",
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+                await response.prepare(request)
+                adapter = TagDialectAdapter(cfg.tts.tag_dialect)
+                line = VoiceChannel._error_line_for_kind(cfg, "rate_limit")
+                await _write_sse(response, "error", {
+                    "kind": "rate_limit",
+                    "spoken": adapter.render(line) if line else "",
+                })
+                return response
+
         utterance_id = str(uuid.uuid4())
 
         response = web.StreamResponse(
@@ -335,6 +364,23 @@ class VoiceChannel(Channel):
         })
         self.pool.ensure(scope_id)
         self.pool.touch(scope_id)
+
+        # Rate limit BEFORE dispatching to the agent (spec 5.2 §8).
+        if self._rate_limiter is not None and self._rate_limiter.enabled:
+            decision = self._rate_limiter.check(scope_id)
+            if not decision.allowed:
+                logger.info(
+                    "Voice WS rate limit hit for scope_id=%s utterance_id=%s",
+                    scope_id, uid,
+                )
+                adapter = TagDialectAdapter(cfg.tts.tag_dialect)
+                line = VoiceChannel._error_line_for_kind(cfg, "rate_limit")
+                await ws.send_json({
+                    "type": "error", "utterance_id": uid,
+                    "kind": "rate_limit",
+                    "spoken": adapter.render(line) if line else "",
+                })
+                return
 
         splitter = ProsodicSplitter()
         adapter = TagDialectAdapter(cfg.tts.tag_dialect)
