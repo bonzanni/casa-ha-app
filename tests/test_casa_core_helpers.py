@@ -161,3 +161,89 @@ def test_build_invoke_message_cid_is_unique_per_call():
     a = build_invoke_message(agent_role="assistant", prompt="hi", payload={})
     b = build_invoke_message(agent_role="assistant", prompt="hi", payload={})
     assert a.context["cid"] != b.context["cid"]
+
+
+# ---------------------------------------------------------------------------
+# Webhook/invoke rate limiting — global bucket (spec 5.2 §8)
+# ---------------------------------------------------------------------------
+
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from rate_limit import RateLimiter, rate_limit_response
+
+
+@pytest.mark.asyncio
+class TestWebhookRateLimit:
+    """The webhook handler exports a thin helper `rate_limit_response`
+    that casa_core.main() wraps around `/webhook/{name}` and
+    `/invoke/{agent}`. These tests pin the helper's HTTP contract
+    directly against a minimal aiohttp app — avoids having to
+    instantiate the full main() state machine for a 429-path check.
+    """
+
+    async def _build_app(self, capacity: int) -> web.Application:
+        limiter = RateLimiter(capacity=capacity, window_s=60.0)
+
+        async def webhook_handler(request: web.Request) -> web.Response:
+            resp = rate_limit_response(limiter, "global")
+            if resp is not None:
+                return resp
+            return web.json_response({"status": "accepted"})
+
+        async def invoke_handler(request: web.Request) -> web.Response:
+            resp = rate_limit_response(limiter, "global")
+            if resp is not None:
+                return resp
+            return web.json_response({"response": "ok"})
+
+        app = web.Application()
+        app.router.add_post("/webhook/{name}", webhook_handler)
+        app.router.add_post("/invoke/{agent}", invoke_handler)
+        return app
+
+    async def test_burst_admits_up_to_capacity_then_429s(self):
+        app = await self._build_app(capacity=3)
+        async with TestClient(TestServer(app)) as client:
+            for _ in range(3):
+                r = await client.post("/webhook/any", json={})
+                assert r.status == 200
+            r = await client.post("/webhook/any", json={})
+            assert r.status == 429
+            assert "Retry-After" in r.headers
+            retry_after = int(r.headers["Retry-After"])
+            assert 1 <= retry_after <= 61
+
+    async def test_global_bucket_shared_across_webhook_and_invoke(self):
+        """All webhook/* and invoke/* calls share the ONE global bucket
+        (spec §8.2: 'all names and agents share one bucket').
+        """
+        app = await self._build_app(capacity=2)
+        async with TestClient(TestServer(app)) as client:
+            r = await client.post("/webhook/ha-alert", json={})
+            assert r.status == 200
+            r = await client.post("/invoke/assistant", json={"prompt": "x"})
+            assert r.status == 200
+            # Bucket exhausted — any further call from either path is 429.
+            r = await client.post("/webhook/other", json={})
+            assert r.status == 429
+            r = await client.post("/invoke/butler", json={"prompt": "x"})
+            assert r.status == 429
+
+    async def test_capacity_zero_disables(self):
+        app = await self._build_app(capacity=0)
+        async with TestClient(TestServer(app)) as client:
+            for _ in range(200):
+                r = await client.post("/webhook/any", json={})
+                assert r.status == 200
+                r = await client.post("/invoke/butler", json={"prompt": "x"})
+                assert r.status == 200
+
+    async def test_rejected_body_is_json_with_error_field(self):
+        app = await self._build_app(capacity=1)
+        async with TestClient(TestServer(app)) as client:
+            await client.post("/webhook/any", json={})  # consume
+            r = await client.post("/webhook/any", json={})
+            assert r.status == 429
+            payload = await r.json()
+            assert payload == {"error": "rate_limited"}
