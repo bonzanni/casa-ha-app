@@ -26,8 +26,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig, load_agent_config
-from log_redact import RedactingFilter
-from log_cid import new_cid
+from log_cid import install_logging, new_cid
 from mcp_registry import McpServerRegistry
 from memory import (
     CachedMemoryProvider,
@@ -342,15 +341,8 @@ def _load_agents_by_role(agents_dir: str) -> dict[str, AgentConfig]:
 async def main() -> None:
     """Async entry point for the Casa add-on."""
 
-    # 1. Logging (with secret redaction)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        stream=sys.stdout,
-    )
-    logging.getLogger().addFilter(RedactingFilter())
-    # Quiet the httpx logger (Telegram polling produces a line every ~10s)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    # 1. Logging (correlation ids + secret redaction, spec 5.2 §7).
+    install_logging()
     logger.info("Casa core starting up")
 
     # 2. Memory
