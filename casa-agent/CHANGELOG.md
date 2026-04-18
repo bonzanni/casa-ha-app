@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.5.7 — 2026-04-18 — Phase 5.3 infra hygiene (partial: items A + K)
+
+### Added
+- `.dockerignore` at the repo root. Excludes `**/build/`,
+  `**/*.egg-info/`, `**/.eggs/`, `**/dist/`, `**/__pycache__/`,
+  `**/*.pyc`, `**/.pytest_cache/`, `**/.mypy_cache/`,
+  `**/.ruff_cache/`, `.spike-venv/`, `.venv/`, `venv/`, `.git/`,
+  `.worktrees/`, `docs/`, `.claude/`, `.env`, `.env.*`, and
+  `test-local/options.json`. Docker does NOT honor `.gitignore`, so
+  host-side pip-install artifacts (seen in 5.2 item F: stale
+  `test-local/mock-claude-sdk/build/lib/` COPYd into the test image
+  and masked product changes) now can't poison Docker builds. This
+  closes the backlog item filed during 5.2-F. Verified with
+  `docker buildx build --progress=plain` on a tiny `COPY . /tmp`
+  probe: **context transfer 360.33 MB → 12.22 kB** (the bulk was
+  the `.spike-venv` virtualenv under `.gitignore` that Docker was
+  shipping to the daemon on every build).
+
+### Changed
+- `test-local/Dockerfile.test` — `ARG BUILD_FROM` now pins the HA
+  base image by sha256 digest
+  (`ghcr.io/home-assistant/amd64-base-python@sha256:cb37b54…`)
+  instead of the floating `3.12-alpine3.22` tag. Pinned 2026-04-18
+  against HA base 2026.04.0 (`org.opencontainers.image.created
+  2026-04-13`). Refresh process documented in-file via a block
+  comment (`docker buildx imagetools inspect … | jq
+  '.manifest.digest'`). Rationale: pre-pin, a silent HA base
+  republish under the same tag could change test behaviour with no
+  record in our repo; CI results stop being reproducible across
+  time. Spec §4 / decision H4.
+  - Scope note: production `casa-agent/Dockerfile` stays unpinned
+    per spec §2 non-goal / H3. It inherits `BUILD_FROM` from the HA
+    builder pipeline, which pins its own base per release.
+    Re-pinning would fight the HA release machinery.
+
+### Deferred
+- **Item J — narrow AppArmor `file,` rule** (spec §3). Requires the
+  complain-mode discovery loop on real Linux hardware with AppArmor
+  enabled (the N150 production box). Casa's dev machine is Windows
+  / Docker Desktop; kernel AppArmor is unreachable. Spec decision
+  H1 explicitly warns against shipping a theoretical path list
+  without the `aa-logprof` / kernel-audit capture. Left on the 5.3
+  roadmap entry; no code change on this release.
+
+### Plan / spec
+- Spec: `docs/superpowers/specs/2026-04-18-infra-hygiene-5.3.md`
+- No separate plan file (mechanical sweep; two edits).
+
 ## 0.5.6 — 2026-04-18 — Phase 5.2 item I: inbound rate limiting
 
 ### Added
