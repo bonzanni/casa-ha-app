@@ -33,6 +33,7 @@ from bus import BusMessage, MessageBus, MessageType
 from channels import Channel
 from channels.telegram_supervisor import ReconnectSupervisor
 from log_cid import new_cid
+from rate_limit import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,12 @@ _TYPING_BACKOFF_INIT = 1.0
 _TYPING_BACKOFF_FACTOR = 2.0
 _TYPING_BACKOFF_MAX = 60.0
 _TYPING_CIRCUIT_BREAK = 10
+
+# One-liner sent when a chat exceeds TELEGRAM_RATE_PER_MIN. Only the
+# FIRST rejection in a streak triggers this reply (spec 5.2 §8.2);
+# subsequent rejects drop silently. Phrasing intentionally kept short
+# and non-alarmist — the bucket refills within a minute.
+_RATE_LIMIT_REPLY = "Slow down — try again in a minute."
 
 # Stream edit throttle (seconds between editMessageText calls).
 _STREAM_THROTTLE = 1.0
@@ -82,6 +89,7 @@ class TelegramChannel(Channel):
         webhook_path: str = "/telegram/update",
         delivery_mode: str = "stream",
         webhook_secret: str = "",
+        rate_limiter: RateLimiter | None = None,
     ) -> None:
         self.bot_token = bot_token
         self.chat_id = chat_id
@@ -91,6 +99,9 @@ class TelegramChannel(Channel):
         self._webhook_path = webhook_path
         self._delivery_mode = delivery_mode  # "stream" or "block"
         self._webhook_secret = webhook_secret
+        # Rate limiter (spec 5.2 §8). None = unlimited; a limiter with
+        # capacity=0 also admits every message.
+        self._rate_limiter = rate_limiter
         self._app: Application | None = None
         self._typing_tasks: dict[str, asyncio.Task] = {}
         # Typing backoff state (shared across all chats) — item-E-orthogonal.
@@ -338,6 +349,23 @@ class TelegramChannel(Channel):
     # Inbound
     # ------------------------------------------------------------------
 
+    async def _send_rate_limit_reply(self, chat_id: str) -> None:
+        """Send the one-shot 'slow down' reply for a rate-limited chat."""
+        if self._app is None:
+            return
+        try:
+            await self._app.bot.send_message(
+                chat_id=chat_id, text=_RATE_LIMIT_REPLY,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A 401/503/etc. on the reply itself is not fatal — the user
+            # simply doesn't see the notice this time. Do NOT raise;
+            # the rest of _handle has already chosen to drop the
+            # message.
+            logger.debug(
+                "rate-limit reply to chat_id=%s failed: %s", chat_id, exc,
+            )
+
     async def _handle(
         self,
         update: Update,
@@ -350,6 +378,18 @@ class TelegramChannel(Channel):
         chat_id = str(update.effective_chat.id) if update.effective_chat else self.chat_id
         user = update.effective_user
         user_name = user.first_name if user else "unknown"
+
+        # Rate limit BEFORE typing indicator or bus dispatch (spec 5.2 §8).
+        if self._rate_limiter is not None and self._rate_limiter.enabled:
+            decision = self._rate_limiter.check(chat_id)
+            if not decision.allowed:
+                if decision.should_notify:
+                    logger.info(
+                        "Telegram rate limit hit for chat_id=%s; replying with one-shot notice",
+                        chat_id,
+                    )
+                    await self._send_rate_limit_reply(chat_id)
+                return
 
         self._start_typing(chat_id)
 
