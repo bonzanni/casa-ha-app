@@ -227,3 +227,153 @@ async def test_handler_exception_unblocks_request_caller():
     loop_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await loop_task
+
+
+# ---------------------------------------------------------------------------
+# Correlation-id propagation (spec 5.2 §7)
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchCid:
+    async def test_dispatcher_sets_cid_from_context(self):
+        from log_cid import cid_var
+
+        bus = MessageBus()
+        seen: list[str] = []
+
+        async def handler(msg: BusMessage):
+            seen.append(cid_var.get())
+            return None
+
+        bus.register("b", handler)
+        msg = BusMessage(
+            type=MessageType.NOTIFICATION, source="a", target="b",
+            content="hi", context={"cid": "cafe0001"},
+        )
+        await bus.send(msg)
+
+        loop = asyncio.create_task(bus.run_agent_loop("b"))
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            loop.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await loop
+
+        assert seen == ["cafe0001"]
+
+    async def test_dispatcher_uses_dash_when_context_missing(self):
+        from log_cid import cid_var
+
+        bus = MessageBus()
+        seen: list[str] = []
+
+        async def handler(msg: BusMessage):
+            seen.append(cid_var.get())
+            return None
+
+        bus.register("b", handler)
+        # Message without a cid in its context (backward-compat path).
+        msg = BusMessage(
+            type=MessageType.NOTIFICATION, source="a", target="b",
+            content="hi",  # context defaults to {}
+        )
+        await bus.send(msg)
+
+        loop = asyncio.create_task(bus.run_agent_loop("b"))
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            loop.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await loop
+
+        assert seen == ["-"]
+
+    async def test_concurrent_dispatches_observe_distinct_cids(self):
+        """Two messages dispatched in parallel — each handler observes
+        its own cid because each _dispatch runs in its own task."""
+        from log_cid import cid_var
+
+        bus = MessageBus()
+        gate = asyncio.Event()
+        barrier: list[str] = []
+
+        async def handler(msg: BusMessage):
+            # Capture cid, then wait until both handlers are running
+            # to force true concurrency. Capture again post-wait to
+            # prove no cross-contamination across tasks.
+            first = cid_var.get()
+            barrier.append(first)
+            if len(barrier) < 2:
+                while len(barrier) < 2:
+                    await asyncio.sleep(0.005)
+            else:
+                gate.set()
+            await gate.wait()
+            second = cid_var.get()
+            barrier.append(second)
+            return None
+
+        bus.register("b", handler)
+        await bus.send(BusMessage(
+            type=MessageType.NOTIFICATION, source="a", target="b",
+            content="one", context={"cid": "11111111"},
+        ))
+        await bus.send(BusMessage(
+            type=MessageType.NOTIFICATION, source="a", target="b",
+            content="two", context={"cid": "22222222"},
+        ))
+
+        loop = asyncio.create_task(bus.run_agent_loop("b"))
+        try:
+            await asyncio.wait_for(gate.wait(), timeout=1.0)
+            # Give both handlers time to resume and capture second cid.
+            await asyncio.sleep(0.1)
+        finally:
+            loop.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await loop
+
+        # barrier has 4 entries: [cid_A_before, cid_B_before,
+        # cid_A_after, cid_B_after] (order of pairs may vary).
+        # The two distinct cids each appear exactly twice.
+        assert sorted(barrier) == ["11111111", "11111111", "22222222", "22222222"]
+
+    async def test_dispatch_does_not_leak_cid_into_outer_context(self):
+        """After _dispatch completes, cid_var in the run_agent_loop task
+        must still read its prior value (reset via token)."""
+        from log_cid import cid_var
+
+        bus = MessageBus()
+
+        async def handler(msg: BusMessage):
+            return None
+
+        bus.register("b", handler)
+        await bus.send(BusMessage(
+            type=MessageType.NOTIFICATION, source="a", target="b",
+            content="hi", context={"cid": "feedface"},
+        ))
+
+        # Observe cid_var from a captured run_agent_loop coroutine.
+        async def observer():
+            try:
+                while True:
+                    await asyncio.sleep(0.02)
+                    # The outer (observer) task's cid_var must always be
+                    # the default — it never ran inside _dispatch.
+                    assert cid_var.get() == "-"
+            except asyncio.CancelledError:
+                raise
+
+        loop = asyncio.create_task(bus.run_agent_loop("b"))
+        obs = asyncio.create_task(observer())
+        try:
+            await asyncio.sleep(0.1)
+        finally:
+            loop.cancel()
+            obs.cancel()
+            for t in (loop, obs):
+                with pytest.raises(asyncio.CancelledError):
+                    await t

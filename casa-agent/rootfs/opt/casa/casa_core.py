@@ -26,7 +26,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig, load_agent_config
-from log_redact import RedactingFilter
+from log_cid import install_logging, new_cid
 from mcp_registry import McpServerRegistry
 from memory import (
     CachedMemoryProvider,
@@ -148,6 +148,8 @@ def build_heartbeat_message(agent: str, prompt: str) -> BusMessage:
 
     ``channel`` must be non-empty: ``Agent._process`` calls
     ``build_session_key(msg.channel, ...)`` which rejects empty channels.
+    Attaches a fresh correlation id so every log record during the
+    heartbeat turn shares one cid (spec 5.2 §7.2).
     """
     return BusMessage(
         type=MessageType.SCHEDULED,
@@ -155,7 +157,11 @@ def build_heartbeat_message(agent: str, prompt: str) -> BusMessage:
         target=agent,
         content=prompt,
         channel="scheduler",
-        context={"chat_id": "heartbeat", "trigger": "heartbeat"},
+        context={
+            "chat_id": "heartbeat",
+            "trigger": "heartbeat",
+            "cid": new_cid(),
+        },
     )
 
 
@@ -170,10 +176,16 @@ def build_invoke_message(
     (e.g. to continue a prior conversation). Otherwise a fresh UUID is
     assigned so two concurrent invocations do not collide on
     ``webhook:default``.
+
+    Every invoke also gets a fresh correlation id (spec 5.2 §7.2).
+    Caller-supplied ``context.cid`` wins so external systems can thread
+    their own trace ids through; missing or empty entries are replaced.
     """
     context = dict(payload.get("context") or {})
     if not context.get("chat_id"):
         context["chat_id"] = str(uuid.uuid4())
+    if not context.get("cid"):
+        context["cid"] = new_cid()
     return BusMessage(
         type=MessageType.REQUEST,
         source="webhook",
@@ -329,15 +341,8 @@ def _load_agents_by_role(agents_dir: str) -> dict[str, AgentConfig]:
 async def main() -> None:
     """Async entry point for the Casa add-on."""
 
-    # 1. Logging (with secret redaction)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        stream=sys.stdout,
-    )
-    logging.getLogger().addFilter(RedactingFilter())
-    # Quiet the httpx logger (Telegram polling produces a line every ~10s)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    # 1. Logging (correlation ids + secret redaction, spec 5.2 §7).
+    install_logging()
     logger.info("Casa core starting up")
 
     # 2. Memory
@@ -570,7 +575,7 @@ async def main() -> None:
             target=assistant_role,
             content=f"Webhook '{name}' triggered with payload: {payload}",
             channel="webhook",
-            context={"webhook_name": name},
+            context={"webhook_name": name, "cid": new_cid()},
         )
         await bus.send(msg)
         return web.json_response({"status": "accepted"})

@@ -20,6 +20,7 @@ from aiohttp import web
 from agent import _classify_error
 from bus import BusMessage, MessageBus, MessageType
 from channels import Channel
+from log_cid import new_cid
 from channels.voice.prosodic import ProsodicSplitter
 from channels.voice.session import VoiceSessionPool
 from channels.voice.tts_adapter import TagDialectAdapter
@@ -190,6 +191,7 @@ class VoiceChannel(Channel):
             context={
                 "chat_id": scope_id,
                 "utterance_id": utterance_id,
+                "cid": new_cid(),
                 **(payload.get("context") or {}),
                 "_on_token": on_token,
                 "_error_sink": _error_sink,
@@ -363,6 +365,7 @@ class VoiceChannel(Channel):
             channel="voice",
             context={
                 "chat_id": scope_id, "utterance_id": uid,
+                "cid": new_cid(),
                 **(frame.get("context") or {}),
                 "_on_token": on_token,
                 "_error_sink": _error_sink,

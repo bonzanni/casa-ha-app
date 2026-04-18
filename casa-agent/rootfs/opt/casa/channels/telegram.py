@@ -31,6 +31,7 @@ from telegram.ext import (
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import Channel
+from log_cid import new_cid
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +274,7 @@ class TelegramChannel(Channel):
                 "chat_id": chat_id,
                 "user_name": user_name,
                 "message_id": str(update.message.message_id),
+                "cid": new_cid(),
             },
         )
         await self._bus.send(msg)

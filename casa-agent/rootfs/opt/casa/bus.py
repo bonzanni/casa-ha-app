@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Coroutine
 
+from log_cid import cid_var
+
 logger = logging.getLogger(__name__)
 
 
@@ -124,6 +126,13 @@ class MessageBus:
             # reloads) can rebind ``bus.handlers[name]`` and have the
             # next dispatch pick up the new handler.
             handler = self.handlers.get(agent_name)
+            # Set cid for every log record emitted during the turn
+            # (spec 5.2 §7.2). Reset via token in finally so a reused
+            # dispatch task (future refactors) cannot leak.
+            cid = ""
+            if msg.context:
+                cid = msg.context.get("cid", "") or ""
+            cid_token = cid_var.set(cid or "-")
             try:
                 if handler is not None:
                     result = await handler(msg)
@@ -155,6 +164,7 @@ class MessageBus:
                     )
                     await self.respond(msg.id, error_resp)
             finally:
+                cid_var.reset(cid_token)
                 if msg.type == MessageType.REQUEST:
                     self._dispatch_tasks.pop(msg.id, None)
                 queue.task_done()
