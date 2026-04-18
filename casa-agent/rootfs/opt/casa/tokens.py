@@ -45,12 +45,33 @@ def estimate_tokens(text: str | None) -> int:
 # ---------------------------------------------------------------------------
 
 
+_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
 def extract_usage(result_msg: object) -> dict[str, int]:
     """Pull token counts off an SDK ``ResultMessage``.
 
-    Implemented in Task 4; stub raises so future tasks must touch it.
+    Reads ``result_msg.usage`` (attribute), expects either a dict or
+    ``None``. Missing fields default to 0. String values are coerced to
+    int; non-numeric values fall back to 0 so a malformed SDK payload
+    cannot crash ``Agent._process``.
     """
-    raise NotImplementedError("implemented in Task 4")
+    usage = getattr(result_msg, "usage", None) or {}
+    out: dict[str, int] = {}
+    for key in _USAGE_KEYS:
+        raw = usage.get(key, 0) if isinstance(usage, dict) else getattr(
+            usage, key, 0,
+        )
+        try:
+            out[key] = int(raw or 0)
+        except (TypeError, ValueError):
+            out[key] = 0
+    return out
 
 
 # ---------------------------------------------------------------------------
