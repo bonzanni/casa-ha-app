@@ -245,3 +245,134 @@ class TestSSE:
         assert "Natural-path Tina voice failure" in body
         # Crucially: done MUST NOT be emitted after error.
         assert "event: done" not in body
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting — per-scope_id token bucket (spec 5.2 §8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def voice_app_with_limiter(request):
+    """Factory fixture: parametrize capacity via request.param."""
+    from rate_limit import RateLimiter
+
+    capacity = getattr(request, "param", 2)
+
+    bus = MessageBus()
+    agent = StubAgent(bus, "butler")
+    bus.register("butler", agent.handle_message)
+    loop_task = asyncio.create_task(bus.run_agent_loop("butler"))
+
+    limiter = RateLimiter(capacity=capacity, window_s=60.0)
+
+    channel = VoiceChannel(
+        bus=bus,
+        default_agent="butler",
+        webhook_secret="",
+        sse_path="/api/converse",
+        ws_path="/api/converse/ws",
+        agent_configs={"butler": _FakeAgentConfig()},
+        memory=_DummyMemory(),
+        idle_timeout=300,
+        rate_limiter=limiter,
+    )
+
+    app = web.Application()
+    channel.register_routes(app)
+    async with TestClient(TestServer(app)) as client:
+        yield client, limiter
+    loop_task.cancel()
+
+
+async def _parse_sse_events(response) -> list[dict]:
+    """Read the full SSE stream into a list of {"event": ..., "data": ...}."""
+    frames: list[dict] = []
+    async for line in response.content:
+        s = line.decode("utf-8").rstrip("\r\n")
+        if s.startswith("event:"):
+            frames.append({"event": s.split(":", 1)[1].strip()})
+        elif s.startswith("data:") and frames:
+            frames[-1]["data"] = json.loads(s.split(":", 1)[1].strip())
+    return frames
+
+
+@pytest.mark.asyncio
+class TestRateLimit:
+    @pytest.mark.parametrize("voice_app_with_limiter", [2], indirect=True)
+    async def test_over_limit_emits_rate_limit_error_frame(
+        self, voice_app_with_limiter,
+    ):
+        client, _limiter = voice_app_with_limiter
+        payload = {
+            "prompt": "do stuff", "agent_role": "butler",
+            "scope_id": "user-rate", "channel": "voice",
+        }
+        # Exhaust the capacity-2 bucket.
+        for _ in range(2):
+            r = await client.post("/api/converse", json=payload)
+            assert r.status == 200
+            frames = await _parse_sse_events(r)
+            assert any(f["event"] == "done" for f in frames)
+
+        # 3rd request: must emit event: error kind=rate_limit and NOT done.
+        r = await client.post("/api/converse", json=payload)
+        assert r.status == 200
+        frames = await _parse_sse_events(r)
+        kinds = [
+            f.get("data", {}).get("kind") for f in frames
+            if f["event"] == "error"
+        ]
+        assert "rate_limit" in kinds
+        assert not any(f["event"] == "done" for f in frames)
+
+    @pytest.mark.parametrize("voice_app_with_limiter", [0], indirect=True)
+    async def test_capacity_zero_admits_unlimited_turns(
+        self, voice_app_with_limiter,
+    ):
+        client, _ = voice_app_with_limiter
+        for i in range(15):
+            r = await client.post(
+                "/api/converse",
+                json={
+                    "prompt": f"turn-{i}", "agent_role": "butler",
+                    "scope_id": "user-x",
+                },
+            )
+            assert r.status == 200
+            frames = await _parse_sse_events(r)
+            assert any(f["event"] == "done" for f in frames), (
+                f"turn {i} did not complete"
+            )
+
+    @pytest.mark.parametrize("voice_app_with_limiter", [1], indirect=True)
+    async def test_bucket_is_per_scope_id(self, voice_app_with_limiter):
+        client, _ = voice_app_with_limiter
+
+        # scope-A exhausts its 1-token bucket.
+        r = await client.post(
+            "/api/converse",
+            json={"prompt": "hi", "agent_role": "butler", "scope_id": "A"},
+        )
+        assert r.status == 200
+        assert any(f["event"] == "done" for f in await _parse_sse_events(r))
+
+        # scope-B is admitted — fresh bucket.
+        r = await client.post(
+            "/api/converse",
+            json={"prompt": "hi", "agent_role": "butler", "scope_id": "B"},
+        )
+        assert r.status == 200
+        assert any(f["event"] == "done" for f in await _parse_sse_events(r))
+
+        # scope-A's second request is rejected with rate_limit.
+        r = await client.post(
+            "/api/converse",
+            json={"prompt": "hi", "agent_role": "butler", "scope_id": "A"},
+        )
+        frames = await _parse_sse_events(r)
+        kinds = [
+            f.get("data", {}).get("kind") for f in frames
+            if f["event"] == "error"
+        ]
+        assert "rate_limit" in kinds
