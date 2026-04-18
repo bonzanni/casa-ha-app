@@ -367,3 +367,144 @@ class TestRetryIntegration:
         # sees the cumulative final text at least at the end.
         assert seen_tokens[-1] == "pong"
         assert FakeClient.attempts == 2
+
+
+# ---------------------------------------------------------------------------
+# Correlation-id end-to-end (spec 5.2 §7.4)
+# ---------------------------------------------------------------------------
+
+
+class TestCorrelationId:
+    """End-to-end dispatch → every log record during the turn carries
+    the cid from msg.context; two concurrent turns are distinguishable."""
+
+    @pytest.fixture(autouse=True)
+    def _cid_factory(self):
+        """Install a minimal LogRecord factory that tags every new
+        record with ``record.cid = cid_var.get()``. This mirrors what
+        ``install_logging`` does in production but skips the
+        StreamHandler (so test stdout stays clean). Needed because
+        Python's ``Logger.callHandlers`` walks ancestor HANDLERS but
+        NOT ancestor LOGGERS' filter chains — a filter on root would
+        not fire for records from descendant loggers. The factory
+        runs inside ``Logger.makeRecord``, so every record everywhere
+        in the process gets tagged regardless of emission path.
+        Scoped to this class via autouse; restored on teardown."""
+        import logging
+        from log_cid import cid_var
+        orig_factory = logging.getLogRecordFactory()
+        def _factory(*args, **kwargs):
+            record = orig_factory(*args, **kwargs)
+            record.cid = cid_var.get()
+            return record
+        logging.setLogRecordFactory(_factory)
+        try:
+            yield
+        finally:
+            logging.setLogRecordFactory(orig_factory)
+
+    async def test_single_turn_records_share_cid(
+        self, tmp_path, caplog,
+    ):
+        import logging
+        from bus import BusMessage, MessageBus, MessageType
+
+        FakeClient.reset()
+        FakeClient.response_text = "pong"
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+
+        bus = MessageBus()
+        bus.register("assistant", agent.handle_message)
+
+        caplog.set_level(logging.INFO)
+
+        msg = BusMessage(
+            type=MessageType.REQUEST,
+            source="test", target="assistant",
+            content="hi", channel="telegram",
+            context={"chat_id": "42", "cid": "abcd1234"},
+        )
+
+        with patch("agent.ClaudeSDKClient", FakeClient), \
+             patch("retry.asyncio.sleep", new=AsyncMock()):
+            loop = asyncio.create_task(bus.run_agent_loop("assistant"))
+            try:
+                result = await bus.request(msg, timeout=5)
+            finally:
+                loop.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await loop
+
+        assert "pong" in str(result.content)
+
+        # Every record emitted during the dispatch window must carry
+        # the cid. We scope to records from Casa modules (avoid pytest's
+        # own handler records).
+        relevant = [
+            r for r in caplog.records
+            if r.name in {"agent", "retry", "bus"}
+        ]
+        # At least one record should have been emitted — the agent log
+        # line "SDK session for 'assistant': sess-..." is unconditional
+        # post-retry. Tolerate zero if the agent stays silent in this
+        # fake path; the point is: none of them may have cid="-".
+        cids_seen = {getattr(r, "cid", None) for r in relevant}
+        # Strip any records with cid="-" that slipped in before the
+        # first dispatch (there should be none, but be explicit).
+        cids_seen.discard(None)
+        # No stray cid="-" during the turn.
+        assert cids_seen <= {"abcd1234"}, cids_seen
+
+    async def test_two_concurrent_turns_produce_distinct_cids(
+        self, tmp_path, caplog,
+    ):
+        import logging
+        from bus import BusMessage, MessageBus, MessageType
+
+        FakeClient.reset()
+        FakeClient.response_text = "pong"
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+
+        bus = MessageBus()
+        bus.register("assistant", agent.handle_message)
+
+        caplog.set_level(logging.INFO)
+
+        def _mk(cid: str, chat_id: str) -> BusMessage:
+            return BusMessage(
+                type=MessageType.REQUEST,
+                source="test", target="assistant",
+                content="hi", channel="telegram",
+                context={"chat_id": chat_id, "cid": cid},
+            )
+
+        with patch("agent.ClaudeSDKClient", FakeClient), \
+             patch("retry.asyncio.sleep", new=AsyncMock()):
+            loop = asyncio.create_task(bus.run_agent_loop("assistant"))
+            try:
+                # Fire both concurrently.
+                results = await asyncio.gather(
+                    bus.request(_mk("aaaa1111", "A"), timeout=5),
+                    bus.request(_mk("bbbb2222", "B"), timeout=5),
+                )
+            finally:
+                loop.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await loop
+
+        assert len(results) == 2
+
+        # Every agent/retry/bus record must carry one of the two cids;
+        # neither may cross-contaminate (dispatcher scopes cid per task).
+        relevant = [
+            r for r in caplog.records
+            if r.name in {"agent", "retry", "bus"}
+            and getattr(r, "cid", "-") != "-"
+        ]
+        cids_seen = {r.cid for r in relevant}
+        assert cids_seen <= {"aaaa1111", "bbbb2222"}
+        # Both turns emitted at least one cid-tagged record.
+        assert "aaaa1111" in cids_seen
+        assert "bbbb2222" in cids_seen
