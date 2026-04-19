@@ -7,9 +7,9 @@ tags every record with ``record.cid = cid_var.get()`` at creation time.
 Records emitted outside any dispatch (startup, shutdown, sweepers) read
 the default value ``"-"``.
 
-``LOG_FORMAT=json`` switches the root handler to :class:`JsonFormatter`;
-any other value (including unset) uses the human-readable format
-``%(asctime)s [%(levelname)s] %(name)s cid=%(cid)s: %(message)s``.
+``LOG_FORMAT=human`` switches the root handler to the human-readable
+format; any other value (including unset) uses :class:`JsonFormatter`.
+This is a 5.5 change — prior Casa versions defaulted to human.
 """
 
 from __future__ import annotations
@@ -159,10 +159,10 @@ def install_logging(
     handler = logging.StreamHandler(stream if stream is not None else sys.stdout)
     handler._casa_owned = True  # type: ignore[attr-defined]
     handler.addFilter(RedactingFilter())
-    if os.environ.get("LOG_FORMAT", "").strip().lower() == "json":
-        handler.setFormatter(JsonFormatter())
-    else:
+    if os.environ.get("LOG_FORMAT", "").strip().lower() == "human":
         handler.setFormatter(_human_formatter())
+    else:
+        handler.setFormatter(JsonFormatter())
     root.addHandler(handler)
 
     root.setLevel(level)
