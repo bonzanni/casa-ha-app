@@ -667,3 +667,171 @@ class TestTokenBudgetMonitoring:
         # Only the second attempt's usage is in the line.
         assert "input=999" in msg
         assert "output=11" in msg
+
+
+# ---------------------------------------------------------------------------
+# TestResumeResilience — 5.8 §3.2
+# ---------------------------------------------------------------------------
+
+
+def _make_agent_with_registry(
+    memory: MemoryProvider,
+    registry: SessionRegistry,
+    role: str = "butler",
+) -> Agent:
+    """Like _make_agent, but takes a pre-constructed SessionRegistry so
+    tests can pre-populate entries.
+    """
+    cfg = AgentConfig(
+        name="Test",
+        role=role,
+        model="claude-sonnet-4-6",
+        personality="You are helpful.",
+        tools=ToolsConfig(allowed=["Read"], permission_mode="acceptEdits"),
+        memory=MemoryConfig(token_budget=1000, read_strategy="per_turn"),
+    )
+    return Agent(
+        config=cfg,
+        memory=memory,
+        session_registry=registry,
+        mcp_registry=McpServerRegistry(),
+        channel_manager=ChannelManager(),
+    )
+
+
+class TestResumeResilience:
+    """Agent._process recovers when claude CLI rejects a stale resume (5.8)."""
+
+    async def test_stale_resume_cleared_and_retried_fresh(self, tmp_path):
+        """First attempt resumes stale-sid -> ProcessError; fallback clears
+        the stale id, retries with resume=None, succeeds with fresh sid."""
+        from claude_agent_sdk import ProcessError
+
+        FakeClient.reset()
+        FakeClient.failure_schedule = [
+            ProcessError("Command failed with exit code 1", exit_code=1),
+            None,
+        ]
+
+        reg = SessionRegistry(str(tmp_path / "sessions.json"))
+        await reg.register("voice:probe-scope", "butler", "stale-sid-abc")
+
+        mem = FakeMemory()
+        agent = _make_agent_with_registry(mem, reg, role="butler")
+
+        with patch("agent.ClaudeSDKClient", FakeClient), \
+             patch("retry.asyncio.sleep", new=AsyncMock()):
+            text = await agent._process(_msg("voice", "probe-scope", "hi"))
+
+        assert text == "pong"
+        assert FakeClient.attempts == 2
+
+    async def test_fallback_uses_resume_none_on_second_attempt(self, tmp_path):
+        """The second FakeClient construction must see options.resume=None."""
+        from claude_agent_sdk import ProcessError
+
+        captured_resumes: list[str | None] = []
+
+        class _CapturingFakeClient(FakeClient):
+            def __init__(self, options):
+                captured_resumes.append(getattr(options, "resume", None))
+                super().__init__(options)
+
+        FakeClient.reset()
+        FakeClient.failure_schedule = [
+            ProcessError("Command failed with exit code 1", exit_code=1),
+            None,
+        ]
+
+        reg = SessionRegistry(str(tmp_path / "sessions.json"))
+        await reg.register("voice:probe-scope", "butler", "stale-sid-abc")
+
+        mem = FakeMemory()
+        agent = _make_agent_with_registry(mem, reg, role="butler")
+
+        with patch("agent.ClaudeSDKClient", _CapturingFakeClient), \
+             patch("retry.asyncio.sleep", new=AsyncMock()):
+            await agent._process(_msg("voice", "probe-scope", "hi"))
+
+        assert len(captured_resumes) == 2
+        assert captured_resumes[0] == "stale-sid-abc"
+        assert captured_resumes[1] is None
+
+    async def test_process_error_without_resume_reraises(self, tmp_path):
+        """Fresh session (no registry entry) + ProcessError -> propagates."""
+        from claude_agent_sdk import ProcessError
+
+        FakeClient.reset()
+        FakeClient.failure_schedule = [
+            ProcessError("Command failed with exit code 1", exit_code=1),
+        ]
+
+        reg = SessionRegistry(str(tmp_path / "sessions.json"))
+        mem = FakeMemory()
+        agent = _make_agent_with_registry(mem, reg, role="butler")
+
+        with patch("agent.ClaudeSDKClient", FakeClient), \
+             patch("retry.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(ProcessError):
+                await agent._process(_msg("voice", "fresh-scope", "hi"))
+
+        assert FakeClient.attempts == 1
+        assert reg.get("voice:fresh-scope") is None
+
+    async def test_fallback_second_process_error_reraises(self, tmp_path):
+        """Both attempts ProcessError -> second propagates; stale id cleared."""
+        from claude_agent_sdk import ProcessError
+
+        FakeClient.reset()
+        FakeClient.failure_schedule = [
+            ProcessError("Command failed with exit code 1", exit_code=1),
+            ProcessError("Command failed with exit code 1", exit_code=1),
+        ]
+
+        reg = SessionRegistry(str(tmp_path / "sessions.json"))
+        await reg.register("voice:probe-scope", "butler", "stale-sid-xyz")
+
+        mem = FakeMemory()
+        agent = _make_agent_with_registry(mem, reg, role="butler")
+
+        with patch("agent.ClaudeSDKClient", FakeClient), \
+             patch("retry.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(ProcessError):
+                await agent._process(_msg("voice", "probe-scope", "hi"))
+
+        assert FakeClient.attempts == 2
+        entry = reg.get("voice:probe-scope")
+        assert entry is not None
+        assert "sdk_session_id" not in entry
+
+    async def test_fallback_logs_warning(self, tmp_path, caplog):
+        """A single WARNING with key + sid fires on fallback."""
+        import logging as _logging
+        from claude_agent_sdk import ProcessError
+
+        FakeClient.reset()
+        FakeClient.failure_schedule = [
+            ProcessError("Command failed with exit code 1", exit_code=1),
+            None,
+        ]
+
+        reg = SessionRegistry(str(tmp_path / "sessions.json"))
+        await reg.register("voice:probe-scope", "butler", "stale-sid-xyz")
+
+        mem = FakeMemory()
+        agent = _make_agent_with_registry(mem, reg, role="butler")
+
+        caplog.set_level(_logging.WARNING, logger="agent")
+        with patch("agent.ClaudeSDKClient", FakeClient), \
+             patch("retry.asyncio.sleep", new=AsyncMock()):
+            await agent._process(_msg("voice", "probe-scope", "hi"))
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING
+            and "SDK resume failed" in r.getMessage()
+        ]
+        assert len(warning_records) == 1
+        msg = warning_records[0].getMessage()
+        assert "voice:probe-scope" in msg
+        assert "stale-sid-xyz" in msg
