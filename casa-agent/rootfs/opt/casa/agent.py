@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import (
@@ -11,6 +12,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookMatcher,
+    ProcessError,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -261,9 +263,28 @@ class Agent:
                                     await on_token(attempt_text)
             return attempt_text, attempt_sid, attempt_usage
 
-        response_text, sdk_session_id, usage = await retry_sdk_call(
-            _attempt_sdk_turn, on_retry=self._log_retry,
-        )
+        try:
+            response_text, sdk_session_id, usage = await retry_sdk_call(
+                _attempt_sdk_turn, on_retry=self._log_retry,
+            )
+        except ProcessError:
+            # claude CLI exited non-zero. If we were resuming a prior
+            # session, the most common cause (spec 5.8) is a stale
+            # sdk_session_id — the local conversation file under
+            # ``/root/.claude/`` was wiped (rebuild) while
+            # ``/data/sessions.json`` persisted. Clear and retry fresh.
+            if resume_session_id is None:
+                raise
+            logger.warning(
+                "SDK resume failed (key=%s sid=%s); clearing and retrying fresh",
+                channel_key, resume_session_id,
+            )
+            await self._session_registry.clear_sdk_session(channel_key)
+            resume_session_id = None
+            options = replace(options, resume=None)
+            response_text, sdk_session_id, usage = await retry_sdk_call(
+                _attempt_sdk_turn, on_retry=self._log_retry,
+            )
 
         # Per-turn telemetry (spec 5.2 §5.2). Microsecond cost — string
         # format + one logger.info — and runs after streaming has
