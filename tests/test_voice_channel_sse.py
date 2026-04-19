@@ -13,6 +13,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from bus import BusMessage, MessageBus, MessageType
+from casa_core_middleware import cid_middleware
 from channels.voice.channel import VoiceChannel
 
 
@@ -71,7 +72,7 @@ async def voice_app():
         idle_timeout=300,
     )
 
-    app = web.Application()
+    app = web.Application(middlewares=[cid_middleware])
     channel.register_routes(app)
     async with TestClient(TestServer(app)) as client:
         yield client, bus
@@ -104,7 +105,7 @@ async def broken_voice_app(monkeypatch):
     # Replace the channel's bus.request method to raise unconditionally
     monkeypatch.setattr(channel._bus, "request", fake_request)
 
-    app = web.Application()
+    app = web.Application(middlewares=[cid_middleware])
     channel.register_routes(app)
     async with TestClient(TestServer(app)) as client:
         yield client, bus
@@ -167,7 +168,7 @@ async def agent_error_voice_app(tmp_path):
     bus.register("butler", agent.handle_message)
     loop_task = asyncio.create_task(bus.run_agent_loop("butler"))
 
-    app = web.Application()
+    app = web.Application(middlewares=[cid_middleware])
     voice_channel.register_routes(app)
     async with TestClient(TestServer(app)) as client:
         yield client
@@ -278,7 +279,7 @@ async def voice_app_with_limiter(request):
         rate_limiter=limiter,
     )
 
-    app = web.Application()
+    app = web.Application(middlewares=[cid_middleware])
     channel.register_routes(app)
     async with TestClient(TestServer(app)) as client:
         yield client, limiter
