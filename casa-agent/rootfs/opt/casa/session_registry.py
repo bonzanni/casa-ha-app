@@ -83,6 +83,27 @@ class SessionRegistry:
             self._data.pop(channel_key, None)
             await self._save_locked()
 
+    async def clear_sdk_session(self, channel_key: str) -> None:
+        """Drop the ``sdk_session_id`` field for a key; keep other metadata.
+
+        Used by the resume-failure recovery path in :mod:`agent` when
+        claude CLI rejects a ``--resume <sid>`` with ``ProcessError``
+        (spec 5.8 §3.1). The entry itself is NOT removed —
+        ``last_active`` stays so the session sweeper still gates on
+        age, and subsequent turns on the same key see an entry without
+        a session id and start a fresh SDK conversation.
+
+        No-op when the key does not exist, or when the entry has no
+        ``sdk_session_id`` field (idempotent).
+        """
+        async with self._lock:
+            entry = self._data.get(channel_key)
+            if entry is None:
+                return
+            if "sdk_session_id" in entry:
+                entry.pop("sdk_session_id", None)
+                await self._save_locked()
+
     async def save(self) -> None:
         """Public save: acquires the lock.
 
