@@ -79,9 +79,18 @@ class CasaAccessLogger(AbstractAccessLogger):
     The parent class's ``self.logger`` is set by ``AppRunner`` when the
     access logger is constructed. We ignore aiohttp's default CLF
     formatting entirely and emit a single structured-key-value string
-    via ``logger.info``; the installed root handler tags ``record.cid``
-    from ``cid_var`` at creation time, formats in the active mode
-    (human/JSON), and runs the line through ``RedactingFilter``.
+    via ``logger.info``; the installed root handler formats in the
+    active mode (human/JSON) and runs the line through
+    ``RedactingFilter``.
+
+    **cid source** — aiohttp fires ``access_log.log()`` from the
+    connection task AFTER the request-handler task has completed, so
+    by that point ``cid_middleware``'s ``finally`` has already reset
+    ``cid_var`` back to ``"-"``. We therefore read the cid from
+    ``request["cid"]`` (the middleware stored it on the request dict
+    at ingress) and re-bind ``cid_var`` for the duration of the
+    ``logger.info()`` call; the LogRecord factory then tags
+    ``record.cid`` with the right value at creation time.
     """
 
     def __init__(self, logger: "logging.Logger", log_format: str = "") -> None:
@@ -96,4 +105,17 @@ class CasaAccessLogger(AbstractAccessLogger):
             f"access method={request.method} path={path} "
             f"status={status} duration_ms={duration_ms} bytes={body_length}"
         )
-        self.logger.info(msg)
+        try:
+            cid = request["cid"]
+        except (KeyError, TypeError):
+            cid = "-"
+        # Re-bind cid_var so the LogRecord factory tags the new record
+        # with the request's cid. ``extra={"cid": ...}`` is rejected by
+        # Python's logging module because the factory has already set
+        # ``record.cid`` (Python refuses to let ``extra`` overwrite
+        # existing record attributes).
+        token = cid_var.set(cid)
+        try:
+            self.logger.info(msg)
+        finally:
+            cid_var.reset(token)
