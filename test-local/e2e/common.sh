@@ -19,10 +19,16 @@ build_image() {
 
 # start_container <name> [extra docker args...]
 # Prints the container id on stdout.
+# Maps ${HOST_PORT}:8080 always; if EXT_PORT is set, also maps
+# ${EXT_PORT}:18065 for tests that exercise the external server block.
 start_container() {
     local name="$1"; shift
+    local port_args=(-p "${HOST_PORT}:8080")
+    if [ -n "${EXT_PORT:-}" ]; then
+        port_args+=(-p "${EXT_PORT}:18065")
+    fi
     docker run -d --rm --name "$name" \
-        -p "${HOST_PORT}:8080" \
+        "${port_args[@]}" \
         "$@" "$IMAGE" >/dev/null
     echo "$name"
 }
