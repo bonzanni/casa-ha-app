@@ -27,6 +27,7 @@ from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig, load_agent_config
 from log_cid import install_logging, new_cid
+from casa_core_middleware import cid_middleware, CasaAccessLogger
 from mcp_registry import McpServerRegistry
 from memory import (
     CachedMemoryProvider,
@@ -631,7 +632,7 @@ async def main() -> None:
             target=assistant_role,
             content=f"Webhook '{name}' triggered with payload: {payload}",
             channel="webhook",
-            context={"webhook_name": name, "cid": new_cid()},
+            context={"webhook_name": name, "cid": request["cid"]},
         )
         await bus.send(msg)
         return web.json_response({"status": "accepted"})
@@ -656,6 +657,7 @@ async def main() -> None:
         if not prompt:
             return web.json_response({"error": "missing 'prompt' field"}, status=400)
 
+        payload.setdefault("context", {})["cid"] = request["cid"]
         msg = build_invoke_message(agent_role, prompt, payload)
         try:
             result = await bus.request(msg, timeout=300)
@@ -761,7 +763,7 @@ async def main() -> None:
         return web.Response(text=html, content_type="text/html")
 
     # 13. aiohttp app
-    app = web.Application()
+    app = web.Application(middlewares=[cid_middleware])
     if voice_channel is not None:
         voice_channel.register_routes(app)
     app.router.add_get("/", dashboard)
@@ -770,7 +772,11 @@ async def main() -> None:
     app.router.add_post("/invoke/{agent}", invoke_handler)
     app.router.add_post("/telegram/update", telegram_update_handler)
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(
+        app,
+        access_log_class=CasaAccessLogger,
+        access_log=logging.getLogger("casa.access"),
+    )
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8099)
     await site.start()
