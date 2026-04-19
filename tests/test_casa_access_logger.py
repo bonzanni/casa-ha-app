@@ -17,9 +17,39 @@ from log_cid import cid_var, install_logging
 # ---------------------------------------------------------------------------
 
 
-def _fake_request(method: str = "GET", path: str = "/healthz") -> SimpleNamespace:
-    """Minimal aiohttp-Request-like object for the logger."""
-    return SimpleNamespace(method=method, path_qs=path, path=path)
+class _FakeRequest:
+    """Minimal aiohttp-Request-like object supporting __getitem__.
+
+    aiohttp's ``web.BaseRequest`` behaves as a ``MutableMapping``, which
+    ``cid_middleware`` uses via ``request["cid"] = cid``. The real
+    ``CasaAccessLogger`` reads that back via ``request["cid"]``, so the
+    fake must support subscript access too.
+    """
+
+    def __init__(
+        self,
+        method: str = "GET",
+        path: str = "/healthz",
+        cid: str | None = None,
+    ) -> None:
+        self.method = method
+        self.path_qs = path
+        self.path = path
+        self._store: dict[str, str] = {}
+        if cid is not None:
+            self._store["cid"] = cid
+
+    def __getitem__(self, key: str) -> str:
+        return self._store[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._store
+
+
+def _fake_request(
+    method: str = "GET", path: str = "/healthz", cid: str | None = None,
+) -> _FakeRequest:
+    return _FakeRequest(method=method, path=path, cid=cid)
 
 
 def _fake_response(status: int = 200, body_length: int = 42) -> SimpleNamespace:
@@ -62,27 +92,44 @@ class TestFormat:
 
 
 class TestCidInRecord:
-    def test_cid_matches_contextvar(self, caplog, monkeypatch):
-        # install_logging installs the LogRecord factory that tags
-        # record.cid from cid_var at creation time.
+    """CasaAccessLogger reads cid from ``request["cid"]`` (set by
+    ``cid_middleware`` at ingress) and passes it via ``extra={}`` —
+    not from ``cid_var``, which has been reset by the middleware's
+    ``finally`` before aiohttp fires ``access_log.log()``.
+    """
+
+    def test_cid_from_request_dict(self, caplog):
         install_logging(level=logging.INFO)
         logger = logging.getLogger("casa.access")
         access = CasaAccessLogger(logger)
-        token = cid_var.set("abcdef01")
-        try:
-            caplog.set_level(logging.INFO, logger="casa.access")
-            access.log(_fake_request(), _fake_response(), 0.010)
-        finally:
-            cid_var.reset(token)
+        caplog.set_level(logging.INFO, logger="casa.access")
+        access.log(_fake_request(cid="abcdef01"), _fake_response(), 0.010)
         assert caplog.records[0].cid == "abcdef01"
 
-    def test_no_binding_gives_dash(self, caplog):
+    def test_missing_request_cid_falls_back_to_dash(self, caplog):
         install_logging(level=logging.INFO)
         logger = logging.getLogger("casa.access")
         access = CasaAccessLogger(logger)
         caplog.set_level(logging.INFO, logger="casa.access")
         access.log(_fake_request(), _fake_response(), 0.010)
         assert caplog.records[0].cid == "-"
+
+    def test_ignores_contextvar(self, caplog):
+        """Even if ``cid_var`` happens to be bound (e.g. during a
+        nested test), the access logger reads from the request dict.
+        This pins the behaviour against the aiohttp lifecycle quirk.
+        """
+        install_logging(level=logging.INFO)
+        logger = logging.getLogger("casa.access")
+        access = CasaAccessLogger(logger)
+        token = cid_var.set("deadbeef")
+        try:
+            caplog.set_level(logging.INFO, logger="casa.access")
+            access.log(_fake_request(cid="abcdef01"), _fake_response(), 0.010)
+        finally:
+            cid_var.reset(token)
+        # request["cid"] wins, not cid_var
+        assert caplog.records[0].cid == "abcdef01"
 
 
 # ---------------------------------------------------------------------------
@@ -107,20 +154,14 @@ class TestLoggerWiring:
 
 class TestJsonMode:
     def test_json_line_parses_with_fields(
-        self, caplog, monkeypatch, capsys
+        self, monkeypatch, capsys
     ):
-        # Use install_logging with LOG_FORMAT=json, emit via the real
-        # StreamHandler, and capture the printed line via capsys.
         monkeypatch.setenv("LOG_FORMAT", "json")
         install_logging(level=logging.INFO)
         logger = logging.getLogger("casa.access")
         access = CasaAccessLogger(logger)
-        token = cid_var.set("facefeed")
-        try:
-            access.log(_fake_request("POST", "/healthz"),
-                       _fake_response(200, 5), 0.002)
-        finally:
-            cid_var.reset(token)
+        access.log(_fake_request("POST", "/healthz", cid="facefeed"),
+                   _fake_response(200, 5), 0.002)
         captured = capsys.readouterr().out
         last = [line for line in captured.splitlines() if line.strip()][-1]
         payload = json.loads(last)
