@@ -220,7 +220,7 @@ class VoiceChannel(Channel):
             context={
                 "chat_id": scope_id,
                 "utterance_id": utterance_id,
-                "cid": new_cid(),
+                "cid": request["cid"],
                 **(payload.get("context") or {}),
                 "_on_token": on_token,
                 "_error_sink": _error_sink,
