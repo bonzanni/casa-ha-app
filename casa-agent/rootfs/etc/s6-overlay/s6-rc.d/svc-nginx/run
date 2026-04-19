@@ -1,4 +1,7 @@
 #!/command/with-contenv bashio
+# 5.5 item 3: strip ANSI from bashio output for clean docker logs.
+export BASHIO_LOG_NO_COLORS=true
+export NO_COLOR=1
 
 # Wait for aiohttp to be ready before proxying (prevents 502 on startup)
 bashio::net.wait_for 8099 127.0.0.1 60

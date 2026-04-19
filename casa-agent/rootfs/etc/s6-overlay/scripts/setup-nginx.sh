@@ -1,10 +1,13 @@
 #!/command/with-contenv bashio
+# 5.5 item 3: strip ANSI from bashio output for clean docker logs.
+export BASHIO_LOG_NO_COLORS=true
+export NO_COLOR=1
 
 INGRESS_PORT=$(bashio::addon.ingress_port)
 
 cat > /etc/nginx/nginx.conf <<NGINX
 worker_processes 1;
-error_log /dev/stdout info;
+error_log /dev/stdout warn;
 pid /tmp/nginx.pid;
 
 events { worker_connections 128; }

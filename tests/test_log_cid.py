@@ -163,7 +163,7 @@ class TestInstallLogging:
                 root.removeFilter(f)
 
     def test_human_format_default(self, monkeypatch):
-        monkeypatch.delenv("LOG_FORMAT", raising=False)
+        monkeypatch.setenv("LOG_FORMAT", "human")
         buf = StringIO()
         install_logging(stream=buf)
 
@@ -232,3 +232,29 @@ class TestInstallLogging:
         assert "sk-abcdefghijklmnopqrst" in line
         assert "uvwxyz1234567890" not in line
         assert "***" in line  # redaction marker present, not just truncation
+
+
+class TestFormatDefaultIsJson:
+    """5.5 item 4 — LOG_FORMAT unset now means JSON."""
+
+    def test_unset_env_yields_json_formatter(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.delenv("LOG_FORMAT", raising=False)
+        install_logging(level=logging.INFO)
+        logging.getLogger("casa.test").info("hello")
+        line = capsys.readouterr().out.strip().splitlines()[-1]
+        payload = json.loads(line)
+        assert payload["level"] == "INFO"
+        assert payload["msg"] == "hello"
+
+    def test_log_format_human_yields_human_formatter(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("LOG_FORMAT", "human")
+        install_logging(level=logging.INFO)
+        logging.getLogger("casa.test").info("hello")
+        line = capsys.readouterr().out.strip().splitlines()[-1]
+        # human format starts with an ISO timestamp and has bracketed level
+        assert "[INFO]" in line
+        assert "hello" in line

@@ -1,4 +1,7 @@
 #!/command/with-contenv bashio
+# 5.5 item 3: strip ANSI from bashio output for clean docker logs.
+export BASHIO_LOG_NO_COLORS=true
+export NO_COLOR=1
 
 if ! bashio::config.true 'enable_terminal'; then
     bashio::log.info "Web terminal is disabled."
@@ -7,6 +10,7 @@ fi
 
 bashio::log.info "Starting ttyd web terminal..."
 exec ttyd \
+    -d 0 \
     --writable \
     --interface 127.0.0.1 \
     --port 7681 \

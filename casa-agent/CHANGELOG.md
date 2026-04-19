@@ -1,5 +1,127 @@
 # Changelog
 
+## 0.5.8 — 2026-04-19 — Phase 5.5: log hygiene
+
+### Added
+- **aiohttp cid middleware** in new `casa_core_middleware.py`
+  (`cid_middleware`). Every inbound HTTP request now gets an 8-char
+  lowercase-hex correlation id at ingress. Operators may override
+  via `X-Request-Cid` header (accepts 8–32 hex chars,
+  case-insensitive; uppercase normalised to lowercase; invalid shape
+  silently ignored in favour of a fresh allocation). The middleware
+  binds `log_cid.cid_var` with a scoped ContextVar token for the
+  handler's task. `asyncio.create_task` snapshots contextvars, so
+  any task the handler spawns (notably `bus.request`'s inner
+  dispatch task) inherits the same cid — access-log lines, ingress
+  INFO lines, and the `turn_done` budget summary all share one cid.
+- **Custom aiohttp `AccessLogger`** (`CasaAccessLogger`) in the same
+  module. Emits one `logger.info(...)` on the `casa.access` logger,
+  which picks up Casa's installed root handler (5.2-H) — so access
+  lines share the active formatter (human/JSON), carry the current
+  cid, and run through `RedactingFilter`. Line format:
+  `access method=<M> path=<P> status=<S> duration_ms=<D> bytes=<B>`.
+  Replaces aiohttp's default CLF output (which double-stamped the
+  timestamp and always logged `cid=-`). Wired into `AppRunner` via
+  `access_log_class=CasaAccessLogger,
+  access_log=logging.getLogger("casa.access")`.
+- **Telegram `_handle` inherit-or-allocate cid** — unifies webhook
+  and polling transport. When the aiohttp middleware has bound
+  `cid_var` (webhook mode via `/telegram/update`), PTB's `_handle`
+  inherits it via contextvars. When running in polling mode (no HTTP
+  ingress), `_handle` allocates a fresh cid via `new_cid()` as
+  before. Pattern:
+  `cid = cid_var.get(); cid = cid if cid != "-" else new_cid()`.
+
+### Changed
+- **[BREAKING] `LOG_FORMAT` default flipped from human to JSON.**
+  Unset `LOG_FORMAT` now yields JSON; any value other than `"human"`
+  (case-insensitive — includes typos like `LOG_FORMAT=JSON` or
+  `LOG_FORMAT=true`) also resolves to JSON. **For prior behaviour,
+  set `LOG_FORMAT=human`** in the addon options. Casa does not
+  consume its own logs, so no internal callers break; only operators
+  reading raw `docker logs` by eye are affected. Motivation:
+  operators running a log aggregator (Loki+Promtail, Vector, Fluent
+  Bit) no longer need to opt-in to JSON — the default is now
+  parseable out of the box.
+- **Addon nginx `error_log` level `info` → `warn`** in
+  `casa-agent/rootfs/etc/s6-overlay/scripts/setup-nginx.sh`. The
+  "closed keepalive connection" info-spam (one line per external
+  request at idle) disappears; real config errors and upstream
+  timeouts still surface. This is the fix the dropped-as-YAGNI 5.6
+  (NPM upstream connection reuse) was reaching for — at zero
+  operational debt versus a template fork or migration-off-NPM.
+- **ttyd `-d 0`** in `svc-ttyd/run`. Routine connection/session
+  chatter silenced; fatal errors stay visible. Only affects
+  deployments that enable the `web_terminal` addon option.
+- **HTTP handler cid reads** — `webhook_handler` (`casa_core.py`),
+  `invoke_handler` (`casa_core.py`), voice SSE handler
+  (`channels/voice/channel.py:_sse_handler`), Telegram webhook POST
+  `telegram_update_handler` — all now read `request["cid"]` instead
+  of calling `new_cid()` inline. `invoke_handler` additionally
+  primes `payload["context"]["cid"]` from `request["cid"]` before
+  calling `build_invoke_message`, so the builder's defensive
+  fallback is a no-op on the normal HTTP path.
+
+### Infra
+- **Bashio ANSI strip (defensive).** Every s6 `run`/`finish` script
+  plus `setup-configs.sh`, `setup-nginx.sh`, `validate-config.sh`,
+  and `sync-repos.sh` now exports `BASHIO_LOG_NO_COLORS=true` and
+  `NO_COLOR=1` at the top (after the shebang, before any `bashio::*`
+  call). Idempotent — re-sourcing on s6 respawn costs nothing.
+  Baseline ANSI count on v0.5.7 prod was not captured this session
+  (SSH-agent auth failure); defensive exports ship regardless so
+  future bashio/s6 TTY-detection changes cannot reintroduce ANSI.
+
+### Not changed
+- **`bus._dispatch` cid binding** — the defensive
+  `cid_var.set(msg.context["cid"])` from 5.2-H stays. It's a no-op
+  when the middleware already bound the same cid; authoritative
+  when a non-HTTP caller sets a different cid in `context` (e.g.
+  scheduler heartbeat). Removing it would silently break non-HTTP
+  cid paths.
+- **`CidFilter` utility class** in `log_cid.py` remains available
+  for manual LogRecord construction. Not auto-wired — the
+  LogRecord factory in `install_logging` handles cid tagging at
+  creation time.
+- **Voice WS per-utterance cid allocation** stays manual. One WS
+  connection, many utterances, one cid per utterance per the 5.2-H
+  contract. The middleware allocates a connection-level cid for the
+  WS upgrade request; the utterance loop then overrides per frame
+  via `new_cid()`.
+- **Scheduler heartbeat cid** stays. It runs in the scheduler
+  task, no HTTP request, so the middleware never sees it.
+  `bus._dispatch` picks up `context["cid"]` as today.
+- **`build_invoke_message` defensive fallback** stays. On the
+  normal HTTP path `invoke_handler` primes `payload.context.cid`
+  from the middleware, so the fallback is a no-op. Non-HTTP
+  callers (future) can still rely on it.
+
+### Tests
+- New: `tests/test_cid_middleware.py` (12 tests across
+  `TestDefaultAllocation`, `TestHeaderOverride`,
+  `TestContextVarBinding`, `TestExceptionSafety`,
+  `TestSpawnedTaskInherits`) — uses Casa's existing
+  `TestClient(TestServer(app))` pattern, no `pytest-aiohttp`
+  dependency.
+- New: `tests/test_casa_access_logger.py` (6 tests across
+  `TestFormat`, `TestCidInRecord`, `TestLoggerWiring`,
+  `TestJsonMode`).
+- Extended: `tests/test_telegram_split.py::TestInheritOrAllocateCid`
+  (2 tests — inherits pre-bound cid, allocates when default).
+- Extended: `tests/test_log_cid.py::TestFormatDefaultIsJson`
+  (2 tests — unset env yields JSON, `LOG_FORMAT=human` yields
+  human). Existing `test_human_format_default` updated to set
+  `LOG_FORMAT=human` explicitly (preserves human-format
+  coverage).
+- Updated: `tests/test_voice_channel_sse.py` — 3 fixture
+  `web.Application()` calls now register `cid_middleware` so
+  handlers see `request["cid"]`.
+- Count: 403 → 425 (+22 new/extended tests).
+
+### Plan / spec
+- Spec: `docs/superpowers/specs/2026-04-19-5.5-log-hygiene.md`
+- Plan: `docs/superpowers/plans/2026-04-19-5.5-log-hygiene.md`
+
 ## 0.5.7 — 2026-04-18 — Phase 5.3 infra hygiene (partial: items A + K)
 
 ### Added
