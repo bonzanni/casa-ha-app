@@ -53,9 +53,46 @@ probes:
     body_json: { prompt: "say 'probe ok'", scope_id: "probe-scope" }
     expect_events: [block, done]
 
+  # ── Negative surface audit ────────────────────────────────────────
+  # Unsigned HMAC-gated endpoints must reject with 401/403 before any
+  # bus dispatch. Regression gate: catches if anyone wires a new
+  # handler to `/invoke/*` / `/webhook/*` / `/api/converse` without
+  # running HMAC verify first.
+
+  surface-invoke-unsigned:
+    method: POST
+    path: /invoke/assistant
+    body_json: { prompt: "surface audit" }
+    expect_status: 401
+    expect_body_contains: invalid signature
+
+  surface-webhook-unsigned:
+    method: POST
+    path: /webhook/surface-audit
+    body_json: { probe: true }
+    expect_status: 401
+    expect_body_contains: invalid signature
+
+  surface-voice-sse-unsigned:
+    method: POST
+    path: /api/converse
+    body_json: { prompt: "surface audit", scope_id: "surface-audit" }
+    expect_status: 401
+    expect_body_contains: invalid signature
+
+  surface-telegram-unsigned:
+    method: POST
+    path: /telegram/update
+    body_json: { update_id: 0, message: { text: "surface audit" } }
+    expect_status: 403
+
 smoke: [healthz, turn-assistant, voice-sse]
 
 regression:
   - healthz
   - turn-assistant
   - voice-sse
+  - surface-invoke-unsigned
+  - surface-webhook-unsigned
+  - surface-voice-sse-unsigned
+  - surface-telegram-unsigned
