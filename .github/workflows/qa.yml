@@ -40,6 +40,8 @@ jobs:
           bash test-local/e2e/test_voice_ws.sh
       - name: SQLite memory
         run: bash test-local/e2e/test_sqlite_memory.sh
+      - name: External surface (5.7)
+        run: bash test-local/e2e/test_external_surface.sh
 
   e2e-slow:
     if: github.event_name == 'schedule'
