@@ -77,6 +77,13 @@ cat >> /etc/nginx/nginx.conf <<'NGINX'
         listen 18065;
         server_name _;
 
+        # 5.7: the public hostname is not a front door for the dashboard.
+        # Exact-match on / only; deeper paths fall through to the catch-all
+        # below and keep their existing gates.
+        location = / {
+            return 404;
+        }
+
         location / {
             proxy_pass http://127.0.0.1:8099;
             proxy_http_version 1.1;
