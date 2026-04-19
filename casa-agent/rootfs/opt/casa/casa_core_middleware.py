@@ -63,3 +63,37 @@ async def cid_middleware(
         return await handler(request)
     finally:
         cid_var.reset(token)
+
+
+# ---------------------------------------------------------------------------
+# access logger
+# ---------------------------------------------------------------------------
+
+
+from aiohttp.abc import AbstractAccessLogger  # noqa: E402 (import-by-feature)
+
+
+class CasaAccessLogger(AbstractAccessLogger):
+    """Emit one access-log line through Casa's 5.2-H formatter.
+
+    The parent class's ``self.logger`` is set by ``AppRunner`` when the
+    access logger is constructed. We ignore aiohttp's default CLF
+    formatting entirely and emit a single structured-key-value string
+    via ``logger.info``; the installed root handler tags ``record.cid``
+    from ``cid_var`` at creation time, formats in the active mode
+    (human/JSON), and runs the line through ``RedactingFilter``.
+    """
+
+    def __init__(self, logger: "logging.Logger", log_format: str = "") -> None:
+        super().__init__(logger, log_format)
+
+    def log(self, request, response, time) -> None:
+        duration_ms = int(time * 1000)
+        path = getattr(request, "path_qs", request.path)
+        status = getattr(response, "status", 0)
+        body_length = getattr(response, "body_length", 0)
+        msg = (
+            f"access method={request.method} path={path} "
+            f"status={status} duration_ms={duration_ms} bytes={body_length}"
+        )
+        self.logger.info(msg)
