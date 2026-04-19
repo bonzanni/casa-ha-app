@@ -32,7 +32,7 @@ from telegram.ext import (
 from bus import BusMessage, MessageBus, MessageType
 from channels import Channel
 from channels.telegram_supervisor import ReconnectSupervisor
-from log_cid import new_cid
+from log_cid import cid_var, new_cid
 from rate_limit import RateLimiter
 
 logger = logging.getLogger(__name__)
@@ -393,6 +393,9 @@ class TelegramChannel(Channel):
 
         self._start_typing(chat_id)
 
+        inherited = cid_var.get()
+        cid = inherited if inherited != "-" else new_cid()
+
         msg = BusMessage(
             type=MessageType.CHANNEL_IN,
             source="telegram",
@@ -403,7 +406,7 @@ class TelegramChannel(Channel):
                 "chat_id": chat_id,
                 "user_name": user_name,
                 "message_id": str(update.message.message_id),
-                "cid": new_cid(),
+                "cid": cid,
             },
         )
         await self._bus.send(msg)
