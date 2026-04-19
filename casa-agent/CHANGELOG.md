@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.5.9 — 2026-04-19 — Phase 5.8: SDK session resume resilience
+
+### Added
+- **`SessionRegistry.clear_sdk_session(channel_key)`** — drops only
+  the `sdk_session_id` field from a registry entry; keeps
+  `last_active` and `agent` intact so the session sweeper and
+  downstream consumers still see the scope. Idempotent and no-op on
+  missing keys.
+- **`Agent._process` resume fallback.** When
+  `claude_agent_sdk.ProcessError` fires on a turn that attempted to
+  resume a prior SDK session (`resume_session_id` was set), Casa now:
+  1. Logs a `WARNING` — `SDK resume failed (key=<k> sid=<sid>); clearing and retrying fresh`.
+  2. Clears the stale `sdk_session_id` via `clear_sdk_session`.
+  3. Rebuilds `ClaudeAgentOptions` with `resume=None` via
+     `dataclasses.replace`.
+  4. Re-runs `retry_sdk_call(_attempt_sdk_turn)` once. On success the
+     fresh `sdk_session_id` is persisted via the existing `register`
+     path.
+  If `resume_session_id` was `None` or the fresh retry also raises
+  `ProcessError`, the exception propagates to the caller — no
+  infinite loop.
+
+### Fixed
+- `/data/sessions.json` persists across `ha apps rebuild` (bind-
+  mounted), but the claude CLI's own session state under
+  `/root/.claude/` does NOT (container-local). Every rebuild
+  therefore orphaned every `sdk_session_id` recorded in
+  `sessions.json`. Subsequent resume attempts crashed claude CLI
+  with exit 1 + `No conversation found with session ID: <uuid>`,
+  manifesting in Casa as `ProcessError` and a user-facing `sdk_error`
+  persona line. Tripped by the v0.5.8 post-deploy `voice-sse` smoke
+  probe (`voice:probe-scope` → butler agent Tina). The fix recovers
+  transparently: the first post-rebuild turn on any stale scope
+  logs one `SDK resume failed` warning and proceeds on a fresh
+  session. Agent memory is unaffected (Honcho / SQLite memory is
+  keyed on user peer + channel key, not `sdk_session_id`).
+
+### Tests
+- New: `tests/test_session_registry.py::TestClearSdkSession` — 4
+  tests (field removal, metadata preservation, missing-key no-op,
+  disk persistence).
+- New: `tests/test_agent_process.py::TestResumeResilience` — 5
+  tests (stale resume cleared and retried, second attempt sees
+  `resume=None`, no-resume re-raises, double-ProcessError re-raises
+  with cleared stale id, fallback logs a single prefixed WARNING).
+- Count: 426 → 435 unit tests green.
+
+### Not changed
+- `retry.py` — stays a pure policy module. `ProcessError` remains
+  classified as `ErrorKind.UNKNOWN` (not in `RETRY_KINDS`). The
+  fallback runs at the outer `Agent._process` layer.
+- `error_kinds.py` — no classification changes.
+- `SessionSweeper` — TTL-based eviction unchanged.
+- `sessions.json` persistence — unchanged shape. The fallback
+  mutates entries only when it fires.
+- Memory providers — unchanged. Honcho / SQLite remain orthogonal
+  to `sdk_session_id`.
+
+### Plan / spec
+- Spec: `docs/superpowers/specs/2026-04-19-5.8-session-resume-resilience.md`
+- Plan: `docs/superpowers/plans/2026-04-19-5.8-session-resume-resilience.md`
+
 ## 0.5.8 — 2026-04-19 — Phase 5.5: log hygiene
 
 ### Added
