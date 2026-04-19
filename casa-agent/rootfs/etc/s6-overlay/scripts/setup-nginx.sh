@@ -1,4 +1,7 @@
 #!/command/with-contenv bashio
+# 5.5 item 3: strip ANSI from bashio output for clean docker logs.
+export BASHIO_LOG_NO_COLORS=true
+export NO_COLOR=1
 
 INGRESS_PORT=$(bashio::addon.ingress_port)
 

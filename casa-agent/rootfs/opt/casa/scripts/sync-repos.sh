@@ -1,5 +1,8 @@
 #!/bin/bash
 # /opt/casa/scripts/sync-repos.sh
+# 5.5 item 3: strip ANSI from bashio output for clean docker logs.
+export BASHIO_LOG_NO_COLORS=true
+export NO_COLOR=1
 # shellcheck source=/dev/null
 source /usr/lib/bashio/bashio.sh
 
