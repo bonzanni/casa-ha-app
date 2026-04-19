@@ -148,3 +148,60 @@ class TestConcurrency:
 
         # Public save() acquires fresh (no caller holds) and completes.
         await reg.save()
+
+
+# ---------------------------------------------------------------------------
+# TestClearSdkSession — 5.8 §3.1
+# ---------------------------------------------------------------------------
+
+
+class TestClearSdkSession:
+    """clear_sdk_session drops only the sdk_session_id field; keeps entry."""
+
+    async def test_removes_sdk_session_id_field(self, tmp_path):
+        path = str(tmp_path / "sessions.json")
+        reg = SessionRegistry(path)
+        await reg.register("voice:scope-a", "butler", "sid-123")
+        assert reg.get("voice:scope-a")["sdk_session_id"] == "sid-123"
+
+        await reg.clear_sdk_session("voice:scope-a")
+
+        entry = reg.get("voice:scope-a")
+        assert entry is not None
+        assert "sdk_session_id" not in entry
+
+    async def test_keeps_last_active_and_agent(self, tmp_path):
+        path = str(tmp_path / "sessions.json")
+        reg = SessionRegistry(path)
+        await reg.register("voice:scope-a", "butler", "sid-123")
+        before = reg.get("voice:scope-a")["last_active"]
+
+        await reg.clear_sdk_session("voice:scope-a")
+
+        entry = reg.get("voice:scope-a")
+        assert entry["agent"] == "butler"
+        assert entry["last_active"] == before
+
+    async def test_missing_key_is_noop(self, tmp_path):
+        path = str(tmp_path / "sessions.json")
+        reg = SessionRegistry(path)
+
+        # Must not raise.
+        await reg.clear_sdk_session("voice:never-registered")
+
+        assert reg.get("voice:never-registered") is None
+
+    async def test_persists_to_disk(self, tmp_path):
+        import json
+        path = str(tmp_path / "sessions.json")
+        reg = SessionRegistry(path)
+        await reg.register("voice:scope-a", "butler", "sid-123")
+
+        await reg.clear_sdk_session("voice:scope-a")
+
+        # Re-read fresh from disk.
+        with open(path) as fh:
+            data = json.load(fh)
+        assert "voice:scope-a" in data
+        assert "sdk_session_id" not in data["voice:scope-a"]
+        assert data["voice:scope-a"]["agent"] == "butler"
