@@ -152,3 +152,121 @@ class TestDefaultScope:
 
         m = MemoryConfig()
         assert m.default_scope == ""
+
+
+# ---------------------------------------------------------------------------
+# TestScopeValidation (3.2)
+# ---------------------------------------------------------------------------
+
+
+def _stub_policy_lib():
+    """Minimal PolicyLibrary with a 'standard' policy for tests that
+    don't care about disclosure rendering."""
+    from policies import PolicyLibrary
+    return PolicyLibrary({
+        "standard": {
+            "categories": {},
+            "safe_on_any_channel": [],
+            "deflection_patterns": {},
+        },
+    })
+
+
+def _write_resident_dir(d, *, scopes_owned, scopes_readable, default_scope):
+    import textwrap
+    (d / "character.yaml").write_text(textwrap.dedent(f"""
+        schema_version: 1
+        role: {d.name}
+        name: Test
+        archetype: test
+        card: test
+        prompt: test
+    """).strip() + "\n")
+    (d / "voice.yaml").write_text("schema_version: 1\n")
+    (d / "response_shape.yaml").write_text("schema_version: 1\n")
+    (d / "disclosure.yaml").write_text(textwrap.dedent("""
+        schema_version: 1
+        policy: standard
+        overrides: {}
+    """).strip() + "\n")
+    (d / "runtime.yaml").write_text(textwrap.dedent(f"""
+        schema_version: 1
+        model: sonnet
+        channels: [telegram]
+        memory:
+          scopes_owned: {scopes_owned}
+          scopes_readable: {scopes_readable}
+          default_scope: {default_scope!r}
+    """).strip() + "\n")
+
+
+def _write_executor_dir(d, *, default_scope):
+    import textwrap
+    (d / "character.yaml").write_text(textwrap.dedent(f"""
+        schema_version: 1
+        role: {d.name}
+        name: Test
+        archetype: test
+        card: test
+        prompt: test
+    """).strip() + "\n")
+    (d / "voice.yaml").write_text("schema_version: 1\n")
+    (d / "response_shape.yaml").write_text("schema_version: 1\n")
+    (d / "runtime.yaml").write_text(textwrap.dedent(f"""
+        schema_version: 1
+        model: sonnet
+        channels: []
+        memory:
+          default_scope: {default_scope!r}
+    """).strip() + "\n")
+
+
+class TestScopeValidation:
+    def test_default_scope_must_be_in_scopes_owned(self, tmp_path):
+        """A resident declaring default_scope outside scopes_owned is rejected."""
+        from agent_loader import load_agent_from_dir, LoadError
+
+        agent_dir = tmp_path / "resident_bad"
+        agent_dir.mkdir()
+        _write_resident_dir(agent_dir, default_scope="nonexistent",
+                            scopes_owned=["personal"],
+                            scopes_readable=["personal", "house"])
+
+        with pytest.raises(LoadError, match="default_scope"):
+            load_agent_from_dir(str(agent_dir), policies=_stub_policy_lib())
+
+    def test_scopes_owned_must_subset_scopes_readable(self, tmp_path):
+        from agent_loader import load_agent_from_dir, LoadError
+
+        agent_dir = tmp_path / "resident_bad"
+        agent_dir.mkdir()
+        _write_resident_dir(agent_dir,
+                            scopes_owned=["personal", "finance"],
+                            scopes_readable=["personal"],  # finance missing
+                            default_scope="personal")
+
+        with pytest.raises(LoadError, match=r"scopes_owned.*subset.*scopes_readable"):
+            load_agent_from_dir(str(agent_dir), policies=_stub_policy_lib())
+
+    def test_executor_cannot_have_default_scope(self, tmp_path):
+        from agent_loader import load_agent_from_dir, LoadError
+
+        agent_dir = tmp_path / "exec_bad"
+        agent_dir.mkdir()
+        _write_executor_dir(agent_dir, default_scope="personal")
+
+        with pytest.raises(LoadError, match="executor.*default_scope"):
+            load_agent_from_dir(str(agent_dir), policies=None)
+
+    def test_valid_resident_loads(self, tmp_path):
+        from agent_loader import load_agent_from_dir
+
+        agent_dir = tmp_path / "resident_ok"
+        agent_dir.mkdir()
+        _write_resident_dir(agent_dir,
+                            scopes_owned=["personal"],
+                            scopes_readable=["personal", "house"],
+                            default_scope="personal")
+
+        cfg = load_agent_from_dir(str(agent_dir), policies=_stub_policy_lib())
+        assert cfg.memory.default_scope == "personal"
