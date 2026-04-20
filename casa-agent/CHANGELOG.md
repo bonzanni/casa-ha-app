@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.5.10 — 2026-04-20 — Phase 5.7: Close public dashboard
+
+### Fixed
+- On the public hostname (`agent.oudekamp.bonzanni.casa`, addon-nginx
+  `:18065`), `GET /` no longer proxies to casa-core and returns
+  the dashboard HTML. It now returns a static **nginx 404** via an
+  exact-match `location = /` rule placed immediately before the
+  existing catch-all. No Python hop, no aiohttp handler invocation.
+  The dashboard remains reachable via HA ingress on the separate
+  `listen $INGRESS_PORT` server block.
+- Test-infra gap from v0.5.9: `test-local/mock-claude-sdk/` was
+  missing `ProcessError`. v0.5.9's resume-resilience code added a
+  `ProcessError` import in `agent.py`, which unit tests tolerated
+  (they resolved the real pip-installed SDK on the host) but the
+  Docker e2e image crashed at container start with `ImportError:
+  cannot import name 'ProcessError'`. Mock now mirrors the real
+  SDK's 3-arg `(message, exit_code, stderr)` signature so tests
+  that construct `ProcessError(..., exit_code=N)` work unchanged.
+  Unblocks all local e2e on this release; no production impact.
+
+### Tests
+- New e2e: `test-local/e2e/test_external_surface.sh` — maps both
+  ingress (`:8080`) and external (`:18065`) ports, asserts three
+  outcomes:
+  1. Ingress `GET /` → 200 (dashboard still alive internally).
+  2. External `GET /` → 404 (new contract).
+  3. External `GET /healthz` → 200 (uptime contract pinned).
+- Wired into `.github/workflows/qa.yml` e2e-fast as the final step.
+- `test-local/e2e/common.sh::start_container()` now accepts an opt-in
+  `EXT_PORT` env var that maps a second host port to container `:18065`.
+  Default behaviour unchanged — all eight pre-existing e2e scripts
+  still map only `:8080`.
+
+### Not changed
+- `casa-core` aiohttp routes — `app.router.add_get("/", dashboard)`
+  stays intact.
+- Ingress server block — the `listen $INGRESS_PORT` block is
+  untouched; HA-authenticated dashboard access works as before.
+- All other external routes — `/invoke/*`, `/webhook/*`,
+  `/api/converse`, `/api/converse/ws`, `/telegram/update` continue to
+  match the catch-all `location /` and hit their existing gates
+  (HMAC, secret token, anonymous `/healthz`).
+- Nginx `/terminal/` rule on the external block — pre-existing 404
+  unchanged.
+
+---
+
 ## 0.5.9 — 2026-04-19 — Phase 5.8: SDK session resume resilience
 
 ### Added
