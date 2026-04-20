@@ -324,6 +324,18 @@ def _wrap_memory_for_strategy(
 # ------------------------------------------------------------------
 
 
+def _log_subagents_deprecation_if_present(agents_dir: str) -> None:
+    """Phase 3.1: subagents.yaml is no longer loaded. If present, log once."""
+    path = os.path.join(agents_dir, "subagents.yaml")
+    if os.path.exists(path):
+        logger.info(
+            "subagents.yaml detected: as of v0.6.0 its entries are no longer "
+            "loaded. See docs/ROADMAP.md §3.1 for the new agents/executors/ "
+            "convention. Alex ships bundled-disabled at agents/executors/"
+            "alex.yaml. Delete this file when convenient.",
+        )
+
+
 def _load_agents_by_role(agents_dir: str) -> dict[str, AgentConfig]:
     """Scan *agents_dir* and return a dict keyed on role.
 
@@ -434,7 +446,7 @@ async def main() -> None:
 
     # 7. Framework tools
     from tools import create_casa_tools, init_tools
-    from executor_registry import ExecutorRegistry
+    from executor_registry import DelegationComplete, ExecutorRegistry
 
     # Phase 3.1 Task 7: init_tools now takes an ExecutorRegistry so the
     # delegate_to_agent tool can resolve Tier 2 executor configs. Task 10
@@ -454,6 +466,7 @@ async def main() -> None:
     from agent import Agent
 
     agents_dir = os.path.join(CONFIG_DIR, "agents")
+    _log_subagents_deprecation_if_present(agents_dir)
     role_configs = _load_agents_by_role(agents_dir)
 
     if "assistant" not in role_configs:
@@ -802,6 +815,45 @@ async def main() -> None:
     for name in list(agents.keys()) + ["telegram"]:
         if name in bus.queues:
             loop_tasks.append(asyncio.create_task(bus.run_agent_loop(name)))
+
+    # 13b. Orphan delegation recovery (Phase 3.1 §7.4). The bus loops are
+    # up; the orphan NOTIFICATIONs we post here queue on Ellen's queue
+    # and drain once she's processing messages. HTTP is already accepting
+    # requests — that's fine, orphans are not racing anything user-facing.
+    orphans = executor_registry.orphans_from_disk()
+    for record in orphans:
+        target_role = record.origin.get("role") or assistant_role
+        if target_role in bus.queues:
+            synthetic = DelegationComplete(
+                delegation_id=record.id,
+                agent=record.agent,
+                status="error",
+                kind="restart_orphan",
+                message="Lost on restart",
+                origin=record.origin,
+                elapsed_s=0.0,
+            )
+            await bus.notify(BusMessage(
+                type=MessageType.NOTIFICATION,
+                source=record.agent,
+                target=target_role,
+                content=synthetic,
+                channel=record.origin.get("channel", ""),
+                context={
+                    "cid": record.origin.get("cid", "-"),
+                    "chat_id": record.origin.get("chat_id", ""),
+                    "delegation_id": record.id,
+                },
+            ))
+            logger.warning(
+                "Orphan delegation recovered: id=%s agent=%s — NOTIFICATION posted",
+                record.id[:8], record.agent,
+            )
+        else:
+            logger.error(
+                "Orphan delegation %s targets unknown role %r — dropped",
+                record.id[:8], target_role,
+            )
 
     # 14. APScheduler heartbeat
     scheduler = AsyncIOScheduler()

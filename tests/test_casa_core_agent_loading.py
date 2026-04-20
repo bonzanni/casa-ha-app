@@ -137,3 +137,37 @@ def test_executors_subdir_not_scanned(tmp_path):
            "channels: [telegram]\n")
     result = _load_agents_by_role(str(agents))
     assert set(result.keys()) == {"assistant"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.1 — subagents.yaml deprecation log
+# ---------------------------------------------------------------------------
+
+
+def test_subagents_yaml_presence_logs_deprecation(tmp_path, caplog):
+    """If agents/subagents.yaml exists, casa_core logs one INFO line
+    explaining the file is no longer loaded as of v0.6.0. The helper
+    lives on casa_core and is called once at startup."""
+    import logging
+    from casa_core import _log_subagents_deprecation_if_present
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    _write(str(agents / "subagents.yaml"), "alex:\n  model: sonnet\n")
+    with caplog.at_level(logging.INFO):
+        _log_subagents_deprecation_if_present(str(agents))
+    assert any(
+        "subagents.yaml" in r.message and "no longer loaded" in r.message
+        for r in caplog.records
+    )
+
+
+def test_subagents_yaml_absent_is_silent(tmp_path, caplog):
+    import logging
+    from casa_core import _log_subagents_deprecation_if_present
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    with caplog.at_level(logging.INFO):
+        _log_subagents_deprecation_if_present(str(agents))
+    assert not any("subagents.yaml" in r.message for r in caplog.records)
