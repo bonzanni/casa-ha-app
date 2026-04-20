@@ -49,6 +49,8 @@ mcp_server_names:
 memory:
   token_budget: 800
   read_strategy: cached
+  scopes_owned: [house]
+  scopes_readable: [house]
 channels:
   - ha_voice
 session:
