@@ -12,7 +12,6 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
-    HookMatcher,
     ProcessError,
     ResultMessage,
     SystemMessage,
@@ -23,7 +22,7 @@ from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig
 from executor_registry import DelegationComplete
-from hooks import block_dangerous_commands, make_path_scope_hook
+from hooks import resolve_hooks
 from log_cid import cid_var
 from mcp_registry import McpServerRegistry
 from channel_trust import channel_trust, user_peer_for_channel
@@ -73,6 +72,12 @@ class Agent:
         # Per-instance so assistant (4000) and butler (800) budgets stay
         # isolated even when the same channel serves both roles.
         self._budget_tracker = BudgetTracker()
+        # Resolve hooks once at construction. HooksConfig.pre_tool_use
+        # empty → default policy bundle (block_dangerous_bash + path_scope
+        # scoped to cfg.cwd).
+        self._resolved_hooks = resolve_hooks(
+            config.hooks, default_cwd=config.cwd,
+        )
 
     # ------------------------------------------------------------------
     # Public entry point (used as bus handler)
@@ -108,7 +113,7 @@ class Agent:
             error_kind = _classify_error(exc)
             logger.error(
                 "Agent '%s' error [%s]: %s",
-                self.config.name,
+                self.config.character.name,
                 error_kind.value,
                 exc,
                 exc_info=(error_kind == ErrorKind.UNKNOWN),
@@ -254,8 +259,8 @@ class Agent:
                     self.config.memory.token_budget,
                 )
 
-            # 3. System prompt = personality + <memory_context>? + <channel_context>.
-            system_parts = [self.config.personality]
+            # 3. System prompt = composed-prompt + runtime-injected blocks.
+            system_parts = [self.config.system_prompt]
             if memory_context:
                 system_parts.append(
                     f"\n<memory_context>\n{memory_context}\n</memory_context>"
@@ -271,16 +276,8 @@ class Agent:
             # 4. MCP servers ---------------------------------------------------
             mcp_servers = self._mcp_registry.resolve(self.config.mcp_server_names)
 
-            # 5. Hooks (agent-identity captured in closures). ------------------
-            hooks = {
-                "PreToolUse": [
-                    HookMatcher(matcher="Bash", hooks=[block_dangerous_commands]),
-                    HookMatcher(
-                        matcher="Read|Write|Edit",
-                        hooks=[make_path_scope_hook(self.config.role)],
-                    ),
-                ],
-            }
+            # 5. Hooks — resolved from hooks.yaml at load time by agent_loader.
+            hooks = self._resolved_hooks
 
             # 6. SDK resume --------------------------------------------------
             existing = self._session_registry.get(channel_key)

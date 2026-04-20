@@ -119,7 +119,10 @@ async def agent_error_voice_app(tmp_path):
     _error_sink fires event: error → SSE skips event: done.
     """
     from agent import Agent
-    from config import AgentConfig, MemoryConfig, SessionConfig, ToolsConfig, TTSConfig
+    from config import (
+        AgentConfig, CharacterConfig, MemoryConfig, SessionConfig,
+        ToolsConfig, TTSConfig,
+    )
     from mcp_registry import McpServerRegistry
     from session_registry import SessionRegistry
     from channels import ChannelManager
@@ -127,10 +130,10 @@ async def agent_error_voice_app(tmp_path):
     bus = MessageBus()
 
     cfg = AgentConfig(
-        name="Tina",
         role="butler",
         model="claude-haiku-4-5",
-        personality="Butler.",
+        system_prompt="Butler.",
+        character=CharacterConfig(name="Tina"),
         tools=ToolsConfig(),
         memory=MemoryConfig(token_budget=800, read_strategy="cached"),
         session=SessionConfig(strategy="pooled", idle_timeout=300),

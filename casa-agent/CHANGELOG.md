@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.7.0 — 2026-04-20 — Agent-definition refactor (Spec X / Phase 4.x)
+
+### Added
+
+- **Per-agent directory format.** Each resident and executor lives in its
+  own directory under `/addon_configs/casa-agent/agents/<role>/` with
+  one file per concern: `character.yaml`, `voice.yaml`,
+  `response_shape.yaml`, `runtime.yaml`, and optionally
+  `disclosure.yaml`, `delegates.yaml`, `triggers.yaml`, `hooks.yaml`.
+  Flat `agents/<role>.yaml` files are no longer loaded.
+- **Strict-mode loader** (`agent_loader.py`) with JSON Schema
+  validation: unknown field / unknown file / missing required
+  `schema_version` / unknown `disclosure.policy` all fail-fast at boot.
+- **Shared policy library** (`policies.py`) resolves
+  `disclosure.policy: <name>` references against
+  `/addon_configs/casa-agent/policies/disclosure.yaml`.
+- **Per-agent trigger registry** (`trigger_registry.py`) replacing the
+  global heartbeat block. Residents declare their own
+  `interval` / `cron` / `webhook` triggers in `triggers.yaml`.
+- **`HOOK_POLICIES` registry + `resolve_hooks`** in `hooks.py`; per-agent
+  hook wiring via `hooks.yaml`, resolved at `Agent.__init__`. Default
+  bundle (`block_dangerous_bash` + `path_scope`) applies when the file
+  is absent or empty.
+- **`config_git`** module — initialises a local git repo under
+  `/addon_configs/casa-agent/` and snapshots manual edits on every boot
+  for free history / rollback.
+
+### Removed (breaking)
+
+- Flat agent YAMLs: `defaults/agents/{assistant,butler,subagents}.yaml`
+  and `defaults/agents/executors/finance.yaml`.
+- Global schedules/webhooks files: `defaults/schedules.yaml`,
+  `defaults/webhooks.yaml`.
+- All one-shot migrations from `setup-configs.sh` (`migrate_rename`,
+  `migrate_memory_fields`, `migrate_voice_fields`,
+  `migrate_disclosure_clause`, `migrate_scope_metadata`,
+  `migrate_channels`, `migrate_executor_rename`, `migrate_mcp_allowed`)
+  and their six regression test modules. Migrations are no longer
+  needed — the new file format is the only format the loader
+  understands.
+- `config.ROLE_ALIASES`, `config._normalize_role`,
+  `config.load_agent_config`, the `_build_*` helpers, and the legacy
+  `name` / `personality` / `description` fields on `AgentConfig`.
+- `casa_core._log_subagents_deprecation_if_present`,
+  `casa_core._load_agents_by_role`, `casa_core.init_heartbeat_defaults`,
+  `casa_core.build_heartbeat_message`, and the inline global heartbeat
+  scheduler block.
+- `hooks.AGENT_PATH_RULES`, `hooks._check_path_scope`,
+  `hooks.make_path_scope_hook` (replaced by the parameterized
+  `make_path_scope_hook_v2`).
+
+### Migration
+
+No production users — this is a hard cut. Existing installations will
+find their old flat YAMLs unread; seed the new tree by deleting
+`/addon_configs/casa-agent/agents/*.yaml` and letting
+`setup-configs.sh` copy the bundled directory defaults on next boot.
+
 ## 0.6.2 — 2026-04-20 — Phase 3.4: disabled-executor pattern (plumbing)
 
 ### Added

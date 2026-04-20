@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import textwrap
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -11,7 +13,7 @@ import pytest
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
-from config import AgentConfig, MemoryConfig, SessionConfig, ToolsConfig
+from config import AgentConfig, CharacterConfig, MemoryConfig, SessionConfig, ToolsConfig
 from executor_registry import (
     DelegationComplete,
     DelegationRecord,
@@ -21,6 +23,38 @@ from executor_registry import (
 pytestmark = pytest.mark.asyncio
 
 
+def _seed_executor_dir(
+    base: Path, role: str = "finance", *, enabled: bool = True,
+) -> Path:
+    """Write a valid executor directory under *base*. Returns the dir path."""
+    d = base / role
+    d.mkdir(parents=True)
+    (d / "character.yaml").write_text(textwrap.dedent(f"""\
+        schema_version: 1
+        name: {role.capitalize()}
+        role: {role}
+        archetype: exec
+        card: |
+          x
+        prompt: |
+          x
+    """), encoding="utf-8")
+    (d / "voice.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+    (d / "response_shape.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+    (d / "runtime.yaml").write_text(textwrap.dedent(f"""\
+        schema_version: 1
+        model: sonnet
+        enabled: {str(enabled).lower()}
+        tools:
+          allowed: [Read]
+        memory:
+          token_budget: 0
+        session:
+          strategy: ephemeral
+    """), encoding="utf-8")
+    return d
+
+
 # ---------------------------------------------------------------------------
 # Harness helpers
 # ---------------------------------------------------------------------------
@@ -28,10 +62,10 @@ pytestmark = pytest.mark.asyncio
 
 def _executor_cfg(role: str = "finance", enabled: bool = True) -> AgentConfig:
     return AgentConfig(
-        name=role.capitalize(),
         role=role,
         model="claude-sonnet-4-6",
-        personality="You are " + role,
+        system_prompt="You are " + role,
+        character=CharacterConfig(name=role.capitalize()),
         enabled=enabled,
         tools=ToolsConfig(allowed=["Read"], permission_mode="acceptEdits"),
         memory=MemoryConfig(token_budget=0),
@@ -166,13 +200,7 @@ class TestDisabledAgent:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "finance.yaml").write_text(
-            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
-            "enabled: false\n"
-            "memory:\n  token_budget: 0\n"
-            "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
-            encoding="utf-8",
-        )
+        _seed_executor_dir(executors, "finance", enabled=False)
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -202,13 +230,7 @@ class TestSyncOk:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "finance.yaml").write_text(
-            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
-            "enabled: true\n"
-            "memory:\n  token_budget: 0\n"
-            "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
-            encoding="utf-8",
-        )
+        _seed_executor_dir(executors, "finance", enabled=True)
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -242,13 +264,7 @@ class TestSyncError:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "finance.yaml").write_text(
-            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
-            "enabled: true\n"
-            "memory:\n  token_budget: 0\n"
-            "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
-            encoding="utf-8",
-        )
+        _seed_executor_dir(executors, "finance", enabled=True)
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -316,13 +332,7 @@ class TestTimeoutDegrades:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "finance.yaml").write_text(
-            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
-            "enabled: true\n"
-            "memory:\n  token_budget: 0\n"
-            "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
-            encoding="utf-8",
-        )
+        _seed_executor_dir(executors, "finance", enabled=True)
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -361,13 +371,7 @@ class TestTimeoutDegrades:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "finance.yaml").write_text(
-            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
-            "enabled: true\n"
-            "memory:\n  token_budget: 0\n"
-            "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
-            encoding="utf-8",
-        )
+        _seed_executor_dir(executors, "finance", enabled=True)
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -414,13 +418,7 @@ class TestAsyncMode:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "finance.yaml").write_text(
-            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
-            "enabled: true\n"
-            "memory:\n  token_budget: 0\n"
-            "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
-            encoding="utf-8",
-        )
+        _seed_executor_dir(executors, "finance", enabled=True)
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -467,13 +465,7 @@ class TestCancellation:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "finance.yaml").write_text(
-            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
-            "enabled: true\n"
-            "memory:\n  token_budget: 0\n"
-            "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
-            encoding="utf-8",
-        )
+        _seed_executor_dir(executors, "finance", enabled=True)
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         reg.load()

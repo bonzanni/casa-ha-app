@@ -96,24 +96,29 @@ def _result(payload: dict) -> dict:
 def _build_executor_options(cfg) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for a Tier 2 executor invocation.
 
-    Executors run stateless: no hooks (resident-scoped), no session
-    resume. MCP servers are resolved per the executor's declared
-    ``mcp_server_names`` via the shared registry — same pattern as
-    :meth:`Agent._process` (agent.py step 4). Degrades to empty-dict
-    when the registry is not bound (legacy callers / test harnesses)."""
+    Executors run stateless (no session resume). Hooks are resolved from
+    the executor's own ``cfg.hooks``. MCP servers are resolved via the
+    shared registry — same pattern as :meth:`Agent._process` (agent.py
+    step 4). Degrades to empty-dict when the registry is not bound
+    (legacy callers / test harnesses)."""
+    from hooks import resolve_hooks
+
     if _mcp_registry is not None:
         mcp_servers = _mcp_registry.resolve(cfg.mcp_server_names)
     else:
         mcp_servers = {}
+
+    resolved_hooks = resolve_hooks(cfg.hooks, default_cwd=cfg.cwd)
+
     return ClaudeAgentOptions(
         model=cfg.model,
-        system_prompt=cfg.personality,
+        system_prompt=cfg.system_prompt,
         allowed_tools=list(cfg.tools.allowed),
         disallowed_tools=list(cfg.tools.disallowed),
         permission_mode=cfg.tools.permission_mode or "acceptEdits",
         max_turns=cfg.tools.max_turns,
         mcp_servers=mcp_servers if mcp_servers else {},
-        hooks={},
+        hooks=resolved_hooks,
         cwd=cfg.cwd or None,
         resume=None,
         setting_sources=["project"],

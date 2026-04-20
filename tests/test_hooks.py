@@ -2,7 +2,7 @@
 
 import pytest
 
-from hooks import block_dangerous_commands, make_path_scope_hook
+from hooks import block_dangerous_commands
 
 pytestmark = pytest.mark.asyncio
 
@@ -66,77 +66,61 @@ async def test_block_curl_post():
 
 
 # ------------------------------------------------------------------
-# make_path_scope_hook
+# make_path_scope_hook_v2 — parameterized path scope
 # ------------------------------------------------------------------
 
 
-async def test_path_allowed_read_for_assistant():
-    hook = make_path_scope_hook("assistant")
-    data = {
-        "tool_name": "Read",
-        "tool_input": {"file_path": "addon_configs/casa/agents/ellen.yaml"},
-    }
-    assert await hook(data, "tid-10", CTX) is None
+async def test_v2_writable_allows_write_under_prefix():
+    from hooks import make_path_scope_hook_v2
+    hook = make_path_scope_hook_v2(
+        writable=["/addon_configs/casa-agent/workspace"],
+        readable=["/addon_configs/casa-agent/workspace"],
+    )
+    data = {"tool_name": "Write",
+            "tool_input": {"file_path":
+                "/addon_configs/casa-agent/workspace/note.txt"}}
+    assert await hook(data, "tid-20", CTX) is None
 
 
-async def test_path_denied_write_for_assistant_to_config():
-    hook = make_path_scope_hook("assistant")
-    data = {
-        "tool_name": "Write",
-        "tool_input": {"file_path": "/config/configuration.yaml"},
-    }
-    result = await hook(data, "tid-11", CTX)
-    assert result is not None
-    assert _decision(result) == "deny"
-    assert result["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
-
-
-async def test_path_traversal_blocked():
-    hook = make_path_scope_hook("butler")
-    data = {
-        "tool_name": "Read",
-        "tool_input": {"file_path": "workspace/../../etc/passwd"},
-    }
-    result = await hook(data, "tid-12", CTX)
+async def test_v2_writable_denies_write_outside():
+    from hooks import make_path_scope_hook_v2
+    hook = make_path_scope_hook_v2(
+        writable=["/addon_configs/casa-agent/workspace"],
+        readable=[],
+    )
+    data = {"tool_name": "Write",
+            "tool_input": {"file_path": "/etc/shadow"}}
+    result = await hook(data, "tid-21", CTX)
     assert result is not None
     assert _decision(result) == "deny"
 
 
-async def test_path_allowed_write_workspace_for_assistant():
-    hook = make_path_scope_hook("assistant")
-    data = {"tool_name": "Write", "tool_input": {"file_path": "workspace/notes.txt"}}
-    assert await hook(data, "tid-13", CTX) is None
+async def test_v2_readable_allows_read():
+    from hooks import make_path_scope_hook_v2
+    hook = make_path_scope_hook_v2(
+        writable=[],
+        readable=["/addon_configs"],
+    )
+    data = {"tool_name": "Read",
+            "tool_input": {"file_path": "/addon_configs/casa-agent/agents/butler/character.yaml"}}
+    assert await hook(data, "tid-22", CTX) is None
 
 
-async def test_path_allowed_write_workspace_for_plugin_builder():
-    hook = make_path_scope_hook("plugin-builder")
-    data = {"tool_name": "Write", "tool_input": {"file_path": "workspace/plugin.py"}}
-    assert await hook(data, "tid-13b", CTX) is None
-
-
-async def test_butler_cannot_write_workspace():
-    hook = make_path_scope_hook("butler")
-    data = {"tool_name": "Write", "tool_input": {"file_path": "workspace/notes.txt"}}
-    result = await hook(data, "tid-13c", CTX)
+async def test_v2_traversal_blocked():
+    from hooks import make_path_scope_hook_v2
+    hook = make_path_scope_hook_v2(
+        writable=[],
+        readable=["/addon_configs"],
+    )
+    data = {"tool_name": "Read",
+            "tool_input": {"file_path": "/addon_configs/../etc/passwd"}}
+    result = await hook(data, "tid-23", CTX)
     assert result is not None
     assert _decision(result) == "deny"
 
 
-async def test_unknown_role_allowed():
-    """Unknown roles fall through to allow. Phase 2 may invert this."""
-    hook = make_path_scope_hook("unknown-role")
-    data = {"tool_name": "Read", "tool_input": {"file_path": "/anywhere/file.txt"}}
-    assert await hook(data, "tid-14", CTX) is None
-
-
-async def test_empty_role_allowed():
-    """Missing role (empty string) also falls through to allow."""
-    hook = make_path_scope_hook("")
-    data = {"tool_name": "Read", "tool_input": {"file_path": "/anywhere/file.txt"}}
-    assert await hook(data, "tid-14b", CTX) is None
-
-
-async def test_non_file_tool_skipped():
-    hook = make_path_scope_hook("butler")
+async def test_v2_non_file_tool_skipped():
+    from hooks import make_path_scope_hook_v2
+    hook = make_path_scope_hook_v2(writable=[], readable=[])
     data = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
-    assert await hook(data, "tid-15", CTX) is None
+    assert await hook(data, "tid-24", CTX) is None
