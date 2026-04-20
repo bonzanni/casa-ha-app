@@ -272,6 +272,7 @@ def _build_runtime_fields(
         read_strategy=memory.get("read_strategy", "per_turn"),
         scopes_owned=list(memory.get("scopes_owned") or []),
         scopes_readable=list(memory.get("scopes_readable") or []),
+        default_scope=memory.get("default_scope", "") or "",
     )
 
     session = runtime.get("session") or {}
