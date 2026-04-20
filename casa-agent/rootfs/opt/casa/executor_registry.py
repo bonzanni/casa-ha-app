@@ -14,6 +14,7 @@ by startup orphan recovery.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -168,9 +169,85 @@ class ExecutorRegistry:
             self._delegations.pop(delegation_id, None)
             await self._write_tombstone_locked()
 
-    # -- Tombstone I/O — stubbed here; real impl in Task 5. --------------
+    # -- Tombstone I/O ---------------------------------------------------
 
     async def _write_tombstone_locked(self) -> None:
-        """Overwritten in Task 5 with real atomic-write logic. No-op
-        here so Task 4's lifecycle tests pass without needing disk."""
-        return None
+        """Persist the in-flight delegations dict. Caller MUST hold
+        ``self._lock``."""
+        snapshot = [
+            {
+                "id": r.id,
+                "agent": r.agent,
+                "started_at": r.started_at,
+                "origin": dict(r.origin),
+            }
+            for r in self._delegations.values()
+        ]
+        try:
+            await asyncio.to_thread(self._write_tombstone, snapshot)
+        except Exception as exc:
+            logger.warning(
+                "Failed to persist delegation tombstone: %s "
+                "(in-flight delegations remain in memory; orphan recovery "
+                "may miss them if Casa restarts)", exc,
+            )
+
+    def _write_tombstone(self, snapshot: list[dict[str, Any]]) -> None:
+        with open(self._tombstone_path, "w", encoding="utf-8") as fh:
+            json.dump(snapshot, fh, indent=2)
+
+    def orphans_from_disk(self) -> list[DelegationRecord]:
+        """Read the tombstone file. Returns any records left by a prior
+        process (Casa restarted mid-delegation). Truncates the file
+        afterward. Called exactly once per startup.
+
+        Failure modes:
+        - File missing: return [] silently.
+        - File corrupt: log ERROR, truncate, return [].
+        """
+        if not os.path.exists(self._tombstone_path):
+            return []
+        try:
+            with open(self._tombstone_path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.error(
+                "Tombstone file corrupt or unreadable (%s): %s — truncating",
+                self._tombstone_path, exc,
+            )
+            try:
+                with open(self._tombstone_path, "w", encoding="utf-8") as fh:
+                    json.dump([], fh)
+            except OSError:
+                pass
+            return []
+        if not isinstance(raw, list):
+            logger.error(
+                "Tombstone file %s is not a JSON array; truncating",
+                self._tombstone_path,
+            )
+            with open(self._tombstone_path, "w", encoding="utf-8") as fh:
+                json.dump([], fh)
+            return []
+        records: list[DelegationRecord] = []
+        for row in raw:
+            try:
+                records.append(DelegationRecord(
+                    id=row["id"],
+                    agent=row["agent"],
+                    started_at=float(row.get("started_at", 0.0)),
+                    origin=dict(row.get("origin") or {}),
+                ))
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning(
+                    "Skipping malformed tombstone entry: %s", exc,
+                )
+        # Truncate so we don't re-post on the NEXT restart too.
+        try:
+            with open(self._tombstone_path, "w", encoding="utf-8") as fh:
+                json.dump([], fh)
+        except OSError as exc:
+            logger.warning(
+                "Failed to truncate tombstone file after orphan read: %s", exc,
+            )
+        return records
