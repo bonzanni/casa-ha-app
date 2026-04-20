@@ -197,7 +197,7 @@ def test_enabled_defaults_true(tmp_path):
 def test_enabled_false_parsed(tmp_path):
     p = tmp_path / "a.yaml"
     p.write_text(
-        "name: T\nrole: alex\nmodel: sonnet\npersonality: x\nenabled: false\n",
+        "name: T\nrole: finance\nmodel: sonnet\npersonality: x\nenabled: false\n",
         encoding="utf-8",
     )
     cfg = load_agent_config(str(p))

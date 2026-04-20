@@ -397,6 +397,31 @@ migrate_channels "$CONFIG_DIR/agents/assistant.yaml" "[telegram, webhook]"
 migrate_channels "$CONFIG_DIR/agents/butler.yaml" "[ha_voice]"
 
 # ------------------------------------------------------------------
+# One-shot v0.6.1: rename executor alex.yaml → finance.yaml. v0.6.0
+# shipped the Alex executor with `role: alex` which conflated name and
+# role (every other agent uses `role=<function>`, `name=<persona>`).
+# The bundled default is now finance.yaml with role=finance, name=Alex.
+# Only acts when the OLD alex.yaml file exists AND the NEW finance.yaml
+# does not — idempotent by file existence check, same pattern as
+# migrate_rename for ellen.yaml/tina.yaml in Phase 2.1.
+# ------------------------------------------------------------------
+
+migrate_executor_rename() {
+    local old="$CONFIG_DIR/agents/executors/alex.yaml"
+    local new="$CONFIG_DIR/agents/executors/finance.yaml"
+
+    if [ -f "$old" ] && [ ! -f "$new" ]; then
+        mv "$old" "$new"
+        sed -i 's/\r$//' "$new"
+        sed -i 's/^role:[[:space:]]*alex[[:space:]]*$/role: finance/' "$new"
+        sed -i 's/^name:[[:space:]]*alex[[:space:]]*$/name: Alex/' "$new"
+        bashio::log.info "Migrated executor alex.yaml -> finance.yaml"
+    fi
+}
+
+migrate_executor_rename
+
+# ------------------------------------------------------------------
 # One-shot: drop obsolete memory_session_id field from sessions.json.
 # Lazy migration in SessionRegistry.touch() also handles this, but
 # doing it at setup time keeps the on-disk schema current immediately.
@@ -427,7 +452,7 @@ fi
 # ------------------------------------------------------------------
 
 for f in agents/assistant.yaml agents/butler.yaml agents/subagents.yaml \
-         agents/executors/alex.yaml schedules.yaml webhooks.yaml; do
+         agents/executors/finance.yaml schedules.yaml webhooks.yaml; do
     if [ ! -f "$CONFIG_DIR/$f" ]; then
         cp "$DEFAULTS_DIR/$f" "$CONFIG_DIR/$f"
         bashio::log.info "Created default config: $f"
