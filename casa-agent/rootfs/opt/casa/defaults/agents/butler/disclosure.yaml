@@ -1,3 +1,11 @@
+# casa: butler_disclosure v2
+# With 3.2 scope-at-retrieval enforcement, the standard categories are
+# redundant here — Tina's scopes_readable=[house] means she cannot
+# retrieve finance/medical/contacts/schedule/credentials content at
+# all. We keep the deflection_patterns inherited from `standard` so
+# she can still speak naturally when Nicola asks her something
+# private.
 schema_version: 1
 policy: standard
-overrides: {}
+overrides:
+  categories: {}

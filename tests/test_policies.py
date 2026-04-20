@@ -128,3 +128,18 @@ class TestRender:
         # Every category surfaces in the rendered block.
         assert "Financial" in rendered or "financial" in rendered
         assert "household_shared" in rendered or "Telegram" in rendered
+
+
+class TestButlerOverrideShortened:
+    def test_empty_categories_override(self, tmp_path):
+        from policies import load_policies
+
+        pol_file = tmp_path / "disclosure.yaml"
+        _write(pol_file, STANDARD_POLICY)
+
+        lib = load_policies(str(pol_file))
+        resolved = lib.resolve("standard", overrides={"categories": {}})
+        assert resolved["categories"] == {}
+        # inherited fields unchanged
+        assert resolved["safe_on_any_channel"] == ["device_state", "sensor_state"]
+        assert "household_shared" in resolved["deflection_patterns"]
