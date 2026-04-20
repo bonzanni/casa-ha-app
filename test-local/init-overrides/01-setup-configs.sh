@@ -287,6 +287,86 @@ migrate_scope_metadata "$CONFIG_DIR/agents/assistant.yaml" \
 migrate_scope_metadata "$CONFIG_DIR/agents/butler.yaml" \
     "[house]" "[house]"
 
+# ------------------------------------------------------------------
+# Mirror of migrate_channels in setup-configs.sh. Source of truth:
+# setup-configs.sh. Backfills `channels:` on pre-2.1 YAMLs that went
+# through migrate_rename but never gained a channels block.
+# ------------------------------------------------------------------
+
+migrate_channels() {
+    local file="$1"
+    local default_channels="$2"
+
+    [ -f "$file" ] || return 0
+
+    sed -i 's/\r$//' "$file"
+
+    if grep -qE '^# casa: channels v1$' "$file"; then
+        return 0
+    fi
+
+    if ! python3 - "$file" "$default_channels" <<'PY'
+import pathlib, re, sys
+
+p = pathlib.Path(sys.argv[1])
+default_channels = sys.argv[2]
+
+try:
+    import yaml
+except ImportError:
+    print(f"[ERROR] yaml unavailable; skipping {p.name}", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    text = p.read_text(encoding="utf-8")
+    data = yaml.safe_load(text) or {}
+except Exception as exc:
+    print(f"[ERROR] could not parse {p.name}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+existing = data.get("channels")
+needs_backfill = (not existing) or (isinstance(existing, list) and len(existing) == 0)
+
+lines = text.splitlines(keepends=True)
+out = []
+
+if needs_backfill:
+    skip_next_indent = False
+    for ln in lines:
+        if re.match(r"^channels:[ \t]*\[[ \t]*\][ \t]*$", ln):
+            continue
+        if re.match(r"^channels:[ \t]*$", ln):
+            skip_next_indent = True
+            continue
+        if skip_next_indent and re.match(r"^[ \t]+-", ln):
+            continue
+        skip_next_indent = False
+        out.append(ln)
+    if out and not out[-1].endswith("\n"):
+        out[-1] = out[-1] + "\n"
+    out.append(f"channels: {default_channels}\n")
+else:
+    out = list(lines)
+    if out and not out[-1].endswith("\n"):
+        out[-1] = out[-1] + "\n"
+
+new_text = "".join(out)
+if not new_text.endswith("\n"):
+    new_text += "\n"
+new_text += "# casa: channels v1\n"
+p.write_text(new_text, encoding="utf-8")
+PY
+    then
+        echo "[ERROR] migrate_channels: python step failed for $(basename "$file"); skipping"
+        return 0
+    fi
+
+    echo "[INFO] Migrated channels backfill in $(basename "$file")"
+}
+
+migrate_channels "$CONFIG_DIR/agents/assistant.yaml" "[telegram, webhook]"
+migrate_channels "$CONFIG_DIR/agents/butler.yaml" "[ha_voice]"
+
 if [ -f "$DATA_DIR/sessions.json" ]; then
     python3 - "$DATA_DIR/sessions.json" <<'PY'
 import json, pathlib, sys

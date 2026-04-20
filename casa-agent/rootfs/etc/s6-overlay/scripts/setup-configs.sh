@@ -309,6 +309,94 @@ migrate_scope_metadata "$CONFIG_DIR/agents/butler.yaml" \
     "[house]" "[house]"
 
 # ------------------------------------------------------------------
+# One-shot 3.1 upgrade-path fix: backfill `channels:` on pre-2.1
+# YAMLs that went through migrate_rename but never gained a channels
+# block. Task 3's Tier 1 loader rejects YAMLs without non-empty
+# channels — before this migration, those files would crash-skip
+# at startup. Idempotent via `# casa: channels v1` marker.
+# Non-destructive: if channels is already present and non-empty, the
+# file is left untouched; only the marker is appended.
+# ------------------------------------------------------------------
+
+migrate_channels() {
+    local file="$1"
+    local default_channels="$2"   # e.g. "[telegram, webhook]"
+
+    [ -f "$file" ] || return 0
+
+    sed -i 's/\r$//' "$file"
+
+    if grep -qE '^# casa: channels v1$' "$file"; then
+        return 0
+    fi
+
+    if ! python3 - "$file" "$default_channels" <<'PY'
+import pathlib, re, sys
+
+p = pathlib.Path(sys.argv[1])
+default_channels = sys.argv[2]
+
+try:
+    import yaml
+except ImportError:
+    print(f"[ERROR] yaml unavailable; skipping {p.name}", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    text = p.read_text(encoding="utf-8")
+    data = yaml.safe_load(text) or {}
+except Exception as exc:
+    print(f"[ERROR] could not parse {p.name}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+existing = data.get("channels")
+# Treat missing, None, or empty list as "needs backfill".
+needs_backfill = (not existing) or (isinstance(existing, list) and len(existing) == 0)
+
+lines = text.splitlines(keepends=True)
+out = []
+
+if needs_backfill:
+    # Remove any existing empty `channels:` or `channels: []` lines to avoid
+    # duplication after we inject the default block.
+    skip_next_indent = False
+    for ln in lines:
+        if re.match(r"^channels:[ \t]*\[[ \t]*\][ \t]*$", ln):
+            continue  # drop `channels: []`
+        if re.match(r"^channels:[ \t]*$", ln):
+            # bare `channels:` with no value — drop + skip its indented block
+            skip_next_indent = True
+            continue
+        if skip_next_indent and re.match(r"^[ \t]+-", ln):
+            continue
+        skip_next_indent = False
+        out.append(ln)
+    if out and not out[-1].endswith("\n"):
+        out[-1] = out[-1] + "\n"
+    out.append(f"channels: {default_channels}\n")
+else:
+    out = list(lines)
+    if out and not out[-1].endswith("\n"):
+        out[-1] = out[-1] + "\n"
+
+new_text = "".join(out)
+if not new_text.endswith("\n"):
+    new_text += "\n"
+new_text += "# casa: channels v1\n"
+p.write_text(new_text, encoding="utf-8")
+PY
+    then
+        echo "[ERROR] migrate_channels: python step failed for $(basename "$file"); skipping"
+        return 0
+    fi
+
+    bashio::log.info "Migrated channels backfill in $(basename "$file")"
+}
+
+migrate_channels "$CONFIG_DIR/agents/assistant.yaml" "[telegram, webhook]"
+migrate_channels "$CONFIG_DIR/agents/butler.yaml" "[ha_voice]"
+
+# ------------------------------------------------------------------
 # One-shot: drop obsolete memory_session_id field from sessions.json.
 # Lazy migration in SessionRegistry.touch() also handles this, but
 # doing it at setup time keeps the on-disk schema current immediately.
