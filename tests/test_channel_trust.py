@@ -1,39 +1,46 @@
-"""Tests for channel_trust helpers."""
-
-import pytest
-
-from channel_trust import channel_trust, user_peer_for_channel
-
-
-class TestUserPeerForChannel:
-    def test_telegram_is_nicola(self):
-        assert user_peer_for_channel("telegram") == "nicola"
-
-    def test_webhook_is_nicola(self):
-        assert user_peer_for_channel("webhook") == "nicola"
-
-    def test_scheduler_is_nicola(self):
-        assert user_peer_for_channel("scheduler") == "nicola"
-
-    def test_voice_is_voice_speaker(self):
-        assert user_peer_for_channel("voice") == "voice_speaker"
-
-    def test_unknown_channel_defaults_to_nicola(self):
-        assert user_peer_for_channel("imap") == "nicola"
+"""Tests for channel_trust.py — canonical token + display helper."""
 
 
 class TestChannelTrust:
-    def test_telegram(self):
-        assert channel_trust("telegram") == "authenticated (Nicola)"
+    def test_telegram_returns_authenticated(self):
+        from channel_trust import channel_trust
+        assert channel_trust("telegram") == "authenticated"
 
-    def test_voice(self):
-        assert channel_trust("voice") == "household-shared (speaker unauthenticated)"
+    def test_voice_returns_household_shared(self):
+        from channel_trust import channel_trust
+        assert channel_trust("voice") == "household-shared"
 
-    def test_scheduler(self):
-        assert channel_trust("scheduler") == "internal (system-initiated)"
+    def test_webhook_returns_external_authenticated(self):
+        from channel_trust import channel_trust
+        assert channel_trust("webhook") == "external-authenticated"
 
-    def test_webhook(self):
-        assert channel_trust("webhook") == "external (authenticated by shared secret)"
+    def test_scheduler_returns_internal(self):
+        from channel_trust import channel_trust
+        assert channel_trust("scheduler") == "internal"
 
-    def test_unknown(self):
-        assert channel_trust("imap") == "unknown"
+    def test_unknown_channel_returns_public(self):
+        from channel_trust import channel_trust
+        assert channel_trust("mystery") == "public"
+
+
+class TestChannelTrustDisplay:
+    def test_display_returns_human_readable(self):
+        from channel_trust import channel_trust_display
+        assert channel_trust_display("telegram") == "authenticated (Nicola)"
+        assert channel_trust_display("voice") == "household-shared (speaker unauthenticated)"
+        assert channel_trust_display("scheduler") == "internal (system-initiated)"
+        assert channel_trust_display("webhook") == "external (authenticated by shared secret)"
+
+    def test_display_unknown_channel_falls_back(self):
+        from channel_trust import channel_trust_display
+        assert channel_trust_display("mystery") == "unknown"
+
+
+class TestUserPeer:
+    def test_telegram_user_peer_is_nicola(self):
+        from channel_trust import user_peer_for_channel
+        assert user_peer_for_channel("telegram") == "nicola"
+
+    def test_voice_user_peer_is_voice_speaker(self):
+        from channel_trust import user_peer_for_channel
+        assert user_peer_for_channel("voice") == "voice_speaker"
