@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.6.0 — 2026-04-20 — Phase 3.1: Residents, Executors, delegate_to_agent
+
+### Added
+
+- **Phase 3.1: Residents, Executors, `delegate_to_agent`**
+  (spec `docs/superpowers/specs/2026-04-20-3.1-residents-executors-delegation.md`,
+  taxonomy foundation `2026-04-20-agent-taxonomy.md`).
+  - Tier 1 resident loader relaxed: any `agents/<role>.yaml` with
+    non-empty `channels:` loads as a resident. No code change required
+    to add new user-defined residents.
+  - Tier 2 executor loader + `ExecutorRegistry` at
+    `casa-agent/rootfs/opt/casa/executor_registry.py`. Scans
+    `agents/executors/*.yaml`; rejects Tier-1-shaped YAMLs; honours
+    `enabled: false` gating.
+  - New framework tool `delegate_to_agent(agent, task, context, mode)`
+    in `casa-framework` MCP. Sync-with-degradation (60s
+    `asyncio.wait` — never `asyncio.wait_for`) + explicit async. Late
+    completions post a bus NOTIFICATION to the delegating resident;
+    Ellen's NOTIFICATION branch synthesizes a fresh turn and replies
+    via the origin channel.
+  - In-flight delegations persisted to `/data/delegations.json`;
+    orphaned records on restart fire a synthetic "lost on restart"
+    NOTIFICATION exactly once.
+  - Alex ships bundled at `defaults/agents/executors/alex.yaml` with
+    `enabled: false`. Becomes functional when 3.4 registers the n8n MCP.
+  - YAML metadata migration: `scopes_owned` + `scopes_readable` on
+    Ellen + Tina, gated by `# casa: scopes v1` marker. Fields parse at
+    runtime but are **unread in v0.6.0** — scope-aware retrieval ships
+    in 3.2.
+
+### Changed
+
+- `subagents.yaml` entries (`automation-builder`, `plugin-builder`,
+  inline `alex`) are no longer loaded. Re-classified as Tier 3
+  Builders (deferred spec). One-time deprecation log on startup if
+  the file is present; no auto-migration.
+
+### Fixed
+
+- Upgrade-path regression: pre-2.1 YAMLs that went through
+  `migrate_rename` (ellen.yaml → assistant.yaml / tina.yaml →
+  butler.yaml) lacked a `channels:` key. Task 3's tightened Tier 1
+  loader would have skipped them at startup. New idempotent
+  `migrate_channels` one-shot in `setup-configs.sh` backfills
+  sensible defaults (`[telegram, webhook]` for assistant;
+  `[ha_voice]` for butler) on upgrade, gated by `# casa: channels v1`
+  marker. Non-destructive: existing channels are preserved.
+
+### Notes
+
+- No deployment steps for existing N150 users beyond `ha apps update`.
+  The scope-metadata and channels-backfill migrations are idempotent;
+  running an older Casa after upgrading YAMLs is a no-op (extra
+  fields ignored by pre-3.1 loaders).
+
+---
+
 ## 0.5.10 — 2026-04-20 — Phase 5.7: Close public dashboard
 
 ### Fixed
