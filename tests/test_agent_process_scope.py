@@ -57,6 +57,11 @@ class FakeClient:
     captured_options = None
     response_text: str = "ok"
 
+    @classmethod
+    def reset(cls) -> None:
+        cls.captured_options = None
+        cls.response_text = "ok"
+
     def __init__(self, options):
         FakeClient.captured_options = options
 
@@ -264,3 +269,139 @@ class TestReadPath:
         prompt = FakeClient.captured_options.system_prompt
         assert '<memory_context scope="personal">' in prompt
         assert "some context data" in prompt
+
+
+class TestWritePath:
+    async def test_classify_writes_to_argmax(self, monkeypatch):
+        """Classify full exchange → write_scope = argmax."""
+        from agent import Agent, ClaudeSDKClient
+        from bus import BusMessage, MessageType
+
+        memory = Mock()
+        memory.ensure_session = AsyncMock()
+        memory.get_context = AsyncMock(return_value="d")
+        memory.add_turn = AsyncMock()
+
+        # score() is called twice (read + write); make the WRITE call
+        # favour finance by returning different dicts on 2nd call.
+        reg = Mock()
+        reg.filter_readable = Mock(return_value=["personal", "business", "finance", "house"])
+        reg.score = Mock(side_effect=[
+            {"personal": 1, "business": 1, "finance": 1, "house": 1},   # read
+            {"personal": 0.1, "business": 0.1, "finance": 0.9, "house": 0.2},   # write
+        ])
+        reg.active_from_scores = Mock(return_value=["finance"])
+        reg.argmax_scope = Mock(return_value="finance")
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            FakeClient.reset()
+            FakeClient.response_text = "€450 to Van der Berg"
+
+            agent = Agent(
+                config=_make_agent_config(),
+                memory=memory,
+                session_registry=Mock(get=Mock(return_value=None),
+                                      touch=AsyncMock(),
+                                      register=AsyncMock()),
+                mcp_registry=Mock(resolve=Mock(return_value={})),
+                channel_manager=Mock(),
+                scope_registry=reg,
+            )
+
+            await agent._process(BusMessage(
+                type=MessageType.CHANNEL_IN, source="telegram", target="assistant",
+                content="plumber?", channel="telegram", context={"chat_id": "12345"},
+            ))
+
+        # Drain background add_turn.
+        await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
+
+        memory.add_turn.assert_awaited_once()
+        kwargs = memory.add_turn.await_args.kwargs
+        assert kwargs["session_id"] == "telegram:12345:finance:assistant"
+
+    async def test_write_restricted_to_owned_and_readable(self, monkeypatch):
+        """Write-scope classifier sees only (scopes_owned ∩ readable)."""
+        from agent import Agent, ClaudeSDKClient
+        from bus import BusMessage, MessageType
+
+        memory = Mock()
+        memory.ensure_session = AsyncMock()
+        memory.get_context = AsyncMock(return_value="")
+        memory.add_turn = AsyncMock()
+
+        reg = Mock()
+        # Trust permits all readable scopes
+        reg.filter_readable = Mock(return_value=["personal", "business", "finance", "house"])
+        reg.score = Mock(return_value={"personal": 1, "business": 1, "finance": 1, "house": 1})
+        reg.active_from_scores = Mock(return_value=["personal"])
+        reg.argmax_scope = Mock(return_value="personal")
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            FakeClient.reset()
+            FakeClient.response_text = "ok"
+
+            agent = Agent(
+                config=_make_agent_config(),   # owned=[personal, business, finance]
+                memory=memory,
+                session_registry=Mock(get=Mock(return_value=None),
+                                      touch=AsyncMock(),
+                                      register=AsyncMock()),
+                mcp_registry=Mock(resolve=Mock(return_value={})),
+                channel_manager=Mock(),
+                scope_registry=reg,
+            )
+
+            await agent._process(BusMessage(
+                type=MessageType.CHANNEL_IN, source="telegram", target="assistant",
+                content="hi", channel="telegram", context={"chat_id": "12345"},
+            ))
+        await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
+
+        # The 2nd score() call (for write) was invoked with owned∩readable:
+        # owned = [personal, business, finance]; readable = [personal, business, finance, house]
+        # → intersection = [personal, business, finance]
+        write_call = reg.score.call_args_list[1]
+        # Signature: score(text, scopes)
+        assert sorted(write_call.args[1]) == ["business", "finance", "personal"]
+
+    async def test_empty_assistant_text_does_not_write(self, monkeypatch):
+        """SDK returns empty string → no add_turn call (gate remains on response_text)."""
+        from agent import Agent, ClaudeSDKClient
+        from bus import BusMessage, MessageType
+
+        memory = Mock()
+        memory.ensure_session = AsyncMock()
+        memory.get_context = AsyncMock(return_value="")
+        memory.add_turn = AsyncMock()
+
+        reg = Mock()
+        reg.filter_readable = Mock(return_value=["personal", "house"])
+        reg.score = Mock(return_value={"personal": 1.0, "house": 0.1})
+        reg.active_from_scores = Mock(return_value=["personal"])
+        reg.argmax_scope = Mock(return_value="personal")
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            FakeClient.reset()
+            FakeClient.response_text = ""  # empty
+
+            agent = Agent(
+                config=_make_agent_config(),
+                memory=memory,
+                session_registry=Mock(get=Mock(return_value=None),
+                                      touch=AsyncMock(),
+                                      register=AsyncMock()),
+                mcp_registry=Mock(resolve=Mock(return_value={})),
+                channel_manager=Mock(),
+                scope_registry=reg,
+            )
+
+            await agent._process(BusMessage(
+                type=MessageType.CHANNEL_IN, source="telegram", target="assistant",
+                content="anything", channel="telegram", context={"chat_id": "12345"},
+            ))
+        await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
+
+        # Empty assistant text ⇒ no write (spec §14.3 acceptable either way;
+        # v0.8.0 preserves today's behaviour — gate on response_text truthy).
+        assert memory.add_turn.await_count == 0
