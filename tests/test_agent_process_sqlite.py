@@ -96,7 +96,13 @@ def _make_agent(
         system_prompt="You are helpful.",
         character=CharacterConfig(name="Test"),
         tools=ToolsConfig(allowed=["Read"], permission_mode="acceptEdits"),
-        memory=MemoryConfig(token_budget=1000, read_strategy="per_turn"),
+        memory=MemoryConfig(
+            token_budget=1000,
+            read_strategy="per_turn",
+            scopes_readable=["personal"],
+            scopes_owned=["personal"],
+            default_scope="personal",
+        ),
     )
     return Agent(
         config=cfg,
@@ -143,7 +149,7 @@ async def test_telegram_turn_persists_nicola_and_assistant_rows(tmp_path):
     rows = memory._conn.execute(
         "SELECT peer_name, content FROM messages "
         "WHERE session_id = ? ORDER BY id ASC",
-        ("telegram:nicola:assistant",),
+        ("telegram:nicola:personal:assistant",),
     ).fetchall()
     assert rows == [("nicola", "hello"), ("assistant", "hi, Nicola")]
 
@@ -159,7 +165,7 @@ async def test_voice_turn_attributes_to_voice_speaker(tmp_path):
     rows = memory._conn.execute(
         "SELECT peer_name, content FROM messages "
         "WHERE session_id = ? ORDER BY id ASC",
-        ("voice:livingroom:butler",),
+        ("voice:livingroom:personal:butler",),
     ).fetchall()
     assert rows == [
         ("voice_speaker", "lights on"),
@@ -176,7 +182,7 @@ async def test_second_turn_sees_first_turn_in_memory_context(tmp_path):
     await _drain(agent)
 
     ctx = await memory.get_context(
-        "telegram:n:assistant", "assistant", tokens=4000,
+        "telegram:n:personal:assistant", "assistant", tokens=4000,
     )
     assert "## Recent exchanges" in ctx
     assert "[nicola] first question" in ctx
