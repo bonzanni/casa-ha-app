@@ -111,7 +111,7 @@ class TestNotificationBranch:
     async def test_ok_completion_synthesizes_turn(self, tmp_path):
         agent = _make_agent(tmp_path)
         complete = DelegationComplete(
-            delegation_id="d-1", agent="alex", status="ok",
+            delegation_id="d-1", agent="finance", status="ok",
             text="Invoice drafted successfully.",
             origin={"role": "assistant", "channel": "telegram",
                     "chat_id": "777", "cid": "c1",
@@ -120,7 +120,7 @@ class TestNotificationBranch:
         )
         msg = BusMessage(
             type=MessageType.NOTIFICATION,
-            source="alex", target="assistant",
+            source="finance", target="assistant",
             content=complete, channel="telegram",
             context={"cid": "c1", "chat_id": "777", "delegation_id": "d-1"},
         )
@@ -134,14 +134,14 @@ class TestNotificationBranch:
         prompt = _FakeClient.captured_prompts[0]
         assert "[System notification: your delegation to" in prompt
         assert "status=ok" in prompt
-        assert "alex" in prompt
+        assert "finance" in prompt
         assert "Invoice drafted" in prompt
         assert "draft me an invoice" in prompt
 
     async def test_error_completion_synthesizes_error_prompt(self, tmp_path):
         agent = _make_agent(tmp_path)
         complete = DelegationComplete(
-            delegation_id="d-2", agent="alex", status="error",
+            delegation_id="d-2", agent="finance", status="error",
             kind="sdk_error", message="SDK failed",
             origin={"role": "assistant", "channel": "telegram",
                     "chat_id": "777", "cid": "c1",
@@ -150,7 +150,7 @@ class TestNotificationBranch:
         )
         msg = BusMessage(
             type=MessageType.NOTIFICATION,
-            source="alex", target="assistant",
+            source="finance", target="assistant",
             content=complete, channel="telegram",
             context={"cid": "c1", "chat_id": "777", "delegation_id": "d-2"},
         )
@@ -168,7 +168,7 @@ class TestNotificationBranch:
     async def test_restart_orphan_synthesizes_special_prompt(self, tmp_path):
         agent = _make_agent(tmp_path)
         complete = DelegationComplete(
-            delegation_id="d-3", agent="alex", status="error",
+            delegation_id="d-3", agent="finance", status="error",
             kind="restart_orphan", message="Lost on restart",
             origin={"role": "assistant", "channel": "telegram",
                     "chat_id": "777", "cid": "c1",
@@ -177,7 +177,7 @@ class TestNotificationBranch:
         )
         msg = BusMessage(
             type=MessageType.NOTIFICATION,
-            source="alex", target="assistant",
+            source="finance", target="assistant",
             content=complete, channel="telegram",
             context={"cid": "c1", "chat_id": "777", "delegation_id": "d-3"},
         )

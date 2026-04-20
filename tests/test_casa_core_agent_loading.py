@@ -129,8 +129,8 @@ def test_executors_subdir_not_scanned(tmp_path):
     executors = agents / "executors"
     executors.mkdir()
     # Tier 2 shape: no channels.
-    _write(str(executors / "alex.yaml"),
-           "name: Alex\nrole: alex\nmodel: sonnet\npersonality: a\n")
+    _write(str(executors / "finance.yaml"),
+           "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n")
     # Tier 1 resident for comparison.
     _write(str(agents / "assistant.yaml"),
            "name: E\nrole: assistant\nmodel: opus\npersonality: e\n"

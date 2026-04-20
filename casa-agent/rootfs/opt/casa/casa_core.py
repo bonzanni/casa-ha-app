@@ -457,7 +457,7 @@ async def main() -> None:
     )
     executor_registry.load()
 
-    init_tools(channel_manager, bus, executor_registry)
+    init_tools(channel_manager, bus, executor_registry, mcp_registry)
     casa_tools_config = create_casa_tools()
     mcp_registry.register_sdk("casa-framework", casa_tools_config)
     logger.info("Registered casa-framework MCP tools")

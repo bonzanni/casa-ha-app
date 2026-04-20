@@ -1,5 +1,5 @@
-name: alex
-role: alex
+name: Alex
+role: finance
 description: >
   Finance executor. Invoke via delegate_to_agent for invoice prep, expense
   categorization, monthly reports, and bookkeeping automations. Routes

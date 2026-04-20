@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.6.1 — 2026-04-20 — Phase 3.1 follow-ups: role-over-name + 3.4 prerequisites
+
+### Fixed
+
+- **Executor role/name cleanup.** v0.6.0 shipped the Alex executor with
+  `role: alex`, conflating human-facing name and functional role. Every
+  other resident uses `role=<function>` (assistant, butler) with
+  `name=<persona>` (Ellen, Tina). Renamed the bundled default file
+  `defaults/agents/executors/alex.yaml` → `finance.yaml`, set
+  `role: finance` + `name: Alex`. New one-shot `migrate_executor_rename`
+  in `setup-configs.sh` moves any existing
+  `/addon_configs/casa-agent/agents/executors/alex.yaml` → `finance.yaml`
+  and patches the `role:` + `name:` lines. Idempotent by file existence.
+  Delegation API change: `delegate_to_agent(agent="finance", ...)` is
+  now the canonical invocation; `agent="alex"` returns `unknown_agent`.
+
+### Added
+
+- **Phase 3.4 prerequisite: MCP registry wiring in
+  `_build_executor_options`.** v0.6.0 hardcoded `mcp_servers={}` for
+  executor invocations, which would have left a future-enabled Alex
+  with zero MCP tools. `init_tools()` now accepts an optional
+  `mcp_registry: McpServerRegistry`; when passed, `_build_executor_options`
+  resolves `cfg.mcp_server_names` through it. `casa_core.main()`
+  passes the registry. Legacy 3-arg `init_tools` still works (degrades
+  to empty mcp_servers) for test harnesses.
+
+- **Phase 3.4 prerequisite: Ellen can now call `delegate_to_agent`.**
+  The Claude Agent SDK blocks MCP tools unless explicitly whitelisted
+  by their `mcp__<server>__<tool>` name. v0.6.0's bundled
+  `assistant.yaml::tools.allowed` didn't list
+  `mcp__casa-framework__delegate_to_agent`, so Ellen refused to invoke
+  it even though the tool was registered. Added both
+  `mcp__casa-framework__delegate_to_agent` and
+  `mcp__casa-framework__send_message` to the bundled default. New
+  `migrate_mcp_allowed` one-shot in `setup-configs.sh` backfills both
+  entries into existing users' `assistant.yaml::tools.allowed`, gated
+  by `# casa: mcp-tools v1` marker. Handles inline list (`allowed: [...]`)
+  and block list (`allowed:\n  - ...`) forms; preserves existing entries.
+
+### Notes
+
+- No deployment steps beyond `ha apps update`. Both new migrations
+  (`migrate_executor_rename`, `migrate_mcp_allowed`) are idempotent.
+  The rename migration only fires if you upgraded to v0.6.0 and had
+  the Alex executor seeded at `/addon_configs/casa-agent/agents/
+  executors/alex.yaml` (which is the case for anyone who ran v0.6.0).
+- Updated Ellen's personality (`Delegation:` section) to reference
+  `delegate_to_agent(agent="finance")` instead of the deprecated
+  "spawn Alex subagent" / "spawn automation-builder subagent" wording.
+  Non-functional prose — Ellen's behaviour is governed by the tool
+  surface, not the prose.
+
+---
+
 ## 0.6.0 — 2026-04-20 — Phase 3.1: Residents, Executors, delegate_to_agent
 
 ### Added
