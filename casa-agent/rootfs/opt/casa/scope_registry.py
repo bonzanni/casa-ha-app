@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+from collections import OrderedDict
 from typing import Any
 
 import yaml
@@ -125,6 +126,7 @@ class ScopeRegistry:
         *,
         threshold: float = 0.35,
         model_name: str = _DEFAULT_MODEL_NAME,
+        embed_cache_size: int = 256,
     ) -> None:
         self._lib = library
         self._threshold = threshold
@@ -132,6 +134,13 @@ class ScopeRegistry:
         self._embeddings: dict[str, Any] = {}  # populated by prepare()
         self._degraded: bool = False           # true when model unavailable
         self._model: Any = None
+        # Per-process LRU cache for query embeddings. Keyed on
+        # text.strip().lower() so voice retriggers and trivial casing
+        # variants hit. ~4 KB per entry at 1024-dim float64 × 256 ≈ 1 MB.
+        self._embed_cache: OrderedDict[str, Any] = OrderedDict()
+        self._embed_cache_max: int = embed_cache_size
+        self._embed_hits: int = 0
+        self._embed_misses: int = 0
 
     def trust_permits(self, scope: str, channel_trust: str) -> bool:
         """True if a channel at *channel_trust* may access *scope*."""
@@ -210,6 +219,29 @@ class ScopeRegistry:
             )
             self._degraded = True
 
+    def _embed_query(self, text: str) -> Any:
+        """Embed *text* with LRU caching. Caller must have checked
+        that self._model is not None (caller is score()).
+
+        Keyed on normalized text so "Turn off the lights." and "turn
+        off the lights" collapse to one cache entry.
+        """
+        key = text.strip().lower()
+        if key in self._embed_cache:
+            self._embed_cache.move_to_end(key)
+            self._embed_hits += 1
+            return self._embed_cache[key]
+        vec = next(iter(self._model.embed([text])))
+        self._embed_cache[key] = vec
+        if len(self._embed_cache) > self._embed_cache_max:
+            self._embed_cache.popitem(last=False)
+        self._embed_misses += 1
+        return vec
+
+    def cache_stats(self) -> tuple[int, int]:
+        """Return (hits, misses) for the per-process embedding cache."""
+        return self._embed_hits, self._embed_misses
+
     def score(
         self, text: str, scopes: list[str],
     ) -> dict[str, float]:
@@ -217,7 +249,8 @@ class ScopeRegistry:
 
         In degraded mode returns 1.0 for every requested scope so that
         the downstream fan-out behaves like pure Revised-A (all scopes
-        active). Empty *scopes* input returns empty dict.
+        active). Empty *scopes* input returns empty dict. Query
+        embedding is cached per-process (see _embed_query).
         """
         if not scopes:
             return {}
@@ -226,7 +259,7 @@ class ScopeRegistry:
 
         import numpy as np
 
-        q_vec = next(iter(self._model.embed([text])))
+        q_vec = self._embed_query(text)
         q_norm = np.linalg.norm(q_vec) or 1.0
         out: dict[str, float] = {}
         for s in scopes:

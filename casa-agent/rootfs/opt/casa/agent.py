@@ -412,13 +412,21 @@ class Agent:
                     s for s in self.config.memory.scopes_owned if s in readable
                 ]
                 if owned_and_readable:
-                    write_scores = self._scope_registry.score(
-                        f"{user_text}\n{response_text}",
-                        owned_and_readable,
-                    )
-                    write_scope = self._scope_registry.argmax_scope(
-                        write_scores, self.config.memory.default_scope,
-                    )
+                    # Skip the classify round-trip when there's only one
+                    # candidate — the argmax is trivially that scope, so
+                    # a 90 ms ONNX forward pass would buy us nothing.
+                    # This is the common butler (voice, owns=[house])
+                    # case.
+                    if len(owned_and_readable) == 1:
+                        write_scope = owned_and_readable[0]
+                    else:
+                        write_scores = self._scope_registry.score(
+                            f"{user_text}\n{response_text}",
+                            owned_and_readable,
+                        )
+                        write_scope = self._scope_registry.argmax_scope(
+                            write_scores, self.config.memory.default_scope,
+                        )
                     write_sid = f"{channel_key}:{write_scope}:{self.config.role}"
                     task = asyncio.create_task(self._add_turn_bg(
                         write_sid, self.config.role, user_text, response_text, user_peer,
@@ -429,11 +437,13 @@ class Agent:
             # --- 3.2 observability ----------------------------------------
             active_str = ",".join(active)
             total_ms = int((time.perf_counter() - scope_start_t) * 1000)
+            hits, misses = self._scope_registry.cache_stats()
             logger.info(
-                "scope_route role=%s channel=%s active=[%s] write=%s (t=%dms)",
+                "scope_route role=%s channel=%s active=[%s] write=%s (t=%dms) embed_cache=%d/%d",
                 self.config.role, msg.channel, active_str,
                 write_scope,
                 total_ms,
+                hits, hits + misses,
             )
 
             # 9. SessionRegistry — only SDK session id now. --------------------
