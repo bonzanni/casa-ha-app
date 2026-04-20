@@ -11,7 +11,7 @@ import pytest
 from agent import Agent
 from bus import BusMessage, MessageType
 from channels import ChannelManager
-from config import AgentConfig, MemoryConfig, ToolsConfig
+from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
 from mcp_registry import McpServerRegistry
 from memory import MemoryProvider
 from session_registry import SessionRegistry
@@ -133,10 +133,10 @@ def _make_agent(
     role: str = "assistant",
 ) -> Agent:
     cfg = AgentConfig(
-        name="Test",
         role=role,
         model="claude-sonnet-4-6",
-        personality="You are helpful.",
+        system_prompt="You are helpful.",
+        character=CharacterConfig(name="Test"),
         tools=ToolsConfig(allowed=["Read"], permission_mode="acceptEdits"),
         memory=MemoryConfig(token_budget=1000, read_strategy="per_turn"),
     )
@@ -684,10 +684,10 @@ def _make_agent_with_registry(
     tests can pre-populate entries.
     """
     cfg = AgentConfig(
-        name="Test",
         role=role,
         model="claude-sonnet-4-6",
-        personality="You are helpful.",
+        system_prompt="You are helpful.",
+        character=CharacterConfig(name="Test"),
         tools=ToolsConfig(allowed=["Read"], permission_mode="acceptEdits"),
         memory=MemoryConfig(token_budget=1000, read_strategy="per_turn"),
     )

@@ -20,7 +20,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from config import AgentConfig, load_agent_config
+from config import AgentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -81,34 +81,27 @@ class ExecutorRegistry:
     # -- Loading / validation -------------------------------------------------
 
     def load(self) -> None:
-        """Scan ``self._dir`` for ``*.yaml`` and register valid executors."""
+        """Scan ``self._dir`` for executor directories and register valid ones."""
+        from agent_loader import LoadError, load_all_executors
+
         self._configs.clear()
         self._disabled_names.clear()
-        if os.path.isdir(self._dir):
-            for entry in sorted(os.listdir(self._dir)):
-                if not entry.endswith(".yaml"):
-                    continue
-                path = os.path.join(self._dir, entry)
-                try:
-                    cfg = load_agent_config(path)
-                except Exception as exc:
-                    logger.error(
-                        "Failed to load executor %s: %s", path, exc,
-                    )
-                    continue
-                if not self._validate_tier2_shape(cfg, entry):
-                    continue
-                if not cfg.enabled:
-                    logger.info(
-                        "Executor %r bundled but disabled (file=%s)",
-                        cfg.role, entry,
-                    )
-                    self._disabled_names.add(cfg.role)
-                    continue
-                self._configs[cfg.role] = cfg
-                logger.info(
-                    "Executor %r loaded (model=%s)", cfg.role, cfg.model,
-                )
+        try:
+            found = load_all_executors(self._dir)
+        except LoadError as exc:
+            logger.error("Executor load failed: %s", exc)
+            found = {}
+
+        for role, cfg in found.items():
+            if not self._validate_tier2_shape(cfg, role):
+                continue
+            if not cfg.enabled:
+                logger.info("Executor %r bundled but disabled", role)
+                self._disabled_names.add(role)
+                continue
+            self._configs[role] = cfg
+            logger.info("Executor %r loaded (model=%s)", role, cfg.model)
+
         logger.info(
             "Executors: enabled=%s disabled=%s",
             sorted(self._configs.keys()),
@@ -116,31 +109,31 @@ class ExecutorRegistry:
         )
 
     def _validate_tier2_shape(
-        self, cfg: AgentConfig, entry: str,
+        self, cfg: AgentConfig, role: str,
     ) -> bool:
         if cfg.channels:
             logger.error(
-                "Rejecting executor %s: Tier 2 forbids non-empty 'channels:' "
+                "Rejecting executor %r: Tier 2 forbids non-empty 'channels:' "
                 "(channels belong to Tier 1 residents in agents/).",
-                entry,
+                role,
             )
             return False
         if cfg.session.strategy != "ephemeral":
             logger.error(
-                "Rejecting executor %s: session.strategy must be 'ephemeral' "
-                "(got %r).", entry, cfg.session.strategy,
+                "Rejecting executor %r: session.strategy must be 'ephemeral' "
+                "(got %r).", role, cfg.session.strategy,
             )
             return False
         if cfg.memory.scopes_owned:
             logger.error(
-                "Rejecting executor %s: memory.scopes_owned must be empty "
-                "(executors own no scope).", entry,
+                "Rejecting executor %r: memory.scopes_owned must be empty "
+                "(executors own no scope).", role,
             )
             return False
         if cfg.memory.token_budget > 0:
             logger.error(
-                "Rejecting executor %s: memory.token_budget must be 0 "
-                "(executors are stateless).", entry,
+                "Rejecting executor %r: memory.token_budget must be 0 "
+                "(executors are stateless).", role,
             )
             return False
         return True

@@ -1,11 +1,10 @@
-"""Safety hooks: command blocking and per-role path-scope enforcement.
+"""Safety hooks: command blocking and parameterized path-scope enforcement.
 
-The Claude Agent SDK's `HookContext` carries no agent identity (only a reserved
-`signal` field). Per-role rules must therefore be bound at hook-registration
-time via a closure; see :func:`make_path_scope_hook`.
-
-Payload shape follows the SDK's `PreToolUseHookSpecificOutput`:
-``hookEventName`` + ``permissionDecision`` (allow | deny | ask) + reason.
+Per-agent hook wiring is driven by each agent's ``hooks.yaml`` file,
+resolved through :func:`resolve_hooks` and the :data:`HOOK_POLICIES`
+registry. Payload shape follows the SDK's
+``PreToolUseHookSpecificOutput``: ``hookEventName`` +
+``permissionDecision`` (allow | deny | ask) + reason.
 """
 
 from __future__ import annotations
@@ -28,24 +27,6 @@ FORBIDDEN_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bssh\b"),
     re.compile(r"\bscp\b"),
 ]
-
-# ---------------------------------------------------------------------------
-# Per-role path rules (keyed on AgentConfig.role, not display name)
-# ---------------------------------------------------------------------------
-
-AGENT_PATH_RULES: dict[str, list[tuple[frozenset[str], str]]] = {
-    "assistant": [
-        (frozenset({"Read"}), "addon_configs/"),
-        (frozenset({"Read"}), "/config/"),
-        (frozenset({"Write"}), "workspace/"),
-    ],
-    "butler": [
-        (frozenset({"Read"}), "workspace/"),
-    ],
-    "plugin-builder": [
-        (frozenset({"Read", "Write"}), "workspace/"),
-    ],
-}
 
 
 HookCallback = Callable[
@@ -105,51 +86,8 @@ async def block_dangerous_commands(
     return None
 
 
-async def _check_path_scope(
-    role: str,
-    input_data: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Check a Read/Write/Edit call against AGENT_PATH_RULES for *role*."""
-    tool_name = input_data.get("tool_name", "")
-    if tool_name not in ("Read", "Write", "Edit"):
-        return None
-
-    rules = AGENT_PATH_RULES.get(role)
-    if rules is None:
-        # Unknown role -- allow by default. Phase 2 may invert this.
-        return None
-
-    raw_path = input_data.get("tool_input", {}).get("file_path", "")
-    norm = _normalize_path(raw_path)
-
-    for perms, prefix in rules:
-        if tool_name in perms and norm.startswith(prefix):
-            return None
-
-    return _deny(
-        f"Role '{role}' is not allowed to {tool_name} path '{raw_path}'"
-    )
-
-
-def make_path_scope_hook(role: str) -> HookCallback:
-    """Return a PreToolUse hook callback bound to *role*.
-
-    The SDK provides no agent identity inside the hook context, so the role
-    must be captured in a closure at registration time.
-    """
-
-    async def _hook(
-        input_data: dict[str, Any],
-        tool_use_id: str | None,
-        context: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        return await _check_path_scope(role, input_data)
-
-    return _hook
-
-
 # ---------------------------------------------------------------------------
-# Phase 4.x — parameterized path_scope + HOOK_POLICIES registry.
+# Parameterized path_scope + HOOK_POLICIES registry.
 # ---------------------------------------------------------------------------
 
 
@@ -164,12 +102,10 @@ def make_path_scope_hook_v2(
 ) -> HookCallback:
     """Return a PreToolUse hook that enforces absolute-path prefixes.
 
-    Unlike :func:`make_path_scope_hook`, this variant is parameterized —
-    no hardcoded ``AGENT_PATH_RULES`` table. The per-agent ``hooks.yaml``
-    supplies the prefix lists.
-
-    ``writable`` applies to Write/Edit. ``readable`` applies to Read/Write/Edit.
-    Anything outside the allowed set denies; exact-match or prefix-match.
+    The per-agent ``hooks.yaml`` supplies the prefix lists.
+    ``writable`` applies to Write/Edit. ``readable`` applies to
+    Read/Write/Edit. Anything outside the allowed set denies;
+    exact-match or prefix-match.
     """
     writable = [_normalize_path(p) for p in (writable or [])]
     readable = [_normalize_path(p) for p in (readable or [])]

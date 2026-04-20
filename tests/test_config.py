@@ -1,17 +1,8 @@
-"""Tests for config.py -- model mapping and agent config loading."""
-
-import textwrap
+"""Tests for config.py -- model mapping and dataclasses."""
 
 import pytest
 
-from config import (
-    AgentConfig,
-    MemoryConfig,
-    SessionConfig,
-    ToolsConfig,
-    load_agent_config,
-    resolve_model,
-)
+from config import resolve_model
 
 
 # ------------------------------------------------------------------
@@ -41,199 +32,7 @@ class TestResolveModel:
 
 
 # ------------------------------------------------------------------
-# load_agent_config
-# ------------------------------------------------------------------
-
-
-class TestLoadAgentConfig:
-    def test_load_all_fields(self, tmp_path):
-        yaml_content = textwrap.dedent("""\
-            name: TestBot
-            role: tester
-            model: sonnet
-            personality: "Friendly bot"
-            description: "A test bot"
-            tools:
-              allowed: [Read, Write]
-              disallowed: [Bash]
-              permission_mode: acceptEdits
-              max_turns: 15
-            mcp_server_names:
-              - homeassistant
-            memory:
-              token_budget: 5000
-              read_strategy: cached
-            session:
-              strategy: persistent
-              idle_timeout: 600
-            channels:
-              - telegram
-              - webhook
-            cwd: /workspace
-        """)
-        cfg_file = tmp_path / "agent.yaml"
-        cfg_file.write_text(yaml_content, encoding="utf-8")
-
-        cfg = load_agent_config(str(cfg_file))
-
-        assert isinstance(cfg, AgentConfig)
-        assert cfg.name == "TestBot"
-        assert cfg.role == "tester"
-        assert cfg.model == "claude-sonnet-4-6"
-        assert cfg.personality == "Friendly bot"
-        assert cfg.description == "A test bot"
-
-        assert isinstance(cfg.tools, ToolsConfig)
-        assert cfg.tools.allowed == ["Read", "Write"]
-        assert cfg.tools.disallowed == ["Bash"]
-        assert cfg.tools.permission_mode == "acceptEdits"
-        assert cfg.tools.max_turns == 15
-
-        assert cfg.mcp_server_names == ["homeassistant"]
-
-        assert isinstance(cfg.memory, MemoryConfig)
-        assert cfg.memory.token_budget == 5000
-        assert cfg.memory.read_strategy == "cached"
-
-        assert isinstance(cfg.session, SessionConfig)
-        assert cfg.session.strategy == "persistent"
-        assert cfg.session.idle_timeout == 600
-
-        assert cfg.channels == ["telegram", "webhook"]
-        assert cfg.cwd == "/workspace"
-
-    def test_env_substitution(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("PRIMARY_AGENT_NAME", "Ellen")
-        monkeypatch.setenv("PRIMARY_AGENT_MODEL", "opus")
-
-        yaml_content = textwrap.dedent("""\
-            name: "${PRIMARY_AGENT_NAME}"
-            role: main
-            model: "${PRIMARY_AGENT_MODEL}"
-            personality: "I am ${PRIMARY_AGENT_NAME}."
-        """)
-        cfg_file = tmp_path / "agent.yaml"
-        cfg_file.write_text(yaml_content, encoding="utf-8")
-
-        cfg = load_agent_config(str(cfg_file))
-
-        assert cfg.name == "Ellen"
-        assert cfg.model == "claude-opus-4-6"
-        assert "Ellen" in cfg.personality
-
-
-def test_missing_role_raises(tmp_path):
-    p = tmp_path / "bad.yaml"
-    p.write_text(
-        "name: Test\n"
-        "model: opus\n"
-        "personality: hi\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Missing required 'role' field"):
-        load_agent_config(str(p))
-
-
-def test_legacy_main_role_normalized(tmp_path, caplog):
-    import logging
-
-    p = tmp_path / "legacy.yaml"
-    p.write_text(
-        "name: Test\n"
-        "role: main\n"
-        "model: opus\n"
-        "personality: hi\n",
-        encoding="utf-8",
-    )
-    with caplog.at_level(logging.WARNING):
-        cfg = load_agent_config(str(p))
-    assert cfg.role == "assistant"
-    assert any("deprecated" in r.message.lower() for r in caplog.records)
-
-
-def test_role_assistant_accepted(tmp_path):
-    p = tmp_path / "new.yaml"
-    p.write_text(
-        "name: Test\n"
-        "role: assistant\n"
-        "model: opus\n"
-        "personality: hi\n",
-        encoding="utf-8",
-    )
-    cfg = load_agent_config(str(p))
-    assert cfg.role == "assistant"
-
-
-def test_unknown_read_strategy_raises(tmp_path):
-    p = tmp_path / "bad.yaml"
-    p.write_text(
-        "name: T\n"
-        "role: assistant\n"
-        "model: opus\n"
-        "personality: x\n"
-        "memory:\n"
-        "  read_strategy: telepathy\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="read_strategy"):
-        load_agent_config(str(p))
-
-
-# ---------------------------------------------------------------------------
-# Phase 3.1 schema — enabled + scopes
-# ---------------------------------------------------------------------------
-
-
-def test_enabled_defaults_true(tmp_path):
-    p = tmp_path / "a.yaml"
-    p.write_text(
-        "name: T\nrole: assistant\nmodel: opus\npersonality: x\n",
-        encoding="utf-8",
-    )
-    cfg = load_agent_config(str(p))
-    assert cfg.enabled is True
-
-
-def test_enabled_false_parsed(tmp_path):
-    p = tmp_path / "a.yaml"
-    p.write_text(
-        "name: T\nrole: finance\nmodel: sonnet\npersonality: x\nenabled: false\n",
-        encoding="utf-8",
-    )
-    cfg = load_agent_config(str(p))
-    assert cfg.enabled is False
-
-
-def test_scopes_default_empty(tmp_path):
-    p = tmp_path / "a.yaml"
-    p.write_text(
-        "name: T\nrole: assistant\nmodel: opus\npersonality: x\n",
-        encoding="utf-8",
-    )
-    cfg = load_agent_config(str(p))
-    assert cfg.memory.scopes_owned == []
-    assert cfg.memory.scopes_readable == []
-
-
-def test_scopes_parsed(tmp_path):
-    p = tmp_path / "a.yaml"
-    p.write_text(
-        "name: T\nrole: assistant\nmodel: opus\npersonality: x\n"
-        "memory:\n"
-        "  token_budget: 4000\n"
-        "  scopes_owned: [personal, business, finance]\n"
-        "  scopes_readable: [personal, business, finance, house]\n",
-        encoding="utf-8",
-    )
-    cfg = load_agent_config(str(p))
-    assert cfg.memory.scopes_owned == ["personal", "business", "finance"]
-    assert cfg.memory.scopes_readable == [
-        "personal", "business", "finance", "house",
-    ]
-
-
-# ------------------------------------------------------------------
-# New dataclasses (Phase 4.x agent-definition refactor)
+# Dataclasses (Phase 4.x agent-definition refactor)
 # ------------------------------------------------------------------
 
 
@@ -315,9 +114,6 @@ class TestHooksConfig:
 
 class TestAgentConfigNewFields:
     def test_new_fields_default_to_empty(self):
-        """The refactor adds character/voice/response_shape/disclosure/
-        delegates/triggers/hooks/system_prompt. Old fields remain for
-        the transition period; they are deleted in the cut commit."""
         from config import (
             AgentConfig, CharacterConfig, VoiceConfig,
             ResponseShapeConfig, HooksConfig,

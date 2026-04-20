@@ -10,7 +10,7 @@ import pytest
 from agent import Agent
 from bus import BusMessage, MessageType
 from channels import ChannelManager
-from config import AgentConfig, MemoryConfig, ToolsConfig
+from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
 from executor_registry import DelegationComplete
 from mcp_registry import McpServerRegistry
 from memory import MemoryProvider
@@ -89,8 +89,9 @@ class _FakeClient:
 
 def _make_agent(tmp_path, role="assistant") -> Agent:
     cfg = AgentConfig(
-        name="Test", role=role, model="claude-sonnet-4-6",
-        personality="Be helpful.",
+        role=role, model="claude-sonnet-4-6",
+        system_prompt="Be helpful.",
+        character=CharacterConfig(name="Test"),
         tools=ToolsConfig(allowed=["Read"], permission_mode="acceptEdits"),
         memory=MemoryConfig(token_budget=1000),
     )

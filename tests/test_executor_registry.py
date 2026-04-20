@@ -2,14 +2,59 @@
 
 from __future__ import annotations
 
+import textwrap
+from pathlib import Path
+
 import pytest
 
 pytestmark = pytest.mark.asyncio
 
 
-def _write(path, text: str) -> None:
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(text)
+# ---------------------------------------------------------------------------
+# Fixture helper — seed a per-concern executor directory under *base*.
+# ---------------------------------------------------------------------------
+
+
+def _seed_executor_dir(
+    base: Path,
+    role: str,
+    *,
+    enabled: bool = True,
+    channels: list[str] | None = None,
+    scopes_owned: list[str] | None = None,
+    strategy: str = "ephemeral",
+    token_budget: int = 0,
+) -> Path:
+    d = base / role
+    d.mkdir(parents=True)
+    (d / "character.yaml").write_text(textwrap.dedent(f"""\
+        schema_version: 1
+        name: {role.capitalize()}
+        role: {role}
+        archetype: exec
+        card: |
+          x
+        prompt: |
+          x
+    """), encoding="utf-8")
+    (d / "voice.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+    (d / "response_shape.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+    channels_part = channels if channels is not None else []
+    scopes_part = scopes_owned if scopes_owned is not None else []
+    (d / "runtime.yaml").write_text(textwrap.dedent(f"""\
+        schema_version: 1
+        model: sonnet
+        enabled: {str(enabled).lower()}
+        tools:
+          allowed: [Read]
+        channels: {channels_part}
+        memory:
+          token_budget: {token_budget}
+          scopes_owned: {scopes_part}
+        session:
+          strategy: {strategy}
+    """), encoding="utf-8")
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -21,7 +66,9 @@ class TestLoader:
     async def test_empty_dir_loads_nothing(self, tmp_path):
         from executor_registry import ExecutorRegistry
 
-        reg = ExecutorRegistry(str(tmp_path / "executors"),
+        executors = tmp_path / "executors"
+        executors.mkdir()
+        reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         reg.load()
         assert reg.get("finance") is None
@@ -40,11 +87,7 @@ class TestLoader:
 
         executors = tmp_path / "executors"
         executors.mkdir()
-        _write(str(executors / "finance.yaml"),
-               "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
-               "enabled: true\n"
-               "memory:\n  token_budget: 0\n"
-               "session:\n  strategy: ephemeral\n  idle_timeout: 0\n")
+        _seed_executor_dir(executors, "finance", enabled=True)
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -61,23 +104,24 @@ class TestLoader:
 
 class TestValidation:
     async def test_rejects_non_empty_channels(self, tmp_path, caplog):
+        """With channels declared, the loader re-infers the tier as
+        ``resident`` and demands disclosure.yaml (which executors do not
+        carry). The file-set check raises ``LoadError`` before the
+        Tier-2 shape validator ever runs — that's still a rejection."""
         import logging
         from executor_registry import ExecutorRegistry
 
         executors = tmp_path / "executors"
         executors.mkdir()
-        _write(str(executors / "bogus.yaml"),
-               "name: B\nrole: bogus\nmodel: sonnet\npersonality: b\n"
-               "channels: [telegram]\n"
-               "memory:\n  token_budget: 0\n"
-               "session:\n  strategy: ephemeral\n  idle_timeout: 0\n")
+        _seed_executor_dir(executors, "bogus", channels=["telegram"])
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.ERROR):
             reg.load()
         assert reg.get("bogus") is None
         assert any(
-            "channels" in r.message.lower() for r in caplog.records
+            "load failed" in r.message.lower()
+            for r in caplog.records
         )
 
     async def test_rejects_non_zero_token_budget(self, tmp_path, caplog):
@@ -86,10 +130,7 @@ class TestValidation:
 
         executors = tmp_path / "executors"
         executors.mkdir()
-        _write(str(executors / "rich.yaml"),
-               "name: R\nrole: rich\nmodel: sonnet\npersonality: r\n"
-               "memory:\n  token_budget: 1000\n"
-               "session:\n  strategy: ephemeral\n  idle_timeout: 0\n")
+        _seed_executor_dir(executors, "rich", token_budget=1000)
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.ERROR):
@@ -105,10 +146,7 @@ class TestValidation:
 
         executors = tmp_path / "executors"
         executors.mkdir()
-        _write(str(executors / "sticky.yaml"),
-               "name: S\nrole: sticky\nmodel: sonnet\npersonality: s\n"
-               "memory:\n  token_budget: 0\n"
-               "session:\n  strategy: persistent\n  idle_timeout: 0\n")
+        _seed_executor_dir(executors, "sticky", strategy="persistent")
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.ERROR):
@@ -121,10 +159,7 @@ class TestValidation:
 
         executors = tmp_path / "executors"
         executors.mkdir()
-        _write(str(executors / "owner.yaml"),
-               "name: O\nrole: owner\nmodel: sonnet\npersonality: o\n"
-               "memory:\n  token_budget: 0\n  scopes_owned: [finance]\n"
-               "session:\n  strategy: ephemeral\n  idle_timeout: 0\n")
+        _seed_executor_dir(executors, "owner", scopes_owned=["finance"])
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.ERROR):
@@ -134,18 +169,28 @@ class TestValidation:
             "scopes_owned" in r.message for r in caplog.records
         )
 
-    async def test_malformed_yaml_skipped(self, tmp_path, caplog):
+    async def test_stray_flat_yaml_rejected(self, tmp_path, caplog):
+        """Flat-YAML files inside executors/ are rejected by the new
+        loader (directories only). ExecutorRegistry catches LoadError
+        and logs ERROR; no executors register."""
         import logging
         from executor_registry import ExecutorRegistry
 
         executors = tmp_path / "executors"
         executors.mkdir()
-        _write(str(executors / "broken.yaml"), "not: valid: yaml: here\n")
+        (executors / "broken.yaml").write_text(
+            "not a directory — the loader rejects this\n",
+            encoding="utf-8",
+        )
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.ERROR):
             reg.load()
         assert reg.get("broken") is None
+        assert any(
+            "executor load failed" in r.message.lower()
+            for r in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -162,11 +207,7 @@ class TestEnabledFiltering:
 
         executors = tmp_path / "executors"
         executors.mkdir()
-        _write(str(executors / "finance.yaml"),
-               "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
-               "enabled: false\n"
-               "memory:\n  token_budget: 0\n"
-               "session:\n  strategy: ephemeral\n  idle_timeout: 0\n")
+        _seed_executor_dir(executors, "finance", enabled=False)
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.INFO):
@@ -181,7 +222,7 @@ class TestEnabledFiltering:
 
 
 # ---------------------------------------------------------------------------
-# TestDelegationLifecycle (in-memory only — tombstone in Task 5)
+# TestDelegationLifecycle (in-memory only)
 # ---------------------------------------------------------------------------
 
 
@@ -338,7 +379,7 @@ class TestTombstone:
 
 class TestOrphanRecovery:
     async def test_orphans_from_disk_returns_records(self, tmp_path):
-        from executor_registry import DelegationRecord, ExecutorRegistry
+        from executor_registry import ExecutorRegistry
 
         tomb = tmp_path / "del.json"
         # Pre-populate as if a prior process left records behind.
@@ -450,18 +491,8 @@ class TestSummaryLog:
 
         executors = tmp_path / "executors"
         executors.mkdir()
-        # One enabled executor.
-        _write(str(executors / "foo.yaml"),
-               "name: Foo\nrole: foo\nmodel: sonnet\npersonality: a\n"
-               "enabled: true\n"
-               "memory:\n  token_budget: 0\n"
-               "session:\n  strategy: ephemeral\n  idle_timeout: 0\n")
-        # One disabled executor.
-        _write(str(executors / "bar.yaml"),
-               "name: Bar\nrole: bar\nmodel: sonnet\npersonality: a\n"
-               "enabled: false\n"
-               "memory:\n  token_budget: 0\n"
-               "session:\n  strategy: ephemeral\n  idle_timeout: 0\n")
+        _seed_executor_dir(executors, "foo", enabled=True)
+        _seed_executor_dir(executors, "bar", enabled=False)
 
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))

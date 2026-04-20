@@ -1,0 +1,15 @@
+schema_version: 1
+enabled: true
+model: sonnet
+tools:
+  allowed: [Read, Skill]
+  disallowed: [Bash, Write, Edit]
+  permission_mode: acceptEdits
+  max_turns: 10
+mcp_server_names:
+  - casa-framework
+memory:
+  token_budget: 0
+session:
+  strategy: ephemeral
+  idle_timeout: 0

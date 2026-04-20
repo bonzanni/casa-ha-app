@@ -1,173 +1,129 @@
-"""Tests for casa_core._load_agents_by_role."""
+"""Tests for casa_core's agent-loading integration.
 
-import logging
-import os
+casa_core.main no longer owns the loader — it just wraps
+agent_loader.load_all_agents. These tests focus on the wrapping and
+directory walk behaviour, using minimal fixture trees.
+"""
+
+from __future__ import annotations
+
+import textwrap
+from pathlib import Path
 
 import pytest
 
 
-def _write(path: str, text: str) -> None:
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(text)
+def _w(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(text), encoding="utf-8")
 
 
-def test_loads_assistant_and_butler(tmp_path):
-    from casa_core import _load_agents_by_role
-
-    agents = tmp_path / "agents"
-    agents.mkdir()
-    _write(str(agents / "assistant.yaml"),
-           "name: Ellen\nrole: assistant\nmodel: opus\npersonality: a\n"
-           "channels: [telegram]\n")
-    _write(str(agents / "butler.yaml"),
-           "name: Tina\nrole: butler\nmodel: haiku\npersonality: b\n"
-           "channels: [ha_voice]\n")
-    result = _load_agents_by_role(str(agents))
-    assert set(result.keys()) == {"assistant", "butler"}
-    assert result["assistant"].name == "Ellen"
-
-
-def test_ignores_subagents_yaml(tmp_path):
-    from casa_core import _load_agents_by_role
-
-    agents = tmp_path / "agents"
-    agents.mkdir()
-    _write(str(agents / "assistant.yaml"),
-           "name: Ellen\nrole: assistant\nmodel: opus\npersonality: a\n"
-           "channels: [telegram]\n")
-    _write(str(agents / "subagents.yaml"),
-           "automation-builder:\n  model: sonnet\n")
-    result = _load_agents_by_role(str(agents))
-    assert set(result.keys()) == {"assistant"}
+def _seed_resident(base: Path, role: str) -> Path:
+    d = base / role
+    _w(d / "character.yaml", f"""\
+        schema_version: 1
+        name: {role.capitalize()}
+        role: {role}
+        archetype: assistant
+        card: |
+          x
+        prompt: |
+          x
+    """)
+    _w(d / "voice.yaml", "schema_version: 1\n")
+    _w(d / "response_shape.yaml", "schema_version: 1\n")
+    _w(d / "disclosure.yaml", "schema_version: 1\npolicy: standard\n")
+    _w(d / "runtime.yaml", """\
+        schema_version: 1
+        model: sonnet
+        tools:
+          allowed: [Read]
+        channels: [telegram]
+    """)
+    return d
 
 
-def test_duplicate_role_second_skipped(tmp_path, caplog):
-    from casa_core import _load_agents_by_role
-
-    agents = tmp_path / "agents"
-    agents.mkdir()
-    _write(str(agents / "a1.yaml"),
-           "name: A\nrole: assistant\nmodel: opus\npersonality: a\n"
-           "channels: [telegram]\n")
-    _write(str(agents / "a2.yaml"),
-           "name: B\nrole: assistant\nmodel: opus\npersonality: b\n"
-           "channels: [telegram]\n")
-    with caplog.at_level(logging.ERROR):
-        result = _load_agents_by_role(str(agents))
-    assert result["assistant"].name == "A"  # lexicographic order: a1 first
-    assert any("Duplicate role" in r.message for r in caplog.records)
-
-
-def test_legacy_main_file_migrates_via_config(tmp_path, caplog):
-    """Sanity check: a file with `role: main` still ends up as assistant
-    (normalized by config._normalize_role)."""
-    from casa_core import _load_agents_by_role
-
-    agents = tmp_path / "agents"
-    agents.mkdir()
-    _write(str(agents / "assistant.yaml"),
-           "name: Ellen\nrole: main\nmodel: opus\npersonality: a\n"
-           "channels: [telegram]\n")
-    with caplog.at_level(logging.WARNING):
-        result = _load_agents_by_role(str(agents))
-    assert "assistant" in result
-    assert any("deprecated" in r.message.lower() for r in caplog.records)
+def _seed_policies(base: Path) -> Path:
+    p = base / "disclosure.yaml"
+    _w(p, """\
+        schema_version: 1
+        policies:
+          standard:
+            categories:
+              financial:
+                required_trust: authenticated
+                examples: [balances]
+            safe_on_any_channel: [device_state]
+            deflection_patterns:
+              household_shared: "private."
+    """)
+    return p
 
 
-def test_missing_directory_returns_empty(tmp_path):
-    from casa_core import _load_agents_by_role
-
-    result = _load_agents_by_role(str(tmp_path / "nonexistent"))
-    assert result == {}
-
-
-# ---------------------------------------------------------------------------
-# Phase 3.1 — tier-boundary loader (channels: required)
-# ---------------------------------------------------------------------------
-
-
-def test_loads_any_role_with_channels(tmp_path):
-    """A new resident YAML with non-empty `channels:` is loaded
-    regardless of role name — allowlist is gone."""
-    from casa_core import _load_agents_by_role
-
-    agents = tmp_path / "agents"
-    agents.mkdir()
-    _write(str(agents / "guest.yaml"),
-           "name: Guest\nrole: guest\nmodel: haiku\npersonality: g\n"
-           "channels: [telegram]\n")
-    result = _load_agents_by_role(str(agents))
-    assert "guest" in result
-    assert result["guest"].channels == ["telegram"]
+def _seed_minimal_tree(base: Path) -> tuple[Path, Path]:
+    agents_root = base / "agents"
+    agents_root.mkdir()
+    _seed_resident(agents_root, "assistant")
+    _seed_resident(agents_root, "butler")
+    policies_dir = base / "policies"
+    policies_dir.mkdir()
+    _seed_policies(policies_dir)
+    return agents_root, policies_dir / "disclosure.yaml"
 
 
-def test_skips_when_channels_empty(tmp_path, caplog):
-    """An agent YAML with missing / empty `channels:` is NOT loaded
-    as a resident (Tier 2 shape — must live in agents/executors/)."""
-    from casa_core import _load_agents_by_role
+class TestLoadsWithShippedFixtures:
+    def test_finds_both_residents(self, tmp_path):
+        from agent_loader import load_all_agents
+        from policies import load_policies
 
-    agents = tmp_path / "agents"
-    agents.mkdir()
-    _write(str(agents / "stateless.yaml"),
-           "name: S\nrole: stateless\nmodel: haiku\npersonality: s\n")
-    with caplog.at_level(logging.ERROR):
-        result = _load_agents_by_role(str(agents))
-    assert "stateless" not in result
-    assert any(
-        "requires non-empty 'channels:'" in r.message
-        for r in caplog.records
-    )
+        agents_root, policy_path = _seed_minimal_tree(tmp_path)
+        policy_lib = load_policies(str(policy_path))
+        found = load_all_agents(str(agents_root), policies=policy_lib)
+        assert set(found.keys()) == {"assistant", "butler"}
 
+    def test_executors_subdir_skipped(self, tmp_path):
+        from agent_loader import load_all_agents
+        from policies import load_policies
 
-def test_executors_subdir_not_scanned(tmp_path):
-    """agents/executors/*.yaml must NOT be picked up by the Tier 1 loader.
-    os.listdir is non-recursive — files in a subdirectory are invisible."""
-    from casa_core import _load_agents_by_role
+        agents_root, policy_path = _seed_minimal_tree(tmp_path)
+        # Drop an executors/ directory with a stray finance executor —
+        # the Tier 1 walker must not pick it up.
+        exec_dir = agents_root / "executors" / "finance"
+        _w(exec_dir / "character.yaml", """\
+            schema_version: 1
+            name: Alex
+            role: finance
+            archetype: finance
+            card: |
+              x
+            prompt: |
+              x
+        """)
+        _w(exec_dir / "voice.yaml", "schema_version: 1\n")
+        _w(exec_dir / "response_shape.yaml", "schema_version: 1\n")
+        _w(exec_dir / "runtime.yaml", """\
+            schema_version: 1
+            model: sonnet
+            enabled: false
+            memory:
+              token_budget: 0
+            session:
+              strategy: ephemeral
+        """)
 
-    agents = tmp_path / "agents"
-    agents.mkdir()
-    executors = agents / "executors"
-    executors.mkdir()
-    # Tier 2 shape: no channels.
-    _write(str(executors / "finance.yaml"),
-           "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n")
-    # Tier 1 resident for comparison.
-    _write(str(agents / "assistant.yaml"),
-           "name: E\nrole: assistant\nmodel: opus\npersonality: e\n"
-           "channels: [telegram]\n")
-    result = _load_agents_by_role(str(agents))
-    assert set(result.keys()) == {"assistant"}
+        policy_lib = load_policies(str(policy_path))
+        found = load_all_agents(str(agents_root), policies=policy_lib)
+        assert "finance" not in found
+        assert set(found.keys()) == {"assistant", "butler"}
 
+    def test_missing_directory_returns_empty(self, tmp_path):
+        from agent_loader import load_all_agents
+        from policies import load_policies
 
-# ---------------------------------------------------------------------------
-# Phase 3.1 — subagents.yaml deprecation log
-# ---------------------------------------------------------------------------
-
-
-def test_subagents_yaml_presence_logs_deprecation(tmp_path, caplog):
-    """If agents/subagents.yaml exists, casa_core logs one INFO line
-    explaining the file is no longer loaded as of v0.6.0. The helper
-    lives on casa_core and is called once at startup."""
-    import logging
-    from casa_core import _log_subagents_deprecation_if_present
-
-    agents = tmp_path / "agents"
-    agents.mkdir()
-    _write(str(agents / "subagents.yaml"), "alex:\n  model: sonnet\n")
-    with caplog.at_level(logging.INFO):
-        _log_subagents_deprecation_if_present(str(agents))
-    assert any(
-        "subagents.yaml" in r.message and "no longer loaded" in r.message
-        for r in caplog.records
-    )
-
-
-def test_subagents_yaml_absent_is_silent(tmp_path, caplog):
-    import logging
-    from casa_core import _log_subagents_deprecation_if_present
-
-    agents = tmp_path / "agents"
-    agents.mkdir()
-    with caplog.at_level(logging.INFO):
-        _log_subagents_deprecation_if_present(str(agents))
-    assert not any("subagents.yaml" in r.message for r in caplog.records)
+        policies_dir = tmp_path / "policies"
+        policies_dir.mkdir()
+        policy_lib = load_policies(str(_seed_policies(policies_dir)))
+        found = load_all_agents(
+            str(tmp_path / "nonexistent"), policies=policy_lib,
+        )
+        assert found == {}

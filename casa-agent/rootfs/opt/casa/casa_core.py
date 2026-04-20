@@ -19,13 +19,14 @@ _CASA_ROOT = str(Path(__file__).resolve().parent)
 if _CASA_ROOT not in sys.path:
     sys.path.insert(0, _CASA_ROOT)
 
-import yaml
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from agent_loader import load_all_agents
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
-from config import AgentConfig, load_agent_config
+from config import AgentConfig
+from config_git import init_repo, snapshot_manual_edits
 from log_cid import install_logging, new_cid
 from casa_core_middleware import cid_middleware, CasaAccessLogger
 from mcp_registry import McpServerRegistry
@@ -36,9 +37,11 @@ from memory import (
     NoOpMemory,
     SqliteMemoryProvider,
 )
+from policies import load_policies
 from session_registry import SessionRegistry
 from session_sweeper import SessionSweeper
 from rate_limit import RateLimiter, rate_limit_response
+from trigger_registry import TriggerRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -184,47 +187,6 @@ def _maybe_register_n8n(
     return mcp_registry.resolve(["n8n-workflows"]).get("n8n-workflows")
 
 
-def init_heartbeat_defaults(env: dict[str, str] | None = None) -> tuple[bool, int]:
-    """Resolve heartbeat defaults from env. Never raises.
-
-    Returns ``(enabled, interval_minutes)``. Called before the HTTP server
-    starts so the dashboard closure has concrete bindings — otherwise a
-    request landing between ``site.start()`` and the scheduler block raises
-    ``UnboundLocalError`` on ``heartbeat_enabled`` / ``heartbeat_interval``.
-    """
-    env = env if env is not None else os.environ
-    enabled = env.get("HEARTBEAT_ENABLED", "true").lower() == "true"
-    try:
-        interval = int(env.get("HEARTBEAT_INTERVAL_MINUTES", "60"))
-    except ValueError:
-        interval = 60
-    if interval < 1:
-        interval = 60
-    return enabled, interval
-
-
-def build_heartbeat_message(agent: str, prompt: str) -> BusMessage:
-    """Build a scheduled heartbeat BusMessage.
-
-    ``channel`` must be non-empty: ``Agent._process`` calls
-    ``build_session_key(msg.channel, ...)`` which rejects empty channels.
-    Attaches a fresh correlation id so every log record during the
-    heartbeat turn shares one cid (spec 5.2 §7.2).
-    """
-    return BusMessage(
-        type=MessageType.SCHEDULED,
-        source="scheduler",
-        target=agent,
-        content=prompt,
-        channel="scheduler",
-        context={
-            "chat_id": "heartbeat",
-            "trigger": "heartbeat",
-            "cid": new_cid(),
-        },
-    )
-
-
 def build_invoke_message(
     agent_role: str,
     prompt: str,
@@ -354,60 +316,6 @@ def _wrap_memory_for_strategy(
 # ------------------------------------------------------------------
 
 
-def _log_subagents_deprecation_if_present(agents_dir: str) -> None:
-    """Phase 3.1: subagents.yaml is no longer loaded. If present, log once."""
-    path = os.path.join(agents_dir, "subagents.yaml")
-    if os.path.exists(path):
-        logger.info(
-            "subagents.yaml detected: as of v0.6.0 its entries are no longer "
-            "loaded. See docs/ROADMAP.md §3.1 for the new agents/executors/ "
-            "convention. Alex ships bundled-disabled at agents/executors/"
-            "alex.yaml. Delete this file when convenient.",
-        )
-
-
-def _load_agents_by_role(agents_dir: str) -> dict[str, AgentConfig]:
-    """Scan *agents_dir* and return a dict keyed on role.
-
-    Tier 1 boundary (taxonomy §4.1): a resident owns a channel. Any
-    ``agents/*.yaml`` whose ``AgentConfig`` declares non-empty
-    ``channels: [...]`` is loaded. Files without channels are skipped
-    with an ERROR log pointing at ``agents/executors/`` for Tier 2.
-
-    ``subagents.yaml`` continues to be explicitly skipped (Tier 3
-    Builders territory — taxonomy §6.4). The ``agents/executors/``
-    subdirectory is invisible to ``os.listdir`` (non-recursive) so
-    executors are never accidentally loaded here.
-    """
-    found: dict[str, AgentConfig] = {}
-    if not os.path.isdir(agents_dir):
-        return found
-    for entry in sorted(os.listdir(agents_dir)):
-        if not entry.endswith(".yaml") or entry == "subagents.yaml":
-            continue
-        path = os.path.join(agents_dir, entry)
-        try:
-            cfg = load_agent_config(path)
-        except Exception as exc:
-            logger.error("Failed to load %s: %s", path, exc)
-            continue
-        if not cfg.channels:
-            logger.error(
-                "Skipping %s: Tier 1 resident requires non-empty 'channels:' "
-                "(role=%r). If this is an executor, move to agents/executors/.",
-                entry, cfg.role,
-            )
-            continue
-        if cfg.role in found:
-            logger.error(
-                "Duplicate role %r in %s (first seen earlier); skipping",
-                cfg.role, entry,
-            )
-            continue
-        found[cfg.role] = cfg
-    return found
-
-
 # ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
@@ -473,6 +381,14 @@ async def main() -> None:
 
     _maybe_register_n8n(mcp_registry)
 
+    # 5b. Config git repo — initialise (idempotent) and snapshot any
+    # manual edits that landed between boots.
+    try:
+        init_repo(CONFIG_DIR)
+        snapshot_manual_edits(CONFIG_DIR)
+    except Exception as exc:
+        logger.warning("config_git bootstrap failed: %s", exc)
+
     # 6. Channel manager
     channel_manager = ChannelManager()
 
@@ -498,14 +414,17 @@ async def main() -> None:
     from agent import Agent
 
     agents_dir = os.path.join(CONFIG_DIR, "agents")
-    _log_subagents_deprecation_if_present(agents_dir)
-    role_configs = _load_agents_by_role(agents_dir)
+    policy_lib = load_policies(
+        os.path.join(CONFIG_DIR, "policies", "disclosure.yaml"),
+    )
+    role_configs = load_all_agents(agents_dir, policies=policy_lib)
 
     if "assistant" not in role_configs:
         raise RuntimeError(
             f"No agent with role 'assistant' found in {agents_dir}. "
             "Casa cannot start without a primary assistant. Check that "
-            "assistant.yaml exists and its YAML includes `role: assistant`."
+            "agents/assistant/ exists and runtime.yaml declares "
+            "`role: assistant`."
         )
 
     agents: dict[str, Agent] = {}
@@ -533,7 +452,7 @@ async def main() -> None:
         logger.info(
             "Agent '%s' registered (name=%s, model=%s, memory=%s)",
             role,
-            cfg.name,
+            cfg.character.name,
             cfg.model,
             cfg.memory.read_strategy,
         )
@@ -741,15 +660,6 @@ async def main() -> None:
     terminal_enabled = os.environ.get("ENABLE_TERMINAL", "false").lower() == "true"
     version = os.environ.get("CASA_VERSION", "dev")
 
-    # Heartbeat defaults must be resolved before `dashboard` is defined:
-    # the HTTP server starts below before the scheduler block, and a
-    # request landing in between would otherwise hit UnboundLocalError on
-    # these closure variables. The scheduler block may still override them
-    # from schedules.yaml.
-    heartbeat_enabled, heartbeat_interval = init_heartbeat_defaults()
-    heartbeat_agent = assistant_role
-    heartbeat_prompt = "Heartbeat: check for pending tasks."
-
     async def dashboard(request: web.Request) -> web.Response:
         ingress_path = request.headers.get("X-Ingress-Path", "")
 
@@ -761,8 +671,9 @@ async def main() -> None:
             if len(parts) >= 3:
                 model = f"{parts[0].capitalize()} {parts[1]}.{parts[2]}"
             display = (
-                agent.config.name
-                if agent.config.name and not agent.config.name.startswith("${")
+                agent.config.character.name
+                if agent.config.character.name
+                and not agent.config.character.name.startswith("${")
                 else role.capitalize()
             )
             agent_rows += _row(display, model)
@@ -805,8 +716,11 @@ async def main() -> None:
         )
         system_rows += _row("Webhook auth", "enabled" if webhook_secret else "disabled",
                             "on" if webhook_secret else "off")
-        hb_label = f"every {heartbeat_interval} min" if heartbeat_enabled else "disabled"
-        system_rows += _row("Heartbeat", hb_label, "on" if heartbeat_enabled else "off")
+        total_triggers = sum(len(cfg.triggers) for cfg in role_configs.values())
+        system_rows += _row(
+            "Triggers", f"{total_triggers} registered",
+            "on" if total_triggers else "off",
+        )
         system_rows += _row("Terminal", "enabled" if terminal_enabled else "disabled",
                             "on" if terminal_enabled else "off")
 
@@ -829,6 +743,21 @@ async def main() -> None:
     app.router.add_post("/webhook/{name}", webhook_handler)
     app.router.add_post("/invoke/{agent}", invoke_handler)
     app.router.add_post("/telegram/update", telegram_update_handler)
+
+    # 13b. Scheduler + per-agent trigger registry (replaces the global
+    # heartbeat block). Register before runner.setup() so webhook routes
+    # land in *app* while the router is still mutable.
+    scheduler = AsyncIOScheduler()
+    trigger_registry = TriggerRegistry(scheduler=scheduler, app=app, bus=bus)
+    for role, cfg in role_configs.items():
+        if cfg.triggers:
+            trigger_registry.register_agent(
+                role=role, triggers=cfg.triggers, channels=cfg.channels,
+            )
+            logger.info(
+                "Registered %d trigger(s) for agent '%s'",
+                len(cfg.triggers), role,
+            )
 
     runner = web.AppRunner(
         app,
@@ -887,37 +816,7 @@ async def main() -> None:
                 record.id[:8], target_role,
             )
 
-    # 14. APScheduler heartbeat
-    scheduler = AsyncIOScheduler()
-
-    schedules_path = os.path.join(CONFIG_DIR, "schedules.yaml")
-    if os.path.exists(schedules_path):
-        with open(schedules_path, "r", encoding="utf-8") as fh:
-            schedules_data = yaml.safe_load(fh) or {}
-        hb = schedules_data.get("heartbeat", {})
-        heartbeat_enabled = hb.get("enabled", heartbeat_enabled)
-        heartbeat_interval = hb.get("interval_minutes", heartbeat_interval)
-        heartbeat_agent = hb.get("agent", heartbeat_agent)
-        heartbeat_prompt = hb.get("prompt", heartbeat_prompt)
-
-    if heartbeat_enabled and heartbeat_agent in agents:
-        async def _heartbeat_tick() -> None:
-            logger.info("Heartbeat firing for agent '%s'", heartbeat_agent)
-            msg = build_heartbeat_message(heartbeat_agent, heartbeat_prompt)
-            await bus.send(msg)
-
-        scheduler.add_job(
-            _heartbeat_tick,
-            "interval",
-            minutes=heartbeat_interval,
-            id="heartbeat",
-        )
-        logger.info(
-            "Heartbeat scheduled: every %d min -> %s",
-            heartbeat_interval,
-            heartbeat_agent,
-        )
-
+    # 14. Kick off timers.
     session_sweeper.start()
     scheduler.start()
 
