@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.6.2 — 2026-04-20 — Phase 3.4: disabled-executor pattern (plumbing)
+
+### Added
+
+- **Glob-based executor seeding.** `setup-configs.sh` now discovers
+  `defaults/agents/executors/*.yaml` at first boot, seeding each to the
+  user's config directory if absent. Adding a new bundled-disabled
+  executor is now a single-file drop — no Casa code edit. Residents
+  and top-level config files stay hand-enumerated (they are individually
+  required by startup). Mirrored into
+  `test-local/init-overrides/01-setup-configs.sh`.
+
+- **`n8n-workflows` MCP server registration.** New
+  `_maybe_register_n8n(mcp_registry, env=None)` helper in
+  `casa_core.py`, wired into `main()` after the existing
+  `homeassistant` block. When `N8N_URL` is set, registers the
+  `n8n-workflows` HTTP MCP server (with `Authorization: Bearer ...`
+  header if `N8N_API_KEY` is also set). Generic shared infrastructure:
+  any agent (resident or executor) that declares `n8n-workflows` in
+  `mcp_server_names` can reach it; per-agent tool whitelisting via
+  `tools.allowed` governs which workflows each agent may actually
+  invoke.
+
+- **Executor enabled/disabled summary log.**
+  `ExecutorRegistry.load()` now emits one INFO line at the tail of
+  loading: `Executors: enabled=[...] disabled=[...]`. Operator
+  visibility into the executor landscape and a stable grep target for
+  future automation.
+
+- **User-facing docs.** New "Enabling a bundled-disabled executor"
+  section in `DOCS.md` walks users through flipping
+  `enabled: false` → `true` on `finance.yaml` (or any future
+  disabled-by-default executor YAML) and restarting the addon.
+
+### Tests
+
+- 4 new unit tests in `tests/test_n8n_registration.py` covering the
+  helper's env-gated behavior (URL unset, URL set with/without API
+  key, whitespace-only URL).
+- 2 new unit tests in `tests/test_executor_registry.py::TestSummaryLog`
+  for the summary log output (mixed state + empty state).
+- New `test-local/e2e/test_delegation.sh` with three scenarios
+  (D-1/D-2/D-3) proving bundled-disabled, flip-to-enabled, and
+  config-not-code discovery contracts. All assertions are log-line +
+  file-presence; tool-behavior contracts remain at the unit level
+  (`test_delegate_to_agent.py`) because the offline mock SDK doesn't
+  dispatch tool calls.
+
+### Non-breaking
+
+- Default-env startup is unchanged for users who don't set `N8N_URL`
+  and don't edit `finance.yaml`. `finance` continues to be bundled as
+  `enabled: false`.
+
+### Deferred
+
+- `finance`'s tool whitelist, prompt polish, and n8n workflow bindings
+  ship in a separate capabilities session. Plumbing only.
+
 ## 0.6.1 — 2026-04-20 — Phase 3.1 follow-ups: role-over-name + 3.4 prerequisites
 
 ### Fixed
