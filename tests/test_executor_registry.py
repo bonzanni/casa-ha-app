@@ -434,3 +434,74 @@ class TestOrphanRecovery:
             "tombstone" in r.message.lower() or "delegation" in r.message.lower()
             for r in caplog.records
         )
+
+
+# ---------------------------------------------------------------------------
+# TestSummaryLog (Phase 3.4)
+# ---------------------------------------------------------------------------
+
+
+class TestSummaryLog:
+    async def test_summary_line_present_with_mixed_enabled_disabled(
+        self, tmp_path, caplog,
+    ):
+        import logging
+        from executor_registry import ExecutorRegistry
+
+        executors = tmp_path / "executors"
+        executors.mkdir()
+        # One enabled executor.
+        _write(str(executors / "foo.yaml"),
+               "name: Foo\nrole: foo\nmodel: sonnet\npersonality: a\n"
+               "enabled: true\n"
+               "memory:\n  token_budget: 0\n"
+               "session:\n  strategy: ephemeral\n  idle_timeout: 0\n")
+        # One disabled executor.
+        _write(str(executors / "bar.yaml"),
+               "name: Bar\nrole: bar\nmodel: sonnet\npersonality: a\n"
+               "enabled: false\n"
+               "memory:\n  token_budget: 0\n"
+               "session:\n  strategy: ephemeral\n  idle_timeout: 0\n")
+
+        reg = ExecutorRegistry(str(executors),
+                               tombstone_path=str(tmp_path / "del.json"))
+        with caplog.at_level(logging.INFO):
+            reg.load()
+
+        summary = [r for r in caplog.records
+                   if r.message.startswith("Executors:")]
+        assert len(summary) == 1, (
+            f"expected exactly one 'Executors:' summary line, "
+            f"got {len(summary)}: {[r.message for r in summary]}"
+        )
+        msg = summary[0].message
+        assert "'foo'" in msg
+        assert "'bar'" in msg
+        # Enabled vs disabled positioning — the helper wraps each set in
+        # its own bracketed list so we can distinguish them.
+        enabled_idx = msg.find("enabled=")
+        disabled_idx = msg.find("disabled=")
+        assert 0 <= enabled_idx < disabled_idx
+        # 'foo' sits in the enabled segment; 'bar' in the disabled segment.
+        assert msg.find("'foo'") < disabled_idx
+        assert msg.find("'bar'") > disabled_idx
+
+    async def test_summary_line_empty_when_dir_missing(
+        self, tmp_path, caplog,
+    ):
+        import logging
+        from executor_registry import ExecutorRegistry
+
+        reg = ExecutorRegistry(str(tmp_path / "does_not_exist"),
+                               tombstone_path=str(tmp_path / "del.json"))
+        with caplog.at_level(logging.INFO):
+            reg.load()
+
+        summary = [r for r in caplog.records
+                   if r.message.startswith("Executors:")]
+        # Missing dir is a no-op (existing test_missing_dir_is_noop); the
+        # summary line is still emitted so operator visibility is uniform.
+        assert len(summary) == 1
+        msg = summary[0].message
+        assert "enabled=[]" in msg
+        assert "disabled=[]" in msg
