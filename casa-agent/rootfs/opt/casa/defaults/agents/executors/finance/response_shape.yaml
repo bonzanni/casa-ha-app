@@ -1,0 +1,8 @@
+schema_version: 1
+max_sentences_confirmation: 2
+max_sentences_status: 4
+register: written
+format: plain
+rules:
+  - "Return the computed result, cite the tool that produced it."
+  - "No personality flourishes, no greetings, no sign-offs."

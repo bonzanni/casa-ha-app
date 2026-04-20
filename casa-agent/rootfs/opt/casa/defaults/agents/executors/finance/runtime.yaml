@@ -1,0 +1,21 @@
+schema_version: 1
+model: sonnet
+enabled: false
+tools:
+  allowed: [Read, Skill]
+  disallowed: [Bash, Write, Edit]
+  permission_mode: acceptEdits
+  max_turns: 10
+mcp_server_names:
+  - n8n-workflows
+  - casa-framework
+memory:
+  token_budget: 0
+  read_strategy: per_turn
+  scopes_owned: []
+  scopes_readable: []
+channels: []
+session:
+  strategy: ephemeral
+  idle_timeout: 0
+cwd: ""
