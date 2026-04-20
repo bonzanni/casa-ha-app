@@ -28,7 +28,7 @@ from executor_registry import DelegationComplete
 from hooks import resolve_hooks
 from log_cid import cid_var
 from mcp_registry import McpServerRegistry
-from channel_trust import channel_trust, user_peer_for_channel
+from channel_trust import channel_trust, channel_trust_display, user_peer_for_channel
 from memory import MemoryProvider
 from session_registry import SessionRegistry, build_session_key
 from retry import retry_sdk_call
@@ -217,7 +217,6 @@ class Agent:
             msg.channel,
             msg.context.get("chat_id"),
         )
-        session_id = f"{channel_key}:{self.config.role}"
         user_peer = user_peer_for_channel(msg.channel)
         user_text = str(msg.content)
 
@@ -229,48 +228,66 @@ class Agent:
             "user_text": user_text,
         })
         try:
-            # 1. Ensure session + peers (idempotent, cheap when warm). ----------
-            try:
-                await self._memory.ensure_session(
-                    session_id=session_id,
-                    agent_role=self.config.role,
-                    user_peer=user_peer,
-                )
-            except Exception:
-                logger.warning(
-                    "Memory ensure_session failed; continuing without memory",
-                )
+            # --- 3.2 scope routing: compute readable × active set ----------
+            trust_token = channel_trust(msg.channel)
+            readable = self._scope_registry.filter_readable(
+                list(self.config.memory.scopes_readable),
+                trust_token,
+            )
+            scores = self._scope_registry.score(user_text, readable)
+            active = self._scope_registry.active_from_scores(
+                scores, self.config.memory.default_scope,
+            )
 
-            # 2. Retrieve memory digest + record budget usage (spec 5.2 §5.2).
-            memory_context = ""
-            try:
-                memory_context = await self._memory.get_context(
-                    session_id=session_id,
-                    agent_role=self.config.role,
-                    tokens=self.config.memory.token_budget,
-                    search_query=user_text,
-                    user_peer=user_peer,
-                )
-            except Exception:
-                logger.warning(
-                    "Memory retrieval failed; proceeding without context",
-                )
-            else:
-                # Only on success: a failed memory call gives us nothing to
-                # measure. The tracker is no-op when budget <= 0.
+            # Per-scope get_context in parallel.
+            per_scope_tokens = max(
+                self.config.memory.token_budget // max(len(active), 1),
+                1,
+            )
+
+            async def _one_scope(scope: str) -> tuple[str, str]:
+                sid = f"{channel_key}:{scope}:{self.config.role}"
+                try:
+                    await self._memory.ensure_session(
+                        session_id=sid,
+                        agent_role=self.config.role,
+                        user_peer=user_peer,
+                    )
+                    digest = await self._memory.get_context(
+                        session_id=sid,
+                        agent_role=self.config.role,
+                        tokens=per_scope_tokens,
+                        search_query=user_text,
+                        user_peer=user_peer,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Memory call failed for scope=%s session=%s",
+                        scope, sid,
+                    )
+                    digest = ""
+                return scope, digest
+
+            digests = dict(await asyncio.gather(
+                *[_one_scope(s) for s in active]
+            ))
+
+            # Budget-tracker record uses the summed prompt text.
+            memory_blocks = "\n".join(
+                f'<memory_context scope="{s}">\n{d}\n</memory_context>'
+                for s, d in digests.items() if d
+            )
+            if memory_blocks:
                 self._budget_tracker.record(
-                    session_id,
-                    estimate_tokens(memory_context),
+                    f"{channel_key}:{self.config.role}",
+                    estimate_tokens(memory_blocks),
                     self.config.memory.token_budget,
                 )
 
             # 3. System prompt = composed-prompt + runtime-injected blocks.
             system_parts = [self.config.system_prompt]
-            if memory_context:
-                system_parts.append(
-                    f"\n<memory_context>\n{memory_context}\n</memory_context>"
-                )
-            from channel_trust import channel_trust_display
+            if memory_blocks:
+                system_parts.append("\n" + memory_blocks)
             system_parts.append(
                 "\n<channel_context>\n"
                 f"channel: {msg.channel}\n"
@@ -380,11 +397,11 @@ class Agent:
                     sdk_session_id,
                 )
 
-            # 8. Persist — off the critical path. Storage is unconditional. ---
-            #    Session+peer topology already scopes visibility (spec §4.3).
+            # 8. Persist — interim: writes to default_scope. Task 11 rewrites.
             if response_text:
+                write_sid = f"{channel_key}:{self.config.memory.default_scope}:{self.config.role}"
                 task = asyncio.create_task(self._add_turn_bg(
-                    session_id, self.config.role, user_text, response_text, user_peer,
+                    write_sid, self.config.role, user_text, response_text, user_peer,
                 ))
                 self._bg_tasks.add(task)
                 task.add_done_callback(self._bg_tasks.discard)

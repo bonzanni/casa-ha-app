@@ -148,7 +148,13 @@ def _make_agent(
         system_prompt="You are helpful.",
         character=CharacterConfig(name="Test"),
         tools=ToolsConfig(allowed=["Read"], permission_mode="acceptEdits"),
-        memory=MemoryConfig(token_budget=1000, read_strategy="per_turn"),
+        memory=MemoryConfig(
+            token_budget=1000,
+            read_strategy="per_turn",
+            scopes_readable=["personal"],
+            scopes_owned=["personal"],
+            default_scope="personal",
+        ),
     )
     return Agent(
         config=cfg,
@@ -177,11 +183,11 @@ async def test_session_id_is_channel_plus_role(tmp_path):
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
-    assert mem.ensure[0][0] == "telegram:123:assistant"
-    assert mem.get[0][0] == "telegram:123:assistant"
+    assert mem.ensure[0][0] == "telegram:123:personal:assistant"
+    assert mem.get[0][0] == "telegram:123:personal:assistant"
     for _ in range(5):
         await asyncio.sleep(0)
-    assert mem.add[0][0] == "telegram:123:assistant"
+    assert mem.add[0][0] == "telegram:123:personal:assistant"
 
 
 async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
@@ -231,7 +237,7 @@ async def test_system_prompt_memory_context_only_when_nonempty(tmp_path):
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent2._process(_msg("telegram", "123", "hi"))
     prompt2 = FakeClient.captured_options.system_prompt
-    assert "<memory_context>" in prompt2
+    assert "<memory_context scope=" in prompt2
     assert "[nicola] hi" in prompt2
 
 
@@ -563,7 +569,7 @@ class TestTokenBudgetMonitoring:
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("telegram", "123", "hi"))
 
-        assert observed == [("telegram:123:assistant", 2000, 1000)]
+        assert observed == [("telegram:123:assistant", 2013, 1000)]
 
     async def test_broken_memory_skips_recorder(self, tmp_path):
         """When get_context raises, we proceed without memory and must
@@ -700,7 +706,13 @@ def _make_agent_with_registry(
         system_prompt="You are helpful.",
         character=CharacterConfig(name="Test"),
         tools=ToolsConfig(allowed=["Read"], permission_mode="acceptEdits"),
-        memory=MemoryConfig(token_budget=1000, read_strategy="per_turn"),
+        memory=MemoryConfig(
+            token_budget=1000,
+            read_strategy="per_turn",
+            scopes_readable=["personal"],
+            scopes_owned=["personal"],
+            default_scope="personal",
+        ),
     )
     return Agent(
         config=cfg,
