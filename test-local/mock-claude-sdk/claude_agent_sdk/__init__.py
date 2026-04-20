@@ -111,6 +111,12 @@ class ClaudeSDKClient:
         if latency > 0:
             await asyncio.sleep(latency)
 
+        # Phase 3.1: finer-grained knob for delegate_to_agent degradation
+        # tests — milliseconds, stacks with MOCK_SDK_LATENCY_SEC.
+        delay_ms = float(os.environ.get("MOCK_SDK_DELAY_MS", "0") or "0")
+        if delay_ms > 0:
+            await asyncio.sleep(delay_ms / 1000.0)
+
         reply = os.environ.get("MOCK_SDK_REPLY", "ok")
 
         yield SystemMessage(subtype="init", data={"session_id": self._session_id})
