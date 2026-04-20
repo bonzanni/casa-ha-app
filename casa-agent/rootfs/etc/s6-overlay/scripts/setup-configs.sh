@@ -397,6 +397,151 @@ migrate_channels "$CONFIG_DIR/agents/assistant.yaml" "[telegram, webhook]"
 migrate_channels "$CONFIG_DIR/agents/butler.yaml" "[ha_voice]"
 
 # ------------------------------------------------------------------
+# One-shot v0.6.1: rename executor alex.yaml → finance.yaml. v0.6.0
+# shipped the Alex executor with `role: alex` which conflated name and
+# role (every other agent uses `role=<function>`, `name=<persona>`).
+# The bundled default is now finance.yaml with role=finance, name=Alex.
+# Only acts when the OLD alex.yaml file exists AND the NEW finance.yaml
+# does not — idempotent by file existence check, same pattern as
+# migrate_rename for ellen.yaml/tina.yaml in Phase 2.1.
+# ------------------------------------------------------------------
+
+migrate_executor_rename() {
+    local old="$CONFIG_DIR/agents/executors/alex.yaml"
+    local new="$CONFIG_DIR/agents/executors/finance.yaml"
+
+    if [ -f "$old" ] && [ ! -f "$new" ]; then
+        mv "$old" "$new"
+        sed -i 's/\r$//' "$new"
+        sed -i 's/^role:[[:space:]]*alex[[:space:]]*$/role: finance/' "$new"
+        sed -i 's/^name:[[:space:]]*alex[[:space:]]*$/name: Alex/' "$new"
+        bashio::log.info "Migrated executor alex.yaml -> finance.yaml"
+    fi
+}
+
+migrate_executor_rename
+
+# ------------------------------------------------------------------
+# One-shot v0.6.1: add the casa-framework MCP tools to Ellen's
+# tools.allowed. The Claude Agent SDK blocks MCP tools unless
+# explicitly whitelisted by their `mcp__<server>__<tool>` name —
+# without this, Ellen cannot invoke `delegate_to_agent` even though
+# the server is registered. Gated by `# casa: mcp-tools v1` marker.
+# Idempotent. Only injects entries that are absent.
+# ------------------------------------------------------------------
+
+migrate_mcp_allowed() {
+    local file="$1"
+
+    [ -f "$file" ] || return 0
+
+    sed -i 's/\r$//' "$file"
+
+    if grep -qE '^# casa: mcp-tools v1$' "$file"; then
+        return 0
+    fi
+
+    if ! python3 - "$file" <<'PY'
+import pathlib, re, sys
+
+p = pathlib.Path(sys.argv[1])
+
+try:
+    import yaml
+except ImportError:
+    print(f"[ERROR] yaml unavailable; skipping {p.name}", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    text = p.read_text(encoding="utf-8")
+    data = yaml.safe_load(text) or {}
+except Exception as exc:
+    print(f"[ERROR] could not parse {p.name}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+needed = [
+    "mcp__casa-framework__delegate_to_agent",
+    "mcp__casa-framework__send_message",
+]
+existing = (data.get("tools") or {}).get("allowed") or []
+to_add = [t for t in needed if t not in existing]
+
+if not to_add:
+    # Nothing to inject content-wise; just append the marker.
+    new_text = text if text.endswith("\n") else text + "\n"
+    new_text += "# casa: mcp-tools v1\n"
+    p.write_text(new_text, encoding="utf-8")
+    sys.exit(0)
+
+# Inject the missing tools into the allowed list. Support both
+# inline (`allowed: [Read, ...]`) and block (`allowed:\n  - Read\n  - ...`)
+# YAML forms. Preserve existing lines verbatim and append new entries
+# in whichever form the file already uses.
+lines = text.splitlines(keepends=True)
+out = []
+i = 0
+injected = False
+while i < len(lines):
+    line = lines[i]
+    out.append(line)
+    # Match the `tools:` block opener.
+    if re.match(r"^tools:[ \t]*$", line):
+        # Look ahead for the `allowed:` line inside the block.
+        j = i + 1
+        while j < len(lines):
+            inner = lines[j]
+            m_inline = re.match(r"^(  allowed:[ \t]*)\[(.*)\][ \t]*$", inner)
+            m_block = re.match(r"^  allowed:[ \t]*$", inner)
+            if m_inline:
+                # Inline form — append new entries inside the brackets.
+                prefix = m_inline.group(1)
+                current = m_inline.group(2).strip()
+                combined_items = [
+                    s.strip() for s in current.split(",") if s.strip()
+                ] + to_add
+                lines[j] = f"{prefix}[{', '.join(combined_items)}]\n"
+                injected = True
+                break
+            if m_block:
+                # Block form — find end of the block and append.
+                k = j + 1
+                last_item_idx = j
+                while k < len(lines) and re.match(r"^    - ", lines[k]):
+                    last_item_idx = k
+                    k += 1
+                extra = "".join(f"    - {t}\n" for t in to_add)
+                lines[last_item_idx] = lines[last_item_idx] + extra
+                injected = True
+                break
+            # Stop scanning once we leave the tools: block
+            if re.match(r"^\S", inner):
+                break
+            j += 1
+        if injected:
+            # Rewrite from the updated `lines` array.
+            out = lines[: i + 1]  # preserve up to and incl. tools: line
+            # Append the rest (which now includes the injected tools)
+            out.extend(lines[i + 1 :])
+            break
+    i += 1
+
+new_text = "".join(out)
+if not new_text.endswith("\n"):
+    new_text += "\n"
+new_text += "# casa: mcp-tools v1\n"
+p.write_text(new_text, encoding="utf-8")
+PY
+    then
+        echo "[ERROR] migrate_mcp_allowed: python step failed for $(basename "$file"); skipping"
+        return 0
+    fi
+
+    bashio::log.info "Migrated mcp-tools permissions in $(basename "$file")"
+}
+
+migrate_mcp_allowed "$CONFIG_DIR/agents/assistant.yaml"
+
+# ------------------------------------------------------------------
 # One-shot: drop obsolete memory_session_id field from sessions.json.
 # Lazy migration in SessionRegistry.touch() also handles this, but
 # doing it at setup time keeps the on-disk schema current immediately.
@@ -427,7 +572,7 @@ fi
 # ------------------------------------------------------------------
 
 for f in agents/assistant.yaml agents/butler.yaml agents/subagents.yaml \
-         agents/executors/alex.yaml schedules.yaml webhooks.yaml; do
+         agents/executors/finance.yaml schedules.yaml webhooks.yaml; do
     if [ ! -f "$CONFIG_DIR/$f" ]; then
         cp "$DEFAULTS_DIR/$f" "$CONFIG_DIR/$f"
         bashio::log.info "Created default config: $f"

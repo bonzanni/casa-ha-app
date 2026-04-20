@@ -367,6 +367,122 @@ PY
 migrate_channels "$CONFIG_DIR/agents/assistant.yaml" "[telegram, webhook]"
 migrate_channels "$CONFIG_DIR/agents/butler.yaml" "[ha_voice]"
 
+# Mirror of migrate_executor_rename in setup-configs.sh
+migrate_executor_rename() {
+    local old="$CONFIG_DIR/agents/executors/alex.yaml"
+    local new="$CONFIG_DIR/agents/executors/finance.yaml"
+
+    if [ -f "$old" ] && [ ! -f "$new" ]; then
+        mv "$old" "$new"
+        sed -i 's/\r$//' "$new"
+        sed -i 's/^role:[[:space:]]*alex[[:space:]]*$/role: finance/' "$new"
+        sed -i 's/^name:[[:space:]]*alex[[:space:]]*$/name: Alex/' "$new"
+        echo "[INFO] Migrated executor alex.yaml -> finance.yaml"
+    fi
+}
+
+migrate_executor_rename
+
+# Mirror of migrate_mcp_allowed in setup-configs.sh
+migrate_mcp_allowed() {
+    local file="$1"
+
+    [ -f "$file" ] || return 0
+
+    sed -i 's/\r$//' "$file"
+
+    if grep -qE '^# casa: mcp-tools v1$' "$file"; then
+        return 0
+    fi
+
+    if ! python3 - "$file" <<'PY'
+import pathlib, re, sys
+
+p = pathlib.Path(sys.argv[1])
+
+try:
+    import yaml
+except ImportError:
+    print(f"[ERROR] yaml unavailable; skipping {p.name}", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    text = p.read_text(encoding="utf-8")
+    data = yaml.safe_load(text) or {}
+except Exception as exc:
+    print(f"[ERROR] could not parse {p.name}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+needed = [
+    "mcp__casa-framework__delegate_to_agent",
+    "mcp__casa-framework__send_message",
+]
+existing = (data.get("tools") or {}).get("allowed") or []
+to_add = [t for t in needed if t not in existing]
+
+if not to_add:
+    new_text = text if text.endswith("\n") else text + "\n"
+    new_text += "# casa: mcp-tools v1\n"
+    p.write_text(new_text, encoding="utf-8")
+    sys.exit(0)
+
+lines = text.splitlines(keepends=True)
+out = []
+i = 0
+injected = False
+while i < len(lines):
+    line = lines[i]
+    out.append(line)
+    if re.match(r"^tools:[ \t]*$", line):
+        j = i + 1
+        while j < len(lines):
+            inner = lines[j]
+            m_inline = re.match(r"^(  allowed:[ \t]*)\[(.*)\][ \t]*$", inner)
+            m_block = re.match(r"^  allowed:[ \t]*$", inner)
+            if m_inline:
+                prefix = m_inline.group(1)
+                current = m_inline.group(2).strip()
+                combined_items = [
+                    s.strip() for s in current.split(",") if s.strip()
+                ] + to_add
+                lines[j] = f"{prefix}[{', '.join(combined_items)}]\n"
+                injected = True
+                break
+            if m_block:
+                k = j + 1
+                last_item_idx = j
+                while k < len(lines) and re.match(r"^    - ", lines[k]):
+                    last_item_idx = k
+                    k += 1
+                extra = "".join(f"    - {t}\n" for t in to_add)
+                lines[last_item_idx] = lines[last_item_idx] + extra
+                injected = True
+                break
+            if re.match(r"^\S", inner):
+                break
+            j += 1
+        if injected:
+            out = lines[: i + 1]
+            out.extend(lines[i + 1 :])
+            break
+    i += 1
+
+new_text = "".join(out)
+if not new_text.endswith("\n"):
+    new_text += "\n"
+new_text += "# casa: mcp-tools v1\n"
+p.write_text(new_text, encoding="utf-8")
+PY
+    then
+        echo "[ERROR] migrate_mcp_allowed: python step failed for $(basename "$file"); skipping"
+        return 0
+    fi
+
+    echo "[INFO] Migrated mcp-tools permissions in $(basename "$file")"
+}
+
+migrate_mcp_allowed "$CONFIG_DIR/agents/assistant.yaml"
+
 if [ -f "$DATA_DIR/sessions.json" ]; then
     python3 - "$DATA_DIR/sessions.json" <<'PY'
 import json, pathlib, sys
@@ -388,7 +504,7 @@ PY
 fi
 
 for f in agents/assistant.yaml agents/butler.yaml agents/subagents.yaml \
-         agents/executors/alex.yaml schedules.yaml webhooks.yaml; do
+         agents/executors/finance.yaml schedules.yaml webhooks.yaml; do
     if [ ! -f "$CONFIG_DIR/$f" ]; then
         cp "$DEFAULTS_DIR/$f" "$CONFIG_DIR/$f"
         echo "[INFO] Created default config: $f"

@@ -19,9 +19,8 @@ personality: |
 
   Delegation:
   - You decide when to delegate. No automatic routing.
-  - For HA automations/scenes: spawn automation-builder subagent
-  - For Casa skills/plugins: spawn plugin-builder subagent
-  - For financial tasks: spawn Alex subagent
+  - For financial tasks: call delegate_to_agent with agent="finance"
+    (Alex). He is invoked ad-hoc and returns a result you narrate.
   - For simple HA device queries: handle directly via HA MCP tools
   - Never delegate status queries or simple questions
 
@@ -32,7 +31,14 @@ personality: |
     For sensitive questions on household-shared voice, defer:
     "I can tell you that privately on Telegram."
 tools:
-  allowed: [Read, Write, Edit, Bash, Skill]
+  allowed:
+    - Read
+    - Write
+    - Edit
+    - Bash
+    - Skill
+    - mcp__casa-framework__delegate_to_agent
+    - mcp__casa-framework__send_message
   disallowed: []
   permission_mode: acceptEdits
   max_turns: 20
