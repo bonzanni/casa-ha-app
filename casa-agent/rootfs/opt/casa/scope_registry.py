@@ -7,12 +7,27 @@ model for user-text routing.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 from typing import Any
 
 import yaml
 import jsonschema
+
+
+logger = logging.getLogger(__name__)
+
+# Lazy import — fastembed pulls in onnxruntime, heavy to load at
+# interpreter start. The factory indirection also gives tests a
+# monkeypatch point.
+_DEFAULT_MODEL_NAME = "intfloat/multilingual-e5-small"
+
+
+def _load_text_embedding_cls():  # pragma: no cover — exercised via monkeypatch
+    from fastembed import TextEmbedding  # type: ignore[import-untyped]
+    return TextEmbedding
 
 
 class ScopeError(Exception):
@@ -109,9 +124,11 @@ class ScopeRegistry:
         library: ScopeLibrary,
         *,
         threshold: float = 0.35,
+        model_name: str = _DEFAULT_MODEL_NAME,
     ) -> None:
         self._lib = library
         self._threshold = threshold
+        self._model_name = model_name
         self._embeddings: dict[str, Any] = {}  # populated by prepare()
         self._degraded: bool = False           # true when model unavailable
         self._model: Any = None
@@ -160,3 +177,55 @@ class ScopeRegistry:
         if top < self._threshold:
             return default_scope
         return winner
+
+    # --- embedding layer -------------------------------------------------
+
+    async def prepare(self) -> None:
+        """Load the embedding model and embed each scope's description.
+
+        Degrades to a flat-scoring mode on any failure (model download,
+        missing file, unexpected exception). Never raises — a broken
+        classifier must not block Casa boot.
+        """
+        try:
+            cls = _load_text_embedding_cls()
+            self._model = await asyncio.to_thread(
+                cls, model_name=self._model_name,
+            )
+            texts = [self._lib.description(n) for n in self._lib.names()]
+            vecs = await asyncio.to_thread(lambda: list(self._model.embed(texts)))
+            self._embeddings = dict(zip(self._lib.names(), vecs))
+        except Exception as exc:
+            logger.error(
+                "ScopeRegistry.prepare failed (%s); entering degraded mode",
+                exc,
+            )
+            self._degraded = True
+
+    def score(
+        self, text: str, scopes: list[str],
+    ) -> dict[str, float]:
+        """Return `{scope: cosine_similarity}` for each scope in *scopes*.
+
+        In degraded mode returns 1.0 for every requested scope so that
+        the downstream fan-out behaves like pure Revised-A (all scopes
+        active). Empty *scopes* input returns empty dict.
+        """
+        if not scopes:
+            return {}
+        if self._degraded or self._model is None:
+            return {s: 1.0 for s in scopes}
+
+        import numpy as np
+
+        q_vec = next(iter(self._model.embed([text])))
+        q_norm = np.linalg.norm(q_vec) or 1.0
+        out: dict[str, float] = {}
+        for s in scopes:
+            v = self._embeddings.get(s)
+            if v is None:
+                out[s] = 0.0
+                continue
+            v_norm = np.linalg.norm(v) or 1.0
+            out[s] = float(np.dot(q_vec, v) / (q_norm * v_norm))
+        return out
