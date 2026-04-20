@@ -299,3 +299,40 @@ class TestScopeRegistryDegradedMode:
         await reg.prepare()
         scores = reg.score("anything", ["personal", "house"])
         assert scores == {"personal": 1.0, "house": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# Real-model integration — gated by env var (slow: downloads ~200MB on first run).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    __import__("os").environ.get("CASA_REAL_EMBED") != "1",
+    reason="set CASA_REAL_EMBED=1 to run the real-model integration test",
+)
+class TestRealEmbedding:
+    @pytest.mark.asyncio
+    async def test_real_model_classifies_domain_text(self, tmp_path):
+        """Sanity check against the real multilingual-e5-small.
+
+        The exact cosine scores depend on the model; we only assert that the
+        domain-appropriate scope wins argmax for each probe.
+        """
+        from scope_registry import load_scope_library, ScopeRegistry
+
+        f = tmp_path / "scopes.yaml"
+        _write(f, EMBED_SCOPES_YAML)  # four canonical scopes
+        reg = ScopeRegistry(load_scope_library(str(f)), threshold=0.0)
+        await reg.prepare()
+        assert reg._degraded is False
+
+        cases = [
+            ("how much do I owe the plumber for the invoice?", "finance"),
+            ("turn off the kitchen lights please", "house"),
+            ("what's my next meeting with the ENPICOM team", "business"),
+            ("reminder: dinner with Marijn on Saturday", "personal"),
+        ]
+        for text, expected in cases:
+            scores = reg.score(text, ["personal", "business", "finance", "house"])
+            winner = reg.argmax_scope(scores, default_scope="personal")
+            assert winner == expected, f"{text!r} → {winner!r} (scores={scores!r})"
