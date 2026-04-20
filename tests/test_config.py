@@ -127,3 +127,28 @@ class TestAgentConfigNewFields:
         assert cfg.triggers == []
         assert isinstance(cfg.hooks, HooksConfig)
         assert cfg.system_prompt == ""
+
+
+# ---------------------------------------------------------------------------
+# TestDefaultScope (3.2)
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultScope:
+    def test_default_scope_parsed(self):
+        from config import MemoryConfig
+
+        m = MemoryConfig(
+            token_budget=4000,
+            read_strategy="per_turn",
+            scopes_owned=["personal"],
+            scopes_readable=["personal", "house"],
+            default_scope="personal",
+        )
+        assert m.default_scope == "personal"
+
+    def test_default_scope_defaults_empty(self):
+        from config import MemoryConfig
+
+        m = MemoryConfig()
+        assert m.default_scope == ""
