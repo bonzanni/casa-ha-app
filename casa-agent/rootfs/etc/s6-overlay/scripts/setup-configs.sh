@@ -571,13 +571,29 @@ fi
 # Copy defaults ONLY if not already present (first boot or new files)
 # ------------------------------------------------------------------
 
+# Residents + top-level config (hand-enumerated — part of the core
+# install contract and individually required by Casa startup).
 for f in agents/assistant.yaml agents/butler.yaml agents/subagents.yaml \
-         agents/executors/finance.yaml schedules.yaml webhooks.yaml; do
+         schedules.yaml webhooks.yaml; do
     if [ ! -f "$CONFIG_DIR/$f" ]; then
         cp "$DEFAULTS_DIR/$f" "$CONFIG_DIR/$f"
         bashio::log.info "Created default config: $f"
     fi
 done
+
+# Executors (glob-discovered — drop a YAML in defaults/agents/executors/
+# and it seeds on next boot; "config not code" per Phase 3.4 spec §3).
+if [ -d "$DEFAULTS_DIR/agents/executors" ]; then
+    for src in "$DEFAULTS_DIR/agents/executors"/*.yaml; do
+        [ -f "$src" ] || continue
+        name=$(basename "$src")
+        dest="$CONFIG_DIR/agents/executors/$name"
+        if [ ! -f "$dest" ]; then
+            cp "$src" "$dest"
+            bashio::log.info "Created default config: agents/executors/$name"
+        fi
+    done
+fi
 
 # Clone skill/plugin repos
 /opt/casa/scripts/sync-repos.sh
