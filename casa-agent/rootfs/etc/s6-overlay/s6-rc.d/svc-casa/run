@@ -27,6 +27,10 @@ export SUBAGENT_MODEL="$(bashio::config 'subagent_model')"
 export ENABLE_TERMINAL="$(bashio::config 'enable_terminal')"
 export CASA_VERSION="$(bashio::addon.version)"
 
+# 3.2: fastembed model cache — must match the path used by
+# setup-configs.sh pre-warm so the runtime finds the downloaded model.
+export FASTEMBED_CACHE_PATH="/data/fastembed"
+
 # SUPERVISOR_TOKEN is injected automatically by the HA Supervisor.
 
 exec python3 /opt/casa/casa_core.py

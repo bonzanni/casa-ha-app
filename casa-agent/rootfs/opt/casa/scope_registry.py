@@ -157,12 +157,20 @@ class ScopeRegistry:
         scores: dict[str, float],
         default_scope: str,
     ) -> list[str]:
-        """Return scopes at or above `threshold`, or `[default_scope]` when
-        nothing clears the bar."""
+        """Return scopes at or above `threshold`, or a safe fallback.
+
+        Fallback rules:
+        - `[default_scope]` if default_scope is in *scores* (i.e., it
+          survived the trust filter upstream).
+        - `[]` otherwise — the channel's trust tier does not permit
+          the agent's default_scope, so no memory is surfaced.
+        """
         active = [s for s, v in scores.items() if v >= self._threshold]
         if active:
             return active
-        return [default_scope]
+        if default_scope in scores:
+            return [default_scope]
+        return []
 
     def argmax_scope(
         self,

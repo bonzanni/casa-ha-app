@@ -163,8 +163,10 @@ class TestActiveSetAndArgmax:
         scores = {"personal": 0.1, "house": 0.2}
         assert reg.active_from_scores(scores, default_scope="personal") == ["personal"]
 
-    def test_active_from_scores_empty_input_falls_back_to_default(self, reg):
-        assert reg.active_from_scores({}, default_scope="personal") == ["personal"]
+    def test_active_from_scores_empty_input_returns_empty(self, reg):
+        # Empty scores means filter_readable returned nothing — default_scope
+        # is not in scores, so the safe result is [] (no trust bypass).
+        assert reg.active_from_scores({}, default_scope="personal") == []
 
     def test_argmax_picks_highest(self, reg):
         scores = {"personal": 0.4, "house": 0.8}
@@ -176,6 +178,19 @@ class TestActiveSetAndArgmax:
 
     def test_argmax_empty_input_returns_default(self, reg):
         assert reg.argmax_scope({}, default_scope="house") == "house"
+
+    def test_active_from_scores_default_not_in_readable_returns_empty(self, reg):
+        """Trust-bypass regression: if default_scope was filtered out of
+        readable by the trust layer, don't sneak it back in as fallback."""
+        # Only 'house' survived filter_readable; 'personal' is not in scores.
+        scores = {"house": 0.1}
+        assert reg.active_from_scores(scores, default_scope="personal") == []
+
+    def test_active_from_scores_multi_scope_above_threshold(self, reg):
+        """Two scopes above threshold → both returned (fan-out case)."""
+        scores = {"personal": 0.9, "house": 0.8}
+        result = reg.active_from_scores(scores, default_scope="personal")
+        assert sorted(result) == ["house", "personal"]
 
 
 # ---------------------------------------------------------------------------
