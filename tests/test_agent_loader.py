@@ -322,3 +322,50 @@ class TestComposition:
         pos_disc = prompt.index("### Disclosure")
 
         assert pos_char < pos_voice < pos_rshape < pos_disc
+
+
+# ---------------------------------------------------------------------------
+# TestLoadAllAgents
+# ---------------------------------------------------------------------------
+
+
+class TestLoadAllAgents:
+    def test_finds_two_residents_skips_executors_subdir(self, tmp_path):
+        from agent_loader import load_all_agents
+        from policies import load_policies
+
+        agents_root = tmp_path / "agents"
+        _seed_resident(agents_root, "assistant")
+        _seed_resident(agents_root, "butler")
+        _seed_executor(agents_root / "executors", "finance")
+        policies = load_policies(str(_policies_file(tmp_path / "policies")))
+
+        found = load_all_agents(str(agents_root), policies=policies)
+        assert set(found.keys()) == {"assistant", "butler"}
+
+    def test_skips_dotdirs(self, tmp_path):
+        from agent_loader import load_all_agents
+        from policies import load_policies
+
+        agents_root = tmp_path / "agents"
+        _seed_resident(agents_root, "assistant")
+        (agents_root / ".git").mkdir()   # git repo root sits here
+
+        policies = load_policies(str(_policies_file(tmp_path / "policies")))
+        found = load_all_agents(str(agents_root), policies=policies)
+        assert set(found.keys()) == {"assistant"}
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        from agent_loader import load_all_agents
+        assert load_all_agents(str(tmp_path / "nope"), policies=None) == {}
+
+
+class TestLoadAllExecutors:
+    def test_finds_executor(self, tmp_path):
+        from agent_loader import load_all_executors
+
+        execs_root = tmp_path / "executors"
+        _seed_executor(execs_root, "finance")
+
+        found = load_all_executors(str(execs_root))
+        assert "finance" in found

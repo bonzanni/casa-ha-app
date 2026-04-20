@@ -414,3 +414,55 @@ def load_agent_from_dir(
     cfg.system_prompt = _compose_prompt(cfg, policies)
 
     return cfg
+
+
+def load_all_agents(
+    agents_dir: str, *, policies: PolicyLibrary | None,
+) -> dict[str, AgentConfig]:
+    """Walk *agents_dir* for resident directories.
+
+    Skips ``executors/`` (Tier 2 home) and any dotdir. Each
+    subdirectory's name becomes the agent role. Raises ``LoadError``
+    on the first malformed agent — strict-mode from day one.
+    """
+    found: dict[str, AgentConfig] = {}
+    if not os.path.isdir(agents_dir):
+        return found
+    for entry in sorted(os.listdir(agents_dir)):
+        if entry.startswith(".") or entry == "executors":
+            continue
+        path = os.path.join(agents_dir, entry)
+        if not os.path.isdir(path):
+            raise LoadError(
+                f"unexpected non-directory at agents/{entry} — each agent "
+                f"is a directory; flat YAML files are no longer supported"
+            )
+        cfg = load_agent_from_dir(path, policies=policies)
+        found[cfg.role] = cfg
+    return found
+
+
+def load_all_executors(
+    executors_dir: str,
+) -> dict[str, AgentConfig]:
+    """Walk *executors_dir* for executor directories.
+
+    Executors never reference the policy library (taxonomy §4.4: the
+    delegating resident owns the disclosure layer).
+    """
+    found: dict[str, AgentConfig] = {}
+    if not os.path.isdir(executors_dir):
+        return found
+    for entry in sorted(os.listdir(executors_dir)):
+        if entry.startswith("."):
+            continue
+        path = os.path.join(executors_dir, entry)
+        if not os.path.isdir(path):
+            raise LoadError(
+                f"unexpected non-directory at executors/{entry} — each "
+                f"executor is a directory; flat YAML files are no longer "
+                f"supported"
+            )
+        cfg = load_agent_from_dir(path, policies=None)
+        found[cfg.role] = cfg
+    return found
