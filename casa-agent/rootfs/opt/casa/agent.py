@@ -265,10 +265,11 @@ class Agent:
                 system_parts.append(
                     f"\n<memory_context>\n{memory_context}\n</memory_context>"
                 )
+            from channel_trust import channel_trust_display
             system_parts.append(
                 "\n<channel_context>\n"
                 f"channel: {msg.channel}\n"
-                f"trust: {channel_trust(msg.channel)}\n"
+                f"trust: {channel_trust_display(msg.channel)}\n"
                 "</channel_context>"
             )
             system_prompt = "\n".join(system_parts)
