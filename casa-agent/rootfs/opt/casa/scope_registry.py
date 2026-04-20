@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # Lazy import — fastembed pulls in onnxruntime, heavy to load at
 # interpreter start. The factory indirection also gives tests a
 # monkeypatch point.
-_DEFAULT_MODEL_NAME = "intfloat/multilingual-e5-small"
+_DEFAULT_MODEL_NAME = "intfloat/multilingual-e5-large"
 
 
 def _load_text_embedding_cls():  # pragma: no cover — exercised via monkeypatch

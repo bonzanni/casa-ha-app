@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.2 — 2026-04-21 — Post-deploy hotfixes (model + trust bypass)
+
+### Fixed
+- Embedding model name — `intfloat/multilingual-e5-small` is not in
+  fastembed 0.4's supported-model catalog (only `-large` ships). v0.8.1
+  was silently booting in degraded mode with the "model not supported"
+  error on first init. Switched `_DEFAULT_MODEL_NAME` (and the
+  setup-configs pre-warm invocation) to `intfloat/multilingual-e5-large`
+  so the classifier comes up non-degraded. The large variant is ~500 MB
+  (vs ~200 MB for small) — still well within N150 capacity.
+- Write-path trust bypass — when the channel's trust tier filters out
+  every scope the agent owns (`scopes_owned ∩ readable == []`), the
+  write path was falling back to `default_scope` and persisting the
+  exchange into a scope the channel cannot see. Now skips the write
+  entirely. Regression test
+  `TestWritePath::test_write_skipped_when_owned_and_readable_empty`
+  covers this. Observed in v0.8.1: webhook → assistant turn was logging
+  `scope_route ... active=[house] write=personal`.
+
 ## 0.8.1 — 2026-04-21 — Debian base image (onnxruntime compatibility)
 
 ### Changed
