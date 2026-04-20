@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "casa:agent.v1",
+  "description": "Meta-schema: which per-concern schemas apply to which tier. Consumed by the loader, not by YAML files.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "tiers"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "tiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resident", "executor"],
+      "properties": {
+        "resident": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["required", "optional"],
+          "properties": {
+            "required": {"type": "array", "items": {"type": "string"}},
+            "optional": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "executor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["required", "optional", "forbidden"],
+          "properties": {
+            "required":  {"type": "array", "items": {"type": "string"}},
+            "optional":  {"type": "array", "items": {"type": "string"}},
+            "forbidden": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      }
+    }
+  }
+}

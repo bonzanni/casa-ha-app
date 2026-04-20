@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "casa:runtime.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "model"],
+  "properties": {
+    "schema_version":   {"const": 1},
+    "model":            {"type": "string", "minLength": 1},
+    "enabled":          {"type": "boolean", "default": true},
+    "tools": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowed":         {"type": "array", "items": {"type": "string"}, "default": []},
+        "disallowed":      {"type": "array", "items": {"type": "string"}, "default": []},
+        "permission_mode": {"type": "string", "default": "acceptEdits"},
+        "max_turns":       {"type": "integer", "minimum": 1, "default": 10}
+      }
+    },
+    "mcp_server_names": {"type": "array", "items": {"type": "string"}, "default": []},
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "token_budget":    {"type": "integer", "minimum": 0, "default": 4000},
+        "read_strategy":   {"type": "string", "enum": ["per_turn", "cached", "card_only"], "default": "per_turn"},
+        "scopes_owned":    {"type": "array", "items": {"type": "string"}, "default": []},
+        "scopes_readable": {"type": "array", "items": {"type": "string"}, "default": []}
+      }
+    },
+    "channels": {"type": "array", "items": {"type": "string"}, "default": []},
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy":     {"type": "string", "enum": ["persistent", "pooled", "ephemeral"], "default": "ephemeral"},
+        "idle_timeout": {"type": "integer", "minimum": 0, "default": 300}
+      }
+    },
+    "tts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tag_dialect": {"type": "string", "enum": ["square_brackets", "parens", "none"], "default": "square_brackets"}
+      }
+    },
+    "voice_errors": {"type": "object", "additionalProperties": {"type": "string"}, "default": {}},
+    "cwd":          {"type": "string", "default": ""}
+  }
+}

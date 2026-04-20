@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "casa:hooks.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "pre_tool_use": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["policy"],
+        "properties": {
+          "policy": {"type": "string", "minLength": 1}
+        }
+      },
+      "default": []
+    }
+  }
+}

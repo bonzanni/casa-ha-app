@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "casa:policy-disclosure.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "policies"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "policies": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["categories", "safe_on_any_channel", "deflection_patterns"],
+        "properties": {
+          "categories": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["required_trust", "examples"],
+              "properties": {
+                "required_trust": {"type": "string", "minLength": 1},
+                "examples":       {"type": "array", "items": {"type": "string"}}
+              }
+            }
+          },
+          "safe_on_any_channel": {"type": "array", "items": {"type": "string"}},
+          "deflection_patterns": {"type": "object", "additionalProperties": {"type": "string"}}
+        }
+      }
+    }
+  }
+}

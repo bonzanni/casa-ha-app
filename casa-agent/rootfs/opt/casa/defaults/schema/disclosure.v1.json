@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "casa:disclosure.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "policy"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "policy":         {"type": "string", "minLength": 1},
+    "overrides":      {"type": "object", "default": {}}
+  }
+}
