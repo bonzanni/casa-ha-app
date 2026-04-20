@@ -316,6 +316,67 @@ class TestScopeRegistryDegradedMode:
         assert scores == {"personal": 1.0, "house": 1.0}
 
 
+class TestEmbeddingCache:
+    @pytest.fixture
+    def reg(self, tmp_path, monkeypatch):
+        from scope_registry import load_scope_library, ScopeRegistry
+        import scope_registry as sr
+
+        monkeypatch.setattr(sr, "_load_text_embedding_cls", lambda: _FakeEmbedder)
+
+        f = tmp_path / "scopes.yaml"
+        _write(f, EMBED_SCOPES_YAML)
+        return ScopeRegistry(load_scope_library(str(f)), embed_cache_size=4)
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_on_repeated_query(self, reg):
+        await reg.prepare()
+        scopes = ["personal", "business", "finance", "house"]
+
+        assert reg.cache_stats() == (0, 0)
+        reg.score("finance stuff", scopes)
+        assert reg.cache_stats() == (0, 1)
+        reg.score("finance stuff", scopes)
+        assert reg.cache_stats() == (1, 1)
+        reg.score("finance stuff", scopes)
+        assert reg.cache_stats() == (2, 1)
+
+    @pytest.mark.asyncio
+    async def test_cache_key_normalizes_whitespace_and_case(self, reg):
+        await reg.prepare()
+        scopes = ["personal"]
+        reg.score("Finance Stuff", scopes)
+        reg.score("  finance stuff  ", scopes)
+        reg.score("finance stuff", scopes)
+        hits, misses = reg.cache_stats()
+        assert misses == 1
+        assert hits == 2
+
+    @pytest.mark.asyncio
+    async def test_lru_eviction_at_capacity(self, reg):
+        await reg.prepare()
+        scopes = ["personal"]
+        reg.score("p one", scopes)
+        reg.score("b two", scopes)
+        reg.score("f three", scopes)
+        reg.score("h four", scopes)
+        assert reg.cache_stats() == (0, 4)
+        reg.score("p five", scopes)
+        assert reg.cache_stats() == (0, 5)
+        reg.score("p one", scopes)
+        assert reg.cache_stats() == (0, 6)
+
+    @pytest.mark.asyncio
+    async def test_degraded_mode_skips_cache(self, reg, monkeypatch):
+        import scope_registry as sr
+        monkeypatch.setattr(sr, "_load_text_embedding_cls",
+                            lambda: (_ for _ in ()).throw(RuntimeError("x")))
+        reg._degraded = True
+        reg.score("anything", ["personal"])
+        reg.score("anything", ["personal"])
+        assert reg.cache_stats() == (0, 0)
+
+
 # ---------------------------------------------------------------------------
 # Real-model integration — gated by env var (slow: downloads ~200MB on first run).
 # ---------------------------------------------------------------------------

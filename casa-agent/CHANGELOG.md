@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.8.3 — 2026-04-21 — Voice-latency optimizations
+
+### Added
+- Per-process LRU cache for query embeddings in `ScopeRegistry` (256
+  entries, keyed on `text.strip().lower()`). Voice retriggers and
+  repeat commands are frequent — hits skip the ~90 ms ONNX forward
+  pass and drop `score()` cost from ~90 ms to ~1 ms (just the cosine
+  dot-products).
+- `scope_route` telemetry now includes `embed_cache=N/M` where `M` is
+  total calls this process has seen. Use to verify the cache is
+  actually paying off after a few hours of real use.
+- `ScopeRegistry.cache_stats()` returns `(hits, misses)` for tests
+  and telemetry.
+
+### Changed
+- Write-path classifier now short-circuits when `owned_and_readable`
+  contains exactly one scope — argmax over a single candidate is
+  trivially that scope. Saves ~90 ms on every butler (voice) turn,
+  since Tina only owns `house`. Assistant (3 owned scopes) still
+  classifies.
+
+### Latency impact (measured on N150 with e5-large)
+- Butler voice critical path: ~90 ms → ~1 ms on cache hit
+- Butler voice total per-turn overhead: ~180 ms → ~0-90 ms
+  (write-path classifier removed unconditionally, read-path when
+  cached)
+- Assistant telegram: unchanged on first call, ~90 ms saved on any
+  repeat of the same user text
+
 ## 0.8.2 — 2026-04-21 — Post-deploy hotfixes (model + trust bypass)
 
 ### Fixed

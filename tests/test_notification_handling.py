@@ -26,6 +26,7 @@ def _mk_scope_registry_stub():
     reg.score.return_value = {"personal": 1.0}
     reg.active_from_scores.return_value = ["personal"]
     reg.argmax_scope.return_value = "personal"
+    reg.cache_stats.return_value = (0, 1)
     return reg
 
 

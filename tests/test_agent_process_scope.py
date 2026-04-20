@@ -109,6 +109,7 @@ def _make_scope_registry(*, readable_out, active_out, argmax_out):
     reg.score = Mock(return_value={s: 1.0 for s in readable_out})
     reg.active_from_scores = Mock(return_value=active_out)
     reg.argmax_scope = Mock(return_value=argmax_out)
+    reg.cache_stats = Mock(return_value=(0, 1))
     return reg
 
 
@@ -292,6 +293,7 @@ class TestWritePath:
         ])
         reg.active_from_scores = Mock(return_value=["finance"])
         reg.argmax_scope = Mock(return_value="finance")
+        reg.cache_stats = Mock(return_value=(0, 1))
 
         with patch("agent.ClaudeSDKClient", FakeClient):
             FakeClient.reset()
@@ -336,6 +338,7 @@ class TestWritePath:
         reg.score = Mock(return_value={"personal": 1, "business": 1, "finance": 1, "house": 1})
         reg.active_from_scores = Mock(return_value=["personal"])
         reg.argmax_scope = Mock(return_value="personal")
+        reg.cache_stats = Mock(return_value=(0, 1))
 
         with patch("agent.ClaudeSDKClient", FakeClient):
             FakeClient.reset()
@@ -380,6 +383,7 @@ class TestWritePath:
         reg.score = Mock(return_value={"personal": 1.0, "house": 0.1})
         reg.active_from_scores = Mock(return_value=["personal"])
         reg.argmax_scope = Mock(return_value="personal")
+        reg.cache_stats = Mock(return_value=(0, 1))
 
         with patch("agent.ClaudeSDKClient", FakeClient):
             FakeClient.reset()
@@ -406,6 +410,70 @@ class TestWritePath:
         # v0.8.0 preserves today's behaviour — gate on response_text truthy).
         assert memory.add_turn.await_count == 0
 
+    async def test_single_owned_scope_skips_write_classify(self, monkeypatch):
+        """Butler (voice) with scopes_owned=[house] should NOT call score()
+        on the write path — argmax over a 1-element list is trivially that
+        element, so the ONNX forward pass is pure waste."""
+        from agent import Agent, ClaudeSDKClient
+        from bus import BusMessage, MessageType
+        from config import (
+            AgentConfig, CharacterConfig, MemoryConfig, SessionConfig,
+            ToolsConfig, VoiceConfig, ResponseShapeConfig,
+        )
+
+        memory = Mock()
+        memory.ensure_session = AsyncMock()
+        memory.get_context = AsyncMock(return_value="")
+        memory.add_turn = AsyncMock()
+
+        # Butler config — owns only house.
+        cfg = AgentConfig(role="butler")
+        cfg.character = CharacterConfig(name="Tina", archetype="", card="", prompt="SYS")
+        cfg.voice = VoiceConfig()
+        cfg.response_shape = ResponseShapeConfig()
+        cfg.system_prompt = "SYS"
+        cfg.tools = ToolsConfig(allowed=["Read"], permission_mode="acceptEdits")
+        cfg.memory = MemoryConfig(
+            token_budget=800, read_strategy="cached",
+            scopes_owned=["house"], scopes_readable=["house"],
+            default_scope="house",
+        )
+        cfg.session = SessionConfig(strategy="pooled", idle_timeout=300)
+        cfg.channels = ["voice"]
+        cfg.model = "haiku"
+
+        reg = Mock()
+        reg.filter_readable = Mock(return_value=["house"])
+        reg.score = Mock(return_value={"house": 0.9})
+        reg.active_from_scores = Mock(return_value=["house"])
+        reg.argmax_scope = Mock(return_value="house")
+        reg.cache_stats = Mock(return_value=(0, 1))
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            FakeClient.reset()
+            FakeClient.response_text = "done"
+
+            agent = Agent(
+                config=cfg, memory=memory,
+                session_registry=Mock(get=Mock(return_value=None),
+                                      touch=AsyncMock(),
+                                      register=AsyncMock()),
+                mcp_registry=Mock(resolve=Mock(return_value={})),
+                channel_manager=Mock(), scope_registry=reg,
+            )
+
+            await agent._process(BusMessage(
+                type=MessageType.CHANNEL_IN, source="voice", target="butler",
+                content="lights off", channel="voice", context={"chat_id": "lr"},
+            ))
+        await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
+
+        # Only the READ-path score() call; no write-side score()
+        assert reg.score.call_count == 1
+        memory.add_turn.assert_awaited_once()
+        write_sid = memory.add_turn.await_args.kwargs["session_id"]
+        assert write_sid == "voice:lr:house:butler"
+
     async def test_write_skipped_when_owned_and_readable_empty(self, monkeypatch):
         """Trust-bypass regression: if the channel's trust tier filters out
         every scope the agent owns, the write path must NOT fall back to
@@ -427,6 +495,7 @@ class TestWritePath:
         reg.score = Mock(return_value={"house": 0.1})
         reg.active_from_scores = Mock(return_value=["house"])
         reg.argmax_scope = Mock(return_value="house")
+        reg.cache_stats = Mock(return_value=(0, 1))
 
         with patch("agent.ClaudeSDKClient", FakeClient):
             FakeClient.reset()
@@ -471,6 +540,7 @@ class TestObservability:
         reg.filter_readable = Mock(return_value=["personal", "finance", "house"])
         reg.score = Mock(return_value={"personal": 0.1, "finance": 0.9, "house": 0.5})
         reg.active_from_scores = Mock(return_value=["finance", "house"])
+        reg.cache_stats = Mock(return_value=(0, 1))
         reg.argmax_scope = Mock(return_value="finance")
 
         with patch("agent.ClaudeSDKClient", FakeClient):
