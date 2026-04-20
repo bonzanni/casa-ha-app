@@ -222,6 +222,92 @@ PY
 migrate_disclosure_clause "$CONFIG_DIR/agents/butler.yaml"
 
 # ------------------------------------------------------------------
+# One-shot 3.1 migration: inject memory.scopes_owned / scopes_readable
+# into resident YAMLs with conservative defaults. Metadata only —
+# runtime retrieval lands in 3.2. Gated by the trailing marker
+# `# casa: scopes v1`. Idempotent.
+# ------------------------------------------------------------------
+
+migrate_scope_metadata() {
+    local file="$1"
+    local default_owned="$2"      # e.g. "[personal, business, finance]"
+    local default_readable="$3"   # e.g. "[personal, business, finance, house]"
+
+    [ -f "$file" ] || return 0
+
+    # Strip CRs so sed / marker checks work on Windows-edited files.
+    sed -i 's/\r$//' "$file"
+
+    if grep -qE '^# casa: scopes v1$' "$file"; then
+        return 0
+    fi
+
+    if ! python3 - "$file" "$default_owned" "$default_readable" <<'PY'
+import pathlib, re, sys
+
+p = pathlib.Path(sys.argv[1])
+default_owned = sys.argv[2]
+default_readable = sys.argv[3]
+
+try:
+    import yaml
+except ImportError:
+    print(f"[ERROR] yaml unavailable; skipping {p.name}", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    text = p.read_text(encoding="utf-8")
+    # Validate YAML parses before rewriting.
+    yaml.safe_load(text)
+except Exception as exc:
+    print(f"[ERROR] could not parse {p.name}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+lines = text.splitlines(keepends=True)
+has_memory = any(re.match(r"^memory:[ \t]*$", ln) for ln in lines)
+has_owned = any(re.match(r"^  scopes_owned:", ln) for ln in lines)
+has_readable = any(re.match(r"^  scopes_readable:", ln) for ln in lines)
+
+out = []
+if has_memory:
+    for ln in lines:
+        out.append(ln)
+        if re.match(r"^memory:[ \t]*$", ln):
+            # Inject missing fields directly under `memory:`.
+            if not has_owned:
+                out.append(f"  scopes_owned: {default_owned}\n")
+            if not has_readable:
+                out.append(f"  scopes_readable: {default_readable}\n")
+else:
+    # No memory: block at all — append a minimal one with just scopes.
+    out = list(lines)
+    if out and not out[-1].endswith("\n"):
+        out[-1] = out[-1] + "\n"
+    out.append("memory:\n")
+    out.append(f"  scopes_owned: {default_owned}\n")
+    out.append(f"  scopes_readable: {default_readable}\n")
+
+new_text = "".join(out)
+if not new_text.endswith("\n"):
+    new_text += "\n"
+new_text += "# casa: scopes v1\n"
+p.write_text(new_text, encoding="utf-8")
+PY
+    then
+        echo "[ERROR] migrate_scope_metadata: python step failed for $(basename "$file"); skipping"
+        return 0
+    fi
+
+    bashio::log.info "Migrated scope metadata in $(basename "$file")"
+}
+
+migrate_scope_metadata "$CONFIG_DIR/agents/assistant.yaml" \
+    "[personal, business, finance]" \
+    "[personal, business, finance, house]"
+migrate_scope_metadata "$CONFIG_DIR/agents/butler.yaml" \
+    "[house]" "[house]"
+
+# ------------------------------------------------------------------
 # One-shot: drop obsolete memory_session_id field from sessions.json.
 # Lazy migration in SessionRegistry.touch() also handles this, but
 # doing it at setup time keeps the on-disk schema current immediately.
