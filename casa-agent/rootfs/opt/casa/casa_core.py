@@ -419,6 +419,24 @@ async def main() -> None:
     )
     role_configs = load_all_agents(agents_dir, policies=policy_lib)
 
+    # 3.2: scope registry — loads scopes.yaml, embeds descriptions.
+    from scope_registry import load_scope_library, ScopeRegistry
+    scope_lib = load_scope_library(
+        os.path.join(CONFIG_DIR, "policies", "scopes.yaml"),
+    )
+    scope_threshold = float(os.environ.get("CASA_SCOPE_THRESHOLD", "0.35"))
+    scope_registry = ScopeRegistry(scope_lib, threshold=scope_threshold)
+    await scope_registry.prepare()
+    if scope_registry._degraded:
+        logger.warning(
+            "ScopeRegistry running in DEGRADED mode — fan-out to all readable scopes"
+        )
+    else:
+        logger.info(
+            "ScopeRegistry ready — embedded %d scopes (threshold=%.2f)",
+            len(scope_lib.names()), scope_threshold,
+        )
+
     if "assistant" not in role_configs:
         raise RuntimeError(
             f"No agent with role 'assistant' found in {agents_dir}. "
@@ -446,6 +464,7 @@ async def main() -> None:
             session_registry=session_registry,
             mcp_registry=mcp_registry,
             channel_manager=channel_manager,
+            scope_registry=scope_registry,
         )
         bus.register(role, agent.handle_message)
         agents[role] = agent

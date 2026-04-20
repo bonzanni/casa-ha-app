@@ -29,6 +29,16 @@ from claude_agent_sdk import (
 pytestmark = pytest.mark.asyncio
 
 
+def _mk_scope_registry_stub():
+    from unittest.mock import Mock
+    reg = Mock()
+    reg.filter_readable.return_value = ["personal"]
+    reg.score.return_value = {"personal": 1.0}
+    reg.active_from_scores.return_value = ["personal"]
+    reg.argmax_scope.return_value = "personal"
+    return reg
+
+
 def _mk_text_block(text: str) -> _SDKTextBlock:
     try:
         return _SDKTextBlock(text=text)
@@ -94,6 +104,7 @@ def _make_agent(
         session_registry=SessionRegistry(str(tmp_path / "sessions.json")),
         mcp_registry=McpServerRegistry(),
         channel_manager=ChannelManager(),
+        scope_registry=_mk_scope_registry_stub(),
     )
 
 

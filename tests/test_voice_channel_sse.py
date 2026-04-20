@@ -17,6 +17,16 @@ from casa_core_middleware import cid_middleware
 from channels.voice.channel import VoiceChannel
 
 
+def _mk_scope_registry_stub():
+    from unittest.mock import Mock
+    reg = Mock()
+    reg.filter_readable.return_value = ["personal"]
+    reg.score.return_value = {"personal": 1.0}
+    reg.active_from_scores.return_value = ["personal"]
+    reg.argmax_scope.return_value = "personal"
+    return reg
+
+
 class StubAgent:
     """Synthetic agent: streams two tokens via on_token, returns a full text."""
 
@@ -161,6 +171,7 @@ async def agent_error_voice_app(tmp_path):
         session_registry=SessionRegistry(str(tmp_path / "sessions.json")),
         mcp_registry=McpServerRegistry(),
         channel_manager=channel_manager,
+        scope_registry=_mk_scope_registry_stub(),
     )
 
     async def _raise(*args, **kwargs):
