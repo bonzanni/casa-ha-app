@@ -4,7 +4,8 @@ CONFIG_DIR="/addon_configs/casa-agent"
 DATA_DIR="/data"
 DEFAULTS_DIR="/opt/casa/defaults"
 
-mkdir -p "$CONFIG_DIR/agents" "$CONFIG_DIR/workspace/.claude/skills" \
+mkdir -p "$CONFIG_DIR/agents" "$CONFIG_DIR/agents/executors" \
+         "$CONFIG_DIR/workspace/.claude/skills" \
          "$CONFIG_DIR/workspace/plugins" "$CONFIG_DIR/workspace/mcp-servers" \
          "$DATA_DIR/sdk-sessions"
 
@@ -307,7 +308,7 @@ PY
 fi
 
 for f in agents/assistant.yaml agents/butler.yaml agents/subagents.yaml \
-         schedules.yaml webhooks.yaml; do
+         agents/executors/alex.yaml schedules.yaml webhooks.yaml; do
     if [ ! -f "$CONFIG_DIR/$f" ]; then
         cp "$DEFAULTS_DIR/$f" "$CONFIG_DIR/$f"
         echo "[INFO] Created default config: $f"
