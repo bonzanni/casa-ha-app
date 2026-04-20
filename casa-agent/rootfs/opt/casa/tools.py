@@ -26,6 +26,7 @@ from executor_registry import (
     DelegationRecord,
     ExecutorRegistry,
 )
+from mcp_registry import McpServerRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -33,18 +34,26 @@ logger = logging.getLogger(__name__)
 _channel_manager: ChannelManager | None = None
 _bus: MessageBus | None = None
 _executor_registry: ExecutorRegistry | None = None
+_mcp_registry: McpServerRegistry | None = None
 
 
 def init_tools(
     channel_manager: ChannelManager,
     bus: MessageBus,
     executor_registry: ExecutorRegistry,
+    mcp_registry: McpServerRegistry | None = None,
 ) -> None:
-    """Initialize module-level references used by tool implementations."""
-    global _channel_manager, _bus, _executor_registry  # noqa: PLW0603
+    """Initialize module-level references used by tool implementations.
+
+    ``mcp_registry`` is required for executor MCP-tool resolution at
+    delegation time. Accepts ``None`` for legacy callers that don't pass
+    it (the `_build_executor_options` code path degrades to empty MCP
+    servers — the executor still runs but with only built-in tools)."""
+    global _channel_manager, _bus, _executor_registry, _mcp_registry  # noqa: PLW0603
     _channel_manager = channel_manager
     _bus = bus
     _executor_registry = executor_registry
+    _mcp_registry = mcp_registry
 
 
 @tool(
@@ -88,8 +97,14 @@ def _build_executor_options(cfg) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for a Tier 2 executor invocation.
 
     Executors run stateless: no hooks (resident-scoped), no session
-    resume, MCP servers resolved per the executor's declared names
-    (empty dict if the registry is not available — keeps tests simple)."""
+    resume. MCP servers are resolved per the executor's declared
+    ``mcp_server_names`` via the shared registry — same pattern as
+    :meth:`Agent._process` (agent.py step 4). Degrades to empty-dict
+    when the registry is not bound (legacy callers / test harnesses)."""
+    if _mcp_registry is not None:
+        mcp_servers = _mcp_registry.resolve(cfg.mcp_server_names)
+    else:
+        mcp_servers = {}
     return ClaudeAgentOptions(
         model=cfg.model,
         system_prompt=cfg.personality,
@@ -97,7 +112,7 @@ def _build_executor_options(cfg) -> ClaudeAgentOptions:
         disallowed_tools=list(cfg.tools.disallowed),
         permission_mode=cfg.tools.permission_mode or "acceptEdits",
         max_turns=cfg.tools.max_turns,
-        mcp_servers={},  # MCP resolution wired in Task 10 via registry
+        mcp_servers=mcp_servers if mcp_servers else {},
         hooks={},
         cwd=cfg.cwd or None,
         resume=None,

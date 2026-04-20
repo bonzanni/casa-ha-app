@@ -503,3 +503,77 @@ class TestCancellation:
         # No notifications posted — executor was cancelled.
         await asyncio.sleep(0.05)
         assert bus.queues["assistant"].empty()
+
+
+# ---------------------------------------------------------------------------
+# TestMcpRegistryWiring — v0.6.1: executor MCP servers resolved via registry
+# ---------------------------------------------------------------------------
+
+
+class TestMcpRegistryWiring:
+    """`init_tools` accepts an optional `mcp_registry`; when passed,
+    `_build_executor_options` resolves `cfg.mcp_server_names` via the
+    registry instead of hardcoding `mcp_servers={}`. This is the hook
+    Phase 3.4 needs to make Alex's `n8n-workflows` + `casa-framework`
+    tools available when he's flipped `enabled: true`."""
+
+    async def test_mcp_registry_not_bound_degrades_to_empty(self, tmp_path):
+        """Legacy 3-arg call — mcp_registry None — must not crash.
+        Executor options come back with empty mcp_servers."""
+        from tools import _build_executor_options, init_tools
+
+        reg = ExecutorRegistry(str(tmp_path / "ex"),
+                               tombstone_path=str(tmp_path / "del.json"))
+        bus = MessageBus()
+        cm = ChannelManager()
+        init_tools(cm, bus, reg)  # no mcp_registry → None default
+
+        cfg = _executor_cfg(role="finance")
+        cfg.mcp_server_names = ["n8n-workflows", "casa-framework"]
+        options = _build_executor_options(cfg)
+        assert options.mcp_servers == {}
+
+    async def test_mcp_registry_bound_resolves_to_registry_output(
+        self, tmp_path,
+    ):
+        """When `mcp_registry` is passed, resolve() wins and its
+        returned dict is passed straight through."""
+        from mcp_registry import McpServerRegistry
+        from tools import _build_executor_options, init_tools
+
+        mcp = McpServerRegistry()
+        # Register a dummy SDK server so resolve() has something to return.
+        mcp.register_sdk("casa-framework", {"type": "stdio", "command": "x"})
+
+        reg = ExecutorRegistry(str(tmp_path / "ex"),
+                               tombstone_path=str(tmp_path / "del.json"))
+        bus = MessageBus()
+        cm = ChannelManager()
+        init_tools(cm, bus, reg, mcp)
+
+        cfg = _executor_cfg(role="finance")
+        cfg.mcp_server_names = ["casa-framework"]
+        options = _build_executor_options(cfg)
+        assert "casa-framework" in options.mcp_servers
+
+    async def test_mcp_registry_bound_but_empty_names_yields_empty(
+        self, tmp_path,
+    ):
+        """Executor YAML with no `mcp_server_names` → empty mcp_servers,
+        regardless of registry state. No exception."""
+        from mcp_registry import McpServerRegistry
+        from tools import _build_executor_options, init_tools
+
+        mcp = McpServerRegistry()
+        mcp.register_sdk("casa-framework", {"type": "stdio", "command": "x"})
+
+        reg = ExecutorRegistry(str(tmp_path / "ex"),
+                               tombstone_path=str(tmp_path / "del.json"))
+        bus = MessageBus()
+        cm = ChannelManager()
+        init_tools(cm, bus, reg, mcp)
+
+        cfg = _executor_cfg(role="finance")
+        cfg.mcp_server_names = []  # executor declares no MCP deps
+        options = _build_executor_options(cfg)
+        assert options.mcp_servers == {}
