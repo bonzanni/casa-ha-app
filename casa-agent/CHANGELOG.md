@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.8.0 — 2026-04-20 — Phase 3.2: Domain scope runtime
+
+### Added
+- Domain scope as the authoritative memory visibility layer. Four scopes
+  ship by default (`personal`, `business`, `finance`, `house`) declared in
+  `/addon_configs/casa-agent/policies/scopes.yaml` with editable
+  natural-language descriptions and `minimum_trust` tiers.
+- `ScopeRegistry` with a local `fastembed` embedding model
+  (`intfloat/multilingual-e5-small`, ~200 MB, downloaded to `/data/fastembed/`
+  on first boot). Scores user text per readable scope; fan-out reads above
+  threshold; end-of-turn classifies the full exchange for the write target.
+- Per-scope Honcho session topology: `{channel}:{chat_id}:{scope}:{role}`.
+  Per-turn telemetry line `scope_route role=... channel=... active=[...]
+  write=... (t=Nms)`.
+- `memory.default_scope` field in resident `runtime.yaml` (required for
+  residents with `scopes_readable`; forbidden on executors).
+- `channel_trust()` now returns a canonical token; `channel_trust_display()`
+  preserves the human-readable form for the `<channel_context>` prompt block.
+
+### Changed
+- **Breaking (internal): memory session topology.** Pre-v0.8.0 Honcho /
+  SQLite sessions (keyed `{channel}:{chat_id}:{role}`) are orphaned. Fresh
+  scoped sessions accumulate from turn 1 after upgrade; prior transcripts
+  remain visible in the Honcho dashboard but Casa does not read from them.
+- Butler `disclosure.yaml` override shortened — `categories: {}`,
+  `safe_on_any_channel` and `deflection_patterns` inherit from the shared
+  `standard` policy. Scope-at-retrieval enforcement makes the confidential
+  category listing redundant for Tina.
+- `Agent` constructor now takes `scope_registry` as a required argument.
+
+### Environment
+- New: `CASA_SCOPE_THRESHOLD` (default `0.35`). Raise to make routing
+  stricter (fewer scopes pulled per turn); lower to be more inclusive.
+
+### Dependencies
+- `fastembed>=0.4,<0.5`.
+
+### Non-goals carried forward
+- No scope-aware tool gating — 3.x follow-up.
+- No legacy memory migration — cold start on upgrade.
+- No remote embedding provider — local only in v0.8.x.
+- No `/finance ...` user-prefix syntax.
+
+### Deployment note
+- First boot downloads the embedding model (~200 MB, ~30 s). Subsequent boots
+  reuse `/data/fastembed/`. Offline first-boot degrades gracefully (fan-out
+  to every readable scope) with a WARNING log.
+
 ## 0.7.0 — 2026-04-20 — Agent-definition refactor (Spec X / Phase 4.x)
 
 ### Added
