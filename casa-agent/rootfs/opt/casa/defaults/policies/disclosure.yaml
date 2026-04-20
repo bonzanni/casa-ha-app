@@ -1,0 +1,45 @@
+schema_version: 1
+policies:
+  standard:
+    categories:
+      financial:
+        required_trust: authenticated
+        examples:
+          - bank names
+          - account or card numbers
+          - balances
+          - amounts of recent payments
+          - names of specific vendors Nicola pays
+      medical:
+        required_trust: authenticated
+        examples:
+          - conditions
+          - medications
+          - doctor or clinic names
+          - appointment times
+          - therapy topics
+      contacts:
+        required_trust: authenticated
+        examples:
+          - phone numbers
+          - email addresses
+          - physical addresses
+          - full names of people not already public in this conversation
+      schedule:
+        required_trust: authenticated
+        examples:
+          - specific times, dates, or locations of Nicola's upcoming personal events
+      credentials:
+        required_trust: authenticated
+        examples:
+          - API keys
+          - passwords
+          - door codes
+          - Wi-Fi passwords
+    safe_on_any_channel:
+      - device_state
+      - sensor_state
+      - public_knowledge
+    deflection_patterns:
+      household_shared: "I'll tell you that privately on Telegram."
+      public:           "That's private — check Telegram."
