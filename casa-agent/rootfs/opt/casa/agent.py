@@ -22,6 +22,7 @@ from claude_agent_sdk import (
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig
+from executor_registry import DelegationComplete
 from hooks import block_dangerous_commands, make_path_scope_hook
 from log_cid import cid_var
 from mcp_registry import McpServerRegistry
@@ -84,6 +85,15 @@ class Agent:
         incrementally via ``on_token``.  The full response is sent or
         finalized after the SDK completes.
         """
+        # Phase 3.1: late-completion delegation NOTIFICATION — synthesize
+        # a fresh turn so the delegating resident narrates the result
+        # back to the user on the origin channel.
+        if (
+            msg.type == MessageType.NOTIFICATION
+            and isinstance(msg.content, DelegationComplete)
+        ):
+            msg = self._synthesize_delegation_turn(msg)
+
         # Obtain a streaming callback from the channel (if available)
         on_token: OnTokenCallback | None = None
         channel = self._channel_manager.get(msg.channel) if msg.channel else None
@@ -138,6 +148,50 @@ class Agent:
             reply_to=msg.id,
             channel=msg.channel,
             context=msg.context,
+        )
+
+    def _synthesize_delegation_turn(self, msg: BusMessage) -> BusMessage:
+        """Convert a NOTIFICATION+DelegationComplete into a REQUEST turn
+        whose content is a synth prompt for the delegating resident."""
+        complete = msg.content
+        assert isinstance(complete, DelegationComplete)
+        short_id = complete.delegation_id[:8]
+
+        origin = complete.origin or {}
+        user_text = origin.get("user_text", "")
+
+        if complete.status == "ok":
+            body = (
+                f"[System notification: your delegation to {complete.agent} "
+                f"(id {short_id}) has returned with status=ok]\n\n"
+                f"Result text from {complete.agent}:\n{complete.text}\n"
+            )
+        elif complete.kind == "restart_orphan":
+            body = (
+                f"[System notification: your delegation to {complete.agent} "
+                f"(id {short_id}) was orphaned by a Casa restart]\n\n"
+                "I lost track of this delegation during a Casa restart. "
+                "Tell the user and offer to retry.\n"
+            )
+        else:
+            body = (
+                f"[System notification: your delegation to {complete.agent} "
+                f"(id {short_id}) has returned with status=error]\n\n"
+                f"Delegation failed ({complete.kind or 'unknown'}): "
+                f"{complete.message}\n"
+            )
+        body += (
+            f"\nThe original user question was: {user_text}\n\n"
+            "Reply to the user via their original channel. Be concise.\n"
+        )
+
+        return BusMessage(
+            type=MessageType.REQUEST,
+            source=msg.source,
+            target=msg.target,
+            content=body,
+            channel=msg.channel,
+            context=dict(msg.context),
         )
 
     # ------------------------------------------------------------------
