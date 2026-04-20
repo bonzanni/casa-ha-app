@@ -327,11 +327,16 @@ def _wrap_memory_for_strategy(
 def _load_agents_by_role(agents_dir: str) -> dict[str, AgentConfig]:
     """Scan *agents_dir* and return a dict keyed on role.
 
-    Ignores ``subagents.yaml`` (multi-agent file for on-demand subagents;
-    Phase 3+). Logs and skips files whose role is neither ``assistant``
-    nor ``butler`` (Phase 4 will handle user-defined agents).
+    Tier 1 boundary (taxonomy §4.1): a resident owns a channel. Any
+    ``agents/*.yaml`` whose ``AgentConfig`` declares non-empty
+    ``channels: [...]`` is loaded. Files without channels are skipped
+    with an ERROR log pointing at ``agents/executors/`` for Tier 2.
+
+    ``subagents.yaml`` continues to be explicitly skipped (Tier 3
+    Builders territory — taxonomy §6.4). The ``agents/executors/``
+    subdirectory is invisible to ``os.listdir`` (non-recursive) so
+    executors are never accidentally loaded here.
     """
-    allowed_roles = {"assistant", "butler"}
     found: dict[str, AgentConfig] = {}
     if not os.path.isdir(agents_dir):
         return found
@@ -344,19 +349,17 @@ def _load_agents_by_role(agents_dir: str) -> dict[str, AgentConfig]:
         except Exception as exc:
             logger.error("Failed to load %s: %s", path, exc)
             continue
-        if cfg.role not in allowed_roles:
-            logger.info(
-                "Skipping %s (role=%r not in always-on set %s)",
-                entry,
-                cfg.role,
-                sorted(allowed_roles),
+        if not cfg.channels:
+            logger.error(
+                "Skipping %s: Tier 1 resident requires non-empty 'channels:' "
+                "(role=%r). If this is an executor, move to agents/executors/.",
+                entry, cfg.role,
             )
             continue
         if cfg.role in found:
             logger.error(
                 "Duplicate role %r in %s (first seen earlier); skipping",
-                cfg.role,
-                entry,
+                cfg.role, entry,
             )
             continue
         found[cfg.role] = cfg
