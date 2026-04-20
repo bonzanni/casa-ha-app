@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextvars import ContextVar
 from dataclasses import replace
 from typing import Any, Awaitable, Callable
 
@@ -22,6 +23,7 @@ from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig
 from hooks import block_dangerous_commands, make_path_scope_hook
+from log_cid import cid_var
 from mcp_registry import McpServerRegistry
 from channel_trust import channel_trust, user_peer_for_channel
 from memory import MemoryProvider
@@ -36,6 +38,14 @@ from tokens import (
 from error_kinds import ErrorKind, _classify_error, _USER_MESSAGES  # noqa: F401 — re-exported
 
 logger = logging.getLogger(__name__)
+
+# Phase 3.1: delegating-turn origin. Set by Agent._process for the
+# duration of a turn so the `delegate_to_agent` tool handler can read
+# the channel/chat_id/cid/role/user_text of the outer user turn without
+# threading them through function arguments. ContextVar semantics —
+# asyncio.create_task snapshots the value, so late-completing executor
+# tasks still see the right origin.
+origin_var: ContextVar[dict | None] = ContextVar("origin_var", default=None)
 
 # Type alias for the streaming callback
 OnTokenCallback = Callable[[str], Awaitable[None]]
@@ -147,182 +157,192 @@ class Agent:
         user_peer = user_peer_for_channel(msg.channel)
         user_text = str(msg.content)
 
-        # 1. Ensure session + peers (idempotent, cheap when warm). ----------
+        origin_token = origin_var.set({
+            "role": self.config.role,
+            "channel": msg.channel,
+            "chat_id": msg.context.get("chat_id", ""),
+            "cid": cid_var.get(),
+            "user_text": user_text,
+        })
         try:
-            await self._memory.ensure_session(
-                session_id=session_id,
-                agent_role=self.config.role,
-                user_peer=user_peer,
-            )
-        except Exception:
-            logger.warning(
-                "Memory ensure_session failed; continuing without memory",
-            )
+            # 1. Ensure session + peers (idempotent, cheap when warm). ----------
+            try:
+                await self._memory.ensure_session(
+                    session_id=session_id,
+                    agent_role=self.config.role,
+                    user_peer=user_peer,
+                )
+            except Exception:
+                logger.warning(
+                    "Memory ensure_session failed; continuing without memory",
+                )
 
-        # 2. Retrieve memory digest + record budget usage (spec 5.2 §5.2).
-        memory_context = ""
-        try:
-            memory_context = await self._memory.get_context(
-                session_id=session_id,
-                agent_role=self.config.role,
-                tokens=self.config.memory.token_budget,
-                search_query=user_text,
-                user_peer=user_peer,
-            )
-        except Exception:
-            logger.warning(
-                "Memory retrieval failed; proceeding without context",
-            )
-        else:
-            # Only on success: a failed memory call gives us nothing to
-            # measure. The tracker is no-op when budget <= 0.
-            self._budget_tracker.record(
-                session_id,
-                estimate_tokens(memory_context),
-                self.config.memory.token_budget,
-            )
+            # 2. Retrieve memory digest + record budget usage (spec 5.2 §5.2).
+            memory_context = ""
+            try:
+                memory_context = await self._memory.get_context(
+                    session_id=session_id,
+                    agent_role=self.config.role,
+                    tokens=self.config.memory.token_budget,
+                    search_query=user_text,
+                    user_peer=user_peer,
+                )
+            except Exception:
+                logger.warning(
+                    "Memory retrieval failed; proceeding without context",
+                )
+            else:
+                # Only on success: a failed memory call gives us nothing to
+                # measure. The tracker is no-op when budget <= 0.
+                self._budget_tracker.record(
+                    session_id,
+                    estimate_tokens(memory_context),
+                    self.config.memory.token_budget,
+                )
 
-        # 3. System prompt = personality + <memory_context>? + <channel_context>.
-        system_parts = [self.config.personality]
-        if memory_context:
+            # 3. System prompt = personality + <memory_context>? + <channel_context>.
+            system_parts = [self.config.personality]
+            if memory_context:
+                system_parts.append(
+                    f"\n<memory_context>\n{memory_context}\n</memory_context>"
+                )
             system_parts.append(
-                f"\n<memory_context>\n{memory_context}\n</memory_context>"
+                "\n<channel_context>\n"
+                f"channel: {msg.channel}\n"
+                f"trust: {channel_trust(msg.channel)}\n"
+                "</channel_context>"
             )
-        system_parts.append(
-            "\n<channel_context>\n"
-            f"channel: {msg.channel}\n"
-            f"trust: {channel_trust(msg.channel)}\n"
-            "</channel_context>"
-        )
-        system_prompt = "\n".join(system_parts)
+            system_prompt = "\n".join(system_parts)
 
-        # 4. MCP servers ---------------------------------------------------
-        mcp_servers = self._mcp_registry.resolve(self.config.mcp_server_names)
+            # 4. MCP servers ---------------------------------------------------
+            mcp_servers = self._mcp_registry.resolve(self.config.mcp_server_names)
 
-        # 5. Hooks (agent-identity captured in closures). ------------------
-        hooks = {
-            "PreToolUse": [
-                HookMatcher(matcher="Bash", hooks=[block_dangerous_commands]),
-                HookMatcher(
-                    matcher="Read|Write|Edit",
-                    hooks=[make_path_scope_hook(self.config.role)],
-                ),
-            ],
-        }
+            # 5. Hooks (agent-identity captured in closures). ------------------
+            hooks = {
+                "PreToolUse": [
+                    HookMatcher(matcher="Bash", hooks=[block_dangerous_commands]),
+                    HookMatcher(
+                        matcher="Read|Write|Edit",
+                        hooks=[make_path_scope_hook(self.config.role)],
+                    ),
+                ],
+            }
 
-        # 6. SDK resume --------------------------------------------------
-        existing = self._session_registry.get(channel_key)
-        resume_session_id: str | None = None
-        if existing:
-            resume_session_id = existing.get("sdk_session_id")
-            await self._session_registry.touch(channel_key)
+            # 6. SDK resume --------------------------------------------------
+            existing = self._session_registry.get(channel_key)
+            resume_session_id: str | None = None
+            if existing:
+                resume_session_id = existing.get("sdk_session_id")
+                await self._session_registry.touch(channel_key)
 
-        options = ClaudeAgentOptions(
-            model=self.config.model,
-            system_prompt=system_prompt,
-            allowed_tools=self.config.tools.allowed,
-            disallowed_tools=self.config.tools.disallowed,
-            permission_mode=self.config.tools.permission_mode or "acceptEdits",
-            max_turns=self.config.tools.max_turns,
-            mcp_servers=mcp_servers if mcp_servers else {},
-            hooks=hooks,
-            cwd=self.config.cwd or None,
-            resume=resume_session_id,
-            setting_sources=["project"],
-        )
-
-        # 7. Query the SDK — retry transient faults (spec 5.2 §3). --------
-        async def _attempt_sdk_turn() -> tuple[str, str | None, dict[str, int]]:
-            """Run one end-to-end SDK turn. Each attempt resets the
-            streaming accumulator so ``on_token`` delivers cumulative
-            text from scratch if an earlier attempt failed mid-turn.
-            ``attempt_usage`` resets per attempt so a failed attempt's
-            partial usage cannot leak into the turn_done summary
-            (spec 5.2 §5.2)."""
-            attempt_text = ""
-            attempt_sid: str | None = resume_session_id
-            attempt_usage: dict[str, int] = {}
-            async with ClaudeSDKClient(options) as client:
-                await client.query(user_text)
-                async for sdk_msg in client.receive_response():
-                    if isinstance(sdk_msg, SystemMessage):
-                        if getattr(sdk_msg, "subtype", None) == "init":
-                            data = getattr(sdk_msg, "data", {}) or {}
-                            if "session_id" in data:
-                                attempt_sid = data["session_id"]
-                    elif isinstance(sdk_msg, ResultMessage):
-                        sid = getattr(sdk_msg, "session_id", None)
-                        if sid:
-                            attempt_sid = sid
-                        attempt_usage = extract_usage(sdk_msg)
-                    elif isinstance(sdk_msg, AssistantMessage):
-                        for block in getattr(sdk_msg, "content", []):
-                            if isinstance(block, TextBlock):
-                                attempt_text += block.text
-                                if on_token is not None:
-                                    await on_token(attempt_text)
-            return attempt_text, attempt_sid, attempt_usage
-
-        try:
-            response_text, sdk_session_id, usage = await retry_sdk_call(
-                _attempt_sdk_turn, on_retry=self._log_retry,
-            )
-        except ProcessError:
-            # claude CLI exited non-zero. If we were resuming a prior
-            # session, the most common cause (spec 5.8) is a stale
-            # sdk_session_id — the local conversation file under
-            # ``/root/.claude/`` was wiped (rebuild) while
-            # ``/data/sessions.json`` persisted. Clear and retry fresh.
-            if resume_session_id is None:
-                raise
-            logger.warning(
-                "SDK resume failed (key=%s sid=%s); clearing and retrying fresh",
-                channel_key, resume_session_id,
-            )
-            await self._session_registry.clear_sdk_session(channel_key)
-            resume_session_id = None
-            options = replace(options, resume=None)
-            response_text, sdk_session_id, usage = await retry_sdk_call(
-                _attempt_sdk_turn, on_retry=self._log_retry,
+            options = ClaudeAgentOptions(
+                model=self.config.model,
+                system_prompt=system_prompt,
+                allowed_tools=self.config.tools.allowed,
+                disallowed_tools=self.config.tools.disallowed,
+                permission_mode=self.config.tools.permission_mode or "acceptEdits",
+                max_turns=self.config.tools.max_turns,
+                mcp_servers=mcp_servers if mcp_servers else {},
+                hooks=hooks,
+                cwd=self.config.cwd or None,
+                resume=resume_session_id,
+                setting_sources=["project"],
             )
 
-        # Per-turn telemetry (spec 5.2 §5.2). Microsecond cost — string
-        # format + one logger.info — and runs after streaming has
-        # already flushed via on_token, so it is not on the voice
-        # critical path.
-        logger.info(
-            format_turn_summary(
-                self.config.role,
-                msg.channel or "-",
-                usage,
-            ),
-        )
+            # 7. Query the SDK — retry transient faults (spec 5.2 §3). --------
+            async def _attempt_sdk_turn() -> tuple[str, str | None, dict[str, int]]:
+                """Run one end-to-end SDK turn. Each attempt resets the
+                streaming accumulator so ``on_token`` delivers cumulative
+                text from scratch if an earlier attempt failed mid-turn.
+                ``attempt_usage`` resets per attempt so a failed attempt's
+                partial usage cannot leak into the turn_done summary
+                (spec 5.2 §5.2)."""
+                attempt_text = ""
+                attempt_sid: str | None = resume_session_id
+                attempt_usage: dict[str, int] = {}
+                async with ClaudeSDKClient(options) as client:
+                    await client.query(user_text)
+                    async for sdk_msg in client.receive_response():
+                        if isinstance(sdk_msg, SystemMessage):
+                            if getattr(sdk_msg, "subtype", None) == "init":
+                                data = getattr(sdk_msg, "data", {}) or {}
+                                if "session_id" in data:
+                                    attempt_sid = data["session_id"]
+                        elif isinstance(sdk_msg, ResultMessage):
+                            sid = getattr(sdk_msg, "session_id", None)
+                            if sid:
+                                attempt_sid = sid
+                            attempt_usage = extract_usage(sdk_msg)
+                        elif isinstance(sdk_msg, AssistantMessage):
+                            for block in getattr(sdk_msg, "content", []):
+                                if isinstance(block, TextBlock):
+                                    attempt_text += block.text
+                                    if on_token is not None:
+                                        await on_token(attempt_text)
+                return attempt_text, attempt_sid, attempt_usage
 
-        if sdk_session_id and sdk_session_id != resume_session_id:
+            try:
+                response_text, sdk_session_id, usage = await retry_sdk_call(
+                    _attempt_sdk_turn, on_retry=self._log_retry,
+                )
+            except ProcessError:
+                # claude CLI exited non-zero. If we were resuming a prior
+                # session, the most common cause (spec 5.8) is a stale
+                # sdk_session_id — the local conversation file under
+                # ``/root/.claude/`` was wiped (rebuild) while
+                # ``/data/sessions.json`` persisted. Clear and retry fresh.
+                if resume_session_id is None:
+                    raise
+                logger.warning(
+                    "SDK resume failed (key=%s sid=%s); clearing and retrying fresh",
+                    channel_key, resume_session_id,
+                )
+                await self._session_registry.clear_sdk_session(channel_key)
+                resume_session_id = None
+                options = replace(options, resume=None)
+                response_text, sdk_session_id, usage = await retry_sdk_call(
+                    _attempt_sdk_turn, on_retry=self._log_retry,
+                )
+
+            # Per-turn telemetry (spec 5.2 §5.2). Microsecond cost — string
+            # format + one logger.info — and runs after streaming has
+            # already flushed via on_token, so it is not on the voice
+            # critical path.
             logger.info(
-                "SDK session for '%s': %s",
-                self.config.role,
-                sdk_session_id,
+                format_turn_summary(
+                    self.config.role,
+                    msg.channel or "-",
+                    usage,
+                ),
             )
 
-        # 8. Persist — off the critical path. Storage is unconditional. ---
-        #    Session+peer topology already scopes visibility (spec §4.3).
-        if response_text:
-            task = asyncio.create_task(self._add_turn_bg(
-                session_id, self.config.role, user_text, response_text, user_peer,
-            ))
-            self._bg_tasks.add(task)
-            task.add_done_callback(self._bg_tasks.discard)
+            if sdk_session_id and sdk_session_id != resume_session_id:
+                logger.info(
+                    "SDK session for '%s': %s",
+                    self.config.role,
+                    sdk_session_id,
+                )
 
-        # 9. SessionRegistry — only SDK session id now. --------------------
-        if sdk_session_id:
-            await self._session_registry.register(
-                channel_key=channel_key,
-                agent=self.config.role,
-                sdk_session_id=sdk_session_id,
-            )
+            # 8. Persist — off the critical path. Storage is unconditional. ---
+            #    Session+peer topology already scopes visibility (spec §4.3).
+            if response_text:
+                task = asyncio.create_task(self._add_turn_bg(
+                    session_id, self.config.role, user_text, response_text, user_peer,
+                ))
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
 
-        return response_text or None
+            # 9. SessionRegistry — only SDK session id now. --------------------
+            if sdk_session_id:
+                await self._session_registry.register(
+                    channel_key=channel_key,
+                    agent=self.config.role,
+                    sdk_session_id=sdk_session_id,
+                )
+
+            return response_text or None
+        finally:
+            origin_var.reset(origin_token)
 
     async def _add_turn_bg(
         self,
