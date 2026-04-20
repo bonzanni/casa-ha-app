@@ -405,3 +405,54 @@ class TestWritePath:
         # Empty assistant text ⇒ no write (spec §14.3 acceptable either way;
         # v0.8.0 preserves today's behaviour — gate on response_text truthy).
         assert memory.add_turn.await_count == 0
+
+
+class TestObservability:
+    async def test_scope_route_log_emitted(self, monkeypatch, caplog):
+        import logging
+        from agent import Agent, ClaudeSDKClient
+        from bus import BusMessage, MessageType
+
+        memory = Mock()
+        memory.ensure_session = AsyncMock()
+        memory.get_context = AsyncMock(return_value="d")
+        memory.add_turn = AsyncMock()
+
+        reg = Mock()
+        reg.filter_readable = Mock(return_value=["personal", "finance", "house"])
+        reg.score = Mock(return_value={"personal": 0.1, "finance": 0.9, "house": 0.5})
+        reg.active_from_scores = Mock(return_value=["finance", "house"])
+        reg.argmax_scope = Mock(return_value="finance")
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            FakeClient.reset()
+            FakeClient.response_text = "reply"
+
+            agent = Agent(
+                config=_make_agent_config(),
+                memory=memory,
+                session_registry=Mock(get=Mock(return_value=None),
+                                      touch=AsyncMock(),
+                                      register=AsyncMock()),
+                mcp_registry=Mock(resolve=Mock(return_value={})),
+                channel_manager=Mock(),
+                scope_registry=reg,
+            )
+
+            caplog.set_level(logging.INFO, logger="agent")
+            await agent._process(BusMessage(
+                type=MessageType.CHANNEL_IN, source="telegram", target="assistant",
+                content="x", channel="telegram", context={"chat_id": "12345"},
+            ))
+        await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
+
+        # Expected shape:
+        # scope_route role=assistant channel=telegram active=[finance,house] write=finance (t=<N>ms)
+        routes = [r for r in caplog.records if "scope_route" in r.message]
+        assert len(routes) == 1, f"expected 1 scope_route log, got {[r.message for r in routes]}"
+        m = routes[0].message
+        assert "role=assistant" in m
+        assert "channel=telegram" in m
+        assert "active=[finance,house]" in m or "active=[house,finance]" in m
+        assert "write=finance" in m
+        assert "t=" in m and "ms" in m

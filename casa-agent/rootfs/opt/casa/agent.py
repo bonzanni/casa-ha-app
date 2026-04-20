@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextvars import ContextVar
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -228,6 +229,8 @@ class Agent:
             "user_text": user_text,
         })
         try:
+            scope_start_t = time.perf_counter()
+
             # --- 3.2 scope routing: compute readable × active set ----------
             trust_token = channel_trust(msg.channel)
             readable = self._scope_registry.filter_readable(
@@ -398,6 +401,7 @@ class Agent:
                 )
 
             # 8. Classify + persist — off the critical path. -----------------
+            write_scope: str = "-"
             if response_text:
                 # Scope-classify the full exchange over (owned ∩ readable).
                 owned_and_readable = [
@@ -418,6 +422,16 @@ class Agent:
                 ))
                 self._bg_tasks.add(task)
                 task.add_done_callback(self._bg_tasks.discard)
+
+            # --- 3.2 observability ----------------------------------------
+            active_str = ",".join(active)
+            total_ms = int((time.perf_counter() - scope_start_t) * 1000)
+            logger.info(
+                "scope_route role=%s channel=%s active=[%s] write=%s (t=%dms)",
+                self.config.role, msg.channel, active_str,
+                write_scope,
+                total_ms,
+            )
 
             # 9. SessionRegistry — only SDK session id now. --------------------
             if sdk_session_id:
