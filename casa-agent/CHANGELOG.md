@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.8.1 — 2026-04-21 — Debian base image (onnxruntime compatibility)
+
+### Changed
+- Base image migrated from `amd64-base-python:3.12-alpine3.22` to
+  `amd64-base-debian:bookworm`. Alpine ships no `musllinux` wheels for
+  `onnxruntime` (a transitive dep of `fastembed>=0.4`), forcing a
+  from-source build that failed under the addon's build constraints.
+  Debian/glibc pulls the prebuilt `manylinux_2_17_x86_64` wheel.
+- Container Python is now 3.11 (Debian bookworm default), down from
+  3.12. Casa's code uses only 3.9+ features; dev-host test suite runs
+  on 3.11.9 so container Python now matches.
+- Python deps installed into a virtualenv at `/opt/casa/venv` (PEP 668
+  "externally managed" environment on Debian prevents direct `pip
+  install` to system site-packages). The venv's `bin/` is prepended to
+  `PATH` so all `python3` invocations in s6 service + setup scripts
+  resolve to the venv interpreter without script changes.
+
+### Dependencies
+- Node.js 18 (Debian bookworm apt) replaces Alpine's nodejs (identical
+  major version; `@anthropic-ai/claude-code` engine constraint
+  `>=18.0.0` still satisfied).
+
+### Image size
+- Uncompressed image grows by ~200-350 MB (Debian base + Python stack
+  larger than Alpine). No impact on the N150's 120 GB storage.
+
 ## 0.8.0 — 2026-04-20 — Phase 3.2: Domain scope runtime
 
 ### Added
