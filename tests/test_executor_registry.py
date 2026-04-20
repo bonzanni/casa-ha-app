@@ -390,6 +390,27 @@ class TestOrphanRecovery:
             for r in caplog.records
         )
 
+    async def test_orphans_from_disk_non_list_logs_and_truncates(
+        self, tmp_path, caplog,
+    ):
+        """Valid JSON but not an array → ERROR log, truncate, return []."""
+        import json
+        import logging
+        from executor_registry import ExecutorRegistry
+
+        tomb = tmp_path / "del.json"
+        tomb.write_text(json.dumps({"not": "a list"}))
+        reg = ExecutorRegistry(str(tmp_path / "executors"),
+                               tombstone_path=str(tomb))
+        with caplog.at_level(logging.ERROR):
+            orphans = reg.orphans_from_disk()
+        assert orphans == []
+        assert json.loads(tomb.read_text()) == []
+        assert any(
+            "not a JSON array" in r.message
+            for r in caplog.records
+        )
+
     async def test_register_on_disk_failure_logs_warning(
         self, tmp_path, caplog,
     ):

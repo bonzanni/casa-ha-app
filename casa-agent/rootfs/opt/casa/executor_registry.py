@@ -226,8 +226,11 @@ class ExecutorRegistry:
                 "Tombstone file %s is not a JSON array; truncating",
                 self._tombstone_path,
             )
-            with open(self._tombstone_path, "w", encoding="utf-8") as fh:
-                json.dump([], fh)
+            try:
+                with open(self._tombstone_path, "w", encoding="utf-8") as fh:
+                    json.dump([], fh)
+            except OSError:
+                pass
             return []
         records: list[DelegationRecord] = []
         for row in raw:
