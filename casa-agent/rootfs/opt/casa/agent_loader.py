@@ -411,6 +411,43 @@ def load_agent_from_dir(
             f"{_DELEGATE_MCP_TOOL!r}"
         )
 
+    # --- 3.2 scope validation -------------------------------------------
+    mem = cfg.memory
+    if tier == "resident":
+        if mem.scopes_readable:
+            # scopes_owned ⊆ scopes_readable
+            missing = set(mem.scopes_owned) - set(mem.scopes_readable)
+            if missing:
+                raise LoadError(
+                    f"agent {role_from_path!r}: memory.scopes_owned must be a "
+                    f"subset of memory.scopes_readable; missing from readable: "
+                    f"{sorted(missing)}"
+                )
+            # default_scope required and must be in scopes_owned
+            if not mem.default_scope:
+                raise LoadError(
+                    f"agent {role_from_path!r}: memory.default_scope is "
+                    f"required when scopes_readable is non-empty"
+                )
+            if mem.default_scope not in mem.scopes_owned:
+                raise LoadError(
+                    f"agent {role_from_path!r}: memory.default_scope "
+                    f"{mem.default_scope!r} must be in scopes_owned "
+                    f"{mem.scopes_owned}"
+                )
+    else:  # executor
+        if mem.default_scope:
+            raise LoadError(
+                f"agent {role_from_path!r}: executor must not declare "
+                f"memory.default_scope"
+            )
+        if mem.scopes_owned or mem.scopes_readable:
+            # This is already enforced upstream per 3.1 but re-assert.
+            raise LoadError(
+                f"agent {role_from_path!r}: executor must not declare "
+                f"memory.scopes_owned or memory.scopes_readable"
+            )
+
     # Compose the system prompt.
     cfg.system_prompt = _compose_prompt(cfg, policies)
 
