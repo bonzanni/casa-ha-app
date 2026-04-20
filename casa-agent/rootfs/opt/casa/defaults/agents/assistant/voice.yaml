@@ -1,0 +1,6 @@
+schema_version: 1
+tone: [direct, warm, dry]
+cadence: natural
+forbidden_patterns:
+  - em_dash
+signature_phrases: {}
