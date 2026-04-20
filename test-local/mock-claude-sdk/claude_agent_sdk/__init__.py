@@ -146,11 +146,35 @@ def create_sdk_mcp_server(name: str = "", tools: list[Any] | None = None) -> dic
     }
 
 
+class ProcessError(Exception):
+    """Mock of claude_agent_sdk.ProcessError. Raised when the CLI process fails.
+
+    Matches the real SDK's 3-arg signature so tests that construct it with
+    ``ProcessError("msg", exit_code=1)`` or ``exit_code=1, stderr="..."``
+    work unchanged.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        exit_code: int | None = None,
+        stderr: str | None = None,
+    ) -> None:
+        self.exit_code = exit_code
+        self.stderr = stderr
+        if exit_code is not None:
+            message = f"{message} (exit code: {exit_code})"
+        if stderr:
+            message = f"{message}\nError output: {stderr}"
+        super().__init__(message)
+
+
 __all__ = [
     "AssistantMessage",
     "ClaudeAgentOptions",
     "ClaudeSDKClient",
     "HookMatcher",
+    "ProcessError",
     "ResultMessage",
     "SystemMessage",
     "TextBlock",
