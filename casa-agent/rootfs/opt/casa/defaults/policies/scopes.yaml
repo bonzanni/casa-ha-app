@@ -1,0 +1,26 @@
+schema_version: 1
+scopes:
+  personal:
+    minimum_trust: authenticated
+    description: |
+      Nicola's private life: relationships, friendships, non-work
+      correspondence, personal plans. Casual Telegram exchanges land
+      here when they don't clearly belong elsewhere.
+  business:
+    minimum_trust: authenticated
+    description: |
+      Professional life — ENPICOM employment, Lesina Holding
+      non-financial operations, work meetings, project deadlines,
+      professional correspondence.
+  finance:
+    minimum_trust: authenticated
+    description: |
+      Money movement — invoices, bills, payments, bank accounts,
+      VAT, taxes, budgets. Both Nicola's personal finance and Lesina
+      Holding operational finance land here.
+  house:
+    minimum_trust: household-shared
+    description: |
+      The physical house in Oudekamp: appliances, HVAC, lights,
+      plumbing, heating, contractors visiting, occupants and guests,
+      environment sensors and device state.

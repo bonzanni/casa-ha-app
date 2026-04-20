@@ -21,6 +21,7 @@ memory:
   read_strategy: per_turn
   scopes_owned: [personal, business, finance]
   scopes_readable: [personal, business, finance, house]
+  default_scope: personal
 channels:
   - telegram
   - webhook

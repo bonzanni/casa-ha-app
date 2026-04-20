@@ -13,6 +13,7 @@ memory:
   read_strategy: cached
   scopes_owned: [house]
   scopes_readable: [house]
+  default_scope: house
 channels:
   - ha_voice
 session:
