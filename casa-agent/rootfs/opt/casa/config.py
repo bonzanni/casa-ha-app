@@ -100,6 +100,10 @@ _VALID_READ_STRATEGIES = ("per_turn", "cached", "card_only")
 class MemoryConfig:
     token_budget: int = 4000
     read_strategy: str = "per_turn"
+    # Phase 3.1 scope metadata — parsed but not read at runtime in v0.6.0.
+    # 3.2 will add these as MemoryProvider call parameters.
+    scopes_owned: list[str] = field(default_factory=list)
+    scopes_readable: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -130,6 +134,9 @@ class AgentConfig:
     model: str = ""
     personality: str = ""
     description: str = ""
+    # Phase 3.1: executors may ship bundled-disabled. Harmless no-op for
+    # residents (the resident loader never checks this).
+    enabled: bool = True
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     mcp_server_names: list[str] = field(default_factory=list)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -168,6 +175,8 @@ def _build_memory_config(raw: dict[str, Any] | None) -> MemoryConfig:
     return MemoryConfig(
         token_budget=raw.get("token_budget", 4000),
         read_strategy=strategy,
+        scopes_owned=list(raw.get("scopes_owned") or []),
+        scopes_readable=list(raw.get("scopes_readable") or []),
     )
 
 
@@ -204,6 +213,7 @@ def load_agent_config(path: str) -> AgentConfig:
         model=resolve_model(data.get("model", "")),
         personality=data.get("personality", ""),
         description=data.get("description", ""),
+        enabled=bool(data.get("enabled", True)),
         tools=_build_tools_config(data.get("tools")),
         mcp_server_names=data.get("mcp_server_names", []),
         memory=_build_memory_config(data.get("memory")),
