@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -835,3 +836,71 @@ class TestResumeResilience:
         msg = warning_records[0].getMessage()
         assert "voice:probe-scope" in msg
         assert "stale-sid-xyz" in msg
+
+
+# ---------------------------------------------------------------------------
+# TestOriginVar — Phase 3.1 §6.6
+# ---------------------------------------------------------------------------
+
+
+class TestOriginVar:
+    """`origin_var` is set for the duration of a turn and reset on exit.
+    Nested asyncio tasks (spawned from a tool handler) inherit the value
+    via asyncio's contextvars snapshot."""
+
+    async def test_origin_var_set_during_turn(self, tmp_path):
+        """FakeClient captures origin_var.get(None) inside receive_response
+        (which runs while the turn is in-flight). After the turn returns
+        we expect origin_var to be reset to None (default sentinel)."""
+        import agent as agent_mod
+
+        captured: dict[str, Any] = {}
+
+        class CapturingClient(FakeClient):
+            async def receive_response(self):
+                captured["inside_turn"] = agent_mod.origin_var.get(None)
+                async for m in super().receive_response():
+                    yield m
+
+        mem = FakeMemory()
+        a = _make_agent(mem, tmp_path, role="assistant")
+        msg = _msg("telegram", "777", "hello")
+        with patch("agent.ClaudeSDKClient", CapturingClient):
+            await a._process(msg)
+
+        assert captured["inside_turn"] is not None
+        origin = captured["inside_turn"]
+        assert origin["role"] == "assistant"
+        assert origin["channel"] == "telegram"
+        assert origin["chat_id"] == "777"
+        assert origin["user_text"] == "hello"
+
+        # After the turn, ContextVar is back to None.
+        assert agent_mod.origin_var.get(None) is None
+
+    async def test_origin_var_inherited_by_child_task(self, tmp_path):
+        """A task spawned from inside receive_response must see the same
+        origin value — this is the pattern delegate_to_agent relies on."""
+        import asyncio as _asyncio
+        import agent as agent_mod
+
+        child_saw: dict[str, Any] = {}
+
+        class SpawningClient(FakeClient):
+            async def receive_response(self):
+                async def _child():
+                    child_saw["origin"] = agent_mod.origin_var.get(None)
+                t = _asyncio.create_task(_child())
+                await t
+                async for m in super().receive_response():
+                    yield m
+
+        mem = FakeMemory()
+        a = _make_agent(mem, tmp_path, role="butler")
+        msg = _msg("voice", "living-room", "lights on")
+        with patch("agent.ClaudeSDKClient", SpawningClient):
+            await a._process(msg)
+
+        assert child_saw["origin"] is not None
+        assert child_saw["origin"]["channel"] == "voice"
+        assert child_saw["origin"]["role"] == "butler"

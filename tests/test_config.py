@@ -177,3 +177,56 @@ def test_unknown_read_strategy_raises(tmp_path):
     )
     with pytest.raises(ValueError, match="read_strategy"):
         load_agent_config(str(p))
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.1 schema — enabled + scopes
+# ---------------------------------------------------------------------------
+
+
+def test_enabled_defaults_true(tmp_path):
+    p = tmp_path / "a.yaml"
+    p.write_text(
+        "name: T\nrole: assistant\nmodel: opus\npersonality: x\n",
+        encoding="utf-8",
+    )
+    cfg = load_agent_config(str(p))
+    assert cfg.enabled is True
+
+
+def test_enabled_false_parsed(tmp_path):
+    p = tmp_path / "a.yaml"
+    p.write_text(
+        "name: T\nrole: alex\nmodel: sonnet\npersonality: x\nenabled: false\n",
+        encoding="utf-8",
+    )
+    cfg = load_agent_config(str(p))
+    assert cfg.enabled is False
+
+
+def test_scopes_default_empty(tmp_path):
+    p = tmp_path / "a.yaml"
+    p.write_text(
+        "name: T\nrole: assistant\nmodel: opus\npersonality: x\n",
+        encoding="utf-8",
+    )
+    cfg = load_agent_config(str(p))
+    assert cfg.memory.scopes_owned == []
+    assert cfg.memory.scopes_readable == []
+
+
+def test_scopes_parsed(tmp_path):
+    p = tmp_path / "a.yaml"
+    p.write_text(
+        "name: T\nrole: assistant\nmodel: opus\npersonality: x\n"
+        "memory:\n"
+        "  token_budget: 4000\n"
+        "  scopes_owned: [personal, business, finance]\n"
+        "  scopes_readable: [personal, business, finance, house]\n",
+        encoding="utf-8",
+    )
+    cfg = load_agent_config(str(p))
+    assert cfg.memory.scopes_owned == ["personal", "business", "finance"]
+    assert cfg.memory.scopes_readable == [
+        "personal", "business", "finance", "house",
+    ]
