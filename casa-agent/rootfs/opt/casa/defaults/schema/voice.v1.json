@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "casa:voice.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version":     {"const": 1},
+    "tone":               {"type": "array", "items": {"type": "string"}, "default": []},
+    "cadence":            {"type": "string", "enum": ["short", "natural", "elaborate"], "default": "natural"},
+    "forbidden_patterns": {"type": "array", "items": {"type": "string"}, "default": []},
+    "signature_phrases":  {"type": "object", "additionalProperties": {"type": "string"}, "default": {}}
+  }
+}

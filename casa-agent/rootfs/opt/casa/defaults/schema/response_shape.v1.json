@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "casa:response_shape.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version":              {"const": 1},
+    "max_sentences_confirmation":  {"type": "integer", "minimum": 1, "default": 2},
+    "max_sentences_status":        {"type": "integer", "minimum": 1, "default": 3},
+    "register":                    {"type": "string", "enum": ["spoken", "written"], "default": "written"},
+    "format":                      {"type": "string", "enum": ["plain", "markdown"], "default": "plain"},
+    "rules":                       {"type": "array", "items": {"type": "string"}, "default": []}
+  }
+}

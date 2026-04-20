@@ -4,3 +4,4 @@ python-telegram-bot==22.7
 aiohttp==3.13.5
 apscheduler==3.11.2
 pyyaml==6.0.3
+jsonschema==4.23.0
