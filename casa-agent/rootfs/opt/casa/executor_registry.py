@@ -74,6 +74,7 @@ class ExecutorRegistry:
         self._dir = executors_dir
         self._tombstone_path = tombstone_path
         self._configs: dict[str, AgentConfig] = {}
+        self._disabled_names: set[str] = set()
         self._delegations: dict[str, DelegationRecord] = {}
         self._lock = asyncio.Lock()
 
@@ -82,31 +83,37 @@ class ExecutorRegistry:
     def load(self) -> None:
         """Scan ``self._dir`` for ``*.yaml`` and register valid executors."""
         self._configs.clear()
-        if not os.path.isdir(self._dir):
-            return
-        for entry in sorted(os.listdir(self._dir)):
-            if not entry.endswith(".yaml"):
-                continue
-            path = os.path.join(self._dir, entry)
-            try:
-                cfg = load_agent_config(path)
-            except Exception as exc:
-                logger.error(
-                    "Failed to load executor %s: %s", path, exc,
-                )
-                continue
-            if not self._validate_tier2_shape(cfg, entry):
-                continue
-            if not cfg.enabled:
+        self._disabled_names.clear()
+        if os.path.isdir(self._dir):
+            for entry in sorted(os.listdir(self._dir)):
+                if not entry.endswith(".yaml"):
+                    continue
+                path = os.path.join(self._dir, entry)
+                try:
+                    cfg = load_agent_config(path)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to load executor %s: %s", path, exc,
+                    )
+                    continue
+                if not self._validate_tier2_shape(cfg, entry):
+                    continue
+                if not cfg.enabled:
+                    logger.info(
+                        "Executor %r bundled but disabled (file=%s)",
+                        cfg.role, entry,
+                    )
+                    self._disabled_names.add(cfg.role)
+                    continue
+                self._configs[cfg.role] = cfg
                 logger.info(
-                    "Executor %r bundled but disabled (file=%s)",
-                    cfg.role, entry,
+                    "Executor %r loaded (model=%s)", cfg.role, cfg.model,
                 )
-                continue
-            self._configs[cfg.role] = cfg
-            logger.info(
-                "Executor %r loaded (model=%s)", cfg.role, cfg.model,
-            )
+        logger.info(
+            "Executors: enabled=%s disabled=%s",
+            sorted(self._configs.keys()),
+            sorted(self._disabled_names),
+        )
 
     def _validate_tier2_shape(
         self, cfg: AgentConfig, entry: str,
