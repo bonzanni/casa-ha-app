@@ -17,9 +17,11 @@ def test_loads_assistant_and_butler(tmp_path):
     agents = tmp_path / "agents"
     agents.mkdir()
     _write(str(agents / "assistant.yaml"),
-           "name: Ellen\nrole: assistant\nmodel: opus\npersonality: a\n")
+           "name: Ellen\nrole: assistant\nmodel: opus\npersonality: a\n"
+           "channels: [telegram]\n")
     _write(str(agents / "butler.yaml"),
-           "name: Tina\nrole: butler\nmodel: haiku\npersonality: b\n")
+           "name: Tina\nrole: butler\nmodel: haiku\npersonality: b\n"
+           "channels: [ha_voice]\n")
     result = _load_agents_by_role(str(agents))
     assert set(result.keys()) == {"assistant", "butler"}
     assert result["assistant"].name == "Ellen"
@@ -31,24 +33,12 @@ def test_ignores_subagents_yaml(tmp_path):
     agents = tmp_path / "agents"
     agents.mkdir()
     _write(str(agents / "assistant.yaml"),
-           "name: Ellen\nrole: assistant\nmodel: opus\npersonality: a\n")
+           "name: Ellen\nrole: assistant\nmodel: opus\npersonality: a\n"
+           "channels: [telegram]\n")
     _write(str(agents / "subagents.yaml"),
            "automation-builder:\n  model: sonnet\n")
     result = _load_agents_by_role(str(agents))
     assert set(result.keys()) == {"assistant"}
-
-
-def test_skips_unknown_role_with_log(tmp_path, caplog):
-    from casa_core import _load_agents_by_role
-
-    agents = tmp_path / "agents"
-    agents.mkdir()
-    _write(str(agents / "alex.yaml"),
-           "name: Alex\nrole: finance\nmodel: sonnet\npersonality: c\n")
-    with caplog.at_level(logging.INFO):
-        result = _load_agents_by_role(str(agents))
-    assert result == {}
-    assert any("not in always-on set" in r.message for r in caplog.records)
 
 
 def test_duplicate_role_second_skipped(tmp_path, caplog):
@@ -57,9 +47,11 @@ def test_duplicate_role_second_skipped(tmp_path, caplog):
     agents = tmp_path / "agents"
     agents.mkdir()
     _write(str(agents / "a1.yaml"),
-           "name: A\nrole: assistant\nmodel: opus\npersonality: a\n")
+           "name: A\nrole: assistant\nmodel: opus\npersonality: a\n"
+           "channels: [telegram]\n")
     _write(str(agents / "a2.yaml"),
-           "name: B\nrole: assistant\nmodel: opus\npersonality: b\n")
+           "name: B\nrole: assistant\nmodel: opus\npersonality: b\n"
+           "channels: [telegram]\n")
     with caplog.at_level(logging.ERROR):
         result = _load_agents_by_role(str(agents))
     assert result["assistant"].name == "A"  # lexicographic order: a1 first
@@ -74,7 +66,8 @@ def test_legacy_main_file_migrates_via_config(tmp_path, caplog):
     agents = tmp_path / "agents"
     agents.mkdir()
     _write(str(agents / "assistant.yaml"),
-           "name: Ellen\nrole: main\nmodel: opus\npersonality: a\n")
+           "name: Ellen\nrole: main\nmodel: opus\npersonality: a\n"
+           "channels: [telegram]\n")
     with caplog.at_level(logging.WARNING):
         result = _load_agents_by_role(str(agents))
     assert "assistant" in result
@@ -86,3 +79,61 @@ def test_missing_directory_returns_empty(tmp_path):
 
     result = _load_agents_by_role(str(tmp_path / "nonexistent"))
     assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.1 — tier-boundary loader (channels: required)
+# ---------------------------------------------------------------------------
+
+
+def test_loads_any_role_with_channels(tmp_path):
+    """A new resident YAML with non-empty `channels:` is loaded
+    regardless of role name — allowlist is gone."""
+    from casa_core import _load_agents_by_role
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    _write(str(agents / "guest.yaml"),
+           "name: Guest\nrole: guest\nmodel: haiku\npersonality: g\n"
+           "channels: [telegram]\n")
+    result = _load_agents_by_role(str(agents))
+    assert "guest" in result
+    assert result["guest"].channels == ["telegram"]
+
+
+def test_skips_when_channels_empty(tmp_path, caplog):
+    """An agent YAML with missing / empty `channels:` is NOT loaded
+    as a resident (Tier 2 shape — must live in agents/executors/)."""
+    from casa_core import _load_agents_by_role
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    _write(str(agents / "stateless.yaml"),
+           "name: S\nrole: stateless\nmodel: haiku\npersonality: s\n")
+    with caplog.at_level(logging.ERROR):
+        result = _load_agents_by_role(str(agents))
+    assert "stateless" not in result
+    assert any(
+        "requires non-empty 'channels:'" in r.message
+        for r in caplog.records
+    )
+
+
+def test_executors_subdir_not_scanned(tmp_path):
+    """agents/executors/*.yaml must NOT be picked up by the Tier 1 loader.
+    os.listdir is non-recursive — files in a subdirectory are invisible."""
+    from casa_core import _load_agents_by_role
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    executors = agents / "executors"
+    executors.mkdir()
+    # Tier 2 shape: no channels.
+    _write(str(executors / "alex.yaml"),
+           "name: Alex\nrole: alex\nmodel: sonnet\npersonality: a\n")
+    # Tier 1 resident for comparison.
+    _write(str(agents / "assistant.yaml"),
+           "name: E\nrole: assistant\nmodel: opus\npersonality: e\n"
+           "channels: [telegram]\n")
+    result = _load_agents_by_role(str(agents))
+    assert set(result.keys()) == {"assistant"}
