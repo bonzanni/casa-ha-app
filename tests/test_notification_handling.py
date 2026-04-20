@@ -19,6 +19,16 @@ from session_registry import SessionRegistry
 pytestmark = pytest.mark.asyncio
 
 
+def _mk_scope_registry_stub():
+    from unittest.mock import Mock
+    reg = Mock()
+    reg.filter_readable.return_value = ["personal"]
+    reg.score.return_value = {"personal": 1.0}
+    reg.active_from_scores.return_value = ["personal"]
+    reg.argmax_scope.return_value = "personal"
+    return reg
+
+
 class FakeMemory(MemoryProvider):
     def __init__(self, context: str = "") -> None:
         self.context = context
@@ -100,6 +110,7 @@ def _make_agent(tmp_path, role="assistant") -> Agent:
         session_registry=SessionRegistry(str(tmp_path / "sess.json")),
         mcp_registry=McpServerRegistry(),
         channel_manager=ChannelManager(),
+        scope_registry=_mk_scope_registry_stub(),
     )
 
 

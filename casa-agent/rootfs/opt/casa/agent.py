@@ -6,7 +6,10 @@ import asyncio
 import logging
 from contextvars import ContextVar
 from dataclasses import replace
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+if TYPE_CHECKING:
+    from scope_registry import ScopeRegistry
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -61,12 +64,14 @@ class Agent:
         session_registry: SessionRegistry,
         mcp_registry: McpServerRegistry,
         channel_manager: ChannelManager,
+        scope_registry: "ScopeRegistry",
     ) -> None:
         self.config = config
         self._memory = memory
         self._session_registry = session_registry
         self._mcp_registry = mcp_registry
         self._channel_manager = channel_manager
+        self._scope_registry = scope_registry
         self._bg_tasks: set[asyncio.Task] = set()
         # Per-(session_id) over-budget streak tracker (spec 5.2 §5.2).
         # Per-instance so assistant (4000) and butler (800) budgets stay
