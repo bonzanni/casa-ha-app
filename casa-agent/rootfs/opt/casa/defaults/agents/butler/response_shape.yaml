@@ -1,0 +1,9 @@
+schema_version: 1
+max_sentences_confirmation: 2
+max_sentences_status: 3
+register: spoken
+format: plain
+rules:
+  - "No preamble, no filler."
+  - "Pick the most likely interpretation and act."
+  - "Report outcome in one short sentence."

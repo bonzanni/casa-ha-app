@@ -1,0 +1,6 @@
+schema_version: 1
+tone: [clear, efficient]
+cadence: short
+forbidden_patterns:
+  - "I'll"
+  - "Let me"
