@@ -434,8 +434,18 @@ async def main() -> None:
 
     # 7. Framework tools
     from tools import create_casa_tools, init_tools
+    from executor_registry import ExecutorRegistry
 
-    init_tools(channel_manager, bus)
+    # Phase 3.1 Task 7: init_tools now takes an ExecutorRegistry so the
+    # delegate_to_agent tool can resolve Tier 2 executor configs. Task 10
+    # replaces this stub with a directory scan + orphan recovery.
+    executor_registry = ExecutorRegistry(
+        os.path.join(CONFIG_DIR, "agents", "executors"),
+        tombstone_path=os.path.join(DATA_DIR, "delegations.json"),
+    )
+    executor_registry.load()
+
+    init_tools(channel_manager, bus, executor_registry)
     casa_tools_config = create_casa_tools()
     mcp_registry.register_sdk("casa-framework", casa_tools_config)
     logger.info("Registered casa-framework MCP tools")
