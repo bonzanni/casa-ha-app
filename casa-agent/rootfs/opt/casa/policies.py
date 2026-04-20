@@ -100,7 +100,8 @@ def render_disclosure_section(resolved: dict[str, Any]) -> str:
         lines.append("Confidential on untrusted channels:")
         for cat_name, cat in cats.items():
             examples = ", ".join(cat.get("examples") or [])
-            lines.append(f"- {cat_name.capitalize()} ({examples})")
+            suffix = f" ({examples})" if examples else ""
+            lines.append(f"- {cat_name.capitalize()}{suffix}")
         lines.append("")
 
     safe = resolved.get("safe_on_any_channel") or []

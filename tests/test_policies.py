@@ -55,7 +55,7 @@ class TestLoad:
         pol_file = tmp_path / "disclosure.yaml"
         _write(pol_file, "schema_version: 99\npolicies: {}\n")
 
-        with pytest.raises(PolicyError, match="schema_version"):
+        with pytest.raises(PolicyError, match=r"schema violation.*1 was expected"):
             load_policies(str(pol_file))
 
     def test_unknown_field_raises(self, tmp_path):
