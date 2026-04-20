@@ -59,6 +59,83 @@ if [ ! -f "$CONFIG_DIR/policies/disclosure.yaml" ] \
     bashio::log.info "Seeded policies/disclosure.yaml"
 fi
 
+if [ ! -f "$CONFIG_DIR/policies/scopes.yaml" ] \
+   && [ -f "$DEFAULTS_DIR/policies/scopes.yaml" ]; then
+    cp "$DEFAULTS_DIR/policies/scopes.yaml" \
+       "$CONFIG_DIR/policies/scopes.yaml"
+    bashio::log.info "Seeded policies/scopes.yaml"
+fi
+
+# ------------------------------------------------------------------
+# 3.2 migration: add memory.default_scope to existing resident
+# runtime.yamls that predate v0.8.0. Idempotent via marker line.
+# ------------------------------------------------------------------
+
+migrate_default_scope() {
+    local runtime_file="$1"
+    local fallback_scope="$2"
+    local marker="# casa: default_scope v1"
+
+    [ -f "$runtime_file" ] || return 0
+    if grep -qF "$marker" "$runtime_file"; then
+        return 0  # already migrated
+    fi
+
+    if grep -qE "^\s*default_scope:" "$runtime_file"; then
+        # Present but unmarked — mark it and move on.
+        printf '\n%s\n' "$marker" >> "$runtime_file"
+        bashio::log.info "Marked existing default_scope in $runtime_file"
+        return 0
+    fi
+
+    # Insert `default_scope: <fallback>` as the last key inside the
+    # `memory:` block using Python sed-alike.
+    python3 - "$runtime_file" "$fallback_scope" "$marker" <<'PY'
+import sys, re, pathlib
+path, scope, marker = sys.argv[1], sys.argv[2], sys.argv[3]
+text = pathlib.Path(path).read_text(encoding="utf-8")
+new = re.sub(
+    r"(memory:\s*\n(?:[ \t]+\S.*\n)*)",
+    lambda m: m.group(1) + f"  default_scope: {scope}\n",
+    text, count=1,
+)
+if new == text:
+    sys.exit(0)  # no memory block — nothing to migrate
+new = new.rstrip() + f"\n{marker}\n"
+pathlib.Path(path).write_text(new, encoding="utf-8")
+PY
+    bashio::log.info "Migrated default_scope in $runtime_file → $fallback_scope"
+}
+
+migrate_default_scope "$CONFIG_DIR/agents/assistant/runtime.yaml" "personal"
+migrate_default_scope "$CONFIG_DIR/agents/butler/runtime.yaml"    "house"
+
+# ------------------------------------------------------------------
+# 3.2 migration: shorten butler/disclosure.yaml override
+# (drop redundant confidential categories; inherit deflection patterns).
+# ------------------------------------------------------------------
+
+migrate_butler_disclosure_v2() {
+    local disc_file="$CONFIG_DIR/agents/butler/disclosure.yaml"
+    local marker="# casa: butler_disclosure v2"
+
+    [ -f "$disc_file" ] || return 0
+    if grep -qF "$marker" "$disc_file"; then
+        return 0
+    fi
+
+    cat > "$disc_file" <<EOF
+$marker
+schema_version: 1
+policy: standard
+overrides:
+  categories: {}
+EOF
+    bashio::log.info "Migrated butler/disclosure.yaml (v2 — categories empty, inherit deflections)"
+}
+
+migrate_butler_disclosure_v2
+
 # Seed schemas (overwrite on every boot — schemas ship with the Casa
 # image and the image is the source of truth; hand-edits under
 # /addon_configs/casa-agent/schema/ get clobbered by design).
@@ -123,6 +200,20 @@ if bashio::config.true 'webhook_auth_enabled'; then
     bashio::log.info "Webhook authentication enabled."
 else
     rm -f "$SECRET_FILE"
+fi
+
+# ------------------------------------------------------------------
+# 3.2: opportunistic embedding-model pre-warm (non-fatal if offline).
+# ------------------------------------------------------------------
+
+if [ ! -d "$DATA_DIR/fastembed" ]; then
+    mkdir -p "$DATA_DIR/fastembed"
+    bashio::log.info "Priming fastembed cache at $DATA_DIR/fastembed (first boot)"
+    FASTEMBED_CACHE_PATH="$DATA_DIR/fastembed" python3 -c "
+from fastembed import TextEmbedding
+TextEmbedding(model_name='intfloat/multilingual-e5-small')
+print('fastembed model cached')
+" 2>&1 || bashio::log.warning "fastembed pre-warm failed; ScopeRegistry will retry at Python init or degrade"
 fi
 
 bashio::log.info "Configuration setup complete."
