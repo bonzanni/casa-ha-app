@@ -24,7 +24,7 @@ class TestLoader:
         reg = ExecutorRegistry(str(tmp_path / "executors"),
                                tombstone_path=str(tmp_path / "del.json"))
         reg.load()
-        assert reg.get("alex") is None
+        assert reg.get("finance") is None
 
     async def test_missing_dir_is_noop(self, tmp_path):
         from executor_registry import ExecutorRegistry
@@ -33,24 +33,24 @@ class TestLoader:
                                tombstone_path=str(tmp_path / "del.json"))
         # Must NOT raise.
         reg.load()
-        assert reg.get("alex") is None
+        assert reg.get("finance") is None
 
     async def test_loads_enabled_executor(self, tmp_path):
         from executor_registry import ExecutorRegistry
 
         executors = tmp_path / "executors"
         executors.mkdir()
-        _write(str(executors / "alex.yaml"),
-               "name: Alex\nrole: alex\nmodel: sonnet\npersonality: a\n"
+        _write(str(executors / "finance.yaml"),
+               "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
                "enabled: true\n"
                "memory:\n  token_budget: 0\n"
                "session:\n  strategy: ephemeral\n  idle_timeout: 0\n")
         reg = ExecutorRegistry(str(executors),
                                tombstone_path=str(tmp_path / "del.json"))
         reg.load()
-        cfg = reg.get("alex")
+        cfg = reg.get("finance")
         assert cfg is not None
-        assert cfg.role == "alex"
+        assert cfg.role == "finance"
         assert cfg.model == "claude-sonnet-4-6"
 
 
@@ -162,8 +162,8 @@ class TestEnabledFiltering:
 
         executors = tmp_path / "executors"
         executors.mkdir()
-        _write(str(executors / "alex.yaml"),
-               "name: Alex\nrole: alex\nmodel: sonnet\npersonality: a\n"
+        _write(str(executors / "finance.yaml"),
+               "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
                "enabled: false\n"
                "memory:\n  token_budget: 0\n"
                "session:\n  strategy: ephemeral\n  idle_timeout: 0\n")
@@ -172,10 +172,10 @@ class TestEnabledFiltering:
         with caplog.at_level(logging.INFO):
             reg.load()
         # Not registered for delegation dispatch.
-        assert reg.get("alex") is None
+        assert reg.get("finance") is None
         # One-line disabled-log present.
         assert any(
-            "disabled" in r.message.lower() and "alex" in r.message.lower()
+            "disabled" in r.message.lower() and "finance" in r.message.lower()
             for r in caplog.records
         )
 
@@ -196,7 +196,7 @@ class TestDelegationLifecycle:
 
         reg = self._make_registry(tmp_path)
         rec = DelegationRecord(
-            id="d-1", agent="alex", started_at=1.0,
+            id="d-1", agent="finance", started_at=1.0,
             origin={"role": "assistant", "channel": "telegram",
                     "chat_id": "x", "cid": "c1", "user_text": "hi"},
         )
@@ -210,7 +210,7 @@ class TestDelegationLifecycle:
 
         reg = self._make_registry(tmp_path)
         rec = DelegationRecord(
-            id="d-2", agent="alex", started_at=1.0,
+            id="d-2", agent="finance", started_at=1.0,
             origin={"role": "assistant", "channel": "telegram",
                     "chat_id": "x", "cid": "c1", "user_text": "hi"},
         )
@@ -223,7 +223,7 @@ class TestDelegationLifecycle:
 
         reg = self._make_registry(tmp_path)
         rec = DelegationRecord(
-            id="d-3", agent="alex", started_at=1.0,
+            id="d-3", agent="finance", started_at=1.0,
             origin={"role": "assistant", "channel": "telegram",
                     "chat_id": "x", "cid": "c1", "user_text": "hi"},
         )
@@ -249,7 +249,7 @@ class TestDelegationCompleteShape:
         from executor_registry import DelegationComplete
 
         c = DelegationComplete(
-            delegation_id="d-1", agent="alex", status="ok",
+            delegation_id="d-1", agent="finance", status="ok",
         )
         assert c.text == ""
         assert c.kind == ""
@@ -261,7 +261,7 @@ class TestDelegationCompleteShape:
         from executor_registry import DelegationComplete
 
         c = DelegationComplete(
-            delegation_id="d-1", agent="alex", status="ok",
+            delegation_id="d-1", agent="finance", status="ok",
             text="result text",
             origin={"role": "assistant"},
             elapsed_s=2.5,
@@ -283,7 +283,7 @@ class TestTombstone:
         reg = ExecutorRegistry(str(tmp_path / "executors"),
                                tombstone_path=str(tomb))
         rec = DelegationRecord(
-            id="d-1", agent="alex", started_at=1.0,
+            id="d-1", agent="finance", started_at=1.0,
             origin={"role": "assistant", "channel": "telegram",
                     "chat_id": "x", "cid": "c1", "user_text": "hi"},
         )
@@ -294,7 +294,7 @@ class TestTombstone:
         assert isinstance(data, list)
         assert len(data) == 1
         assert data[0]["id"] == "d-1"
-        assert data[0]["agent"] == "alex"
+        assert data[0]["agent"] == "finance"
         assert data[0]["origin"]["channel"] == "telegram"
 
     async def test_complete_removes_from_file(self, tmp_path):
@@ -304,7 +304,7 @@ class TestTombstone:
         reg = ExecutorRegistry(str(tmp_path / "executors"),
                                tombstone_path=str(tomb))
         rec = DelegationRecord(
-            id="d-1", agent="alex", started_at=1.0, origin={},
+            id="d-1", agent="finance", started_at=1.0, origin={},
         )
         await reg.register_delegation(rec)
         await reg.complete_delegation("d-1")
@@ -321,7 +321,7 @@ class TestTombstone:
                                tombstone_path=str(tomb))
         for i in range(3):
             await reg.register_delegation(DelegationRecord(
-                id=f"d-{i}", agent="alex", started_at=1.0, origin={},
+                id=f"d-{i}", agent="finance", started_at=1.0, origin={},
             ))
         import json
         data = json.loads(tomb.read_text())
@@ -345,12 +345,12 @@ class TestOrphanRecovery:
         import json
         tomb.write_text(json.dumps([
             {
-                "id": "orphan-1", "agent": "alex", "started_at": 100.0,
+                "id": "orphan-1", "agent": "finance", "started_at": 100.0,
                 "origin": {"role": "assistant", "channel": "telegram",
                            "chat_id": "x", "cid": "c1", "user_text": "hi"},
             },
             {
-                "id": "orphan-2", "agent": "alex", "started_at": 101.0,
+                "id": "orphan-2", "agent": "finance", "started_at": 101.0,
                 "origin": {"role": "assistant", "channel": "telegram",
                            "chat_id": "y", "cid": "c2", "user_text": "hey"},
             },
@@ -425,7 +425,7 @@ class TestOrphanRecovery:
         reg = ExecutorRegistry(str(tmp_path / "executors"),
                                tombstone_path=bad_path)
         rec = DelegationRecord(
-            id="d-1", agent="alex", started_at=1.0, origin={},
+            id="d-1", agent="finance", started_at=1.0, origin={},
         )
         with caplog.at_level(logging.WARNING):
             await reg.register_delegation(rec)

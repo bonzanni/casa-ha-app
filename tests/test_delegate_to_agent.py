@@ -26,7 +26,7 @@ pytestmark = pytest.mark.asyncio
 # ---------------------------------------------------------------------------
 
 
-def _executor_cfg(role: str = "alex", enabled: bool = True) -> AgentConfig:
+def _executor_cfg(role: str = "finance", enabled: bool = True) -> AgentConfig:
     return AgentConfig(
         name=role.capitalize(),
         role=role,
@@ -47,12 +47,12 @@ class _FakeExecutorClient:
     drive the 60s degradation path without actually waiting 60s.
     """
 
-    response_text: str = "alex reply"
+    response_text: str = "finance reply"
     delay_s: float = 0.0
     raise_in_receive: Exception | None = None
 
     @classmethod
-    def reset(cls, response="alex reply", delay=0.0, raise_exc=None):
+    def reset(cls, response="finance reply", delay=0.0, raise_exc=None):
         cls.response_text = response
         cls.delay_s = delay
         cls.raise_in_receive = raise_exc
@@ -166,8 +166,8 @@ class TestDisabledAgent:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "alex.yaml").write_text(
-            "name: Alex\nrole: alex\nmodel: sonnet\npersonality: a\n"
+        (executors / "finance.yaml").write_text(
+            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
             "enabled: false\n"
             "memory:\n  token_budget: 0\n"
             "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
@@ -182,7 +182,7 @@ class TestDisabledAgent:
 
         result = await _with_origin(
             delegate_to_agent.handler({
-                "agent": "alex", "task": "x", "context": "", "mode": "sync",
+                "agent": "finance", "task": "x", "context": "", "mode": "sync",
             }),
             _origin(),
         )
@@ -202,8 +202,8 @@ class TestSyncOk:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "alex.yaml").write_text(
-            "name: Alex\nrole: alex\nmodel: sonnet\npersonality: a\n"
+        (executors / "finance.yaml").write_text(
+            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
             "enabled: true\n"
             "memory:\n  token_budget: 0\n"
             "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
@@ -220,7 +220,7 @@ class TestSyncOk:
         with patch("tools.ClaudeSDKClient", _FakeExecutorClient):
             result = await _with_origin(
                 delegate_to_agent.handler({
-                    "agent": "alex", "task": "draft invoice",
+                    "agent": "finance", "task": "draft invoice",
                     "context": "lesina march",
                     "mode": "sync",
                 }),
@@ -228,7 +228,7 @@ class TestSyncOk:
             )
         payload = json.loads(result["content"][0]["text"])
         assert payload["status"] == "ok"
-        assert payload["agent"] == "alex"
+        assert payload["agent"] == "finance"
         assert payload["text"] == "invoice drafted"
         assert "delegation_id" in payload
         assert payload["elapsed_s"] >= 0
@@ -242,8 +242,8 @@ class TestSyncError:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "alex.yaml").write_text(
-            "name: Alex\nrole: alex\nmodel: sonnet\npersonality: a\n"
+        (executors / "finance.yaml").write_text(
+            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
             "enabled: true\n"
             "memory:\n  token_budget: 0\n"
             "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
@@ -260,7 +260,7 @@ class TestSyncError:
         with patch("tools.ClaudeSDKClient", _FakeExecutorClient):
             result = await _with_origin(
                 delegate_to_agent.handler({
-                    "agent": "alex", "task": "x", "context": "",
+                    "agent": "finance", "task": "x", "context": "",
                     "mode": "sync",
                 }),
                 _origin(),
@@ -292,7 +292,7 @@ class TestOriginMissing:
 
         # NOTE: not wrapped in _with_origin — origin_var stays None.
         result = await delegate_to_agent.handler({
-            "agent": "alex", "task": "x", "context": "", "mode": "sync",
+            "agent": "finance", "task": "x", "context": "", "mode": "sync",
         })
         payload = json.loads(result["content"][0]["text"])
         assert payload["status"] == "error"
@@ -316,8 +316,8 @@ class TestTimeoutDegrades:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "alex.yaml").write_text(
-            "name: Alex\nrole: alex\nmodel: sonnet\npersonality: a\n"
+        (executors / "finance.yaml").write_text(
+            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
             "enabled: true\n"
             "memory:\n  token_budget: 0\n"
             "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
@@ -338,14 +338,14 @@ class TestTimeoutDegrades:
         with patch("tools.ClaudeSDKClient", _FakeExecutorClient):
             result = await _with_origin(
                 delegate_to_agent.handler({
-                    "agent": "alex", "task": "slow task",
+                    "agent": "finance", "task": "slow task",
                     "context": "", "mode": "sync",
                 }),
                 _origin(),
             )
         payload = json.loads(result["content"][0]["text"])
         assert payload["status"] == "pending"
-        assert payload["agent"] == "alex"
+        assert payload["agent"] == "finance"
         assert "delegation_id" in payload
 
         # Let the background task finish so we don't leak it.
@@ -361,8 +361,8 @@ class TestTimeoutDegrades:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "alex.yaml").write_text(
-            "name: Alex\nrole: alex\nmodel: sonnet\npersonality: a\n"
+        (executors / "finance.yaml").write_text(
+            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
             "enabled: true\n"
             "memory:\n  token_budget: 0\n"
             "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
@@ -382,7 +382,7 @@ class TestTimeoutDegrades:
         with patch("tools.ClaudeSDKClient", _FakeExecutorClient):
             await _with_origin(
                 delegate_to_agent.handler({
-                    "agent": "alex", "task": "x", "context": "",
+                    "agent": "finance", "task": "x", "context": "",
                     "mode": "sync",
                 }),
                 _origin(),
@@ -414,8 +414,8 @@ class TestAsyncMode:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "alex.yaml").write_text(
-            "name: Alex\nrole: alex\nmodel: sonnet\npersonality: a\n"
+        (executors / "finance.yaml").write_text(
+            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
             "enabled: true\n"
             "memory:\n  token_budget: 0\n"
             "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
@@ -434,7 +434,7 @@ class TestAsyncMode:
             t0 = asyncio.get_event_loop().time()
             result = await _with_origin(
                 delegate_to_agent.handler({
-                    "agent": "alex", "task": "x", "context": "",
+                    "agent": "finance", "task": "x", "context": "",
                     "mode": "async",
                 }),
                 _origin(),
@@ -467,8 +467,8 @@ class TestCancellation:
 
         executors = tmp_path / "ex"
         executors.mkdir()
-        (executors / "alex.yaml").write_text(
-            "name: Alex\nrole: alex\nmodel: sonnet\npersonality: a\n"
+        (executors / "finance.yaml").write_text(
+            "name: Alex\nrole: finance\nmodel: sonnet\npersonality: a\n"
             "enabled: true\n"
             "memory:\n  token_budget: 0\n"
             "session:\n  strategy: ephemeral\n  idle_timeout: 0\n",
@@ -488,7 +488,7 @@ class TestCancellation:
             with patch("tools.ClaudeSDKClient", _FakeExecutorClient):
                 return await _with_origin(
                     delegate_to_agent.handler({
-                        "agent": "alex", "task": "x", "context": "",
+                        "agent": "finance", "task": "x", "context": "",
                         "mode": "sync",
                     }),
                     _origin(),

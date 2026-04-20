@@ -367,6 +367,22 @@ PY
 migrate_channels "$CONFIG_DIR/agents/assistant.yaml" "[telegram, webhook]"
 migrate_channels "$CONFIG_DIR/agents/butler.yaml" "[ha_voice]"
 
+# Mirror of migrate_executor_rename in setup-configs.sh
+migrate_executor_rename() {
+    local old="$CONFIG_DIR/agents/executors/alex.yaml"
+    local new="$CONFIG_DIR/agents/executors/finance.yaml"
+
+    if [ -f "$old" ] && [ ! -f "$new" ]; then
+        mv "$old" "$new"
+        sed -i 's/\r$//' "$new"
+        sed -i 's/^role:[[:space:]]*alex[[:space:]]*$/role: finance/' "$new"
+        sed -i 's/^name:[[:space:]]*alex[[:space:]]*$/name: Alex/' "$new"
+        echo "[INFO] Migrated executor alex.yaml -> finance.yaml"
+    fi
+}
+
+migrate_executor_rename
+
 if [ -f "$DATA_DIR/sessions.json" ]; then
     python3 - "$DATA_DIR/sessions.json" <<'PY'
 import json, pathlib, sys
@@ -388,7 +404,7 @@ PY
 fi
 
 for f in agents/assistant.yaml agents/butler.yaml agents/subagents.yaml \
-         agents/executors/alex.yaml schedules.yaml webhooks.yaml; do
+         agents/executors/finance.yaml schedules.yaml webhooks.yaml; do
     if [ ! -f "$CONFIG_DIR/$f" ]; then
         cp "$DEFAULTS_DIR/$f" "$CONFIG_DIR/$f"
         echo "[INFO] Created default config: $f"
