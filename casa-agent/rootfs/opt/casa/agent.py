@@ -404,10 +404,13 @@ class Agent:
             write_scope: str = "-"
             if response_text:
                 # Scope-classify the full exchange over (owned ∩ readable).
+                # Empty intersection = channel's trust tier forbids every
+                # scope the agent owns. Persisting to default_scope would
+                # leak the exchange into a scope the channel can't see —
+                # skip the write instead.
                 owned_and_readable = [
                     s for s in self.config.memory.scopes_owned if s in readable
                 ]
-                write_scope = self.config.memory.default_scope
                 if owned_and_readable:
                     write_scores = self._scope_registry.score(
                         f"{user_text}\n{response_text}",
@@ -416,12 +419,12 @@ class Agent:
                     write_scope = self._scope_registry.argmax_scope(
                         write_scores, self.config.memory.default_scope,
                     )
-                write_sid = f"{channel_key}:{write_scope}:{self.config.role}"
-                task = asyncio.create_task(self._add_turn_bg(
-                    write_sid, self.config.role, user_text, response_text, user_peer,
-                ))
-                self._bg_tasks.add(task)
-                task.add_done_callback(self._bg_tasks.discard)
+                    write_sid = f"{channel_key}:{write_scope}:{self.config.role}"
+                    task = asyncio.create_task(self._add_turn_bg(
+                        write_sid, self.config.role, user_text, response_text, user_peer,
+                    ))
+                    self._bg_tasks.add(task)
+                    task.add_done_callback(self._bg_tasks.discard)
 
             # --- 3.2 observability ----------------------------------------
             active_str = ",".join(active)

@@ -211,7 +211,7 @@ if [ ! -d "$DATA_DIR/fastembed" ]; then
     bashio::log.info "Priming fastembed cache at $DATA_DIR/fastembed (first boot)"
     FASTEMBED_CACHE_PATH="$DATA_DIR/fastembed" python3 -c "
 from fastembed import TextEmbedding
-TextEmbedding(model_name='intfloat/multilingual-e5-small')
+TextEmbedding(model_name='intfloat/multilingual-e5-large')
 print('fastembed model cached')
 " 2>&1 || bashio::log.warning "fastembed pre-warm failed; ScopeRegistry will retry at Python init or degrade"
 fi

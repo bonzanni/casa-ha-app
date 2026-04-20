@@ -406,6 +406,55 @@ class TestWritePath:
         # v0.8.0 preserves today's behaviour — gate on response_text truthy).
         assert memory.add_turn.await_count == 0
 
+    async def test_write_skipped_when_owned_and_readable_empty(self, monkeypatch):
+        """Trust-bypass regression: if the channel's trust tier filters out
+        every scope the agent owns, the write path must NOT fall back to
+        default_scope (which would leak the exchange into a scope the
+        channel can't see). Skip the write entirely."""
+        from agent import Agent, ClaudeSDKClient
+        from bus import BusMessage, MessageType
+
+        memory = Mock()
+        memory.ensure_session = AsyncMock()
+        memory.get_context = AsyncMock(return_value="")
+        memory.add_turn = AsyncMock()
+
+        # Webhook (external-authenticated) against assistant:
+        # readable reduced to [house]; owned = [personal, business, finance];
+        # intersection is empty.
+        reg = Mock()
+        reg.filter_readable = Mock(return_value=["house"])
+        reg.score = Mock(return_value={"house": 0.1})
+        reg.active_from_scores = Mock(return_value=["house"])
+        reg.argmax_scope = Mock(return_value="house")
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            FakeClient.reset()
+            FakeClient.response_text = "reply from assistant"
+
+            agent = Agent(
+                config=_make_agent_config(),   # owned=[personal, business, finance]
+                memory=memory,
+                session_registry=Mock(get=Mock(return_value=None),
+                                      touch=AsyncMock(),
+                                      register=AsyncMock()),
+                mcp_registry=Mock(resolve=Mock(return_value={})),
+                channel_manager=Mock(),
+                scope_registry=reg,
+            )
+
+            await agent._process(BusMessage(
+                type=MessageType.CHANNEL_IN, source="webhook", target="assistant",
+                content="probe", channel="webhook", context={"chat_id": "ext1"},
+            ))
+        await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
+
+        # owned∩readable is empty → no write. The classifier score() call
+        # for the write step should also be skipped (only the read-side
+        # score() call should appear).
+        assert memory.add_turn.await_count == 0
+        assert reg.score.call_count == 1  # read-only; no write-side score
+
 
 class TestObservability:
     async def test_scope_route_log_emitted(self, monkeypatch, caplog):
