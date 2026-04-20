@@ -1,0 +1,5 @@
+schema_version: 1
+delegates:
+  - agent: finance
+    purpose: "invoicing, expense categorization, financial reporting"
+    when: "user asks about money, invoices, budgets, or financial reports"

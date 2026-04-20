@@ -1,0 +1,30 @@
+schema_version: 1
+model: "${PRIMARY_AGENT_MODEL}"
+enabled: true
+tools:
+  allowed:
+    - Read
+    - Write
+    - Edit
+    - Bash
+    - Skill
+    - mcp__casa-framework__delegate_to_agent
+    - mcp__casa-framework__send_message
+  disallowed: []
+  permission_mode: acceptEdits
+  max_turns: 20
+mcp_server_names:
+  - homeassistant
+  - casa-framework
+memory:
+  token_budget: 4000
+  read_strategy: per_turn
+  scopes_owned: [personal, business, finance]
+  scopes_readable: [personal, business, finance, house]
+channels:
+  - telegram
+  - webhook
+session:
+  strategy: persistent
+  idle_timeout: 86400
+cwd: /addon_configs/casa-agent/workspace

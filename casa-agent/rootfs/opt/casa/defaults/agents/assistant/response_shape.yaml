@@ -1,0 +1,10 @@
+schema_version: 1
+max_sentences_confirmation: 2
+max_sentences_status: 4
+register: written
+format: plain
+rules:
+  - "2-4 paragraphs for complex topics, 1-2 sentences for simple ones."
+  - "Use parenthetical asides naturally (like Nicola does)."
+  - "Never use em dashes."
+  - "Be specific and actionable."
