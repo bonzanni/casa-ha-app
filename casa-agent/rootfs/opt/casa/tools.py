@@ -127,12 +127,15 @@ def _attach_completion_callback(
     """Wire the bus NOTIFICATION post on delegation completion.
 
     Used by the degraded-sync and async paths. Task 7's sync-ok /
-    sync-error paths don't attach this — they bookkeep inline.
+    sync-error paths bookkeep inline.
     """
+    loop = asyncio.get_running_loop()
+
     def _done(t: asyncio.Task) -> None:
         if t.cancelled():
-            asyncio.ensure_future(_executor_registry.cancel_delegation(record.id))
+            loop.create_task(_executor_registry.cancel_delegation(record.id))
             return
+        complete: DelegationComplete | None = None
         try:
             text = t.result()
             complete = DelegationComplete(
@@ -143,7 +146,7 @@ def _attach_completion_callback(
                 origin=record.origin,
                 elapsed_s=time.time() - record.started_at,
             )
-            asyncio.ensure_future(_executor_registry.complete_delegation(record.id))
+            loop.create_task(_executor_registry.complete_delegation(record.id))
         except Exception as exc:
             kind = _classify_error(exc).value
             complete = DelegationComplete(
@@ -155,12 +158,12 @@ def _attach_completion_callback(
                 origin=record.origin,
                 elapsed_s=time.time() - record.started_at,
             )
-            asyncio.ensure_future(_executor_registry.fail_delegation(record.id, exc))
+            loop.create_task(_executor_registry.fail_delegation(record.id, exc))
 
-        if _bus is None:
+        if _bus is None or complete is None:
             return
         target_role = record.origin.get("role") or "assistant"
-        asyncio.ensure_future(_bus.notify(BusMessage(
+        loop.create_task(_bus.notify(BusMessage(
             type=MessageType.NOTIFICATION,
             source=record.agent,
             target=target_role,
