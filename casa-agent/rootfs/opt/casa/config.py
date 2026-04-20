@@ -128,6 +128,60 @@ class TTSConfig:
 
 
 @dataclass
+class CharacterConfig:
+    name: str = ""
+    archetype: str = ""
+    card: str = ""
+    prompt: str = ""
+
+
+@dataclass
+class VoiceConfig:
+    tone: list[str] = field(default_factory=list)
+    cadence: str = "natural"
+    forbidden_patterns: list[str] = field(default_factory=list)
+    signature_phrases: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class ResponseShapeConfig:
+    max_sentences_confirmation: int = 2
+    max_sentences_status: int = 3
+    register: str = "written"
+    format: str = "plain"
+    rules: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DisclosureConfig:
+    policy: str = ""
+    overrides: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class DelegateEntry:
+    agent: str
+    purpose: str
+    when: str
+
+
+@dataclass
+class TriggerSpec:
+    name: str
+    type: str                                   # interval | cron | webhook
+    minutes: int = 0
+    schedule: str = ""
+    path: str = ""
+    channel: str = ""
+    prompt: str = ""
+
+
+@dataclass
+class HooksConfig:
+    pre_tool_use: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class AgentConfig:
     name: str = ""
     role: str = ""
@@ -145,6 +199,19 @@ class AgentConfig:
     voice_errors: dict[str, str] = field(default_factory=dict)
     channels: list[str] = field(default_factory=list)
     cwd: str = ""
+
+    # Refactor — populated by agent_loader.load_agent_from_dir.
+    # Residents and executors both populate character, voice, response_shape,
+    # hooks. Residents additionally populate disclosure and delegates.
+    # triggers are on residents only (spec: executors cannot have triggers).
+    character: CharacterConfig = field(default_factory=CharacterConfig)
+    voice: VoiceConfig = field(default_factory=VoiceConfig)
+    response_shape: ResponseShapeConfig = field(default_factory=ResponseShapeConfig)
+    disclosure: DisclosureConfig | None = None
+    delegates: list[DelegateEntry] = field(default_factory=list)
+    triggers: list[TriggerSpec] = field(default_factory=list)
+    hooks: HooksConfig = field(default_factory=HooksConfig)
+    system_prompt: str = ""
 
 
 # ---------------------------------------------------------------------------
