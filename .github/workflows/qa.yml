@@ -42,6 +42,8 @@ jobs:
         run: bash test-local/e2e/test_sqlite_memory.sh
       - name: External surface (5.7)
         run: bash test-local/e2e/test_external_surface.sh
+      - name: Delegation
+        run: bash test-local/e2e/test_delegation.sh
 
   e2e-slow:
     if: github.event_name == 'schedule'
