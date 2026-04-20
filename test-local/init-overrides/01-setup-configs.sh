@@ -56,6 +56,78 @@ if [ ! -f "$CONFIG_DIR/policies/disclosure.yaml" ] \
     echo "[INFO] Seeded policies/disclosure.yaml"
 fi
 
+if [ ! -f "$CONFIG_DIR/policies/scopes.yaml" ] \
+   && [ -f "$DEFAULTS_DIR/policies/scopes.yaml" ]; then
+    cp "$DEFAULTS_DIR/policies/scopes.yaml" \
+       "$CONFIG_DIR/policies/scopes.yaml"
+    echo "[INFO] Seeded policies/scopes.yaml"
+fi
+
+# ------------------------------------------------------------------
+# 3.2 migration: add memory.default_scope to existing resident
+# runtime.yamls that predate v0.8.0. Idempotent via marker line.
+# ------------------------------------------------------------------
+
+migrate_default_scope() {
+    runtime_file="$1"
+    fallback_scope="$2"
+    marker="# casa: default_scope v1"
+
+    [ -f "$runtime_file" ] || return 0
+    if grep -qF "$marker" "$runtime_file"; then
+        return 0
+    fi
+    if grep -qE "^[[:space:]]*default_scope:" "$runtime_file"; then
+        printf '\n%s\n' "$marker" >> "$runtime_file"
+        echo "[INFO] Marked existing default_scope in $runtime_file"
+        return 0
+    fi
+    python3 - "$runtime_file" "$fallback_scope" "$marker" <<'PY'
+import sys, re, pathlib
+path, scope, marker = sys.argv[1], sys.argv[2], sys.argv[3]
+text = pathlib.Path(path).read_text(encoding="utf-8")
+new = re.sub(
+    r"(memory:\s*\n(?:[ \t]+\S.*\n)*)",
+    lambda m: m.group(1) + f"  default_scope: {scope}\n",
+    text, count=1,
+)
+if new == text:
+    sys.exit(0)
+new = new.rstrip() + f"\n{marker}\n"
+pathlib.Path(path).write_text(new, encoding="utf-8")
+PY
+    echo "[INFO] Migrated default_scope in $runtime_file → $fallback_scope"
+}
+
+migrate_default_scope "$CONFIG_DIR/agents/assistant/runtime.yaml" "personal"
+migrate_default_scope "$CONFIG_DIR/agents/butler/runtime.yaml"    "house"
+
+# ------------------------------------------------------------------
+# 3.2 migration: shorten butler/disclosure.yaml override
+# (drop redundant confidential categories; inherit deflection patterns).
+# ------------------------------------------------------------------
+
+migrate_butler_disclosure_v2() {
+    disc_file="$CONFIG_DIR/agents/butler/disclosure.yaml"
+    marker="# casa: butler_disclosure v2"
+
+    [ -f "$disc_file" ] || return 0
+    if grep -qF "$marker" "$disc_file"; then
+        return 0
+    fi
+
+    cat > "$disc_file" <<EOF
+$marker
+schema_version: 1
+policy: standard
+overrides:
+  categories: {}
+EOF
+    echo "[INFO] Migrated butler/disclosure.yaml (v2 — categories empty, inherit deflections)"
+}
+
+migrate_butler_disclosure_v2
+
 # Seed schemas (overwrite on every boot).
 if [ -d "$DEFAULTS_DIR/schema" ]; then
     cp "$DEFAULTS_DIR/schema"/*.json "$CONFIG_DIR/schema/" 2>/dev/null || true
