@@ -135,7 +135,57 @@ class ScopeRoutingTester(Tester):
     def recommend_from_sweep(
         self, reports: dict[Any, Report],
     ) -> Recommendation:
-        # Implemented in Task 4. Stub for now so the ABC contract holds.
-        raise NotImplementedError(
-            "recommend_from_sweep: wired in Task 4 of the 3.2.1 plan.",
+        """Policy:
+          1. Filter to reports where fallback_rate <= 0.20.
+          2. Also filter out values outside optimization_bounds["threshold"].
+          3. Among survivors, pick max accuracy; tiebreak on lower fallback_rate.
+          4. If no survivor, recommend None with a 'too noisy' justification.
+        """
+        lower, upper = self.optimization_bounds["threshold"]
+        # "current" = what the live system runs today. We don't try to
+        # infer it from the sweep (reports might not even include it);
+        # hardcode to the shipped default so Builder sees a stable value
+        # until it passes an explicit baseline in 3.5.
+        current = DEFAULT_THRESHOLD
+
+        survivors = [
+            (v, r) for v, r in reports.items()
+            if r.metrics.get("fallback_rate", 1.0) <= 0.20
+            and lower <= v <= upper
+        ]
+
+        if not survivors:
+            return Recommendation(
+                tester_id=self.id,
+                axis="threshold",
+                current=current,
+                recommended=None,
+                justification=(
+                    "No threshold in the swept range satisfied "
+                    "fallback_rate <= 0.20 AND lies within "
+                    f"optimization_bounds {self.optimization_bounds['threshold']}. "
+                    "The data is too noisy to recommend a change; "
+                    "grow the probe suite or inspect the sweep table."
+                ),
+                evidence=reports,
+            )
+
+        survivors.sort(
+            key=lambda kv: (
+                -kv[1].accuracy,
+                kv[1].metrics.get("fallback_rate", 1.0),
+            ),
+        )
+        best_v, best_r = survivors[0]
+        return Recommendation(
+            tester_id=self.id,
+            axis="threshold",
+            current=current,
+            recommended=best_v,
+            justification=(
+                f"threshold={best_v} gives accuracy={best_r.accuracy:.3f} "
+                f"with fallback_rate={best_r.metrics['fallback_rate']:.3f}; "
+                f"picked over {len(survivors) - 1} other survivor(s)."
+            ),
+            evidence=reports,
         )

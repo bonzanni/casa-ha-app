@@ -244,3 +244,106 @@ class TestScopeRoutingTesterFull:
             f"fallback_rate {report.metrics['fallback_rate']:.3f} "
             f"> cap {FALLBACK_CAP}"
         )
+
+
+class TestRecommendFromSweep:
+    def _fake_report(self, threshold, accuracy, fallback_rate):
+        from casa_eval.base import Report
+        return Report(
+            tester_id="scope_routing",
+            suite_id="scope_routing.default",
+            config={"threshold": threshold},
+            total=30,
+            passed=int(round(accuracy * 30)),
+            failed=30 - int(round(accuracy * 30)),
+            accuracy=accuracy,
+            metrics={"fallback_rate": fallback_rate},
+            failures=[],
+            timestamp="2026-04-21T00:00:00Z",
+        )
+
+    def test_picks_max_accuracy_among_survivors(self, lib):
+        from casa_eval.scope_routing import ScopeRoutingTester
+
+        reports = {
+            0.25: self._fake_report(0.25, 0.88, fallback_rate=0.05),
+            0.30: self._fake_report(0.30, 0.92, fallback_rate=0.10),  # winner
+            0.35: self._fake_report(0.35, 0.90, fallback_rate=0.15),
+            0.40: self._fake_report(0.40, 0.86, fallback_rate=0.25),  # over cap, excluded
+        }
+        rec = ScopeRoutingTester(scope_library=lib).recommend_from_sweep(reports)
+        assert rec.tester_id == "scope_routing"
+        assert rec.axis == "threshold"
+        assert rec.recommended == 0.30
+        assert rec.current == 0.35
+        assert "fallback_rate" in rec.justification or "accuracy" in rec.justification
+
+    def test_tiebreak_on_lower_fallback_rate(self, lib):
+        from casa_eval.scope_routing import ScopeRoutingTester
+
+        reports = {
+            0.25: self._fake_report(0.25, 0.90, fallback_rate=0.15),
+            0.30: self._fake_report(0.30, 0.90, fallback_rate=0.08),  # lower fallback -> wins
+        }
+        rec = ScopeRoutingTester(scope_library=lib).recommend_from_sweep(reports)
+        assert rec.recommended == 0.30
+
+    def test_refuses_outside_bounds(self, lib):
+        from casa_eval.scope_routing import ScopeRoutingTester
+
+        reports = {
+            0.15: self._fake_report(0.15, 0.95, fallback_rate=0.02),  # below 0.20 lower bound
+            0.35: self._fake_report(0.35, 0.80, fallback_rate=0.10),
+        }
+        rec = ScopeRoutingTester(scope_library=lib).recommend_from_sweep(reports)
+        # 0.15 is below optimization_bounds["threshold"] = (0.20, 0.50),
+        # so the tester must not recommend it.
+        assert rec.recommended == 0.35
+
+    def test_returns_none_when_all_exceed_fallback_cap(self, lib):
+        from casa_eval.scope_routing import ScopeRoutingTester
+
+        reports = {
+            0.35: self._fake_report(0.35, 0.90, fallback_rate=0.25),
+            0.40: self._fake_report(0.40, 0.85, fallback_rate=0.30),
+        }
+        rec = ScopeRoutingTester(scope_library=lib).recommend_from_sweep(reports)
+        assert rec.recommended is None
+        assert "too noisy" in rec.justification.lower() \
+            or "fallback" in rec.justification.lower()
+
+
+@pytest.mark.skipif(
+    os.environ.get("CASA_EVAL_SWEEP") != "1" or
+    os.environ.get("CASA_REAL_EMBED") != "1",
+    reason="set CASA_EVAL_SWEEP=1 CASA_REAL_EMBED=1 to run the sweep report",
+)
+class TestScopeRoutingSweep:
+    def test_sweep_prints_table_and_recommendation(self):
+        """Informational — never fails. Operator reads the printed table."""
+        import sys
+        from scope_registry import load_scope_library
+        from casa_eval.base import Suite
+        from casa_eval.scope_routing import ScopeRoutingTester
+
+        lib = load_scope_library(PROD_SCOPES_YAML)
+        tester = ScopeRoutingTester(scope_library=lib)
+        suite = Suite.from_yaml(FIXTURE_PATH)
+        values = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
+        reports = tester.sweep(suite, axis="threshold", values=values)
+
+        print("\n--- scope-routing sweep ---", file=sys.stderr)
+        print("threshold |  accuracy  | fallback  | top2  | mean_winner",
+              file=sys.stderr)
+        for v in values:
+            r = reports[v]
+            print(
+                f"  {v:.2f}    |   {r.accuracy:.3f}    |   {r.metrics['fallback_rate']:.3f}   "
+                f"| {r.metrics['top2_accuracy']:.3f} |    {r.metrics['mean_winner_score']:.3f}",
+                file=sys.stderr,
+            )
+
+        rec = tester.recommend_from_sweep(reports)
+        print(f"\nRecommendation: {rec.recommended} (current={rec.current})",
+              file=sys.stderr)
+        print(f"Justification: {rec.justification}", file=sys.stderr)
