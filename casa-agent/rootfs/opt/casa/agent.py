@@ -7,6 +7,7 @@ import logging
 import time
 from contextvars import ContextVar
 from dataclasses import replace
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
@@ -30,6 +31,7 @@ from hooks import resolve_hooks
 from log_cid import cid_var
 from mcp_registry import McpServerRegistry
 from channel_trust import channel_trust, channel_trust_display, user_peer_for_channel
+from timekeeping import resolve_tz
 from memory import MemoryProvider
 from session_registry import SessionRegistry, build_session_key
 from retry import retry_sdk_call
@@ -310,6 +312,15 @@ class Agent:
                 f"channel: {msg.channel}\n"
                 f"trust: {channel_trust_display(msg.channel)}\n"
                 "</channel_context>"
+            )
+            _now = datetime.now(resolve_tz())
+            system_parts.append(
+                f"\n<current_time>\n"
+                f"{_now.isoformat(timespec='seconds')} "
+                f"({_now.strftime('%A').lower()} "
+                f"{_now.strftime('%p').lower()}, "
+                f"week {_now.isocalendar().week})\n"
+                f"</current_time>"
             )
             system_prompt = "\n".join(system_parts)
 
