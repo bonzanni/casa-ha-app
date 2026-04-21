@@ -46,6 +46,16 @@
   `extra=` or additional score fields in the format string) to unblock
   the audit tool. Parser logic is fully tested against synthetic logs
   and will work the moment the emission ships the expected fields.
+- Measured sweep on the 35-case seed fixture shows accuracy is
+  **threshold-invariant over [0.20, 0.45]** — `mean_winner_score ~= 0.787`,
+  so every case sits above the entire optimization range and `argmax`
+  never falls back. `recommend_from_sweep` picks 0.20 by tiebreak only;
+  this is not a real improvement. `scope_threshold` stays at 0.35.
+  `ACCURACY_BASELINE` was measured at 0.80 on the seed fixture (not
+  0.85 as initially scoped) — raising it requires either dropping
+  cross-cutting probes from the default set or hardening
+  `scopes.yaml` descriptions to better differentiate
+  finance/business/personal. Tracked as a 3.2.2 follow-up.
 
 ### Notes — post-deploy recipe
 - Full-mode pytest on the live N150:
