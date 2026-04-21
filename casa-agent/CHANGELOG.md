@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.9.0 — 2026-04-21 — Phase 3.3: Scheduling v2 + builder-first config ergonomics
+
+### Added
+
+- **`get_schedule` framework tool** on `casa-framework` MCP server.
+  Returns the caller's own upcoming interval + cron triggers as a
+  markdown bullet list within a configurable `within_hours` window
+  (default 24, clamped to [1, 720]). Own-role visibility only.
+- **Unified `<field>_file:` prose externalization idiom.** New shared
+  `_resolve_prose` helper in `agent_loader.py` reads either an inline
+  YAML field or a relative markdown file under the agent dir. Applies
+  `_substitute_env` so external prompts see the same env-var
+  substitutions as inline strings. Path traversal + non-`.md`
+  extension rejected at load time.
+- **Schema support** for `prompt_file` and `card_file` alternatives
+  via `oneOf` branches in `character.v1.json` and `triggers.v1.json`.
+- **APScheduler hardening**: explicit timezone (`resolve_tz()`:
+  `CASA_TZ` → `TZ` → `Europe/Amsterdam`), `misfire_grace_time=600`,
+  `coalesce=True`, `max_instances=1`. Restart-safe and wall-clock
+  correct.
+- **`<current_time>` system-prompt block** — every agent turn gets an
+  ISO-8601 timestamp with weekday, time-of-day, and ISO week number
+  injected into the composed system prompt. Same timezone source as
+  the scheduler.
+- **`casa_tz` addon option** in `config.yaml`. Default
+  `Europe/Amsterdam`. Propagated to Python via `CASA_TZ` env var.
+- **`TriggerRegistry.list_jobs_for(role, within_hours)`** public method
+  backing the tool.
+- **Seeded defaults**: `assistant/prompts/system.md`,
+  `butler/prompts/system.md`, `executors/finance/prompts/system.md`
+  — system prompts extracted from inline. `assistant/triggers.yaml`
+  gains `morning-briefing` cron at `"0 8 * * 1-5"` Europe/Amsterdam
+  using `prompt_file: prompts/morning-briefing.md`.
+
+### Changed
+
+- `_build_character` and `_build_triggers` take `agent_dir` kwarg for
+  relative-path resolution.
+- `init_tools` in `tools.py` takes a new optional
+  `trigger_registry` kwarg.
+- Scheduler + trigger registry construction moved ahead of `init_tools`
+  call in `casa_core.py` so the tool has a live registry reference.
+- `_check_file_set` now skips subdirectories inside an agent dir (so
+  `prompts/` doesn't trigger the unknown-file guard).
+
+### Migration
+
+Pre-1.0.0 doctrine: no migration script. Existing
+`/addon_configs/casa-agent/agents/*/character.yaml` files using
+inline `prompt:` still validate and load. Users who want to benefit
+from markdown-editable system prompts can either delete the overlay
+(next boot re-seeds the updated defaults) or hand-move their prompt
+to `<agent>/prompts/system.md` and switch `character.yaml` to
+`prompt_file:`.
+
 ## 0.8.6 — 2026-04-21 — Pre-1.0.0 migration cleanup
 
 Codebase slimming pass. Removes every version-migration block in
