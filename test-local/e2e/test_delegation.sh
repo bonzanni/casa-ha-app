@@ -49,7 +49,9 @@ MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /addon_configs/casa-agent/agents/
 assert_log_contains "$NAME" "Executor 'finance' bundled but disabled"
 
 # Summary line: enabled=[] disabled=['finance'].
-docker logs "$NAME" 2>&1 | grep -qE "Executors: enabled=\[\] disabled=\['finance'\]" \
+# Use grep -F (fixed string) — GNU/BSD greps disagree on \[\] in ERE,
+# which made this assertion flake in CI even when the line was present.
+docker logs "$NAME" 2>&1 | grep -qF "Executors: enabled=[] disabled=['finance']" \
     || { docker logs "$NAME" 2>&1 | grep -i executor | tail -10; fail "D-1: summary line missing or wrong shape"; }
 
 # n8n not registered (no N8N_URL).
@@ -87,7 +89,7 @@ docker logs "$NAME" 2>&1 | grep -qE "Executor 'finance' loaded \(model=" \
     || { docker logs "$NAME" 2>&1 | grep -i executor | tail -10; fail "D-2: 'loaded' line missing"; }
 
 # Summary line reflects enabled finance.
-docker logs "$NAME" 2>&1 | grep -qE "Executors: enabled=\['finance'\] disabled=\[\]" \
+docker logs "$NAME" 2>&1 | grep -qF "Executors: enabled=['finance'] disabled=[]" \
     || { docker logs "$NAME" 2>&1 | grep -i executor | tail -10; fail "D-2: summary line shows wrong state"; }
 
 # No n8n registration (fixture has no N8N_URL).
@@ -172,7 +174,7 @@ MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /addon_configs/casa-agent/agents/
 assert_log_contains "$NAME" "Executor 'health' bundled but disabled"
 
 # Summary line has both finance and health in disabled set (sorted alphabetically).
-docker logs "$NAME" 2>&1 | grep -qE "Executors: enabled=\[\] disabled=\['finance', 'health'\]" \
+docker logs "$NAME" 2>&1 | grep -qF "Executors: enabled=[] disabled=['finance', 'health']" \
     || { docker logs "$NAME" 2>&1 | grep -i executor | tail -10; fail "D-3: summary line missing or wrong shape"; }
 
 stop_container "$NAME"
