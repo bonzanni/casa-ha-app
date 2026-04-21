@@ -3,13 +3,29 @@
   "$id": "casa:character.v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "name", "role", "archetype", "card", "prompt"],
+  "required": ["schema_version", "name", "role", "archetype"],
   "properties": {
     "schema_version": {"const": 1},
-    "name":      {"type": "string", "minLength": 1},
-    "role":      {"type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_-]*$"},
-    "archetype": {"type": "string", "minLength": 1},
-    "card":      {"type": "string", "minLength": 1},
-    "prompt":    {"type": "string", "minLength": 1}
-  }
+    "name":        {"type": "string", "minLength": 1},
+    "role":        {"type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_-]*$"},
+    "archetype":   {"type": "string", "minLength": 1},
+    "card":        {"type": "string", "minLength": 1},
+    "card_file":   {"type": "string", "minLength": 1, "pattern": "\\.md$"},
+    "prompt":      {"type": "string", "minLength": 1},
+    "prompt_file": {"type": "string", "minLength": 1, "pattern": "\\.md$"}
+  },
+  "allOf": [
+    {
+      "oneOf": [
+        {"required": ["card"], "not": {"required": ["card_file"]}},
+        {"required": ["card_file"], "not": {"required": ["card"]}}
+      ]
+    },
+    {
+      "oneOf": [
+        {"required": ["prompt"], "not": {"required": ["prompt_file"]}},
+        {"required": ["prompt_file"], "not": {"required": ["prompt"]}}
+      ]
+    }
+  ]
 }

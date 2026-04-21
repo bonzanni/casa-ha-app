@@ -74,3 +74,51 @@ class TestTriggersSchemaPromptFile:
             ],
         }
         jsonschema.validate(doc, schema)
+
+
+class TestCharacterSchemaPromptFile:
+    def test_accepts_prompt_and_card_inline(self):
+        schema = _load_schema("character")
+        doc = {
+            "schema_version": 1, "name": "Ellen", "role": "assistant",
+            "archetype": "assistant", "card": "x", "prompt": "y",
+        }
+        jsonschema.validate(doc, schema)
+
+    def test_accepts_prompt_file_and_card_file(self):
+        schema = _load_schema("character")
+        doc = {
+            "schema_version": 1, "name": "Ellen", "role": "assistant",
+            "archetype": "assistant",
+            "card_file": "prompts/card.md",
+            "prompt_file": "prompts/system.md",
+        }
+        jsonschema.validate(doc, schema)
+
+    def test_rejects_both_prompt_and_prompt_file(self):
+        schema = _load_schema("character")
+        doc = {
+            "schema_version": 1, "name": "Ellen", "role": "assistant",
+            "archetype": "assistant", "card": "x",
+            "prompt": "y", "prompt_file": "prompts/system.md",
+        }
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(doc, schema)
+
+    def test_rejects_neither_card_nor_card_file(self):
+        schema = _load_schema("character")
+        doc = {
+            "schema_version": 1, "name": "Ellen", "role": "assistant",
+            "archetype": "assistant", "prompt": "y",
+        }
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(doc, schema)
+
+    def test_rejects_neither_prompt_nor_prompt_file(self):
+        schema = _load_schema("character")
+        doc = {
+            "schema_version": 1, "name": "Ellen", "role": "assistant",
+            "archetype": "assistant", "card": "x",
+        }
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(doc, schema)
