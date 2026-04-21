@@ -41,6 +41,7 @@ from policies import load_policies
 from session_registry import SessionRegistry
 from session_sweeper import SessionSweeper
 from rate_limit import RateLimiter, rate_limit_response
+from timekeeping import resolve_tz
 from trigger_registry import TriggerRegistry
 
 logger = logging.getLogger(__name__)
@@ -766,7 +767,14 @@ async def main() -> None:
     # 13b. Scheduler + per-agent trigger registry (replaces the global
     # heartbeat block). Register before runner.setup() so webhook routes
     # land in *app* while the router is still mutable.
-    scheduler = AsyncIOScheduler()
+    scheduler = AsyncIOScheduler(
+        timezone=resolve_tz(),
+        job_defaults={
+            "misfire_grace_time": 600,   # 10 min — covers short Casa restarts
+            "coalesce": True,            # collapse missed fires to one
+            "max_instances": 1,          # no overlap of same job
+        },
+    )
     trigger_registry = TriggerRegistry(scheduler=scheduler, app=app, bus=bus)
     for role, cfg in role_configs.items():
         if cfg.triggers:
