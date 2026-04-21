@@ -56,7 +56,7 @@ assert_log_contains "$NAME" "SQLite memory provider initialized"
 pass "SQLite picked as default on fresh install"
 
 log "Turn 1 — /invoke records a row into memory.sqlite"
-curl -sf -X POST "http://localhost:${HOST_PORT}/invoke/assistant" \
+curl -sf -X POST "http://localhost:${HOST_PORT}/invoke/butler" \
     -H 'Content-Type: application/json' \
     -d '{"prompt":"E2E-MARKER-ONE","context":{"chat_id":"e2e"}}' >/dev/null \
     || fail "first /invoke failed"
@@ -86,7 +86,7 @@ print(c.execute(\"SELECT COUNT(*) FROM messages WHERE content LIKE '%E2E-MARKER-
 pass "turn 1 survived restart"
 
 log "Turn 2 — appending a second turn after restart"
-curl -sf -X POST "http://localhost:${HOST_PORT}/invoke/assistant" \
+curl -sf -X POST "http://localhost:${HOST_PORT}/invoke/butler" \
     -H 'Content-Type: application/json' \
     -d '{"prompt":"E2E-MARKER-TWO","context":{"chat_id":"e2e"}}' >/dev/null \
     || fail "second /invoke failed"
