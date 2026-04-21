@@ -44,6 +44,8 @@ jobs:
         run: bash test-local/e2e/test_external_surface.sh
       - name: Delegation
         run: bash test-local/e2e/test_delegation.sh
+      - name: E2E - scheduling
+        run: bash test-local/e2e/test_scheduling.sh
 
   e2e-slow:
     if: github.event_name == 'schedule'
