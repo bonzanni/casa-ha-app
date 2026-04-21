@@ -42,3 +42,8 @@ __all__ = [
     "Case", "Failure", "Recommendation", "Report", "Suite", "Tester",
     "list_testers", "get_tester",
 ]
+
+
+# Import-side-effect: registers ScopeRoutingTester via @_register.
+# Placed at module end so _register is fully defined first.
+from casa_eval import scope_routing as _scope_routing  # noqa: F401,E402
