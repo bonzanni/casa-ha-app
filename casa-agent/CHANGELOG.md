@@ -19,7 +19,7 @@ Spec at `docs/superpowers/specs/2026-04-21-3.2.2-scope-routing-hardening.md`.
   The flat-curve finding from v0.8.4 still holds — threshold tuning is
   a no-op at this fixture scale; the gain comes entirely from the
   description corpus change.
-- **Structured `scope_route` log emission.** `agent.py:441` now emits
+- **Structured `scope_route` log emission.** `agent.py:455` now emits
   via `logger.info("scope_route", extra={"channel": ..., "winner": ...,
   "winner_score": ..., "second_score": ..., "threshold": ...})`. New
   `_winner_pair()` helper computes the read-side winner from the
@@ -48,7 +48,7 @@ Spec at `docs/superpowers/specs/2026-04-21-3.2.2-scope-routing-hardening.md`.
   M-7..M-9 in `test_migration.sh`.
 
 Rollback: §10 of the spec. Backup file + marker removal restore v0.8.4
-runtime behaviour; reverting the formatter changes and `agent.py:441`
+runtime behaviour; reverting the formatter changes and `agent.py:455`
 restore prior log shape.
 
 ## 0.8.4 — 2026-04-21 — Scope-routing evaluation harness
