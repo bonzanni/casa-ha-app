@@ -56,6 +56,24 @@ if [ ! -f "$CONFIG_DIR/policies/disclosure.yaml" ] \
     echo "[INFO] Seeded policies/disclosure.yaml"
 fi
 
+# v0.8.5: refresh scope corpora to the keyword-style descriptions.
+# Marker prevents re-running on every boot. Manual edits made by the
+# user (or future Builder) AFTER the marker is written are preserved.
+# Placed ABOVE the seed-if-missing block below so migrations run first
+# (see reference_migrations_vs_seed_order memory note).
+SCOPE_MIGRATION_MARKER="$CONFIG_DIR/migrations/scope_corpus_v0.8.5.applied"
+if [ ! -f "$SCOPE_MIGRATION_MARKER" ] \
+   && [ -f "$CONFIG_DIR/policies/scopes.yaml" ] \
+   && [ -f "$DEFAULTS_DIR/policies/scopes.yaml" ]; then
+    mkdir -p "$CONFIG_DIR/migrations"
+    cp "$CONFIG_DIR/policies/scopes.yaml" \
+       "$CONFIG_DIR/policies/scopes.yaml.pre-v0.8.5.bak"
+    cp "$DEFAULTS_DIR/policies/scopes.yaml" \
+       "$CONFIG_DIR/policies/scopes.yaml"
+    touch "$SCOPE_MIGRATION_MARKER"
+    echo "[INFO] Migrated policies/scopes.yaml to v0.8.5 corpora (backup: scopes.yaml.pre-v0.8.5.bak)"
+fi
+
 if [ ! -f "$CONFIG_DIR/policies/scopes.yaml" ] \
    && [ -f "$DEFAULTS_DIR/policies/scopes.yaml" ]; then
     cp "$DEFAULTS_DIR/policies/scopes.yaml" \
