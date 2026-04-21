@@ -7,7 +7,10 @@ import json
 import logging
 import time
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from trigger_registry import TriggerRegistry
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -35,6 +38,7 @@ _channel_manager: ChannelManager | None = None
 _bus: MessageBus | None = None
 _executor_registry: ExecutorRegistry | None = None
 _mcp_registry: McpServerRegistry | None = None
+_trigger_registry: "TriggerRegistry | None" = None
 
 
 def init_tools(
@@ -42,18 +46,23 @@ def init_tools(
     bus: MessageBus,
     executor_registry: ExecutorRegistry,
     mcp_registry: McpServerRegistry | None = None,
+    trigger_registry: "TriggerRegistry | None" = None,
 ) -> None:
     """Initialize module-level references used by tool implementations.
 
     ``mcp_registry`` is required for executor MCP-tool resolution at
-    delegation time. Accepts ``None`` for legacy callers that don't pass
+    delegation time. ``trigger_registry`` is required for the
+    ``get_schedule`` tool; callers that don't pass it get a degraded
+    tool that returns "not initialized" on every call.
+    Accepts ``None`` for legacy callers that don't pass
     it (the `_build_executor_options` code path degrades to empty MCP
     servers — the executor still runs but with only built-in tools)."""
-    global _channel_manager, _bus, _executor_registry, _mcp_registry  # noqa: PLW0603
+    global _channel_manager, _bus, _executor_registry, _mcp_registry, _trigger_registry  # noqa: PLW0603
     _channel_manager = channel_manager
     _bus = bus
     _executor_registry = executor_registry
     _mcp_registry = mcp_registry
+    _trigger_registry = trigger_registry
 
 
 @tool(
@@ -334,10 +343,68 @@ async def delegate_to_agent(args: dict) -> dict:
     })
 
 
+# ---------------------------------------------------------------------------
+# get_schedule — Phase 3.3
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    "get_schedule",
+    "Return your upcoming scheduled triggers (interval + cron) within a "
+    "time window. Returns a markdown bullet list with name, type, cron/interval "
+    "description, and next fire time. Own-role only.",
+    {"within_hours": int},
+)
+async def get_schedule(args: dict) -> dict:
+    import agent as agent_mod
+
+    if _trigger_registry is None:
+        return {"content": [{"type": "text",
+                             "text": "Error: trigger registry not initialized"}]}
+
+    origin = agent_mod.origin_var.get(None)
+    if origin is None:
+        return {"content": [{"type": "text",
+                             "text": "Error: get_schedule called outside a turn context"}]}
+
+    role = origin.get("role") or ""
+    if not role:
+        return {"content": [{"type": "text",
+                             "text": "Error: turn origin has no role"}]}
+
+    raw_hours = args.get("within_hours", 24)
+    try:
+        within_hours = int(raw_hours) if raw_hours is not None else 24
+    except (TypeError, ValueError):
+        within_hours = 24
+    within_hours = max(1, min(720, within_hours))
+
+    summaries = _trigger_registry.list_jobs_for(
+        role=role, within_hours=within_hours,
+    )
+
+    if not summaries:
+        text = f"(no scheduled triggers in the next {within_hours} hours)"
+    else:
+        lines = []
+        for s in summaries:
+            if s.type == "cron":
+                desc = f"(cron, `{s.schedule_desc}`)"
+            else:
+                desc = f"(interval, {s.schedule_desc})"
+            lines.append(
+                f"- **{s.name}** {desc} — next: "
+                f"{s.next_fire.isoformat(timespec='seconds')}"
+            )
+        text = "\n".join(lines)
+
+    return {"content": [{"type": "text", "text": text}]}
+
+
 def create_casa_tools() -> dict[str, Any]:
     """Create and return the casa-framework MCP server config."""
     server = create_sdk_mcp_server(
         name="casa-framework",
-        tools=[send_message, delegate_to_agent],
+        tools=[send_message, delegate_to_agent, get_schedule],
     )
     return server
