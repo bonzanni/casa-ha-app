@@ -27,6 +27,13 @@ if [ -n "$val" ]; then
     printf '%s' "$val" > "${S6_ENV}/CLAUDE_CODE_OAUTH_TOKEN"
 fi
 
+# Map scope_threshold -> CASA_SCOPE_THRESHOLD (casa_core.py reads the
+# CASA_ prefix). Mirrors the real svc-casa/run behaviour.
+val=$(jq -r '.scope_threshold // empty' "$OPTIONS")
+if [ -n "$val" ]; then
+    printf '%s' "$val" > "${S6_ENV}/CASA_SCOPE_THRESHOLD"
+fi
+
 # Static version for test mode
 printf 'dev' > "${S6_ENV}/CASA_VERSION"
 

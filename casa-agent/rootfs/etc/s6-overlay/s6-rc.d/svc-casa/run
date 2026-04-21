@@ -31,6 +31,12 @@ export CASA_VERSION="$(bashio::addon.version)"
 # setup-configs.sh pre-warm so the runtime finds the downloaded model.
 export FASTEMBED_CACHE_PATH="/data/fastembed"
 
+# 3.2.1: scope classifier threshold — promoted from env-only default to
+# first-class addon option so Builder can tune it via supervisor.addon_options_set.
+# Runtime read at casa_core.py:427 is unchanged; only the source of the
+# env var changes (was: fallback 0.35; now: bashio::config value).
+export CASA_SCOPE_THRESHOLD="$(bashio::config 'scope_threshold')"
+
 # SUPERVISOR_TOKEN is injected automatically by the HA Supervisor.
 
 exec python3 /opt/casa/casa_core.py

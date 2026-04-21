@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.8.3"
+version: "0.8.4"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 init: false
@@ -55,6 +55,9 @@ options:
   # Workspace repos
   repos: []
 
+  # Domain-scope routing
+  scope_threshold: 0.35
+
 schema:
   public_url: str?
   claude_oauth_token: password
@@ -78,3 +81,4 @@ schema:
     - url: url
       path: str
       branch: str?
+  scope_threshold: "float(0.0,1.0)?"
