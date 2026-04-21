@@ -59,22 +59,6 @@ if [ ! -f "$CONFIG_DIR/policies/disclosure.yaml" ] \
     bashio::log.info "Seeded policies/disclosure.yaml"
 fi
 
-# v0.8.5: refresh scope corpora to the keyword-style descriptions.
-# Marker prevents re-running on every boot. Manual edits made by the
-# user (or future Builder) AFTER the marker is written are preserved.
-SCOPE_MIGRATION_MARKER="$CONFIG_DIR/migrations/scope_corpus_v0.8.5.applied"
-if [ ! -f "$SCOPE_MIGRATION_MARKER" ] \
-   && [ -f "$CONFIG_DIR/policies/scopes.yaml" ] \
-   && [ -f "$DEFAULTS_DIR/policies/scopes.yaml" ]; then
-    mkdir -p "$CONFIG_DIR/migrations"
-    cp "$CONFIG_DIR/policies/scopes.yaml" \
-       "$CONFIG_DIR/policies/scopes.yaml.pre-v0.8.5.bak"
-    cp "$DEFAULTS_DIR/policies/scopes.yaml" \
-       "$CONFIG_DIR/policies/scopes.yaml"
-    touch "$SCOPE_MIGRATION_MARKER"
-    bashio::log.info "Migrated policies/scopes.yaml to v0.8.5 corpora (backup: scopes.yaml.pre-v0.8.5.bak)"
-fi
-
 if [ ! -f "$CONFIG_DIR/policies/scopes.yaml" ] \
    && [ -f "$DEFAULTS_DIR/policies/scopes.yaml" ]; then
     cp "$DEFAULTS_DIR/policies/scopes.yaml" \
@@ -82,75 +66,11 @@ if [ ! -f "$CONFIG_DIR/policies/scopes.yaml" ] \
     bashio::log.info "Seeded policies/scopes.yaml"
 fi
 
-# ------------------------------------------------------------------
-# 3.2 migration: add memory.default_scope to existing resident
-# runtime.yamls that predate v0.8.0. Idempotent via marker line.
-# ------------------------------------------------------------------
-
-migrate_default_scope() {
-    local runtime_file="$1"
-    local fallback_scope="$2"
-    local marker="# casa: default_scope v1"
-
-    [ -f "$runtime_file" ] || return 0
-    if grep -qF "$marker" "$runtime_file"; then
-        return 0  # already migrated
-    fi
-
-    if grep -qE "^\s*default_scope:" "$runtime_file"; then
-        # Present but unmarked — mark it and move on.
-        printf '\n%s\n' "$marker" >> "$runtime_file"
-        bashio::log.info "Marked existing default_scope in $runtime_file"
-        return 0
-    fi
-
-    # Insert `default_scope: <fallback>` as the last key inside the
-    # `memory:` block using Python sed-alike.
-    python3 - "$runtime_file" "$fallback_scope" "$marker" <<'PY'
-import sys, re, pathlib
-path, scope, marker = sys.argv[1], sys.argv[2], sys.argv[3]
-text = pathlib.Path(path).read_text(encoding="utf-8")
-new = re.sub(
-    r"(memory:\s*\n(?:[ \t]+\S.*\n)*)",
-    lambda m: m.group(1) + f"  default_scope: {scope}\n",
-    text, count=1,
-)
-if new == text:
-    sys.exit(0)  # no memory block — nothing to migrate
-new = new.rstrip() + f"\n{marker}\n"
-pathlib.Path(path).write_text(new, encoding="utf-8")
-PY
-    bashio::log.info "Migrated default_scope in $runtime_file → $fallback_scope"
-}
-
-migrate_default_scope "$CONFIG_DIR/agents/assistant/runtime.yaml" "personal"
-migrate_default_scope "$CONFIG_DIR/agents/butler/runtime.yaml"    "house"
-
-# ------------------------------------------------------------------
-# 3.2 migration: shorten butler/disclosure.yaml override
-# (drop redundant confidential categories; inherit deflection patterns).
-# ------------------------------------------------------------------
-
-migrate_butler_disclosure_v2() {
-    local disc_file="$CONFIG_DIR/agents/butler/disclosure.yaml"
-    local marker="# casa: butler_disclosure v2"
-
-    [ -f "$disc_file" ] || return 0
-    if grep -qF "$marker" "$disc_file"; then
-        return 0
-    fi
-
-    cat > "$disc_file" <<EOF
-$marker
-schema_version: 1
-policy: standard
-overrides:
-  categories: {}
-EOF
-    bashio::log.info "Migrated butler/disclosure.yaml (v2 — categories empty, inherit deflections)"
-}
-
-migrate_butler_disclosure_v2
+# Pre-1.0.0 doctrine (see memory/feedback_ship_gate_doctrine.md): no
+# migration blocks in this script. Breaking changes just update the
+# defaults; the overlay at /addon_configs/casa-agent/ is expected to
+# be wiped across updates in development mode. This keeps
+# setup-configs.sh lean. Revisit when v1.0.0 ships.
 
 # Seed schemas (overwrite on every boot — schemas ship with the Casa
 # image and the image is the source of truth; hand-edits under
