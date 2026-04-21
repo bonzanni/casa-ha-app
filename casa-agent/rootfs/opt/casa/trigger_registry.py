@@ -11,6 +11,8 @@ only understood assistant-level scheduling.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from aiohttp import web
@@ -29,6 +31,14 @@ class TriggerError(Exception):
     """Raised on any trigger-wiring conflict or invalid shape."""
 
 
+@dataclass
+class TriggerSummary:
+    name: str
+    type: str            # "interval" | "cron"
+    schedule_desc: str   # "every 30m" or the raw 5-field cron
+    next_fire: datetime  # tz-aware
+
+
 class TriggerRegistry:
     def __init__(
         self,
@@ -42,6 +52,7 @@ class TriggerRegistry:
         self._bus = bus
         self._seen_job_ids: set[str] = set()
         self._seen_webhook_paths: set[str] = set()
+        self._specs_by_job_id: dict[str, TriggerSpec] = {}
 
     def register_agent(
         self,
@@ -128,6 +139,7 @@ class TriggerRegistry:
                 day_of_week=day_of_week, id=job_id,
             )
         self._seen_job_ids.add(job_id)
+        self._specs_by_job_id[job_id] = trig
 
     def _register_webhook(self, role: str, trig: TriggerSpec) -> None:
         async def _handler(request: web.Request) -> web.Response:
@@ -156,3 +168,42 @@ class TriggerRegistry:
             return web.json_response({"status": "accepted"})
 
         self._app.router.add_post(trig.path, _handler)
+
+    def list_jobs_for(
+        self, role: str, within_hours: int,
+    ) -> list[TriggerSummary]:
+        """Return summaries of this agent's scheduled jobs firing in the window.
+
+        Sorted by next fire time ascending. Does not include webhook
+        triggers (they have no schedule).
+        """
+        within_hours = max(1, min(720, int(within_hours)))
+        now = datetime.now(self._scheduler.timezone)
+        cutoff = now + timedelta(hours=within_hours)
+
+        out: list[TriggerSummary] = []
+        prefix = f"{role}:"
+        for job in self._scheduler.get_jobs():
+            if not job.id.startswith(prefix):
+                continue
+            next_fire = job.next_run_time
+            if next_fire is None or next_fire > cutoff:
+                continue
+            trig = self._specs_by_job_id.get(job.id)
+            if trig is None:
+                continue
+            if trig.type == "interval":
+                schedule_desc = f"every {trig.minutes}m"
+            elif trig.type == "cron":
+                schedule_desc = trig.schedule
+            else:
+                continue
+            out.append(TriggerSummary(
+                name=trig.name,
+                type=trig.type,
+                schedule_desc=schedule_desc,
+                next_fire=next_fire,
+            ))
+
+        out.sort(key=lambda s: s.next_fire)
+        return out
