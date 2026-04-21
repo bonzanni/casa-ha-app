@@ -97,9 +97,9 @@ class Recommendation:
             "current": self.current,
             "recommended": self.recommended,
             "justification": self.justification,
-            # JSON object keys must be strings; stringify the axis values.
+            # JSON object keys must be strings; stringify numeric axis values.
             "evidence": {
-                str(k): (v.to_json() if isinstance(v, Report) else v)
+                str(k): (asdict(v) if isinstance(v, Report) else v)
                 for k, v in self.evidence.items()
             },
         })
