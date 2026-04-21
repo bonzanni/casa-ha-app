@@ -4,18 +4,27 @@
 # Build: docker build -f test-local/Dockerfile.test -t casa-test .
 # Run:   docker run --rm -p 8080:8080 casa-test
 
-# Base: ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.22
-# Digest pinned 2026-04-18 (HA base 2026.04.0). Refresh deliberately:
+# Base: ghcr.io/home-assistant/amd64-base-debian:bookworm
+# Migrated from alpine-python:3.12 in v0.8.5 — mirrors the main
+# casa-agent/Dockerfile migration shipped in v0.8.1. fastembed>=0.4
+# depends on onnxruntime, which ships manylinux wheels only (no
+# musllinux), so the Alpine base can't install the test dependencies.
+#
+# Digest pinned 2026-04-21. Refresh deliberately:
 #   docker buildx imagetools inspect \
-#     ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.22 \
+#     ghcr.io/home-assistant/amd64-base-debian:bookworm \
 #     --format '{{ json . }}' | jq -r '.manifest.digest'
 # Rationale: floating tags let a silent base-image update change
 # test behaviour with no record in this repo. See 5.3 spec §4.
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-python@sha256:cb37b54194179d8af605d3a35c28daa4d65a9bfc9bd3d7bbe19a62fcaff0fbce
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian@sha256:8dca988e5ecd0e890792d3d0c73333977314b177265108e4b559f2d9d22e85aa
 FROM ${BUILD_FROM}
 
-# --- Same as casa-agent/Dockerfile ---
-RUN apk add --no-cache nodejs npm git nginx jq curl \
+# --- Mirrors casa-agent/Dockerfile (Debian bookworm) ---
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         python3 python3-pip python3-venv \
+         nodejs npm git nginx-light jq curl ca-certificates netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/* \
     && npm install -g @anthropic-ai/claude-code \
     && npm cache clean --force
 
@@ -31,12 +40,18 @@ RUN case "${TARGETARCH}" in \
        -o /usr/bin/ttyd \
     && chmod +x /usr/bin/ttyd
 
+# Python venv at /opt/casa/venv (mirrors main Dockerfile) — Debian 12
+# system Python is PEP 668 "externally managed"; the venv keeps pip off
+# system site-packages without --break-system-packages.
+RUN python3 -m venv /opt/casa/venv
+ENV PATH="/opt/casa/venv/bin:${PATH}"
+
 COPY casa-agent/requirements.txt /tmp/
-RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+RUN /opt/casa/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
 
 # E2E: swap the real Claude Agent SDK for the offline mock.
 COPY test-local/mock-claude-sdk /tmp/mock-claude-sdk
-RUN pip3 install --no-cache-dir --force-reinstall --no-deps /tmp/mock-claude-sdk \
+RUN /opt/casa/venv/bin/pip install --no-cache-dir --force-reinstall --no-deps /tmp/mock-claude-sdk \
  && python3 -c "from claude_agent_sdk import ClaudeSDKClient; print('mock SDK active')"
 
 COPY casa-agent/rootfs /
