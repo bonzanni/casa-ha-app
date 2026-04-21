@@ -25,6 +25,27 @@ from typing import IO
 
 from log_redact import RedactingFilter
 
+# Module-level constant — Python's stock LogRecord attributes. Anything
+# else attached to a record (via logger.*("msg", extra={...}) or by a
+# LogRecordFactory) is treated as a structured extra by both formatters
+# below. Keep in sync if upstream Python adds attributes (3.12 added
+# taskName).
+STANDARD_LOGRECORD_ATTRS = frozenset({
+    "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+    "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+    "created", "msecs", "relativeCreated", "thread", "threadName",
+    "processName", "process", "message", "cid", "asctime", "taskName",
+})
+
+
+def _record_extras(record: logging.LogRecord) -> dict:
+    """Return non-standard LogRecord attrs as a flat dict."""
+    return {
+        k: v for k, v in record.__dict__.items()
+        if k not in STANDARD_LOGRECORD_ATTRS and not k.startswith("_")
+    }
+
+
 # ---------------------------------------------------------------------------
 # Context var + cid helpers
 # ---------------------------------------------------------------------------
@@ -67,9 +88,24 @@ _HUMAN_FORMAT = "%(asctime)s [%(levelname)s] %(name)s cid=%(cid)s: %(message)s"
 _ISO_UTC_DATEFMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
-def _human_formatter() -> logging.Formatter:
-    """ISO-UTC human format: ``2026-04-18T14:32:01Z [INFO] name cid=X: msg``."""
-    fmt = logging.Formatter(_HUMAN_FORMAT, datefmt=_ISO_UTC_DATEFMT)
+class HumanFormatter(logging.Formatter):
+    """Human-readable formatter that appends LogRecord extras as
+    `key=val` suffix. Mirrors `JsonFormatter`'s extras-merging so a
+    single `logger.info("evt", extra={...})` call renders coherently
+    in both modes."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        base = super().format(record)
+        extras = _record_extras(record)
+        if not extras:
+            return base
+        suffix = " ".join(f"{k}={v}" for k, v in extras.items())
+        return f"{base} {suffix}"
+
+
+def _human_formatter() -> HumanFormatter:
+    """ISO-UTC human format: ``2026-04-18T14:32:01Z [INFO] name cid=X: msg [extras]``."""
+    fmt = HumanFormatter(_HUMAN_FORMAT, datefmt=_ISO_UTC_DATEFMT)
     fmt.converter = time.gmtime
     return fmt
 
@@ -92,6 +128,8 @@ class JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
+        # Flatten any extras (e.g. logger.info("evt", extra={"channel": "x"})).
+        payload.update(_record_extras(record))
         return json.dumps(payload, default=str)
 
 
