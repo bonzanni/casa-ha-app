@@ -142,6 +142,11 @@ class ScopeRegistry:
         self._embed_hits: int = 0
         self._embed_misses: int = 0
 
+    @property
+    def threshold(self) -> float:
+        """Score floor used by `active_from_scores` and `argmax_scope`."""
+        return self._threshold
+
     def trust_permits(self, scope: str, channel_trust: str) -> bool:
         """True if a channel at *channel_trust* may access *scope*."""
         scope_min = self._lib.minimum_trust(scope)

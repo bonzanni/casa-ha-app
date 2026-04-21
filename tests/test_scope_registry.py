@@ -412,3 +412,19 @@ class TestRealEmbedding:
             scores = reg.score(text, ["personal", "business", "finance", "house"])
             winner = reg.argmax_scope(scores, default_scope="personal")
             assert winner == expected, f"{text!r} → {winner!r} (scores={scores!r})"
+
+
+class TestThresholdProperty:
+    def test_threshold_property_returns_constructor_value(self):
+        from scope_registry import ScopeLibrary, ScopeRegistry
+        lib = ScopeLibrary({"personal": {"minimum_trust": "authenticated",
+                                          "description": "x"}})
+        reg = ScopeRegistry(lib, threshold=0.42)
+        assert reg.threshold == 0.42
+
+    def test_threshold_property_default_is_0_35(self):
+        from scope_registry import ScopeLibrary, ScopeRegistry
+        lib = ScopeLibrary({"personal": {"minimum_trust": "authenticated",
+                                          "description": "x"}})
+        reg = ScopeRegistry(lib)
+        assert reg.threshold == 0.35
