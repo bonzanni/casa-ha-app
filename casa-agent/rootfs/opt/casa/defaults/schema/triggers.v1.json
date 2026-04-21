@@ -13,18 +13,40 @@
         "additionalProperties": false,
         "required": ["name", "type"],
         "properties": {
-          "name":     {"type": "string", "minLength": 1, "pattern": "^[a-zA-Z0-9_-]+$"},
-          "type":     {"type": "string", "enum": ["interval", "cron", "webhook"]},
-          "minutes":  {"type": "integer", "minimum": 1},
-          "schedule": {"type": "string", "minLength": 1},
-          "path":     {"type": "string", "pattern": "^/.+"},
-          "channel":  {"type": "string"},
-          "prompt":   {"type": "string"}
+          "name":        {"type": "string", "minLength": 1, "pattern": "^[a-zA-Z0-9_-]+$"},
+          "type":        {"type": "string", "enum": ["interval", "cron", "webhook"]},
+          "minutes":     {"type": "integer", "minimum": 1},
+          "schedule":    {"type": "string", "minLength": 1},
+          "path":        {"type": "string", "pattern": "^/.+"},
+          "channel":     {"type": "string"},
+          "prompt":      {"type": "string", "minLength": 1},
+          "prompt_file": {"type": "string", "minLength": 1, "pattern": "\\.md$"}
         },
         "allOf": [
-          {"if": {"properties": {"type": {"const": "interval"}}}, "then": {"required": ["minutes", "channel", "prompt"]}},
-          {"if": {"properties": {"type": {"const": "cron"}}},     "then": {"required": ["schedule", "channel", "prompt"]}},
-          {"if": {"properties": {"type": {"const": "webhook"}}},  "then": {"required": ["path"]}}
+          {
+            "if": {"properties": {"type": {"const": "interval"}}},
+            "then": {
+              "required": ["minutes", "channel"],
+              "oneOf": [
+                {"required": ["prompt"], "not": {"required": ["prompt_file"]}},
+                {"required": ["prompt_file"], "not": {"required": ["prompt"]}}
+              ]
+            }
+          },
+          {
+            "if": {"properties": {"type": {"const": "cron"}}},
+            "then": {
+              "required": ["schedule", "channel"],
+              "oneOf": [
+                {"required": ["prompt"], "not": {"required": ["prompt_file"]}},
+                {"required": ["prompt_file"], "not": {"required": ["prompt"]}}
+              ]
+            }
+          },
+          {
+            "if": {"properties": {"type": {"const": "webhook"}}},
+            "then": {"required": ["path"]}
+          }
         ]
       }
     }
