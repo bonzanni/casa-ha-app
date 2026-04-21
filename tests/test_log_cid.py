@@ -10,6 +10,7 @@ from io import StringIO
 
 from log_cid import (
     CidFilter,
+    HumanFormatter,
     JsonFormatter,
     cid_var,
     install_logging,
@@ -258,3 +259,53 @@ class TestFormatDefaultIsJson:
         # human format starts with an ISO timestamp and has bracketed level
         assert "[INFO]" in line
         assert "hello" in line
+
+
+class TestExtrasFlatten:
+    def _make_record(self, extras):
+        rec = logging.LogRecord(
+            name="t", level=logging.INFO, pathname=__file__,
+            lineno=1, msg="evt", args=(), exc_info=None,
+        )
+        rec.cid = "ab12"
+        for k, v in extras.items():
+            setattr(rec, k, v)
+        return rec
+
+    def test_json_formatter_flattens_extras(self):
+        from log_cid import JsonFormatter
+        rec = self._make_record({"channel": "telegram", "winner": "house"})
+        out = json.loads(JsonFormatter().format(rec))
+        assert out["msg"] == "evt"
+        assert out["channel"] == "telegram"
+        assert out["winner"] == "house"
+
+    def test_json_formatter_ignores_standard_attrs(self):
+        from log_cid import JsonFormatter
+        rec = self._make_record({})
+        out = json.loads(JsonFormatter().format(rec))
+        for k in ("pathname", "lineno", "funcName", "args", "module"):
+            assert k not in out
+
+    def test_human_formatter_appends_extras_as_key_val_suffix(self):
+        from log_cid import HumanFormatter
+        fmt = HumanFormatter(
+            "%(asctime)s [%(levelname)s] %(name)s cid=%(cid)s: %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%SZ",
+        )
+        rec = self._make_record({"channel": "voice", "winner_score": 0.61})
+        out = fmt.format(rec)
+        assert "evt" in out
+        assert "channel=voice" in out
+        assert "winner_score=0.61" in out
+
+    def test_human_formatter_no_extras_no_trailing_space(self):
+        from log_cid import HumanFormatter
+        fmt = HumanFormatter(
+            "%(asctime)s [%(levelname)s] %(name)s cid=%(cid)s: %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%SZ",
+        )
+        rec = self._make_record({})
+        out = fmt.format(rec)
+        assert out.rstrip() == out
+        assert out.endswith("evt")
