@@ -14,3 +14,9 @@ triggers:
 
       If there's nothing actionable, stay quiet -- do NOT send a message.
       If there IS something, take action or notify Nicola via Telegram.
+
+  - name: morning-briefing
+    type: cron
+    schedule: "0 8 * * 1-5"
+    channel: telegram
+    prompt_file: prompts/morning-briefing.md
