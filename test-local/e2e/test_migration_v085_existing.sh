@@ -19,9 +19,27 @@ wait_healthy "$NAME"
 
 # Wipe the seeded scopes.yaml and replace with a sentinel that
 # represents "old overlay shape" — anything different from defaults.
-MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c \
-    'echo "schema_version: 1\nscopes:\n  personal:\n    minimum_trust: authenticated\n    description: old prose" \
-     > /addon_configs/casa-agent/policies/scopes.yaml'
+# Must satisfy the schema (minLength=20 per description, all four
+# scopes referenced by agent runtime.yamls present) so the container
+# can boot before the migration runs on Phase B's restart. Use a
+# here-doc rather than `echo "...\n..."` — BusyBox and dash disagree
+# on literal `\n` handling, and the schema parser expects real newlines.
+MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c 'cat > /addon_configs/casa-agent/policies/scopes.yaml <<EOF
+schema_version: 1
+scopes:
+  personal:
+    minimum_trust: authenticated
+    description: old prose sentinel for personal scope pre-migration
+  business:
+    minimum_trust: authenticated
+    description: old prose sentinel for business scope pre-migration
+  finance:
+    minimum_trust: authenticated
+    description: old prose sentinel for finance scope pre-migration
+  house:
+    minimum_trust: household-shared
+    description: old prose sentinel for house scope pre-migration
+EOF'
 
 # Remove the marker if it exists (so we can re-test the migration path).
 MSYS_NO_PATHCONV=1 docker exec "$NAME" \
