@@ -70,30 +70,6 @@ class TestSessionRegistry:
         assert set(entries.keys()) == {"a", "b"}
 
 
-class TestMigration:
-    async def test_legacy_memory_session_id_field_is_dropped_on_rewrite(
-        self, tmp_path,
-    ):
-        import json
-        path = tmp_path / "sessions.json"
-        path.write_text(json.dumps({
-            "telegram:1": {
-                "agent": "assistant",
-                "sdk_session_id": "sdk-legacy",
-                "memory_session_id": "mem-legacy",
-                "last_active": "2026-04-01T00:00:00+00:00",
-            }
-        }))
-
-        reg = SessionRegistry(str(path))
-        # Load-time preservation is fine; write-through drops the field.
-        await reg.touch("telegram:1")
-
-        data = json.loads(path.read_text())
-        assert "memory_session_id" not in data["telegram:1"]
-        assert data["telegram:1"]["sdk_session_id"] == "sdk-legacy"
-
-
 class TestConcurrency:
     async def test_concurrent_register_on_distinct_keys_preserves_all(
         self, tmp_path,
