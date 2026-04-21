@@ -64,6 +64,11 @@ class TestDataclassRoundtrip:
         parsed = json.loads(payload)
         assert parsed["recommended"] == 0.30
         assert set(parsed["evidence"].keys()) == {"0.3", "0.35"}  # JSON keys always str
+        # Issue #1 regression guard: evidence values must be nested
+        # JSON objects, not double-encoded JSON strings.
+        assert isinstance(parsed["evidence"]["0.3"], dict)
+        assert parsed["evidence"]["0.3"]["tester_id"] == "x"
+        assert parsed["evidence"]["0.3"]["accuracy"] == 1.0
 
 
 class TestSuiteLoader:
@@ -93,14 +98,19 @@ class TestSuiteLoader:
 
 class TestTesterRegistry:
     def test_list_and_get_empty_registry(self):
-        # With no testers registered, list_testers() returns [] and
-        # get_tester raises KeyError on unknown ids.
-        import importlib
+        # Clear the registry, assert empty-state behavior, then restore
+        # so other tests aren't affected. Directly tests the API
+        # contract without relying on importlib.reload semantics.
         import casa_eval
-        importlib.reload(casa_eval)
-        assert casa_eval.list_testers() == []
-        with pytest.raises(KeyError):
-            casa_eval.get_tester("scope_routing")
+        saved = dict(casa_eval._REGISTRY)
+        casa_eval._REGISTRY.clear()
+        try:
+            assert casa_eval.list_testers() == []
+            with pytest.raises(KeyError):
+                casa_eval.get_tester("scope_routing")
+        finally:
+            casa_eval._REGISTRY.clear()
+            casa_eval._REGISTRY.update(saved)
 
 
 class TestSweepContract:
