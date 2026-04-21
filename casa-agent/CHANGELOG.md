@@ -1,9 +1,9 @@
 # Changelog
 
-## v0.8.5 — 2026-04-21
+## 0.8.5 — 2026-04-21 — Phase 3.2.2: scope-routing hardening
 
-Phase 3.2.2: scope-routing accuracy hardening + structured `scope_route`
-emission. Spec at `docs/superpowers/specs/2026-04-21-3.2.2-scope-routing-hardening.md`.
+Scope-routing accuracy hardening + structured `scope_route` emission.
+Spec at `docs/superpowers/specs/2026-04-21-3.2.2-scope-routing-hardening.md`.
 
 - **scopes.yaml description hardening** — Replaced the v0.8.0 prose
   corpora with comma-separated keyword phrase clusters targeting the
