@@ -45,6 +45,7 @@ class TestParseScopeRouteLine:
         assert mod.parse_line("not JSON at all") is None
         assert mod.parse_line('{"msg": "other_event"}') is None
         assert mod.parse_line("") is None
+        assert mod.parse_line('{"msg": "scope_route"') is None  # truncated
 
 
 class TestBucketAndHistogram:

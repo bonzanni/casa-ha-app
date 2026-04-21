@@ -1,18 +1,30 @@
 #!/usr/bin/env python3
 """eval_scope_dist.py — audit live scope-routing distribution.
 
-Reads Casa structured JSON logs (from --log-file or a live HA host via
-SSH), buckets `scope_route` events by channel, prints a winner-score
-histogram per channel, and flags channels whose winners cluster within
-+-0.05 of the current threshold (signal that the threshold is wrong for
-that channel, not that the classifier is weak).
+LIMITATION (as of v0.8.4)
+=========================
+This script expects JSON-structured `scope_route` log records with fields:
+    msg="scope_route", channel, winner, winner_score, second_score, threshold
 
-Pure log reader: no writes to Casa, no mutations of /data.
+The live casa addon at v0.8.4 emits `scope_route` as a FORMATTED-STRING
+log line (see agent.py:441) WITHOUT winner_score — so this script will
+report "total records: 0" against unmodified production logs.
+
+Two follow-ups unblock real use:
+  1. (preferred) Add a JSON emission alongside the formatted line in
+     agent.py so scope_route events carry winner_score + second_score.
+  2. (fallback) Rewrite parse_line as a regex over the current format;
+     only channel + active + write + t_ms + embed_cache will be
+     extractable — no winner-score histogram possible without upstream
+     field addition.
+
+Until then the parser is validated against synthetic logs (see
+tests/test_eval_scope_dist.py) and waits for the upstream emission.
 
 Usage:
-    eval_scope_dist.py --log-file /path/to/casa.log [--threshold 0.35]
+    eval_scope_dist.py --log-file /path/to/casa.log --threshold 0.35
     eval_scope_dist.py --ha-host n150-ha --since 24h --threshold 0.35
-    eval_scope_dist.py --log-file casa.log --json > dist.json
+    eval_scope_dist.py --log-file casa.log --threshold 0.35 --json > dist.json
 """
 
 from __future__ import annotations
@@ -108,8 +120,13 @@ def read_ssh_logs(
         "--since", since, container,
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        print(
+            f"ssh failed (returncode={proc.returncode}): {proc.stderr.strip()}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     yield from proc.stdout.splitlines()
-    yield from proc.stderr.splitlines()
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +144,7 @@ def _summarize(
             "count": len(records),
             "mean": (sum(scores) / len(scores)) if scores else 0.0,
             "p50": sorted(scores)[len(scores) // 2] if scores else 0.0,
-            "p95": (sorted(scores)[int(0.95 * (len(scores) - 1))]
+            "p95": (sorted(scores)[min(len(scores) - 1, int(0.95 * len(scores)))]
                     if scores else 0.0),
             "histogram": score_histogram(scores, threshold),
             "flag_near_threshold": is_clustered_near_threshold(
