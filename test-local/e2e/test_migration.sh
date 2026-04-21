@@ -48,3 +48,25 @@ MSYS_NO_PATHCONV=1 docker exec "$NAME" \
     | grep -q "initial config snapshot" \
     || fail "initial config snapshot commit missing"
 pass "initial commit present"
+
+log "M-7: v0.8.5 scope migration marker NOT present on fresh install"
+# Fresh install path: scopes.yaml was seeded from defaults, never
+# migrated, so the marker should be absent. Migration only fires when
+# an *existing* overlay is found at boot.
+MSYS_NO_PATHCONV=1 docker exec "$NAME" \
+    test ! -f /addon_configs/casa-agent/migrations/scope_corpus_v0.8.5.applied \
+    || fail "v0.8.5 migration marker should not exist on fresh install"
+pass "v0.8.5 migration marker absent on fresh install"
+
+log "M-8: scopes.yaml content matches shipped defaults"
+MSYS_NO_PATHCONV=1 docker exec "$NAME" \
+    diff -q /addon_configs/casa-agent/policies/scopes.yaml \
+            /opt/casa/defaults/policies/scopes.yaml \
+    || fail "fresh-install scopes.yaml does not match shipped defaults"
+pass "fresh-install scopes.yaml matches shipped defaults"
+
+log "M-9: backup file NOT present on fresh install"
+MSYS_NO_PATHCONV=1 docker exec "$NAME" \
+    test ! -f /addon_configs/casa-agent/policies/scopes.yaml.pre-v0.8.5.bak \
+    || fail "v0.8.5 backup file should not exist on fresh install"
+pass "v0.8.5 backup file absent on fresh install"
