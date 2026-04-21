@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.8.4 — 2026-04-21 — Scope-routing evaluation harness
+
+### Added
+- `casa_eval/` framework — pluggable `Tester` ABC +
+  `Suite`/`Case`/`Report`/`Failure`/`Recommendation` dataclasses, all
+  JSON-round-trippable. Designed so a future Builder MCP tool can call
+  the same `Tester.run()` / `Tester.sweep()` / `recommend_from_sweep()`
+  surface with a thin JSON wrapper.
+- `ScopeRoutingTester` — evaluates scope-routing accuracy on a labelled
+  probe suite with a tunable threshold. Emits `accuracy`,
+  `top2_accuracy`, `fallback_rate`, `mean_winner_score`, `mean_margin`,
+  `p50_latency_ms`, `p95_latency_ms`. `optimization_axes = ["threshold"]`;
+  `optimization_bounds = {"threshold": (0.20, 0.50)}`. Model is frozen
+  (see CHANGELOG 0.8.2 rationale).
+- `tests/fixtures/eval/scope_routing/default.yaml` — 35-case probe
+  suite across the four shipped scopes. Grows by hand when Nicola spots
+  a misroute in prod (`metadata.source='real-misroute'`).
+- Three pytest run modes: fast (mocked `_FakeEmbedder`, always-on in
+  CI); full (`CASA_REAL_EMBED=1`, asserts `accuracy >= 0.85`,
+  `fallback_rate <= 0.20`); sweep (`CASA_EVAL_SWEEP=1
+  CASA_REAL_EMBED=1`, informational table + recommendation).
+- `scripts/eval_scope_dist.py` — audits live `scope_route` log lines,
+  emits per-channel winner-score histograms (text or `--json`), flags
+  channels whose winners cluster within ±0.05 of the threshold.
+
+### Changed
+- `scope_threshold` promoted from a silent env-var fallback (the
+  `CASA_SCOPE_THRESHOLD` default `0.35` at `casa_core.py:427`) to a
+  first-class HA addon option in `config.yaml`. Default unchanged;
+  users can now tune it via the HA UI and Builder will be able to tune
+  it via `supervisor.addon_options_set` in 3.5. Runtime read semantics
+  at `casa_core.py:427` are untouched — the env var is now sourced
+  from `bashio::config 'scope_threshold'` in
+  `etc/s6-overlay/s6-rc.d/svc-casa/run`. Restart-required, matching
+  every other addon option (restart cost on N150 ≈ 3 sec).
+
+### Notes — post-deploy recipe
+- Full-mode pytest on the live N150:
+  `sudo docker exec addon_c071ea9c_casa-agent sh -c \
+   'cd /opt/casa && CASA_REAL_EMBED=1 python3 -m pytest \
+    /opt/casa/tests/test_scope_routing_eval.py::TestScopeRoutingTesterFull -v'`
+  (run via `/ha-prod-console:exec` after each deploy that touches
+  `scopes.yaml` descriptions or the threshold).
+
 ## 0.8.3 — 2026-04-21 — Voice-latency optimizations
 
 ### Added
