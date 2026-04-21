@@ -1,0 +1,119 @@
+suite_id: scope_routing.default
+description: |
+  Hand-grown probes for scope routing. Sourced from TestRealEmbedding
+  canonical seeds and Nicola's Telegram/voice history. Grow this file
+  whenever a misroute lands in prod — commit, re-run the eval, confirm
+  the fix didn't regress other cases.
+  Tagging: metadata.channel ∈ {telegram, voice, webhook};
+  metadata.source='real-misroute' marks cases added after a prod miss.
+cases:
+  # --- finance ---
+  - input: "how much do I owe the plumber for the invoice?"
+    expected: finance
+    metadata: {channel: telegram, source: TestRealEmbedding}
+  - input: "pay the electricity bill before the deadline"
+    expected: finance
+    metadata: {channel: telegram}
+  - input: "what's the VAT rate for consulting in Italy"
+    expected: finance
+    metadata: {channel: telegram}
+  - input: "transfer 500 euros from business account to personal"
+    expected: finance
+    metadata: {channel: voice}
+  - input: "remind me to file my taxes next week"
+    expected: finance
+    metadata: {channel: telegram}
+  - input: "record the 2000 euro invoice from ENPICOM"
+    expected: finance
+    metadata: {channel: webhook}
+  - input: "what's the balance on the Lesina Holding account"
+    expected: finance
+    metadata: {channel: telegram}
+  # --- house ---
+  - input: "turn off the kitchen lights please"
+    expected: house
+    metadata: {channel: voice, source: TestRealEmbedding}
+  - input: "set the living room thermostat to 20 degrees"
+    expected: house
+    metadata: {channel: voice}
+  - input: "the dishwasher is leaking again, call the plumber"
+    expected: house
+    metadata: {channel: telegram}
+  - input: "when is the cleaner coming next"
+    expected: house
+    metadata: {channel: telegram}
+  - input: "what's the temperature in the bedroom"
+    expected: house
+    metadata: {channel: voice}
+  - input: "dim the lights in the hallway"
+    expected: house
+    metadata: {channel: voice}
+  - input: "schedule HVAC maintenance for the fall"
+    expected: house
+    metadata: {channel: telegram}
+  # --- business ---
+  - input: "what's my next meeting with the ENPICOM team"
+    expected: business
+    metadata: {channel: telegram, source: TestRealEmbedding}
+  - input: "prepare a summary for tomorrow's Lesina board call"
+    expected: business
+    metadata: {channel: telegram}
+  - input: "draft the quarterly report for Q2"
+    expected: business
+    metadata: {channel: telegram}
+  - input: "reschedule the call with the EPO office"
+    expected: business
+    metadata: {channel: telegram}
+  - input: "send the project status update to the team"
+    expected: business
+    metadata: {channel: telegram}
+  - input: "what's on my calendar this afternoon"
+    expected: business
+    metadata: {channel: voice}
+  - input: "block two hours tomorrow for deep work on the patent"
+    expected: business
+    metadata: {channel: telegram}
+  # --- personal ---
+  - input: "reminder: dinner with Marijn on Saturday"
+    expected: personal
+    metadata: {channel: telegram, source: TestRealEmbedding}
+  - input: "what should I get mom for her birthday"
+    expected: personal
+    metadata: {channel: telegram}
+  - input: "text Elena I'll be late for dinner"
+    expected: personal
+    metadata: {channel: voice}
+  - input: "did I already reply to Stefano's message"
+    expected: personal
+    metadata: {channel: telegram}
+  - input: "what did I promise to do this weekend"
+    expected: personal
+    metadata: {channel: telegram}
+  - input: "remind me to call dad on Sunday"
+    expected: personal
+    metadata: {channel: telegram}
+  - input: "how was my run yesterday"
+    expected: personal
+    metadata: {channel: voice}
+  # --- cross-cutting / tricky ---
+  - input: "book a flight to Amsterdam for the team offsite"
+    expected: business
+    metadata: {channel: telegram, source: hand-picked-tricky}
+  - input: "book a flight for our anniversary weekend"
+    expected: personal
+    metadata: {channel: telegram, source: hand-picked-tricky}
+  - input: "order new filters for the boiler"
+    expected: house
+    metadata: {channel: telegram, source: hand-picked-tricky}
+  - input: "pay the invoice from the plumber who fixed the boiler"
+    expected: finance
+    metadata: {channel: telegram, source: hand-picked-tricky}
+  - input: "what's the Wi-Fi password again"
+    expected: house
+    metadata: {channel: voice, source: hand-picked-tricky}
+  - input: "send Elena the Airbnb confirmation"
+    expected: personal
+    metadata: {channel: telegram, source: hand-picked-tricky}
+  - input: "how much did I spend on groceries last month"
+    expected: finance
+    metadata: {channel: telegram, source: hand-picked-tricky}
