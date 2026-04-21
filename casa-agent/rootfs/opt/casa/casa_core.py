@@ -406,7 +406,24 @@ async def main() -> None:
     )
     executor_registry.load()
 
-    init_tools(channel_manager, bus, executor_registry, mcp_registry)
+    # Scheduler + trigger registry constructed here so the get_schedule
+    # tool can see the registry via init_tools. The per-role
+    # register_agent loop stays below (needs role_configs).
+    app = web.Application(middlewares=[cid_middleware])
+    scheduler = AsyncIOScheduler(
+        timezone=resolve_tz(),
+        job_defaults={
+            "misfire_grace_time": 600,   # 10 min — covers short Casa restarts
+            "coalesce": True,            # collapse missed fires to one
+            "max_instances": 1,          # no overlap of same job
+        },
+    )
+    trigger_registry = TriggerRegistry(scheduler=scheduler, app=app, bus=bus)
+
+    init_tools(
+        channel_manager, bus, executor_registry, mcp_registry,
+        trigger_registry=trigger_registry,
+    )
     casa_tools_config = create_casa_tools()
     mcp_registry.register_sdk("casa-framework", casa_tools_config)
     logger.info("Registered casa-framework MCP tools")
@@ -754,8 +771,9 @@ async def main() -> None:
         )
         return web.Response(text=html, content_type="text/html")
 
-    # 13. aiohttp app
-    app = web.Application(middlewares=[cid_middleware])
+    # 13. aiohttp app — app was constructed earlier (above init_tools) so
+    # trigger_registry could be wired in. Route registrations that reference
+    # closures (dashboard, handlers) happen here once those closures exist.
     if voice_channel is not None:
         voice_channel.register_routes(app)
     app.router.add_get("/", dashboard)
@@ -764,18 +782,10 @@ async def main() -> None:
     app.router.add_post("/invoke/{agent}", invoke_handler)
     app.router.add_post("/telegram/update", telegram_update_handler)
 
-    # 13b. Scheduler + per-agent trigger registry (replaces the global
-    # heartbeat block). Register before runner.setup() so webhook routes
-    # land in *app* while the router is still mutable.
-    scheduler = AsyncIOScheduler(
-        timezone=resolve_tz(),
-        job_defaults={
-            "misfire_grace_time": 600,   # 10 min — covers short Casa restarts
-            "coalesce": True,            # collapse missed fires to one
-            "max_instances": 1,          # no overlap of same job
-        },
-    )
-    trigger_registry = TriggerRegistry(scheduler=scheduler, app=app, bus=bus)
+    # 13b. Per-agent trigger registration. Registry + scheduler were
+    # constructed earlier (needed by init_tools for get_schedule).
+    # Register before runner.setup() so webhook routes land in *app*
+    # while the router is still mutable.
     for role, cfg in role_configs.items():
         if cfg.triggers:
             trigger_registry.register_agent(
