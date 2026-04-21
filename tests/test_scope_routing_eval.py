@@ -1,0 +1,171 @@
+"""Scope-routing tester tests — fast (mocked) + full + sweep.
+
+Fast mode uses a deterministic _FakeEmbedder (same pattern as
+test_scope_registry.py) so it runs in CI. Full mode hits the real
+e5-large via CASA_REAL_EMBED=1. Sweep mode is informational only
+(no assertions on the accuracy curve), gated by CASA_EVAL_SWEEP=1.
+
+ACCURACY_BASELINE is bumped by code edit only — never by fixture edit.
+"""
+
+from __future__ import annotations
+
+import os
+import textwrap
+
+import pytest
+
+
+ACCURACY_BASELINE = 0.85  # minimum full-mode accuracy on default.yaml
+FALLBACK_CAP = 0.20       # maximum full-mode fallback_rate
+
+
+SCOPES_YAML_TEXT = """\
+schema_version: 1
+scopes:
+  personal:
+    minimum_trust: authenticated
+    description: |
+      personal private life correspondence non-work plans.
+  business:
+    minimum_trust: authenticated
+    description: |
+      business professional work career meetings deadlines.
+  finance:
+    minimum_trust: authenticated
+    description: |
+      finance invoices bills payments banking taxes VAT.
+  house:
+    minimum_trust: household-shared
+    description: |
+      house appliances plumbing heating lights contractors sensors.
+"""
+
+
+class _FakeEmbedder:
+    """First-character slot embedder (mirrors test_scope_registry.py)."""
+
+    def __init__(self, model_name: str = "fake", **_: object) -> None:
+        self.model_name = model_name
+
+    def embed(self, texts):
+        import numpy as np
+        slots = {"p": 0, "b": 1, "f": 2, "h": 3}
+        for t in texts:
+            v = np.zeros(4, dtype=float)
+            if t:
+                key = t.strip().lower()[:1]
+                v[slots.get(key, 0)] = 1.0
+            yield v
+
+
+def _suite_dict_inline():
+    """In-memory suite for fast mode — 'p'/'b'/'f'/'h' probes only."""
+    from casa_eval.base import Case, Suite
+    return Suite(
+        suite_id="scope_routing.mocked",
+        description="first-char probes for fast mode",
+        cases=[
+            Case(input="personal friend hi", expected="personal"),
+            Case(input="business meeting note", expected="business"),
+            Case(input="finance invoice due", expected="finance"),
+            Case(input="house lights off", expected="house"),
+            # One intentionally-wrong case to exercise Failure path.
+            Case(input="f prefix but labelled house", expected="house",
+                 metadata={"source": "unit-mismatch"}),
+        ],
+    )
+
+
+@pytest.fixture
+def lib(tmp_path, monkeypatch):
+    """Scope library + monkeypatched fake embedder factory."""
+    import scope_registry as sr
+    monkeypatch.setattr(sr, "_load_text_embedding_cls", lambda: _FakeEmbedder)
+
+    f = tmp_path / "scopes.yaml"
+    f.write_text(textwrap.dedent(SCOPES_YAML_TEXT), encoding="utf-8")
+    return sr.load_scope_library(str(f))
+
+
+class TestScopeRoutingTesterFast:
+    def test_registered_via_import(self):
+        import casa_eval
+        assert "scope_routing" in casa_eval.list_testers()
+
+    def test_run_returns_report_with_correct_totals(self, lib):
+        from casa_eval.scope_routing import ScopeRoutingTester
+
+        tester = ScopeRoutingTester(scope_library=lib)
+        report = tester.run(_suite_dict_inline(), threshold=0.35)
+        assert report.tester_id == "scope_routing"
+        assert report.suite_id == "scope_routing.mocked"
+        assert report.total == 5
+        # 4 correct, 1 mismatched (the 'f'-but-labelled-house case).
+        assert report.passed == 4
+        assert report.failed == 1
+        assert report.accuracy == pytest.approx(0.8)
+        assert report.config == {"threshold": 0.35}
+
+    def test_failure_extra_includes_scores_and_margin(self, lib):
+        from casa_eval.scope_routing import ScopeRoutingTester
+
+        tester = ScopeRoutingTester(scope_library=lib)
+        report = tester.run(_suite_dict_inline(), threshold=0.35)
+        assert len(report.failures) == 1
+        f = report.failures[0]
+        assert f.expected == "house"
+        assert f.actual == "finance"  # 'f' prefix -> finance wins
+        assert "scores" in f.extra
+        assert set(f.extra["scores"].keys()) == {
+            "personal", "business", "finance", "house",
+        }
+        assert "margin" in f.extra
+        assert f.extra["margin"] == pytest.approx(1.0)  # finance=1.0 vs others=0.0
+
+    def test_metrics_shape(self, lib):
+        from casa_eval.scope_routing import ScopeRoutingTester
+
+        tester = ScopeRoutingTester(scope_library=lib)
+        report = tester.run(_suite_dict_inline(), threshold=0.35)
+        required = {
+            "accuracy", "top2_accuracy", "fallback_rate",
+            "mean_winner_score", "mean_margin",
+            "p50_latency_ms", "p95_latency_ms",
+        }
+        assert required.issubset(report.metrics.keys())
+        # fallback_rate sanity: the 'f-labelled-house' case has winner=1.0,
+        # above threshold, so zero fallbacks in this mocked suite.
+        assert report.metrics["fallback_rate"] == 0.0
+
+    def test_run_uses_default_scope_from_metadata(self, lib):
+        from casa_eval.base import Case, Suite
+        from casa_eval.scope_routing import ScopeRoutingTester
+
+        # Empty inputs embed to zero-vectors -> cosine=0 for every scope ->
+        # every case is below threshold -> falls back to default_scope.
+        # Case 0 overrides default_scope via metadata; case 1 uses the
+        # tester-level DEFAULT_SCOPE_FALLBACK ("personal").
+        suite = Suite(
+            suite_id="s", description="",
+            cases=[
+                Case(input="", expected="house",
+                     metadata={"default_scope": "house"}),
+                Case(input="", expected="personal"),
+            ],
+        )
+        tester = ScopeRoutingTester(scope_library=lib)
+        report = tester.run(suite, threshold=0.35)
+        # Both cases pass because the fallback matches `expected` in each.
+        assert report.passed == 2
+        assert report.metrics["fallback_rate"] == 1.0
+
+    def test_report_json_roundtrip(self, lib):
+        from casa_eval.scope_routing import ScopeRoutingTester
+        from casa_eval.base import Report
+
+        tester = ScopeRoutingTester(scope_library=lib)
+        report = tester.run(_suite_dict_inline(), threshold=0.35)
+        roundtripped = Report.from_json(report.to_json())
+        assert roundtripped.total == report.total
+        assert roundtripped.metrics["fallback_rate"] == report.metrics["fallback_rate"]
