@@ -176,6 +176,12 @@ FIXTURE_PATH = os.path.join(
     "fixtures", "eval", "scope_routing", "default.yaml",
 )
 
+PROD_SCOPES_YAML = os.path.join(
+    os.path.dirname(__file__), "..",
+    "casa-agent", "rootfs", "opt", "casa",
+    "defaults", "policies", "scopes.yaml",
+)
+
 
 @pytest.mark.skipif(
     os.environ.get("CASA_REAL_EMBED") != "1",
@@ -183,17 +189,26 @@ FIXTURE_PATH = os.path.join(
 )
 class TestScopeRoutingTesterFull:
     def test_fixture_loads_and_has_enough_cases(self):
+        from collections import Counter
         from casa_eval.base import Suite
+        from scope_registry import load_scope_library
+
         suite = Suite.from_yaml(FIXTURE_PATH)
         assert suite.suite_id == "scope_routing.default"
         assert len(suite.cases) >= 30, (
             f"fixture must hold >=30 probes, got {len(suite.cases)}"
         )
-        valid_scopes = {"personal", "business", "finance", "house"}
+        lib = load_scope_library(PROD_SCOPES_YAML)
+        valid_scopes = set(lib.names())
         bad = [c.expected for c in suite.cases if c.expected not in valid_scopes]
-        assert not bad, f"unknown expected scopes: {set(bad)}"
+        assert not bad, (
+            f"unknown expected scopes: {set(bad)}; valid: {valid_scopes}"
+        )
+        counts = Counter(c.expected for c in suite.cases)
+        for scope, n in counts.items():
+            assert n >= 5, f"scope {scope!r} has only {n} cases; need >=5"
 
-    def test_full_mode_meets_accuracy_baseline(self, tmp_path):
+    def test_full_mode_meets_accuracy_baseline(self):
         """Real e5-large against the default fixture.
 
         Uses the actual scopes.yaml shipped in the addon (not the
@@ -203,9 +218,7 @@ class TestScopeRoutingTesterFull:
         from casa_eval.base import Suite
         from casa_eval.scope_routing import ScopeRoutingTester
 
-        lib = load_scope_library(
-            "casa-agent/rootfs/opt/casa/defaults/policies/scopes.yaml",
-        )
+        lib = load_scope_library(PROD_SCOPES_YAML)
         tester = ScopeRoutingTester(scope_library=lib)
         suite = Suite.from_yaml(FIXTURE_PATH)
         report = tester.run(suite, threshold=0.35)
