@@ -10,6 +10,7 @@ tools:
     - Skill
     - mcp__casa-framework__delegate_to_agent
     - mcp__casa-framework__send_message
+    - mcp__casa-framework__get_schedule
   disallowed: []
   permission_mode: acceptEdits
   max_turns: 20
