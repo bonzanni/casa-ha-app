@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.8.6 — 2026-04-21 — Pre-1.0.0 migration cleanup
+
+Codebase slimming pass. Removes every version-migration block in
+`setup-configs.sh` + the matching test-mode override + the v0.8.5
+existing-instance e2e scenario + a pre-2.2a lazy-migration `.pop` in
+`SessionRegistry`. Net -303 lines across the branch.
+
+Driver: **pre-1.0.0 doctrine.** Casa is in full development mode
+until v1.0.0. `/addon_configs/casa-agent/` is expected to be wiped
+between addon updates; breaking changes ship by updating the shipped
+defaults, not by migrating user state. Migration blocks + `.applied`
+markers + `.pre-vX.Y.Z.bak` backups are over-engineering at this
+stage — v0.8.5 proved it: the scope-corpus migration block shipped
+with v0.8.5 never fired on the N150 deploy because the overlay was
+fresh on update; seed-if-missing produced an identical outcome.
+
+Removed:
+- `casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh` —
+  the v0.8.5 `SCOPE_MIGRATION_MARKER` block (lines 62-76),
+  `migrate_default_scope()` + its two invocations (lines 83-128),
+  `migrate_butler_disclosure_v2()` + invocation (lines 130-153).
+  Seed-if-missing blocks retained — those are idempotent seeding,
+  not migrations.
+- `test-local/init-overrides/01-setup-configs.sh` — same blocks
+  mirrored from prod.
+- `test-local/e2e/test_migration.sh` — M-7 (v0.8.5 marker absent),
+  M-9 (backup absent). Reworked M-8 → M-6 as a generic seed-content
+  check (`scopes.yaml == shipped defaults` on fresh install).
+- `test-local/e2e/test_migration_v085_existing.sh` — whole 68-line
+  script deleted (the existing-overlay → migrate → backup scenario
+  is dead code).
+- `casa-agent/rootfs/opt/casa/session_registry.py` — the
+  `.pop("memory_session_id", None)` in `touch()` + the matching
+  docstring notes about lazy migration from pre-2.2a entries.
+- `tests/test_session_registry.py::TestMigration` class.
+
+Ship-gate doctrine saved to
+`memory/feedback_ship_gate_doctrine.md` (new this session):
+9-gate sequence per version bump; Monitor as the default for tests
+and long-running tasks; `/ha-prod-console:*` as the first choice for
+N150 interaction; pre-1.0.0 = no migrations.
+
+Unchanged (NOT migrations):
+- `executor_registry.py` orphan-recovery tombstone — runtime
+  crash-recovery, not version migration.
+- `log_cid.py` boot-time filter cleanup — idempotence, not
+  version migration.
+
 ## 0.8.5 — 2026-04-21 — Phase 3.2.2: scope-routing hardening
 
 Scope-routing accuracy hardening + structured `scope_route` emission.
