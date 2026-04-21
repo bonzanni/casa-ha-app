@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.8.5 — 2026-04-21
+
+Phase 3.2.2: scope-routing accuracy hardening + structured `scope_route`
+emission. Spec at `docs/superpowers/specs/2026-04-21-3.2.2-scope-routing-hardening.md`.
+
+- **scopes.yaml description hardening** — Replaced the v0.8.0 prose
+  corpora with comma-separated keyword phrase clusters targeting the
+  7 cross-cutting probe failures the v0.8.4 sweep exposed. Generic
+  only — no personal names, organizations, or place names — so the
+  addon stays shippable to other households. Tenant-specific signals
+  belong in the per-instance overlay at
+  `/addon_configs/casa-agent/policies/scopes.yaml`, which Builder
+  (Phase 3.5) is authorized to edit. The new authoring contract is
+  documented as a top-of-file comment block in the defaults file
+  itself.
+- **`ACCURACY_BASELINE` 0.80 → 0.85** in `tests/test_scope_routing_eval.py`.
+  The flat-curve finding from v0.8.4 still holds — threshold tuning is
+  a no-op at this fixture scale; the gain comes entirely from the
+  description corpus change.
+- **Structured `scope_route` log emission.** `agent.py:441` now emits
+  via `logger.info("scope_route", extra={"channel": ..., "winner": ...,
+  "winner_score": ..., "second_score": ..., "threshold": ...})`. New
+  `_winner_pair()` helper computes the read-side winner from the
+  `scores` dict.
+- **Generic `extra={...}` flow in `log_cid.py`.** `JsonFormatter` now
+  flattens non-standard `LogRecord` attributes into the JSON payload;
+  new `HumanFormatter` appends them as `key=val` suffix. Benefits any
+  future structured log call, not just `scope_route`. New
+  `STANDARD_LOGRECORD_ATTRS` constant + `_record_extras()` helper.
+- **`scripts/eval_scope_dist.py` works against live N150 logs** —
+  the parser was always ready for this shape; the upstream emission
+  is the change that unblocks it.
+- **One-shot v0.8.5 migration** in `setup-configs.sh` — refreshes
+  the per-instance overlay at `/addon_configs/casa-agent/policies/scopes.yaml`
+  on first boot, gated by marker file
+  `migrations/scope_corpus_v0.8.5.applied`. Pre-migration overlay is
+  preserved as `scopes.yaml.pre-v0.8.5.bak`. Manual edits made AFTER
+  the marker is written are preserved across all later boots.
+- **`ScopeRegistry.threshold` exposed as a public read-only property.**
+  Was `_threshold` private; agent.py needed read access for the new
+  emission. Constructor signature unchanged.
+- **Tests.** New `TestExtrasFlatten` (4 cases) in `tests/test_log_cid.py`;
+  new `TestScopeRouteEmission` in `tests/test_agent_process_scope.py`;
+  new `TestThresholdProperty` in `tests/test_scope_registry.py`. New
+  e2e scenario `test-local/e2e/test_migration_v085_existing.sh` plus
+  M-7..M-9 in `test_migration.sh`.
+
+Rollback: §10 of the spec. Backup file + marker removal restore v0.8.4
+runtime behaviour; reverting the formatter changes and `agent.py:441`
+restore prior log shape.
+
 ## 0.8.4 — 2026-04-21 — Scope-routing evaluation harness
 
 ### Added
