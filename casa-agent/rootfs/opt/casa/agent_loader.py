@@ -114,6 +114,8 @@ def _check_file_set(agent_dir: str, tier: str, role: str) -> None:
     for entry in os.listdir(agent_dir):
         if entry.startswith("."):
             continue  # dotfiles skipped per spec
+        if os.path.isdir(os.path.join(agent_dir, entry)):
+            continue  # subdirectories are not config files (e.g. prompts/)
         on_disk.add(entry)
 
     missing = required - on_disk
@@ -186,12 +188,75 @@ def _render_delegates_section(delegates: list[DelegateEntry]) -> str:
 # --- Per-file builders -----------------------------------------------------
 
 
-def _build_character(data: dict[str, Any]) -> CharacterConfig:
+def _resolve_prose(
+    data: dict[str, Any],
+    *,
+    field: str,
+    agent_dir: str,
+    source_label: str,
+) -> str:
+    """Return either the inline ``<field>`` string or the contents of the
+    markdown file referenced by ``<field>_file`` (relative to agent_dir).
+
+    JSON Schema enforces exactly-one-of, so at runtime we trust that
+    constraint; the defensive check here surfaces a clearer error if the
+    schema ever drifts. Applies ``_substitute_env`` so external prompts
+    see the same env-var substitutions as inline YAML strings.
+    """
+    inline = data.get(field)
+    file_ref = data.get(f"{field}_file")
+
+    if inline is not None and file_ref is not None:
+        raise LoadError(
+            f"{source_label}: both {field!r} and {field}_file set — "
+            f"exactly one must be provided"
+        )
+    if inline is not None:
+        return inline
+    if file_ref is None:
+        return ""
+
+    if os.path.isabs(file_ref):
+        raise LoadError(
+            f"{source_label}: {field}_file must be relative to agent dir, "
+            f"got {file_ref!r}"
+        )
+
+    resolved = os.path.realpath(os.path.join(agent_dir, file_ref))
+    agent_dir_abs = os.path.realpath(agent_dir)
+    try:
+        common = os.path.commonpath([agent_dir_abs, resolved])
+    except ValueError:
+        common = ""
+    if common != agent_dir_abs:
+        raise LoadError(
+            f"{source_label}: {field}_file {file_ref!r} escapes agent dir"
+        )
+    if not resolved.endswith(".md"):
+        raise LoadError(
+            f"{source_label}: {field}_file must end in .md, got {file_ref!r}"
+        )
+    if not os.path.exists(resolved):
+        raise LoadError(
+            f"{source_label}: {field}_file not found at {resolved}"
+        )
+
+    with open(resolved, "r", encoding="utf-8") as fh:
+        return _substitute_env(fh.read())
+
+
+def _build_character(data: dict[str, Any], *, agent_dir: str) -> CharacterConfig:
     return CharacterConfig(
         name=data["name"],
         archetype=data["archetype"],
-        card=data["card"],
-        prompt=data["prompt"],
+        card=_resolve_prose(
+            data, field="card", agent_dir=agent_dir,
+            source_label="character.yaml",
+        ),
+        prompt=_resolve_prose(
+            data, field="prompt", agent_dir=agent_dir,
+            source_label="character.yaml",
+        ),
     )
 
 
@@ -228,9 +293,19 @@ def _build_delegates(data: dict[str, Any]) -> list[DelegateEntry]:
     ]
 
 
-def _build_triggers(data: dict[str, Any]) -> list[TriggerSpec]:
+def _build_triggers(
+    data: dict[str, Any], *, agent_dir: str,
+) -> list[TriggerSpec]:
     specs: list[TriggerSpec] = []
     for t in (data.get("triggers") or []):
+        trig_name = t.get("name", "?")
+        if t.get("type") in ("interval", "cron"):
+            prompt_text = _resolve_prose(
+                t, field="prompt", agent_dir=agent_dir,
+                source_label=f"triggers.yaml::{trig_name}",
+            )
+        else:
+            prompt_text = ""  # webhook triggers have no prompt
         specs.append(TriggerSpec(
             name=t["name"],
             type=t["type"],
@@ -238,7 +313,7 @@ def _build_triggers(data: dict[str, Any]) -> list[TriggerSpec]:
             schedule=t.get("schedule", "") or "",
             path=t.get("path", "") or "",
             channel=t.get("channel", "") or "",
-            prompt=t.get("prompt", "") or "",
+            prompt=prompt_text,
         ))
     return specs
 
@@ -357,7 +432,7 @@ def load_agent_from_dir(
         )
 
     cfg = AgentConfig(role=role_from_path)
-    cfg.character = _build_character(char_data)
+    cfg.character = _build_character(char_data, agent_dir=agent_dir)
 
     # voice.yaml
     voice_path = os.path.join(agent_dir, "voice.yaml")
@@ -393,7 +468,7 @@ def load_agent_from_dir(
     if os.path.exists(trig_path):
         trig_data = _read_yaml(trig_path)
         _validate(trig_data, "triggers", trig_path)
-        cfg.triggers = _build_triggers(trig_data)
+        cfg.triggers = _build_triggers(trig_data, agent_dir=agent_dir)
 
     # hooks.yaml — optional.
     hooks_path = os.path.join(agent_dir, "hooks.yaml")
