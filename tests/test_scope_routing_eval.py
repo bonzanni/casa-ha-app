@@ -169,3 +169,65 @@ class TestScopeRoutingTesterFast:
         roundtripped = Report.from_json(report.to_json())
         assert roundtripped.total == report.total
         assert roundtripped.metrics["fallback_rate"] == report.metrics["fallback_rate"]
+
+
+FIXTURE_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "fixtures", "eval", "scope_routing", "default.yaml",
+)
+
+
+@pytest.mark.skipif(
+    os.environ.get("CASA_REAL_EMBED") != "1",
+    reason="set CASA_REAL_EMBED=1 to run full-mode real-embedder eval",
+)
+class TestScopeRoutingTesterFull:
+    def test_fixture_loads_and_has_enough_cases(self):
+        from casa_eval.base import Suite
+        suite = Suite.from_yaml(FIXTURE_PATH)
+        assert suite.suite_id == "scope_routing.default"
+        assert len(suite.cases) >= 30, (
+            f"fixture must hold >=30 probes, got {len(suite.cases)}"
+        )
+        valid_scopes = {"personal", "business", "finance", "house"}
+        bad = [c.expected for c in suite.cases if c.expected not in valid_scopes]
+        assert not bad, f"unknown expected scopes: {set(bad)}"
+
+    def test_full_mode_meets_accuracy_baseline(self, tmp_path):
+        """Real e5-large against the default fixture.
+
+        Uses the actual scopes.yaml shipped in the addon (not the
+        4-scope mocked YAML), so descriptions match production.
+        """
+        from scope_registry import load_scope_library
+        from casa_eval.base import Suite
+        from casa_eval.scope_routing import ScopeRoutingTester
+
+        lib = load_scope_library(
+            "casa-agent/rootfs/opt/casa/defaults/policies/scopes.yaml",
+        )
+        tester = ScopeRoutingTester(scope_library=lib)
+        suite = Suite.from_yaml(FIXTURE_PATH)
+        report = tester.run(suite, threshold=0.35)
+
+        # Pretty-print failures to stderr for the operator before asserting.
+        if report.failures:
+            import sys
+            print("\n--- scope-routing eval failures ---", file=sys.stderr)
+            for f in report.failures:
+                print(
+                    f"[{f.case_index}] expected={f.expected!r} actual={f.actual!r} "
+                    f"margin={f.extra.get('margin'):.3f} input={f.input!r}",
+                    file=sys.stderr,
+                )
+            print(f"accuracy={report.accuracy:.3f} "
+                  f"fallback_rate={report.metrics['fallback_rate']:.3f}",
+                  file=sys.stderr)
+
+        assert report.accuracy >= ACCURACY_BASELINE, (
+            f"accuracy {report.accuracy:.3f} < baseline {ACCURACY_BASELINE}"
+        )
+        assert report.metrics["fallback_rate"] <= FALLBACK_CAP, (
+            f"fallback_rate {report.metrics['fallback_rate']:.3f} "
+            f"> cap {FALLBACK_CAP}"
+        )
