@@ -49,8 +49,7 @@ class SessionRegistry:
 
         The Honcho session ID is *not* tracked here in the 2.2a
         topology: it is derived at call time as
-        ``f"{channel_key}:{agent}"``. If a legacy entry on disk has a
-        ``memory_session_id`` field, it is dropped on first write.
+        ``f"{channel_key}:{agent}"``.
         """
         async with self._lock:
             self._data[channel_key] = {
@@ -65,15 +64,10 @@ class SessionRegistry:
         return self._data.get(channel_key)
 
     async def touch(self, channel_key: str) -> None:
-        """Update ``last_active`` for an existing entry and persist.
-
-        Also drops any obsolete ``memory_session_id`` field from a
-        pre-2.2a entry — lazy migration, safe to re-run.
-        """
+        """Update ``last_active`` for an existing entry and persist."""
         async with self._lock:
             entry = self._data.get(channel_key)
             if entry is not None:
-                entry.pop("memory_session_id", None)
                 entry["last_active"] = datetime.now(timezone.utc).isoformat()
                 await self._save_locked()
 
