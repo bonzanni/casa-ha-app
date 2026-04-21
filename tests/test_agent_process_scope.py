@@ -542,6 +542,7 @@ class TestObservability:
         reg.active_from_scores = Mock(return_value=["finance", "house"])
         reg.cache_stats = Mock(return_value=(0, 1))
         reg.argmax_scope = Mock(return_value="finance")
+        reg.threshold = 0.35
 
         with patch("agent.ClaudeSDKClient", FakeClient):
             FakeClient.reset()
@@ -565,13 +566,68 @@ class TestObservability:
             ))
         await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
 
-        # Expected shape:
-        # scope_route role=assistant channel=telegram active=[finance,house] write=finance (t=<N>ms)
-        routes = [r for r in caplog.records if "scope_route" in r.message]
+        # New structured shape: message == "scope_route", fields on extra.
+        routes = [r for r in caplog.records if r.message == "scope_route"]
         assert len(routes) == 1, f"expected 1 scope_route log, got {[r.message for r in routes]}"
-        m = routes[0].message
-        assert "role=assistant" in m
-        assert "channel=telegram" in m
-        assert "active=[finance,house]" in m or "active=[house,finance]" in m
-        assert "write=finance" in m
-        assert "t=" in m and "ms" in m
+        rec = routes[0]
+        assert rec.role == "assistant"
+        assert rec.channel == "telegram"
+        assert set(rec.active) == {"finance", "house"}
+        assert rec.write == "finance"
+        assert isinstance(rec.t_ms, int)
+
+
+class TestScopeRouteEmission:
+    """Verify agent.py:441 emits a parser-shaped scope_route record."""
+
+    async def test_emits_structured_fields_via_extra(self, caplog):
+        import logging
+        from agent import Agent
+        from bus import BusMessage, MessageType
+
+        memory = Mock()
+        memory.ensure_session = AsyncMock()
+        memory.get_context = AsyncMock(return_value="d")
+        memory.add_turn = AsyncMock()
+
+        reg = Mock()
+        reg.filter_readable = Mock(return_value=["personal", "finance", "house"])
+        reg.score = Mock(return_value={"personal": 0.1, "finance": 0.9, "house": 0.5})
+        reg.active_from_scores = Mock(return_value=["finance", "house"])
+        reg.cache_stats = Mock(return_value=(0, 1))
+        reg.argmax_scope = Mock(return_value="finance")
+        reg.threshold = 0.35
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            FakeClient.reset()
+            FakeClient.response_text = "reply"
+
+            agent = Agent(
+                config=_make_agent_config(),
+                memory=memory,
+                session_registry=Mock(get=Mock(return_value=None),
+                                      touch=AsyncMock(),
+                                      register=AsyncMock()),
+                mcp_registry=Mock(resolve=Mock(return_value={})),
+                channel_manager=Mock(),
+                scope_registry=reg,
+            )
+
+            caplog.set_level(logging.INFO, logger="agent")
+            await agent._process(BusMessage(
+                type=MessageType.CHANNEL_IN, source="telegram", target="assistant",
+                content="x", channel="telegram", context={"chat_id": "12345"},
+            ))
+        await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
+
+        records = [r for r in caplog.records if r.message == "scope_route"]
+        assert len(records) == 1, [r.message for r in caplog.records]
+        rec = records[0]
+        # Required-by-parser fields:
+        for key in ("channel", "role", "active", "write", "winner",
+                    "winner_score", "second_score", "threshold"):
+            assert hasattr(rec, key), f"missing extra: {key}"
+        # Type sanity:
+        assert isinstance(rec.winner_score, float)
+        assert isinstance(rec.threshold, float)
+        assert isinstance(rec.active, list)

@@ -55,6 +55,20 @@ origin_var: ContextVar[dict | None] = ContextVar("origin_var", default=None)
 OnTokenCallback = Callable[[str], Awaitable[None]]
 
 
+def _winner_pair(scores: dict[str, float]) -> tuple[str | None, float, float]:
+    """Pick (winner, winner_score, second_score) from a scope-score dict.
+
+    Returns (None, 0.0, 0.0) when scores is empty (e.g., trust filter
+    pruned every readable scope).
+    """
+    if not scores:
+        return None, 0.0, 0.0
+    sorted_pairs = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    winner, winner_score = sorted_pairs[0]
+    second_score = sorted_pairs[1][1] if len(sorted_pairs) > 1 else 0.0
+    return winner, float(winner_score), float(second_score)
+
+
 class Agent:
     """A Casa agent backed by the Claude Agent SDK."""
 
@@ -435,15 +449,24 @@ class Agent:
                     task.add_done_callback(self._bg_tasks.discard)
 
             # --- 3.2 observability ----------------------------------------
-            active_str = ",".join(active)
             total_ms = int((time.perf_counter() - scope_start_t) * 1000)
             hits, misses = self._scope_registry.cache_stats()
+            winner, winner_score, second_score = _winner_pair(scores)
             logger.info(
-                "scope_route role=%s channel=%s active=[%s] write=%s (t=%dms) embed_cache=%d/%d",
-                self.config.role, msg.channel, active_str,
-                write_scope,
-                total_ms,
-                hits, hits + misses,
+                "scope_route",
+                extra={
+                    "channel": msg.channel,
+                    "role": self.config.role,
+                    "active": list(active),
+                    "write": write_scope,
+                    "winner": winner,
+                    "winner_score": winner_score,
+                    "second_score": second_score,
+                    "threshold": self._scope_registry.threshold,
+                    "t_ms": total_ms,
+                    "embed_cache_hits": hits,
+                    "embed_cache_total": hits + misses,
+                },
             )
 
             # 9. SessionRegistry — only SDK session id now. --------------------
