@@ -1,26 +1,91 @@
+# Scope-description authoring contract
+# ====================================
+# Each `description` is the embedding corpus for fastembed e5-large.
+# The classifier at runtime computes cosine(query, description) per
+# scope and picks argmax. So the description IS the scope's signal —
+# nothing else differentiates one scope from another.
+#
+# Format
+# ------
+# Comma-separated phrases. No prose. Cluster phrases by concept;
+# inside a cluster, list 3-8 surface forms a user might say. Aim for
+# ~30-60 phrases per scope. More phrases = broader recall but also
+# more cosine bleed into adjacent scopes.
+#
+# Tenancy rules (defaults file ONLY)
+# ----------------------------------
+# This file ships in the addon image and is the seed for every
+# install. It MUST stay tenant-agnostic:
+#   - no personal names (use <person-name> as a placeholder if needed)
+#   - no company or organization names (<organization>)
+#   - no addresses, cities, or place names (<location>)
+# Tenant-specific signals belong in the per-instance overlay at
+# /addon_configs/casa-agent/policies/scopes.yaml, which Builder
+# (Phase 3.5) is authorized to edit. The overlay's authoring contract
+# permits PII; this file's does not.
+#
+# Verification
+# ------------
+# After any edit, run:
+#   CASA_REAL_EMBED=1 pytest tests/test_scope_routing_eval.py
+# Then re-run the sweep to confirm no regression on the seed fixture:
+#   CASA_REAL_EMBED=1 CASA_EVAL_SWEEP=1 python scripts/run_sweep.py
+
 schema_version: 1
 scopes:
   personal:
     minimum_trust: authenticated
     description: |
-      Nicola's private life: relationships, friendships, non-work
-      correspondence, personal plans. Casual Telegram exchanges land
-      here when they don't clearly belong elsewhere.
+      private life, personal life, friendships, family,
+      parents, siblings, partner, romantic relationship,
+      dating, anniversary, birthday, gift, present,
+      weekend plans, weekend trip, dinner with, lunch with,
+      coffee with, drinks with, party, celebration,
+      exercise, workout, run, running, gym, training,
+      hobbies, leisure, entertainment, movies, music, books,
+      casual chat, personal correspondence, social plans,
+      promise, reminder, errand,
+      non-work, off-work, after-hours
+
   business:
     minimum_trust: authenticated
     description: |
-      Professional life — ENPICOM employment, Lesina Holding
-      non-financial operations, work meetings, project deadlines,
-      professional correspondence.
+      professional life, work, employment, career, job,
+      work meetings, calls with colleagues, team meetings,
+      project deadlines, project status, status update,
+      quarterly report, monthly report, weekly report,
+      Q1, Q2, Q3, Q4, fiscal quarter, fiscal year,
+      business correspondence, professional correspondence,
+      work email, calendar, agenda, meeting prep,
+      team offsite, work travel, business trip,
+      conference, workshop, presentation, deliverable,
+      patent, intellectual property, contract,
+      board call, board meeting, leadership update
+
   finance:
     minimum_trust: authenticated
     description: |
-      Money movement — invoices, bills, payments, bank accounts,
-      VAT, taxes, budgets. Both Nicola's personal finance and Lesina
-      Holding operational finance land here.
+      money, money movement, financial transactions,
+      invoices, bills, payments, receipts,
+      bank account, bank balance, transfer, wire,
+      deposit, withdrawal, statement, reconciliation,
+      expense, expenses, spend, spending, cost, price,
+      budget, budgeting, savings,
+      euro, euros, dollar, dollars, currency, amount,
+      VAT, taxes, tax filing, tax return,
+      accounting, bookkeeping, ledger,
+      salary, payroll, dividend, refund
+
   house:
     minimum_trust: household-shared
     description: |
-      The physical house in Oudekamp: appliances, HVAC, lights,
-      plumbing, heating, contractors visiting, occupants and guests,
-      environment sensors and device state.
+      house, home, household, residence,
+      appliances, dishwasher, washing machine, fridge, oven,
+      HVAC, heating, cooling, boiler, thermostat, temperature,
+      lights, lighting, lamp, switch, dim,
+      plumbing, leak, drain, faucet, toilet,
+      contractor, plumber, electrician, cleaner, maintenance,
+      occupants, guests, visitors,
+      sensors, device state, smart home, automation,
+      Wi-Fi, network, router,
+      rooms, kitchen, bedroom, living room, bathroom, hallway, garage
