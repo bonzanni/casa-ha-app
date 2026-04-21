@@ -45,7 +45,21 @@ Spec at `docs/superpowers/specs/2026-04-21-3.2.2-scope-routing-hardening.md`.
   new `TestScopeRouteEmission` in `tests/test_agent_process_scope.py`;
   new `TestThresholdProperty` in `tests/test_scope_registry.py`. New
   e2e scenario `test-local/e2e/test_migration_v085_existing.sh` plus
-  M-7..M-9 in `test_migration.sh`.
+  M-7..M-9 in `test_migration.sh`. 594 unit tests green; full-mode
+  accuracy gate 0.943 (baseline 0.85); all local e2e scripts green
+  after Dockerfile.test infra catch-up (see below).
+- **Test-infra catch-up — `test-local/Dockerfile.test` migrated to
+  Debian bookworm.** The main `casa-agent/Dockerfile` switched to
+  `amd64-base-debian:bookworm` in v0.8.1 when fastembed pulled
+  onnxruntime (no musllinux wheel) — but the test Dockerfile was
+  left on Alpine/musl, breaking the local e2e harness and
+  `.github/workflows/qa.yml` CI from v0.8.1 onward. v0.8.5 mirrors
+  the v0.8.1 migration recipe into the test image so e2e can run
+  again. Also adds the v0.8.5 migration block to
+  `test-local/init-overrides/01-setup-configs.sh` (the test-mode
+  setup-configs override that replaces the bashio-dependent prod
+  script) — without this the test container would skip the
+  migration entirely since the prod script never runs there.
 
 Rollback: §10 of the spec. Backup file + marker removal restore v0.8.4
 runtime behaviour; reverting the formatter changes and `agent.py:455`
