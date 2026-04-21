@@ -43,6 +43,13 @@ if [ "$_scope_threshold" != "null" ] && [ -n "$_scope_threshold" ]; then
     export CASA_SCOPE_THRESHOLD="$_scope_threshold"
 fi
 
+# 3.3: scheduler timezone — optional; falls back to UTC in timekeeping.py
+# if unset or "null".
+_casa_tz="$(bashio::config 'casa_tz')"
+if [ "$_casa_tz" != "null" ] && [ -n "$_casa_tz" ]; then
+    export CASA_TZ="$_casa_tz"
+fi
+
 # SUPERVISOR_TOKEN is injected automatically by the HA Supervisor.
 
 exec python3 /opt/casa/casa_core.py
