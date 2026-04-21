@@ -36,6 +36,17 @@
   `etc/s6-overlay/s6-rc.d/svc-casa/run`. Restart-required, matching
   every other addon option (restart cost on N150 ≈ 3 sec).
 
+### Known limitations
+- `scripts/eval_scope_dist.py` expects JSON-structured `scope_route`
+  log records with `winner_score`/`second_score`/`threshold` fields.
+  The live addon at v0.8.4 emits `scope_route` as a formatted-string
+  log line (see `agent.py:441`) without `winner_score`, so the script
+  reports "total records: 0" against unmodified production logs. A
+  follow-up commit will extend the upstream emission (either JSON
+  `extra=` or additional score fields in the format string) to unblock
+  the audit tool. Parser logic is fully tested against synthetic logs
+  and will work the moment the emission ships the expected fields.
+
 ### Notes — post-deploy recipe
 - Full-mode pytest on the live N150:
   `sudo docker exec addon_c071ea9c_casa-agent sh -c \

@@ -35,7 +35,13 @@ export FASTEMBED_CACHE_PATH="/data/fastembed"
 # first-class addon option so Builder can tune it via supervisor.addon_options_set.
 # Runtime read at casa_core.py:427 is unchanged; only the source of the
 # env var changes (was: fallback 0.35; now: bashio::config value).
-export CASA_SCOPE_THRESHOLD="$(bashio::config 'scope_threshold')"
+# "null"-normalize matches the PUBLIC_URL pattern: if a user clears the
+# key via YAML UI, leave the var unset so casa_core.py:427 falls back to "0.35"
+# rather than attempting float("null").
+_scope_threshold="$(bashio::config 'scope_threshold')"
+if [ "$_scope_threshold" != "null" ] && [ -n "$_scope_threshold" ]; then
+    export CASA_SCOPE_THRESHOLD="$_scope_threshold"
+fi
 
 # SUPERVISOR_TOKEN is injected automatically by the HA Supervisor.
 
