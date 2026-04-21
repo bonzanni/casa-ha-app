@@ -52,12 +52,19 @@ stop_container() {
 }
 
 assert_log_contains() {
+    # Poll docker logs for up to 15s — on CI, `docker logs` sometimes lags
+    # behind the container's Python stdout even after healthz is green.
     local name="$1"
     local needle="$2"
-    if ! docker logs "$name" 2>&1 | grep -qF "$needle"; then
-        docker logs "$name" 2>&1 | tail -30 >&2
-        fail "expected log line '$needle' not found in $name"
-    fi
+    local deadline=$(( $(date +%s) + 15 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if docker logs "$name" 2>&1 | grep -qF "$needle"; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    docker logs "$name" 2>&1 | tail -30 >&2
+    fail "expected log line '$needle' not found in $name"
 }
 
 assert_log_not_contains() {
