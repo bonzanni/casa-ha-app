@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import pytest_asyncio
 
 # Ensure the Casa package root is importable.
 _casa_root = str(Path(__file__).resolve().parent.parent / "casa-agent" / "rootfs" / "opt" / "casa")
@@ -148,8 +149,9 @@ class _FakeTelegramBot:
         return True
 
     async def send_message(self, chat_id, text, message_thread_id=None, **kw):
+        # Always register the supergroup so tests can inspect _supergroups[chat_id].
+        sg = self._require_supergroup(chat_id)
         if message_thread_id is not None:
-            sg = self._require_supergroup(chat_id)
             sg.messages_by_thread[message_thread_id].append(text)
         else:
             self.messages.append((chat_id, text))
@@ -183,3 +185,20 @@ class _FakeTelegramBot:
 @pytest.fixture
 def fake_telegram_bot():
     return _FakeTelegramBot()
+
+
+@pytest_asyncio.fixture
+async def engagement_fixture(tmp_path):
+    from engagement_registry import EngagementRegistry
+
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+    rec = await reg.create(
+        kind="specialist", role_or_type="finance", driver="in_casa",
+        task="t", origin={"role": "assistant"}, topic_id=555,
+    )
+
+    class _Fx:
+        registry = reg
+        active_record = rec
+
+    return _Fx()
