@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from contextvars import ContextVar
@@ -521,6 +522,40 @@ async def config_git_commit(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# casa_reload - Plan 3 (hard reload via Supervisor addon restart)
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    "casa_reload",
+    "Restart the Casa addon via Supervisor. Your own session will be "
+    "terminated. Only call AFTER emit_completion has been sent.",
+    {},
+)
+async def casa_reload(_: dict) -> dict:
+    import aiohttp
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if not token:
+        return _result({
+            "status": "error",
+            "kind": "no_supervisor_token",
+            "message": "SUPERVISOR_TOKEN not set - cannot restart addon",
+        })
+    headers = {"Authorization": f"Bearer {token}"}
+    url = "http://supervisor/addons/self/restart"
+    try:
+        async with aiohttp.ClientSession(headers=headers) as s:
+            async with s.post(url) as resp:
+                return _result({"supervisor_status": resp.status})
+    except Exception as exc:  # noqa: BLE001
+        return _result({
+            "status": "error",
+            "kind": "supervisor_error",
+            "message": str(exc),
+        })
+
+
+# ---------------------------------------------------------------------------
 # engage_executor — Plan 2 stub; Tier 3 types arrive Plan 3+
 # ---------------------------------------------------------------------------
 
@@ -884,6 +919,6 @@ def create_casa_tools() -> dict[str, Any]:
         name="casa-framework",
         tools=[send_message, delegate_to_specialist, get_schedule, engage_executor,
                emit_completion, cancel_engagement, query_engager,
-               config_git_commit],
+               config_git_commit, casa_reload],
     )
     return server
