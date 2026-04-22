@@ -1,0 +1,19 @@
+schema_version: 1
+pre_tool_use:
+  - policy: block_dangerous_bash
+  - policy: path_scope
+    writable:
+      - /addon_configs/casa-agent/agents
+      - /addon_configs/casa-agent/policies
+      - /addon_configs/casa-agent/workspace
+    readable:
+      - /addon_configs/casa-agent
+      - /opt/casa/defaults
+  - policy: casa_config_guard
+    forbid_delete_residents: true
+    forbid_write_paths:
+      - /data
+      - /addon_configs/casa-agent/schema
+      - /opt/casa
+  - policy: commit_size_guard
+    max_files: 20
