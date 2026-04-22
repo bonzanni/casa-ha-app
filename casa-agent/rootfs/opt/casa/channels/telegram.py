@@ -81,15 +81,17 @@ class TelegramChannel(Channel):
 
     def __init__(
         self,
-        bot_token: str,
-        chat_id: str,
-        default_agent: str,
-        bus: MessageBus,
+        bot_token: str = "",
+        chat_id: str = "",
+        default_agent: str = "",
+        bus: MessageBus | None = None,
         webhook_url: str = "",
         webhook_path: str = "/telegram/update",
         delivery_mode: str = "stream",
         webhook_secret: str = "",
         rate_limiter: RateLimiter | None = None,
+        bot: Any = None,
+        engagement_supergroup_id: int | None = None,
     ) -> None:
         self.bot_token = bot_token
         self.chat_id = chat_id
@@ -110,6 +112,9 @@ class TelegramChannel(Channel):
         # Reconnect supervisor + health probe task.
         self._supervisor: ReconnectSupervisor | None = None
         self._probe_task: asyncio.Task | None = None
+        # Test-injection bot and engagement supergroup.
+        self._bot = bot
+        self.engagement_supergroup_id = engagement_supergroup_id
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -410,6 +415,67 @@ class TelegramChannel(Channel):
             },
         )
         await self._bus.send(msg)
+
+    # ------------------------------------------------------------------
+    # Bot accessor (supports test injection via bot= kwarg)
+    # ------------------------------------------------------------------
+
+    @property
+    def bot(self) -> Any:
+        if self._bot is not None:
+            return self._bot
+        return self._app.bot if self._app is not None else None
+
+    # ------------------------------------------------------------------
+    # Engagement topic helpers
+    # ------------------------------------------------------------------
+
+    async def open_engagement_topic(
+        self, *, name: str, icon_emoji: str | None = None,
+    ) -> int:
+        """Create a Telegram forum topic in the engagement supergroup.
+
+        Returns the ``message_thread_id``. Raises RuntimeError if the
+        supergroup is not configured.
+        """
+        if not self.engagement_supergroup_id:
+            raise RuntimeError("engagement supergroup not configured")
+        topic = await self.bot.create_forum_topic(
+            chat_id=self.engagement_supergroup_id,
+            name=name,
+            icon_custom_emoji_id=icon_emoji,
+        )
+        return topic.message_thread_id
+
+    async def send_to_topic(self, thread_id: int, text: str) -> None:
+        """Post a message into the given forum-supergroup topic."""
+        if not self.engagement_supergroup_id:
+            raise RuntimeError("engagement supergroup not configured")
+        await self.bot.send_message(
+            chat_id=self.engagement_supergroup_id,
+            text=text,
+            message_thread_id=thread_id,
+        )
+
+    async def close_topic_with_check(self, thread_id: int) -> None:
+        """Close the topic and flip its icon emoji to ✅."""
+        if not self.engagement_supergroup_id:
+            raise RuntimeError("engagement supergroup not configured")
+        try:
+            await self.bot.edit_forum_topic(
+                chat_id=self.engagement_supergroup_id,
+                message_thread_id=thread_id,
+                icon_custom_emoji_id="✅",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "edit_forum_topic failed for thread=%s: %s",
+                thread_id, exc,
+            )
+        await self.bot.close_forum_topic(
+            chat_id=self.engagement_supergroup_id,
+            message_thread_id=thread_id,
+        )
 
     # ------------------------------------------------------------------
     # Outbound: block mode
