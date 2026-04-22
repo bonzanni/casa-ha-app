@@ -331,6 +331,60 @@ as errored and tells you to start a fresh one.
   narration, edit `prompts/system.md` in Ellen's agent folder and
   restart.
 
+## Configurator (v0.12.0)
+
+The `configurator` is the first Tier 3 Executor - knows Casa's configuration surface and can CRUD it on your behalf. Ask Ellen for a configuration change; she opens a dedicated engagement topic where you talk directly to the configurator.
+
+### What's supported
+
+| Surface | Create | Read | Update | Delete |
+|---|---|---|---|---|
+| Specialist agents (Tier 2) | yes | yes | yes | yes |
+| Resident agents (Tier 1) | rare | yes | yes | blocked by default |
+| Per-agent YAMLs | yes | yes | yes | yes |
+| Per-agent prompts | yes | yes | yes | yes |
+| Triggers (cron, interval, webhook) | yes | yes | yes | yes |
+| Delegate wiring | yes | yes | yes | yes |
+| Policies (scopes corpus, disclosure) | - | yes | yes | - |
+
+Not yet supported:
+
+- Eval running (configurator can shell to casa_eval, but no first-class recipe).
+- Plugin/skill installation - waiting on Plan 5 plugin-developer.
+- Creating new executor types - waiting on Plans 4/5.
+
+### Invocation
+
+Ask Ellen for a configuration change in 1:1 chat. Examples:
+
+- "Make a new specialist called fitness using sonnet"
+- "Add a morning briefing trigger to yourself at 7am on weekdays"
+- "Change Alex's prompt to be more concise"
+- "Remove the garbage_reminder trigger"
+- "Wire Alex into your delegates"
+
+Ellen opens a topic `#[configurator] <short task>` in your engagement supergroup. The configurator reads its doctrine, asks questions as needed, edits YAMLs, commits, and reloads Casa.
+
+### Reload behavior
+
+- hard - Supervisor addon restart (~10-15s). Agent-shape changes, runtime, scope corpus.
+- soft - In-process casa_reload_triggers(role). Trigger-only edits; no downtime.
+- none - Prompt, response_shape, doctrine edits take effect on next turn.
+
+Hard reload: Ellen verifies the reload landed on her resumed turn, then narrates.
+
+### Recipe discovery
+
+Configurator reads short markdown recipes from its own doctrine tree at `/addon_configs/casa-agent/agents/executors/configurator/doctrine/`. Edit these recipes to customize per-instance (e.g., add house rules).
+
+### Troubleshooting
+
+- **"engagement_not_configured"** - you haven't set telegram_engagement_supergroup_id, or the bot doesn't have can_manage_topics.
+- **Configurator stalls after first message** - check engagement's driver log. If you see prompt_template_missing, restart the addon.
+- **Hook denied, configurator cancelled** - expected for resident deletion. To override: edit configurator's hooks.yaml, commit, reload, retry.
+- **Soft reload didn't take effect** - casa_reload_triggers requires the role to exist before the edit.
+- **Doctrine references stale fields** - file an issue; maintainer forgot to sync doctrine with Casa-core change.
+
 ## Enabling a bundled-disabled specialist
 
 Casa ships some Tier 2 specialist agents disabled by default (`finance`
