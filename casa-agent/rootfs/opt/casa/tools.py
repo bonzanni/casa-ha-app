@@ -7,6 +7,7 @@ import json
 import logging
 import time
 import uuid
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -25,6 +26,7 @@ from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from error_kinds import _classify_error
 from mcp_registry import McpServerRegistry
+from engagement_registry import EngagementRecord, EngagementRegistry
 from specialist_registry import (
     DelegationComplete,
     DelegationRecord,
@@ -39,6 +41,10 @@ _bus: MessageBus | None = None
 _specialist_registry: SpecialistRegistry | None = None
 _mcp_registry: McpServerRegistry | None = None
 _trigger_registry: "TriggerRegistry | None" = None
+_engagement_registry: EngagementRegistry | None = None
+engagement_var: ContextVar[EngagementRecord | None] = ContextVar(
+    "engagement_var", default=None,
+)
 
 
 def init_tools(
@@ -47,6 +53,7 @@ def init_tools(
     specialist_registry: SpecialistRegistry,
     mcp_registry: McpServerRegistry | None = None,
     trigger_registry: "TriggerRegistry | None" = None,
+    engagement_registry: EngagementRegistry | None = None,
 ) -> None:
     """Initialize module-level references used by tool implementations.
 
@@ -57,12 +64,13 @@ def init_tools(
     Accepts ``None`` for legacy callers that don't pass
     it (the `_build_specialist_options` code path degrades to empty MCP
     servers — the specialist still runs but with only built-in tools)."""
-    global _channel_manager, _bus, _specialist_registry, _mcp_registry, _trigger_registry  # noqa: PLW0603
+    global _channel_manager, _bus, _specialist_registry, _mcp_registry, _trigger_registry, _engagement_registry  # noqa: PLW0603
     _channel_manager = channel_manager
     _bus = bus
     _specialist_registry = specialist_registry
     _mcp_registry = mcp_registry
     _trigger_registry = trigger_registry
+    _engagement_registry = engagement_registry
 
 
 @tool(
@@ -401,10 +409,41 @@ async def get_schedule(args: dict) -> dict:
     return {"content": [{"type": "text", "text": text}]}
 
 
+# ---------------------------------------------------------------------------
+# engage_executor — Plan 2 stub; Tier 3 types arrive Plan 3+
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    "engage_executor",
+    "Start a Tier 3 Executor engagement (configurator, ha-developer, etc.). "
+    "Returns an engagement_id; result arrives later as a NOTIFICATION.",
+    {"executor_type": str, "task": str, "context": str},
+)
+async def engage_executor(args: dict) -> dict:
+    import agent as agent_mod
+    origin = agent_mod.origin_var.get(None)
+    if origin is None:
+        return _result({
+            "status": "error",
+            "kind": "no_origin",
+            "message": "engage_executor called outside a turn",
+        })
+    return _result({
+        "status": "error",
+        "kind": "no_executor_types",
+        "message": (
+            "No Tier 3 Executor types are registered in this Casa version. "
+            "Tier 3 types arrive in Plan 3 (configurator) and Plan 4 "
+            "(ha-developer). For Plan 2, use delegate_to_specialist(mode=interactive)."
+        ),
+    })
+
+
 def create_casa_tools() -> dict[str, Any]:
     """Create and return the casa-framework MCP server config."""
     server = create_sdk_mcp_server(
         name="casa-framework",
-        tools=[send_message, delegate_to_specialist, get_schedule],
+        tools=[send_message, delegate_to_specialist, get_schedule, engage_executor],
     )
     return server
