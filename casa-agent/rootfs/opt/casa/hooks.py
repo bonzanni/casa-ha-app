@@ -143,6 +143,74 @@ def _has_prefix(norm: str, prefixes: list[str]) -> bool:
                for p in prefixes)
 
 
+# ---------------------------------------------------------------------------
+# casa_config_guard - Plan 3 (blocks /data/, schema/, resident deletions)
+# ---------------------------------------------------------------------------
+
+
+_RESIDENT_RM_RE = re.compile(
+    r"\brm\s+(-[a-zA-Z]+\s+)*"
+    r"/addon_configs/casa-agent/agents/(?!specialists/|executors/)[^/\s]+"
+)
+
+
+def make_casa_config_guard_hook(
+    *,
+    forbid_write_paths: list[str] | None = None,
+    forbid_delete_residents: bool = True,
+) -> HookCallback:
+    """Return a PreToolUse hook that guards Casa-specific destructive ops."""
+    forbid_write = [_normalize_path(p) for p in (forbid_write_paths or [])]
+
+    async def _hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        tool_name = input_data.get("tool_name", "")
+        if tool_name in ("Write", "Edit"):
+            raw = input_data.get("tool_input", {}).get("file_path", "")
+            norm = _normalize_path(raw)
+            if _has_prefix(norm, forbid_write):
+                return _deny(
+                    f"casa_config_guard: {tool_name} blocked - {raw!r} is "
+                    f"in a forbidden prefix ({forbid_write}). This path "
+                    f"holds runtime state or authoritative schema; editing "
+                    f"it would break Casa. Ask the user if you believe "
+                    f"this is necessary."
+                )
+        elif tool_name == "Bash":
+            command = input_data.get("tool_input", {}).get("command", "")
+            if forbid_delete_residents and _RESIDENT_RM_RE.search(command):
+                return _deny(
+                    "casa_config_guard: Bash blocked - command looks like "
+                    "a resident agent deletion. Residents are very "
+                    "destructive to remove; ask the user explicitly in the "
+                    "engagement topic and retry only if they say yes."
+                )
+        return None
+
+    return _hook
+
+
+def _policy_casa_config_guard(**kwargs: Any):
+    from claude_agent_sdk import HookMatcher
+    forbid_write_paths = kwargs.pop("forbid_write_paths", None)
+    forbid_delete_residents = kwargs.pop("forbid_delete_residents", True)
+    if kwargs:
+        raise UnknownPolicyError(
+            f"casa_config_guard: unknown parameter(s) {list(kwargs)}; "
+            f"supported: forbid_write_paths, forbid_delete_residents"
+        )
+    return HookMatcher(
+        matcher="Write|Edit|Bash",
+        hooks=[make_casa_config_guard_hook(
+            forbid_write_paths=forbid_write_paths,
+            forbid_delete_residents=forbid_delete_residents,
+        )],
+    )
+
+
 # HOOK_POLICIES — name → (HookMatcher-factory that takes kwargs and returns
 # HookMatcher). The agent_loader resolves `hooks.yaml::pre_tool_use` entries
 # through this table.
@@ -174,6 +242,7 @@ def _policy_path_scope(**kwargs: Any):
 HOOK_POLICIES: dict[str, Callable[..., Any]] = {
     "block_dangerous_bash": _policy_block_dangerous_bash,
     "path_scope":           _policy_path_scope,
+    "casa_config_guard":    _policy_casa_config_guard,
 }
 
 
