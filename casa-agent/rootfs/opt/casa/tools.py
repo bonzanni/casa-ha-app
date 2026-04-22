@@ -440,6 +440,147 @@ async def engage_executor(args: dict) -> dict:
     })
 
 
+# ---------------------------------------------------------------------------
+# _finalize_engagement — shared funnel for completion + cancel
+# ---------------------------------------------------------------------------
+
+
+async def _finalize_engagement(
+    engagement: EngagementRecord,
+    *,
+    outcome: str,                       # "completed" | "cancelled" | "error"
+    text: str,
+    artifacts: list[str],
+    next_steps: list[dict],
+    driver: Any | None,
+    memory_provider: Any | None,
+) -> None:
+    """End an engagement: update registry, close topic, NOTIFY Ellen, write
+    Ellen's meta-scope summary.
+
+    Never raises on channel/memory side-effects — logs warnings and continues
+    so the registry always reaches a terminal state.
+    """
+    now = time.time()
+
+    # 1. Registry transition
+    if _engagement_registry is not None:
+        if outcome == "completed":
+            await _engagement_registry.mark_completed(engagement.id, completed_at=now)
+        elif outcome == "cancelled":
+            await _engagement_registry.mark_cancelled(engagement.id)
+        else:  # "error"
+            await _engagement_registry.mark_error(
+                engagement.id, kind="emit_completion_error", message=text,
+            )
+
+    # 2. Post completion message into the topic (if any) and close it
+    if engagement.topic_id is not None and _channel_manager is not None:
+        tch = _channel_manager.get(engagement.origin.get("channel", "telegram"))
+        if tch is not None:
+            try:
+                await tch.send_to_topic(
+                    engagement.topic_id,
+                    f"Engagement {outcome}. Summary:\n{text}" if text else f"Engagement {outcome}.",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "finalize engagement %s: send_to_topic failed: %s",
+                    engagement.id[:8], exc,
+                )
+            try:
+                await tch.close_topic_with_check(thread_id=engagement.topic_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "finalize engagement %s: close_topic_with_check failed: %s",
+                    engagement.id[:8], exc,
+                )
+
+    # 3. Tear down driver client
+    if driver is not None:
+        try:
+            await driver.cancel(engagement)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "finalize engagement %s: driver.cancel failed: %s",
+                engagement.id[:8], exc,
+            )
+
+    # 4. NOTIFY Ellen (via existing DelegationComplete-shaped pathway)
+    if _bus is not None:
+        target_role = engagement.origin.get("role") or "assistant"
+        complete = DelegationComplete(
+            delegation_id=engagement.id,
+            agent=engagement.role_or_type,
+            status="ok" if outcome == "completed" else "error",
+            text=text,
+            kind="" if outcome == "completed" else outcome,
+            message=text,
+            origin=dict(engagement.origin),
+            elapsed_s=now - engagement.started_at,
+        )
+        try:
+            await _bus.notify(BusMessage(
+                type=MessageType.NOTIFICATION,
+                source=engagement.role_or_type,
+                target=target_role,
+                content=complete,
+                channel=engagement.origin.get("channel", ""),
+                context={
+                    "cid": engagement.origin.get("cid", "-"),
+                    "chat_id": engagement.origin.get("chat_id", ""),
+                    "engagement_id": engagement.id,
+                    "next_steps": next_steps,
+                },
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "finalize engagement %s: bus.notify failed: %s",
+                engagement.id[:8], exc,
+            )
+
+    # 5. Write Ellen's meta-scope summary (best-effort)
+    if memory_provider is not None:
+        try:
+            summary = json.dumps({
+                "kind": "engagement_summary",
+                "engagement_id": engagement.id,
+                "specialist_or_type": engagement.role_or_type,
+                "task": engagement.task,
+                "status": outcome,
+                "started_at": engagement.started_at,
+                "completed_at": now,
+                "duration_s": now - engagement.started_at,
+                "text": text,
+                "artifacts": artifacts,
+                "next_steps": next_steps,
+            })
+            # Use Ellen's meta session. The session_id convention is
+            # {channel}:{chat_id}:meta:assistant — mirror plan-1 scope stack.
+            channel = engagement.origin.get("channel", "telegram")
+            chat_id = str(engagement.origin.get("chat_id", ""))
+            await memory_provider.ensure_session(
+                session_id=f"{channel}:{chat_id}:meta:assistant",
+                agent_role="assistant",
+            )
+            await memory_provider.add_turn(
+                session_id=f"{channel}:{chat_id}:meta:assistant",
+                agent_role="assistant",
+                user_text="(engagement summary written)",
+                assistant_text=summary,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "finalize engagement %s: meta summary write failed: %s",
+                engagement.id[:8], exc,
+            )
+
+    logger.info(
+        "Engagement %s finalized outcome=%s",
+        engagement.id[:8], outcome,
+    )
+
+
 def create_casa_tools() -> dict[str, Any]:
     """Create and return the casa-framework MCP server config."""
     server = create_sdk_mcp_server(
