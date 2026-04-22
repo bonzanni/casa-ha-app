@@ -35,6 +35,12 @@ from specialist_registry import (
 
 logger = logging.getLogger(__name__)
 
+# Icon map for interactive engagement topic naming.
+_ICON_FOR_KIND: dict[tuple[str, str], str] = {
+    ("specialist", "finance"): "💰",
+    # Plan 3+ adds ("executor", "configurator"): "⚙️", etc.
+}
+
 # Module-level references, initialized via init_tools()
 _channel_manager: ChannelManager | None = None
 _bus: MessageBus | None = None
@@ -264,6 +270,84 @@ async def delegate_to_specialist(args: dict) -> dict:
             "status": "error",
             "kind": "unknown_specialist",
             "message": f"No enabled specialist named {specialist_name!r}",
+        })
+
+    if mode == "interactive":
+        # Need telegram channel + supergroup configured.
+        if _channel_manager is None:
+            return _result({"status": "error", "kind": "no_channel_manager",
+                            "message": "channel manager missing"})
+        channel = _channel_manager.get(origin.get("channel", "telegram"))
+        if (channel is None
+                or not getattr(channel, "engagement_supergroup_id", 0)
+                or not getattr(channel, "engagement_permission_ok", False)):
+            return _result({
+                "status": "error", "kind": "engagement_not_configured",
+                "message": ("set telegram_engagement_supergroup_id in addon "
+                            "options and verify the bot has can_manage_topics"),
+            })
+        # Open topic
+        icon = _ICON_FOR_KIND.get(("specialist", specialist_name), "🧵")
+        short_task = (task_text or "").splitlines()[0][:80].strip() or "engagement"
+        try:
+            topic_id = await channel.open_engagement_topic(
+                name=f"#[{specialist_name}] {short_task}",
+                icon_emoji=icon,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _result({"status": "error", "kind": "topic_create_failed",
+                            "message": str(exc)})
+        # Create record
+        rec = await _engagement_registry.create(
+            kind="specialist", role_or_type=specialist_name, driver="in_casa",
+            task=task_text, origin=dict(origin), topic_id=topic_id,
+        )
+        # Rename the topic to include the short engagement id for disambiguation
+        try:
+            await channel.bot.edit_forum_topic(
+                chat_id=channel.engagement_supergroup_id,
+                message_thread_id=topic_id,
+                name=f"#[{specialist_name}] {short_task} · {rec.id[:8]}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("edit_forum_topic rename failed: %s", exc)
+
+        # Build options + start driver
+        options = _build_specialist_options(cfg)
+        # Augment allowed tools (additive) with query_engager + emit_completion
+        injected = list(options.allowed_tools or [])
+        for t in ("mcp__casa-framework__query_engager",
+                  "mcp__casa-framework__emit_completion"):
+            if t not in injected:
+                injected.append(t)
+        options.allowed_tools = injected
+
+        prompt = (
+            f"You are engaged with the user in a Telegram forum topic.\n"
+            f"Task: {task_text}\n\n"
+            f"Context from Ellen:\n{context_text or '(none)'}\n\n"
+            f"When the task is complete, call emit_completion(text=..., "
+            f"artifacts=..., next_steps=..., status='ok')."
+        )
+
+        driver = getattr(agent_mod, "active_engagement_driver", None)
+        if driver is None:
+            return _result({"status": "error", "kind": "no_driver",
+                            "message": "engagement driver not initialized"})
+        try:
+            await driver.start(rec, prompt=prompt, options=options)
+        except Exception as exc:  # noqa: BLE001
+            await _engagement_registry.mark_error(rec.id, kind="driver_start_failed",
+                                                  message=str(exc))
+            return _result({"status": "error", "kind": "driver_start_failed",
+                            "message": str(exc)})
+
+        return _result({
+            "status": "pending",
+            "engagement_id": rec.id,
+            "agent": specialist_name,
+            "mode": "interactive",
+            "topic_id": topic_id,
         })
 
     delegation_id = str(uuid.uuid4())
