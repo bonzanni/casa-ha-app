@@ -406,6 +406,13 @@ async def main() -> None:
     )
     specialist_registry.load()
 
+    from engagement_registry import EngagementRegistry
+    engagement_registry = EngagementRegistry(
+        tombstone_path=os.path.join(DATA_DIR, "engagements.json"),
+        bus=bus,
+    )
+    await engagement_registry.load()
+
     # Scheduler + trigger registry constructed here so the get_schedule
     # tool can see the registry via init_tools. The per-role
     # register_agent loop stays below (needs role_configs).
@@ -423,6 +430,7 @@ async def main() -> None:
     init_tools(
         channel_manager, bus, specialist_registry, mcp_registry,
         trigger_registry=trigger_registry,
+        engagement_registry=engagement_registry,
     )
     casa_tools_config = create_casa_tools()
     mcp_registry.register_sdk("casa-framework", casa_tools_config)
@@ -533,6 +541,9 @@ async def main() -> None:
 
         telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
         telegram_delivery = os.environ.get("TELEGRAM_DELIVERY_MODE", "stream")
+        telegram_engagement_supergroup_id = int(os.environ.get(
+            "TELEGRAM_ENGAGEMENT_SUPERGROUP_ID", "0",
+        ) or "0")
 
         # Derive transport: webhook only possible when public_url is set
         telegram_transport = os.environ.get("TELEGRAM_TRANSPORT", "polling")
@@ -554,8 +565,10 @@ async def main() -> None:
             delivery_mode=telegram_delivery,
             webhook_secret=webhook_secret,
             rate_limiter=telegram_rate_limiter,
+            engagement_supergroup_id=telegram_engagement_supergroup_id or None,
         )
         channel_manager.register(telegram_channel)
+        await telegram_channel.setup_engagement_features()
         logger.info(
             "Telegram channel registered (transport=%s, delivery=%s, chat_id=%s)",
             telegram_transport,
@@ -570,6 +583,56 @@ async def main() -> None:
             await ch.send(str(msg.content), msg.context)
 
     bus.register("telegram", _telegram_outbound)
+
+    # Engagement infrastructure: InCasaDriver + Observer
+    from drivers.in_casa_driver import InCasaDriver
+
+    async def _send_to_topic(thread_id: int, text: str) -> None:
+        if telegram_channel is not None:
+            await telegram_channel.send_to_topic(thread_id, text)
+
+    engagement_driver = InCasaDriver(send_to_topic=_send_to_topic)
+
+    # Expose on the agent module so tools.emit_completion / cancel_engagement
+    # can find it without circular imports.
+    import agent as agent_mod
+    agent_mod.active_engagement_driver = engagement_driver
+    agent_mod.active_memory_provider = base_memory    # already constructed above
+
+    from observer import Observer
+    observer = Observer(
+        bus=bus,
+        engagement_registry=engagement_registry,
+        model_name=os.environ.get("SECONDARY_AGENT_MODEL", "haiku"),
+    )
+    await observer.subscribe()
+
+    if telegram_channel is not None:
+        telegram_channel._engagement_registry = engagement_registry
+        telegram_channel._engagement_driver = engagement_driver
+        telegram_channel._observer = observer
+
+        async def _driver_send_user_turn(rec, text):
+            await engagement_driver.send_user_turn(rec, text)
+        telegram_channel._driver_send_user_turn = _driver_send_user_turn
+
+        async def _finalize_cancel(rec, reason="user"):
+            from tools import _finalize_engagement
+            await _finalize_engagement(
+                rec, outcome="cancelled", text=f"Cancelled by {reason}.",
+                artifacts=[], next_steps=[],
+                driver=engagement_driver, memory_provider=base_memory,
+            )
+        telegram_channel._finalize_cancel = _finalize_cancel
+
+        async def _finalize_complete_user(rec):
+            from tools import _finalize_engagement
+            await _finalize_engagement(
+                rec, outcome="completed", text="User-marked complete.",
+                artifacts=[], next_steps=[],
+                driver=engagement_driver, memory_provider=base_memory,
+            )
+        telegram_channel._finalize_complete_user = _finalize_complete_user
 
     # 10b. Voice channel
     voice_sse_enabled = os.environ.get(
@@ -855,6 +918,16 @@ async def main() -> None:
 
     # 14. Kick off timers.
     session_sweeper.start()
+    scheduler.add_job(
+        lambda: asyncio.create_task(
+            engagement_registry.sweep_idle_and_suspend(driver=engagement_driver)
+        ),
+        trigger="cron",
+        id="engagement_idle_sweep",
+        hour=8, minute=0,
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
     scheduler.start()
 
     # 15. Graceful shutdown
