@@ -8,7 +8,7 @@ tools:
     - Edit
     - Bash
     - Skill
-    - mcp__casa-framework__delegate_to_agent
+    - mcp__casa-framework__delegate_to_specialist
     - mcp__casa-framework__send_message
     - mcp__casa-framework__get_schedule
   disallowed: []

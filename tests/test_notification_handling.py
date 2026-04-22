@@ -11,7 +11,7 @@ from agent import Agent
 from bus import BusMessage, MessageType
 from channels import ChannelManager
 from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
-from executor_registry import DelegationComplete
+from specialist_registry import DelegationComplete
 from mcp_registry import McpServerRegistry
 from memory import MemoryProvider
 from session_registry import SessionRegistry

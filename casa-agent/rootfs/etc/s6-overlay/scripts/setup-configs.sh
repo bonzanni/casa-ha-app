@@ -12,6 +12,7 @@ DEFAULTS_DIR="/opt/casa/defaults"
 # ------------------------------------------------------------------
 
 mkdir -p "$CONFIG_DIR/agents" \
+         "$CONFIG_DIR/agents/specialists" \
          "$CONFIG_DIR/agents/executors" \
          "$CONFIG_DIR/policies" \
          "$CONFIG_DIR/schema" \
@@ -38,16 +39,17 @@ if [ -d "$DEFAULTS_DIR/agents" ]; then
     for src in "$DEFAULTS_DIR/agents"/*/; do
         [ -d "$src" ] || continue
         name=$(basename "$src")
+        [ "$name" = "specialists" ] && continue
         [ "$name" = "executors" ] && continue
         seed_agent_dir "$src" "$CONFIG_DIR/agents/$name"
     done
 fi
 
-if [ -d "$DEFAULTS_DIR/agents/executors" ]; then
-    for src in "$DEFAULTS_DIR/agents/executors"/*/; do
+if [ -d "$DEFAULTS_DIR/agents/specialists" ]; then
+    for src in "$DEFAULTS_DIR/agents/specialists"/*/; do
         [ -d "$src" ] || continue
         name=$(basename "$src")
-        seed_agent_dir "$src" "$CONFIG_DIR/agents/executors/$name"
+        seed_agent_dir "$src" "$CONFIG_DIR/agents/specialists/$name"
     done
 fi
 

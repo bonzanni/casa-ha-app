@@ -10,7 +10,7 @@
     "tiers": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["resident", "executor"],
+      "required": ["resident", "specialist"],
       "properties": {
         "resident": {
           "type": "object",
@@ -21,7 +21,7 @@
             "optional": {"type": "array", "items": {"type": "string"}}
           }
         },
-        "executor": {
+        "specialist": {
           "type": "object",
           "additionalProperties": false,
           "required": ["required", "optional", "forbidden"],

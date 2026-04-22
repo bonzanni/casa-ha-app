@@ -1,4 +1,4 @@
-"""Tests for the delegate_to_agent framework tool (Phase 3.1)."""
+"""Tests for the delegate_to_specialist framework tool (Phase 3.1)."""
 
 from __future__ import annotations
 
@@ -14,19 +14,19 @@ import pytest
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig, CharacterConfig, MemoryConfig, SessionConfig, ToolsConfig
-from executor_registry import (
+from specialist_registry import (
     DelegationComplete,
     DelegationRecord,
-    ExecutorRegistry,
+    SpecialistRegistry,
 )
 
 pytestmark = pytest.mark.asyncio
 
 
-def _seed_executor_dir(
+def _seed_specialist_dir(
     base: Path, role: str = "finance", *, enabled: bool = True,
 ) -> Path:
-    """Write a valid executor directory under *base*. Returns the dir path."""
+    """Write a valid specialist directory under *base*. Returns the dir path."""
     d = base / role
     d.mkdir(parents=True)
     (d / "character.yaml").write_text(textwrap.dedent(f"""\
@@ -60,7 +60,7 @@ def _seed_executor_dir(
 # ---------------------------------------------------------------------------
 
 
-def _executor_cfg(role: str = "finance", enabled: bool = True) -> AgentConfig:
+def _specialist_cfg(role: str = "finance", enabled: bool = True) -> AgentConfig:
     return AgentConfig(
         role=role,
         model="claude-sonnet-4-6",
@@ -73,8 +73,8 @@ def _executor_cfg(role: str = "finance", enabled: bool = True) -> AgentConfig:
     )
 
 
-class _FakeExecutorClient:
-    """Minimal ClaudeSDKClient substitute for executor turns.
+class _FakeSpecialistClient:
+    """Minimal ClaudeSDKClient substitute for specialist turns.
 
     ``response_text`` is the text yielded by an AssistantMessage block.
     ``delay_s`` sleeps inside ``receive_response`` so timeout tests can
@@ -107,19 +107,19 @@ class _FakeExecutorClient:
         from claude_agent_sdk import (
             AssistantMessage, ResultMessage, TextBlock, SystemMessage,
         )
-        if _FakeExecutorClient.delay_s > 0:
-            await asyncio.sleep(_FakeExecutorClient.delay_s)
-        if _FakeExecutorClient.raise_in_receive is not None:
-            raise _FakeExecutorClient.raise_in_receive
+        if _FakeSpecialistClient.delay_s > 0:
+            await asyncio.sleep(_FakeSpecialistClient.delay_s)
+        if _FakeSpecialistClient.raise_in_receive is not None:
+            raise _FakeSpecialistClient.raise_in_receive
 
         # SDK shape has drifted: fields like AssistantMessage.model and
         # ResultMessage's positional args may be absent on older SDKs.
         # Mirror the `_mk_*` helpers in test_agent_process.py — try the
         # kwargs form, fall back to __new__ + attribute assignment.
         try:
-            block = TextBlock(text=_FakeExecutorClient.response_text)
+            block = TextBlock(text=_FakeSpecialistClient.response_text)
         except TypeError:
-            block = TextBlock(_FakeExecutorClient.response_text)  # type: ignore[call-arg]
+            block = TextBlock(_FakeSpecialistClient.response_text)  # type: ignore[call-arg]
         try:
             sys_msg = SystemMessage(
                 subtype="init", data={"session_id": "exec-sid"},
@@ -170,17 +170,17 @@ def _origin(role="assistant", channel="telegram", chat_id="x"):
 
 class TestUnknownAgent:
     async def test_returns_error_content(self, tmp_path):
-        from tools import delegate_to_agent, init_tools
+        from tools import delegate_to_specialist, init_tools
 
-        reg = ExecutorRegistry(str(tmp_path / "ex"),
-                               tombstone_path=str(tmp_path / "del.json"))
+        reg = SpecialistRegistry(str(tmp_path / "ex"),
+                                 tombstone_path=str(tmp_path / "del.json"))
         bus = MessageBus()
         cm = ChannelManager()
         init_tools(cm, bus, reg)
 
         result = await _with_origin(
-            delegate_to_agent.handler({
-                "agent": "ghost", "task": "x", "context": "", "mode": "sync",
+            delegate_to_specialist.handler({
+                "specialist": "ghost", "task": "x", "context": "", "mode": "sync",
             }),
             _origin(),
         )
@@ -188,35 +188,35 @@ class TestUnknownAgent:
         text = result["content"][0]["text"]
         payload = json.loads(text)
         assert payload["status"] == "error"
-        assert payload["kind"] == "unknown_agent"
+        assert payload["kind"] == "unknown_specialist"
 
 
 class TestDisabledAgent:
-    async def test_returns_unknown_agent_error(self, tmp_path):
-        """Disabled executors are filtered at load-time — get() returns None,
+    async def test_returns_unknown_specialist_error(self, tmp_path):
+        """Disabled specialists are filtered at load-time — get() returns None,
         the tool cannot distinguish them from truly unknown names. Both
-        paths collapse to kind=unknown_agent."""
-        from tools import delegate_to_agent, init_tools
+        paths collapse to kind=unknown_specialist."""
+        from tools import delegate_to_specialist, init_tools
 
-        executors = tmp_path / "ex"
-        executors.mkdir()
-        _seed_executor_dir(executors, "finance", enabled=False)
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=False)
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         reg.load()
         bus = MessageBus()
         cm = ChannelManager()
         init_tools(cm, bus, reg)
 
         result = await _with_origin(
-            delegate_to_agent.handler({
-                "agent": "finance", "task": "x", "context": "", "mode": "sync",
+            delegate_to_specialist.handler({
+                "specialist": "finance", "task": "x", "context": "", "mode": "sync",
             }),
             _origin(),
         )
         payload = json.loads(result["content"][0]["text"])
         assert payload["status"] == "error"
-        assert payload["kind"] == "unknown_agent"
+        assert payload["kind"] == "unknown_specialist"
 
 
 # ---------------------------------------------------------------------------
@@ -225,24 +225,24 @@ class TestDisabledAgent:
 
 
 class TestSyncOk:
-    async def test_returns_executor_text(self, tmp_path):
-        from tools import delegate_to_agent, init_tools
+    async def test_returns_specialist_text(self, tmp_path):
+        from tools import delegate_to_specialist, init_tools
 
-        executors = tmp_path / "ex"
-        executors.mkdir()
-        _seed_executor_dir(executors, "finance", enabled=True)
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         reg.load()
         bus = MessageBus()
         cm = ChannelManager()
         init_tools(cm, bus, reg)
 
-        _FakeExecutorClient.reset(response="invoice drafted", delay=0)
-        with patch("tools.ClaudeSDKClient", _FakeExecutorClient):
+        _FakeSpecialistClient.reset(response="invoice drafted", delay=0)
+        with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
             result = await _with_origin(
-                delegate_to_agent.handler({
-                    "agent": "finance", "task": "draft invoice",
+                delegate_to_specialist.handler({
+                    "specialist": "finance", "task": "draft invoice",
                     "context": "lesina march",
                     "mode": "sync",
                 }),
@@ -259,24 +259,24 @@ class TestSyncOk:
 
 
 class TestSyncError:
-    async def test_executor_raises_is_reported_as_error(self, tmp_path):
-        from tools import delegate_to_agent, init_tools
+    async def test_specialist_raises_is_reported_as_error(self, tmp_path):
+        from tools import delegate_to_specialist, init_tools
 
-        executors = tmp_path / "ex"
-        executors.mkdir()
-        _seed_executor_dir(executors, "finance", enabled=True)
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         reg.load()
         bus = MessageBus()
         cm = ChannelManager()
         init_tools(cm, bus, reg)
 
-        _FakeExecutorClient.reset(raise_exc=RuntimeError("boom"))
-        with patch("tools.ClaudeSDKClient", _FakeExecutorClient):
+        _FakeSpecialistClient.reset(raise_exc=RuntimeError("boom"))
+        with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
             result = await _with_origin(
-                delegate_to_agent.handler({
-                    "agent": "finance", "task": "x", "context": "",
+                delegate_to_specialist.handler({
+                    "specialist": "finance", "task": "x", "context": "",
                     "mode": "sync",
                 }),
                 _origin(),
@@ -298,17 +298,17 @@ class TestOriginMissing:
     async def test_no_origin_returns_error(self, tmp_path):
         """Called outside a turn (origin_var unset) — shouldn't happen
         in prod but must not crash. Return error, do not dispatch."""
-        from tools import delegate_to_agent, init_tools
+        from tools import delegate_to_specialist, init_tools
 
-        reg = ExecutorRegistry(str(tmp_path / "ex"),
-                               tombstone_path=str(tmp_path / "del.json"))
+        reg = SpecialistRegistry(str(tmp_path / "ex"),
+                                 tombstone_path=str(tmp_path / "del.json"))
         bus = MessageBus()
         cm = ChannelManager()
         init_tools(cm, bus, reg)
 
         # NOTE: not wrapped in _with_origin — origin_var stays None.
-        result = await delegate_to_agent.handler({
-            "agent": "finance", "task": "x", "context": "", "mode": "sync",
+        result = await delegate_to_specialist.handler({
+            "specialist": "finance", "task": "x", "context": "", "mode": "sync",
         })
         payload = json.loads(result["content"][0]["text"])
         assert payload["status"] == "error"
@@ -324,31 +324,31 @@ class TestTimeoutDegrades:
     async def test_sync_over_timeout_returns_pending(
         self, tmp_path, monkeypatch,
     ):
-        """A sync call whose executor exceeds the 60s wait returns a
+        """A sync call whose specialist exceeds the 60s wait returns a
         pending marker. Here we monkeypatch the wait ceiling to 50ms
         so we don't actually wait 60s."""
-        from tools import delegate_to_agent, init_tools
+        from tools import delegate_to_specialist, init_tools
         import tools as tools_mod
 
-        executors = tmp_path / "ex"
-        executors.mkdir()
-        _seed_executor_dir(executors, "finance", enabled=True)
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         reg.load()
         bus = MessageBus()
         bus.register("assistant", None)  # queue to receive the late NOTIFICATION
         cm = ChannelManager()
         init_tools(cm, bus, reg)
 
-        # Make the executor body take "longer" than we wait.
-        _FakeExecutorClient.reset(response="eventual", delay=0.2)
+        # Make the specialist body take "longer" than we wait.
+        _FakeSpecialistClient.reset(response="eventual", delay=0.2)
         monkeypatch.setattr(tools_mod, "_SYNC_WAIT_TIMEOUT_S", 0.05)
 
-        with patch("tools.ClaudeSDKClient", _FakeExecutorClient):
+        with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
             result = await _with_origin(
-                delegate_to_agent.handler({
-                    "agent": "finance", "task": "slow task",
+                delegate_to_specialist.handler({
+                    "specialist": "finance", "task": "slow task",
                     "context": "", "mode": "sync",
                 }),
                 _origin(),
@@ -366,27 +366,27 @@ class TestTimeoutDegrades:
     ):
         """After the pending return, the completion callback should post
         a NOTIFICATION to the delegator's bus queue."""
-        from tools import delegate_to_agent, init_tools
+        from tools import delegate_to_specialist, init_tools
         import tools as tools_mod
 
-        executors = tmp_path / "ex"
-        executors.mkdir()
-        _seed_executor_dir(executors, "finance", enabled=True)
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         reg.load()
         bus = MessageBus()
         bus.register("assistant", None)  # Ellen's queue
         cm = ChannelManager()
         init_tools(cm, bus, reg)
 
-        _FakeExecutorClient.reset(response="late result", delay=0.1)
+        _FakeSpecialistClient.reset(response="late result", delay=0.1)
         monkeypatch.setattr(tools_mod, "_SYNC_WAIT_TIMEOUT_S", 0.02)
 
-        with patch("tools.ClaudeSDKClient", _FakeExecutorClient):
+        with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
             await _with_origin(
-                delegate_to_agent.handler({
-                    "agent": "finance", "task": "x", "context": "",
+                delegate_to_specialist.handler({
+                    "specialist": "finance", "task": "x", "context": "",
                     "mode": "sync",
                 }),
                 _origin(),
@@ -414,25 +414,25 @@ class TestTimeoutDegrades:
 
 class TestAsyncMode:
     async def test_returns_pending_immediately(self, tmp_path):
-        from tools import delegate_to_agent, init_tools
+        from tools import delegate_to_specialist, init_tools
 
-        executors = tmp_path / "ex"
-        executors.mkdir()
-        _seed_executor_dir(executors, "finance", enabled=True)
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         reg.load()
         bus = MessageBus()
         bus.register("assistant", None)
         cm = ChannelManager()
         init_tools(cm, bus, reg)
 
-        _FakeExecutorClient.reset(response="async reply", delay=0.05)
-        with patch("tools.ClaudeSDKClient", _FakeExecutorClient):
+        _FakeSpecialistClient.reset(response="async reply", delay=0.05)
+        with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
             t0 = asyncio.get_event_loop().time()
             result = await _with_origin(
-                delegate_to_agent.handler({
-                    "agent": "finance", "task": "x", "context": "",
+                delegate_to_specialist.handler({
+                    "specialist": "finance", "task": "x", "context": "",
                     "mode": "async",
                 }),
                 _origin(),
@@ -441,11 +441,11 @@ class TestAsyncMode:
             payload = json.loads(result["content"][0]["text"])
             assert payload["status"] == "pending"
             assert payload["mode"] == "async"
-            # Returned without waiting for the executor body.
+            # Returned without waiting for the specialist body.
             assert (t1 - t0) < 0.04
 
             # Wait for background completion (keep patch active so the
-            # executor task uses the fake, not the real SDK).
+            # specialist task uses the fake, not the real SDK).
             await asyncio.sleep(0.15)
 
             # Verify a NOTIFICATION landed.
@@ -458,29 +458,29 @@ class TestAsyncMode:
 
 
 class TestCancellation:
-    async def test_caller_cancel_cancels_executor_task(self, tmp_path):
+    async def test_caller_cancel_cancels_specialist_task(self, tmp_path):
         """If the outer turn is cancelled (voice barge-in), the in-flight
-        executor task must be cancelled too — no NOTIFICATION posts."""
-        from tools import delegate_to_agent, init_tools
+        specialist task must be cancelled too — no NOTIFICATION posts."""
+        from tools import delegate_to_specialist, init_tools
 
-        executors = tmp_path / "ex"
-        executors.mkdir()
-        _seed_executor_dir(executors, "finance", enabled=True)
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         reg.load()
         bus = MessageBus()
         bus.register("assistant", None)
         cm = ChannelManager()
         init_tools(cm, bus, reg)
 
-        _FakeExecutorClient.reset(response="slow", delay=1.0)
+        _FakeSpecialistClient.reset(response="slow", delay=1.0)
 
         async def _invoke():
-            with patch("tools.ClaudeSDKClient", _FakeExecutorClient):
+            with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
                 return await _with_origin(
-                    delegate_to_agent.handler({
-                        "agent": "finance", "task": "x", "context": "",
+                    delegate_to_specialist.handler({
+                        "specialist": "finance", "task": "x", "context": "",
                         "mode": "sync",
                     }),
                     _origin(),
@@ -492,37 +492,37 @@ class TestCancellation:
         with pytest.raises(asyncio.CancelledError):
             await invocation
 
-        # No notifications posted — executor was cancelled.
+        # No notifications posted — specialist was cancelled.
         await asyncio.sleep(0.05)
         assert bus.queues["assistant"].empty()
 
 
 # ---------------------------------------------------------------------------
-# TestMcpRegistryWiring — v0.6.1: executor MCP servers resolved via registry
+# TestMcpRegistryWiring — v0.6.1: specialist MCP servers resolved via registry
 # ---------------------------------------------------------------------------
 
 
 class TestMcpRegistryWiring:
     """`init_tools` accepts an optional `mcp_registry`; when passed,
-    `_build_executor_options` resolves `cfg.mcp_server_names` via the
+    `_build_specialist_options` resolves `cfg.mcp_server_names` via the
     registry instead of hardcoding `mcp_servers={}`. This is the hook
     Phase 3.4 needs to make Alex's `n8n-workflows` + `casa-framework`
     tools available when he's flipped `enabled: true`."""
 
     async def test_mcp_registry_not_bound_degrades_to_empty(self, tmp_path):
         """Legacy 3-arg call — mcp_registry None — must not crash.
-        Executor options come back with empty mcp_servers."""
-        from tools import _build_executor_options, init_tools
+        Specialist options come back with empty mcp_servers."""
+        from tools import _build_specialist_options, init_tools
 
-        reg = ExecutorRegistry(str(tmp_path / "ex"),
-                               tombstone_path=str(tmp_path / "del.json"))
+        reg = SpecialistRegistry(str(tmp_path / "ex"),
+                                 tombstone_path=str(tmp_path / "del.json"))
         bus = MessageBus()
         cm = ChannelManager()
         init_tools(cm, bus, reg)  # no mcp_registry → None default
 
-        cfg = _executor_cfg(role="finance")
+        cfg = _specialist_cfg(role="finance")
         cfg.mcp_server_names = ["n8n-workflows", "casa-framework"]
-        options = _build_executor_options(cfg)
+        options = _build_specialist_options(cfg)
         assert options.mcp_servers == {}
 
     async def test_mcp_registry_bound_resolves_to_registry_output(
@@ -531,41 +531,41 @@ class TestMcpRegistryWiring:
         """When `mcp_registry` is passed, resolve() wins and its
         returned dict is passed straight through."""
         from mcp_registry import McpServerRegistry
-        from tools import _build_executor_options, init_tools
+        from tools import _build_specialist_options, init_tools
 
         mcp = McpServerRegistry()
         # Register a dummy SDK server so resolve() has something to return.
         mcp.register_sdk("casa-framework", {"type": "stdio", "command": "x"})
 
-        reg = ExecutorRegistry(str(tmp_path / "ex"),
-                               tombstone_path=str(tmp_path / "del.json"))
+        reg = SpecialistRegistry(str(tmp_path / "ex"),
+                                 tombstone_path=str(tmp_path / "del.json"))
         bus = MessageBus()
         cm = ChannelManager()
         init_tools(cm, bus, reg, mcp)
 
-        cfg = _executor_cfg(role="finance")
+        cfg = _specialist_cfg(role="finance")
         cfg.mcp_server_names = ["casa-framework"]
-        options = _build_executor_options(cfg)
+        options = _build_specialist_options(cfg)
         assert "casa-framework" in options.mcp_servers
 
     async def test_mcp_registry_bound_but_empty_names_yields_empty(
         self, tmp_path,
     ):
-        """Executor YAML with no `mcp_server_names` → empty mcp_servers,
+        """Specialist YAML with no `mcp_server_names` → empty mcp_servers,
         regardless of registry state. No exception."""
         from mcp_registry import McpServerRegistry
-        from tools import _build_executor_options, init_tools
+        from tools import _build_specialist_options, init_tools
 
         mcp = McpServerRegistry()
         mcp.register_sdk("casa-framework", {"type": "stdio", "command": "x"})
 
-        reg = ExecutorRegistry(str(tmp_path / "ex"),
-                               tombstone_path=str(tmp_path / "del.json"))
+        reg = SpecialistRegistry(str(tmp_path / "ex"),
+                                 tombstone_path=str(tmp_path / "del.json"))
         bus = MessageBus()
         cm = ChannelManager()
         init_tools(cm, bus, reg, mcp)
 
-        cfg = _executor_cfg(role="finance")
-        cfg.mcp_server_names = []  # executor declares no MCP deps
-        options = _build_executor_options(cfg)
+        cfg = _specialist_cfg(role="finance")
+        cfg.mcp_server_names = []  # specialist declares no MCP deps
+        options = _build_specialist_options(cfg)
         assert options.mcp_servers == {}

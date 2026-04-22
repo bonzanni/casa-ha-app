@@ -1,4 +1,4 @@
-"""Tests for executor_registry.py — Tier 2 loader + registry."""
+"""Tests for specialist_registry.py — Tier 2 loader + registry."""
 
 from __future__ import annotations
 
@@ -11,11 +11,11 @@ pytestmark = pytest.mark.asyncio
 
 
 # ---------------------------------------------------------------------------
-# Fixture helper — seed a per-concern executor directory under *base*.
+# Fixture helper — seed a per-concern specialist directory under *base*.
 # ---------------------------------------------------------------------------
 
 
-def _seed_executor_dir(
+def _seed_specialist_dir(
     base: Path,
     role: str,
     *,
@@ -64,32 +64,32 @@ def _seed_executor_dir(
 
 class TestLoader:
     async def test_empty_dir_loads_nothing(self, tmp_path):
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
-        executors = tmp_path / "executors"
-        executors.mkdir()
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         reg.load()
         assert reg.get("finance") is None
 
     async def test_missing_dir_is_noop(self, tmp_path):
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
-        reg = ExecutorRegistry(str(tmp_path / "does_not_exist"),
-                               tombstone_path=str(tmp_path / "del.json"))
+        reg = SpecialistRegistry(str(tmp_path / "does_not_exist"),
+                                 tombstone_path=str(tmp_path / "del.json"))
         # Must NOT raise.
         reg.load()
         assert reg.get("finance") is None
 
-    async def test_loads_enabled_executor(self, tmp_path):
-        from executor_registry import ExecutorRegistry
+    async def test_loads_enabled_specialist(self, tmp_path):
+        from specialist_registry import SpecialistRegistry
 
-        executors = tmp_path / "executors"
-        executors.mkdir()
-        _seed_executor_dir(executors, "finance", enabled=True)
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         reg.load()
         cfg = reg.get("finance")
         assert cfg is not None
@@ -105,17 +105,17 @@ class TestLoader:
 class TestValidation:
     async def test_rejects_non_empty_channels(self, tmp_path, caplog):
         """With channels declared, the loader re-infers the tier as
-        ``resident`` and demands disclosure.yaml (which executors do not
+        ``resident`` and demands disclosure.yaml (which specialists do not
         carry). The file-set check raises ``LoadError`` before the
         Tier-2 shape validator ever runs — that's still a rejection."""
         import logging
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
-        executors = tmp_path / "executors"
-        executors.mkdir()
-        _seed_executor_dir(executors, "bogus", channels=["telegram"])
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "bogus", channels=["telegram"])
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.ERROR):
             reg.load()
         assert reg.get("bogus") is None
@@ -126,13 +126,13 @@ class TestValidation:
 
     async def test_rejects_non_zero_token_budget(self, tmp_path, caplog):
         import logging
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
-        executors = tmp_path / "executors"
-        executors.mkdir()
-        _seed_executor_dir(executors, "rich", token_budget=1000)
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "rich", token_budget=1000)
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.ERROR):
             reg.load()
         assert reg.get("rich") is None
@@ -142,26 +142,26 @@ class TestValidation:
 
     async def test_rejects_non_ephemeral_session(self, tmp_path, caplog):
         import logging
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
-        executors = tmp_path / "executors"
-        executors.mkdir()
-        _seed_executor_dir(executors, "sticky", strategy="persistent")
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "sticky", strategy="persistent")
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.ERROR):
             reg.load()
         assert reg.get("sticky") is None
 
     async def test_rejects_scopes_owned(self, tmp_path, caplog):
         import logging
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
-        executors = tmp_path / "executors"
-        executors.mkdir()
-        _seed_executor_dir(executors, "owner", scopes_owned=["finance"])
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "owner", scopes_owned=["finance"])
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.ERROR):
             reg.load()
         assert reg.get("owner") is None
@@ -170,25 +170,25 @@ class TestValidation:
         )
 
     async def test_stray_flat_yaml_rejected(self, tmp_path, caplog):
-        """Flat-YAML files inside executors/ are rejected by the new
-        loader (directories only). ExecutorRegistry catches LoadError
-        and logs ERROR; no executors register."""
+        """Flat-YAML files inside specialists/ are rejected by the new
+        loader (directories only). SpecialistRegistry catches LoadError
+        and logs ERROR; no specialists register."""
         import logging
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
-        executors = tmp_path / "executors"
-        executors.mkdir()
-        (executors / "broken.yaml").write_text(
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        (specialists / "broken.yaml").write_text(
             "not a directory — the loader rejects this\n",
             encoding="utf-8",
         )
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.ERROR):
             reg.load()
         assert reg.get("broken") is None
         assert any(
-            "executor load failed" in r.message.lower()
+            "specialist load failed" in r.message.lower()
             for r in caplog.records
         )
 
@@ -199,17 +199,17 @@ class TestValidation:
 
 
 class TestEnabledFiltering:
-    async def test_disabled_executor_parsed_but_skipped(
+    async def test_disabled_specialist_parsed_but_skipped(
         self, tmp_path, caplog,
     ):
         import logging
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
-        executors = tmp_path / "executors"
-        executors.mkdir()
-        _seed_executor_dir(executors, "finance", enabled=False)
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=False)
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.INFO):
             reg.load()
         # Not registered for delegation dispatch.
@@ -228,12 +228,12 @@ class TestEnabledFiltering:
 
 class TestDelegationLifecycle:
     def _make_registry(self, tmp_path):
-        from executor_registry import ExecutorRegistry
-        return ExecutorRegistry(str(tmp_path / "executors"),
-                                tombstone_path=str(tmp_path / "del.json"))
+        from specialist_registry import SpecialistRegistry
+        return SpecialistRegistry(str(tmp_path / "specialists"),
+                                  tombstone_path=str(tmp_path / "del.json"))
 
     async def test_register_then_complete_removes_record(self, tmp_path):
-        from executor_registry import DelegationRecord
+        from specialist_registry import DelegationRecord
 
         reg = self._make_registry(tmp_path)
         rec = DelegationRecord(
@@ -247,7 +247,7 @@ class TestDelegationLifecycle:
         assert not reg.has_delegation("d-1")
 
     async def test_fail_delegation_removes_record(self, tmp_path):
-        from executor_registry import DelegationRecord
+        from specialist_registry import DelegationRecord
 
         reg = self._make_registry(tmp_path)
         rec = DelegationRecord(
@@ -260,7 +260,7 @@ class TestDelegationLifecycle:
         assert not reg.has_delegation("d-2")
 
     async def test_cancel_delegation_removes_record(self, tmp_path):
-        from executor_registry import DelegationRecord
+        from specialist_registry import DelegationRecord
 
         reg = self._make_registry(tmp_path)
         rec = DelegationRecord(
@@ -287,7 +287,7 @@ class TestDelegationLifecycle:
 
 class TestDelegationCompleteShape:
     async def test_defaults(self):
-        from executor_registry import DelegationComplete
+        from specialist_registry import DelegationComplete
 
         c = DelegationComplete(
             delegation_id="d-1", agent="finance", status="ok",
@@ -299,7 +299,7 @@ class TestDelegationCompleteShape:
         assert c.elapsed_s == 0.0
 
     async def test_full_ok(self):
-        from executor_registry import DelegationComplete
+        from specialist_registry import DelegationComplete
 
         c = DelegationComplete(
             delegation_id="d-1", agent="finance", status="ok",
@@ -318,11 +318,11 @@ class TestDelegationCompleteShape:
 
 class TestTombstone:
     async def test_register_writes_file(self, tmp_path):
-        from executor_registry import DelegationRecord, ExecutorRegistry
+        from specialist_registry import DelegationRecord, SpecialistRegistry
 
         tomb = tmp_path / "del.json"
-        reg = ExecutorRegistry(str(tmp_path / "executors"),
-                               tombstone_path=str(tomb))
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                 tombstone_path=str(tomb))
         rec = DelegationRecord(
             id="d-1", agent="finance", started_at=1.0,
             origin={"role": "assistant", "channel": "telegram",
@@ -339,11 +339,11 @@ class TestTombstone:
         assert data[0]["origin"]["channel"] == "telegram"
 
     async def test_complete_removes_from_file(self, tmp_path):
-        from executor_registry import DelegationRecord, ExecutorRegistry
+        from specialist_registry import DelegationRecord, SpecialistRegistry
 
         tomb = tmp_path / "del.json"
-        reg = ExecutorRegistry(str(tmp_path / "executors"),
-                               tombstone_path=str(tomb))
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                 tombstone_path=str(tomb))
         rec = DelegationRecord(
             id="d-1", agent="finance", started_at=1.0, origin={},
         )
@@ -355,11 +355,11 @@ class TestTombstone:
         assert data == []
 
     async def test_multiple_in_flight(self, tmp_path):
-        from executor_registry import DelegationRecord, ExecutorRegistry
+        from specialist_registry import DelegationRecord, SpecialistRegistry
 
         tomb = tmp_path / "del.json"
-        reg = ExecutorRegistry(str(tmp_path / "executors"),
-                               tombstone_path=str(tomb))
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                 tombstone_path=str(tomb))
         for i in range(3):
             await reg.register_delegation(DelegationRecord(
                 id=f"d-{i}", agent="finance", started_at=1.0, origin={},
@@ -379,7 +379,7 @@ class TestTombstone:
 
 class TestOrphanRecovery:
     async def test_orphans_from_disk_returns_records(self, tmp_path):
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
         tomb = tmp_path / "del.json"
         # Pre-populate as if a prior process left records behind.
@@ -396,30 +396,30 @@ class TestOrphanRecovery:
                            "chat_id": "y", "cid": "c2", "user_text": "hey"},
             },
         ]))
-        reg = ExecutorRegistry(str(tmp_path / "executors"),
-                               tombstone_path=str(tomb))
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                 tombstone_path=str(tomb))
         orphans = reg.orphans_from_disk()
         assert [o.id for o in orphans] == ["orphan-1", "orphan-2"]
         # File is truncated after read.
         assert json.loads(tomb.read_text()) == []
 
     async def test_orphans_from_disk_missing_file_is_empty(self, tmp_path):
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
-        reg = ExecutorRegistry(str(tmp_path / "executors"),
-                               tombstone_path=str(tmp_path / "del.json"))
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                 tombstone_path=str(tmp_path / "del.json"))
         assert reg.orphans_from_disk() == []
 
     async def test_orphans_from_disk_corrupt_logs_and_truncates(
         self, tmp_path, caplog,
     ):
         import logging
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
         tomb = tmp_path / "del.json"
         tomb.write_text("{not json at all")
-        reg = ExecutorRegistry(str(tmp_path / "executors"),
-                               tombstone_path=str(tomb))
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                 tombstone_path=str(tomb))
         with caplog.at_level(logging.ERROR):
             orphans = reg.orphans_from_disk()
         assert orphans == []
@@ -437,12 +437,12 @@ class TestOrphanRecovery:
         """Valid JSON but not an array → ERROR log, truncate, return []."""
         import json
         import logging
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
         tomb = tmp_path / "del.json"
         tomb.write_text(json.dumps({"not": "a list"}))
-        reg = ExecutorRegistry(str(tmp_path / "executors"),
-                               tombstone_path=str(tomb))
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                 tombstone_path=str(tomb))
         with caplog.at_level(logging.ERROR):
             orphans = reg.orphans_from_disk()
         assert orphans == []
@@ -458,13 +458,13 @@ class TestOrphanRecovery:
         """If the tombstone write fails, the in-memory delegation is
         still registered — the worst-case is missed orphan recovery."""
         import logging
-        from executor_registry import DelegationRecord, ExecutorRegistry
+        from specialist_registry import DelegationRecord, SpecialistRegistry
 
         # Non-writable path — parent directory does not exist and we
         # refuse to create it, to force a write failure.
         bad_path = str(tmp_path / "nonexistent" / "subdir" / "del.json")
-        reg = ExecutorRegistry(str(tmp_path / "executors"),
-                               tombstone_path=bad_path)
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                 tombstone_path=bad_path)
         rec = DelegationRecord(
             id="d-1", agent="finance", started_at=1.0, origin={},
         )
@@ -487,22 +487,22 @@ class TestSummaryLog:
         self, tmp_path, caplog,
     ):
         import logging
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
-        executors = tmp_path / "executors"
-        executors.mkdir()
-        _seed_executor_dir(executors, "foo", enabled=True)
-        _seed_executor_dir(executors, "bar", enabled=False)
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "foo", enabled=True)
+        _seed_specialist_dir(specialists, "bar", enabled=False)
 
-        reg = ExecutorRegistry(str(executors),
-                               tombstone_path=str(tmp_path / "del.json"))
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.INFO):
             reg.load()
 
         summary = [r for r in caplog.records
-                   if r.message.startswith("Executors:")]
+                   if r.message.startswith("Specialists:")]
         assert len(summary) == 1, (
-            f"expected exactly one 'Executors:' summary line, "
+            f"expected exactly one 'Specialists:' summary line, "
             f"got {len(summary)}: {[r.message for r in summary]}"
         )
         msg = summary[0].message
@@ -521,15 +521,15 @@ class TestSummaryLog:
         self, tmp_path, caplog,
     ):
         import logging
-        from executor_registry import ExecutorRegistry
+        from specialist_registry import SpecialistRegistry
 
-        reg = ExecutorRegistry(str(tmp_path / "does_not_exist"),
-                               tombstone_path=str(tmp_path / "del.json"))
+        reg = SpecialistRegistry(str(tmp_path / "does_not_exist"),
+                                 tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.INFO):
             reg.load()
 
         summary = [r for r in caplog.records
-                   if r.message.startswith("Executors:")]
+                   if r.message.startswith("Specialists:")]
         # Missing dir is a no-op (existing test_missing_dir_is_noop); the
         # summary line is still emitted so operator visibility is uniform.
         assert len(summary) == 1

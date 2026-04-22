@@ -57,7 +57,7 @@ def _seed_resident(base: Path, role: str = "assistant") -> Path:
     return d
 
 
-def _seed_executor(base: Path, role: str = "finance") -> Path:
+def _seed_specialist(base: Path, role: str = "finance") -> Path:
     d = base / role
     _w(d / "character.yaml", f"""\
         schema_version: 1
@@ -125,16 +125,16 @@ class TestHappyPath:
         assert "### Response shape" in cfg.system_prompt
         assert "### Disclosure" in cfg.system_prompt
 
-    def test_loads_executor_directory(self, tmp_path):
+    def test_loads_specialist_directory(self, tmp_path):
         from agent_loader import load_agent_from_dir
 
-        agent_dir = _seed_executor(tmp_path / "executors", "finance")
+        agent_dir = _seed_specialist(tmp_path / "specialists", "finance")
 
         cfg = load_agent_from_dir(str(agent_dir), policies=None)
 
         assert cfg.role == "finance"
         assert cfg.enabled is False
-        # Executors get character + voice + response_shape only — no
+        # Specialists get character + voice + response_shape only — no
         # Disclosure, no Delegation section in the prompt.
         assert cfg.system_prompt.startswith("You are Alex.")
         assert "### Disclosure" not in cfg.system_prompt
@@ -219,19 +219,19 @@ class TestTierRules:
         with pytest.raises(LoadError, match="disclosure.yaml"):
             load_agent_from_dir(str(agent_dir), policies=policies)
 
-    def test_executor_with_disclosure_raises(self, tmp_path):
+    def test_specialist_with_disclosure_raises(self, tmp_path):
         from agent_loader import load_agent_from_dir, LoadError
 
-        agent_dir = _seed_executor(tmp_path / "executors", "finance")
+        agent_dir = _seed_specialist(tmp_path / "specialists", "finance")
         _w(agent_dir / "disclosure.yaml", "schema_version: 1\npolicy: standard\n")
 
         with pytest.raises(LoadError, match="disclosure.yaml"):
             load_agent_from_dir(str(agent_dir), policies=None)
 
-    def test_executor_with_triggers_raises(self, tmp_path):
+    def test_specialist_with_triggers_raises(self, tmp_path):
         from agent_loader import load_agent_from_dir, LoadError
 
-        agent_dir = _seed_executor(tmp_path / "executors", "finance")
+        agent_dir = _seed_specialist(tmp_path / "specialists", "finance")
         _w(agent_dir / "triggers.yaml",
            "schema_version: 1\ntriggers: []\n")
 
@@ -276,10 +276,10 @@ class TestDelegatesValidation:
                 purpose: money
                 when: money q
         """)
-        # runtime.yaml tools.allowed missing delegate_to_agent
+        # runtime.yaml tools.allowed missing delegate_to_specialist
         policies = load_policies(str(_policies_file(tmp_path / "policies")))
 
-        with pytest.raises(LoadError, match="delegate_to_agent"):
+        with pytest.raises(LoadError, match="delegate_to_specialist"):
             load_agent_from_dir(str(agent_dir), policies=policies)
 
     def test_empty_delegates_does_not_require_mcp_tool(self, tmp_path):
@@ -330,14 +330,14 @@ class TestComposition:
 
 
 class TestLoadAllAgents:
-    def test_finds_two_residents_skips_executors_subdir(self, tmp_path):
+    def test_finds_two_residents_skips_specialists_subdir(self, tmp_path):
         from agent_loader import load_all_agents
         from policies import load_policies
 
         agents_root = tmp_path / "agents"
         _seed_resident(agents_root, "assistant")
         _seed_resident(agents_root, "butler")
-        _seed_executor(agents_root / "executors", "finance")
+        _seed_specialist(agents_root / "specialists", "finance")
         policies = load_policies(str(_policies_file(tmp_path / "policies")))
 
         found = load_all_agents(str(agents_root), policies=policies)
@@ -360,12 +360,12 @@ class TestLoadAllAgents:
         assert load_all_agents(str(tmp_path / "nope"), policies=None) == {}
 
 
-class TestLoadAllExecutors:
-    def test_finds_executor(self, tmp_path):
-        from agent_loader import load_all_executors
+class TestLoadAllSpecialists:
+    def test_finds_specialist(self, tmp_path):
+        from agent_loader import load_all_specialists
 
-        execs_root = tmp_path / "executors"
-        _seed_executor(execs_root, "finance")
+        specialists_root = tmp_path / "specialists"
+        _seed_specialist(specialists_root, "finance")
 
-        found = load_all_executors(str(execs_root))
+        found = load_all_specialists(str(specialists_root))
         assert "finance" in found

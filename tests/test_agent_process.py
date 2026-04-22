@@ -905,7 +905,7 @@ class TestOriginVar:
 
     async def test_origin_var_inherited_by_child_task(self, tmp_path):
         """A task spawned from inside receive_response must see the same
-        origin value — this is the pattern delegate_to_agent relies on."""
+        origin value — this is the pattern delegate_to_specialist relies on."""
         import asyncio as _asyncio
         import agent as agent_mod
 
