@@ -170,6 +170,7 @@ When `enable_terminal` is enabled, a web terminal is available at the `/terminal
 
 - **Add-on won't start**: Check the log for "claude_oauth_token is required". You must set the token before starting.
 - **No Telegram messages**: Verify `telegram_bot_token` and `telegram_chat_id` are correct. The bot must have been started (`/start` in Telegram).
+- **Engagements won't open (`engagement_not_configured`)**: See the "Troubleshooting engagements" subsection under [Engagements (v0.11.0)](#engagements-v0110) — most common cause is the bot missing "Manage topics" admin permission in the engagement supergroup.
 - **Memory not working**: By default, memory persists to `/data/memory.sqlite` (SQLite backend). If `HONCHO_API_KEY` is set but memory still appears empty, check container logs for `SQLite memory init failed` or Honcho connection errors. To disable memory entirely, set `MEMORY_BACKEND=noop`.
 - **502 errors on ingress**: The Python process may still be starting. Wait up to 60 seconds after add-on start.
 
@@ -177,42 +178,158 @@ When `enable_terminal` is enabled, a web terminal is available at the `/terminal
 
 Casa supports **engagements** — bounded conversational threads where a
 specialist (Tier 2) or executor (Tier 3, Plan 3+) works with you on a
-specific task, separate from your 1:1 chat with Ellen.
+specific task, separate from your 1:1 chat with Ellen. Each engagement
+lives in its own Telegram forum topic inside a dedicated supergroup.
+
+The setup is a one-time Telegram configuration. Skip this section to
+keep Casa running in 1:1-only mode (Ellen delegates synchronously and
+returns a single response; `delegate_to_specialist(mode="interactive")`
+will return `engagement_not_configured`).
 
 ### Setup
 
-1. In Telegram, create a new **forum supergroup** (Topics enabled) dedicated
-   to Casa engagements. Different from your 1:1 chat with the bot.
-2. Add the Casa bot to the supergroup as **administrator** with
-   "Manage Topics" permission enabled.
-3. Get the chat ID (negative integer). You can read it from
-   `https://api.telegram.org/bot<TOKEN>/getUpdates` after posting a message
-   in the supergroup.
-4. Set `telegram_engagement_supergroup_id` in addon options to the chat ID.
-5. Restart the Casa addon.
+#### 1. Create a dedicated forum supergroup
 
-On boot Casa registers three slash commands on the supergroup:
+This must be a **different** chat from your 1:1 DM with the Casa bot.
+Engagement topics live here, not in your personal chat.
 
-- `/cancel` — cancel the current engagement in this topic.
-- `/complete` — mark the engagement complete (no agent summary).
-- `/silent` — stop Ellen's proactive notifications for this engagement.
+1. In Telegram, tap the **✏️ pencil icon** (top right, most clients) → **New Group**.
+2. Pick any co-owners you want (or just yourself) and give the group a name
+   (e.g. "Casa Engagements"). Confirm.
+3. Open the group's settings (tap the group name at top). Telegram will
+   usually auto-convert small groups to a supergroup on first edit;
+   if you see a **"Convert to supergroup"** button, tap it.
+4. In group settings, find **"Topics"** (sometimes under "Group Type" or
+   "Permissions"). Toggle it **ON**. The chat now shows individual topic
+   threads instead of a single linear feed.
 
-Type `/` in any topic to see them in the autocomplete menu.
+#### 2. Add the Casa bot as a topic-managing admin
+
+1. Open the group → tap the group name → **Add Members** → search for your
+   bot's `@username` → add it.
+2. Tap the bot in the members list → **Promote to admin**.
+3. Turn ON **"Manage topics"**. This permission is **required** —
+   Casa refuses to enable engagements without it and logs
+   `bot lacks can_manage_topics; engagements disabled`.
+4. Other permissions (delete messages, pin, etc.) are optional. Casa does
+   not require them. Leave unused ones off to minimise the bot's surface.
+5. Confirm. The bot is now a topic-managing admin.
+
+#### 3. Find the supergroup's chat ID
+
+Casa needs the **negative integer** Telegram assigns to the supergroup.
+
+1. Post any message in the supergroup (e.g. "setup probe").
+2. In a browser, open:
+   `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
+   (substitute your bot token from @BotFather — same one you put in
+   `telegram_bot_token`).
+3. Find the most recent `message` object. `message.chat.id` is your
+   supergroup chat ID. It will be a negative integer starting with
+   `-100`, e.g. `-1001234567890`.
+
+Alternatives:
+- Add a helper bot like `@getidsbot` or `@RawDataBot` to the supergroup
+  temporarily; it will reply with the chat ID.
+- If you already run Casa on the 1:1 chat, the addon log also echoes
+  the ID under the `CHANNEL_IN` traces when the bot sees any message
+  in the supergroup.
+
+#### 4. Configure Casa
+
+1. Home Assistant → **Settings** → **Add-ons** → **Casa Agent** → **Configuration**.
+2. Set `telegram_engagement_supergroup_id` to the negative integer from step 3.
+   Leave it at `0` to disable engagements (Casa still boots; interactive
+   mode returns `engagement_not_configured`).
+3. **Save** → **Restart** the addon.
+
+#### 5. Verify
+
+Once the addon has restarted, check the log for:
+
+```
+Engagement supergroup -100…: commands registered (['cancel', 'complete', 'silent'])
+```
+
+If you see this line, engagements are live. If you see:
+
+```
+Engagement supergroup -100…: bot lacks can_manage_topics; engagements disabled
+```
+
+the bot wasn't promoted correctly — go back to step 2 and re-check the
+**Manage topics** toggle. The log line uses Ellen's level-ERROR — it's
+easy to grep for.
+
+In Telegram, inside the engagement supergroup, type `/` in any topic.
+The autocomplete should list `/cancel`, `/complete`, and `/silent`.
+These commands are registered via Telegram's `setMyCommands` scoped to
+the supergroup only — they do NOT appear in your 1:1 DM with Ellen.
 
 ### Starting an engagement
 
-Ask Ellen in the main chat for something multi-turn, e.g.
+Ask Ellen in the main 1:1 chat for something multi-turn, e.g.
 *"let's work through Q2 invoicing with Alex"*. Ellen may open an
 engagement — if so she'll tell you which topic to head to. The
-specialist is waiting there.
+specialist is waiting there, already primed with context.
+
+You do **not** post in the main supergroup feed — always open an
+existing topic thread. Casa automatically creates new topics as new
+engagements start; they're named `#[<role>] <task> · <engagement-id>`.
+If you accidentally post in the main feed, the bot will reply once
+per boot with a redirect hint, then silently ignore further main-feed
+messages.
+
+### In-topic slash commands
+
+| Command | What it does |
+|---------|--------------|
+| `/cancel` | End this engagement now. Topic is closed, the engaged agent's client is torn down, Ellen is notified in the main chat. |
+| `/complete` | Mark this engagement complete without requesting an agent summary. Same cleanup as `/cancel` but with a neutral status. |
+| `/silent` | Stop the observer from interjecting to Ellen about this engagement. The specialist keeps working in the topic. |
+
+The engaged agent can also end the engagement itself by calling the
+`emit_completion` MCP tool — that produces a structured summary
+(text + artifacts + next_steps) which Ellen relays to you.
 
 ### Idle reminders
 
 Engagements have no hard timeout. If an engagement sits idle for 3 days
 (specialists) or 7 days (executors, Plan 3+), Ellen will nudge you in the
-main 1:1 chat. Reminder re-fires weekly. Suspend/resume is automatic —
-after 24 hours of inactivity Casa tears down the underlying SDK client to
-free resources; it resumes seamlessly on your next message in the topic.
+main 1:1 chat. Reminder re-fires weekly.
+
+Suspend/resume is automatic — after 24 hours of inactivity Casa tears
+down the underlying SDK client to free resources. It resumes seamlessly
+on your next message in the topic (the conversation-session state is
+persisted and reloaded). If two consecutive resume attempts fail (e.g.
+the SDK session was rotated server-side), Casa marks the engagement
+as errored and tells you to start a fresh one.
+
+### Troubleshooting engagements
+
+- **"Engagements disabled" / `engagement_not_configured` on delegate call.**
+  Most common: the bot wasn't promoted to admin with **Manage topics**.
+  Re-check step 2 of Setup. Also check `telegram_engagement_supergroup_id`
+  is not `0` and the addon was restarted after the option was set.
+- **`/cancel` / `/complete` / `/silent` don't appear in autocomplete.**
+  They're scoped to the supergroup only. Make sure you're typing `/` in
+  a topic inside the engagement supergroup, not your 1:1 DM with Ellen.
+  Also: Telegram caches `setMyCommands` client-side — restart the
+  Telegram client if they don't show up within 30 seconds of addon boot.
+- **"No active engagement in this topic" reply in a topic.**
+  The engagement for that topic has already completed, cancelled, or
+  errored (registry status transition). Start a fresh engagement from
+  your 1:1 DM with Ellen — do not reuse old topics.
+- **"Could not resume this engagement" reply after 24h+ idle.**
+  The suspended SDK session rotated before you came back. The
+  engagement is marked as errored after two failed resumes. Start a
+  new one; your prior conversation is still in Ellen's meta-scope
+  memory.
+- **Ellen doesn't narrate completion in the main chat.**
+  Ellen receives the `ENGAGEMENT_COMPLETION` notification but chooses
+  how to surface it based on her system prompt. If you want louder
+  narration, edit `prompts/system.md` in Ellen's agent folder and
+  restart.
 
 ## Enabling a bundled-disabled specialist
 
