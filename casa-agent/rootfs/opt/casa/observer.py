@@ -112,13 +112,90 @@ class Observer:
             self._interjection_counts.get(engagement_id, 0) + 1
         )
 
-    # -- interjection (Task 19 fills this in) -----------------------------
+    # -- interjection -----------------------------------------------------
 
     async def _interject(
         self, engagement_id: str, event_type: str, payload: dict,
     ) -> None:
-        """LLM pass + NOTIFY Ellen. Implemented in Task 19."""
-        logger.debug(
-            "observer trigger (not yet implemented): engagement=%s event=%s",
-            engagement_id[:8] if engagement_id else "?", event_type,
+        rec = self._registry.get(engagement_id)
+        if rec is None:
+            return
+        decision = await self._decide_interjection(event_type, payload, rec)
+        if not decision.get("interject"):
+            return
+        text = decision.get("text", "")
+        logger.info(
+            "observer.interjection engagement=%s event=%s",
+            engagement_id[:8], event_type,
         )
+        try:
+            from bus import BusMessage, MessageType  # lazy import
+            await self._bus.notify(BusMessage(
+                type=MessageType.NOTIFICATION,
+                source="observer",
+                target=rec.origin.get("role", "assistant"),
+                content={
+                    "event": "observer_interjection",
+                    "engagement_id": engagement_id,
+                    "triggering_event": event_type,
+                    "suggested_text": text,
+                },
+                channel=rec.origin.get("channel", ""),
+                context={
+                    "cid": rec.origin.get("cid", "-"),
+                    "chat_id": rec.origin.get("chat_id", ""),
+                    "engagement_id": engagement_id,
+                },
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("observer notify failed: %s", exc)
+
+    async def _decide_interjection(
+        self, event_type: str, payload: dict, rec: Any,
+    ) -> dict:
+        """Run a bounded LLM pass to decide whether to post to main chat.
+
+        Input: event + engagement summary + last N bus events (future — in Plan 2
+        we pass only event + engagement summary since bus history is not retained).
+        Output: {interject: bool, text: str}.
+        """
+        from claude_agent_sdk import (
+            AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, TextBlock,
+        )
+        system = (
+            "You are Ellen's observer. Decide whether to interject in the main "
+            "chat about an in-flight engagement. Respond with STRICT JSON: "
+            "{\"interject\": true|false, \"text\": \"...\"}. "
+            "Interject only for actionable events the user should see "
+            "(errors, idle, warnings); be terse — one sentence max."
+        )
+        body = json.dumps({
+            "event_type": event_type,
+            "payload": payload,
+            "engagement": {
+                "id": rec.id,
+                "task": rec.task,
+                "role_or_type": rec.role_or_type,
+            },
+        })
+        options = ClaudeAgentOptions(
+            model=self._model,
+            system_prompt=system,
+            max_turns=1,
+            mcp_servers={},
+        )
+        out = ""
+        try:
+            async with ClaudeSDKClient(options) as client:
+                await client.query(body)
+                async for msg in client.receive_response():
+                    if isinstance(msg, AssistantMessage):
+                        for b in getattr(msg, "content", []):
+                            if isinstance(b, TextBlock):
+                                out += b.text
+            return json.loads(out.strip())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "observer _decide_interjection failed: %s — suppressing", exc,
+            )
+            return {"interject": False, "text": ""}
