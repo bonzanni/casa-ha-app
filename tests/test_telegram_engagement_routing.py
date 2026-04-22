@@ -69,6 +69,11 @@ class TestSupergroupRouting:
         ch._driver_send_user_turn.assert_not_called()
 
 
+async def rec_with_session(registry, rec, session_id):
+    await registry.persist_session_id(rec.id, session_id)
+    await registry.mark_idle(rec.id)
+
+
 class TestSlashCommands:
     async def test_slash_cancel_triggers_cancel(self, fake_telegram_bot, engagement_fixture):
         from channels.telegram import TelegramChannel
@@ -111,3 +116,49 @@ class TestSlashCommands:
         u = _mk_update(chat_id=-1001, text="/silent", thread_id=rec.topic_id)
         await ch.handle_update(u)
         observer.silence.assert_called_once_with(rec.id)
+
+
+class TestResumeOnTurn:
+    async def test_resume_called_when_driver_not_alive(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = engagement_fixture.registry
+        ch._driver_send_user_turn = AsyncMock()
+        driver = MagicMock()
+        driver.is_alive = MagicMock(return_value=False)
+        driver.resume = AsyncMock()
+        ch._engagement_driver = driver
+        rec = engagement_fixture.active_record
+        rec.sdk_session_id = "sess-xyz"
+        await rec_with_session(engagement_fixture.registry, rec, "sess-xyz")
+
+        u = _mk_update(chat_id=-1001, text="Hi again", thread_id=rec.topic_id)
+        await ch.handle_update(u)
+        driver.resume.assert_awaited_once_with(rec, "sess-xyz")
+        ch._driver_send_user_turn.assert_awaited_once()
+
+    async def test_two_resume_failures_mark_error(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = engagement_fixture.registry
+        ch._driver_send_user_turn = AsyncMock()
+        driver = MagicMock()
+        driver.is_alive = MagicMock(return_value=False)
+        driver.resume = AsyncMock(side_effect=RuntimeError("rotated"))
+        ch._engagement_driver = driver
+        rec = engagement_fixture.active_record
+        await rec_with_session(engagement_fixture.registry, rec, "sess-xyz")
+
+        u = _mk_update(chat_id=-1001, text="turn1", thread_id=rec.topic_id)
+        await ch.handle_update(u)
+        u = _mk_update(chat_id=-1001, text="turn2", thread_id=rec.topic_id)
+        await ch.handle_update(u)
+        assert rec.status == "error"

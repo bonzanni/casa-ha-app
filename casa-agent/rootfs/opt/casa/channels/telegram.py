@@ -120,6 +120,7 @@ class TelegramChannel(Channel):
         self._engagement_registry = None
         self._observer = None
         self._driver_send_user_turn = None
+        self._engagement_driver = None
         self._finalize_cancel = None
         self._finalize_complete_user = None
         self._main_feed_redirect_seen: set[int] = set()
@@ -472,6 +473,42 @@ class TelegramChannel(Channel):
                         self._observer.silence(rec.id)
                     await self.send_to_topic(
                         thread_id, "Observer quieted for this engagement.",
+                    )
+                    return
+
+            # Resume suspended client if needed
+            if self._engagement_driver is not None:
+                drv = self._engagement_driver
+                if not drv.is_alive(rec) and rec.sdk_session_id:
+                    fail_count = rec.origin.get("_resume_fail_count", 0)
+                    try:
+                        await drv.resume(rec, rec.sdk_session_id)
+                        rec.origin["_resume_fail_count"] = 0
+                    except Exception as exc:  # noqa: BLE001
+                        fail_count += 1
+                        rec.origin["_resume_fail_count"] = fail_count
+                        logger.warning(
+                            "resume failed (%d/2) for engagement %s: %s",
+                            fail_count, rec.id[:8], exc,
+                        )
+                        if fail_count >= 2:
+                            await self._engagement_registry.mark_error(
+                                rec.id, kind="resume_failed", message=str(exc),
+                            )
+                        await self.send_to_topic(
+                            thread_id,
+                            f"Could not resume this engagement: {exc}. "
+                            f"Start a fresh one if needed.",
+                        )
+                        return
+                elif not drv.is_alive(rec):
+                    # No session to resume — orphan
+                    await self._engagement_registry.mark_error(
+                        rec.id, kind="orphan_no_session",
+                        message="no sdk_session_id to resume with",
+                    )
+                    await self.send_to_topic(
+                        thread_id, "This engagement can't be resumed.",
                     )
                     return
 
