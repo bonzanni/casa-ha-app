@@ -4,6 +4,7 @@
   "telegram_bot_token": "",
   "telegram_chat_id": "",
   "telegram_engagement_supergroup_id": 0,
+  "telegram_bot_api_base": "",
   "telegram_transport": "polling",
   "telegram_delivery_mode": "stream",
   "honcho_api_url": "https://api.honcho.dev",
