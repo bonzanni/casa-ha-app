@@ -116,6 +116,15 @@ class TelegramChannel(Channel):
         self._bot = bot
         self.engagement_supergroup_id = engagement_supergroup_id
         self.engagement_permission_ok = False
+        # Injectable collaborators (wired at startup by Task 22; tests assign AsyncMocks).
+        self._engagement_registry = None
+        self._observer = None
+        self._driver_send_user_turn = None
+        self._finalize_cancel = None
+        self._finalize_complete_user = None
+        self._main_feed_redirect_seen: set[int] = set()
+        # Default routing: forward to the existing PTB handler.
+        self._route_to_ellen = self._route_to_ellen_default
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -416,6 +425,82 @@ class TelegramChannel(Channel):
             },
         )
         await self._bus.send(msg)
+
+    # ------------------------------------------------------------------
+    # Engagement routing (Task 11)
+    # ------------------------------------------------------------------
+
+    async def _route_to_ellen_default(self, update) -> None:
+        """Default behavior for non-engagement chats: feed into existing _handle."""
+        await self._handle(update, None)
+
+    async def handle_update(self, update) -> None:
+        """Single-arg entry-point. Routes by chat_id to engagement or Ellen."""
+        msg = getattr(update, "message", None)
+        if msg is None:
+            return
+        chat_id = msg.chat.id
+        text = (msg.text or "").strip()
+        thread_id = getattr(msg, "message_thread_id", None)
+        user_id = msg.from_user.id if msg.from_user else None
+
+        # 1) 1:1 chat with Ellen — existing behaviour
+        # Note: self.chat_id may be a string or int — coerce for comparison
+        if str(chat_id) == str(self.chat_id):
+            return await self._route_to_ellen(update)
+
+        # 2) Engagement supergroup
+        if self.engagement_supergroup_id and chat_id == self.engagement_supergroup_id:
+            if not thread_id:
+                await self._maybe_redirect_main_feed(user_id)
+                return
+            if self._engagement_registry is None:
+                return  # not wired yet; ignore silently
+            rec = self._engagement_registry.by_topic_id(thread_id)
+            if rec is None or rec.status in ("completed", "cancelled", "error"):
+                await self.send_to_topic(thread_id, "No active engagement in this topic.")
+                return
+
+            if text.startswith("/"):
+                command = text.split()[0].lower()
+                if command == "/cancel":
+                    return await self._finalize_cancel(rec, reason="user")
+                if command == "/complete":
+                    return await self._finalize_complete_user(rec)
+                if command == "/silent":
+                    if self._observer is not None:
+                        self._observer.silence(rec.id)
+                    await self.send_to_topic(
+                        thread_id, "Observer quieted for this engagement.",
+                    )
+                    return
+
+            if self._driver_send_user_turn is not None:
+                await self._driver_send_user_turn(rec, text)
+            if self._engagement_registry is not None:
+                import time as _time
+                await self._engagement_registry.update_user_turn(rec.id, _time.time())
+            return
+
+        # 3) Other chats — existing enforcement applies
+        return await self._route_to_ellen(update)
+
+    async def _maybe_redirect_main_feed(self, user_id: int | None) -> None:
+        if user_id is None:
+            return
+        if user_id in self._main_feed_redirect_seen:
+            return
+        self._main_feed_redirect_seen.add(user_id)
+        try:
+            await self.bot.send_message(
+                chat_id=self.engagement_supergroup_id,
+                text=(
+                    "This supergroup is for engagement topics. Start one by "
+                    "talking to me in our DM."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("main-feed redirect send failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Bot accessor (supports test injection via bot= kwarg)
