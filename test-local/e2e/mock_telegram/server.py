@@ -30,6 +30,8 @@ STATE: dict = {
     "main_feed_messages": [],
     "commands_by_scope": {},
     "can_manage_topics": True,
+    "pending_updates": [],
+    "next_update_id": 1,
 }
 
 
@@ -106,7 +108,12 @@ async def handle_method(request: web.Request) -> web.Response:
         scope = json.dumps(payload.get("scope") or {"type": "default"})
         return web.json_response({"ok": True, "result": STATE["commands_by_scope"].get(scope, [])})
 
-    # Swallow all other methods (deleteForumTopic, getUpdates, etc.)
+    if method == "getUpdates":
+        updates = list(STATE["pending_updates"])
+        STATE["pending_updates"].clear()
+        return web.json_response({"ok": True, "result": updates})
+
+    # Swallow all other methods (deleteForumTopic, etc.)
     return web.json_response({"ok": True, "result": True})
 
 
@@ -119,8 +126,23 @@ async def handle_reset(request: web.Request) -> web.Response:
     STATE["messages_by_thread"].clear()
     STATE["main_feed_messages"].clear()
     STATE["commands_by_scope"].clear()
+    STATE["pending_updates"].clear()
     STATE["next_thread_id"] = 1001
+    STATE["next_update_id"] = 1
     STATE["can_manage_topics"] = True
+    return web.json_response({"ok": True})
+
+
+async def handle_inject_update(request: web.Request) -> web.Response:
+    """Test-only endpoint: inject an incoming Telegram Update into the
+    getUpdates pipeline. Used by e2e scripts to simulate user messages
+    in engagement topics.
+
+    Body: JSON - an Update payload.
+    """
+    payload = await request.json()
+    STATE["pending_updates"].append(payload)
+    STATE["next_update_id"] += 1
     return web.json_response({"ok": True})
 
 
@@ -131,6 +153,7 @@ def app_factory() -> web.Application:
     app.router.add_post(r"/{method}", handle_method)
     app.router.add_get("/_inspect", handle_inspect)
     app.router.add_post("/_reset", handle_reset)
+    app.router.add_post("/_inject", handle_inject_update)
     return app
 
 
