@@ -164,7 +164,7 @@ def _maybe_register_n8n(
 ) -> dict[str, object] | None:
     """Register the ``n8n-workflows`` HTTP MCP server if ``N8N_URL`` is set.
 
-    Generic shared infrastructure — any agent (resident or executor) that
+    Generic shared infrastructure — any agent (resident or specialist) that
     declares ``n8n-workflows`` in ``mcp_server_names`` can reach it; the
     per-agent ``tools.allowed`` list governs which workflows each agent
     may invoke. Matches the shape of the ``homeassistant`` env-gated
@@ -395,16 +395,16 @@ async def main() -> None:
 
     # 7. Framework tools
     from tools import create_casa_tools, init_tools
-    from executor_registry import DelegationComplete, ExecutorRegistry
+    from specialist_registry import DelegationComplete, SpecialistRegistry
 
-    # Phase 3.1 Task 7: init_tools now takes an ExecutorRegistry so the
-    # delegate_to_agent tool can resolve Tier 2 executor configs. Task 10
-    # replaces this stub with a directory scan + orphan recovery.
-    executor_registry = ExecutorRegistry(
-        os.path.join(CONFIG_DIR, "agents", "executors"),
+    # Phase 3.1 Task 7: init_tools now takes a SpecialistRegistry so the
+    # delegate_to_specialist tool can resolve Tier 2 specialist configs.
+    # Task 10 replaces this stub with a directory scan + orphan recovery.
+    specialist_registry = SpecialistRegistry(
+        os.path.join(CONFIG_DIR, "agents", "specialists"),
         tombstone_path=os.path.join(DATA_DIR, "delegations.json"),
     )
-    executor_registry.load()
+    specialist_registry.load()
 
     # Scheduler + trigger registry constructed here so the get_schedule
     # tool can see the registry via init_tools. The per-role
@@ -421,7 +421,7 @@ async def main() -> None:
     trigger_registry = TriggerRegistry(scheduler=scheduler, app=app, bus=bus)
 
     init_tools(
-        channel_manager, bus, executor_registry, mcp_registry,
+        channel_manager, bus, specialist_registry, mcp_registry,
         trigger_registry=trigger_registry,
     )
     casa_tools_config = create_casa_tools()
@@ -818,7 +818,7 @@ async def main() -> None:
     # up; the orphan NOTIFICATIONs we post here queue on Ellen's queue
     # and drain once she's processing messages. HTTP is already accepting
     # requests — that's fine, orphans are not racing anything user-facing.
-    orphans = executor_registry.orphans_from_disk()
+    orphans = specialist_registry.orphans_from_disk()
     for record in orphans:
         target_role = record.origin.get("role") or assistant_role
         if target_role in bus.queues:
