@@ -200,7 +200,7 @@ def _write_resident_dir(d, *, scopes_owned, scopes_readable, default_scope):
     """).strip() + "\n")
 
 
-def _write_executor_dir(d, *, default_scope):
+def _write_specialist_dir(d, *, default_scope):
     import textwrap
     (d / "character.yaml").write_text(textwrap.dedent(f"""
         schema_version: 1
@@ -248,14 +248,14 @@ class TestScopeValidation:
         with pytest.raises(LoadError, match=r"scopes_owned.*subset.*scopes_readable"):
             load_agent_from_dir(str(agent_dir), policies=_stub_policy_lib())
 
-    def test_executor_cannot_have_default_scope(self, tmp_path):
+    def test_specialist_cannot_have_default_scope(self, tmp_path):
         from agent_loader import load_agent_from_dir, LoadError
 
-        agent_dir = tmp_path / "exec_bad"
+        agent_dir = tmp_path / "specialist_bad"
         agent_dir.mkdir()
-        _write_executor_dir(agent_dir, default_scope="personal")
+        _write_specialist_dir(agent_dir, default_scope="personal")
 
-        with pytest.raises(LoadError, match="executor.*default_scope"):
+        with pytest.raises(LoadError, match="specialist.*default_scope"):
             load_agent_from_dir(str(agent_dir), policies=None)
 
     def test_valid_resident_loads(self, tmp_path):
