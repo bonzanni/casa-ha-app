@@ -11,6 +11,7 @@ build/
 docs/
 .worktrees/
 .env
+.env.smoke
 test-local/options.json
 test-local/fixtures/**/workspace/
 test-local/fixtures/**/data/

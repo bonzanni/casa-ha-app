@@ -3,10 +3,20 @@
 # configured test supergroup. Requires:
 #   TELEGRAM_BOT_TOKEN            — same bot token Casa uses
 #   TELEGRAM_TEST_SUPERGROUP_ID   — a dedicated test forum supergroup
+#
+# Values may be exported in the environment OR stored in
+# test-local/smoke/.env.smoke (gitignored). The .env.smoke file is
+# auto-sourced if present; see .env.smoke.example for the template.
 set -euo pipefail
 
-: "${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN}"
-: "${TELEGRAM_TEST_SUPERGROUP_ID:?set TELEGRAM_TEST_SUPERGROUP_ID}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "${HERE}/.env.smoke" ]; then
+    # shellcheck source=/dev/null
+    set -a; . "${HERE}/.env.smoke"; set +a
+fi
+
+: "${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN (env or test-local/smoke/.env.smoke)}"
+: "${TELEGRAM_TEST_SUPERGROUP_ID:?set TELEGRAM_TEST_SUPERGROUP_ID (env or test-local/smoke/.env.smoke)}"
 
 API="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
 
