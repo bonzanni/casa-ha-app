@@ -43,7 +43,7 @@ TIER_FILES: dict[str, dict[str, set[str]]] = {
         "optional":  {"delegates.yaml", "triggers.yaml", "hooks.yaml"},
         "forbidden": set(),
     },
-    "executor": {
+    "specialist": {
         "required":  {"character.yaml", "voice.yaml", "response_shape.yaml",
                       "runtime.yaml"},
         "optional":  {"hooks.yaml"},
@@ -51,7 +51,7 @@ TIER_FILES: dict[str, dict[str, set[str]]] = {
     },
 }
 
-_DELEGATE_MCP_TOOL = "mcp__casa-framework__delegate_to_agent"
+_DELEGATE_MCP_TOOL = "mcp__casa-framework__delegate_to_specialist"
 
 
 class LoadError(Exception):
@@ -101,7 +101,7 @@ def _read_yaml(path: str) -> dict[str, Any]:
 
 def _infer_tier(runtime_data: dict[str, Any]) -> str:
     channels = runtime_data.get("channels") or []
-    return "resident" if channels else "executor"
+    return "resident" if channels else "specialist"
 
 
 def _check_file_set(agent_dir: str, tier: str, role: str) -> None:
@@ -175,12 +175,12 @@ def _render_delegates_section(delegates: list[DelegateEntry]) -> str:
     if not delegates:
         return ""
     lines = ["### Delegation", ""]
-    lines.append("You may delegate to the following executors:")
+    lines.append("You may delegate to the following specialists:")
     for d in delegates:
         lines.append(f"  - {d.agent}: {d.purpose} — when: {d.when}")
     lines.append("")
     lines.append(
-        "Invoke via mcp__casa-framework__delegate_to_agent(agent=..., task=...)."
+        "Invoke via mcp__casa-framework__delegate_to_specialist(specialist=..., task=...)."
     )
     return "\n".join(lines).rstrip() + "\n"
 
@@ -400,7 +400,7 @@ def load_agent_from_dir(
 ) -> AgentConfig:
     """Load one agent directory. Strict: every error raises LoadError.
 
-    ``policies`` may be None for executor loads (executors have no
+    ``policies`` may be None for specialist loads (specialists have no
     disclosure.yaml). It must be non-None for residents or the composer
     raises at Disclosure-render time.
     """
@@ -510,16 +510,16 @@ def load_agent_from_dir(
                     f"{mem.default_scope!r} must be in scopes_owned "
                     f"{mem.scopes_owned}"
                 )
-    else:  # executor
+    else:  # specialist
         if mem.default_scope:
             raise LoadError(
-                f"agent {role_from_path!r}: executor must not declare "
+                f"agent {role_from_path!r}: specialist must not declare "
                 f"memory.default_scope"
             )
         if mem.scopes_owned or mem.scopes_readable:
             # This is already enforced upstream per 3.1 but re-assert.
             raise LoadError(
-                f"agent {role_from_path!r}: executor must not declare "
+                f"agent {role_from_path!r}: specialist must not declare "
                 f"memory.scopes_owned or memory.scopes_readable"
             )
 
@@ -534,7 +534,7 @@ def load_all_agents(
 ) -> dict[str, AgentConfig]:
     """Walk *agents_dir* for resident directories.
 
-    Skips ``executors/`` (Tier 2 home) and any dotdir. Each
+    Skips ``specialists/`` (Tier 2 home) and any dotdir. Each
     subdirectory's name becomes the agent role. Raises ``LoadError``
     on the first malformed agent — strict-mode from day one.
     """
@@ -542,7 +542,7 @@ def load_all_agents(
     if not os.path.isdir(agents_dir):
         return found
     for entry in sorted(os.listdir(agents_dir)):
-        if entry.startswith(".") or entry == "executors":
+        if entry.startswith(".") or entry == "specialists":
             continue
         path = os.path.join(agents_dir, entry)
         if not os.path.isdir(path):
@@ -555,25 +555,25 @@ def load_all_agents(
     return found
 
 
-def load_all_executors(
-    executors_dir: str,
+def load_all_specialists(
+    specialists_dir: str,
 ) -> dict[str, AgentConfig]:
-    """Walk *executors_dir* for executor directories.
+    """Walk *specialists_dir* for specialist directories.
 
-    Executors never reference the policy library (taxonomy §4.4: the
+    Specialists never reference the policy library (taxonomy §4.4: the
     delegating resident owns the disclosure layer).
     """
     found: dict[str, AgentConfig] = {}
-    if not os.path.isdir(executors_dir):
+    if not os.path.isdir(specialists_dir):
         return found
-    for entry in sorted(os.listdir(executors_dir)):
+    for entry in sorted(os.listdir(specialists_dir)):
         if entry.startswith("."):
             continue
-        path = os.path.join(executors_dir, entry)
+        path = os.path.join(specialists_dir, entry)
         if not os.path.isdir(path):
             raise LoadError(
-                f"unexpected non-directory at executors/{entry} — each "
-                f"executor is a directory; flat YAML files are no longer "
+                f"unexpected non-directory at specialists/{entry} — each "
+                f"specialist is a directory; flat YAML files are no longer "
                 f"supported"
             )
         cfg = load_agent_from_dir(path, policies=None)
