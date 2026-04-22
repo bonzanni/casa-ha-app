@@ -177,3 +177,105 @@ class EngagementRegistry:
     def _write_tombstone(self, snapshot: list[dict[str, Any]]) -> None:
         with open(self._tombstone_path, "w", encoding="utf-8") as fh:
             json.dump(snapshot, fh, indent=2)
+
+    # -- Mutators ---------------------------------------------------------
+
+    async def create(
+        self,
+        kind: str,
+        role_or_type: str,
+        driver: str,
+        task: str,
+        origin: dict[str, Any],
+        topic_id: int | None,
+    ) -> EngagementRecord:
+        engagement_id = uuid.uuid4().hex
+        now = time.time()
+        rec = EngagementRecord(
+            id=engagement_id,
+            kind=kind,
+            role_or_type=role_or_type,
+            driver=driver,
+            status="active",
+            topic_id=topic_id,
+            started_at=now,
+            last_user_turn_ts=now,
+            last_idle_reminder_ts=0.0,
+            completed_at=None,
+            sdk_session_id=None,
+            origin=dict(origin),
+            task=task,
+        )
+        async with self._lock:
+            self._records[engagement_id] = rec
+            if topic_id is not None:
+                self._topic_index[topic_id] = engagement_id
+            await self._write_tombstone_locked()
+        logger.info(
+            "Engagement %s created (kind=%s role_or_type=%s topic_id=%s)",
+            engagement_id[:8], kind, role_or_type, topic_id,
+        )
+        return rec
+
+    async def mark_completed(self, engagement_id: str, completed_at: float) -> None:
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            rec.status = "completed"
+            rec.completed_at = completed_at
+            await self._write_tombstone_locked()
+
+    async def mark_cancelled(self, engagement_id: str) -> None:
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            rec.status = "cancelled"
+            rec.completed_at = time.time()
+            await self._write_tombstone_locked()
+
+    async def mark_error(self, engagement_id: str, kind: str, message: str) -> None:
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            rec.status = "error"
+            rec.completed_at = time.time()
+            rec.origin["error_kind"] = kind
+            rec.origin["error_message"] = message
+            await self._write_tombstone_locked()
+
+    async def mark_idle(self, engagement_id: str) -> None:
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            rec.status = "idle"
+            await self._write_tombstone_locked()
+
+    async def update_user_turn(self, engagement_id: str, ts: float) -> None:
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            rec.last_user_turn_ts = ts
+            if rec.status == "idle":
+                rec.status = "active"
+            await self._write_tombstone_locked()
+
+    async def update_last_idle_reminder(self, engagement_id: str, ts: float) -> None:
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            rec.last_idle_reminder_ts = ts
+            await self._write_tombstone_locked()
+
+    async def persist_session_id(self, engagement_id: str, session_id: str) -> None:
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            rec.sdk_session_id = session_id
+            await self._write_tombstone_locked()
