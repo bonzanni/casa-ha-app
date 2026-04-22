@@ -51,6 +51,14 @@ TIER_FILES: dict[str, dict[str, set[str]]] = {
     },
 }
 
+TIER_FILES["executor"] = {
+    "required":  {"definition.yaml", "prompt.md"},
+    "optional":  {"hooks.yaml", "observer.yaml"},
+    "forbidden": {"character.yaml", "runtime.yaml", "delegates.yaml",
+                  "disclosure.yaml", "response_shape.yaml", "voice.yaml",
+                  "triggers.yaml"},
+}
+
 _DELEGATE_MCP_TOOL = "mcp__casa-framework__delegate_to_specialist"
 
 
@@ -580,3 +588,89 @@ def load_all_specialists(
         cfg = load_agent_from_dir(path, policies=None)
         found[cfg.role] = cfg
     return found
+
+
+def load_all_executors(base_dir: str) -> dict[str, "ExecutorDefinition"]:
+    """Scan ``<base_dir>/executors/*/`` and return loaded executors.
+
+    Each executor dir must contain ``definition.yaml`` and ``prompt.md``.
+    ``hooks.yaml`` and ``observer.yaml`` are optional. Raises
+    :class:`LoadError` on any schema violation, missing required file,
+    or forbidden file.
+    """
+    from config import ExecutorDefinition, resolve_model
+
+    executors_root = os.path.join(base_dir, "executors")
+    out: dict[str, ExecutorDefinition] = {}
+    if not os.path.isdir(executors_root):
+        return out
+
+    for entry in sorted(os.listdir(executors_root)):
+        exec_dir = os.path.join(executors_root, entry)
+        if not os.path.isdir(exec_dir):
+            continue
+
+        present = {
+            f for f in os.listdir(exec_dir)
+            if os.path.isfile(os.path.join(exec_dir, f))
+        }
+        rules = TIER_FILES["executor"]
+        missing = rules["required"] - present
+        if missing:
+            raise LoadError(
+                f"executor {entry!r}: missing required file(s) {sorted(missing)}"
+            )
+        forbidden = present & rules["forbidden"]
+        if forbidden:
+            raise LoadError(
+                f"executor {entry!r}: forbidden file(s) present {sorted(forbidden)}"
+            )
+
+        defn_path = os.path.join(exec_dir, "definition.yaml")
+        defn = _read_yaml(defn_path)
+        _validate(defn, "executor", defn_path)
+
+        tools = defn.get("tools") or {}
+        doctrine_name = defn.get("doctrine_dir", "doctrine")
+        doctrine_abs = os.path.join(exec_dir, doctrine_name)
+
+        hooks_name = defn.get("hooks_file", "hooks.yaml")
+        hooks_abs = (os.path.join(exec_dir, hooks_name)
+                     if hooks_name in present else None)
+
+        observer_name = defn.get("observer_policy_file", "observer.yaml")
+        observer_abs = (os.path.join(exec_dir, observer_name)
+                        if observer_name in present else None)
+
+        prompt_name = defn.get("prompt_template_file", "prompt.md")
+        prompt_abs = os.path.join(exec_dir, prompt_name)
+        if not os.path.isfile(prompt_abs):
+            raise LoadError(
+                f"executor {entry!r}: prompt template file "
+                f"{prompt_name!r} not found"
+            )
+
+        d = ExecutorDefinition(
+            type=defn["type"],
+            description=defn["description"],
+            model=resolve_model(defn["model"]),
+            driver=defn["driver"],
+            enabled=defn.get("enabled", True),
+            tools_allowed=list(tools.get("allowed", [])),
+            tools_disallowed=list(tools.get("disallowed", [])),
+            permission_mode=tools.get("permission_mode", "acceptEdits"),
+            mcp_server_names=list(defn.get("mcp_server_names", [])),
+            idle_reminder_days=int(defn.get("idle_reminder_days", 7)),
+            prompt_template_path=prompt_abs,
+            hooks_path=hooks_abs,
+            observer_policy_path=observer_abs,
+            doctrine_dir=doctrine_abs,
+        )
+        if d.type != entry:
+            raise LoadError(
+                f"executor directory {entry!r} holds definition with "
+                f"type={d.type!r} - mismatch"
+            )
+        out[d.type] = d
+
+    return out
