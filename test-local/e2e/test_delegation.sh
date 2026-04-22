@@ -49,10 +49,9 @@ MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /addon_configs/casa-agent/agents/
 assert_log_contains "$NAME" "Executor 'finance' bundled but disabled"
 
 # Summary line: enabled=[] disabled=['finance'].
-# Use grep -F (fixed string) — GNU/BSD greps disagree on \[\] in ERE,
-# which made this assertion flake in CI even when the line was present.
-docker logs "$NAME" 2>&1 | grep -qF "Executors: enabled=[] disabled=['finance']" \
-    || { docker logs "$NAME" 2>&1 | grep -i executor | tail -10; fail "D-1: summary line missing or wrong shape"; }
+# Use assert_log_contains (polls up to 15s, grep -qF) — covers both the
+# ERE \[\] portability gap and the docker-logs stdout lag on CI.
+assert_log_contains "$NAME" "Executors: enabled=[] disabled=['finance']"
 
 # n8n not registered (no N8N_URL).
 assert_log_not_contains "$NAME" "Registered n8n-workflows MCP server"
@@ -84,13 +83,14 @@ MSYS_NO_PATHCONV=1 docker run -d --rm --name "$NAME" \
     "$IMAGE" >/dev/null
 wait_healthy "$NAME"
 
-# 'loaded' line (executor registered for delegation dispatch).
-docker logs "$NAME" 2>&1 | grep -qE "Executor 'finance' loaded \(model=" \
-    || { docker logs "$NAME" 2>&1 | grep -i executor | tail -10; fail "D-2: 'loaded' line missing"; }
+# 'loaded' line (executor registered for delegation dispatch). Using
+# assert_log_contains for its built-in 15s poll — docker logs stdout
+# lag on CI caused D-2 to flake even after healthz was green (seen in
+# run 24767143034 on 2026-04-22).
+assert_log_contains "$NAME" "Executor 'finance' loaded (model="
 
 # Summary line reflects enabled finance.
-docker logs "$NAME" 2>&1 | grep -qF "Executors: enabled=['finance'] disabled=[]" \
-    || { docker logs "$NAME" 2>&1 | grep -i executor | tail -10; fail "D-2: summary line shows wrong state"; }
+assert_log_contains "$NAME" "Executors: enabled=['finance'] disabled=[]"
 
 # No n8n registration (fixture has no N8N_URL).
 assert_log_not_contains "$NAME" "Registered n8n-workflows MCP server"
@@ -174,8 +174,7 @@ MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /addon_configs/casa-agent/agents/
 assert_log_contains "$NAME" "Executor 'health' bundled but disabled"
 
 # Summary line has both finance and health in disabled set (sorted alphabetically).
-docker logs "$NAME" 2>&1 | grep -qF "Executors: enabled=[] disabled=['finance', 'health']" \
-    || { docker logs "$NAME" 2>&1 | grep -i executor | tail -10; fail "D-3: summary line missing or wrong shape"; }
+assert_log_contains "$NAME" "Executors: enabled=[] disabled=['finance', 'health']"
 
 stop_container "$NAME"
 rm -rf "$TMP_D3_DIR" 2>/dev/null || true
