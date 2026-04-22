@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from trigger_registry import TriggerRegistry
 
+from executor_registry import ExecutorRegistry
+
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -49,18 +51,20 @@ _specialist_registry: SpecialistRegistry | None = None
 _mcp_registry: McpServerRegistry | None = None
 _trigger_registry: "TriggerRegistry | None" = None
 _engagement_registry: EngagementRegistry | None = None
+_executor_registry: "ExecutorRegistry | None" = None
 engagement_var: ContextVar[EngagementRecord | None] = ContextVar(
     "engagement_var", default=None,
 )
 
 
 def init_tools(
-    channel_manager: ChannelManager,
-    bus: MessageBus,
-    specialist_registry: SpecialistRegistry,
-    mcp_registry: McpServerRegistry | None = None,
-    trigger_registry: "TriggerRegistry | None" = None,
-    engagement_registry: EngagementRegistry | None = None,
+    channel_manager,
+    bus,
+    specialist_registry,
+    mcp_registry=None,
+    trigger_registry=None,
+    engagement_registry=None,
+    executor_registry=None,
 ) -> None:
     """Initialize module-level references used by tool implementations.
 
@@ -71,13 +75,14 @@ def init_tools(
     Accepts ``None`` for legacy callers that don't pass
     it (the `_build_specialist_options` code path degrades to empty MCP
     servers — the specialist still runs but with only built-in tools)."""
-    global _channel_manager, _bus, _specialist_registry, _mcp_registry, _trigger_registry, _engagement_registry  # noqa: PLW0603
+    global _channel_manager, _bus, _specialist_registry, _mcp_registry, _trigger_registry, _engagement_registry, _executor_registry  # noqa: PLW0603
     _channel_manager = channel_manager
     _bus = bus
     _specialist_registry = specialist_registry
     _mcp_registry = mcp_registry
     _trigger_registry = trigger_registry
     _engagement_registry = engagement_registry
+    _executor_registry = executor_registry
 
 
 @tool(
@@ -144,6 +149,45 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
         mcp_servers=mcp_servers if mcp_servers else {},
         hooks=resolved_hooks,
         cwd=cfg.cwd or None,
+        resume=None,
+        setting_sources=["project"],
+    )
+
+
+def _build_executor_options(defn) -> ClaudeAgentOptions:
+    """Build ClaudeAgentOptions for a Tier 3 Executor invocation.
+
+    Unlike specialists, executors DO have MCP servers and structured hooks
+    driven by their definition.yaml + hooks.yaml. Prompt is injected at
+    engage_executor time - this helper does not set system_prompt.
+    """
+    from config import HooksConfig
+    from hooks import resolve_hooks
+    import yaml
+
+    hooks_cfg = HooksConfig()
+    if defn.hooks_path and os.path.isfile(defn.hooks_path):
+        with open(defn.hooks_path, "r", encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh) or {}
+        hooks_cfg = HooksConfig(pre_tool_use=list(raw.get("pre_tool_use") or []))
+
+    resolved_hooks = resolve_hooks(hooks_cfg, default_cwd="/addon_configs/casa-agent")
+
+    if _mcp_registry is not None:
+        mcp_servers = _mcp_registry.resolve(defn.mcp_server_names)
+    else:
+        mcp_servers = {}
+
+    return ClaudeAgentOptions(
+        model=defn.model,
+        system_prompt="",
+        allowed_tools=list(defn.tools_allowed),
+        disallowed_tools=list(defn.tools_disallowed),
+        permission_mode=defn.permission_mode or "acceptEdits",
+        max_turns=200,
+        mcp_servers=mcp_servers if mcp_servers else {},
+        hooks=resolved_hooks,
+        cwd="/addon_configs/casa-agent",
         resume=None,
         setting_sources=["project"],
     )
