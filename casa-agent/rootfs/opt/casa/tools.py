@@ -24,19 +24,19 @@ from claude_agent_sdk import (
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from error_kinds import _classify_error
-from executor_registry import (
+from mcp_registry import McpServerRegistry
+from specialist_registry import (
     DelegationComplete,
     DelegationRecord,
-    ExecutorRegistry,
+    SpecialistRegistry,
 )
-from mcp_registry import McpServerRegistry
 
 logger = logging.getLogger(__name__)
 
 # Module-level references, initialized via init_tools()
 _channel_manager: ChannelManager | None = None
 _bus: MessageBus | None = None
-_executor_registry: ExecutorRegistry | None = None
+_specialist_registry: SpecialistRegistry | None = None
 _mcp_registry: McpServerRegistry | None = None
 _trigger_registry: "TriggerRegistry | None" = None
 
@@ -44,23 +44,23 @@ _trigger_registry: "TriggerRegistry | None" = None
 def init_tools(
     channel_manager: ChannelManager,
     bus: MessageBus,
-    executor_registry: ExecutorRegistry,
+    specialist_registry: SpecialistRegistry,
     mcp_registry: McpServerRegistry | None = None,
     trigger_registry: "TriggerRegistry | None" = None,
 ) -> None:
     """Initialize module-level references used by tool implementations.
 
-    ``mcp_registry`` is required for executor MCP-tool resolution at
+    ``mcp_registry`` is required for specialist MCP-tool resolution at
     delegation time. ``trigger_registry`` is required for the
     ``get_schedule`` tool; callers that don't pass it get a degraded
     tool that returns "not initialized" on every call.
     Accepts ``None`` for legacy callers that don't pass
-    it (the `_build_executor_options` code path degrades to empty MCP
-    servers — the executor still runs but with only built-in tools)."""
-    global _channel_manager, _bus, _executor_registry, _mcp_registry, _trigger_registry  # noqa: PLW0603
+    it (the `_build_specialist_options` code path degrades to empty MCP
+    servers — the specialist still runs but with only built-in tools)."""
+    global _channel_manager, _bus, _specialist_registry, _mcp_registry, _trigger_registry  # noqa: PLW0603
     _channel_manager = channel_manager
     _bus = bus
-    _executor_registry = executor_registry
+    _specialist_registry = specialist_registry
     _mcp_registry = mcp_registry
     _trigger_registry = trigger_registry
 
@@ -87,7 +87,7 @@ async def send_message(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# delegate_to_agent — Phase 3.1
+# delegate_to_specialist — Phase 3.1
 # ---------------------------------------------------------------------------
 
 
@@ -102,11 +102,11 @@ def _result(payload: dict) -> dict:
     return {"content": [{"type": "text", "text": json.dumps(payload)}]}
 
 
-def _build_executor_options(cfg) -> ClaudeAgentOptions:
-    """Build ClaudeAgentOptions for a Tier 2 executor invocation.
+def _build_specialist_options(cfg) -> ClaudeAgentOptions:
+    """Build ClaudeAgentOptions for a Tier 2 specialist invocation.
 
-    Executors run stateless (no session resume). Hooks are resolved from
-    the executor's own ``cfg.hooks``. MCP servers are resolved via the
+    Specialists run stateless (no session resume). Hooks are resolved from
+    the specialist's own ``cfg.hooks``. MCP servers are resolved via the
     shared registry — same pattern as :meth:`Agent._process` (agent.py
     step 4). Degrades to empty-dict when the registry is not bound
     (legacy callers / test harnesses)."""
@@ -134,9 +134,9 @@ def _build_executor_options(cfg) -> ClaudeAgentOptions:
     )
 
 
-async def _run_executor(cfg, task_text: str, context_text: str) -> str:
-    """Run one ephemeral executor turn and return the concatenated text."""
-    options = _build_executor_options(cfg)
+async def _run_specialist(cfg, task_text: str, context_text: str) -> str:
+    """Run one ephemeral specialist turn and return the concatenated text."""
+    options = _build_specialist_options(cfg)
     prompt = f"{task_text}\n\nContext:\n{context_text}" if context_text else task_text
     text = ""
     async with ClaudeSDKClient(options) as client:
@@ -162,7 +162,7 @@ def _attach_completion_callback(
 
     def _done(t: asyncio.Task) -> None:
         if t.cancelled():
-            loop.create_task(_executor_registry.cancel_delegation(record.id))
+            loop.create_task(_specialist_registry.cancel_delegation(record.id))
             return
         complete: DelegationComplete | None = None
         try:
@@ -175,7 +175,7 @@ def _attach_completion_callback(
                 origin=record.origin,
                 elapsed_s=time.time() - record.started_at,
             )
-            loop.create_task(_executor_registry.complete_delegation(record.id))
+            loop.create_task(_specialist_registry.complete_delegation(record.id))
         except Exception as exc:
             kind = _classify_error(exc).value
             complete = DelegationComplete(
@@ -187,7 +187,7 @@ def _attach_completion_callback(
                 origin=record.origin,
                 elapsed_s=time.time() - record.started_at,
             )
-            loop.create_task(_executor_registry.fail_delegation(record.id, exc))
+            loop.create_task(_specialist_registry.fail_delegation(record.id, exc))
 
         if _bus is None or complete is None:
             return
@@ -208,12 +208,12 @@ def _attach_completion_callback(
 
 
 @tool(
-    "delegate_to_agent",
-    "Delegate a task to a specialized executor agent and return its result.",
-    {"agent": str, "task": str, "context": str, "mode": str},
+    "delegate_to_specialist",
+    "Delegate a task to a specialist agent and return its result.",
+    {"specialist": str, "task": str, "context": str, "mode": str},
 )
-async def delegate_to_agent(args: dict) -> dict:
-    """Invoke a Tier 2 executor via the SDK and return its text.
+async def delegate_to_specialist(args: dict) -> dict:
+    """Invoke a Tier 2 specialist via the SDK and return its text.
 
     Sync mode (default): ``asyncio.wait`` up to 60s, return ok/error
     content; on timeout, attach completion callback and return a
@@ -226,58 +226,58 @@ async def delegate_to_agent(args: dict) -> dict:
     # Import lazily — matches the `agent.py` origin_var ContextVar.
     import agent as agent_mod
 
-    agent_name = args.get("agent", "")
+    specialist_name = args.get("specialist", "")
     task_text = args.get("task", "")
     context_text = args.get("context", "") or ""
     mode = args.get("mode", "sync") or "sync"
 
-    if _executor_registry is None:
+    if _specialist_registry is None:
         return _result({
             "status": "error",
             "kind": "not_initialized",
-            "message": "executor registry not initialized",
+            "message": "specialist registry not initialized",
         })
 
     # Check origin BEFORE agent lookup: the tool must never dispatch
     # without an origin, even if the name is also invalid. Lets
     # callers test the no-origin branch without first seeding a
-    # valid executor.
+    # valid specialist.
     origin = agent_mod.origin_var.get(None)
     if origin is None:
         return _result({
             "status": "error",
             "kind": "no_origin",
-            "message": "delegate_to_agent called outside a turn",
+            "message": "delegate_to_specialist called outside a turn",
         })
 
-    cfg = _executor_registry.get(agent_name)
+    cfg = _specialist_registry.get(specialist_name)
     if cfg is None:
         return _result({
             "status": "error",
-            "kind": "unknown_agent",
-            "message": f"No enabled executor named {agent_name!r}",
+            "kind": "unknown_specialist",
+            "message": f"No enabled specialist named {specialist_name!r}",
         })
 
     delegation_id = str(uuid.uuid4())
     started_at = time.time()
     record = DelegationRecord(
-        id=delegation_id, agent=agent_name, started_at=started_at,
+        id=delegation_id, agent=specialist_name, started_at=started_at,
         origin=dict(origin),
     )
-    await _executor_registry.register_delegation(record)
+    await _specialist_registry.register_delegation(record)
 
-    task = asyncio.create_task(_run_executor(cfg, task_text, context_text))
+    task = asyncio.create_task(_run_specialist(cfg, task_text, context_text))
 
     if mode == "async":
         _attach_completion_callback(task, record)
         logger.info(
             "Delegation %s → %s (async mode)",
-            delegation_id[:8], agent_name,
+            delegation_id[:8], specialist_name,
         )
         return _result({
             "status": "pending",
             "delegation_id": delegation_id,
-            "agent": agent_name,
+            "agent": specialist_name,
             "mode": "async",
         })
 
@@ -286,7 +286,7 @@ async def delegate_to_agent(args: dict) -> dict:
         done, pending = await asyncio.wait({task}, timeout=_SYNC_WAIT_TIMEOUT_S)
     except asyncio.CancelledError:
         task.cancel()
-        await _executor_registry.cancel_delegation(delegation_id)
+        await _specialist_registry.cancel_delegation(delegation_id)
         raise
 
     if pending:
@@ -294,12 +294,12 @@ async def delegate_to_agent(args: dict) -> dict:
         _attach_completion_callback(task, record)
         logger.info(
             "Delegation %s → %s timed out at 60s — degraded to pending",
-            delegation_id[:8], agent_name,
+            delegation_id[:8], specialist_name,
         )
         return _result({
             "status": "pending",
             "delegation_id": delegation_id,
-            "agent": agent_name,
+            "agent": specialist_name,
             "timeout_s": 60,
             "note": (
                 "Delegation continues in background; you will receive a "
@@ -312,32 +312,32 @@ async def delegate_to_agent(args: dict) -> dict:
     if finished.exception() is not None:
         exc = finished.exception()
         kind = _classify_error(exc).value
-        await _executor_registry.fail_delegation(delegation_id, exc)
+        await _specialist_registry.fail_delegation(delegation_id, exc)
         elapsed = time.time() - started_at
         logger.info(
             "Delegation %s → %s failed: %s (%s)",
-            delegation_id[:8], agent_name, kind, exc,
+            delegation_id[:8], specialist_name, kind, exc,
         )
         return _result({
             "status": "error",
             "delegation_id": delegation_id,
-            "agent": agent_name,
+            "agent": specialist_name,
             "kind": kind,
             "message": str(exc),
             "elapsed_s": elapsed,
         })
 
     text = finished.result()
-    await _executor_registry.complete_delegation(delegation_id)
+    await _specialist_registry.complete_delegation(delegation_id)
     elapsed = time.time() - started_at
     logger.info(
         "Delegation %s → %s ok (%.2fs)",
-        delegation_id[:8], agent_name, elapsed,
+        delegation_id[:8], specialist_name, elapsed,
     )
     return _result({
         "status": "ok",
         "delegation_id": delegation_id,
-        "agent": agent_name,
+        "agent": specialist_name,
         "elapsed_s": elapsed,
         "text": text,
     })
@@ -405,6 +405,6 @@ def create_casa_tools() -> dict[str, Any]:
     """Create and return the casa-framework MCP server config."""
     server = create_sdk_mcp_server(
         name="casa-framework",
-        tools=[send_message, delegate_to_agent, get_schedule],
+        tools=[send_message, delegate_to_specialist, get_schedule],
     )
     return server

@@ -42,16 +42,16 @@ wait_healthy "$NAME"
 # finance/ dir seeded to user config via the seed_agent_dir helper.
 # MSYS_NO_PATHCONV=1 prevents Git Bash from rewriting the container-side
 # path to a Windows one.
-MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /addon_configs/casa-agent/agents/executors/finance/runtime.yaml \
+MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /addon_configs/casa-agent/agents/specialists/finance/runtime.yaml \
     || fail "D-1: finance/ was not seeded to /addon_configs"
 
-# Per-executor disabled log line present (post-cut shape — no file=...).
-assert_log_contains "$NAME" "Executor 'finance' bundled but disabled"
+# Per-specialist disabled log line present (post-cut shape — no file=...).
+assert_log_contains "$NAME" "Specialist 'finance' bundled but disabled"
 
 # Summary line: enabled=[] disabled=['finance'].
 # Use assert_log_contains (polls up to 15s, grep -qF) — covers both the
 # ERE \[\] portability gap and the docker-logs stdout lag on CI.
-assert_log_contains "$NAME" "Executors: enabled=[] disabled=['finance']"
+assert_log_contains "$NAME" "Specialists: enabled=[] disabled=['finance']"
 
 # n8n not registered (no N8N_URL).
 assert_log_not_contains "$NAME" "Registered n8n-workflows MCP server"
@@ -75,7 +75,7 @@ cp -r "${REPO_ROOT}/test-local/fixtures/delegation-enabled/." "$TMP_D2/"
 _dir_hash() {
     ( cd "$1" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}' )
 }
-FIXTURE_HASH_BEFORE=$(_dir_hash "$TMP_D2/agents/executors/finance")
+FIXTURE_HASH_BEFORE=$(_dir_hash "$TMP_D2/agents/specialists/finance")
 
 MSYS_NO_PATHCONV=1 docker run -d --rm --name "$NAME" \
     -p "${HOST_PORT}:8080" \
@@ -83,14 +83,14 @@ MSYS_NO_PATHCONV=1 docker run -d --rm --name "$NAME" \
     "$IMAGE" >/dev/null
 wait_healthy "$NAME"
 
-# 'loaded' line (executor registered for delegation dispatch). Using
+# 'loaded' line (specialist registered for delegation dispatch). Using
 # assert_log_contains for its built-in 15s poll — docker logs stdout
 # lag on CI caused D-2 to flake even after healthz was green (seen in
 # run 24767143034 on 2026-04-22).
-assert_log_contains "$NAME" "Executor 'finance' loaded (model="
+assert_log_contains "$NAME" "Specialist 'finance' loaded (model="
 
 # Summary line reflects enabled finance.
-assert_log_contains "$NAME" "Executors: enabled=['finance'] disabled=[]"
+assert_log_contains "$NAME" "Specialists: enabled=['finance'] disabled=[]"
 
 # No n8n registration (fixture has no N8N_URL).
 assert_log_not_contains "$NAME" "Registered n8n-workflows MCP server"
@@ -100,7 +100,7 @@ stop_container "$NAME"
 # Post-boot: the fixture's user-editable directory must still be content-
 # identical to its pre-boot state (no migration overrode the user's
 # enabled: true). Hash folds every file's sha256 into one.
-FIXTURE_HASH_AFTER=$(_dir_hash "$TMP_D2/agents/executors/finance")
+FIXTURE_HASH_AFTER=$(_dir_hash "$TMP_D2/agents/specialists/finance")
 [ "$FIXTURE_HASH_BEFORE" = "$FIXTURE_HASH_AFTER" ] \
     || fail "D-2: fixture finance/ dir was modified by boot (hash drift)"
 
@@ -112,9 +112,9 @@ rm -rf "$TMP_D2" 2>/dev/null || true
 pass "D-2 flip-to-enabled contract"
 
 # ============================================================
-# D-3: second-executor discovery (config-not-code regression)
+# D-3: second-specialist discovery (config-not-code regression)
 # ============================================================
-log "D-3: second-executor discovery"
+log "D-3: second-specialist discovery"
 
 NAME="casa-deleg-d3-$$"
 TMP_D3_DIR="${TMPBASE}/casa-deleg-d3-$$"
@@ -123,17 +123,17 @@ mkdir -p "$HEALTH_DIR"
 
 # Minimal Tier 2 directory — enabled: false, empty channels, ephemeral
 # session, zero token budget. Written inline; not committed as a fixture
-# because the whole point is that *any* new executor dir in defaults/
+# because the whole point is that *any* new specialist dir in defaults/
 # gets picked up by the seed_agent_dir glob.
 cat > "$HEALTH_DIR/character.yaml" <<'YAML'
 schema_version: 1
 name: Doc
 role: health
-archetype: health-executor
+archetype: health-specialist
 card: |
   D-3 test fixture — do not ship.
 prompt: |
-  Test-only health executor stub.
+  Test-only health specialist stub.
 YAML
 printf 'schema_version: 1\n' > "$HEALTH_DIR/voice.yaml"
 printf 'schema_version: 1\n' > "$HEALTH_DIR/response_shape.yaml"
@@ -155,28 +155,28 @@ session:
   idle_timeout: 0
 YAML
 
-# Bind-mount the directory into the image's defaults executors dir. Docker
+# Bind-mount the directory into the image's defaults specialists dir. Docker
 # supports directory bind-mounts; setup-configs.sh's seed_agent_dir picks
 # it up on first boot.
 MSYS_NO_PATHCONV=1 docker run -d --rm --name "$NAME" \
     -p "${HOST_PORT}:8080" \
-    -v "${HEALTH_DIR}:/opt/casa/defaults/agents/executors/health:ro" \
+    -v "${HEALTH_DIR}:/opt/casa/defaults/agents/specialists/health:ro" \
     "$IMAGE" >/dev/null
 wait_healthy "$NAME"
 
 # Both dirs seeded to user config (the seed_agent_dir ran for each).
-MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /addon_configs/casa-agent/agents/executors/finance/runtime.yaml \
+MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /addon_configs/casa-agent/agents/specialists/finance/runtime.yaml \
     || fail "D-3: finance/ was not seeded"
-MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /addon_configs/casa-agent/agents/executors/health/runtime.yaml \
+MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /addon_configs/casa-agent/agents/specialists/health/runtime.yaml \
     || fail "D-3: health/ was not seeded"
 
-# Per-executor disabled log line for health (post-cut shape — no file=...).
-assert_log_contains "$NAME" "Executor 'health' bundled but disabled"
+# Per-specialist disabled log line for health (post-cut shape — no file=...).
+assert_log_contains "$NAME" "Specialist 'health' bundled but disabled"
 
 # Summary line has both finance and health in disabled set (sorted alphabetically).
-assert_log_contains "$NAME" "Executors: enabled=[] disabled=['finance', 'health']"
+assert_log_contains "$NAME" "Specialists: enabled=[] disabled=['finance', 'health']"
 
 stop_container "$NAME"
 rm -rf "$TMP_D3_DIR" 2>/dev/null || true
 
-pass "D-3 second-executor discovery"
+pass "D-3 second-specialist discovery"

@@ -30,7 +30,7 @@ class TestGetSchedule:
         tools.init_tools(
             channel_manager=MagicMock(),
             bus=MagicMock(),
-            executor_registry=MagicMock(),
+            specialist_registry=MagicMock(),
             mcp_registry=MagicMock(),
             trigger_registry=reg,
         )
@@ -53,7 +53,7 @@ class TestGetSchedule:
         import tools
         tools.init_tools(
             channel_manager=MagicMock(), bus=MagicMock(),
-            executor_registry=MagicMock(), mcp_registry=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
             trigger_registry=MagicMock(),
         )
         result = await tools.get_schedule.handler({"within_hours": 24})
@@ -68,7 +68,7 @@ class TestGetSchedule:
         reg.list_jobs_for = MagicMock(return_value=[])
         tools.init_tools(
             channel_manager=MagicMock(), bus=MagicMock(),
-            executor_registry=MagicMock(), mcp_registry=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
             trigger_registry=reg,
         )
         token = agent_mod.origin_var.set({
@@ -92,7 +92,7 @@ class TestGetSchedule:
         reg.list_jobs_for = MagicMock(return_value=[])
         tools.init_tools(
             channel_manager=MagicMock(), bus=MagicMock(),
-            executor_registry=MagicMock(), mcp_registry=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
             trigger_registry=reg,
         )
         token = agent_mod.origin_var.set({
