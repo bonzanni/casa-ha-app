@@ -1,0 +1,3 @@
+schema_version: 1
+# v0.12.0 ships empty; observer.py does not yet read per-type overrides.
+classifier_overrides: {}
