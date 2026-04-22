@@ -149,6 +149,64 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
     )
 
 
+def _build_world_state_summary() -> str:
+    """Return a short (<=500 tokens) snapshot of Casa's config surface.
+
+    Called at engagement start and interpolated into the executor's
+    prompt template as {world_state_summary}. Read-only - does not
+    include in-flight session or delegation state.
+    """
+    lines: list[str] = []
+    try:
+        specialists = sorted(
+            getattr(_specialist_registry, "_configs", {}).keys()
+        ) if _specialist_registry else []
+    except Exception:  # noqa: BLE001
+        specialists = []
+    lines.append(f"Enabled specialists:  {', '.join(specialists) or '(none)'}")
+
+    residents: list[str] = []
+    agents_dir = "/addon_configs/casa-agent/agents"
+    try:
+        if os.path.isdir(agents_dir):
+            for name in sorted(os.listdir(agents_dir)):
+                if name in ("specialists", "executors"):
+                    continue
+                if os.path.isdir(os.path.join(agents_dir, name)):
+                    residents.append(name)
+    except OSError:
+        pass
+    lines.append(f"Residents:            {', '.join(residents) or '(none)'}")
+
+    try:
+        import agent as agent_mod
+        exec_reg = getattr(agent_mod, "active_executor_registry", None)
+        exec_types = exec_reg.list_types() if exec_reg else []
+    except Exception:  # noqa: BLE001
+        exec_types = []
+    lines.append(f"Enabled executors:    {', '.join(exec_types) or '(none)'}")
+
+    try:
+        import agent as agent_mod
+        scope_reg = getattr(agent_mod, "active_scope_registry", None)
+        scopes = sorted(scope_reg._scopes.keys()) if scope_reg else []
+    except Exception:  # noqa: BLE001
+        scopes = []
+    lines.append(f"Scopes:               {', '.join(scopes) or '(none)'}")
+
+    version = "unknown"
+    for candidate in ("/opt/casa/VERSION", "/addon_configs/casa-agent/VERSION"):
+        try:
+            with open(candidate) as fh:
+                version = fh.read().strip()
+                break
+        except OSError:
+            continue
+    lines.append(f"Addon version:        {version}")
+
+    return "\n".join(lines)
+
+
 async def _run_specialist(cfg, task_text: str, context_text: str) -> str:
     """Run one ephemeral specialist turn and return the concatenated text."""
     options = _build_specialist_options(cfg)
