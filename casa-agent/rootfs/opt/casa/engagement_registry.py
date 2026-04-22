@@ -25,6 +25,17 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Sweep constants
+# ---------------------------------------------------------------------------
+
+_IDLE_REMINDER_DAYS_SPECIALIST = 3
+_IDLE_REMINDER_DAYS_EXECUTOR = 7          # default; per-type override lands Plan 3
+_IDLE_REMINDER_REFIRE_DAYS = 7
+_SESSION_SUSPEND_IDLE_S = 86400
+_IDLE_SWEEP_CRON = "0 8 * * *"            # daily 08:00 user TZ
+
+
+# ---------------------------------------------------------------------------
 # Record
 # ---------------------------------------------------------------------------
 
@@ -279,3 +290,63 @@ class EngagementRegistry:
                 return
             rec.sdk_session_id = session_id
             await self._write_tombstone_locked()
+
+    async def sweep_idle_and_suspend(
+        self, *, driver: Any, now_override: float | None = None,
+    ) -> None:
+        """Daily scan: fire idle_detected + tear down clients past suspend threshold.
+
+        ``driver`` is the ``DriverProtocol`` instance for in_casa — used to
+        check is_alive, read session_id, and close the client. For tests,
+        ``now_override`` short-circuits ``time.time()``.
+        """
+        import time
+        from bus import BusMessage, MessageType
+
+        now = now_override if now_override is not None else time.time()
+
+        for rec in list(self.active_and_idle()):
+            idle_s = now - rec.last_user_turn_ts
+
+            # 1) Session suspension (in_casa only)
+            if (rec.driver == "in_casa" and rec.status == "active"
+                    and idle_s > _SESSION_SUSPEND_IDLE_S
+                    and driver.is_alive(rec)):
+                session_id = driver.get_session_id(rec)
+                try:
+                    await driver.cancel(rec)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "sweep: driver.cancel(%s) failed: %s", rec.id[:8], exc,
+                    )
+                if session_id is not None:
+                    await self.persist_session_id(rec.id, session_id)
+                await self.mark_idle(rec.id)
+
+            # 2) Idle reminder
+            threshold_s = (
+                _IDLE_REMINDER_DAYS_SPECIALIST * 86400
+                if rec.kind == "specialist"
+                else _IDLE_REMINDER_DAYS_EXECUTOR * 86400
+            )
+            if idle_s > threshold_s and (
+                rec.last_idle_reminder_ts == 0
+                or now - rec.last_idle_reminder_ts > _IDLE_REMINDER_REFIRE_DAYS * 86400
+            ):
+                if self._bus is not None:
+                    try:
+                        await self._bus.notify(BusMessage(
+                            type=MessageType.NOTIFICATION,
+                            source=rec.role_or_type,
+                            target="observer",
+                            content={
+                                "event": "idle_detected",
+                                "engagement_id": rec.id,
+                                "last_user_turn_ts": rec.last_user_turn_ts,
+                                "idle_days": int(idle_s // 86400),
+                            },
+                            context={"engagement_id": rec.id},
+                        ))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("sweep: idle notify failed: %s", exc)
+                await self.update_last_idle_reminder(rec.id, now)
