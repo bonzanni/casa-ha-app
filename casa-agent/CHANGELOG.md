@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.10.0 — 2026-04-22 — Rename: Tier 2 "Executor" → "Specialist"
+
+Preparation for Phase 3.5 engagement primitive + Tier 3 Executors (see
+`docs/superpowers/specs/2026-04-22-3.5-engagement-and-executors.md` §10).
+The "Executor" term shipped in v0.6.2 is renamed to "Specialist" to
+free the name for the ephemeral, task-bounded Tier 3 agents coming in
+Plan 2. Zero behavior change — pure terminology refactor.
+
+### Breaking (acceptable pre-1.0.0)
+
+- **Directory:** `/addon_configs/casa-agent/agents/executors/` →
+  `/addon_configs/casa-agent/agents/specialists/`. Migration on first
+  boot under v0.10.0 is by convention — the overlay is wipe-acceptable
+  per the pre-1.0.0 doctrine. An empty `agents/executors/` directory
+  is now reserved for Plan 2+ Tier 3 Executor types.
+- **MCP tool:** `mcp__casa-framework__delegate_to_agent` →
+  `mcp__casa-framework__delegate_to_specialist`. Tool argument key
+  `agent=...` → `specialist=...`. Error kind `unknown_agent` →
+  `unknown_specialist`. Ellen's shipped `runtime.yaml` tool allow-list
+  updated accordingly.
+- **Python imports:** `from executor_registry import ExecutorRegistry` →
+  `from specialist_registry import SpecialistRegistry`. Internal to
+  Casa — affects nobody outside the codebase.
+
+### Code
+
+- `executor_registry.py` → `specialist_registry.py` (class
+  `ExecutorRegistry` → `SpecialistRegistry`).
+- `agent_loader.py`: `load_all_executors` → `load_all_specialists`;
+  `TIER_FILES["executor"]` → `TIER_FILES["specialist"]`; `_DELEGATE_MCP_TOOL`
+  constant updated; all error messages updated; `load_all_agents` now
+  skips BOTH `specialists/` (Tier 2 home) and `executors/` (reserved
+  for Plan 2 Tier 3).
+- `tools.py`: `delegate_to_agent` handler → `delegate_to_specialist`;
+  `_executor_registry` state var renamed; `_build_executor_options` →
+  `_build_specialist_options`; `_run_executor` → `_run_specialist`;
+  `init_tools` signature updated.
+- `casa_core.py`, `agent.py`: import updates, variable renames,
+  comment sweep.
+- `defaults/agents/executors/` → `defaults/agents/specialists/`
+  (including `finance/`). Finance prompt and character card updated.
+  Ellen's character card and `runtime.yaml` tool allow-list updated.
+  `defaults/schema/agent.v1.json` meta-doc updated to match the new
+  TIER_FILES key.
+- `setup-configs.sh` + `test-local/init-overrides/01-setup-configs.sh`:
+  seed `agents/specialists/` from defaults; reserve empty
+  `agents/executors/` for Plan 2.
+
+### Tests
+
+- `tests/test_executor_registry.py` → `test_specialist_registry.py`.
+- `tests/test_delegate_to_agent.py` → `test_delegate_to_specialist.py`.
+- `tests/test_agent_loader.py`, `test_agent_process.py`, `test_config.py`,
+  `test_get_schedule_tool.py`, `test_notification_handling.py`,
+  `test_casa_core_agent_loading.py`: reference updates.
+- `test-local/mock-claude-sdk/claude_agent_sdk/__init__.py`: comment update.
+- `test-local/e2e/test_delegation.sh` → `test_specialist_delegation.sh`;
+  fixture dir `test-local/fixtures/delegation-enabled/agents/executors/`
+  → `agents/specialists/`. `.github/workflows/qa.yml` updated to the
+  new script name.
+
+### Freed
+
+- `agents/executors/` is now reserved for Tier 3 Executor types, arriving
+  in Plan 2 (engagement primitive). Empty in v0.10.0.
+
 ## 0.9.1 — 2026-04-22 — Drop dead pre-v0.7.0 heartbeat config
 
 ### Removed

@@ -172,25 +172,25 @@ When `enable_terminal` is enabled, a web terminal is available at the `/terminal
 - **Memory not working**: By default, memory persists to `/data/memory.sqlite` (SQLite backend). If `HONCHO_API_KEY` is set but memory still appears empty, check container logs for `SQLite memory init failed` or Honcho connection errors. To disable memory entirely, set `MEMORY_BACKEND=noop`.
 - **502 errors on ingress**: The Python process may still be starting. Wait up to 60 seconds after add-on start.
 
-## Enabling a bundled-disabled executor
+## Enabling a bundled-disabled specialist
 
-Casa ships some Tier 2 executor agents disabled by default (`finance`
+Casa ships some Tier 2 specialist agents disabled by default (`finance`
 today; others in future releases). They are "bundled but disabled" —
-the YAML is shipped, but the executor is not registered for delegation
+the YAML is shipped, but the specialist is not registered for delegation
 dispatch until you opt in.
 
 To enable one:
 
 1. Open your Home Assistant addon config folder at
-   `/addon_configs/<addon-uuid>/agents/executors/`.
-2. Edit the executor's YAML file (for example `finance.yaml`).
+   `/addon_configs/<addon-uuid>/agents/specialists/`.
+2. Edit the specialist's YAML file (for example `finance.yaml`).
 3. Change `enabled: false` to `enabled: true`.
 4. Restart the Casa addon.
 
 After restart, check the addon log for the
-`Executors: enabled=[...] disabled=[...]` summary line to confirm
-your executor moved into the enabled set. Residents can now invoke
-it via `delegate_to_agent(agent="<role>", ...)`.
+`Specialists: enabled=[...] disabled=[...]` summary line to confirm
+your specialist moved into the enabled set. Residents can now invoke
+it via `delegate_to_specialist(specialist="<role>", ...)`.
 
 To disable it again, set `enabled: false` and restart. Your edits to
 the YAML file persist across addon updates — Casa only seeds from
