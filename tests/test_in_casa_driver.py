@@ -179,3 +179,51 @@ class TestInCasaCancel:
         await drv.cancel(rec)
         await drv.cancel(rec)
         assert drv.is_alive(rec) is False
+
+
+class TestInCasaResume:
+    async def test_resume_reopens_client_with_session_id(self, monkeypatch):
+        from drivers.in_casa_driver import InCasaDriver
+
+        seen_resume = []
+
+        class _FakeClient:
+            def __init__(self, options):
+                seen_resume.append(getattr(options, "resume", None))
+                self.session_id = "sess-new"
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+            async def receive_response(self):
+                if False:
+                    yield None  # pragma: no cover
+            async def close(self): pass
+
+        monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+
+        drv = InCasaDriver(send_to_topic=AsyncMock())
+        rec = _make_record(sdk_session_id="sess-old")
+        await drv.resume(rec, session_id="sess-old")
+        assert drv.is_alive(rec) is True
+        assert seen_resume == ["sess-old"]
+
+    async def test_get_session_id_returns_clients_session_id(self, monkeypatch):
+        from drivers.in_casa_driver import InCasaDriver
+
+        class _FakeClient:
+            def __init__(self, options):
+                self.session_id = "sess-xyz"
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+            async def receive_response(self):
+                if False:
+                    yield None  # pragma: no cover
+            async def close(self): pass
+
+        monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+
+        drv = InCasaDriver(send_to_topic=AsyncMock())
+        rec = _make_record()
+        await drv.start(rec, "p", ClaudeAgentOptions(model="sonnet"))
+        assert drv.get_session_id(rec) == "sess-xyz"

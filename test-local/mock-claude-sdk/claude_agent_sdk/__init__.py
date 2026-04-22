@@ -85,6 +85,8 @@ class ClaudeSDKClient:
         self._last_prompt: str = ""
         # Reuse session id on resume so registry round-tripping is observable.
         self._session_id: str = options.resume or f"mock-{uuid.uuid4().hex[:12]}"
+        # Public attribute mirroring the real SDK's ClaudeSDKClient.session_id.
+        self.session_id: str = self._session_id
         _log({
             "event": "client_init",
             "model": options.model,

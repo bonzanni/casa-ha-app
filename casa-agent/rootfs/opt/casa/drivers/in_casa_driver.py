@@ -96,8 +96,32 @@ class InCasaDriver(DriverProtocol):
     async def resume(
         self, engagement: EngagementRecord, session_id: str,
     ) -> None:
-        # Implemented in Task 8.
-        raise NotImplementedError("Task 8 — resume path")
+        """Reopen a ClaudeSDKClient with resume=session_id.
+
+        Caller (telegram routing path, after user turn in a suspended topic)
+        handles retry + error surfacing. This method raises on failure.
+        """
+        if self.is_alive(engagement):
+            logger.warning(
+                "resume() called on engagement %s that is already alive",
+                engagement.id[:8],
+            )
+            return
+        options = ClaudeAgentOptions(resume=session_id)
+        client = ClaudeSDKClient(options)
+        entered = await client.__aenter__()
+        self._clients[engagement.id] = entered or client
+        self._ctx_stack[engagement.id] = client
+        self._locks[engagement.id] = asyncio.Lock()
+        logger.info(
+            "Engagement %s resumed (session=%s)",
+            engagement.id[:8], session_id,
+        )
+
+    def get_session_id(self, engagement: EngagementRecord) -> str | None:
+        """Return the live client's session_id for persistence before cancel."""
+        client = self._clients.get(engagement.id)
+        return getattr(client, "session_id", None) if client else None
 
     def is_alive(self, engagement: EngagementRecord) -> bool:
         return engagement.id in self._clients
