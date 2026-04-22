@@ -630,11 +630,40 @@ async def emit_completion(args: dict) -> dict:
     return _result({"status": "acknowledged"})
 
 
+@tool(
+    "cancel_engagement",
+    "Cancel an in-flight engagement by id. Closes the topic and NOTIFIES the engager.",
+    {"engagement_id": str},
+)
+async def cancel_engagement(args: dict) -> dict:
+    engagement_id = args.get("engagement_id", "") or ""
+    if _engagement_registry is None:
+        return _result({"status": "error", "kind": "not_initialized",
+                        "message": "engagement registry not initialized"})
+    rec = _engagement_registry.get(engagement_id)
+    if rec is None:
+        return _result({"status": "error", "kind": "unknown_engagement",
+                        "message": f"no engagement named {engagement_id!r}"})
+
+    driver = None
+    try:
+        import agent as agent_mod  # noqa: F401
+        driver = getattr(agent_mod, "active_engagement_driver", None)
+    except Exception:
+        pass
+
+    await _finalize_engagement(
+        rec, outcome="cancelled", text="Engagement cancelled.",
+        artifacts=[], next_steps=[], driver=driver, memory_provider=None,
+    )
+    return _result({"status": "ok", "engagement_id": engagement_id})
+
+
 def create_casa_tools() -> dict[str, Any]:
     """Create and return the casa-framework MCP server config."""
     server = create_sdk_mcp_server(
         name="casa-framework",
         tools=[send_message, delegate_to_specialist, get_schedule, engage_executor,
-               emit_completion],
+               emit_completion, cancel_engagement],
     )
     return server
