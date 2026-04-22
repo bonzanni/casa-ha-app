@@ -7,7 +7,6 @@ for an offline mock so runtime tests need no OAuth token.
 
 ```bash
 make -C test-local test          # smoke + migration + runtime, ~3 min
-make -C test-local test-slow     # adds the ~90s heartbeat test
 make -C test-local clean         # remove leftover containers
 ```
 
@@ -20,7 +19,6 @@ bash test-local/e2e/test_smoke.sh
 bash test-local/e2e/test_migration.sh
 bash test-local/e2e/test_invoke_sessions.sh
 bash test-local/e2e/test_concurrency.sh
-bash test-local/e2e/test_heartbeat.sh    # slow, ~90s
 ```
 
 ## What the E2E suite covers
@@ -30,7 +28,6 @@ bash test-local/e2e/test_heartbeat.sh    # slow, ~90s
 | `e2e/test_smoke.sh` | build, `/healthz`, dashboard startup race (BUG-D1) |
 | `e2e/test_migration.sh` | role-based rename, CRLF handling (BUG-M1/M2), re-run idempotency |
 | `e2e/test_invoke_sessions.sh` | per-invoke session isolation (BUG-I1) |
-| `e2e/test_heartbeat.sh` | scheduled tick actually reaches the agent (BUG-H1) |
 | `e2e/test_concurrency.sh` | parallel invokes with simulated SDK latency |
 
 ## Manually running with real credentials
@@ -52,5 +49,4 @@ Endpoints:
 
 ## Editing options
 
-Edit `test-local/options.json` (untracked) to change agent names, tokens,
-heartbeat interval, etc.
+Edit `test-local/options.json` (untracked) to change agent names, tokens, etc.

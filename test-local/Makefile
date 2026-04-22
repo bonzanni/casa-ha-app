@@ -3,7 +3,7 @@ SHELL := /usr/bin/env bash
 IMAGE ?= casa-test
 ROOT  := $(shell git rev-parse --show-toplevel)
 
-.PHONY: build test test-smoke test-migration test-runtime test-voice test-slow clean help
+.PHONY: build test test-smoke test-migration test-runtime test-voice clean help
 
 help:
 	@echo "Targets:"
@@ -13,7 +13,6 @@ help:
 	@echo "  test-migration  Legacy YAML migration scenarios"
 	@echo "  test-runtime    /invoke session isolation + concurrency"
 	@echo "  test-voice      Voice pipeline SSE + WS smoke scenarios"
-	@echo "  test-slow       Heartbeat (adds ~90s)"
 	@echo "  clean           Remove dangling test containers"
 
 build:
@@ -32,9 +31,6 @@ test-runtime: build
 test-voice: build
 	cd $(ROOT) && bash test-local/e2e/test_voice_sse.sh
 	cd $(ROOT) && bash test-local/e2e/test_voice_ws.sh
-
-test-slow: build
-	cd $(ROOT) && bash test-local/e2e/test_heartbeat.sh
 
 test: test-smoke test-migration test-runtime test-voice
 

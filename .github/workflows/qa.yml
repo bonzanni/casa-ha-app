@@ -3,8 +3,6 @@ on:
   push:
     branches: [master, main]
   pull_request:
-  schedule:
-    - cron: "0 4 * * *"  # nightly for slow tests
 
 jobs:
   unit:
@@ -46,14 +44,3 @@ jobs:
         run: bash test-local/e2e/test_delegation.sh
       - name: E2E - scheduling
         run: bash test-local/e2e/test_scheduling.sh
-
-  e2e-slow:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    needs: e2e-fast
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build image
-        run: docker build -f test-local/Dockerfile.test -t casa-test .
-      - name: Heartbeat
-        run: bash test-local/e2e/test_heartbeat.sh
