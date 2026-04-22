@@ -913,12 +913,79 @@ async def cancel_engagement(args: dict) -> dict:
     return _result({"status": "ok", "engagement_id": engagement_id})
 
 
+# ---------------------------------------------------------------------------
+# casa_reload_triggers - Plan 3 (soft reload for triggers.yaml edits only)
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    "casa_reload_triggers",
+    "Re-register triggers for one agent in-process (no addon restart). "
+    "Use when ONLY <role>/triggers.yaml changed. For anything else, use casa_reload.",
+    {"role": str},
+)
+async def casa_reload_triggers(args: dict) -> dict:
+    role = args["role"]
+    if _trigger_registry is None:
+        return _result({
+            "status": "error",
+            "kind": "not_initialized",
+            "message": "trigger registry not wired",
+        })
+
+    import agent_loader
+    base = "/addon_configs/casa-agent"
+    agents_dir = os.path.join(base, "agents")
+    agent_dir = None
+    # Look in residents (top-level) and specialists/
+    for candidate in (os.path.join(agents_dir, role),
+                      os.path.join(agents_dir, "specialists", role)):
+        if os.path.isdir(candidate):
+            agent_dir = candidate
+            break
+    if agent_dir is None:
+        return _result({
+            "status": "error",
+            "kind": "unknown_role",
+            "message": f"no agent directory found for role={role!r}",
+        })
+
+    try:
+        cfg = await asyncio.to_thread(
+            agent_loader.load_agent_from_dir, agent_dir, policies=None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _result({
+            "status": "error",
+            "kind": "load_error",
+            "message": str(exc),
+        })
+
+    try:
+        await asyncio.to_thread(
+            _trigger_registry.reregister_for,
+            role, list(cfg.triggers), list(cfg.channels),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _result({
+            "status": "error",
+            "kind": "reregister_failed",
+            "message": str(exc),
+        })
+
+    return _result({
+        "status": "ok",
+        "role": role,
+        "registered": [t.name for t in cfg.triggers],
+    })
+
+
 def create_casa_tools() -> dict[str, Any]:
     """Create and return the casa-framework MCP server config."""
     server = create_sdk_mcp_server(
         name="casa-framework",
         tools=[send_message, delegate_to_specialist, get_schedule, engage_executor,
                emit_completion, cancel_engagement, query_engager,
-               config_git_commit, casa_reload],
+               config_git_commit, casa_reload, casa_reload_triggers],
     )
     return server
