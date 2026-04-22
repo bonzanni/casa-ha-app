@@ -270,3 +270,40 @@ class TestScopeValidation:
 
         cfg = load_agent_from_dir(str(agent_dir), policies=_stub_policy_lib())
         assert cfg.memory.default_scope == "personal"
+
+
+class TestExecutorDefinition:
+    def test_minimal_fields(self):
+        from config import ExecutorDefinition
+        d = ExecutorDefinition(
+            type="configurator",
+            description="Configure Casa.",
+            model="claude-sonnet-4-6",
+            driver="in_casa",
+        )
+        assert d.type == "configurator"
+        assert d.enabled is True
+        assert d.idle_reminder_days == 7
+        assert d.tools_allowed == []
+        assert d.permission_mode == "acceptEdits"
+
+    def test_full_fields(self):
+        from config import ExecutorDefinition
+        d = ExecutorDefinition(
+            type="configurator",
+            description="Configure Casa.",
+            model="claude-sonnet-4-6",
+            driver="in_casa",
+            enabled=True,
+            tools_allowed=["Read", "Write"],
+            tools_disallowed=[],
+            permission_mode="acceptEdits",
+            mcp_server_names=["casa-framework"],
+            idle_reminder_days=14,
+            prompt_template_path="/x/prompt.md",
+            hooks_path="/x/hooks.yaml",
+            observer_policy_path="/x/observer.yaml",
+            doctrine_dir="/x/doctrine",
+        )
+        assert d.idle_reminder_days == 14
+        assert d.mcp_server_names == ["casa-framework"]
