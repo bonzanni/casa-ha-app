@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.12.0 — 2026-04-??
+
+### Added — Phase 3.5 Plan 3: UC1 Configurator
+
+- First Tier 3 Executor type: configurator - knows Casa's configuration surface and CRUDs it via engagement topic.
+- ExecutorRegistry + ExecutorDefinition + agent_loader.load_all_executors.
+- executor.v1.json JSON schema.
+- Three new MCP tools: config_git_commit, casa_reload (Supervisor addon restart), casa_reload_triggers(role) (in-process).
+- TriggerRegistry.reregister_for(role, triggers, channels) - soft-reload primitive.
+- Two new hook policies: casa_config_guard (blocks /data/, /schema/, /opt/casa/, resident deletion) and commit_size_guard (ask above N files).
+- engage_executor real implementation (was stub in v0.11.0).
+- TELEGRAM_BOT_API_BASE env override in channels/telegram.py - retires Plan 2's deferred e2e coverage.
+- Configurator defaults at defaults/agents/executors/configurator/: definition.yaml, prompt.md, hooks.yaml, observer.yaml + 20 doctrine markdown files (~3000 lines).
+- Ellen prompt updates: runtime.yaml (engage_executor allowlisted), delegates.yaml (configurator entry), prompts/system.md (Configuration requests section).
+- Setup-configs.sh + test override: seed agents/executors/ subtree.
+- DOCS.md: "Configurator (v0.12.0)" section.
+- E2E: test_engagement.sh E-1..E-8 fleshed (Plan 2 deferred cleared) + E-9 happy path + E-10 hook-blocked.
+- Manual smoke: test-local/smoke/test_configurator_engagement.sh.
+- Addon option: telegram_bot_api_base (default empty).
+
 ## 0.11.0 — 2026-04-22 — Engagement primitive + Tier 2 Specialist interactive mode
 
 ### Added
