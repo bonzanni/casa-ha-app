@@ -70,6 +70,20 @@ def _install_telegram_stubs() -> None:
     tg_ext.filters = MagicMock()
     tg.ext = tg_ext
 
+    # Simple shim classes so `from telegram import BotCommand, BotCommandScopeChat` works
+    class _FakeBotCommand:
+        def __init__(self, command, description):
+            self.command = command
+            self.description = description
+
+    class _FakeBotCommandScopeChat:
+        def __init__(self, chat_id):
+            self.chat_id = chat_id
+            self.type = "chat"
+
+    tg.BotCommand = _FakeBotCommand
+    tg.BotCommandScopeChat = _FakeBotCommandScopeChat
+
     sys.modules["telegram"] = tg
     sys.modules["telegram.constants"] = tg_const
     sys.modules["telegram.error"] = tg_err
