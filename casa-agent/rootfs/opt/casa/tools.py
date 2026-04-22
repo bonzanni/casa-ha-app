@@ -494,6 +494,33 @@ async def get_schedule(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# config_git_commit - Plan 3 (Tier 3 executor support)
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    "config_git_commit",
+    "Stage and commit all tracked changes under /addon_configs/casa-agent/. "
+    "Returns the commit SHA (empty if nothing changed).",
+    {"message": str},
+)
+async def config_git_commit(args: dict) -> dict:
+    message = args.get("message") or "configurator: commit"
+    try:
+        import config_git
+        sha = await asyncio.to_thread(
+            config_git.commit_config, "/addon_configs/casa-agent", message,
+        )
+        return _result({"sha": sha, "message": message})
+    except Exception as exc:  # noqa: BLE001
+        return _result({
+            "status": "error",
+            "kind": "git_error",
+            "message": str(exc),
+        })
+
+
+# ---------------------------------------------------------------------------
 # engage_executor — Plan 2 stub; Tier 3 types arrive Plan 3+
 # ---------------------------------------------------------------------------
 
@@ -856,6 +883,7 @@ def create_casa_tools() -> dict[str, Any]:
     server = create_sdk_mcp_server(
         name="casa-framework",
         tools=[send_message, delegate_to_specialist, get_schedule, engage_executor,
-               emit_completion, cancel_engagement, query_engager],
+               emit_completion, cancel_engagement, query_engager,
+               config_git_commit],
     )
     return server
