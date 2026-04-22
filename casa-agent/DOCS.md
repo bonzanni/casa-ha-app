@@ -26,6 +26,7 @@ Casa runs always-on AI agents inside your Home Assistant instance. The primary a
 |--------|-------------|
 | `telegram_bot_token` | Telegram bot token from @BotFather. Enables the Telegram channel. |
 | `telegram_chat_id` | Telegram chat ID to restrict messages to. Leave empty to accept all chats. |
+| `telegram_engagement_supergroup_id` | Chat ID of the dedicated Telegram forum supergroup used for interactive engagements (Tier 2 Specialist interactive mode; Tier 3 Executor types, Plan 3+). Must be a negative integer. Leave at 0 to disable engagements. |
 
 ### Optional -- Memory
 
@@ -171,6 +172,47 @@ When `enable_terminal` is enabled, a web terminal is available at the `/terminal
 - **No Telegram messages**: Verify `telegram_bot_token` and `telegram_chat_id` are correct. The bot must have been started (`/start` in Telegram).
 - **Memory not working**: By default, memory persists to `/data/memory.sqlite` (SQLite backend). If `HONCHO_API_KEY` is set but memory still appears empty, check container logs for `SQLite memory init failed` or Honcho connection errors. To disable memory entirely, set `MEMORY_BACKEND=noop`.
 - **502 errors on ingress**: The Python process may still be starting. Wait up to 60 seconds after add-on start.
+
+## Engagements (v0.11.0)
+
+Casa supports **engagements** — bounded conversational threads where a
+specialist (Tier 2) or executor (Tier 3, Plan 3+) works with you on a
+specific task, separate from your 1:1 chat with Ellen.
+
+### Setup
+
+1. In Telegram, create a new **forum supergroup** (Topics enabled) dedicated
+   to Casa engagements. Different from your 1:1 chat with the bot.
+2. Add the Casa bot to the supergroup as **administrator** with
+   "Manage Topics" permission enabled.
+3. Get the chat ID (negative integer). You can read it from
+   `https://api.telegram.org/bot<TOKEN>/getUpdates` after posting a message
+   in the supergroup.
+4. Set `telegram_engagement_supergroup_id` in addon options to the chat ID.
+5. Restart the Casa addon.
+
+On boot Casa registers three slash commands on the supergroup:
+
+- `/cancel` — cancel the current engagement in this topic.
+- `/complete` — mark the engagement complete (no agent summary).
+- `/silent` — stop Ellen's proactive notifications for this engagement.
+
+Type `/` in any topic to see them in the autocomplete menu.
+
+### Starting an engagement
+
+Ask Ellen in the main chat for something multi-turn, e.g.
+*"let's work through Q2 invoicing with Alex"*. Ellen may open an
+engagement — if so she'll tell you which topic to head to. The
+specialist is waiting there.
+
+### Idle reminders
+
+Engagements have no hard timeout. If an engagement sits idle for 3 days
+(specialists) or 7 days (executors, Plan 3+), Ellen will nudge you in the
+main 1:1 chat. Reminder re-fires weekly. Suspend/resume is automatic —
+after 24 hours of inactivity Casa tears down the underlying SDK client to
+free resources; it resumes seamlessly on your next message in the topic.
 
 ## Enabling a bundled-disabled specialist
 

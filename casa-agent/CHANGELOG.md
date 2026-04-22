@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.11.0 — 2026-04-22 — Engagement primitive + Tier 2 Specialist interactive mode
+
+### Added
+
+- **Engagements — bounded conversational threads in a Telegram forum supergroup.**
+  New addon option `telegram_engagement_supergroup_id` binds Casa to a
+  dedicated supergroup; each engagement spawns a forum topic via
+  `createForumTopic`. See DOCS.md "Engagements" section for setup.
+- **`delegate_to_specialist(mode="interactive")`**. New branch: instead of
+  one-shot sync/async invocation, opens an engagement topic where the
+  specialist (e.g. Alex) works with the user turn-by-turn. Completion is
+  agent-driven via the new `emit_completion` tool; the user can end early
+  via `/complete` or `/cancel` in the topic.
+- **`engage_executor` MCP tool** (stub — returns `kind=no_executor_types`
+  until Tier 3 types land in Plan 3+). Wires Ellen for the future
+  engage flow; Plan 3 fleshes out with the configurator executor type.
+- **`query_engager` MCP tool** — specialist-side retrieval. Bounded LLM
+  synthesis over the engager's scope-filtered memory; returns `unknown`
+  when context is insufficient.
+- **`emit_completion` MCP tool** — specialist-side completion funnel.
+  Publishes a structured summary (`text`, `artifacts`, `next_steps`),
+  closes the topic (✅ icon), writes the summary to Ellen's meta-scope
+  memory, and NOTIFIES Ellen for in-main-chat narration.
+- **`cancel_engagement` MCP tool** — Ellen-callable. Tears down the
+  driver and finalizes the record.
+- **Observer module.** Static classifier + rate limiter (3 per engagement)
+  + `/silent` per-engagement override. Trigger events (errors, warnings,
+  idle-detected, unknown query_engager) run a bounded haiku-class LLM
+  pass that may NOTIFY Ellen to interject in the main 1:1 chat.
+  Per-type YAML override arrives with Plan 3.
+- **Idle + suspension scheduler.** New APScheduler job
+  (`engagement_idle_sweep`, daily 08:00) emits `idle_detected` bus
+  events after 3 days of no user turn (specialists; 7 days for
+  executors — Plan 3+); weekly re-fire. Live SDK clients torn down
+  after 24h idle with `sdk_session_id` persisted for seamless resume
+  on next user turn.
+- **`in_casa` driver** (full impl) and **`claude_code` driver stub**
+  (raises `NotImplementedError`, Plan 5 fills in).
+- **Slash commands** `/cancel`, `/complete`, `/silent` registered in the
+  engagement supergroup via `setMyCommands` for in-UI discoverability.
+- **Addon option** `telegram_engagement_supergroup_id` (int?, 0 = disabled).
+
+### Infrastructure
+
+- New `casa-agent/rootfs/opt/casa/engagement_registry.py` — mirrors
+  `specialist_registry.py` pattern. Persists live records to
+  `/data/engagements.json`; finished records drop from disk (Ellen's
+  meta-scope memory is the durable log).
+- New `casa-agent/rootfs/opt/casa/drivers/` subpackage: `driver_protocol.py`,
+  `in_casa_driver.py`, `claude_code_driver.py`.
+- Ellen's shipped `runtime.yaml` + `delegates.yaml` + `prompts/system.md`
+  updated to explain engagements and the new tools.
+- Mock Telegram Bot API server at `test-local/e2e/mock_telegram/server.py`
+  used by the new `test_engagement.sh` (CI).
+- Manual Telegram smoke at `test-local/smoke/test_telegram_engagement.sh`
+  exercises the real Bot API; not in CI — run pre-N150 deploy.
+- `.github/workflows/qa.yml` adds the engagement e2e step.
+
+### Breaking — acceptable pre-1.0.0
+
+- `init_tools` signature adds a new kwarg `engagement_registry`. Internal
+  to Casa; no external consumers.
+
+### Deferred
+
+- Tier 3 executor types (configurator, ha-developer, plugin-developer)
+  — Plans 3, 4, 5.
+- Per-type `observer.yaml` override — Plan 3.
+- `claude_code` driver implementation — Plan 5.
+- `next_steps` auto-chain by Ellen — Plan 3 (no Tier 3 types to chain to yet).
+- Engagement topic archival/housekeeping — Plan 6+.
+- `test_engagement.sh` E-1..E-8 checkpoints — scaffolded but not functional;
+  flesh in follow-up commits as `TELEGRAM_BOT_API_BASE` override lands.
+
+### Version
+
+- `casa-agent/config.yaml`: `0.10.0` → `0.11.0`.
+
 ## 0.10.0 — 2026-04-22 — Rename: Tier 2 "Executor" → "Specialist"
 
 Preparation for Phase 3.5 engagement primitive + Tier 3 Executors (see
