@@ -62,8 +62,6 @@ options panel) for finer control:
 
 | Option | Description |
 |--------|-------------|
-| `heartbeat_enabled` | Enable periodic heartbeat that prompts the primary agent to check for pending tasks. Default: `true`. |
-| `heartbeat_interval_minutes` | Heartbeat interval in minutes (15--1440). Default: `60`. |
 | `enable_terminal` | Enable a web terminal accessible via the ingress panel. Default: `false`. |
 | `webhook_secret` | HMAC-SHA256 secret for authenticating webhook requests. Leave empty to skip verification. |
 
@@ -90,7 +88,7 @@ Repos are cloned on first boot and pulled on subsequent boots (unless there are 
 2. **Message flow**: Incoming messages (Telegram, webhook, voice) are routed through an async message bus to the appropriate agent based on the originating channel.
 3. **Agent processing**: Each agent builds a system prompt (personality + memory context), queries the Claude Agent SDK, stores the conversation in memory, and sends the response back through the originating channel.
 4. **Home Assistant integration**: Agents interact with HA via the official HA MCP server, allowing them to control devices, read states, and create automations.
-5. **Heartbeat**: A configurable periodic prompt checks for pending tasks, upcoming events, and proactive actions.
+5. **Per-agent triggers**: Each agent declares scheduled triggers (cron or interval) in its own `agents/<role>/triggers.yaml`. The TriggerRegistry registers them at boot, and fires them via the agent's normal turn loop.
 
 ## API endpoints
 

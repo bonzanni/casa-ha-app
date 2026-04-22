@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.9.0"
+version: "0.9.1"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 init: false
@@ -45,10 +45,6 @@ options:
   voice_agent_model: "haiku"
   subagent_model: "sonnet"
 
-  # Heartbeat
-  heartbeat_enabled: true
-  heartbeat_interval_minutes: 60
-
   # Web terminal
   enable_terminal: false
 
@@ -77,8 +73,6 @@ schema:
   primary_agent_model: "list(opus|sonnet|haiku)?"
   voice_agent_model: "list(opus|sonnet|haiku)?"
   subagent_model: "list(opus|sonnet|haiku)?"
-  heartbeat_enabled: bool?
-  heartbeat_interval_minutes: "int(15,1440)?"
   enable_terminal: bool?
   repos:
     - url: url

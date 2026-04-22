@@ -14,8 +14,6 @@
   "primary_agent_model": "opus",
   "voice_agent_model": "haiku",
   "subagent_model": "sonnet",
-  "heartbeat_enabled": false,
-  "heartbeat_interval_minutes": 60,
   "enable_terminal": false,
   "repos": []
 }
