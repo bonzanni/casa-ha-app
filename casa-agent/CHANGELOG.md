@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.9.1 — 2026-04-22 — Drop dead pre-v0.7.0 heartbeat config
+
+### Removed
+
+- **`heartbeat_enabled` / `heartbeat_interval_minutes` addon options.**
+  Zero runtime consumers — the global heartbeat block was removed in
+  v0.7.0 (Phase 4.x refactor, replaced by per-agent
+  `agents/<role>/triggers.yaml`). Since then the options have been
+  visible in the HA UI but had no effect. Removed from `config.yaml`
+  (both `options:` and `schema:` blocks), `DOCS.md` Features table,
+  `translations/en.yaml`, `test-local/options.json.example`, and the
+  `test-local/init-overrides/03-export-env.sh` export loop.
+- **`e2e-slow` nightly CI job + `test-local/e2e/test_heartbeat.sh`.**
+  Same v0.7.0 rot — the test referenced `defaults/webhooks.yaml` and a
+  top-level `schedules.yaml`/`heartbeat:` block that no longer exist.
+  Also dropped the `schedule: cron "0 4 * * *"` workflow trigger and
+  the `test-slow` Makefile target. (Landed earlier today on master in
+  commit `ff24829`; called out here for completeness.)
+
+### Changed
+
+- **DOCS.md "How it works" bullet 5** rewritten from the
+  global-heartbeat narrative to the current per-agent trigger
+  architecture.
+
+### Migration
+
+- **Pre-1.0.0, no migration block.** `/addon_configs/casa-agent/` is
+  wipe-acceptable; if a user had explicit `heartbeat_enabled: ...` in
+  their options YAML, the HA UI will surface it as "unused option" on
+  next restart and they can delete it. Nothing in the runtime depended
+  on the value.
+
 ## 0.9.0 — 2026-04-21 — Phase 3.3: Scheduling v2 + builder-first config ergonomics
 
 ### Added

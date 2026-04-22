@@ -71,14 +71,6 @@ configuration:
     name: Subagent Model
     description: >-
       Claude model used by on-demand subagents (automation-builder, plugin-builder, etc.).
-  heartbeat_enabled:
-    name: Enable Heartbeat
-    description: >-
-      Periodically prompt the primary agent to check for pending tasks and events.
-  heartbeat_interval_minutes:
-    name: Heartbeat Interval (minutes)
-    description: >-
-      How often the heartbeat fires, in minutes. Range: 15 to 1440.
   enable_terminal:
     name: Enable Web Terminal
     description: >-
