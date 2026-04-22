@@ -658,14 +658,14 @@ async def casa_reload(_: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# engage_executor — Plan 2 stub; Tier 3 types arrive Plan 3+
+# engage_executor — Plan 3 real impl (configurator + future Tier 3 types)
 # ---------------------------------------------------------------------------
 
 
 @tool(
     "engage_executor",
     "Start a Tier 3 Executor engagement (configurator, ha-developer, etc.). "
-    "Returns an engagement_id; result arrives later as a NOTIFICATION.",
+    "Returns engagement_id; result arrives later as a NOTIFICATION.",
     {"executor_type": str, "task": str, "context": str},
 )
 async def engage_executor(args: dict) -> dict:
@@ -673,18 +673,126 @@ async def engage_executor(args: dict) -> dict:
     origin = agent_mod.origin_var.get(None)
     if origin is None:
         return _result({
-            "status": "error",
-            "kind": "no_origin",
+            "status": "error", "kind": "no_origin",
             "message": "engage_executor called outside a turn",
         })
+
+    executor_type = args.get("executor_type", "")
+    task_text = args.get("task", "") or ""
+    context_text = args.get("context", "") or ""
+
+    if _executor_registry is None or not _executor_registry.list_types():
+        return _result({
+            "status": "error", "kind": "no_executor_types",
+            "message": (
+                "No Tier 3 Executor types registered. "
+                "Ship Plan 3/4/5 or enable an executor in its definition.yaml."
+            ),
+        })
+
+    defn = _executor_registry.get(executor_type)
+    if defn is None:
+        return _result({
+            "status": "error", "kind": "unknown_executor_type",
+            "message": (
+                f"No enabled executor type named {executor_type!r}. "
+                f"Available: {_executor_registry.list_types()}"
+            ),
+        })
+
+    if _channel_manager is None:
+        return _result({
+            "status": "error", "kind": "no_channel_manager",
+            "message": "channel manager missing",
+        })
+    channel = _channel_manager.get(origin.get("channel", "telegram"))
+    if (channel is None
+            or not getattr(channel, "engagement_supergroup_id", 0)
+            or not getattr(channel, "engagement_permission_ok", False)):
+        return _result({
+            "status": "error", "kind": "engagement_not_configured",
+            "message": ("set telegram_engagement_supergroup_id in addon "
+                        "options and verify the bot has can_manage_topics"),
+        })
+
+    short_task = (task_text or "").splitlines()[0][:80].strip() or "engagement"
+    try:
+        topic_id = await channel.open_engagement_topic(
+            name=f"#[{executor_type}] {short_task}",
+            icon_emoji="tools",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _result({
+            "status": "error", "kind": "topic_create_failed",
+            "message": str(exc),
+        })
+
+    rec = await _engagement_registry.create(
+        kind="executor", role_or_type=executor_type, driver=defn.driver,
+        task=task_text, origin=dict(origin), topic_id=topic_id,
+    )
+
+    try:
+        await channel.bot.edit_forum_topic(
+            chat_id=channel.engagement_supergroup_id,
+            message_thread_id=topic_id,
+            name=f"#[{executor_type}] {short_task} | {rec.id[:8]}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("edit_forum_topic rename failed: %s", exc)
+
+    options = _build_executor_options(defn)
+    injected = list(options.allowed_tools or [])
+    for t in ("mcp__casa-framework__query_engager",
+              "mcp__casa-framework__emit_completion"):
+        if t not in injected:
+            injected.append(t)
+    options.allowed_tools = injected
+
+    prompt_template = ""
+    try:
+        with open(defn.prompt_template_path, "r", encoding="utf-8") as fh:
+            prompt_template = fh.read()
+    except OSError as exc:
+        await _engagement_registry.mark_error(
+            rec.id, kind="prompt_template_missing", message=str(exc),
+        )
+        return _result({
+            "status": "error", "kind": "prompt_template_missing",
+            "message": str(exc),
+        })
+
+    world_state = _build_world_state_summary()
+    prompt = (
+        prompt_template
+        .replace("{task}", task_text)
+        .replace("{context}", context_text or "(none)")
+        .replace("{world_state_summary}", world_state)
+    )
+    options.system_prompt = prompt
+
+    driver = getattr(agent_mod, "active_engagement_driver", None)
+    if driver is None:
+        return _result({
+            "status": "error", "kind": "no_driver",
+            "message": "engagement driver not initialized",
+        })
+    try:
+        await driver.start(rec, prompt=prompt, options=options)
+    except Exception as exc:  # noqa: BLE001
+        await _engagement_registry.mark_error(
+            rec.id, kind="driver_start_failed", message=str(exc),
+        )
+        return _result({
+            "status": "error", "kind": "driver_start_failed",
+            "message": str(exc),
+        })
+
     return _result({
-        "status": "error",
-        "kind": "no_executor_types",
-        "message": (
-            "No Tier 3 Executor types are registered in this Casa version. "
-            "Tier 3 types arrive in Plan 3 (configurator) and Plan 4 "
-            "(ha-developer). For Plan 2, use delegate_to_specialist(mode=interactive)."
-        ),
+        "status": "pending",
+        "engagement_id": rec.id,
+        "executor_type": executor_type,
+        "topic_id": topic_id,
     })
 
 
