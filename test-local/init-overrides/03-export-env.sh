@@ -33,6 +33,10 @@ if [ -n "$val" ]; then
     printf '%s' "$val" > "${S6_ENV}/CASA_SCOPE_THRESHOLD"
 fi
 
+# Engagement supergroup (0 = disabled; always export so consumers can check).
+val=$(jq -r '.telegram_engagement_supergroup_id // 0' "$OPTIONS")
+printf '%s' "$val" > "${S6_ENV}/TELEGRAM_ENGAGEMENT_SUPERGROUP_ID"
+
 # Static version for test mode
 printf 'dev' > "${S6_ENV}/CASA_VERSION"
 
