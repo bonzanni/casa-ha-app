@@ -8,9 +8,11 @@ tools:
     - Edit
     - Bash
     - Skill
+    - mcp__casa-framework__cancel_engagement
     - mcp__casa-framework__delegate_to_specialist
-    - mcp__casa-framework__send_message
+    - mcp__casa-framework__engage_executor
     - mcp__casa-framework__get_schedule
+    - mcp__casa-framework__send_message
   disallowed: []
   permission_mode: acceptEdits
   max_turns: 20
