@@ -53,6 +53,7 @@ class TriggerRegistry:
         self._seen_job_ids: set[str] = set()
         self._seen_webhook_paths: set[str] = set()
         self._specs_by_job_id: dict[str, TriggerSpec] = {}
+        self._webhook_paths_by_role: dict[str, list[str]] = {}
 
     def register_agent(
         self,
@@ -168,6 +169,40 @@ class TriggerRegistry:
             return web.json_response({"status": "accepted"})
 
         self._app.router.add_post(trig.path, _handler)
+        self._webhook_paths_by_role.setdefault(role, []).append(trig.path)
+
+    def reregister_for(
+        self,
+        role: str,
+        triggers: list[TriggerSpec],
+        channels: list[str],
+    ) -> None:
+        """Remove this role's existing APScheduler jobs and webhook paths,
+        then re-wire from the supplied specs.
+
+        Fail-closed: if re-registration raises, the agent is left with NO
+        triggers (the unwind already happened). The caller should surface
+        the error.
+        """
+        prefix = f"{role}:"
+        to_drop = [
+            jid for jid in list(self._seen_job_ids) if jid.startswith(prefix)
+        ]
+        for jid in to_drop:
+            try:
+                self._scheduler.remove_job(jid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("remove_job %s failed: %s", jid, exc)
+            self._seen_job_ids.discard(jid)
+            self._specs_by_job_id.pop(jid, None)
+
+        for path in self._webhook_paths_by_role.get(role, []):
+            self._seen_webhook_paths.discard(path)
+            # aiohttp has no supported public "remove route" API. Callers
+            # should avoid reusing webhook paths across re-registrations.
+        self._webhook_paths_by_role[role] = []
+
+        self.register_agent(role, triggers, channels)
 
     def list_jobs_for(
         self, role: str, within_hours: int,
