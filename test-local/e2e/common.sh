@@ -74,3 +74,36 @@ assert_log_not_contains() {
         fail "forbidden log line '$needle' found in $name"
     fi
 }
+
+# wait_for_text_in_log <container> <pattern> [timeout_s]
+# Polls `docker logs` until *pattern* (grep -E, fixed regex ok) appears.
+# Returns 0 on match, 1 on timeout. Unlike assert_log_contains this never
+# fails the suite — callers decide what to do.
+wait_for_text_in_log() {
+    local name="$1"
+    local pattern="$2"
+    local timeout="${3:-30}"
+    local end=$(( $(date +%s) + timeout ))
+    while [ "$(date +%s)" -lt "$end" ]; do
+        if docker logs "$name" 2>&1 | grep -Eq "$pattern"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# assert_file_contains <container> <path> <needle> <label>
+# Fails the suite if *needle* is not in <path> inside <container>.
+assert_file_contains() {
+    local name="$1"
+    local path="$2"
+    local needle="$3"
+    local label="$4"
+    if MSYS_NO_PATHCONV=1 docker exec "$name" grep -qF "$needle" "$path"; then
+        pass "$label"
+    else
+        MSYS_NO_PATHCONV=1 docker exec "$name" cat "$path" 2>&1 | tail -20 >&2 || true
+        fail "$label (grep for '$needle' in $path failed)"
+    fi
+}
