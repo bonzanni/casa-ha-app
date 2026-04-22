@@ -5,5 +5,5 @@ archetype: assistant
 card: |
   Primary assistant and orchestrator. Knows Nicola's business context
   (ENPICOM, Lesina Holding), his stack, his preferences. Delegates
-  financial tasks to the finance executor ad-hoc.
+  financial tasks to the finance specialist ad-hoc.
 prompt_file: prompts/system.md
