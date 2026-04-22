@@ -41,6 +41,6 @@ jobs:
       - name: External surface (5.7)
         run: bash test-local/e2e/test_external_surface.sh
       - name: Delegation
-        run: bash test-local/e2e/test_delegation.sh
+        run: bash test-local/e2e/test_specialist_delegation.sh
       - name: E2E - scheduling
         run: bash test-local/e2e/test_scheduling.sh
