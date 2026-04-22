@@ -768,5 +768,169 @@ assert_file_contains "$NAME" \
 
 pass "E-9 configurator executor engagement: topic + routing + completion wired"
 
+# ---------------------------------------------------------------------------
+# E-10 — Configurator hook-blocked (resident deletion) path.
+#
+# Structural harness verifying the casa_config_guard PreToolUse hook denies
+# resident-directory deletions AND that a subsequent _finalize_engagement
+# with outcome="cancelled" emits the correct NOTIFICATION shape. Mirrors the
+# shape of the real path (Ellen asks configurator to delete butler →
+# configurator proposes rm -rf → hook denies → configurator emits cancel).
+#
+# Assertion points:
+#   1. hook denies   rm -rf /addon_configs/casa-agent/agents/butler
+#      → permissionDecision == "deny"
+#   2. hook allows   non-resident paths (specialists/ subtree + benign bash)
+#      → hook returns None
+#   3. butler/ directory is still present after the hook fires
+#   4. _finalize_engagement(outcome="cancelled") emits one NOTIFICATION
+#      whose content.kind == "cancelled" and status == "error"
+# ---------------------------------------------------------------------------
+log "E-10: configurator hook-blocked (resident deletion) structural harness"
+curl -s -X POST "http://localhost:${MOCK_PORT}/_reset" >/dev/null
+
+# Seed a butler resident directory so the "still exists after deny" check has
+# something to look at (mirrors a real installation with an enabled resident).
+MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c \
+    "mkdir -p /addon_configs/casa-agent/agents/butler && \
+     printf 'role: butler\n' > /addon_configs/casa-agent/agents/butler/runtime.yaml"
+
+read -r -d '' E10_PY <<'PY' || true
+import asyncio, os, sys
+sys.path.insert(0, "/opt/casa")
+from engagement_registry import EngagementRegistry
+from channels.telegram import TelegramChannel
+from hooks import make_casa_config_guard_hook
+
+async def main():
+    os.environ["TELEGRAM_BOT_API_BASE"] = os.environ["MOCK_TG_BASE"]
+    supergroup = int(os.environ["SUPERGROUP_ID"])
+
+    # 1. Build the hook as configurator/hooks.yaml wires it: forbid resident
+    #    deletion, and forbid writes into the usual runtime-state prefixes.
+    hook = make_casa_config_guard_hook(
+        forbid_write_paths=["/data/", "/opt/casa/schema/"],
+        forbid_delete_residents=True,
+    )
+
+    # 2. rm -rf against a resident directory must be DENIED.
+    deny_input = {
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "rm -rf /addon_configs/casa-agent/agents/butler",
+        },
+    }
+    deny_out = await hook(deny_input, "tuid-1", {})
+    assert deny_out is not None, "E-10.1 hook returned None for resident rm"
+    spec = deny_out.get("hookSpecificOutput", {})
+    assert spec.get("permissionDecision") == "deny", \
+        f"E-10.1 expected deny, got {spec}"
+    assert "resident" in spec.get("permissionDecisionReason", "").lower(), \
+        f"E-10.1 deny reason missing 'resident': {spec}"
+
+    # 3. Hook must NOT deny specialist-subtree deletions (not a resident).
+    allow_specialist = {
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "rm -rf /addon_configs/casa-agent/agents/specialists/foo",
+        },
+    }
+    out = await hook(allow_specialist, "tuid-2", {})
+    assert out is None, f"E-10.2 specialist path wrongly denied: {out}"
+
+    # 3b. Hook must NOT deny executor-subtree deletions either.
+    allow_executor = {
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "rm -rf /addon_configs/casa-agent/agents/executors/foo",
+        },
+    }
+    out = await hook(allow_executor, "tuid-3", {})
+    assert out is None, f"E-10.2 executor path wrongly denied: {out}"
+
+    # 3c. A benign Bash command must pass straight through.
+    benign = {"tool_name": "Bash", "tool_input": {"command": "ls -la /tmp"}}
+    out = await hook(benign, "tuid-4", {})
+    assert out is None, f"E-10.2 benign bash wrongly denied: {out}"
+
+    # 4. butler/ directory still exists on disk (hook didn't somehow delete it,
+    #    and the deny-decision is structural; the SDK would have aborted the
+    #    tool call before the rm ever ran).
+    butler_dir = "/addon_configs/casa-agent/agents/butler"
+    assert os.path.isdir(butler_dir), f"E-10.3 butler dir missing: {butler_dir}"
+
+    # 5. Simulate the tail of the cancelled path: configurator's proposed
+    #    destructive tool was denied → it emits a cancel outcome → Ellen is
+    #    NOTIFIED with kind="cancelled".
+    reg = EngagementRegistry(tombstone_path="/tmp/_eng_e10.json", bus=None)
+    ch = TelegramChannel(
+        bot_token="test-token", chat_id="999", default_agent="assistant",
+        bus=None, webhook_url="", delivery_mode="block",
+        engagement_supergroup_id=supergroup,
+    )
+    await ch._rebuild()
+    ch._engagement_registry = reg
+
+    class StubBus:
+        def __init__(self): self.notifs = []
+        async def notify(self, msg): self.notifs.append(msg)
+    class StubChanMgr:
+        def get(self, _name): return ch
+    bus = StubBus()
+    import tools as _tools
+    _tools._engagement_registry = reg
+    _tools._bus = bus
+    _tools._channel_manager = StubChanMgr()
+
+    class StubDriver:
+        async def cancel(self, rec): pass
+
+    tid = await ch.open_engagement_topic(
+        name="#[configurator] delete butler", icon_emoji="tools",
+    )
+    rec = await reg.create(
+        kind="executor", role_or_type="configurator", driver="in_casa",
+        task="delete butler resident",
+        origin={"channel": "telegram", "chat_id": "999", "role": "assistant"},
+        topic_id=tid,
+    )
+
+    await _tools._finalize_engagement(
+        rec, outcome="cancelled",
+        text="resident deletion denied by casa_config_guard",
+        artifacts=[], next_steps=[],
+        driver=StubDriver(), memory_provider=None,
+    )
+
+    # Assertion point 4: NOTIFICATION emitted with cancelled-shaped content.
+    assert reg.get(rec.id).status == "cancelled", \
+        f"E-10.4 status: {reg.get(rec.id).status}"
+    assert len(bus.notifs) == 1, f"E-10.4 expected 1 notif, got {len(bus.notifs)}"
+    content = bus.notifs[0].content
+    assert getattr(content, "kind", None) == "cancelled", \
+        f"E-10.4 notif kind: {getattr(content, 'kind', None)!r}"
+    assert getattr(content, "status", None) == "error", \
+        f"E-10.4 notif status: {getattr(content, 'status', None)!r}"
+    assert bus.notifs[0].target == "assistant", \
+        f"E-10.4 notif target: {bus.notifs[0].target}"
+
+    # butler/ still there after the whole flow.
+    assert os.path.isdir(butler_dir), \
+        f"E-10.3 butler dir vanished during finalize: {butler_dir}"
+
+    await ch._teardown_app()
+    print("OK")
+
+asyncio.run(main())
+PY
+run_harness "E-10" "$E10_PY"
+
+# Cross-boundary filesystem check: butler dir is untouched.
+MSYS_NO_PATHCONV=1 docker exec "$NAME" test -d \
+    /addon_configs/casa-agent/agents/butler \
+    || fail "E-10.3 butler dir missing after harness (should still exist)"
+
+pass "E-10 hook denies resident rm + cancelled NOTIFICATION wired"
+
 stop_container "$NAME"
 echo "=== test_engagement.sh complete ==="
