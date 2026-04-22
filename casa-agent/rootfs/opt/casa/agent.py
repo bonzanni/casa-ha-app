@@ -45,6 +45,12 @@ from error_kinds import ErrorKind, _classify_error, _USER_MESSAGES  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+# Module-level driver/provider/registry references written by casa_core.main
+# so tool handlers can reach them without circular imports.
+active_engagement_driver = None   # InCasaDriver | None, set by casa_core.main
+active_memory_provider = None     # MemoryProvider | None, set by casa_core.main
+active_executor_registry = None   # ExecutorRegistry | None, set by casa_core.main
+
 # Phase 3.1: delegating-turn origin. Set by Agent._process for the
 # duration of a turn so the `delegate_to_specialist` tool handler can read
 # the channel/chat_id/cid/role/user_text of the outer user turn without
