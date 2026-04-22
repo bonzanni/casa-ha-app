@@ -42,5 +42,9 @@ jobs:
         run: bash test-local/e2e/test_external_surface.sh
       - name: Delegation
         run: bash test-local/e2e/test_specialist_delegation.sh
+      - name: Engagement (Plan 2)
+        run: |
+          pip install aiohttp
+          bash test-local/e2e/test_engagement.sh
       - name: E2E - scheduling
         run: bash test-local/e2e/test_scheduling.sh
