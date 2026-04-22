@@ -534,15 +534,16 @@ def load_all_agents(
 ) -> dict[str, AgentConfig]:
     """Walk *agents_dir* for resident directories.
 
-    Skips ``specialists/`` (Tier 2 home) and any dotdir. Each
-    subdirectory's name becomes the agent role. Raises ``LoadError``
-    on the first malformed agent — strict-mode from day one.
+    Skips ``specialists/`` (Tier 2 home), ``executors/`` (reserved for
+    Plan 2 Tier 3), and any dotdir. Each subdirectory's name becomes
+    the agent role. Raises ``LoadError`` on the first malformed agent —
+    strict-mode from day one.
     """
     found: dict[str, AgentConfig] = {}
     if not os.path.isdir(agents_dir):
         return found
     for entry in sorted(os.listdir(agents_dir)):
-        if entry.startswith(".") or entry == "specialists":
+        if entry.startswith(".") or entry in ("specialists", "executors"):
             continue
         path = os.path.join(agents_dir, entry)
         if not os.path.isdir(path):
