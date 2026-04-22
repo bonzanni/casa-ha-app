@@ -50,6 +50,14 @@ if [ -d "$DEFAULTS_DIR/agents/specialists" ]; then
     done
 fi
 
+if [ -d "$DEFAULTS_DIR/agents/executors" ]; then
+    for src in "$DEFAULTS_DIR/agents/executors"/*/; do
+        [ -d "$src" ] || continue
+        name=$(basename "$src")
+        seed_agent_dir "$src" "$CONFIG_DIR/agents/executors/$name"
+    done
+fi
+
 # Seed shared policy library.
 if [ ! -f "$CONFIG_DIR/policies/disclosure.yaml" ] \
    && [ -f "$DEFAULTS_DIR/policies/disclosure.yaml" ]; then
