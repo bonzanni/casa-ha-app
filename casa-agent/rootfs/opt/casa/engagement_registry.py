@@ -58,3 +58,122 @@ class EngagementRecord:
     sdk_session_id: str | None
     origin: dict[str, Any]
     task: str
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+
+class EngagementRegistry:
+    """In-memory dict + ``/data/engagements.json`` tombstone.
+
+    All mutation methods acquire ``self._lock`` and write the tombstone
+    inside the lock, same pattern as SpecialistRegistry.register_delegation.
+    The ``bus`` parameter is used to publish ``idle_detected`` events from
+    the sweep task; tests that don't exercise the sweep may pass ``None``.
+    """
+
+    def __init__(self, *, tombstone_path: str, bus: Any | None) -> None:
+        self._tombstone_path = tombstone_path
+        self._bus = bus
+        self._records: dict[str, EngagementRecord] = {}
+        self._topic_index: dict[int, str] = {}
+        self._lock = asyncio.Lock()
+
+    async def load(self) -> None:
+        """Read the tombstone into memory. Called once at startup."""
+        if not os.path.exists(self._tombstone_path):
+            return
+        try:
+            with open(self._tombstone_path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.error(
+                "Engagement tombstone corrupt or unreadable (%s): %s — truncating",
+                self._tombstone_path, exc,
+            )
+            try:
+                with open(self._tombstone_path, "w", encoding="utf-8") as fh:
+                    json.dump([], fh)
+            except OSError:
+                pass
+            return
+        if not isinstance(raw, list):
+            logger.error(
+                "Engagement tombstone %s is not a JSON array; truncating",
+                self._tombstone_path,
+            )
+            try:
+                with open(self._tombstone_path, "w", encoding="utf-8") as fh:
+                    json.dump([], fh)
+            except OSError:
+                pass
+            return
+        for row in raw:
+            try:
+                rec = EngagementRecord(
+                    id=row["id"],
+                    kind=row["kind"],
+                    role_or_type=row["role_or_type"],
+                    driver=row["driver"],
+                    status=row["status"],
+                    topic_id=row.get("topic_id"),
+                    started_at=float(row["started_at"]),
+                    last_user_turn_ts=float(row["last_user_turn_ts"]),
+                    last_idle_reminder_ts=float(row.get("last_idle_reminder_ts", 0.0)),
+                    completed_at=row.get("completed_at"),
+                    sdk_session_id=row.get("sdk_session_id"),
+                    origin=dict(row.get("origin") or {}),
+                    task=row.get("task", ""),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("Skipping malformed engagement row: %s", exc)
+                continue
+            self._records[rec.id] = rec
+            if rec.topic_id is not None:
+                self._topic_index[rec.topic_id] = rec.id
+
+    def active_and_idle(self) -> list[EngagementRecord]:
+        return [r for r in self._records.values() if r.status in ("active", "idle")]
+
+    def get(self, engagement_id: str) -> EngagementRecord | None:
+        return self._records.get(engagement_id)
+
+    def by_topic_id(self, topic_id: int) -> EngagementRecord | None:
+        rec_id = self._topic_index.get(topic_id)
+        return self._records.get(rec_id) if rec_id else None
+
+    # -- Persist helper ---------------------------------------------------
+
+    async def _write_tombstone_locked(self) -> None:
+        """Caller MUST hold self._lock."""
+        snapshot = []
+        for rec in self._records.values():
+            if rec.status in ("completed", "cancelled", "error"):
+                # Finished records are dropped from disk — Ellen's meta-scope
+                # memory carries the durable record (spec §4.6).
+                continue
+            snapshot.append({
+                "id": rec.id,
+                "kind": rec.kind,
+                "role_or_type": rec.role_or_type,
+                "driver": rec.driver,
+                "status": rec.status,
+                "topic_id": rec.topic_id,
+                "started_at": rec.started_at,
+                "last_user_turn_ts": rec.last_user_turn_ts,
+                "last_idle_reminder_ts": rec.last_idle_reminder_ts,
+                "completed_at": rec.completed_at,
+                "sdk_session_id": rec.sdk_session_id,
+                "origin": dict(rec.origin),
+                "task": rec.task,
+            })
+        try:
+            await asyncio.to_thread(self._write_tombstone, snapshot)
+        except Exception as exc:
+            logger.warning("Failed to persist engagement tombstone: %s", exc)
+
+    def _write_tombstone(self, snapshot: list[dict[str, Any]]) -> None:
+        with open(self._tombstone_path, "w", encoding="utf-8") as fh:
+            json.dump(snapshot, fh, indent=2)
