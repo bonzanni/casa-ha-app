@@ -313,6 +313,15 @@ async def main():
     agent_mod.active_memory_provider = None
 
     ch._engagement_registry = reg
+    # Inject _finalize_cancel collaborator (prod wiring lives in casa_core.py).
+    drv = agent_mod.active_engagement_driver
+    async def _finalize_cancel(rec, reason="user"):
+        await tools._finalize_engagement(
+            rec, outcome="cancelled", text=f"Cancelled by {reason}.",
+            artifacts=[], next_steps=[],
+            driver=drv, memory_provider=None,
+        )
+    ch._finalize_cancel = _finalize_cancel
 
     tid = await ch.open_engagement_topic(name="E-4", icon_emoji=None)
     rec = await reg.create(kind="specialist", role_or_type="finance",
