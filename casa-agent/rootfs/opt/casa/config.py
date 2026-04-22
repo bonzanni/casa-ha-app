@@ -175,3 +175,26 @@ class AgentConfig:
     triggers: list[TriggerSpec] = field(default_factory=list)
     hooks: HooksConfig = field(default_factory=HooksConfig)
     system_prompt: str = ""
+
+
+@dataclass
+class ExecutorDefinition:
+    """Tier 3 Executor type definition.
+
+    Materially different shape from AgentConfig: no session, no
+    scopes_owned, no channels. Mirrors spec section 5.2 YAML.
+    """
+    type: str
+    description: str
+    model: str
+    driver: str                                  # "in_casa" | "claude_code"
+    enabled: bool = True
+    tools_allowed: list[str] = field(default_factory=list)
+    tools_disallowed: list[str] = field(default_factory=list)
+    permission_mode: str = "acceptEdits"
+    mcp_server_names: list[str] = field(default_factory=list)
+    idle_reminder_days: int = 7
+    prompt_template_path: str = ""
+    hooks_path: str | None = None
+    observer_policy_path: str | None = None
+    doctrine_dir: str = ""
