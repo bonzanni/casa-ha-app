@@ -413,6 +413,12 @@ async def main() -> None:
     )
     await engagement_registry.load()
 
+    from executor_registry import ExecutorRegistry
+    executor_registry = ExecutorRegistry(
+        os.path.join(CONFIG_DIR, "agents", "executors"),
+    )
+    executor_registry.load()
+
     # Scheduler + trigger registry constructed here so the get_schedule
     # tool can see the registry via init_tools. The per-role
     # register_agent loop stays below (needs role_configs).
@@ -431,6 +437,7 @@ async def main() -> None:
         channel_manager, bus, specialist_registry, mcp_registry,
         trigger_registry=trigger_registry,
         engagement_registry=engagement_registry,
+        executor_registry=executor_registry,
     )
     casa_tools_config = create_casa_tools()
     mcp_registry.register_sdk("casa-framework", casa_tools_config)
@@ -598,6 +605,7 @@ async def main() -> None:
     import agent as agent_mod
     agent_mod.active_engagement_driver = engagement_driver
     agent_mod.active_memory_provider = base_memory    # already constructed above
+    agent_mod.active_executor_registry = executor_registry
 
     from observer import Observer
     observer = Observer(
