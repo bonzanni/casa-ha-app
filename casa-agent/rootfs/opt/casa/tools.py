@@ -581,10 +581,60 @@ async def _finalize_engagement(
     )
 
 
+# ---------------------------------------------------------------------------
+# emit_completion — called by the engaged agent
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    "emit_completion",
+    "Mark this engagement complete. Ellen receives the summary. Must be called "
+    "from inside an active engagement.",
+    {"text": str, "artifacts": list, "next_steps": list, "status": str},
+)
+async def emit_completion(args: dict) -> dict:
+    engagement = engagement_var.get(None)
+    if engagement is None:
+        return _result({
+            "status": "error",
+            "kind": "not_in_engagement",
+            "message": "emit_completion called outside an engagement",
+        })
+
+    text = args.get("text", "") or ""
+    artifacts = list(args.get("artifacts") or [])
+    next_steps = list(args.get("next_steps") or [])
+    status_in = args.get("status", "ok") or "ok"
+    outcome = "completed" if status_in == "ok" else "error"
+
+    # Driver + memory_provider are discovered via the agent singleton
+    # accessible through the agent module (plan-1 pattern).
+    driver = None
+    memory_provider = None
+    try:
+        import agent as agent_mod  # noqa: F401
+        driver = getattr(agent_mod, "active_engagement_driver", None)
+        memory_provider = getattr(agent_mod, "active_memory_provider", None)
+    except Exception:
+        pass
+
+    await _finalize_engagement(
+        engagement,
+        outcome=outcome,
+        text=text,
+        artifacts=artifacts,
+        next_steps=next_steps,
+        driver=driver,
+        memory_provider=memory_provider,
+    )
+    return _result({"status": "acknowledged"})
+
+
 def create_casa_tools() -> dict[str, Any]:
     """Create and return the casa-framework MCP server config."""
     server = create_sdk_mcp_server(
         name="casa-framework",
-        tools=[send_message, delegate_to_specialist, get_schedule, engage_executor],
+        tools=[send_message, delegate_to_specialist, get_schedule, engage_executor,
+               emit_completion],
     )
     return server
