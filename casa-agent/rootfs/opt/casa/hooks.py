@@ -239,10 +239,74 @@ def _policy_path_scope(**kwargs: Any):
     )
 
 
+# ---------------------------------------------------------------------------
+# commit_size_guard - Plan 3 (asks user before batch commits > N files)
+# ---------------------------------------------------------------------------
+
+
+def _git_porcelain_count(repo_dir: str = "/addon_configs/casa-agent") -> int:
+    """Return the number of lines in ``git status --porcelain``.
+
+    Isolated for testability - tests monkeypatch this function.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir, capture_output=True, text=True, check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    return sum(1 for line in out.stdout.splitlines() if line.strip())
+
+
+def make_commit_size_guard_hook(*, max_files: int) -> HookCallback:
+    """Deny Write/Edit when >= max_files are already uncommitted.
+
+    Forces the agent to emit_completion + config_git_commit before
+    piling on more changes.
+    """
+    async def _hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        tool_name = input_data.get("tool_name", "")
+        if tool_name not in ("Write", "Edit"):
+            return None
+        count = _git_porcelain_count()
+        if count > max_files:
+            return _deny(
+                f"commit_size_guard: {count} files already uncommitted "
+                f"(max={max_files}). Call config_git_commit to stage your "
+                f"current batch, then continue. If you must commit more "
+                f"than {max_files} files atomically, ask the user first."
+            )
+        return None
+
+    return _hook
+
+
+def _policy_commit_size_guard(**kwargs: Any):
+    from claude_agent_sdk import HookMatcher
+    max_files = int(kwargs.pop("max_files", 20))
+    if kwargs:
+        raise UnknownPolicyError(
+            f"commit_size_guard: unknown parameter(s) {list(kwargs)}; "
+            f"supported: max_files"
+        )
+    return HookMatcher(
+        matcher="Write|Edit",
+        hooks=[make_commit_size_guard_hook(max_files=max_files)],
+    )
+
+
 HOOK_POLICIES: dict[str, Callable[..., Any]] = {
     "block_dangerous_bash": _policy_block_dangerous_bash,
     "path_scope":           _policy_path_scope,
     "casa_config_guard":    _policy_casa_config_guard,
+    "commit_size_guard":    _policy_commit_size_guard,
 }
 
 
