@@ -630,6 +630,114 @@ async def emit_completion(args: dict) -> dict:
     return _result({"status": "acknowledged"})
 
 
+# ---------------------------------------------------------------------------
+# query_engager — retrieval + bounded synthesis
+# ---------------------------------------------------------------------------
+
+
+_QUERY_ENGAGER_SYSTEM = (
+    "You answer factually using ONLY the provided context. If the context "
+    "does not answer the question, reply with exactly: UNKNOWN"
+)
+
+
+async def _synthesize_answer(
+    question: str, context: str, max_tokens: int,
+) -> str:
+    """Run a constrained Anthropic pass via the SDK. Returns the synthesized
+    answer, or the literal string 'UNKNOWN' if the context is insufficient.
+
+    Uses SECONDARY_AGENT_MODEL (env-resolved). No tools. No streaming — the
+    caller needs a single string.
+    """
+    import os
+    model = os.environ.get("SECONDARY_AGENT_MODEL", "haiku")
+    options = ClaudeAgentOptions(
+        model=model,
+        system_prompt=_QUERY_ENGAGER_SYSTEM,
+        max_turns=1,
+        mcp_servers={},
+    )
+    prompt = f"Context:\n{context}\n\nQuestion: {question}"
+    out = ""
+    async with ClaudeSDKClient(options) as client:
+        await client.query(prompt)
+        async for msg in client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for b in getattr(msg, "content", []):
+                    if isinstance(b, TextBlock):
+                        out += b.text
+    return out.strip()
+
+
+@tool(
+    "query_engager",
+    "Ask the engaging agent a question. Returns synthesized answer from the "
+    "engager's scope-filtered memory, or status=unknown. Callable only from "
+    "inside an active engagement.",
+    {"question": str, "max_tokens": int},
+)
+async def query_engager(args: dict) -> dict:
+    engagement = engagement_var.get(None)
+    if engagement is None:
+        return _result({"status": "error", "kind": "not_in_engagement",
+                        "message": "query_engager called outside an engagement"})
+    question = args.get("question", "") or ""
+    max_tokens = int(args.get("max_tokens") or 500)
+
+    # Retrieve engager-side context
+    memory_provider = None
+    try:
+        import agent as agent_mod
+        memory_provider = getattr(agent_mod, "active_memory_provider", None)
+    except Exception:
+        pass
+    engager_role = engagement.origin.get("role", "assistant")
+    channel = engagement.origin.get("channel", "telegram")
+    chat_id = str(engagement.origin.get("chat_id", ""))
+    engager_scope = engagement.origin.get("scope", "meta")
+    session_id = f"{channel}:{chat_id}:{engager_scope}:{engager_role}"
+
+    context = ""
+    if memory_provider is not None:
+        try:
+            context = await memory_provider.get_context(
+                session_id=session_id,
+                agent_role=engager_role,
+                tokens=2000,
+                search_query=question,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "query_engager: get_context failed (%s); returning unknown", exc,
+            )
+            context = ""
+
+    # Publish bus event so observer can see the query
+    if _bus is not None:
+        try:
+            await _bus.notify(BusMessage(
+                type=MessageType.NOTIFICATION,
+                source=engagement.role_or_type, target="observer",
+                content={
+                    "event": "query_engager",
+                    "engagement_id": engagement.id,
+                    "question": question,
+                    "status": "pending",
+                },
+                context={"engagement_id": engagement.id},
+            ))
+        except Exception:
+            pass
+
+    if not context:
+        return _result({"status": "unknown", "text": ""})
+    answer = await _synthesize_answer(question, context, max_tokens)
+    if answer.strip().upper().startswith("UNKNOWN"):
+        return _result({"status": "unknown", "text": ""})
+    return _result({"status": "ok", "text": answer})
+
+
 @tool(
     "cancel_engagement",
     "Cancel an in-flight engagement by id. Closes the topic and NOTIFIES the engager.",
@@ -664,6 +772,6 @@ def create_casa_tools() -> dict[str, Any]:
     server = create_sdk_mcp_server(
         name="casa-framework",
         tools=[send_message, delegate_to_specialist, get_schedule, engage_executor,
-               emit_completion, cancel_engagement],
+               emit_completion, cancel_engagement, query_engager],
     )
     return server
