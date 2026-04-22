@@ -40,4 +40,10 @@ printf '%s' "$val" > "${S6_ENV}/TELEGRAM_ENGAGEMENT_SUPERGROUP_ID"
 # Static version for test mode
 printf 'dev' > "${S6_ENV}/CASA_VERSION"
 
+TELEGRAM_BOT_API_BASE="$(jq -r '.telegram_bot_api_base // ""' /data/options.json)"
+export TELEGRAM_BOT_API_BASE
+if [ -n "$TELEGRAM_BOT_API_BASE" ]; then
+  echo "$TELEGRAM_BOT_API_BASE" > /var/run/s6/container_environment/TELEGRAM_BOT_API_BASE
+fi
+
 echo "[INFO] Environment exported from options.json (local test mode)."

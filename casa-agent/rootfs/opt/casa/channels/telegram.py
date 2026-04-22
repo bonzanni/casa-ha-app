@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Awaitable, Callable
 
@@ -205,11 +206,12 @@ class TelegramChannel(Channel):
         """
         await self._teardown_app()
 
-        app = (
-            Application.builder()
-            .token(self.bot_token)
-            .build()
-        )
+        _bot_api_base = os.environ.get("TELEGRAM_BOT_API_BASE", "").strip()
+        builder = Application.builder().token(self.bot_token)
+        if _bot_api_base:
+            builder = builder.base_url(f"{_bot_api_base}/bot")
+            builder = builder.base_file_url(f"{_bot_api_base}/file/bot")
+        app = builder.build()
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle)
         )

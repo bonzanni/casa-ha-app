@@ -87,3 +87,6 @@ configuration:
       Tier 3 Executor types, Plan 3+). Must be a negative integer
       (Telegram supergroup chat IDs are always negative). Leave at 0
       to disable engagement features; Casa still boots.
+  telegram_bot_api_base:
+    name: "Telegram Bot API base URL"
+    description: "Override Telegram Bot API endpoint - leave blank for api.telegram.org. Used by e2e harness."
