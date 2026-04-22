@@ -93,11 +93,23 @@ async def handle_method(request: web.Request) -> web.Response:
     if method == "sendMessage":
         tid = payload.get("message_thread_id")
         text = payload.get("text", "")
+        chat_id = int(payload.get("chat_id", 0))
         if tid:
             STATE["messages_by_thread"].setdefault(int(tid), []).append(text)
         else:
             STATE["main_feed_messages"].append(text)
-        return web.json_response({"ok": True, "result": {"message_id": 1, "text": text}})
+        # PTB's Message.de_json requires message_id + date + chat. Return a
+        # minimally-well-formed Message so callers can deserialize the reply.
+        STATE["next_message_id"] = STATE.get("next_message_id", 1) + 1
+        result = {
+            "message_id": STATE["next_message_id"],
+            "date": 0,
+            "chat": {"id": chat_id, "type": "supergroup" if tid else "private"},
+            "text": text,
+        }
+        if tid:
+            result["message_thread_id"] = int(tid)
+        return web.json_response({"ok": True, "result": result})
 
     if method == "setMyCommands":
         scope = json.dumps(payload.get("scope") or {"type": "default"})
