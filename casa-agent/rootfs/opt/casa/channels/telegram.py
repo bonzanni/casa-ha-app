@@ -115,6 +115,7 @@ class TelegramChannel(Channel):
         # Test-injection bot and engagement supergroup.
         self._bot = bot
         self.engagement_supergroup_id = engagement_supergroup_id
+        self.engagement_permission_ok = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -429,6 +430,55 @@ class TelegramChannel(Channel):
     # ------------------------------------------------------------------
     # Engagement topic helpers
     # ------------------------------------------------------------------
+
+    ENGAGEMENT_COMMANDS = [
+        ("cancel", "Cancel this engagement and close the topic"),
+        ("complete", "Mark this engagement complete (no agent summary)"),
+        ("silent", "Stop proactive notifications from Ellen for this engagement"),
+    ]
+
+    async def setup_engagement_features(self) -> None:
+        """Idempotent startup wiring for forum-supergroup engagements.
+
+        - Verifies the bot has ``can_manage_topics`` in the supergroup.
+        - Registers slash commands scoped to that supergroup.
+        Safe to call when ``engagement_supergroup_id`` is unset — no-op.
+        """
+        self.engagement_permission_ok = False
+        if not self.engagement_supergroup_id:
+            return
+        # Bot-permissions check
+        try:
+            me = await self.bot.get_me()
+            member = await self.bot.get_chat_member(
+                chat_id=self.engagement_supergroup_id,
+                user_id=me.id,
+            )
+            if not getattr(member, "can_manage_topics", False):
+                logger.error(
+                    "Engagement supergroup %s: bot lacks can_manage_topics; "
+                    "engagements disabled",
+                    self.engagement_supergroup_id,
+                )
+                return
+            self.engagement_permission_ok = True
+        except Exception as exc:
+            logger.error(
+                "Engagement supergroup %s: bot-permissions check failed: %s",
+                self.engagement_supergroup_id, exc,
+            )
+            return
+
+        # setMyCommands — scoped to the supergroup chat
+        from telegram import BotCommand, BotCommandScopeChat  # type: ignore
+        commands = [BotCommand(c, d) for c, d in self.ENGAGEMENT_COMMANDS]
+        scope = BotCommandScopeChat(chat_id=self.engagement_supergroup_id)
+        await self.bot.set_my_commands(commands, scope=scope)
+        logger.info(
+            "Engagement supergroup %s: commands registered (%s)",
+            self.engagement_supergroup_id,
+            [c for c, _ in self.ENGAGEMENT_COMMANDS],
+        )
 
     async def open_engagement_topic(
         self, *, name: str, icon_emoji: str | None = None,
