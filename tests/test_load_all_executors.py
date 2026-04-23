@@ -79,3 +79,51 @@ class TestLoadAllExecutors:
             """))
         with pytest.raises(LoadError):
             load_all_executors(str(tmp_path))
+
+
+class TestExecutorDefinitionPlan4aFields:
+    def test_populates_plan4a_fields_with_defaults(self, tmp_path):
+        from agent_loader import load_all_executors
+
+        ex_dir = tmp_path / "executors" / "myx"
+        ex_dir.mkdir(parents=True)
+        (ex_dir / "definition.yaml").write_text(
+            "schema_version: 1\n"
+            "type: myx\n"
+            "description: A test executor with a minimum of twenty characters.\n"
+            "model: sonnet\n"
+            "driver: claude_code\n"
+        )
+        (ex_dir / "prompt.md").write_text("hi")
+
+        result = load_all_executors(str(tmp_path))
+        defn = result["myx"]
+
+        assert defn.extra_dirs == []
+        assert defn.mirror_chat_to_topic is True
+        assert defn.archive_session_full is False
+        assert defn.plugins_dir == ""
+
+    def test_reads_plan4a_fields_from_yaml(self, tmp_path):
+        from agent_loader import load_all_executors
+
+        ex_dir = tmp_path / "executors" / "myx"
+        ex_dir.mkdir(parents=True)
+        (ex_dir / "definition.yaml").write_text(
+            "schema_version: 1\n"
+            "type: myx\n"
+            "description: A test executor with a minimum of twenty characters.\n"
+            "model: sonnet\n"
+            "driver: claude_code\n"
+            "extra_dirs:\n"
+            "  - /data/casa-plugins-repo\n"
+            "mirror_chat_to_topic: false\n"
+            "archive_session_full: true\n"
+        )
+        (ex_dir / "prompt.md").write_text("hi")
+
+        defn = load_all_executors(str(tmp_path))["myx"]
+
+        assert defn.extra_dirs == ["/data/casa-plugins-repo"]
+        assert defn.mirror_chat_to_topic is False
+        assert defn.archive_session_full is True
