@@ -1,0 +1,24 @@
+schema_version: 1
+type: hello-driver
+description: |
+  Disposable test-harness executor type. Spawns a claude_code subprocess,
+  accepts one turn, echoes it, and calls emit_completion. Validates the
+  driver end-to-end without depending on a real user-facing task. Never
+  visible to users — enabled: false and test fixtures flip the registry's
+  enabled check.
+model: sonnet
+driver: claude_code
+enabled: false
+tools:
+  allowed:
+    - mcp__casa-framework__emit_completion
+    - mcp__casa-framework__query_engager
+  permission_mode: bypassPermissions
+mcp_server_names:
+  - casa-framework
+idle_reminder_days: 1
+prompt_template_file: prompt.md
+hooks_file: hooks.yaml
+observer_policy_file: observer.yaml
+mirror_chat_to_topic: false
+archive_session_full: false

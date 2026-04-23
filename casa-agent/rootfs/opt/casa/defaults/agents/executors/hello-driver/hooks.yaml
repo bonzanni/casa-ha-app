@@ -1,0 +1,3 @@
+# hello-driver has no hook policies — baseline smoke only.
+PreToolUse: []
+PostToolUse: []
