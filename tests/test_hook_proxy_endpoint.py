@@ -17,7 +17,7 @@ pytestmark = pytest.mark.asyncio
 
 
 async def test_unknown_policy_returns_deny_body():
-    from casa_core import _make_hooks_resolve_handler
+    from internal_handlers import _make_internal_hooks_resolve_handler as _make_hooks_resolve_handler
 
     handler = _make_hooks_resolve_handler(hook_policies={})
     app = web.Application()
@@ -37,7 +37,7 @@ async def test_unknown_policy_returns_deny_body():
 
 async def test_callback_returning_none_returns_empty_allow():
     """HookCallback returning None → HTTP 200 with {} (CC interprets as allow)."""
-    from casa_core import _make_hooks_resolve_handler
+    from internal_handlers import _make_internal_hooks_resolve_handler as _make_hooks_resolve_handler
 
     async def always_allow_callback(input_data, tool_use_id, context):
         return None
@@ -58,7 +58,7 @@ async def test_callback_returning_none_returns_empty_allow():
 
 
 async def test_callback_returning_deny_is_passed_through():
-    from casa_core import _make_hooks_resolve_handler
+    from internal_handlers import _make_internal_hooks_resolve_handler as _make_hooks_resolve_handler
 
     async def deny_cb(input_data, tool_use_id, context):
         return {"hookSpecificOutput": {
@@ -87,7 +87,7 @@ async def test_callback_returning_deny_is_passed_through():
 async def test_matcher_mismatch_returns_empty_allow():
     """When payload.tool_name does not match the policy's matcher regex,
     the handler returns {} without calling the callback."""
-    from casa_core import _make_hooks_resolve_handler
+    from internal_handlers import _make_internal_hooks_resolve_handler as _make_hooks_resolve_handler
 
     called = {"n": 0}
     async def cb(input_data, tool_use_id, context):
@@ -111,7 +111,7 @@ async def test_matcher_mismatch_returns_empty_allow():
 
 
 async def test_malformed_json_returns_deny():
-    from casa_core import _make_hooks_resolve_handler
+    from internal_handlers import _make_internal_hooks_resolve_handler as _make_hooks_resolve_handler
 
     handler = _make_hooks_resolve_handler(hook_policies={})
     app = web.Application()
@@ -129,7 +129,7 @@ async def test_malformed_json_returns_deny():
 
 
 async def test_callback_exception_returns_deny():
-    from casa_core import _make_hooks_resolve_handler
+    from internal_handlers import _make_internal_hooks_resolve_handler as _make_hooks_resolve_handler
 
     async def boom(input_data, tool_use_id, context):
         raise RuntimeError("policy kapow")
