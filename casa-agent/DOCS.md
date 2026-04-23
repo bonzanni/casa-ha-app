@@ -409,7 +409,7 @@ To disable it again, set `enabled: false` and restart. Your edits to
 the YAML file persist across addon updates — Casa only seeds from
 bundled defaults when the file is absent.
 
-## Claude Code driver (v0.13.0)
+## Claude Code driver (v0.13.1)
 
 Plan 4a infrastructure — does not change user-facing behavior by itself.
 Enables future Tier 3 executors (plugin-developer, ha-developer) to run
@@ -442,31 +442,74 @@ HTTP exfil via any allowed tool). The real perimeter is **trust in the
 executor's prompt scope and minimal `tools.allowed` list**. Do not engage
 a `claude_code` executor with a prompt from an untrusted source.
 
-### Known limitations (v0.13.0)
+### MCP HTTP bridge (v0.13.1)
 
-The v0.13.0 ship is **infrastructure-only**. The following integration
-points are stubbed for a real Claude CLI subprocess and will land in
-Plan 4a.1:
+Real `claude` CLI subprocesses reach Casa's MCP tools via
+`POST /mcp/casa-framework` — stateless JSON-RPC 2.0 over HTTP, no SSE.
+Engagement identity propagates through the `X-Casa-Engagement-Id` header
+(written into `.mcp.json` by `provision_workspace`) and the bridge binds
+`tools.engagement_var` for the tool call's duration. Missing / unknown
+header → bound to `None` and engagement-gated tools return
+`not_in_engagement`. GET returns 405. The same `CASA_TOOLS` tuple backs
+both the SDK path and the HTTP path, so every in-process tool is
+automatically reachable from real CLI engagements.
 
-- **MCP HTTP bridge.** `.mcp.json` points at `http://127.0.0.1:8099/mcp/casa-framework`,
-  but that route is not yet served by Casa's aiohttp app. A real `claude`
-  subprocess would fail its MCP handshake. The mock CLI used in CI does
-  not exercise the HTTP path — it prints tool-use JSON to stdout. Plan 4a.1
-  adds an aiohttp MCP JSON-RPC bridge + `X-Casa-Engagement-Id` header
-  propagation so `emit_completion` / `query_engager` can resolve the
-  calling engagement.
+### Hook enforcement (v0.13.1)
 
-- **`/hooks/resolve` policy enforcement.** Current implementation registers
-  pass-through allow-stubs for all `HOOK_POLICIES` names because the
-  registry values are SDK `HookMatcher` factories, not
-  `(payload: dict) -> dict` callables. Real enforcement through CC hooks
-  requires an HTTP-native policy layer (future work). In-process hook
-  enforcement for `in_casa` engagements is unaffected.
+`/hooks/resolve` is the CC-side counterpart to the in-process hook layer.
+`hook_proxy.sh` POSTs the CC hook payload to `http://127.0.0.1:8099/hooks/resolve`
+with a policy name; the handler resolves `HOOK_POLICIES[name]["factory"]()`,
+gates on the policy's matcher regex, and awaits the callback to produce a
+CC-native `{"hookSpecificOutput": {...}}` response. Callback exceptions
+deny (not fail-open). Unknown policy denies. Matcher mismatch returns an
+empty `{}` (CC allow). Per-executor hook parameters on the HTTP path use
+factory defaults (the Configurator's defaults match what it wants);
+wiring YAML params into the HTTP path is a later item.
 
-- **Boot replay missing-service-dir heal.** If a `claude_code` engagement's
-  service dir is deleted while Casa is stopped, boot replay logs a warning
-  but does not recreate the service. The engagement stays UNDERGOING until
-  manually cancelled. Plan 4a.1 tracks this as §6.5 (workspace sweeper).
+### Workspace lifecycle (v0.13.1)
+
+- **Provisioning:** `/data/engagements/<id>/.casa-meta.json` is written
+  with `status: "UNDERGOING"` on engagement start.
+- **Termination:** `_finalize_engagement` updates status to
+  `COMPLETED` / `CANCELLED` / `ERROR` and writes `retention_until =
+  now + 7 days`.
+- **Sweeper:** APScheduler job (id `workspace_sweep`) runs every 6 hours,
+  deletes terminal workspaces past `retention_until`. Missing `.casa-meta.json`
+  or missing `retention_until` → leave alone (operator prunes explicitly
+  via the MCP tool). The N150 has > 30 GB free so disk-pressure aggressive
+  mode is not implemented.
+
+### Workspace inspection MCP tools (v0.13.1)
+
+All three are exposed on both the SDK and HTTP paths:
+
+- `list_engagement_workspaces(status?)` — enumerate `/data/engagements/`
+  entries with status, size, created/finished/retention timestamps.
+  Truncates at 100. Optional status filter.
+- `delete_engagement_workspace(engagement_id, force=false)` — delete a
+  workspace. Refuses UNDERGOING without `force=true`; with `force=true`
+  cancels + finalizes first, then rmtrees.
+- `peek_engagement_workspace(engagement_id, path?, max_bytes?)` —
+  read-only. Empty path returns a 3-deep tree listing; otherwise reads
+  file contents up to `max_bytes` (default 64 KB, hard cap 512 KB).
+  Path-traversal guarded via resolved-path containment check.
+
+### Boot-replay heal (v0.13.1)
+
+When a UNDERGOING engagement's s6 service dir is missing but the workspace
+still exists AND the executor type is in `executor_registry`, boot replay
+re-renders the run + log/run scripts and re-plants the service dir. Missing
+workspace still warns and skips — operator must cancel manually or let the
+sweeper collect after retention. Missing executor in registry also warns
+and skips.
+
+### Known limitations
+
+- Per-executor hook parameters (e.g. `casa_config_guard.forbid_write_paths`)
+  on the HTTP path use factory defaults rather than the executor's
+  `hooks.yaml` values. The Configurator's defaults happen to match what
+  it wants; wiring YAML params into the HTTP path is tracked as a later
+  item.
 
 ### Boot replay
 
