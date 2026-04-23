@@ -32,7 +32,7 @@ RESP=$(MSYS_NO_PATHCONV=1 docker exec "$NAME" curl -fsSL -X POST \
     -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}' \
     http://127.0.0.1:8100/mcp/casa-framework)
 echo "  initialize: $RESP"
-echo "$RESP" | grep -q '"name":"casa-framework"' \
+echo "$RESP" | python3 -c 'import json, sys; d = json.load(sys.stdin); assert d.get("result", {}).get("serverInfo", {}).get("name") == "casa-framework", d' \
     || fail "M-1 svc-casa-mcp not responding on 8100"
 pass "M-1 svc-casa-mcp bound on 8100"
 
