@@ -1,8 +1,8 @@
 """DriverProtocol — abstract base class for engagement drivers.
 
 Two implementations:
-- in_casa_driver.InCasaDriver (full)
-- claude_code_driver.ClaudeCodeDriver (stub, Plan 5)
+- in_casa_driver.InCasaDriver
+- claude_code_driver.ClaudeCodeDriver
 """
 
 from __future__ import annotations
@@ -23,8 +23,14 @@ class DriverProtocol(ABC):
         prompt: str,
         options: Any,
     ) -> None:
-        """Spin up the engaged agent. For in_casa: instantiate a
-        ClaudeSDKClient with *options* and open the connection."""
+        """Spin up the engaged agent.
+
+        - ``in_casa`` driver: ``options`` is a ``ClaudeAgentOptions`` and
+          ``prompt`` is the first user turn.
+        - ``claude_code`` driver: ``options`` is the ``ExecutorDefinition``
+          and ``prompt`` is the system-prompt body (will be written to
+          ``CLAUDE.md``, not passed as a turn).
+        """
 
     @abstractmethod
     async def send_user_turn(
