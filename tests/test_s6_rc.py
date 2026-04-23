@@ -148,3 +148,41 @@ class TestStartStopService:
         await s6_rc.stop_service(engagement_id="abc")
 
         assert calls == [["s6-rc", "-d", "change", "engagement-abc"]]
+
+
+class TestSweepOrphans:
+    async def test_removes_dirs_not_in_keep_set(self, tmp_path):
+        from drivers.s6_rc import sweep_orphan_service_dirs, write_service_dir
+
+        svc_root = tmp_path / "casa-s6-services"
+        svc_root.mkdir()
+
+        for eid in ("keep1", "keep2", "orphan1", "orphan2"):
+            write_service_dir(
+                svc_root=str(svc_root), engagement_id=eid,
+                run_script="#!/bin/sh\nexec true\n", depends_on=[],
+            )
+
+        removed = sweep_orphan_service_dirs(
+            svc_root=str(svc_root), keep_engagement_ids={"keep1", "keep2"},
+        )
+
+        assert set(removed) == {"orphan1", "orphan2"}
+        assert (svc_root / "engagement-keep1").exists()
+        assert (svc_root / "engagement-keep2").exists()
+        assert not (svc_root / "engagement-orphan1").exists()
+        assert not (svc_root / "engagement-orphan2").exists()
+
+    async def test_ignores_non_engagement_dirs(self, tmp_path):
+        """A foreign dir under svc_root is left alone (defensive)."""
+        from drivers.s6_rc import sweep_orphan_service_dirs
+
+        svc_root = tmp_path / "casa-s6-services"
+        svc_root.mkdir()
+        (svc_root / "random-other-thing").mkdir()
+
+        removed = sweep_orphan_service_dirs(
+            svc_root=str(svc_root), keep_engagement_ids=set(),
+        )
+        assert removed == []
+        assert (svc_root / "random-other-thing").exists()

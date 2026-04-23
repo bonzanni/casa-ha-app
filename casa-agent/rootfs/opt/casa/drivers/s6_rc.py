@@ -121,3 +121,27 @@ async def stop_service(*, engagement_id: str) -> None:
         ["s6-rc", "-d", "change", f"engagement-{engagement_id}"],
         check=True,
     )
+
+
+def sweep_orphan_service_dirs(
+    *, svc_root: str, keep_engagement_ids: set[str],
+) -> list[str]:
+    """Remove /<svc_root>/engagement-<id>/ where <id> not in keep set.
+
+    Returns the list of removed engagement_ids. Only dirs prefixed with
+    'engagement-' are considered — foreign dirs are untouched.
+    """
+    removed: list[str] = []
+    root = Path(svc_root)
+    if not root.is_dir():
+        return removed
+    for entry in root.iterdir():
+        if not entry.is_dir() or not entry.name.startswith("engagement-"):
+            continue
+        eid = entry.name[len("engagement-"):]
+        if eid in keep_engagement_ids:
+            continue
+        logger.warning("s6_rc sweep: removing orphan service dir %s", entry)
+        shutil.rmtree(entry)
+        removed.append(eid)
+    return removed
