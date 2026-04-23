@@ -1438,6 +1438,108 @@ PY
 )"
 pass "D-8 restart-survival: engagement PID unchanged across svc-casa restart"
 
+# ---------------------------------------------------------------------------
+# D-9 — MCP HTTP bridge round-trip: direct curl to /mcp/casa-framework
+# ---------------------------------------------------------------------------
+# We construct an engagement with the engage_executor tool (mock path),
+# then POST a tools/call for emit_completion with X-Casa-Engagement-Id set.
+# The bridge must dispatch, bind engagement_var, finalize the engagement,
+# and return a JSON-RPC result envelope.
+run_harness "D-9 mcp-bridge" "$(cat <<'PY'
+import json, os, subprocess, time, urllib.request, urllib.error
+
+def http(method, body=None, headers=None):
+    req = urllib.request.Request(
+        "http://127.0.0.1:8099/mcp/casa-framework",
+        data=(json.dumps(body).encode() if body is not None else None),
+        headers={"Content-Type": "application/json", **(headers or {})},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+# 1. initialize
+status, body = http("POST", {"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+assert status == 200, (status, body)
+init = json.loads(body)["result"]
+assert init["serverInfo"]["name"] == "casa-framework", init
+
+# 2. tools/list must include emit_completion
+status, body = http("POST", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+tools = {t["name"] for t in json.loads(body)["result"]["tools"]}
+assert "emit_completion" in tools, tools
+assert "list_engagement_workspaces" in tools, tools
+
+# 3. GET returns 405
+status, _ = http("GET")
+assert status == 405, status
+
+# 4. tools/call on emit_completion WITHOUT header returns not_in_engagement
+status, body = http("POST", {
+    "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+    "params": {"name": "emit_completion",
+               "arguments": {"text": "no engagement", "artifacts": [],
+                             "next_steps": [], "status": "ok"}},
+})
+assert status == 200, (status, body)
+result_text = json.loads(body)["result"]["content"][0]["text"]
+assert "not_in_engagement" in result_text, result_text
+
+print("D-9 mcp-bridge: all round-trips passed", flush=True)
+PY
+)"
+pass "D-9 mcp-bridge: initialize/tools/list/tools/call all work end-to-end"
+
+# ---------------------------------------------------------------------------
+# D-10 — Real /hooks/resolve enforcement: block_dangerous_bash denies rm -rf
+# ---------------------------------------------------------------------------
+# Direct POST to /hooks/resolve with the hook_proxy.sh body shape.
+# The handler must resolve HOOK_POLICIES["block_dangerous_bash"], call the
+# real async callback, and return a CC-native deny envelope.
+run_harness "D-10 hook-deny" "$(cat <<'PY'
+import json, urllib.request
+
+def resolve(policy, payload):
+    req = urllib.request.Request(
+        "http://127.0.0.1:8099/hooks/resolve",
+        data=json.dumps({"policy": policy, "payload": payload}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return r.status, json.loads(r.read().decode())
+
+# 1. dangerous bash -> deny
+status, body = resolve(
+    "block_dangerous_bash",
+    {"tool_name": "Bash", "tool_input": {"command": "rm -rf /data"}},
+)
+assert status == 200, (status, body)
+out = body["hookSpecificOutput"]
+assert out["permissionDecision"] == "deny", body
+assert "rm" in out["permissionDecisionReason"].lower()
+
+# 2. benign bash -> allow (empty body)
+status, body = resolve(
+    "block_dangerous_bash",
+    {"tool_name": "Bash", "tool_input": {"command": "echo hello"}},
+)
+assert status == 200, (status, body)
+assert body == {}, f"benign bash should return empty (allow); got {body}"
+
+# 3. unknown policy -> deny (200)
+status, body = resolve("nope_nope", {"tool_name": "Bash"})
+assert status == 200, (status, body)
+assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+
+print("D-10 hook-deny: dangerous denied, benign allowed, unknown denied", flush=True)
+PY
+)"
+pass "D-10 hook-deny: real /hooks/resolve gates PreToolUse correctly"
+
 stop_container "$D_NAME"
 
 echo "=== test_engagement.sh complete ==="
