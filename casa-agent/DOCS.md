@@ -408,3 +408,52 @@ it via `delegate_to_specialist(specialist="<role>", ...)`.
 To disable it again, set `enabled: false` and restart. Your edits to
 the YAML file persist across addon updates — Casa only seeds from
 bundled defaults when the file is absent.
+
+## Claude Code driver (v0.13.0)
+
+Plan 4a infrastructure — does not change user-facing behavior by itself.
+Enables future Tier 3 executors (plugin-developer, ha-developer) to run
+inside real Claude Code CLI sessions, reachable from the iOS app or
+claude.ai/code via remote control.
+
+### Architecture
+
+Each `driver: claude_code` engagement becomes its own s6-rc-supervised
+service inside the addon container. s6 owns supervision; Casa orchestrates
+lifecycle via `s6-rc-compile` + `s6-rc-update`. Engagement subprocesses
+outlive Casa-main restarts (service dependencies are ordering-only, not
+lifetime-coupled).
+
+- **Workspace:** `/data/engagements/<id>/` — CLAUDE.md, `.mcp.json`,
+  isolated `$HOME`, Tier 1 baseline + Tier 2 per-executor plugin symlinks,
+  named FIFO for Casa → CLI turn delivery.
+- **Service dir:** `/data/casa-s6-services/engagement-<id>/` — `run` script
+  + `type: longrun` + ordering dependency on `init-setup-configs`.
+- **Auth:** `CLAUDE_CODE_OAUTH_TOKEN` flows via s6-overlay's `/command/with-contenv`.
+  No `ANTHROPIC_API_KEY` path.
+
+### Security caveat
+
+The `block_token_exfiltration` and `block_credential_file_reads` hook
+policies are speedbumps against casual prompt injection, not
+defense-in-depth. They do not stop determined malicious prompts (indirect
+env reads via `/proc/self/environ`, Write-then-exec, variable obfuscation,
+HTTP exfil via any allowed tool). The real perimeter is **trust in the
+executor's prompt scope and minimal `tools.allowed` list**. Do not engage
+a `claude_code` executor with a prompt from an untrusted source.
+
+### Boot replay
+
+On Casa boot, `replay_undergoing_engagements` reconstructs the s6
+supervision tree: sweeps orphan service dirs (engagements not UNDERGOING),
+compiles + updates once, starts each remaining service, and spawns
+URL-capture + respawn-poller tasks. Self-healing: a finalize that died
+mid-teardown leaves an orphan that the next boot removes.
+
+### Idle + resume
+
+Engagement subprocesses idle via s6-supervision (no idle timeout in the
+driver). On HA host reboot, `/data/` persists; boot replay re-launches
+every UNDERGOING engagement's service, and the `run` script reads the
+persisted `.session_id` to resume the CLI conversation exactly where it
+left off.
