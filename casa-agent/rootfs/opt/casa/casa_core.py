@@ -66,16 +66,20 @@ async def healthz(_request: web.Request) -> web.Response:
 
 
 async def replay_undergoing_engagements(
-    *, registry, driver,
+    *, registry, driver, executor_registry=None,
 ) -> None:
     """On Casa boot: reconstruct s6 services for UNDERGOING claude_code engagements.
 
-    Sweeps orphan service dirs whose engagement is not UNDERGOING, recreates
-    service defs for UNDERGOING engagements whose dir is missing, runs a
-    single compile+update, starts each service, and spawns URL-capture +
-    respawn-poller tasks.
+    Heal path (Plan 4a.1): when a UNDERGOING engagement's service dir is
+    missing but the workspace dir at /data/engagements/<id>/ still exists
+    and the executor is registered, re-render the run script and re-plant
+    the s6 service dir. Missing workspace dir remains a warn-and-skip case
+    (§7.3 of the 4a.1 spec).
     """
     from drivers import s6_rc
+    from drivers.workspace import (
+        render_log_run_script, render_run_script,
+    )
 
     undergoing = [
         r for r in registry.active_and_idle()
@@ -90,22 +94,59 @@ async def replay_undergoing_engagements(
             keep_engagement_ids=keep_ids,
         )
 
-        # 2. Re-plant any missing UNDERGOING service dirs (workspace must exist).
+        # 2. Heal missing service dirs for UNDERGOING engagements.
         for rec in undergoing:
             svc_dir = os.path.join(
                 s6_rc.ENGAGEMENT_SOURCES_ROOT, f"engagement-{rec.id}",
             )
-            if not os.path.isdir(svc_dir):
+            if os.path.isdir(svc_dir):
+                continue
+
+            if executor_registry is None:
                 logger.warning(
                     "boot replay: service dir missing for engagement %s "
-                    "— leaving UNDERGOING; next start will re-create on demand",
+                    "— no executor_registry passed; leaving UNDERGOING",
                     rec.id[:8],
                 )
-                # Could re-render and re-plant here, but requires the executor
-                # definition which isn't in the engagement record. Left for
-                # v0.13.1 if needed — the record remains UNDERGOING and will
-                # be healed when the user next engages (new engagement) or
-                # manually cancels the stuck one.
+                continue
+
+            defn = executor_registry.get(rec.role_or_type)
+            if defn is None:
+                logger.warning(
+                    "boot replay: cannot heal engagement %s — executor type "
+                    "%r not registered; leaving UNDERGOING",
+                    rec.id[:8], rec.role_or_type,
+                )
+                continue
+
+            # Re-render run + log scripts.
+            run_script = render_run_script(
+                engagement_id=rec.id,
+                permission_mode=defn.permission_mode or "acceptEdits",
+                extra_dirs=list(defn.extra_dirs or []),
+            )
+            log_script = render_log_run_script(engagement_id=rec.id)
+            s6_rc.write_service_dir(
+                svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                engagement_id=rec.id,
+                run_script=run_script,
+                depends_on=["init-setup-configs"],
+                log_run_script=log_script,
+            )
+            # Ensure FIFO exists — it might have been wiped alongside the svc dir.
+            fifo = os.path.join("/data/engagements", rec.id, "stdin.fifo")
+            try:
+                if os.path.isdir(os.path.dirname(fifo)) and not os.path.exists(fifo):
+                    os.mkfifo(fifo, 0o600)
+            except OSError as exc:
+                logger.warning(
+                    "boot replay: mkfifo %s failed: %s — continuing",
+                    fifo, exc,
+                )
+            logger.info(
+                "boot replay: healed engagement %s (%s)",
+                rec.id[:8], rec.role_or_type,
+            )
 
         # 3. Single compile + update pass.
         await s6_rc._compile_and_update_locked()
@@ -804,6 +845,7 @@ async def main() -> None:
         await replay_undergoing_engagements(
             registry=engagement_registry,
             driver=claude_code_driver,
+            executor_registry=executor_registry,
         )
     except Exception as exc:  # noqa: BLE001
         logger.error(
