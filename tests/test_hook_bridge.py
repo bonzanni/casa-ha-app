@@ -1,0 +1,41 @@
+"""Tests for drivers.hook_bridge -- Casa hook policy -> CC settings.json."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+
+class TestHookBridgeTranslate:
+    def test_emits_pretooluse_block_for_each_policy(self):
+        from drivers.hook_bridge import translate_hooks_to_settings
+
+        hooks_yaml = {
+            "PreToolUse": [
+                {"policy": "casa_config_guard", "matcher": "Write|Edit"},
+                {"policy": "commit_size_guard", "matcher": "Bash"},
+            ],
+        }
+
+        settings = translate_hooks_to_settings(
+            hooks_yaml, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
+        )
+
+        assert "hooks" in settings
+        pre = settings["hooks"]["PreToolUse"]
+        assert len(pre) == 2
+
+        first = pre[0]
+        assert first["matcher"] == "Write|Edit"
+        assert first["hooks"][0]["type"] == "command"
+        assert first["hooks"][0]["command"].endswith(
+            "hook_proxy.sh casa_config_guard"
+        )
+
+    def test_empty_hooks_yaml_produces_empty_hooks(self):
+        from drivers.hook_bridge import translate_hooks_to_settings
+        settings = translate_hooks_to_settings(
+            {}, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
+        )
+        assert settings == {"hooks": {}}
