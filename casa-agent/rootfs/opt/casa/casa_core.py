@@ -69,8 +69,9 @@ async def start_internal_unix_runner(
       POST /internal/hooks/resolve -> _make_internal_hooks_resolve_handler(...)
 
     Returns the AppRunner so the caller can `await runner.cleanup()` on
-    shutdown. The cleanup also unlinks the socket file (UnixSite handles
-    the unlink itself; we don't need to chmod after, just before binding).
+    shutdown. We register an `on_cleanup` hook on the internal app that
+    unlinks the socket file when cleanup runs — `web.UnixSite` does not
+    do this on its own.
 
     Parent directory permissions: 0700 if we have to create it. Socket
     permissions: 0600 (root-only). Both processes in the addon container
@@ -106,6 +107,19 @@ async def start_internal_unix_runner(
         "/internal/hooks/resolve",
         _make_internal_hooks_resolve_handler(hook_policies=hook_policies),
     )
+
+    async def _unlink_socket_on_cleanup(_app: web.Application) -> None:
+        try:
+            os.unlink(socket_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(
+                "start_internal_unix_runner: unlink %s on cleanup failed: %s",
+                socket_path, exc,
+            )
+
+    internal_app.on_cleanup.append(_unlink_socket_on_cleanup)
 
     runner = web.AppRunner(internal_app)
     await runner.setup()
