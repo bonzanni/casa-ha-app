@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 import yaml
@@ -190,3 +191,60 @@ def load_casa_meta(workspace_path: str) -> dict | None:
             "load_casa_meta: I/O error reading %s", path, exc_info=True,
         )
         return None
+
+
+# ---------------------------------------------------------------------------
+# Workspace sweeper — §6.5 of Plan 4a (Plan 4a.1 delivery).
+# ---------------------------------------------------------------------------
+
+
+async def _sweep_workspaces(*, engagements_root: str) -> None:
+    """Periodic sweep: delete terminal engagement workspaces past retention.
+
+    Status semantics from .casa-meta.json:
+      - UNDERGOING: skip (engagement still running).
+      - COMPLETED / CANCELLED: delete iff retention_until <= now.
+      - Terminal but retention_until is null: log warning + skip (bug).
+      - No .casa-meta.json at all: skip (caller-managed via
+        delete_engagement_workspace MCP tool).
+
+    Disk-pressure mode (§6.5 aggressive tier) is out of scope — see spec
+    §8.3. The N150 has >30 GB free.
+    """
+    import shutil
+
+    if not os.path.isdir(engagements_root):
+        return
+
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    for entry in os.scandir(engagements_root):
+        if not entry.is_dir():
+            continue
+        meta = load_casa_meta(entry.path)
+        if meta is None:
+            continue
+        status = meta.get("status")
+        if status == "UNDERGOING":
+            continue
+        retention_until = meta.get("retention_until")
+        if retention_until is None:
+            logger.warning(
+                "workspace sweep: engagement %s has terminal status %r "
+                "but retention_until is null; skipping",
+                entry.name, status,
+            )
+            continue
+        if retention_until > now_iso:
+            continue
+        try:
+            shutil.rmtree(entry.path)
+            logger.info(
+                "workspace sweep: removed %s (status=%s, past retention)",
+                entry.name, status,
+            )
+        except OSError as exc:
+            logger.warning(
+                "workspace sweep: rmtree %s failed: %s",
+                entry.path, exc,
+            )
