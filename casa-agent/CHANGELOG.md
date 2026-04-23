@@ -1,5 +1,76 @@
 # Changelog
 
+## [0.13.1] — 2026-04-23
+
+### Added
+- **MCP JSON-RPC 2.0 HTTP bridge at `POST /mcp/casa-framework`.** Real
+  `claude` CLI subprocesses can now reach Casa MCP tools via the in-process
+  bridge. `X-Casa-Engagement-Id` request header binds `engagement_var` for
+  the tool call's duration; missing/unknown id binds `None` and tools that
+  guard on engagement context return `not_in_engagement`. GET returns 405.
+  Stateless (no session, no SSE). New module: `mcp_bridge.py` (244 LoC).
+- **`X-Casa-Engagement-Id` header** written into per-engagement `.mcp.json`
+  by `provision_workspace` so the CC CLI forwards it on every `tools/call`.
+- **Workspace sweeper.** APScheduler job every 6 hours removes
+  `/data/engagements/<id>/` for COMPLETED/CANCELLED engagements past
+  `retention_until` (default 7 days from terminal transition).
+  `_finalize_engagement` writes `.casa-meta.json` with terminal status +
+  retention at terminal-transition time for claude_code driver engagements.
+- **Three new MCP tools** exposed on both the SDK path and the HTTP bridge:
+  - `list_engagement_workspaces(status?)` — enumerate workspaces with
+    status + size, truncated at 100 entries.
+  - `delete_engagement_workspace(engagement_id, force=false)` — delete
+    a workspace; refuses UNDERGOING without `force=true`.
+  - `peek_engagement_workspace(engagement_id, path?, max_bytes?)` —
+    read-only tree listing or file read with path-traversal guard.
+- **Boot-replay heal path.** When an UNDERGOING engagement's s6 service
+  dir is missing and the executor type is in the registry,
+  `replay_undergoing_engagements` re-renders the run + log/run scripts
+  and re-plants the dir (workspace must still exist — missing workspace
+  stays warn-and-skip per §7.3 of the 4a.1 spec). Missing executor →
+  warn-and-skip. Takes new optional `executor_registry` kwarg.
+- **MCP-blip spike harness** at `test-local/spike/mcp_blip/` — throwaway
+  aiohttp server + driver script that simulates mid-`tools/call` connection
+  loss to empirically classify CC's MCP client as pessimistic (retries) or
+  optimistic (no retry). Runs on N150, not CI. Result feeds the
+  Plan 4b / 3.6 decision.
+
+### Changed
+- **`HOOK_POLICIES` refactored** from `{name: factory_returning_HookMatcher}`
+  to two-tier `{name: {"matcher": regex, "factory":
+  factory_returning_HookCallback}}`. The SDK path builds the `HookMatcher`
+  once, at `resolve_hooks` time; the new HTTP path reuses the same raw
+  `HookCallback`. Four `_policy_*` thin-wrapper helpers dropped; four
+  slimmer `_*_factory` helpers replace them.
+- **`/hooks/resolve`** replaces the v0.13.0 pass-through stub with real
+  policy enforcement: `block_dangerous_bash`, `path_scope`,
+  `casa_config_guard`, `commit_size_guard` all produce real deny/allow
+  decisions for `claude_code` engagements. Returns CC-native
+  `{"hookSpecificOutput": {...}}` shape. Defensive matcher regex re-check
+  before dispatch. Callback exceptions return deny, not fail-open.
+- **`CASA_TOOLS`** extracted to a module-level tuple in `tools.py` for
+  iteration by both the SDK server and the HTTP bridge. Adding a tool to
+  the tuple exposes it on both transports automatically.
+
+### Fixed
+- **`scripts/hook_proxy.sh` port 8080 → 8099.** Casa binds on 8099; the
+  stale shim would have always failed open to "casa unreachable". The
+  v0.13.0 stub handler hid this bug; flipping to real enforcement without
+  the port fix would have wedged all engagements behind the fail-open
+  path.
+
+### Spike findings
+- (Fill in from `test-local/spike/mcp_blip/README.md` Result section
+  after running the spike on the N150. Include the 1-line verdict:
+  `retry_observed=yes|no`, and the ROADMAP implication for 3.6 /
+  Plan 4b.)
+
+### Known limitations
+- Per-executor hook parameters (e.g. `casa_config_guard.forbid_write_paths`)
+  on the HTTP path use factory defaults — the Configurator's defaults
+  happen to match what that executor wants. Wiring per-executor YAML
+  params into the HTTP path is a later item.
+
 ## [0.13.0] — 2026-04-23
 
 ### Added
