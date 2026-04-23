@@ -19,7 +19,12 @@ import logging
 from typing import Any, Awaitable, Callable
 
 from aiohttp import web
-from claude_agent_sdk import SdkMcpTool
+
+# NOTE: Any is an internal type in `claude_agent_sdk`; neither the pinned
+# 0.1.61 release nor the e2e mock SDK re-export it. We rely only on duck-typing
+# via ``.name``, ``.description``, ``.input_schema``, ``.handler`` — no runtime
+# import is needed. Type hints use ``Any`` to keep mypy/pylance happy without
+# pinning a private symbol.
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +86,7 @@ def _py_type_to_json(py_type: Any) -> dict[str, Any]:
     return {}
 
 
-def _tool_schema(tool: SdkMcpTool) -> dict[str, Any]:
+def _tool_schema(tool: Any) -> dict[str, Any]:
     """Return the MCP tools/list entry for an @tool-decorated function."""
     ischema: dict[str, Any]
     if isinstance(tool.input_schema, dict):
@@ -113,7 +118,7 @@ ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
 def _build_tool_dispatch(
-    tools: tuple[SdkMcpTool, ...],
+    tools: tuple[Any, ...],
 ) -> dict[str, ToolHandler]:
     """Return {tool_name: handler_coroutine} from the shared CASA_TOOLS tuple."""
     return {t.name: t.handler for t in tools}
@@ -132,7 +137,7 @@ async def _mcp_get_not_allowed(_request: web.Request) -> web.Response:
 
 def _make_mcp_handler(
     *,
-    tools: tuple[SdkMcpTool, ...],
+    tools: tuple[Any, ...],
     engagement_registry: Any,
 ):
     """Build the aiohttp POST handler for /mcp/casa-framework.
