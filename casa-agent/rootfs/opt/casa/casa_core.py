@@ -986,7 +986,13 @@ async def main() -> None:
     # Plan 4a: claude_code driver. Shares send_to_topic with in_casa.
     from drivers.claude_code_driver import ClaudeCodeDriver
 
-    _casa_framework_mcp_url = "http://127.0.0.1:8099/mcp/casa-framework"
+    # Plan 4b/3.6: point new workspaces at svc-casa-mcp on port 8100.
+    # Pre-v0.14.0 workspaces still hit casa-main's public 8099 (back-compat
+    # fallback registered in this same file); see DOCS.md for migration.
+    _casa_framework_mcp_url = os.environ.get(
+        "CASA_FRAMEWORK_MCP_URL",
+        "http://127.0.0.1:8100/mcp/casa-framework",
+    )
 
     claude_code_driver = ClaudeCodeDriver(
         engagements_root="/data/engagements",
