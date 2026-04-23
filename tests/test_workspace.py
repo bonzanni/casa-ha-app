@@ -172,6 +172,34 @@ class TestProvisionWorkspace:
         assert "/plugins/superpowers" in target.replace("\\", "/")
         assert str(base) not in target
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo/symlink not meaningful on Windows")
+    async def test_mcp_json_carries_engagement_id_header(self, tmp_path):
+        """Plan 4a.1: .mcp.json.mcpServers.casa-framework.headers contains
+        X-Casa-Engagement-Id so the HTTP bridge can bind engagement_var."""
+        from pathlib import Path
+        from drivers.workspace import provision_workspace
+
+        defn = self._make_defn(tmp_path)
+        base_plugins_dir = tmp_path / "opt-casa-claude-plugins-base"
+        base_plugins_dir.mkdir()
+        (base_plugins_dir / "superpowers").mkdir()
+
+        ws = tmp_path / "engagements"
+        ws.mkdir()
+
+        await provision_workspace(
+            engagements_root=str(ws),
+            base_plugins_root=str(base_plugins_dir),
+            engagement_id="eng-hdr-test",
+            defn=defn,
+            task="t", context="c",
+            casa_framework_mcp_url="http://127.0.0.1:8099/mcp/casa-framework",
+        )
+
+        mcp = json.loads((Path(ws) / "eng-hdr-test" / ".mcp.json").read_text())
+        server_cfg = mcp["mcpServers"]["casa-framework"]
+        assert server_cfg["headers"] == {"X-Casa-Engagement-Id": "eng-hdr-test"}
+
 
 class TestCasaMeta:
     def test_write_and_load_roundtrip(self, tmp_path):
