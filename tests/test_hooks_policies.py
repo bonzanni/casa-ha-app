@@ -117,3 +117,50 @@ class TestResolveHooks:
         ])
         with pytest.raises(UnknownPolicyError, match="bogus_param"):
             resolve_hooks(cfg, default_cwd="/cwd")
+
+
+# --- 0.13.1 — two-tier HOOK_POLICIES shape --------------------------------
+
+
+def test_hook_policies_are_two_tier_dicts():
+    """Each policy entry is {'matcher': regex, 'factory': callable}."""
+    from hooks import HOOK_POLICIES
+
+    for name, entry in HOOK_POLICIES.items():
+        assert isinstance(entry, dict), f"{name}: must be dict"
+        assert set(entry.keys()) == {"matcher", "factory"}, (
+            f"{name}: keys must be exactly {{matcher, factory}}"
+        )
+        assert isinstance(entry["matcher"], str)
+        assert callable(entry["factory"])
+
+
+def test_factory_returns_hookcallback():
+    """factory(**kwargs) must return an awaitable-callable, not a HookMatcher."""
+    from hooks import HOOK_POLICIES
+
+    entry = HOOK_POLICIES["casa_config_guard"]
+    cb = entry["factory"](forbid_write_paths=["/data"])
+
+    # HookCallback is (input, tool_use_id, context) -> Awaitable[dict | None]
+    # We don't import HookCallback directly (it's a type alias); we just
+    # assert callability + coroutinefunction-ness.
+    import inspect
+    assert inspect.iscoroutinefunction(cb), (
+        f"factory returned {type(cb)!r}; must be async function"
+    )
+
+
+def test_resolve_hooks_still_builds_HookMatcher():
+    """The SDK-path consumer (resolve_hooks) still produces HookMatcher objects."""
+    from config import HooksConfig
+    from hooks import resolve_hooks
+
+    cfg = HooksConfig(pre_tool_use=[{"policy": "block_dangerous_bash"}])
+    resolved = resolve_hooks(cfg, default_cwd="/tmp")
+    assert "PreToolUse" in resolved
+    assert len(resolved["PreToolUse"]) == 1
+    # HookMatcher has .matcher and .hooks — duck-type check is fine.
+    matcher = resolved["PreToolUse"][0]
+    assert hasattr(matcher, "matcher") and hasattr(matcher, "hooks")
+    assert matcher.matcher == "Bash"
