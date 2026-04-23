@@ -57,3 +57,35 @@ class TestRemoveServiceDir:
         svc_root.mkdir()
         # Does not raise.
         remove_service_dir(svc_root=str(svc_root), engagement_id="nosuch")
+
+
+class TestCompileAndUpdateLocked:
+    async def test_invokes_compile_then_update_with_three_sources(self, monkeypatch):
+        """The canonical call: compile with overlay + casa + engagement sources, update."""
+        from drivers import s6_rc
+
+        calls: list[list[str]] = []
+
+        def fake_run(argv, check=True, **kwargs):
+            calls.append(list(argv))
+            class _R: returncode = 0
+            return _R()
+
+        # Route both asyncio.to_thread(subprocess.run, ...) and direct subprocess.run
+        monkeypatch.setattr(s6_rc.subprocess, "run", fake_run)
+
+        await s6_rc._compile_and_update_locked()
+
+        # Two calls: compile, then update
+        assert len(calls) == 2
+        compile_cmd = calls[0]
+        assert compile_cmd[0] == "s6-rc-compile"
+        # Compile receives: new_db, overlay_src, casa_src, engagement_src
+        assert compile_cmd[2] == s6_rc.S6_OVERLAY_SOURCES
+        assert compile_cmd[3] == s6_rc.CASA_SOURCES
+        assert compile_cmd[4] == s6_rc.ENGAGEMENT_SOURCES_ROOT
+        new_db = compile_cmd[1]
+        assert new_db.startswith("/tmp/s6-casa-db-")
+
+        update_cmd = calls[1]
+        assert update_cmd == ["s6-rc-update", new_db]
