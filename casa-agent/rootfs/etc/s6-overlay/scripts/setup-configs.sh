@@ -19,7 +19,9 @@ mkdir -p "$CONFIG_DIR/agents" \
          "$CONFIG_DIR/workspace/.claude/skills" \
          "$CONFIG_DIR/workspace/plugins" \
          "$CONFIG_DIR/workspace/mcp-servers" \
-         "$DATA_DIR/sdk-sessions"
+         "$DATA_DIR/sdk-sessions" \
+         "$DATA_DIR/casa-s6-services" \
+         "$DATA_DIR/engagements"
 
 # ------------------------------------------------------------------
 # Seed defaults on first boot (directory-copy — "cp -r" of each agent
