@@ -50,6 +50,79 @@ CONFIG_DIR = "/addon_configs/casa-agent"
 DATA_DIR = "/data"
 
 
+# ---------------------------------------------------------------------------
+# Plan 4b/3.6: internal Unix-socket AppRunner for svc-casa-mcp consumption
+# ---------------------------------------------------------------------------
+
+
+async def start_internal_unix_runner(
+    *,
+    socket_path: str,
+    tool_dispatch: dict,
+    engagement_registry,
+    hook_policies: dict,
+) -> "web.AppRunner":
+    """Build and start a second aiohttp AppRunner bound to a Unix socket.
+
+    Routes:
+      POST /internal/tools/call    -> _make_internal_tools_call_handler(...)
+      POST /internal/hooks/resolve -> _make_internal_hooks_resolve_handler(...)
+
+    Returns the AppRunner so the caller can `await runner.cleanup()` on
+    shutdown. The cleanup also unlinks the socket file (UnixSite handles
+    the unlink itself; we don't need to chmod after, just before binding).
+
+    Parent directory permissions: 0700 if we have to create it. Socket
+    permissions: 0600 (root-only). Both processes in the addon container
+    run as root, so 0600 is sufficient (no group access needed).
+    """
+    parent = os.path.dirname(socket_path) or "/"
+    if not os.path.isdir(parent):
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+    # If a prior instance left a stale socket file, remove it.
+    if os.path.exists(socket_path):
+        try:
+            os.unlink(socket_path)
+        except OSError as exc:
+            logger.warning(
+                "start_internal_unix_runner: stale socket %s could not be "
+                "unlinked: %s", socket_path, exc,
+            )
+
+    from internal_handlers import (
+        _make_internal_tools_call_handler,
+        _make_internal_hooks_resolve_handler,
+    )
+
+    internal_app = web.Application()
+    internal_app.router.add_post(
+        "/internal/tools/call",
+        _make_internal_tools_call_handler(
+            tool_dispatch=tool_dispatch,
+            engagement_registry=engagement_registry,
+        ),
+    )
+    internal_app.router.add_post(
+        "/internal/hooks/resolve",
+        _make_internal_hooks_resolve_handler(hook_policies=hook_policies),
+    )
+
+    runner = web.AppRunner(internal_app)
+    await runner.setup()
+    site = web.UnixSite(runner, socket_path)
+    await site.start()
+    # web.UnixSite doesn't accept a mode= kwarg; chmod after bind.
+    try:
+        os.chmod(socket_path, 0o600)
+    except OSError as exc:
+        logger.warning(
+            "start_internal_unix_runner: chmod 0600 on %s failed: %s",
+            socket_path, exc,
+        )
+    logger.info("Internal Unix-socket runner listening on %s", socket_path)
+    return runner
+
+
 # ------------------------------------------------------------------
 # Health endpoint
 # ------------------------------------------------------------------
@@ -1149,6 +1222,24 @@ async def main() -> None:
     await site.start()
     logger.info("HTTP server listening on 0.0.0.0:8099")
 
+    # Plan 4b/3.6: second AppRunner for the Unix-socket internal API
+    # consumed by svc-casa-mcp. The same internal handlers are reused
+    # in-process by the public-8099 fallback (route registrations above).
+    from hooks import HOOK_POLICIES as _HOOK_POLICIES_FOR_INTERNAL
+    _internal_hook_policies = _build_cc_hook_policies(_HOOK_POLICIES_FOR_INTERNAL)
+    from tools import CASA_TOOLS as _CASA_TOOLS_FOR_INTERNAL
+    _internal_tool_dispatch = {
+        t.name: t.handler for t in _CASA_TOOLS_FOR_INTERNAL
+    }
+    internal_runner = await start_internal_unix_runner(
+        socket_path="/run/casa/internal.sock",
+        tool_dispatch=_internal_tool_dispatch,
+        engagement_registry=engagement_registry,
+        hook_policies=_internal_hook_policies,
+    )
+    # Track for shutdown.
+    runners: list[web.AppRunner] = [runner, internal_runner]
+
     # 12. Start all channels
     await channel_manager.start_all()
 
@@ -1253,7 +1344,8 @@ async def main() -> None:
     await asyncio.gather(*loop_tasks, return_exceptions=True)
 
     await channel_manager.stop_all()
-    await runner.cleanup()
+    for _r in runners:
+        await _r.cleanup()
     logger.info("Casa core shutdown complete")
 
 
