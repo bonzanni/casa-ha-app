@@ -746,6 +746,43 @@ async def main() -> None:
     agent_mod.active_memory_provider = base_memory    # already constructed above
     agent_mod.active_executor_registry = executor_registry
 
+    # Plan 4a: claude_code driver. Shares send_to_topic with in_casa.
+    from drivers.claude_code_driver import ClaudeCodeDriver
+
+    _casa_framework_mcp_url = "http://127.0.0.1:8099/mcp/casa-framework"
+
+    claude_code_driver = ClaudeCodeDriver(
+        engagements_root="/data/engagements",
+        base_plugins_root="/opt/casa/claude-plugins/base",
+        send_to_topic=_send_to_topic,
+        casa_framework_mcp_url=_casa_framework_mcp_url,
+    )
+
+    # Wire bus sink so subprocess_respawn events reach the observer.
+    async def _publish_driver_bus_event(event: dict) -> None:
+        await bus.notify(BusMessage(
+            type=MessageType.NOTIFICATION,
+            source="claude_code_driver",
+            target="observer",
+            content=event,
+            context={"engagement_id": event.get("engagement_id", "-")},
+        ))
+    claude_code_driver._publish_bus_event = _publish_driver_bus_event
+    agent_mod.active_claude_code_driver = claude_code_driver
+
+    # Plan 4a: boot replay for claude_code engagements.
+    try:
+        await replay_undergoing_engagements(
+            registry=engagement_registry,
+            driver=claude_code_driver,
+            engagements_root="/data/engagements",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Plan 4a boot-replay failed — claude_code engagements may be "
+            "in an inconsistent state: %s", exc,
+        )
+
     from observer import Observer
     observer = Observer(
         bus=bus,
