@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import os
-import platform
 import stat
+import sys
 
 import pytest
 
@@ -12,6 +12,7 @@ pytestmark = pytest.mark.asyncio
 
 
 class TestWriteServiceDir:
+    @pytest.mark.skipif(sys.platform == "win32", reason="chmod exec-bits not meaningful on Windows")
     async def test_writes_type_run_and_dependencies(self, tmp_path):
         from drivers.s6_rc import write_service_dir
 
@@ -30,8 +31,7 @@ class TestWriteServiceDir:
         assert (svc_dir / "type").read_text() == "longrun\n"
         assert (svc_dir / "run").read_text() == run_contents
         mode = os.stat(svc_dir / "run").st_mode
-        if platform.system() != "Windows":
-            assert mode & stat.S_IXUSR, "run script must be executable"
+        assert mode & stat.S_IXUSR, "run script must be executable"
         assert (svc_dir / "dependencies.d" / "init-setup-configs").exists()
 
 
