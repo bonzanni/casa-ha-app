@@ -97,11 +97,12 @@ async def provision_workspace(
     )
     (ws / "CLAUDE.md").write_text(prompt_interpolated, encoding="utf-8")
 
-    # 2. .mcp.json — point at Casa's in-process casa-framework MCP server.
+    # 2. .mcp.json — point at Casa's MCP HTTP bridge with engagement id header.
     mcp_config = {"mcpServers": {
         "casa-framework": {
             "type": "http",
             "url": casa_framework_mcp_url,
+            "headers": {"X-Casa-Engagement-Id": engagement_id},
         }
     }}
     (ws / ".mcp.json").write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
