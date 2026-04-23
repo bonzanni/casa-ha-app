@@ -89,3 +89,62 @@ class TestCompileAndUpdateLocked:
 
         update_cmd = calls[1]
         assert update_cmd == ["s6-rc-update", new_db]
+
+
+class TestServiceStatus:
+    async def test_service_is_up_parses_svstat(self, monkeypatch):
+        from drivers import s6_rc
+
+        def fake_run(argv, **kwargs):
+            class _R:
+                returncode = 0
+                stdout = "12345\n"        # s6-svstat -u prints pid or 0
+            assert argv == ["s6-svstat", "-u", "/run/service/engagement-abc"]
+            return _R()
+        monkeypatch.setattr(s6_rc.subprocess, "run", fake_run)
+
+        pid = await s6_rc.service_pid(engagement_id="abc")
+        assert pid == 12345
+
+    async def test_service_is_up_returns_none_when_down(self, monkeypatch):
+        from drivers import s6_rc
+
+        def fake_run(argv, **kwargs):
+            class _R:
+                returncode = 0
+                stdout = "0\n"
+            return _R()
+        monkeypatch.setattr(s6_rc.subprocess, "run", fake_run)
+
+        pid = await s6_rc.service_pid(engagement_id="down")
+        assert pid is None
+
+
+class TestStartStopService:
+    async def test_start_service_invokes_rc_change(self, monkeypatch):
+        from drivers import s6_rc
+        calls: list[list[str]] = []
+
+        def fake_run(argv, check=True, **kwargs):
+            calls.append(list(argv))
+            class _R: returncode = 0
+            return _R()
+        monkeypatch.setattr(s6_rc.subprocess, "run", fake_run)
+
+        await s6_rc.start_service(engagement_id="abc")
+
+        assert calls == [["s6-rc", "-u", "change", "engagement-abc"]]
+
+    async def test_stop_service_invokes_rc_change_down(self, monkeypatch):
+        from drivers import s6_rc
+        calls: list[list[str]] = []
+
+        def fake_run(argv, check=True, **kwargs):
+            calls.append(list(argv))
+            class _R: returncode = 0
+            return _R()
+        monkeypatch.setattr(s6_rc.subprocess, "run", fake_run)
+
+        await s6_rc.stop_service(engagement_id="abc")
+
+        assert calls == [["s6-rc", "-d", "change", "engagement-abc"]]

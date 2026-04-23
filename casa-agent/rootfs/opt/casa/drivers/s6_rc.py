@@ -87,3 +87,37 @@ async def compile_and_update() -> None:
     """Public entry point. Acquires _compile_lock before calling the inner."""
     async with _compile_lock:
         await _compile_and_update_locked()
+
+
+async def service_pid(*, engagement_id: str) -> int | None:
+    """Return the live supervised PID for engagement-<id>, or None if down/absent."""
+    result = await asyncio.to_thread(
+        subprocess.run,
+        ["s6-svstat", "-u", f"/run/service/engagement-{engagement_id}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        pid = int(result.stdout.strip())
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+async def start_service(*, engagement_id: str) -> None:
+    """s6-rc -u change engagement-<id> — brings the service up. Idempotent."""
+    await asyncio.to_thread(
+        subprocess.run,
+        ["s6-rc", "-u", "change", f"engagement-{engagement_id}"],
+        check=True,
+    )
+
+
+async def stop_service(*, engagement_id: str) -> None:
+    """s6-rc -d change engagement-<id> — brings the service down. Idempotent."""
+    await asyncio.to_thread(
+        subprocess.run,
+        ["s6-rc", "-d", "change", f"engagement-{engagement_id}"],
+        check=True,
+    )
