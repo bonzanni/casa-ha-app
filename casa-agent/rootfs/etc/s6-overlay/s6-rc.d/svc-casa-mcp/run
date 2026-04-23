@@ -1,0 +1,9 @@
+#!/command/with-contenv bashio
+# 5.5 item 3: strip ANSI from bashio output for clean docker logs.
+export BASHIO_LOG_NO_COLORS=true
+export NO_COLOR=1
+
+# Plan 4b/3.6: standalone MCP HTTP service.
+# Listens on 127.0.0.1:8100 and forwards to casa-main over Unix socket
+# at /run/casa/internal.sock (created by casa-main's startup).
+exec /opt/casa/venv/bin/python3 /opt/casa/svc_casa_mcp.py
