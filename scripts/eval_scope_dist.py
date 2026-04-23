@@ -112,8 +112,9 @@ def read_log_file(path: str) -> Iterable[str]:
 def read_ssh_logs(
     host: str, since: str, container: str = "addon_c071ea9c_casa-agent",
 ) -> Iterable[str]:
-    """Pull recent container logs over SSH. Uses the same sudo+docker
-    prefix pattern as ha-prod-console so no new admin path is introduced.
+    """Pull recent container logs over SSH. Wraps `ssh <host> sudo -n
+    docker logs --since <since> <container>` — `sudo -n` because the HA
+    SSH addon runs unprivileged and docker-socket ops require root.
     """
     cmd = [
         "ssh", host, "sudo", "-n", "docker", "logs",
