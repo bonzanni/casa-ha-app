@@ -7,6 +7,10 @@ import logging
 import os
 from pathlib import Path
 
+import yaml
+
+from drivers.hook_bridge import translate_hooks_to_settings
+
 logger = logging.getLogger(__name__)
 
 _TEMPLATE_PATH = os.path.join(
@@ -86,11 +90,17 @@ async def provision_workspace(
     }}
     (ws / ".mcp.json").write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
 
-    # 3. .claude/settings.json — written by hook_bridge in its own pass;
-    #    provision a stub here so the dir exists.
+    # 3. .claude/settings.json with translated hooks.
     (ws / ".claude").mkdir()
+    hooks_yaml: dict = {}
+    if getattr(defn, "hooks_path", None) and os.path.isfile(defn.hooks_path):
+        with open(defn.hooks_path, "r", encoding="utf-8") as fh:
+            hooks_yaml = yaml.safe_load(fh) or {}
+    settings = translate_hooks_to_settings(
+        hooks_yaml, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
+    )
     (ws / ".claude" / "settings.json").write_text(
-        json.dumps({"hooks": {}}, indent=2), encoding="utf-8",
+        json.dumps(settings, indent=2), encoding="utf-8",
     )
 
     # 4. Per-engagement HOME + plugin symlinks.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -186,3 +187,46 @@ class TestCasaMeta:
         ws = tmp_path / "w"
         ws.mkdir()
         assert load_casa_meta(str(ws)) is None
+
+
+class TestProvisionWithHooks:
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="workspace provisioning uses mkfifo/symlink (Linux-only)",
+    )
+    async def test_settings_json_contains_translated_hooks(self, tmp_path):
+        from pathlib import Path
+        from drivers.workspace import provision_workspace
+        from config import ExecutorDefinition
+
+        # Fake executor dir with hooks.yaml
+        exec_dir = tmp_path / "defaults-executors" / "cfg"
+        exec_dir.mkdir(parents=True)
+        (exec_dir / "prompt.md").write_text("p")
+        (exec_dir / "hooks.yaml").write_text(
+            "PreToolUse:\n"
+            "  - policy: casa_config_guard\n"
+            "    matcher: Write|Edit\n"
+        )
+        defn = ExecutorDefinition(
+            type="cfg",
+            description="A config executor with twenty chars",
+            model="sonnet", driver="claude_code",
+            prompt_template_path=str(exec_dir / "prompt.md"),
+            hooks_path=str(exec_dir / "hooks.yaml"),
+        )
+
+        (tmp_path / "eng").mkdir()
+        path = await provision_workspace(
+            engagements_root=str(tmp_path / "eng"),
+            base_plugins_root=str(tmp_path),
+            engagement_id="e42",
+            defn=defn, task="t", context="c",
+            casa_framework_mcp_url="x",
+        )
+
+        settings = json.loads(
+            (Path(path) / ".claude" / "settings.json").read_text()
+        )
+        assert "PreToolUse" in settings["hooks"]
+        assert settings["hooks"]["PreToolUse"][0]["matcher"] == "Write|Edit"
