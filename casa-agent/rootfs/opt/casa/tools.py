@@ -741,14 +741,8 @@ async def engage_executor(args: dict) -> dict:
     except Exception as exc:  # noqa: BLE001
         logger.warning("edit_forum_topic rename failed: %s", exc)
 
-    options = _build_executor_options(defn)
-    injected = list(options.allowed_tools or [])
-    for t in ("mcp__casa-framework__query_engager",
-              "mcp__casa-framework__emit_completion"):
-        if t not in injected:
-            injected.append(t)
-    options.allowed_tools = injected
-
+    # Read + interpolate prompt template (needed by both driver paths —
+    # in_casa: options.system_prompt; claude_code: CLAUDE.md body).
     prompt_template = ""
     try:
         with open(defn.prompt_template_path, "r", encoding="utf-8") as fh:
@@ -769,24 +763,52 @@ async def engage_executor(args: dict) -> dict:
         .replace("{context}", context_text or "(none)")
         .replace("{world_state_summary}", world_state)
     )
-    options.system_prompt = prompt
 
-    driver = getattr(agent_mod, "active_engagement_driver", None)
-    if driver is None:
-        return _result({
-            "status": "error", "kind": "no_driver",
-            "message": "engagement driver not initialized",
-        })
-    try:
-        await driver.start(rec, prompt=prompt, options=options)
-    except Exception as exc:  # noqa: BLE001
-        await _engagement_registry.mark_error(
-            rec.id, kind="driver_start_failed", message=str(exc),
-        )
-        return _result({
-            "status": "error", "kind": "driver_start_failed",
-            "message": str(exc),
-        })
+    # Driver dispatch — in_casa uses ClaudeAgentOptions + system_prompt;
+    # claude_code uses the ExecutorDefinition + workspace-CLAUDE.md.
+    if defn.driver == "claude_code":
+        driver = getattr(agent_mod, "active_claude_code_driver", None)
+        if driver is None:
+            return _result({
+                "status": "error", "kind": "no_driver",
+                "message": "claude_code driver not initialized",
+            })
+        try:
+            await driver.start(rec, prompt=prompt, options=defn)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "claude_code driver.start failed for %s", rec.id[:8],
+            )
+            return _result({
+                "status": "error", "kind": "driver_start_failed",
+                "message": str(exc),
+            })
+    else:
+        options = _build_executor_options(defn)
+        injected = list(options.allowed_tools or [])
+        for t in ("mcp__casa-framework__query_engager",
+                  "mcp__casa-framework__emit_completion"):
+            if t not in injected:
+                injected.append(t)
+        options.allowed_tools = injected
+        options.system_prompt = prompt
+
+        driver = getattr(agent_mod, "active_engagement_driver", None)
+        if driver is None:
+            return _result({
+                "status": "error", "kind": "no_driver",
+                "message": "engagement driver not initialized",
+            })
+        try:
+            await driver.start(rec, prompt=prompt, options=options)
+        except Exception as exc:  # noqa: BLE001
+            await _engagement_registry.mark_error(
+                rec.id, kind="driver_start_failed", message=str(exc),
+            )
+            return _result({
+                "status": "error", "kind": "driver_start_failed",
+                "message": str(exc),
+            })
 
     return _result({
         "status": "pending",
@@ -931,6 +953,42 @@ async def _finalize_engagement(
                 engagement.id[:8], exc,
             )
 
+    # Plan 4a: per-executor-type Honcho archival (only for kind=executor).
+    if (memory_provider is not None
+            and engagement.kind == "executor"):
+        try:
+            channel = engagement.origin.get("channel", "telegram")
+            chat_id = str(engagement.origin.get("chat_id", ""))
+            type_session = f"{channel}:{chat_id}:executor:{engagement.role_or_type}"
+            type_summary = json.dumps({
+                "kind": "executor_engagement_summary",
+                "engagement_id": engagement.id,
+                "executor_type": engagement.role_or_type,
+                "started_at": engagement.started_at,
+                "finished_at": now,
+                "duration_s": now - engagement.started_at,
+                "terminal_state": outcome,
+                "engager": engagement.origin.get("role") or "assistant",
+                "task": engagement.task,
+                "last_text": text,
+                "artifacts": artifacts,
+            })
+            await memory_provider.ensure_session(
+                session_id=type_session,
+                agent_role=f"executor:{engagement.role_or_type}",
+            )
+            await memory_provider.add_turn(
+                session_id=type_session,
+                agent_role=f"executor:{engagement.role_or_type}",
+                user_text="(executor engagement summary)",
+                assistant_text=type_summary,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "finalize engagement %s: executor-type archival failed: %s",
+                engagement.id[:8], exc,
+            )
+
     logger.info(
         "Engagement %s finalized outcome=%s",
         engagement.id[:8], outcome,
@@ -969,7 +1027,10 @@ async def emit_completion(args: dict) -> dict:
     memory_provider = None
     try:
         import agent as agent_mod  # noqa: F401
-        driver = getattr(agent_mod, "active_engagement_driver", None)
+        if engagement.driver == "claude_code":
+            driver = getattr(agent_mod, "active_claude_code_driver", None)
+        else:
+            driver = getattr(agent_mod, "active_engagement_driver", None)
         memory_provider = getattr(agent_mod, "active_memory_provider", None)
     except Exception:
         pass
@@ -1112,7 +1173,10 @@ async def cancel_engagement(args: dict) -> dict:
     driver = None
     try:
         import agent as agent_mod  # noqa: F401
-        driver = getattr(agent_mod, "active_engagement_driver", None)
+        if rec.driver == "claude_code":
+            driver = getattr(agent_mod, "active_claude_code_driver", None)
+        else:
+            driver = getattr(agent_mod, "active_engagement_driver", None)
     except Exception:
         pass
 

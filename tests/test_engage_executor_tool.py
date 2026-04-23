@@ -190,3 +190,13 @@ class TestEngageExecutorReal:
         r = await engage_executor.handler({"executor_type": "configurator", "task": "t"})
         payload = json.loads(r["content"][0]["text"])
         assert payload["kind"] == "no_origin"
+
+
+class TestEngageExecutorClaudeCode:
+    @pytest.mark.skip(reason="Full wiring test — covered by D-block E2E in Phase G")
+    async def test_dispatches_to_claude_code_driver(self, monkeypatch, tmp_path):
+        """When executor.driver == 'claude_code', engage_executor calls the
+        claude_code driver with the ExecutorDefinition as options."""
+        # See TestEngageExecutorConfigurator for the setup pattern. The real
+        # coverage lands in the E2E D-block against the mock CLI.
+        pass
