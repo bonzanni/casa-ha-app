@@ -6,15 +6,11 @@ See docs/superpowers/specs/2026-04-23-3.5-plan4a-claude-code-driver-design.md.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 import re
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-
-_URL_REGEX = re.compile(r"Remote Control URL:\s+(https?://\S+)")
 
 from drivers import s6_rc
 from drivers.driver_protocol import DriverProtocol
@@ -24,6 +20,7 @@ from drivers.workspace import (
 from engagement_registry import EngagementRecord
 
 logger = logging.getLogger(__name__)
+_URL_REGEX = re.compile(r"Remote Control URL:\s+(https?://\S+)")
 
 TopicSender = Callable[[int, str], Awaitable[None]]
 
@@ -96,7 +93,11 @@ class ClaudeCodeDriver(DriverProtocol):
 
         # 5. Write initial prompt to FIFO — background, non-blocking.
         if prompt:
-            asyncio.create_task(self._write_to_fifo(engagement, prompt))
+            prompt_task = asyncio.create_task(
+                self._write_to_fifo(engagement, prompt),
+                name=f"initial_prompt:{engagement.id[:8]}",
+            )
+            self._tasks.setdefault(engagement.id, []).append(prompt_task)
 
         logger.info("claude_code engagement %s started", engagement.id[:8])
 
@@ -110,6 +111,7 @@ class ClaudeCodeDriver(DriverProtocol):
         # Cancel background tasks
         for t in self._tasks.pop(engagement.id, []):
             t.cancel()
+        self._last_turn_ts.pop(engagement.id, None)
 
         async with s6_rc._compile_lock:
             # Stop is tolerant of "already down" — log and continue.
@@ -118,10 +120,14 @@ class ClaudeCodeDriver(DriverProtocol):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("stop_service(%s) failed: %s",
                                engagement.id[:8], exc)
-            s6_rc.remove_service_dir(
-                svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
-                engagement_id=engagement.id,
-            )
+            try:
+                s6_rc.remove_service_dir(
+                    svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                    engagement_id=engagement.id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("remove_service_dir(%s) failed: %s",
+                               engagement.id[:8], exc)
             try:
                 await s6_rc._compile_and_update_locked()
             except Exception as exc:  # noqa: BLE001
