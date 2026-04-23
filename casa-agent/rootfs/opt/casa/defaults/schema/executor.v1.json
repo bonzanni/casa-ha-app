@@ -25,6 +25,13 @@
     "prompt_template_file": {"type": "string", "default": "prompt.md"},
     "hooks_file": {"type": "string", "default": "hooks.yaml"},
     "observer_policy_file": {"type": "string", "default": "observer.yaml"},
-    "doctrine_dir": {"type": "string", "default": "doctrine"}
+    "doctrine_dir": {"type": "string", "default": "doctrine"},
+    "extra_dirs": {
+      "type": "array",
+      "items": {"type": "string"},
+      "default": []
+    },
+    "mirror_chat_to_topic": {"type": "boolean", "default": true},
+    "archive_session_full": {"type": "boolean", "default": false}
   }
 }
