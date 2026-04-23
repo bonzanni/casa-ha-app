@@ -33,3 +33,27 @@ class TestWriteServiceDir:
         if platform.system() != "Windows":
             assert mode & stat.S_IXUSR, "run script must be executable"
         assert (svc_dir / "dependencies.d" / "init-setup-configs").exists()
+
+
+class TestRemoveServiceDir:
+    async def test_removes_existing_dir(self, tmp_path):
+        from drivers.s6_rc import remove_service_dir, write_service_dir
+
+        svc_root = tmp_path / "casa-s6-services"
+        svc_root.mkdir()
+        write_service_dir(
+            svc_root=str(svc_root), engagement_id="x1",
+            run_script="#!/bin/sh\nexec true\n", depends_on=[],
+        )
+        assert (svc_root / "engagement-x1").exists()
+
+        remove_service_dir(svc_root=str(svc_root), engagement_id="x1")
+        assert not (svc_root / "engagement-x1").exists()
+
+    async def test_remove_missing_is_noop(self, tmp_path):
+        from drivers.s6_rc import remove_service_dir
+
+        svc_root = tmp_path / "casa-s6-services"
+        svc_root.mkdir()
+        # Does not raise.
+        remove_service_dir(svc_root=str(svc_root), engagement_id="nosuch")
