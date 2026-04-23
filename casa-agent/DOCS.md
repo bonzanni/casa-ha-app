@@ -526,3 +526,43 @@ driver). On HA host reboot, `/data/` persists; boot replay re-launches
 every UNDERGOING engagement's service, and the `run` script reads the
 persisted `.session_id` to resume the CLI conversation exactly where it
 left off.
+
+## svc-casa-mcp service (v0.14.0)
+
+Casa runs the `casa-framework` MCP server as a separate s6-supervised
+service called `svc-casa-mcp`, listening on `127.0.0.1:8100` inside the
+addon container. Engagement subprocesses connect to it via the URL
+written into their `.mcp.json` at provisioning time.
+
+**Why it exists.** Engagement subprocesses survive casa-main restarts
+(addon updates, container respawns, HA reboots) because they run under
+their own s6 services. Before v0.14.0, the MCP server lived inside
+casa-main, so a casa-main restart dropped every live MCP connection
+and any mid-turn tool call would fail with a connection error. With
+the extracted service, the engagement's MCP TCP connection stays open
+across casa-main restarts; mid-restart tool calls return JSON-RPC
+`-32000 casa_temporarily_unavailable` (a clean recoverable error the
+model can handle), not a connection drop.
+
+**On-disk artifacts.**
+- `/run/casa/internal.sock` (mode 0600) — Unix socket created by
+  casa-main; svc-casa-mcp connects to it for every forwarded tool call.
+- New engagement workspaces' `.mcp.json` points at
+  `http://127.0.0.1:8100/mcp/casa-framework` and includes the
+  `X-Casa-Engagement-Id` header binding.
+- New engagement workspaces' hook proxy script POSTs to
+  `http://127.0.0.1:8100/hooks/resolve`.
+
+**Back-compat for pre-v0.14.0 workspaces.** Casa-main's public listener
+on port 8099 still serves `/mcp/casa-framework` and `/hooks/resolve`
+as a fallback. Pre-v0.14.0 workspaces (whose `.mcp.json` was baked at
+provisioning time with the 8099 URL) continue to function until they
+cycle out (manual cancel + re-engage, or 7-day workspace retention
+sweep). The fallback is removed in v0.14.2 or later.
+
+**Operational env-var overrides.**
+- `CASA_FRAMEWORK_MCP_URL` — overrides the default URL that gets baked
+  into newly-provisioned workspaces' `.mcp.json`. Leave unset for the
+  shipped default.
+- `CASA_HOOK_RESOLVE_URL` — overrides where `hook_proxy.sh` POSTs hook
+  decisions.

@@ -71,3 +71,26 @@ Ellen is the only agent allowed to invoke specialists or executors.
 | observer.yaml | forbidden | forbidden | optional |
 
 agent_loader.py enforces these rules. Adding a forbidden file or removing a required file makes the agent fail to load.
+
+## MCP service topology (v0.14.0)
+
+The `casa-framework` MCP server runs as its own s6-supervised service
+called `svc-casa-mcp`, NOT inside casa-main. It listens on
+`127.0.0.1:8100` and forwards every tool call and hook decision to
+casa-main over a Unix socket at `/run/casa/internal.sock`.
+
+This means:
+- An engagement subprocess's MCP TCP connection survives a casa-main
+  restart (addon update, in-container respawn). Mid-restart tool calls
+  return JSON-RPC `-32000 casa_temporarily_unavailable` (a recoverable
+  error the model handles), not a connection drop.
+- Casa-main's public port 8099 still serves `/mcp/casa-framework` and
+  `/hooks/resolve` as a back-compat fallback for pre-v0.14.0 workspaces;
+  these routes will be removed in v0.14.2 or later.
+- New engagement workspaces have `.mcp.json` pointing at port 8100;
+  pre-v0.14.0 workspaces still point at 8099 and continue to function
+  via the fallback.
+
+You (Configurator) do NOT need to touch any of this — workspace
+provisioning + hook proxying are framework concerns. If a user asks why
+their engagement survived a Casa restart cleanly, this is the reason.
