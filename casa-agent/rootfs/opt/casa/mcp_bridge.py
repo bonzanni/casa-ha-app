@@ -28,85 +28,17 @@ from aiohttp import web
 
 logger = logging.getLogger(__name__)
 
-VERSION = "0.13.1"
-PROTOCOL_VERSION = "2025-06-18"
-
-
-# ---------------------------------------------------------------------------
-# JSON-RPC envelope helpers
-# ---------------------------------------------------------------------------
-
-
-def _jsonrpc_ok(req_id: Any, result: Any) -> web.Response:
-    return web.json_response({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "result": result,
-    })
-
-
-def _jsonrpc_error(req_id: Any, code: int, message: str) -> web.Response:
-    return web.json_response({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "error": {"code": code, "message": message},
-    })
-
-
-# ---------------------------------------------------------------------------
-# tools/list schema translation
-# ---------------------------------------------------------------------------
-
-
-_PY_TO_JSON_TYPE: dict[type, str] = {
-    str: "string",
-    int: "integer",
-    float: "number",
-    bool: "boolean",
-    list: "array",
-    dict: "object",
-}
-
-
-def _py_type_to_json(py_type: Any) -> dict[str, Any]:
-    """Convert a Python-type annotation into a JSON Schema type dict.
-
-    The @tool(...) decorator in claude_agent_sdk accepts a dict-of-types
-    style (e.g. {"message": str}) — we translate those here. Keeping this
-    inline (rather than reusing the SDK's private helper) means we don't
-    depend on internal SDK paths.
-    """
-    if py_type in _PY_TO_JSON_TYPE:
-        return {"type": _PY_TO_JSON_TYPE[py_type]}
-    if py_type is list:
-        return {"type": "array"}
-    if py_type is dict:
-        return {"type": "object"}
-    # Unknown / complex — fall back to permissive.
-    return {}
-
-
-def _tool_schema(tool: Any) -> dict[str, Any]:
-    """Return the MCP tools/list entry for an @tool-decorated function."""
-    ischema: dict[str, Any]
-    if isinstance(tool.input_schema, dict):
-        props = {
-            name: _py_type_to_json(ty)
-            for name, ty in tool.input_schema.items()
-        }
-        ischema = {"type": "object", "properties": props}
-    else:
-        # TypedDict or pre-built JSON Schema — pass through.
-        ischema = (
-            tool.input_schema
-            if isinstance(tool.input_schema, dict)
-            else {"type": "object"}
-        )
-    return {
-        "name": tool.name,
-        "description": tool.description,
-        "inputSchema": ischema,
-    }
+# Envelope helpers + version constants extracted to mcp_envelope.py in v0.14.0
+# (Plan 4b Phase 3.6). mcp_bridge.py re-exports them transitionally; the
+# whole module is deleted in Milestone 8 of the v0.14.0 plan.
+from mcp_envelope import (  # noqa: F401 — re-exported for back-compat
+    PROTOCOL_VERSION,
+    VERSION,
+    _jsonrpc_error,
+    _jsonrpc_ok,
+    _py_type_to_json,
+    _tool_schema,
+)
 
 
 # ---------------------------------------------------------------------------
