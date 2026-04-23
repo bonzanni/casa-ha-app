@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Mock `claude` CLI for CI. See §9.1 of the plan-4a design spec.
+
+Usage (exactly mimics real claude):
+    claude --remote-control <name> [--resume <sid>] --permission-mode <mode> --add-dir <dir>...
+
+Reads user turns line-by-line from stdin. For each turn, appends JSONL
+entries for `user` and `assistant` messages to
+$HOME/.claude/projects/<slug>/sessions/<sid>.jsonl. Prints the
+`Remote Control URL:` line on boot. On `/mock emit_completion`, prints
+a synthetic MCP tool-call JSON line and exits 0. On `/mock cancel`, exits 0.
+On `--resume <sid>`, reads the prior transcript and prints "Resumed
+session <sid> with N prior turns" before entering the main loop.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import sys
+import time
+import uuid
+
+URL_FORMAT = "Remote Control URL: https://mock-relay.test/{sid}"
+
+
+def _parse_args(argv: list[str]) -> dict:
+    """Tolerant parse — ignore unknown flags (real CLI adds flags over time)."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--remote-control")
+    parser.add_argument("--resume")
+    parser.add_argument("--permission-mode")
+    parser.add_argument("--add-dir", action="append", default=[])
+    args, _ = parser.parse_known_args(argv)
+    return vars(args)
+
+
+def _slug(cwd: str) -> str:
+    return cwd.replace("/", "-").lstrip("-") or "root"
+
+
+def _session_path(home: str, cwd: str, sid: str) -> pathlib.Path:
+    return pathlib.Path(home) / ".claude" / "projects" / _slug(cwd) / "sessions" / f"{sid}.jsonl"
+
+
+def main() -> int:
+    args = _parse_args(sys.argv[1:])
+    home = os.environ.get("HOME", "/tmp/mock-home")
+    cwd = os.getcwd()
+
+    if args["resume"]:
+        sid = args["resume"]
+        path = _session_path(home, cwd, sid)
+        prior = 0
+        if path.exists():
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.strip():
+                        prior += 1
+        print(f"Resumed session {sid} with {prior} prior turns", flush=True)
+    else:
+        sid = uuid.uuid4().hex
+        # Persist session_id to .session_id so a subsequent respawn can resume.
+        pathlib.Path("./.session_id").write_text(sid, encoding="utf-8")
+        path = _session_path(home, cwd, sid)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    print(URL_FORMAT.format(sid=sid), flush=True)
+
+    # Main loop: read stdin line by line.
+    for line in sys.stdin:
+        text = line.rstrip("\n")
+        if not text:
+            continue
+        # Trigger: emit_completion
+        if text.startswith("/mock emit_completion"):
+            payload = text[len("/mock emit_completion"):].strip() or "{}"
+            try:
+                payload_obj = json.loads(payload)
+            except json.JSONDecodeError:
+                payload_obj = {"text": payload}
+            print(json.dumps({
+                "type": "tool_use",
+                "name": "mcp__casa-framework__emit_completion",
+                "input": payload_obj,
+            }), flush=True)
+            return 0
+        if text.startswith("/mock cancel"):
+            return 0
+
+        # Normal turn: append user + assistant JSONL, echo to stdout.
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"role": "user", "text": text,
+                                 "ts": time.time()}) + "\n")
+            reply = f"(mock) You said: {text}"
+            fh.write(json.dumps({"role": "assistant", "text": reply,
+                                 "ts": time.time()}) + "\n")
+        print(reply, flush=True)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
