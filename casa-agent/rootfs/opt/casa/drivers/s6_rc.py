@@ -44,3 +44,10 @@ def write_service_dir(
     for dep in depends_on:
         (deps_dir / dep).touch()
     return str(svc_dir)
+
+
+def remove_service_dir(*, svc_root: str, engagement_id: str) -> None:
+    """Idempotent rm -rf of /<svc_root>/engagement-<id>/."""
+    svc_dir = Path(svc_root) / f"engagement-{engagement_id}"
+    if svc_dir.exists():
+        shutil.rmtree(svc_dir)
