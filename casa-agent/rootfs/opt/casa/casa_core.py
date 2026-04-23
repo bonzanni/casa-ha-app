@@ -60,6 +60,74 @@ async def healthz(_request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
+# ------------------------------------------------------------------
+# /hooks/resolve — CC hook_proxy.sh loopback endpoint
+# ------------------------------------------------------------------
+
+
+def _build_cc_hook_policies(hook_policies: dict) -> dict:
+    """Wrap SDK-level HOOK_POLICIES factories into HTTP-friendly sync callables.
+
+    HOOK_POLICIES values are factories(**kwargs) -> HookMatcher (SDK objects).
+    For the CC driver's /hooks/resolve endpoint we need simple
+    (payload: dict) -> dict functions that return {"decision": "allow"|"block"}.
+
+    This function registers only the policies that make sense for the CC
+    driver context and wraps them with a default-allow stub (the heavy
+    enforcement logic lives inside the CC hook callbacks running inside the
+    sandbox; this endpoint is a lightweight gate for structured policy
+    decisions).
+
+    The stub allow-all wrapper is intentional: the HOOK_POLICIES factories
+    produce SDK HookMatcher objects that are not HTTP-callable.  A richer
+    bridge (running the async HookCallback coroutines against the payload)
+    can replace these stubs in a future iteration.
+    """
+    cc_policies: dict = {}
+    for name in hook_policies:
+        def _allow_stub(payload: dict, _name: str = name) -> dict:
+            return {"decision": "allow",
+                    "reason": f"{_name}: cc-http-stub (pass-through)"}
+        cc_policies[name] = _allow_stub
+    return cc_policies
+
+
+def _make_hooks_resolve_handler(*, hook_policies: dict):
+    """Build the /hooks/resolve aiohttp handler.
+
+    hook_policies maps policy-name -> callable(payload: dict) -> dict.
+    Decision shape is {"decision": "allow" | "block", "reason": str?}.
+    """
+    async def handler(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"decision": "block", "reason": "bad json"}, status=200,
+            )
+        policy_name = body.get("policy")
+        payload = body.get("payload") or {}
+
+        policy_fn = hook_policies.get(policy_name)
+        if policy_fn is None:
+            return web.json_response({
+                "decision": "block",
+                "reason": f"unknown policy: {policy_name}",
+            }, status=200)
+        try:
+            result = policy_fn(payload)
+            if not isinstance(result, dict) or "decision" not in result:
+                result = {"decision": "block",
+                          "reason": "malformed policy result"}
+            return web.json_response(result, status=200)
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response({
+                "decision": "block",
+                "reason": f"policy {policy_name!r} raised: {exc}",
+            }, status=200)
+    return handler
+
+
 _STATUS_PAGE = """\
 <!DOCTYPE html>
 <html lang="en"><head>
@@ -852,6 +920,12 @@ async def main() -> None:
     app.router.add_post("/webhook/{name}", webhook_handler)
     app.router.add_post("/invoke/{agent}", invoke_handler)
     app.router.add_post("/telegram/update", telegram_update_handler)
+    from hooks import HOOK_POLICIES as _HOOK_POLICIES
+    _cc_hook_policies = _build_cc_hook_policies(_HOOK_POLICIES)
+    app.router.add_post(
+        "/hooks/resolve",
+        _make_hooks_resolve_handler(hook_policies=_cc_hook_policies),
+    )
 
     # 13b. Per-agent trigger registration. Registry + scheduler were
     # constructed earlier (needed by init_tools for get_schedule).
