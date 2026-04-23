@@ -1,0 +1,4 @@
+# hello-driver uses default observer classifier (silent/peek/trigger mapping).
+destructive_tools: []
+rate_limit: 3
+default_interjection_mode: warn_only
