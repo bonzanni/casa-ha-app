@@ -39,15 +39,18 @@ read -p "    Press enter after you reply... "
 echo "Step 4: Wait for emit_completion + casa_reload_triggers (~5-10s)"
 read -p "    Press enter after you see the completion summary... "
 
-echo "Step 5: Verify trigger landed via /ha-prod-console:ssh:"
-echo "  cat /addon_configs/casa-agent/agents/assistant/triggers.yaml"
+echo "Step 5: Verify trigger landed (SSH to the HA host):"
+echo "  ssh <ha-host> sudo -n docker exec addon_c071ea9c_casa-agent \\"
+echo "    cat /addon_configs/casa-agent/agents/assistant/triggers.yaml"
 read -p "    Press enter after manual verification... "
 
 echo "Step 6: Verify Ellen narrated the outcome in 1:1 chat"
 read -p "    Press enter after confirming narration... "
 
 echo "Step 7: Verify no addon restart (soft reload only):"
-echo "  /ha-prod-console:info -> uptime should be unchanged"
+echo "  ssh <ha-host> sudo -n docker exec hassio_cli \\"
+echo "    ha apps info c071ea9c_casa-agent --raw-json | grep -E '^(version|state)'"
+echo "  Uptime should be unchanged."
 read -p "    Press enter after manual verification... "
 
 echo "=== PASS ==="

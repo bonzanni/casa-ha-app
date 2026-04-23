@@ -6,8 +6,7 @@ __pycache__/
 dist/
 build/
 .eggs/
-.claude/*
-!.claude/prod.yml
+.claude/
 docs/
 .worktrees/
 .env
