@@ -9,9 +9,12 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+_URL_REGEX = re.compile(r"Remote Control URL:\s+(https?://\S+)")
 
 from drivers import s6_rc
 from drivers.driver_protocol import DriverProtocol
@@ -42,6 +45,7 @@ class ClaudeCodeDriver(DriverProtocol):
         self._casa_framework_mcp_url = casa_framework_mcp_url
         # Per-engagement background tasks (URL capture, respawn poller).
         self._tasks: dict[str, list[asyncio.Task]] = {}
+        self._last_turn_ts: dict[str, float] = {}
 
     # -- DriverProtocol ---------------------------------------------------
 
@@ -160,15 +164,114 @@ class ClaudeCodeDriver(DriverProtocol):
             with open(fifo, "a", encoding="utf-8") as fh:
                 fh.write(text + "\n")
         await asyncio.to_thread(_write)
+        self._last_turn_ts[engagement.id] = time.time()
 
     def _spawn_background_tasks(self, engagement: EngagementRecord) -> None:
-        """Start URL capture + respawn poller tasks for this engagement.
+        log_path = f"/var/log/casa-engagement-{engagement.id}/current"
+        self._tasks[engagement.id] = [
+            asyncio.create_task(self._capture_url(engagement, log_path=log_path)),
+            asyncio.create_task(self._poll_respawns(engagement)),
+        ]
 
-        Placeholder list so cancel() doesn't KeyError. Real task spawning
-        lands in Tasks C3 (URL capture) and C4 (respawn poller).
-        """
-        self._tasks.setdefault(engagement.id, [])
+    async def _capture_url(
+        self, engagement: EngagementRecord, *,
+        log_path: str, initial_window_s: float = 60.0,
+    ) -> None:
+        """Persistent tail — posts topic notices on URL change only."""
+        last_seen: str | None = None
+        initial_posted_warning = False
+        deadline = asyncio.get_event_loop().time() + initial_window_s
+
+        async for line in _tail_file(log_path):
+            m = _URL_REGEX.search(line)
+            if not m:
+                now = asyncio.get_event_loop().time()
+                if (not initial_posted_warning and last_seen is None
+                        and now > deadline):
+                    await self._send_to_topic(
+                        engagement.topic_id,
+                        "Remote control URL not yet available — Telegram-only "
+                        "for now. Will post here if it becomes available later.",
+                    )
+                    initial_posted_warning = True
+                continue
+
+            url = m.group(1)
+            if url == last_seen:
+                continue
+            last_seen = url
+            await self._send_to_topic(
+                engagement.topic_id,
+                f"Remote control: {url} — open in iOS app or browser "
+                f"to drive from anywhere.",
+            )
+
+    async def _poll_respawns(
+        self, engagement: EngagementRecord, *, interval_s: float = 5.0,
+    ) -> None:
+        """Emit subprocess_respawn bus events when s6-svstat shows a new PID."""
+        last_pid: int | None = None
+        while True:
+            await asyncio.sleep(interval_s)
+            pid = await s6_rc.service_pid(engagement_id=engagement.id)
+            if pid is None:
+                continue
+            if last_pid is not None and pid != last_pid:
+                await self._publish_bus_event({
+                    "type": "subprocess_respawn",
+                    "engagement_id": engagement.id,
+                    "previous_pid": last_pid,
+                    "new_pid": pid,
+                    "ts": time.time(),
+                })
+                await self._maybe_warn_of_lost_turn(engagement)
+            last_pid = pid
+
+    async def _publish_bus_event(self, event: dict) -> None:
+        """Overridable (tests inject). Default no-op at driver layer —
+        casa_core wires a real bus sink in at construction time (see Phase E)."""
+        logger.debug("bus event (no sink wired): %s", event)
+
+    async def _maybe_warn_of_lost_turn(
+        self, engagement: EngagementRecord,
+    ) -> None:
+        """If the last send_user_turn was within 5 seconds of now, post a
+        topic warning that the turn may have been lost during respawn."""
+        last_ts = self._last_turn_ts.get(engagement.id)
+        if last_ts is None:
+            return
+        if time.time() - last_ts < 5.0:
+            await self._send_to_topic(
+                engagement.topic_id,
+                "Your last message may not have reached the engagement — "
+                "please retype it.",
+            )
 
 
 def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+async def _tail_file(log_path: str):
+    """Yield new lines from a file as they appear. Terminates on task cancel.
+
+    For tests, we read existing content first then attempt to tail; in
+    production, s6-log rotates the file but the FIFO-style readline loop
+    handles that fine (readline() returns "" at EOF; we sleep and retry).
+    """
+    path = Path(log_path)
+    pos = 0
+    while True:
+        try:
+            if path.exists():
+                with path.open("r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(pos)
+                    while True:
+                        line = fh.readline()
+                        if not line:
+                            pos = fh.tell()
+                            break
+                        yield line
+        except (OSError, asyncio.CancelledError):
+            raise
+        await asyncio.sleep(0.1)
