@@ -96,7 +96,7 @@ class Observer:
             return "silent"  # Plan 3 adds per-type destructive_tools list
         if event_type == "tool_result":
             return "trigger" if payload.get("status") == "error" else "silent"
-        if event_type in ("warn", "error", "idle_detected"):
+        if event_type in ("warn", "error", "idle_detected", "subprocess_respawn"):
             return "trigger"
         if event_type == "query_engager":
             return "trigger" if payload.get("status") == "unknown" else "silent"

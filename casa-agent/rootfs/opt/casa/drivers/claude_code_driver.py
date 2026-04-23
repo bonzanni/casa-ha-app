@@ -15,7 +15,7 @@ from typing import Any, Awaitable, Callable
 from drivers import s6_rc
 from drivers.driver_protocol import DriverProtocol
 from drivers.workspace import (
-    provision_workspace, render_run_script, write_casa_meta,
+    provision_workspace, render_log_run_script, render_run_script, write_casa_meta,
 )
 from engagement_registry import EngagementRecord
 
@@ -71,17 +71,19 @@ class ClaudeCodeDriver(DriverProtocol):
                 finished_at=None, retention_until=None,
             )
 
-            # 2. Write the s6 service dir.
+            # 2. Write the s6 service dir (with log sub-service for stdout capture).
             run_script = render_run_script(
                 engagement_id=engagement.id,
                 permission_mode=defn.permission_mode or "acceptEdits",
                 extra_dirs=list(defn.extra_dirs),
             )
+            log_script = render_log_run_script(engagement_id=engagement.id)
             s6_rc.write_service_dir(
                 svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
                 engagement_id=engagement.id,
                 run_script=run_script,
                 depends_on=["init-setup-configs"],
+                log_run_script=log_script,
             )
 
             # 3. Compile + update + change — lock held, inner helper.
@@ -224,7 +226,7 @@ class ClaudeCodeDriver(DriverProtocol):
                 continue
             if last_pid is not None and pid != last_pid:
                 await self._publish_bus_event({
-                    "type": "subprocess_respawn",
+                    "event": "subprocess_respawn",
                     "engagement_id": engagement.id,
                     "previous_pid": last_pid,
                     "new_pid": pid,
