@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.13.0] — 2026-04-XX
+
+### Added
+- **Plan 4a Phase F:** Tier 1 baseline plugin pack `superpowers@v5.0.7`
+  bundled at `/opt/casa/claude-plugins/base/superpowers/`. Auto-symlinked
+  into every `claude_code`-driver engagement's isolated `$HOME` at
+  provisioning time (§7.1/§7.2 of the Plan 4a design spec).
+- **Plan 4a Phase F:** `/data/casa-s6-services/` and `/data/engagements/`
+  directories pre-created by `setup-configs.sh` on every boot.
+- **Plan 4a Phase F:** `hello-driver` executor defaults at
+  `defaults/agents/executors/hello-driver/` — disposable test-harness
+  type for Phase G E2E validation of the `claude_code` driver end-to-end.
+
 ## 0.12.0 — 2026-04-??
 
 ### Added — Phase 3.5 Plan 3: UC1 Configurator

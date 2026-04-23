@@ -14,6 +14,16 @@ RUN apt-get update \
     && npm install -g @anthropic-ai/claude-code \
     && npm cache clean --force
 
+# Plan 4a: Tier 1 baseline plugin packs for claude_code driver.
+# These are symlinked into each engagement's isolated HOME at provisioning time.
+# Updating the pin is a Casa image release concern; see CHANGELOG for cadence.
+ARG SUPERPOWERS_REF=v5.0.7
+RUN mkdir -p /opt/casa/claude-plugins/base \
+    && git clone --depth=1 --branch ${SUPERPOWERS_REF} \
+       https://github.com/obra/superpowers \
+       /opt/casa/claude-plugins/base/superpowers \
+    && rm -rf /opt/casa/claude-plugins/base/superpowers/.git
+
 # Install ttyd (not packaged in Debian).
 ARG TTYD_VERSION=1.7.7
 ARG TARGETARCH
