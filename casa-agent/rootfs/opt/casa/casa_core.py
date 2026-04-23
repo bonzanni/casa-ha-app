@@ -1041,6 +1041,19 @@ async def main() -> None:
         _make_hooks_resolve_handler(hook_policies=_cc_hook_policies),
     )
 
+    # Plan 4a.1: MCP JSON-RPC 2.0 bridge for the claude_code driver.
+    # See mcp_bridge.py + docs/superpowers/specs/2026-04-23-3.5-plan4a-1-mcp-bridge-design.md §4.
+    from mcp_bridge import _make_mcp_handler, _mcp_get_not_allowed
+    from tools import CASA_TOOLS
+    app.router.add_post(
+        "/mcp/casa-framework",
+        _make_mcp_handler(
+            tools=CASA_TOOLS,
+            engagement_registry=engagement_registry,
+        ),
+    )
+    app.router.add_get("/mcp/casa-framework", _mcp_get_not_allowed)
+
     # 13b. Per-agent trigger registration. Registry + scheduler were
     # constructed earlier (needed by init_tools for get_schedule).
     # Register before runner.setup() so webhook routes land in *app*
