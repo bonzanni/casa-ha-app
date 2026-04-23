@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import shutil
 import stat
 import subprocess
@@ -38,7 +37,7 @@ def write_service_dir(
     (svc_dir / "type").write_text("longrun\n")
     run_path = svc_dir / "run"
     run_path.write_text(run_script)
-    run_path.chmod(run_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+    run_path.chmod(run_path.stat().st_mode | stat.S_IXUSR)
     deps_dir = svc_dir / "dependencies.d"
     deps_dir.mkdir()
     for dep in depends_on:
