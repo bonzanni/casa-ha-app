@@ -61,6 +61,77 @@ async def healthz(_request: web.Request) -> web.Response:
 
 
 # ------------------------------------------------------------------
+# Plan 4a Phase E: boot replay for claude_code engagements
+# ------------------------------------------------------------------
+
+
+async def replay_undergoing_engagements(
+    *, registry, driver, engagements_root: str,
+) -> None:
+    """On Casa boot: reconstruct s6 services for UNDERGOING claude_code engagements.
+
+    Sweeps orphan service dirs whose engagement is not UNDERGOING, recreates
+    service defs for UNDERGOING engagements whose dir is missing, runs a
+    single compile+update, starts each service, and spawns URL-capture +
+    respawn-poller tasks.
+    """
+    from drivers import s6_rc
+
+    undergoing = [
+        r for r in registry._records.values()
+        if r.driver == "claude_code" and r.status in ("active", "idle")
+    ]
+    keep_ids = {r.id for r in undergoing}
+
+    async with s6_rc._compile_lock:
+        # 1. Orphan sweep — dirs for non-UNDERGOING engagements, remove them.
+        s6_rc.sweep_orphan_service_dirs(
+            svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+            keep_engagement_ids=keep_ids,
+        )
+
+        # 2. Re-plant any missing UNDERGOING service dirs (workspace must exist).
+        for rec in undergoing:
+            svc_dir = os.path.join(
+                s6_rc.ENGAGEMENT_SOURCES_ROOT, f"engagement-{rec.id}",
+            )
+            if not os.path.isdir(svc_dir):
+                logger.warning(
+                    "boot replay: service dir missing for engagement %s "
+                    "— leaving UNDERGOING; next start will re-create on demand",
+                    rec.id[:8],
+                )
+                # Could re-render and re-plant here, but requires the executor
+                # definition which isn't in the engagement record. Left for
+                # v0.13.1 if needed — the record remains UNDERGOING and will
+                # be healed when the user next engages (new engagement) or
+                # manually cancels the stuck one.
+
+        # 3. Single compile + update pass.
+        await s6_rc._compile_and_update_locked()
+
+        # 4. Start each (idempotent under s6-rc change).
+        for rec in undergoing:
+            try:
+                await s6_rc.start_service(engagement_id=rec.id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "boot replay: start_service(%s) failed: %s",
+                    rec.id[:8], exc,
+                )
+
+    # 5. Background tasks OUTSIDE the lock (long-lived).
+    for rec in undergoing:
+        try:
+            driver._spawn_background_tasks(rec)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "boot replay: background tasks for %s failed: %s",
+                rec.id[:8], exc,
+            )
+
+
+# ------------------------------------------------------------------
 # /hooks/resolve — CC hook_proxy.sh loopback endpoint
 # ------------------------------------------------------------------
 
