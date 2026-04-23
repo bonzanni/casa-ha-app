@@ -1293,6 +1293,198 @@ async def casa_reload_triggers(args: dict) -> dict:
     })
 
 
+# ---------------------------------------------------------------------------
+# Plan 4a.1: workspace inspection tools
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    "list_engagement_workspaces",
+    "List engagement workspaces under /data/engagements with status + size. "
+    "Optional status filter. Truncates at 100 entries.",
+    {"status": str},
+)
+async def list_engagement_workspaces(args: dict) -> dict:
+    from drivers.workspace import load_casa_meta
+
+    status_filter = (args.get("status") or "").strip() or None
+    root = _ENGAGEMENTS_ROOT
+
+    if not os.path.isdir(root):
+        return _result({"workspaces": [], "truncated": False, "total": 0})
+
+    entries: list[dict] = []
+    for ent in sorted(os.scandir(root), key=lambda e: e.name):
+        if not ent.is_dir():
+            continue
+        meta = load_casa_meta(ent.path) or {}
+        if status_filter and meta.get("status") != status_filter:
+            continue
+        size_bytes = 0
+        for dirpath, _dirs, files in os.walk(ent.path):
+            for f in files:
+                try:
+                    size_bytes += os.stat(os.path.join(dirpath, f)).st_size
+                except OSError:
+                    pass
+        entries.append({
+            "engagement_id": ent.name,
+            "executor_type": meta.get("executor_type"),
+            "status": meta.get("status"),
+            "created_at": meta.get("created_at"),
+            "finished_at": meta.get("finished_at"),
+            "retention_until": meta.get("retention_until"),
+            "size_bytes": size_bytes,
+        })
+
+    total = len(entries)
+    truncated = total > 100
+    return _result({
+        "workspaces": entries[:100],
+        "truncated": truncated,
+        "total": total,
+    })
+
+
+@tool(
+    "delete_engagement_workspace",
+    "Delete /data/engagements/<id>/ and cancel+finalize the engagement if "
+    "still UNDERGOING. Requires force=true to act on UNDERGOING engagements.",
+    {"engagement_id": str, "force": bool},
+)
+async def delete_engagement_workspace(args: dict) -> dict:
+    import shutil
+
+    engagement_id = (args.get("engagement_id") or "").strip()
+    force = bool(args.get("force", False))
+
+    if not engagement_id:
+        return _result({
+            "status": "error", "kind": "bad_request",
+            "message": "engagement_id is required",
+        })
+    if _engagement_registry is None:
+        return _result({
+            "status": "error", "kind": "not_initialized",
+            "message": "engagement registry not wired",
+        })
+
+    rec = _engagement_registry.get(engagement_id)
+    if rec is None:
+        return _result({
+            "status": "error", "kind": "unknown_engagement",
+            "message": f"no engagement named {engagement_id!r}",
+        })
+
+    if rec.status == "active" and not force:
+        return _result({
+            "status": "error", "kind": "refused",
+            "message": "engagement is UNDERGOING; pass force=true to cancel + delete",
+        })
+
+    if rec.status == "active" and force:
+        # Finalize as cancelled before pulling the workspace.
+        driver = None
+        try:
+            import agent as agent_mod
+            driver = (getattr(agent_mod, "active_claude_code_driver", None)
+                      if rec.driver == "claude_code"
+                      else getattr(agent_mod, "active_engagement_driver", None))
+        except Exception:
+            pass
+        await _finalize_engagement(
+            rec, outcome="cancelled",
+            text="Workspace deletion forced",
+            artifacts=[], next_steps=[],
+            driver=driver, memory_provider=None,
+        )
+
+    ws = os.path.join(_ENGAGEMENTS_ROOT, engagement_id)
+    if os.path.isdir(ws):
+        try:
+            shutil.rmtree(ws)
+        except OSError as exc:
+            return _result({
+                "status": "error", "kind": "rmtree_failed",
+                "message": f"rmtree {ws}: {exc}",
+            })
+    return _result({
+        "status": "ok", "engagement_id": engagement_id,
+        "workspace_removed": os.path.isdir(ws) is False,
+    })
+
+
+_PEEK_MAX_DEFAULT = 65_536
+_PEEK_MAX_HARD = 524_288
+
+
+@tool(
+    "peek_engagement_workspace",
+    "Read-only inspection of /data/engagements/<id>/. Empty path returns a "
+    "3-deep tree listing; otherwise reads file contents up to max_bytes "
+    "(default 64KB, hard cap 512KB). Path-traversal guarded.",
+    {"engagement_id": str, "path": str, "max_bytes": int},
+)
+async def peek_engagement_workspace(args: dict) -> dict:
+    from pathlib import Path as _Path
+
+    engagement_id = (args.get("engagement_id") or "").strip()
+    if not engagement_id:
+        return _result({"status": "error", "kind": "bad_request",
+                        "message": "engagement_id is required"})
+
+    ws_root = _Path(_ENGAGEMENTS_ROOT) / engagement_id
+    if not ws_root.is_dir():
+        return _result({"status": "error", "kind": "unknown_workspace",
+                        "message": f"no workspace for {engagement_id!r}"})
+
+    path_arg = (args.get("path") or "").strip()
+    if not path_arg:
+        tree = _walk_workspace_tree(ws_root, max_depth=3)
+        return _result({"status": "ok", "tree": tree})
+
+    full = (ws_root / path_arg).resolve()
+    ws_resolved = ws_root.resolve()
+    try:
+        full.relative_to(ws_resolved)
+    except ValueError:
+        return _result({"status": "error", "kind": "path_outside_workspace",
+                        "message": f"path {path_arg!r} escapes the workspace"})
+
+    if not full.is_file():
+        return _result({"status": "error", "kind": "not_a_file",
+                        "message": f"{path_arg!r} is not a regular file"})
+
+    max_bytes = int(args.get("max_bytes") or _PEEK_MAX_DEFAULT)
+    if max_bytes > _PEEK_MAX_HARD:
+        max_bytes = _PEEK_MAX_HARD
+    if max_bytes < 1:
+        max_bytes = _PEEK_MAX_DEFAULT
+
+    contents = full.read_text(errors="replace")[:max_bytes]
+    return _result({"status": "ok", "path": path_arg, "contents": contents})
+
+
+def _walk_workspace_tree(root, *, max_depth: int) -> list[dict]:
+    out: list[dict] = []
+    def _walk(d, depth):
+        if depth > max_depth:
+            return []
+        children: list[dict] = []
+        try:
+            for e in sorted(os.scandir(d), key=lambda e: e.name):
+                entry = {"name": e.name,
+                         "type": "dir" if e.is_dir() else "file"}
+                if e.is_dir() and depth < max_depth:
+                    entry["children"] = _walk(e.path, depth + 1)
+                children.append(entry)
+        except OSError:
+            pass
+        return children
+    out = _walk(str(root), 1)
+    return out
+
+
 # Module-level tool registry — iterated by create_casa_tools() for the SDK
 # path and by the MCP HTTP bridge (mcp_bridge._build_tool_dispatch) for
 # real `claude` CLI engagements. Adding a tool here exposes it on both
@@ -1308,6 +1500,9 @@ CASA_TOOLS: tuple = (
     config_git_commit,
     casa_reload,
     casa_reload_triggers,
+    list_engagement_workspaces,
+    delete_engagement_workspace,
+    peek_engagement_workspace,
 )
 
 
