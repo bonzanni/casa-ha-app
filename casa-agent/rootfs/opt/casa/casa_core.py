@@ -797,24 +797,31 @@ async def main() -> None:
         telegram_channel._observer = observer
 
         async def _driver_send_user_turn(rec, text):
-            await engagement_driver.send_user_turn(rec, text)
+            if rec.driver == "claude_code":
+                await claude_code_driver.send_user_turn(rec, text)
+            else:
+                await engagement_driver.send_user_turn(rec, text)
         telegram_channel._driver_send_user_turn = _driver_send_user_turn
 
         async def _finalize_cancel(rec, reason="user"):
             from tools import _finalize_engagement
+            driver = (claude_code_driver if rec.driver == "claude_code"
+                      else engagement_driver)
             await _finalize_engagement(
                 rec, outcome="cancelled", text=f"Cancelled by {reason}.",
                 artifacts=[], next_steps=[],
-                driver=engagement_driver, memory_provider=base_memory,
+                driver=driver, memory_provider=base_memory,
             )
         telegram_channel._finalize_cancel = _finalize_cancel
 
         async def _finalize_complete_user(rec):
             from tools import _finalize_engagement
+            driver = (claude_code_driver if rec.driver == "claude_code"
+                      else engagement_driver)
             await _finalize_engagement(
                 rec, outcome="completed", text="User-marked complete.",
                 artifacts=[], next_steps=[],
-                driver=engagement_driver, memory_provider=base_memory,
+                driver=driver, memory_provider=base_memory,
             )
         telegram_channel._finalize_complete_user = _finalize_complete_user
 
