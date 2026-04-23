@@ -230,3 +230,8 @@ class TestProvisionWithHooks:
         )
         assert "PreToolUse" in settings["hooks"]
         assert settings["hooks"]["PreToolUse"][0]["matcher"] == "Write|Edit"
+        entry = settings["hooks"]["PreToolUse"][0]
+        assert entry["hooks"][0]["type"] == "command"
+        assert entry["hooks"][0]["command"].endswith(
+            "hook_proxy.sh casa_config_guard"
+        )
