@@ -193,7 +193,7 @@ class TestEngageExecutorReal:
 
 
 class TestEngageExecutorClaudeCode:
-    @pytest.mark.skip(reason="Full wiring test — covered by D-block E2E in Phase G")
+    @pytest.mark.skip(reason="TODO(Phase G): Full wiring test — covered by D-block E2E")
     async def test_dispatches_to_claude_code_driver(self, monkeypatch, tmp_path):
         """When executor.driver == 'claude_code', engage_executor calls the
         claude_code driver with the ExecutorDefinition as options."""
