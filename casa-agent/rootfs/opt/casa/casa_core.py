@@ -1208,6 +1208,21 @@ async def main() -> None:
         replace_existing=True,
         misfire_grace_time=3600,
     )
+    # Plan 4a.1 §8: workspace sweeper — every 6 hours, removes terminal
+    # engagement workspaces past retention.
+    from drivers.workspace import _sweep_workspaces as _sweep_ws
+    scheduler.add_job(
+        lambda: asyncio.create_task(
+            _sweep_ws(engagements_root="/data/engagements")
+        ),
+        trigger="interval",
+        id="workspace_sweep",
+        hours=6,
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
     scheduler.start()
 
     # 15. Graceful shutdown
