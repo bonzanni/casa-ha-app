@@ -18,14 +18,21 @@ fi
 
 PAYLOAD="$(cat)"
 
+# Build the request body with jq so $POLICY is safely encoded regardless of
+# special characters, and $PAYLOAD is parsed as JSON (not re-encoded as a
+# string). jq is present in the Casa image.
+BODY=$(jq -nc --arg p "$POLICY" --argjson pl "$PAYLOAD" \
+       '{"policy":$p,"payload":$pl}') || {
+  echo '{"decision": "block", "reason": "hook_proxy: malformed payload"}'
+  exit 0
+}
+
 RESP=$(curl -sf -X POST \
      -H "Content-Type: application/json" \
-     --data-binary "{\"policy\":\"$POLICY\",\"payload\":$PAYLOAD}" \
+     --data-binary "$BODY" \
      "http://127.0.0.1:8080/hooks/resolve" 2>&1) || {
-  # On any transport error, allow by default -- the hook should not block
-  # the engagement if Casa is unreachable (fail-open). Logged on Casa's side
-  # via the hooks endpoint noting missed traffic would be ideal but is
-  # future work.
+  # On any transport error, allow by default — the hook should not block
+  # the engagement if Casa is unreachable (fail-open).
   echo '{"decision": "allow", "reason": "hook_proxy: casa unreachable"}'
   exit 0
 }
