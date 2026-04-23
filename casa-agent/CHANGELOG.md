@@ -1,17 +1,67 @@
 # Changelog
 
-## [0.13.0] — 2026-04-XX
+## [0.13.0] — 2026-04-23
 
 ### Added
-- **Plan 4a Phase F:** Tier 1 baseline plugin pack `superpowers@v5.0.7`
-  bundled at `/opt/casa/claude-plugins/base/superpowers/`. Auto-symlinked
-  into every `claude_code`-driver engagement's isolated `$HOME` at
-  provisioning time (§7.1/§7.2 of the Plan 4a design spec).
-- **Plan 4a Phase F:** `/data/casa-s6-services/` and `/data/engagements/`
-  directories pre-created by `setup-configs.sh` on every boot.
-- **Plan 4a Phase F:** `hello-driver` executor defaults at
-  `defaults/agents/executors/hello-driver/` — disposable test-harness
-  type for Phase G E2E validation of the `claude_code` driver end-to-end.
+- **Plan 4a — `claude_code` driver.** Replaces the v0.11.0 stub.
+  Per-engagement s6-rc-supervised `claude` CLI process (instead of
+  Casa-main child) — engagement subprocesses outlive Casa-main restarts.
+  New modules: `drivers/s6_rc.py`, `drivers/workspace.py`,
+  `drivers/hook_bridge.py`, `scripts/hook_proxy.sh`,
+  `scripts/engagement_run_template.sh`.
+- **Remote control infrastructure.** Each engagement posts its
+  `--remote-control` URL to the Telegram topic when it becomes available;
+  users can attach via Claude iOS app or claude.ai/code and drive the
+  engagement from anywhere.
+- **Tier 1 baseline plugin pack.** `superpowers@v5.0.7` bundled at
+  `/opt/casa/claude-plugins/base/superpowers/`. Symlinked into every
+  `claude_code`-driver engagement's isolated `$HOME` at provisioning.
+- **`hello-driver` test harness executor type.** `enabled: false`;
+  validates the driver lifecycle in CI via mock CLI.
+- **Boot replay for UNDERGOING engagements.** `replay_undergoing_engagements`
+  in `casa_core.py` sweeps orphan service dirs, recompiles the s6 db,
+  starts each UNDERGOING engagement's service, and spawns URL-capture +
+  respawn-poller tasks.
+- **Transcript archival to Honcho keyed by executor type.** Retrofits
+  the already-shipped v0.12.0 Configurator — every engagement's completion
+  summary lands under peer `executor:<type>` for future "Ellen primes a
+  new engagement with past lessons" (Plan 4b+).
+- **`/hooks/resolve` loopback endpoint.** Routes CC hook decisions through
+  Casa's `HOOK_POLICIES` registry via `hook_proxy.sh` — same policy code
+  governs `in_casa` and `claude_code` executors.
+- **Sensitive-env blocklist.** The per-engagement `run` script unsets
+  `TELEGRAM_BOT_TOKEN` / `HONCHO_API_KEY` / `WEBHOOK_SECRET` /
+  `SUPERVISOR_TOKEN` / `HASSIO_TOKEN` before spawning the CLI.
+  `CLAUDE_CODE_OAUTH_TOKEN` is preserved (CLI needs it). Future sensitive
+  vars must be added to this list in the same commit.
+
+### Changed
+- `ExecutorDefinition` gains four optional fields: `extra_dirs`,
+  `mirror_chat_to_topic`, `archive_session_full`, `plugins_dir`.
+- `engage_executor` now dispatches to the `claude_code` driver for
+  `driver: claude_code` executor types instead of raising NotImplementedError.
+- `_finalize_engagement` now routes `driver.cancel()` to the per-engagement
+  driver based on `engagement.driver`.
+
+### Infrastructure
+- Dockerfile clones superpowers at build time (adds ~30 MB to image).
+- `setup-configs.sh` pre-creates `/data/casa-s6-services/` and
+  `/data/engagements/`.
+
+### Notes
+- §10.2 of the design spec — `emit_completion` landing during a Casa-main
+  restart's ~30s MCP blip is a known sharp edge in v0.13.0. If Plan 4a.1
+  spike-milestone-3 discovers the CLI's MCP client is optimistic (silently
+  drops the call on connection loss), ROADMAP 3.6 (`casa-framework` MCP
+  extraction to its own s6 service) is re-prioritized as a co-requisite
+  before Plan 4b's `plugin-developer` ships. Until then: accept-the-gap.
+- `/hooks/resolve` endpoint routes policies through a pass-through stub
+  at the HTTP boundary; HOOK_POLICIES values are SDK HookMatcher factories
+  not directly HTTP-callable. Real enforcement via in-process hook
+  callbacks still works. Future iteration will ship an HTTP-native policy
+  layer.
+- TelegramChannel now skips InCasaDriver's resume/orphan logic for
+  `claude_code` engagements (which have no `sdk_session_id`).
 
 ## 0.12.0 — 2026-04-??
 
