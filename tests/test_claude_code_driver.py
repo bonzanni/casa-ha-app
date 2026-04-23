@@ -101,3 +101,131 @@ class TestStart:
         # Workspace provisioned
         assert (tmp_path / "engagements" / rec.id / "CLAUDE.md").exists()
         assert (tmp_path / "engagements" / rec.id / "stdin.fifo").exists()
+
+
+class TestURLCapture:
+    async def test_first_url_line_posts_to_topic(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path), base_plugins_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+        )
+        log = tmp_path / "log"
+        log.write_text("boot...\nRemote Control URL: https://r.test/abc\nmore\n")
+
+        rec = _make_record()
+        # capture_url reads new lines as they appear — for a test, we pre-write
+        # then run the coroutine with a short time budget.
+        task = asyncio.create_task(
+            drv._capture_url(rec, log_path=str(log), initial_window_s=1.0)
+        )
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # send_to_topic was called with the topic_id + a remote-control message.
+        sender.assert_awaited()
+        args, _ = sender.call_args
+        assert args[0] == rec.topic_id
+        assert "https://r.test/abc" in args[1]
+
+    async def test_duplicate_url_not_reposted(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path), base_plugins_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+        )
+        log = tmp_path / "log"
+        # Same URL twice
+        log.write_text(
+            "Remote Control URL: https://r.test/same\n"
+            "filler\n"
+            "Remote Control URL: https://r.test/same\n"
+        )
+
+        rec = _make_record()
+        task = asyncio.create_task(
+            drv._capture_url(rec, log_path=str(log), initial_window_s=1.0)
+        )
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try: await task
+        except asyncio.CancelledError: pass
+
+        # Only one post, not two
+        assert sender.await_count == 1
+
+
+class TestRespawnPoller:
+    async def test_emits_bus_event_on_pid_change(self, monkeypatch, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers import s6_rc
+
+        pids = iter([100, 100, 200, 200, 200])
+        async def fake_pid(*, engagement_id):
+            try:
+                return next(pids)
+            except StopIteration:
+                return 200
+        monkeypatch.setattr(s6_rc, "service_pid", fake_pid)
+
+        bus_events: list[dict] = []
+        async def fake_publish(*args, **kwargs):
+            bus_events.append({"args": args, "kwargs": kwargs})
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path), base_plugins_root=str(tmp_path),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="x",
+        )
+        drv._publish_bus_event = fake_publish     # dependency injection
+
+        rec = _make_record()
+        task = asyncio.create_task(
+            drv._poll_respawns(rec, interval_s=0.05)
+        )
+        await asyncio.sleep(0.4)        # enough ticks to see the 100 → 200 change
+        task.cancel()
+        try: await task
+        except asyncio.CancelledError: pass
+
+        # At least one subprocess_respawn event with previous=100, new=200
+        respawn = [e for e in bus_events if
+                   e["args"][0].get("type") == "subprocess_respawn"]
+        assert len(respawn) >= 1
+        assert respawn[0]["args"][0]["previous_pid"] == 100
+        assert respawn[0]["args"][0]["new_pid"] == 200
+
+
+class TestCancel:
+    async def test_cancel_stops_service_and_removes_dir(self, monkeypatch, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers import s6_rc
+
+        stopped: list[str] = []
+        async def fake_stop(*, engagement_id):
+            stopped.append(engagement_id)
+        async def fake_cau(): pass
+
+        monkeypatch.setattr(s6_rc, "stop_service", fake_stop)
+        monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+        monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(tmp_path / "svc"))
+        (tmp_path / "svc").mkdir()
+        (tmp_path / "svc" / "engagement-abc12345def67890").mkdir()
+        (tmp_path / "svc" / "engagement-abc12345def67890" / "type").write_text("longrun\n")
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "eng"), base_plugins_root=str(tmp_path),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+        await drv.cancel(rec)
+
+        assert stopped == [rec.id]
+        assert not (tmp_path / "svc" / f"engagement-{rec.id}").exists()
