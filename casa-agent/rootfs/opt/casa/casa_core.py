@@ -137,65 +137,94 @@ async def replay_undergoing_engagements(
 
 
 def _build_cc_hook_policies(hook_policies: dict) -> dict:
-    """Wrap SDK-level HOOK_POLICIES factories into HTTP-friendly sync callables.
+    """Build {policy_name: (matcher_regex, async_callback)} from HOOK_POLICIES.
 
-    HOOK_POLICIES values are factories(**kwargs) -> HookMatcher (SDK objects).
-    For the CC driver's /hooks/resolve endpoint we need simple
-    (payload: dict) -> dict functions that return {"decision": "allow"|"block"}.
+    Plan 4a.1: policies are now two-tier {matcher, factory}; we invoke each
+    factory with no kwargs (the HTTP path does not accept per-call params —
+    parameterization lives in the executor's hooks.yaml, which the SDK path
+    also consumes verbatim). Unknown-param executor hooks.yaml entries still
+    surface through the SDK-path's resolve_hooks validation at executor load
+    time; the HTTP path inherits whatever configuration the factory
+    with-defaults produces.
 
-    This function registers only the policies that make sense for the CC
-    driver context and wraps them with a default-allow stub (the heavy
-    enforcement logic lives inside the CC hook callbacks running inside the
-    sandbox; this endpoint is a lightweight gate for structured policy
-    decisions).
-
-    The stub allow-all wrapper is intentional: the HOOK_POLICIES factories
-    produce SDK HookMatcher objects that are not HTTP-callable.  A richer
-    bridge (running the async HookCallback coroutines against the payload)
-    can replace these stubs in a future iteration.
+    When an executor defines non-default hook parameters (e.g.
+    casa_config_guard.forbid_write_paths), the CC driver path currently
+    uses the factory defaults. This is acceptable for v0.13.1 because the
+    only in-tree executor-hooks config is the Configurator's, and its
+    defaults match what the executor wants. Wiring per-executor params
+    into the HTTP path is a later item.
     """
     cc_policies: dict = {}
-    for name in hook_policies:
-        def _allow_stub(payload: dict, _name: str = name) -> dict:
-            return {"decision": "allow",
-                    "reason": f"{_name}: cc-http-stub (pass-through)"}
-        cc_policies[name] = _allow_stub
+    for name, entry in hook_policies.items():
+        matcher = entry["matcher"]
+        callback = entry["factory"]()  # default-configured HookCallback
+        cc_policies[name] = (matcher, callback)
     return cc_policies
 
 
 def _make_hooks_resolve_handler(*, hook_policies: dict):
     """Build the /hooks/resolve aiohttp handler.
 
-    hook_policies maps policy-name -> callable(payload: dict) -> dict.
-    Decision shape is {"decision": "allow" | "block", "reason": str?}.
+    hook_policies maps policy-name -> (matcher_regex, async_callback).
+    The callback is the same HookCallback used on the SDK path; its return
+    dict (or None) is the CC-native hook response body.
     """
+    import re as _re
+
     async def handler(request: web.Request) -> web.Response:
         try:
             body = await request.json()
         except Exception:
             return web.json_response(
-                {"decision": "block", "reason": "bad json"}, status=200,
+                {"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "hooks.resolve: malformed JSON",
+                }},
+                status=200,
             )
+
         policy_name = body.get("policy")
         payload = body.get("payload") or {}
 
-        policy_fn = hook_policies.get(policy_name)
-        if policy_fn is None:
-            return web.json_response({
-                "decision": "block",
-                "reason": f"unknown policy: {policy_name}",
-            }, status=200)
+        entry = hook_policies.get(policy_name)
+        if entry is None:
+            return web.json_response(
+                {"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": f"unknown policy: {policy_name}",
+                }},
+                status=200,
+            )
+        matcher_regex, callback = entry
+
+        # Defensive matcher gate — the CC client already filtered by
+        # settings.json matcher, but re-check here so a misconfigured shim
+        # doesn't accidentally invoke a policy on the wrong tool.
+        tool_name = payload.get("tool_name", "")
+        if not _re.fullmatch(matcher_regex, tool_name):
+            return web.json_response({}, status=200)  # empty = allow
+
         try:
-            result = policy_fn(payload)
-            if not isinstance(result, dict) or "decision" not in result:
-                result = {"decision": "block",
-                          "reason": "malformed policy result"}
-            return web.json_response(result, status=200)
+            result = await callback(payload, None, {})
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({
-                "decision": "block",
-                "reason": f"policy {policy_name!r} raised: {exc}",
-            }, status=200)
+            return web.json_response(
+                {"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason":
+                        f"policy {policy_name!r} raised: {exc}",
+                }},
+                status=200,
+            )
+
+        # None from HookCallback → allow (empty body).
+        if result is None:
+            return web.json_response({}, status=200)
+        # Otherwise return the CC-native response (already shaped by _deny).
+        return web.json_response(result, status=200)
+
     return handler
 
 

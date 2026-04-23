@@ -30,7 +30,7 @@ BODY=$(jq -nc --arg p "$POLICY" --argjson pl "$PAYLOAD" \
 RESP=$(curl -sf -X POST \
      -H "Content-Type: application/json" \
      --data-binary "$BODY" \
-     "http://127.0.0.1:8080/hooks/resolve" 2>&1) || {
+     "http://127.0.0.1:8099/hooks/resolve" 2>&1) || {
   # On any transport error, allow by default — the hook should not block
   # the engagement if Casa is unreachable (fail-open).
   echo '{"decision": "allow", "reason": "hook_proxy: casa unreachable"}'
