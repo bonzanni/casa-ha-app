@@ -138,10 +138,36 @@ class ClaudeSDKClient:
         )
 
 
+class SdkMcpTool:
+    """Mock of claude_agent_sdk.SdkMcpTool.
+
+    Real SDK's @tool decorator wraps an async function into a dataclass with
+    ``name``, ``description``, ``input_schema``, ``handler`` attributes.
+    v0.13.1's mcp_bridge._build_tool_dispatch iterates CASA_TOOLS expecting
+    each entry to have ``.name`` and ``.handler`` — without this shim the
+    mock dropped the decorator silently and callers got raw function objects.
+    """
+
+    def __init__(self, name: str, description: str, input_schema, handler):
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+        self.handler = handler
+
+    def __call__(self, *args, **kwargs):
+        # Some call sites invoke the decorated function directly (SDK path).
+        return self.handler(*args, **kwargs)
+
+
 def tool(name: str, description: str, params: dict[str, Any]) -> Any:
-    """Mock decorator for @tool. Just returns the wrapped function unchanged."""
+    """Mock decorator for @tool. Wraps the async function into an SdkMcpTool-shaped
+    object so duck-typing on ``.name``/``.description``/``.input_schema``/``.handler``
+    works across the SDK and HTTP bridge paths."""
     def decorator(func):
-        return func
+        return SdkMcpTool(
+            name=name, description=description,
+            input_schema=params, handler=func,
+        )
     return decorator
 
 
@@ -184,6 +210,7 @@ __all__ = [
     "HookMatcher",
     "ProcessError",
     "ResultMessage",
+    "SdkMcpTool",
     "SystemMessage",
     "TextBlock",
     "tool",
