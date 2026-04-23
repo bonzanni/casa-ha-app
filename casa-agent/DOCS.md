@@ -442,6 +442,32 @@ HTTP exfil via any allowed tool). The real perimeter is **trust in the
 executor's prompt scope and minimal `tools.allowed` list**. Do not engage
 a `claude_code` executor with a prompt from an untrusted source.
 
+### Known limitations (v0.13.0)
+
+The v0.13.0 ship is **infrastructure-only**. The following integration
+points are stubbed for a real Claude CLI subprocess and will land in
+Plan 4a.1:
+
+- **MCP HTTP bridge.** `.mcp.json` points at `http://127.0.0.1:8099/mcp/casa-framework`,
+  but that route is not yet served by Casa's aiohttp app. A real `claude`
+  subprocess would fail its MCP handshake. The mock CLI used in CI does
+  not exercise the HTTP path — it prints tool-use JSON to stdout. Plan 4a.1
+  adds an aiohttp MCP JSON-RPC bridge + `X-Casa-Engagement-Id` header
+  propagation so `emit_completion` / `query_engager` can resolve the
+  calling engagement.
+
+- **`/hooks/resolve` policy enforcement.** Current implementation registers
+  pass-through allow-stubs for all `HOOK_POLICIES` names because the
+  registry values are SDK `HookMatcher` factories, not
+  `(payload: dict) -> dict` callables. Real enforcement through CC hooks
+  requires an HTTP-native policy layer (future work). In-process hook
+  enforcement for `in_casa` engagements is unaffected.
+
+- **Boot replay missing-service-dir heal.** If a `claude_code` engagement's
+  service dir is deleted while Casa is stopped, boot replay logs a warning
+  but does not recreate the service. The engagement stays UNDERGOING until
+  manually cancelled. Plan 4a.1 tracks this as §6.5 (workspace sweeper).
+
 ### Boot replay
 
 On Casa boot, `replay_undergoing_engagements` reconstructs the s6

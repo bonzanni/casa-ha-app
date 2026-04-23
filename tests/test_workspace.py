@@ -60,6 +60,15 @@ class TestRenderRunScript:
         assert "{EXTRA_UNSET}" not in out
 
 
+    def test_render_log_run_script(self):
+        from drivers.workspace import render_log_run_script
+
+        script = render_log_run_script(engagement_id="xxxxxxxxxxxxxxxx")
+        assert script.startswith("#!/command/with-contenv sh\n")
+        assert "mkdir -p /var/log/casa-engagement-xxxxxxxxxxxxxxxx" in script
+        assert "exec s6-log n20 s1000000 /var/log/casa-engagement-xxxxxxxxxxxxxxxx" in script
+
+
 class TestProvisionWorkspace:
     def _make_defn(self, tmp_path, executor_type="hello-driver", plugins=None):
         """Build an ExecutorDefinition stub for workspace tests."""

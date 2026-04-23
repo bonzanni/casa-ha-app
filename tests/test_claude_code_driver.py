@@ -197,7 +197,7 @@ class TestRespawnPoller:
 
         # At least one subprocess_respawn event with previous=100, new=200
         respawn = [e for e in bus_events if
-                   e["args"][0].get("type") == "subprocess_respawn"]
+                   e["args"][0].get("event") == "subprocess_respawn"]
         assert len(respawn) >= 1
         assert respawn[0]["args"][0]["previous_pid"] == 100
         assert respawn[0]["args"][0]["new_pid"] == 200

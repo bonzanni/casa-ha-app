@@ -35,6 +35,30 @@ class TestWriteServiceDir:
         assert (svc_dir / "dependencies.d" / "init-setup-configs").exists()
 
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="chmod exec-bits not meaningful on Windows")
+    async def test_writes_log_subservice_when_log_script_provided(self, tmp_path):
+        from drivers.s6_rc import write_service_dir
+
+        svc_root = tmp_path / "casa-s6-services"
+        svc_root.mkdir()
+
+        write_service_dir(
+            svc_root=str(svc_root),
+            engagement_id="abc12345",
+            run_script="#!/command/with-contenv sh\nexec true\n",
+            depends_on=[],
+            log_run_script="#!/command/with-contenv sh\nexec s6-log /var/log/casa-engagement-abc12345/\n",
+        )
+
+        log_dir = svc_root / "engagement-abc12345" / "log"
+        assert log_dir.is_dir()
+        assert (log_dir / "type").read_text() == "longrun\n"
+        assert (log_dir / "run").is_file()
+        mode = os.stat(log_dir / "run").st_mode
+        assert mode & stat.S_IXUSR
+        assert (log_dir / "dependencies.d" / "engagement-abc12345").exists()
+
+
 class TestRemoveServiceDir:
     async def test_removes_existing_dir(self, tmp_path):
         from drivers.s6_rc import remove_service_dir, write_service_dir

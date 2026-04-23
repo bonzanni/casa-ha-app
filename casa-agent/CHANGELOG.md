@@ -62,6 +62,17 @@
   layer.
 - TelegramChannel now skips InCasaDriver's resume/orphan logic for
   `claude_code` engagements (which have no `sdk_session_id`).
+- **MCP HTTP bridge deferred to Plan 4a.1.** The `casa-framework` MCP server
+  is currently an in-process SDK server (via `create_sdk_mcp_server`) with
+  no HTTP surface. `ClaudeCodeDriver` writes `.mcp.json` pointing at
+  `http://127.0.0.1:8099/mcp/casa-framework`, but that route is not yet
+  implemented. The v0.13.0 infrastructure (s6-rc, workspace, boot replay,
+  hook bridge, hello-driver) is fully reviewed and green in CI via the
+  mock CLI, but a real `claude` CLI subprocess cannot yet reach the Casa
+  MCP tools. Plan 4a.1 will add an aiohttp MCP JSON-RPC bridge at
+  `/mcp/casa-framework` and propagate engagement context via an
+  `X-Casa-Engagement-Id` request header so `emit_completion` /
+  `query_engager` can resolve the calling engagement.
 
 ## 0.12.0 — 2026-04-??
 

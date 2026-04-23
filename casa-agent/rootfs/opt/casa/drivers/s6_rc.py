@@ -26,9 +26,12 @@ LIVE_DB_SYMLINK = "/run/s6-rc/compiled"
 
 def write_service_dir(
     *, svc_root: str, engagement_id: str, run_script: str,
-    depends_on: list[str],
+    depends_on: list[str], log_run_script: str | None = None,
 ) -> str:
     """Create /<svc_root>/engagement-<id>/ with type/run/dependencies.d/.
+
+    When log_run_script is provided, also create a log/ child service dir
+    (type=longrun) so s6-log routes stdout to /var/log/casa-engagement-<id>/.
 
     Returns the full path to the service dir.
     """
@@ -42,6 +45,18 @@ def write_service_dir(
     deps_dir.mkdir()
     for dep in depends_on:
         (deps_dir / dep).touch()
+
+    if log_run_script is not None:
+        log_dir = svc_dir / "log"
+        log_dir.mkdir()
+        (log_dir / "type").write_text("longrun\n")
+        log_run_path = log_dir / "run"
+        log_run_path.write_text(log_run_script)
+        log_run_path.chmod(log_run_path.stat().st_mode | stat.S_IXUSR)
+        (log_dir / "dependencies.d").mkdir()
+        # Ordering — log dep on the main engagement service so it starts first.
+        (log_dir / "dependencies.d" / f"engagement-{engagement_id}").touch()
+
     return str(svc_dir)
 
 

@@ -45,6 +45,22 @@ def render_run_script(
     )
 
 
+def render_log_run_script(*, engagement_id: str) -> str:
+    """Render an s6-log run script for an engagement's stdout capture.
+
+    The resulting script routes the engagement service's stdout to
+    /var/log/casa-engagement-<id>/current, rotating at 1MB with up to 20
+    archive files. This is consumed by drivers.claude_code_driver._capture_url
+    via readline tailing.
+    """
+    return (
+        "#!/command/with-contenv sh\n"
+        "set -e\n"
+        f"mkdir -p /var/log/casa-engagement-{engagement_id}\n"
+        f"exec s6-log n20 s1000000 /var/log/casa-engagement-{engagement_id}\n"
+    )
+
+
 async def provision_workspace(
     *,
     engagements_root: str,

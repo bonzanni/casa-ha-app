@@ -779,6 +779,9 @@ async def engage_executor(args: dict) -> dict:
             logger.exception(
                 "claude_code driver.start failed for %s", rec.id[:8],
             )
+            await _engagement_registry.mark_error(
+                rec.id, kind="driver_start_failed", message=str(exc),
+            )
             return _result({
                 "status": "error", "kind": "driver_start_failed",
                 "message": str(exc),
