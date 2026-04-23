@@ -1257,12 +1257,28 @@ async def casa_reload_triggers(args: dict) -> dict:
     })
 
 
+# Module-level tool registry — iterated by create_casa_tools() for the SDK
+# path and by the MCP HTTP bridge (mcp_bridge._build_tool_dispatch) for
+# real `claude` CLI engagements. Adding a tool here exposes it on both
+# transports automatically.
+CASA_TOOLS: tuple = (
+    send_message,
+    delegate_to_specialist,
+    get_schedule,
+    engage_executor,
+    emit_completion,
+    cancel_engagement,
+    query_engager,
+    config_git_commit,
+    casa_reload,
+    casa_reload_triggers,
+)
+
+
 def create_casa_tools() -> dict[str, Any]:
     """Create and return the casa-framework MCP server config."""
     server = create_sdk_mcp_server(
         name="casa-framework",
-        tools=[send_message, delegate_to_specialist, get_schedule, engage_executor,
-               emit_completion, cancel_engagement, query_engager,
-               config_git_commit, casa_reload, casa_reload_triggers],
+        tools=list(CASA_TOOLS),
     )
     return server
