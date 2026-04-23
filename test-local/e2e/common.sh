@@ -75,6 +75,29 @@ assert_log_not_contains() {
     fi
 }
 
+# Build a test-only image that overrides /usr/bin/claude with the mock CLI
+# from test-local/mock-claude-cli/claude. Used by the D-block engagement
+# tests in test_engagement.sh when CASA_USE_MOCK_CLAUDE=1.
+build_image_with_mock_cli() {
+    local repo_root
+    repo_root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
+    local tag="$IMAGE"
+    build_image          # build the standard Casa image first
+
+    # Overlay the mock CLI on top with a tiny derivative Dockerfile.
+    local derivative
+    derivative="$(mktemp -d)"
+    cat > "$derivative/Dockerfile" <<EOF
+FROM ${tag}
+COPY mock-claude /usr/bin/claude
+RUN chmod +x /usr/bin/claude
+EOF
+    cp "$repo_root/test-local/mock-claude-cli/claude" "$derivative/mock-claude"
+    MSYS_NO_PATHCONV=1 docker build -q -t "$tag" "$derivative" >/dev/null
+    rm -rf "$derivative"
+    log "Overlaid mock claude CLI on $tag"
+}
+
 # wait_for_text_in_log <container> <pattern> [timeout_s]
 # Polls `docker logs` until *pattern* (grep -E, fixed regex ok) appears.
 # Returns 0 on match, 1 on timeout. Unlike assert_log_contains this never
