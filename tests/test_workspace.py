@@ -41,3 +41,18 @@ class TestRenderRunScript:
         )
         assert "--add-dir /data/engagements/xxxxxxxxxxxxxxxx/" in out
         assert "--permission-mode dontAsk" in out
+
+    def test_extra_unset_names_appear_in_unset_line(self):
+        from drivers.workspace import render_run_script
+
+        out = render_run_script(
+            engagement_id="xxxxxxxxxxxxxxxx",
+            permission_mode="dontAsk",
+            extra_dirs=[],
+            extra_unset=["MY_SECRET", "ANOTHER_TOKEN"],
+        )
+        # The template unsets base secrets then "{EXTRA_UNSET}" — after
+        # rendering, the extras should appear in the unset command.
+        assert "MY_SECRET" in out
+        assert "ANOTHER_TOKEN" in out
+        assert "{EXTRA_UNSET}" not in out
