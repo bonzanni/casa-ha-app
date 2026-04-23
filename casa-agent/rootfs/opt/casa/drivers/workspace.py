@@ -55,6 +55,14 @@ async def provision_workspace(
 
     Returns the absolute workspace path. Caller must NOT create the
     directory first — this function does.
+
+    Note: filesystem I/O (mkdir, write_text, os.symlink, os.mkfifo) is
+    currently synchronous despite the ``async def`` surface. The cost
+    per engagement-start (one-time provisioning of a few files + one
+    FIFO + a handful of symlinks) is well under 10ms on the N150, so the
+    brief event-loop stall is acceptable. If profiling later shows
+    otherwise, wrap the filesystem calls in ``asyncio.to_thread`` to
+    match the pattern in ``drivers/s6_rc.py``.
     """
     ws = Path(engagements_root) / engagement_id
     ws.mkdir(parents=True, exist_ok=False)
@@ -145,5 +153,13 @@ def load_casa_meta(workspace_path: str) -> dict | None:
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError:
+        logger.warning(
+            "load_casa_meta: %s is not valid JSON — treating as absent", path,
+        )
+        return None
+    except OSError:
+        logger.warning(
+            "load_casa_meta: I/O error reading %s", path, exc_info=True,
+        )
         return None
