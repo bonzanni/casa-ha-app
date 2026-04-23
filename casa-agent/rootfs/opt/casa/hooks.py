@@ -193,52 +193,6 @@ def make_casa_config_guard_hook(
     return _hook
 
 
-def _policy_casa_config_guard(**kwargs: Any):
-    from claude_agent_sdk import HookMatcher
-    forbid_write_paths = kwargs.pop("forbid_write_paths", None)
-    forbid_delete_residents = kwargs.pop("forbid_delete_residents", True)
-    if kwargs:
-        raise UnknownPolicyError(
-            f"casa_config_guard: unknown parameter(s) {list(kwargs)}; "
-            f"supported: forbid_write_paths, forbid_delete_residents"
-        )
-    return HookMatcher(
-        matcher="Write|Edit|Bash",
-        hooks=[make_casa_config_guard_hook(
-            forbid_write_paths=forbid_write_paths,
-            forbid_delete_residents=forbid_delete_residents,
-        )],
-    )
-
-
-# HOOK_POLICIES — name → (HookMatcher-factory that takes kwargs and returns
-# HookMatcher). The agent_loader resolves `hooks.yaml::pre_tool_use` entries
-# through this table.
-
-def _policy_block_dangerous_bash(**kwargs: Any):
-    from claude_agent_sdk import HookMatcher
-    if kwargs:
-        raise UnknownPolicyError(
-            f"block_dangerous_bash takes no parameters; got {list(kwargs)}"
-        )
-    return HookMatcher(matcher="Bash", hooks=[block_dangerous_commands])
-
-
-def _policy_path_scope(**kwargs: Any):
-    from claude_agent_sdk import HookMatcher
-    writable = kwargs.pop("writable", None)
-    readable = kwargs.pop("readable", None)
-    if kwargs:
-        raise UnknownPolicyError(
-            f"path_scope: unknown parameter(s) {list(kwargs)}; "
-            f"supported: writable, readable"
-        )
-    return HookMatcher(
-        matcher="Read|Write|Edit",
-        hooks=[make_path_scope_hook_v2(writable=writable, readable=readable)],
-    )
-
-
 # ---------------------------------------------------------------------------
 # commit_size_guard - Plan 3 (asks user before batch commits > N files)
 # ---------------------------------------------------------------------------
@@ -288,41 +242,96 @@ def make_commit_size_guard_hook(*, max_files: int) -> HookCallback:
     return _hook
 
 
-def _policy_commit_size_guard(**kwargs: Any):
-    from claude_agent_sdk import HookMatcher
+# ---------------------------------------------------------------------------
+# HOOK_POLICIES — two-tier registry (Plan 4a.1).
+#
+# Each entry is {"matcher": regex, "factory": fn(**kwargs) -> HookCallback}.
+# The "matcher" regex names the CC tool names the policy applies to; it's
+# used identically by both consumers:
+#   - SDK path (resolve_hooks below) passes it to HookMatcher(matcher=...).
+#   - HTTP path (_build_cc_hook_policies in casa_core.py) gates the
+#     HookCallback invocation on the CC tool name before dispatching.
+# The "factory" returns a raw async HookCallback — the same coroutine shape
+# produced by make_*_hook_* helpers above. Both consumers call it directly.
+# ---------------------------------------------------------------------------
+
+
+def _block_dangerous_bash_factory(**kwargs: Any) -> HookCallback:
+    if kwargs:
+        raise UnknownPolicyError(
+            f"block_dangerous_bash takes no parameters; got {list(kwargs)}"
+        )
+    return block_dangerous_commands
+
+
+def _path_scope_factory(**kwargs: Any) -> HookCallback:
+    writable = kwargs.pop("writable", None)
+    readable = kwargs.pop("readable", None)
+    if kwargs:
+        raise UnknownPolicyError(
+            f"path_scope: unknown parameter(s) {list(kwargs)}; "
+            f"supported: writable, readable"
+        )
+    return make_path_scope_hook_v2(writable=writable, readable=readable)
+
+
+def _casa_config_guard_factory(**kwargs: Any) -> HookCallback:
+    forbid_write_paths = kwargs.pop("forbid_write_paths", None)
+    forbid_delete_residents = kwargs.pop("forbid_delete_residents", True)
+    if kwargs:
+        raise UnknownPolicyError(
+            f"casa_config_guard: unknown parameter(s) {list(kwargs)}; "
+            f"supported: forbid_write_paths, forbid_delete_residents"
+        )
+    return make_casa_config_guard_hook(
+        forbid_write_paths=forbid_write_paths,
+        forbid_delete_residents=forbid_delete_residents,
+    )
+
+
+def _commit_size_guard_factory(**kwargs: Any) -> HookCallback:
     max_files = int(kwargs.pop("max_files", 20))
     if kwargs:
         raise UnknownPolicyError(
             f"commit_size_guard: unknown parameter(s) {list(kwargs)}; "
             f"supported: max_files"
         )
-    return HookMatcher(
-        matcher="Write|Edit",
-        hooks=[make_commit_size_guard_hook(max_files=max_files)],
-    )
+    return make_commit_size_guard_hook(max_files=max_files)
 
 
-HOOK_POLICIES: dict[str, Callable[..., Any]] = {
-    "block_dangerous_bash": _policy_block_dangerous_bash,
-    "path_scope":           _policy_path_scope,
-    "casa_config_guard":    _policy_casa_config_guard,
-    "commit_size_guard":    _policy_commit_size_guard,
+HOOK_POLICIES: dict[str, dict[str, Any]] = {
+    "block_dangerous_bash": {
+        "matcher": "Bash",
+        "factory": _block_dangerous_bash_factory,
+    },
+    "path_scope": {
+        "matcher": "Read|Write|Edit",
+        "factory": _path_scope_factory,
+    },
+    "casa_config_guard": {
+        "matcher": "Write|Edit|Bash",
+        "factory": _casa_config_guard_factory,
+    },
+    "commit_size_guard": {
+        "matcher": "Write|Edit",
+        "factory": _commit_size_guard_factory,
+    },
 }
 
 
 def resolve_hooks(
-    config: "HooksConfig",   # forward-ref — imported lazily below
+    config: "HooksConfig",
     *,
     default_cwd: str,
 ) -> dict[str, list[Any]]:
     """Turn a HooksConfig into ``{"PreToolUse": [HookMatcher, ...]}``.
 
-    When ``config.pre_tool_use`` is empty, the default policy bundle is
-    applied: ``block_dangerous_bash`` + ``path_scope`` scoped to the
-    agent's ``default_cwd``. When it is non-empty, every entry is
-    resolved through :data:`HOOK_POLICIES` and unknown policy names
-    raise :class:`UnknownPolicyError`.
+    Builds SDK HookMatcher objects from the two-tier HOOK_POLICIES shape.
+    The factory returns a raw HookCallback; HookMatcher wraps it with the
+    policy's matcher regex.
     """
+    from claude_agent_sdk import HookMatcher
+
     matchers: list[Any] = []
     entries = list(config.pre_tool_use or [])
 
@@ -336,13 +345,17 @@ def resolve_hooks(
 
     for entry in entries:
         policy_name = entry.get("policy")
-        factory = HOOK_POLICIES.get(policy_name)
-        if factory is None:
+        policy = HOOK_POLICIES.get(policy_name)
+        if policy is None:
             raise UnknownPolicyError(
                 f"unknown hook policy {policy_name!r}; "
                 f"available: {sorted(HOOK_POLICIES)}"
             )
         params = {k: v for k, v in entry.items() if k != "policy"}
-        matchers.append(factory(**params))
+        callback = policy["factory"](**params)
+        matchers.append(HookMatcher(
+            matcher=policy["matcher"],
+            hooks=[callback],
+        ))
 
     return {"PreToolUse": matchers}
