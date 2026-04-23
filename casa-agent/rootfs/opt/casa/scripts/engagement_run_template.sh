@@ -2,6 +2,7 @@
 # Casa claude_code engagement run script.
 # Substitutions performed by drivers.workspace.render_run_script():
 #   {ID}             — engagement id (hex uuid)
+#   {ID_SHORT}       — first 8 chars of engagement id (remote-control slug)
 #   {PERMISSION_MODE}— permission-mode flag value
 #   {ADD_DIR_FLAGS}  — space-joined --add-dir <path> flags
 #   {EXTRA_UNSET}    — additional space-separated env var names to unset
