@@ -66,7 +66,7 @@ async def healthz(_request: web.Request) -> web.Response:
 
 
 async def replay_undergoing_engagements(
-    *, registry, driver, engagements_root: str,
+    *, registry, driver,
 ) -> None:
     """On Casa boot: reconstruct s6 services for UNDERGOING claude_code engagements.
 
@@ -78,8 +78,8 @@ async def replay_undergoing_engagements(
     from drivers import s6_rc
 
     undergoing = [
-        r for r in registry._records.values()
-        if r.driver == "claude_code" and r.status in ("active", "idle")
+        r for r in registry.active_and_idle()
+        if r.driver == "claude_code"
     ]
     keep_ids = {r.id for r in undergoing}
 
@@ -775,7 +775,6 @@ async def main() -> None:
         await replay_undergoing_engagements(
             registry=engagement_registry,
             driver=claude_code_driver,
-            engagements_root="/data/engagements",
         )
     except Exception as exc:  # noqa: BLE001
         logger.error(

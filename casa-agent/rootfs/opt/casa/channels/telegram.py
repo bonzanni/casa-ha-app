@@ -478,8 +478,10 @@ class TelegramChannel(Channel):
                     )
                     return
 
-            # Resume suspended client if needed
-            if self._engagement_driver is not None:
+            # Resume suspended client if needed (in_casa driver only — the
+            # claude_code driver has s6 keeping the subprocess alive across
+            # Casa restarts, and its engagements never have sdk_session_id).
+            if rec.driver != "claude_code" and self._engagement_driver is not None:
                 drv = self._engagement_driver
                 if not drv.is_alive(rec) and rec.sdk_session_id:
                     fail_count = rec.origin.get("_resume_fail_count", 0)

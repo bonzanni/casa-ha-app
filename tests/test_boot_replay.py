@@ -54,7 +54,7 @@ async def test_replay_sweeps_orphans_and_replants_missing(monkeypatch, tmp_path)
     driver._spawn_background_tasks = lambda rec: None
 
     await replay_undergoing_engagements(
-        registry=reg, driver=driver, engagements_root=str(tmp_path / "eng"),
+        registry=reg, driver=driver,
     )
 
     # Orphan gone, keep1 still there
