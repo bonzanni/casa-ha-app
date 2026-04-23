@@ -78,6 +78,24 @@ class TestStart:
                             str(tmp_path / "svc-root"))
         (tmp_path / "svc-root").mkdir()
 
+        # Don't actually spawn _capture_url / _poll_respawns background tasks
+        # in the unit test — they're covered by TestURLCapture and TestRespawnPoller
+        # directly. Without this patch, _capture_url polls a non-existent log
+        # path forever and hangs CI.
+        monkeypatch.setattr(
+            ClaudeCodeDriver, "_spawn_background_tasks",
+            lambda self, engagement: None,
+        )
+
+        # Don't block on FIFO open — the real FIFO has no reader in this test
+        # because the s6 service is mocked away. Bypassing is safe: this test
+        # only verifies start() provisioning + dispatch, not FIFO I/O.
+        async def _noop_write(self, engagement, text):
+            return None
+        monkeypatch.setattr(
+            ClaudeCodeDriver, "_write_to_fifo", _noop_write,
+        )
+
         defn = _make_defn(tmp_path)
         rec = _make_record()
 
