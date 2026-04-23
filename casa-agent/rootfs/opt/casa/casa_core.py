@@ -123,6 +123,166 @@ async def start_internal_unix_runner(
     return runner
 
 
+# ---------------------------------------------------------------------------
+# Plan 4b/3.6: public-8099 back-compat fallback handlers
+#
+# These wrap the new internal_handlers in JSON-RPC envelope code (for
+# /mcp/casa-framework) and adapt the body shape (for /hooks/resolve).
+# Behavior is byte-identical to v0.13.1 — the wrappers exist so that
+# pre-v0.14.0 workspaces (whose .mcp.json points at port 8099) keep
+# working through the v0.14.x migration window. svc-casa-mcp on port
+# 8100 is the canonical path for new workspaces.
+# ---------------------------------------------------------------------------
+
+
+def _make_public_mcp_fallback_handler(
+    *,
+    tools: list,
+    tool_dispatch: dict,
+    engagement_registry,
+):
+    """Public-8099 /mcp/casa-framework JSON-RPC handler.
+
+    Parses JSON-RPC envelope, dispatches via the same internal handler
+    that the Unix socket exposes (in-process call), wraps the result
+    back into a JSON-RPC envelope.
+    """
+    from mcp_envelope import (
+        PROTOCOL_VERSION, VERSION,
+        _jsonrpc_error, _jsonrpc_ok, _tool_schema,
+    )
+
+    # Pre-compute the static tools/list response (snapshot at boot).
+    tool_schemas = [_tool_schema(t) for t in tools]
+
+    async def handler(request: web.Request) -> web.Response:
+        try:
+            msg = await request.json()
+        except Exception:
+            return _jsonrpc_error(None, -32700, "Parse error")
+
+        if not isinstance(msg, dict):
+            return _jsonrpc_error(None, -32600, "Invalid Request")
+
+        method = msg.get("method")
+        req_id = msg.get("id")
+        params = msg.get("params") or {}
+
+        if method == "notifications/initialized":
+            return web.Response(status=202)
+
+        if method == "initialize":
+            return _jsonrpc_ok(req_id, {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "casa-framework", "version": VERSION},
+            })
+
+        if method == "tools/list":
+            return _jsonrpc_ok(req_id, {"tools": tool_schemas})
+
+        if method == "ping":
+            return _jsonrpc_ok(req_id, {})
+
+        if method == "tools/call":
+            # Translate JSON-RPC params + X-Casa-Engagement-Id header into the
+            # internal-handler body shape, then dispatch in-process.
+            name = params.get("name")
+            arguments = params.get("arguments") or {}
+            eng_id = request.headers.get("X-Casa-Engagement-Id")
+            inner_body = {
+                "name": name,
+                "arguments": arguments,
+                "engagement_id": eng_id,
+            }
+            result = await _dispatch_internal_tools_call(
+                body=inner_body,
+                tool_dispatch=tool_dispatch,
+                engagement_registry=engagement_registry,
+            )
+            if "error" in result:
+                err = result["error"]
+                return _jsonrpc_error(req_id, err["code"], err["message"])
+            return _jsonrpc_ok(req_id, result)
+
+        return _jsonrpc_error(req_id, -32601, f"Method not found: {method}")
+
+    return handler
+
+
+def _make_public_hooks_fallback_handler(*, hook_policies: dict):
+    """Public-8099 /hooks/resolve handler.
+
+    Same body shape as the internal handler ({"policy": ..., "payload": ...}).
+    Just re-exports the internal factory under a different name for clarity
+    at the call site — behavior is identical.
+    """
+    from internal_handlers import _make_internal_hooks_resolve_handler
+    return _make_internal_hooks_resolve_handler(hook_policies=hook_policies)
+
+
+def _make_public_mcp_get_405_handler():
+    """GET /mcp/casa-framework -> 405 Method Not Allowed (mirrors v0.13.1)."""
+    async def handler(_request: web.Request) -> web.Response:
+        return web.Response(
+            status=405, text="Method Not Allowed\n",
+            headers={"Allow": "POST"},
+        )
+    return handler
+
+
+async def _dispatch_internal_tools_call(
+    *,
+    body: dict,
+    tool_dispatch: dict,
+    engagement_registry,
+) -> dict:
+    """In-process equivalent of POST /internal/tools/call. Returns the
+    bare dict the internal handler would have returned in its response
+    body — used by the public-8099 JSON-RPC fallback to avoid an HTTP
+    round-trip to ourselves.
+
+    Kept separate from _make_internal_tools_call_handler so the public
+    fallback doesn't need to synthesize an aiohttp web.Request.
+    """
+    name = body.get("name")
+    arguments = body.get("arguments") or {}
+    eng_id = body.get("engagement_id")
+
+    if not isinstance(name, str):
+        return {"error": {"code": -32602, "message": "missing name"}}
+
+    fn = tool_dispatch.get(name)
+    if fn is None:
+        return {"error": {"code": -32602,
+                          "message": f"Unknown tool: {name}"}}
+
+    engagement = None
+    if eng_id:
+        try:
+            rec = engagement_registry.get(eng_id)
+        except Exception:  # noqa: BLE001
+            rec = None
+        if rec is not None and getattr(rec, "status", None) == "active":
+            engagement = rec
+
+    from tools import engagement_var
+    token = engagement_var.set(engagement)
+    try:
+        result = await fn(arguments)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "public /mcp/casa-framework fallback: tool %r raised: %s",
+            name, exc,
+        )
+        return {"error": {"code": -32001,
+                          "message": f"Tool {name!r} raised: {exc}"}}
+    finally:
+        engagement_var.reset(token)
+
+    return result
+
+
 # ------------------------------------------------------------------
 # Health endpoint
 # ------------------------------------------------------------------
@@ -274,72 +434,6 @@ def _build_cc_hook_policies(hook_policies: dict) -> dict:
         callback = entry["factory"]()  # default-configured HookCallback
         cc_policies[name] = (matcher, callback)
     return cc_policies
-
-
-def _make_hooks_resolve_handler(*, hook_policies: dict):
-    """Build the /hooks/resolve aiohttp handler.
-
-    hook_policies maps policy-name -> (matcher_regex, async_callback).
-    The callback is the same HookCallback used on the SDK path; its return
-    dict (or None) is the CC-native hook response body.
-    """
-    import re as _re
-
-    async def handler(request: web.Request) -> web.Response:
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(
-                {"hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": "hooks.resolve: malformed JSON",
-                }},
-                status=200,
-            )
-
-        policy_name = body.get("policy")
-        payload = body.get("payload") or {}
-
-        entry = hook_policies.get(policy_name)
-        if entry is None:
-            return web.json_response(
-                {"hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": f"unknown policy: {policy_name}",
-                }},
-                status=200,
-            )
-        matcher_regex, callback = entry
-
-        # Defensive matcher gate — the CC client already filtered by
-        # settings.json matcher, but re-check here so a misconfigured shim
-        # doesn't accidentally invoke a policy on the wrong tool.
-        tool_name = payload.get("tool_name", "")
-        if not _re.fullmatch(matcher_regex, tool_name):
-            return web.json_response({}, status=200)  # empty = allow
-
-        try:
-            result = await callback(payload, None, {})
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response(
-                {"hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason":
-                        f"policy {policy_name!r} raised: {exc}",
-                }},
-                status=200,
-            )
-
-        # None from HookCallback → allow (empty body).
-        if result is None:
-            return web.json_response({}, status=200)
-        # Otherwise return the CC-native response (already shaped by _deny).
-        return web.json_response(result, status=200)
-
-    return handler
 
 
 _STATUS_PAGE = """\
@@ -1178,25 +1272,30 @@ async def main() -> None:
     app.router.add_post("/webhook/{name}", webhook_handler)
     app.router.add_post("/invoke/{agent}", invoke_handler)
     app.router.add_post("/telegram/update", telegram_update_handler)
+    # Plan 4b/3.6: public-8099 back-compat fallback handlers.
+    # New workspaces point at svc-casa-mcp on 127.0.0.1:8100; this block
+    # keeps 8099 serving the same routes for pre-v0.14.0 workspaces still
+    # pointing here. Removed in v0.14.2 or later (one-release migration).
     from hooks import HOOK_POLICIES as _HOOK_POLICIES
     _cc_hook_policies = _build_cc_hook_policies(_HOOK_POLICIES)
     app.router.add_post(
         "/hooks/resolve",
-        _make_hooks_resolve_handler(hook_policies=_cc_hook_policies),
+        _make_public_hooks_fallback_handler(hook_policies=_cc_hook_policies),
     )
 
-    # Plan 4a.1: MCP JSON-RPC 2.0 bridge for the claude_code driver.
-    # See mcp_bridge.py + docs/superpowers/specs/2026-04-23-3.5-plan4a-1-mcp-bridge-design.md §4.
-    from mcp_bridge import _make_mcp_handler, _mcp_get_not_allowed
     from tools import CASA_TOOLS
+    _public_tool_dispatch = {t.name: t.handler for t in CASA_TOOLS}
     app.router.add_post(
         "/mcp/casa-framework",
-        _make_mcp_handler(
-            tools=CASA_TOOLS,
+        _make_public_mcp_fallback_handler(
+            tools=list(CASA_TOOLS),
+            tool_dispatch=_public_tool_dispatch,
             engagement_registry=engagement_registry,
         ),
     )
-    app.router.add_get("/mcp/casa-framework", _mcp_get_not_allowed)
+    app.router.add_get(
+        "/mcp/casa-framework", _make_public_mcp_get_405_handler(),
+    )
 
     # 13b. Per-agent trigger registration. Registry + scheduler were
     # constructed earlier (needed by init_tools for get_schedule).
