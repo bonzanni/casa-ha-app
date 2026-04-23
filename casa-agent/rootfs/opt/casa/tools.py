@@ -44,6 +44,10 @@ _ICON_FOR_KIND: dict[tuple[str, str], str] = {
     # Plan 3+ adds ("executor", "configurator"): "⚙️", etc.
 }
 
+# Plan 4a.1 §8: workspace retention for claude_code driver engagements.
+_ENGAGEMENTS_ROOT = "/data/engagements"
+_WORKSPACE_RETENTION_DAYS = 7
+
 # Module-level references, initialized via init_tools()
 _channel_manager: ChannelManager | None = None
 _bus: MessageBus | None = None
@@ -953,6 +957,38 @@ async def _finalize_engagement(
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "finalize engagement %s: meta summary write failed: %s",
+                engagement.id[:8], exc,
+            )
+
+    # Plan 4a.1 §8.4: update .casa-meta.json with terminal status + retention_until.
+    if engagement.driver == "claude_code":
+        try:
+            from drivers.workspace import load_casa_meta, write_casa_meta
+            ws = os.path.join(_ENGAGEMENTS_ROOT, engagement.id)
+            if os.path.isdir(ws):
+                meta = load_casa_meta(ws) or {}
+                finished_iso = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now),
+                )
+                retention_iso = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(now + _WORKSPACE_RETENTION_DAYS * 24 * 3600),
+                )
+                final_status = ("COMPLETED" if outcome == "completed"
+                                else "CANCELLED" if outcome == "cancelled"
+                                else "ERROR")
+                write_casa_meta(
+                    workspace_path=ws,
+                    engagement_id=engagement.id,
+                    executor_type=engagement.role_or_type,
+                    status=final_status,
+                    created_at=meta.get("created_at") or finished_iso,
+                    finished_at=finished_iso,
+                    retention_until=retention_iso,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "finalize engagement %s: .casa-meta update failed: %s",
                 engagement.id[:8], exc,
             )
 
