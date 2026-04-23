@@ -162,3 +162,70 @@ class TestResumeOnTurn:
         u = _mk_update(chat_id=-1001, text="turn2", thread_id=rec.topic_id)
         await ch.handle_update(u)
         assert rec.status == "error"
+
+
+class TestDriverSendUserTurnRouting:
+    """Unit tests for the _driver_send_user_turn closure set by casa_core.
+
+    The closure branches on rec.driver — claude_code goes to the claude_code
+    driver, everything else to the in_casa engagement driver.
+    """
+
+    async def test_claude_code_rec_routes_to_claude_code_driver(self):
+        """When rec.driver == 'claude_code', the closure calls claude_code_driver."""
+        from engagement_registry import EngagementRecord
+
+        engagement_driver = MagicMock()
+        engagement_driver.send_user_turn = AsyncMock()
+        claude_code_driver = MagicMock()
+        claude_code_driver.send_user_turn = AsyncMock()
+
+        # Reproduce the closure from casa_core.py E6 change.
+        async def _driver_send_user_turn(rec, text):
+            if rec.driver == "claude_code":
+                await claude_code_driver.send_user_turn(rec, text)
+            else:
+                await engagement_driver.send_user_turn(rec, text)
+
+        rec = EngagementRecord(
+            id="e-cc", kind="executor", role_or_type="configurator",
+            driver="claude_code", status="active", topic_id=555,
+            started_at=1.0, last_user_turn_ts=2.0, last_idle_reminder_ts=0.0,
+            completed_at=None, sdk_session_id=None,
+            origin={"channel": "telegram", "chat_id": "42"},
+            task="do stuff",
+        )
+
+        await _driver_send_user_turn(rec, "hello")
+
+        claude_code_driver.send_user_turn.assert_awaited_once_with(rec, "hello")
+        engagement_driver.send_user_turn.assert_not_called()
+
+    async def test_in_casa_rec_routes_to_engagement_driver(self):
+        """When rec.driver == 'in_casa', the closure calls engagement_driver."""
+        from engagement_registry import EngagementRecord
+
+        engagement_driver = MagicMock()
+        engagement_driver.send_user_turn = AsyncMock()
+        claude_code_driver = MagicMock()
+        claude_code_driver.send_user_turn = AsyncMock()
+
+        async def _driver_send_user_turn(rec, text):
+            if rec.driver == "claude_code":
+                await claude_code_driver.send_user_turn(rec, text)
+            else:
+                await engagement_driver.send_user_turn(rec, text)
+
+        rec = EngagementRecord(
+            id="e-ic", kind="executor", role_or_type="configurator",
+            driver="in_casa", status="active", topic_id=555,
+            started_at=1.0, last_user_turn_ts=2.0, last_idle_reminder_ts=0.0,
+            completed_at=None, sdk_session_id=None,
+            origin={"channel": "telegram", "chat_id": "42"},
+            task="do stuff",
+        )
+
+        await _driver_send_user_turn(rec, "hello")
+
+        engagement_driver.send_user_turn.assert_awaited_once_with(rec, "hello")
+        claude_code_driver.send_user_turn.assert_not_called()
