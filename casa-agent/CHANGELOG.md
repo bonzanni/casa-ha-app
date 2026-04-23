@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.14.0] — Phase 3.6 — `casa-framework` MCP extraction
+
+### Added
+- `svc-casa-mcp` — new s6-rc-supervised standalone service (s6 service
+  files at `etc/s6-overlay/s6-rc.d/svc-casa-mcp/`, Python entry at
+  `rootfs/opt/casa/svc_casa_mcp.py`). Listens on `127.0.0.1:8100`,
+  serves `POST /mcp/casa-framework` (JSON-RPC 2.0) and `POST /hooks/resolve`,
+  forwards every request to casa-main over a Unix domain socket at
+  `/run/casa/internal.sock`.
+- Casa-main second `aiohttp.AppRunner` on the Unix socket exposing
+  `POST /internal/tools/call` and `POST /internal/hooks/resolve`. New
+  helper `start_internal_unix_runner()` in `casa_core.py`.
+- New module `mcp_envelope.py` — JSON-RPC envelope helpers + tool schema
+  translation, shared between svc-casa-mcp and the public-port fallback.
+- New module `internal_handlers.py` — pure aiohttp handler factories
+  bound to the Unix socket and consumed in-process by the public-8099
+  fallback.
+- `CASA_FRAMEWORK_MCP_URL` and `CASA_HOOK_RESOLVE_URL` env-var overrides
+  for ops-time port redirection.
+- E2E coverage: `test-local/e2e/test_mcp_restart_survival.sh` (D-13)
+  proves bouncing casa-main does not drop engagement-subprocess MCP
+  connections; new D-11 + D-12 blocks in `test_engagement.sh` exercise
+  svc-casa-mcp on port 8100.
+
+### Changed
+- `drivers/workspace.py` `.mcp.json` writer now points at
+  `127.0.0.1:8100/mcp/casa-framework` for newly-provisioned workspaces
+  (was 8099). Existing pre-v0.14.0 workspaces unaffected.
+- `scripts/hook_proxy.sh` default URL bumped from 8099 → 8100 with
+  `CASA_HOOK_RESOLVE_URL` env override.
+- Casa-main public port 8099 continues to serve `/mcp/casa-framework`
+  and `/hooks/resolve` as a back-compat fallback for pre-v0.14.0
+  workspaces. Removed in v0.14.2 or later (one-release migration).
+
+### Removed
+- `casa-agent/rootfs/opt/casa/mcp_bridge.py` — logic split between
+  `mcp_envelope.py`, `internal_handlers.py`, `svc_casa_mcp.py`, and
+  `casa_core.py`'s public-fallback wrappers. Net coverage unchanged.
+- `tests/test_mcp_bridge.py` — coverage migrated to
+  `tests/test_mcp_envelope.py`, `test_internal_handlers.py`,
+  `test_svc_casa_mcp.py`, and `test_public_fallback_routes.py`.
+
+### Notes
+- Restart-survival semantics are Level 1 only: mid-restart tool calls
+  return `casa_temporarily_unavailable`; the model handles retry. No
+  buffering, no replay, no idempotency guarantees beyond what individual
+  tool handlers already provide.
+- The pre-existing v0.13.1 known limitation (per-executor hook params
+  on the HTTP path use factory defaults) is unchanged in v0.14.0 — that
+  wiring is a later item.
+
 ## [0.13.1] — 2026-04-23
 
 ### Added
