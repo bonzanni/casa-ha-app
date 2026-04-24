@@ -1758,6 +1758,27 @@ PY
 )"
 pass "P-5: _tool_uninstall_casa_plugin present in tools module"
 
+# ---------------------------------------------------------------------------
+# P-6 — marketplace_read_only guard: removing a plugin that is not in the
+#        user marketplace returns an error containing "not found"
+# ---------------------------------------------------------------------------
+log "P-6: marketplace_read_only guard on casa-plugins-defaults"
+run_harness "P-6" "$(cat <<'PY'
+import sys, json
+sys.path.insert(0, "/opt/casa")
+from tools import _tool_marketplace_remove_plugin
+
+r = _tool_marketplace_remove_plugin(plugin_name="superpowers")
+assert r.get("removed") is False, f"expected removed=False, got {r}"
+err = r.get("error", "")
+assert "not found" in err.lower(), (
+    f"expected 'not found' in error, got: {err!r}"
+)
+print("P-6 OK (seed plugin not in user mkt)")
+PY
+)"
+pass "P-6: marketplace_read_only guard — seed plugin not removable from user mkt"
+
 fi  # end CASA_PLAN_4B
 
 stop_container "$D_NAME"
