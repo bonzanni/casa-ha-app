@@ -25,6 +25,8 @@ def user_mkt(tmp_path: Path, monkeypatch) -> Path:
         ],
     }), encoding="utf-8")
     monkeypatch.setattr("marketplace_ops.USER_MARKETPLACE_PATH", target)
+    # Redirect agent-home mkdir away from real /addon_configs/ (permission-denied on CI).
+    monkeypatch.setattr("tools._AGENT_HOME_ROOT", tmp_path / "agent-home")
     return target
 
 
