@@ -40,20 +40,21 @@ TIER_FILES: dict[str, dict[str, set[str]]] = {
     "resident": {
         "required":  {"character.yaml", "voice.yaml", "response_shape.yaml",
                       "disclosure.yaml", "runtime.yaml"},
-        "optional":  {"delegates.yaml", "triggers.yaml", "hooks.yaml"},
+        "optional":  {"delegates.yaml", "triggers.yaml", "hooks.yaml",
+                      "plugins.yaml"},
         "forbidden": set(),
     },
     "specialist": {
         "required":  {"character.yaml", "voice.yaml", "response_shape.yaml",
                       "runtime.yaml"},
-        "optional":  {"hooks.yaml"},
+        "optional":  {"hooks.yaml", "plugins.yaml"},
         "forbidden": {"disclosure.yaml", "delegates.yaml", "triggers.yaml"},
     },
 }
 
 TIER_FILES["executor"] = {
     "required":  {"definition.yaml", "prompt.md"},
-    "optional":  {"hooks.yaml", "observer.yaml"},
+    "optional":  {"hooks.yaml", "observer.yaml", "plugins.yaml"},
     "forbidden": {"character.yaml", "runtime.yaml", "delegates.yaml",
                   "disclosure.yaml", "response_shape.yaml", "voice.yaml",
                   "triggers.yaml"},
