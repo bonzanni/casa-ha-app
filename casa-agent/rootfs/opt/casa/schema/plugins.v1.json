@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Casa plugins.yaml v1",
+  "type": "object",
+  "required": ["schema_version", "plugins"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "plugins": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "marketplace"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string", "minLength": 1, "pattern": "^[a-z0-9][a-z0-9-]*$"},
+          "marketplace": {"type": "string", "enum": ["casa-plugins-defaults", "casa-plugins"]},
+          "version": {"type": "string"}
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}
