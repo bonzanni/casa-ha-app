@@ -189,4 +189,27 @@ ANTHROPIC_API_KEY=sk-ant-bootstrap-noop \
 claude plugin marketplace add /addon_configs/casa-agent/marketplace/ \
   --scope user 2>/dev/null || true
 
+# For every plugin referenced by defaults/agents/**/plugins.yaml,
+# ensure it's installed into cc-home so `claude plugin list --json`
+# (used by the binding layer in /opt/casa/plugins_binding.py) sees it.
+# An advisory flock serializes against any concurrent Configurator
+# install_casa_plugin calls (spike §Key learning 5).
+INSTALL_LOCK=/addon_configs/casa-agent/cc-home/.claude/plugins/.install.lock
+mkdir -p "$(dirname "$INSTALL_LOCK")"
+
+if command -v yq >/dev/null 2>&1; then
+    shopt -s globstar 2>/dev/null || true
+    for plugin_ref in $(yq -r '.plugins[] | "\(.name)@\(.marketplace)"' \
+                           /opt/casa/defaults/agents/**/plugins.yaml \
+                           /opt/casa/defaults/agents/executors/*/plugins.yaml \
+                           2>/dev/null | sort -u); do
+        if [ -z "$plugin_ref" ]; then continue; fi
+        flock "$INSTALL_LOCK" claude plugin install "$plugin_ref" --scope user \
+            >/dev/null 2>&1 \
+            || bashio::log.warning "plugin install skipped: $plugin_ref"
+    done
+else
+    bashio::log.warning "yq not found — skipping default-plugin install loop"
+fi
+
 bashio::log.info "Configuration setup complete."
