@@ -93,3 +93,111 @@ This means:
 You (Configurator) do NOT need to touch any of this — workspace
 provisioning + hook proxying are framework concerns. If a user asks why
 their engagement survived a Casa restart cleanly, this is the reason.
+
+## Plugin consumer infrastructure (v0.14.1)
+
+Casa uses Claude Code's native plugin machinery via a two-marketplace model.
+
+### Two marketplaces
+
+- **`casa-plugins-defaults`** — seed-managed, read-only. Catalog at
+  `/opt/casa/defaults/marketplace-defaults/.claude-plugin/marketplace.json`.
+  Pre-installed cache at `/opt/claude-seed/` (built at image build, `chmod a-w`).
+  Contains: superpowers, plugin-dev, skill-creator, mcp-server-dev, document-skills.
+  Configurator MUST NOT mutate this marketplace.
+- **`casa-plugins`** — user-writable. Catalog at
+  `/addon_configs/casa-agent/marketplace/.claude-plugin/marketplace.json`.
+  Configurator mutates via `marketplace_ops` helpers (add/remove/update).
+
+### Plugin cache
+
+- Seed cache: `/opt/claude-seed/cache/casa-plugins-defaults/<plugin>/<version>/`
+  (read-only, baked into image).
+- User cache: `/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins/<plugin>/<version>/`
+  (managed by `claude plugin install --scope user`).
+
+### Binding layer
+
+`/opt/casa/plugins_binding.py::build_sdk_plugins` — shells
+`claude plugin list --json`, translates `installPath` entries into SDK
+`plugins=[{"type":"local","path":...}]` shape. Called from every
+`ClaudeAgentOptions` construction in `agent.py` and `tools.py`.
+
+### Per-agent enablement
+
+Each in_casa agent has a project-scope settings.json at
+`/addon_configs/casa-agent/agent-home/<role>/.claude/settings.json` with:
+
+```json
+{"enabledPlugins": {"<plugin>@<marketplace>": true}}
+```
+
+Provisioned at boot by `casa_core.provision_agent_home()` — idempotent,
+preserves user-added entries.
+
+### Workspace-template (claude_code executors)
+
+For Tier 3 executors, `defaults/agents/executors/<type>/workspace-template/`
+is rendered per engagement via `drivers.workspace.render_workspace_template`.
+`CLAUDE.md.tmpl` is interpolated with `{task}/{context}/{world_state_summary}/{executor_type}`.
+`.claude/settings.json::enabledPlugins` is generated from the executor's
+`plugins.yaml`.
+
+### Plugin environment variables
+
+`/addon_configs/casa-agent/plugin-env.conf` — POSIX `VAR=value` lines,
+mode 0600, managed by Configurator via `set_plugin_env_reference` MCP tool.
+Values accept `op://vault/item/field` references; resolved at boot by
+`secrets_resolver.resolve`. Sourced into the addon process env before
+SDK clients spawn.
+
+### System requirements (plugin-runtime tools)
+
+Plugins may declare `casa.systemRequirements` in their marketplace entry:
+
+- `{type: tarball, url, sha256, verify_bin}` — HTTPS download + sha256 check.
+- `{type: venv, package, verify_bin}` — `python -m venv` + pip install.
+- `{type: npm, package, verify_bin}` — `npm install --prefix` + .bin symlink.
+- `{type: apt}` — **REJECTED at marketplace-add time** (§4.3.2 / P-10).
+
+Install into `/addon_configs/casa-agent/tools/` with symlinks in `tools/bin/`
+(on `PATH` via `/run/s6/container_environment/PATH`).
+
+### Manifest + reconciler
+
+`/addon_configs/casa-agent/system-requirements.yaml` records
+`{name, winning_strategy, install_dir, verify_bin, pin_sha256?, pin_version?, declared_at}`
+for every installed requirement. `setup-configs.sh` invokes
+`scripts/reconcile_system_requirements.py` at each boot to check
+`verify_bin` resolves; writes `system-requirements.status.yaml` and exits
+non-zero on any `degraded`. Non-blocking (degrades affected plugins,
+never crashes boot).
+
+### Configurator MCP tools (v0.14.1)
+
+Core:
+- `marketplace_add_plugin` — append entry to user marketplace + refresh CC.
+- `marketplace_remove_plugin` — remove from user marketplace.
+- `marketplace_update_plugin` — bump ref on existing entry.
+- `marketplace_list_plugins` — enumerate user marketplace entries.
+- `install_casa_plugin` — two-stage commit: stage 1 = systemRequirements,
+  stage 2 = `claude plugin install --scope project` per target agent-home.
+  Stage 2 failure rolls back stage 1 via `rmtree`.
+- `uninstall_casa_plugin` — `claude plugin uninstall --scope project`
+  per target.
+- `verify_plugin_state` — per-plugin readiness report: tools +
+  secrets (from plugin-env.conf) + mcp_started + overall `ready` bool.
+
+Helpers:
+- `set_plugin_env_reference` — upsert `VAR=value` in plugin-env.conf.
+- `list_vault_items` — `op item list --format json` filtered.
+- `get_item_fields` — `op item get --format json` field metadata.
+
+### 1P universal resolver
+
+All password-typed addon options (`claude_oauth_token`, `honcho_api_key`,
+`telegram_bot_token`, `webhook_secret`, `github_token`) accept
+`op://vault/item/field` references. Resolved at boot by
+`secrets_resolver.resolve` (lru_cache, shells `op read`).
+`onepassword_service_account_token` is the single root of trust —
+plaintext only.
