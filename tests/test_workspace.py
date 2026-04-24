@@ -135,7 +135,8 @@ class TestProvisionWorkspace:
         assert "casa-framework" in mcp["mcpServers"]
 
         assert (p / ".claude" / "settings.json").exists()
-        assert (p / ".home" / ".claude" / "plugins" / "superpowers").is_symlink()
+        # Plugin symlinks removed in v0.14.x (Plan 4b §16.2); HOME dir still created.
+        assert (p / ".home" / ".claude" / "plugins").is_dir()
 
         # FIFO
         assert os.path.exists(p / "stdin.fifo")
@@ -143,9 +144,9 @@ class TestProvisionWorkspace:
         mode = os.stat(p / "stdin.fifo").st_mode
         assert _stat.S_ISFIFO(mode)
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo/symlink not meaningful on Windows")
-    async def test_per_executor_plugins_override_baseline(self, tmp_path):
-        """Tier 2 wins precedence over Tier 1 (same-named pack)."""
+    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo not meaningful on Windows")
+    async def test_per_executor_plugins_no_symlinks(self, tmp_path):
+        """Plugin symlinks removed in v0.14.x (Plan 4b §16.2); HOME dir exists."""
         from pathlib import Path
         from drivers.workspace import provision_workspace
 
@@ -166,11 +167,10 @@ class TestProvisionWorkspace:
             casa_framework_mcp_url="http://x",
         )
 
-        sp_link = Path(path) / ".home" / ".claude" / "plugins" / "superpowers"
-        # The link target is the per-executor version, not the baseline.
-        target = os.readlink(sp_link)
-        assert "/plugins/superpowers" in target.replace("\\", "/")
-        assert str(base) not in target
+        plugins_dir = Path(path) / ".home" / ".claude" / "plugins"
+        # Dir exists but contains no symlinks — symlink assembly was removed.
+        assert plugins_dir.is_dir()
+        assert list(plugins_dir.iterdir()) == []
 
     @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo/symlink not meaningful on Windows")
     async def test_mcp_json_carries_engagement_id_header(self, tmp_path):
