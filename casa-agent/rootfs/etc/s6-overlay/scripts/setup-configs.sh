@@ -16,9 +16,6 @@ mkdir -p "$CONFIG_DIR/agents" \
          "$CONFIG_DIR/agents/executors" \
          "$CONFIG_DIR/policies" \
          "$CONFIG_DIR/schema" \
-         "$CONFIG_DIR/workspace/.claude/skills" \
-         "$CONFIG_DIR/workspace/plugins" \
-         "$CONFIG_DIR/workspace/mcp-servers" \
          "$DATA_DIR/sdk-sessions" \
          "$DATA_DIR/casa-s6-services" \
          "$DATA_DIR/engagements"
@@ -126,9 +123,6 @@ else
         bashio::log.info "Snapshotted manual edits in config repo"
     fi
 fi
-
-# Clone skill/plugin repos
-/opt/casa/scripts/sync-repos.sh
 
 # Initialize session registry if missing
 if [ ! -f "$DATA_DIR/sessions.json" ]; then
