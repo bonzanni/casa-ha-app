@@ -35,6 +35,9 @@ options:
   telegram_delivery_mode: "stream"
   honcho_api_url: "https://api.honcho.dev"
   honcho_api_key: ""
+  onepassword_service_account_token: ""
+  onepassword_default_vault: "Casa"
+  github_token: ""
   webhook_auth_enabled: false
   webhook_secret: ""
 
@@ -70,6 +73,9 @@ schema:
   telegram_delivery_mode: "list(stream|block)?"
   honcho_api_url: url?
   honcho_api_key: password?
+  onepassword_service_account_token: password?
+  onepassword_default_vault: str?
+  github_token: password?
   webhook_auth_enabled: bool?
   webhook_secret: password?
   primary_agent_name: str?
