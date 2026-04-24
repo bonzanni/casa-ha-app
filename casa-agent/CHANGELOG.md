@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.14.5] - 2026-04-24
+
+### Fixed
+- **N150 turn-assistant failure after plan 4b:** `assistant/runtime.yaml`
+  had `cwd: /addon_configs/casa-agent/workspace` (legacy), but F.2 dropped
+  the `mkdir -p workspace/...` block from setup-configs.sh. SDK spawn
+  failed with `CLIConnectionError: Working directory does not exist`.
+  Change cwd to empty so B.4 agent-home fallback takes effect.
+
 ## [0.14.4] - 2026-04-24
 
 ### Removed

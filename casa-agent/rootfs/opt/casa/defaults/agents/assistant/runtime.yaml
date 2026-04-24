@@ -31,4 +31,4 @@ channels:
 session:
   strategy: persistent
   idle_timeout: 86400
-cwd: /addon_configs/casa-agent/workspace
+cwd: ""
