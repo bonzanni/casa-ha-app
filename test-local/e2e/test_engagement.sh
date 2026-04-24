@@ -1779,6 +1779,75 @@ PY
 )"
 pass "P-6: marketplace_read_only guard — seed plugin not removable from user mkt"
 
+# ---------------------------------------------------------------------------
+# P-7 — tarball systemRequirements infrastructure importable
+# ---------------------------------------------------------------------------
+log "P-7: tarball systemRequirements infrastructure present"
+run_harness "P-7" "$(cat <<'PY'
+import sys
+sys.path.insert(0, "/opt/casa")
+from system_requirements.tarball import install_tarball, IntegrityError
+from system_requirements.orchestrator import install_requirements
+print("P-7 OK")
+PY
+)"
+pass "P-7: system_requirements tarball + orchestrator importable"
+
+# ---------------------------------------------------------------------------
+# P-8 — upgrade survival: reconcile_system_requirements.py present + --help
+# ---------------------------------------------------------------------------
+log "P-8: upgrade survival — reconciler infrastructure"
+MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f \
+    /opt/casa/scripts/reconcile_system_requirements.py \
+    || fail "P-8: reconcile_system_requirements.py missing"
+MSYS_NO_PATHCONV=1 docker exec "$NAME" \
+    /opt/casa/venv/bin/python /opt/casa/scripts/reconcile_system_requirements.py --help \
+    >/dev/null 2>&1 \
+    || fail "P-8: reconcile_system_requirements.py --help failed"
+pass "P-8: reconcile_system_requirements.py present and --help exits cleanly"
+
+# ---------------------------------------------------------------------------
+# P-9 — self_containment_guard blocks anti-pattern push
+# ---------------------------------------------------------------------------
+log "P-9: self_containment_guard blocks anti-pattern push"
+run_harness "P-9" "$(cat <<'PY'
+import asyncio, sys, tempfile
+sys.path.insert(0, "/opt/casa")
+from pathlib import Path
+from hooks import make_self_containment_guard
+
+async def main():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "fake-repo"
+        repo.mkdir()
+        (repo / ".claude-plugin").mkdir()
+        (repo / ".claude-plugin" / "plugin.json").write_text("{}")
+        (repo / "README.md").write_text("please install ffmpeg manually\n")
+
+        hook = make_self_containment_guard()
+        res = await hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"},
+                "cwd": str(repo),
+            },
+            None,
+            {},
+        )
+        assert res is not None, (
+            "self_containment_guard returned None — hook must deny the push"
+        )
+        spec = res.get("hookSpecificOutput", {})
+        assert spec.get("permissionDecision") == "deny", (
+            f"expected deny, got: {spec}"
+        )
+    print("P-9 OK")
+
+asyncio.run(main())
+PY
+)"
+pass "P-9: self_containment_guard denies push with anti-pattern README"
+
 fi  # end CASA_PLAN_4B
 
 stop_container "$D_NAME"
