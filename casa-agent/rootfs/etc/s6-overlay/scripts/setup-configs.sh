@@ -164,4 +164,29 @@ print('fastembed model cached')
 " 2>&1 || bashio::log.warning "fastembed pre-warm failed; ScopeRegistry will retry at Python init or degrade"
 fi
 
+# --- Plan 4b: plugin consumer infrastructure bootstrap ----------------------
+
+# Seed the user-writable marketplace overlay (idempotent — only if absent).
+if [ ! -f /addon_configs/casa-agent/marketplace/.claude-plugin/marketplace.json ]; then
+    mkdir -p /addon_configs/casa-agent/marketplace/.claude-plugin
+    cp /opt/casa/defaults/marketplace-user/.claude-plugin/marketplace.json \
+       /addon_configs/casa-agent/marketplace/.claude-plugin/marketplace.json
+    bashio::log.info "Seeded user marketplace at /addon_configs/casa-agent/marketplace/"
+fi
+
+# Ensure casa-main's HOME is cc-home (required by binding layer + CC CLI).
+export HOME=/addon_configs/casa-agent/cc-home
+mkdir -p "$HOME/.claude"
+
+# Trigger seed-marketplace auto-register into cc-home's in-memory view.
+# The API call fails with the bogus key; the startup path runs first.
+# Exit 0 expected. Spike §Key learning 7 — plain `claude plugin ...` calls
+# do NOT run full startup, so this `claude -p` is load-bearing.
+ANTHROPIC_API_KEY=sk-ant-bootstrap-noop \
+  claude -p "noop" --allow-dangerously-skip-permissions >/dev/null 2>&1 || true
+
+# Register the user marketplace in casa-main's HOME. Idempotent.
+claude plugin marketplace add /addon_configs/casa-agent/marketplace/ \
+  --scope user 2>/dev/null || true
+
 bashio::log.info "Configuration setup complete."
