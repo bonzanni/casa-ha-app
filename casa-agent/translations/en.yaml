@@ -39,6 +39,15 @@ configuration:
     name: Honcho API Key
     description: >-
       API key for Honcho. When set, enables persistent cross-session memory.
+  onepassword_service_account_token:
+    name: "1Password service account token"
+    description: "Token from https://developer.1password.com/docs/service-accounts/ — plaintext only, cannot be a op:// reference (root of trust). Read access to the vault named in 'onepassword_default_vault'."
+  onepassword_default_vault:
+    name: "1Password default vault"
+    description: "Vault name used when an op:// reference omits the vault segment. Default: Casa."
+  github_token:
+    name: "GitHub personal-access token"
+    description: "Required for plugin-developer (gh repo create + git push). Accepts op:// references (op://<vault>/<item>/<field>) or plaintext. Must have repo scope."
   webhook_auth_enabled:
     name: Enable Webhook Authentication
     description: >-
