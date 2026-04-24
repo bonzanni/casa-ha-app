@@ -53,9 +53,6 @@ options:
   # Web terminal
   enable_terminal: false
 
-  # Workspace repos
-  repos: []
-
   # Domain-scope routing
   scope_threshold: 0.35
 
@@ -84,9 +81,5 @@ schema:
   voice_agent_model: "list(opus|sonnet|haiku)?"
   subagent_model: "list(opus|sonnet|haiku)?"
   enable_terminal: bool?
-  repos:
-    - url: url
-      path: str
-      branch: str?
   scope_threshold: "float(0.0,1.0)?"
   casa_tz: str?
