@@ -62,6 +62,9 @@ def build_sdk_plugins(
     except subprocess.TimeoutExpired:
         logger.warning("binding layer degraded: claude plugin list --json timed out")
         return []
+    except FileNotFoundError:
+        logger.warning("binding layer degraded: claude CLI not found on PATH")
+        return []
 
     try:
         entries = json.loads(result.stdout)
