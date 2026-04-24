@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.14.3] - 2026-04-24
+
+### Fixed
+- **N150 boot crash on v0.14.2:** `assistant/delegates.yaml` plugin-developer
+  entry used `{executor_type, description, typical_task, engagement_mode}`
+  shape but `delegates.v1.json` schema only accepts `{agent, purpose, when}`.
+  Rewrote the entry in the correct shape. All 4 delegate entries now match
+  the schema.
+
 ## [0.14.2] - 2026-04-24
 
 ### Fixed
