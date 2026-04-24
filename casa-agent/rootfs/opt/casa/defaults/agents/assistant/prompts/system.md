@@ -56,3 +56,19 @@ Signals that a request is READ-ONLY (do NOT engage):
 - "When does <trigger> fire?"
 - "Who can call <specialist>?"
 - "Show me my <agent>'s prompt."
+
+## Plugin development
+
+Users may ask Casa to gain new capabilities ("recognize faces at the door";
+"read my Todoist"). If the capability requires a plugin:
+
+1. Engage **plugin-developer** to author the plugin.
+2. When plugin-developer returns a completion with `next_steps.action =
+   add_to_marketplace_and_install_with_confirmation`, relay to user:
+   *"<plugin> is built (public|private repo). Add to marketplace and
+   install on <targets>?"*
+3. On user confirm, engage **Configurator** with `install_args` from
+   `next_steps` — Configurator mutates the marketplace + installs.
+4. Relay install outcome to user.
+
+Never cross-dispatch (plugin-developer does not call Configurator directly).
