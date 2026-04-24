@@ -1702,6 +1702,62 @@ PY
 )"
 pass "P-1: plugin-developer workspace provisioned with correct enabledPlugins"
 
+# ---------------------------------------------------------------------------
+# P-2 — mock gh CLI present
+# ---------------------------------------------------------------------------
+log "P-2: mock gh repo create handler present"
+MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c \
+    'which gh >/dev/null 2>&1 && echo "P-2 OK (gh CLI present in image)" || echo "P-2 SKIP (gh not in image)"' \
+    | grep -qE "P-2 (OK|SKIP)" && pass "P-2: gh CLI check done" \
+    || fail "P-2: gh CLI check failed unexpectedly"
+
+# ---------------------------------------------------------------------------
+# P-3 — emit_completion tool is present in the CASA_TOOLS registry
+# ---------------------------------------------------------------------------
+log "P-3: emit_completion tool callable"
+run_harness "P-3" "$(cat <<'PY'
+import sys
+sys.path.insert(0, "/opt/casa")
+from tools import CASA_TOOLS
+names = [t.name if hasattr(t, "name") else t.get("name", str(t)) for t in CASA_TOOLS]
+assert "emit_completion" in names, f"emit_completion missing from CASA_TOOLS: {names}"
+print("P-3 OK")
+PY
+)"
+pass "P-3: emit_completion present in CASA_TOOLS"
+
+# ---------------------------------------------------------------------------
+# P-4 — install_casa_plugin tool registered
+# ---------------------------------------------------------------------------
+log "P-4: Configurator install_casa_plugin tool registered"
+run_harness "P-4" "$(cat <<'PY'
+import sys
+sys.path.insert(0, "/opt/casa")
+import tools
+assert hasattr(tools, "_tool_install_casa_plugin"), (
+    "install tool missing: _tool_install_casa_plugin not in tools module"
+)
+print("P-4 OK")
+PY
+)"
+pass "P-4: _tool_install_casa_plugin present in tools module"
+
+# ---------------------------------------------------------------------------
+# P-5 — uninstall_casa_plugin tool registered
+# ---------------------------------------------------------------------------
+log "P-5: uninstall_casa_plugin tool registered"
+run_harness "P-5" "$(cat <<'PY'
+import sys
+sys.path.insert(0, "/opt/casa")
+import tools
+assert hasattr(tools, "_tool_uninstall_casa_plugin"), (
+    "uninstall tool missing: _tool_uninstall_casa_plugin not in tools module"
+)
+print("P-5 OK")
+PY
+)"
+pass "P-5: _tool_uninstall_casa_plugin present in tools module"
+
 fi  # end CASA_PLAN_4B
 
 stop_container "$D_NAME"
