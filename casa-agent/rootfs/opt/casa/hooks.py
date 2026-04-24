@@ -9,8 +9,9 @@ registry. Payload shape follows the SDK's
 
 from __future__ import annotations
 
+import os
 import re
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable
 
 # ---------------------------------------------------------------------------
@@ -256,6 +257,76 @@ def make_commit_size_guard_hook(*, max_files: int) -> HookCallback:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# self_containment_guard - Plan 4b §6.6 / P-6
+# (pre-push grep for §2.0 self-containment anti-patterns)
+# ---------------------------------------------------------------------------
+
+_PLEASE_INSTALL_RE = re.compile(
+    r"(please\s+install|manually\s+install|fork\s+the\s+dockerfile)",
+    re.IGNORECASE,
+)
+_APT_CMD_RE = re.compile(r"\b(apt|apt-get|yum|dnf|pacman)\s+install\b")
+_NONBASELINE_BIN_RE = re.compile(
+    r"/usr/(local/)?bin/(terraform|kubectl|aws|ffmpeg|helm|docker|packer|ansible)\b"
+)
+
+
+def make_self_containment_guard() -> HookCallback:
+    """Pre-push grep for §2.0 self-containment anti-patterns."""
+
+    async def hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if input_data.get("tool_name") != "Bash":
+            return None
+        cmd = input_data.get("tool_input", {}).get("command", "")
+        if not re.match(r"\s*git\s+push\b", cmd):
+            return None
+
+        cwd = Path(input_data.get("cwd") or os.getcwd())
+        if not cwd.is_dir():
+            return None
+
+        findings: list[str] = []
+        for root, dirs, files in os.walk(cwd):
+            # Skip VCS + deps.
+            dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "__pycache__")]
+            for f in files:
+                p = Path(root) / f
+                try:
+                    content = p.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                if f.lower() == "readme.md" and _PLEASE_INSTALL_RE.search(content):
+                    findings.append(f"{p.relative_to(cwd)}: 'please install X manually'")
+                if f.endswith((".sh", ".bash")) and _APT_CMD_RE.search(content):
+                    findings.append(f"{p.relative_to(cwd)}: apt/yum install")
+                if f.endswith((".py", ".js", ".ts", ".sh")) and _NONBASELINE_BIN_RE.search(content):
+                    findings.append(f"{p.relative_to(cwd)}: hardcoded non-baseline binary path")
+
+        if findings:
+            return _deny(
+                "Blocked by self_containment_guard (§2.0 axiom):\n"
+                + "\n".join(f"- {fi}" for fi in findings)
+                + "\nDeclare via casa.systemRequirements or use ${CLAUDE_PLUGIN_ROOT}. "
+                "Override with --allow-anti-pattern only if false positive."
+            )
+        return None
+
+    return hook
+
+
+def _self_containment_guard_factory(**kwargs: Any) -> HookCallback:
+    if kwargs:
+        raise UnknownPolicyError(
+            f"self_containment_guard takes no parameters; got {list(kwargs)}"
+        )
+    return make_self_containment_guard()
+
+
 def _block_dangerous_bash_factory(**kwargs: Any) -> HookCallback:
     if kwargs:
         raise UnknownPolicyError(
@@ -315,6 +386,10 @@ HOOK_POLICIES: dict[str, dict[str, Any]] = {
     "commit_size_guard": {
         "matcher": "Write|Edit",
         "factory": _commit_size_guard_factory,
+    },
+    "self_containment_guard": {
+        "matcher": "Bash",
+        "factory": _self_containment_guard_factory,
     },
 }
 
