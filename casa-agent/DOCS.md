@@ -549,3 +549,41 @@ sweep). The fallback is removed in v0.14.2 or later.
   shipped default.
 - `CASA_HOOK_RESOLVE_URL` — overrides where `hook_proxy.sh` POSTs hook
   decisions.
+
+## Plugin consumer infrastructure (v0.14.1)
+
+Casa uses Claude Code's native plugin machinery. Two marketplaces are
+registered at boot:
+
+- **casa-plugins-defaults** — seed-managed, ships with the addon.
+  Contains superpowers, plugin-dev, skill-creator, mcp-server-dev,
+  document-skills. Read-only — `claude plugin uninstall` against these
+  returns a "seed-managed" error.
+- **casa-plugins** — user-writable. Plugins authored by plugin-developer
+  land here, Configurator mutates.
+
+Each in_casa agent gets a project-scope settings dir at
+`/addon_configs/casa-agent/agent-home/<role>/.claude/settings.json` with
+`enabledPlugins` keyed as `<plugin>@<marketplace>`.
+
+## 1Password integration (v0.14.1)
+
+Set `onepassword_service_account_token` (from https://developer.1password.com/docs/service-accounts/)
+as a plaintext addon option — it's the single root of trust and cannot
+self-reference. Set `onepassword_default_vault` to the vault name (default
+"Casa"). Every other password-typed option (`claude_oauth_token`,
+`telegram_bot_token`, `github_token`, `webhook_secret`, `honcho_api_key`)
+accepts either plaintext OR an `op://` reference.
+
+Plugin env vars resolved via `plugin-env.conf` (`/addon_configs/casa-agent/plugin-env.conf`),
+managed by Configurator.
+
+## Plugin-developer (v0.14.1)
+
+Ask the primary assistant to build a plugin. It engages plugin-developer in
+a dedicated Telegram topic. Plugin-developer asks public/private, authors
+the plugin in its own GitHub repo, pushes, and emits completion. Assistant
+relays; on your confirm, Configurator installs to the target agents +
+asks for secrets via 1P Q&A.
+
+Pre-requisites: `github_token` + `onepassword_service_account_token`.
