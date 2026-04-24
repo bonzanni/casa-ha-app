@@ -428,7 +428,8 @@ class TestAsyncMode:
         init_tools(cm, bus, reg)
 
         _FakeSpecialistClient.reset(response="async reply", delay=0.05)
-        with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
+        with patch("tools.ClaudeSDKClient", _FakeSpecialistClient), \
+             patch("tools.build_sdk_plugins", return_value=[]):
             t0 = asyncio.get_event_loop().time()
             result = await _with_origin(
                 delegate_to_specialist.handler({

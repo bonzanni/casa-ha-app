@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from trigger_registry import TriggerRegistry
 
 from executor_registry import ExecutorRegistry
+from plugins_binding import build_sdk_plugins
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -143,18 +144,30 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
 
     resolved_hooks = resolve_hooks(cfg.hooks, default_cwd=cfg.cwd)
 
+    sdk_plugins = build_sdk_plugins(
+        home="/addon_configs/casa-agent/cc-home",
+        shared_cache="/addon_configs/casa-agent/cc-home/.claude/plugins",
+        seed="/opt/claude-seed",
+    )
+
+    allowed_tools = list(cfg.tools.allowed)
+    if "Skill" not in allowed_tools:
+        allowed_tools.append("Skill")
+
     return ClaudeAgentOptions(
         model=cfg.model,
         system_prompt=cfg.system_prompt,
-        allowed_tools=list(cfg.tools.allowed),
+        allowed_tools=allowed_tools,
         disallowed_tools=list(cfg.tools.disallowed),
         permission_mode=cfg.tools.permission_mode or "acceptEdits",
         max_turns=cfg.tools.max_turns,
         mcp_servers=mcp_servers if mcp_servers else {},
         hooks=resolved_hooks,
-        cwd=cfg.cwd or None,
+        cwd=(cfg.cwd
+             or f"/addon_configs/casa-agent/agent-home/{getattr(cfg, 'role', 'unknown')}"),
         resume=None,
         setting_sources=["project"],
+        plugins=sdk_plugins,
     )
 
 
@@ -182,10 +195,24 @@ def _build_executor_options(defn) -> ClaudeAgentOptions:
     else:
         mcp_servers = {}
 
+    sdk_plugins = build_sdk_plugins(
+        home="/addon_configs/casa-agent/cc-home",
+        shared_cache="/addon_configs/casa-agent/cc-home/.claude/plugins",
+        seed="/opt/claude-seed",
+    )
+
+    allowed_tools = list(defn.tools_allowed)
+    if "Skill" not in allowed_tools:
+        allowed_tools.append("Skill")
+
+    # Executors (in_casa driver — Configurator, future Tier-3) operate on
+    # the addon-config root rather than an agent-home, because their
+    # mutation surface spans /addon_configs/casa-agent/ (agents/, marketplace/,
+    # plugin-env.conf, etc.).
     return ClaudeAgentOptions(
         model=defn.model,
         system_prompt="",
-        allowed_tools=list(defn.tools_allowed),
+        allowed_tools=allowed_tools,
         disallowed_tools=list(defn.tools_disallowed),
         permission_mode=defn.permission_mode or "acceptEdits",
         max_turns=200,
@@ -194,6 +221,7 @@ def _build_executor_options(defn) -> ClaudeAgentOptions:
         cwd="/addon_configs/casa-agent",
         resume=None,
         setting_sources=["project"],
+        plugins=sdk_plugins,
     )
 
 
