@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.14.2] - 2026-04-24
+
+### Fixed
+- **N150 boot crash on v0.14.1:** `agent_loader._check_file_set` rejected
+  `plugins.yaml` (added by Plan 4b B.7) as "unknown file", crashing
+  casa-main with exit 1 before SDK clients spawned. Added `plugins.yaml`
+  to the `optional` file set for resident, specialist, and executor tiers.
+
 ## [0.14.1] - 2026-04-24
 
 ### Added
