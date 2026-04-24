@@ -1,6 +1,39 @@
 # Changelog
 
-## [0.14.1] — Plan 4b plugin-developer + consumer infrastructure
+## [0.14.1] - 2026-04-24
+
+### Added
+- **plugin-developer executor** (Tier 3 claude_code driver) that authors
+  Claude Code plugins in dedicated per-plugin GitHub repos. Default plugin
+  pack: superpowers + plugin-dev + skill-creator + mcp-server-dev +
+  document-skills. Produces 100% CC-native plugins — installable into Casa
+  agents via Configurator OR into any regular CC session.
+- **Two-marketplace model** — `casa-plugins-defaults` (seed-managed, read-only,
+  ships with the image) + `casa-plugins` (user-writable via Configurator).
+- **Binding layer** at `/opt/casa/plugins_binding.py` — resolves
+  `enabledPlugins` → `plugins=[{type:"local",path:...}]` for in_casa agents
+  via `claude plugin list --json::installPath`. SDK does not auto-consume
+  plugins; this closes the gap.
+- **Workspace-template** pattern for claude_code executors
+  (`defaults/agents/executors/<type>/workspace-template/` rendered into
+  every engagement workspace).
+- **Seven Configurator MCP tools** — `marketplace_add_plugin` /
+  `marketplace_remove_plugin` / `marketplace_update_plugin` /
+  `marketplace_list_plugins` / `install_casa_plugin` (two-stage commit) /
+  `uninstall_casa_plugin` / `verify_plugin_state`.
+- **`casa.systemRequirements`** — tarball/venv/npm install strategies
+  into `/addon_configs/casa-agent/tools/`. apt/dpkg declarations rejected
+  at add-time (§4.3.2).
+- **Boot-time reconciler** — idempotent, non-blocking; records status to
+  `system-requirements.status.yaml`.
+- **self_containment_guard** pre-push hook policy — greps for hardcoded
+  non-baseline paths, "please install X manually" README strings,
+  `apt install` in shell scripts.
+- **Universal 1P resolver** — all password-typed addon options accept
+  `op://vault/item/field`. `op` CLI installed at image build.
+- **`github_token` addon option** (required for plugin-developer).
+- **Self-containment axiom** (§2.0) codified — plugins fully operational
+  on fresh Casa install solely by marketplace-add + install_casa_plugin.
 
 ### Removed
 
@@ -8,6 +41,22 @@
   scratch-sync mechanism with no runtime consumer (§9 of Plan 4b spec).
   **Migration:** users with non-empty `repos:` entries must remove them
   from the addon config before upgrading. No data migration needed.
+- `/opt/casa/claude-plugins/` symlink tree (Tier 1/2 bundled plugins).
+  Replaced by seed-managed `casa-plugins-defaults` marketplace.
+
+### Changed
+- Resident SDK construction now sets `cwd=/addon_configs/casa-agent/agent-home/<role>/`
+  and injects `plugins=[...]` from the binding layer. `"Skill"` added to
+  `allowed_tools` automatically.
+- Claude_code engagement subprocesses inherit `CLAUDE_CODE_PLUGIN_SEED_DIR=
+  /opt/claude-seed` + `CLAUDE_CODE_PLUGIN_CACHE_DIR=
+  /addon_configs/casa-agent/cc-home/.claude/plugins`.
+- Casa-main HOME moved from `/root` to `/addon_configs/casa-agent/cc-home/`.
+
+### Notes
+- Pre-1.0 wipe-on-update doctrine — no migration code shipped.
+- Plan 4b spec: `docs/superpowers/specs/2026-04-24-3.5-plan4b-plugin-developer.md`.
+- Plan: `docs/superpowers/plans/2026-04-24-3.5-plan4b-plugin-developer.md`.
 
 ## [0.14.0] — Phase 3.6 — `casa-framework` MCP extraction
 
