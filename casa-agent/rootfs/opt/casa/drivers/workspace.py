@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 
 import yaml
 
 from drivers.hook_bridge import translate_hooks_to_settings
+from plugins_config import load_plugins_yaml
 
 logger = logging.getLogger(__name__)
 
@@ -248,3 +250,62 @@ async def _sweep_workspaces(*, engagements_root: str) -> None:
                 "workspace sweep: rmtree %s failed: %s",
                 entry.path, exc,
             )
+
+
+# ---------------------------------------------------------------------------
+# Workspace-template rendering — §16.3 of Plan 4b.
+# ---------------------------------------------------------------------------
+
+
+def render_workspace_template(
+    *,
+    template_root: Path,
+    plugins_yaml: Path,
+    dest: Path,
+    executor_type: str,
+    task: str,
+    context: str,
+    world_state_summary: str,
+) -> None:
+    """Copy the executor's workspace-template/ subtree into `dest`, interpolate
+    CLAUDE.md.tmpl → CLAUDE.md, and generate .claude/settings.json with
+    enabledPlugins from plugins.yaml. Plan 4b §16.3.
+    """
+    if not template_root.is_dir():
+        raise FileNotFoundError(f"workspace template missing: {template_root}")
+
+    dest.mkdir(parents=True, exist_ok=True)
+
+    # Copy every file under template_root except CLAUDE.md.tmpl (handled below).
+    for src in template_root.rglob("*"):
+        if src.is_dir():
+            continue
+        rel = src.relative_to(template_root)
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if rel.name == "CLAUDE.md.tmpl":
+            continue
+        shutil.copy2(src, target)
+
+    # Interpolate CLAUDE.md.
+    tmpl = template_root / "CLAUDE.md.tmpl"
+    if tmpl.is_file():
+        text = tmpl.read_text(encoding="utf-8")
+        text = (
+            text.replace("{executor_type}", executor_type)
+                .replace("{task}", task)
+                .replace("{context}", context)
+                .replace("{world_state_summary}", world_state_summary)
+        )
+        (dest / "CLAUDE.md").write_text(text, encoding="utf-8")
+
+    # Generate .claude/settings.json::enabledPlugins from plugins.yaml.
+    claude_dir = dest / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    settings_path = claude_dir / "settings.json"
+    cfg = load_plugins_yaml(plugins_yaml)
+    enabled = {ref: True for ref in cfg.iter_refs()}
+    settings_path.write_text(
+        json.dumps({"enabledPlugins": enabled}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
