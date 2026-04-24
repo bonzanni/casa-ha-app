@@ -23,6 +23,8 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
+from plugins_binding import build_sdk_plugins
+
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig
@@ -344,18 +346,41 @@ class Agent:
                 resume_session_id = existing.get("sdk_session_id")
                 await self._session_registry.touch(channel_key)
 
+            # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at
+            # /addon_configs/casa-agent/agent-home/<role>/; configured cwd on
+            # Config stays as an override for legacy tests.
+            agent_home = (
+                self.config.cwd
+                or f"/addon_configs/casa-agent/agent-home/{self.config.role}"
+            )
+
+            # Binding layer — SDK does NOT auto-consume enabledPlugins; we
+            # build the `plugins=[...]` list from `claude plugin list --json`.
+            sdk_plugins = build_sdk_plugins(
+                home="/addon_configs/casa-agent/cc-home",
+                shared_cache="/addon_configs/casa-agent/cc-home/.claude/plugins",
+                seed="/opt/claude-seed",
+            )
+
+            # "Skill" is a valid allowed_tools entry (spike §Key learning 4);
+            # append if not already declared so plugin-shipped skills resolve.
+            allowed_tools = list(self.config.tools.allowed)
+            if "Skill" not in allowed_tools:
+                allowed_tools.append("Skill")
+
             options = ClaudeAgentOptions(
                 model=self.config.model,
                 system_prompt=system_prompt,
-                allowed_tools=self.config.tools.allowed,
+                allowed_tools=allowed_tools,
                 disallowed_tools=self.config.tools.disallowed,
                 permission_mode=self.config.tools.permission_mode or "acceptEdits",
                 max_turns=self.config.tools.max_turns,
                 mcp_servers=mcp_servers if mcp_servers else {},
                 hooks=hooks,
-                cwd=self.config.cwd or None,
+                cwd=agent_home,
                 resume=resume_session_id,
                 setting_sources=["project"],
+                plugins=sdk_plugins,
             )
 
             # 7. Query the SDK — retry transient faults (spec 5.2 §3). --------
