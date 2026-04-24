@@ -719,6 +719,32 @@ async def main() -> None:
     install_logging()
     logger.info("Casa core starting up")
 
+    # 1a. §8: universal op:// resolution for password-typed addon options.
+    # OP_SERVICE_ACCOUNT_TOKEN is already in env (exported by svc-casa/run from
+    # the onepassword_service_account_token addon option). Resolve all
+    # password-typed options in-place now, before any consumer reads them.
+    from secrets_resolver import resolve as _resolve_secret
+    _PASSWORD_ENV_VARS = (
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "HONCHO_API_KEY",
+        "TELEGRAM_BOT_TOKEN",
+        "WEBHOOK_SECRET",
+        "GITHUB_TOKEN",
+    )
+    for _var in _PASSWORD_ENV_VARS:
+        _raw = os.environ.get(_var, "")
+        if _raw:
+            try:
+                _resolved = _resolve_secret(_raw)
+                if _resolved != _raw:
+                    os.environ[_var] = _resolved
+            except RuntimeError as _exc:
+                logger.warning(
+                    "secrets_resolver: %s op:// resolution failed: %s — "
+                    "using raw value; credential will likely be rejected",
+                    _var, _exc,
+                )
+
     # 2. Memory
     base_memory: MemoryProvider
     mem_choice = resolve_memory_backend_choice(dict(os.environ))
