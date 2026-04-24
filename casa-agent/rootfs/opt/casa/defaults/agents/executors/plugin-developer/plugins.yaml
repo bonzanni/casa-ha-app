@@ -1,0 +1,13 @@
+schema_version: 1
+plugins:
+  - name: superpowers
+    marketplace: casa-plugins-defaults
+    version: 5.0.7
+  - name: plugin-dev
+    marketplace: casa-plugins-defaults
+  - name: skill-creator
+    marketplace: casa-plugins-defaults
+  - name: mcp-server-dev
+    marketplace: casa-plugins-defaults
+  - name: document-skills
+    marketplace: casa-plugins-defaults

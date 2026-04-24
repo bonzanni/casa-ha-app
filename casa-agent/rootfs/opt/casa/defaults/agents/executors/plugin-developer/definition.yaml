@@ -1,0 +1,36 @@
+schema_version: 1
+type: plugin-developer
+description: |
+  Author Claude Code plugins in dedicated per-plugin GitHub repos, using
+  superpowers workflow (brainstorming → spec → plan → execute), with agent
+  dispatch, web/GitHub research, and Telegram-mediated interaction. Produces
+  100% CC-native plugins (no Casa-specific file formats) — installable into
+  Casa agents via Configurator or into any regular CC session via the normal
+  CC install flow.
+model: sonnet
+driver: claude_code
+enabled: false          # flipped to true by a follow-up user config once Casa tests pass
+tools:
+  allowed:
+    - mcp__casa-framework__query_engager
+    - mcp__casa-framework__emit_completion
+    # Bash(git push*) must be allow-listed so self_containment_guard hook fires
+    - "Bash(git*)"
+    - "Bash(gh*)"
+    - Read
+    - Write
+    - Edit
+    - Glob
+    - Grep
+    - Skill
+  permission_mode: acceptEdits
+mcp_server_names:
+  - casa-framework
+idle_reminder_days: 7
+prompt_template_file: prompt.md
+hooks_file: hooks.yaml
+observer_policy_file: observer.yaml
+doctrine_dir: doctrine
+extra_dirs: []
+mirror_chat_to_topic: true
+archive_session_full: true
