@@ -212,4 +212,23 @@ else
     bashio::log.warning "yq not found — skipping default-plugin install loop"
 fi
 
+# --- Plan 4b: plugin-runtime tool dir + PATH propagation (P-9) -------------
+# Ensure the persistent tools bin dir exists, and add it to PATH for every
+# s6-supervised service (casa-main, svc-casa-mcp, engagements). Writing to
+# /run/s6/container_environment/PATH is how s6-overlay propagates env to
+# children; /etc/profile.d/* is NOT sourced by non-interactive services.
+TOOLS_ROOT=/addon_configs/casa-agent/tools
+TOOLS_BIN="$TOOLS_ROOT/bin"
+mkdir -p "$TOOLS_BIN"
+
+# Merge TOOLS_BIN into s6 container env PATH (takes precedence over /usr/local/bin).
+CURRENT_PATH="${PATH}"
+if ! printf "%s" "$CURRENT_PATH" | grep -q "^\(.*:\)\?${TOOLS_BIN}\(:\|$\)"; then
+    NEW_PATH="$TOOLS_BIN:$CURRENT_PATH"
+    printf "%s" "$NEW_PATH" > /run/s6/container_environment/PATH
+fi
+
+# Drop any legacy profile.d leftover from earlier drafts. Safe on fresh install.
+rm -f /etc/profile.d/casa-tools.sh
+
 bashio::log.info "Configuration setup complete."
