@@ -842,6 +842,17 @@ async def main() -> None:
     )
     role_configs = load_all_agents(agents_dir, policies=policy_lib)
 
+    # Plan 4b §5.1 — ensure every loaded in_casa agent has an agent-home with
+    # default plugins seeded from plugins.yaml. Idempotent — runs every boot.
+    from agent_home import provision_agent_home as _provision_agent_home
+    _HOME_ROOT = Path("/addon_configs/casa-agent/agent-home")
+    _DEFAULTS_ROOT = Path("/opt/casa")
+    for _role in role_configs:
+        try:
+            _provision_agent_home(role=_role, home_root=_HOME_ROOT, defaults_root=_DEFAULTS_ROOT)
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("agent-home provisioning failed for role=%s: %s", _role, _exc)
+
     # 3.2: scope registry — loads scopes.yaml, embeds descriptions.
     from scope_registry import load_scope_library, ScopeRegistry
     scope_lib = load_scope_library(
