@@ -1604,6 +1604,7 @@ def _tool_marketplace_list_plugins() -> dict:
 # ---------------------------------------------------------------------------
 
 _INSTALL_LOCK = "/addon_configs/casa-agent/cc-home/.claude/plugins/.install.lock"
+_AGENT_HOME_ROOT = Path("/addon_configs/casa-agent/agent-home")
 
 
 def _tool_install_casa_plugin(
@@ -1644,7 +1645,7 @@ def _tool_install_casa_plugin(
     installed: list[str] = []
     failed: list[str] = []
     for role in targets:
-        agent_home = Path(f"/addon_configs/casa-agent/agent-home/{role}")
+        agent_home = _AGENT_HOME_ROOT / role
         agent_home.mkdir(parents=True, exist_ok=True)
         cmd = [
             "flock", _INSTALL_LOCK,
@@ -1768,17 +1769,18 @@ def _tool_uninstall_casa_plugin(
 ) -> dict:
     if targets is None:
         targets = []
-        for d in Path("/addon_configs/casa-agent/agent-home").iterdir():
-            settings = d / ".claude" / "settings.json"
-            if not settings.is_file():
-                continue
-            data = json.loads(settings.read_text(encoding="utf-8"))
-            if any(k.startswith(f"{plugin_name}@") for k in data.get("enabledPlugins", {})):
-                targets.append(d.name)
+        if _AGENT_HOME_ROOT.is_dir():
+            for d in _AGENT_HOME_ROOT.iterdir():
+                settings = d / ".claude" / "settings.json"
+                if not settings.is_file():
+                    continue
+                data = json.loads(settings.read_text(encoding="utf-8"))
+                if any(k.startswith(f"{plugin_name}@") for k in data.get("enabledPlugins", {})):
+                    targets.append(d.name)
 
     uninstalled: list[str] = []
     for role in targets:
-        agent_home = Path(f"/addon_configs/casa-agent/agent-home/{role}")
+        agent_home = _AGENT_HOME_ROOT / role
         cmd = ["claude", "plugin", "uninstall",
                f"{plugin_name}@casa-plugins", "--scope", "project"]
         r = subprocess.run(cmd, cwd=agent_home, capture_output=True, text=True, timeout=60)
