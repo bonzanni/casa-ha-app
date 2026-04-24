@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import time
 import uuid
 from contextvars import ContextVar
@@ -15,6 +16,13 @@ if TYPE_CHECKING:
     from trigger_registry import TriggerRegistry
 
 from executor_registry import ExecutorRegistry
+from marketplace_ops import (
+    MarketplaceError,
+    add_plugin_entry,
+    list_plugin_entries,
+    remove_plugin_entry,
+    update_plugin_entry,
+)
 from plugins_binding import build_sdk_plugins
 
 from claude_agent_sdk import (
@@ -1513,6 +1521,132 @@ def _walk_workspace_tree(root, *, max_depth: int) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Plan 4b §7.1: marketplace_* Configurator MCP tools
+# ---------------------------------------------------------------------------
+
+
+def _tool_marketplace_add_plugin(
+    *,
+    plugin_name: str,
+    repo_url: str,
+    ref: str,
+    description: str,
+    category: str = "productivity",
+    version: str | None = None,
+    casa_system_requirements: list[dict] | None = None,
+) -> dict:
+    # Normalize repo_url → github source shape.
+    repo = repo_url.replace("https://github.com/", "").rstrip("/")
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+
+    entry = {
+        "name": plugin_name,
+        "description": description,
+        "version": version or ref,
+        "source": {"source": "github", "repo": repo, "sha": ref},
+        "category": category,
+    }
+    if casa_system_requirements:
+        entry["casa"] = {"systemRequirements": casa_system_requirements}
+
+    try:
+        add_plugin_entry(entry)
+    except MarketplaceError as exc:
+        return {"added": False, "error": str(exc)}
+
+    # Refresh CC's view of the user marketplace.
+    subprocess.run(
+        ["claude", "plugin", "marketplace", "update", "casa-plugins"],
+        capture_output=True, text=True, timeout=30,
+    )
+    return {"added": True, "entry": entry}
+
+
+def _tool_marketplace_remove_plugin(*, plugin_name: str) -> dict:
+    try:
+        remove_plugin_entry(plugin_name)
+    except MarketplaceError as exc:
+        return {"removed": False, "error": str(exc)}
+    subprocess.run(
+        ["claude", "plugin", "marketplace", "update", "casa-plugins"],
+        capture_output=True, text=True, timeout=30,
+    )
+    return {"removed": True}
+
+
+def _tool_marketplace_update_plugin(*, plugin_name: str, new_ref: str) -> dict:
+    try:
+        update_plugin_entry(plugin_name, new_ref=new_ref)
+    except MarketplaceError as exc:
+        return {"updated": False, "error": str(exc)}
+    subprocess.run(
+        ["claude", "plugin", "marketplace", "update", "casa-plugins"],
+        capture_output=True, text=True, timeout=30,
+    )
+    return {"updated": True, "new_ref": new_ref}
+
+
+def _tool_marketplace_list_plugins() -> dict:
+    return {"plugins": list_plugin_entries()}
+
+
+@tool(
+    "marketplace_add_plugin",
+    "Add a plugin entry to the user marketplace.",
+    {
+        "plugin_name": str,
+        "repo_url": str,
+        "ref": str,
+        "description": str,
+        "category": str,
+        "version": str,
+        "casa_system_requirements": list,
+    },
+)
+async def marketplace_add_plugin(args: dict) -> dict:
+    return _result(_tool_marketplace_add_plugin(
+        plugin_name=args["plugin_name"],
+        repo_url=args["repo_url"],
+        ref=args["ref"],
+        description=args["description"],
+        category=args.get("category", "productivity"),
+        version=args.get("version"),
+        casa_system_requirements=args.get("casa_system_requirements"),
+    ))
+
+
+@tool(
+    "marketplace_remove_plugin",
+    "Remove a plugin entry from the user marketplace.",
+    {"plugin_name": str},
+)
+async def marketplace_remove_plugin(args: dict) -> dict:
+    return _result(_tool_marketplace_remove_plugin(plugin_name=args["plugin_name"]))
+
+
+@tool(
+    "marketplace_update_plugin",
+    "Update a plugin's sha/ref in the user marketplace.",
+    {"plugin_name": str, "new_ref": str},
+)
+async def marketplace_update_plugin(args: dict) -> dict:
+    return _result(_tool_marketplace_update_plugin(
+        plugin_name=args["plugin_name"],
+        new_ref=args["new_ref"],
+    ))
+
+
+@tool(
+    "marketplace_list_plugins",
+    "List all plugins in the user marketplace.",
+    {},
+)
+async def marketplace_list_plugins(args: dict) -> dict:
+    return _result(_tool_marketplace_list_plugins())
+
+
 # Module-level tool registry — iterated by create_casa_tools() for the SDK
 # path and by the MCP HTTP bridge (mcp_bridge._build_tool_dispatch) for
 # real `claude` CLI engagements. Adding a tool here exposes it on both
@@ -1531,6 +1665,10 @@ CASA_TOOLS: tuple = (
     list_engagement_workspaces,
     delete_engagement_workspace,
     peek_engagement_workspace,
+    marketplace_add_plugin,
+    marketplace_remove_plugin,
+    marketplace_update_plugin,
+    marketplace_list_plugins,
 )
 
 
