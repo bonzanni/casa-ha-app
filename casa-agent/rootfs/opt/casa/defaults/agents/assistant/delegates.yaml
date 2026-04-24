@@ -26,3 +26,10 @@ delegates:
       configurator opens a dedicated Telegram topic, commits changes, and reloads Casa.
       Do NOT invoke when the user asks a read-only/factual question about current config
       (answer directly) or asks to install a plugin/skill (say this is not yet supported).
+  - executor_type: plugin-developer
+    description: |
+      Authors new Claude Code plugins in dedicated GitHub repos. Use when
+      the user asks to "build a plugin" / "create a plugin for X" / "add a
+      capability to Tina or Ellen that requires a plugin."
+    typical_task: "Build <plugin-purpose> for <target agents>."
+    engagement_mode: interactive
