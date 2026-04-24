@@ -1644,6 +1644,66 @@ PY
 )"
 pass "D-12 svc-hook-deny: svc-casa-mcp /hooks/resolve gates PreToolUse correctly"
 
+
+# ============================================================================
+# Plan 4b P-block: plugin-developer + Configurator install flow
+# Gated on CASA_USE_MOCK_CLAUDE=1 (already checked above) + CASA_PLAN_4B=1
+# ============================================================================
+if [ "${CASA_PLAN_4B:-0}" = "1" ]; then
+
+# ---------------------------------------------------------------------------
+# P-1 — plugin-developer workspace provisioning
+# Calls provision_workspace directly for a plugin-developer executor to verify
+# CLAUDE.md, .claude/settings.json, and enabledPlugins are written correctly.
+# ---------------------------------------------------------------------------
+log "P-1: plugin-developer workspace provisioning"
+run_harness "P-1" "$(cat <<'PY'
+import asyncio, pathlib, json, sys
+sys.path.insert(0, "/opt/casa")
+
+async def main():
+    from drivers.workspace import provision_workspace
+    from executor_registry import ExecutorRegistry
+
+    exec_reg = ExecutorRegistry("/opt/casa/defaults/agents/executors")
+    exec_reg.load()
+    defn = exec_reg.get("plugin-developer")
+    assert defn is not None, "plugin-developer executor not found in registry"
+
+    ws = await provision_workspace(
+        engagements_root="/tmp/p1-engagements",
+        base_plugins_root="/opt/casa/claude-plugins/base",
+        engagement_id="p1test00000000000000000000000001",
+        defn=defn,
+        task="test plugin",
+        context="t=1",
+        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        workspace_template_root=pathlib.Path(
+            "/opt/casa/defaults/agents/executors/plugin-developer/workspace-template"
+        ),
+        plugins_yaml=pathlib.Path(
+            "/opt/casa/defaults/agents/executors/plugin-developer/plugins.yaml"
+        ),
+    )
+
+    ws_path = pathlib.Path(ws)
+    assert (ws_path / "CLAUDE.md").exists(), "CLAUDE.md missing"
+    assert (ws_path / ".claude" / "settings.json").exists(), ".claude/settings.json missing"
+
+    settings = json.loads((ws_path / ".claude" / "settings.json").read_text())
+    enabled = settings.get("enabledPlugins", {})
+    assert "superpowers@casa-plugins-defaults" in enabled, (
+        f"superpowers@casa-plugins-defaults not in enabledPlugins: {list(enabled)}"
+    )
+    print("P-1 OK")
+
+asyncio.run(main())
+PY
+)"
+pass "P-1: plugin-developer workspace provisioned with correct enabledPlugins"
+
+fi  # end CASA_PLAN_4B
+
 stop_container "$D_NAME"
 
 echo "=== test_engagement.sh complete ==="
