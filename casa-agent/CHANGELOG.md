@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.14.4] - 2026-04-24
+
+### Removed
+- **Partial `ellen/` and `tina/` default agent dirs** (created by Plan 4b B.7
+  with only `plugins.yaml`). These are plan-hypothetical agents not yet
+  implemented; their partial dirs failed `agent_loader` required-file check
+  in CI (`missing required file runtime.yaml`). Delete cleanly — can be
+  re-added when the agents are fully specified.
+
 ## [0.14.3] - 2026-04-24
 
 ### Fixed
