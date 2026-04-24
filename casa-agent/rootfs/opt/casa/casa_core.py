@@ -745,6 +745,19 @@ async def main() -> None:
                     _var, _exc,
                 )
 
+    # 1b. §5.5 / §8.3: source plugin-env.conf into process env.
+    # Resolved after OP_SERVICE_ACCOUNT_TOKEN is available so that op://
+    # references inside plugin-env.conf can be resolved by the same `op` CLI.
+    from plugin_env_conf import read_entries as _read_plugin_env
+    for _var, _value in _read_plugin_env().items():
+        try:
+            os.environ[_var] = _resolve_secret(_value)
+        except RuntimeError as _exc:
+            logger.warning(
+                "plugin-env: %s unresolved: %s — plugin's MCP server will fail to start",
+                _var, _exc,
+            )
+
     # 2. Memory
     base_memory: MemoryProvider
     mem_choice = resolve_memory_backend_choice(dict(os.environ))
