@@ -1,0 +1,36 @@
+{
+  "name": "casa-plugins-defaults",
+  "owner": {"name": "Casa"},
+  "plugins": [
+    {
+      "name": "superpowers",
+      "description": "Superpowers meta-skill pack (brainstorming, writing-plans, subagent-driven-development, executing-plans, requesting-code-review, ...).",
+      "version": "5.0.7",
+      "source": {"source": "github", "repo": "obra/superpowers", "sha": "v5.0.7"}
+    },
+    {
+      "name": "claude-dev",
+      "description": "Claude Code plugin authoring doctrine (plugin-structure, plugin-settings, agent-development, command-development, hook-development, mcp-integration, skill-development).",
+      "version": "0.0.1",
+      "source": {"source": "github", "repo": "<TODO-plan-write>/claude-dev", "sha": "<TODO-pin>"}
+    },
+    {
+      "name": "skill-creator",
+      "description": "SKILL.md authoring craft — create new skills, edit existing skills, measure skill performance.",
+      "version": "0.0.1",
+      "source": {"source": "github", "repo": "<TODO-plan-write>/skill-creator", "sha": "<TODO-pin>"}
+    },
+    {
+      "name": "mcp-server-dev",
+      "description": "MCP server development — build-mcp-server, build-mcpb, build-mcp-app.",
+      "version": "0.0.1",
+      "source": {"source": "github", "repo": "<TODO-plan-write>/mcp-server-dev", "sha": "<TODO-pin>"}
+    },
+    {
+      "name": "document-skills",
+      "description": "Document-flavor skills — mcp-builder, doc-coauthoring, theme-factory.",
+      "version": "0.0.1",
+      "source": {"source": "github", "repo": "<TODO-plan-write>/document-skills", "sha": "<TODO-pin>"}
+    }
+  ]
+}
