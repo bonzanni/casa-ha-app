@@ -9,7 +9,7 @@ FROM ${BUILD_FROM}
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
          python3 python3-pip python3-venv \
-         nodejs npm git nginx-light jq curl ca-certificates \
+         nodejs npm git nginx-light jq curl ca-certificates unzip \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g @anthropic-ai/claude-code \
     && npm cache clean --force
@@ -36,6 +36,35 @@ RUN case "${TARGETARCH}" in \
        "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.${TTYD_ARCH}" \
        -o /usr/bin/ttyd \
     && chmod +x /usr/bin/ttyd
+
+# gh CLI for plugin-developer's GitHub repo creation + push (§6.1 / §6.3 / §8.5)
+ARG GH_CLI_VERSION=2.45.0
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+        amd64) GH_ARCH="linux_amd64" ;; \
+        arm64) GH_ARCH="linux_arm64" ;; \
+        *) echo "unsupported arch $(dpkg --print-architecture)"; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/gh.tar.gz \
+      "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_${GH_ARCH}.tar.gz"; \
+    tar -xzf /tmp/gh.tar.gz -C /tmp; \
+    mv /tmp/gh_${GH_CLI_VERSION}_${GH_ARCH}/bin/gh /usr/local/bin/; \
+    rm -rf /tmp/gh*; \
+    gh --version
+
+# 1Password op CLI for secret resolution (§8 universal resolver)
+ARG OP_CLI_VERSION=2.30.0
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+        amd64) OP_ARCH="amd64" ;; \
+        arm64) OP_ARCH="arm64" ;; \
+        *) echo "unsupported arch $(dpkg --print-architecture)"; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/op.zip \
+      "https://cache.agilebits.com/dist/1P/op2/pkg/v${OP_CLI_VERSION}/op_linux_${OP_ARCH}_v${OP_CLI_VERSION}.zip"; \
+    unzip /tmp/op.zip -d /usr/local/bin; \
+    rm /tmp/op.zip; \
+    op --version
 
 # Python dependencies live in a venv under /opt/casa/venv — Debian
 # 12's system Python is PEP 668 "externally managed"; the venv keeps
