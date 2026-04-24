@@ -6,10 +6,12 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
 import uuid
 from contextvars import ContextVar
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -20,9 +22,14 @@ from marketplace_ops import (
     MarketplaceError,
     add_plugin_entry,
     list_plugin_entries,
+    load_user_marketplace,
     remove_plugin_entry,
     update_plugin_entry,
 )
+from plugin_env_extractor import extract_env_vars
+from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — available for future use
+from system_requirements.orchestrator import install_requirements, OrchestrationError
+from system_requirements.manifest import add_plugin_entry as add_manifest
 from plugins_binding import build_sdk_plugins
 
 from claude_agent_sdk import (
@@ -1592,6 +1599,93 @@ def _tool_marketplace_list_plugins() -> dict:
     return {"plugins": list_plugin_entries()}
 
 
+# ---------------------------------------------------------------------------
+# Plan 4b §7.3 / §4.3.3: install_casa_plugin two-stage commit
+# ---------------------------------------------------------------------------
+
+_INSTALL_LOCK = "/addon_configs/casa-agent/cc-home/.claude/plugins/.install.lock"
+
+
+def _tool_install_casa_plugin(
+    *,
+    plugin_name: str,
+    targets: list[str],
+) -> dict:
+    # 1. Validate marketplace entry exists.
+    data = load_user_marketplace()
+    entry = next((p for p in data["plugins"] if p["name"] == plugin_name), None)
+    if entry is None:
+        return {"ok": False, "error": "plugin_not_in_marketplace"}
+
+    # 2. Refresh CC's view.
+    subprocess.run(
+        ["claude", "plugin", "marketplace", "update", "casa-plugins"],
+        capture_output=True, text=True, timeout=30,
+    )
+
+    # 3. Stage 1 — install system requirements (if any).
+    reqs = (entry.get("casa") or {}).get("systemRequirements") or []
+    outcomes: list = []
+    if reqs:
+        try:
+            outcomes = install_requirements(
+                plugin_name=plugin_name,
+                requirements=reqs,
+                tools_root=Path("/addon_configs/casa-agent/tools"),
+            )
+        except OrchestrationError as exc:
+            return {"ok": False, "error": "system_requirements_failed", "detail": str(exc)}
+
+        # Record manifest BEFORE stage 2 so reconciler can recover on crash.
+        for outcome in outcomes:
+            add_manifest(outcome.manifest_entry(plugin_name))
+
+    # 4. Stage 2 — claude plugin install in each agent-home.
+    installed: list[str] = []
+    failed: list[str] = []
+    for role in targets:
+        agent_home = Path(f"/addon_configs/casa-agent/agent-home/{role}")
+        agent_home.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            "flock", _INSTALL_LOCK,
+            "claude", "plugin", "install",
+            f"{plugin_name}@casa-plugins", "--scope", "project",
+        ]
+        r = subprocess.run(cmd, cwd=agent_home, capture_output=True, text=True, timeout=300)
+        if r.returncode == 0:
+            installed.append(role)
+        else:
+            failed.append(role)
+
+    if failed:
+        # Best-effort rollback of stage 1.
+        for outcome in outcomes:
+            shutil.rmtree(outcome.install_dir, ignore_errors=True)
+        return {
+            "ok": False,
+            "error": "agent_install_failed",
+            "failed": failed,
+            "installed": installed,
+        }
+
+    # 5. Extract required env vars from cached plugin's .mcp.json.
+    cache_root = Path(
+        "/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins"
+    )
+    mcp_json = next(
+        iter(cache_root.glob(f"{plugin_name}/*/.mcp.json")),
+        None,
+    )
+    env_vars = extract_env_vars(mcp_json) if mcp_json else set()
+
+    return {
+        "ok": True,
+        "installed_on": installed,
+        "required_env_vars": sorted(env_vars),
+        "system_requirements_installed": len(outcomes),
+    }
+
+
 @tool(
     "marketplace_add_plugin",
     "Add a plugin entry to the user marketplace.",
@@ -1647,6 +1741,21 @@ async def marketplace_list_plugins(args: dict) -> dict:
     return _result(_tool_marketplace_list_plugins())
 
 
+@tool(
+    "install_casa_plugin",
+    "Install a plugin into target agents (two-stage commit: system requirements then per-agent-home plugin install).",
+    {
+        "plugin_name": str,
+        "targets": list,
+    },
+)
+async def install_casa_plugin(args: dict) -> dict:
+    return _result(_tool_install_casa_plugin(
+        plugin_name=args["plugin_name"],
+        targets=args["targets"],
+    ))
+
+
 # Module-level tool registry — iterated by create_casa_tools() for the SDK
 # path and by the MCP HTTP bridge (mcp_bridge._build_tool_dispatch) for
 # real `claude` CLI engagements. Adding a tool here exposes it on both
@@ -1669,6 +1778,7 @@ CASA_TOOLS: tuple = (
     marketplace_remove_plugin,
     marketplace_update_plugin,
     marketplace_list_plugins,
+    install_casa_plugin,
 )
 
 
