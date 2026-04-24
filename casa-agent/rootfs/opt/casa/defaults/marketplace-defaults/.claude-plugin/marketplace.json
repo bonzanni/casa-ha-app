@@ -7,13 +7,13 @@
       "name": "superpowers",
       "description": "Superpowers meta-skill pack (brainstorming, writing-plans, subagent-driven-development, executing-plans, requesting-code-review, ...).",
       "version": "5.0.7",
-      "source": {"source": "github", "repo": "obra/superpowers", "sha": "v5.0.7"}
+      "source": {"source": "github", "repo": "obra/superpowers", "ref": "v5.0.7"}
     },
     {
       "name": "claude-dev",
       "description": "Claude Code plugin authoring doctrine (plugin-structure, plugin-settings, agent-development, command-development, hook-development, mcp-integration, skill-development).",
       "version": "0.2.1",
-      "source": {"source": "github", "repo": "bonzanni/claude-dev", "sha": "643b9648a4e41825b39f8861b50001be0e348ce2"}
+      "source": {"source": "github", "repo": "bonzanni/claude-dev", "ref": "643b9648a4e41825b39f8861b50001be0e348ce2"}
     },
     {
       "name": "skill-creator",
@@ -31,7 +31,7 @@
       "name": "document-skills",
       "description": "Document-flavor skills — mcp-builder, doc-coauthoring, theme-factory.",
       "version": "0.0.1",
-      "source": {"source": "github", "repo": "anthropics/skills", "sha": "5128e1865d670f5d6c9cef000e6dfc4e951fb5b9"}
+      "source": {"source": "github", "repo": "anthropics/skills", "ref": "5128e1865d670f5d6c9cef000e6dfc4e951fb5b9"}
     }
   ]
 }
