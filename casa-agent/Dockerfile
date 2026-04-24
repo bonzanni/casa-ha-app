@@ -10,6 +10,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
          python3 python3-pip python3-venv \
          nodejs npm git nginx-light jq yq curl ca-certificates unzip \
+         openssh-client \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g @anthropic-ai/claude-code \
     && npm cache clean --force
