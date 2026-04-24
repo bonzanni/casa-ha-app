@@ -1756,6 +1756,212 @@ async def install_casa_plugin(args: dict) -> dict:
     ))
 
 
+# ---------------------------------------------------------------------------
+# Plan 4b §7.4–7.6: uninstall + verify_plugin_state + vault helper tools
+# ---------------------------------------------------------------------------
+
+
+def _tool_uninstall_casa_plugin(
+    *,
+    plugin_name: str,
+    targets: list[str] | None = None,
+) -> dict:
+    if targets is None:
+        targets = []
+        for d in Path("/addon_configs/casa-agent/agent-home").iterdir():
+            settings = d / ".claude" / "settings.json"
+            if not settings.is_file():
+                continue
+            data = json.loads(settings.read_text(encoding="utf-8"))
+            if any(k.startswith(f"{plugin_name}@") for k in data.get("enabledPlugins", {})):
+                targets.append(d.name)
+
+    uninstalled: list[str] = []
+    for role in targets:
+        agent_home = Path(f"/addon_configs/casa-agent/agent-home/{role}")
+        cmd = ["claude", "plugin", "uninstall",
+               f"{plugin_name}@casa-plugins", "--scope", "project"]
+        r = subprocess.run(cmd, cwd=agent_home, capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            uninstalled.append(role)
+    return {"uninstalled_from": uninstalled}
+
+
+def _tool_verify_plugin_state(
+    *,
+    plugin_name: str,
+    _tools_bin: Path | None = None,
+    _cache_root: Path | None = None,
+) -> dict:
+    """Check tool readiness, secret resolution, and MCP cache for a plugin.
+
+    The optional ``_tools_bin`` and ``_cache_root`` parameters override the
+    production paths for testing.
+    """
+    from system_requirements.manifest import read_manifest
+    from plugin_env_conf import read_entries
+
+    data = read_manifest()
+    tool_entries = [p for p in data["plugins"] if p["name"] == plugin_name]
+
+    tools_bin = _tools_bin if _tools_bin is not None else Path("/addon_configs/casa-agent/tools/bin")
+    tools_status = []
+    for t in tool_entries:
+        vb = t.get("verify_bin", "")
+        if (tools_bin / vb).is_symlink() or (tools_bin / vb).is_file():
+            tools_status.append({"requirement": t["winning_strategy"], "verify_bin": vb,
+                                 "status": "ready"})
+        else:
+            tools_status.append({"requirement": t["winning_strategy"], "verify_bin": vb,
+                                 "status": "missing",
+                                 "reason": f"{vb} not in tools/bin"})
+
+    cache_root = _cache_root if _cache_root is not None else Path(
+        "/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins"
+    )
+    mcp_json = next(iter(cache_root.glob(f"{plugin_name}/*/.mcp.json")), None)
+    required = extract_env_vars(mcp_json) if mcp_json else set()
+    env_conf = read_entries()
+    secrets_status = []
+    for var in sorted(required):
+        if var in env_conf:
+            source = "op" if env_conf[var].startswith("op://") else "plain"
+            secrets_status.append({"var": var, "source": source, "status": "resolved"})
+        else:
+            secrets_status.append({"var": var, "source": "missing",
+                                   "status": "unresolved",
+                                   "reason": "not in plugin-env.conf"})
+
+    mcp_started = mcp_json is not None
+    mcp_errors: list[dict] = []
+
+    ready = (
+        all(t["status"] == "ready" for t in tools_status)
+        and all(s["status"] == "resolved" for s in secrets_status)
+        and mcp_started
+    )
+    return {
+        "tools": tools_status,
+        "secrets": secrets_status,
+        "mcp_started": mcp_started,
+        "mcp_errors": mcp_errors,
+        "ready": ready,
+    }
+
+
+def _tool_verify_plugin_secrets(*, plugin_name: str) -> dict:
+    """Back-compat shim (one release only)."""
+    state = _tool_verify_plugin_state(plugin_name=plugin_name)
+    return {"secrets": state["secrets"]}
+
+
+def _tool_set_plugin_env_reference(
+    *,
+    plugin: str,
+    var_name: str,
+    op_ref_or_value: str,
+) -> dict:
+    from plugin_env_conf import set_entry as _set_env_entry_local
+    _set_env_entry_local(var_name, op_ref_or_value)
+    return {"ok": True}
+
+
+def _tool_list_vault_items(*, query: str = "", vault: str = "") -> dict:
+    cmd = ["op", "item", "list", "--format", "json"]
+    if vault:
+        cmd += ["--vault", vault]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        return {"error": r.stderr.strip()}
+    items = json.loads(r.stdout)
+    if query:
+        items = [i for i in items if query.lower() in (i.get("title", "")).lower()]
+    return {"items": [{"name": i.get("title"), "id": i.get("id"),
+                       "category": i.get("category"),
+                       "updated_at": i.get("updated_at")} for i in items]}
+
+
+def _tool_get_item_fields(*, item: str, vault: str = "") -> dict:
+    cmd = ["op", "item", "get", item, "--format", "json"]
+    if vault:
+        cmd += ["--vault", vault]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        return {"error": r.stderr.strip()}
+    data = json.loads(r.stdout)
+    return {"fields": [{"label": f.get("label"),
+                        "section": (f.get("section") or {}).get("label", ""),
+                        "type": f.get("type")}
+                       for f in data.get("fields", [])]}
+
+
+@tool(
+    "uninstall_casa_plugin",
+    "Uninstall a plugin from target agent-homes (or all homes that have it enabled if targets omitted).",
+    {"plugin_name": str, "targets": list},
+)
+async def uninstall_casa_plugin(args: dict) -> dict:
+    return _result(_tool_uninstall_casa_plugin(
+        plugin_name=args["plugin_name"],
+        targets=args.get("targets") or None,
+    ))
+
+
+@tool(
+    "verify_plugin_state",
+    "Check tool readiness, secret resolution, and MCP cache status for a plugin.",
+    {"plugin_name": str},
+)
+async def verify_plugin_state(args: dict) -> dict:
+    return _result(_tool_verify_plugin_state(plugin_name=args["plugin_name"]))
+
+
+@tool(
+    "verify_plugin_secrets",
+    "Back-compat shim: check secret resolution for a plugin (use verify_plugin_state instead).",
+    {"plugin_name": str},
+)
+async def verify_plugin_secrets(args: dict) -> dict:
+    return _result(_tool_verify_plugin_secrets(plugin_name=args["plugin_name"]))
+
+
+@tool(
+    "set_plugin_env_reference",
+    "Upsert a VAR=value or VAR=op://... line in plugin-env.conf.",
+    {"plugin": str, "var_name": str, "op_ref_or_value": str},
+)
+async def set_plugin_env_reference(args: dict) -> dict:
+    return _result(_tool_set_plugin_env_reference(
+        plugin=args["plugin"],
+        var_name=args["var_name"],
+        op_ref_or_value=args["op_ref_or_value"],
+    ))
+
+
+@tool(
+    "list_vault_items",
+    "List 1Password vault items, optionally filtered by query string and/or vault name.",
+    {"query": str, "vault": str},
+)
+async def list_vault_items(args: dict) -> dict:
+    return _result(_tool_list_vault_items(
+        query=args.get("query", ""),
+        vault=args.get("vault", ""),
+    ))
+
+
+@tool(
+    "get_item_fields",
+    "Get field labels and types for a 1Password item (does not return secret values).",
+    {"item": str, "vault": str},
+)
+async def get_item_fields(args: dict) -> dict:
+    return _result(_tool_get_item_fields(
+        item=args["item"],
+        vault=args.get("vault", ""),
+    ))
+
+
 # Module-level tool registry — iterated by create_casa_tools() for the SDK
 # path and by the MCP HTTP bridge (mcp_bridge._build_tool_dispatch) for
 # real `claude` CLI engagements. Adding a tool here exposes it on both
@@ -1779,6 +1985,12 @@ CASA_TOOLS: tuple = (
     marketplace_update_plugin,
     marketplace_list_plugins,
     install_casa_plugin,
+    uninstall_casa_plugin,
+    verify_plugin_state,
+    verify_plugin_secrets,
+    set_plugin_env_reference,
+    list_vault_items,
+    get_item_fields,
 )
 
 
