@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -72,10 +73,19 @@ class ClaudeCodeDriver(DriverProtocol):
             )
 
             # 2. Write the s6 service dir (with log sub-service for stdout capture).
+            extra_env: dict[str, str] = {}
+            if defn.type == "plugin-developer":
+                # §B.9 / §E stub: pass GITHUB_TOKEN through from container env.
+                # Real resolver (_resolve_github_token via §E secrets_resolver)
+                # will replace this passthrough when §E lands.
+                github_token = os.environ.get("GITHUB_TOKEN", "")
+                if github_token:
+                    extra_env["GITHUB_TOKEN"] = github_token
             run_script = render_run_script(
                 engagement_id=engagement.id,
                 permission_mode=defn.permission_mode or "acceptEdits",
                 extra_dirs=list(defn.extra_dirs),
+                extra_env=extra_env or None,
             )
             log_script = render_log_run_script(engagement_id=engagement.id)
             s6_rc.write_service_dir(

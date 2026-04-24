@@ -24,11 +24,17 @@ _TEMPLATE_PATH = os.path.join(
 def render_run_script(
     *, engagement_id: str, permission_mode: str,
     extra_dirs: list[str], extra_unset: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> str:
     """Read the run-script template and substitute per-engagement values.
 
     The per-engagement workspace is always included in --add-dir; any
     caller-provided extras are appended after it.
+
+    ``extra_env`` — optional mapping of env var name → value to export
+    inside the run script (e.g. GITHUB_TOKEN for plugin-developer).
+    Values are shell-quoted with single quotes; embedded single-quotes in
+    values are escaped via the standard ``'\''`` idiom.
     """
     with open(_TEMPLATE_PATH, "r", encoding="utf-8") as fh:
         template = fh.read()
@@ -38,6 +44,14 @@ def render_run_script(
 
     extra_unset_str = " ".join(extra_unset or [])
 
+    if extra_env:
+        export_lines = "\n".join(
+            "export {}='{}'".format(k, v.replace("'", "'\\''"))
+            for k, v in extra_env.items()
+        )
+    else:
+        export_lines = ""
+
     return (
         template
         .replace("{ID_SHORT}", engagement_id[:8])
@@ -45,6 +59,7 @@ def render_run_script(
         .replace("{PERMISSION_MODE}", permission_mode)
         .replace("{ADD_DIR_FLAGS}", add_dir_flags)
         .replace("{EXTRA_UNSET}", extra_unset_str)
+        .replace("{EXTRA_EXPORT}", export_lines)
     )
 
 
@@ -73,32 +88,73 @@ async def provision_workspace(
     task: str,
     context: str,
     casa_framework_mcp_url: str,
+    workspace_template_root: Path | None = None,
+    plugins_yaml: Path | None = None,
+    world_state_summary: str = "",
 ) -> str:
     """Create /<engagements_root>/<id>/ with the full provisioning tree.
 
     Returns the absolute workspace path. Caller must NOT create the
     directory first — this function does.
 
+    If ``workspace_template_root`` and ``plugins_yaml`` are both provided
+    and the template directory exists, ``render_workspace_template`` is
+    called to populate CLAUDE.md and .claude/settings.json (Plan 4b §16.3).
+    Otherwise the legacy prompt-interpolation path is used.
+
     Note: filesystem I/O (mkdir, write_text, os.symlink, os.mkfifo) is
     currently synchronous despite the ``async def`` surface. The cost
     per engagement-start (one-time provisioning of a few files + one
-    FIFO + a handful of symlinks) is well under 10ms on the N150, so the
-    brief event-loop stall is acceptable. If profiling later shows
-    otherwise, wrap the filesystem calls in ``asyncio.to_thread`` to
-    match the pattern in ``drivers/s6_rc.py``.
+    FIFO) is well under 10ms on the N150, so the brief event-loop stall
+    is acceptable. If profiling later shows otherwise, wrap the filesystem
+    calls in ``asyncio.to_thread`` to match the pattern in
+    ``drivers/s6_rc.py``.
     """
     ws = Path(engagements_root) / engagement_id
     ws.mkdir(parents=True, exist_ok=False)
 
-    # 1. CLAUDE.md — the executor prompt, interpolated.
-    prompt_text = _read_text(defn.prompt_template_path)
-    prompt_interpolated = (
-        prompt_text
-        .replace("{task}", task or "")
-        .replace("{context}", context or "(none)")
-        .replace("{executor_type}", defn.type)
-    )
-    (ws / "CLAUDE.md").write_text(prompt_interpolated, encoding="utf-8")
+    # Plan 4b §16.3: if a workspace-template exists for this executor, render it
+    # into the workspace root. This subsumes the old symlink-loop behavior.
+    if (
+        workspace_template_root is not None
+        and plugins_yaml is not None
+        and workspace_template_root.is_dir()
+    ):
+        render_workspace_template(
+            template_root=workspace_template_root,
+            plugins_yaml=plugins_yaml,
+            dest=ws,
+            executor_type=defn.type,
+            task=task,
+            context=context,
+            world_state_summary=world_state_summary,
+        )
+    else:
+        # 1. CLAUDE.md — the executor prompt, interpolated (legacy path).
+        prompt_text = _read_text(defn.prompt_template_path)
+        prompt_interpolated = (
+            prompt_text
+            .replace("{task}", task or "")
+            .replace("{context}", context or "(none)")
+            .replace("{executor_type}", defn.type)
+        )
+        (ws / "CLAUDE.md").write_text(prompt_interpolated, encoding="utf-8")
+
+        # .claude/settings.json with translated hooks (legacy path).
+        (ws / ".claude").mkdir(exist_ok=True)
+        hooks_yaml_data: dict = {}
+        if getattr(defn, "hooks_path", None) and os.path.isfile(defn.hooks_path):
+            with open(defn.hooks_path, "r", encoding="utf-8") as fh:
+                hooks_yaml_data = yaml.safe_load(fh) or {}
+        settings = translate_hooks_to_settings(
+            hooks_yaml_data, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
+        )
+        (ws / ".claude" / "settings.json").write_text(
+            json.dumps(settings, indent=2), encoding="utf-8",
+        )
+
+        # Per-engagement HOME dir (plugins symlinks removed in v0.14.x).
+        (ws / ".home" / ".claude" / "plugins").mkdir(parents=True)
 
     # 2. .mcp.json — point at Casa's MCP HTTP bridge with engagement id header.
     mcp_config = {"mcpServers": {
@@ -110,43 +166,7 @@ async def provision_workspace(
     }}
     (ws / ".mcp.json").write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
 
-    # 3. .claude/settings.json with translated hooks.
-    (ws / ".claude").mkdir()
-    hooks_yaml: dict = {}
-    if getattr(defn, "hooks_path", None) and os.path.isfile(defn.hooks_path):
-        with open(defn.hooks_path, "r", encoding="utf-8") as fh:
-            hooks_yaml = yaml.safe_load(fh) or {}
-    settings = translate_hooks_to_settings(
-        hooks_yaml, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
-    )
-    (ws / ".claude" / "settings.json").write_text(
-        json.dumps(settings, indent=2), encoding="utf-8",
-    )
-
-    # 4. Per-engagement HOME + plugin symlinks.
-    plugins_dst = ws / ".home" / ".claude" / "plugins"
-    plugins_dst.mkdir(parents=True)
-
-    # Tier 1 — baseline symlinks first.
-    base_root = Path(base_plugins_root)
-    if base_root.is_dir():
-        for pack in sorted(base_root.iterdir()):
-            if pack.is_dir():
-                os.symlink(str(pack), str(plugins_dst / pack.name))
-
-    # Tier 2 — per-executor packs, force-override any Tier 1 pack of the same name.
-    if defn.plugins_dir:
-        pe_root = Path(defn.plugins_dir)
-        if pe_root.is_dir():
-            for pack in sorted(pe_root.iterdir()):
-                if not pack.is_dir():
-                    continue
-                link = plugins_dst / pack.name
-                if link.exists() or link.is_symlink():
-                    link.unlink()
-                os.symlink(str(pack), str(link))
-
-    # 5. Named FIFO for stdin.
+    # 3. Named FIFO for stdin.
     fifo_path = ws / "stdin.fifo"
     os.mkfifo(str(fifo_path), 0o600)
 
