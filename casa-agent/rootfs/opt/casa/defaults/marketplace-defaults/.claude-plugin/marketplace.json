@@ -1,7 +1,7 @@
 {
   "name": "casa-plugins-defaults",
   "owner": {"name": "Casa"},
-  "_notes": "claude-dev → bonzanni/claude-dev (community repo; this is the Casa-maintained plugin-dev pack used locally as 'claude-dev'; no Anthropic-owned repo exists under that name — anthropics/claude-plugins-official calls it 'plugin-dev' but bonzanni/claude-dev is the upstream Casa already uses). skill-creator → anthropics/claude-plugins-official subdir plugins/skill-creator (official Anthropic pack). mcp-server-dev → anthropics/claude-plugins-official subdir plugins/mcp-server-dev (official Anthropic pack). document-skills → anthropics/skills top-level repo (Anthropic monorepo; 'document-skills' is a named pack in its marketplace.json whose skills live under skills/xlsx, skills/docx, skills/pptx, skills/pdf — the whole repo is the plugin source as confirmed by the anthropic-agent-skills marketplace using source: './').",
+  "_notes": "plugin-dev → anthropics/claude-plugins-official subdir plugins/plugin-dev (the public Anthropic equivalent to the private bonzanni/claude-dev pack; skill set matches plan description: plugin-structure, plugin-settings, agent-development, command-development, hook-development, mcp-integration, skill-development). skill-creator → anthropics/claude-plugins-official subdir plugins/skill-creator (official Anthropic pack). mcp-server-dev → anthropics/claude-plugins-official subdir plugins/mcp-server-dev (official Anthropic pack). document-skills → anthropics/skills top-level repo (Anthropic monorepo; 'document-skills' is a named pack in its marketplace.json whose skills live under skills/xlsx, skills/docx, skills/pptx, skills/pdf — the whole repo is the plugin source as confirmed by the anthropic-agent-skills marketplace using source: './').",
   "plugins": [
     {
       "name": "superpowers",
@@ -10,10 +10,10 @@
       "source": {"source": "github", "repo": "obra/superpowers", "ref": "v5.0.7"}
     },
     {
-      "name": "claude-dev",
+      "name": "plugin-dev",
       "description": "Claude Code plugin authoring doctrine (plugin-structure, plugin-settings, agent-development, command-development, hook-development, mcp-integration, skill-development).",
-      "version": "0.2.1",
-      "source": {"source": "github", "repo": "bonzanni/claude-dev", "ref": "643b9648a4e41825b39f8861b50001be0e348ce2"}
+      "version": "0.0.1",
+      "source": {"source": "git-subdir", "url": "https://github.com/anthropics/claude-plugins-official.git", "path": "plugins/plugin-dev", "ref": "main", "sha": "020446a4294f09d9c32e60bff0c4ae8fb39205cb"}
     },
     {
       "name": "skill-creator",
