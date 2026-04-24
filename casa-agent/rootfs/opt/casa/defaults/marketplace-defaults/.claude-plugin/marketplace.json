@@ -31,7 +31,7 @@
       "name": "document-skills",
       "description": "Document-flavor skills — mcp-builder, doc-coauthoring, theme-factory.",
       "version": "0.0.1",
-      "source": {"source": "github", "repo": "anthropics/skills", "ref": "5128e1865d670f5d6c9cef000e6dfc4e951fb5b9"}
+      "source": {"source": "github", "repo": "anthropics/skills", "ref": "main"}
     }
   ]
 }
