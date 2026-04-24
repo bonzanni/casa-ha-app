@@ -231,4 +231,20 @@ fi
 # Drop any legacy profile.d leftover from earlier drafts. Safe on fresh install.
 rm -f /etc/profile.d/casa-tools.sh
 
+# --- Plan 4b: system-requirements reconciliation (§4.3.4) -----------------
+# Reconciler runs the declared install strategy for every plugin tool that is
+# missing after upgrade (persistent volume survives, but failures / user-wipes
+# happen). Non-blocking — degrades affected plugins, never crashes boot.
+MANIFEST=/addon_configs/casa-agent/system-requirements.yaml
+STATUS_FILE=/addon_configs/casa-agent/system-requirements.status.yaml
+if [ -f "$MANIFEST" ]; then
+    python3 /opt/casa/scripts/reconcile_system_requirements.py \
+        --manifest "$MANIFEST" \
+        --tools-root "$TOOLS_ROOT" \
+        --status-file "$STATUS_FILE" \
+        --log-level warning \
+        || bashio::log.warning \
+          "system-requirements reconciliation had failures — see $STATUS_FILE"
+fi
+
 bashio::log.info "Configuration setup complete."
