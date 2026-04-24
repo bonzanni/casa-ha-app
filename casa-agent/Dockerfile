@@ -85,3 +85,58 @@ RUN chmod +x /etc/s6-overlay/scripts/*.sh \
     && find /etc/s6-overlay/s6-rc.d -name 'run' -o -name 'finish' \
     | xargs chmod +x \
     && chmod +x /opt/casa/scripts/*.sh
+
+# --- Seed-marketplace build (§3.2 + §10.1 + spike §Gate 3) -------------------
+
+# Copy marketplace catalogs into the image.
+COPY rootfs/opt/casa/defaults/marketplace-defaults/ /opt/casa/defaults/marketplace-defaults/
+COPY rootfs/opt/casa/defaults/marketplace-user/ /opt/casa/defaults/marketplace-user/
+
+# Pin the default-marketplace plugin refs. Each entry also appears in
+# /opt/casa/defaults/marketplace-defaults/.claude-plugin/marketplace.json
+# with a matching `source:{source:"github",repo:"...",ref:"..."}` stanza so
+# the seed is reproducible and offline-resolvable.
+ARG SUPERPOWERS_REF=v5.0.7
+
+# Create the non-root user the build-install runs under.
+# `--allow-dangerously-skip-permissions` refuses to run as root.
+RUN id -u casa >/dev/null 2>&1 || useradd -m -s /bin/bash casa; \
+    mkdir -p /opt/claude-seed && chown -R casa:casa /opt/claude-seed
+
+USER casa
+
+# Force git to use HTTPS instead of SSH for github.com so build-time
+# `claude plugin install` works in the hermetic Docker build context
+# (no SSH keys available; CC CLI uses git@github.com URLs by default).
+RUN git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+# Build-time seed install. CLAUDE_CODE_PLUGIN_CACHE_DIR points at the seed's
+# plugins/ root (parent of cache/) — NOT plugins/cache/. Per spike §Gate 1.
+RUN CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin marketplace add /opt/casa/defaults/marketplace-defaults/ \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin install superpowers@casa-plugins-defaults \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin install plugin-dev@casa-plugins-defaults \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin install skill-creator@casa-plugins-defaults \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin install mcp-server-dev@casa-plugins-defaults \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin install document-skills@casa-plugins-defaults
+
+USER root
+
+# Spike §Gate 3 addendum: the build-time install populates
+# known_marketplaces.json + cache/ but does NOT populate marketplaces/<name>/.
+# Manually copy so runtime plugin resolution works.
+RUN mkdir -p /opt/claude-seed/marketplaces \
+ && cp -r /opt/casa/defaults/marketplace-defaults \
+          /opt/claude-seed/marketplaces/casa-plugins-defaults \
+ && chmod -R a-w /opt/claude-seed \
+ && chmod -R a+rX /opt/claude-seed
+
+# Make the seed visible to every consumer (casa-main + every engagement
+# subprocess). Engagement subprocesses also get CLAUDE_CODE_PLUGIN_CACHE_DIR
+# exported at spawn time (see §B workspace-template + §5.3).
+ENV CLAUDE_CODE_PLUGIN_SEED_DIR=/opt/claude-seed
