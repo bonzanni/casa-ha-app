@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.14.1] — Plan 4b plugin-developer + consumer infrastructure
+
+### Removed
+
+- `repos:` addon option + `sync-repos.sh` script. This was a half-built
+  scratch-sync mechanism with no runtime consumer (§9 of Plan 4b spec).
+  **Migration:** users with non-empty `repos:` entries must remove them
+  from the addon config before upgrading. No data migration needed.
+
 ## [0.14.0] — Phase 3.6 — `casa-framework` MCP extraction
 
 ### Added

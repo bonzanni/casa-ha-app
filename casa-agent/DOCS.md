@@ -66,26 +66,9 @@ options panel) for finer control:
 | `enable_terminal` | Enable a web terminal accessible via the ingress panel. Default: `false`. |
 | `webhook_secret` | HMAC-SHA256 secret for authenticating webhook requests. Leave empty to skip verification. |
 
-### Optional -- Workspace
-
-| Option | Description |
-|--------|-------------|
-| `repos` | List of git repositories to clone into the workspace. Each entry needs `url`, `path`, and optionally `branch`. |
-
-Example:
-
-```yaml
-repos:
-  - url: https://github.com/you/casa-skills
-    path: casa-skills
-    branch: main
-```
-
-Repos are cloned on first boot and pulled on subsequent boots (unless there are local changes).
-
 ## How it works
 
-1. **Startup**: The add-on validates your OAuth token, copies default agent configs (if first boot), syncs workspace repos, and starts nginx + the Casa core process.
+1. **Startup**: The add-on validates your OAuth token, copies default agent configs (if first boot), and starts nginx + the Casa core process.
 2. **Message flow**: Incoming messages (Telegram, webhook, voice) are routed through an async message bus to the appropriate agent based on the originating channel.
 3. **Agent processing**: Each agent builds a system prompt (personality + memory context), queries the Claude Agent SDK, stores the conversation in memory, and sends the response back through the originating channel.
 4. **Home Assistant integration**: Agents interact with HA via the official HA MCP server, allowing them to control devices, read states, and create automations.

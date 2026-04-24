@@ -84,10 +84,6 @@ configuration:
     name: Enable Web Terminal
     description: >-
       Expose a web terminal in the ingress panel for shell access to the container.
-  repos:
-    name: Workspace Repositories
-    description: >-
-      Git repositories to clone into the workspace. Cloned on first boot, pulled on restart.
   telegram_engagement_supergroup_id:
     name: "Telegram engagement supergroup chat ID"
     description: |
