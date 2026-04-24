@@ -38,7 +38,6 @@ Everything you edit lives under `/addon_configs/casa-agent/`:
       disclosure.yaml
     schema/
       *.v1.json                    # READ-ONLY - editing breaks loaders
-    workspace/                     # scratch dir you can use for non-tracked work
 
 Read-only to you (hook-blocked): `/data/**` (runtime state), `/addon_configs/casa-agent/schema/**`, `/opt/casa/**`.
 
