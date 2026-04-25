@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.15.0] - 2026-04-25 — Resident-to-resident delegation
+
+Residents can now delegate to other residents and specialists by role
+via the new `delegate_to_agent` MCP tool. Lifts the previous "Ellen is
+the only delegator" architectural constraint.
+
+### New
+
+- `delegate_to_agent(agent=<role>, task=, context=, mode={sync,async,interactive})` —
+  unified delegation tool. Resolves `agent` against a merged role map of
+  residents + specialists. `mode=interactive` is rejected for residents.
+- `<delegates>` and `<executors>` system-prompt blocks rendered at turn
+  time from each resident's `delegates.yaml` / `executors.yaml`. Closes
+  the long-standing dead-data bug where `cfg.delegates` was loaded but
+  never reached the model.
+- `<delegation_context>` block prepended to delegated calls so target
+  agents can adapt voice/text register.
+- New `executors.yaml` (assistant-only) — `configurator`,
+  `plugin-developer`, and `engagement` entries moved out of
+  `delegates.yaml`.
+- `agent_registry` module: name↔role bidirectional map for prompt
+  rendering and future code paths.
+
+### Breaking (no back-compat alias; pre-1.0.0)
+
+- `delegate_to_specialist` removed; replace with `delegate_to_agent`.
+- `mcp__casa-framework__delegate_to_specialist` removed from
+  `runtime.yaml::tools.allowed` allowlists; replace with
+  `…delegate_to_agent`.
+- Configurator doctrine updated; recipes wire/unwire generalized.
+
+### Behavioral
+
+- Single-hop depth cap: a delegated agent cannot itself call
+  `delegate_to_agent` (returns `delegation_depth_exceeded`). Trivially
+  relaxable via the `_MAX_DELEGATION_DEPTH` constant in `tools.py`.
+
+### Out of scope (separate specs)
+
+- HA-control plugin / Tina's tool inventory.
+- Cross-channel sending.
+- Multi-hop chaining.
+
 ## [0.14.12] - 2026-04-25
 
 Log-noise sweep — four fixes surfaced by a live N150 log audit
