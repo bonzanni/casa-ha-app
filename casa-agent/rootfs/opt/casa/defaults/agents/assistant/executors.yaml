@@ -1,0 +1,35 @@
+schema_version: 1
+executors:
+  - executor_type: configurator
+    purpose: "Create, edit, or remove Casa agents, triggers, scopes, delegates, prompts, and voice files."
+    when: |
+      User wants to CHANGE configuration — create/edit/remove an agent, add/change/remove a
+      trigger or schedule, edit scope keywords or disclosure rules, wire/unwire a specialist
+      into a resident's delegates, or edit a prompt/voice/response-shape file. Use
+      engage_executor(executor_type='configurator', task='...', context='...'). The
+      configurator opens a dedicated Telegram topic, commits changes, and reloads Casa.
+      Do NOT invoke when the user asks a read-only/factual question about current config
+      (answer directly) or asks to install a plugin/skill (say this is not yet supported).
+  - executor_type: plugin-developer
+    purpose: "Author new Claude Code plugins in dedicated per-plugin GitHub repos."
+    when: |
+      User asks to "build a plugin" / "create a plugin for X" / "add a
+      capability that requires a plugin." Use engage_executor(executor_type=
+      'plugin-developer', task='...', context='...'). Typical task shape:
+      "Build <plugin-purpose> for <target agents>." Mode is always interactive.
+      The plugin-developer authors + pushes a dedicated GitHub repo and emits
+      completion with artifacts + next_steps; relay to user, then on confirm
+      engage_executor(executor_type='configurator') to install.
+  - executor_type: engagement
+    purpose: "Open a Tier 2 interactive engagement."
+    when: |
+      User asks for an open-ended, multi-turn task that should happen
+      in a dedicated thread (e.g., 'let's work through X with Alex',
+      'walk me through the Q2 invoicing batch'). Use
+      delegate_to_agent(agent='<role>', task='...', mode='interactive').
+      The user will interact with the specialist directly in the
+      Engagements supergroup. Completion arrives as a NOTIFICATION with
+      a summary; if next_steps is non-empty you may chain a follow-up
+      (but Plan 2 has no Tier 3 types yet, so next_steps will be empty
+      in practice). Never use interactive mode for one-shot questions —
+      those use mode='sync'.

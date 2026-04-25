@@ -170,3 +170,19 @@ def test_assistant_delegates_yaml_has_no_executor_entries():
     assert "configurator" not in agents
     assert "plugin-developer" not in agents
     assert "engagement" not in agents
+
+
+# ---------------------------------------------------------------------------
+# Task 14: assistant/executors.yaml seed sanity
+# ---------------------------------------------------------------------------
+
+
+def test_assistant_executors_yaml_seed_loads():
+    from agent_loader import _read_yaml, _validate
+    path = (
+        "casa-agent/rootfs/opt/casa/defaults/agents/assistant/executors.yaml"
+    )
+    data = _read_yaml(path)
+    _validate(data, "executors", path)
+    types = {e["executor_type"] for e in data["executors"]}
+    assert {"configurator", "plugin-developer", "engagement"}.issubset(types)
