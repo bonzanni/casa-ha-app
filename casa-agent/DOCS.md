@@ -166,7 +166,7 @@ lives in its own Telegram forum topic inside a dedicated supergroup.
 
 The setup is a one-time Telegram configuration. Skip this section to
 keep Casa running in 1:1-only mode (Ellen delegates synchronously and
-returns a single response; `delegate_to_specialist(mode="interactive")`
+returns a single response; `delegate_to_agent(mode="interactive")`
 will return `engagement_not_configured`).
 
 ### Setup
@@ -386,7 +386,7 @@ To enable one:
 After restart, check the addon log for the
 `Specialists: enabled=[...] disabled=[...]` summary line to confirm
 your specialist moved into the enabled set. Residents can now invoke
-it via `delegate_to_specialist(specialist="<role>", ...)`.
+it via `delegate_to_agent(agent="<role>", ...)`.
 
 To disable it again, set `enabled: false` and restart. Your edits to
 the YAML file persist across addon updates — Casa only seeds from

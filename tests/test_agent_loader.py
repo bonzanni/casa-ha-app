@@ -276,10 +276,10 @@ class TestDelegatesValidation:
                 purpose: money
                 when: money q
         """)
-        # runtime.yaml tools.allowed missing delegate_to_specialist
+        # runtime.yaml tools.allowed missing delegate_to_agent
         policies = load_policies(str(_policies_file(tmp_path / "policies")))
 
-        with pytest.raises(LoadError, match="delegate_to_specialist"):
+        with pytest.raises(LoadError, match="delegate_to_agent"):
             load_agent_from_dir(str(agent_dir), policies=policies)
 
     def test_empty_delegates_does_not_require_mcp_tool(self, tmp_path):

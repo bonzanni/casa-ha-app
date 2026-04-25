@@ -62,7 +62,7 @@ TIER_FILES["executor"] = {
                   "response_shape.yaml", "voice.yaml", "triggers.yaml"},
 }
 
-_DELEGATE_MCP_TOOL = "mcp__casa-framework__delegate_to_specialist"
+_DELEGATE_MCP_TOOL = "mcp__casa-framework__delegate_to_agent"
 
 
 class LoadError(Exception):
@@ -191,7 +191,7 @@ def _render_delegates_section(delegates: list[DelegateEntry]) -> str:
         lines.append(f"  - {d.agent}: {d.purpose} — when: {d.when}")
     lines.append("")
     lines.append(
-        "Invoke via mcp__casa-framework__delegate_to_specialist(specialist=..., task=...)."
+        "Invoke via mcp__casa-framework__delegate_to_agent(agent=..., task=...)."
     )
     return "\n".join(lines).rstrip() + "\n"
 

@@ -858,7 +858,7 @@ async def main() -> None:
     from specialist_registry import DelegationComplete, SpecialistRegistry
 
     # Phase 3.1 Task 7: init_tools now takes a SpecialistRegistry so the
-    # delegate_to_specialist tool can resolve Tier 2 specialist configs.
+    # delegate_to_agent tool can resolve resident + specialist configs.
     # Task 10 replaces this stub with a directory scan + orphan recovery.
     specialist_registry = SpecialistRegistry(
         os.path.join(CONFIG_DIR, "agents", "specialists"),

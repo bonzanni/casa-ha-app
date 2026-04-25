@@ -1,4 +1,4 @@
-"""Tests for delegate_to_specialist mode=interactive branch."""
+"""Tests for delegate_to_agent mode=interactive branch."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ class TestInteractiveMode:
     async def test_opens_topic_and_creates_engagement(self, tmp_path, monkeypatch):
         import agent as agent_mod
         from engagement_registry import EngagementRegistry
-        from tools import delegate_to_specialist, init_tools
+        from tools import delegate_to_agent, init_tools
 
         reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
         tch = MagicMock()
@@ -62,8 +62,8 @@ class TestInteractiveMode:
             "scope": "business",
         })
         try:
-            res = await delegate_to_specialist.handler({
-                "specialist": "finance", "task": "Plan Q2", "context": "",
+            res = await delegate_to_agent.handler({
+                "agent": "finance", "task": "Plan Q2", "context": "",
                 "mode": "interactive",
             })
         finally:
@@ -80,7 +80,7 @@ class TestInteractiveMode:
     ):
         import agent as agent_mod
         from engagement_registry import EngagementRegistry
-        from tools import delegate_to_specialist, init_tools
+        from tools import delegate_to_agent, init_tools
 
         reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
         tch = MagicMock()
@@ -99,8 +99,8 @@ class TestInteractiveMode:
             "chat_id": "c1", "cid": "x", "user_text": "hi",
         })
         try:
-            res = await delegate_to_specialist.handler({
-                "specialist": "finance", "task": "x", "context": "",
+            res = await delegate_to_agent.handler({
+                "agent": "finance", "task": "x", "context": "",
                 "mode": "interactive",
             })
         finally:

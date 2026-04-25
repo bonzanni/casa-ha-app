@@ -127,7 +127,7 @@ async def send_message(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# delegate_to_specialist — Phase 3.1
+# delegate_to_agent — Phase 3.1
 # ---------------------------------------------------------------------------
 
 
@@ -298,7 +298,7 @@ def _build_world_state_summary() -> str:
     return "\n".join(lines)
 
 
-async def _run_specialist(cfg, task_text: str, context_text: str) -> str:
+async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
     """Run one ephemeral specialist turn and return the concatenated text."""
     options = _build_specialist_options(cfg)
     prompt = f"{task_text}\n\nContext:\n{context_text}" if context_text else task_text
@@ -372,11 +372,11 @@ def _attach_completion_callback(
 
 
 @tool(
-    "delegate_to_specialist",
-    "Delegate a task to a specialist agent and return its result.",
-    {"specialist": str, "task": str, "context": str, "mode": str},
+    "delegate_to_agent",
+    "Delegate a task to another agent (resident or specialist) and return its result.",
+    {"agent": str, "task": str, "context": str, "mode": str},
 )
-async def delegate_to_specialist(args: dict) -> dict:
+async def delegate_to_agent(args: dict) -> dict:
     """Invoke a Tier 2 specialist via the SDK and return its text.
 
     Sync mode (default): ``asyncio.wait`` up to 60s, return ok/error
@@ -390,7 +390,7 @@ async def delegate_to_specialist(args: dict) -> dict:
     # Import lazily — matches the `agent.py` origin_var ContextVar.
     import agent as agent_mod
 
-    specialist_name = args.get("specialist", "")
+    agent_name = args.get("agent", "")
     task_text = args.get("task", "")
     context_text = args.get("context", "") or ""
     mode = args.get("mode", "sync") or "sync"
@@ -411,15 +411,15 @@ async def delegate_to_specialist(args: dict) -> dict:
         return _result({
             "status": "error",
             "kind": "no_origin",
-            "message": "delegate_to_specialist called outside a turn",
+            "message": "delegate_to_agent called outside a turn",
         })
 
-    cfg = _specialist_registry.get(specialist_name)
+    cfg = _specialist_registry.get(agent_name)
     if cfg is None:
         return _result({
             "status": "error",
             "kind": "unknown_specialist",
-            "message": f"No enabled specialist named {specialist_name!r}",
+            "message": f"No enabled specialist named {agent_name!r}",
         })
 
     if mode == "interactive":
@@ -437,11 +437,11 @@ async def delegate_to_specialist(args: dict) -> dict:
                             "options and verify the bot has can_manage_topics"),
             })
         # Open topic
-        icon = _ICON_FOR_KIND.get(("specialist", specialist_name), "🧵")
+        icon = _ICON_FOR_KIND.get(("specialist", agent_name), "🧵")
         short_task = (task_text or "").splitlines()[0][:80].strip() or "engagement"
         try:
             topic_id = await channel.open_engagement_topic(
-                name=f"#[{specialist_name}] {short_task}",
+                name=f"#[{agent_name}] {short_task}",
                 icon_emoji=icon,
             )
         except Exception as exc:  # noqa: BLE001
@@ -449,7 +449,7 @@ async def delegate_to_specialist(args: dict) -> dict:
                             "message": str(exc)})
         # Create record
         rec = await _engagement_registry.create(
-            kind="specialist", role_or_type=specialist_name, driver="in_casa",
+            kind="specialist", role_or_type=agent_name, driver="in_casa",
             task=task_text, origin=dict(origin), topic_id=topic_id,
         )
         # Rename the topic to include the short engagement id for disambiguation
@@ -457,7 +457,7 @@ async def delegate_to_specialist(args: dict) -> dict:
             await channel.bot.edit_forum_topic(
                 chat_id=channel.engagement_supergroup_id,
                 message_thread_id=topic_id,
-                name=f"#[{specialist_name}] {short_task} · {rec.id[:8]}",
+                name=f"#[{agent_name}] {short_task} · {rec.id[:8]}",
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("edit_forum_topic rename failed: %s", exc)
@@ -495,7 +495,7 @@ async def delegate_to_specialist(args: dict) -> dict:
         return _result({
             "status": "pending",
             "engagement_id": rec.id,
-            "agent": specialist_name,
+            "agent": agent_name,
             "mode": "interactive",
             "topic_id": topic_id,
         })
@@ -503,23 +503,23 @@ async def delegate_to_specialist(args: dict) -> dict:
     delegation_id = str(uuid.uuid4())
     started_at = time.time()
     record = DelegationRecord(
-        id=delegation_id, agent=specialist_name, started_at=started_at,
+        id=delegation_id, agent=agent_name, started_at=started_at,
         origin=dict(origin),
     )
     await _specialist_registry.register_delegation(record)
 
-    task = asyncio.create_task(_run_specialist(cfg, task_text, context_text))
+    task = asyncio.create_task(_run_delegated_agent(cfg, task_text, context_text))
 
     if mode == "async":
         _attach_completion_callback(task, record)
         logger.info(
             "Delegation %s → %s (async mode)",
-            delegation_id[:8], specialist_name,
+            delegation_id[:8], agent_name,
         )
         return _result({
             "status": "pending",
             "delegation_id": delegation_id,
-            "agent": specialist_name,
+            "agent": agent_name,
             "mode": "async",
         })
 
@@ -536,12 +536,12 @@ async def delegate_to_specialist(args: dict) -> dict:
         _attach_completion_callback(task, record)
         logger.info(
             "Delegation %s → %s timed out at 60s — degraded to pending",
-            delegation_id[:8], specialist_name,
+            delegation_id[:8], agent_name,
         )
         return _result({
             "status": "pending",
             "delegation_id": delegation_id,
-            "agent": specialist_name,
+            "agent": agent_name,
             "timeout_s": 60,
             "note": (
                 "Delegation continues in background; you will receive a "
@@ -558,12 +558,12 @@ async def delegate_to_specialist(args: dict) -> dict:
         elapsed = time.time() - started_at
         logger.info(
             "Delegation %s → %s failed: %s (%s)",
-            delegation_id[:8], specialist_name, kind, exc,
+            delegation_id[:8], agent_name, kind, exc,
         )
         return _result({
             "status": "error",
             "delegation_id": delegation_id,
-            "agent": specialist_name,
+            "agent": agent_name,
             "kind": kind,
             "message": str(exc),
             "elapsed_s": elapsed,
@@ -574,12 +574,12 @@ async def delegate_to_specialist(args: dict) -> dict:
     elapsed = time.time() - started_at
     logger.info(
         "Delegation %s → %s ok (%.2fs)",
-        delegation_id[:8], specialist_name, elapsed,
+        delegation_id[:8], agent_name, elapsed,
     )
     return _result({
         "status": "ok",
         "delegation_id": delegation_id,
-        "agent": specialist_name,
+        "agent": agent_name,
         "elapsed_s": elapsed,
         "text": text,
     })
@@ -2055,7 +2055,7 @@ async def get_item_fields(args: dict) -> dict:
 # transports automatically.
 CASA_TOOLS: tuple = (
     send_message,
-    delegate_to_specialist,
+    delegate_to_agent,
     get_schedule,
     engage_executor,
     emit_completion,

@@ -4,7 +4,7 @@ Symmetric with :mod:`session_registry` and :mod:`mcp_registry`.
 Scans a directory for per-specialist YAML files, validates the Tier 2
 shape (no channels, zero token budget, ephemeral session, no
 scopes_owned), honours the new ``enabled: bool`` field, and exposes a
-runtime lookup used by the ``delegate_to_specialist`` framework tool.
+runtime lookup used by the ``delegate_to_agent`` framework tool.
 
 Also holds the in-flight delegation table (in-memory + ``/data/
 delegations.json`` tombstone) consumed by the completion callback and
