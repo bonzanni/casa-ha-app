@@ -1,5 +1,83 @@
 # Changelog
 
+## [0.14.9] - 2026-04-25
+
+Unified github access. Replaces the five distinct mechanisms across
+build / boot / Configurator runtime / plugin-developer engagement with
+one path: a system-level `/etc/gitconfig` (SSH→HTTPS rewrite + a
+credential helper) plus `$GITHUB_TOKEN` propagated at addon-wide scope
+via `/run/s6/container_environment/GITHUB_TOKEN`.
+
+### Added
+
+- **`/etc/gitconfig`** ships in the image. Contains an SSH→HTTPS
+  insteadOf rewrite for github.com (no token) and a `credential.helper`
+  pointing at `/opt/casa/scripts/git-credential-casa.sh`. Applies
+  system-wide regardless of which user or HOME the process runs under.
+
+- **`/opt/casa/scripts/git-credential-casa.sh`** — stateless POSIX shell
+  helper. Reads `$GITHUB_TOKEN` from process env at request time, emits
+  `username=x-access-token\npassword=...` on stdout. Token never
+  written to any config file. Includes CR/LF strip on token to prevent
+  malformed credential responses if `op read` emits trailing newlines.
+
+### Changed
+
+- **`setup-configs.sh`** resolves `op://${ONEPASSWORD_DEFAULT_VAULT}/GitHub/credential`
+  at boot via `bashio::config` + `op read`, then writes the token to
+  `/run/s6/container_environment/GITHUB_TOKEN` (mode 0600). s6-overlay
+  merges this into every supervised service's environment, so casa-main,
+  svc-casa-mcp, every engagement subprocess, and every `git`/`gh`/`claude
+  plugin install` invocation inherits the same token automatically.
+
+- **`setup-configs.sh`** seed-copies cc-home plugin state from the
+  image-baked `/opt/claude-seed/` on first boot (idempotent — sentinel
+  is `installed_plugins.json` in cc-home). Replaces the v0.14.8 boot
+  install loop. Symlink-based — CC CLI tolerates `installPath` via
+  symlink (verified by spike D.1 on N150). No network access required
+  at boot for the 5 default plugins.
+
+- **`Dockerfile`** pairs each `claude plugin install` with a
+  `claude plugin enable` so the image-baked seed has `enabled: true`
+  for all 5 default plugins. Without this, the seed-copy would
+  preserve `enabled: false` from the build (CC CLI's `install` does
+  not auto-enable).
+
+### Removed
+
+- **v0.14.8 boot install loop** in `setup-configs.sh` (the
+  `claude plugin install <ref>` loop with `flock`-serialised stderr
+  capture). Default-plugin install state now comes from the seed-copy.
+
+- **`_resolve_plugin_developer_github_token`** in
+  `drivers/claude_code_driver.py` and the per-engagement
+  `extra_env["GITHUB_TOKEN"]` injection. The token is in the
+  addon-wide environment and inherited automatically.
+
+- **`Dockerfile`'s per-USER `git config --global url.X.insteadOf`**
+  for the `casa` build user. The same rewrite ships in `/etc/gitconfig`,
+  which applies to every USER.
+
+### Tokenless mode
+
+If `onepassword_service_account_token` or `onepassword_default_vault`
+is unset/null, OR if `op read` fails for any reason, `GITHUB_TOKEN`
+stays unset. Casa runs in **public-only mode**: all anonymous github
+clones still work via `/etc/gitconfig`'s SSH→HTTPS rewrite; private-repo
+clones return 404/403; plugin-developer's `gh repo create` fails (logged
+at engagement scope). No secret material leaks anywhere.
+
+### Notes
+
+- Pre-1.0.0 wipe-on-update: no migration. On addon update,
+  `/opt/claude-seed/` is rebuilt fresh in the new image; cc-home is
+  refilled by the seed-copy on next boot.
+
+- The unified path is verified by the v0.14.9 spike findings on N150
+  (2026-04-25): all four spikes passed against the production
+  `op://Casa/GitHub/credential` with the proposed credential-helper
+  pattern.
+
 ## [0.14.8] - 2026-04-25
 
 Boot-time fix — register the seed marketplace alongside the user
