@@ -142,6 +142,14 @@ class SpecialistRegistry:
         """Return the enabled specialist config, or None."""
         return self._configs.get(agent_name)
 
+    def all_configs(self) -> dict[str, "AgentConfig"]:
+        """Return a snapshot of enabled specialist configs by role.
+
+        Used at boot to build the merged role→AgentConfig registry that
+        ``delegate_to_agent`` resolves against. Returns a defensive copy.
+        """
+        return dict(self._configs)
+
     # -- Delegation bookkeeping (in-memory; tombstone in Task 5) ----------
 
     def has_delegation(self, delegation_id: str) -> bool:

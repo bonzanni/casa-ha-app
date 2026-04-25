@@ -893,16 +893,6 @@ async def main() -> None:
     )
     trigger_registry = TriggerRegistry(scheduler=scheduler, app=app, bus=bus)
 
-    init_tools(
-        channel_manager, bus, specialist_registry, mcp_registry,
-        trigger_registry=trigger_registry,
-        engagement_registry=engagement_registry,
-        executor_registry=executor_registry,
-    )
-    casa_tools_config = create_casa_tools()
-    mcp_registry.register_sdk("casa-framework", casa_tools_config)
-    logger.info("Registered casa-framework MCP tools")
-
     # 8. Load agent configs by role
     from agent import Agent
 
@@ -911,6 +901,20 @@ async def main() -> None:
         os.path.join(CONFIG_DIR, "policies", "disclosure.yaml"),
     )
     role_configs = load_all_agents(agents_dir, policies=policy_lib)
+
+    specialist_configs = specialist_registry.all_configs()
+    init_tools(
+        channel_manager, bus, specialist_registry, mcp_registry,
+        agent_role_map=_build_role_registry(
+            residents=role_configs, specialists=specialist_configs,
+        ),
+        trigger_registry=trigger_registry,
+        engagement_registry=engagement_registry,
+        executor_registry=executor_registry,
+    )
+    casa_tools_config = create_casa_tools()
+    mcp_registry.register_sdk("casa-framework", casa_tools_config)
+    logger.info("Registered casa-framework MCP tools")
 
     # Plan 4b §5.1 — ensure every loaded in_casa agent has an agent-home with
     # default plugins seeded from plugins.yaml. Idempotent — runs every boot.

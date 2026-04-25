@@ -188,14 +188,14 @@ class TestUnknownAgent:
         text = result["content"][0]["text"]
         payload = json.loads(text)
         assert payload["status"] == "error"
-        assert payload["kind"] == "unknown_specialist"
+        assert payload["kind"] == "unknown_agent"
 
 
 class TestDisabledAgent:
-    async def test_returns_unknown_specialist_error(self, tmp_path):
+    async def test_returns_unknown_agent_error(self, tmp_path):
         """Disabled specialists are filtered at load-time — get() returns None,
         the tool cannot distinguish them from truly unknown names. Both
-        paths collapse to kind=unknown_specialist."""
+        paths collapse to kind=unknown_agent."""
         from tools import delegate_to_agent, init_tools
 
         specialists = tmp_path / "ex"
@@ -216,7 +216,7 @@ class TestDisabledAgent:
         )
         payload = json.loads(result["content"][0]["text"])
         assert payload["status"] == "error"
-        assert payload["kind"] == "unknown_specialist"
+        assert payload["kind"] == "unknown_agent"
 
 
 # ---------------------------------------------------------------------------
@@ -570,3 +570,88 @@ class TestMcpRegistryWiring:
         cfg.mcp_server_names = []  # specialist declares no MCP deps
         options = _build_specialist_options(cfg)
         assert options.mcp_servers == {}
+
+
+# ---------------------------------------------------------------------------
+# TestMergedRoleMap — Task 7: delegate_to_agent resolves resident configs
+# ---------------------------------------------------------------------------
+
+
+class TestMergedRoleMap:
+    async def test_delegate_to_agent_resolves_resident(self, tmp_path, monkeypatch):
+        """delegate_to_agent(agent='butler', ...) finds a resident config."""
+        import tools
+
+        # Build a butler resident cfg using the existing helper
+        resident_cfg = _specialist_cfg(role="butler")
+        resident_cfg.character.name = "Tina"
+
+        reg = SpecialistRegistry(
+            str(tmp_path / "specs"),
+            tombstone_path=str(tmp_path / "tombs.json"),
+        )
+        tools.init_tools(
+            channel_manager=None,
+            bus=None,
+            specialist_registry=reg,
+            mcp_registry=None,
+            agent_role_map={"butler": resident_cfg},
+        )
+
+        import agent as agent_mod
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram", "chat_id": "1",
+            "user_id": 1, "cid": "abc", "user_text": "x",
+        })
+        try:
+            async def _fake_run(cfg, task_text, context_text):
+                return f"Tina says ok: {task_text}"
+            monkeypatch.setattr(tools, "_run_delegated_agent", _fake_run)
+
+            result = await tools.delegate_to_agent.handler({
+                "agent": "butler",
+                "task": "turn off the lights",
+                "context": "",
+                "mode": "sync",
+            })
+            payload = json.loads(result["content"][0]["text"])
+            assert payload["status"] == "ok"
+            assert payload["agent"] == "butler"
+            assert "Tina says ok" in payload["text"]
+        finally:
+            agent_mod.origin_var.reset(token)
+
+    async def test_delegate_to_agent_unknown_returns_unknown_agent(
+        self, tmp_path, monkeypatch,
+    ):
+        import tools
+
+        reg = SpecialistRegistry(
+            str(tmp_path / "specs"),
+            tombstone_path=str(tmp_path / "tombs.json"),
+        )
+        tools.init_tools(
+            channel_manager=None,
+            bus=None,
+            specialist_registry=reg,
+            mcp_registry=None,
+            agent_role_map={},
+        )
+
+        import agent as agent_mod
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram", "chat_id": "1",
+            "user_id": 1, "cid": "abc", "user_text": "x",
+        })
+        try:
+            result = await tools.delegate_to_agent.handler({
+                "agent": "ghost",
+                "task": "anything",
+                "context": "",
+                "mode": "sync",
+            })
+            payload = json.loads(result["content"][0]["text"])
+            assert payload["status"] == "error"
+            assert payload["kind"] == "unknown_agent"
+        finally:
+            agent_mod.origin_var.reset(token)
