@@ -53,3 +53,12 @@ uuid_count=$(echo "$webhook_keys" | grep -Ev "^webhook:(user-A|user-B)$" | grep 
 [ "$uuid_count" -eq 2 ] \
     || fail "expected 2 UUID-backed invoke sessions, got $uuid_count (keys: $webhook_keys)"
 pass "C-3b each chat_id-less invoke gets its own session"
+
+log "C-4: cc-home has 5 default plugins after boot (seed-copy verified)"
+plugin_count=$(docker exec "$NAME" sh -c \
+    'export HOME=/addon_configs/casa-agent/cc-home; \
+     claude plugin list --json' \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d))")
+[ "$plugin_count" = "5" ] \
+    || fail "expected 5 default plugins from seed-copy, got $plugin_count"
+pass "C-4 default plugins seeded: 5/5"
