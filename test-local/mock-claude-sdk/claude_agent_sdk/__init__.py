@@ -75,6 +75,12 @@ class ClaudeAgentOptions:
     cwd: str | None = None
     resume: str | None = None
     setting_sources: list[str] = field(default_factory=list)
+    # Plan 4b (commit 28b8748): casa_core wires plugins=build_sdk_plugins(...)
+    # into resident SDK construction. Without this field the dataclass init
+    # raised TypeError, every turn failed, and /data/sessions.json stayed
+    # empty — masking the bug under unit tests (which use the host's real
+    # SDK). See reference_mock_sdk_drift in memory for the v0.5.9 precedent.
+    plugins: list[Any] = field(default_factory=list)
 
 
 class ClaudeSDKClient:
