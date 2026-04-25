@@ -904,14 +904,15 @@ async def main() -> None:
 
     specialist_configs = specialist_registry.all_configs()
     from agent_registry import AgentRegistry
+    agent_registry = AgentRegistry.build(
+        residents=role_configs, specialists=specialist_configs,
+    )
     init_tools(
         channel_manager, bus, specialist_registry, mcp_registry,
         agent_role_map=_build_role_registry(
             residents=role_configs, specialists=specialist_configs,
         ),
-        agent_registry=AgentRegistry.build(
-            residents=role_configs, specialists=specialist_configs,
-        ),
+        agent_registry=agent_registry,
         trigger_registry=trigger_registry,
         engagement_registry=engagement_registry,
         executor_registry=executor_registry,
@@ -977,6 +978,7 @@ async def main() -> None:
             mcp_registry=mcp_registry,
             channel_manager=channel_manager,
             scope_registry=scope_registry,
+            agent_registry=agent_registry,
         )
         bus.register(role, agent.handle_message)
         agents[role] = agent

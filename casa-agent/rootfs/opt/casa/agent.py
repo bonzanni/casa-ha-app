@@ -80,6 +80,23 @@ def _winner_pair(scores: dict[str, float]) -> tuple[str | None, float, float]:
     return winner, float(winner_score), float(second_score)
 
 
+def _render_delegates_block(delegates, registry) -> str:
+    """Render the <delegates> system-prompt block.
+
+    Empty string when ``delegates`` is empty so callers can append
+    unconditionally without polluting the prompt.
+    """
+    if not delegates:
+        return ""
+    lines = ["<delegates>"]
+    for d in delegates:
+        name = registry.role_to_name(d.agent) if registry is not None else d.agent
+        lines.append(f"- {name} (role: {d.agent}) — {d.purpose}")
+        lines.append(f"  Delegate when: {d.when}")
+    lines.append("</delegates>")
+    return "\n".join(lines)
+
+
 class Agent:
     """A Casa agent backed by the Claude Agent SDK."""
 
@@ -91,6 +108,7 @@ class Agent:
         mcp_registry: McpServerRegistry,
         channel_manager: ChannelManager,
         scope_registry: "ScopeRegistry",
+        agent_registry=None,
     ) -> None:
         self.config = config
         self._memory = memory
@@ -98,6 +116,7 @@ class Agent:
         self._mcp_registry = mcp_registry
         self._channel_manager = channel_manager
         self._scope_registry = scope_registry
+        self._agent_registry = agent_registry
         self._bg_tasks: set[asyncio.Task] = set()
         # Per-(session_id) over-budget streak tracker (spec 5.2 §5.2).
         # Per-instance so assistant (4000) and butler (800) budgets stay
@@ -326,6 +345,12 @@ class Agent:
                 f"trust: {channel_trust_display(msg.channel)}\n"
                 "</channel_context>"
             )
+            # <delegates> block — renders cfg.delegates with display names.
+            delegates_block = _render_delegates_block(
+                self.config.delegates, self._agent_registry,
+            )
+            if delegates_block:
+                system_parts.append("\n" + delegates_block)
             _now = datetime.now(resolve_tz())
             system_parts.append(
                 f"\n<current_time>\n"
