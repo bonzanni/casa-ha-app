@@ -138,4 +138,31 @@ else
     rm -f "$SECRET_FILE"
 fi
 
+# === seed-copy: begin (test override) ===========================
+# Mirror of the production setup-configs.sh seed-copy block. The test
+# image's `claude` is the real CLI (Dockerfile.test installs it), and
+# /opt/claude-seed/ is populated at image build time by Dockerfile's
+# `claude plugin install` lines. This block populates cc-home from the
+# seed so e2e/test_invoke_sessions.sh::C-4 sees the 5 default plugins.
+SEED_DIR="${SEED_DIR:-/opt/claude-seed}"
+CC_HOME="${CC_HOME:-/addon_configs/casa-agent/cc-home}"
+CC_PLUGINS_DIR="$CC_HOME/.claude/plugins"
+
+if [ -d "$SEED_DIR" ] && [ ! -f "$CC_PLUGINS_DIR/installed_plugins.json" ]; then
+    echo "[INFO] Seeding cc-home plugin state from $SEED_DIR (test mode)"
+    mkdir -p "$CC_PLUGINS_DIR/cache"
+    if [ ! -e "$CC_PLUGINS_DIR/cache/casa-plugins-defaults" ]; then
+        ln -s "$SEED_DIR/cache/casa-plugins-defaults" \
+              "$CC_PLUGINS_DIR/cache/casa-plugins-defaults"
+    fi
+    cp "$SEED_DIR/installed_plugins.json" "$CC_PLUGINS_DIR/installed_plugins.json"
+    if [ ! -f "$CC_PLUGINS_DIR/known_marketplaces.json" ]; then
+        cp "$SEED_DIR/known_marketplaces.json" "$CC_PLUGINS_DIR/known_marketplaces.json"
+    fi
+    if [ ! -d "$CC_PLUGINS_DIR/marketplaces" ]; then
+        cp -r "$SEED_DIR/marketplaces" "$CC_PLUGINS_DIR/marketplaces"
+    fi
+fi
+# === seed-copy: end ==============================================
+
 echo "[INFO] Configuration setup complete (local test mode)."
