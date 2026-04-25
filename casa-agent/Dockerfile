@@ -117,23 +117,13 @@ RUN CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
  && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
     claude plugin install superpowers@casa-plugins-defaults \
  && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin enable  superpowers@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
     claude plugin install plugin-dev@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin enable  plugin-dev@casa-plugins-defaults \
  && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
     claude plugin install skill-creator@casa-plugins-defaults \
  && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin enable  skill-creator@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
     claude plugin install mcp-server-dev@casa-plugins-defaults \
  && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin enable  mcp-server-dev@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin install document-skills@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin enable  document-skills@casa-plugins-defaults
+    claude plugin install document-skills@casa-plugins-defaults
 
 USER root
 
