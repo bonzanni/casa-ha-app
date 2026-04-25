@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.14.12] - 2026-04-25
+
+Log-noise sweep — four fixes surfaced by a live N150 log audit
+(2026-04-25). All changes target log signal/noise; no behavior shifts
+beyond the heartbeat-delivery one called out below.
+
+### Fixed
+
+- **Telegram channel**: `chat_id` validation. The `context["chat_id"]`
+  slot is overloaded — user-initiated messages carry a numeric Telegram
+  chat id, but scheduled triggers carry session-keying labels like
+  `"interval:heartbeat"`. The Telegram API rejects non-numeric values
+  with `BadRequest: Chat not found`, which used to bubble through
+  `finalize_stream → send` and surface as a full traceback at the bus
+  dispatcher. New `_resolve_chat_id` helper falls back to the channel's
+  registered default when the value isn't numeric. **Behavioral note:**
+  hourly heartbeats now actually deliver to the registered chat instead
+  of silently failing — if the agent prompt's "stay quiet" instruction
+  isn't honored, the user will see hourly pings. Tune the prompt if so.
+- **CC CLI transcript persistence**: `setup-configs.sh` now symlinks
+  `/root/.claude/projects` to `/addon_configs/casa-agent/cc-home/.claude/projects`
+  on boot. The bundled CC CLI uses `$HOME=/root → ~/.claude/projects/`,
+  but `/root/` is wiped on every container rebuild, so the SDK's
+  `--resume <sid>` path failed on every first turn after a deploy
+  (visible as `claude_agent_sdk._internal.query: Fatal error in message
+  reader` for `voice:probe-scope` and `telegram:interval:heartbeat`).
+  One-time migration on first boot copies any pre-existing transcripts
+  into the persistent location before replacing the dir with a symlink.
+- **Empty `s6-rc-compile` at boot**: `replay_undergoing_engagements`
+  used to call `_compile_and_update_locked()` unconditionally, which
+  printed `source /data/casa-s6-services is empty` to stderr at every
+  boot when no claude_code engagements were active. Now early-returns
+  when both `undergoing` and `removed_orphans` are empty — the
+  engagement sources dir is unchanged, so a compile would be wasted.
+- **`svc-nginx/finish` and `svc-ttyd/finish`**: gate the `bashio::log.warning`
+  on exit codes 0 and 256, mirroring the existing pattern in
+  `svc-casa-mcp/finish`. Code 0 = clean stop (s6 told it to); code 256
+  = s6 "do-not-restart" sentinel. Anything else still surfaces.
+
+### Files
+
+- `casa-agent/rootfs/opt/casa/channels/telegram.py` — `_resolve_chat_id`
+  helper + 3 call-site updates (`send`, `create_on_token`, `finalize_stream`).
+- `casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh` — projects
+  dir symlink with first-boot migration.
+- `casa-agent/rootfs/opt/casa/casa_core.py` — `replay_undergoing_engagements`
+  fast path.
+- `casa-agent/rootfs/etc/s6-overlay/s6-rc.d/svc-nginx/finish` and
+  `.../svc-ttyd/finish` — exit-code gate.
+
 ## [0.14.11] - 2026-04-25
 
 Test tiering — Half 1. Re-groups existing CI tests into a three-tier

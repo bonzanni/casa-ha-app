@@ -129,6 +129,21 @@ if [ ! -f "$DATA_DIR/sessions.json" ]; then
     echo '{}' > "$DATA_DIR/sessions.json"
 fi
 
+# Persist CC CLI conversation transcripts across container rebuilds.
+# The bundled CC CLI uses $HOME=/root → ~/.claude/projects/<cwd-encoded>/<sid>.jsonl;
+# /root/ is wiped on every rebuild, so the SDK's --resume <sid> path fails on
+# every first turn after a deploy (sessions.json under /data/ persists, but the
+# transcript files vanish — see agent.py resume-recovery comment). Symlink the
+# projects dir to a path under /addon_configs/ (persistent volume) so transcripts
+# survive rebuilds and resume just works.
+PERSIST_PROJECTS="$CONFIG_DIR/cc-home/.claude/projects"
+mkdir -p "$PERSIST_PROJECTS" /root/.claude
+if [ -e /root/.claude/projects ] && [ ! -L /root/.claude/projects ]; then
+    cp -R /root/.claude/projects/. "$PERSIST_PROJECTS/" 2>/dev/null || true
+    rm -rf /root/.claude/projects
+fi
+[ -L /root/.claude/projects ] || ln -s "$PERSIST_PROJECTS" /root/.claude/projects
+
 # Auto-generate webhook secret if auth is enabled and no secret is set.
 SECRET_FILE="$DATA_DIR/webhook_secret"
 if bashio::config.true 'webhook_auth_enabled'; then
