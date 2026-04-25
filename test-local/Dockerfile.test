@@ -119,4 +119,50 @@ RUN printf '#!/bin/sh\nENABLED=$(jq -r ".enable_terminal // false" /data/options
 
 RUN chmod +x /etc/s6-overlay/scripts/*.sh
 
+# --- Populate /opt/claude-seed/ (mirrors production Dockerfile §90..143) ---
+# v0.14.9 seed-copy at boot expects this dir to exist with the install
+# state for the 5 default plugins. Build it the same way production does
+# so test container's setup-configs.sh seed-copy block has something to
+# copy from. /etc/gitconfig (shipped via rootfs COPY above) handles the
+# SSH→HTTPS rewrite for the github.com clones below.
+COPY casa-agent/rootfs/opt/casa/defaults/marketplace-defaults/ /opt/casa/defaults/marketplace-defaults/
+
+RUN id -u casa >/dev/null 2>&1 || useradd -m -s /bin/bash casa; \
+    mkdir -p /opt/claude-seed && chown -R casa:casa /opt/claude-seed
+
+USER casa
+
+RUN CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin marketplace add /opt/casa/defaults/marketplace-defaults/ \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin install superpowers@casa-plugins-defaults \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin enable  superpowers@casa-plugins-defaults \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin install plugin-dev@casa-plugins-defaults \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin enable  plugin-dev@casa-plugins-defaults \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin install skill-creator@casa-plugins-defaults \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin enable  skill-creator@casa-plugins-defaults \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin install mcp-server-dev@casa-plugins-defaults \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin enable  mcp-server-dev@casa-plugins-defaults \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin install document-skills@casa-plugins-defaults \
+ && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+    claude plugin enable  document-skills@casa-plugins-defaults
+
+USER root
+
+RUN mkdir -p /opt/claude-seed/marketplaces \
+ && cp -r /opt/casa/defaults/marketplace-defaults \
+          /opt/claude-seed/marketplaces/casa-plugins-defaults \
+ && chmod -R a-w /opt/claude-seed \
+ && chmod -R a+rX /opt/claude-seed
+
+ENV CLAUDE_CODE_PLUGIN_SEED_DIR=/opt/claude-seed
+
 ENV SUPERVISOR_TOKEN=mock-token-for-testing
