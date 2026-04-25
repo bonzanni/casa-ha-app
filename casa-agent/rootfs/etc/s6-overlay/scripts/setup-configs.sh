@@ -198,6 +198,39 @@ claude plugin marketplace add /addon_configs/casa-agent/marketplace/ \
 INSTALL_LOCK=/addon_configs/casa-agent/cc-home/.claude/plugins/.install.lock
 mkdir -p "$(dirname "$INSTALL_LOCK")"
 
+# === github-token: begin ========================================
+# v0.14.9: resolve op://VAULT/GitHub/credential at boot, export to s6
+# container env so every supervised service + engagement subprocess
+# inherits $GITHUB_TOKEN automatically. The token is consumed by
+# /opt/casa/scripts/git-credential-casa.sh (wired in /etc/gitconfig)
+# at git auth time — never written to disk.
+#
+# If 1P credentials aren't configured, leave $GITHUB_TOKEN unset →
+# public-only mode: anonymous github clones still work via the
+# /etc/gitconfig SSH→HTTPS rewrite; private clones return 404/403.
+OP_TOK="$(bashio::config 'onepassword_service_account_token')"
+VAULT="$(bashio::config 'onepassword_default_vault')"
+GH_TOKEN=""
+if [ -n "$OP_TOK" ] && [ "$OP_TOK" != "null" ] \
+   && [ -n "$VAULT" ] && [ "$VAULT" != "null" ]; then
+    GH_TOKEN=$(OP_SERVICE_ACCOUNT_TOKEN="$OP_TOK" \
+        op read "op://${VAULT}/GitHub/credential" 2>/dev/null) || GH_TOKEN=""
+fi
+if [ -n "$GH_TOKEN" ]; then
+    # s6-overlay's /run/s6/container_environment/<NAME> is read once at
+    # service-spawn time and merged into each child process's env.
+    # File mode 0600 root-only — same protection level as /data/ secrets.
+    umask 077
+    printf "%s" "$GH_TOKEN" > /run/s6/container_environment/GITHUB_TOKEN
+    umask 022
+    bashio::log.info "GitHub access: token-authenticated (public + private per PAT scope)"
+else
+    rm -f /run/s6/container_environment/GITHUB_TOKEN
+    bashio::log.info "GitHub access: anonymous (public only)"
+fi
+unset OP_TOK VAULT GH_TOKEN
+# === github-token: end ==========================================
+
 # === seed-copy: begin ===========================================
 # v0.14.9: replace the boot install loop with a no-network seed copy.
 # /opt/claude-seed/ is image-baked at Dockerfile build time and contains
