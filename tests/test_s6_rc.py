@@ -122,8 +122,8 @@ class TestServiceStatus:
         def fake_run(argv, **kwargs):
             class _R:
                 returncode = 0
-                stdout = "12345\n"        # s6-svstat -u prints pid or 0
-            assert argv == ["s6-svstat", "-u", "/run/service/engagement-abc"]
+                stdout = "12345\n"        # s6-svstat -p prints pid (0 if down)
+            assert argv == ["s6-svstat", "-p", "/run/service/engagement-abc"]
             return _R()
         monkeypatch.setattr(s6_rc.subprocess, "run", fake_run)
 
