@@ -105,10 +105,17 @@ async def compile_and_update() -> None:
 
 
 async def service_pid(*, engagement_id: str) -> int | None:
-    """Return the live supervised PID for engagement-<id>, or None if down/absent."""
+    """Return the live supervised PID for engagement-<id>, or None if down/absent.
+
+    Uses ``s6-svstat -p`` which prints the supervised process PID
+    (or ``0`` when the service is down). The earlier flag ``-u`` printed
+    ``true``/``false`` (up status) which always failed ``int()`` and
+    silently returned ``None`` — every engagement looked dead, breaking
+    is_alive_async on every restart-survival code path.
+    """
     result = await asyncio.to_thread(
         subprocess.run,
-        ["s6-svstat", "-u", f"/run/service/engagement-{engagement_id}"],
+        ["s6-svstat", "-p", f"/run/service/engagement-{engagement_id}"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
