@@ -1,5 +1,104 @@
 # Changelog
 
+## [0.14.6] - 2026-04-25
+
+### Removed
+- **`github_token` addon option.** Plugin-developer now resolves
+  `op://${onepassword_default_vault}/GitHub/credential` directly at
+  engagement spawn time. Vault is configurable via
+  `onepassword_default_vault`; item title (`GitHub`) and field label
+  (`credential`) are conventional. One fewer addon option to configure;
+  1P is the single source of truth.
+
+### Migration
+- Users with `github_token` set in addon options: remove the entry, then
+  ensure your 1P vault contains a `GitHub` item with a `credential` field
+  holding a GitHub PAT (`repo` scope).
+
+## [0.14.6] - 2026-04-25
+
+Bug-review v0.14.6 — security and correctness sweep against findings
+from `docs/bug-review-2026-04-24.md`. No new features; all changes
+are surgical fixes with regression tests.
+
+### Security
+
+- **block_dangerous_bash regex bypass.** Replaced flat regex matcher
+  with an argv-aware checker that splits on shell separators
+  (`;`, `&&`, `||`, `|`, `&`), shlex-parses each piece, and recurses
+  into `bash -c "..."` / `sh -c "..."`. Variants that previously
+  bypassed the safety hook (`rm -r -f`, `rm --recursive --force`,
+  `rm -rfv`, `rm -fR`, `/usr/bin/rm -rf`, `bash -c "rm -rf /"`,
+  `; rm -rf /`) are now all blocked. Verified live on N150 v0.14.5
+  before the fix.
+- **Tarball zip-slip / symlink-escape (`system_requirements/tarball.py`).**
+  `tarfile.extractall` and `zipfile.extractall` now validate every
+  member up front: symlinks/hardlinks/devices/fifos refused, and any
+  member whose resolved path leaves the extract dir is rejected. Uses
+  the `data` filter on Python 3.11.4+, falls back to manual member
+  validation on the production 3.11.2 runtime. Also: the `extract:`
+  field is resolved-path-checked, and unsafe URL schemes (`file://`,
+  `ftp://`, `jar:`) are refused before download.
+- **Tarball `install_cmd` shell injection.** `install_cmd` is now an
+  argv list (`list[str]`) only — `subprocess.run(..., shell=True)` is
+  gone. Backwards-incompatible with any marketplace entry that supplied
+  a shell string (the first-party manifest does not).
+- **Workspace `extra_dirs` shell injection.** Each entry must be an
+  absolute path with no shell-special characters
+  (`; | & ` ` $ < > ' "` newline / null). Values are still
+  `shlex.quote`'d at render time.
+- **Workspace `extra_env` key injection.** Keys must match
+  `^[A-Z_][A-Z0-9_]*$` (the same convention used by
+  `plugin_env_conf.py`); a newline or `$(...)` in the key would
+  otherwise escape the rendered `export` line.
+- **`casa_reload` / `config_git_commit` defense in depth.** Both tools
+  now verify the calling agent's role (`origin_var` for SDK path,
+  `engagement_var.role_or_type` for engagement-bridge path) and refuse
+  unless it's `configurator`. Pre-fix they relied solely on each
+  agent's `runtime.yaml::tools.allowed`, which is a single point of
+  failure if a permissive default sneaks into a new role.
+- **Telegram `/cancel` and `/complete` are originator-only.** Pre-fix
+  any user in the engagement supergroup could fire either command and
+  terminate someone else's engagement. Bus context now carries
+  `user_id`, propagates through `origin_var` → `engagement.origin`,
+  and the slash-command handler refuses unless `from_user.id` matches.
+  `/silent` stays open (local to the topic). Legacy engagements with
+  no `user_id` in origin still work.
+
+### Reliability
+
+- **`emit_completion` idempotency.** Re-emitting completion (SDK retry
+  / hook misfire) is a recognised no-op now: the second call returns
+  `{"status": "acknowledged", "kind": "already_terminal"}` without
+  re-NOTIFYing Ellen, re-closing the topic, or re-writing the
+  meta-scope summary into Honcho.
+- **`delete_engagement_workspace` covers `idle`.** The live-state
+  guard previously checked only `"active"`; an idle engagement
+  (SDK-suspended after 24h) had its s6 service still running, but a
+  non-`force` delete still tore down the workspace under it. Now both
+  `active` and `idle` require `force=true`.
+- **`_tail_file` follows log rotation.** The s6-log 1 MB rotation of
+  `/var/log/casa-engagement-<id>/current` no longer drops the new
+  file's content. Tracks `st_ino`; on inode change resets `pos = 0`.
+  Also resets if the file shrinks below `pos` (truncate-in-place).
+- **`ClaudeCodeDriver.start` rolls back on failure.** If
+  `provision_workspace`, `write_service_dir`, `_compile_and_update`,
+  or `start_service` raises, the partial workspace + s6 service dir +
+  s6-rc compile are best-effort cleaned up before the original
+  exception is re-raised. No more orphan UNDERGOING ghosts that the
+  sweeper skips forever and that boot replay tries to resurrect.
+- **Invalid `casa_tz` no longer crashes every turn.** `resolve_tz()`
+  catches `ZoneInfoNotFoundError`, logs a warning naming the bad
+  value, falls back to `Europe/Amsterdam`. `lru_cache` does not cache
+  exceptions, which pre-fix meant every single turn re-raised.
+
+### Tests
+
+- 37 new regression tests covering all of the above. The live N150
+  bypass for `block_dangerous_bash` is captured directly in
+  `test_rm_recursive_force_all_blocked`; the rest mirror their bug
+  preconditions one-for-one.
+
 ## [0.14.5] - 2026-04-24
 
 ### Fixed

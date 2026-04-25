@@ -250,6 +250,10 @@ class Agent:
             "role": self.config.role,
             "channel": msg.channel,
             "chat_id": msg.context.get("chat_id", ""),
+            # Bug 8 (v0.14.6): propagated through engagement.origin so the
+            # Telegram channel can verify the user that issues /cancel or
+            # /complete in an engagement topic actually owns the engagement.
+            "user_id": msg.context.get("user_id"),
             "cid": cid_var.get(),
             "user_text": user_text,
         })

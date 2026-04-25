@@ -729,7 +729,6 @@ async def main() -> None:
         "HONCHO_API_KEY",
         "TELEGRAM_BOT_TOKEN",
         "WEBHOOK_SECRET",
-        "GITHUB_TOKEN",
     )
     for _var in _PASSWORD_ENV_VARS:
         _raw = os.environ.get(_var, "")

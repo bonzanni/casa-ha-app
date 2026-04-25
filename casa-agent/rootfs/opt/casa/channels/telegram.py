@@ -422,6 +422,10 @@ class TelegramChannel(Channel):
             channel="telegram",
             context={
                 "chat_id": chat_id,
+                # Bug 8 (v0.14.6): user_id is needed downstream to enforce
+                # originator-only /cancel and /complete on engagement topics.
+                # Stored as int when present (Telegram user ids are ints).
+                "user_id": user.id if user else None,
                 "user_name": user_name,
                 "message_id": str(update.message.message_id),
                 "cid": cid,
@@ -466,9 +470,26 @@ class TelegramChannel(Channel):
 
             if text.startswith("/"):
                 command = text.split()[0].lower()
-                if command == "/cancel":
-                    return await self._finalize_cancel(rec, reason="user")
-                if command == "/complete":
+                # Bug 8 (v0.14.6): /cancel and /complete are originator-only.
+                # Pre-fix any user in the supergroup could terminate any
+                # engagement; user_id wasn't even checked. /silent stays
+                # open since it's local to the engagement (anyone reading
+                # along can quiet the observer in their topic).
+                if command in ("/cancel", "/complete"):
+                    owner_id = rec.origin.get("user_id")
+                    if (
+                        owner_id is not None
+                        and user_id is not None
+                        and int(owner_id) != int(user_id)
+                    ):
+                        await self.send_to_topic(
+                            thread_id,
+                            f"Only the engagement originator can {command}. "
+                            "Ask them, or start your own engagement.",
+                        )
+                        return
+                    if command == "/cancel":
+                        return await self._finalize_cancel(rec, reason="user")
                     return await self._finalize_complete_user(rec)
                 if command == "/silent":
                     if self._observer is not None:

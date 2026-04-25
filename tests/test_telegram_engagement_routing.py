@@ -118,6 +118,135 @@ class TestSlashCommands:
         observer.silence.assert_called_once_with(rec.id)
 
 
+class TestSlashCommandOriginatorOnly:
+    """Bug 8 (v0.14.6): /cancel and /complete are originator-only.
+
+    Pre-fix any user in the engagement supergroup could fire either
+    command and terminate someone else's engagement.
+    """
+
+    async def _record_with_owner(self, tmp_path, owner_user_id: int):
+        from engagement_registry import EngagementRegistry
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            kind="specialist", role_or_type="finance", driver="in_casa",
+            task="t",
+            origin={"role": "assistant", "user_id": owner_user_id},
+            topic_id=555,
+        )
+        return reg, rec
+
+    async def test_foreign_user_cancel_refused(
+        self, fake_telegram_bot, tmp_path,
+    ):
+        from channels.telegram import TelegramChannel
+        reg, rec = await self._record_with_owner(tmp_path, owner_user_id=42)
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = reg
+        ch._finalize_cancel = AsyncMock()
+
+        # User 999 is NOT the engagement originator (42).
+        u = _mk_update(chat_id=-1001, text="/cancel",
+                       thread_id=rec.topic_id, user_id=999)
+        await ch.handle_update(u)
+        ch._finalize_cancel.assert_not_awaited()
+
+        # The topic gets a refusal message instead.
+        sg = fake_telegram_bot._supergroups[-1001]
+        msgs = sg.messages_by_thread.get(rec.topic_id, [])
+        assert any("originator" in m for m in msgs), (
+            f"expected originator-refusal message in topic; got: {msgs}"
+        )
+
+    async def test_foreign_user_complete_refused(
+        self, fake_telegram_bot, tmp_path,
+    ):
+        from channels.telegram import TelegramChannel
+        reg, rec = await self._record_with_owner(tmp_path, owner_user_id=42)
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = reg
+        ch._finalize_complete_user = AsyncMock()
+
+        u = _mk_update(chat_id=-1001, text="/complete",
+                       thread_id=rec.topic_id, user_id=999)
+        await ch.handle_update(u)
+        ch._finalize_complete_user.assert_not_awaited()
+
+    async def test_originator_cancel_allowed(
+        self, fake_telegram_bot, tmp_path,
+    ):
+        from channels.telegram import TelegramChannel
+        reg, rec = await self._record_with_owner(tmp_path, owner_user_id=42)
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = reg
+        ch._finalize_cancel = AsyncMock()
+
+        # Same user_id as engagement origin: allowed.
+        u = _mk_update(chat_id=-1001, text="/cancel",
+                       thread_id=rec.topic_id, user_id=42)
+        await ch.handle_update(u)
+        ch._finalize_cancel.assert_awaited_once()
+
+    async def test_originator_complete_allowed(
+        self, fake_telegram_bot, tmp_path,
+    ):
+        from channels.telegram import TelegramChannel
+        reg, rec = await self._record_with_owner(tmp_path, owner_user_id=42)
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = reg
+        ch._finalize_complete_user = AsyncMock()
+
+        u = _mk_update(chat_id=-1001, text="/complete",
+                       thread_id=rec.topic_id, user_id=42)
+        await ch.handle_update(u)
+        ch._finalize_complete_user.assert_awaited_once()
+
+    async def test_silent_remains_unrestricted(
+        self, fake_telegram_bot, tmp_path,
+    ):
+        """/silent is local to the topic — anyone in it can quiet the observer."""
+        from channels.telegram import TelegramChannel
+        reg, rec = await self._record_with_owner(tmp_path, owner_user_id=42)
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = reg
+        observer = MagicMock(); observer.silence = MagicMock()
+        ch._observer = observer
+
+        u = _mk_update(chat_id=-1001, text="/silent",
+                       thread_id=rec.topic_id, user_id=999)
+        await ch.handle_update(u)
+        observer.silence.assert_called_once_with(rec.id)
+
+    async def test_legacy_engagement_without_user_id_still_works(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """Pre-v0.14.6 engagements have no user_id in origin — fall through
+        to the open behaviour (anyone can /cancel) for back-compat."""
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = engagement_fixture.registry
+        ch._finalize_cancel = AsyncMock()
+        rec = engagement_fixture.active_record
+        assert rec.origin.get("user_id") is None  # legacy shape
+
+        u = _mk_update(chat_id=-1001, text="/cancel",
+                       thread_id=rec.topic_id, user_id=999)
+        await ch.handle_update(u)
+        ch._finalize_cancel.assert_awaited_once()
+
+
 class TestResumeOnTurn:
     async def test_resume_called_when_driver_not_alive(
         self, fake_telegram_bot, engagement_fixture,

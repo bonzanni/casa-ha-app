@@ -11,13 +11,41 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable
 
 # ---------------------------------------------------------------------------
-# Forbidden shell patterns
+# Forbidden shell commands (argv-aware)
+#
+# History: pre-v0.14.6 this was a flat list of regex patterns matched against
+# the raw command string. That trivially missed equivalents like
+# `rm -r -f`, `rm --recursive --force`, `rm -rfv`, etc. The argv-aware
+# matcher below splits the command on shell separators (;, &&, ||, |, &),
+# shlex'es each piece into argv tokens, and inspects argv[0] + argv[1:].
+# It also recurses into `bash -c <str>` / `sh -c <str>` so that wrapper
+# shells don't bypass the check.
+# FORBIDDEN_PATTERNS is kept as a deprecated alias of the legacy regex list
+# so existing imports don't break; the live matcher is _command_is_dangerous.
 # ---------------------------------------------------------------------------
 
+# Programs that are denied outright (no allow-listed flag set).
+_DENY_PROGRAMS = frozenset({
+    "shutdown", "reboot", "halt", "poweroff", "ssh", "scp",
+})
+
+# Wrapper shells whose -c argument we should re-scan.
+_WRAPPER_SHELLS = frozenset({"bash", "sh", "dash", "zsh", "ash", "ksh"})
+
+# Shell-control operators on which we split the command into pipeline pieces.
+# Order matters in the regex: longer operators first so we don't double-split.
+_PIPELINE_SPLIT_RE = re.compile(r"&&|\|\||;|\||&")
+
+# Env-var assignment prefix (FOO=bar cmd) — skipped when locating argv[0].
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# Kept for back-compat with any external code that imported the old name.
+# Not used by block_dangerous_commands — the argv matcher is authoritative.
 FORBIDDEN_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\brm\s+-rf\b"),
     re.compile(r"\bshutdown\b"),
@@ -28,6 +56,121 @@ FORBIDDEN_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bssh\b"),
     re.compile(r"\bscp\b"),
 ]
+
+
+def _split_pipeline(command: str) -> list[list[str]]:
+    """Split a shell command line into a list of argv lists.
+
+    Splits on ;, &&, ||, |, & (ignoring quoted contents via shlex), then
+    runs shlex.split on each piece. Leading FOO=bar assignments are
+    stripped so argv[0] is the real program name.
+    """
+    pieces = _PIPELINE_SPLIT_RE.split(command)
+    out: list[list[str]] = []
+    for piece in pieces:
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            argv = shlex.split(piece, posix=True)
+        except ValueError:
+            # Mismatched quotes — fall back to whitespace split. Permissive
+            # by intent: a malformed command is the user's problem; we
+            # still want to *try* to detect dangerous primitives in it.
+            argv = piece.split()
+        while argv and _ENV_ASSIGN_RE.match(argv[0]):
+            argv = argv[1:]
+        if argv:
+            out.append(argv)
+    return out
+
+
+def _rm_has_recursive_and_force(argv: list[str]) -> bool:
+    """True iff `rm` argv contains both a recursive AND a force flag.
+
+    Recognises -r / -R / --recursive and -f / --force in any order, and
+    short-flag clusters (-rf, -fr, -rfv, -rfd, -fRv, ...).
+    """
+    has_recursive = False
+    has_force = False
+    for arg in argv[1:]:
+        if arg == "--":
+            break  # everything after -- is positional
+        if arg in ("--recursive",):
+            has_recursive = True
+        elif arg == "--force":
+            has_force = True
+        elif arg.startswith("--"):
+            continue
+        elif arg.startswith("-") and len(arg) > 1:
+            for ch in arg[1:]:
+                if ch in ("r", "R"):
+                    has_recursive = True
+                elif ch == "f":
+                    has_force = True
+    return has_recursive and has_force
+
+
+def _dd_writes_block_device(argv: list[str]) -> bool:
+    """True iff dd has if= or of= argument (block-level read or write)."""
+    return any(a.startswith("if=") or a.startswith("of=") for a in argv[1:])
+
+
+def _curl_sends_data(argv: list[str]) -> bool:
+    """True iff curl is doing a write request (-X POST/PUT/DELETE/PATCH or -d/--data*)."""
+    args = argv[1:]
+    write_methods = {"POST", "PUT", "DELETE", "PATCH"}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-X", "--request") and i + 1 < len(args):
+            if args[i + 1].upper() in write_methods:
+                return True
+        if a in ("-d", "--data", "--data-raw", "--data-binary",
+                 "--data-urlencode", "-T", "--upload-file"):
+            return True
+        # Combined short forms: -XPOST, -dfoo
+        if a.startswith("-X") and len(a) > 2 and a[2:].upper() in write_methods:
+            return True
+        if a.startswith("-d") and len(a) > 2 and not a.startswith("-d="):
+            return True
+        i += 1
+    return False
+
+
+def _command_is_dangerous(command: str, *, _depth: int = 0) -> str | None:
+    """Return a human-readable reason if the command is dangerous, else None.
+
+    Recurses up to 3 levels deep into wrapper shells (bash -c, sh -c, ...).
+    """
+    if _depth > 3:
+        return None
+    for argv in _split_pipeline(command):
+        prog_path = argv[0]
+        # Strip absolute path: /usr/bin/rm -> rm.
+        prog = os.path.basename(prog_path)
+
+        # Wrapper-shell recursion: bash -c "<cmd>" / sh -c "<cmd>".
+        if prog in _WRAPPER_SHELLS:
+            for j in range(1, len(argv) - 1):
+                if argv[j] == "-c":
+                    inner_reason = _command_is_dangerous(
+                        argv[j + 1], _depth=_depth + 1,
+                    )
+                    if inner_reason:
+                        return f"{prog} -c wrapping {inner_reason}"
+                    break  # don't double-scan the same -c
+            # Fall through — the outer wrapper shell itself isn't denied.
+
+        if prog == "rm" and _rm_has_recursive_and_force(argv):
+            return f"rm with recursive+force flags: {shlex.join(argv)!r}"
+        if prog == "dd" and _dd_writes_block_device(argv):
+            return f"dd with if=/of= argument: {shlex.join(argv)!r}"
+        if prog == "curl" and _curl_sends_data(argv):
+            return f"curl sending data: {shlex.join(argv)!r}"
+        if prog in _DENY_PROGRAMS:
+            return f"{prog} is not allowed"
+    return None
 
 
 HookCallback = Callable[
@@ -75,15 +218,21 @@ async def block_dangerous_commands(
     tool_use_id: str | None,
     context: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Block Bash commands that match FORBIDDEN_PATTERNS."""
+    """Block Bash commands that contain dangerous primitives.
+
+    Uses an argv-aware matcher (see ``_command_is_dangerous``) so that
+    flag variations (``-r -f`` vs ``-rf``, ``--recursive --force``,
+    short-flag clusters) and wrapper shells (``bash -c "..."``) all
+    resolve to the same decision.
+    """
     tool_name = input_data.get("tool_name", "")
     if tool_name != "Bash":
         return None
 
     command = input_data.get("tool_input", {}).get("command", "")
-    for pattern in FORBIDDEN_PATTERNS:
-        if pattern.search(command):
-            return _deny(f"Blocked by safety hook: {pattern.pattern}")
+    reason = _command_is_dangerous(command)
+    if reason is not None:
+        return _deny(f"Blocked by safety hook: {reason}")
     return None
 
 

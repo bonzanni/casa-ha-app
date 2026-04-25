@@ -87,3 +87,64 @@ async def test_unknown_engagement_error(tmp_path, monkeypatch):
     payload = json.loads(result["content"][0]["text"])
     assert payload["status"] == "error"
     assert payload["kind"] == "unknown_engagement"
+
+
+# ---------------------------------------------------------------------------
+# Bug 12 (v0.14.6): the live-state guard must include "idle".
+# Pre-fix it only checked "active" — an idle engagement (SDK-suspended
+# after 24h) had its s6 service still running, but a non-force delete
+# still tore down the workspace under it.
+# ---------------------------------------------------------------------------
+
+
+async def test_refuses_idle_without_force(tmp_path, monkeypatch):
+    import tools as tools_mod
+    from tools import delete_engagement_workspace
+    from engagement_registry import EngagementRegistry, EngagementRecord
+
+    _make_ws(tmp_path, "eng-idle", status="UNDERGOING")
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "t.json"), bus=None)
+    reg._records["eng-idle"] = EngagementRecord(
+        id="eng-idle", kind="executor", role_or_type="hello-driver",
+        driver="claude_code", status="idle", topic_id=None,
+        started_at=0.0, last_user_turn_ts=0.0, last_idle_reminder_ts=0.0,
+        completed_at=None, sdk_session_id="sess-x", origin={}, task="t",
+    )
+    monkeypatch.setattr(tools_mod, "_engagement_registry", reg)
+    monkeypatch.setattr(tools_mod, "_ENGAGEMENTS_ROOT", str(tmp_path),
+                        raising=False)
+
+    result = await delete_engagement_workspace.handler(
+        {"engagement_id": "eng-idle"},
+    )
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["status"] == "error"
+    assert payload["kind"] == "refused"
+    assert "idle" in payload["message"]
+    assert (tmp_path / "eng-idle").exists()  # workspace untouched
+
+
+async def test_force_deletes_idle(tmp_path, monkeypatch):
+    """force=true on idle still finalises and deletes (parity with active)."""
+    import tools as tools_mod
+    from tools import delete_engagement_workspace
+    from engagement_registry import EngagementRegistry, EngagementRecord
+
+    _make_ws(tmp_path, "eng-idle", status="UNDERGOING")
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "t.json"), bus=None)
+    reg._records["eng-idle"] = EngagementRecord(
+        id="eng-idle", kind="executor", role_or_type="hello-driver",
+        driver="claude_code", status="idle", topic_id=None,
+        started_at=0.0, last_user_turn_ts=0.0, last_idle_reminder_ts=0.0,
+        completed_at=None, sdk_session_id="sess-x", origin={}, task="t",
+    )
+    monkeypatch.setattr(tools_mod, "_engagement_registry", reg)
+    monkeypatch.setattr(tools_mod, "_ENGAGEMENTS_ROOT", str(tmp_path),
+                        raising=False)
+
+    result = await delete_engagement_workspace.handler(
+        {"engagement_id": "eng-idle", "force": True},
+    )
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["status"] == "ok"
+    assert not (tmp_path / "eng-idle").exists()

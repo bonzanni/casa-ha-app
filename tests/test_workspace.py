@@ -69,6 +69,114 @@ class TestRenderRunScript:
         assert "exec s6-log n20 s1000000 /var/log/casa-engagement-xxxxxxxxxxxxxxxx" in script
 
 
+class TestRenderRunScriptShellInjection:
+    """Bug 4 + Bug 5 (v0.14.6): extra_dirs and extra_env keys must not
+    inject shell into the rendered run script."""
+
+    def test_extra_dir_with_semicolon_rejected(self):
+        from drivers.workspace import WorkspaceConfigError, render_run_script
+        with pytest.raises(WorkspaceConfigError, match="shell-special"):
+            render_run_script(
+                engagement_id="x" * 16,
+                permission_mode="dontAsk",
+                extra_dirs=["/tmp; rm -rf /data"],
+            )
+
+    def test_extra_dir_with_quote_rejected(self):
+        from drivers.workspace import WorkspaceConfigError, render_run_script
+        with pytest.raises(WorkspaceConfigError, match="shell-special"):
+            render_run_script(
+                engagement_id="x" * 16,
+                permission_mode="dontAsk",
+                extra_dirs=["/tmp/'; touch /tmp/pwned ;#"],
+            )
+
+    def test_extra_dir_with_newline_rejected(self):
+        from drivers.workspace import WorkspaceConfigError, render_run_script
+        with pytest.raises(WorkspaceConfigError, match="shell-special"):
+            render_run_script(
+                engagement_id="x" * 16,
+                permission_mode="dontAsk",
+                extra_dirs=["/tmp\nrm -rf /data"],
+            )
+
+    def test_relative_extra_dir_rejected(self):
+        from drivers.workspace import WorkspaceConfigError, render_run_script
+        with pytest.raises(WorkspaceConfigError, match="absolute path"):
+            render_run_script(
+                engagement_id="x" * 16,
+                permission_mode="dontAsk",
+                extra_dirs=["relative/path"],
+            )
+
+    def test_extra_dir_with_space_quoted_via_shlex(self):
+        """Spaces in absolute paths are allowed but rendered shlex-quoted."""
+        from drivers.workspace import render_run_script
+        out = render_run_script(
+            engagement_id="x" * 16,
+            permission_mode="dontAsk",
+            extra_dirs=["/path/with space"],
+        )
+        # Either shlex.quote'd or single-quoted — never bare.
+        assert "/path/with space" in out
+        # The bare unquoted form would be a defect.
+        assert "--add-dir /path/with space\n" not in out
+
+    def test_extra_env_key_with_newline_rejected(self):
+        """Bug 5: a newline in the key escapes the export statement."""
+        from drivers.workspace import WorkspaceConfigError, render_run_script
+        with pytest.raises(WorkspaceConfigError, match="extra_env keys"):
+            render_run_script(
+                engagement_id="x" * 16,
+                permission_mode="dontAsk",
+                extra_dirs=[],
+                extra_env={"FOO\nrm -rf /data": "harmless"},
+            )
+
+    def test_extra_env_key_with_dollar_rejected(self):
+        from drivers.workspace import WorkspaceConfigError, render_run_script
+        with pytest.raises(WorkspaceConfigError, match="extra_env keys"):
+            render_run_script(
+                engagement_id="x" * 16,
+                permission_mode="dontAsk",
+                extra_dirs=[],
+                extra_env={"$(whoami)": "harmless"},
+            )
+
+    def test_extra_env_lowercase_key_rejected(self):
+        """Lowercase keys also rejected — convention is upper-snake."""
+        from drivers.workspace import WorkspaceConfigError, render_run_script
+        with pytest.raises(WorkspaceConfigError):
+            render_run_script(
+                engagement_id="x" * 16,
+                permission_mode="dontAsk",
+                extra_dirs=[],
+                extra_env={"foo": "bar"},
+            )
+
+    def test_extra_env_value_with_quote_escaped(self):
+        """Embedded single-quote in value is escaped via '\\'' idiom."""
+        from drivers.workspace import render_run_script
+        out = render_run_script(
+            engagement_id="x" * 16,
+            permission_mode="dontAsk",
+            extra_dirs=[],
+            extra_env={"GITHUB_TOKEN": "abc'def"},
+        )
+        assert "export GITHUB_TOKEN='abc'\\''def'" in out
+
+    def test_valid_extra_env_renders(self):
+        from drivers.workspace import render_run_script
+        out = render_run_script(
+            engagement_id="x" * 16,
+            permission_mode="dontAsk",
+            extra_dirs=[],
+            extra_env={"GITHUB_TOKEN": "ghp_abc", "OP_TOKEN": "ops_xyz"},
+        )
+        assert "export GITHUB_TOKEN='ghp_abc'" in out
+        assert "export OP_TOKEN='ops_xyz'" in out
+
+
 class TestProvisionWorkspace:
     def _make_defn(self, tmp_path, executor_type="hello-driver", plugins=None):
         """Build an ExecutorDefinition stub for workspace tests."""

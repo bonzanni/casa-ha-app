@@ -50,55 +50,116 @@ class ClaudeCodeDriver(DriverProtocol):
     async def start(
         self, engagement: EngagementRecord, prompt: str, options: Any,
     ) -> None:
-        """options is the ExecutorDefinition — see DriverProtocol.start docstring."""
+        """options is the ExecutorDefinition — see DriverProtocol.start docstring.
+
+        Bug 13 (v0.14.6): if any step from provision_workspace through
+        start_service fails, roll back the partial state (workspace,
+        service dir, s6-rc compile) so the engagement registry / sweeper
+        don't end up with a permanent UNDERGOING ghost. The exception is
+        re-raised so engage_executor's caller surfaces the failure.
+        """
+        import shutil
         defn = options
+        # Workspace path is deterministic — compute it up front so the
+        # rollback path can rmtree even if provision_workspace raises
+        # before returning the assignment.
+        ws_path = str(Path(self._engagements_root) / engagement.id)
+        service_dir_written = False
         async with s6_rc._compile_lock:
-            # 1. Provision workspace (CLAUDE.md, .mcp.json, plugins, FIFO, meta).
-            ws = await provision_workspace(
-                engagements_root=self._engagements_root,
-                base_plugins_root=self._base_plugins_root,
-                engagement_id=engagement.id,
-                defn=defn,
-                task=engagement.task,
-                context=engagement.origin.get("context", ""),
-                casa_framework_mcp_url=self._casa_framework_mcp_url,
-            )
-            write_casa_meta(
-                workspace_path=ws,
-                engagement_id=engagement.id,
-                executor_type=defn.type,
-                status="UNDERGOING",
-                created_at=_iso_now(),
-                finished_at=None, retention_until=None,
-            )
+            try:
+                # 1. Provision workspace (CLAUDE.md, .mcp.json, plugins, FIFO, meta).
+                ws = await provision_workspace(
+                    engagements_root=self._engagements_root,
+                    base_plugins_root=self._base_plugins_root,
+                    engagement_id=engagement.id,
+                    defn=defn,
+                    task=engagement.task,
+                    context=engagement.origin.get("context", ""),
+                    casa_framework_mcp_url=self._casa_framework_mcp_url,
+                )
+                write_casa_meta(
+                    workspace_path=ws,
+                    engagement_id=engagement.id,
+                    executor_type=defn.type,
+                    status="UNDERGOING",
+                    created_at=_iso_now(),
+                    finished_at=None, retention_until=None,
+                )
 
-            # 2. Write the s6 service dir (with log sub-service for stdout capture).
-            extra_env: dict[str, str] = {}
-            if defn.type == "plugin-developer":
-                # §B.9 / §E stub: pass GITHUB_TOKEN through from container env.
-                # Real resolver (_resolve_github_token via §E secrets_resolver)
-                # will replace this passthrough when §E lands.
-                github_token = os.environ.get("GITHUB_TOKEN", "")
-                if github_token:
-                    extra_env["GITHUB_TOKEN"] = github_token
-            run_script = render_run_script(
-                engagement_id=engagement.id,
-                permission_mode=defn.permission_mode or "acceptEdits",
-                extra_dirs=list(defn.extra_dirs),
-                extra_env=extra_env or None,
-            )
-            log_script = render_log_run_script(engagement_id=engagement.id)
-            s6_rc.write_service_dir(
-                svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
-                engagement_id=engagement.id,
-                run_script=run_script,
-                depends_on=["init-setup-configs"],
-                log_run_script=log_script,
-            )
+                # 2. Write the s6 service dir (with log sub-service for stdout capture).
+                extra_env: dict[str, str] = {}
+                if defn.type == "plugin-developer":
+                    # Resolve op://${vault}/GitHub/credential at engagement spawn time.
+                    # Vault name from onepassword_default_vault addon option (defaults
+                    # to "Casa"). Item shape is conventional: title="GitHub",
+                    # field=credential. Failures log a warning — engagement starts
+                    # but `gh repo create` / `git push` will fail.
+                    from secrets_resolver import resolve as _resolve_secret
+                    _vault = os.environ.get("ONEPASSWORD_DEFAULT_VAULT", "Casa")
+                    _op_ref = f"op://{_vault}/GitHub/credential"
+                    try:
+                        _gh_token = _resolve_secret(_op_ref)
+                    except RuntimeError as _exc:
+                        logger.warning(
+                            "plugin-developer engagement: %s unresolved (%s) — "
+                            "gh repo create / git push will fail",
+                            _op_ref, _exc,
+                        )
+                        _gh_token = ""
+                    if _gh_token and _gh_token != _op_ref:
+                        extra_env["GITHUB_TOKEN"] = _gh_token
+                run_script = render_run_script(
+                    engagement_id=engagement.id,
+                    permission_mode=defn.permission_mode or "acceptEdits",
+                    extra_dirs=list(defn.extra_dirs),
+                    extra_env=extra_env or None,
+                )
+                log_script = render_log_run_script(engagement_id=engagement.id)
+                s6_rc.write_service_dir(
+                    svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                    engagement_id=engagement.id,
+                    run_script=run_script,
+                    depends_on=["init-setup-configs"],
+                    log_run_script=log_script,
+                )
+                service_dir_written = True
 
-            # 3. Compile + update + change — lock held, inner helper.
-            await s6_rc._compile_and_update_locked()
-            await s6_rc.start_service(engagement_id=engagement.id)
+                # 3. Compile + update + change — lock held, inner helper.
+                await s6_rc._compile_and_update_locked()
+                await s6_rc.start_service(engagement_id=engagement.id)
+            except Exception as start_exc:  # noqa: BLE001 — rollback is opportunistic
+                logger.warning(
+                    "claude_code start failed for engagement %s: %s; rolling back",
+                    engagement.id[:8], start_exc,
+                )
+                # Best-effort rollback. Each step swallows its own errors so
+                # one rollback failure doesn't mask the original cause.
+                if service_dir_written:
+                    try:
+                        s6_rc.remove_service_dir(
+                            svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                            engagement_id=engagement.id,
+                        )
+                    except Exception as rb_exc:  # noqa: BLE001
+                        logger.warning(
+                            "rollback remove_service_dir failed: %s", rb_exc,
+                        )
+                    try:
+                        await s6_rc._compile_and_update_locked()
+                    except Exception as rb_exc:  # noqa: BLE001
+                        logger.warning(
+                            "rollback compile_and_update failed: %s", rb_exc,
+                        )
+                # Always attempt to remove the workspace tree at the
+                # deterministic path — provision_workspace may have raised
+                # AFTER creating partial state.
+                try:
+                    shutil.rmtree(ws_path, ignore_errors=True)
+                except Exception as rb_exc:  # noqa: BLE001
+                    logger.warning(
+                        "rollback rmtree(%s) failed: %s", ws_path, rb_exc,
+                    )
+                raise
 
         # 4. Kick off URL capture + respawn poller tasks (outside lock).
         self._spawn_background_tasks(engagement)
@@ -273,16 +334,33 @@ def _iso_now() -> str:
 async def _tail_file(log_path: str):
     """Yield new lines from a file as they appear. Terminates on task cancel.
 
-    For tests, we read existing content first then attempt to tail; in
-    production, s6-log rotates the file but the FIFO-style readline loop
-    handles that fine (readline() returns "" at EOF; we sleep and retry).
+    Bug 11 (v0.14.6): tracks the file's inode so rotation is handled.
+    s6-log rotates ``current`` at 1 MB by renaming it to ``@<timestamp>.s``
+    and creating a fresh ``current``. Pre-fix the loop kept seeking to
+    the OLD pos in the new (smaller) file, so all lines below the prior
+    cutoff were silently dropped. Now: when ``st_ino`` changes, reset
+    ``pos`` to 0 so the new file is read from its start. We also reset
+    if the file shrinks below ``pos`` (truncate-in-place pattern).
     """
     path = Path(log_path)
     pos = 0
+    last_inode: int | None = None
     while True:
         try:
             if path.exists():
+                try:
+                    current_inode = path.stat().st_ino
+                except OSError:
+                    current_inode = None
+                if last_inode is not None and current_inode != last_inode:
+                    pos = 0
+                last_inode = current_inode
+
                 with path.open("r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(0, 2)            # SEEK_END
+                    end = fh.tell()
+                    if pos > end:
+                        pos = 0
                     fh.seek(pos)
                     while True:
                         line = fh.readline()

@@ -572,8 +572,8 @@ Set `onepassword_service_account_token` (from https://developer.1password.com/do
 as a plaintext addon option — it's the single root of trust and cannot
 self-reference. Set `onepassword_default_vault` to the vault name (default
 "Casa"). Every other password-typed option (`claude_oauth_token`,
-`telegram_bot_token`, `github_token`, `webhook_secret`, `honcho_api_key`)
-accepts either plaintext OR an `op://` reference.
+`telegram_bot_token`, `webhook_secret`, `honcho_api_key`) accepts either
+plaintext OR an `op://` reference.
 
 Plugin env vars resolved via `plugin-env.conf` (`/addon_configs/casa-agent/plugin-env.conf`),
 managed by Configurator.
@@ -586,4 +586,11 @@ the plugin in its own GitHub repo, pushes, and emits completion. Assistant
 relays; on your confirm, Configurator installs to the target agents +
 asks for secrets via 1P Q&A.
 
-Pre-requisites: `github_token` + `onepassword_service_account_token`.
+Prerequisites:
+
+- `onepassword_service_account_token` set (plaintext).
+- 1P item titled exactly `GitHub` in the vault named by
+  `onepassword_default_vault` (default `Casa`), with a field labeled
+  `credential` holding a GitHub PAT with `repo` scope. Plugin-developer
+  resolves `op://${onepassword_default_vault}/GitHub/credential` at
+  engagement spawn — no separate addon option.

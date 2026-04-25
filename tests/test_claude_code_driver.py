@@ -121,6 +121,120 @@ class TestStart:
         assert (tmp_path / "engagements" / rec.id / "stdin.fifo").exists()
 
 
+class TestStartRollback:
+    """Bug 13 (v0.14.6): if any step in start() fails, the partial
+    workspace + service-dir + s6-rc compile must be rolled back.
+
+    Pre-fix the workspace was left UNDERGOING and the sweeper skipped it
+    forever, leaking disk and producing ghost engagements that boot
+    replay would attempt to resurrect.
+    """
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="workspace provisioning uses mkfifo/symlink (Linux-only)",
+    )
+    async def test_start_service_failure_cleans_up(self, monkeypatch, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers import s6_rc
+
+        compile_calls: list[str] = []
+
+        async def fake_cau():
+            compile_calls.append("compile")
+
+        async def fake_start_fail(*, engagement_id):
+            raise RuntimeError("simulated s6-rc start failure")
+
+        monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+        monkeypatch.setattr(s6_rc, "start_service", fake_start_fail)
+        monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT",
+                            str(tmp_path / "svc-root"))
+        (tmp_path / "svc-root").mkdir()
+
+        defn = _make_defn(tmp_path)
+        rec = _make_record()
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            base_plugins_root=str(tmp_path / "base-plugins"),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        )
+        (tmp_path / "engagements").mkdir()
+        (tmp_path / "base-plugins").mkdir()
+
+        with pytest.raises(RuntimeError, match="simulated s6-rc start failure"):
+            await drv.start(rec, prompt="hi", options=defn)
+
+        # The original failure is re-raised.
+        # Rollback removed the workspace.
+        assert not (tmp_path / "engagements" / rec.id).exists(), (
+            "Bug 13: workspace not cleaned up on start_service failure — "
+            "leaves an orphan UNDERGOING that the sweeper will skip forever"
+        )
+        # And the s6 service dir.
+        assert not (tmp_path / "svc-root" / f"engagement-{rec.id}").exists(), (
+            "Bug 13: s6 service dir not cleaned up on start_service failure"
+        )
+        # _compile_and_update_locked should be called twice: once forward,
+        # once on rollback.
+        assert compile_calls.count("compile") == 2
+
+    async def test_provision_failure_cleans_up(self, monkeypatch, tmp_path):
+        """Failure during provisioning (before service-dir write) — only
+        the workspace tree needs cleanup, not the (never-written) service dir."""
+        from drivers import workspace as ws_mod
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers import s6_rc
+
+        async def fail_provision(**kw):
+            # Simulate partial workspace creation, then explode.
+            from pathlib import Path
+            ws = Path(kw["engagements_root"]) / kw["engagement_id"]
+            ws.mkdir(parents=True, exist_ok=False)
+            (ws / "CLAUDE.md").write_text("partial", encoding="utf-8")
+            raise OSError("disk full")
+
+        monkeypatch.setattr(ws_mod, "provision_workspace", fail_provision)
+
+        # Also patch the imported reference inside the driver module.
+        from drivers import claude_code_driver as ccd
+        monkeypatch.setattr(ccd, "provision_workspace", fail_provision)
+
+        async def fake_cau():
+            pass
+
+        async def fake_start(*, engagement_id):
+            pass
+
+        monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+        monkeypatch.setattr(s6_rc, "start_service", fake_start)
+        monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT",
+                            str(tmp_path / "svc-root"))
+        (tmp_path / "svc-root").mkdir()
+
+        defn = _make_defn(tmp_path)
+        rec = _make_record()
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            base_plugins_root=str(tmp_path / "base-plugins"),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        )
+        (tmp_path / "engagements").mkdir()
+        (tmp_path / "base-plugins").mkdir()
+
+        with pytest.raises(OSError, match="disk full"):
+            await drv.start(rec, prompt="hi", options=defn)
+
+        # Provisioning aborted before write_casa_meta — but the partial
+        # workspace tree should still be removed (rmtree(ignore_errors=True)
+        # is best-effort).
+        assert not (tmp_path / "engagements" / rec.id).exists()
+
+
 class TestURLCapture:
     async def test_first_url_line_posts_to_topic(self, tmp_path):
         from drivers.claude_code_driver import ClaudeCodeDriver

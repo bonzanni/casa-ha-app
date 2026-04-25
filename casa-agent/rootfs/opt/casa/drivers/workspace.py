@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import shlex
 import shutil
 import time
 from pathlib import Path
@@ -20,6 +22,38 @@ _TEMPLATE_PATH = os.path.join(
     os.path.dirname(__file__), "..", "scripts", "engagement_run_template.sh",
 )
 
+# Bug 5 (v0.14.6): env-var names must match shell-identifier syntax.
+# Pre-fix the key was interpolated unsanitised into `export {}='{}'`,
+# so a key containing "\n" or other shell-special chars escaped the
+# export line and ran arbitrary commands. Same upper-snake convention
+# as ``plugin_env_conf._VAR_NAME_RE``.
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+
+
+class WorkspaceConfigError(ValueError):
+    """Raised when ExecutorDefinition values would shell-inject the run script."""
+
+
+def _validate_extra_dir(d: str) -> None:
+    """Reject extra_dir entries that aren't usable absolute paths.
+
+    Bug 4 (v0.14.6): pre-fix any string was interpolated unquoted into
+    `--add-dir <d>`. Strings with spaces, newlines, semicolons, or
+    quotes injected shell. We now require an absolute POSIX path with
+    no shell-special characters; values still get shlex.quote'd for
+    belt-and-braces.
+    """
+    if not isinstance(d, str) or not d:
+        raise WorkspaceConfigError(f"extra_dir must be a non-empty string: {d!r}")
+    if not d.startswith("/"):
+        raise WorkspaceConfigError(
+            f"extra_dir must be an absolute path (start with '/'): {d!r}"
+        )
+    if any(c in d for c in "\n\r\0;|&`$<>'\""):
+        raise WorkspaceConfigError(
+            f"extra_dir contains shell-special characters: {d!r}"
+        )
+
 
 def render_run_script(
     *, engagement_id: str, permission_mode: str,
@@ -31,22 +65,35 @@ def render_run_script(
     The per-engagement workspace is always included in --add-dir; any
     caller-provided extras are appended after it.
 
+    ``extra_dirs`` — each element MUST be an absolute path with no
+    shell-special characters. Each value is also shlex.quote'd before
+    interpolation so a stricter validator can be added later without
+    re-checking quoting (Bug 4, v0.14.6).
+
     ``extra_env`` — optional mapping of env var name → value to export
-    inside the run script (e.g. GITHUB_TOKEN for plugin-developer).
-    Values are shell-quoted with single quotes; embedded single-quotes in
-    values are escaped via the standard ``'\''`` idiom.
+    inside the run script. Names must match ``[A-Za-z_][A-Za-z0-9_]*``
+    (rejected at render time). Values are single-quote-escaped via the
+    standard ``'\\''`` idiom (Bug 5, v0.14.6).
     """
     with open(_TEMPLATE_PATH, "r", encoding="utf-8") as fh:
         template = fh.read()
 
+    for d in extra_dirs:
+        _validate_extra_dir(d)
     all_dirs = [f"/data/engagements/{engagement_id}/", *extra_dirs]
-    add_dir_flags = " ".join(f"--add-dir {d}" for d in all_dirs)
+    add_dir_flags = " ".join(f"--add-dir {shlex.quote(d)}" for d in all_dirs)
 
     extra_unset_str = " ".join(extra_unset or [])
 
     if extra_env:
+        bad = [k for k in extra_env if not _ENV_VAR_NAME_RE.match(str(k))]
+        if bad:
+            raise WorkspaceConfigError(
+                f"extra_env keys must match [A-Za-z_][A-Za-z0-9_]*; "
+                f"got invalid: {bad!r}"
+            )
         export_lines = "\n".join(
-            "export {}='{}'".format(k, v.replace("'", "'\\''"))
+            "export {}='{}'".format(k, str(v).replace("'", "'\\''"))
             for k, v in extra_env.items()
         )
     else:
