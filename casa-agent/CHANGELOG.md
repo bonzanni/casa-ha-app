@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.14.10] - 2026-04-25
+
+v0.14.9 follow-up: enable seeded plugins after seed-copy. The v0.14.9
+seed-copy populates cc-home with 5 default plugins but they all carry
+`enabled: false` (CC CLI's `--cache-dir`-mode install at build doesn't
+auto-enable). The binding layer (`plugins_binding.py::build_sdk_plugins`)
+filters out `enabled: false` entries — so engagements were getting
+`plugins=[]` even though all 5 plugins were structurally present.
+Live verification on N150 v0.14.9 caught this: `claude plugin list
+--json` showed 5/5 plugins, all `enabled=False`.
+
+### Fixed
+
+- **`setup-configs.sh` seed-copy block** now runs `claude plugin enable
+  <ref>` for each of the 5 default plugins after the cc-home seed-copy
+  completes. Runtime `--scope user` enable persists the flag in
+  cc-home's `installed_plugins.json` and is idempotent (returns clean
+  on a no-op re-run because of the `|| true` and `>/dev/null 2>&1`).
+
+- **`test-local/init-overrides/01-setup-configs.sh`** mirrors the same
+  enable loop so the local e2e build matches production.
+
+### Tests
+
+- **`test_invoke_sessions.sh::C-4`** strengthened to assert `5/5`
+  (total/enabled), not just `5` (total). Plain count-check would have
+  passed on v0.14.9 even with all-disabled plugins; this catches the
+  binding-layer's enabled-filter contract explicitly.
+
 ## [0.14.9] - 2026-04-25
 
 Unified github access. Replaces the five distinct mechanisms across

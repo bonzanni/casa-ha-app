@@ -274,6 +274,19 @@ if [ -d "$SEED_DIR" ] && [ ! -f "$CC_PLUGINS_DIR/installed_plugins.json" ]; then
         cp -r "$SEED_DIR/marketplaces" "$CC_PLUGINS_DIR/marketplaces"
     fi
     _sc_log "Seeded cc-home with $(ls "$CC_PLUGINS_DIR/cache/casa-plugins-defaults/" 2>/dev/null | wc -l) default plugins"
+
+    # Build-time `claude plugin install` against $CLAUDE_CODE_PLUGIN_CACHE_DIR
+    # leaves enabled=false in the seed's installed_plugins.json. The binding
+    # layer (plugins_binding.py::build_sdk_plugins) filters out enabled=false
+    # entries, so without this enable loop, engagements get plugins=[] even
+    # though all 5 are present. At runtime against cc-home (--scope user),
+    # `claude plugin enable` flips the flag persistently and is idempotent.
+    HOME="$CC_HOME" claude plugin enable superpowers@casa-plugins-defaults    >/dev/null 2>&1 || true
+    HOME="$CC_HOME" claude plugin enable plugin-dev@casa-plugins-defaults     >/dev/null 2>&1 || true
+    HOME="$CC_HOME" claude plugin enable skill-creator@casa-plugins-defaults  >/dev/null 2>&1 || true
+    HOME="$CC_HOME" claude plugin enable mcp-server-dev@casa-plugins-defaults >/dev/null 2>&1 || true
+    HOME="$CC_HOME" claude plugin enable document-skills@casa-plugins-defaults >/dev/null 2>&1 || true
+    _sc_log "Enabled $(HOME="$CC_HOME" claude plugin list --json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for p in d if p.get('enabled')))") of $(HOME="$CC_HOME" claude plugin list --json 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)))") seeded plugins"
 fi
 # === seed-copy: end =============================================
 
