@@ -151,3 +151,22 @@ def test_executors_yaml_rejected_on_specialist(tmp_path):
     """)
     with pytest.raises(LoadError):
         load_agent_from_dir(str(d), policies=None)
+
+
+# ---------------------------------------------------------------------------
+# Task 13: assistant/delegates.yaml seed sanity
+# ---------------------------------------------------------------------------
+
+
+def test_assistant_delegates_yaml_has_no_executor_entries():
+    """The seed assistant/delegates.yaml must not contain configurator,
+    plugin-developer, or engagement — those moved to executors.yaml."""
+    from agent_loader import _read_yaml
+    path = (
+        "casa-agent/rootfs/opt/casa/defaults/agents/assistant/delegates.yaml"
+    )
+    data = _read_yaml(path)
+    agents = {entry["agent"] for entry in (data.get("delegates") or [])}
+    assert "configurator" not in agents
+    assert "plugin-developer" not in agents
+    assert "engagement" not in agents
