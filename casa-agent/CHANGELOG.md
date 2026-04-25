@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.14.11] - 2026-04-25
+
+Test tiering — Half 1. Re-groups existing CI tests into a three-tier
+structure so trivial PRs get sub-2-minute "is the system on fire"
+feedback while hardening (timing/chaos) tests run nightly + on-demand.
+No runtime / addon code changes; CI plumbing + test-file rearrangement
+only.
+
+### CI
+
+- **`.github/workflows/qa.yml`** rewritten as `tier1-smoke` (every push
+  + PR + nightly + manual, ~7-8 min cold-cache) / `tier2-functional`
+  (push + PR + manual, ~12 min, parallel with tier 1) /
+  `baseline-runtime` (unchanged, parallel with tier 2) /
+  `tier3-hardening` (nightly + manual only). Tier 1 has no `needs:`
+  gating against tier 2 — contributors get fail-fast smoke signal in
+  parallel with the full functional sweep.
+- **Nightly cron** at 04:00 UTC. Nightly skips tier 2 (already verified
+  on the master push that landed the changes); runs tier 1 + tier 3.
+- **Manual `workflow_dispatch`** runs all three tiers from any branch.
+- **D-block + P-block CI steps** stay commented out, deferred to the
+  pre-existing v0.14.10 D/P-block sweep follow-up. Their split scripts
+  exist (so the sweep can re-enable them by uncommenting one block) but
+  do not run in CI today.
+
+### Tests
+
+- **`test-local/e2e/test_engagement.sh` split into 3 files**
+  (1859 lines → 3 self-contained scripts):
+  - `test_engagement_E.sh` (~944 lines): E-0..E-10 Tier-2 specialist +
+    Configurator. Tier 2.
+  - `test_engagement_D.sh`: D-1..D-12 claude_code driver lifecycle.
+    Tier 3. Requires `CASA_USE_MOCK_CLAUDE=1`; skips cleanly otherwise.
+  - `test_engagement_P.sh`: P-1..P-9 plugin-developer harness. Tier 2.
+    Requires `CASA_USE_MOCK_CLAUDE=1` + `CASA_PLAN_4B=1`; skips
+    cleanly otherwise.
+- **`start_mock_telegram_server` helper** added to
+  `test-local/e2e/common.sh`; replaces the inline E-0 spawn block.
+- **Checkpoint count** preserved across the split (sum of `^pass "`
+  lines in the 3 new files = original + 1; the +1 is the new
+  `pass "P-block container healthy"` boot line because P now boots its
+  own container, where it previously reused D's).
+
+### Removed
+
+- **`test-local/e2e/test_migration.sh`** (57 lines) — asserted seeded
+  YAML markers for behavior the v0.7.0+ pre-1.0 wipe-on-update doctrine
+  explicitly does NOT do. Same fate v0.9.1 gave `test_heartbeat.sh`.
+  `git log -- test-local/e2e/test_migration.sh` recovers it post-1.0
+  if migrations are reintroduced.
+- **`test-local/Makefile::test-migration`** target dropped.
+
+### Build
+
+- **`test-local/Makefile`** gains `test-tier1`, `test-tier2`,
+  `test-tier3`, `test-all`; legacy `test`/`test-smoke`/`test-runtime`/
+  `test-voice` targets retained.
+
 ## [0.14.10] - 2026-04-25
 
 v0.14.9 follow-up: enable seeded plugins after seed-copy. The v0.14.9
