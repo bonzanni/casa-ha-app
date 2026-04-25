@@ -69,6 +69,7 @@ _channel_manager: ChannelManager | None = None
 _bus: MessageBus | None = None
 _specialist_registry: SpecialistRegistry | None = None
 _mcp_registry: McpServerRegistry | None = None
+_agent_role_map: dict[str, "AgentConfig"] = {}  # merged residents + specialists
 _trigger_registry: "TriggerRegistry | None" = None
 _engagement_registry: EngagementRegistry | None = None
 _executor_registry: "ExecutorRegistry | None" = None
@@ -82,6 +83,8 @@ def init_tools(
     bus,
     specialist_registry,
     mcp_registry=None,
+    *,
+    agent_role_map: dict | None = None,
     trigger_registry=None,
     engagement_registry=None,
     executor_registry=None,
@@ -94,12 +97,18 @@ def init_tools(
     tool that returns "not initialized" on every call.
     Accepts ``None`` for legacy callers that don't pass
     it (the `_build_specialist_options` code path degrades to empty MCP
-    servers — the specialist still runs but with only built-in tools)."""
-    global _channel_manager, _bus, _specialist_registry, _mcp_registry, _trigger_registry, _engagement_registry, _executor_registry  # noqa: PLW0603
+    servers — the specialist still runs but with only built-in tools).
+
+    ``agent_role_map`` is a merged dict of role→AgentConfig covering both
+    residents and specialists. If omitted, ``delegate_to_agent`` falls back
+    to resolving against ``specialist_registry`` alone (back-compat)."""
+    global _channel_manager, _bus, _specialist_registry, _mcp_registry, \
+        _agent_role_map, _trigger_registry, _engagement_registry, _executor_registry  # noqa: PLW0603
     _channel_manager = channel_manager
     _bus = bus
     _specialist_registry = specialist_registry
     _mcp_registry = mcp_registry
+    _agent_role_map = dict(agent_role_map or {})
     _trigger_registry = trigger_registry
     _engagement_registry = engagement_registry
     _executor_registry = executor_registry
@@ -414,12 +423,18 @@ async def delegate_to_agent(args: dict) -> dict:
             "message": "delegate_to_agent called outside a turn",
         })
 
-    cfg = _specialist_registry.get(agent_name)
+    # Resolve target. Look in the merged role map (residents + specialists)
+    # first; fall back to the specialist registry for back-compat with any
+    # caller still relying on the old wiring.
+    cfg = _agent_role_map.get(agent_name) or (
+        _specialist_registry.get(agent_name)
+        if _specialist_registry is not None else None
+    )
     if cfg is None:
         return _result({
             "status": "error",
-            "kind": "unknown_specialist",
-            "message": f"No enabled specialist named {agent_name!r}",
+            "kind": "unknown_agent",
+            "message": f"No enabled agent named {agent_name!r}",
         })
 
     if mode == "interactive":
