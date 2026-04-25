@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import time
 from pathlib import Path
@@ -24,34 +23,6 @@ logger = logging.getLogger(__name__)
 _URL_REGEX = re.compile(r"Remote Control URL:\s+(https?://\S+)")
 
 TopicSender = Callable[[int, str], Awaitable[None]]
-
-
-def _resolve_plugin_developer_github_token() -> str:
-    """Resolve `op://${ONEPASSWORD_DEFAULT_VAULT}/GitHub/credential` for
-    plugin-developer engagements (v0.14.6).
-
-    Returns the resolved token on success, or "" on failure (logs warning).
-    Vault from `ONEPASSWORD_DEFAULT_VAULT` env (default "Casa"); item title
-    `GitHub` and field label `credential` are conventional.
-    """
-    from secrets_resolver import resolve as _resolve_secret
-
-    vault = os.environ.get("ONEPASSWORD_DEFAULT_VAULT") or "Casa"
-    op_ref = f"op://{vault}/GitHub/credential"
-    try:
-        token = _resolve_secret(op_ref)
-    except RuntimeError as exc:
-        logger.warning(
-            "plugin-developer engagement: %s unresolved (%s) — "
-            "gh repo create / git push will fail",
-            op_ref, exc,
-        )
-        return ""
-    # secrets_resolver.resolve returns input unchanged for non-op:// values;
-    # if op:// resolution silently passed through, treat as failure.
-    if not token or token == op_ref:
-        return ""
-    return token
 
 
 class ClaudeCodeDriver(DriverProtocol):
@@ -115,11 +86,11 @@ class ClaudeCodeDriver(DriverProtocol):
                 )
 
                 # 2. Write the s6 service dir (with log sub-service for stdout capture).
+                # v0.14.9: GITHUB_TOKEN is set at addon boot via
+                # setup-configs.sh → /run/s6/container_environment/GITHUB_TOKEN, and
+                # s6-overlay merges it into every supervised service's env. Engagement
+                # subprocesses inherit it without per-engagement plumbing.
                 extra_env: dict[str, str] = {}
-                if defn.type == "plugin-developer":
-                    _gh_token = _resolve_plugin_developer_github_token()
-                    if _gh_token:
-                        extra_env["GITHUB_TOKEN"] = _gh_token
                 run_script = render_run_script(
                     engagement_id=engagement.id,
                     permission_mode=defn.permission_mode or "acceptEdits",
