@@ -97,6 +97,18 @@ def _render_delegates_block(delegates, registry) -> str:
     return "\n".join(lines)
 
 
+def _render_executors_block(executors) -> str:
+    """Render the <executors> system-prompt block (assistant role only)."""
+    if not executors:
+        return ""
+    lines = ["<executors>"]
+    for e in executors:
+        lines.append(f"- {e.executor_type} — {e.purpose}")
+        lines.append(f"  Engage when: {e.when}")
+    lines.append("</executors>")
+    return "\n".join(lines)
+
+
 class Agent:
     """A Casa agent backed by the Claude Agent SDK."""
 
@@ -351,6 +363,10 @@ class Agent:
             )
             if delegates_block:
                 system_parts.append("\n" + delegates_block)
+            # <executors> block — assistant role only (loader enforces this).
+            executors_block = _render_executors_block(self.config.executors)
+            if executors_block:
+                system_parts.append("\n" + executors_block)
             _now = datetime.now(resolve_tz())
             system_parts.append(
                 f"\n<current_time>\n"
