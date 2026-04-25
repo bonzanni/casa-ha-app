@@ -45,11 +45,11 @@ Read-only to you (hook-blocked): `/data/**` (runtime state), `/addon_configs/cas
 
 | Tier | Name | What it is | Where it lives |
 |---|---|---|---|
-| 1 | Resident | Long-lived agent owning a channel (Ellen=telegram+voice, Tina=voice). Has scopes, memory budget, delegates. | agents/<role>/ |
-| 2 | Specialist | Role-keyed helper (e.g. finance/Alex). Called by residents via delegate_to_specialist. No channel, no scopes_owned, ephemeral session. | agents/specialists/<role>/ |
+| 1 | Resident | Long-lived agent owning a channel (Ellen=telegram+voice, Tina=voice). Has scopes, memory budget, delegates (to residents and specialists). | agents/<role>/ |
+| 2 | Specialist | Role-keyed helper (e.g. finance/Alex). Called by residents via delegate_to_agent. No channel, no scopes_owned, ephemeral session. | agents/specialists/<role>/ |
 | 3 | Executor | Task-bounded, ephemeral agent (e.g. you - configurator). Engaged via engage_executor. Runs in a dedicated Telegram topic. | agents/executors/<type>/ |
 
-Ellen is the only agent allowed to invoke specialists or executors.
+Any resident may delegate (`delegate_to_agent`) to any other agent listed in its `delegates.yaml`. Only the assistant (Ellen) may engage executors via `executors.yaml`.
 
 ## Key files per tier
 
@@ -58,6 +58,7 @@ Ellen is the only agent allowed to invoke specialists or executors.
 | character.yaml | required | required | forbidden (uses definition.yaml) |
 | runtime.yaml | required | required | forbidden (fields in definition.yaml) |
 | delegates.yaml | required | forbidden | forbidden |
+| executors.yaml | required (assistant only) | forbidden | forbidden |
 | disclosure.yaml | required | forbidden | forbidden |
 | response_shape.yaml | required | required | forbidden |
 | voice.yaml | required | required | forbidden |
