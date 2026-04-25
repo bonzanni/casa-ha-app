@@ -1027,12 +1027,14 @@ async def main():
     assert pathlib.Path(f"{ws}/stdin.fifo").exists(), "FIFO missing"
     assert pathlib.Path(f"{ws}/CLAUDE.md").exists(), "CLAUDE.md missing"
 
-    # s6 reports the service up
+    # s6 reports the service up. `s6-svstat -u` prints "true"/"false"
+    # (up status); `-p` prints the PID. The original parse `int(stdout)`
+    # broke once -u returned the literal "true". Parse boolean instead.
     import subprocess
     r = subprocess.run(["s6-svstat", "-u", f"/run/service/engagement-{rec.id}"],
                        capture_output=True, text=True)
-    pid = int((r.stdout or "0").strip() or "0")
-    assert pid > 0, f"s6 service not up, svstat stdout={r.stdout!r}"
+    up = (r.stdout or "").strip() == "true"
+    assert up, f"s6 service not up, svstat stdout={r.stdout!r}"
 
     print("OK")
 
@@ -1188,14 +1190,13 @@ async def main():
 
     assert not svc_dir.exists(), "service dir should be removed after cancel"
 
-    # s6-svstat should report the service absent or down.
+    # s6-svstat should report the service absent or down. `-u` prints
+    # "true"/"false". Absent service: nonzero exit. Down service: "false".
     r = subprocess.run(
         ["s6-svstat", "-u", f"/run/service/engagement-{rec.id}"],
         capture_output=True, text=True,
     )
-    # After cancel + compile+update, the service name should be gone.
-    # Some s6 versions print "0" for stale entries; some error. Either OK.
-    assert r.returncode != 0 or (r.stdout or "0").strip() == "0", (
+    assert r.returncode != 0 or (r.stdout or "").strip() == "false", (
         f"service still reports up: stdout={r.stdout!r} rc={r.returncode}"
     )
     print("OK")
@@ -1406,8 +1407,11 @@ async def main():
     await asyncio.sleep(1.5)
 
     def _pid():
+        # Use -p: prints PID directly. (-u prints "true"/"false", which
+        # always failed int() and silently returned 0 here.) The whole
+        # point of this test is comparing PIDs across a parent restart.
         r = subprocess.run(
-            ["s6-svstat", "-u", f"/run/service/engagement-{rec.id}"],
+            ["s6-svstat", "-p", f"/run/service/engagement-{rec.id}"],
             capture_output=True, text=True,
         )
         try:
