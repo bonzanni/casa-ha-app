@@ -179,7 +179,14 @@ mkdir -p "$HOME/.claude"
 ANTHROPIC_API_KEY=sk-ant-bootstrap-noop \
   claude -p "noop" --allow-dangerously-skip-permissions >/dev/null 2>&1 || true
 
-# Register the user marketplace in casa-main's HOME. Idempotent.
+# Register both marketplaces in casa-main's HOME. Idempotent.
+# - casa-plugins-defaults: read-only seed at /opt/casa/defaults/marketplace-defaults/.
+#   Required so `<name>@casa-plugins-defaults` install refs in defaults/agents/**/plugins.yaml
+#   resolve. Without this, the install loop below silently fails for every default plugin
+#   (CC CLI: 'Plugin "<name>" not found in marketplace "casa-plugins-defaults"').
+# - casa-plugins: user-writable overlay at /addon_configs/casa-agent/marketplace/.
+claude plugin marketplace add /opt/casa/defaults/marketplace-defaults/ \
+  --scope user 2>/dev/null || true
 claude plugin marketplace add /addon_configs/casa-agent/marketplace/ \
   --scope user 2>/dev/null || true
 
@@ -198,9 +205,11 @@ if command -v yq >/dev/null 2>&1; then
                            /opt/casa/defaults/agents/executors/*/plugins.yaml \
                            2>/dev/null | sort -u); do
         if [ -z "$plugin_ref" ]; then continue; fi
-        flock "$INSTALL_LOCK" claude plugin install "$plugin_ref" --scope user \
-            >/dev/null 2>&1 \
-            || bashio::log.warning "plugin install skipped: $plugin_ref"
+        # Capture stderr into the warning so future failures stay diagnosable
+        # instead of cryptic "skipped" lines hiding the CC CLI's real reason.
+        install_err=$(flock "$INSTALL_LOCK" \
+            claude plugin install "$plugin_ref" --scope user 2>&1 >/dev/null) \
+            || bashio::log.warning "plugin install skipped: $plugin_ref — ${install_err:-no stderr}"
     done
 else
     bashio::log.warning "yq not found — skipping default-plugin install loop"
