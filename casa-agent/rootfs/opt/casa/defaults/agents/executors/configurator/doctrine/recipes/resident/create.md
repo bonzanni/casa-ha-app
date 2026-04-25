@@ -38,3 +38,12 @@ Scope rebalance may require editing another resident's memory.scopes_owned/reada
 1. config_git_commit(message="add resident <role> with scope <scope>")
 2. emit_completion
 3. casa_reload()
+
+## Register handling for delegated turns
+
+Any resident's `prompts/system.md` should honor the framework-injected
+`<delegation_context>::suggested_register` hint. When invoked via another
+agent's `delegate_to_agent` call, the calling channel is text → answer in
+conversational text register; voice → answer in spoken register. See
+butler/prompts/system.md for the canonical paragraph; copy or adapt it
+when authoring a new resident.

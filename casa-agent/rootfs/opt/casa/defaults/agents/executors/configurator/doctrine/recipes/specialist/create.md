@@ -1,6 +1,6 @@
 # Recipe: create a new specialist
 
-A Specialist is a Tier 2 agent, role-keyed (e.g. finance, fitness). Residents invoke specialists via delegate_to_specialist. Specialists are ephemeral - no persistent session, no scopes_owned.
+A Specialist is a Tier 2 agent, role-keyed (e.g. finance, fitness). Residents invoke specialists via delegate_to_agent. Specialists are ephemeral - no persistent session, no scopes_owned.
 
 ## Ask the user
 

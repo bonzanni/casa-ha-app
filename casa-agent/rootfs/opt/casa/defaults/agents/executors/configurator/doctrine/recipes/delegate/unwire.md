@@ -1,4 +1,6 @@
-# Recipe: unwire a specialist from a resident's delegates
+# Recipe: unwire an agent from a resident's delegates
+
+The target may be a resident or a specialist — same edit either way.
 
 ## Edit agents/<resident-role>/delegates.yaml
 
@@ -13,6 +15,6 @@ Remove the matching entry. Leave `delegates: []` if it was the last.
 
 **Hard.**
 
-    config_git_commit(message="unwire <specialist> from <resident>'s delegates")
+    config_git_commit(message="unwire <target> from <resident>'s delegates")
     emit_completion
     casa_reload()
