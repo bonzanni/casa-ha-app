@@ -1,19 +1,34 @@
 # Changelog
 
-## [0.14.6] - 2026-04-25
+## [0.14.7] - 2026-04-25
 
-### Removed
-- **`github_token` addon option.** Plugin-developer now resolves
-  `op://${onepassword_default_vault}/GitHub/credential` directly at
-  engagement spawn time. Vault is configurable via
-  `onepassword_default_vault`; item title (`GitHub`) and field label
-  (`credential`) are conventional. One fewer addon option to configure;
-  1P is the single source of truth.
+Bug-review v0.14.6 follow-up — closes Bug 10, the only finding from
+`docs/bug-review-2026-04-24.md` deferred from v0.14.6 because it
+needed a locking design rather than a surgical patch.
 
-### Migration
-- Users with `github_token` set in addon options: remove the entry, then
-  ensure your 1P vault contains a `GitHub` item with a `credential` field
-  holding a GitHub PAT (`repo` scope).
+### Reliability
+
+- **Telegram `handle_update` topic-status race (Bug 10).** aiohttp
+  dispatched each Telegram update as its own task, so a `/cancel`
+  arriving alongside a regular turn could race: the regular turn
+  passed `rec.status` while the cancel was mid-finalize, then routed
+  to a driver that `_finalize_engagement` had just torn down (driver
+  raised `DriverNotAliveError` or the turn landed on a closed topic).
+  Fixed with a per-topic `asyncio.Lock` keyed by `message_thread_id`
+  on `TelegramChannel._engagement_handler_locks`, mirroring the
+  `in_casa_driver._locks: dict[id, Lock]` idiom. Updates landing on
+  the same topic now serialise; different topics still run in
+  parallel. Three new tests in
+  `tests/test_telegram_engagement_routing.py::TestHandleUpdateConcurrencyRace`
+  exercise the cancel-vs-turn race, the two-regular-turns drop-
+  resistance case, and cross-topic parallelism (deadlock-detection).
+
+### CHANGELOG cleanup
+
+- Collapsed the inadvertent duplicate `## [0.14.6]` heading from
+  commit `615eac1` into a single section; moved the `Removed` /
+  `Migration` blocks below `Tests` so they sit in the same v0.14.6
+  body as the other notes.
 
 ## [0.14.6] - 2026-04-25
 
@@ -98,6 +113,21 @@ are surgical fixes with regression tests.
   bypass for `block_dangerous_bash` is captured directly in
   `test_rm_recursive_force_all_blocked`; the rest mirror their bug
   preconditions one-for-one.
+
+### Removed
+
+- **`github_token` addon option.** Plugin-developer now resolves
+  `op://${onepassword_default_vault}/GitHub/credential` directly at
+  engagement-spawn time. Vault is configurable via
+  `onepassword_default_vault`; item title (`GitHub`) and field label
+  (`credential`) are conventional. One fewer addon option to configure;
+  1P is the single source of truth.
+
+### Migration
+
+- Users with `github_token` set in addon options: remove the entry,
+  then ensure your 1P vault contains a `GitHub` item with a
+  `credential` field holding a GitHub PAT (`repo` scope).
 
 ## [0.14.5] - 2026-04-24
 
