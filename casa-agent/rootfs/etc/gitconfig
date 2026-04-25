@@ -1,0 +1,23 @@
+# Casa system git config (ships in image via rootfs COPY).
+#
+# - SSH→HTTPS rewrite: any `git@github.com:OWNER/REPO` URL is rewritten
+#   to `https://github.com/OWNER/REPO`. CC CLI's plugin install resolver
+#   uses `git@github.com:` URLs by default for `source: github` entries
+#   in marketplace catalogs; rewriting them lets us authenticate via
+#   credential helper on the HTTPS path (no SSH known_hosts in container).
+#
+# - Credential helper: when git authenticates an HTTPS request to
+#   github.com, it invokes /opt/casa/scripts/git-credential-casa.sh,
+#   which reads $GITHUB_TOKEN from env and emits username/password.
+#   Token is never written to any config file.
+#
+# This config is /etc/gitconfig (system-level), so it applies to every
+# git operation regardless of which user or HOME the process runs under
+# — relevant for engagement subprocesses that get a fresh HOME per
+# engagement and would otherwise miss user-scoped git config.
+
+[url "https://github.com/"]
+    insteadOf = git@github.com:
+
+[credential "https://github.com"]
+    helper = /opt/casa/scripts/git-credential-casa.sh
