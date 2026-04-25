@@ -369,3 +369,21 @@ class TestLoadAllSpecialists:
 
         found = load_all_specialists(str(specialists_root))
         assert "finance" in found
+
+
+# ---------------------------------------------------------------------------
+# TestBuildRoleRegistry
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_role_across_residents_and_specialists_fails(tmp_path):
+    """A role present in BOTH residents/<role>/ and specialists/<role>/
+    must fail boot — both registries cannot share a role."""
+    from casa_core import _build_role_registry  # introduced by Task 5
+    residents = {"finance": object()}      # placeholder configs
+    specialists = {"finance": object()}    # collision on `finance`
+    with pytest.raises(ValueError) as exc:
+        _build_role_registry(residents=residents, specialists=specialists)
+    msg = str(exc.value).lower()
+    assert "duplicate" in msg
+    assert "finance" in msg
