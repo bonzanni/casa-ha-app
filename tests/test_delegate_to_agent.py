@@ -692,3 +692,43 @@ class TestMergedRoleMap:
             assert payload["kind"] == "interactive_not_supported"
         finally:
             agent_mod.origin_var.reset(token)
+
+    async def test_delegate_to_agent_depth_cap(self, tmp_path, monkeypatch):
+        """A nested delegate_to_agent (depth >= 1) returns delegation_depth_exceeded."""
+        import tools, agent as agent_mod
+
+        resident_cfg = _specialist_cfg(role="butler")
+        resident_cfg.character.name = "Tina"
+        resident_cfg.channels = ["voice"]
+
+        from specialist_registry import SpecialistRegistry
+        spec_reg = SpecialistRegistry(
+            specialists_dir=str(tmp_path / "specs"),
+            tombstone_path=str(tmp_path / "tombs.json"),
+        )
+        tools.init_tools(
+            channel_manager=None,
+            bus=None,
+            specialist_registry=spec_reg,
+            mcp_registry=None,
+            agent_role_map={"butler": resident_cfg},
+        )
+        # Set origin AT depth=1 (simulating that we are already inside a
+        # delegated turn).
+        token = agent_mod.origin_var.set({
+            "role": "butler", "channel": "telegram", "chat_id": "1",
+            "user_id": 1, "cid": "abc", "user_text": "x",
+            "delegation_depth": 1,
+        })
+        try:
+            result = await tools.delegate_to_agent.handler({
+                "agent": "butler",
+                "task": "nested",
+                "context": "",
+                "mode": "sync",
+            })
+            payload = json.loads(result["content"][0]["text"])
+            assert payload["status"] == "error"
+            assert payload["kind"] == "delegation_depth_exceeded"
+        finally:
+            agent_mod.origin_var.reset(token)

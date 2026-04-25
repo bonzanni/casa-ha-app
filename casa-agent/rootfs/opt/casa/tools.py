@@ -145,6 +145,10 @@ async def send_message(args: dict) -> dict:
 # path without waiting a minute.
 _SYNC_WAIT_TIMEOUT_S: float = 60.0
 
+# Phase 3.5 (Plan 4b): max delegation depth. depth=0 is a direct call from
+# a resident; depth>=1 is a delegated turn. Cap at 1 to prevent chains.
+_MAX_DELEGATION_DEPTH: int = 1
+
 
 def _result(payload: dict) -> dict:
     """Wrap a JSON-serializable payload as the tool's MCP content."""
@@ -308,17 +312,27 @@ def _build_world_state_summary() -> str:
 
 
 async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
-    """Run one ephemeral specialist turn and return the concatenated text."""
+    """Run one ephemeral delegated turn and return the concatenated text."""
+    import agent as agent_mod
+    parent = agent_mod.origin_var.get(None) or {}
+    child_origin = {
+        **parent,
+        "delegation_depth": int(parent.get("delegation_depth", 0)) + 1,
+    }
     options = _build_specialist_options(cfg)
     prompt = f"{task_text}\n\nContext:\n{context_text}" if context_text else task_text
     text = ""
-    async with ClaudeSDKClient(options) as client:
-        await client.query(prompt)
-        async for sdk_msg in client.receive_response():
-            if isinstance(sdk_msg, AssistantMessage):
-                for block in getattr(sdk_msg, "content", []):
-                    if isinstance(block, TextBlock):
-                        text += block.text
+    token = agent_mod.origin_var.set(child_origin)
+    try:
+        async with ClaudeSDKClient(options) as client:
+            await client.query(prompt)
+            async for sdk_msg in client.receive_response():
+                if isinstance(sdk_msg, AssistantMessage):
+                    for block in getattr(sdk_msg, "content", []):
+                        if isinstance(block, TextBlock):
+                            text += block.text
+    finally:
+        agent_mod.origin_var.reset(token)
     return text
 
 
@@ -421,6 +435,18 @@ async def delegate_to_agent(args: dict) -> dict:
             "status": "error",
             "kind": "no_origin",
             "message": "delegate_to_agent called outside a turn",
+        })
+
+    # Check depth cap: prevent delegation chains beyond depth=1.
+    current_depth = int((origin or {}).get("delegation_depth", 0))
+    if current_depth >= _MAX_DELEGATION_DEPTH:
+        return _result({
+            "status": "error",
+            "kind": "delegation_depth_exceeded",
+            "message": (
+                f"Delegation depth {current_depth} exceeds cap "
+                f"{_MAX_DELEGATION_DEPTH}; cannot chain further."
+            ),
         })
 
     # Resolve target. Look in the merged role map (residents + specialists)
