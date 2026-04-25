@@ -130,3 +130,28 @@ assert_file_contains() {
         fail "$label (grep for '$needle' in $path failed)"
     fi
 }
+
+# start_mock_telegram_server [port]
+# Spawns the mock Telegram server backing the engagement e2e tests.
+# Echoes the PID of the spawned python process on stdout (caller traps cleanup).
+# Honors $MOCK_TG_PORT (default 8081) so multiple suites can pick distinct
+# ports if ever run in parallel.
+# Returns 0 on success, 1 on timeout (after which caller should fail loudly).
+start_mock_telegram_server() {
+    local port="${1:-${MOCK_TG_PORT:-8081}}"
+    local repo_root
+    repo_root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
+    python3 "$repo_root/test-local/e2e/mock_telegram/server.py" \
+        >/tmp/mock-tg.log 2>&1 &
+    local pid=$!
+    local i
+    for i in $(seq 1 10); do
+        if curl -sf "http://localhost:${port}/_inspect" >/dev/null 2>&1; then
+            echo "$pid"
+            return 0
+        fi
+        sleep 0.3
+    done
+    kill "$pid" 2>/dev/null || true
+    return 1
+}
