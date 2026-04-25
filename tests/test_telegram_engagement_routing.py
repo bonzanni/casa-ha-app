@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -358,3 +359,156 @@ class TestDriverSendUserTurnRouting:
 
         engagement_driver.send_user_turn.assert_awaited_once_with(rec, "hello")
         claude_code_driver.send_user_turn.assert_not_called()
+
+
+class TestHandleUpdateConcurrencyRace:
+    """Bug 10 (v0.14.7): per-topic lock around handle_update.
+
+    Pre-fix, aiohttp dispatched each Telegram update as its own task and
+    a /cancel arriving alongside a regular turn could race: the regular
+    turn passed the rec.status check while the cancel was mid-finalize,
+    then routed to a driver that _finalize_engagement had just torn
+    down. The fix is a per-topic asyncio.Lock wrapping the engagement-
+    supergroup branch in handle_update.
+    """
+
+    async def test_concurrent_cancel_and_turn_serialised_per_topic(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """Concurrent /cancel + regular update on the same topic.
+
+        With the lock, the cancel-task wins (asyncio.gather schedules it
+        first; uncontended setdefault returns the same Lock for both
+        tasks; the cancel-task acquires first). cancel_impl yields BEFORE
+        mutating registry status — without the lock the regular turn
+        would slip past the status check during that yield and call
+        _driver_send_user_turn on a soon-to-be-dead engagement.
+
+        Acceptance criterion 1: with the lock the regular turn either
+        runs before the cancel (saw "active") or is dropped after the
+        cancel finalises (sees "cancelled" → "no active" reply). It
+        NEVER reaches the driver after the cancel-task entered its lock.
+        """
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        registry = engagement_fixture.registry
+        ch._engagement_registry = registry
+        rec = engagement_fixture.active_record  # driver=in_casa, status=active
+        # No user_id in origin → originator-only check at line 494 falls
+        # through (legacy back-compat shape; see Bug 8 test class).
+
+        async def cancel_impl(rec_arg, *, reason):
+            # Yield the event loop FIRST. Without the per-topic lock
+            # this gives the turn-task a window to reach
+            # `await driver_send_user_turn` before mark_cancelled fires
+            # — exactly the race window Bug 10 documents.
+            await asyncio.sleep(0)
+            await registry.mark_cancelled(rec_arg.id)
+
+        ch._finalize_cancel = AsyncMock(side_effect=cancel_impl)
+        ch._driver_send_user_turn = AsyncMock()
+
+        u_cancel = _mk_update(chat_id=-1001, text="/cancel",
+                              thread_id=rec.topic_id, user_id=99)
+        u_turn = _mk_update(chat_id=-1001, text="hello",
+                            thread_id=rec.topic_id, user_id=99)
+
+        # gather schedules u_cancel first; with the lock it wins.
+        await asyncio.gather(
+            ch.handle_update(u_cancel),
+            ch.handle_update(u_turn),
+        )
+
+        # The lock guarantees cancel completes before the turn is
+        # routed. With cancel completing first, the turn sees terminal
+        # status at re-check and is dropped (case a in acceptance).
+        assert ch._driver_send_user_turn.await_count == 0, (
+            "regular turn was routed despite a concurrent /cancel; "
+            "the per-topic lock is missing or broken"
+        )
+        ch._finalize_cancel.assert_awaited_once()
+        assert registry.get(rec.id).status == "cancelled"
+
+    async def test_concurrent_regular_turns_both_routed(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """Two regular updates on the same active engagement → both
+        reach the driver.
+
+        Acceptance criterion 2: the lock must serialise but not drop —
+        per-topic ordering is fine, lost messages are not.
+        """
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = engagement_fixture.registry
+        rec = engagement_fixture.active_record
+        ch._driver_send_user_turn = AsyncMock()
+
+        u1 = _mk_update(chat_id=-1001, text="hello1", thread_id=rec.topic_id)
+        u2 = _mk_update(chat_id=-1001, text="hello2", thread_id=rec.topic_id)
+
+        await asyncio.gather(ch.handle_update(u1), ch.handle_update(u2))
+
+        assert ch._driver_send_user_turn.await_count == 2
+        texts_sent = sorted(
+            c.args[1] for c in ch._driver_send_user_turn.await_args_list
+        )
+        assert texts_sent == ["hello1", "hello2"]
+
+    async def test_concurrent_turns_on_different_topics_run_in_parallel(
+        self, fake_telegram_bot, tmp_path,
+    ):
+        """The lock is keyed by thread_id — two updates on different
+        engagements must not block each other.
+
+        Set up two engagements in different topics; have the first
+        turn's driver call block on an event the second turn must set.
+        If different topics share a lock, this deadlocks; with per-
+        topic locks it completes.
+        """
+        from channels.telegram import TelegramChannel
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None,
+        )
+        rec_a = await reg.create(
+            kind="specialist", role_or_type="finance", driver="in_casa",
+            task="t", origin={"role": "assistant"}, topic_id=111,
+        )
+        rec_b = await reg.create(
+            kind="specialist", role_or_type="logistics", driver="in_casa",
+            task="t", origin={"role": "assistant"}, topic_id=222,
+        )
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = reg
+
+        b_routed = asyncio.Event()
+        a_can_finish = asyncio.Event()
+
+        async def driver_send(rec_arg, text):
+            if rec_arg.id == rec_a.id:
+                # A holds its lock; wait for B to also be routed.
+                await asyncio.wait_for(b_routed.wait(), timeout=2.0)
+                a_can_finish.set()
+            else:
+                b_routed.set()
+
+        ch._driver_send_user_turn = driver_send
+
+        u_a = _mk_update(chat_id=-1001, text="for-A", thread_id=rec_a.topic_id)
+        u_b = _mk_update(chat_id=-1001, text="for-B", thread_id=rec_b.topic_id)
+
+        # If different topics serialised on a shared lock, this hangs:
+        # u_a holds the lock waiting for b_routed, but u_b can't run
+        # because it's blocked on the same lock. wait_for(2.0) catches
+        # the deadlock.
+        await asyncio.gather(ch.handle_update(u_a), ch.handle_update(u_b))
+        assert b_routed.is_set()
+        assert a_can_finish.is_set()

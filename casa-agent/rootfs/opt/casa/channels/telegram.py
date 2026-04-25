@@ -125,6 +125,14 @@ class TelegramChannel(Channel):
         self._finalize_cancel = None
         self._finalize_complete_user = None
         self._main_feed_redirect_seen: set[int] = set()
+        # Per-topic handler lock (Bug 10, v0.14.7). aiohttp dispatches
+        # handle_update concurrently per Bot-API update; without this,
+        # /cancel racing a regular turn could route the turn to a driver
+        # that's already been torn down by _finalize_engagement. Keyed by
+        # message_thread_id (1:1 with engagement via _topic_index). Mirrors
+        # in_casa_driver._locks. Entries are not pruned — bounded growth,
+        # cleared on add-on restart.
+        self._engagement_handler_locks: dict[int, asyncio.Lock] = {}
         # Default routing: forward to the existing PTB handler.
         self._route_to_ellen = self._route_to_ellen_default
 
@@ -463,86 +471,94 @@ class TelegramChannel(Channel):
                 return
             if self._engagement_registry is None:
                 return  # not wired yet; ignore silently
-            rec = self._engagement_registry.by_topic_id(thread_id)
-            if rec is None or rec.status in ("completed", "cancelled", "error"):
-                await self.send_to_topic(thread_id, "No active engagement in this topic.")
-                return
-
-            if text.startswith("/"):
-                command = text.split()[0].lower()
-                # Bug 8 (v0.14.6): /cancel and /complete are originator-only.
-                # Pre-fix any user in the supergroup could terminate any
-                # engagement; user_id wasn't even checked. /silent stays
-                # open since it's local to the engagement (anyone reading
-                # along can quiet the observer in their topic).
-                if command in ("/cancel", "/complete"):
-                    owner_id = rec.origin.get("user_id")
-                    if (
-                        owner_id is not None
-                        and user_id is not None
-                        and int(owner_id) != int(user_id)
-                    ):
-                        await self.send_to_topic(
-                            thread_id,
-                            f"Only the engagement originator can {command}. "
-                            "Ask them, or start your own engagement.",
-                        )
-                        return
-                    if command == "/cancel":
-                        return await self._finalize_cancel(rec, reason="user")
-                    return await self._finalize_complete_user(rec)
-                if command == "/silent":
-                    if self._observer is not None:
-                        self._observer.silence(rec.id)
-                    await self.send_to_topic(
-                        thread_id, "Observer quieted for this engagement.",
-                    )
+            # Bug 10 (v0.14.7): per-topic lock serialises updates landing
+            # in the same engagement so a /cancel can't finish tearing
+            # down the driver while a concurrent regular turn is still
+            # mid-routing. Different topics still run in parallel.
+            lock = self._engagement_handler_locks.setdefault(
+                thread_id, asyncio.Lock(),
+            )
+            async with lock:
+                rec = self._engagement_registry.by_topic_id(thread_id)
+                if rec is None or rec.status in ("completed", "cancelled", "error"):
+                    await self.send_to_topic(thread_id, "No active engagement in this topic.")
                     return
 
-            # Resume suspended client if needed (in_casa driver only — the
-            # claude_code driver has s6 keeping the subprocess alive across
-            # Casa restarts, and its engagements never have sdk_session_id).
-            if rec.driver != "claude_code" and self._engagement_driver is not None:
-                drv = self._engagement_driver
-                if not drv.is_alive(rec) and rec.sdk_session_id:
-                    fail_count = rec.origin.get("_resume_fail_count", 0)
-                    try:
-                        await drv.resume(rec, rec.sdk_session_id)
-                        rec.origin["_resume_fail_count"] = 0
-                    except Exception as exc:  # noqa: BLE001
-                        fail_count += 1
-                        rec.origin["_resume_fail_count"] = fail_count
-                        logger.warning(
-                            "resume failed (%d/2) for engagement %s: %s",
-                            fail_count, rec.id[:8], exc,
-                        )
-                        if fail_count >= 2:
-                            await self._engagement_registry.mark_error(
-                                rec.id, kind="resume_failed", message=str(exc),
+                if text.startswith("/"):
+                    command = text.split()[0].lower()
+                    # Bug 8 (v0.14.6): /cancel and /complete are originator-only.
+                    # Pre-fix any user in the supergroup could terminate any
+                    # engagement; user_id wasn't even checked. /silent stays
+                    # open since it's local to the engagement (anyone reading
+                    # along can quiet the observer in their topic).
+                    if command in ("/cancel", "/complete"):
+                        owner_id = rec.origin.get("user_id")
+                        if (
+                            owner_id is not None
+                            and user_id is not None
+                            and int(owner_id) != int(user_id)
+                        ):
+                            await self.send_to_topic(
+                                thread_id,
+                                f"Only the engagement originator can {command}. "
+                                "Ask them, or start your own engagement.",
                             )
+                            return
+                        if command == "/cancel":
+                            return await self._finalize_cancel(rec, reason="user")
+                        return await self._finalize_complete_user(rec)
+                    if command == "/silent":
+                        if self._observer is not None:
+                            self._observer.silence(rec.id)
                         await self.send_to_topic(
-                            thread_id,
-                            f"Could not resume this engagement: {exc}. "
-                            f"Start a fresh one if needed.",
+                            thread_id, "Observer quieted for this engagement.",
                         )
                         return
-                elif not drv.is_alive(rec):
-                    # No session to resume — orphan
-                    await self._engagement_registry.mark_error(
-                        rec.id, kind="orphan_no_session",
-                        message="no sdk_session_id to resume with",
-                    )
-                    await self.send_to_topic(
-                        thread_id, "This engagement can't be resumed.",
-                    )
-                    return
 
-            if self._driver_send_user_turn is not None:
-                await self._driver_send_user_turn(rec, text)
-            if self._engagement_registry is not None:
-                import time as _time
-                await self._engagement_registry.update_user_turn(rec.id, _time.time())
-            return
+                # Resume suspended client if needed (in_casa driver only — the
+                # claude_code driver has s6 keeping the subprocess alive across
+                # Casa restarts, and its engagements never have sdk_session_id).
+                if rec.driver != "claude_code" and self._engagement_driver is not None:
+                    drv = self._engagement_driver
+                    if not drv.is_alive(rec) and rec.sdk_session_id:
+                        fail_count = rec.origin.get("_resume_fail_count", 0)
+                        try:
+                            await drv.resume(rec, rec.sdk_session_id)
+                            rec.origin["_resume_fail_count"] = 0
+                        except Exception as exc:  # noqa: BLE001
+                            fail_count += 1
+                            rec.origin["_resume_fail_count"] = fail_count
+                            logger.warning(
+                                "resume failed (%d/2) for engagement %s: %s",
+                                fail_count, rec.id[:8], exc,
+                            )
+                            if fail_count >= 2:
+                                await self._engagement_registry.mark_error(
+                                    rec.id, kind="resume_failed", message=str(exc),
+                                )
+                            await self.send_to_topic(
+                                thread_id,
+                                f"Could not resume this engagement: {exc}. "
+                                f"Start a fresh one if needed.",
+                            )
+                            return
+                    elif not drv.is_alive(rec):
+                        # No session to resume — orphan
+                        await self._engagement_registry.mark_error(
+                            rec.id, kind="orphan_no_session",
+                            message="no sdk_session_id to resume with",
+                        )
+                        await self.send_to_topic(
+                            thread_id, "This engagement can't be resumed.",
+                        )
+                        return
+
+                if self._driver_send_user_turn is not None:
+                    await self._driver_send_user_turn(rec, text)
+                if self._engagement_registry is not None:
+                    import time as _time
+                    await self._engagement_registry.update_user_turn(rec.id, _time.time())
+                return
 
         # 3) Other chats — existing enforcement applies
         return await self._route_to_ellen(update)
