@@ -1,0 +1,938 @@
+#!/usr/bin/env bash
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=common.sh
+. "$HERE/common.sh"
+
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+
+MOCK_PORT=8081
+MOCK_PID=""
+NAME="casa-eng-$$"
+SUPERGROUP_ID=-1001
+
+cleanup_all() {
+    docker ps -q --filter "name=casa-eng-.*-$$" | xargs -r docker stop >/dev/null 2>&1 || true
+    docker stop "$NAME" >/dev/null 2>&1 || true
+    if [ -n "$MOCK_PID" ]; then
+        kill "$MOCK_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup_all EXIT
+
+# --- E-0: start mock Telegram server ------------------------------------
+log "E-0: start mock Telegram server"
+MOCK_PID="$(start_mock_telegram_server "$MOCK_PORT")" \
+    || fail "E-0: mock TG never started"
+pass "E-0 mock TG up"
+
+build_image
+
+# --- Boot one long-lived container with engagement wiring ---------------
+# We run the engagement e2e as a python harness executed via `docker exec`.
+# The container doesn't need a live Telegram application — the harness
+# constructs a TelegramChannel directly with bot_token="test" and a mock-TG
+# base URL so `createForumTopic` / `sendMessage` land in the mock's state.
+log "E-0b: boot container with engagement wiring"
+MSYS_NO_PATHCONV=1 docker run -d --rm --name "$NAME" \
+    -p "${HOST_PORT}:8080" \
+    -e TELEGRAM_ENGAGEMENT_SUPERGROUP_ID="$SUPERGROUP_ID" \
+    -e TELEGRAM_BOT_API_BASE="http://host.docker.internal:${MOCK_PORT}" \
+    --add-host=host.docker.internal:host-gateway \
+    "$IMAGE" >/dev/null
+wait_healthy "$NAME"
+pass "E-0b container healthy"
+
+# ---------------------------------------------------------------------------
+# Helper: run_harness <label> <py>
+# Copies the python source into /tmp in the container and runs it inside
+# the casa venv. Fails (assert_contains style) if the harness's last line
+# is not "OK".
+# ---------------------------------------------------------------------------
+run_harness() {
+    local label="$1"; shift
+    local py="$1"; shift
+    local host_tmp
+    host_tmp="$(mktemp)"
+    printf '%s\n' "$py" > "$host_tmp"
+    MSYS_NO_PATHCONV=1 docker cp "$host_tmp" "$NAME:/tmp/_harness.py" >/dev/null
+    rm -f "$host_tmp"
+    local out
+    if ! out=$(MSYS_NO_PATHCONV=1 docker exec -e MOCK_TG_BASE="http://host.docker.internal:${MOCK_PORT}" \
+               -e SUPERGROUP_ID="$SUPERGROUP_ID" \
+               "$NAME" /opt/casa/venv/bin/python /tmp/_harness.py 2>&1); then
+        printf '%s\n' "$out" >&2
+        fail "$label harness exited non-zero"
+    fi
+    printf '%s\n' "$out" | tail -20 >&2
+    printf '%s\n' "$out" | tail -1 | grep -qF "OK" \
+        || fail "$label harness did not print OK as final line"
+}
+
+# ---------------------------------------------------------------------------
+# E-1 — Tier 2 interactive open: channel.open_engagement_topic creates a
+# forum topic in the mock-TG supergroup and the registry records it.
+# ---------------------------------------------------------------------------
+log "E-1: delegate_to_specialist(mode=interactive) opens a topic"
+curl -s -X POST "http://localhost:${MOCK_PORT}/_reset" >/dev/null
+
+read -r -d '' E1_PY <<'PY' || true
+import asyncio, os, sys, json
+sys.path.insert(0, "/opt/casa")
+from engagement_registry import EngagementRegistry
+from channels.telegram import TelegramChannel
+
+async def main():
+    os.environ["TELEGRAM_BOT_API_BASE"] = os.environ["MOCK_TG_BASE"]
+    supergroup = int(os.environ["SUPERGROUP_ID"])
+    reg = EngagementRegistry(tombstone_path="/tmp/_eng_e1.json", bus=None)
+    await reg.load()
+    ch = TelegramChannel(
+        bot_token="test-token", chat_id="999", default_agent="assistant",
+        bus=None, webhook_url="", delivery_mode="block",
+        engagement_supergroup_id=supergroup,
+    )
+    # Stand up the PTB Application against the mock TG URL.
+    await ch._rebuild()
+    ch._engagement_registry = reg
+    tid = await ch.open_engagement_topic(name="E-1 test topic", icon_emoji=None)
+    rec = await reg.create(
+        kind="specialist", role_or_type="finance", driver="in_casa",
+        task="E-1 task", origin={"channel": "telegram", "chat_id": "999"},
+        topic_id=tid,
+    )
+    assert tid is not None, "createForumTopic returned None"
+    assert reg.by_topic_id(tid) is rec, "by_topic_id did not resolve"
+    assert os.path.exists("/tmp/_eng_e1.json"), "tombstone not written"
+    with open("/tmp/_eng_e1.json") as fh:
+        assert json.load(fh), "tombstone empty"
+    await ch._teardown_app()
+    print("OK")
+
+asyncio.run(main())
+PY
+run_harness "E-1" "$E1_PY"
+
+# Mock TG saw createForumTopic land (topic count ≥ 1).
+TOPICS=$(curl -s "http://localhost:${MOCK_PORT}/_inspect" \
+    | python3 -c 'import sys,json;print(len(json.load(sys.stdin).get("topics",{})))')
+[ "$TOPICS" -ge 1 ] || fail "E-1: expected ≥1 topic in mock TG, got $TOPICS"
+pass "E-1 interactive-mode opens topic (mock TG topics=$TOPICS)"
+
+# ---------------------------------------------------------------------------
+# E-2 — User turn routed: a user message inside an engagement topic reaches
+# the driver. We inject a real Telegram Update shape through handle_update
+# and assert the driver's send_user_turn path was reached.
+# ---------------------------------------------------------------------------
+log "E-2: user turn in topic routed to driver"
+curl -s -X POST "http://localhost:${MOCK_PORT}/_reset" >/dev/null
+
+read -r -d '' E2_PY <<'PY' || true
+import asyncio, os, sys
+sys.path.insert(0, "/opt/casa")
+from types import SimpleNamespace
+from engagement_registry import EngagementRegistry
+from channels.telegram import TelegramChannel
+
+async def main():
+    os.environ["TELEGRAM_BOT_API_BASE"] = os.environ["MOCK_TG_BASE"]
+    supergroup = int(os.environ["SUPERGROUP_ID"])
+    reg = EngagementRegistry(tombstone_path="/tmp/_eng_e2.json", bus=None)
+    await reg.load()
+    ch = TelegramChannel(
+        bot_token="test-token", chat_id="999", default_agent="assistant",
+        bus=None, webhook_url="", delivery_mode="block",
+        engagement_supergroup_id=supergroup,
+    )
+    await ch._rebuild()
+
+    # Stub driver: record turns, always alive.
+    class StubDriver:
+        def __init__(self): self.turns = []
+        def is_alive(self, rec): return True
+        async def send_user_turn(self, rec, text): self.turns.append((rec.id, text))
+        async def resume(self, rec, sid): pass
+        def get_session_id(self, rec): return None
+        async def cancel(self, rec): pass
+    drv = StubDriver()
+    ch._engagement_registry = reg
+    ch._engagement_driver = drv
+    ch._driver_send_user_turn = drv.send_user_turn
+
+    tid = await ch.open_engagement_topic(name="E-2", icon_emoji=None)
+    rec = await reg.create(kind="specialist", role_or_type="finance",
+                            driver="in_casa", task="", origin={"channel":"telegram"},
+                            topic_id=tid)
+
+    # Synthetic Telegram update: user message in the topic.
+    update = SimpleNamespace(
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=supergroup),
+            message_thread_id=tid,
+            text="hello from user",
+            from_user=SimpleNamespace(id=7777),
+        ),
+    )
+    await ch.handle_update(update)
+    assert len(drv.turns) == 1, f"expected 1 driver turn, got {len(drv.turns)}"
+    assert drv.turns[0][1] == "hello from user", f"wrong text: {drv.turns[0]}"
+    # last_user_turn_ts should advance.
+    assert reg.get(rec.id).last_user_turn_ts > 0
+    await ch._teardown_app()
+    print("OK")
+
+asyncio.run(main())
+PY
+run_harness "E-2" "$E2_PY"
+pass "E-2 user turn routed to driver"
+
+# ---------------------------------------------------------------------------
+# E-3 — emit_completion happy path: _finalize_engagement closes the topic
+# (icon=✅ on mock TG), marks record completed, and posts NOTIFICATION.
+# ---------------------------------------------------------------------------
+log "E-3: emit_completion closes topic, ✅ icon, NOTIFICATION posted"
+curl -s -X POST "http://localhost:${MOCK_PORT}/_reset" >/dev/null
+
+read -r -d '' E3_PY <<'PY' || true
+import asyncio, os, sys, json
+sys.path.insert(0, "/opt/casa")
+from engagement_registry import EngagementRegistry
+from channels.telegram import TelegramChannel
+
+async def main():
+    os.environ["TELEGRAM_BOT_API_BASE"] = os.environ["MOCK_TG_BASE"]
+    supergroup = int(os.environ["SUPERGROUP_ID"])
+    reg = EngagementRegistry(tombstone_path="/tmp/_eng_e3.json", bus=None)
+    ch = TelegramChannel(
+        bot_token="test-token", chat_id="999", default_agent="assistant",
+        bus=None, webhook_url="", delivery_mode="block",
+        engagement_supergroup_id=supergroup,
+    )
+    await ch._rebuild()
+
+    # Minimal bus that captures NOTIFICATIONs.
+    class StubBus:
+        def __init__(self): self.notifs = []
+        async def notify(self, msg): self.notifs.append(msg)
+    bus = StubBus()
+
+    # Minimal channel_manager.get(...) that returns our channel.
+    class StubChanMgr:
+        def get(self, name): return ch
+    cm = StubChanMgr()
+
+    # Inject bus + channel_manager + registry into the tools module.
+    import tools
+    tools._engagement_registry = reg
+    tools._bus = bus
+    tools._channel_manager = cm
+
+    tid = await ch.open_engagement_topic(name="E-3", icon_emoji=None)
+    rec = await reg.create(kind="specialist", role_or_type="finance",
+                            driver="in_casa", task="",
+                            origin={"channel":"telegram", "role":"assistant"},
+                            topic_id=tid)
+
+    # Stub driver (cancel is called inside _finalize_engagement)
+    class StubDriver:
+        async def cancel(self, rec): pass
+    await tools._finalize_engagement(
+        rec, outcome="completed", text="all done",
+        artifacts=[], next_steps=[],
+        driver=StubDriver(), memory_provider=None,
+    )
+
+    # Inspect mock TG: topic must be closed with ✅ icon.
+    import urllib.request
+    with urllib.request.urlopen(os.environ["MOCK_TG_BASE"] + "/_inspect") as r:
+        state = json.loads(r.read())
+    topic = state["topics"][str(tid)]
+    assert topic["closed"] is True, f"topic not closed: {topic}"
+    assert topic["icon_custom_emoji_id"] == "✅", f"icon wrong: {topic}"
+    # Bus got one NOTIFICATION targeting assistant.
+    assert len(bus.notifs) == 1, f"bus notifs: {len(bus.notifs)}"
+    assert bus.notifs[0].target == "assistant"
+    # Record transitioned to completed.
+    assert reg.get(rec.id).status == "completed"
+    await ch._teardown_app()
+    print("OK")
+
+asyncio.run(main())
+PY
+run_harness "E-3" "$E3_PY"
+pass "E-3 emit_completion closes topic with ✅ + NOTIFY Ellen"
+
+# ---------------------------------------------------------------------------
+# E-4 — /cancel: user-driven cancellation closes the topic and marks the
+# record cancelled.
+# ---------------------------------------------------------------------------
+log "E-4: /cancel user-driven"
+curl -s -X POST "http://localhost:${MOCK_PORT}/_reset" >/dev/null
+
+read -r -d '' E4_PY <<'PY' || true
+import asyncio, os, sys
+sys.path.insert(0, "/opt/casa")
+from types import SimpleNamespace
+from engagement_registry import EngagementRegistry
+from channels.telegram import TelegramChannel
+
+async def main():
+    os.environ["TELEGRAM_BOT_API_BASE"] = os.environ["MOCK_TG_BASE"]
+    supergroup = int(os.environ["SUPERGROUP_ID"])
+    reg = EngagementRegistry(tombstone_path="/tmp/_eng_e4.json", bus=None)
+    ch = TelegramChannel(
+        bot_token="test-token", chat_id="999", default_agent="assistant",
+        bus=None, webhook_url="", delivery_mode="block",
+        engagement_supergroup_id=supergroup,
+    )
+    await ch._rebuild()
+
+    import tools
+    class StubBus:
+        def __init__(self): self.notifs = []
+        async def notify(self, msg): self.notifs.append(msg)
+    class StubChanMgr:
+        def get(self, name): return ch
+    tools._engagement_registry = reg
+    tools._bus = StubBus()
+    tools._channel_manager = StubChanMgr()
+
+    # Stub driver to satisfy _finalize_engagement path triggered by _finalize_cancel.
+    class StubDriver:
+        def is_alive(self, rec): return False
+        async def cancel(self, rec): pass
+    # Bind into agent module so tools._finalize_cancel finds it.
+    import agent as agent_mod
+    agent_mod.active_engagement_driver = StubDriver()
+    agent_mod.active_memory_provider = None
+
+    ch._engagement_registry = reg
+    # Inject _finalize_cancel collaborator (prod wiring lives in casa_core.py).
+    drv = agent_mod.active_engagement_driver
+    async def _finalize_cancel(rec, reason="user"):
+        await tools._finalize_engagement(
+            rec, outcome="cancelled", text=f"Cancelled by {reason}.",
+            artifacts=[], next_steps=[],
+            driver=drv, memory_provider=None,
+        )
+    ch._finalize_cancel = _finalize_cancel
+
+    tid = await ch.open_engagement_topic(name="E-4", icon_emoji=None)
+    rec = await reg.create(kind="specialist", role_or_type="finance",
+                            driver="in_casa", task="",
+                            origin={"channel":"telegram","role":"assistant"},
+                            topic_id=tid)
+
+    update = SimpleNamespace(
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=supergroup),
+            message_thread_id=tid, text="/cancel",
+            from_user=SimpleNamespace(id=7777),
+        ),
+    )
+    await ch.handle_update(update)
+
+    # Record must be cancelled; topic closed in mock TG.
+    assert reg.get(rec.id).status == "cancelled", \
+        f"status: {reg.get(rec.id).status}"
+    import urllib.request, json as _json
+    with urllib.request.urlopen(os.environ["MOCK_TG_BASE"] + "/_inspect") as r:
+        state = _json.loads(r.read())
+    assert state["topics"][str(tid)]["closed"] is True
+    await ch._teardown_app()
+    print("OK")
+
+asyncio.run(main())
+PY
+run_harness "E-4" "$E4_PY"
+pass "E-4 /cancel marks record cancelled + closes topic"
+
+# ---------------------------------------------------------------------------
+# E-5 — /silent: toggles observer.is_silenced(engagement_id) → True.
+# ---------------------------------------------------------------------------
+log "E-5: /silent squelches observer"
+curl -s -X POST "http://localhost:${MOCK_PORT}/_reset" >/dev/null
+
+read -r -d '' E5_PY <<'PY' || true
+import asyncio, os, sys
+sys.path.insert(0, "/opt/casa")
+from types import SimpleNamespace
+from engagement_registry import EngagementRegistry
+from channels.telegram import TelegramChannel
+
+async def main():
+    os.environ["TELEGRAM_BOT_API_BASE"] = os.environ["MOCK_TG_BASE"]
+    supergroup = int(os.environ["SUPERGROUP_ID"])
+    reg = EngagementRegistry(tombstone_path="/tmp/_eng_e5.json", bus=None)
+    ch = TelegramChannel(
+        bot_token="test-token", chat_id="999", default_agent="assistant",
+        bus=None, webhook_url="", delivery_mode="block",
+        engagement_supergroup_id=supergroup,
+    )
+    await ch._rebuild()
+
+    class StubObserver:
+        def __init__(self): self.silenced = set()
+        def silence(self, eid): self.silenced.add(eid)
+        def is_silenced(self, eid): return eid in self.silenced
+    obs = StubObserver()
+
+    ch._engagement_registry = reg
+    ch._observer = obs
+
+    tid = await ch.open_engagement_topic(name="E-5", icon_emoji=None)
+    rec = await reg.create(kind="specialist", role_or_type="finance",
+                            driver="in_casa", task="",
+                            origin={"channel":"telegram"}, topic_id=tid)
+
+    update = SimpleNamespace(
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=supergroup),
+            message_thread_id=tid, text="/silent",
+            from_user=SimpleNamespace(id=7777),
+        ),
+    )
+    await ch.handle_update(update)
+    assert obs.is_silenced(rec.id), "observer not silenced after /silent"
+    await ch._teardown_app()
+    print("OK")
+
+asyncio.run(main())
+PY
+run_harness "E-5" "$E5_PY"
+pass "E-5 /silent flips observer.is_silenced"
+
+# ---------------------------------------------------------------------------
+# E-6 — Idle sweep fires idle_detected on bus after 4 days of user silence.
+# Uses now_override to fast-forward clock without monkey-patching time.
+# ---------------------------------------------------------------------------
+log "E-6: idle sweep fires idle_detected NOTIFICATION"
+
+read -r -d '' E6_PY <<'PY' || true
+import asyncio, os, sys, time
+sys.path.insert(0, "/opt/casa")
+from engagement_registry import EngagementRegistry
+from bus import MessageType
+
+async def main():
+    # Bus that captures NOTIFICATIONs.
+    class StubBus:
+        def __init__(self): self.notifs = []
+        async def notify(self, msg): self.notifs.append(msg)
+    bus = StubBus()
+
+    reg = EngagementRegistry(tombstone_path="/tmp/_eng_e6.json", bus=bus)
+    rec = await reg.create(kind="specialist", role_or_type="finance",
+                            driver="telegram_channel", task="",
+                            origin={"channel":"telegram"}, topic_id=5001)
+
+    # Stub driver (not used since rec.driver != in_casa).
+    class StubDriver:
+        def is_alive(self, rec): return False
+        def get_session_id(self, rec): return None
+        async def cancel(self, rec): pass
+    # Fast-forward 4 days beyond last_user_turn_ts.
+    future = rec.last_user_turn_ts + 4 * 86400 + 1
+    await reg.sweep_idle_and_suspend(driver=StubDriver(), now_override=future)
+
+    idle = [n for n in bus.notifs
+            if n.type == MessageType.NOTIFICATION
+            and isinstance(n.content, dict)
+            and n.content.get("event") == "idle_detected"]
+    assert len(idle) == 1, f"expected 1 idle_detected, got {len(bus.notifs)}"
+    assert idle[0].content["engagement_id"] == rec.id
+    # Re-firing within the refire window → no second notify.
+    await reg.sweep_idle_and_suspend(driver=StubDriver(), now_override=future + 60)
+    idle2 = [n for n in bus.notifs
+             if isinstance(n.content, dict)
+             and n.content.get("event") == "idle_detected"]
+    assert len(idle2) == 1, f"unexpected refire: {len(idle2)}"
+    print("OK")
+
+asyncio.run(main())
+PY
+run_harness "E-6" "$E6_PY"
+pass "E-6 idle_detected fires + does not refire within window"
+
+# ---------------------------------------------------------------------------
+# E-7 — Session suspend after 24h, resume on next user turn. Asserts the
+# driver transitions dead → alive via the resume path.
+# ---------------------------------------------------------------------------
+log "E-7: 24h idle suspends client; next turn resumes"
+curl -s -X POST "http://localhost:${MOCK_PORT}/_reset" >/dev/null
+
+read -r -d '' E7_PY <<'PY' || true
+import asyncio, os, sys
+sys.path.insert(0, "/opt/casa")
+from types import SimpleNamespace
+from engagement_registry import EngagementRegistry
+from channels.telegram import TelegramChannel
+
+async def main():
+    os.environ["TELEGRAM_BOT_API_BASE"] = os.environ["MOCK_TG_BASE"]
+    supergroup = int(os.environ["SUPERGROUP_ID"])
+    reg = EngagementRegistry(tombstone_path="/tmp/_eng_e7.json", bus=None)
+    ch = TelegramChannel(
+        bot_token="test-token", chat_id="999", default_agent="assistant",
+        bus=None, webhook_url="", delivery_mode="block",
+        engagement_supergroup_id=supergroup,
+    )
+    await ch._rebuild()
+
+    # Stub driver: alive flag flips after cancel; resume restores it.
+    class StubDriver:
+        def __init__(self):
+            self._alive = {}
+            self.turns = []
+        def is_alive(self, rec): return self._alive.get(rec.id, False)
+        def get_session_id(self, rec): return "mock-session-e7"
+        async def cancel(self, rec): self._alive.pop(rec.id, None)
+        async def resume(self, rec, session_id):
+            assert session_id == "mock-session-e7", f"resume got {session_id}"
+            self._alive[rec.id] = True
+        async def send_user_turn(self, rec, text): self.turns.append(text)
+    drv = StubDriver()
+    ch._engagement_registry = reg
+    ch._engagement_driver = drv
+    ch._driver_send_user_turn = drv.send_user_turn
+
+    tid = await ch.open_engagement_topic(name="E-7", icon_emoji=None)
+    rec = await reg.create(kind="specialist", role_or_type="finance",
+                            driver="in_casa", task="",
+                            origin={"channel":"telegram"}, topic_id=tid)
+    drv._alive[rec.id] = True
+
+    # Fast-forward 25h; sweep should suspend.
+    future = rec.last_user_turn_ts + 25 * 3600
+    await reg.sweep_idle_and_suspend(driver=drv, now_override=future)
+    assert reg.get(rec.id).status == "idle", \
+        f"status after sweep: {reg.get(rec.id).status}"
+    assert not drv.is_alive(rec), "driver still alive after sweep"
+    assert reg.get(rec.id).sdk_session_id == "mock-session-e7", \
+        "sdk_session_id not persisted"
+
+    # User turn arrives — handle_update should resume + forward the turn.
+    update = SimpleNamespace(
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=supergroup),
+            message_thread_id=tid, text="are you there?",
+            from_user=SimpleNamespace(id=7777),
+        ),
+    )
+    await ch.handle_update(update)
+    assert drv.is_alive(rec), "driver not alive after resume"
+    assert drv.turns == ["are you there?"], f"turns: {drv.turns}"
+    assert reg.get(rec.id).status == "active", \
+        f"status after resume: {reg.get(rec.id).status}"
+    await ch._teardown_app()
+    print("OK")
+
+asyncio.run(main())
+PY
+run_harness "E-7" "$E7_PY"
+pass "E-7 suspend-then-resume on next turn"
+
+# ---------------------------------------------------------------------------
+# E-8 — Orphan recovery: pre-seed /data/engagements.json, restart container,
+# verify EngagementRegistry loads the record on startup.
+# ---------------------------------------------------------------------------
+log "E-8: startup with pre-seeded engagements.json"
+
+# Write a valid tombstone containing one active engagement.
+SEED_JSON='[{"id":"e8orphan0000000000000000000000","kind":"specialist","role_or_type":"finance","driver":"in_casa","status":"active","topic_id":9999,"started_at":1000.0,"last_user_turn_ts":1000.0,"last_idle_reminder_ts":0,"completed_at":null,"sdk_session_id":"mock-session-e8","origin":{"channel":"telegram"},"task":"E-8 orphan"}]'
+MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c \
+    "printf '%s' '$SEED_JSON' > /data/engagements.json"
+
+read -r -d '' E8_PY <<'PY' || true
+import asyncio, os, sys, json
+sys.path.insert(0, "/opt/casa")
+from engagement_registry import EngagementRegistry
+
+async def main():
+    # Load straight from the container's /data tombstone — same path casa_core uses.
+    reg = EngagementRegistry(tombstone_path="/data/engagements.json", bus=None)
+    await reg.load()
+    survivors = reg.active_and_idle()
+    assert len(survivors) == 1, f"expected 1 survivor, got {len(survivors)}"
+    rec = survivors[0]
+    assert rec.id == "e8orphan0000000000000000000000"
+    assert rec.topic_id == 9999
+    assert rec.sdk_session_id == "mock-session-e8"
+    assert reg.by_topic_id(9999) is rec, "topic index not built"
+    print("OK")
+
+asyncio.run(main())
+PY
+run_harness "E-8" "$E8_PY"
+# Tombstone cleanup so subsequent runs (or post-test poke-around) stay clean.
+MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c "rm -f /data/engagements.json" || true
+pass "E-8 orphan recovery: pre-seeded record survives load()"
+
+# ---------------------------------------------------------------------------
+# E-9 — Configurator executor happy-path (structural, harness-driven).
+#
+# The "real" happy-path (Ellen reasons → calls engage_executor → configurator
+# reasons → patches triggers.yaml → emits completion → Ellen NOTIFIED) requires
+# a live Anthropic API + claude_agent_sdk, which CI cannot exercise. E-9 is
+# therefore a structural harness that confirms every wiring point around the
+# executor engagement type:
+#
+#   1. ExecutorRegistry loads the bundled configurator definition.
+#   2. engage_executor's pattern (open topic → reg.create(kind=executor) →
+#      driver.start) is exercised end-to-end through the real TelegramChannel
+#      against the mock TG server.
+#   3. A user approval message in the topic is routed to driver.send_user_turn.
+#   4. The stub driver writes to triggers.yaml (as a real configurator would
+#      via the Write tool) and then invokes _finalize_engagement — exactly the
+#      path emit_completion takes in production.
+#   5. After finalize: topic closed with ✅, NOTIFICATION posted to Ellen,
+#      registry entry in "completed" state, triggers.yaml contains the new
+#      trigger name.
+#
+# A real end-to-end run — Ellen reasoning + configurator reasoning over the
+# live SDK — lives in the manual smoke (test_configurator_engagement.sh, T29).
+# ---------------------------------------------------------------------------
+log "E-9: configurator executor engagement end-to-end (harness-driven)"
+curl -s -X POST "http://localhost:${MOCK_PORT}/_reset" >/dev/null
+
+# Seed a writable triggers.yaml path in the container so the stub driver can
+# mimic the Configurator's "add a trigger" edit.
+MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c \
+    "mkdir -p /addon_configs/casa-agent/agents/assistant && \
+     printf 'triggers: []\n' > /addon_configs/casa-agent/agents/assistant/triggers.yaml"
+
+read -r -d '' E9_PY <<'PY' || true
+import asyncio, os, sys, json
+sys.path.insert(0, "/opt/casa")
+from types import SimpleNamespace
+from engagement_registry import EngagementRegistry
+from executor_registry import ExecutorRegistry
+from channels.telegram import TelegramChannel
+
+async def main():
+    os.environ["TELEGRAM_BOT_API_BASE"] = os.environ["MOCK_TG_BASE"]
+    supergroup = int(os.environ["SUPERGROUP_ID"])
+
+    # 1. Executor registry loads the bundled configurator definition.
+    #    Point at /opt/casa/defaults where configurator/ ships in the image.
+    exec_reg = ExecutorRegistry("/opt/casa/defaults/agents/executors")
+    exec_reg.load()
+    types = exec_reg.list_types()
+    assert "configurator" in types, f"configurator not loaded, types={types}"
+    defn = exec_reg.get("configurator")
+    assert defn is not None and defn.enabled, "configurator disabled or missing"
+    assert defn.driver == "in_casa", f"unexpected driver: {defn.driver}"
+
+    # 2. Stand up channel + registry wiring like casa_core does.
+    reg = EngagementRegistry(tombstone_path="/tmp/_eng_e9.json", bus=None)
+    ch = TelegramChannel(
+        bot_token="test-token", chat_id="999", default_agent="assistant",
+        bus=None, webhook_url="", delivery_mode="block",
+        engagement_supergroup_id=supergroup,
+    )
+    await ch._rebuild()
+    ch._engagement_registry = reg
+    # engage_executor gate: channel must advertise permission OK.
+    ch.engagement_permission_ok = True
+
+    # 3. Stub driver: mimics an in_casa Configurator client. Instead of
+    #    reasoning via SDK, the stub:
+    #      * records start() args so we can verify the prompt/options path
+    #      * treats the first user turn ("yes do it") as approval
+    #      * on approval: writes a test_trigger entry into triggers.yaml
+    #      * on approval: invokes tools._finalize_engagement(outcome="completed")
+    class StubConfiguratorDriver:
+        def __init__(self):
+            self._alive = {}
+            self.start_calls = []
+            self.turns = []
+        def is_alive(self, rec): return self._alive.get(rec.id, False)
+        def get_session_id(self, rec): return "mock-session-e9"
+        async def start(self, rec, prompt, options):
+            self.start_calls.append((rec.id, prompt[:40], len(options.allowed_tools)))
+            self._alive[rec.id] = True
+        async def send_user_turn(self, rec, text):
+            self.turns.append(text)
+            if text.strip().lower().startswith("yes"):
+                # Simulate the Configurator's Write tool patching triggers.yaml.
+                path = "/addon_configs/casa-agent/agents/assistant/triggers.yaml"
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(
+                        "triggers:\n"
+                        "  - name: test_trigger\n"
+                        "    cron: '0 9 * * *'\n"
+                        "    prompt: fire daily at 9\n"
+                    )
+                # Simulate emit_completion path.
+                import tools as _tools
+                await _tools._finalize_engagement(
+                    rec, outcome="completed",
+                    text="added test_trigger to assistant",
+                    artifacts=[path], next_steps=[],
+                    driver=self, memory_provider=None,
+                )
+        async def cancel(self, rec): self._alive.pop(rec.id, None)
+        async def resume(self, rec, sid): self._alive[rec.id] = True
+    drv = StubConfiguratorDriver()
+    ch._engagement_driver = drv
+    ch._driver_send_user_turn = drv.send_user_turn
+
+    # 4. Wire tools + agent module like casa_core.main does (so _finalize
+    #    can reach bus + channel_manager).
+    class StubBus:
+        def __init__(self): self.notifs = []
+        async def notify(self, msg): self.notifs.append(msg)
+    class StubChanMgr:
+        def get(self, _name): return ch
+    bus = StubBus()
+    import tools as _tools
+    _tools._engagement_registry = reg
+    _tools._bus = bus
+    _tools._channel_manager = StubChanMgr()
+    _tools._executor_registry = exec_reg
+    import agent as agent_mod
+    agent_mod.active_engagement_driver = drv
+    agent_mod.active_executor_registry = exec_reg
+    agent_mod.active_memory_provider = None
+
+    # 5. Simulate Ellen's engage_executor turn: open topic + create record +
+    #    driver.start. We drive the same sequence engage_executor does, using
+    #    the registered executor definition. (A direct call to engage_executor
+    #    would require ContextVar plumbing for origin_var and is covered by
+    #    unit tests.)
+    tid = await ch.open_engagement_topic(
+        name="#[configurator] add test_trigger to assistant",
+        icon_emoji="tools",
+    )
+    assert tid is not None, "open_engagement_topic returned None"
+    rec = await reg.create(
+        kind="executor", role_or_type="configurator", driver=defn.driver,
+        task="add test_trigger cron to assistant that fires at 0 9 * * *",
+        origin={"channel": "telegram", "chat_id": "999", "role": "assistant"},
+        topic_id=tid,
+    )
+    await drv.start(rec, prompt="(stubbed configurator prompt)",
+                    options=SimpleNamespace(allowed_tools=list(defn.tools_allowed)))
+    assert len(drv.start_calls) == 1, f"driver.start not called: {drv.start_calls}"
+    assert drv.is_alive(rec), "driver not alive after start"
+
+    # 6. Inspect mock TG: topic must exist with configurator name tag.
+    import urllib.request
+    with urllib.request.urlopen(os.environ["MOCK_TG_BASE"] + "/_inspect") as r:
+        state = json.loads(r.read())
+    topic = state["topics"].get(str(tid))
+    assert topic is not None, f"mock TG has no topic {tid}, state={list(state['topics'])}"
+    assert "configurator" in topic["name"], f"topic name missing tag: {topic['name']}"
+
+    # 7. User approval message arrives in the topic — routed to driver.
+    update = SimpleNamespace(
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=supergroup),
+            message_thread_id=tid, text="yes do it",
+            from_user=SimpleNamespace(id=7777),
+        ),
+    )
+    await ch.handle_update(update)
+    assert drv.turns == ["yes do it"], f"driver turns: {drv.turns}"
+
+    # 8. Registry transitioned to completed.
+    assert reg.get(rec.id).status == "completed", \
+        f"status: {reg.get(rec.id).status}"
+
+    # 9. Topic closed with ✅ in mock TG.
+    with urllib.request.urlopen(os.environ["MOCK_TG_BASE"] + "/_inspect") as r:
+        state = json.loads(r.read())
+    topic = state["topics"][str(tid)]
+    assert topic["closed"] is True, f"topic not closed after finalize: {topic}"
+    assert topic["icon_custom_emoji_id"] == "✅", f"icon wrong: {topic}"
+
+    # 10. Exactly one NOTIFICATION went out, targeting Ellen (the default resident).
+    assert len(bus.notifs) == 1, f"expected 1 notif, got {len(bus.notifs)}"
+    assert bus.notifs[0].target == "assistant", \
+        f"notif target: {bus.notifs[0].target}"
+    # Content is a DelegationComplete-shaped object; status=ok on happy path.
+    assert getattr(bus.notifs[0].content, "status", None) == "ok", \
+        f"notif status: {bus.notifs[0].content}"
+
+    await ch._teardown_app()
+    print("OK")
+
+asyncio.run(main())
+PY
+run_harness "E-9" "$E9_PY"
+
+# Cross-boundary filesystem check: triggers.yaml was patched by the stub
+# driver inside the container (mirrors what the real Configurator does via
+# its Write tool).
+assert_file_contains "$NAME" \
+    "/addon_configs/casa-agent/agents/assistant/triggers.yaml" \
+    "test_trigger" \
+    "E-9 triggers.yaml contains test_trigger after completion"
+
+pass "E-9 configurator executor engagement: topic + routing + completion wired"
+
+# ---------------------------------------------------------------------------
+# E-10 — Configurator hook-blocked (resident deletion) path.
+#
+# Structural harness verifying the casa_config_guard PreToolUse hook denies
+# resident-directory deletions AND that a subsequent _finalize_engagement
+# with outcome="cancelled" emits the correct NOTIFICATION shape. Mirrors the
+# shape of the real path (Ellen asks configurator to delete butler →
+# configurator proposes rm -rf → hook denies → configurator emits cancel).
+#
+# Assertion points:
+#   1. hook denies   rm -rf /addon_configs/casa-agent/agents/butler
+#      → permissionDecision == "deny"
+#   2. hook allows   non-resident paths (specialists/ subtree + benign bash)
+#      → hook returns None
+#   3. butler/ directory is still present after the hook fires
+#   4. _finalize_engagement(outcome="cancelled") emits one NOTIFICATION
+#      whose content.kind == "cancelled" and status == "error"
+# ---------------------------------------------------------------------------
+log "E-10: configurator hook-blocked (resident deletion) structural harness"
+curl -s -X POST "http://localhost:${MOCK_PORT}/_reset" >/dev/null
+
+# Seed a butler resident directory so the "still exists after deny" check has
+# something to look at (mirrors a real installation with an enabled resident).
+MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c \
+    "mkdir -p /addon_configs/casa-agent/agents/butler && \
+     printf 'role: butler\n' > /addon_configs/casa-agent/agents/butler/runtime.yaml"
+
+read -r -d '' E10_PY <<'PY' || true
+import asyncio, os, sys
+sys.path.insert(0, "/opt/casa")
+from engagement_registry import EngagementRegistry
+from channels.telegram import TelegramChannel
+from hooks import make_casa_config_guard_hook
+
+async def main():
+    os.environ["TELEGRAM_BOT_API_BASE"] = os.environ["MOCK_TG_BASE"]
+    supergroup = int(os.environ["SUPERGROUP_ID"])
+
+    # 1. Build the hook as configurator/hooks.yaml wires it: forbid resident
+    #    deletion, and forbid writes into the usual runtime-state prefixes.
+    hook = make_casa_config_guard_hook(
+        forbid_write_paths=["/data/", "/opt/casa/schema/"],
+        forbid_delete_residents=True,
+    )
+
+    # 2. rm -rf against a resident directory must be DENIED.
+    deny_input = {
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "rm -rf /addon_configs/casa-agent/agents/butler",
+        },
+    }
+    deny_out = await hook(deny_input, "tuid-1", {})
+    assert deny_out is not None, "E-10.1 hook returned None for resident rm"
+    spec = deny_out.get("hookSpecificOutput", {})
+    assert spec.get("permissionDecision") == "deny", \
+        f"E-10.1 expected deny, got {spec}"
+    assert "resident" in spec.get("permissionDecisionReason", "").lower(), \
+        f"E-10.1 deny reason missing 'resident': {spec}"
+
+    # 3. Hook must NOT deny specialist-subtree deletions (not a resident).
+    allow_specialist = {
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "rm -rf /addon_configs/casa-agent/agents/specialists/foo",
+        },
+    }
+    out = await hook(allow_specialist, "tuid-2", {})
+    assert out is None, f"E-10.2 specialist path wrongly denied: {out}"
+
+    # 3b. Hook must NOT deny executor-subtree deletions either.
+    allow_executor = {
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "rm -rf /addon_configs/casa-agent/agents/executors/foo",
+        },
+    }
+    out = await hook(allow_executor, "tuid-3", {})
+    assert out is None, f"E-10.2 executor path wrongly denied: {out}"
+
+    # 3c. A benign Bash command must pass straight through.
+    benign = {"tool_name": "Bash", "tool_input": {"command": "ls -la /tmp"}}
+    out = await hook(benign, "tuid-4", {})
+    assert out is None, f"E-10.2 benign bash wrongly denied: {out}"
+
+    # 4. butler/ directory still exists on disk (hook didn't somehow delete it,
+    #    and the deny-decision is structural; the SDK would have aborted the
+    #    tool call before the rm ever ran).
+    butler_dir = "/addon_configs/casa-agent/agents/butler"
+    assert os.path.isdir(butler_dir), f"E-10.3 butler dir missing: {butler_dir}"
+
+    # 5. Simulate the tail of the cancelled path: configurator's proposed
+    #    destructive tool was denied → it emits a cancel outcome → Ellen is
+    #    NOTIFIED with kind="cancelled".
+    reg = EngagementRegistry(tombstone_path="/tmp/_eng_e10.json", bus=None)
+    ch = TelegramChannel(
+        bot_token="test-token", chat_id="999", default_agent="assistant",
+        bus=None, webhook_url="", delivery_mode="block",
+        engagement_supergroup_id=supergroup,
+    )
+    await ch._rebuild()
+    ch._engagement_registry = reg
+
+    class StubBus:
+        def __init__(self): self.notifs = []
+        async def notify(self, msg): self.notifs.append(msg)
+    class StubChanMgr:
+        def get(self, _name): return ch
+    bus = StubBus()
+    import tools as _tools
+    _tools._engagement_registry = reg
+    _tools._bus = bus
+    _tools._channel_manager = StubChanMgr()
+
+    class StubDriver:
+        async def cancel(self, rec): pass
+
+    tid = await ch.open_engagement_topic(
+        name="#[configurator] delete butler", icon_emoji="tools",
+    )
+    rec = await reg.create(
+        kind="executor", role_or_type="configurator", driver="in_casa",
+        task="delete butler resident",
+        origin={"channel": "telegram", "chat_id": "999", "role": "assistant"},
+        topic_id=tid,
+    )
+
+    await _tools._finalize_engagement(
+        rec, outcome="cancelled",
+        text="resident deletion denied by casa_config_guard",
+        artifacts=[], next_steps=[],
+        driver=StubDriver(), memory_provider=None,
+    )
+
+    # Assertion point 4: NOTIFICATION emitted with cancelled-shaped content.
+    assert reg.get(rec.id).status == "cancelled", \
+        f"E-10.4 status: {reg.get(rec.id).status}"
+    assert len(bus.notifs) == 1, f"E-10.4 expected 1 notif, got {len(bus.notifs)}"
+    content = bus.notifs[0].content
+    assert getattr(content, "kind", None) == "cancelled", \
+        f"E-10.4 notif kind: {getattr(content, 'kind', None)!r}"
+    assert getattr(content, "status", None) == "error", \
+        f"E-10.4 notif status: {getattr(content, 'status', None)!r}"
+    assert bus.notifs[0].target == "assistant", \
+        f"E-10.4 notif target: {bus.notifs[0].target}"
+
+    # butler/ still there after the whole flow.
+    assert os.path.isdir(butler_dir), \
+        f"E-10.3 butler dir vanished during finalize: {butler_dir}"
+
+    await ch._teardown_app()
+    print("OK")
+
+asyncio.run(main())
+PY
+run_harness "E-10" "$E10_PY"
+
+# Cross-boundary filesystem check: butler dir is untouched.
+MSYS_NO_PATHCONV=1 docker exec "$NAME" test -d \
+    /addon_configs/casa-agent/agents/butler \
+    || fail "E-10.3 butler dir missing after harness (should still exist)"
+
+pass "E-10 hook denies resident rm + cancelled NOTIFICATION wired"
+
+stop_container "$NAME"
