@@ -198,6 +198,52 @@ claude plugin marketplace add /addon_configs/casa-agent/marketplace/ \
 INSTALL_LOCK=/addon_configs/casa-agent/cc-home/.claude/plugins/.install.lock
 mkdir -p "$(dirname "$INSTALL_LOCK")"
 
+# === seed-copy: begin ===========================================
+# v0.14.9: replace the boot install loop with a no-network seed copy.
+# /opt/claude-seed/ is image-baked at Dockerfile build time and contains
+# the full CC CLI install state for the 5 default plugins. We populate
+# cc-home from it on first boot only (idempotent — sentinel is the
+# presence of installed_plugins.json in cc-home's plugin dir).
+#
+# Spike result (Task D.1, 2026-04-25): option (a) symlink works.
+# CC CLI tolerates installPath via symlink — `claude plugin list --json`
+# resolves all 5 plugins via the seed cache. If you find this is broken
+# in a future image, fall back to full copy + installPath rewrite per
+# spec §4 option (b).
+SEED_DIR="${SEED_DIR:-/opt/claude-seed}"
+CC_HOME="${CC_HOME:-/addon_configs/casa-agent/cc-home}"
+CC_PLUGINS_DIR="$CC_HOME/.claude/plugins"
+
+# _sc_log: portable wrapper — uses bashio in production, printf in test envs.
+# (bashio::log.info uses '::' which is a bash function-name extension not
+#  valid in POSIX sh; defining a helper keeps the block sh-compatible.)
+_sc_log() { if command -v bashio >/dev/null 2>&1; then bashio::log.info "$*"; else printf '[INFO] %s\n' "$*"; fi; }
+
+if [ -d "$SEED_DIR" ] && [ ! -f "$CC_PLUGINS_DIR/installed_plugins.json" ]; then
+    _sc_log "Seeding cc-home plugin state from $SEED_DIR"
+    mkdir -p "$CC_PLUGINS_DIR/cache"
+    # Symlink the seed cache dir; CC CLI tolerates installPath via symlink
+    # (verified by Task D.1 spike). Pre-1.0.0 wipe-on-update means both
+    # endpoints survive together.
+    if [ ! -e "$CC_PLUGINS_DIR/cache/casa-plugins-defaults" ]; then
+        ln -s "$SEED_DIR/cache/casa-plugins-defaults" \
+              "$CC_PLUGINS_DIR/cache/casa-plugins-defaults"
+    fi
+    # Copy install state. installed_plugins.json contains absolute paths
+    # under $SEED_DIR/cache/...; the symlink above makes them resolvable.
+    cp "$SEED_DIR/installed_plugins.json" "$CC_PLUGINS_DIR/installed_plugins.json"
+    # known_marketplaces.json + marketplaces/ are merged with what
+    # `claude plugin marketplace add` already wrote — only copy if absent.
+    if [ ! -f "$CC_PLUGINS_DIR/known_marketplaces.json" ]; then
+        cp "$SEED_DIR/known_marketplaces.json" "$CC_PLUGINS_DIR/known_marketplaces.json"
+    fi
+    if [ ! -d "$CC_PLUGINS_DIR/marketplaces" ]; then
+        cp -r "$SEED_DIR/marketplaces" "$CC_PLUGINS_DIR/marketplaces"
+    fi
+    _sc_log "Seeded cc-home with $(ls "$CC_PLUGINS_DIR/cache/casa-plugins-defaults/" 2>/dev/null | wc -l) default plugins"
+fi
+# === seed-copy: end =============================================
+
 if command -v yq >/dev/null 2>&1; then
     shopt -s globstar 2>/dev/null || true
     for plugin_ref in $(yq -r '.plugins[] | "\(.name)@\(.marketplace)"' \
