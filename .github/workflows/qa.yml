@@ -58,6 +58,8 @@ jobs:
         run: |
           pip install aiohttp
           bash test-local/e2e/test_engagement_E.sh
+      - name: Delegation E-block
+        run: bash test-local/e2e/test_delegation_E.sh
       # P-block stays disabled until v0.14.10's D/P-block sweep ships.
       # When re-enabled, uncomment the step below (env vars stay):
       # - name: Engagement P-block
