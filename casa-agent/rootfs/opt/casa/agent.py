@@ -55,7 +55,7 @@ active_executor_registry = None   # ExecutorRegistry | None, set by casa_core.ma
 active_claude_code_driver = None  # ClaudeCodeDriver | None, set by casa_core.main
 
 # Phase 3.1: delegating-turn origin. Set by Agent._process for the
-# duration of a turn so the `delegate_to_specialist` tool handler can read
+# duration of a turn so the `delegate_to_agent` tool handler can read
 # the channel/chat_id/cid/role/user_text of the outer user turn without
 # threading them through function arguments. ContextVar semantics —
 # asyncio.create_task snapshots the value, so late-completing specialist

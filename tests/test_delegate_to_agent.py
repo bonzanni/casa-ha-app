@@ -1,4 +1,4 @@
-"""Tests for the delegate_to_specialist framework tool (Phase 3.1)."""
+"""Tests for the delegate_to_agent framework tool (Phase 3.1)."""
 
 from __future__ import annotations
 
@@ -170,7 +170,7 @@ def _origin(role="assistant", channel="telegram", chat_id="x"):
 
 class TestUnknownAgent:
     async def test_returns_error_content(self, tmp_path):
-        from tools import delegate_to_specialist, init_tools
+        from tools import delegate_to_agent, init_tools
 
         reg = SpecialistRegistry(str(tmp_path / "ex"),
                                  tombstone_path=str(tmp_path / "del.json"))
@@ -179,8 +179,8 @@ class TestUnknownAgent:
         init_tools(cm, bus, reg)
 
         result = await _with_origin(
-            delegate_to_specialist.handler({
-                "specialist": "ghost", "task": "x", "context": "", "mode": "sync",
+            delegate_to_agent.handler({
+                "agent": "ghost", "task": "x", "context": "", "mode": "sync",
             }),
             _origin(),
         )
@@ -196,7 +196,7 @@ class TestDisabledAgent:
         """Disabled specialists are filtered at load-time — get() returns None,
         the tool cannot distinguish them from truly unknown names. Both
         paths collapse to kind=unknown_specialist."""
-        from tools import delegate_to_specialist, init_tools
+        from tools import delegate_to_agent, init_tools
 
         specialists = tmp_path / "ex"
         specialists.mkdir()
@@ -209,8 +209,8 @@ class TestDisabledAgent:
         init_tools(cm, bus, reg)
 
         result = await _with_origin(
-            delegate_to_specialist.handler({
-                "specialist": "finance", "task": "x", "context": "", "mode": "sync",
+            delegate_to_agent.handler({
+                "agent": "finance", "task": "x", "context": "", "mode": "sync",
             }),
             _origin(),
         )
@@ -226,7 +226,7 @@ class TestDisabledAgent:
 
 class TestSyncOk:
     async def test_returns_specialist_text(self, tmp_path):
-        from tools import delegate_to_specialist, init_tools
+        from tools import delegate_to_agent, init_tools
 
         specialists = tmp_path / "ex"
         specialists.mkdir()
@@ -241,8 +241,8 @@ class TestSyncOk:
         _FakeSpecialistClient.reset(response="invoice drafted", delay=0)
         with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
             result = await _with_origin(
-                delegate_to_specialist.handler({
-                    "specialist": "finance", "task": "draft invoice",
+                delegate_to_agent.handler({
+                    "agent": "finance", "task": "draft invoice",
                     "context": "lesina march",
                     "mode": "sync",
                 }),
@@ -260,7 +260,7 @@ class TestSyncOk:
 
 class TestSyncError:
     async def test_specialist_raises_is_reported_as_error(self, tmp_path):
-        from tools import delegate_to_specialist, init_tools
+        from tools import delegate_to_agent, init_tools
 
         specialists = tmp_path / "ex"
         specialists.mkdir()
@@ -275,8 +275,8 @@ class TestSyncError:
         _FakeSpecialistClient.reset(raise_exc=RuntimeError("boom"))
         with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
             result = await _with_origin(
-                delegate_to_specialist.handler({
-                    "specialist": "finance", "task": "x", "context": "",
+                delegate_to_agent.handler({
+                    "agent": "finance", "task": "x", "context": "",
                     "mode": "sync",
                 }),
                 _origin(),
@@ -298,7 +298,7 @@ class TestOriginMissing:
     async def test_no_origin_returns_error(self, tmp_path):
         """Called outside a turn (origin_var unset) — shouldn't happen
         in prod but must not crash. Return error, do not dispatch."""
-        from tools import delegate_to_specialist, init_tools
+        from tools import delegate_to_agent, init_tools
 
         reg = SpecialistRegistry(str(tmp_path / "ex"),
                                  tombstone_path=str(tmp_path / "del.json"))
@@ -307,8 +307,8 @@ class TestOriginMissing:
         init_tools(cm, bus, reg)
 
         # NOTE: not wrapped in _with_origin — origin_var stays None.
-        result = await delegate_to_specialist.handler({
-            "specialist": "finance", "task": "x", "context": "", "mode": "sync",
+        result = await delegate_to_agent.handler({
+            "agent": "finance", "task": "x", "context": "", "mode": "sync",
         })
         payload = json.loads(result["content"][0]["text"])
         assert payload["status"] == "error"
@@ -327,7 +327,7 @@ class TestTimeoutDegrades:
         """A sync call whose specialist exceeds the 60s wait returns a
         pending marker. Here we monkeypatch the wait ceiling to 50ms
         so we don't actually wait 60s."""
-        from tools import delegate_to_specialist, init_tools
+        from tools import delegate_to_agent, init_tools
         import tools as tools_mod
 
         specialists = tmp_path / "ex"
@@ -347,8 +347,8 @@ class TestTimeoutDegrades:
 
         with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
             result = await _with_origin(
-                delegate_to_specialist.handler({
-                    "specialist": "finance", "task": "slow task",
+                delegate_to_agent.handler({
+                    "agent": "finance", "task": "slow task",
                     "context": "", "mode": "sync",
                 }),
                 _origin(),
@@ -366,7 +366,7 @@ class TestTimeoutDegrades:
     ):
         """After the pending return, the completion callback should post
         a NOTIFICATION to the delegator's bus queue."""
-        from tools import delegate_to_specialist, init_tools
+        from tools import delegate_to_agent, init_tools
         import tools as tools_mod
 
         specialists = tmp_path / "ex"
@@ -385,8 +385,8 @@ class TestTimeoutDegrades:
 
         with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
             await _with_origin(
-                delegate_to_specialist.handler({
-                    "specialist": "finance", "task": "x", "context": "",
+                delegate_to_agent.handler({
+                    "agent": "finance", "task": "x", "context": "",
                     "mode": "sync",
                 }),
                 _origin(),
@@ -414,7 +414,7 @@ class TestTimeoutDegrades:
 
 class TestAsyncMode:
     async def test_returns_pending_immediately(self, tmp_path):
-        from tools import delegate_to_specialist, init_tools
+        from tools import delegate_to_agent, init_tools
 
         specialists = tmp_path / "ex"
         specialists.mkdir()
@@ -432,8 +432,8 @@ class TestAsyncMode:
              patch("tools.build_sdk_plugins", return_value=[]):
             t0 = asyncio.get_event_loop().time()
             result = await _with_origin(
-                delegate_to_specialist.handler({
-                    "specialist": "finance", "task": "x", "context": "",
+                delegate_to_agent.handler({
+                    "agent": "finance", "task": "x", "context": "",
                     "mode": "async",
                 }),
                 _origin(),
@@ -462,7 +462,7 @@ class TestCancellation:
     async def test_caller_cancel_cancels_specialist_task(self, tmp_path):
         """If the outer turn is cancelled (voice barge-in), the in-flight
         specialist task must be cancelled too — no NOTIFICATION posts."""
-        from tools import delegate_to_specialist, init_tools
+        from tools import delegate_to_agent, init_tools
 
         specialists = tmp_path / "ex"
         specialists.mkdir()
@@ -480,8 +480,8 @@ class TestCancellation:
         async def _invoke():
             with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
                 return await _with_origin(
-                    delegate_to_specialist.handler({
-                        "specialist": "finance", "task": "x", "context": "",
+                    delegate_to_agent.handler({
+                        "agent": "finance", "task": "x", "context": "",
                         "mode": "sync",
                     }),
                     _origin(),
