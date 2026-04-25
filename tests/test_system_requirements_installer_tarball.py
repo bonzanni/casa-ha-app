@@ -137,7 +137,13 @@ def test_symlink_member_rejected(tmp_path: Path) -> None:
         tf.add(pkg, arcname=".")
     url, sha, server = _serve_local_file(tar_path)
     try:
-        with pytest.raises(UnsafeArchiveError, match="symlink"):
+        # Accept either our explicit "symlink" wording (raised by the
+        # member-iteration guard at tarball.py:89) OR Python 3.11+'s
+        # tarfile.AbsoluteLinkError "link to an absolute path" wording
+        # (raised by the data filter at tarball.py:83 before we ever see
+        # the member). Both signal correct refusal of the unsafe entry.
+        with pytest.raises(UnsafeArchiveError,
+                           match=r"symlink|link to an absolute path"):
             install_tarball(
                 plugin_name="evil",
                 spec={"type": "tarball", "url": url, "sha256": sha,
