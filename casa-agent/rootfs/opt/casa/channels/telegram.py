@@ -58,6 +58,29 @@ _RATE_LIMIT_REPLY = "Slow down — try again in a minute."
 # Stream edit throttle (seconds between editMessageText calls).
 _STREAM_THROTTLE = 1.0
 
+
+def _resolve_chat_id(context: dict[str, Any], default: int | str) -> int | str:
+    """Pick a deliverable Telegram chat id from ``context``.
+
+    The ``context["chat_id"]`` slot is overloaded — for user-initiated
+    messages it carries a real Telegram chat id (signed integer); for
+    scheduled triggers and voice scope probes it carries a session-keying
+    label like ``"interval:heartbeat"`` or ``"probe-scope"``. The Telegram
+    API rejects non-numeric values with ``BadRequest: Chat not found``,
+    which used to bubble through ``finalize_stream → send`` and surface
+    as a full traceback at the bus dispatcher. Fall back to the channel's
+    registered default when the value isn't a valid chat id.
+    """
+    raw = context.get("chat_id")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+    return default
+
 # Reconnect supervisor backoff schedule (spec 5.2 §4.2): 1s, 2s, 4s, 8s,
 # 16s, cap 60s, unbounded. Reuses retry.compute_backoff_ms via
 # ReconnectSupervisor. Module-level so tests can monkey-patch short
@@ -700,7 +723,7 @@ class TelegramChannel(Channel):
             logger.warning("Telegram channel not started; cannot send message")
             return
 
-        target_chat = context.get("chat_id", self.chat_id)
+        target_chat = _resolve_chat_id(context, self.chat_id)
         self._stop_typing(str(target_chat))
 
         for chunk in _split_message(message):
@@ -726,7 +749,7 @@ class TelegramChannel(Channel):
                 pass
             return _noop
 
-        target_chat = str(context.get("chat_id", self.chat_id))
+        target_chat = str(_resolve_chat_id(context, self.chat_id))
         state: dict[str, Any] = {
             "message_id": None,
             "last_edit": 0.0,
@@ -780,7 +803,7 @@ class TelegramChannel(Channel):
         if self._app is None:
             return
 
-        target_chat = context.get("chat_id", self.chat_id)
+        target_chat = _resolve_chat_id(context, self.chat_id)
         self._stop_typing(str(target_chat))
 
         if self._delivery_mode != "stream":

@@ -336,10 +336,18 @@ async def replay_undergoing_engagements(
 
     async with s6_rc._compile_lock:
         # 1. Orphan sweep — dirs for non-UNDERGOING engagements, remove them.
-        s6_rc.sweep_orphan_service_dirs(
+        removed_orphans = s6_rc.sweep_orphan_service_dirs(
             svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
             keep_engagement_ids=keep_ids,
         )
+
+        # Fast path: no UNDERGOING engagements and no orphans were swept →
+        # the engagement sources dir is empty and unchanged. Running
+        # s6-rc-compile against an empty source dir prints
+        # "source /data/casa-s6-services is empty" to stderr at every boot,
+        # plus burns one compile + one s6-rc-update for nothing. Skip it.
+        if not undergoing and not removed_orphans:
+            return
 
         # 2. Heal missing service dirs for UNDERGOING engagements.
         for rec in undergoing:

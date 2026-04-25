@@ -7,4 +7,8 @@ if ! bashio::config.true 'enable_terminal'; then
     exit 256
 fi
 
-bashio::log.warning "ttyd exited with code ${1}"
+# Code 0 = clean stop (s6 told it to). Code 256 = s6 "do-not-restart" sentinel.
+# Anything else means ttyd crashed and the supervisor will respawn it.
+if [ "${1}" -ne 0 ] && [ "${1}" -ne 256 ]; then
+    bashio::log.warning "ttyd exited with code ${1} — supervisor will respawn"
+fi
