@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.14.8] - 2026-04-25
+
+Boot-time fix — register the seed marketplace alongside the user
+marketplace so default plugins actually install. Caught from the
+N150 boot log: every default plugin in
+`defaults/agents/**/plugins.yaml` was logging
+`WARNING: plugin install skipped: <name>@casa-plugins-defaults`
+and `claude plugin list --json` returned `[]`, so the binding
+layer (`/opt/casa/plugins_binding.py::build_sdk_plugins`) handed
+no plugins to engagements at all.
+
+### Fixed
+
+- **Seed marketplace was never registered with the CC CLI.**
+  `setup-configs.sh` only ran
+  `claude plugin marketplace add /addon_configs/casa-agent/marketplace/`
+  (the user-writable overlay). The read-only seed at
+  `/opt/casa/defaults/marketplace-defaults/` — which is where every
+  `<name>@casa-plugins-defaults` install ref resolves — was missing
+  from the install loop's environment, so all five default plugins
+  (`document-skills`, `mcp-server-dev`, `plugin-dev`, `skill-creator`,
+  `superpowers`) failed to install with
+  `Plugin "<name>" not found in marketplace "casa-plugins-defaults"`.
+  Added a second `claude plugin marketplace add` for the seed dir
+  immediately before the install loop. Idempotent (`|| true` on
+  re-register).
+
+### Diagnostic
+
+- **Surface the CC CLI's stderr in the install warning.** Replaced
+  `>/dev/null 2>&1 || bashio::log.warning "plugin install skipped: $ref"`
+  with `install_err=$(... 2>&1 >/dev/null) || bashio::log.warning
+  "plugin install skipped: $ref — $install_err"`. Future install
+  failures stay diagnosable instead of cryptic.
+
 ## [0.14.7] - 2026-04-25
 
 Bug-review v0.14.6 follow-up — closes Bug 10, the only finding from
