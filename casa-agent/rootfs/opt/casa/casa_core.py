@@ -903,9 +903,13 @@ async def main() -> None:
     role_configs = load_all_agents(agents_dir, policies=policy_lib)
 
     specialist_configs = specialist_registry.all_configs()
+    from agent_registry import AgentRegistry
     init_tools(
         channel_manager, bus, specialist_registry, mcp_registry,
         agent_role_map=_build_role_registry(
+            residents=role_configs, specialists=specialist_configs,
+        ),
+        agent_registry=AgentRegistry.build(
             residents=role_configs, specialists=specialist_configs,
         ),
         trigger_registry=trigger_registry,
