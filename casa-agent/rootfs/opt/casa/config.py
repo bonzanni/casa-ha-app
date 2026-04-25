@@ -138,6 +138,13 @@ class DelegateEntry:
 
 
 @dataclass
+class ExecutorEntry:
+    executor_type: str
+    purpose: str
+    when: str
+
+
+@dataclass
 class TriggerSpec:
     name: str
     type: str                                   # interval | cron | webhook
@@ -172,6 +179,7 @@ class AgentConfig:
     response_shape: ResponseShapeConfig = field(default_factory=ResponseShapeConfig)
     disclosure: DisclosureConfig | None = None
     delegates: list[DelegateEntry] = field(default_factory=list)
+    executors: list[ExecutorEntry] = field(default_factory=list)
     triggers: list[TriggerSpec] = field(default_factory=list)
     hooks: HooksConfig = field(default_factory=HooksConfig)
     system_prompt: str = ""

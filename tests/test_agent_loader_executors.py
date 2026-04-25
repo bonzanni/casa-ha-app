@@ -57,3 +57,21 @@ def test_executors_schema_rejects_unknown_property(tmp_path):
     data = _read_yaml(str(f))
     with pytest.raises(LoadError):
         _validate(data, "executors", str(f))
+
+
+def test_executor_entry_dataclass_fields():
+    from config import ExecutorEntry
+    e = ExecutorEntry(
+        executor_type="configurator",
+        purpose="edit configs",
+        when="user wants to change configuration",
+    )
+    assert e.executor_type == "configurator"
+    assert e.purpose == "edit configs"
+    assert e.when == "user wants to change configuration"
+
+
+def test_agent_config_has_executors_field():
+    from config import AgentConfig
+    cfg = AgentConfig()
+    assert cfg.executors == []
