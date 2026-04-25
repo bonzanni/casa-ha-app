@@ -73,6 +73,7 @@ _agent_role_map: dict[str, "AgentConfig"] = {}  # merged residents + specialists
 _trigger_registry: "TriggerRegistry | None" = None
 _engagement_registry: EngagementRegistry | None = None
 _executor_registry: "ExecutorRegistry | None" = None
+_agent_registry = None  # AgentRegistry | None
 engagement_var: ContextVar[EngagementRecord | None] = ContextVar(
     "engagement_var", default=None,
 )
@@ -85,6 +86,7 @@ def init_tools(
     mcp_registry=None,
     *,
     agent_role_map: dict | None = None,
+    agent_registry=None,
     trigger_registry=None,
     engagement_registry=None,
     executor_registry=None,
@@ -103,12 +105,14 @@ def init_tools(
     residents and specialists. If omitted, ``delegate_to_agent`` falls back
     to resolving against ``specialist_registry`` alone (back-compat)."""
     global _channel_manager, _bus, _specialist_registry, _mcp_registry, \
-        _agent_role_map, _trigger_registry, _engagement_registry, _executor_registry  # noqa: PLW0603
+        _agent_role_map, _agent_registry, _trigger_registry, \
+        _engagement_registry, _executor_registry  # noqa: PLW0603
     _channel_manager = channel_manager
     _bus = bus
     _specialist_registry = specialist_registry
     _mcp_registry = mcp_registry
     _agent_role_map = dict(agent_role_map or {})
+    _agent_registry = agent_registry
     _trigger_registry = trigger_registry
     _engagement_registry = engagement_registry
     _executor_registry = executor_registry
@@ -319,8 +323,39 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
         **parent,
         "delegation_depth": int(parent.get("delegation_depth", 0)) + 1,
     }
+
+    # Resolve caller display name; fall back to role.
+    caller_role = str(parent.get("role", "")) or "(unknown)"
+    caller_name = (
+        _agent_registry.role_to_name(caller_role)
+        if _agent_registry is not None else caller_role
+    )
+    originating_channel = str(parent.get("channel", "")) or "(unknown)"
+    suggested_register = "voice" if originating_channel == "voice" else "text"
+
+    delegation_context = (
+        "<delegation_context>\n"
+        f"caller_role: {caller_role}\n"
+        f"caller_name: {caller_name}\n"
+        f"originating_channel: {originating_channel}\n"
+        f"suggested_register: {suggested_register}\n"
+        "</delegation_context>"
+    )
+
+    if context_text:
+        body = (
+            f"{delegation_context}\n\n"
+            f"Task: {task_text}\n\n"
+            f"Context from {caller_name}:\n{context_text}"
+        )
+    else:
+        body = (
+            f"{delegation_context}\n\n"
+            f"Task: {task_text}"
+        )
+    prompt = body
+
     options = _build_specialist_options(cfg)
-    prompt = f"{task_text}\n\nContext:\n{context_text}" if context_text else task_text
     text = ""
     token = agent_mod.origin_var.set(child_origin)
     try:
