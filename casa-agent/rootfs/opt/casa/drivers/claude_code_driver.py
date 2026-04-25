@@ -26,6 +26,34 @@ _URL_REGEX = re.compile(r"Remote Control URL:\s+(https?://\S+)")
 TopicSender = Callable[[int, str], Awaitable[None]]
 
 
+def _resolve_plugin_developer_github_token() -> str:
+    """Resolve `op://${ONEPASSWORD_DEFAULT_VAULT}/GitHub/credential` for
+    plugin-developer engagements (v0.14.6).
+
+    Returns the resolved token on success, or "" on failure (logs warning).
+    Vault from `ONEPASSWORD_DEFAULT_VAULT` env (default "Casa"); item title
+    `GitHub` and field label `credential` are conventional.
+    """
+    from secrets_resolver import resolve as _resolve_secret
+
+    vault = os.environ.get("ONEPASSWORD_DEFAULT_VAULT") or "Casa"
+    op_ref = f"op://{vault}/GitHub/credential"
+    try:
+        token = _resolve_secret(op_ref)
+    except RuntimeError as exc:
+        logger.warning(
+            "plugin-developer engagement: %s unresolved (%s) — "
+            "gh repo create / git push will fail",
+            op_ref, exc,
+        )
+        return ""
+    # secrets_resolver.resolve returns input unchanged for non-op:// values;
+    # if op:// resolution silently passed through, treat as failure.
+    if not token or token == op_ref:
+        return ""
+    return token
+
+
 class ClaudeCodeDriver(DriverProtocol):
     """s6-rc orchestrator. Does not manage subprocesses directly."""
 
@@ -89,24 +117,8 @@ class ClaudeCodeDriver(DriverProtocol):
                 # 2. Write the s6 service dir (with log sub-service for stdout capture).
                 extra_env: dict[str, str] = {}
                 if defn.type == "plugin-developer":
-                    # Resolve op://${vault}/GitHub/credential at engagement spawn time.
-                    # Vault name from onepassword_default_vault addon option (defaults
-                    # to "Casa"). Item shape is conventional: title="GitHub",
-                    # field=credential. Failures log a warning — engagement starts
-                    # but `gh repo create` / `git push` will fail.
-                    from secrets_resolver import resolve as _resolve_secret
-                    _vault = os.environ.get("ONEPASSWORD_DEFAULT_VAULT", "Casa")
-                    _op_ref = f"op://{_vault}/GitHub/credential"
-                    try:
-                        _gh_token = _resolve_secret(_op_ref)
-                    except RuntimeError as _exc:
-                        logger.warning(
-                            "plugin-developer engagement: %s unresolved (%s) — "
-                            "gh repo create / git push will fail",
-                            _op_ref, _exc,
-                        )
-                        _gh_token = ""
-                    if _gh_token and _gh_token != _op_ref:
+                    _gh_token = _resolve_plugin_developer_github_token()
+                    if _gh_token:
                         extra_env["GITHUB_TOKEN"] = _gh_token
                 run_script = render_run_script(
                     engagement_id=engagement.id,
