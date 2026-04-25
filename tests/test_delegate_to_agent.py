@@ -655,3 +655,40 @@ class TestMergedRoleMap:
             assert payload["kind"] == "unknown_agent"
         finally:
             agent_mod.origin_var.reset(token)
+
+    async def test_delegate_to_agent_interactive_rejected_for_resident(
+        self, tmp_path, monkeypatch,
+    ):
+        import tools, agent as agent_mod
+
+        resident_cfg = _specialist_cfg(role="butler")
+        resident_cfg.character.name = "Tina"
+        resident_cfg.channels = ["voice"]   # marker that it's a resident
+
+        spec_reg = SpecialistRegistry(
+            specialists_dir=str(tmp_path / "specs"),
+            tombstone_path=str(tmp_path / "tombs.json"),
+        )
+        tools.init_tools(
+            channel_manager=None,
+            bus=None,
+            specialist_registry=spec_reg,
+            mcp_registry=None,
+            agent_role_map={"butler": resident_cfg},
+        )
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram", "chat_id": "1",
+            "user_id": 1, "cid": "abc", "user_text": "x",
+        })
+        try:
+            result = await tools.delegate_to_agent.handler({
+                "agent": "butler",
+                "task": "x",
+                "context": "",
+                "mode": "interactive",
+            })
+            payload = json.loads(result["content"][0]["text"])
+            assert payload["status"] == "error"
+            assert payload["kind"] == "interactive_not_supported"
+        finally:
+            agent_mod.origin_var.reset(token)
