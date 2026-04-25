@@ -19,6 +19,7 @@ from config import (
     CharacterConfig,
     DelegateEntry,
     DisclosureConfig,
+    ExecutorEntry,
     HooksConfig,
     MemoryConfig,
     ResponseShapeConfig,
@@ -40,15 +41,16 @@ TIER_FILES: dict[str, dict[str, set[str]]] = {
     "resident": {
         "required":  {"character.yaml", "voice.yaml", "response_shape.yaml",
                       "disclosure.yaml", "runtime.yaml"},
-        "optional":  {"delegates.yaml", "triggers.yaml", "hooks.yaml",
-                      "plugins.yaml"},
+        "optional":  {"delegates.yaml", "executors.yaml", "triggers.yaml",
+                      "hooks.yaml", "plugins.yaml"},
         "forbidden": set(),
     },
     "specialist": {
         "required":  {"character.yaml", "voice.yaml", "response_shape.yaml",
                       "runtime.yaml"},
         "optional":  {"hooks.yaml", "plugins.yaml"},
-        "forbidden": {"disclosure.yaml", "delegates.yaml", "triggers.yaml"},
+        "forbidden": {"disclosure.yaml", "delegates.yaml", "executors.yaml",
+                      "triggers.yaml"},
     },
 }
 
@@ -56,8 +58,8 @@ TIER_FILES["executor"] = {
     "required":  {"definition.yaml", "prompt.md"},
     "optional":  {"hooks.yaml", "observer.yaml", "plugins.yaml"},
     "forbidden": {"character.yaml", "runtime.yaml", "delegates.yaml",
-                  "disclosure.yaml", "response_shape.yaml", "voice.yaml",
-                  "triggers.yaml"},
+                  "executors.yaml", "disclosure.yaml",
+                  "response_shape.yaml", "voice.yaml", "triggers.yaml"},
 }
 
 _DELEGATE_MCP_TOOL = "mcp__casa-framework__delegate_to_specialist"
@@ -302,6 +304,17 @@ def _build_delegates(data: dict[str, Any]) -> list[DelegateEntry]:
     ]
 
 
+def _build_executors(data: dict[str, Any]) -> list[ExecutorEntry]:
+    return [
+        ExecutorEntry(
+            executor_type=e["executor_type"],
+            purpose=e["purpose"],
+            when=e["when"],
+        )
+        for e in (data.get("executors") or [])
+    ]
+
+
 def _build_triggers(
     data: dict[str, Any], *, agent_dir: str,
 ) -> list[TriggerSpec]:
@@ -471,6 +484,18 @@ def load_agent_from_dir(
         deleg_data = _read_yaml(deleg_path)
         _validate(deleg_data, "delegates", deleg_path)
         cfg.delegates = _build_delegates(deleg_data)
+
+    # executors.yaml — optional, ASSISTANT role only.
+    exec_path = os.path.join(agent_dir, "executors.yaml")
+    if os.path.exists(exec_path):
+        if role_from_path != "assistant":
+            raise LoadError(
+                f"agent {role_from_path!r}: executors.yaml is only allowed "
+                f"on the assistant role (found at {exec_path})"
+            )
+        exec_data = _read_yaml(exec_path)
+        _validate(exec_data, "executors", exec_path)
+        cfg.executors = _build_executors(exec_data)
 
     # triggers.yaml — optional, resident only.
     trig_path = os.path.join(agent_dir, "triggers.yaml")
