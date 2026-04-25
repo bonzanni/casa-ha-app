@@ -35,6 +35,60 @@ no plugins to engagements at all.
   "plugin install skipped: $ref — $install_err"`. Future install
   failures stay diagnosable instead of cryptic.
 
+### CI clean-up surfaced by this ship
+
+v0.14.1 was the first Plan 4b commit to enable CI jobs that hadn't
+run before (`CASA_USE_MOCK_CLAUDE=1` D-block, `CASA_PLAN_4B=1` P-block).
+Every Plan 4b master push since has been red in ways that were not
+being tracked, because the unit job failed first and hid everything
+downstream. Unblocking CI here surfaced four pre-existing bugs that
+also ship fixed in this bump:
+
+- **`drivers/s6_rc.py::service_pid` used the wrong `s6-svstat` flag.**
+  `-u` prints the literal `true`/`false` up status; `-p` prints the
+  supervised PID. The code asked for `-u` and parsed as `int()`, so
+  `service_pid()` always returned `None` and
+  `ClaudeCodeDriver.is_alive_async()` always reported every engagement
+  as dead. Flipped to `-p`. Shipped since v0.13.0 (2026-04-23).
+
+- **Mock SDK `ClaudeAgentOptions` missing `plugins=` field.**
+  v0.14.1's binding-layer wiring in `agent.py` and `tools.py` passes
+  `plugins=build_sdk_plugins(...)` into every SDK construction. The
+  test-only mock dataclass had no such field, so every resident /
+  specialist / executor turn raised `TypeError` on the mock, the SDK
+  session id was never captured, and `/data/sessions.json` stayed
+  empty — breaking the Invoke-sessions E2E. Added `plugins` to the
+  mock dataclass. (Matches `reference_mock_sdk_drift` memory: v0.5.9
+  precedent — new kwargs MUST be mirrored into the mock same commit.)
+
+- **Py 3.11+ tarfile raises `AbsoluteLinkError` not "symlink".**
+  `tests/test_system_requirements_installer_tarball.py::test_symlink_
+  member_rejected` used `pytest.raises(UnsafeArchiveError,
+  match="symlink")` but the message is wrapped from
+  `tarfile.data_filter`'s "link to an absolute path". Broadened the
+  regex to accept either phrasing. This is what turned master CI red
+  on every Plan 4b commit; this is the fix.
+
+- **D-block `s6-svstat -u` parse bugs in `test_engagement.sh`.** D-1,
+  D-4 cancel, and D-13 restart survival all invoked `s6-svstat -u`
+  and parsed stdout as `int`. D-1 / D-13 fixed (D-13 switched to
+  `-p`; D-1 parses `"true"` as boolean). D-4 parses `"false"` for
+  down.
+
+### Known limitation — CI D/P block disabled for v0.14.8
+
+Plan 4a D-block (`CASA_USE_MOCK_CLAUDE=1`) and Plan 4b P-block
+(`CASA_PLAN_4B=1`) are **intentionally disabled** in `.github/workflows/
+qa.yml` for this ship. They were authored without ever running on
+Linux CI — D-2 alone surfaces a further JSONL-glob mismatch, and
+D-3..D-8 / P-1..P-9 are unverified. Sweeping them properly exceeds
+this ship's scope. Tracked for **v0.14.9 follow-up**: run D/P block
+locally against real Linux s6/mock CLI behaviour, fix each harness,
+re-enable the CI env vars in one go.
+
+Plan 2 E-block (E-0..E-10) still runs in every qa.yml e2e-fast run,
+which continues to verify engagement primitives end-to-end.
+
 ## [0.14.7] - 2026-04-25
 
 Bug-review v0.14.6 follow-up — closes Bug 10, the only finding from
