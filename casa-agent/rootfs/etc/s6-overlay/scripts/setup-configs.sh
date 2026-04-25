@@ -244,22 +244,10 @@ if [ -d "$SEED_DIR" ] && [ ! -f "$CC_PLUGINS_DIR/installed_plugins.json" ]; then
 fi
 # === seed-copy: end =============================================
 
-if command -v yq >/dev/null 2>&1; then
-    shopt -s globstar 2>/dev/null || true
-    for plugin_ref in $(yq -r '.plugins[] | "\(.name)@\(.marketplace)"' \
-                           /opt/casa/defaults/agents/**/plugins.yaml \
-                           /opt/casa/defaults/agents/executors/*/plugins.yaml \
-                           2>/dev/null | sort -u); do
-        if [ -z "$plugin_ref" ]; then continue; fi
-        # Capture stderr into the warning so future failures stay diagnosable
-        # instead of cryptic "skipped" lines hiding the CC CLI's real reason.
-        install_err=$(flock "$INSTALL_LOCK" \
-            claude plugin install "$plugin_ref" --scope user 2>&1 >/dev/null) \
-            || bashio::log.warning "plugin install skipped: $plugin_ref — ${install_err:-no stderr}"
-    done
-else
-    bashio::log.warning "yq not found — skipping default-plugin install loop"
-fi
+# v0.14.9: replaced by the seed-copy block above. Default plugins are
+# baked at image build time; user-marketplace plugins are installed on
+# demand by Configurator's `install_casa_plugin` MCP tool, which goes
+# through /etc/gitconfig + git-credential-casa.sh.
 
 # --- Plan 4b: plugin-runtime tool dir + PATH propagation (P-9) -------------
 # Ensure the persistent tools bin dir exists, and add it to PATH for every
