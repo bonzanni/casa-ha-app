@@ -1,0 +1,62 @@
+"""Tests for /opt/casa/scripts/git-credential-casa.sh.
+
+The helper is invoked by git when an HTTPS clone needs credentials.
+It reads $GITHUB_TOKEN from process env. If the var is unset/empty,
+emit nothing → git treats as anonymous. If set, emit
+'username=x-access-token\npassword=$GITHUB_TOKEN\n' on stdout.
+"""
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.unit
+
+HELPER = Path(
+    "casa-agent/rootfs/opt/casa/scripts/git-credential-casa.sh"
+)
+
+
+def _run(action: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """Invoke the helper with the given action ('get'/'store'/'erase')."""
+    return subprocess.run(
+        ["sh", str(HELPER), action],
+        capture_output=True, text=True,
+        env={"PATH": "/usr/bin:/bin", **(env or {})},
+        check=False, timeout=5,
+    )
+
+
+def test_get_with_token_emits_credentials() -> None:
+    r = _run("get", env={"GITHUB_TOKEN": "ghp_testtoken123"})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "username=x-access-token\npassword=ghp_testtoken123\n"
+
+
+def test_get_without_token_emits_nothing() -> None:
+    r = _run("get", env={})  # GITHUB_TOKEN absent
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ""
+
+
+def test_get_with_empty_token_emits_nothing() -> None:
+    r = _run("get", env={"GITHUB_TOKEN": ""})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ""
+
+
+def test_store_action_is_noop() -> None:
+    """git invokes the helper with 'store' after a successful auth.
+    A stateless helper must not write anything to disk."""
+    r = _run("store", env={"GITHUB_TOKEN": "ghp_x"})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ""
+
+
+def test_erase_action_is_noop() -> None:
+    """git invokes 'erase' on auth failure. Stateless helper must noop."""
+    r = _run("erase", env={"GITHUB_TOKEN": "ghp_x"})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ""
