@@ -437,6 +437,17 @@ async def delegate_to_agent(args: dict) -> dict:
             "message": f"No enabled agent named {agent_name!r}",
         })
 
+    is_resident = bool(getattr(cfg, "channels", []))
+    if mode == "interactive" and is_resident:
+        return _result({
+            "status": "error",
+            "kind": "interactive_not_supported",
+            "message": (
+                f"Cannot open a Telegram engagement for resident "
+                f"{agent_name!r} — residents already own their own channels."
+            ),
+        })
+
     if mode == "interactive":
         # Need telegram channel + supergroup configured.
         if _channel_manager is None:
