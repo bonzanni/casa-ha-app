@@ -106,10 +106,9 @@ RUN id -u casa >/dev/null 2>&1 || useradd -m -s /bin/bash casa; \
 
 USER casa
 
-# Force git to use HTTPS instead of SSH for github.com so build-time
-# `claude plugin install` works in the hermetic Docker build context
-# (no SSH keys available; CC CLI uses git@github.com URLs by default).
-RUN git config --global url."https://github.com/".insteadOf "git@github.com:"
+# Build-time SSH→HTTPS rewrite is handled by /etc/gitconfig (shipped via
+# `COPY rootfs /` above). System-level config applies to every USER, so
+# the `casa` build user inherits the rewrite without any per-user setup.
 
 # Build-time seed install. CLAUDE_CODE_PLUGIN_CACHE_DIR points at the seed's
 # plugins/ root (parent of cache/) — NOT plugins/cache/. Per spike §Gate 1.
