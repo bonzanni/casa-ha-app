@@ -13,7 +13,6 @@ fi
 export CLAUDE_CODE_OAUTH_TOKEN="$(bashio::config 'claude_oauth_token')"
 export OP_SERVICE_ACCOUNT_TOKEN="$(bashio::config 'onepassword_service_account_token')"
 export ONEPASSWORD_DEFAULT_VAULT="$(bashio::config 'onepassword_default_vault')"
-export GITHUB_TOKEN="$(bashio::config 'github_token')"
 export HONCHO_API_KEY="$(bashio::config 'honcho_api_key')"
 export HONCHO_API_URL="$(bashio::config 'honcho_api_url')"
 export TELEGRAM_BOT_TOKEN="$(bashio::config 'telegram_bot_token')"

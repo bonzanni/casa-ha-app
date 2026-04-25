@@ -648,13 +648,61 @@ async def get_schedule(args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# Bug 7 (v0.14.6): role guard for the privileged config tools.
+# Pre-fix: gated only by each agent's runtime.yaml::tools.allowed,
+# meaning a copy-paste error or permissive default in a new resident /
+# specialist / executor silently exposed addon-restart and config-commit
+# powers. Defense in depth at the tool itself.
+_PRIVILEGED_CONFIG_ROLES = frozenset({"configurator"})
+
+
+def _effective_caller_role() -> str | None:
+    """Return the calling agent's role for authorisation checks.
+
+    Resolves SDK-path turns via ``origin_var`` and engagement-bridge
+    turns (claude_code executors) via ``engagement_var.role_or_type``.
+    Returns None if neither context is bound — in which case the tool
+    must refuse rather than fall back to permissive default.
+    """
+    try:
+        import agent as agent_mod
+        origin = agent_mod.origin_var.get(None)
+        if origin is not None:
+            r = origin.get("role")
+            if r:
+                return r
+    except Exception:  # noqa: BLE001 - defensive against import-time issues
+        pass
+    eng = engagement_var.get(None)
+    if eng is not None:
+        return getattr(eng, "role_or_type", None)
+    return None
+
+
+def _refuse_unprivileged(tool_name: str, caller: str | None) -> dict:
+    return _result({
+        "status": "error",
+        "kind": "not_authorized",
+        "message": (
+            f"{tool_name} is restricted to roles "
+            f"{sorted(_PRIVILEGED_CONFIG_ROLES)}; calling role={caller!r}. "
+            "Have a configurator engagement perform this action instead."
+        ),
+    })
+
+
 @tool(
     "config_git_commit",
     "Stage and commit all tracked changes under /addon_configs/casa-agent/. "
-    "Returns the commit SHA (empty if nothing changed).",
+    "Returns the commit SHA (empty if nothing changed). "
+    "Restricted to the configurator executor role.",
     {"message": str},
 )
 async def config_git_commit(args: dict) -> dict:
+    caller = _effective_caller_role()
+    if caller not in _PRIVILEGED_CONFIG_ROLES:
+        return _refuse_unprivileged("config_git_commit", caller)
+
     message = args.get("message") or "configurator: commit"
     try:
         import config_git
@@ -678,10 +726,15 @@ async def config_git_commit(args: dict) -> dict:
 @tool(
     "casa_reload",
     "Restart the Casa addon via Supervisor. Your own session will be "
-    "terminated. Only call AFTER emit_completion has been sent.",
+    "terminated. Only call AFTER emit_completion has been sent. "
+    "Restricted to the configurator executor role.",
     {},
 )
 async def casa_reload(_: dict) -> dict:
+    caller = _effective_caller_role()
+    if caller not in _PRIVILEGED_CONFIG_ROLES:
+        return _refuse_unprivileged("casa_reload", caller)
+
     import aiohttp
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token:
@@ -1097,6 +1150,26 @@ async def emit_completion(args: dict) -> dict:
             "message": "emit_completion called outside an engagement",
         })
 
+    # Bug 9 (v0.14.6): idempotency. Re-emitting completion (e.g. SDK
+    # retry, hook misfire) used to re-run _finalize_engagement, which
+    # double-closes the topic, double-NOTIFYs Ellen, and double-writes
+    # the meta-scope summary into Honcho. Re-read the live registry
+    # state so we catch transitions that happened on another in-flight
+    # turn since this engagement_var snapshot was taken.
+    if _engagement_registry is not None:
+        live = _engagement_registry.get(engagement.id)
+        if live is not None and live.status in (
+            "completed", "cancelled", "error",
+        ):
+            return _result({
+                "status": "acknowledged",
+                "kind": "already_terminal",
+                "message": (
+                    f"engagement is already {live.status!r}; "
+                    "emit_completion is a no-op."
+                ),
+            })
+
     text = args.get("text", "") or ""
     artifacts = list(args.get("artifacts") or [])
     next_steps = list(args.get("next_steps") or [])
@@ -1389,10 +1462,13 @@ async def list_engagement_workspaces(args: dict) -> dict:
     })
 
 
+_LIVE_ENGAGEMENT_STATES = frozenset({"active", "idle"})
+
+
 @tool(
     "delete_engagement_workspace",
     "Delete /data/engagements/<id>/ and cancel+finalize the engagement if "
-    "still UNDERGOING. Requires force=true to act on UNDERGOING engagements.",
+    "still active or idle. Requires force=true to act on a live engagement.",
     {"engagement_id": str, "force": bool},
 )
 async def delete_engagement_workspace(args: dict) -> dict:
@@ -1419,13 +1495,22 @@ async def delete_engagement_workspace(args: dict) -> dict:
             "message": f"no engagement named {engagement_id!r}",
         })
 
-    if rec.status == "active" and not force:
+    # Bug 12 (v0.14.6): treat ``idle`` the same as ``active``. An idle
+    # engagement is the SDK-suspended-after-24h state — its s6 service
+    # and workspace are still live and the driver may resume on the
+    # next user turn. Pre-fix the guard only checked ``active`` and
+    # quietly yanked an idle workspace out from under a still-running
+    # service.
+    if rec.status in _LIVE_ENGAGEMENT_STATES and not force:
         return _result({
             "status": "error", "kind": "refused",
-            "message": "engagement is UNDERGOING; pass force=true to cancel + delete",
+            "message": (
+                f"engagement is {rec.status!r} (still live); "
+                "pass force=true to cancel + delete"
+            ),
         })
 
-    if rec.status == "active" and force:
+    if rec.status in _LIVE_ENGAGEMENT_STATES and force:
         # Finalize as cancelled before pulling the workspace.
         driver = None
         try:

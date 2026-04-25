@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.14.5"
+version: "0.14.6"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 init: false
@@ -37,7 +37,6 @@ options:
   honcho_api_key: ""
   onepassword_service_account_token: ""
   onepassword_default_vault: "Casa"
-  github_token: ""
   webhook_auth_enabled: false
   webhook_secret: ""
 
@@ -72,7 +71,6 @@ schema:
   honcho_api_key: password?
   onepassword_service_account_token: password?
   onepassword_default_vault: str?
-  github_token: password?
   webhook_auth_enabled: bool?
   webhook_secret: password?
   primary_agent_name: str?
