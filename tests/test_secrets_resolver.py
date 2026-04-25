@@ -54,3 +54,16 @@ def test_cached(mock_run) -> None:
     resolve("op://a/b/c")
     resolve("op://a/b/c")
     assert mock_run.call_count == 1
+
+
+@patch("secrets_resolver.subprocess.run")
+def test_op_resolves_github_credential(mock_run) -> None:
+    """v0.14.9: setup-configs.sh resolves op://VAULT/GitHub/credential
+    at boot. Verify the resolver shells `op read` with the canonical
+    GitHub credential reference shape."""
+    resolve.cache_clear()
+    mock_run.return_value.stdout = "github_pat_TESTTOKEN\n"
+    mock_run.return_value.returncode = 0
+    token = resolve("op://CasaTest/GitHub/credential")
+    assert token == "github_pat_TESTTOKEN"
+    assert mock_run.call_args[0][0] == ["op", "read", "op://CasaTest/GitHub/credential"]
