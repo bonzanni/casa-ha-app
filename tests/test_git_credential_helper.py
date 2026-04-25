@@ -47,6 +47,22 @@ def test_get_with_empty_token_emits_nothing() -> None:
     assert r.stdout == ""
 
 
+def test_get_strips_trailing_newline_from_token() -> None:
+    """`op read` can emit trailing newline on some versions; helper
+    must strip it so git's credential protocol doesn't see a malformed
+    extra blank line in the response."""
+    r = _run("get", env={"GITHUB_TOKEN": "ghp_abc\n"})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "username=x-access-token\npassword=ghp_abc\n"
+
+
+def test_get_strips_crlf_from_token() -> None:
+    """Same as above for CRLF-terminated tokens."""
+    r = _run("get", env={"GITHUB_TOKEN": "ghp_abc\r\n"})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "username=x-access-token\npassword=ghp_abc\n"
+
+
 def test_store_action_is_noop() -> None:
     """git invokes the helper with 'store' after a successful auth.
     A stateless helper must not write anything to disk."""
