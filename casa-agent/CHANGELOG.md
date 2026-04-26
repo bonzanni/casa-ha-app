@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — Memory M1: spec consolidation + cleanup
+
+### Added
+- `docs/superpowers/specs/2026-04-26-memory-architecture.md` —
+  consolidated current-state spec for the memory subsystem. Supersedes
+  2.2a/2.2b/3.2/3.2.1/3.2.2 design specs for "what is true today"
+  purposes.
+
+### Removed
+- `card_only` read strategy. Reserved in 2.2a, never implemented; the
+  branch in `_wrap_memory_for_strategy` warned and fell back to
+  `per_turn`. No default YAML used it.
+- SQLite-side `peer_cards` table + reader. No code ever wrote to it;
+  the deferred `remember_fact` tool stays a Honcho-only feature per the
+  graceful-degradation doctrine.
+- `archive_session_full` executor field. Parsed and stored but no
+  reader. Plan 4a transcript archival fires unconditionally on
+  `kind=executor`.
+
+### Migration
+- None. Existing SQLite databases keep their now-orphan `peer_cards`
+  table (harmless, no longer read). Existing `definition.yaml` files
+  with `archive_session_full: ...` will fail schema validation —
+  delete the line.
+
 ## [0.15.2] - 2026-04-26 — Heartbeat noise + sweeper crash
 
 Two production bugs visible in `addon_c071ea9c_casa-agent` logs.
