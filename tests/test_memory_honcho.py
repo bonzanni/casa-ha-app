@@ -289,3 +289,97 @@ async def test_get_context_renders_summary_and_peer_repr_when_honcho_returns_the
     assert call["peer_perspective"] == "assistant"
     assert call["search_query"] == "what's the weather"
     assert call["tokens"] == 4000
+
+
+async def test_get_context_emits_memory_call_log(stub_env, caplog):
+    """M3b — Honcho.get_context must emit one `memory_call` log line per
+    call with backend, session_id, agent_role, t_ms, peer_count,
+    summary_present, peer_repr_present, cache_hit. Provider-level
+    emission so the SDK return is in scope for the present/count fields.
+
+    Cache_hit is False on this path — wrapper-bypass emission tested in
+    test_memory_cached.py."""
+    import logging
+
+    from memory import HonchoMemoryProvider
+
+    p = HonchoMemoryProvider(api_url="http://h", api_key="k")
+    client: StubHoncho = p._client  # type: ignore[attr-defined]
+    session = client.session("telegram:1:domestic:assistant")
+
+    @dataclass
+    class _Summary:
+        content: str
+
+    @dataclass
+    class _Ctx:
+        messages: list = field(default_factory=list)
+        summary: Any = None
+        peer_representation: Any = None
+        peer_card: list = field(default_factory=list)
+
+    session._next_context = _Ctx(
+        messages=[
+            StubMessage(peer_name="nicola", content="hi"),
+            StubMessage(peer_name="assistant", content="hello"),
+        ],
+        summary=_Summary(content="prior chat"),
+        peer_representation="user is friendly",
+        peer_card=[],
+    )
+
+    with caplog.at_level(logging.INFO, logger="memory"):
+        await p.get_context(
+            "telegram:1:domestic:assistant", "assistant",
+            tokens=2000, search_query="hi",
+        )
+
+    # Exactly one memory_call line on this single get_context call.
+    records = [r for r in caplog.records if r.message == "memory_call"]
+    assert len(records) == 1, (
+        f"expected 1 memory_call, got {len(records)}: "
+        f"{[r.message for r in caplog.records]}"
+    )
+    rec = records[0]
+    assert rec.backend == "honcho"
+    assert rec.session_id == "telegram:1:domestic:assistant"
+    assert rec.agent_role == "assistant"
+    assert isinstance(rec.t_ms, int) and rec.t_ms >= 0
+    assert rec.peer_count == 2
+    assert rec.summary_present is True
+    assert rec.peer_repr_present is True
+    assert rec.cache_hit is False
+
+
+async def test_get_context_memory_call_when_summary_missing(stub_env, caplog):
+    """summary_present + peer_repr_present must be False when the SDK
+    returns None for those fields — distinct from absent (no logging
+    at all)."""
+    import logging
+
+    from memory import HonchoMemoryProvider
+
+    p = HonchoMemoryProvider(api_url="http://h", api_key="k")
+    client: StubHoncho = p._client  # type: ignore[attr-defined]
+    session = client.session("telegram:1:domestic:assistant")
+
+    @dataclass
+    class _Ctx:
+        messages: list = field(default_factory=list)
+        summary: Any = None
+        peer_representation: Any = None
+        peer_card: list = field(default_factory=list)
+
+    session._next_context = _Ctx(
+        messages=[StubMessage(peer_name="nicola", content="hi")],
+    )
+
+    with caplog.at_level(logging.INFO, logger="memory"):
+        await p.get_context(
+            "telegram:1:domestic:assistant", "assistant", tokens=500,
+        )
+
+    rec = [r for r in caplog.records if r.message == "memory_call"][0]
+    assert rec.summary_present is False
+    assert rec.peer_repr_present is False
+    assert rec.peer_count == 1
