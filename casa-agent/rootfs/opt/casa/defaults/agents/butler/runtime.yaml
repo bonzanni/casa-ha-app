@@ -2,7 +2,11 @@ schema_version: 1
 model: "${VOICE_AGENT_MODEL}"
 enabled: true
 tools:
-  allowed: [Read, Skill, mcp__casa-framework__get_schedule]
+  allowed:
+    - Read
+    - Skill
+    - mcp__casa-framework__get_schedule
+    - mcp__homeassistant
   disallowed: [Bash, Write, Edit]
   permission_mode: acceptEdits
   max_turns: 10
