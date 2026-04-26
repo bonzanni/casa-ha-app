@@ -210,6 +210,8 @@ class HonchoMemoryProvider(MemoryProvider):
         search_query: str | None = None,
         user_peer: str = "nicola",
     ) -> str:
+        import time
+        t_start = time.perf_counter()
         session = await _to_thread(self._client.session, session_id)
         ctx = await _to_thread(
             session.context,
@@ -218,7 +220,27 @@ class HonchoMemoryProvider(MemoryProvider):
             peer_perspective=agent_role,
             search_query=search_query,
         )
-        return _render(ctx)
+        rendered = _render(ctx)
+        # M3b telemetry — one line per real backend call. peer_count is
+        # message count; summary_present / peer_repr_present are bools
+        # derived from the SDK return shape so operators can see WHEN
+        # Honcho actually populates these fields without re-running the
+        # render.
+        summary_obj = getattr(ctx, "summary", None)
+        logger.info(
+            "memory_call",
+            extra={
+                "backend": "honcho",
+                "session_id": session_id,
+                "agent_role": agent_role,
+                "t_ms": int((time.perf_counter() - t_start) * 1000),
+                "peer_count": len(getattr(ctx, "messages", None) or []),
+                "summary_present": bool(getattr(summary_obj, "content", None)),
+                "peer_repr_present": bool(getattr(ctx, "peer_representation", None)),
+                "cache_hit": False,
+            },
+        )
+        return rendered
 
     async def add_turn(
         self,
