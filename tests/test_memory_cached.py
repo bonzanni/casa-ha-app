@@ -248,3 +248,65 @@ class TestColdKeyDedup:
             f"expected 3 distinct lock keys, got {len(cached._locks)}: "
             f"{list(cached._locks.keys())}"
         )
+
+
+async def test_get_context_cache_miss_does_not_emit_wrapper_log(caplog):
+    """M3b — on cache miss, CachedMemoryProvider does NOT emit its own
+    memory_call. The inner backend's emission carries the call.
+    Asserting this prevents double-counting in operators' rate dashboards."""
+    import logging
+    inner = RecordingProvider()
+    inner.queue("ctx-A")
+    cached = CachedMemoryProvider(inner)
+
+    with caplog.at_level(logging.INFO, logger="memory"):
+        await cached.get_context("sid", "role", tokens=100)
+
+    # RecordingProvider is a test stub and does NOT emit memory_call —
+    # only real providers (Honcho/SQLite) do. So the count should be 0
+    # with this stub. The contract under test here is "wrapper does not
+    # emit on miss" — if a future change makes the wrapper emit a miss
+    # line, this test catches it.
+    wrapper_records = [
+        r for r in caplog.records
+        if r.message == "memory_call" and getattr(r, "cache_hit", None) is False
+    ]
+    assert len(wrapper_records) == 0, (
+        f"wrapper emitted memory_call on cache miss: {wrapper_records}"
+    )
+
+
+async def test_get_context_cache_hit_emits_memory_call(caplog):
+    """M3b — on cache hit, the wrapper emits its own memory_call line
+    with cache_hit=True, backend = inner backend's class-derived name,
+    t_ms ~ 0, and peer_count / summary_present / peer_repr_present None
+    (we don't re-derive these on hit because the cache stores only the
+    rendered string)."""
+    import logging
+    inner = RecordingProvider()
+    inner.queue("ctx-A")
+    cached = CachedMemoryProvider(inner)
+
+    # Prime the cache (miss path).
+    await cached.get_context("sid", "role", tokens=100)
+
+    # Now the hit path — this is the one we're asserting.
+    with caplog.at_level(logging.INFO, logger="memory"):
+        await cached.get_context("sid", "role", tokens=100)
+
+    records = [r for r in caplog.records if r.message == "memory_call"]
+    assert len(records) == 1, (
+        f"expected exactly 1 memory_call (the cache-hit emission); "
+        f"got {len(records)}: {records}"
+    )
+    rec = records[0]
+    assert rec.cache_hit is True
+    # backend name is derived from the inner provider's class name.
+    # RecordingProvider is the test stub here.
+    assert rec.backend == "recording"
+    assert rec.session_id == "sid"
+    assert rec.agent_role == "role"
+    assert isinstance(rec.t_ms, int) and rec.t_ms >= 0
+    assert rec.peer_count is None
+    assert rec.summary_present is None
+    assert rec.peer_repr_present is None
