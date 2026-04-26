@@ -833,12 +833,16 @@ async def main() -> None:
 
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
     if supervisor_token:
+        ha_mcp_url = os.environ.get(
+            "CASA_HA_MCP_URL",
+            "http://supervisor/core/api/mcp",
+        )
         mcp_registry.register_http(
             name="homeassistant",
-            url="http://supervisor/core/api/mcp",
+            url=ha_mcp_url,
             headers={"Authorization": f"Bearer {supervisor_token}"},
         )
-        logger.info("Registered Home Assistant MCP server")
+        logger.info("Registered Home Assistant MCP server (url=%s)", ha_mcp_url)
 
     _maybe_register_n8n(mcp_registry)
 
