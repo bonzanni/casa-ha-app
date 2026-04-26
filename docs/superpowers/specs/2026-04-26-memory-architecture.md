@@ -579,11 +579,13 @@ downstream parser handles both.
 | `peer_repr_present` | `bool \| None` | `True` when SDK's `peer_representation` is non-empty; `False` on SQLite always; `None` on cache-hit emissions |
 | `cache_hit` | `bool` | `True` only on `CachedMemoryProvider`'s wrapper-served path; `False` on every direct backend emission, including the wrapped-backend's own emission on cache miss |
 
-Note on field naming: `peer_count` measures messages-actually-rendered
-(token-budget-bounded), not total messages in storage. Honcho's SDK
-return list and SQLite's row-fetch list both reflect the per-call
-ingestion count — the field name predates the M3b telemetry framing
-and is preserved for grep-compatibility with the operator dashboards.
+Note on field naming: `peer_count` measures messages-actually-
+rendered (token-budget-bounded), not total messages in storage.
+The name reflects Honcho's framing where each session message is
+attributed to its peer; SQLite's `_get_context_sync` returns
+`len(messages)` after the same `tokens // 40` truncation Honcho
+applies via its `tokens=` parameter, so the two backends report
+comparable values.
 
 **Emission sites** (live code refs as of v0.15.4 — re-grep for class
 names if line numbers drift):
@@ -591,14 +593,14 @@ names if line numbers drift):
 - `HonchoMemoryProvider.get_context` (search `casa-agent/rootfs/opt/casa/memory.py` for `class HonchoMemoryProvider`) — `cache_hit=False`, all fields populated from the SDK return.
 - `SqliteMemoryProvider.get_context` (search same file for `class SqliteMemoryProvider`) — `cache_hit=False`, `summary_present=False`, `peer_repr_present=False` per the § 10 graceful-degradation contract.
 - `CachedMemoryProvider.get_context` (search same file for `class CachedMemoryProvider`) — emits ONLY on cache hit, with `cache_hit=True` and `backend` resolved by `CachedMemoryProvider._resolve_backend_name` (see below).
-- `NoOpMemory.get_context` — does NOT emit. Operators using `MEMORY_BACKEND=noop` have explicitly disabled persistence; per-turn telemetry would be noise. The boot-time `_MemoryChoice` log emitted by `casa_core.main` is the operator's confirmation that noop was selected.
+- `NoOpMemory.get_context` — does NOT emit. Operators using `MEMORY_BACKEND=noop` have explicitly disabled persistence; per-turn telemetry would be noise. The boot-time `MEMORY_BACKEND=noop; using no-op memory` log emitted from the memory-factory block in `casa_core.py:807` is the operator's confirmation that noop was selected.
 
 **Backend-name resolution** (`CachedMemoryProvider._resolve_backend_name`):
 
 The wrapper's cache-hit emission needs a string for the `backend`
 field even though it doesn't call the inner backend (which would have
 self-identified). The static helper resolves the inner provider's
-class name through three tiers, in order:
+class name through four tiers, in order:
 
 1. **Production-provider lookup table.** Direct mapping for the three
    shipped classes:
