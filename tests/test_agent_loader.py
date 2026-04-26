@@ -406,3 +406,21 @@ def test_butler_runtime_grants_homeassistant_server_level():
     assert "mcp__homeassistant" in allowed, (
         f"butler.tools.allowed missing mcp__homeassistant; got {allowed}"
     )
+
+
+def test_assistant_delegates_include_butler():
+    """Ellen's delegates.yaml must list butler so the v0.15.0 <delegates>
+    block advertises Tina to her and delegate_to_agent('butler', ...) passes
+    the role-map gate."""
+    import yaml
+    from pathlib import Path
+
+    delegates_path = (
+        Path(__file__).resolve().parents[1]
+        / "casa-agent/rootfs/opt/casa/defaults/agents/assistant/delegates.yaml"
+    )
+    data = yaml.safe_load(delegates_path.read_text(encoding="utf-8"))
+    delegate_roles = [d["agent"] for d in data["delegates"]]
+    assert "butler" in delegate_roles, (
+        f"assistant.delegates missing butler; got {delegate_roles}"
+    )
