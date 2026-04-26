@@ -21,6 +21,16 @@ from typing import Any
 
 CALL_LOG = "/data/mock_sdk_calls.jsonl"
 
+# v0.15.1: optional file-driven simulation of an HTTP MCP tool invocation.
+# Set MOCK_SDK_TOOL_INVOKE_FILE to a JSON file containing a list of
+# {server, tool, args} entries. On each receive_response call the mock
+# pops entry 0 and (if options.mcp_servers[server] has a url) makes a
+# real JSON-RPC tools/call POST to that URL before yielding messages.
+# Used by test-local/e2e/test_ha_delegation.sh to exercise the
+# resident-options → SDK → HTTP MCP transport chain without needing a
+# live model. See docs/superpowers/plans/2026-04-26-tina-ha-control.md F.1.
+TOOL_INVOKE_FILE = "/data/mock_sdk_tool_invoke.json"
+
 
 def _log(entry: dict[str, Any]) -> None:
     entry = {"ts": time.time(), **entry}
@@ -29,6 +39,66 @@ def _log(entry: dict[str, Any]) -> None:
             fh.write(json.dumps(entry) + "\n")
     except OSError:
         pass
+
+
+def _post_jsonrpc(url: str, headers: dict[str, str], body: bytes) -> None:
+    """Synchronous urllib POST. Called via asyncio.to_thread so the
+    surrounding event loop (e.g. an aiohttp test server) isn't blocked."""
+    import urllib.request, urllib.error  # stdlib; no new deps in the mock
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json", **headers},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        resp.read()
+
+
+async def _maybe_invoke_mcp_tool(options: "ClaudeAgentOptions") -> None:
+    """If MOCK_SDK_TOOL_INVOKE_FILE points at a non-empty list, pop entry 0
+    and POST a JSON-RPC tools/call to that server's HTTP URL. Errors are
+    swallowed (and logged) so a misconfigured test can't break unrelated
+    code paths."""
+    path = os.environ.get("MOCK_SDK_TOOL_INVOKE_FILE", TOOL_INVOKE_FILE)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            entries = json.load(fh)
+    except (OSError, ValueError):
+        return
+    if not isinstance(entries, list) or not entries:
+        return
+
+    entry = entries.pop(0)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(entries, fh)
+    except OSError:
+        pass
+
+    server = entry.get("server")
+    tool = entry.get("tool")
+    args = entry.get("args") or {}
+    cfg = (options.mcp_servers or {}).get(server) or {}
+    url = cfg.get("url") if isinstance(cfg, dict) else None
+    if not url:
+        _log({"event": "mcp_invoke_skipped",
+              "server": server, "tool": tool,
+              "reason": "no url in options.mcp_servers"})
+        return
+
+    headers = cfg.get("headers") or {}
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": args},
+    }).encode("utf-8")
+
+    try:
+        await asyncio.to_thread(_post_jsonrpc, url, headers, body)
+        _log({"event": "mcp_invoke", "server": server, "tool": tool,
+              "url": url, "status": "ok"})
+    except Exception as exc:  # noqa: BLE001 — mock must not break callers
+        _log({"event": "mcp_invoke", "server": server, "tool": tool,
+              "url": url, "status": "error", "exc": str(exc)})
 
 
 @dataclass
@@ -124,6 +194,10 @@ class ClaudeSDKClient:
         delay_ms = float(os.environ.get("MOCK_SDK_DELAY_MS", "0") or "0")
         if delay_ms > 0:
             await asyncio.sleep(delay_ms / 1000.0)
+
+        # v0.15.1: optionally simulate an HTTP MCP tool invocation before
+        # yielding the canned reply. See _maybe_invoke_mcp_tool above.
+        await _maybe_invoke_mcp_tool(self.options)
 
         reply = os.environ.get("MOCK_SDK_REPLY", "ok")
 
