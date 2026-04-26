@@ -148,7 +148,9 @@ def test_wrap_for_strategy_per_turn_returns_bare():
     assert wrapped is backend
 
 
-def test_wrap_for_strategy_card_only_falls_back_to_per_turn_with_warning(caplog):
+def test_wrap_for_strategy_unknown_returns_bare(caplog):
+    """Spec M1.B: unknown strategies fall through to bare per_turn
+    behaviour. card_only is no longer a recognised value."""
     import logging
 
     from casa_core import _wrap_memory_for_strategy
@@ -161,7 +163,8 @@ def test_wrap_for_strategy_card_only_falls_back_to_per_turn_with_warning(caplog)
             backend, "finance", "card_only", sqlite_warning_emitted=flag,
         )
     assert wrapped is backend
-    assert any("card_only" in r.message for r in caplog.records)
+    # No warning is emitted any more — fallthrough is silent.
+    assert not any("card_only" in r.message for r in caplog.records)
 
 
 # --- Startup-degrade on SQLite open failure (spec §9) -----------------------
