@@ -468,14 +468,33 @@ class SqliteMemoryProvider(MemoryProvider):
         self, session_id: str, agent_role: str, tokens: int,
         search_query: str | None = None, user_peer: str = "nicola",
     ) -> str:
+        import time
+        t_start = time.perf_counter()
         # search_query is ignored on SQLite (no semantic retrieval).
-        return await asyncio.to_thread(
+        rendered, peer_count = await asyncio.to_thread(
             self._get_context_sync, session_id, tokens, user_peer,
         )
+        # M3b telemetry — backend=sqlite always emits summary_present /
+        # peer_repr_present False per the spec § 10 graceful-degradation
+        # contract.
+        logger.info(
+            "memory_call",
+            extra={
+                "backend": "sqlite",
+                "session_id": session_id,
+                "agent_role": agent_role,
+                "t_ms": int((time.perf_counter() - t_start) * 1000),
+                "peer_count": peer_count,
+                "summary_present": False,
+                "peer_repr_present": False,
+                "cache_hit": False,
+            },
+        )
+        return rendered
 
     def _get_context_sync(
         self, session_id: str, tokens: int, user_peer: str,
-    ) -> str:
+    ) -> tuple[str, int]:
         last_n = max(1, tokens // 40)
         msg_rows = self._conn.execute(
             "SELECT peer_name, content FROM messages "
@@ -486,7 +505,7 @@ class SqliteMemoryProvider(MemoryProvider):
             _SqliteMsg(peer_name=r[0], content=r[1])
             for r in reversed(msg_rows)
         ]
-        return _render(_SqliteCtx(messages=messages))
+        return _render(_SqliteCtx(messages=messages)), len(messages)
 
     async def add_turn(
         self, session_id: str, agent_role: str,
