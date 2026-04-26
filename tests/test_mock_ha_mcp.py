@@ -52,3 +52,19 @@ class TestMockHaMcp(AioHTTPTestCase):
         assert len(calls) == 1
         assert calls[0]["name"] == "HassTurnOff"
         assert calls[0]["arguments"] == {"name": "kitchen"}
+
+    async def test_tools_call_unknown_tool_rejected_and_unrecorded(self):
+        await self.client.post("/_reset")
+
+        resp = await self.client.post("/", json={
+            "jsonrpc": "2.0", "id": 4,
+            "method": "tools/call",
+            "params": {"name": "HassTurnNope", "arguments": {}},
+        })
+        body = await resp.json()
+        assert body["error"]["code"] == -32602
+        assert "HassTurnNope" in body["error"]["message"]
+
+        calls_resp = await self.client.get("/_calls")
+        calls = await calls_resp.json()
+        assert calls == []
