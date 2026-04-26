@@ -624,7 +624,7 @@ scopes (§ 6 step 6), each with its own `_one_scope` coroutine that
 calls `get_context` once. Per-scope attribution lets operators answer
 "why is finance scope slow?" without re-implementing the join in the
 log pipeline. The `cid_var` value (already injected via `extra` by the
-existing logger filter in `agent_logging.py`) ties multiple
+existing logger filter in `log_cid.py`) ties multiple
 `memory_call` lines back to the same turn's `scope_route` line.
 
 **Why CachedMemoryProvider's emission is asymmetric** (only on hits,
