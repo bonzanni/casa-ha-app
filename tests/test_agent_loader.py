@@ -397,7 +397,10 @@ def test_butler_runtime_grants_homeassistant_server_level():
     import yaml
     from pathlib import Path
 
-    runtime_path = Path("casa-agent/rootfs/opt/casa/defaults/agents/butler/runtime.yaml")
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "casa-agent/rootfs/opt/casa/defaults/agents/butler/runtime.yaml"
+    )
     data = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
     allowed = data["tools"]["allowed"]
     assert "mcp__homeassistant" in allowed, (
