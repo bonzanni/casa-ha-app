@@ -90,6 +90,11 @@ async def handle_jsonrpc(request: web.Request) -> web.Response:
         params = payload.get("params") or {}
         name = params.get("name")
         arguments = params.get("arguments") or {}
+        known = {t["name"] for t in TOOLS}
+        if name not in known:
+            # Reject unknown tool names so misspellings in e2e fail loudly
+            # instead of silently appending a phantom call.
+            return _error(req_id, -32602, f"unknown tool: {name!r}")
         STATE["calls"].append({"name": name, "arguments": arguments})
 
         if name == "GetLiveContext":
