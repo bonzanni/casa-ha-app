@@ -387,3 +387,19 @@ def test_duplicate_role_across_residents_and_specialists_fails(tmp_path):
     msg = str(exc.value).lower()
     assert "duplicate" in msg
     assert "finance" in msg
+
+
+def test_butler_runtime_grants_homeassistant_server_level():
+    """Butler must have server-level mcp__homeassistant grant so every HA
+    Assist tool the user exposes is callable without per-tool enumeration.
+    Spike (2026-04-26) confirmed the SDK forwards `mcp__<server>` verbatim
+    to the CC CLI, which honours it as a server-level wildcard."""
+    import yaml
+    from pathlib import Path
+
+    runtime_path = Path("casa-agent/rootfs/opt/casa/defaults/agents/butler/runtime.yaml")
+    data = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
+    allowed = data["tools"]["allowed"]
+    assert "mcp__homeassistant" in allowed, (
+        f"butler.tools.allowed missing mcp__homeassistant; got {allowed}"
+    )
