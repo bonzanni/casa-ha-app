@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.15.1] - 2026-04-26 — Tina HA control
+
+Tina (butler) becomes the universal Home Assistant operator. Server-level
+grant to the homeassistant MCP gives her every Assist tool the user has
+exposed; new prompt sections teach her how to use them; Ellen's
+delegates.yaml gains a butler entry so the Telegram-via-Ellen path
+("ask Tina to turn off the lights") works end-to-end. Closes the
+v0.15.0 deferred manual smoke.
+
+### New
+
+- `mcp__homeassistant` server-level grant in `defaults/agents/butler/runtime.yaml` —
+  every HA Assist tool callable from Tina, present and future, no
+  enumeration required.
+- Three new prompt sections in `defaults/agents/butler/prompts/system.md`:
+  `## Home Assistant tools`, `## Intent patterns`, `## Error recovery`.
+- `butler` entry in `defaults/agents/assistant/delegates.yaml` so Ellen's
+  `<delegates>` block advertises Tina and `delegate_to_agent("butler", ...)`
+  passes the role-map gate.
+- `CASA_HA_MCP_URL` env override on `casa_core.py` — defaults to
+  `http://supervisor/core/api/mcp`. Used by e2e to point HA traffic at
+  the mock.
+- Mock HA MCP server at `test-local/e2e/mock_ha_mcp/server.py` — minimal
+  JSON-RPC 2.0 implementation with `HassTurnOn`/`HassTurnOff`/
+  `GetLiveContext` and `/_calls`/`/_reset` test side-channels; rejects
+  unknown tool names with `-32602`.
+- Mock SDK file-driven HTTP MCP tool-invoke hook
+  (`MOCK_SDK_TOOL_INVOKE_FILE`) — lets tier-2 e2e exercise the
+  resident-options → SDK → HTTP MCP transport chain without a live model.
+- Tier-2 e2e `test-local/e2e/test_ha_delegation.sh` — H-0..H-3 covering
+  the CASA_HA_MCP_URL flow, the voice-direct path, and the
+  agent_loader → SDK options chain.
+- Configurator doctrine recipe `recipes/resident/grant_ha_tools.md`.
+
+### Notes
+
+- HA integration must be enabled and entities exposed to default Assist
+  pipeline by the user — Casa cannot configure these.
+- "Trust the model fully" decision recorded in spec §6 — no per-tool /
+  per-domain restrictions. Safety guardrails (irreversible actions
+  behind confirmation read-back) tracked as future roadmap item.
+- Tier-2 e2e exercises butler→HA directly via the mock-SDK hook;
+  the Ellen→delegate_to_agent→butler two-hop chain stays covered by the
+  J.5 manual smoke (live SDK on N150).
+
 ## [0.15.0] - 2026-04-25 — Resident-to-resident delegation
 
 Residents can now delegate to other residents and specialists by role
