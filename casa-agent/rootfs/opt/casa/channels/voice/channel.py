@@ -442,26 +442,34 @@ class VoiceChannel(Channel):
             })
 
     async def _prewarm(self, scope_id: str) -> None:
-        session_id = f"voice:{scope_id}:{self.default_agent}"
-        try:
-            await self._memory.ensure_session(
-                session_id=session_id,
-                agent_role=self.default_agent,
-                user_peer="voice_speaker",
-            )
-            cfg = self._agent_configs.get(self.default_agent)
-            tokens = getattr(
-                getattr(cfg, "memory", None), "token_budget", 800,
-            )
-            await self._memory.get_context(
-                session_id=session_id,
-                agent_role=self.default_agent,
-                tokens=tokens,
-                search_query=None,
-                user_peer="voice_speaker",
-            )
-        except Exception as exc:
-            logger.warning("Voice prewarm failed for %s: %s", scope_id, exc)
+        cfg = self._agent_configs.get(self.default_agent)
+        if cfg is None:
+            return
+        scopes = list(getattr(getattr(cfg, "memory", None), "scopes_readable", []) or [])
+        if not scopes:
+            return
+        total_budget = getattr(getattr(cfg, "memory", None), "token_budget", 800)
+        per_scope = max(total_budget // max(len(scopes), 1), 1)
+        for scope in scopes:
+            session_id = f"voice:{scope_id}:{scope}:{self.default_agent}"
+            try:
+                await self._memory.ensure_session(
+                    session_id=session_id,
+                    agent_role=self.default_agent,
+                    user_peer="voice_speaker",
+                )
+                await self._memory.get_context(
+                    session_id=session_id,
+                    agent_role=self.default_agent,
+                    tokens=per_scope,
+                    search_query=None,
+                    user_peer="voice_speaker",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Voice prewarm failed for %s scope=%s: %s",
+                    scope_id, scope, exc,
+                )
 
 
 async def _write_sse(response: web.StreamResponse, event: str, data: dict) -> None:
