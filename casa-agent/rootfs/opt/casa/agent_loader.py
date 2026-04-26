@@ -694,7 +694,6 @@ def load_all_executors(base_dir: str) -> dict[str, "ExecutorDefinition"]:
             # Plan 4a additions
             extra_dirs=list(defn.get("extra_dirs", [])),
             mirror_chat_to_topic=bool(defn.get("mirror_chat_to_topic", True)),
-            archive_session_full=bool(defn.get("archive_session_full", False)),
             plugins_dir=(os.path.join(exec_dir, "plugins")
                         if os.path.isdir(os.path.join(exec_dir, "plugins"))
                         else ""),

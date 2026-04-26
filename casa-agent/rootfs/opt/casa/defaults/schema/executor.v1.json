@@ -31,7 +31,6 @@
       "items": {"type": "string"},
       "default": []
     },
-    "mirror_chat_to_topic": {"type": "boolean", "default": true},
-    "archive_session_full": {"type": "boolean", "default": false}
+    "mirror_chat_to_topic": {"type": "boolean", "default": true}
   }
 }

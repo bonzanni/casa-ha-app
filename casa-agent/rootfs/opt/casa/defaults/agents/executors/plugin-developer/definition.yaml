@@ -33,4 +33,3 @@ observer_policy_file: observer.yaml
 doctrine_dir: doctrine
 extra_dirs: []
 mirror_chat_to_topic: true
-archive_session_full: true
