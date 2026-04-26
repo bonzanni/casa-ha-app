@@ -301,6 +301,17 @@ class Agent:
             active = self._scope_registry.active_from_scores(
                 scores, self.config.memory.default_scope,
             )
+            # M2.G6: stamp the engager's rooted scope onto origin so any
+            # downstream tool that snapshots origin (engage_executor →
+            # query_engager) sees the actual scope, not the "meta"
+            # fallback at tools.py:1357. ContextVar.reset() at the
+            # finally block reverts both this set and the original.
+            origin_var.set({
+                **(origin_var.get() or {}),
+                "scope": self._scope_registry.argmax_scope(
+                    scores, self.config.memory.default_scope,
+                ),
+            })
 
             # Per-scope get_context in parallel.
             per_scope_tokens = max(
