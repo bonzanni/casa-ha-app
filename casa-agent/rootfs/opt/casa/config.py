@@ -209,5 +209,4 @@ class ExecutorDefinition:
     # --- Plan 4a additions (claude_code driver) ---
     extra_dirs: list[str] = field(default_factory=list)
     mirror_chat_to_topic: bool = True
-    archive_session_full: bool = False
     plugins_dir: str = ""   # absolute path to per-executor plugins/ dir; "" = none

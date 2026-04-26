@@ -21,4 +21,3 @@ prompt_template_file: prompt.md
 hooks_file: hooks.yaml
 observer_policy_file: observer.yaml
 mirror_chat_to_topic: false
-archive_session_full: false
