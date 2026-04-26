@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.15.2] - 2026-04-26 — Heartbeat noise + sweeper crash
+
+Two production bugs visible in `addon_c071ea9c_casa-agent` logs.
+
+`engagement_idle_sweep` (cron 08:00 daily) and `workspace_sweep`
+(interval 6h) were registered as `lambda: asyncio.create_task(...)`
+in `casa_core.py`. APScheduler's `AsyncIOExecutor` runs sync callables
+in a worker thread, so `asyncio.create_task` raised
+`RuntimeError: no running event loop` on every fire — silently no-op
+since v0.13.0. Fix: pass the coroutine functions directly with
+`kwargs={...}`; AsyncIOExecutor schedules them on the loop natively
+(same pattern `trigger_registry._register_scheduled` already uses).
+
+Ellen's `heartbeat` trigger fires every 60min and was producing
+chatty "checking in" messages despite the prompt's "stay quiet"
+instruction. The Telegram channel runs in `stream` mode — the *first
+token* posts a new chat message, so any preamble Ellen drafts before
+deciding to stay silent has already gone out. Rewrite the prompt:
+silence is now framed as the default action, the bar for sending is
+explicit and narrow, and a "no preamble, no reflection text" rule
+forbids the first-token leak.
+
+### Fixed
+
+- `casa_core.py:1506,1519` — `engagement_idle_sweep` and
+  `workspace_sweep` jobs now register the coroutine function
+  directly. Adds `tests/test_scheduled_sweeper_jobs.py` to lock
+  the wiring (would have caught this since v0.13.0).
+- `defaults/agents/assistant/triggers.yaml` heartbeat prompt
+  rewritten — silence-first framing, explicit "what NOT to send"
+  list, no-preamble rule.
+
 ## [0.15.1] - 2026-04-26 — Tina HA control
 
 Tina (butler) becomes the universal Home Assistant operator. Server-level

@@ -5,15 +5,37 @@ triggers:
     minutes: 60
     channel: telegram
     prompt: |
-      This is your periodic heartbeat. Reflect on your current state:
+      Silent heartbeat self-check. The DEFAULT ACTION is to produce zero
+      output text and end the turn. Most heartbeats produce no message.
 
-      1. Check if there are any pending tasks or follow-ups you committed to
-      2. Check if any scheduled events are coming up in the next hour
-      3. Review if any notifications or results arrived while idle
-      4. Consider if there's anything proactive you should do for Nicola
+      The Telegram channel streams: the FIRST token you emit is sent as a
+      new chat message immediately. There is no preamble buffer. So either
+      you produce nothing at all, or the very first character you produce
+      is the final message text — never a thought or acknowledgement.
 
-      If there's nothing actionable, stay quiet -- do NOT send a message.
-      If there IS something, take action or notify Nicola via Telegram.
+      Override the default ONLY if ALL three are true:
+        1. There is a CONCRETE, time-sensitive thing happening right now
+           (a meeting in <30min Nicola may not have noticed; a deadline
+           today he last mentioned days ago and hasn't acted on; an
+           inbound notification that arrived while he was offline that
+           he'd want to know about NOW).
+        2. He has not already been told about it in the last 24h.
+        3. Sending it now is more useful than waiting for him to ask.
+
+      The following are NEVER reasons to send:
+        - "Just checking in" / "Heartbeat ran" / "All quiet"
+        - Reflecting on your state, the system, or the conversation
+        - Restating today's calendar, yesterday's work, or memory contents
+        - Acknowledging that you ran the heartbeat
+        - Any status-about-yourself message
+        - Anything that begins with "I" or "Let me"
+
+      If you decide to send, output ONLY the final telegram message text.
+      No greeting. No "Hey Nicola". No "Quick heads-up". Just the fact and
+      the action, 1-3 lines.
+
+      If unsure, stay silent. Noise erodes Nicola's trust in your messages
+      far faster than a missed nudge.
 
   - name: morning-briefing
     type: cron
