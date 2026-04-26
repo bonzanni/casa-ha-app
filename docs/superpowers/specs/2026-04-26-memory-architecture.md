@@ -266,6 +266,18 @@ never matches the 4-segment id the agent computes. M2 (G1) closes that
 drift by looping over `scopes_readable` and warming one entry per
 scope.
 
+**Engagements carry the engager's scope.** When an MCP tool spawns an
+engagement during a turn (e.g. `engage_executor` → Tina, `delegate_to_agent`
+→ a specialist), the engagement record's `origin` dict carries
+`scope = argmax_scope(scores, default_scope)` stamped onto `origin_var`
+by `agent.py:309-314` immediately after the read-path classifier runs.
+Downstream consumers — chiefly `query_engager` at `tools.py:1357`,
+which rebuilds `{channel}:{chat_id}:{scope}:{role}` to retrieve from
+the engager's actual session — read it via `engagement.origin.get(
+"scope", "meta")`. The literal `"meta"` fallback handles edge paths
+(cron triggers, boot replay) that engage without going through
+`_process`. M2 (G6) shipped this stamp.
+
 ---
 
 ## 6. Read path
@@ -512,10 +524,13 @@ the shipped corpora to keyword-style phrases and committed
 The full backlog lives in `docs/MEMORY-ROADMAP.md`. The phases
 remaining for memory work:
 
-- **M2 — Honcho-side breakage fixes.** G1 voice prewarm building a
-  3-segment session id; G4 cancel paths passing `memory_provider=None`
-  to `_finalize_engagement`; G6 `engagement.origin.scope` plumbed to
-  match the read.
+- **M2 — Shipped v0.15.3.** G1 voice prewarm session-id repaired
+  (4-segment shape, one entry per `scopes_readable`); G4 cancel +
+  force-delete paths now resolve `memory_provider` so meta + executor
+  archival writes fire on cancellations; G6 `engagement.origin.scope`
+  stamped via `argmax_scope` so `query_engager` retrieves from the
+  engager's rooted scope, not the `"meta"` fallback. See §5 for the
+  origin-scope narrative.
 - **M3 — Honcho contract coverage.** Real-response integration test
   for `summary` + `peer_representation` (§9 gap above), single
   per-turn `memory_call` telemetry line. Closes B8.
