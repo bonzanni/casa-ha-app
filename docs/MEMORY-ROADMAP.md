@@ -4,7 +4,7 @@ Living tracker for the memory subsystem (Honcho + SQLite + scope-routing
 + disclosure). Multi-session, gitignored like `ROADMAP.md`. Read at the
 start of every memory-touching session; update at the end.
 
-Last updated: 2026-04-26 — M2 shipped as v0.15.3 (folded M1 in).
+Last updated: 2026-04-27 — M3 shipped as v0.15.4 (Honcho contract coverage + `memory_call` telemetry).
 
 ## Doctrine
 
@@ -28,7 +28,7 @@ primary store is out of scope until that doctrine changes.
 |---|---|---|---|
 | M1 | Spec consolidation + dead-code removal | ✅ Shipped (v0.15.3) | `plans/2026-04-26-memory-m1-spec-recovery-and-cleanup.md` |
 | M2 | Honcho-side breakage fixes (voice prewarm, cancel paths, origin scope) | ✅ Shipped (v0.15.3) | `plans/2026-04-26-memory-m2-honcho-fixes.md` |
-| M3 | Honcho contract coverage (real summary/peer_repr test + latency telemetry) | 📋 Planned | — |
+| M3 | Honcho contract coverage (real summary/peer_repr test + latency telemetry) | ✅ Shipped (v0.15.4) | `plans/2026-04-27-memory-m3-honcho-contract-coverage.md` |
 | M4 | Engagement memory (executors get continuity; meta scope readable) | 📋 Brainstorm needed | — |
 | M5 | `remember_fact` tool (the deferred-since-0.4.0 feature) | 📋 Planned | — |
 | M6 | Cross-role recall (consult-other-agent-memory) | 📋 Optional, large | — |
@@ -104,7 +104,13 @@ SQLite write counts.
   ms, peer count, summary present (bool), peer_repr present (bool),
   cache hit. Closes B8 enough.
 
-**Status:** 📋 Planned. M1 prerequisite.
+**Status:** ✅ Shipped 2026-04-27 as v0.15.4. M3a closed by the
+populated-response integration test in
+`tests/test_memory_honcho.py`; M3b closed by `memory_call` info-level
+emissions in Honcho/SQLite providers + cache-hit branch of
+CachedMemoryProvider. NoOp intentionally silent. New spec § 13
+documents the telemetry contract. Live `HONCHO_LIVE_TEST=1`-gated
+test deferred as M3a.1 follow-up.
 
 ## M4 — Engagement memory
 

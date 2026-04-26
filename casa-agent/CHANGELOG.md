@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.15.4] - 2026-04-27 — Memory M3: Honcho contract coverage + `memory_call` telemetry
+
+Observability + confidence-coverage release. No runtime-behaviour
+changes; closes the M2-era spec § 9 "real-Honcho-response coverage
+not in tests today" gap and adds per-memory-call telemetry.
+
+### Added
+- **M3a — Honcho populated-response integration test.**
+  `tests/test_memory_honcho.py::test_get_context_renders_summary_and_peer_repr_when_honcho_returns_them`
+  primes the SDK stub with populated `summary.content` +
+  `peer_representation` + `peer_card` + recent `messages` and asserts
+  all four `_render` sections appear in canonical order. Closes the
+  spec § 9 wiring-coverage gap. Live `HONCHO_LIVE_TEST=1`-gated test
+  deferred as M3a.1 follow-up.
+- **M3b — `memory_call` info-level log line.** Emitted from each
+  concrete provider's `get_context` (Honcho + SQLite) and from
+  `CachedMemoryProvider`'s cache-hit branch. Fields: `backend`,
+  `session_id`, `agent_role`, `t_ms`, `peer_count`,
+  `summary_present`, `peer_repr_present`, `cache_hit`. NoOp provider
+  intentionally silent — see new spec § 13 for the full contract.
+- **Spec § 13** (`docs/superpowers/specs/2026-04-26-memory-architecture.md`)
+  documents the `memory_call` field set and emission rules.
+
+### Migration
+- None. M3 adds log lines and tests; no schema, config, or runtime
+  contract change. Operators relying on a regex-style log scrape that
+  asserted "no `memory_call` lines exist" would need to update —
+  vanishingly unlikely.
+
 ## [0.15.3] - 2026-04-26 — Memory M1+M2: spec consolidation + Honcho-side fixes
 
 First user-visible memory ship since v0.8.4. Folds the internal-only M1
