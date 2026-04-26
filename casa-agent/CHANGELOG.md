@@ -1,14 +1,18 @@
 # Changelog
 
-## Unreleased — Memory M1: spec consolidation + cleanup
+## [0.15.3] - 2026-04-26 — Memory M1+M2: spec consolidation + Honcho-side fixes
 
-### Added
+First user-visible memory ship since v0.8.4. Folds the internal-only M1
+cleanup (no version bump at the time) into the same release as M2's
+three Honcho-touching bug fixes.
+
+### Added (M1)
 - `docs/superpowers/specs/2026-04-26-memory-architecture.md` —
   consolidated current-state spec for the memory subsystem. Supersedes
   2.2a/2.2b/3.2/3.2.1/3.2.2 design specs for "what is true today"
   purposes.
 
-### Removed
+### Removed (M1)
 - `card_only` read strategy. Reserved in 2.2a, never implemented; the
   branch in `_wrap_memory_for_strategy` warned and fell back to
   `per_turn`. No default YAML used it.
@@ -19,11 +23,43 @@
   reader. Plan 4a transcript archival fires unconditionally on
   `kind=executor`.
 
+### Fixed (M2)
+- **Voice prewarm cache key restored.**
+  `channels/voice/channel.py::_prewarm` was building the pre-3.2
+  3-segment session id `voice:{scope_id}:{role}`. The agent's read
+  path uses 4 segments `{channel}:{chat_id}:{scope}:{role}`, so the
+  prewarm cache key never matched the real-turn key — every wake-word
+  paid the full cold-read latency. Now loops over the agent's
+  `scopes_readable` and warms one entry per scope using the 4-segment
+  shape with budget // len(scopes) tokens each.
+- **Cancel + force-delete now write engagement summaries.**
+  `cancel_engagement` and `delete_engagement_workspace(force=True)`
+  passed `memory_provider=None` to `_finalize_engagement`, silently
+  skipping the meta-scope summary write and the per-executor-type
+  Honcho archival. Both sites now resolve `active_memory_provider`
+  from the `agent` module the same way `emit_completion` does.
+  Cancellations and force-deletes leave the same Honcho trace as
+  normal completions.
+- **`query_engager` reads from the engager's actual scope.**
+  `tools.py:1357` reads `engagement.origin.get("scope", "meta")`;
+  `agent.py` never set `"scope"`, so Tina's `query_engager("what did
+  the user say…")` always retrieved from Ellen's meta scope — which
+  only contains engagement summaries, never user conversation. The
+  agent now stamps `argmax_scope(scores, default_scope)` onto
+  `origin_var` after the read-path classifier runs, so engagements
+  spawned during a turn carry the scope the turn was rooted in.
+
 ### Migration
-- None. Existing SQLite databases keep their now-orphan `peer_cards`
-  table (harmless, no longer read). Existing `definition.yaml` files
-  with `archive_session_full: ...` will fail schema validation —
-  delete the line.
+- M1 migration notes still apply: existing SQLite databases keep their
+  now-orphan `peer_cards` table (harmless, no longer read); existing
+  `definition.yaml` files with `archive_session_full: ...` will fail
+  schema validation — delete the line.
+- M2: no migration. Voice prewarm change is transparent (cache hits
+  start working again). Cancel-path memory writes are additive (Honcho
+  gets entries it was missing). G6 stamps a new `scope` key onto
+  `engagement.origin` — code reading `origin` with `.get(..., default)`
+  is unaffected; any code doing exact-equality dict comparison would
+  need updating but no such site exists.
 
 ## [0.15.2] - 2026-04-26 — Heartbeat noise + sweeper crash
 

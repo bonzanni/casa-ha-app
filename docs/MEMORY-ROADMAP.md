@@ -4,7 +4,7 @@ Living tracker for the memory subsystem (Honcho + SQLite + scope-routing
 + disclosure). Multi-session, gitignored like `ROADMAP.md`. Read at the
 start of every memory-touching session; update at the end.
 
-Last updated: 2026-04-26 — M1 shipped (consolidated spec + dropped card_only / SQLite peer_cards / archive_session_full).
+Last updated: 2026-04-26 — M2 shipped as v0.15.3 (folded M1 in).
 
 ## Doctrine
 
@@ -26,8 +26,8 @@ primary store is out of scope until that doctrine changes.
 
 | Phase | Focus | Status | Plan |
 |---|---|---|---|
-| M1 | Spec consolidation + dead-code removal | ✅ Shipped | `plans/2026-04-26-memory-m1-spec-recovery-and-cleanup.md` |
-| M2 | Honcho-side breakage fixes (voice prewarm, cancel paths, origin scope) | 📋 Planned | — |
+| M1 | Spec consolidation + dead-code removal | ✅ Shipped (v0.15.3) | `plans/2026-04-26-memory-m1-spec-recovery-and-cleanup.md` |
+| M2 | Honcho-side breakage fixes (voice prewarm, cancel paths, origin scope) | ✅ Shipped (v0.15.3) | `plans/2026-04-26-memory-m2-honcho-fixes.md` |
 | M3 | Honcho contract coverage (real summary/peer_repr test + latency telemetry) | 📋 Planned | — |
 | M4 | Engagement memory (executors get continuity; meta scope readable) | 📋 Brainstorm needed | — |
 | M5 | `remember_fact` tool (the deferred-since-0.4.0 feature) | 📋 Planned | — |
@@ -58,7 +58,7 @@ phase reasons about a smaller surface.
   `peer_card` rendering stays untouched.
 - Drop `archive_session_full` (dead config, never read).
 
-**Status:** ✅ Shipped 2026-04-26 — consolidated spec doc + three dead-code removals (card_only, SQLite peer_cards, archive_session_full). See CHANGELOG "Unreleased — Memory M1" for details.
+**Status:** ✅ Shipped 2026-04-26 as v0.15.3 (folded into the M2 release because M1 was internal-only — no version bump at the time).
 
 ## M2 — Honcho-side breakage fixes
 
@@ -82,7 +82,7 @@ M3/M4/M5 means we're adding features on top of a working baseline, not a
   `"scope"`. Either set it from active scopes at engage-time, or remove
   the `.get` fallback and accept the constant.
 
-**Status:** 📋 Planned. M1 prerequisite.
+**Status:** ✅ Shipped 2026-04-26 as v0.15.3. Voice prewarm now uses 4-segment session ids; cancel + force-delete write meta summaries to Honcho; origin_var carries argmax scope so query_engager retrieves from the engager's rooted scope.
 
 ## M3 — Honcho contract coverage
 
