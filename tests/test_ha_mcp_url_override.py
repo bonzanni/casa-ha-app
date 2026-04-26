@@ -1,4 +1,11 @@
-"""Verify CASA_HA_MCP_URL env override is honored when present."""
+"""Contract tests for the `CASA_HA_MCP_URL` env override.
+
+These inline the env-read pattern that `casa_core.main` uses; they lock the
+contract (env var → registered URL) but do not invoke `casa_core.main`,
+which would require booting the full app. The Phase F e2e
+(`test-local/e2e/test_ha_delegation.sh`) covers the live wiring by
+asserting the addon log line `Registered Home Assistant MCP server (url=...)`
+contains the override URL."""
 from __future__ import annotations
 
 import os
