@@ -1502,11 +1502,15 @@ async def main() -> None:
             )
 
     # 14. Kick off timers.
+    # AsyncIOScheduler's AsyncIOExecutor schedules coroutine functions on
+    # the running loop directly. A sync lambda that calls create_task
+    # gets dispatched to a worker thread instead, where no loop is bound,
+    # raising RuntimeError on every fire (silent regression from v0.13.0).
+    # Pass the coroutine functions directly with kwargs.
     session_sweeper.start()
     scheduler.add_job(
-        lambda: asyncio.create_task(
-            engagement_registry.sweep_idle_and_suspend(driver=engagement_driver)
-        ),
+        engagement_registry.sweep_idle_and_suspend,
+        kwargs={"driver": engagement_driver},
         trigger="cron",
         id="engagement_idle_sweep",
         hour=8, minute=0,
@@ -1517,9 +1521,8 @@ async def main() -> None:
     # engagement workspaces past retention.
     from drivers.workspace import _sweep_workspaces as _sweep_ws
     scheduler.add_job(
-        lambda: asyncio.create_task(
-            _sweep_ws(engagements_root="/data/engagements")
-        ),
+        _sweep_ws,
+        kwargs={"engagements_root": "/data/engagements"},
         trigger="interval",
         id="workspace_sweep",
         hours=6,
