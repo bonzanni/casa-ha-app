@@ -66,7 +66,7 @@ class ToolsConfig:
     max_turns: int = 10
 
 
-_VALID_READ_STRATEGIES = ("per_turn", "cached", "card_only")
+_VALID_READ_STRATEGIES = ("per_turn", "cached")
 
 
 @dataclass

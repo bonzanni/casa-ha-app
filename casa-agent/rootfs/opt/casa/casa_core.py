@@ -698,14 +698,6 @@ def _wrap_memory_for_strategy(
             return backend
         return CachedMemoryProvider(backend)
 
-    if strategy == "card_only":
-        logger.warning(
-            "Agent '%s' requests read_strategy=card_only which is not "
-            "implemented in 2.2a; falling back to per_turn",
-            role,
-        )
-        return backend
-
     # per_turn
     return backend
 
