@@ -1413,18 +1413,21 @@ async def cancel_engagement(args: dict) -> dict:
                         "message": f"no engagement named {engagement_id!r}"})
 
     driver = None
+    memory_provider = None
     try:
         import agent as agent_mod  # noqa: F401
         if rec.driver == "claude_code":
             driver = getattr(agent_mod, "active_claude_code_driver", None)
         else:
             driver = getattr(agent_mod, "active_engagement_driver", None)
+        memory_provider = getattr(agent_mod, "active_memory_provider", None)
     except Exception:
         pass
 
     await _finalize_engagement(
         rec, outcome="cancelled", text="Engagement cancelled.",
-        artifacts=[], next_steps=[], driver=driver, memory_provider=None,
+        artifacts=[], next_steps=[], driver=driver,
+        memory_provider=memory_provider,
     )
     return _result({"status": "ok", "engagement_id": engagement_id})
 
@@ -1600,18 +1603,20 @@ async def delete_engagement_workspace(args: dict) -> dict:
     if rec.status in _LIVE_ENGAGEMENT_STATES and force:
         # Finalize as cancelled before pulling the workspace.
         driver = None
+        memory_provider = None
         try:
             import agent as agent_mod
             driver = (getattr(agent_mod, "active_claude_code_driver", None)
                       if rec.driver == "claude_code"
                       else getattr(agent_mod, "active_engagement_driver", None))
+            memory_provider = getattr(agent_mod, "active_memory_provider", None)
         except Exception:
             pass
         await _finalize_engagement(
             rec, outcome="cancelled",
             text="Workspace deletion forced",
             artifacts=[], next_steps=[],
-            driver=driver, memory_provider=None,
+            driver=driver, memory_provider=memory_provider,
         )
 
     ws = os.path.join(_ENGAGEMENTS_ROOT, engagement_id)
