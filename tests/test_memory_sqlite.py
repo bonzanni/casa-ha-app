@@ -23,7 +23,9 @@ async def test_open_creates_all_tables():
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
     }
-    assert {"messages", "sessions", "peer_cards", "schema_meta"} <= tables
+    # M1.C: peer_cards dropped — Honcho is where peer cards live.
+    assert {"messages", "sessions", "schema_meta"} <= tables
+    assert "peer_cards" not in tables
 
 
 async def test_schema_version_seeded():
@@ -372,63 +374,6 @@ async def test_get_context_no_summary_or_perspective_sections():
     out = await p.get_context("s", "assistant", tokens=4000)
     assert "## Summary so far" not in out
     assert "## My perspective" not in out
-
-
-# --- peer_cards scoping ----------------------------------------------------
-
-
-async def test_peer_card_bullets_scoped_to_user_peer():
-    """A bullet on nicola's card is visible to any nicola session but
-    never to a voice_speaker session."""
-    from memory import SqliteMemoryProvider
-    import time as _time
-
-    p = SqliteMemoryProvider(":memory:")
-    # Seed bullets directly — 2.2b has no write-side API for peer_cards
-    # (that's the 4.x `remember_fact` tool seam, spec §11).
-    p._conn.execute(
-        "INSERT INTO peer_cards (peer_name, bullet, created_ts) VALUES (?, ?, ?)",
-        ("nicola", "prefers Celsius", _time.time()),
-    )
-    p._conn.commit()
-
-    await p.ensure_session("telegram:1:assistant", "assistant")
-    await p.add_turn("telegram:1:assistant", "assistant", "hi", "hello")
-
-    out_nicola = await p.get_context(
-        "telegram:1:assistant", "assistant", tokens=4000, user_peer="nicola",
-    )
-    assert "## What I know about you" in out_nicola
-    assert "- prefers Celsius" in out_nicola
-
-    await p.ensure_session("voice:lr:butler", "butler", user_peer="voice_speaker")
-    await p.add_turn(
-        "voice:lr:butler", "butler", "lights", "ok", user_peer="voice_speaker",
-    )
-    out_voice = await p.get_context(
-        "voice:lr:butler", "butler", tokens=4000, user_peer="voice_speaker",
-    )
-    # voice_speaker has no card bullets → no header, no leakage.
-    assert "## What I know about you" not in out_voice
-    assert "prefers Celsius" not in out_voice
-
-
-async def test_peer_card_ordered_by_created_ts():
-    from memory import SqliteMemoryProvider
-
-    p = SqliteMemoryProvider(":memory:")
-    p._conn.execute(
-        "INSERT INTO peer_cards (peer_name, bullet, created_ts) VALUES "
-        "('nicola', 'second', 200), ('nicola', 'first', 100)"
-    )
-    p._conn.commit()
-
-    await p.ensure_session("s", "assistant")
-    await p.add_turn("s", "assistant", "u", "a")
-    out = await p.get_context("s", "assistant", tokens=4000)
-    first_pos = out.index("- first")
-    second_pos = out.index("- second")
-    assert first_pos < second_pos
 
 
 # --- Topology visibility smoke --------------------------------------------
