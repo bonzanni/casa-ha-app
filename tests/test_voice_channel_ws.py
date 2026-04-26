@@ -28,7 +28,7 @@ class _StreamingAgent:
 
 class _FakeCfg:
     class tts: tag_dialect = "square_brackets"
-    memory = type("M", (), {"token_budget": 800})()
+    memory = type("M", (), {"token_budget": 800, "scopes_readable": ["domestic"]})()
     role = "butler"
     voice_errors: dict = {}
 
