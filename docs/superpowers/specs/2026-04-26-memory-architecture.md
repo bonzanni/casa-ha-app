@@ -422,19 +422,19 @@ renders via `_render(context)` (`memory.py:100-133`):
 `_render` silently omits any section whose source field is empty or
 `None`, so missing data never produces placeholder lines.
 
-**Honest gap: real-Honcho-response coverage is not in tests today.**
-`tests/test_memory_honcho.py` mocks the SDK with stubs whose `context`
-returns hand-built `_Ctx` dataclasses where `summary` and
-`peer_representation` are `None` in every assertion. We assert
-`peer_target`/`peer_perspective`/`tokens`/`search_query` are forwarded
-correctly and that `add_peers` / `add_messages` carry the right peer
-identities and configs — but nothing in the suite exercises a Honcho
-response that *actually* contains a non-`None` `summary` or
-`peer_representation`. The roadmap **M3** entry explicitly closes this
-gap with a recorded-response (or live, behind a flag) integration
-test, plus a single-line per-turn `memory_call` telemetry event
-covering backend/latency/cache hit. Until M3 lands, the §1 doctrine
-"Honcho is primary" is asserted by configuration, not by test.
+**M3 closure (v0.15.4).** Real-response coverage now lives at
+`tests/test_memory_honcho.py::test_get_context_renders_summary_and_peer_repr_when_honcho_returns_them`,
+which primes the SDK stub with populated `summary.content` +
+`peer_representation` + `peer_card` + recent `messages` and asserts
+that all four canonical sections appear in the rendered output, in
+the order `_render` emits (peer_card → summary → perspective →
+recent). The test exercises the SDK return → `HonchoMemoryProvider.
+get_context` → `_render` → markdown wiring end-to-end, which is the
+contract this section names. A live `HONCHO_LIVE_TEST=1`-gated
+integration test is deferred as M3a.1 follow-up; the cassette-style
+hand-rolled fixture is sufficient for day-one confidence per the
+plan-2026-04-27 design notes (determinism, no CI secret, SDK shape
+fully observable).
 
 ---
 
@@ -531,9 +531,13 @@ remaining for memory work:
   stamped via `argmax_scope` so `query_engager` retrieves from the
   engager's rooted scope, not the `"meta"` fallback. See §5 for the
   origin-scope narrative.
-- **M3 — Honcho contract coverage.** Real-response integration test
-  for `summary` + `peer_representation` (§9 gap above), single
-  per-turn `memory_call` telemetry line. Closes B8.
+- **M3 — Shipped v0.15.4.** Real-response integration test added at
+  `tests/test_memory_honcho.py::test_get_context_renders_summary_and_peer_repr_when_honcho_returns_them`
+  closes the § 9 gap; `memory_call` info-level log line emits from each
+  concrete provider's `get_context` plus `CachedMemoryProvider`'s cache-
+  hit branch (see § 13 for the field contract). Live-flag-gated test
+  deferred as M3a.1 follow-up. NoOp provider is intentionally silent —
+  see § 13 emission-sites note.
 - **M4 — Engagement memory.** Combines G5 (`meta` and
   `executor:<type>` not declared in `scopes.yaml`), G9 (Tier-3
   Executors get no memory injection at all), B4 (engagement summaries
@@ -550,3 +554,93 @@ Explicitly ruled out by the §1 doctrine and the roadmap "explicitly
 NOT doing" section: B3 SQLite summariser, B2 SQLite retention/pruning,
 G10 backend migration, B7 disclosure-as-enforcement, G2 SQLite
 peer_cards writer.
+
+---
+
+## 13. `memory_call` telemetry (M3b, v0.15.4)
+
+Every concrete memory provider emits one `memory_call` info-level log
+line per `get_context` call. The line is the per-memory-read companion
+to the per-turn `scope_route` line at `agent.py:554-568` (§ 11). Both
+share the `logger.info("event_name", extra={...})` shape so a single
+downstream parser handles both.
+
+**Fields** (always present, types as listed):
+
+| Field | Type | Notes |
+|---|---|---|
+| `event` (log message) | `"memory_call"` | constant |
+| `backend` | `str` | `"honcho"`, `"sqlite"`, or — on cache-hit emissions — the wrapped backend's mapped name |
+| `session_id` | `str` | the 4-segment session id (§ 5) |
+| `agent_role` | `str` | role passed to `get_context` |
+| `t_ms` | `int` | latency in milliseconds, measured from method entry to just-before-return |
+| `peer_count` | `int \| None` | length of `messages` on the SDK / SQLite return; `None` on cache-hit emissions (cache stores rendered string only) |
+| `summary_present` | `bool \| None` | `True` when SDK's `summary.content` is non-empty; `False` on SQLite always (§ 10); `None` on cache-hit emissions |
+| `peer_repr_present` | `bool \| None` | `True` when SDK's `peer_representation` is non-empty; `False` on SQLite always; `None` on cache-hit emissions |
+| `cache_hit` | `bool` | `True` only on `CachedMemoryProvider`'s wrapper-served path; `False` on every direct backend emission, including the wrapped-backend's own emission on cache miss |
+
+Note on field naming: `peer_count` measures messages-actually-rendered
+(token-budget-bounded), not total messages in storage. Honcho's SDK
+return list and SQLite's row-fetch list both reflect the per-call
+ingestion count — the field name predates the M3b telemetry framing
+and is preserved for grep-compatibility with the operator dashboards.
+
+**Emission sites** (live code refs as of v0.15.4 — re-grep for class
+names if line numbers drift):
+
+- `HonchoMemoryProvider.get_context` (search `casa-agent/rootfs/opt/casa/memory.py` for `class HonchoMemoryProvider`) — `cache_hit=False`, all fields populated from the SDK return.
+- `SqliteMemoryProvider.get_context` (search same file for `class SqliteMemoryProvider`) — `cache_hit=False`, `summary_present=False`, `peer_repr_present=False` per the § 10 graceful-degradation contract.
+- `CachedMemoryProvider.get_context` (search same file for `class CachedMemoryProvider`) — emits ONLY on cache hit, with `cache_hit=True` and `backend` resolved by `CachedMemoryProvider._resolve_backend_name` (see below).
+- `NoOpMemory.get_context` — does NOT emit. Operators using `MEMORY_BACKEND=noop` have explicitly disabled persistence; per-turn telemetry would be noise. The boot-time `_MemoryChoice` log emitted by `casa_core.main` is the operator's confirmation that noop was selected.
+
+**Backend-name resolution** (`CachedMemoryProvider._resolve_backend_name`):
+
+The wrapper's cache-hit emission needs a string for the `backend`
+field even though it doesn't call the inner backend (which would have
+self-identified). The static helper resolves the inner provider's
+class name through three tiers, in order:
+
+1. **Production-provider lookup table.** Direct mapping for the three
+   shipped classes:
+   - `HonchoMemoryProvider` → `"honcho"`
+   - `SqliteMemoryProvider` → `"sqlite"`
+   - `NoOpMemory` → `"noop"`
+2. **`MemoryProvider`-suffix strip.** Any class name ending in
+   `MemoryProvider` not in the table gets the suffix removed and
+   lowercased.
+3. **`Provider`-suffix strip.** Any class name ending in `Provider`
+   (but not `MemoryProvider`) gets that suffix removed and lowercased.
+   This branch catches test stubs (`RecordingProvider` → `"recording"`)
+   and any future generic provider that doesn't follow the
+   `MemoryProvider` naming convention.
+4. **Fallback.** Bare `cls.__name__.lower()`.
+
+Future production providers should land in the table to short-circuit
+the fallbacks, both for clarity and to lock in the operator-facing
+name independent of class-name churn.
+
+**Why provider-level, not aggregated per-turn:** a turn fans out to N
+scopes (§ 6 step 6), each with its own `_one_scope` coroutine that
+calls `get_context` once. Per-scope attribution lets operators answer
+"why is finance scope slow?" without re-implementing the join in the
+log pipeline. The `cid_var` value (already injected via `extra` by the
+existing logger filter in `agent_logging.py`) ties multiple
+`memory_call` lines back to the same turn's `scope_route` line.
+
+**Why CachedMemoryProvider's emission is asymmetric** (only on hits,
+never on misses): one `memory_call` per logical memory read is the
+contract. On miss, the wrapped backend's own emission counts as the
+"the memory call that happened"; on hit, the backend never runs so the
+wrapper takes ownership of the line. Operators see exactly one
+`memory_call` per `_one_scope` call, with `cache_hit` distinguishing
+the served path. Double-emission on misses would falsify rate
+dashboards.
+
+**Drift risk.** The four emission sites (Honcho, SQLite, two Cached-
+hit sites) carry near-identical 8-field dicts. Plan §B chose explicit
+per-site emission over a helper to keep the contract visible — the
+trade-off is that field-set drift between sites is the failure mode.
+Tests at `tests/test_memory_honcho.py`, `tests/test_memory_sqlite.py`,
+`tests/test_memory_cached.py` assert each site's field shape; any
+future addition to the contract MUST update all four sites and all
+three test files in the same commit.
