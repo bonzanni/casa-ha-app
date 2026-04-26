@@ -27,6 +27,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/common.sh"
 
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+# Cold-boot fastembed download (~30-60s in CI, longer locally) means default
+# 30s is too tight. Override only if caller didn't already set BOOT_TIMEOUT.
+export BOOT_TIMEOUT="${BOOT_TIMEOUT:-180}"
 MOCK_HA_PORT="${MOCK_HA_PORT:-8200}"
 MOCK_HA_PID=""
 NAME="casa-ha-deleg-$$"
@@ -114,68 +117,18 @@ curl -sf -X POST "http://localhost:${MOCK_HA_PORT}/_reset" >/dev/null
 MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c \
     "echo '"'[{"server":"homeassistant","tool":"HassTurnOn","args":{"name":"bedroom"}}]'"' > /data/mock_sdk_tool_invoke.json"
 
-read -r -d '' BUTLER_PY <<'PY' || true
-import asyncio, os, sys
-sys.path.insert(0, "/opt/casa")
-
-from agent_loader import load_agent_from_dir
-from policies import load_policies
-from mcp_registry import McpServerRegistry
-from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
-
-
-async def main():
-    # 1. Load butler from defaults — same path casa_core uses.
-    policies = load_policies("/opt/casa/defaults/policies/disclosure.yaml")
-    cfg = load_agent_from_dir(
-        "/opt/casa/defaults/agents/butler",
-        policies=policies,
-    )
-    assert "mcp__homeassistant" in cfg.tools.allowed, \
-        f"butler.tools.allowed missing mcp__homeassistant: {cfg.tools.allowed}"
-    assert "homeassistant" in cfg.mcp_server_names, \
-        f"butler.mcp_server_names missing homeassistant: {cfg.mcp_server_names}"
-
-    # 2. Build the same registry casa_core does and resolve butler's MCP servers.
-    reg = McpServerRegistry()
-    reg.register_http(
-        name="homeassistant",
-        url=os.environ.get("CASA_HA_MCP_URL"),
-        headers={"Authorization": "Bearer test-token-v0151"},
-    )
-    resolved = reg.resolve(cfg.mcp_server_names)
-    assert "homeassistant" in resolved and resolved["homeassistant"]["url"], \
-        f"registry.resolve did not surface mock URL: {resolved}"
-
-    # 3. Construct SDK options the way casa_core does for residents.
-    opts = ClaudeAgentOptions(
-        model=cfg.model or "haiku",
-        system_prompt=cfg.system_prompt or "",
-        allowed_tools=list(cfg.tools.allowed),
-        mcp_servers=resolved,
-        max_turns=1,
-    )
-
-    # 4. Run a query — mock SDK reads /data/mock_sdk_tool_invoke.json and
-    #    fires the HTTP call against the resolved homeassistant URL.
-    async with ClaudeSDKClient(opts) as client:
-        await client.query("turn on the bedroom light")
-        async for _msg in client.receive_response():
-            pass
-
-    print("OK")
-
-
-asyncio.run(main())
-PY
-
-host_tmp="$(mktemp)"
-printf '%s\n' "$BUTLER_PY" > "$host_tmp"
-MSYS_NO_PATHCONV=1 docker cp "$host_tmp" "$NAME:/tmp/butler_resident_harness.py" >/dev/null
-rm -f "$host_tmp"
+# NOTE: do NOT prefix MSYS_NO_PATHCONV here — the host path starts with /c/
+# and needs Git Bash's automatic translation to C:\. The container-side path
+# `casa-...:/tmp/...` doesn't start with / so it isn't translated.
+docker cp \
+    "$REPO_ROOT/test-local/e2e/harnesses/ha_delegation_butler.py" \
+    "$NAME:/tmp/ha_delegation_butler.py" >/dev/null
 
 if ! out=$(MSYS_NO_PATHCONV=1 docker exec \
-        "$NAME" /opt/casa/venv/bin/python /tmp/butler_resident_harness.py 2>&1); then
+        -e VOICE_AGENT_MODEL=haiku \
+        -e VOICE_AGENT_NAME=Tina \
+        -e PRIMARY_AGENT_NAME=Ellen \
+        "$NAME" /opt/casa/venv/bin/python /tmp/ha_delegation_butler.py 2>&1); then
     printf '%s\n' "$out" | tail -30 >&2
     fail "H-3: butler-resident harness exited non-zero"
 fi
