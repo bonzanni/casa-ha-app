@@ -79,23 +79,23 @@ breaking change every backend must implement.
 
 ## 3. Provider catalogue
 
+Four providers implement (or wrap) the §2 ABC: **HonchoMemoryProvider**
+(§3.1), **SqliteMemoryProvider** (§3.2), **CachedMemoryProvider** (§3.3,
+a wrapper), and **NoOpMemory** at `memory.py:66` — every method is a
+stub; `MEMORY_BACKEND=noop` selects it. Used to disable memory entirely
+without an `if memory:` guard at every call site.
+
 ### 3.1 HonchoMemoryProvider — `memory.py:161`
 
 Honcho v3 backed. Constructed with `(api_url, api_key, workspace_id="casa")`.
 
 **v3 SDK calls actually used:**
 
-- `client.session(session_id)` — returns a session handle. Lazy in v3
-  (no API call until `add_peers` / `context` / `add_messages` fire).
-- `client.peer(name)` — returns a peer handle. Lazy.
-- `session.add_peers([(peer, SessionPeerConfig(...)), ...])` — declares
-  participants and their observation flags. Called once per `ensure_session`.
-- `session.context(tokens=..., peer_target=..., peer_perspective=...,
-  search_query=...)` — single-call retrieval that packs messages,
-  optional summary, optional peer_card, optional peer_representation
-  into one token-budgeted payload.
-- `session.add_messages([user.message(...), agent.message(...)])` —
-  one transactional write of two messages.
+- `client.session(id=...)` — get/create session
+- `client.peer(id=...)` — get/create peer
+- `session.add_peers([...])` with `SessionPeerConfig(observe_others, observe_me)` — wire trust topology
+- `session.context(tokens=..., peer_target=..., peer_perspective=..., search_query=...)` — fetch turn history + summary + peer_representation (see §9 for field semantics)
+- `session.add_messages([...])` — append turn messages
 
 **`SessionPeerConfig` flags** (from `honcho.api_types`):
 
@@ -153,7 +153,8 @@ it into the same `_render` function the Honcho path uses.
 Section omission rules in `_render` mean SQLite digests render only
 `## What I know about you` (when peer_card has bullets — never, today)
 and `## Recent exchanges`. `## Summary so far` and `## My perspective`
-never appear on SQLite. `tokens // 40` is the rough last-N truncation.
+never appear on SQLite. `tokens // 40` is the rough last-N truncation
+(`memory.py:464`).
 
 ### 3.3 CachedMemoryProvider — `memory.py:245`
 
@@ -181,13 +182,6 @@ detects an underlying `SqliteMemoryProvider` and skips the wrap entirely
 when `read_strategy: cached`, emitting one INFO line at boot ("SQLite
 backend — caching not applied"). SQLite reads are sub-millisecond; the
 wrapper would add staleness without measurable benefit.
-
-### 3.4 NoOpMemory — `memory.py:66`
-
-All three methods are stubs. `ensure_session` and `add_turn` return
-`None`; `get_context` returns `""`. Reachable only via
-`MEMORY_BACKEND=noop`. Used in tests and in installs that specifically
-want no persistence.
 
 ---
 
@@ -279,8 +273,7 @@ scope.
 Implemented in `Agent._process` at `agent.py:292-348`. Per-turn flow:
 
 1. **Trust resolution.** `trust_token = channel_trust(msg.channel)` —
-   one of `internal | authenticated | external-authenticated |
-   household-shared | public`.
+   see `channel_trust.py:9` for the live tier ordering.
 2. **Trust filter.** `self._scope_registry.filter_readable(
    self.config.memory.scopes_readable, trust_token)` drops every
    scope whose `minimum_trust` is not satisfied by the channel's tier.
@@ -438,9 +431,9 @@ covering backend/latency/cache hit. Until M3 lands, the §1 doctrine
 What SQLite is, in current code:
 
 - **Last-N exchange replay only.** `_get_context_sync` reads
-  `tokens // 40` rows from `messages` ordered by `id DESC`, reverses
-  to chronological order, and feeds them through the same `_render`
-  the Honcho path uses. The `_SqliteCtx` shim sets `summary=None` and
+  `tokens // 40` rows (`memory.py:464`) from `messages` ordered by
+  `id DESC`, reverses to chronological order, and feeds them through
+  the same `_render` the Honcho path uses. The `_SqliteCtx` shim sets `summary=None` and
   `peer_representation=None`, so the only sections that can appear
   are `## What I know about you` (driven by `peer_cards`) and
   `## Recent exchanges`.
