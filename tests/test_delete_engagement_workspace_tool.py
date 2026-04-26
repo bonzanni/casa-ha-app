@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -148,3 +149,61 @@ async def test_force_deletes_idle(tmp_path, monkeypatch):
     payload = json.loads(result["content"][0]["text"])
     assert payload["status"] == "ok"
     assert not (tmp_path / "eng-idle").exists()
+
+
+async def test_force_delete_writes_meta_scope_summary(tmp_path, monkeypatch):
+    """M2.G4 — force=True on a still-live engagement must write the
+    summary before pulling the workspace. Pre-fix passed memory_provider
+    =None to _finalize_engagement so force-delete was silent."""
+    import sys
+    from engagement_registry import EngagementRegistry
+    from tools import delete_engagement_workspace, init_tools
+
+    reg = EngagementRegistry(
+        tombstone_path=str(tmp_path / "e.json"), bus=None,
+    )
+    rec = await reg.create(
+        kind="executor", role_or_type="configurator", driver="in_casa",
+        task="t",
+        origin={
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "456", "cid": "abc",
+        },
+        topic_id=99,
+    )
+    # Engagement starts in 'active' (live) status — force=True path.
+
+    mp = MagicMock()
+    mp.ensure_session = AsyncMock(return_value=None)
+    mp.add_turn = AsyncMock(return_value=None)
+
+    fake_agent_mod = MagicMock()
+    fake_agent_mod.active_memory_provider = mp
+    fake_agent_mod.active_engagement_driver = None
+    fake_agent_mod.active_claude_code_driver = None
+    monkeypatch.setitem(sys.modules, "agent", fake_agent_mod)
+
+    tch = MagicMock()
+    tch.send_to_topic = AsyncMock()
+    tch.close_topic_with_check = AsyncMock()
+    cm = MagicMock()
+    cm.get.return_value = tch
+    bus = MagicMock()
+    bus.notify = AsyncMock()
+    init_tools(
+        channel_manager=cm, bus=bus,
+        specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+        trigger_registry=MagicMock(), engagement_registry=reg,
+    )
+
+    res = await delete_engagement_workspace.handler({
+        "engagement_id": rec.id, "force": True,
+    })
+    payload = json.loads(res["content"][0]["text"])
+    assert payload["status"] == "ok"
+
+    meta_sid = "telegram:456:meta:assistant"
+    assert any(
+        c.kwargs.get("session_id") == meta_sid
+        for c in mp.add_turn.await_args_list
+    ), f"expected add_turn({meta_sid!r}); got {mp.add_turn.await_args_list}"
