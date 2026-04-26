@@ -202,3 +202,90 @@ async def test_add_turn_voice_uses_voice_speaker(stub_env):
     msgs = session.add_messages_calls[0]
     assert msgs[0].peer_name == "voice_speaker"
     assert msgs[1].peer_name == "butler"
+
+
+async def test_get_context_renders_summary_and_peer_repr_when_honcho_returns_them(stub_env):
+    """M3a — closes the spec § 9 'real-Honcho-response coverage' gap.
+
+    Existing tests prime the SDK stub with summary=None /
+    peer_representation=None. This one populates both — plus a peer_card
+    bullet and recent messages — and asserts the rendered output
+    contains all four canonical sections from `_render`. Verifies the
+    end-to-end wiring SDK return → HonchoMemoryProvider.get_context →
+    _render → markdown digest, which is the integration contract spec
+    § 9 names but no test exercises today.
+
+    The duck-type matches honcho-ai==2.1.1's SessionContext (verified by
+    Task A.1) — `summary` is an object with `.content: str`,
+    `peer_representation` is `str | None`, `messages` is
+    `list[StubMessage]`, `peer_card` is `list[str]`.
+    """
+    from memory import HonchoMemoryProvider
+
+    p = HonchoMemoryProvider(api_url="http://h", api_key="k")
+    client: StubHoncho = p._client  # type: ignore[attr-defined]
+    session = client.session("telegram:1:domestic:assistant")
+
+    @dataclass
+    class _Summary:
+        content: str
+
+    @dataclass
+    class _Ctx:
+        messages: list = field(default_factory=list)
+        summary: Any = None
+        peer_representation: Any = None
+        peer_card: list = field(default_factory=list)
+
+    session._next_context = _Ctx(
+        messages=[
+            StubMessage(peer_name="nicola", content="what's the weather"),
+            StubMessage(peer_name="assistant", content="sunny, 18C"),
+        ],
+        summary=_Summary(
+            content="Earlier we discussed the user's morning routine.",
+        ),
+        peer_representation=(
+            "User values brevity and prefers Celsius."
+        ),
+        peer_card=["lives in Amsterdam", "drinks oat milk"],
+    )
+
+    out = await p.get_context(
+        "telegram:1:domestic:assistant", "assistant",
+        tokens=4000, search_query="what's the weather",
+    )
+
+    # All four canonical sections present, in the order _render emits.
+    # _render's order is (memory.py:111-131): peer_card → summary →
+    # peer_representation → messages. Assert each substring AND assert
+    # ordering by index comparisons so a future _render reordering
+    # surfaces here, not silently in production.
+    idx_card = out.find("## What I know about you")
+    idx_summary = out.find("## Summary so far")
+    idx_perspective = out.find("## My perspective")
+    idx_recent = out.find("## Recent exchanges")
+    assert idx_card != -1, f"missing peer_card section. out={out!r}"
+    assert idx_summary != -1, f"missing summary section. out={out!r}"
+    assert idx_perspective != -1, f"missing peer_repr section. out={out!r}"
+    assert idx_recent != -1, f"missing messages section. out={out!r}"
+    assert idx_card < idx_summary < idx_perspective < idx_recent
+
+    # Content fidelity: verify each section carries the populated value
+    # (regression guard against a future _render that emits headers but
+    # drops bodies).
+    assert "- lives in Amsterdam" in out
+    assert "- drinks oat milk" in out
+    assert "Earlier we discussed the user's morning routine." in out
+    assert "User values brevity and prefers Celsius." in out
+    assert "[nicola] what's the weather" in out
+    assert "[assistant] sunny, 18C" in out
+
+    # The SDK call still receives the right peer_target / peer_perspective
+    # / search_query forwarding (M2 baseline; reverify here so the new
+    # test is self-sufficient as a single-test sanity check).
+    call = session.context_calls[0]
+    assert call["peer_target"] == "nicola"
+    assert call["peer_perspective"] == "assistant"
+    assert call["search_query"] == "what's the weather"
+    assert call["tokens"] == 4000
