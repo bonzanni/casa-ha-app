@@ -405,3 +405,54 @@ async def test_butler_session_never_sees_assistant_session_messages():
     assert "[butler] voice a" in out
     assert "secret from telegram" not in out
     assert "telegram answer" not in out
+
+
+async def test_get_context_emits_memory_call_log(caplog):
+    """M3b — SqliteMemoryProvider.get_context emits one memory_call
+    line per call with backend=sqlite, summary_present/peer_repr_present
+    always False (no Honcho-equivalent fields on this backend per
+    spec § 10), peer_count = number of rows returned, cache_hit=False."""
+    import logging
+    from memory import SqliteMemoryProvider
+
+    p = SqliteMemoryProvider(":memory:")
+    sid = "telegram:1:domestic:assistant"
+    await p.ensure_session(sid, "assistant")
+    await p.add_turn(sid, "assistant", "hi", "hello")
+    await p.add_turn(sid, "assistant", "more", "ok")
+
+    with caplog.at_level(logging.INFO, logger="memory"):
+        await p.get_context(sid, "assistant", tokens=4000)
+
+    records = [r for r in caplog.records if r.message == "memory_call"]
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.backend == "sqlite"
+    assert rec.session_id == sid
+    assert rec.agent_role == "assistant"
+    assert isinstance(rec.t_ms, int) and rec.t_ms >= 0
+    # Two add_turn calls × 2 messages each = 4 message rows.
+    assert rec.peer_count == 4
+    assert rec.summary_present is False
+    assert rec.peer_repr_present is False
+    assert rec.cache_hit is False
+
+
+async def test_get_context_memory_call_empty_session(caplog):
+    """Even on an empty session (no rows), the log line must fire so
+    operators can detect 'why was the digest empty' (no Honcho call vs
+    empty session)."""
+    import logging
+    from memory import SqliteMemoryProvider
+
+    p = SqliteMemoryProvider(":memory:")
+    sid = "telegram:1:domestic:assistant"
+    await p.ensure_session(sid, "assistant")
+
+    with caplog.at_level(logging.INFO, logger="memory"):
+        out = await p.get_context(sid, "assistant", tokens=200)
+
+    assert out == ""
+    rec = [r for r in caplog.records if r.message == "memory_call"][0]
+    assert rec.peer_count == 0
+    assert rec.backend == "sqlite"
