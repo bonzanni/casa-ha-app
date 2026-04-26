@@ -359,13 +359,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_active  REAL NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS peer_cards (
-    peer_name    TEXT NOT NULL,
-    bullet       TEXT NOT NULL,
-    created_ts   REAL NOT NULL,
-    PRIMARY KEY (peer_name, bullet)
-);
-
 CREATE TABLE IF NOT EXISTS schema_meta (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
@@ -383,12 +376,12 @@ class _SqliteMsg:
 class _SqliteCtx:
     """Duck-typed shape consumed by ``_render``.
 
-    ``summary`` and ``peer_representation`` are always ``None`` on SQLite
-    (no summariser in 2.2b, no dialectic retrieval — spec §5). The 2.2c
-    summariser seam sets ``summary`` once it ships.
+    ``peer_card``, ``summary`` and ``peer_representation`` are always
+    absent on SQLite — graceful-degradation contract (M1.C, see
+    docs/superpowers/specs/2026-04-26-memory-architecture.md §10).
+    Honcho's SessionContext supplies them.
     """
     messages: list[_SqliteMsg] = field(default_factory=list)
-    peer_card: list[str] = field(default_factory=list)
     summary: None = None
     peer_representation: None = None
 
@@ -471,16 +464,7 @@ class SqliteMemoryProvider(MemoryProvider):
             _SqliteMsg(peer_name=r[0], content=r[1])
             for r in reversed(msg_rows)
         ]
-
-        card_rows = self._conn.execute(
-            "SELECT bullet FROM peer_cards "
-            "WHERE peer_name = ? ORDER BY created_ts ASC",
-            (user_peer,),
-        ).fetchall()
-        peer_card = [r[0] for r in card_rows]
-
-        ctx = _SqliteCtx(messages=messages, peer_card=peer_card)
-        return _render(ctx)
+        return _render(_SqliteCtx(messages=messages))
 
     async def add_turn(
         self, session_id: str, agent_role: str,

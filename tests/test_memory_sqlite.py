@@ -101,7 +101,8 @@ async def test_reopen_existing_db_preserves_data_and_schema(tmp_path):
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
     }
-    assert {"messages", "sessions", "peer_cards", "schema_meta"} <= tables
+    assert {"messages", "sessions", "schema_meta"} <= tables
+    assert "peer_cards" not in tables
 
 
 async def test_parent_directory_created(tmp_path):
