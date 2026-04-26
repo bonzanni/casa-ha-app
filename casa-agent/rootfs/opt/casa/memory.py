@@ -139,6 +139,7 @@ def _render(context: object) -> str:
 
 import asyncio  # noqa: E402  (kept near the usage site for clarity)
 import logging  # noqa: E402
+import time  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +211,6 @@ class HonchoMemoryProvider(MemoryProvider):
         search_query: str | None = None,
         user_peer: str = "nicola",
     ) -> str:
-        import time
         t_start = time.perf_counter()
         session = await _to_thread(self._client.session, session_id)
         ctx = await _to_thread(
@@ -284,6 +284,35 @@ class CachedMemoryProvider(MemoryProvider):
         self._locks: dict[tuple[str, str, int], asyncio.Lock] = {}
         self._bg_tasks: set[asyncio.Task] = set()
 
+    @staticmethod
+    def _resolve_backend_name(backend: "MemoryProvider") -> str:
+        """Short string for memory_call's `backend` field.
+
+        Lookup table for the three production provider classes; falls
+        back to `class.__name__` lowercased + suffix-stripped for tests
+        and any future provider. Used only by the M3b telemetry line on
+        the cache-hit path — production providers emit their own name
+        directly from get_context.
+        """
+        # Use class-name string (not isinstance) so the table works
+        # under the lazy-import pattern at module load time.
+        cls = backend.__class__.__name__
+        table = {
+            "HonchoMemoryProvider": "honcho",
+            "SqliteMemoryProvider": "sqlite",
+            "NoOpMemory": "noop",
+        }
+        if cls in table:
+            return table[cls]
+        # Fallback: strip "MemoryProvider" or "Provider" suffix,
+        # lowercase the rest. `RecordingProvider` (test stub) →
+        # "recording".
+        if cls.endswith("MemoryProvider"):
+            return cls[:-len("MemoryProvider")].lower()
+        if cls.endswith("Provider"):
+            return cls[:-len("Provider")].lower()
+        return cls.lower()
+
     async def ensure_session(
         self, session_id: str, agent_role: str, user_peer: str = "nicola",
     ) -> None:
@@ -297,20 +326,59 @@ class CachedMemoryProvider(MemoryProvider):
         search_query: str | None = None,
         user_peer: str = "nicola",
     ) -> str:
+        t_start = time.perf_counter()
         key = (session_id, agent_role, tokens)
         cached = self._cache.get(key)
         if cached is not None:
+            # M3b — wrapper emits its own line on cache hit since the
+            # inner backend never runs. peer_count / summary_present /
+            # peer_repr_present are None because the cache stores only
+            # the rendered string; re-deriving from the string would be
+            # brittle (header parsing). Operators get cache_hit=True as
+            # the primary signal.
+            logger.info(
+                "memory_call",
+                extra={
+                    "backend": self._resolve_backend_name(self._backend),
+                    "session_id": session_id,
+                    "agent_role": agent_role,
+                    "t_ms": int((time.perf_counter() - t_start) * 1000),
+                    "peer_count": None,
+                    "summary_present": None,
+                    "peer_repr_present": None,
+                    "cache_hit": True,
+                },
+            )
             return cached
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             cached = self._cache.get(key)  # re-check after acquire
             if cached is not None:
+                # Miss + recheck-hit fast path (concurrent caller filled
+                # the cache while we waited on the lock). Same emission
+                # as the top-of-method hit branch.
+                logger.info(
+                    "memory_call",
+                    extra={
+                        "backend": self._resolve_backend_name(self._backend),
+                        "session_id": session_id,
+                        "agent_role": agent_role,
+                        "t_ms": int((time.perf_counter() - t_start) * 1000),
+                        "peer_count": None,
+                        "summary_present": None,
+                        "peer_repr_present": None,
+                        "cache_hit": True,
+                    },
+                )
                 return cached
             fresh = await self._backend.get_context(
                 session_id, agent_role, tokens,
                 search_query=search_query, user_peer=user_peer,
             )
             self._cache[key] = fresh
+        # Cache miss path — inner backend's get_context already emitted
+        # its own memory_call line with cache_hit=False. We do NOT emit
+        # here; double-emission would falsify rate dashboards.
         return fresh
 
     async def add_turn(
@@ -450,7 +518,6 @@ class SqliteMemoryProvider(MemoryProvider):
     def _ensure_session_sync(
         self, session_id: str, agent_role: str, user_peer: str,
     ) -> None:
-        import time
         now = time.time()
         with self._conn:
             self._conn.execute(
@@ -468,7 +535,6 @@ class SqliteMemoryProvider(MemoryProvider):
         self, session_id: str, agent_role: str, tokens: int,
         search_query: str | None = None, user_peer: str = "nicola",
     ) -> str:
-        import time
         t_start = time.perf_counter()
         # search_query is ignored on SQLite (no semantic retrieval).
         rendered, peer_count = await asyncio.to_thread(
@@ -520,7 +586,6 @@ class SqliteMemoryProvider(MemoryProvider):
         self, session_id: str, agent_role: str,
         user_text: str, assistant_text: str, user_peer: str,
     ) -> None:
-        import time
         now = time.time()
         with self._conn:  # rolls back automatically on exception
             self._conn.execute(
