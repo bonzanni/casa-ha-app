@@ -110,7 +110,7 @@ async def test_replay_heals_missing_service_dir_with_known_executor(
             prompt_template_path="/nope/prompt.md", hooks_path=None,
             observer_policy_path=None, doctrine_dir="/nope/doctrine",
             extra_dirs=[], mirror_chat_to_topic=False,
-            archive_session_full=False, plugins_dir="",
+            plugins_dir="",
         ),
     })
 

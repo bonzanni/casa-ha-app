@@ -103,7 +103,6 @@ class TestExecutorDefinitionPlan4aFields:
 
         assert defn.extra_dirs == []
         assert defn.mirror_chat_to_topic is True
-        assert defn.archive_session_full is False
         assert defn.plugins_dir == ""
 
     def test_reads_plan4a_fields_from_yaml(self, tmp_path):
@@ -120,7 +119,6 @@ class TestExecutorDefinitionPlan4aFields:
             "extra_dirs:\n"
             "  - /data/casa-plugins-repo\n"
             "mirror_chat_to_topic: false\n"
-            "archive_session_full: true\n"
         )
         (ex_dir / "prompt.md").write_text("hi")
 
@@ -128,7 +126,6 @@ class TestExecutorDefinitionPlan4aFields:
 
         assert defn.extra_dirs == ["/data/casa-plugins-repo"]
         assert defn.mirror_chat_to_topic is False
-        assert defn.archive_session_full is True
 
     def test_plugins_dir_resolves_when_plugins_subdir_exists(self, tmp_path):
         from agent_loader import load_all_executors
