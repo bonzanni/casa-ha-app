@@ -112,3 +112,26 @@ The new specialist won't be callable until the resident's delegates.yaml lists i
 - Setting memory.token_budget > 0 - loader rejects.
 - Including channels: [telegram] - loader rejects.
 - Copying a resident's disclosure.yaml - loader rejects.
+
+## Memory-bearing specialist (M4b, v0.17.0)
+
+Specialists are per-`(role, user_peer)` Honcho peers — channel-agnostic
+and scope-agnostic. To opt a specialist into memory, set
+`memory.token_budget > 0` in `runtime.yaml`:
+
+```yaml
+memory:
+  token_budget: 4000        # 0 = stateless (legacy); >0 enables Honcho memory
+  read_strategy: per_turn   # cached not yet supported for specialists
+  scopes_owned: []          # MUST stay empty — specialists don't partition by scope
+  scopes_readable: []       # MUST stay empty — specialists don't partition by scope
+```
+
+The session id is `f"{role}:{user_peer}"` (e.g. `finance:nicola`).
+Specialists become richer over time at their own domain reasoning;
+Honcho's `peer_representation` accumulates the specialist's
+theory-of-mind of the user across all delegate-call channels.
+
+Trust gating happens one level up: a specialist is callable from a
+channel iff some resident on that channel has it in `delegates`.
+Once invoked, the specialist's full unified memory is in scope.
