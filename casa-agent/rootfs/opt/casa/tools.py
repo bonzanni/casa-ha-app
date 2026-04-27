@@ -987,7 +987,6 @@ async def engage_executor(args: dict) -> dict:
     # type hasn't opted in (defn.memory.enabled=False is the default).
     executor_memory_block = ""
     if defn.memory.enabled:
-        import agent as agent_mod
         memory_provider = getattr(agent_mod, "active_memory_provider", None)
         executor_memory_block = await _fetch_executor_archive(
             memory_provider=memory_provider,
