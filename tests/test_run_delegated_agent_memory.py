@@ -120,3 +120,23 @@ def _set_origin(monkeypatch, *, role: str = "assistant",
         "scope": scope,
         "delegation_depth": 0,
     })
+
+
+async def test_token_budget_zero_skips_all_memory_calls(monkeypatch):
+    """A specialist with token_budget=0 keeps today's stateless behavior:
+    no ensure_session, no get_context, no add_turn."""
+    cfg = _specialist_cfg(role="finance", token_budget=0)
+    mp = _make_memory_provider()
+    _patch_active_memory_provider(monkeypatch, mp)
+    _set_origin(monkeypatch)
+    _FakeSpecialistClient.reset(response="finance reply")
+
+    with patch.object(tools, "ClaudeSDKClient", _FakeSpecialistClient):
+        text = await tools._run_delegated_agent(
+            cfg, task_text="how is Q1 cashflow?", context_text="",
+        )
+
+    assert text == "finance reply"
+    mp.ensure_session.assert_not_awaited()
+    mp.get_context.assert_not_awaited()
+    mp.add_turn.assert_not_awaited()
