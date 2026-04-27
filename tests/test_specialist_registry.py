@@ -124,7 +124,9 @@ class TestValidation:
             for r in caplog.records
         )
 
-    async def test_rejects_non_zero_token_budget(self, tmp_path, caplog):
+    async def test_accepts_non_zero_token_budget(self, tmp_path, caplog):
+        """M4b: specialists may opt into Honcho memory by setting
+        memory.token_budget > 0. The validator must accept this."""
         import logging
         from specialist_registry import SpecialistRegistry
 
@@ -135,9 +137,13 @@ class TestValidation:
                                  tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.ERROR):
             reg.load()
-        assert reg.get("rich") is None
-        assert any(
-            "token_budget" in r.message for r in caplog.records
+        cfg = reg.get("rich")
+        assert cfg is not None, "specialist with token_budget>0 must load"
+        assert cfg.memory.token_budget == 1000
+        # No rejection log mentioning token_budget
+        assert not any(
+            "token_budget" in r.message and "Rejecting" in r.message
+            for r in caplog.records
         )
 
     async def test_rejects_non_ephemeral_session(self, tmp_path, caplog):
