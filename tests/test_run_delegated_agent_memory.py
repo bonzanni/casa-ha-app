@@ -280,8 +280,14 @@ async def test_add_turn_fires_with_task_body_and_reply(monkeypatch):
     if bg:
         await asyncio.gather(*list(bg), return_exceptions=True)
 
-    mp.add_turn.assert_awaited_once()
-    kwargs = mp.add_turn.await_args.kwargs
+    # Two add_turn calls expected: specialist session + parent meta scope
+    # (the latter added by Task 12). Locate the specialist-session call.
+    specialist_calls = [
+        c for c in mp.add_turn.await_args_list
+        if c.kwargs.get("session_id") == "finance:nicola"
+    ]
+    assert len(specialist_calls) == 1
+    kwargs = specialist_calls[0].kwargs
     assert kwargs["session_id"] == "finance:nicola"
     assert kwargs["agent_role"] == "finance"
     assert kwargs["user_peer"] == "nicola"
@@ -338,3 +344,32 @@ async def test_add_turn_failure_does_not_surface(monkeypatch, caplog):
     assert any(
         r.levelno >= logging.WARNING for r in caplog.records
     ), "expected at least one WARNING from the failed add_turn"
+
+
+async def test_delegation_writes_meta_scope_summary(monkeypatch):
+    """Each delegate-to-specialist call writes one summary line to the
+    parent's meta session, mirroring _finalize_engagement (tools.py:1163-1197)."""
+    cfg = _specialist_cfg(role="finance", token_budget=4000)
+    mp = _make_memory_provider()
+    _patch_active_memory_provider(monkeypatch, mp)
+    _set_origin(monkeypatch, channel="telegram", chat_id="abc",
+                role="assistant", scope="personal")
+    _FakeSpecialistClient.reset(response="on track; June 15 ETA")
+
+    with patch.object(tools, "ClaudeSDKClient", _FakeSpecialistClient):
+        await tools._run_delegated_agent(
+            cfg, task_text="Q1 cashflow?", context_text="",
+        )
+
+    bg = getattr(tools, "_specialist_bg_tasks", set())
+    if bg:
+        await asyncio.gather(*list(bg), return_exceptions=True)
+
+    # Two add_turn calls expected: one to finance:nicola (specialist),
+    # one to telegram:abc:meta:assistant (parent meta).
+    sessions_written = {
+        c.kwargs["session_id"]
+        for c in mp.add_turn.await_args_list
+    }
+    assert "finance:nicola" in sessions_written
+    assert "telegram:abc:meta:assistant" in sessions_written
