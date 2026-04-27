@@ -228,8 +228,11 @@ Live session ids are 4 segments:
 - `channel` — `telegram`, `voice`, `webhook`, `scheduler`, etc.
 - `chat_id` — the per-channel conversation key (Telegram chat id, voice
   room, webhook conversation handle); `"default"` when missing.
-- `scope` — one of `personal | business | finance | house` (or any
-  scope declared in `policies/scopes.yaml`); inserted by Phase 3.2.
+- `scope` — one of `personal | business | finance | house` (topical) or
+  `meta` (system, M4 v0.16.0); any scope declared in
+  `policies/scopes.yaml`. Topical scopes are inserted by Phase 3.2's
+  classifier; the `meta` system scope is always-on for residents whose
+  `scopes_readable` includes it (today: assistant only).
 - `role` — `assistant`, `butler`, `finance`, etc.
 
 **Two-stage build.** The first two segments are joined by
@@ -271,12 +274,21 @@ engagement during a turn (e.g. `engage_executor` → Tina, `delegate_to_agent`
 → a specialist), the engagement record's `origin` dict carries
 `scope = argmax_scope(scores, default_scope)` stamped onto `origin_var`
 by `agent.py:309-314` immediately after the read-path classifier runs.
-Downstream consumers — chiefly `query_engager` at `tools.py:1357`,
+Downstream consumers — chiefly `query_engager` at `tools.py:1410`,
 which rebuilds `{channel}:{chat_id}:{scope}:{role}` to retrieve from
 the engager's actual session — read it via `engagement.origin.get(
 "scope", "meta")`. The literal `"meta"` fallback handles edge paths
 (cron triggers, boot replay) that engage without going through
 `_process`. M2 (G6) shipped this stamp.
+
+**Meta as a real scope (M4, v0.16.0).** The literal `"meta"` fallback at
+`tools.py:1410` is now consistent with a real declared scope (`kind:
+system`) rather than a written-but-never-read magic string. The
+fallback still handles edge paths (cron triggers, boot replay) that
+engage without going through `_process` and therefore have no rooted
+topical scope to stamp. M2.G6's argmax stamp continues to operate over
+topical scopes only — system scopes have no description, no embedding,
+and never win argmax.
 
 ---
 
@@ -291,24 +303,29 @@ Implemented in `Agent._process` at `agent.py:292-348`. Per-turn flow:
    scope whose `minimum_trust` is not satisfied by the channel's tier.
    Filter happens *before* scoring — denied scopes never get an
    embedding lookup.
-3. **Scoring.** `self._scope_registry.score(user_text, readable)`
-   computes cosine similarity between the per-utterance e5-large
-   embedding and each readable scope's pre-embedded `description`.
-   Returns `{scope: float}`.
-4. **Active set.** `active_from_scores(scores, default_scope)` keeps
-   scores above `threshold` (default `0.35`); if everything falls
-   short and `default_scope` is in `scores`, returns
-   `[default_scope]`; otherwise returns `[]` (all paths refuse the
-   write rather than leak into a forbidden scope).
-5. **Per-scope budget.** `per_scope_tokens =
+3. **System / topical partition (M4 v0.16.0).** The readable set is
+   split by `ScopeRegistry.kind(s)`:
+   - `kind: system` scopes (today: only `meta`) are **always-on** —
+     no classifier scoring, no embedding lookup, no threshold check.
+   - `kind: topical` scopes go through steps 4-5.
+4. **Scoring.** `self._scope_registry.score(user_text,
+   topical_readable)` computes cosine similarity between the
+   per-utterance e5-large embedding and each readable topical scope's
+   pre-embedded `description`. Returns `{scope: float}`.
+5. **Active set.** `active_from_scores(scores, default_scope)` keeps
+   topical scores above `threshold` (default `0.35`); if everything
+   falls short and `default_scope` is in `scores`, returns
+   `[default_scope]`; otherwise returns `[]`. Final active set is
+   `system_readable + active_topical`.
+6. **Per-scope budget.** `per_scope_tokens =
    max(self.config.memory.token_budget // max(len(active), 1), 1)` —
    total budget divided evenly so the system prompt stays bounded.
-6. **Parallel ensure + fetch.** `asyncio.gather` runs an `_one_scope`
+7. **Parallel ensure + fetch.** `asyncio.gather` runs an `_one_scope`
    coroutine per active scope. Each builds its 4-segment `sid`, calls
    `ensure_session` then `get_context`, and returns
    `(scope, digest)`. Per-scope exceptions are caught and replaced
    with `digest=""` so one Honcho hiccup doesn't kill the whole turn.
-7. **Digest concatenation.** Non-empty digests are joined as
+8. **Digest concatenation.** Non-empty digests are joined as
 
    ```
    <memory_context scope="finance">
@@ -322,7 +339,7 @@ Implemented in `Agent._process` at `agent.py:292-348`. Per-turn flow:
    (one block per active scope). The full `memory_blocks` string is
    appended to the system prompt alongside `<channel_context>`,
    `<delegates>`, `<executors>`, `<current_time>`.
-8. **Token budget tracking.** `BudgetTracker.record(...)` measures
+9. **Token budget tracking.** `BudgetTracker.record(...)` measures
    the assembled `memory_blocks` against the agent's
    `token_budget` and emits a per-turn over-budget streak counter
    used by the spec-5.2 budget telemetry.
@@ -478,8 +495,17 @@ explicitly in the "ruled out" section of `docs/MEMORY-ROADMAP.md`.
 Implemented in `casa-agent/rootfs/opt/casa/scope_registry.py`.
 
 - **`ScopeLibrary`** (`scope_registry.py:44`) — loads + validates
-  `policies/scopes.yaml` against `defaults/schema/policy-scopes.v1.json`.
-  Each scope has a `minimum_trust` and a `description`.
+  `policies/scopes.yaml` against
+  `defaults/schema/policy-scopes.v2.json` (M4 schema bump). Each
+  scope has a `minimum_trust`, a `kind` (`topical | system`), and —
+  for topical scopes only — a `description`.
+- **`ScopeLibrary.kind(name) -> str`** (M4 v0.16.0) — returns
+  `"topical"` or `"system"` for the loaded scope. Schema v2 enforces
+  the partition at load time (topical requires `description`, system
+  forbids it).
+- **`ScopeRegistry.kind(name)`** — delegates to the underlying library.
+  `Agent._process` uses it to partition `readable` into the always-on
+  system set and the classifier-routed topical set (§ 6 step 3).
 - **`ScopeRegistry`** (`scope_registry.py:114`) — wraps the library
   with the trust-filter helpers and the embedding model.
 - **Model.** `intfloat/multilingual-e5-large` via `fastembed`'s ONNX
@@ -538,11 +564,15 @@ remaining for memory work:
   hit branch (see § 13 for the field contract). Live-flag-gated test
   deferred as M3a.1 follow-up. NoOp provider is intentionally silent —
   see § 13 emission-sites note.
-- **M4 — Engagement memory.** Combines G5 (`meta` and
-  `executor:<type>` not declared in `scopes.yaml`), G9 (Tier-3
-  Executors get no memory injection at all), B4 (engagement summaries
-  are write-only). Brainstorm-required before plan-write because the
-  "executors stateless" framing has real arguments either way.
+- **M4 — Shipped v0.16.0.** L1: `meta` declared as `kind: system` in
+  `scopes.yaml` v2; resident `scopes_readable` updated to include
+  `meta` (assistant only — voice/Tina excluded by trust gate). L3:
+  `ExecutorMemoryConfig` on `ExecutorDefinition`; Configurator opts
+  in. New `{executor_memory}` prompt slot in `engage_executor`
+  populated from per-executor Honcho session at
+  `{channel}:{chat_id}:executor:{type}`. L4: free benefit — meta
+  session already populated by `_finalize_engagement` (M2.G4)
+  becomes readable. See § 14 for the full shape.
 - **M5 — `remember_fact` tool.** The deferred-since-v0.4.0 feature.
   Honcho path appends to `peer_card` via the v3 SDK; SQLite path
   log-and-skips per the §1 doctrine.
@@ -622,7 +652,7 @@ the fallbacks, both for clarity and to lock in the operator-facing
 name independent of class-name churn.
 
 **Why provider-level, not aggregated per-turn:** a turn fans out to N
-scopes (§ 6 step 6), each with its own `_one_scope` coroutine that
+scopes (§ 6 step 7), each with its own `_one_scope` coroutine that
 calls `get_context` once. Per-scope attribution lets operators answer
 "why is finance scope slow?" without re-implementing the join in the
 log pipeline. The `cid_var` value (already injected via `extra` by the
@@ -646,3 +676,72 @@ Tests at `tests/test_memory_honcho.py`, `tests/test_memory_sqlite.py`,
 `tests/test_memory_cached.py` assert each site's field shape; any
 future addition to the contract MUST update all four sites and all
 three test files in the same commit.
+
+---
+
+## 14. Engagement memory (M4, v0.16.0)
+
+Three layers, one user-visible behavior: engagement summaries flow back
+into resident context.
+
+### 14.1 L1 — `meta` as a system scope
+
+`policies/scopes.yaml` v2 declares `meta` as `kind: system,
+minimum_trust: authenticated`. System scopes have no description (no
+embedding) and bypass the per-turn classifier. After the trust filter,
+they are unconditionally added to the active set for any agent whose
+`scopes_readable` includes them.
+
+Today only the assistant (Ellen) declares `meta` in
+`scopes_readable`. Voice / `household-shared`-trust agents (Tina) are
+filtered out by the `authenticated` trust gate — voice latency budget
+unchanged; engagement summaries never leak to the voice channel.
+
+### 14.2 L3 — Per-executor archive read at engage-start
+
+`ExecutorMemoryConfig(enabled: bool = False, token_budget: int = 2000)`
+on `ExecutorDefinition` (`config.py:203`) opts an executor type into
+cross-engagement context. When `enabled: true`, `engage_executor`
+(`tools.py:896`) reads from
+`{channel}:{chat_id}:executor:{type}` via Honcho's
+`session.context(tokens=token_budget)` and interpolates the digest
+into the prompt template's `{executor_memory}` slot under the header
+`"## Prior engagements (lessons learned)"`.
+
+Empty archive (fresh executor type, fresh install) returns `""` from
+the helper — slot collapses to a blank line. No dangling header.
+
+Driver compatibility: `in_casa` driver receives the rendered prompt
+via `options.system_prompt` + `driver.start(prompt=...)`. `claude_code`
+driver renders `CLAUDE.md.tmpl` (or the legacy single-template path)
+through `drivers/workspace.py`; the same `{executor_memory}` slot is
+substituted there too (forward-compat for memory-enabled claude_code
+executors).
+
+### 14.3 L4 — Free benefit from L1
+
+`_finalize_engagement` (`tools.py::_finalize_engagement`, meta-write
+block at `tools.py:1163-1197`) already writes one summary per terminal
+engagement to the meta session
+`{channel}:{chat_id}:meta:assistant`, regardless of engagement kind
+(specialist OR executor). The write site has been live since M2.G4
+(v0.15.3). Once L1 declares meta as a readable scope, those summaries
+become readable on Ellen's normal turn — no new writer code.
+
+### 14.4 What is intentionally deferred
+
+- **L2 — Specialists become memory-bearing.** Deferred to M4b. The
+  per-specialist session shape genuinely competes with Honcho's
+  per-peer cross-session continuity, and the structural change (lifting
+  the `agent_loader.py:562-573` ban + wiring memory in
+  `_run_delegated_agent` at `tools.py:318`) deserves its own
+  brainstorm.
+- **Synthesized "lessons learned" archive content.** Today's archive
+  contents are `executor_engagement_summary` JSON blobs from
+  `tools.py:1239` (write block at `tools.py:1231-1264`); Honcho's
+  summary across them is modestly useful but not richly actionable.
+  Future tweaks (free-form `lesson` field on emit_completion;
+  executor emits a `lesson` string before terminate) wait until real
+  archive usage shows the JSON form too thin.
+- **`remember_fact` via directional `peer_card`.** Deferred to M5.
+- **Cross-role recall (`consult_other_agent_memory`).** Deferred to M6.
