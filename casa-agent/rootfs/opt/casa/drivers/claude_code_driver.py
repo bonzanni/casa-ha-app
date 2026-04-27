@@ -73,10 +73,7 @@ class ClaudeCodeDriver(DriverProtocol):
                 # configurator) works without further plumbing. Lazy imports
                 # avoid a top-level cycle (drivers ← agent ← drivers).
                 executor_memory_block = ""
-                if (
-                    getattr(defn, "memory", None) is not None
-                    and defn.memory.enabled
-                ):
+                if defn.memory.enabled:
                     import agent as agent_mod
                     from tools import _fetch_executor_archive
                     executor_memory_block = await _fetch_executor_archive(
