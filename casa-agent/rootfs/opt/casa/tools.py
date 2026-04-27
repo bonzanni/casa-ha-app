@@ -343,17 +343,51 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
     )
 
     if context_text:
-        body = (
-            f"{delegation_context}\n\n"
+        body_tail = (
             f"Task: {task_text}\n\n"
             f"Context from {caller_name}:\n{context_text}"
         )
     else:
-        body = (
-            f"{delegation_context}\n\n"
-            f"Task: {task_text}"
-        )
-    prompt = body
+        body_tail = f"Task: {task_text}"
+
+    # M4b: optional specialist memory read.
+    # Opt-in via cfg.memory.token_budget > 0. Session keyed
+    # f"{role}:{user_peer}" — channel-agnostic, scope-agnostic, per-peer.
+    memory_block = ""
+    user_peer = "nicola"
+    session_id = f"{cfg.role}:{user_peer}"
+    memory_provider = None
+    if cfg.memory.token_budget > 0:
+        memory_provider = getattr(agent_mod, "active_memory_provider", None)
+        if memory_provider is not None:
+            try:
+                await memory_provider.ensure_session(
+                    session_id=session_id,
+                    agent_role=cfg.role,
+                    user_peer=user_peer,
+                )
+                digest = await memory_provider.get_context(
+                    session_id=session_id,
+                    agent_role=cfg.role,
+                    tokens=cfg.memory.token_budget,
+                    search_query=task_text,
+                    user_peer=user_peer,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "specialist memory read failed for %s (%s); "
+                    "continuing with no memory context",
+                    cfg.role, exc,
+                )
+                digest = ""
+            if digest:
+                memory_block = (
+                    f'<memory_context agent="{cfg.role}">\n'
+                    f"{digest}\n"
+                    f"</memory_context>\n\n"
+                )
+
+    prompt = f"{delegation_context}\n\n{memory_block}{body_tail}"
 
     options = _build_specialist_options(cfg)
     text = ""
