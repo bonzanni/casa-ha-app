@@ -12,14 +12,16 @@ def _write(path, text: str) -> None:
 
 
 SCOPES_YAML = """\
-schema_version: 1
+schema_version: 2
 scopes:
   personal:
     minimum_trust: authenticated
+    kind: topical
     description: |
       Private life: relationships, friendships, non-work correspondence.
   house:
     minimum_trust: household-shared
+    kind: topical
     description: |
       The physical house: appliances, lights, plumbing, contractors.
 """
@@ -48,7 +50,7 @@ class TestScopeLibraryLoad:
         from scope_registry import load_scope_library, ScopeError
 
         f = tmp_path / "scopes.yaml"
-        _write(f, "schema_version: 99\nscopes: {personal: {minimum_trust: authenticated, description: '01234567890123456789'}}\n")
+        _write(f, "schema_version: 99\nscopes: {personal: {minimum_trust: authenticated, kind: topical, description: '01234567890123456789'}}\n")
 
         with pytest.raises(ScopeError, match=r"schema violation"):
             load_scope_library(str(f))
@@ -58,10 +60,11 @@ class TestScopeLibraryLoad:
 
         f = tmp_path / "scopes.yaml"
         _write(f, textwrap.dedent("""\
-            schema_version: 1
+            schema_version: 2
             scopes:
               weird:
                 minimum_trust: supercalifragilistic
+                kind: topical
                 description: |
                   Long enough description to pass the minLength check.
         """))
@@ -74,10 +77,11 @@ class TestScopeLibraryLoad:
 
         f = tmp_path / "scopes.yaml"
         _write(f, textwrap.dedent("""\
-            schema_version: 1
+            schema_version: 2
             scopes:
               x:
                 minimum_trust: authenticated
+                kind: topical
                 description: short
         """))
 
@@ -222,22 +226,26 @@ class _FakeEmbedder:
 
 
 EMBED_SCOPES_YAML = """\
-schema_version: 1
+schema_version: 2
 scopes:
   personal:
     minimum_trust: authenticated
+    kind: topical
     description: |
       personal private life correspondence non-work plans.
   business:
     minimum_trust: authenticated
+    kind: topical
     description: |
       business professional work career meetings deadlines.
   finance:
     minimum_trust: authenticated
+    kind: topical
     description: |
       finance invoices bills payments banking taxes VAT.
   house:
     minimum_trust: household-shared
+    kind: topical
     description: |
       house appliances plumbing heating lights contractors sensors.
 """

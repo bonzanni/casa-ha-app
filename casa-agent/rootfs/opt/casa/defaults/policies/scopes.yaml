@@ -31,10 +31,11 @@
 # Then re-run the sweep to confirm no regression on the seed fixture:
 #   CASA_REAL_EMBED=1 CASA_EVAL_SWEEP=1 python scripts/run_sweep.py
 
-schema_version: 1
+schema_version: 2
 scopes:
   personal:
     minimum_trust: authenticated
+    kind: topical
     description: |
       private life, personal life, friendships, family,
       parents, siblings, partner, romantic relationship,
@@ -49,6 +50,7 @@ scopes:
 
   business:
     minimum_trust: authenticated
+    kind: topical
     description: |
       professional life, work, employment, career, job,
       work meetings, calls with colleagues, team meetings,
@@ -64,6 +66,7 @@ scopes:
 
   finance:
     minimum_trust: authenticated
+    kind: topical
     description: |
       money, money movement, financial transactions,
       invoices, bills, payments, receipts,
@@ -78,6 +81,7 @@ scopes:
 
   house:
     minimum_trust: household-shared
+    kind: topical
     description: |
       house, home, household, residence,
       appliances, dishwasher, washing machine, fridge, oven,
@@ -89,3 +93,11 @@ scopes:
       sensors, device state, smart home, automation,
       Wi-Fi, network, router,
       rooms, kitchen, bedroom, living room, bathroom, hallway, garage
+
+  meta:
+    minimum_trust: authenticated
+    kind: system
+    # System scope: always-on after trust filter; no embedding,
+    # no classifier routing. Tool-written by _finalize_engagement
+    # (see tools.py:1131); read by residents whose scopes_readable
+    # includes 'meta' (see runtime.yaml).

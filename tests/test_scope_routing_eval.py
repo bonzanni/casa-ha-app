@@ -30,22 +30,26 @@ FALLBACK_CAP = 0.20       # maximum full-mode fallback_rate
 
 
 SCOPES_YAML_TEXT = """\
-schema_version: 1
+schema_version: 2
 scopes:
   personal:
     minimum_trust: authenticated
+    kind: topical
     description: |
       personal private life correspondence non-work plans.
   business:
     minimum_trust: authenticated
+    kind: topical
     description: |
       business professional work career meetings deadlines.
   finance:
     minimum_trust: authenticated
+    kind: topical
     description: |
       finance invoices bills payments banking taxes VAT.
   house:
     minimum_trust: household-shared
+    kind: topical
     description: |
       house appliances plumbing heating lights contractors sensors.
 """
