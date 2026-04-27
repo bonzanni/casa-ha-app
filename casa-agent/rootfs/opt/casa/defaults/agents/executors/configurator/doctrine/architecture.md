@@ -75,10 +75,12 @@ agent_loader.py enforces these rules. Adding a forbidden file or removing a requ
 ## Memory wiring per tier (v0.16.0 — Memory M4)
 
 Residents (Tier 1) own per-scope sessions and read summaries from the
-`meta` system scope each turn. Specialists (Tier 2) are stateless per
-delegation — no session continuity. Tier 3 Executors are ephemeral per
-engagement, but may opt in to a per-(channel, chat, executor_type)
-**archive** of prior engagement summaries.
+`meta` system scope each turn. Specialists (Tier 2) were stateless per
+delegation through v0.16.0 — *Specialist memory (M4b, v0.17.0)* below
+documents the per-`(role, user_peer)` Honcho memory opt-in. Tier 3
+Executors are ephemeral per engagement, but may opt in to a
+per-(channel, chat, executor_type) **archive** of prior engagement
+summaries.
 
 **Scope kinds.** `policies/scopes.yaml` v2 declares each scope with
 `kind: topical | system`:
