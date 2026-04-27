@@ -47,3 +47,30 @@ agent's `delegate_to_agent` call, the calling channel is text → answer in
 conversational text register; voice → answer in spoken register. See
 butler/prompts/system.md for the canonical paragraph; copy or adapt it
 when authoring a new resident.
+
+## Engagement-memory readability (M4, v0.16.0)
+
+If the new resident may be a target of `engage_executor` engagements
+(today: only assistant/Ellen, but a future second resident could
+acquire that capability), include `meta` in `memory.scopes_readable`:
+
+```yaml
+memory:
+  scopes_readable: [<your-topical-scopes>, meta]
+  scopes_owned:    [<your-topical-scopes>]   # NOT meta
+  default_scope:   <your-default-topical-scope>
+```
+
+`meta` is the system scope where `_finalize_engagement` writes
+engagement summaries (specialist + executor). Including it in
+`scopes_readable` makes Ellen's "what did Configurator just do?" /
+"what did Finance say?" turns answerable.
+
+DO NOT add `meta` to `scopes_owned` — meta is exclusively
+tool-written. Routing the resident's own `add_turn` to meta would
+dilute the engagement-summary signal with conversational noise.
+
+For voice-only / `household-shared`-trust residents (today: butler/
+Tina), exclude `meta` from `scopes_readable`. Even if added, the
+trust filter at `agent.py:296` would drop it (meta requires
+`authenticated`); excluding it makes the intent explicit.
