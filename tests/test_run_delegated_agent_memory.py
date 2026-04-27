@@ -221,3 +221,41 @@ async def test_empty_digest_omits_memory_context_block(monkeypatch):
     prompt = _FakeSpecialistClient.captured_prompt
     assert "<memory_context" not in prompt
     assert "Task: hi" in prompt
+
+
+async def test_get_context_raises_yields_no_memory_block(monkeypatch):
+    """If get_context raises, the specialist still runs — no memory_context
+    block, no exception propagated."""
+    cfg = _specialist_cfg(role="finance", token_budget=4000)
+    mp = _make_memory_provider()
+    mp.get_context = AsyncMock(side_effect=RuntimeError("honcho boom"))
+    _patch_active_memory_provider(monkeypatch, mp)
+    _set_origin(monkeypatch)
+    _FakeSpecialistClient.reset()
+
+    with patch.object(tools, "ClaudeSDKClient", _FakeSpecialistClient):
+        text = await tools._run_delegated_agent(
+            cfg, task_text="hi", context_text="",
+        )
+
+    assert text == "finance reply"
+    prompt = _FakeSpecialistClient.captured_prompt
+    assert "<memory_context" not in prompt
+
+
+async def test_active_memory_provider_none_skips(monkeypatch):
+    """If the global memory provider is unset (NoOp / boot-degraded), the
+    specialist runs as today (no memory injection), no exception."""
+    cfg = _specialist_cfg(role="finance", token_budget=4000)
+    _patch_active_memory_provider(monkeypatch, None)
+    _set_origin(monkeypatch)
+    _FakeSpecialistClient.reset()
+
+    with patch.object(tools, "ClaudeSDKClient", _FakeSpecialistClient):
+        text = await tools._run_delegated_agent(
+            cfg, task_text="hi", context_text="",
+        )
+
+    assert text == "finance reply"
+    prompt = _FakeSpecialistClient.captured_prompt
+    assert "<memory_context" not in prompt
