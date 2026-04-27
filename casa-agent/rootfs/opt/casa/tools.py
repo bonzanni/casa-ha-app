@@ -362,9 +362,12 @@ async def _specialist_meta_write_bg(
 ) -> None:
     """Write a one-line specialist-call summary to the parent's meta session.
 
-    Mirrors _finalize_engagement's meta-write (tools.py:1163-1197) for
-    inline delegate_to_agent calls. Gives Ellen a unified view of
-    specialist activity independent of which scope her own turn wrote to.
+    Mirrors _finalize_engagement's meta-write (tools.py:1325-1334) for
+    inline delegate_to_agent calls, with task and reply truncated to
+    200 chars per side (the engagement-finalize meta-write is untruncated;
+    this helper introduces the per-summary cap as new M4b policy). Gives
+    Ellen a unified view of specialist activity independent of which scope
+    her own turn wrote to.
     """
     channel = str(parent_origin.get("channel") or "")
     chat_id = str(parent_origin.get("chat_id") or "")
