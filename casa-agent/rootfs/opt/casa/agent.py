@@ -297,15 +297,24 @@ class Agent:
                 list(self.config.memory.scopes_readable),
                 trust_token,
             )
-            scores = self._scope_registry.score(user_text, readable)
-            active = self._scope_registry.active_from_scores(
+            # M4: Partition. System scopes (kind: system) are always-on after
+            # the trust filter — no classifier routing, no embedding lookup.
+            # Topical scopes (kind: topical) go through the embedding score()
+            # + active_from_scores() pipeline as before.
+            system_readable = [
+                s for s in readable if self._scope_registry.kind(s) == "system"
+            ]
+            topical_readable = [
+                s for s in readable if self._scope_registry.kind(s) == "topical"
+            ]
+            scores = self._scope_registry.score(user_text, topical_readable)
+            active_topical = self._scope_registry.active_from_scores(
                 scores, self.config.memory.default_scope,
             )
-            # M2.G6: stamp the engager's rooted scope onto origin so any
-            # downstream tool that snapshots origin (engage_executor →
-            # query_engager) sees the actual scope, not the "meta"
-            # fallback at tools.py:1357. ContextVar.reset() at the
-            # finally block reverts both this set and the original.
+            active = system_readable + active_topical
+            # M2.G6: argmax over topical-only scores. System scopes have no
+            # embedding (no description); they can never be the rooted
+            # write/origin scope. Argmax picks the engager's actual domain.
             origin_var.set({
                 **(origin_var.get() or {}),
                 "scope": self._scope_registry.argmax_scope(
