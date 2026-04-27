@@ -31,6 +31,15 @@
       "items": {"type": "string"},
       "default": []
     },
-    "mirror_chat_to_topic": {"type": "boolean", "default": true}
+    "mirror_chat_to_topic": {"type": "boolean", "default": true},
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled":      {"type": "boolean"},
+        "token_budget": {"type": "integer", "minimum": 100}
+      }
+    }
   }
 }
