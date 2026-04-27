@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -95,3 +96,44 @@ def test_substitutes_executor_memory_slot_when_memory_enabled(monkeypatch, tmp_p
     assert "ws ok" in rendered
     assert "Prior engagements" in rendered
     assert "{executor_memory}" not in rendered
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="provision_workspace uses os.mkfifo (Linux-only)",
+)
+async def test_workspace_legacy_path_substitutes_executor_memory(tmp_path):
+    """The legacy provision_workspace path threads executor_memory through.
+
+    Forward-compat coverage for the claude_code driver — no claude_code
+    executor opts into memory today, but workspace.py wires the slot so a
+    future memory-enabled claude_code executor works without plumbing.
+    """
+    from drivers.workspace import provision_workspace
+
+    class _Defn:
+        type = "x"
+        prompt_template_path = str(tmp_path / "prompt.md")
+        hooks_path = None
+    (tmp_path / "prompt.md").write_text(
+        "task={task} mem={executor_memory}\n", encoding="utf-8",
+    )
+
+    eng_root = tmp_path / "engagements"
+    eng_root.mkdir()
+    plugins_root = tmp_path / "plugins_root"
+    plugins_root.mkdir()
+
+    await provision_workspace(
+        engagements_root=str(eng_root),
+        base_plugins_root=str(plugins_root),
+        engagement_id="abc12345",
+        defn=_Defn(),
+        task="dotask",
+        context="(none)",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
+        executor_memory="## Prior\nbody",
+    )
+    claude_md = (eng_root / "abc12345" / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "task=dotask" in claude_md
+    assert "mem=## Prior\nbody" in claude_md

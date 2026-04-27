@@ -66,6 +66,29 @@ class ClaudeCodeDriver(DriverProtocol):
         service_dir_written = False
         async with s6_rc._compile_lock:
             try:
+                # M4: precompute executor_memory if the executor opts in.
+                # Forward-compat — no claude_code executor opts in today, but
+                # threading the slot now means a future memory-enabled
+                # claude_code executor (e.g. claude_code-flavoured
+                # configurator) works without further plumbing. Lazy imports
+                # avoid a top-level cycle (drivers ← agent ← drivers).
+                executor_memory_block = ""
+                if (
+                    getattr(defn, "memory", None) is not None
+                    and defn.memory.enabled
+                ):
+                    import agent as agent_mod
+                    from tools import _fetch_executor_archive
+                    executor_memory_block = await _fetch_executor_archive(
+                        memory_provider=getattr(
+                            agent_mod, "active_memory_provider", None,
+                        ),
+                        channel=engagement.origin.get("channel", "telegram"),
+                        chat_id=str(engagement.origin.get("chat_id", "")),
+                        executor_type=defn.type,
+                        token_budget=defn.memory.token_budget,
+                    )
+
                 # 1. Provision workspace (CLAUDE.md, .mcp.json, plugins, FIFO, meta).
                 ws = await provision_workspace(
                     engagements_root=self._engagements_root,
@@ -75,6 +98,7 @@ class ClaudeCodeDriver(DriverProtocol):
                     task=engagement.task,
                     context=engagement.origin.get("context", ""),
                     casa_framework_mcp_url=self._casa_framework_mcp_url,
+                    executor_memory=executor_memory_block,
                 )
                 write_casa_meta(
                     workspace_path=ws,

@@ -138,6 +138,7 @@ async def provision_workspace(
     workspace_template_root: Path | None = None,
     plugins_yaml: Path | None = None,
     world_state_summary: str = "",
+    executor_memory: str = "",
 ) -> str:
     """Create /<engagements_root>/<id>/ with the full provisioning tree.
 
@@ -175,6 +176,7 @@ async def provision_workspace(
             task=task,
             context=context,
             world_state_summary=world_state_summary,
+            executor_memory=executor_memory,
         )
     else:
         # 1. CLAUDE.md — the executor prompt, interpolated (legacy path).
@@ -184,6 +186,7 @@ async def provision_workspace(
             .replace("{task}", task or "")
             .replace("{context}", context or "(none)")
             .replace("{executor_type}", defn.type)
+            .replace("{executor_memory}", executor_memory or "")
         )
         (ws / "CLAUDE.md").write_text(prompt_interpolated, encoding="utf-8")
 
@@ -333,6 +336,7 @@ def render_workspace_template(
     task: str,
     context: str,
     world_state_summary: str,
+    executor_memory: str = "",
 ) -> None:
     """Copy the executor's workspace-template/ subtree into `dest`, interpolate
     CLAUDE.md.tmpl → CLAUDE.md, and generate .claude/settings.json with
@@ -363,6 +367,7 @@ def render_workspace_template(
                 .replace("{task}", task)
                 .replace("{context}", context)
                 .replace("{world_state_summary}", world_state_summary)
+                .replace("{executor_memory}", executor_memory or "")
         )
         (dest / "CLAUDE.md").write_text(text, encoding="utf-8")
 
