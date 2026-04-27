@@ -72,6 +72,40 @@ Any resident may delegate (`delegate_to_agent`) to any other agent listed in its
 
 agent_loader.py enforces these rules. Adding a forbidden file or removing a required file makes the agent fail to load.
 
+## Memory wiring per tier (v0.16.0 — Memory M4)
+
+Residents (Tier 1) own per-scope sessions and read summaries from the
+`meta` system scope each turn. Specialists (Tier 2) are stateless per
+delegation — no session continuity. Tier 3 Executors are ephemeral per
+engagement, but may opt in to a per-(channel, chat, executor_type)
+**archive** of prior engagement summaries.
+
+**Scope kinds.** `policies/scopes.yaml` v2 declares each scope with
+`kind: topical | system`:
+
+- `kind: topical` — embedded by fastembed; classifier picks active scopes
+  per turn against the user utterance. `description` required.
+- `kind: system` — always-on for any agent that includes the scope in
+  `scopes_readable` and clears the trust gate. No embedding, no classifier
+  routing. `description` forbidden. Only `meta` is system today.
+
+**Executor memory opt-in.** A Tier 3 executor's `definition.yaml` may
+include:
+
+    memory:
+      enabled: true       # default false
+      token_budget: 2000
+
+When `enabled: true`, `engage_executor` reads the archive at
+`{channel}:{chat_id}:executor:{type}` and substitutes the digest into the
+prompt template's `{executor_memory}` slot before driver dispatch. The
+archive is populated by `_finalize_engagement` (one summary per terminal
+engagement) — no separate writer code.
+
+For Configurator (you), `memory.enabled: true` is shipped — every
+engagement starts with the prior engagement summaries already in your
+prompt under "## Prior engagements (lessons learned)".
+
 ## MCP service topology (v0.14.0)
 
 The `casa-framework` MCP server runs as its own s6-supervised service
