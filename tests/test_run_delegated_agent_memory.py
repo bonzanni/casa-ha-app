@@ -259,3 +259,82 @@ async def test_active_memory_provider_none_skips(monkeypatch):
     assert text == "finance reply"
     prompt = _FakeSpecialistClient.captured_prompt
     assert "<memory_context" not in prompt
+
+
+async def test_add_turn_fires_with_task_body_and_reply(monkeypatch):
+    """After the SDK returns, _run_delegated_agent fires a background
+    add_turn writing user_text=<task_text>, assistant_text=<reply>."""
+    cfg = _specialist_cfg(role="finance", token_budget=4000)
+    mp = _make_memory_provider()
+    _patch_active_memory_provider(monkeypatch, mp)
+    _set_origin(monkeypatch)
+    _FakeSpecialistClient.reset(response="on track; June 15 ETA")
+
+    with patch.object(tools, "ClaudeSDKClient", _FakeSpecialistClient):
+        await tools._run_delegated_agent(
+            cfg, task_text="Q1 cashflow?", context_text="",
+        )
+
+    # Background tasks live in tools._specialist_bg_tasks; drain them.
+    bg = getattr(tools, "_specialist_bg_tasks", set())
+    if bg:
+        await asyncio.gather(*list(bg), return_exceptions=True)
+
+    mp.add_turn.assert_awaited_once()
+    kwargs = mp.add_turn.await_args.kwargs
+    assert kwargs["session_id"] == "finance:nicola"
+    assert kwargs["agent_role"] == "finance"
+    assert kwargs["user_peer"] == "nicola"
+    assert kwargs["user_text"] == "Q1 cashflow?"
+    assert kwargs["assistant_text"] == "on track; June 15 ETA"
+
+
+async def test_add_turn_skipped_on_empty_reply(monkeypatch):
+    """If the SDK produces no text, no add_turn fires (parity with
+    Agent._process at agent.py:527 — `if response_text:` gates writes)."""
+    cfg = _specialist_cfg(role="finance", token_budget=4000)
+    mp = _make_memory_provider()
+    _patch_active_memory_provider(monkeypatch, mp)
+    _set_origin(monkeypatch)
+    _FakeSpecialistClient.reset(response="")  # empty SDK reply
+
+    with patch.object(tools, "ClaudeSDKClient", _FakeSpecialistClient):
+        await tools._run_delegated_agent(
+            cfg, task_text="hi", context_text="",
+        )
+
+    bg = getattr(tools, "_specialist_bg_tasks", set())
+    if bg:
+        await asyncio.gather(*list(bg), return_exceptions=True)
+
+    mp.add_turn.assert_not_awaited()
+
+
+async def test_add_turn_failure_does_not_surface(monkeypatch, caplog):
+    """If add_turn raises, _run_delegated_agent has already returned;
+    the exception is logged WARNING, never propagated."""
+    import logging
+    cfg = _specialist_cfg(role="finance", token_budget=4000)
+    mp = _make_memory_provider()
+    mp.add_turn = AsyncMock(side_effect=RuntimeError("honcho down"))
+    _patch_active_memory_provider(monkeypatch, mp)
+    _set_origin(monkeypatch)
+    _FakeSpecialistClient.reset(response="ok")
+
+    caplog.set_level(logging.WARNING, logger="tools")
+    with patch.object(tools, "ClaudeSDKClient", _FakeSpecialistClient):
+        text = await tools._run_delegated_agent(
+            cfg, task_text="hi", context_text="",
+        )
+
+    assert text == "ok"  # caller did not see the failure
+
+    bg = getattr(tools, "_specialist_bg_tasks", set())
+    if bg:
+        await asyncio.gather(*list(bg), return_exceptions=True)
+
+    # The warning emission is implementation-flexible (logger name + level
+    # is what we care about). Just confirm at least one WARNING was logged.
+    assert any(
+        r.levelno >= logging.WARNING for r in caplog.records
+    ), "expected at least one WARNING from the failed add_turn"
