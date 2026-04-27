@@ -129,6 +129,9 @@ class TestAgentProcessInjects:
         monkeypatch.setattr(scope_reg, "score", lambda q, s: [])
         monkeypatch.setattr(scope_reg, "active_from_scores",
                             lambda sc, d: [d] if d else [])
+        # M4: agent._process now partitions readable into system/topical
+        # via scope_registry.kind(); empty ScopeLibrary would raise.
+        monkeypatch.setattr(scope_reg, "kind", lambda s: "topical")
 
         agent = agent_mod.Agent(
             config=cfg,
