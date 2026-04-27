@@ -8,18 +8,21 @@ import pytest
 
 
 TRUST_MATRIX_YAML = """\
-schema_version: 1
+schema_version: 2
 scopes:
   authed_only:
     minimum_trust: authenticated
+    kind: topical
     description: |
       Scope reserved for authenticated Nicola channels.
   household:
     minimum_trust: household-shared
+    kind: topical
     description: |
       Scope available in the house including voice.
   public_scope:
     minimum_trust: public
+    kind: topical
     description: |
       Scope available on any channel, trust-agnostic.
 """
