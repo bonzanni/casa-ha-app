@@ -106,6 +106,30 @@ For Configurator (you), `memory.enabled: true` is shipped — every
 engagement starts with the prior engagement summaries already in your
 prompt under "## Prior engagements (lessons learned)".
 
+## Specialist memory (M4b, v0.17.0)
+
+Specialists carry **per-`(role, user_peer)` Honcho memory** —
+channel-agnostic, scope-agnostic, mixed-domain. Session id is
+`f"{role}:{user_peer}"` (2-segment, distinct from residents'
+4-segment `{channel}:{chat_id}:{scope}:{role}`).
+
+Honcho's existing `observe_others=True`-on-agent-peer setup
+(`memory.py:185-204`) populates `peer_representation` automatically
+over time, giving each specialist a domain-narrow theory-of-mind of
+the user. `search_query` retrieval at read time is scoped to the
+specialist's own corpus — denser per token than searching a
+coordinator's mixed-domain memory.
+
+Specialists do **not** participate in scope partitioning; their
+`scopes_owned` and `scopes_readable` MUST stay empty
+(`agent_loader.py:562-573` enforces this). Specialists also do **not**
+participate in trust filtering at the memory layer — trust is one
+level up at the resident's `delegates` decision.
+
+Enabling memory on a specialist: set `memory.token_budget > 0` in
+`runtime.yaml`. Disabling: set `token_budget: 0` (back to stateless;
+prior session messages stay in Honcho but are no longer read).
+
 ## MCP service topology (v0.14.0)
 
 The `casa-framework` MCP server runs as its own s6-supervised service
