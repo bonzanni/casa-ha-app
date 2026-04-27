@@ -735,7 +735,7 @@ executors).
 ### 14.3 L4 — Free benefit from L1
 
 `_finalize_engagement` (`tools.py::_finalize_engagement`, meta-write
-block at `tools.py:1163-1197`) already writes one summary per terminal
+block at `tools.py:1321-1334`) already writes one summary per terminal
 engagement to the meta session
 `{channel}:{chat_id}:meta:assistant`, regardless of engagement kind
 (specialist OR executor). The write site has been live since M2.G4
@@ -744,15 +744,14 @@ become readable on Ellen's normal turn — no new writer code.
 
 ### 14.4 What is intentionally deferred
 
-- **L2 — Specialists become memory-bearing.** Deferred to M4b. The
-  per-specialist session shape genuinely competes with Honcho's
-  per-peer cross-session continuity, and the structural change (lifting
-  the `agent_loader.py:562-573` ban + wiring memory in
-  `_run_delegated_agent` at `tools.py:318`) deserves its own
-  brainstorm.
+- **L2 — Specialists become memory-bearing.** Shipped in M4b
+  (v0.17.0) — see § 15. The structural change (dropping the duplicate
+  validator at `specialist_registry.py:_validate_tier2_shape` +
+  wiring memory in `_run_delegated_agent` at `tools.py:399`) landed
+  with `cfg.memory.token_budget > 0` as the opt-in.
 - **Synthesized "lessons learned" archive content.** Today's archive
   contents are `executor_engagement_summary` JSON blobs from
-  `tools.py:1239` (write block at `tools.py:1231-1264`); Honcho's
+  `tools.py:1381` (write block at `tools.py:1373-1407`); Honcho's
   summary across them is modestly useful but not richly actionable.
   Future tweaks (free-form `lesson` field on emit_completion;
   executor emits a `lesson` string before terminate) wait until real
