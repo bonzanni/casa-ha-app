@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "casa:policy-scopes.v1",
+  "$id": "casa:policy-scopes.v2",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "scopes"],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "scopes": {
       "type": "object",
       "minProperties": 1,
@@ -13,14 +13,25 @@
         "^[a-z][a-z0-9_-]*$": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["minimum_trust", "description"],
+          "required": ["minimum_trust", "kind"],
           "properties": {
             "minimum_trust": {
               "enum": ["internal", "authenticated", "external-authenticated",
                        "household-shared", "public"]
             },
+            "kind": {"enum": ["topical", "system"]},
             "description": {"type": "string", "minLength": 20}
-          }
+          },
+          "allOf": [
+            {
+              "if":   {"properties": {"kind": {"const": "topical"}}},
+              "then": {"required": ["description"]}
+            },
+            {
+              "if":   {"properties": {"kind": {"const": "system"}}},
+              "then": {"not": {"required": ["description"]}}
+            }
+          ]
         }
       },
       "additionalProperties": false

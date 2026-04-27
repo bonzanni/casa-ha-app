@@ -37,12 +37,12 @@ class ScopeError(Exception):
 
 # Schema file ships alongside the disclosure schema in defaults/schema/.
 POLICY_SCOPES_SCHEMA_PATH = os.path.join(
-    os.path.dirname(__file__), "defaults", "schema", "policy-scopes.v1.json",
+    os.path.dirname(__file__), "defaults", "schema", "policy-scopes.v2.json",
 )
 
 
 class ScopeLibrary:
-    """Parsed scope definitions — names, minimum_trust, description."""
+    """Parsed scope definitions — names, minimum_trust, kind, description."""
 
     def __init__(self, scopes: dict[str, dict[str, Any]]) -> None:
         self._scopes = scopes
@@ -57,8 +57,13 @@ class ScopeLibrary:
             )
         return self._scopes[name]
 
+    def kind(self, name: str) -> str:
+        """Return 'topical' or 'system' for *name*. M4 v2 schema."""
+        return self.get(name)["kind"]
+
     def description(self, name: str) -> str:
-        return self.get(name)["description"]
+        # System scopes have no description (schema-enforced).
+        return self.get(name).get("description", "")
 
     def minimum_trust(self, name: str) -> str:
         return self.get(name)["minimum_trust"]
@@ -151,6 +156,10 @@ class ScopeRegistry:
         """True if a channel at *channel_trust* may access *scope*."""
         scope_min = self._lib.minimum_trust(scope)
         return _trust_rank(channel_trust) <= _trust_rank(scope_min)
+
+    def kind(self, scope: str) -> str:
+        """Delegate to library; returns 'topical' | 'system' (M4)."""
+        return self._lib.kind(scope)
 
     def filter_readable(
         self, agent_scopes: list[str], channel_trust: str,
