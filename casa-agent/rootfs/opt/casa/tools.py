@@ -982,11 +982,27 @@ async def engage_executor(args: dict) -> dict:
         })
 
     world_state = _build_world_state_summary()
+
+    # M4 L3: per-executor archive injection. Skipped when the executor
+    # type hasn't opted in (defn.memory.enabled=False is the default).
+    executor_memory_block = ""
+    if defn.memory.enabled:
+        import agent as agent_mod
+        memory_provider = getattr(agent_mod, "active_memory_provider", None)
+        executor_memory_block = await _fetch_executor_archive(
+            memory_provider=memory_provider,
+            channel=origin.get("channel", "telegram"),
+            chat_id=str(origin.get("chat_id", "")),
+            executor_type=executor_type,
+            token_budget=defn.memory.token_budget,
+        )
+
     prompt = (
         prompt_template
         .replace("{task}", task_text)
         .replace("{context}", context_text or "(none)")
         .replace("{world_state_summary}", world_state)
+        .replace("{executor_memory}", executor_memory_block)
     )
 
     # Driver dispatch — in_casa uses ClaudeAgentOptions + system_prompt;
