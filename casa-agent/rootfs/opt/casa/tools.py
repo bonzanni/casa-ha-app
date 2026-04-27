@@ -162,11 +162,14 @@ def _result(payload: dict) -> dict:
 def _build_specialist_options(cfg) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for a Tier 2 specialist invocation.
 
-    Specialists run stateless (no session resume). Hooks are resolved from
-    the specialist's own ``cfg.hooks``. MCP servers are resolved via the
-    shared registry — same pattern as :meth:`Agent._process` (agent.py
-    step 4). Degrades to empty-dict when the registry is not bound
-    (legacy callers / test harnesses)."""
+    Specialists carry per-``(role, user_peer)`` Honcho memory (M4b,
+    v0.17.0); SDK-level session resume stays disabled (``resume=None``)
+    because memory enters the specialist via prompt injection in
+    :func:`_run_delegated_agent`, not via SDK continuity. Hooks are
+    resolved from the specialist's own ``cfg.hooks``. MCP servers are
+    resolved via the shared registry — same pattern as
+    :meth:`Agent._process` (agent.py step 4). Degrades to empty-dict
+    when the registry is not bound (legacy callers / test harnesses)."""
     from hooks import resolve_hooks
 
     if _mcp_registry is not None:
