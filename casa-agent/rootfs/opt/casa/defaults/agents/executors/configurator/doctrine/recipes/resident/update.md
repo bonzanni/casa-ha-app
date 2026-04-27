@@ -18,6 +18,17 @@ Residents own channels and are long-lived. Updating scoped fields is safe; touch
 
 For any of these, do a dry-run summary in the topic first.
 
+## Adding `meta` to scopes_readable (engagement-memory access — M4)
+
+If the user wants this resident to start seeing engagement summaries
+("Ellen, what's been engaged lately?"), add `meta` to
+`memory.scopes_readable` (NOT `scopes_owned`). Trust gate is
+`authenticated`, so `household-shared`-trust residents (voice) are a
+no-op even if added.
+
+This is a **none reload** in M4 v0.16.0+ — the scope partition is
+re-evaluated each turn from `scopes_readable`.
+
 ## Always
 
 - Commit.
