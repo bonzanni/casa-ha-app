@@ -10,10 +10,10 @@ mcp_server_names:
   - n8n-workflows
   - casa-framework
 memory:
-  token_budget: 0
-  read_strategy: per_turn
-  scopes_owned: []
-  scopes_readable: []
+  token_budget: 4000        # M4b: opt in to specialist memory (per-(role, user_peer) Honcho session)
+  read_strategy: per_turn   # cached not yet supported for specialists
+  scopes_owned: []          # specialists do not participate in scope partitioning
+  scopes_readable: []       # specialists do not participate in scope partitioning
 channels: []
 session:
   strategy: ephemeral

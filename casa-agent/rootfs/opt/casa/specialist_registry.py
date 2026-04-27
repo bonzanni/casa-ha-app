@@ -130,12 +130,6 @@ class SpecialistRegistry:
                 "(specialists own no scope).", role,
             )
             return False
-        if cfg.memory.token_budget > 0:
-            logger.error(
-                "Rejecting specialist %r: memory.token_budget must be 0 "
-                "(specialists are stateless).", role,
-            )
-            return False
         return True
 
     def get(self, agent_name: str) -> AgentConfig | None:
