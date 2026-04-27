@@ -23,7 +23,7 @@ memory:
   token_budget: 4000
   read_strategy: per_turn
   scopes_owned: [personal, business, finance]
-  scopes_readable: [personal, business, finance, house]
+  scopes_readable: [personal, business, finance, house, meta]
   default_scope: personal
 channels:
   - telegram
