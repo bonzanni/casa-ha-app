@@ -78,3 +78,50 @@ def test_schema_rejects_token_budget_below_minimum():
     d = _base_defn() | {"memory": {"enabled": True, "token_budget": 50}}
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(d, _load_schema())
+
+
+def test_load_all_executors_parses_memory_block(tmp_path):
+    """End-to-end: defintion.yaml memory block lands on ExecutorDefinition."""
+    from agent_loader import load_all_executors
+
+    base = tmp_path
+    exec_dir = base / "executors" / "configurator"
+    exec_dir.mkdir(parents=True)
+    (exec_dir / "definition.yaml").write_text(
+        "schema_version: 1\n"
+        "type: configurator\n"
+        "description: Configure Casa via the configurator executor.\n"
+        "model: sonnet\n"
+        "driver: in_casa\n"
+        "memory:\n"
+        "  enabled: true\n"
+        "  token_budget: 1500\n",
+        encoding="utf-8",
+    )
+    (exec_dir / "prompt.md").write_text("hello {task}", encoding="utf-8")
+
+    out = load_all_executors(str(base))
+    assert "configurator" in out
+    assert out["configurator"].memory.enabled is True
+    assert out["configurator"].memory.token_budget == 1500
+
+
+def test_load_all_executors_defaults_memory_when_block_absent(tmp_path):
+    from agent_loader import load_all_executors
+
+    base = tmp_path
+    exec_dir = base / "executors" / "smoke"
+    exec_dir.mkdir(parents=True)
+    (exec_dir / "definition.yaml").write_text(
+        "schema_version: 1\n"
+        "type: smoke\n"
+        "description: Smoke-test executor with no memory configuration here.\n"
+        "model: sonnet\n"
+        "driver: in_casa\n",
+        encoding="utf-8",
+    )
+    (exec_dir / "prompt.md").write_text("hello {task}", encoding="utf-8")
+
+    out = load_all_executors(str(base))
+    assert out["smoke"].memory.enabled is False
+    assert out["smoke"].memory.token_budget == 2000

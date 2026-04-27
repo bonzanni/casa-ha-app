@@ -20,6 +20,7 @@ from config import (
     DelegateEntry,
     DisclosureConfig,
     ExecutorEntry,
+    ExecutorMemoryConfig,
     HooksConfig,
     MemoryConfig,
     ResponseShapeConfig,
@@ -313,6 +314,20 @@ def _build_executors(data: dict[str, Any]) -> list[ExecutorEntry]:
         )
         for e in (data.get("executors") or [])
     ]
+
+
+def _build_executor_memory(block: dict[str, Any]) -> "ExecutorMemoryConfig":
+    """Build an ExecutorMemoryConfig from the parsed `memory:` block.
+
+    Empty block -> default-disabled. Schema validation has already
+    enforced the shape before this is called.
+    """
+    if not block:
+        return ExecutorMemoryConfig()
+    return ExecutorMemoryConfig(
+        enabled=bool(block.get("enabled", False)),
+        token_budget=int(block.get("token_budget", 2000)),
+    )
 
 
 def _build_triggers(
@@ -676,6 +691,7 @@ def load_all_executors(base_dir: str) -> dict[str, "ExecutorDefinition"]:
                 f"{prompt_name!r} not found"
             )
 
+        memory_block = defn.get("memory") or {}
         d = ExecutorDefinition(
             type=defn["type"],
             description=defn["description"],
@@ -697,6 +713,8 @@ def load_all_executors(base_dir: str) -> dict[str, "ExecutorDefinition"]:
             plugins_dir=(os.path.join(exec_dir, "plugins")
                         if os.path.isdir(os.path.join(exec_dir, "plugins"))
                         else ""),
+            # M4 addition (engagement memory)
+            memory=_build_executor_memory(memory_block),
         )
         if d.type != entry:
             raise LoadError(
