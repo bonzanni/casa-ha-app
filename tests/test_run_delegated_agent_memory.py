@@ -140,3 +140,31 @@ async def test_token_budget_zero_skips_all_memory_calls(monkeypatch):
     mp.ensure_session.assert_not_awaited()
     mp.get_context.assert_not_awaited()
     mp.add_turn.assert_not_awaited()
+
+
+async def test_token_budget_positive_calls_ensure_and_get_context(monkeypatch):
+    """A memory-bearing specialist (token_budget>0) opens a Honcho session
+    keyed `f"{role}:{user_peer}"` and fetches with search_query=task_text."""
+    cfg = _specialist_cfg(role="finance", token_budget=4000)
+    mp = _make_memory_provider(get_context_returns="")
+    _patch_active_memory_provider(monkeypatch, mp)
+    _set_origin(monkeypatch)
+    _FakeSpecialistClient.reset()
+
+    with patch.object(tools, "ClaudeSDKClient", _FakeSpecialistClient):
+        await tools._run_delegated_agent(
+            cfg, task_text="how is Q1 cashflow?", context_text="",
+        )
+
+    mp.ensure_session.assert_awaited_once_with(
+        session_id="finance:nicola",
+        agent_role="finance",
+        user_peer="nicola",
+    )
+    mp.get_context.assert_awaited_once()
+    kwargs = mp.get_context.await_args.kwargs
+    assert kwargs["session_id"] == "finance:nicola"
+    assert kwargs["agent_role"] == "finance"
+    assert kwargs["user_peer"] == "nicola"
+    assert kwargs["tokens"] == 4000
+    assert kwargs["search_query"] == "how is Q1 cashflow?"
