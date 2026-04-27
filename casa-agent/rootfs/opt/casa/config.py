@@ -186,6 +186,20 @@ class AgentConfig:
 
 
 @dataclass
+class ExecutorMemoryConfig:
+    """Per-executor memory wiring (M4).
+
+    Defaults to ``enabled=False`` so existing executor definitions without
+    a ``memory:`` block continue to work unchanged. When enabled, the
+    engager pulls a per-channel-per-chat archive of prior engagement
+    summaries and interpolates the digest into ``{executor_memory}`` in
+    the prompt template.
+    """
+    enabled: bool = False
+    token_budget: int = 2000
+
+
+@dataclass
 class ExecutorDefinition:
     """Tier 3 Executor type definition.
 
@@ -210,3 +224,5 @@ class ExecutorDefinition:
     extra_dirs: list[str] = field(default_factory=list)
     mirror_chat_to_topic: bool = True
     plugins_dir: str = ""   # absolute path to per-executor plugins/ dir; "" = none
+    # --- M4 addition (engagement memory) ---
+    memory: ExecutorMemoryConfig = field(default_factory=ExecutorMemoryConfig)
