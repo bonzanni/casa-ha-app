@@ -352,6 +352,47 @@ async def _specialist_add_turn_bg(
         )
 
 
+async def _specialist_meta_write_bg(
+    *,
+    memory_provider: Any,
+    parent_origin: dict[str, Any],
+    specialist_role: str,
+    task_text: str,
+    assistant_text: str,
+) -> None:
+    """Write a one-line specialist-call summary to the parent's meta session.
+
+    Mirrors _finalize_engagement's meta-write (tools.py:1163-1197) for
+    inline delegate_to_agent calls. Gives Ellen a unified view of
+    specialist activity independent of which scope her own turn wrote to.
+    """
+    channel = str(parent_origin.get("channel") or "")
+    chat_id = str(parent_origin.get("chat_id") or "")
+    parent_role = str(parent_origin.get("role") or "assistant")
+    if not channel or not chat_id:
+        return  # No parent context to attribute to (cron / boot replay).
+    meta_sid = f"{channel}:{chat_id}:meta:{parent_role}"
+    user_text = f"delegated to {specialist_role}: {task_text[:200]}"
+    asst_text = f"{specialist_role} → {assistant_text[:200]}"
+    try:
+        await memory_provider.ensure_session(
+            session_id=meta_sid,
+            agent_role=parent_role,
+            user_peer="nicola",
+        )
+        await memory_provider.add_turn(
+            session_id=meta_sid,
+            agent_role=parent_role,
+            user_text=user_text,
+            assistant_text=asst_text,
+            user_peer="nicola",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "specialist meta-write failed for sid=%s: %s", meta_sid, exc,
+        )
+
+
 async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
     """Run one ephemeral delegated turn and return the concatenated text."""
     import agent as agent_mod
@@ -454,6 +495,17 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
         ))
         _specialist_bg_tasks.add(task)
         task.add_done_callback(_specialist_bg_tasks.discard)
+
+        # M4b: optional meta-write so Ellen sees specialist activity.
+        meta_task = asyncio.create_task(_specialist_meta_write_bg(
+            memory_provider=memory_provider,
+            parent_origin=parent,
+            specialist_role=cfg.role,
+            task_text=task_text,
+            assistant_text=text,
+        ))
+        _specialist_bg_tasks.add(meta_task)
+        meta_task.add_done_callback(_specialist_bg_tasks.discard)
 
     return text
 
