@@ -315,6 +315,40 @@ def _build_world_state_summary() -> str:
     return "\n".join(lines)
 
 
+# M4b: specialist memory write-path bg-task anchoring (parity with
+# Agent._bg_tasks at agent.py:592-614). Module-level so it persists
+# across delegate_to_agent calls.
+_specialist_bg_tasks: set[asyncio.Task[Any]] = set()
+
+
+async def _specialist_add_turn_bg(
+    *,
+    memory_provider: Any,
+    session_id: str,
+    agent_role: str,
+    user_text: str,
+    assistant_text: str,
+    user_peer: str,
+) -> None:
+    """Persist one specialist turn in the background.
+
+    Mirrors Agent._add_turn_bg at agent.py:592-614: try/except, log on
+    failure, never surface (the caller has already returned text)."""
+    try:
+        await memory_provider.add_turn(
+            session_id=session_id,
+            agent_role=agent_role,
+            user_text=user_text,
+            assistant_text=assistant_text,
+            user_peer=user_peer,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "specialist memory add_turn failed for session=%s role=%s: %s",
+            session_id, agent_role, exc,
+        )
+
+
 async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
     """Run one ephemeral delegated turn and return the concatenated text."""
     import agent as agent_mod
@@ -402,6 +436,22 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
                             text += block.text
     finally:
         agent_mod.origin_var.reset(token)
+
+    # M4b: write the turn back to specialist memory in the background.
+    if (cfg.memory.token_budget > 0
+            and text
+            and memory_provider is not None):
+        task = asyncio.create_task(_specialist_add_turn_bg(
+            memory_provider=memory_provider,
+            session_id=session_id,
+            agent_role=cfg.role,
+            user_text=task_text,
+            assistant_text=text,
+            user_peer=user_peer,
+        ))
+        _specialist_bg_tasks.add(task)
+        task.add_done_callback(_specialist_bg_tasks.discard)
+
     return text
 
 
