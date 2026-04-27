@@ -137,3 +137,60 @@ async def test_workspace_legacy_path_substitutes_executor_memory(tmp_path):
     claude_md = (eng_root / "abc12345" / "CLAUDE.md").read_text(encoding="utf-8")
     assert "task=dotask" in claude_md
     assert "mem=## Prior\nbody" in claude_md
+
+
+async def test_executor_archive_is_read_on_second_engagement(tmp_path):
+    """First engagement writes to the archive; second reads it.
+
+    Drives the read+write contract end-to-end against an in-memory mock
+    memory_provider. Doesn't exercise engage_executor's full topic-
+    creation path — that requires a Telegram channel mock + engagement
+    registry, which is out of scope for the L3 contract test.
+    """
+    # In-memory archive: session_id → list of (user, assistant) tuples.
+    archive: dict[str, list[tuple[str, str]]] = {}
+
+    class _Mp:
+        async def ensure_session(self, *, session_id, agent_role,
+                                 user_peer="nicola"):
+            archive.setdefault(session_id, [])
+
+        async def add_turn(self, *, session_id, agent_role,
+                           user_text, assistant_text, user_peer="nicola"):
+            archive.setdefault(session_id, []).append(
+                (user_text, assistant_text),
+            )
+
+        async def get_context(self, *, session_id, agent_role, tokens,
+                              search_query=None, user_peer="nicola"):
+            entries = archive.get(session_id, [])
+            if not entries:
+                return ""
+            return "## Recent exchanges\n" + "\n".join(
+                f"- {u} → {a}" for u, a in entries
+            )
+
+    mp = _Mp()
+
+    # First "engagement": the WRITE side of _finalize_engagement.
+    # Simulate by calling the same shape directly.
+    await mp.ensure_session(
+        session_id="telegram:42:executor:configurator",
+        agent_role="executor:configurator",
+    )
+    await mp.add_turn(
+        session_id="telegram:42:executor:configurator",
+        agent_role="executor:configurator",
+        user_text="(executor engagement summary)",
+        assistant_text='{"task": "edit-scope", "outcome": "completed"}',
+    )
+
+    # Second engagement: the READ side via _fetch_executor_archive.
+    out = await _fetch_executor_archive(
+        memory_provider=mp,
+        channel="telegram", chat_id="42",
+        executor_type="configurator", token_budget=2000,
+    )
+    assert "Prior engagements (lessons learned)" in out
+    assert "edit-scope" in out
+    assert "completed" in out
