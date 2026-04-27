@@ -168,3 +168,56 @@ async def test_token_budget_positive_calls_ensure_and_get_context(monkeypatch):
     assert kwargs["user_peer"] == "nicola"
     assert kwargs["tokens"] == 4000
     assert kwargs["search_query"] == "how is Q1 cashflow?"
+
+
+async def test_digest_injected_as_memory_context_block(monkeypatch):
+    """When get_context returns a non-empty digest, the prompt sent to the
+    SDK contains a <memory_context agent="finance"> block with that digest,
+    placed between <delegation_context> and `Task:`."""
+    cfg = _specialist_cfg(role="finance", token_budget=4000)
+    digest = (
+        "## Summary so far\n"
+        "Nicola asked about Q1 dining-out spend; baseline €420.\n"
+        "## Recent exchanges\n"
+        "- 2026-04-25 Sun: Q1 dining-out spend: €420\n"
+    )
+    mp = _make_memory_provider(get_context_returns=digest)
+    _patch_active_memory_provider(monkeypatch, mp)
+    _set_origin(monkeypatch)
+    _FakeSpecialistClient.reset()
+
+    with patch.object(tools, "ClaudeSDKClient", _FakeSpecialistClient):
+        await tools._run_delegated_agent(
+            cfg,
+            task_text="this week's spend?",
+            context_text="",
+        )
+
+    prompt = _FakeSpecialistClient.captured_prompt
+    assert '<memory_context agent="finance">' in prompt
+    assert "Nicola asked about Q1 dining-out spend" in prompt
+    assert "</memory_context>" in prompt
+    # Ordering: delegation_context → memory_context → Task:
+    delegation_idx = prompt.index("<delegation_context>")
+    memory_idx = prompt.index('<memory_context agent="finance">')
+    task_idx = prompt.index("Task:")
+    assert delegation_idx < memory_idx < task_idx
+
+
+async def test_empty_digest_omits_memory_context_block(monkeypatch):
+    """When get_context returns "", no memory_context block is rendered —
+    the prompt looks like today's stateless prompt."""
+    cfg = _specialist_cfg(role="finance", token_budget=4000)
+    mp = _make_memory_provider(get_context_returns="")
+    _patch_active_memory_provider(monkeypatch, mp)
+    _set_origin(monkeypatch)
+    _FakeSpecialistClient.reset()
+
+    with patch.object(tools, "ClaudeSDKClient", _FakeSpecialistClient):
+        await tools._run_delegated_agent(
+            cfg, task_text="hi", context_text="",
+        )
+
+    prompt = _FakeSpecialistClient.captured_prompt
+    assert "<memory_context" not in prompt
+    assert "Task: hi" in prompt
