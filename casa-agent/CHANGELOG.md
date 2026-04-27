@@ -1,5 +1,80 @@
 # Changelog
 
+## [0.17.0] - 2026-04-28 — Memory M4b: Specialists become memory-bearing
+
+Specialists (Tier 2 — Finance today; future Health/Personal/Business)
+gain per-`(role, user_peer)` Honcho memory. One channel-agnostic,
+scope-agnostic session per specialist accumulates messages, summary,
+and `peer_representation` across all delegate-call channels.
+
+### Added
+
+- **Specialist memory read+write in `_run_delegated_agent`.**
+  When `cfg.memory.token_budget > 0` and a memory provider is bound,
+  `tools.py:_run_delegated_agent` opens a Honcho session keyed
+  `f"{role}:{user_peer}"` (e.g. `finance:nicola`), fetches a digest
+  via `get_context(search_query=task_text, tokens=…)`, and prepends
+  a `<memory_context agent="{role}">…</memory_context>` block between
+  `<delegation_context>` and `Task:`. After the SDK returns text, a
+  background task writes the turn back via `add_turn(user_text=task_text,
+  assistant_text=…)`. Failures fail-soft (WARNING log, no propagation).
+- **`_specialist_meta_write_bg` — coordinator visibility.** Each
+  `delegate_to_agent` call also writes a one-line summary to the
+  parent's meta session (`{channel}:{chat_id}:meta:{parent_role}`),
+  giving Ellen a unified view of specialist activity independent of
+  which scope her own per-turn argmax write went to. Task and reply
+  truncated to 200 chars per side.
+- **Finance opted in by default.** `defaults/agents/specialists/finance/runtime.yaml`
+  bumps `memory.token_budget` from 0 to 4000.
+
+### Breaking
+
+Pre-1.0.0 license per `feedback_pre_1_0_0_license.md`:
+
+- `specialist_registry._validate_tier2_shape` no longer rejects
+  specialists with `token_budget > 0`. Operators with stateless
+  specialists (`token_budget: 0`) are unaffected; operators who set
+  `token_budget > 0` will now see Honcho memory engaged.
+
+### Internal additive (non-breaking)
+
+- New module-level helpers in `tools.py`:
+  - `_specialist_bg_tasks: set[asyncio.Task]` — GC anchor.
+  - `_specialist_add_turn_bg(...)` — fail-soft background writer.
+  - `_specialist_meta_write_bg(...)` — fail-soft meta-summary writer.
+- `_build_specialist_options` docstring updated; SDK `resume=None`
+  unchanged (memory enters via prompt injection, not SDK continuity).
+
+### Architecture
+
+- New 2-segment session id shape `f"{role}:{user_peer}"` joins the
+  existing 4-segment `{channel}:{chat_id}:{scope}:{role}` topology.
+  Specialists are channel-agnostic and scope-agnostic; both shapes
+  are first-class to Honcho (sessions are id-opaque).
+- Trust gating stays one level up at the resident's `delegates`
+  decision — no per-call channel filter at the memory layer.
+
+### Doctrine + spec
+
+- **Configurator doctrine sync** (per
+  `feedback_configurator_doctrine_sync.md`):
+  - `recipes/specialist/create.md` — memory-bearing specialist example.
+  - `recipes/specialist/update.md` — enable-memory recipe for an
+    existing stateless specialist.
+  - `architecture.md` — specialist memory subsection + correction to
+    the v0.16.0 "stateless specialists" claim.
+- **Live arch spec.** `docs/superpowers/specs/2026-04-26-memory-architecture.md`
+  § 5 gains a 2-segment specialist-sessions paragraph, plus new § 15
+  documenting the read path, write path, meta-scope coordinator
+  visibility, and what's deferred to M5/M6.
+
+### Deferred
+
+- Specialist `peer_card` writes / `remember_fact` MCP tool → **M5**.
+- Cross-specialist recall via `peer_perspective` → **M6**.
+- `read_strategy: cached` for specialists.
+- Multi-user (`user_peer != "nicola"`).
+
 ## [0.16.0] - 2026-04-27 — Memory M4: Engagement memory
 
 Three layers, one user-visible behavior: engagement summaries flow back
