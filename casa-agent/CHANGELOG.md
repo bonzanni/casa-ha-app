@@ -1,5 +1,70 @@
 # Changelog
 
+## [0.16.0] - 2026-04-27 — Memory M4: Engagement memory
+
+Three layers, one user-visible behavior: engagement summaries flow back
+into Ellen's per-turn memory and Configurator engages with prior
+context.
+
+### Added
+
+- **L1 — `meta` declared as a system scope.** `policies/scopes.yaml`
+  bumps to schema v2 with a new `kind: topical | system` field. System
+  scopes are always-on after the trust filter — no embedding, no
+  classifier routing. `meta` is the first system scope; assistant adds
+  it to `scopes_readable`. Voice (Tina) is excluded by the
+  `authenticated` trust gate.
+- **L3 — Per-executor archive read at engage-start.** New
+  `ExecutorMemoryConfig(enabled, token_budget)` on
+  `ExecutorDefinition`; Configurator opts in. `engage_executor`
+  interpolates a new `{executor_memory}` prompt slot from the
+  per-(channel, chat, executor_type) Honcho session. `claude_code`
+  driver-side `workspace.py` slot supported for forward-compat with
+  future memory-enabled claude_code executors.
+- **L4 — Free benefit.** `_finalize_engagement` already writes
+  engagement summaries to the meta session for both specialist and
+  executor engagements (since M2.G4, v0.15.3). L1 makes them readable
+  on Ellen's normal turn. No new write code.
+
+### Breaking
+
+Pre-1.0.0 license per `feedback_pre_1_0_0_license.md`:
+
+- `policies/scopes.yaml` schema bumped v1 → v2. No migration shim.
+  Tenant overlays at `/addon_configs/casa-agent/policies/scopes.yaml`
+  must be updated by the operator on upgrade.
+- `defaults/schema/policy-scopes.v1.json` removed; replaced by
+  `policy-scopes.v2.json`.
+
+### Internal additive (non-breaking)
+
+- `executor.v1.json` gains optional `memory` property; existing
+  executor `definition.yaml` files without a `memory:` block remain
+  valid (default disabled).
+
+### Doctrine + spec
+
+- **Configurator doctrine sync** (per
+  `feedback_configurator_doctrine_sync.md`): `architecture.md`,
+  `recipes/scopes/edit.md` (also fixes pre-existing list-style format
+  drift), `recipes/executor/scaffold.md`,
+  `recipes/resident/{create,update}.md` updated in the same commit
+  set.
+- **Architecture spec**
+  (`docs/superpowers/specs/2026-04-26-memory-architecture.md`): § 5,
+  § 6, § 11 updated; new § 14 "Engagement memory"; § 12 M4 entry
+  flipped to "Shipped v0.16.0".
+
+### Deferred to future ships
+
+- L2 — Specialists become memory-bearing → M4b (separate brainstorm).
+- Synthesized "lessons learned" archive content → future tweak after
+  real archive usage patterns emerge.
+- `remember_fact` via directional `peer_card` → M5.
+- Cross-role recall (`consult_other_agent_memory`) → M6.
+- `HONCHO_LIVE_TEST=1`-gated integration test → M3a.1 follow-up
+  bundle.
+
 ## [0.15.4] - 2026-04-27 — Memory M3: Honcho contract coverage + `memory_call` telemetry
 
 Observability + confidence-coverage release. No runtime-behaviour
