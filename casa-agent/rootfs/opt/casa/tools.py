@@ -849,6 +849,44 @@ async def casa_reload(_: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+async def _fetch_executor_archive(
+    *, memory_provider, channel: str, chat_id: str,
+    executor_type: str, token_budget: int,
+) -> str:
+    """Read the per-(channel, chat, executor_type) archive of prior
+    engagement summaries via Honcho's ``session.context``. Returns the
+    rendered digest wrapped under a recognizable header, or "" when the
+    archive is empty / provider is None / read fails.
+
+    Mirrors the WRITE site at ``tools.py:1222`` exactly:
+    session_id = ``f"{channel}:{chat_id}:executor:{executor_type}"``
+    agent_role = ``f"executor:{executor_type}"``.
+    """
+    if memory_provider is None:
+        return ""
+    session_id = f"{channel}:{chat_id}:executor:{executor_type}"
+    agent_role = f"executor:{executor_type}"
+    try:
+        await memory_provider.ensure_session(
+            session_id=session_id,
+            agent_role=agent_role,
+        )
+        digest = await memory_provider.get_context(
+            session_id=session_id,
+            agent_role=agent_role,
+            tokens=token_budget,
+        )
+    except Exception as exc:  # noqa: BLE001 — ARCH: same shape as 1246, 1407
+        logger.warning(
+            "executor archive fetch failed for type=%s: %s",
+            executor_type, exc,
+        )
+        return ""
+    if not digest:
+        return ""
+    return f"## Prior engagements (lessons learned)\n{digest}"
+
+
 @tool(
     "engage_executor",
     "Start a Tier 3 Executor engagement (configurator, ha-developer, etc.). "
