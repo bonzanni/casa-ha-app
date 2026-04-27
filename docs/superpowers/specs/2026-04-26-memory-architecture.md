@@ -290,6 +290,20 @@ topical scope to stamp. M2.G6's argmax stamp continues to operate over
 topical scopes only — system scopes have no description, no embedding,
 and never win argmax.
 
+**Specialist sessions are 2-segment (M4b, v0.17.0).** Specialists are
+per-`(role, user_peer)` Honcho peers — channel-agnostic, scope-agnostic.
+Session id shape is `f"{role}:{user_peer}"` (e.g. `finance:nicola`).
+This is the *only* place in Casa where the canonical session id is not
+4-segment. The asymmetry is justified: residents are channel-trust-aware
+coordinators that read partitioned memory; specialists are domain
+experts that the coordinator already gated. Both shapes are first-class
+to Honcho — sessions are id-opaque.
+
+The session is opened lazily on the first delegate-call where
+`cfg.memory.token_budget > 0`; `_run_delegated_agent` (`tools.py:399`)
+fires `ensure_session` + `get_context` before SDK invocation and a
+background `add_turn` after. See § 15 for the full shape.
+
 ---
 
 ## 6. Read path
@@ -745,3 +759,78 @@ become readable on Ellen's normal turn — no new writer code.
   archive usage shows the JSON form too thin.
 - **`remember_fact` via directional `peer_card`.** Deferred to M5.
 - **Cross-role recall (`consult_other_agent_memory`).** Deferred to M6.
+
+---
+
+## 15. Specialist memory (M4b, v0.17.0)
+
+Specialists (Tier 2 — Finance today) become first-class Honcho peers
+that accumulate per-`(role, user_peer)` memory. Opt-in via the existing
+`MemoryConfig.token_budget` field at `config.py:73-78`: `> 0` enables;
+`== 0` keeps statelessness.
+
+### 15.1 Read path
+
+`_run_delegated_agent` at `casa-agent/rootfs/opt/casa/tools.py:399`:
+
+1. Computes `session_id = f"{cfg.role}:nicola"` and resolves
+   `memory_provider = getattr(agent_mod, "active_memory_provider",
+   None)`.
+2. If `cfg.memory.token_budget > 0` and the provider is non-None,
+   awaits `ensure_session(session_id, agent_role=cfg.role,
+   user_peer="nicola")` and `get_context(session_id, ...,
+   tokens=cfg.memory.token_budget, search_query=task_text,
+   user_peer="nicola")`.
+3. On a non-empty digest, prepends a
+   `<memory_context agent="{role}">…</memory_context>` block between
+   the existing `<delegation_context>` and `Task:`.
+4. Per-call exceptions are caught and logged `WARNING` — specialist
+   still runs with no memory_context block on Honcho hiccups (parity
+   with the resident `_one_scope` catch-all).
+
+The `HonchoMemoryProvider.ensure_session` at `memory.py:185-204`
+configures the agent peer with `observe_others=True`, so
+`peer_representation` populates automatically over time. `get_context`
+at `memory.py:206-243` calls `session.context(peer_target=user_peer,
+peer_perspective=agent_role)` — Finance's perspective on Nicola.
+
+### 15.2 Write path
+
+After the SDK invocation returns text, if
+`cfg.memory.token_budget > 0` AND `text` is non-empty AND
+`memory_provider` is non-None, `_run_delegated_agent` fires a
+background task `_specialist_add_turn_bg` that calls
+`memory_provider.add_turn(session_id=f"{role}:nicola", agent_role=role,
+user_text=task_text, assistant_text=text, user_peer="nicola")`. The
+`user_text` is the **task body** — *not* the wrapped prompt with
+`<delegation_context>` + `<memory_context>` — so the session messages
+reflect the semantic exchange, not SDK plumbing.
+
+Background tasks are anchored against GC in module-level
+`tools._specialist_bg_tasks`. Failures log `WARNING` and never surface
+to the caller.
+
+### 15.3 Meta-scope coordinator visibility (M4b optional)
+
+When `delegate_to_agent` writes the specialist turn, it ALSO writes a
+one-line summary to the parent resident's meta session
+`f"{channel}:{chat_id}:meta:{parent_role}"` via
+`_specialist_meta_write_bg`. This gives Ellen a unified
+"specialists-have-been-doing-X" view independent of which scope her
+own turn wrote to. The summary format is:
+
+- `user_text`: `"delegated to {specialist_role}: {task_text[:200]}"`
+- `assistant_text`: `"{specialist_role} → {assistant_text[:200]}"`
+
+Ellen reads `meta` automatically per turn (M4 L1, § 6 step 3 of this
+spec).
+
+### 15.4 What's deferred
+
+- Specialist `peer_card` writes / `remember_fact` MCP tool → **M5**.
+- Cross-specialist recall (`consult_other_agent_memory`) via
+  `peer_perspective` → **M6**.
+- `read_strategy: cached` for specialists — measured-need follow-up.
+- Multi-user (`user_peer != "nicola"`) — out of scope; constant.
+- Per-call channel-based memory filtering — structurally answered by
+  splitting roles, not by adding a filter knob.
