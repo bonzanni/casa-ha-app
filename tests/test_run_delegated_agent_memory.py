@@ -348,7 +348,7 @@ async def test_add_turn_failure_does_not_surface(monkeypatch, caplog):
 
 async def test_delegation_writes_meta_scope_summary(monkeypatch):
     """Each delegate-to-specialist call writes one summary line to the
-    parent's meta session, mirroring _finalize_engagement (tools.py:1163-1197)."""
+    parent's meta session, mirroring _finalize_engagement (tools.py:1325-1334)."""
     cfg = _specialist_cfg(role="finance", token_budget=4000)
     mp = _make_memory_provider()
     _patch_active_memory_provider(monkeypatch, mp)
