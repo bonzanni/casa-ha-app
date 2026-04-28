@@ -127,7 +127,11 @@ memory:
   scopes_readable: []       # MUST stay empty — specialists don't partition by scope
 ```
 
-The session id is `f"{role}:{user_peer}"` (e.g. `finance:nicola`).
+The session id is `f"{role}-{user_peer}"` (e.g. `finance-nicola`).
+Built via `honcho_ids.honcho_session_id(role, user_peer)` — direct
+f-string concatenation is forbidden because Honcho's server regex
+rejects characters outside `[A-Za-z0-9_-]`.
+
 Specialists become richer over time at their own domain reasoning;
 Honcho's `peer_representation` accumulates the specialist's
 theory-of-mind of the user across all delegate-call channels.
