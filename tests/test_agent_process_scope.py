@@ -578,7 +578,7 @@ class TestObservability:
 
 
 class TestScopeRouteEmission:
-    """Verify agent.py:441 emits a parser-shaped scope_route record."""
+    """Verify agent.py:567 emits a parser-shaped scope_route record."""
 
     async def test_emits_structured_fields_via_extra(self, caplog):
         import logging
