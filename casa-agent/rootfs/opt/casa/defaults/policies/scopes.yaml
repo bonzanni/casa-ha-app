@@ -99,5 +99,5 @@ scopes:
     kind: system
     # System scope: always-on after trust filter; no embedding,
     # no classifier routing. Tool-written by _finalize_engagement
-    # (see tools.py:1131); read by residents whose scopes_readable
+    # (see tools.py:1326-1338); read by residents whose scopes_readable
     # includes 'meta' (see runtime.yaml).

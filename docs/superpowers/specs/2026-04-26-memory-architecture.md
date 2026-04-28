@@ -85,7 +85,7 @@ a wrapper), and **NoOpMemory** at `memory.py:66` — every method is a
 stub; `MEMORY_BACKEND=noop` selects it. Used to disable memory entirely
 without an `if memory:` guard at every call site.
 
-### 3.1 HonchoMemoryProvider — `memory.py:161`
+### 3.1 HonchoMemoryProvider — `memory.py:162`
 
 Honcho v3 backed. Constructed with `(api_url, api_key, workspace_id="casa")`.
 
@@ -112,7 +112,7 @@ All SDK calls run inside `asyncio.to_thread` via the local
 imported with a `try`/`except ImportError` guard so the module loads
 on installs without `honcho-ai` (NoOp/SQLite-only paths).
 
-### 3.2 SqliteMemoryProvider — `memory.py:396`
+### 3.2 SqliteMemoryProvider — `memory.py:479`
 
 Durable local-storage backend. Single `sqlite3.Connection` opened with
 `check_same_thread=False` and held for process lifetime. Every public
@@ -154,9 +154,9 @@ Section omission rules in `_render` mean SQLite digests render only
 `## What I know about you` (when peer_card has bullets — never, today)
 and `## Recent exchanges`. `## Summary so far` and `## My perspective`
 never appear on SQLite. `tokens // 40` is the rough last-N truncation
-(`memory.py:464`).
+(`memory.py:564`).
 
-### 3.3 CachedMemoryProvider — `memory.py:245`
+### 3.3 CachedMemoryProvider — `memory.py:267`
 
 Warm-cache + background-refresh wrapper around any `MemoryProvider`.
 Built for the voice (butler) latency budget per 2.2a §7 strategy S1.
@@ -277,8 +277,8 @@ scope.
 engagement during a turn (e.g. `engage_executor` → Tina, `delegate_to_agent`
 → a specialist), the engagement record's `origin` dict carries
 `scope = argmax_scope(scores, default_scope)` stamped onto `origin_var`
-by `agent.py:309-314` immediately after the read-path classifier runs.
-Downstream consumers — chiefly `query_engager` at `tools.py:1410`,
+by `agent.py:319-323` immediately after the read-path classifier runs.
+Downstream consumers — chiefly `query_engager` at `tools.py:1540`,
 which rebuilds `{channel}-{chat_id}-{scope}-{role}` (via `honcho_session_id`) to retrieve from
 the engager's actual session — read it via `engagement.origin.get(
 "scope", "meta")`. The literal `"meta"` fallback handles edge paths
@@ -286,7 +286,7 @@ the engager's actual session — read it via `engagement.origin.get(
 `_process`. M2 (G6) shipped this stamp.
 
 **Meta as a real scope (M4, v0.16.0).** The literal `"meta"` fallback at
-`tools.py:1410` is now consistent with a real declared scope (`kind:
+`tools.py:1540` is now consistent with a real declared scope (`kind:
 system`) rather than a written-but-never-read magic string. The
 fallback still handles edge paths (cron triggers, boot replay) that
 engage without going through `_process` and therefore have no rooted
@@ -305,7 +305,7 @@ experts that the coordinator already gated. Both shapes are first-class
 to Honcho — sessions are id-opaque.
 
 The session is opened lazily on the first delegate-call where
-`cfg.memory.token_budget > 0`; `_run_delegated_agent` (`tools.py:399`)
+`cfg.memory.token_budget > 0`; `_run_delegated_agent` (`tools.py:400`)
 fires `ensure_session` + `get_context` before SDK invocation and a
 background `add_turn` after. See § 15 for the full shape.
 
@@ -313,7 +313,7 @@ background `add_turn` after. See § 15 for the full shape.
 
 ## 6. Read path
 
-Implemented in `Agent._process` at `agent.py:292-348`. Per-turn flow:
+Implemented in `Agent._process` at `agent.py:269` (function definition; the read-path block runs from `agent.py:292` through the `_one_scope` helper definition ending around line 354). Per-turn flow:
 
 1. **Trust resolution.** `trust_token = channel_trust(msg.channel)` —
    see `channel_trust.py:9` for the live tier ordering.
@@ -371,7 +371,7 @@ the system prompt at agent-load time, not per turn.
 
 ## 7. Write path
 
-Implemented at `agent.py:505-538`, on the same `_process` task path
+Implemented at `agent.py:526-560`, on the same `_process` task path
 that just received `response_text` from the SDK.
 
 1. **Skip on empty response.** `if response_text:` — no write when the
@@ -479,7 +479,7 @@ fully observable).
 What SQLite is, in current code:
 
 - **Last-N exchange replay only.** `_get_context_sync` reads
-  `tokens // 40` rows (`memory.py:464`) from `messages` ordered by
+  `tokens // 40` rows (`memory.py:564`) from `messages` ordered by
   `id DESC`, reverses to chronological order, and feeds them through
   the same `_render` the Honcho path uses. The `_SqliteCtx` shim sets `summary=None` and
   `peer_representation=None`, so the only sections that can appear
@@ -525,13 +525,13 @@ Implemented in `casa-agent/rootfs/opt/casa/scope_registry.py`.
 - **`ScopeRegistry.kind(name)`** — delegates to the underlying library.
   `Agent._process` uses it to partition `readable` into the always-on
   system set and the classifier-routed topical set (§ 6 step 3).
-- **`ScopeRegistry`** (`scope_registry.py:114`) — wraps the library
+- **`ScopeRegistry`** (`scope_registry.py:119`) — wraps the library
   with the trust-filter helpers and the embedding model.
 - **Model.** `intfloat/multilingual-e5-large` via `fastembed`'s ONNX
   runtime. CPU-only, ~500 MB, downloaded on first boot to
   `/data/fastembed/`. Lazy import (`_load_text_embedding_cls`) keeps
   interpreter start fast and gives tests a monkeypatch point.
-- **`prepare()`** (`scope_registry.py:205`) — loads the model,
+- **`prepare()`** (`scope_registry.py:214`) — loads the model,
   embeds each scope's `description` once, caches the vector dict.
   All failures log ERROR and flip the registry into degraded mode
   (`self._degraded = True`); boot does not abort.
@@ -721,7 +721,7 @@ unchanged; engagement summaries never leak to the voice channel.
 `ExecutorMemoryConfig(enabled: bool = False, token_budget: int = 2000)`
 on `ExecutorDefinition` (`config.py:203`) opts an executor type into
 cross-engagement context. When `enabled: true`, `engage_executor`
-(`tools.py:896`) reads from
+(`tools.py:1040`) reads from
 `{channel}-{chat_id}-executor-{type}` (built via `honcho_session_id`) via Honcho's
 `session.context(tokens=token_budget)` and interpolates the digest
 into the prompt template's `{executor_memory}` slot under the header
@@ -740,7 +740,7 @@ executors).
 ### 14.3 L4 — Free benefit from L1
 
 `_finalize_engagement` (`tools.py::_finalize_engagement`, meta-write
-block at `tools.py:1321-1334`) already writes one summary per terminal
+block at `tools.py:1326-1338`) already writes one summary per terminal
 engagement to the meta session
 `{channel}-{chat_id}-meta-assistant` (built via `honcho_session_id`), regardless of engagement kind
 (specialist OR executor). The write site has been live since M2.G4
@@ -752,11 +752,11 @@ become readable on Ellen's normal turn — no new writer code.
 - **L2 — Specialists become memory-bearing.** Shipped in M4b
   (v0.17.0) — see § 15. The structural change (dropping the duplicate
   validator at `specialist_registry.py:_validate_tier2_shape` +
-  wiring memory in `_run_delegated_agent` at `tools.py:399`) landed
+  wiring memory in `_run_delegated_agent` at `tools.py:400`) landed
   with `cfg.memory.token_budget > 0` as the opt-in.
 - **Synthesized "lessons learned" archive content.** Today's archive
   contents are `executor_engagement_summary` JSON blobs from
-  `tools.py:1381` (write block at `tools.py:1373-1407`); Honcho's
+  `tools.py:1386` (write block at `tools.py:1377-1408`); Honcho's
   summary across them is modestly useful but not richly actionable.
   Future tweaks (free-form `lesson` field on emit_completion;
   executor emits a `lesson` string before terminate) wait until real
@@ -775,7 +775,7 @@ that accumulate per-`(role, user_peer)` memory. Opt-in via the existing
 
 ### 15.1 Read path
 
-`_run_delegated_agent` at `casa-agent/rootfs/opt/casa/tools.py:399`:
+`_run_delegated_agent` at `casa-agent/rootfs/opt/casa/tools.py:400`:
 
 1. Computes `session_id = f"{cfg.role}:nicola"` and resolves
    `memory_provider = getattr(agent_mod, "active_memory_provider",
