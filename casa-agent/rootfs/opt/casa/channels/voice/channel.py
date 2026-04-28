@@ -20,6 +20,7 @@ from aiohttp import web
 from agent import _classify_error
 from bus import BusMessage, MessageBus, MessageType
 from channels import Channel
+from honcho_ids import honcho_session_id
 from log_cid import new_cid
 from rate_limit import RateLimiter
 from channels.voice.prosodic import ProsodicSplitter
@@ -451,7 +452,9 @@ class VoiceChannel(Channel):
         total_budget = getattr(getattr(cfg, "memory", None), "token_budget", 800)
         per_scope = max(total_budget // max(len(scopes), 1), 1)
         for scope in scopes:
-            session_id = f"voice:{scope_id}:{scope}:{self.default_agent}"
+            session_id = honcho_session_id(
+                "voice", scope_id, scope, self.default_agent,
+            )
             try:
                 await self._memory.ensure_session(
                     session_id=session_id,
