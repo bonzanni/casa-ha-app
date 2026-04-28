@@ -3,6 +3,29 @@
 This file tracks repo-level changes across the Casa project. Add-on
 version history lives in [`casa-agent/CHANGELOG.md`](casa-agent/CHANGELOG.md).
 
+## 2026-04-28 — Memory M5 deriver-trust resolution (documentation only)
+
+- M5 (`remember_fact` MCP tool) closed without code. The Honcho deriver
+  covers the recall need via the `summary.content` path on the regular
+  `add_messages` flow Casa already runs; empirical N150 probes (sessions
+  `m5-probe-2026-04-28-1777392473` and
+  `m5-probe-pcfg-2026-04-28-1777396895`, workspace `casa`,
+  `honcho-ai==2.1.1`) showed ~460-char summary content within ~90s of
+  22 biographical messages. Three alternatives explicitly rejected:
+  RMW `set_card`, tagged-message variant, override-only carve-out.
+- New spec
+  `docs/superpowers/specs/2026-04-28-memory-m5-deriver-trust-design.md`
+  records the decision, the live evidence, and the explicit "not built"
+  list (no `remember_fact` tool, no `set_card` calls, no tagged-message
+  shim, no SQLite-side writer, no `peer_card.create=True` session-config
+  knob until a future honcho-ai upgrade exposes it).
+- Doc-cleanup edits:
+  `docs/superpowers/specs/2026-04-26-memory-architecture.md` (§ 12,
+  § 14.4, § 15.4); `docs/MEMORY-ROADMAP.md` (roadmap table, § M5 phase
+  entry rewritten with archaeology blockquote, M3/M4b forward-refs,
+  session-start prompt); `docs/ROADMAP.md` (line 325–326).
+- No version bump. Active version stays `v0.17.2`.
+
 ## 2026-04-17 — Phase 2.1 E2E suite
 
 - Fixed unintended bus serialisation (`casa-agent/rootfs/opt/casa/bus.py`):
