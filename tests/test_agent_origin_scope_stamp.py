@@ -1,7 +1,7 @@
 """M2.G6 — agent must stamp the read-path argmax scope onto origin_var
 after `active` is computed, so engage_executor (and any other tool that
 reads origin.scope) gets the engager's actual rooted scope rather than
-the literal "meta" fallback used by tools.py:1357.
+the literal "meta" fallback used by tools.py:1558.
 
 The test follows the existing test_agent_process_scope.py pattern:
 real Agent + FakeClient SDK substitute. We capture origin_var inside

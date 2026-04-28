@@ -1,7 +1,7 @@
 """Specialist memory read+write inside _run_delegated_agent (M4b).
 
 Tests are TDD-shaped: each one fails on master tip 93b442e because
-_run_delegated_agent at tools.py:318 does not yet call ensure_session,
+_run_delegated_agent at tools.py:400 does not yet call ensure_session,
 get_context, or add_turn.
 """
 
@@ -297,7 +297,7 @@ async def test_add_turn_fires_with_task_body_and_reply(monkeypatch):
 
 async def test_add_turn_skipped_on_empty_reply(monkeypatch):
     """If the SDK produces no text, no add_turn fires (parity with
-    Agent._process at agent.py:527 — `if response_text:` gates writes)."""
+    Agent._process at agent.py:528 — `if response_text:` gates writes)."""
     cfg = _specialist_cfg(role="finance", token_budget=4000)
     mp = _make_memory_provider()
     _patch_active_memory_provider(monkeypatch, mp)
@@ -348,7 +348,7 @@ async def test_add_turn_failure_does_not_surface(monkeypatch, caplog):
 
 async def test_delegation_writes_meta_scope_summary(monkeypatch):
     """Each delegate-to-specialist call writes one summary line to the
-    parent's meta session, mirroring _finalize_engagement (tools.py:1325-1334)."""
+    parent's meta session, mirroring _finalize_engagement (tools.py:1326-1338)."""
     cfg = _specialist_cfg(role="finance", token_budget=4000)
     mp = _make_memory_provider()
     _patch_active_memory_provider(monkeypatch, mp)
