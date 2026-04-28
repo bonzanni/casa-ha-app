@@ -26,6 +26,7 @@ from marketplace_ops import (
     remove_plugin_entry,
     update_plugin_entry,
 )
+from honcho_ids import honcho_session_id
 from plugin_env_extractor import extract_env_vars
 from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — available for future use
 from system_requirements.orchestrator import install_requirements, OrchestrationError
@@ -374,7 +375,7 @@ async def _specialist_meta_write_bg(
     parent_role = str(parent_origin.get("role") or "assistant")
     if not channel or not chat_id:
         return  # No parent context to attribute to (cron / boot replay).
-    meta_sid = f"{channel}:{chat_id}:meta:{parent_role}"
+    meta_sid = honcho_session_id(channel, chat_id, "meta", parent_role)
     user_text = f"delegated to {specialist_role}: {task_text[:200]}"
     asst_text = f"{specialist_role} → {assistant_text[:200]}"
     try:
@@ -433,10 +434,11 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
 
     # M4b: optional specialist memory read.
     # Opt-in via cfg.memory.token_budget > 0. Session keyed
-    # f"{role}:{user_peer}" — channel-agnostic, scope-agnostic, per-peer.
+    # via honcho_session_id(role, user_peer) — channel-agnostic,
+    # scope-agnostic, per-peer.
     memory_block = ""
     user_peer = "nicola"
-    session_id = f"{cfg.role}:{user_peer}"
+    session_id = honcho_session_id(cfg.role, user_peer)
     memory_provider = None
     if cfg.memory.token_budget > 0:
         memory_provider = getattr(agent_mod, "active_memory_provider", None)
