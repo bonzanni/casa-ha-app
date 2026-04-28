@@ -1556,7 +1556,9 @@ async def query_engager(args: dict) -> dict:
     channel = engagement.origin.get("channel", "telegram")
     chat_id = str(engagement.origin.get("chat_id", ""))
     engager_scope = engagement.origin.get("scope", "meta")
-    session_id = f"{channel}:{chat_id}:{engager_scope}:{engager_role}"
+    session_id = honcho_session_id(
+        channel, chat_id, engager_scope, engager_role,
+    )
 
     context = ""
     if memory_provider is not None:
