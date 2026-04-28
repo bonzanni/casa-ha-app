@@ -4,7 +4,7 @@ Living tracker for the memory subsystem (Honcho + SQLite + scope-routing
 + disclosure). Multi-session, gitignored like `ROADMAP.md`. Read at the
 start of every memory-touching session; update at the end.
 
-Last updated: 2026-04-27 — M3 shipped as v0.15.4 (Honcho contract coverage + `memory_call` telemetry).
+Last updated: 2026-04-28 — M4b shipped as v0.17.0 (specialists become memory-bearing first-class Honcho peers; 2-segment session id `f"{role}:{user_peer}"`; channel-agnostic, scope-agnostic; Finance opted in by default; validator drop in `specialist_registry`); 20 plan tasks + 4 fix-up commits = 21 commits ff-merged; CI green (PR + master); N150 smoke 3/3 PASS on v0.17.0; Finance still operator-disabled in prod — paths exercise on enable.
 
 ## Doctrine
 
@@ -29,7 +29,8 @@ primary store is out of scope until that doctrine changes.
 | M1 | Spec consolidation + dead-code removal | ✅ Shipped (v0.15.3) | `plans/2026-04-26-memory-m1-spec-recovery-and-cleanup.md` |
 | M2 | Honcho-side breakage fixes (voice prewarm, cancel paths, origin scope) | ✅ Shipped (v0.15.3) | `plans/2026-04-26-memory-m2-honcho-fixes.md` |
 | M3 | Honcho contract coverage (real summary/peer_repr test + latency telemetry) | ✅ Shipped (v0.15.4) | `plans/2026-04-27-memory-m3-honcho-contract-coverage.md` |
-| M4 | Engagement memory (executors get continuity; meta scope readable) | 📋 Brainstorm needed | — |
+| M4 | Engagement memory (meta scope + executor archive read; specialists deferred) | ✅ Shipped (v0.16.0) | `plans/2026-04-27-memory-m4-engagement-memory.md` (spec: `specs/2026-04-27-memory-m4-engagement-memory-design.md`) |
+| M4b | Specialists become memory-bearing (per-`(role, user_peer)` 2-segment Honcho session; opt-in via `cfg.memory.token_budget > 0`) | ✅ Shipped (v0.17.0) | `plans/2026-04-27-memory-m4b-specialist-memory-design.md` (spec: `specs/2026-04-27-memory-m4b-specialist-memory-design.md`) |
 | M5 | `remember_fact` tool (the deferred-since-0.4.0 feature) | 📋 Planned | — |
 | M6 | Cross-role recall (consult-other-agent-memory) | 📋 Optional, large | — |
 
@@ -112,30 +113,124 @@ CachedMemoryProvider. NoOp intentionally silent. New spec § 13
 documents the telemetry contract. Live `HONCHO_LIVE_TEST=1`-gated
 test deferred as M3a.1 follow-up.
 
-## M4 — Engagement memory
+## M4 — Engagement memory (Medium scope: L1 + L3 + L4)
 
-**Why.** Three audit findings collapse into one design problem:
-- G5 — `meta` and `executor:<type>` are session-id segments not declared
-  in `scopes.yaml`. Never readable.
-- G9 — Tier-3 Executors get NO memory injection. Configurator starts
-  blind every engagement.
-- B4 — engagement summaries are write-only in normal recall.
+**Why.** Three audit findings (G5, G9, B4) collapse into one design;
+brainstorm 2026-04-27 reframed roadmap A/B/C as a layered L1/L2/L3/L4
+model. M4 ships the **Medium** subset: residents + executors. L2
+(specialists) deferred to M4b.
 
-Fix: make engagement history actually flow back into agent context.
-Three approaches, design-pick required:
+**Layered architecture:**
+- **L1** — `meta` declared as a system scope (`kind: system`,
+  `minimum_trust: authenticated`) in a v2 `scopes.yaml`. Always-on
+  after trust filter; no classifier routing; no embedding. Resident
+  `scopes_readable` adds `meta`. Voice (Tina) excluded by trust.
+- **L3** — Executor archive read at engage-start. New
+  `ExecutorMemoryConfig(enabled, token_budget)` on `ExecutorDefinition`
+  (`config.py:189` — note: the M4 design spec mis-cites this as
+  `ExecutorEntry`; `ExecutorEntry` at `config.py:141` is the
+  resident-side delegate ref, a different class — corrected in the
+  plan's Decisions log D5); Configurator opts in. New
+  `{executor_memory}` prompt-template slot in `engage_executor`
+  (`tools.py:858`).
+- **L4** — Free benefit: `_finalize_engagement` already writes
+  engagement summaries to the `meta` session for both specialist and
+  executor engagements; L1 makes them readable on Ellen's normal
+  turn. No new write code.
 
-1. **Minimal.** Declare `meta` as readable-by-assistant scope. Engagement
-   summaries reach Ellen's normal turn. ~50 LOC.
-2. **Right.** Executors get `MemoryConfig` on `definition.yaml`
-   (scopes_owned, scopes_readable). Configurator remembers what it
-   changed last week.
-3. **Both.** Combined.
+**Deliverables:**
+- `policy-scopes.v2.json` schema with `kind: topical | system`.
+- `defaults/policies/scopes.yaml` v2 declaring `meta`.
+- `assistant/runtime.yaml::scopes_readable` adds `meta`.
+- `agent.py::_process` partitions readable into system (always-on) +
+  topical (classifier-routed).
+- `ExecutorMemoryConfig` dataclass; `ExecutorDefinition.memory` field
+  (corrected from spec's `ExecutorEntry`); `executor.v1.json` schema
+  additive update (no const bump per plan D2).
+- `tools.py::engage_executor` `{executor_memory}` slot interpolation
+  via new `_fetch_executor_archive` helper.
+- Configurator doctrine sync: `architecture.md`, `recipes/scopes/edit.md`,
+  `recipes/executor/scaffold.md`, `recipes/resident/{create,update}.md`.
+- Architecture-spec updates (§§ 5, 6, 11, new § 14) ship in same
+  commit set per spec-doc-rot prevention.
 
-Real argument for "executors stateless" exists ("fresh slate per
-engagement, reasoned from artifacts"). **This needs a brainstorm
-session before plan-writing.**
+**Pre-1.0.0 license invoked:** scopes.yaml schema bump v1→v2 with
+no migration shim. Existing v1 fixtures regenerated; loader rejects
+v1 overlays at boot.
 
-**Status:** 📋 Brainstorm needed. M2/M3 prerequisite.
+**Version:** v0.16.0. **Ship-gate:** ineligible for low-risk fast
+path (changes runtime read semantics + new schema + production-critical
+paths); all 9 gates apply.
+
+**Status:** ✅ Shipped 2026-04-27 as v0.16.0. All 21 plan tasks landed
++ 4 fix-up commits (test-convention align, redundant-import drops,
+guard simplification). Master tip `93b442e`. Workflow_dispatch CI:
+all 4 jobs (tier1/tier2/tier3/baseline-runtime) green. N150 deployed
+via `/ha-prod-console:update`; smoke 3/3 PASS (healthz, turn-assistant,
+voice-sse). Pre-1.0.0 schema bump scopes.yaml v1→v2 with no migration
+shim landed cleanly. Configurator doctrine sync + arch-spec § 5/6/11/12
++ new § 14 in same commit set. Plan caught & corrected 7 stale plan
+citations during implementation (per spec-doc-rot prevention). M4b
+(specialists) remains separate brainstorm; M5 `remember_fact`, M6
+cross-role recall queued.
+
+## M4b — Specialists become memory-bearing (✅ Shipped v0.17.0, 2026-04-28)
+
+**What shipped.** Specialists (Tier 2 — Finance today; future
+Health/Personal/Business) gain per-`(role, user_peer)` Honcho memory.
+Each enabled specialist becomes a first-class Honcho peer whose session
+id is `f"{role}:{user_peer}"` (e.g. `finance:nicola`),
+**channel-agnostic** and **scope-agnostic**. Honcho's
+`observe_others=True`-on-agent-peer setup populates `peer_representation`
+automatically over time, giving each specialist a domain-narrow
+theory-of-mind of the user.
+
+**Architecture chosen:** Option A — one session per `(specialist,
+user_peer)`, mixed-domain. Brainstorm 2026-04-27 collapsed the original
+three candidates into a fourth, cleaner shape based on user behavioral
+elicitation: scenario-1 ruled out per-channel partition; scenario-2
+ruled out domain-scope partition. Spec: `2026-04-27-memory-m4b-specialist-memory-design.md`.
+
+**Code surface:**
+- `tools.py:_run_delegated_agent` (now at `:399`) reads via
+  `ensure_session` + `get_context` before SDK invocation; injects
+  `<memory_context agent="{role}">…</memory_context>` block between
+  `<delegation_context>` and `Task:`. Writes via background
+  `_specialist_add_turn_bg` after SDK return. Module-level
+  `_specialist_bg_tasks: set[asyncio.Task]` GC anchor.
+- `_specialist_meta_write_bg` writes 200-char-truncated summaries to
+  the parent's meta session for coordinator visibility, so Ellen sees
+  specialist activity independent of which scope her per-turn argmax
+  went to.
+- **Validator drop**: `specialist_registry._validate_tier2_shape` no
+  longer rejects `token_budget > 0`. Plan-time gap: M4b spec § 4.3
+  acknowledged only `agent_loader.py:562-573`; the duplicate validator
+  in `specialist_registry.py:133-138` was caught by the Task 13
+  implementer subagent in flight and dropped in commit `58fa70b`.
+- **Defaults flip**: `defaults/agents/specialists/finance/runtime.yaml`
+  bumps `memory.token_budget` 0 → 4000.
+
+**Trust posture.** No per-call filter at the memory layer. Trust
+enforcement stays one level up at the resident's `delegates`
+decision. If voice-Tina is ever permitted to delegate to Finance,
+Finance's full unified memory is in scope — operator must
+structurally split into separate specialist roles
+(e.g. `finance_personal` vs `finance_business`) if per-channel
+memory partition is desired.
+
+**Pre-existing concern surfaced during deploy verify**: live N150
+log shows `Memory add_turn failed in background: ... pattern '^[a-zA-Z0-9_-]+$' ...`
+on the resident write path. Honcho server-side validation rejects
+colons in session IDs that Casa has used since v0.2.2. Fail-soft
+absorbs it (background-only, no user regression). NOT M4b-introduced
+but M4b's own 2-segment session ID `finance:nicola` will hit the
+same wall once Finance is operator-enabled. See
+`reference_honcho_session_id_pattern_drift` memory.
+
+**Deferred to M5/M6:** specialist `peer_card` writes / `remember_fact`
+MCP tool → M5. Cross-specialist recall via `peer_perspective` → M6.
+`read_strategy: cached` for specialists. Multi-user
+(`user_peer != "nicola"`) — out of scope.
 
 ## M5 — `remember_fact` tool
 
