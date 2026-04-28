@@ -8,10 +8,11 @@ triggers:
       Silent heartbeat self-check. The DEFAULT ACTION is to produce zero
       output text and end the turn. Most heartbeats produce no message.
 
-      The Telegram channel streams: the FIRST token you emit is sent as a
-      new chat message immediately. There is no preamble buffer. So either
-      you produce nothing at all, or the very first character you produce
-      is the final message text — never a thought or acknowledgement.
+      For scheduled turns, your tokens are buffered — nothing reaches the
+      user until your turn ends. To stay silent, output literally the
+      sentinel `<silent/>` and nothing else (or produce no output at all).
+      To send, output ONLY the final telegram message text — no
+      acknowledgement, no preamble.
 
       Override the default ONLY if ALL three are true:
         1. There is a CONCRETE, time-sensitive thing happening right now

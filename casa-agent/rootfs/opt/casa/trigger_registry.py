@@ -114,7 +114,7 @@ class TriggerRegistry:
                 content=trig.prompt,
                 channel=trig.channel,
                 context={
-                    "chat_id": f"{trig.type}:{trig.name}",
+                    "chat_id": f"{trig.type}-{trig.name}",
                     "trigger": trig.name,
                     "cid": new_cid(),
                 },

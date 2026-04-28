@@ -1,5 +1,57 @@
 # Changelog
 
+## [0.17.2] - 2026-04-28 — Scheduled trigger silence (F1 follow-up)
+
+**Fixes the v0.17.1 regression where every scheduled trigger fire
+raised `ValueError` at session-id construction, plus the
+longer-standing leak where Ellen's heartbeat emitted
+acknowledgement-style first tokens into Telegram before her
+silence-check completed.**
+
+### Fixed
+
+- **`trigger_registry.py:117`** — scheduled-trigger `chat_id` now
+  hyphenates `{trig.type}-{trig.name}` instead of colon-joining, so
+  `build_session_key` + `honcho_session_id` accept it. Eliminates the
+  hourly `ERROR Agent 'Ellen' error [unknown]: part 1='interval:heartbeat'
+  contains characters outside [A-Za-z0-9_-]` log line.
+
+### Changed
+
+- **`agent.py` `handle_message`** — `MessageType.SCHEDULED` turns no
+  longer receive a `create_on_token` streaming callback. The agent
+  thinks privately; only the final text is delivered. Other message
+  types (`REQUEST`, `NOTIFICATION`, `RESPONSE`, `CHANNEL_IN`) are
+  untouched.
+- **`agent.py` `handle_message`** — sentinel-based silence gate for
+  `SCHEDULED`: when the model returns `<silent/>` (exact match after
+  `strip()`) or whitespace-only output, the send path is skipped and
+  no `RESPONSE` BusMessage is emitted.
+- **`defaults/agents/assistant/triggers.yaml`** — heartbeat prompt
+  replaces the obsolete streaming warning with the
+  `<silent/>` sentinel contract. Override rules and closing
+  instructions unchanged.
+
+### Tests
+
+- `tests/test_trigger_registry.py::TestInterval::test_interval_chat_id_is_honcho_compliant`
+  — roundtrip assertion that producer (trigger_registry) and validator
+  (`honcho_session_id`) agree on shape.
+- `tests/test_agent_process.py::TestScheduledSilence` (5 tests) —
+  `create_on_token` count for SCHEDULED vs REQUEST, sentinel
+  suppression, whitespace suppression, real-text passthrough.
+
+### Not changed
+
+- No deprecation shim for the colon-shaped `chat_id` (pre-1.0 license,
+  per `feedback_pre_1_0_0_license`).
+- No silent server-side sanitization in `honcho_session_id` — the
+  v0.17.1 fail-fast doctrine stands.
+- `morning-briefing.md` — sentinel is opt-in; prompts that always
+  send simply never emit `<silent/>`.
+- Voice channel user-supplied `scope_id` validation is followup, not
+  blocker (see spec §7).
+
 ## [0.17.1] - 2026-04-28 — Honcho session-id format fix (F1)
 
 **Fixes the 11-day silent Honcho-write bug discovered post-M4b deploy.**
