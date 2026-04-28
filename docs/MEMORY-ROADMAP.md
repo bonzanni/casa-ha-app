@@ -4,7 +4,7 @@ Living tracker for the memory subsystem (Honcho + SQLite + scope-routing
 + disclosure). Multi-session, gitignored like `ROADMAP.md`. Read at the
 start of every memory-touching session; update at the end.
 
-Last updated: 2026-04-28 — M4b shipped as v0.17.0 (specialists become memory-bearing first-class Honcho peers; 2-segment session id `f"{role}:{user_peer}"`; channel-agnostic, scope-agnostic; Finance opted in by default; validator drop in `specialist_registry`); 20 plan tasks + 4 fix-up commits = 21 commits ff-merged; CI green (PR + master); N150 smoke 3/3 PASS on v0.17.0; Finance still operator-disabled in prod — paths exercise on enable.
+Last updated: 2026-04-28 — M4b shipped as v0.17.0 (specialists become memory-bearing first-class Honcho peers; 2-segment session id `f"{role}-{user_peer}"` since v0.17.1; channel-agnostic, scope-agnostic; Finance opted in by default; validator drop in `specialist_registry`); 20 plan tasks + 4 fix-up commits = 21 commits ff-merged; CI green (PR + master); N150 smoke 3/3 PASS on v0.17.0; Finance still operator-disabled in prod — paths exercise on enable.
 
 ## Doctrine
 
@@ -70,8 +70,8 @@ M3/M4/M5 means we're adding features on top of a working baseline, not a
 
 **Deliverables:**
 - **G1 voice prewarm.** `channels/voice/channel.py:445` builds session_id
-  in pre-3.2 shape (`voice:{scope_id}:{role}` — 3 segments). Agent uses
-  4 segments (`{channel}:{chat_id}:{scope}:{role}`). Result: prewarm
+  in pre-3.2 shape (`voice-{scope_id}-{role}` — 3 segments). Agent uses
+  4 segments (`{channel}-{chat_id}-{scope}-{role}`). Result: prewarm
   cache key never read on real turn. Restore intended voice latency
   budget. Loop over `scopes_readable`; warm one entry per scope.
 - **G4 cancel-path memory.** `cancel_engagement` (`tools.py:1427`) and
@@ -179,7 +179,9 @@ cross-role recall queued.
 **What shipped.** Specialists (Tier 2 — Finance today; future
 Health/Personal/Business) gain per-`(role, user_peer)` Honcho memory.
 Each enabled specialist becomes a first-class Honcho peer whose session
-id is `f"{role}:{user_peer}"` (e.g. `finance:nicola`),
+id is `f"{role}-{user_peer}"` (e.g. `finance-nicola`; built via
+`honcho_session_id` since v0.17.1, originally `:`-joined at v0.17.0
+ship and rotated by F1),
 **channel-agnostic** and **scope-agnostic**. Honcho's
 `observe_others=True`-on-agent-peer setup populates `peer_representation`
 automatically over time, giving each specialist a domain-narrow
@@ -223,9 +225,11 @@ log shows `Memory add_turn failed in background: ... pattern '^[a-zA-Z0-9_-]+$' 
 on the resident write path. Honcho server-side validation rejects
 colons in session IDs that Casa has used since v0.2.2. Fail-soft
 absorbs it (background-only, no user regression). NOT M4b-introduced
-but M4b's own 2-segment session ID `finance:nicola` will hit the
-same wall once Finance is operator-enabled. See
-`reference_honcho_session_id_pattern_drift` memory.
+but M4b's own 2-segment session ID would have hit the same wall
+once Finance was operator-enabled, but F1 (v0.17.1, this branch)
+closed the regex bug and rotated the M4b session shape to
+`finance-nicola` before any specialist write hit the wire. See
+`reference_honcho_session_id_format` memory.
 
 **Deferred to M5/M6:** specialist `peer_card` writes / `remember_fact`
 MCP tool → M5. Cross-specialist recall via `peer_perspective` → M6.
@@ -269,14 +273,22 @@ The tool path wins for size. **Defer to after M3-M5 ship.**
 
 ## Open follow-ups (pick up next session)
 
-> **Session-start prompt:** "We have two memory follow-ups left after the
-> M4b ship (v0.17.0, 2026-04-28). Read this section + `MEMORY.md`'s
-> `reference_honcho_session_id_pattern_drift` and `project_memory_m4b_shipped`
-> entries, then pick one of the two items below and execute end-to-end."
+> **Session-start prompt:** "F1 shipped as v0.17.1 (2026-04-28); F2 remains
+> the open memory follow-up. Read this section + `MEMORY.md`'s
+> `reference_honcho_session_id_format` and `project_memory_m4b_shipped`
+> entries, then pick up F2 if it's still pending."
 
-### F1 — Honcho session-id colon-pattern rejection (LIVE FAILURE on N150)
+### F1 — Honcho session-id colon-pattern rejection (✅ Shipped v0.17.1, 2026-04-28)
 
-**Symptom.** Live N150 logs (since some unknown date pre-2026-04-28) show:
+**Status: SHIPPED v0.17.1 (2026-04-28).**
+
+Implementation plan: `docs/superpowers/plans/2026-04-28-honcho-session-id-format-fix.md`.
+Spec: `docs/superpowers/specs/2026-04-28-honcho-session-id-format-design.md`.
+Memory entry rotated: `memory/reference_honcho_session_id_pattern_drift.md` →
+`memory/reference_honcho_session_id_format.md`.
+
+**Original symptom (pre-fix).** Live N150 logs (since some unknown date
+pre-2026-04-28) showed:
 
 ```
 {"level":"WARNING","logger":"agent","msg":"Memory add_turn failed in background:
@@ -288,49 +300,27 @@ The tool path wins for size. **Defer to after M3-M5 ship.**
 ```
 
 The Honcho server-side regex `^[a-zA-Z0-9_-]+$` does NOT permit colons.
-Casa has used 4-segment colon-separated session IDs
+Casa had used 4-segment colon-separated session IDs
 (`{channel}:{chat_id}:{scope}:{role}`) since v0.2.2. Resident write
-path is silently failing — fail-soft (background-only, WARNING-only,
-no user regression visible) but **all new resident turns are NOT being
-persisted to Honcho**. The `peer_count: 0` in many `memory_call`
-emissions may be a manifestation of this (no writes ⇒ no peer growth).
+path was silently failing — fail-soft (background-only, WARNING-only,
+no user regression visible) but **all new resident turns were NOT being
+persisted to Honcho** for ~11 days. M4b's specialist write path
+(`f"{role}:{user_peer}"`, e.g. `finance:nicola`) had the same pattern
+violation, latent until Finance opted in.
 
-M4b's new specialist write path uses `f"{role}:{user_peer}"` (2-segment
-but still colon-separated, e.g. `finance:nicola`) — same pattern
-violation. Once Finance is operator-enabled, M4b's writes will hit the
-same wall.
-
-**Investigation steps:**
-
-1. Determine whether this is a recent Honcho server-side change or a
-   long-standing silent failure. Compare M3-era logs (early April 2026)
-   against today's. If the WARNING was already there pre-M3, it's
-   long-standing; if not, it's a recent regression.
-2. Check `casa-agent/requirements.txt` for the pinned `honcho-ai` SDK
-   version against Honcho's release notes / open issues for any
-   pattern-validation change.
-3. Probe Honcho directly with a colon-separated session ID via raw
-   HTTP — confirm whether the rejection is server-side or client-side
-   (in the SDK's input validation).
-4. If recent regression: pin / downgrade the SDK + raise an upstream
-   issue. If always-present: Casa needs a session-id format change.
-
-**Possible fixes (if structural fix needed):**
-
-- **Replace `:` with `-` or `_`** in Casa's session-id format. e.g.
-  `voice-default-house-butler` instead of `voice:default:house:butler`.
-  Touches every `build_session_key` / `_one_scope` / specialist write
-  path / executor archive path / probe — but is mechanical.
-- **Hash the session id** to a colon-free token (e.g. `sha256(sid)[:32]`).
-  Loses human readability in Honcho dashboard but preserves topology.
-- **Argue for `:` permitted upstream** — open a Honcho GitHub issue.
-
-**Eligibility for the low-risk fast path:** NO. This is a runtime
-behavior change and a possible breaking session-id rename. Full
-ship-gate (steps 1-9) applies.
+**Fix shipped.** New `casa-agent/rootfs/opt/casa/honcho_ids.py::honcho_session_id`
+canonical builder joins segments with `-` and validates each segment
+against `^[A-Za-z0-9_-]+$` before join. All build sites
+(`build_session_key`, `_one_scope`, voice prewarm, specialist M4b
+write, executor archive read/write, finalize meta write,
+`query_engager` engager-scope rebuild) routed through the builder.
+`session_sweeper` partition flipped from `:` to `-` to match.
+Pre-v0.17.1 colon-shaped Honcho sessions are abandoned in place (per
+the §5 "pre-3.2 IDs are orphaned" doctrine — same precedent).
 
 **Memory references:**
-- `reference_honcho_session_id_pattern_drift.md` (this finding's notes)
+- `reference_honcho_session_id_format.md` (rotated post-ship from
+  `reference_honcho_session_id_pattern_drift.md`)
 - `project_memory_m4b_shipped.md` (M4b ship summary; flagged this as
   follow-up)
 - `docs/superpowers/specs/2026-04-26-memory-architecture.md` § 5

@@ -48,33 +48,33 @@ class FakeMemoryProvider(MemoryProvider):
 
 async def test_fake_roundtrip_threads_user_peer():
     mem = FakeMemoryProvider()
-    await mem.ensure_session("telegram:1:assistant", "assistant")
+    await mem.ensure_session("telegram-1-assistant", "assistant")
     ctx = await mem.get_context(
-        "telegram:1:assistant", "assistant", tokens=4000, search_query="hi",
+        "telegram-1-assistant", "assistant", tokens=4000, search_query="hi",
     )
     await mem.add_turn(
-        "telegram:1:assistant", "assistant", "hi", "hello",
+        "telegram-1-assistant", "assistant", "hi", "hello",
     )
 
     assert mem.ensure_calls == [
-        ("telegram:1:assistant", "assistant", "nicola"),
+        ("telegram-1-assistant", "assistant", "nicola"),
     ]
     assert mem.get_calls == [
-        ("telegram:1:assistant", "assistant", 4000, "hi", "nicola"),
+        ("telegram-1-assistant", "assistant", 4000, "hi", "nicola"),
     ]
     assert mem.add_calls == [
-        ("telegram:1:assistant", "assistant", "hi", "hello", "nicola"),
+        ("telegram-1-assistant", "assistant", "hi", "hello", "nicola"),
     ]
-    assert ctx == "ctx(telegram:1:assistant,assistant,nicola)"
+    assert ctx == "ctx(telegram-1-assistant,assistant,nicola)"
 
 
 async def test_fake_voice_user_peer_override():
     mem = FakeMemoryProvider()
     await mem.ensure_session(
-        "voice:lr:butler", "butler", user_peer="voice_speaker",
+        "voice-lr-butler", "butler", user_peer="voice_speaker",
     )
     await mem.add_turn(
-        "voice:lr:butler", "butler", "lights on", "ok",
+        "voice-lr-butler", "butler", "lights on", "ok",
         user_peer="voice_speaker",
     )
     assert mem.ensure_calls[0][2] == "voice_speaker"

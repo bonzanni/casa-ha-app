@@ -222,8 +222,10 @@ The choice object is later turned into a concrete provider in
 Live session ids are 4 segments:
 
 ```
-{channel}:{chat_id}:{scope}:{role}
+{channel}-{chat_id}-{scope}-{role}
 ```
+
+Joined via `casa-agent/rootfs/opt/casa/honcho_ids.py::honcho_session_id`. The hyphen separator (rather than the v0.2.2–v0.17.0 colon) satisfies Honcho's server-side `^[A-Za-z0-9_-]+$` resource-name regex (upstream `src/schemas/api.py:37`).
 
 - `channel` — `telegram`, `voice`, `webhook`, `scheduler`, etc.
 - `chat_id` — the per-channel conversation key (Telegram chat id, voice
@@ -236,26 +238,28 @@ Live session ids are 4 segments:
 - `role` — `assistant`, `butler`, `finance`, etc.
 
 **Two-stage build.** The first two segments are joined by
-`build_session_key` in `session_registry.py:12`:
+`build_session_key` in `session_registry.py:12`, which now delegates to
+`honcho_session_id`:
 
 ```python
 def build_session_key(channel: str, scope_id: str | None) -> str:
     sid = scope_id if scope_id else "default"
-    return f"{channel}:{sid}"
+    return honcho_session_id(channel, sid)
 ```
 
-The agent appends the remaining two segments at call time. The
-canonical join site is `agent.py:312` inside the `_one_scope` helper:
+The agent appends the remaining two segments at call time, also via
+`honcho_session_id`. The canonical join site is in the `_one_scope`
+helper:
 
 ```python
-sid = f"{channel_key}:{scope}:{self.config.role}"
+sid = honcho_session_id(channel_key, scope, self.config.role)
 ```
 
-The same shape is reused on the write path
-(`agent.py:532`: `write_sid = f"{channel_key}:{write_scope}:{self.config.role}"`).
+The same shape is reused on the write path (resident write site in
+`agent.py` builds `write_sid = honcho_session_id(channel_key, write_scope, self.config.role)`).
 
 **Pre-3.2 IDs are orphaned.** The 2.2a topology used 3 segments
-(`{channel_key}:{role}`, no scope). When v0.8.0 inserted the scope
+(`{channel_key}-{role}`, no scope). When v0.8.0 inserted the scope
 segment, prior Honcho sessions and SQLite rows were abandoned in place
 — still queryable in the Honcho dashboard or the SQLite file, but never
 read by Casa again. Phase 3.2 §10 made this an explicit ship-time
@@ -264,7 +268,7 @@ carried Nicola's biographical facts across the cut.
 
 **Out-of-band consumers can drift.** The voice channel pre-warmer in
 `channels/voice/channel.py` was found in the M1 audit to still build a
-3-segment session id (`voice:{scope_id}:{role}`), so its cache key
+3-segment session id (`voice-{scope_id}-{role}`), so its cache key
 never matches the 4-segment id the agent computes. M2 (G1) closes that
 drift by looping over `scopes_readable` and warming one entry per
 scope.
@@ -275,7 +279,7 @@ engagement during a turn (e.g. `engage_executor` → Tina, `delegate_to_agent`
 `scope = argmax_scope(scores, default_scope)` stamped onto `origin_var`
 by `agent.py:309-314` immediately after the read-path classifier runs.
 Downstream consumers — chiefly `query_engager` at `tools.py:1410`,
-which rebuilds `{channel}:{chat_id}:{scope}:{role}` to retrieve from
+which rebuilds `{channel}-{chat_id}-{scope}-{role}` (via `honcho_session_id`) to retrieve from
 the engager's actual session — read it via `engagement.origin.get(
 "scope", "meta")`. The literal `"meta"` fallback handles edge paths
 (cron triggers, boot replay) that engage without going through
@@ -292,7 +296,8 @@ and never win argmax.
 
 **Specialist sessions are 2-segment (M4b, v0.17.0).** Specialists are
 per-`(role, user_peer)` Honcho peers — channel-agnostic, scope-agnostic.
-Session id shape is `f"{role}:{user_peer}"` (e.g. `finance:nicola`).
+Session id shape is `honcho_session_id(role, user_peer)` → `{role}-{user_peer}`
+(e.g. `finance-nicola`).
 This is the *only* place in Casa where the canonical session id is not
 4-segment. The asymmetry is justified: residents are channel-trust-aware
 coordinators that read partitioned memory; specialists are domain
@@ -493,8 +498,8 @@ What SQLite is, in current code:
   pruning job. Roadmap explicitly defers retention/pruning under "log
   a warning above N MB, never auto-prune".
 - **Switching backends = fresh start.** No dual-write, no migration,
-  no export/import CLI. Session ids stay derived (`{channel}:{chat_id}
-  :{scope}:{role}`), so a swap from Honcho back to SQLite resumes the
+  no export/import CLI. Session ids stay derived (`{channel}-{chat_id}
+  -{scope}-{role}`), so a swap from Honcho back to SQLite resumes the
   prior SQLite sessions naturally; switching from SQLite → Honcho
   walks away from accumulated SQLite history.
 
@@ -584,7 +589,7 @@ remaining for memory work:
   `ExecutorMemoryConfig` on `ExecutorDefinition`; Configurator opts
   in. New `{executor_memory}` prompt slot in `engage_executor`
   populated from per-executor Honcho session at
-  `{channel}:{chat_id}:executor:{type}`. L4: free benefit — meta
+  `{channel}-{chat_id}-executor-{type}` (built via `honcho_session_id`). L4: free benefit — meta
   session already populated by `_finalize_engagement` (M2.G4)
   becomes readable. See § 14 for the full shape.
 - **M5 — `remember_fact` tool.** The deferred-since-v0.4.0 feature.
@@ -717,7 +722,7 @@ unchanged; engagement summaries never leak to the voice channel.
 on `ExecutorDefinition` (`config.py:203`) opts an executor type into
 cross-engagement context. When `enabled: true`, `engage_executor`
 (`tools.py:896`) reads from
-`{channel}:{chat_id}:executor:{type}` via Honcho's
+`{channel}-{chat_id}-executor-{type}` (built via `honcho_session_id`) via Honcho's
 `session.context(tokens=token_budget)` and interpolates the digest
 into the prompt template's `{executor_memory}` slot under the header
 `"## Prior engagements (lessons learned)"`.
@@ -737,7 +742,7 @@ executors).
 `_finalize_engagement` (`tools.py::_finalize_engagement`, meta-write
 block at `tools.py:1321-1334`) already writes one summary per terminal
 engagement to the meta session
-`{channel}:{chat_id}:meta:assistant`, regardless of engagement kind
+`{channel}-{chat_id}-meta-assistant` (built via `honcho_session_id`), regardless of engagement kind
 (specialist OR executor). The write site has been live since M2.G4
 (v0.15.3). Once L1 declares meta as a readable scope, those summaries
 become readable on Ellen's normal turn — no new writer code.
@@ -799,7 +804,7 @@ After the SDK invocation returns text, if
 `cfg.memory.token_budget > 0` AND `text` is non-empty AND
 `memory_provider` is non-None, `_run_delegated_agent` fires a
 background task `_specialist_add_turn_bg` that calls
-`memory_provider.add_turn(session_id=f"{role}:nicola", agent_role=role,
+`memory_provider.add_turn(session_id=honcho_session_id(role, "nicola"), agent_role=role,
 user_text=task_text, assistant_text=text, user_peer="nicola")`. The
 `user_text` is the **task body** — *not* the wrapped prompt with
 `<delegation_context>` + `<memory_context>` — so the session messages
@@ -813,7 +818,8 @@ to the caller.
 
 When `delegate_to_agent` writes the specialist turn, it ALSO writes a
 one-line summary to the parent resident's meta session
-`f"{channel}:{chat_id}:meta:{parent_role}"` via
+`honcho_session_id(channel, chat_id, "meta", parent_role)` →
+`{channel}-{chat_id}-meta-{parent_role}` via
 `_specialist_meta_write_bg`. This gives Ellen a unified
 "specialists-have-been-doing-X" view independent of which scope her
 own turn wrote to. The summary format is:

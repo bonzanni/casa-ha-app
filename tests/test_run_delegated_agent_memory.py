@@ -157,13 +157,13 @@ async def test_token_budget_positive_calls_ensure_and_get_context(monkeypatch):
         )
 
     mp.ensure_session.assert_awaited_once_with(
-        session_id="finance:nicola",
+        session_id="finance-nicola",
         agent_role="finance",
         user_peer="nicola",
     )
     mp.get_context.assert_awaited_once()
     kwargs = mp.get_context.await_args.kwargs
-    assert kwargs["session_id"] == "finance:nicola"
+    assert kwargs["session_id"] == "finance-nicola"
     assert kwargs["agent_role"] == "finance"
     assert kwargs["user_peer"] == "nicola"
     assert kwargs["tokens"] == 4000
@@ -284,11 +284,11 @@ async def test_add_turn_fires_with_task_body_and_reply(monkeypatch):
     # (the latter added by Task 12). Locate the specialist-session call.
     specialist_calls = [
         c for c in mp.add_turn.await_args_list
-        if c.kwargs.get("session_id") == "finance:nicola"
+        if c.kwargs.get("session_id") == "finance-nicola"
     ]
     assert len(specialist_calls) == 1
     kwargs = specialist_calls[0].kwargs
-    assert kwargs["session_id"] == "finance:nicola"
+    assert kwargs["session_id"] == "finance-nicola"
     assert kwargs["agent_role"] == "finance"
     assert kwargs["user_peer"] == "nicola"
     assert kwargs["user_text"] == "Q1 cashflow?"
@@ -365,11 +365,11 @@ async def test_delegation_writes_meta_scope_summary(monkeypatch):
     if bg:
         await asyncio.gather(*list(bg), return_exceptions=True)
 
-    # Two add_turn calls expected: one to finance:nicola (specialist),
-    # one to telegram:abc:meta:assistant (parent meta).
+    # Two add_turn calls expected: one to finance-nicola (specialist),
+    # one to telegram-abc-meta-assistant (parent meta).
     sessions_written = {
         c.kwargs["session_id"]
         for c in mp.add_turn.await_args_list
     }
-    assert "finance:nicola" in sessions_written
-    assert "telegram:abc:meta:assistant" in sessions_written
+    assert "finance-nicola" in sessions_written
+    assert "telegram-abc-meta-assistant" in sessions_written

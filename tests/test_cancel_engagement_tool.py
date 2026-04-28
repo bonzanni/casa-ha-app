@@ -100,7 +100,7 @@ async def test_cancel_writes_meta_scope_summary(tmp_path, monkeypatch):
     assert payload["status"] == "ok"
 
     # Meta-scope summary write fired exactly once.
-    meta_sid = "telegram:123:meta:assistant"
+    meta_sid = "telegram-123-meta-assistant"
     assert any(
         c.kwargs.get("session_id") == meta_sid
         for c in mp.ensure_session.await_args_list
@@ -111,7 +111,7 @@ async def test_cancel_writes_meta_scope_summary(tmp_path, monkeypatch):
     )
 
     # Per-executor-type archival also fired (kind=executor branch).
-    type_sid = "telegram:123:executor:configurator"
+    type_sid = "telegram-123-executor-configurator"
     assert any(
         c.kwargs.get("session_id") == type_sid
         for c in mp.add_turn.await_args_list

@@ -50,7 +50,7 @@ in its `runtime.yaml`. To turn it into a memory-bearing peer:
    ```
 2. Reload via `reload_agents`.
 3. The next `delegate_to_agent` call to this specialist opens a fresh
-   Honcho session at `f"{role}:nicola"` and starts accumulating.
+   Honcho session at `f"{role}-nicola"` (built via `honcho_ids.honcho_session_id(role, user_peer)`) and starts accumulating.
 
 There is no migration step from stateless calls. Past
 delegate_to_agent invocations were not stored anywhere; the

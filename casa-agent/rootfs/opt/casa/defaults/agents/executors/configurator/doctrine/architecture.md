@@ -99,7 +99,7 @@ include:
       token_budget: 2000
 
 When `enabled: true`, `engage_executor` reads the archive at
-`{channel}:{chat_id}:executor:{type}` and substitutes the digest into the
+`{channel}-{chat_id}-executor-{type}` (built via `honcho_session_id`) and substitutes the digest into the
 prompt template's `{executor_memory}` slot before driver dispatch. The
 archive is populated by `_finalize_engagement` (one summary per terminal
 engagement) — no separate writer code.
@@ -112,8 +112,10 @@ prompt under "## Prior engagements (lessons learned)".
 
 Specialists carry **per-`(role, user_peer)` Honcho memory** —
 channel-agnostic, scope-agnostic, mixed-domain. Session id is
-`f"{role}:{user_peer}"` (2-segment, distinct from residents'
-4-segment `{channel}:{chat_id}:{scope}:{role}`).
+`f"{role}-{user_peer}"` (2-segment, distinct from residents'
+4-segment `{channel}-{chat_id}-{scope}-{role}`). Both shapes are
+built via `honcho_session_id` to satisfy Honcho's
+`^[A-Za-z0-9_-]+$` server-side regex.
 
 Honcho's existing `observe_others=True`-on-agent-peer setup
 (`memory.py:185-204`) populates `peer_representation` automatically

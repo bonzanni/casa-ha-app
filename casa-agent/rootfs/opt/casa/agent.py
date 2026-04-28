@@ -35,6 +35,7 @@ from mcp_registry import McpServerRegistry
 from channel_trust import channel_trust, channel_trust_display, user_peer_for_channel
 from timekeeping import resolve_tz
 from memory import MemoryProvider
+from honcho_ids import honcho_session_id
 from session_registry import SessionRegistry, build_session_key
 from retry import retry_sdk_call
 from tokens import (
@@ -329,7 +330,7 @@ class Agent:
             )
 
             async def _one_scope(scope: str) -> tuple[str, str]:
-                sid = f"{channel_key}:{scope}:{self.config.role}"
+                sid = honcho_session_id(channel_key, scope, self.config.role)
                 try:
                     await self._memory.ensure_session(
                         session_id=sid,
@@ -362,7 +363,7 @@ class Agent:
             )
             if memory_blocks:
                 self._budget_tracker.record(
-                    f"{channel_key}:{self.config.role}",
+                    f"{channel_key}-{self.config.role}",
                     estimate_tokens(memory_blocks),
                     self.config.memory.token_budget,
                 )
@@ -549,7 +550,9 @@ class Agent:
                         write_scope = self._scope_registry.argmax_scope(
                             write_scores, self.config.memory.default_scope,
                         )
-                    write_sid = f"{channel_key}:{write_scope}:{self.config.role}"
+                    write_sid = honcho_session_id(
+                        channel_key, write_scope, self.config.role,
+                    )
                     task = asyncio.create_task(self._add_turn_bg(
                         write_sid, self.config.role, user_text, response_text, user_peer,
                     ))

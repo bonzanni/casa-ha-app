@@ -52,7 +52,7 @@ class TestEvictionPolicy:
         # 5 active tg entries (10 days old — well under 30-day TTL).
         for i in range(5):
             await _seed(
-                reg, f"telegram:{i}", f"sdk-{i}",
+                reg, f"telegram-{i}", f"sdk-{i}",
                 last_active=now - timedelta(days=10),
             )
 
@@ -73,9 +73,9 @@ class TestEvictionPolicy:
         now = datetime(2026, 4, 18, tzinfo=timezone.utc)
         # 3 active + 2 expired (31 days old).
         for i in range(3):
-            await _seed(reg, f"telegram:{i}", f"sdk-{i}", now - timedelta(days=10))
+            await _seed(reg, f"telegram-{i}", f"sdk-{i}", now - timedelta(days=10))
         for i in range(3, 5):
-            await _seed(reg, f"telegram:{i}", f"sdk-{i}", now - timedelta(days=31))
+            await _seed(reg, f"telegram-{i}", f"sdk-{i}", now - timedelta(days=31))
 
         sweeper = SessionSweeper(
             registry=reg,
@@ -87,11 +87,11 @@ class TestEvictionPolicy:
         await sweeper._sweep_once()
 
         remaining = reg.all_entries()
-        assert set(remaining.keys()) == {"telegram:0", "telegram:1", "telegram:2"}
+        assert set(remaining.keys()) == {"telegram-0", "telegram-1", "telegram-2"}
 
         # Disk state agrees.
         on_disk = json.loads((tmp_path / "sessions.json").read_text())
-        assert set(on_disk.keys()) == {"telegram:0", "telegram:1", "telegram:2"}
+        assert set(on_disk.keys()) == {"telegram-0", "telegram-1", "telegram-2"}
 
     async def test_ttl_boundary_is_inclusive_on_keep_side(self, tmp_path):
         """An entry whose age equals the TTL exactly is KEPT (not evicted).
@@ -101,7 +101,7 @@ class TestEvictionPolicy:
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
         now = datetime(2026, 4, 18, tzinfo=timezone.utc)
-        await _seed(reg, "telegram:x", "sdk-x", now - timedelta(days=30))
+        await _seed(reg, "telegram-x", "sdk-x", now - timedelta(days=30))
 
         sweeper = SessionSweeper(
             registry=reg,
@@ -112,7 +112,7 @@ class TestEvictionPolicy:
         )
         await sweeper._sweep_once()
 
-        assert reg.get("telegram:x") is not None
+        assert reg.get("telegram-x") is not None
 
     async def test_webhook_uuid_scope_uses_short_ttl(self, tmp_path):
         path = str(tmp_path / "sessions.json")
@@ -121,7 +121,7 @@ class TestEvictionPolicy:
         one_shot = str(uuid.uuid4())
         # 2 days old: under the 30-day standard TTL, OVER the 1-day webhook TTL.
         await _seed(
-            reg, f"webhook:{one_shot}", "sdk-uuid",
+            reg, f"webhook-{one_shot}", "sdk-uuid",
             now - timedelta(days=2),
         )
 
@@ -134,7 +134,36 @@ class TestEvictionPolicy:
         )
         await sweeper._sweep_once()
 
-        assert reg.get(f"webhook:{one_shot}") is None
+        assert reg.get(f"webhook-{one_shot}") is None
+
+    async def test_sweep_extracts_channel_from_hyphen_key(self, tmp_path):
+        """Post v0.17.1 the registry key shape is {channel}-{scope_id}; the
+        sweeper must partition on '-' to read the channel correctly when
+        classifying webhook-vs-session TTL.
+        """
+        # Fabricate a registry with one expired webhook UUID-scope entry
+        # written under the new hyphen shape.
+        old_iso = (
+            datetime.now(timezone.utc) - timedelta(days=2)
+        ).isoformat()
+        path = tmp_path / "sessions.json"
+        path.write_text(json.dumps({
+            "webhook-12345678-1234-1234-1234-123456789012": {
+                "agent": "assistant",
+                "sdk_session_id": "sdk-x",
+                "last_active": old_iso,
+            },
+        }))
+        reg = SessionRegistry(str(path))
+        sweeper = SessionSweeper(
+            registry=reg,
+            session_ttl_days=30,
+            webhook_session_ttl_days=1,  # < 2 days elapsed
+        )
+        await sweeper._sweep_once()
+        assert reg.get(
+            "webhook-12345678-1234-1234-1234-123456789012"
+        ) is None  # evicted under webhook TTL
 
     async def test_webhook_non_uuid_scope_uses_standard_ttl(self, tmp_path):
         """A webhook entry with a deliberately-pinned non-UUID chat_id is NOT
@@ -145,7 +174,7 @@ class TestEvictionPolicy:
         now = datetime(2026, 4, 18, tzinfo=timezone.utc)
         # 2 days old: under standard 30-day TTL → survives.
         await _seed(
-            reg, "webhook:ha-automation-daily", "sdk-pinned",
+            reg, "webhook-ha-automation-daily", "sdk-pinned",
             now - timedelta(days=2),
         )
 
@@ -158,7 +187,7 @@ class TestEvictionPolicy:
         )
         await sweeper._sweep_once()
 
-        assert reg.get("webhook:ha-automation-daily") is not None
+        assert reg.get("webhook-ha-automation-daily") is not None
 
     async def test_non_webhook_channels_ignore_webhook_ttl(self, tmp_path):
         """A 2-day-old telegram entry whose scope_id happens to be a UUID must
@@ -169,7 +198,7 @@ class TestEvictionPolicy:
         now = datetime(2026, 4, 18, tzinfo=timezone.utc)
         coincidental_uuid = str(uuid.uuid4())
         await _seed(
-            reg, f"telegram:{coincidental_uuid}", "sdk-tg",
+            reg, f"telegram-{coincidental_uuid}", "sdk-tg",
             now - timedelta(days=2),
         )
 
@@ -182,19 +211,19 @@ class TestEvictionPolicy:
         )
         await sweeper._sweep_once()
 
-        assert reg.get(f"telegram:{coincidental_uuid}") is not None
+        assert reg.get(f"telegram-{coincidental_uuid}") is not None
 
     async def test_unparseable_last_active_is_evicted(self, tmp_path):
         """A corrupt / missing last_active is treated as stale garbage."""
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
         async with reg._lock:
-            reg._data["telegram:bad"] = {
+            reg._data["telegram-bad"] = {
                 "agent": "assistant",
                 "sdk_session_id": "sdk-bad",
                 "last_active": "not-a-date",
             }
-            reg._data["telegram:missing"] = {
+            reg._data["telegram-missing"] = {
                 "agent": "assistant",
                 "sdk_session_id": "sdk-missing",
                 # no last_active field
@@ -211,15 +240,15 @@ class TestEvictionPolicy:
         )
         await sweeper._sweep_once()
 
-        assert reg.get("telegram:bad") is None
-        assert reg.get("telegram:missing") is None
+        assert reg.get("telegram-bad") is None
+        assert reg.get("telegram-missing") is None
 
     async def test_no_evictions_triggers_no_save(self, tmp_path, monkeypatch):
         """If nothing needs eviction, the sweep must not rewrite the file."""
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
         now = datetime(2026, 4, 18, tzinfo=timezone.utc)
-        await _seed(reg, "telegram:1", "sdk-1", now - timedelta(days=1))
+        await _seed(reg, "telegram-1", "sdk-1", now - timedelta(days=1))
 
         save_calls = [0]
         orig = reg._save_locked
@@ -250,7 +279,7 @@ class TestEvictionPolicy:
         reg = SessionRegistry(path)
         now = datetime(2026, 4, 18, tzinfo=timezone.utc)
         for i in range(7):
-            await _seed(reg, f"telegram:{i}", f"sdk-{i}", now - timedelta(days=60))
+            await _seed(reg, f"telegram-{i}", f"sdk-{i}", now - timedelta(days=60))
 
         sweeper = SessionSweeper(
             registry=reg,
@@ -284,7 +313,7 @@ class TestConcurrency:
         now = datetime(2026, 4, 18, tzinfo=timezone.utc)
         # 5 expired entries to evict.
         for i in range(5):
-            await _seed(reg, f"telegram:old-{i}", f"sdk-{i}", now - timedelta(days=60))
+            await _seed(reg, f"telegram-old-{i}", f"sdk-{i}", now - timedelta(days=60))
 
         sweeper = SessionSweeper(
             registry=reg,
@@ -296,15 +325,15 @@ class TestConcurrency:
         # Fire sweep + register concurrently on the same event loop.
         await asyncio.gather(
             sweeper._sweep_once(),
-            reg.register("telegram:new", "assistant", "sdk-new"),
+            reg.register("telegram-new", "assistant", "sdk-new"),
         )
 
         remaining = reg.all_entries()
         # All 5 old entries gone, new entry present.
-        assert set(remaining.keys()) == {"telegram:new"}
+        assert set(remaining.keys()) == {"telegram-new"}
 
         on_disk = json.loads((tmp_path / "sessions.json").read_text())
-        assert set(on_disk.keys()) == {"telegram:new"}
+        assert set(on_disk.keys()) == {"telegram-new"}
 
     async def test_sweep_holds_lock_during_eviction(self, tmp_path):
         """Register() called during the critical section must wait for it."""
@@ -312,7 +341,7 @@ class TestConcurrency:
         reg = SessionRegistry(path)
         now = datetime(2026, 4, 18, tzinfo=timezone.utc)
         for i in range(3):
-            await _seed(reg, f"telegram:old-{i}", f"sdk-{i}", now - timedelta(days=60))
+            await _seed(reg, f"telegram-old-{i}", f"sdk-{i}", now - timedelta(days=60))
 
         # Block inside the sweep by wrapping _save_locked with a release-timed
         # suspension. While the sweep holds the lock, a concurrent register()
@@ -340,7 +369,7 @@ class TestConcurrency:
         await asyncio.sleep(0)
 
         register_task = asyncio.create_task(
-            reg.register("telegram:new", "assistant", "sdk-new"),
+            reg.register("telegram-new", "assistant", "sdk-new"),
         )
         await asyncio.sleep(0.02)
         assert not register_task.done(), \
@@ -348,9 +377,9 @@ class TestConcurrency:
 
         release.set()
         await asyncio.gather(sweep_task, register_task)
-        assert reg.get("telegram:new") is not None
+        assert reg.get("telegram-new") is not None
         for i in range(3):
-            assert reg.get(f"telegram:old-{i}") is None
+            assert reg.get(f"telegram-old-{i}") is None
 
 
 # ---------------------------------------------------------------------------
@@ -375,8 +404,8 @@ class TestSdkSessionPrune:
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
         now = datetime(2026, 4, 18, tzinfo=timezone.utc)
-        await _seed(reg, "telegram:1", "sdk-1", now - timedelta(days=60))
-        await _seed(reg, "telegram:2", "sdk-2", now - timedelta(days=60))
+        await _seed(reg, "telegram-1", "sdk-1", now - timedelta(days=60))
+        await _seed(reg, "telegram-2", "sdk-2", now - timedelta(days=60))
 
         sweeper = SessionSweeper(
             registry=reg,
@@ -404,7 +433,7 @@ class TestSdkSessionPrune:
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
         now = datetime(2026, 4, 18, tzinfo=timezone.utc)
-        await _seed(reg, "telegram:1", "sdk-1", now - timedelta(days=60))
+        await _seed(reg, "telegram-1", "sdk-1", now - timedelta(days=60))
 
         sweeper = SessionSweeper(
             registry=reg,
@@ -415,7 +444,7 @@ class TestSdkSessionPrune:
         )
         await sweeper._sweep_once()
 
-        assert reg.get("telegram:1") is None  # eviction still happened
+        assert reg.get("telegram-1") is None  # eviction still happened
 
     async def test_prune_raising_does_not_break_sweep(
         self, tmp_path, monkeypatch,
@@ -433,8 +462,8 @@ class TestSdkSessionPrune:
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
         now = datetime(2026, 4, 18, tzinfo=timezone.utc)
-        await _seed(reg, "telegram:1", "sdk-1", now - timedelta(days=60))
-        await _seed(reg, "telegram:2", "sdk-2", now - timedelta(days=60))
+        await _seed(reg, "telegram-1", "sdk-1", now - timedelta(days=60))
+        await _seed(reg, "telegram-2", "sdk-2", now - timedelta(days=60))
 
         sweeper = SessionSweeper(
             registry=reg,
@@ -463,7 +492,7 @@ class TestLifecycle:
         now = [datetime(2026, 4, 18, tzinfo=timezone.utc)]
 
         # 1 expired entry we can watch get evicted by the periodic tick.
-        await _seed(reg, "telegram:old", "sdk-old", now[0] - timedelta(days=60))
+        await _seed(reg, "telegram-old", "sdk-old", now[0] - timedelta(days=60))
 
         # Use a very short sweep interval so the test completes quickly.
         # sweep_interval_hours is converted to seconds internally; pass a
@@ -479,9 +508,9 @@ class TestLifecycle:
         try:
             for _ in range(200):
                 await asyncio.sleep(0.01)
-                if reg.get("telegram:old") is None:
+                if reg.get("telegram-old") is None:
                     break
-            assert reg.get("telegram:old") is None
+            assert reg.get("telegram-old") is None
         finally:
             await sweeper.stop()
 
