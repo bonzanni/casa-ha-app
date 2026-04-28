@@ -100,3 +100,27 @@ def test_reject_over_100_chars():
     long = "x" * 60
     with pytest.raises(ValueError, match="Honcho rejects > 100"):
         honcho_session_id(long, long)  # joined = 121 chars
+
+
+def test_pre_fix_session_id_would_trip_honcho_regex():
+    """Regression fixture — locks in why honcho_session_id exists.
+
+    The pre-v0.17.1 shape ``f"{channel}:{chat_id}:{scope}:{role}"``
+    matches NEITHER the new builder's per-part regex NOR the Honcho
+    server's overall regex. This test passes the literal pre-fix
+    string as a single part and confirms ``honcho_session_id`` rejects
+    it — the same character class Honcho rejects upstream.
+
+    If this test ever passes a colon-containing string, the fix has
+    silently regressed.
+    """
+    pre_fix = "telegram:123456:domestic:assistant"
+    assert ":" in pre_fix  # sanity
+    with pytest.raises(ValueError, match=r"outside \[A-Za-z0-9_-\]"):
+        honcho_session_id(pre_fix)
+
+    # Independently: every individual segment IS clean — proving the
+    # ONLY issue is the separator. The new builder joins on '-' so
+    # the resulting id IS Honcho-compliant.
+    sid = honcho_session_id("telegram", "123456", "domestic", "assistant")
+    assert HONCHO_PATTERN.fullmatch(sid)
