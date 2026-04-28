@@ -162,11 +162,19 @@ class Agent:
         ):
             msg = self._synthesize_delegation_turn(msg)
 
-        # Obtain a streaming callback from the channel (if available)
+        # Obtain a streaming callback from the channel (if available).
+        # SCHEDULED turns are buffered: the agent thinks privately and
+        # only the final text is sent. This prevents Telegram leaking
+        # acknowledgement-style first tokens into the chat before the
+        # prompt's silence check completes (spec 2026-04-28 §3.2 B.1).
         on_token: OnTokenCallback | None = None
         channel = self._channel_manager.get(msg.channel) if msg.channel else None
 
-        if channel is not None and hasattr(channel, "create_on_token"):
+        if (
+            channel is not None
+            and hasattr(channel, "create_on_token")
+            and msg.type != MessageType.SCHEDULED
+        ):
             on_token = channel.create_on_token(msg.context)
 
         error_kind: ErrorKind | None = None

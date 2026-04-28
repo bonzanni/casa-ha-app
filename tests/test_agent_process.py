@@ -929,3 +929,88 @@ class TestOriginVar:
         assert child_saw["origin"] is not None
         assert child_saw["origin"]["channel"] == "voice"
         assert child_saw["origin"]["role"] == "butler"
+
+
+# ---------------------------------------------------------------------------
+# Scheduled-trigger silence (spec 2026-04-28 §3.2)
+# ---------------------------------------------------------------------------
+
+
+class _StubChannel:
+    """Minimal channel double for handle_message dispatch tests.
+
+    NOT a Channel subclass — Channel is ABC and instantiation would
+    fail. The agent only does hasattr() checks plus direct attribute
+    calls, so a duck-typed object suffices. ChannelManager.register
+    keys on .name.
+    """
+
+    name = "telegram"
+    default_agent = "assistant"
+
+    def __init__(self) -> None:
+        from unittest.mock import MagicMock, AsyncMock
+        # create_on_token is a sync factory returning an async callback.
+        self.create_on_token = MagicMock(return_value=AsyncMock())
+        self.send = AsyncMock()
+        self.finalize_stream = AsyncMock()
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+
+def _scheduled_msg(text: str = "tick") -> BusMessage:
+    return BusMessage(
+        type=MessageType.SCHEDULED,
+        source="scheduler",
+        target="assistant",
+        content=text,
+        channel="telegram",
+        context={"chat_id": "interval-heartbeat"},
+    )
+
+
+def _request_msg(text: str = "hi") -> BusMessage:
+    return BusMessage(
+        type=MessageType.REQUEST,
+        source="user",
+        target="assistant",
+        content=text,
+        channel="telegram",
+        context={"chat_id": "12345"},
+    )
+
+
+class TestScheduledSilence:
+    async def test_scheduled_does_not_create_on_token(self, tmp_path):
+        """Spec §3.2 B.1: SCHEDULED must NOT receive a streaming
+        callback. The Telegram channel sends the first token as a new
+        chat message; suppressing on_token is the load-bearing fix."""
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+        stub = _StubChannel()
+        agent._channel_manager.register(stub)
+
+        with patch.object(
+            agent, "_process", AsyncMock(return_value=""),
+        ):
+            await agent.handle_message(_scheduled_msg())
+
+        assert stub.create_on_token.call_count == 0
+
+    async def test_request_still_streams(self, tmp_path):
+        """Spec §3.2 B.1 non-goal: streaming for REQUEST is unchanged."""
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+        stub = _StubChannel()
+        agent._channel_manager.register(stub)
+
+        with patch.object(
+            agent, "_process", AsyncMock(return_value="pong"),
+        ):
+            await agent.handle_message(_request_msg())
+
+        assert stub.create_on_token.call_count == 1
