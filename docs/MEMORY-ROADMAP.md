@@ -267,6 +267,119 @@ The tool path wins for size. **Defer to after M3-M5 ship.**
 
 **Status:** 📋 Optional. M5 prerequisite.
 
+## Open follow-ups (pick up next session)
+
+> **Session-start prompt:** "We have two memory follow-ups left after the
+> M4b ship (v0.17.0, 2026-04-28). Read this section + `MEMORY.md`'s
+> `reference_honcho_session_id_pattern_drift` and `project_memory_m4b_shipped`
+> entries, then pick one of the two items below and execute end-to-end."
+
+### F1 — Honcho session-id colon-pattern rejection (LIVE FAILURE on N150)
+
+**Symptom.** Live N150 logs (since some unknown date pre-2026-04-28) show:
+
+```
+{"level":"WARNING","logger":"agent","msg":"Memory add_turn failed in background:
+  [{'type': 'string_pattern_mismatch',
+    'loc': ['body', 'id'],
+    'msg': \"String should match pattern '^[a-zA-Z0-9_-]+$'\",
+    'input': 'voice:probe-scope:house:butler',
+    'ctx': {'pattern': '^[a-zA-Z0-9_-]+$'}}]"}
+```
+
+The Honcho server-side regex `^[a-zA-Z0-9_-]+$` does NOT permit colons.
+Casa has used 4-segment colon-separated session IDs
+(`{channel}:{chat_id}:{scope}:{role}`) since v0.2.2. Resident write
+path is silently failing — fail-soft (background-only, WARNING-only,
+no user regression visible) but **all new resident turns are NOT being
+persisted to Honcho**. The `peer_count: 0` in many `memory_call`
+emissions may be a manifestation of this (no writes ⇒ no peer growth).
+
+M4b's new specialist write path uses `f"{role}:{user_peer}"` (2-segment
+but still colon-separated, e.g. `finance:nicola`) — same pattern
+violation. Once Finance is operator-enabled, M4b's writes will hit the
+same wall.
+
+**Investigation steps:**
+
+1. Determine whether this is a recent Honcho server-side change or a
+   long-standing silent failure. Compare M3-era logs (early April 2026)
+   against today's. If the WARNING was already there pre-M3, it's
+   long-standing; if not, it's a recent regression.
+2. Check `casa-agent/requirements.txt` for the pinned `honcho-ai` SDK
+   version against Honcho's release notes / open issues for any
+   pattern-validation change.
+3. Probe Honcho directly with a colon-separated session ID via raw
+   HTTP — confirm whether the rejection is server-side or client-side
+   (in the SDK's input validation).
+4. If recent regression: pin / downgrade the SDK + raise an upstream
+   issue. If always-present: Casa needs a session-id format change.
+
+**Possible fixes (if structural fix needed):**
+
+- **Replace `:` with `-` or `_`** in Casa's session-id format. e.g.
+  `voice-default-house-butler` instead of `voice:default:house:butler`.
+  Touches every `build_session_key` / `_one_scope` / specialist write
+  path / executor archive path / probe — but is mechanical.
+- **Hash the session id** to a colon-free token (e.g. `sha256(sid)[:32]`).
+  Loses human readability in Honcho dashboard but preserves topology.
+- **Argue for `:` permitted upstream** — open a Honcho GitHub issue.
+
+**Eligibility for the low-risk fast path:** NO. This is a runtime
+behavior change and a possible breaking session-id rename. Full
+ship-gate (steps 1-9) applies.
+
+**Memory references:**
+- `reference_honcho_session_id_pattern_drift.md` (this finding's notes)
+- `project_memory_m4b_shipped.md` (M4b ship summary; flagged this as
+  follow-up)
+- `docs/superpowers/specs/2026-04-26-memory-architecture.md` § 5
+  (session-id topology)
+
+### F2 — Stale `tools.py:1003` docstring citation (doc-only sweep)
+
+**Symptom.** `casa-agent/rootfs/opt/casa/tools.py:1003` — the
+`_fetch_executor_archive` function's docstring says:
+
+> "Mirrors the WRITE site at `tools.py:1222`."
+
+Actual write site is now at `tools.py:1381`. Pre-existing M4-era drift
+that compounded with M4b's line shifts (M4b added `_specialist_*_bg`
+helpers above `_run_delegated_agent`, pushing existing functions further
+down). The M4b § 14.4 spec edit fixed the same `1239 → 1381` citation
+in the live arch spec (commit `3263254`); the in-code docstring missed
+the same fix because it's outside any M4b-touched function and the
+final-review reviewer correctly flagged it as out-of-scope.
+
+**Investigation / sweep scope:**
+
+Re-grep the full Casa codebase for stale `tools.py:NNN` /
+`memory.py:NNN-NNN` / `agent.py:NNN-NNN` / `agent_loader.py:NNN-NNN`
+citations in:
+
+1. **In-code docstrings** in `casa-agent/rootfs/opt/casa/*.py`
+2. **Doctrine markdown** in
+   `casa-agent/rootfs/opt/casa/defaults/agents/executors/configurator/doctrine/**/*.md`
+3. **Live arch spec** at
+   `docs/superpowers/specs/2026-04-26-memory-architecture.md`
+4. **Memory entries** in
+   `~/.claude/projects/.../memory/*.md` that cite line numbers
+
+For each citation, run `grep` against the actual file and either fix or
+note as pre-existing if outside the sweep budget. The doctrine file
+`feedback_spec_doc_rot_prevention.md` mandates this discipline.
+
+**Eligibility for the low-risk fast path:** YES. Doc-only sweep, no
+runtime change. Skip step 4 (feature-branch CI), rely on master CI on
+push.
+
+**Memory references:**
+- `feedback_spec_doc_rot_prevention.md` (rationale for the discipline)
+- `project_memory_m4b_shipped.md` (final-review section flags this as
+  out-of-scope-for-M4b)
+
+---
+
 ## Explicitly NOT doing
 
 These were in the audit but ruled out by the "Honcho primary, SQLite
