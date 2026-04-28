@@ -184,11 +184,11 @@ async def test_session_id_is_channel_plus_role(tmp_path):
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
-    assert mem.ensure[0][0] == "telegram:123:personal:assistant"
-    assert mem.get[0][0] == "telegram:123:personal:assistant"
+    assert mem.ensure[0][0] == "telegram-123-personal-assistant"
+    assert mem.get[0][0] == "telegram-123-personal-assistant"
     for _ in range(5):
         await asyncio.sleep(0)
-    assert mem.add[0][0] == "telegram:123:personal:assistant"
+    assert mem.add[0][0] == "telegram-123-personal-assistant"
 
 
 async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
@@ -570,7 +570,7 @@ class TestTokenBudgetMonitoring:
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("telegram", "123", "hi"))
 
-        assert observed == [("telegram:123:assistant", 2013, 1000)]
+        assert observed == [("telegram-123-assistant", 2013, 1000)]
 
     async def test_broken_memory_skips_recorder(self, tmp_path):
         """When get_context raises, we proceed without memory and must
@@ -616,7 +616,7 @@ class TestTokenBudgetMonitoring:
 
         rows = [
             r for r in caplog.records
-            if r.name == "tokens" and "telegram:123:assistant" in r.getMessage()
+            if r.name == "tokens" and "telegram-123-assistant" in r.getMessage()
         ]
         assert len(rows) == 1, [r.getMessage() for r in rows]
 
@@ -740,7 +740,7 @@ class TestResumeResilience:
         ]
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
-        await reg.register("voice:probe-scope", "butler", "stale-sid-abc")
+        await reg.register("voice-probe-scope", "butler", "stale-sid-abc")
 
         mem = FakeMemory()
         agent = _make_agent_with_registry(mem, reg, role="butler")
@@ -770,7 +770,7 @@ class TestResumeResilience:
         ]
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
-        await reg.register("voice:probe-scope", "butler", "stale-sid-abc")
+        await reg.register("voice-probe-scope", "butler", "stale-sid-abc")
 
         mem = FakeMemory()
         agent = _make_agent_with_registry(mem, reg, role="butler")
@@ -802,7 +802,7 @@ class TestResumeResilience:
                 await agent._process(_msg("voice", "fresh-scope", "hi"))
 
         assert FakeClient.attempts == 1
-        assert reg.get("voice:fresh-scope") is None
+        assert reg.get("voice-fresh-scope") is None
 
     async def test_fallback_second_process_error_reraises(self, tmp_path):
         """Both attempts ProcessError -> second propagates; stale id cleared."""
@@ -815,7 +815,7 @@ class TestResumeResilience:
         ]
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
-        await reg.register("voice:probe-scope", "butler", "stale-sid-xyz")
+        await reg.register("voice-probe-scope", "butler", "stale-sid-xyz")
 
         mem = FakeMemory()
         agent = _make_agent_with_registry(mem, reg, role="butler")
@@ -826,7 +826,7 @@ class TestResumeResilience:
                 await agent._process(_msg("voice", "probe-scope", "hi"))
 
         assert FakeClient.attempts == 2
-        entry = reg.get("voice:probe-scope")
+        entry = reg.get("voice-probe-scope")
         assert entry is not None
         assert "sdk_session_id" not in entry
 
@@ -842,7 +842,7 @@ class TestResumeResilience:
         ]
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
-        await reg.register("voice:probe-scope", "butler", "stale-sid-xyz")
+        await reg.register("voice-probe-scope", "butler", "stale-sid-xyz")
 
         mem = FakeMemory()
         agent = _make_agent_with_registry(mem, reg, role="butler")
@@ -859,7 +859,7 @@ class TestResumeResilience:
         ]
         assert len(warning_records) == 1
         msg = warning_records[0].getMessage()
-        assert "voice:probe-scope" in msg
+        assert "voice-probe-scope" in msg
         assert "stale-sid-xyz" in msg
 
 
