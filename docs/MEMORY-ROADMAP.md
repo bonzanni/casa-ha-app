@@ -4,7 +4,7 @@ Living tracker for the memory subsystem (Honcho + SQLite + scope-routing
 + disclosure). Multi-session, gitignored like `ROADMAP.md`. Read at the
 start of every memory-touching session; update at the end.
 
-Last updated: 2026-04-28 — M4b shipped as v0.17.0 (specialists become memory-bearing first-class Honcho peers; 2-segment session id `f"{role}-{user_peer}"` since v0.17.1; channel-agnostic, scope-agnostic; Finance opted in by default; validator drop in `specialist_registry`); 20 plan tasks + 4 fix-up commits = 21 commits ff-merged; CI green (PR + master); N150 smoke 3/3 PASS on v0.17.0; Finance still operator-disabled in prod — paths exercise on enable.
+Last updated: 2026-04-28 — F2 stale-citation sweep shipped (master `466e585`, doc-only, no version bump); 19 cites flipped across in-code docstrings, configurator doctrine, the live arch spec, and one user-memory example. M4b remains the most recent feature ship as v0.17.0 (Finance still operator-disabled in prod — paths exercise on enable).
 
 ## Doctrine
 
@@ -273,10 +273,10 @@ The tool path wins for size. **Defer to after M3-M5 ship.**
 
 ## Open follow-ups (pick up next session)
 
-> **Session-start prompt:** "F1 shipped as v0.17.1 (2026-04-28); F2 remains
-> the open memory follow-up. Read this section + `MEMORY.md`'s
-> `reference_honcho_session_id_format` and `project_memory_m4b_shipped`
-> entries, then pick up F2 if it's still pending."
+> **Session-start prompt:** "F1 (v0.17.1, 2026-04-28) and F2 (master `466e585`,
+> 2026-04-28) both shipped. No memory follow-ups currently open. Next memory
+> work is M5 (`remember_fact` tool); read `MEMORY.md` + the M5 phase entry
+> above before starting."
 
 ### F1 — Honcho session-id colon-pattern rejection (✅ Shipped v0.17.1, 2026-04-28)
 
@@ -326,47 +326,56 @@ the §5 "pre-3.2 IDs are orphaned" doctrine — same precedent).
 - `docs/superpowers/specs/2026-04-26-memory-architecture.md` § 5
   (session-id topology)
 
-### F2 — Stale `tools.py:1003` docstring citation (doc-only sweep)
+### F2 — Stale citation sweep (✅ Shipped master `466e585`, 2026-04-28)
 
-**Symptom.** `casa-agent/rootfs/opt/casa/tools.py:1003` — the
-`_fetch_executor_archive` function's docstring says:
+**Status: SHIPPED master `466e585` (2026-04-28).** Doc-only PR #14 ff-merged
+to master; no version bump (Casa convention for doc-only). Low-risk fast
+path: feature-branch CI ran by GitHub default but step 4 was officially
+skipped per `feedback_ship_gate_doctrine`.
 
-> "Mirrors the WRITE site at `tools.py:1222`."
+**Headline.** The original F2 trigger — `casa-agent/rootfs/opt/casa/tools.py:1003`
+docstring citing the wrong write-site line — was already closed as a side
+effect of F1 Task 7 (the docstring is now at line 1005 and cites
+`tools.py:1383`, the current `honcho_session_id` build site for the executor
+archive write). The real F2 work was the broader sweep.
 
-Actual write site is now at `tools.py:1381`. Pre-existing M4-era drift
-that compounded with M4b's line shifts (M4b added `_specialist_*_bg`
-helpers above `_run_delegated_agent`, pushing existing functions further
-down). The M4b § 14.4 spec edit fixed the same `1239 → 1381` citation
-in the live arch spec (commit `3263254`); the in-code docstring missed
-the same fix because it's outside any M4b-touched function and the
-final-review reviewer correctly flagged it as out-of-scope.
+**What shipped (19 cites flipped, 0 demoted):**
 
-**Investigation / sweep scope:**
+- **In-code docstrings** under `casa-agent/rootfs/opt/casa/*.py` — 3 cites
+  in `tools.py` (M4b helper docstrings: `Agent._bg_tasks` cite
+  `agent.py:592-614 → :133`; `Agent._add_turn_bg` cite `:592-614 → :595-617`;
+  `_finalize_engagement` meta-write cite `tools.py:1325-1334 → :1326-1338`).
+- **Configurator doctrine markdown** — 1 cite in `defaults/policies/scopes.yaml`
+  (`meta` scope's pointer at the tool-write site, `tools.py:1131 → :1326-1338`).
+- **Live arch spec** at `docs/superpowers/specs/2026-04-26-memory-architecture.md`
+  — 14 cites refreshed: 3 class-def lines in `memory.py` (Honcho/Sqlite/Cached
+  providers), 2 `tokens // 40` cites, 2 `query_engager` cites, 3
+  `_run_delegated_agent` cites, 2 ScopeRegistry cites, 1 `engage_executor`
+  cite, 1 meta-write block, 1 executor archive write block, 1 origin-stamp
+  range, 1 read-path span, 1 write-path block.
+- **Sibling test files** under `tests/` (extended-scope per M4b ship-summary
+  discipline that test docstrings drift independently) — 5 cites in
+  `test_agent_origin_scope_stamp.py`, `test_agent_process_scope.py`,
+  `test_run_delegated_agent_memory.py`.
+- **User-memory entry** `feedback_spec_doc_rot_prevention.md` — 1 cite
+  (example kept live for instructional value: `memory.py:464 → :564`).
 
-Re-grep the full Casa codebase for stale `tools.py:NNN` /
-`memory.py:NNN-NNN` / `agent.py:NNN-NNN` / `agent_loader.py:NNN-NNN`
-citations in:
+**Out-of-budget (frozen historical records, not retroactively rewritten):**
 
-1. **In-code docstrings** in `casa-agent/rootfs/opt/casa/*.py`
-2. **Doctrine markdown** in
-   `casa-agent/rootfs/opt/casa/defaults/agents/executors/configurator/doctrine/**/*.md`
-3. **Live arch spec** at
-   `docs/superpowers/specs/2026-04-26-memory-architecture.md`
-4. **Memory entries** in
-   `~/.claude/projects/.../memory/*.md` that cite line numbers
-
-For each citation, run `grep` against the actual file and either fix or
-note as pre-existing if outside the sweep budget. The doctrine file
-`feedback_spec_doc_rot_prevention.md` mandates this discipline.
-
-**Eligibility for the low-risk fast path:** YES. Doc-only sweep, no
-runtime change. Skip step 4 (feature-branch CI), rely on master CI on
-push.
+- `project_*_shipped.md`, `project_*_design_state.md` (M2/M3/M4/M4b) —
+  describe state at ship/design time; rewriting would corrupt the historical
+  record.
+- `casa-agent/CHANGELOG.md` — per-version ship descriptions, frozen.
+- `scripts/eval_scope_dist.py` docstring — pinned to "as of v0.8.4", broader
+  rewrite needed beyond a citation flip.
+- `honcho_ids.py:4` upstream `src/schemas/api.py:37` — navigational hint to
+  Honcho's repo; the regex itself is independently verifiable from server
+  error messages.
 
 **Memory references:**
 - `feedback_spec_doc_rot_prevention.md` (rationale for the discipline)
-- `project_memory_m4b_shipped.md` (final-review section flags this as
-  out-of-scope-for-M4b)
+- `project_memory_m4b_shipped.md` (final-review section originally flagged
+  this as out-of-scope-for-M4b)
 
 ---
 
