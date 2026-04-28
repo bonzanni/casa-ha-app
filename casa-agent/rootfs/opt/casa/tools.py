@@ -320,7 +320,7 @@ def _build_world_state_summary() -> str:
 
 
 # M4b: specialist memory write-path bg-task anchoring (parity with
-# Agent._bg_tasks at agent.py:592-614). Module-level so it persists
+# Agent._bg_tasks at agent.py:133). Module-level so it persists
 # across delegate_to_agent calls.
 _specialist_bg_tasks: set[asyncio.Task[Any]] = set()
 
@@ -336,7 +336,7 @@ async def _specialist_add_turn_bg(
 ) -> None:
     """Persist one specialist turn in the background.
 
-    Mirrors Agent._add_turn_bg at agent.py:592-614: try/except, log on
+    Mirrors Agent._add_turn_bg at agent.py:595-617: try/except, log on
     failure, never surface (the caller has already returned text)."""
     try:
         await memory_provider.add_turn(
@@ -363,7 +363,7 @@ async def _specialist_meta_write_bg(
 ) -> None:
     """Write a one-line specialist-call summary to the parent's meta session.
 
-    Mirrors _finalize_engagement's meta-write (tools.py:1325-1334) for
+    Mirrors _finalize_engagement's meta-write (tools.py:1326-1338) for
     inline delegate_to_agent calls, with task and reply truncated to
     200 chars per side (the engagement-finalize meta-write is untruncated;
     this helper introduces the per-summary cap as new M4b policy). Gives
