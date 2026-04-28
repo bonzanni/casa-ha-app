@@ -28,7 +28,7 @@ def test_build_invoke_message_caller_supplied_chat_id_wins():
         payload={"context": {"chat_id": "user-A"}},
     )
     assert msg.context["chat_id"] == "user-A"
-    assert build_session_key(msg.channel, msg.context["chat_id"]) == "webhook:user-A"
+    assert build_session_key(msg.channel, msg.context["chat_id"]) == "webhook-user-A"
 
 
 def test_build_invoke_message_generates_chat_id_when_missing():
@@ -42,7 +42,7 @@ def test_build_invoke_message_generates_chat_id_when_missing():
     key_a = build_session_key(a.channel, a.context["chat_id"])
     key_b = build_session_key(b.channel, b.context["chat_id"])
     assert key_a != key_b
-    assert key_a != "webhook:default"
+    assert key_a != "webhook-default"
 
 
 def test_build_invoke_message_target_is_agent_role():

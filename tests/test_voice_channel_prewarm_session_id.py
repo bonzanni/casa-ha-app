@@ -1,7 +1,7 @@
 """M2.G1 — voice prewarm must use the 4-segment session id shape so the
-real-turn cache hit fires. Pre-fix it built `voice:{scope_id}:{role}`
+real-turn cache hit fires. Pre-fix it built `voice-{scope_id}-{role}`
 which is the pre-3.2 shape; the agent uses
-`{channel}:{chat_id}:{scope}:{role}` so the prewarm key never read."""
+`{channel}-{chat_id}-{scope}-{role}` so the prewarm key never read."""
 
 from __future__ import annotations
 
@@ -47,11 +47,11 @@ async def test_prewarm_warms_one_session_per_readable_scope():
     assert len(ensure_calls) == 3
     assert len(get_calls) == 3
 
-    # 4-segment shape: voice:user-xyz:{scope}:assistant
+    # 4-segment shape: voice-user-xyz-{scope}-assistant
     expected_sids = {
-        "voice:user-xyz:domestic:assistant",
-        "voice:user-xyz:finance:assistant",
-        "voice:user-xyz:meta:assistant",
+        "voice-user-xyz-domestic-assistant",
+        "voice-user-xyz-finance-assistant",
+        "voice-user-xyz-meta-assistant",
     }
     actual_sids = {c.kwargs["session_id"] for c in ensure_calls}
     assert actual_sids == expected_sids

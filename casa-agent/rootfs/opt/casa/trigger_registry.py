@@ -161,7 +161,7 @@ class TriggerRegistry:
                 channel="webhook",
                 context={
                     "webhook_name": trig.name,
-                    "chat_id": f"webhook:{trig.name}",
+                    "chat_id": trig.name,
                     "cid": request.get("cid") or new_cid(),
                 },
             )

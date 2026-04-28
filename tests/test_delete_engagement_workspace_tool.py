@@ -202,7 +202,7 @@ async def test_force_delete_writes_meta_scope_summary(tmp_path, monkeypatch):
     payload = json.loads(res["content"][0]["text"])
     assert payload["status"] == "ok"
 
-    meta_sid = "telegram:456:meta:assistant"
+    meta_sid = "telegram-456-meta-assistant"
     assert any(
         c.kwargs.get("session_id") == meta_sid
         for c in mp.add_turn.await_args_list

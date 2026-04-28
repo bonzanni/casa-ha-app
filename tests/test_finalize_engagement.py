@@ -18,7 +18,8 @@ class TestFinalizeEngagement:
         reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
         rec = await reg.create(
             kind="specialist", role_or_type="finance", driver="in_casa",
-            task="t", origin={"role": "assistant", "channel": "telegram"},
+            task="t",
+            origin={"role": "assistant", "channel": "telegram", "chat_id": "12345"},
             topic_id=42,
         )
 

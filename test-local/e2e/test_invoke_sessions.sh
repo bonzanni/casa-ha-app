@@ -30,12 +30,12 @@ log "Inspecting /data/sessions.json"
 keys=$(docker exec "$NAME" sh -c \
     'python3 -c "import json,sys; print(\",\".join(sorted(json.load(open(\"/data/sessions.json\")).keys())))"')
 echo "  registry keys: $keys"
-echo "$keys" | grep -q "webhook:user-A" \
-    || fail "missing 'webhook:user-A' entry"
-echo "$keys" | grep -q "webhook:user-B" \
-    || fail "missing 'webhook:user-B' entry"
-echo "$keys" | grep -q "webhook:default" \
-    && fail "unwanted 'webhook:default' entry present (BUG-I1 regression)"
+echo "$keys" | grep -q "webhook-user-A" \
+    || fail "missing 'webhook-user-A' entry"
+echo "$keys" | grep -q "webhook-user-B" \
+    || fail "missing 'webhook-user-B' entry"
+echo "$keys" | grep -q "webhook-default" \
+    && fail "unwanted 'webhook-default' entry present (BUG-I1 regression)"
 pass "C-3a distinct caller-supplied chat_ids"
 
 log "C-3b: two /invoke calls WITHOUT chat_id get unique UUIDs"
@@ -48,8 +48,8 @@ curl -sf -X POST "http://localhost:${HOST_PORT}/invoke/assistant" \
 
 sleep 1
 webhook_keys=$(docker exec "$NAME" sh -c \
-    'python3 -c "import json; d=json.load(open(\"/data/sessions.json\")); print(chr(10).join(k for k in d if k.startswith(\"webhook:\")))"')
-uuid_count=$(echo "$webhook_keys" | grep -Ev "^webhook:(user-A|user-B)$" | grep -c "^webhook:" || true)
+    'python3 -c "import json; d=json.load(open(\"/data/sessions.json\")); print(chr(10).join(k for k in d if k.startswith(\"webhook-\")))"')
+uuid_count=$(echo "$webhook_keys" | grep -Ev "^webhook-(user-A|user-B)$" | grep -c "^webhook-" || true)
 [ "$uuid_count" -eq 2 ] \
     || fail "expected 2 UUID-backed invoke sessions, got $uuid_count (keys: $webhook_keys)"
 pass "C-3b each chat_id-less invoke gets its own session"

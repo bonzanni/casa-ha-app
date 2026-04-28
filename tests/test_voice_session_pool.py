@@ -14,7 +14,7 @@ class TestPoolLifecycle:
         sess = pool.ensure("user-xyz")
         assert isinstance(sess, VoiceSession)
         assert sess.scope_id == "user-xyz"
-        assert sess.session_key == "voice:user-xyz"
+        assert sess.session_key == "voice-user-xyz"
 
     async def test_ensure_returns_same_instance(self):
         pool = VoiceSessionPool(idle_timeout=300)

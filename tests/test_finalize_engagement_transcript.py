@@ -40,12 +40,12 @@ async def test_archival_writes_summary_to_executor_type_peer(monkeypatch):
     calls = memory_provider.add_turn.await_args_list
     session_ids = [c.kwargs["session_id"] for c in calls]
     # New: executor-type write also runs
-    assert any(s == "telegram:42:executor:configurator" for s in session_ids)
+    assert any(s == "telegram-42-executor-configurator" for s in session_ids)
 
     # The executor-type summary is a JSON blob with task + terminal_state + etc.
     exec_call = next(
         c for c in calls
-        if c.kwargs["session_id"] == "telegram:42:executor:configurator"
+        if c.kwargs["session_id"] == "telegram-42-executor-configurator"
     )
     summary = json.loads(exec_call.kwargs["assistant_text"])
     assert summary["terminal_state"] == "completed"
