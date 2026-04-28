@@ -41,7 +41,7 @@ def _is_uuid_scope(scope_id: str) -> bool:
 
     Used to distinguish a webhook one-shot (random chat_id fabricated
     by `build_invoke_message`) from a deliberately-pinned webhook
-    session (e.g. `webhook:ha-automation-daily`). Only the former
+    session (e.g. `webhook-ha-automation-daily`). Only the former
     qualifies for the short `webhook_session_ttl_days`.
     """
     try:
@@ -178,7 +178,7 @@ class SessionSweeper:
 
         async with self._registry._lock:
             for key, entry in self._registry._data.items():
-                channel, _, scope_id = key.partition(":")
+                channel, _, scope_id = key.partition("-")
                 last_active = _parse_last_active(entry.get("last_active"))
 
                 if last_active is None:
