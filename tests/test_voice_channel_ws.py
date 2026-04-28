@@ -65,7 +65,7 @@ class TestWSTurn:
         client, _, memory, _ = ws_app
         async with client.ws_connect("/api/converse/ws") as ws:
             await ws.send_json({
-                "type": "stt_start", "session_key": "voice:s",
+                "type": "stt_start", "session_key": "voice-s",
                 "scope_id": "s", "context": {"device_id": "kitchen"},
             })
             await ws.send_json({
