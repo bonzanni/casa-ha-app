@@ -1316,7 +1316,7 @@ Plan 2. Zero behavior change — pure terminology refactor.
   top-level `schedules.yaml`/`heartbeat:` block that no longer exist.
   Also dropped the `schedule: cron "0 4 * * *"` workflow trigger and
   the `test-slow` Makefile target. (Landed earlier today on master in
-  commit `ff24829`; called out here for completeness.)
+  commit `2ffa4a6`; called out here for completeness.)
 
 ### Changed
 
