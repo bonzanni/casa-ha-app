@@ -1014,3 +1014,61 @@ class TestScheduledSilence:
             await agent.handle_message(_request_msg())
 
         assert stub.create_on_token.call_count == 1
+
+    async def test_silent_sentinel_suppresses_send(self, tmp_path):
+        """Spec §3.2 B.2: text == '<silent/>' (after strip) must
+        suppress channel.send / finalize_stream and produce no
+        BusMessage downstream."""
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+        stub = _StubChannel()
+        agent._channel_manager.register(stub)
+
+        with patch.object(
+            agent, "_process", AsyncMock(return_value="<silent/>"),
+        ):
+            result = await agent.handle_message(_scheduled_msg())
+
+        assert stub.send.call_count == 0
+        assert stub.finalize_stream.call_count == 0
+        assert result is None
+
+    async def test_whitespace_suppresses_send(self, tmp_path):
+        """Spec §3.2 B.2: empty / whitespace-only text suppresses
+        delivery the same way as the explicit sentinel."""
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+        stub = _StubChannel()
+        agent._channel_manager.register(stub)
+
+        with patch.object(
+            agent, "_process", AsyncMock(return_value="   \n  "),
+        ):
+            result = await agent.handle_message(_scheduled_msg())
+
+        assert stub.send.call_count == 0
+        assert stub.finalize_stream.call_count == 0
+        assert result is None
+
+    async def test_real_text_passes_through(self, tmp_path):
+        """Spec §3.2 B.2: any non-sentinel, non-empty text reaches the
+        channel and emits a RESPONSE BusMessage with the same body."""
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+        stub = _StubChannel()
+        agent._channel_manager.register(stub)
+
+        text = "Meeting with Ana in 20 min."
+        with patch.object(
+            agent, "_process", AsyncMock(return_value=text),
+        ):
+            result = await agent.handle_message(_scheduled_msg())
+
+        # No on_token (Fix B.1 disables streaming for SCHEDULED) →
+        # falls through to channel.send, NOT finalize_stream.
+        assert stub.send.call_count == 1
+        sent_text = stub.send.call_args.args[0]
+        assert sent_text == text
+        assert stub.finalize_stream.call_count == 0
+        assert result is not None
+        assert result.content == text

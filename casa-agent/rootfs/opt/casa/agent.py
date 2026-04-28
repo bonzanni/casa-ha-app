@@ -207,6 +207,18 @@ class Agent:
             if handled:
                 text = ""  # suppress normal text delivery below
 
+        # Scheduled-trigger silence contract (spec 2026-04-28 §3.2 B.2).
+        # The agent's tokens are buffered by Fix B.1, so the prompt can
+        # signal "do not send" via the literal sentinel `<silent/>` or
+        # by producing only whitespace. Strict, exact-match-after-strip
+        # — substring matches are rejected by design (see spec §3.2
+        # rationale: prompt produces `<silent/>` followed by recanting
+        # text → send the whole thing).
+        if msg.type == MessageType.SCHEDULED and text:
+            stripped = text.strip()
+            if not stripped or stripped == "<silent/>":
+                text = ""
+
         if text and channel is not None:
             if on_token is not None and hasattr(channel, "finalize_stream"):
                 await channel.finalize_stream(text, msg.context, on_token)
