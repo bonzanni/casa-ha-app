@@ -9,17 +9,28 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-def build_session_key(channel: str, scope_id: str | None) -> str:
-    """Build a canonical session key of the form ``{channel}:{scope_id}``.
+def build_session_key(channel: str, scope_id: str | int | None) -> str:
+    """Build a canonical channel key of the form ``{channel}-{scope_id}``.
 
-    The format is project-wide (Telegram, voice, webhooks, scheduled).
-    ``scope_id`` may contain colons; they are preserved verbatim.
-    Empty or ``None`` scope IDs become ``"default"``.
+    Used internally by :class:`SessionRegistry` (JSON-on-disk dict
+    keyed by this string) AND as the channel-key prefix for Honcho
+    session ids (see :func:`honcho_ids.honcho_session_id`).
+
+    ``scope_id`` may be ``int`` (Telegram ``chat_id``) or ``str``
+    (voice ``scope_id``); coerced to ``str``. ``None`` or falsy values
+    map to ``"default"``.
+
+    Raises ``ValueError`` when ``channel`` is empty or when either
+    part contains characters outside ``[A-Za-z0-9_-]`` (Honcho's
+    server-side resource-name regex). The pre-fix ``:`` separator is
+    forbidden in inputs to prevent silent regression to invalid ids.
     """
+    from honcho_ids import honcho_session_id
+
     if not channel:
         raise ValueError("channel is required")
     sid = scope_id if scope_id else "default"
-    return f"{channel}:{sid}"
+    return honcho_session_id(channel, str(sid))
 
 
 class SessionRegistry:
@@ -47,9 +58,10 @@ class SessionRegistry:
     ) -> None:
         """Register (or overwrite) a session entry and persist.
 
-        The Honcho session ID is *not* tracked here in the 2.2a
+        The Honcho session ID is *not* tracked here in the v0.17.1
         topology: it is derived at call time as
-        ``f"{channel_key}:{agent}"``.
+        ``honcho_session_id(channel_key, scope, role)`` (see
+        ``honcho_ids.honcho_session_id``).
         """
         async with self._lock:
             self._data[channel_key] = {
