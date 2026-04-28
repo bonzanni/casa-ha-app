@@ -1,5 +1,68 @@
 # Changelog
 
+## [0.17.1] - 2026-04-28 — Honcho session-id format fix (F1)
+
+**Fixes the 11-day silent Honcho-write bug discovered post-M4b deploy.**
+Every Casa Honcho session-create has 422'd since v0.2.2 (2026-04-17)
+because session ids contained `:`, which Honcho's server-side
+`^[A-Za-z0-9_-]+$` regex rejects. Reads returned empty digests; writes
+were dropped. Failures landed in `try/except → WARNING` so the bug
+remained invisible until M4b's `peer_count: 0` telemetry pattern was
+finally read as "writes never landed" rather than "fresh sessions".
+
+### Added
+
+- **`casa-agent/rootfs/opt/casa/honcho_ids.py`** — single canonical
+  builder `honcho_session_id(*parts)`. Joins parts with `-` (hyphen),
+  fail-fasts (`ValueError`) on inputs containing characters outside
+  `[A-Za-z0-9_-]`. Strict-reject by design — silent sanitization is
+  what blinded us for 11 days.
+- **Regression integration test** in `tests/test_honcho_ids.py`
+  asserting that the pre-fix colon shape WOULD have tripped Honcho's
+  `string_pattern_mismatch` validator.
+
+### Changed
+
+- **All 11 Honcho session-id construction sites** flipped to call
+  `honcho_session_id` instead of f-string concatenation:
+  - `agent.py:332,552` (resident read/write)
+  - `channels/voice/channel.py:454` (voice prewarm)
+  - `tools.py:377` (coordinator meta write)
+  - `tools.py:439` (M4b specialist)
+  - `tools.py:1009` (executor archive read)
+  - `tools.py:1326,1330` (engagement-finalize meta)
+  - `tools.py:1379` (executor archive write)
+  - `tools.py:1553` (query_engager)
+- **`session_registry.build_session_key`** rewired through
+  `honcho_session_id`. Output shape flipped from `{channel}:{scope_id}`
+  to `{channel}-{scope_id}`. Now also accepts `int` `scope_id`
+  (Telegram `chat_id`).
+- **`session_sweeper`** partitions registry keys on `-` (was `:`).
+  Pre-existing colon-shaped JSON entries fall through to the 30-day
+  session TTL and age out — no migration shim per pre-1.0.0 license
+  (zero data was ever persisted under the old shape; every server
+  create 422'd since v0.2.2).
+
+### Breaking
+
+- **Channel-key on-disk format** (`{DATA_DIR}/sessions.json`) flipped
+  from `{channel}:{scope_id}` to `{channel}-{scope_id}`. Pre-v0.17.1
+  entries become orphans and age out via TTL — no operator action.
+- **`build_session_key`** now rejects `scope_id` containing `:`,
+  whitespace, or any character outside `[A-Za-z0-9_-]`. Previously
+  preserved colons verbatim.
+
+### Spec / doctrine
+
+- `docs/superpowers/specs/2026-04-28-honcho-session-id-format-design.md`
+  (new — design rationale, decision log, migration table)
+- `docs/superpowers/plans/2026-04-28-honcho-session-id-format-fix.md`
+  (new — task-by-task implementation plan)
+- `docs/superpowers/specs/2026-04-26-memory-architecture.md` § 5/§ 14/§ 15
+  swept to hyphen shape
+- Configurator doctrine (`architecture.md`,
+  `recipes/specialist/create.md`) swept
+
 ## [0.17.0] - 2026-04-28 — Memory M4b: Specialists become memory-bearing
 
 Specialists (Tier 2 — Finance today; future Health/Personal/Business)
