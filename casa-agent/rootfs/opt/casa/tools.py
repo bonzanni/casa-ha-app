@@ -1002,13 +1002,13 @@ async def _fetch_executor_archive(
     rendered digest wrapped under a recognizable header, or "" when the
     archive is empty / provider is None / read fails.
 
-    Mirrors the WRITE site at ``tools.py:1222`` exactly:
-    session_id = ``f"{channel}:{chat_id}:executor:{executor_type}"``
+    Mirrors the WRITE site at ``tools.py:1383`` exactly:
+    session_id = ``honcho_session_id(channel, chat_id, "executor", executor_type)``
     agent_role = ``f"executor:{executor_type}"``.
     """
     if memory_provider is None:
         return ""
-    session_id = f"{channel}:{chat_id}:executor:{executor_type}"
+    session_id = honcho_session_id(channel, chat_id, "executor", executor_type)
     agent_role = f"executor:{executor_type}"
     try:
         await memory_provider.ensure_session(
@@ -1321,15 +1321,17 @@ async def _finalize_engagement(
                 "next_steps": next_steps,
             })
             # Use Ellen's meta session. The session_id convention is
-            # {channel}:{chat_id}:meta:assistant — mirror plan-1 scope stack.
+            # honcho_session_id(channel, chat_id, "meta", "assistant")
+            # — mirror plan-1 scope stack.
             channel = engagement.origin.get("channel", "telegram")
             chat_id = str(engagement.origin.get("chat_id", ""))
+            meta_sid = honcho_session_id(channel, chat_id, "meta", "assistant")
             await memory_provider.ensure_session(
-                session_id=f"{channel}:{chat_id}:meta:assistant",
+                session_id=meta_sid,
                 agent_role="assistant",
             )
             await memory_provider.add_turn(
-                session_id=f"{channel}:{chat_id}:meta:assistant",
+                session_id=meta_sid,
                 agent_role="assistant",
                 user_text="(engagement summary written)",
                 assistant_text=summary,
@@ -1378,7 +1380,9 @@ async def _finalize_engagement(
         try:
             channel = engagement.origin.get("channel", "telegram")
             chat_id = str(engagement.origin.get("chat_id", ""))
-            type_session = f"{channel}:{chat_id}:executor:{engagement.role_or_type}"
+            type_session = honcho_session_id(
+                channel, chat_id, "executor", engagement.role_or_type,
+            )
             type_summary = json.dumps({
                 "kind": "executor_engagement_summary",
                 "engagement_id": engagement.id,
