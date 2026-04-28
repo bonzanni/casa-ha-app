@@ -122,12 +122,12 @@ async def test_ensure_session_inserts_first_time():
     from memory import SqliteMemoryProvider
 
     p = SqliteMemoryProvider(":memory:")
-    await p.ensure_session("telegram:1:assistant", "assistant")
+    await p.ensure_session("telegram-1-assistant", "assistant")
 
     row = p._conn.execute(
         "SELECT agent_role, user_peer, created_ts, last_active "
         "FROM sessions WHERE session_id=?",
-        ("telegram:1:assistant",),
+        ("telegram-1-assistant",),
     ).fetchone()
     assert row is not None
     assert row[0] == "assistant"
@@ -160,13 +160,13 @@ async def test_ensure_session_preserves_topology_across_calls():
     from memory import SqliteMemoryProvider
 
     p = SqliteMemoryProvider(":memory:")
-    await p.ensure_session("voice:lr:butler", "butler", user_peer="voice_speaker")
+    await p.ensure_session("voice-lr-butler", "butler", user_peer="voice_speaker")
     # Second call with wrong-looking args — must not rewrite.
-    await p.ensure_session("voice:lr:butler", "assistant", user_peer="nicola")
+    await p.ensure_session("voice-lr-butler", "assistant", user_peer="nicola")
 
     row = p._conn.execute(
         "SELECT agent_role, user_peer FROM sessions WHERE session_id=?",
-        ("voice:lr:butler",),
+        ("voice-lr-butler",),
     ).fetchone()
     assert row[0] == "butler"
     assert row[1] == "voice_speaker"
@@ -179,16 +179,16 @@ async def test_add_turn_writes_user_and_assistant_rows():
     from memory import SqliteMemoryProvider
 
     p = SqliteMemoryProvider(":memory:")
-    await p.ensure_session("telegram:1:assistant", "assistant")
+    await p.ensure_session("telegram-1-assistant", "assistant")
     await p.add_turn(
-        "telegram:1:assistant", "assistant",
+        "telegram-1-assistant", "assistant",
         user_text="hi", assistant_text="hello",
     )
 
     rows = p._conn.execute(
         "SELECT peer_name, content FROM messages "
         "WHERE session_id=? ORDER BY id ASC",
-        ("telegram:1:assistant",),
+        ("telegram-1-assistant",),
     ).fetchall()
     assert rows == [("nicola", "hi"), ("assistant", "hello")]
 
@@ -197,9 +197,9 @@ async def test_add_turn_voice_uses_voice_speaker():
     from memory import SqliteMemoryProvider
 
     p = SqliteMemoryProvider(":memory:")
-    await p.ensure_session("voice:lr:butler", "butler", user_peer="voice_speaker")
+    await p.ensure_session("voice-lr-butler", "butler", user_peer="voice_speaker")
     await p.add_turn(
-        "voice:lr:butler", "butler",
+        "voice-lr-butler", "butler",
         user_text="lights on", assistant_text="ok",
         user_peer="voice_speaker",
     )
@@ -207,7 +207,7 @@ async def test_add_turn_voice_uses_voice_speaker():
     rows = p._conn.execute(
         "SELECT peer_name FROM messages "
         "WHERE session_id=? ORDER BY id ASC",
-        ("voice:lr:butler",),
+        ("voice-lr-butler",),
     ).fetchall()
     assert [r[0] for r in rows] == ["voice_speaker", "butler"]
 
@@ -386,20 +386,20 @@ async def test_butler_session_never_sees_assistant_session_messages():
     from memory import SqliteMemoryProvider
 
     p = SqliteMemoryProvider(":memory:")
-    await p.ensure_session("telegram:1:assistant", "assistant")
+    await p.ensure_session("telegram-1-assistant", "assistant")
     await p.add_turn(
-        "telegram:1:assistant", "assistant",
+        "telegram-1-assistant", "assistant",
         "secret from telegram", "telegram answer",
     )
 
-    await p.ensure_session("voice:lr:butler", "butler", user_peer="voice_speaker")
+    await p.ensure_session("voice-lr-butler", "butler", user_peer="voice_speaker")
     await p.add_turn(
-        "voice:lr:butler", "butler", "voice q", "voice a",
+        "voice-lr-butler", "butler", "voice q", "voice a",
         user_peer="voice_speaker",
     )
 
     out = await p.get_context(
-        "voice:lr:butler", "butler", tokens=4000, user_peer="voice_speaker",
+        "voice-lr-butler", "butler", tokens=4000, user_peer="voice_speaker",
     )
     assert "[voice_speaker] voice q" in out
     assert "[butler] voice a" in out
@@ -416,7 +416,7 @@ async def test_get_context_emits_memory_call_log(caplog):
     from memory import SqliteMemoryProvider
 
     p = SqliteMemoryProvider(":memory:")
-    sid = "telegram:1:domestic:assistant"
+    sid = "telegram-1-domestic-assistant"
     await p.ensure_session(sid, "assistant")
     await p.add_turn(sid, "assistant", "hi", "hello")
     await p.add_turn(sid, "assistant", "more", "ok")
@@ -446,7 +446,7 @@ async def test_get_context_memory_call_empty_session(caplog):
     from memory import SqliteMemoryProvider
 
     p = SqliteMemoryProvider(":memory:")
-    sid = "telegram:1:domestic:assistant"
+    sid = "telegram-1-domestic-assistant"
     await p.ensure_session(sid, "assistant")
 
     with caplog.at_level(logging.INFO, logger="memory"):

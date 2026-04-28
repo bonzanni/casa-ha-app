@@ -93,10 +93,10 @@ async def test_ensure_session_adds_peers_with_correct_flags(stub_env):
     from memory import HonchoMemoryProvider
 
     p = HonchoMemoryProvider(api_url="http://h", api_key="k")
-    await p.ensure_session("telegram:1:assistant", "assistant")
+    await p.ensure_session("telegram-1-assistant", "assistant")
 
     client: StubHoncho = p._client  # type: ignore[attr-defined]
-    session = client.sessions["telegram:1:assistant"]
+    session = client.sessions["telegram-1-assistant"]
     assert len(session.add_peers_calls) == 1
     peers = session.add_peers_calls[0]
     names_flags = {peer.name: cfg for peer, cfg in peers}
@@ -111,10 +111,10 @@ async def test_ensure_session_voice_attributes_to_voice_speaker(stub_env):
 
     p = HonchoMemoryProvider(api_url="http://h", api_key="k")
     await p.ensure_session(
-        "voice:lr:butler", "butler", user_peer="voice_speaker",
+        "voice-lr-butler", "butler", user_peer="voice_speaker",
     )
     client: StubHoncho = p._client  # type: ignore[attr-defined]
-    peers = client.sessions["voice:lr:butler"].add_peers_calls[0]
+    peers = client.sessions["voice-lr-butler"].add_peers_calls[0]
     names = {peer.name for peer, _ in peers}
     assert names == {"voice_speaker", "butler"}
     assert "nicola" not in names
@@ -126,7 +126,7 @@ async def test_get_context_forwards_perspective_and_target(stub_env):
     p = HonchoMemoryProvider(api_url="http://h", api_key="k")
     client: StubHoncho = p._client  # type: ignore[attr-defined]
     # Prime a context the stub will return
-    session = client.session("telegram:1:assistant")
+    session = client.session("telegram-1-assistant")
 
     @dataclass
     class _Ctx:
@@ -138,7 +138,7 @@ async def test_get_context_forwards_perspective_and_target(stub_env):
     session._next_context = _Ctx(peer_card=["x"])
 
     out = await p.get_context(
-        "telegram:1:assistant", "assistant",
+        "telegram-1-assistant", "assistant",
         tokens=4000, search_query="hi",
     )
     call = session.context_calls[0]
@@ -154,7 +154,7 @@ async def test_get_context_empty_returns_empty_string(stub_env):
 
     p = HonchoMemoryProvider(api_url="http://h", api_key="k")
     client: StubHoncho = p._client  # type: ignore[attr-defined]
-    session = client.session("telegram:1:assistant")
+    session = client.session("telegram-1-assistant")
 
     @dataclass
     class _Ctx:
@@ -165,7 +165,7 @@ async def test_get_context_empty_returns_empty_string(stub_env):
 
     session._next_context = _Ctx()
     out = await p.get_context(
-        "telegram:1:assistant", "assistant", tokens=100,
+        "telegram-1-assistant", "assistant", tokens=100,
     )
     assert out == ""
 
@@ -175,11 +175,11 @@ async def test_add_turn_writes_user_and_assistant_messages(stub_env):
 
     p = HonchoMemoryProvider(api_url="http://h", api_key="k")
     await p.add_turn(
-        "telegram:1:assistant", "assistant",
+        "telegram-1-assistant", "assistant",
         user_text="hi", assistant_text="hello",
     )
     client: StubHoncho = p._client  # type: ignore[attr-defined]
-    session = client.sessions["telegram:1:assistant"]
+    session = client.sessions["telegram-1-assistant"]
     assert len(session.add_messages_calls) == 1
     msgs = session.add_messages_calls[0]
     assert msgs[0].peer_name == "nicola"
@@ -193,12 +193,12 @@ async def test_add_turn_voice_uses_voice_speaker(stub_env):
 
     p = HonchoMemoryProvider(api_url="http://h", api_key="k")
     await p.add_turn(
-        "voice:lr:butler", "butler",
+        "voice-lr-butler", "butler",
         user_text="lights on", assistant_text="ok",
         user_peer="voice_speaker",
     )
     client: StubHoncho = p._client  # type: ignore[attr-defined]
-    session = client.sessions["voice:lr:butler"]
+    session = client.sessions["voice-lr-butler"]
     msgs = session.add_messages_calls[0]
     assert msgs[0].peer_name == "voice_speaker"
     assert msgs[1].peer_name == "butler"
@@ -224,7 +224,7 @@ async def test_get_context_renders_summary_and_peer_repr_when_honcho_returns_the
 
     p = HonchoMemoryProvider(api_url="http://h", api_key="k")
     client: StubHoncho = p._client  # type: ignore[attr-defined]
-    session = client.session("telegram:1:domestic:assistant")
+    session = client.session("telegram-1-domestic-assistant")
 
     @dataclass
     class _Summary:
@@ -252,7 +252,7 @@ async def test_get_context_renders_summary_and_peer_repr_when_honcho_returns_the
     )
 
     out = await p.get_context(
-        "telegram:1:domestic:assistant", "assistant",
+        "telegram-1-domestic-assistant", "assistant",
         tokens=4000, search_query="what's the weather",
     )
 
@@ -305,7 +305,7 @@ async def test_get_context_emits_memory_call_log(stub_env, caplog):
 
     p = HonchoMemoryProvider(api_url="http://h", api_key="k")
     client: StubHoncho = p._client  # type: ignore[attr-defined]
-    session = client.session("telegram:1:domestic:assistant")
+    session = client.session("telegram-1-domestic-assistant")
 
     @dataclass
     class _Summary:
@@ -330,7 +330,7 @@ async def test_get_context_emits_memory_call_log(stub_env, caplog):
 
     with caplog.at_level(logging.INFO, logger="memory"):
         await p.get_context(
-            "telegram:1:domestic:assistant", "assistant",
+            "telegram-1-domestic-assistant", "assistant",
             tokens=2000, search_query="hi",
         )
 
@@ -342,7 +342,7 @@ async def test_get_context_emits_memory_call_log(stub_env, caplog):
     )
     rec = records[0]
     assert rec.backend == "honcho"
-    assert rec.session_id == "telegram:1:domestic:assistant"
+    assert rec.session_id == "telegram-1-domestic-assistant"
     assert rec.agent_role == "assistant"
     assert isinstance(rec.t_ms, int) and rec.t_ms >= 0
     assert rec.peer_count == 2
@@ -361,7 +361,7 @@ async def test_get_context_memory_call_when_summary_missing(stub_env, caplog):
 
     p = HonchoMemoryProvider(api_url="http://h", api_key="k")
     client: StubHoncho = p._client  # type: ignore[attr-defined]
-    session = client.session("telegram:1:domestic:assistant")
+    session = client.session("telegram-1-domestic-assistant")
 
     @dataclass
     class _Ctx:
@@ -376,7 +376,7 @@ async def test_get_context_memory_call_when_summary_missing(stub_env, caplog):
 
     with caplog.at_level(logging.INFO, logger="memory"):
         await p.get_context(
-            "telegram:1:domestic:assistant", "assistant", tokens=500,
+            "telegram-1-domestic-assistant", "assistant", tokens=500,
         )
 
     rec = [r for r in caplog.records if r.message == "memory_call"][0]
