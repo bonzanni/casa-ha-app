@@ -273,10 +273,10 @@ The tool path wins for size. **Defer to after M3-M5 ship.**
 
 ## Open follow-ups (pick up next session)
 
-> **Session-start prompt:** "We have two memory follow-ups left after the
-> M4b ship (v0.17.0, 2026-04-28). Read this section + `MEMORY.md`'s
-> `reference_honcho_session_id_pattern_drift` and `project_memory_m4b_shipped`
-> entries, then pick one of the two items below and execute end-to-end."
+> **Session-start prompt:** "F1 shipped as v0.17.1 (2026-04-28); F2 remains
+> the open memory follow-up. Read this section + `MEMORY.md`'s
+> `reference_honcho_session_id_format` and `project_memory_m4b_shipped`
+> entries, then pick up F2 if it's still pending."
 
 ### F1 — Honcho session-id colon-pattern rejection (✅ Shipped v0.17.1, 2026-04-28)
 
