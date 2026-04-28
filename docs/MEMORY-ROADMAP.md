@@ -225,9 +225,11 @@ log shows `Memory add_turn failed in background: ... pattern '^[a-zA-Z0-9_-]+$' 
 on the resident write path. Honcho server-side validation rejects
 colons in session IDs that Casa has used since v0.2.2. Fail-soft
 absorbs it (background-only, no user regression). NOT M4b-introduced
-but M4b's own 2-segment session ID `finance:nicola` will hit the
-same wall once Finance is operator-enabled. See
-`reference_honcho_session_id_pattern_drift` memory.
+but M4b's own 2-segment session ID would have hit the same wall
+once Finance was operator-enabled, but F1 (v0.17.1, this branch)
+closed the regex bug and rotated the M4b session shape to
+`finance-nicola` before any specialist write hit the wire. See
+`reference_honcho_session_id_format` memory.
 
 **Deferred to M5/M6:** specialist `peer_card` writes / `remember_fact`
 MCP tool → M5. Cross-specialist recall via `peer_perspective` → M6.

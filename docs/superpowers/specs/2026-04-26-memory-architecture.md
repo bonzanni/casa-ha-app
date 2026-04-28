@@ -804,7 +804,7 @@ After the SDK invocation returns text, if
 `cfg.memory.token_budget > 0` AND `text` is non-empty AND
 `memory_provider` is non-None, `_run_delegated_agent` fires a
 background task `_specialist_add_turn_bg` that calls
-`memory_provider.add_turn(session_id=f"{role}:nicola", agent_role=role,
+`memory_provider.add_turn(session_id=honcho_session_id(role, "nicola"), agent_role=role,
 user_text=task_text, assistant_text=text, user_peer="nicola")`. The
 `user_text` is the **task body** — *not* the wrapped prompt with
 `<delegation_context>` + `<memory_context>` — so the session messages

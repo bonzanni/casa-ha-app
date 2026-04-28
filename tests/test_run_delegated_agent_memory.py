@@ -365,8 +365,8 @@ async def test_delegation_writes_meta_scope_summary(monkeypatch):
     if bg:
         await asyncio.gather(*list(bg), return_exceptions=True)
 
-    # Two add_turn calls expected: one to finance:nicola (specialist),
-    # one to telegram:abc:meta:assistant (parent meta).
+    # Two add_turn calls expected: one to finance-nicola (specialist),
+    # one to telegram-abc-meta-assistant (parent meta).
     sessions_written = {
         c.kwargs["session_id"]
         for c in mp.add_turn.await_args_list
