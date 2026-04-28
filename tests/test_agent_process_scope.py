@@ -169,7 +169,7 @@ class TestReadPath:
 
         assert memory.get_context.call_count == 1
         called_sid = memory.get_context.call_args.kwargs["session_id"]
-        assert called_sid == "telegram:12345:finance:assistant"
+        assert called_sid == "telegram-12345-finance-assistant"
 
     async def test_fan_out_two_scopes_parallel(self):
         """Active=[finance, house] → two get_context calls, one per scope."""
@@ -194,8 +194,8 @@ class TestReadPath:
             c.kwargs["session_id"] for c in memory.get_context.call_args_list
         ]
         assert sorted(session_ids_called) == [
-            "telegram:12345:finance:assistant",
-            "telegram:12345:house:assistant",
+            "telegram-12345-finance-assistant",
+            "telegram-12345-house-assistant",
         ]
 
     async def test_trust_filters_unreadable_scopes(self):
@@ -246,7 +246,7 @@ class TestReadPath:
 
         assert memory.add_turn.call_count == 1
         write_sid = memory.add_turn.call_args.kwargs["session_id"]
-        assert write_sid == "telegram:12345:personal:assistant"
+        assert write_sid == "telegram-12345-personal-assistant"
 
     async def test_memory_context_includes_scope_attribute(self):
         """When digest is non-empty, system prompt has scope= attribute."""
@@ -320,7 +320,7 @@ class TestWritePath:
 
         memory.add_turn.assert_awaited_once()
         kwargs = memory.add_turn.await_args.kwargs
-        assert kwargs["session_id"] == "telegram:12345:finance:assistant"
+        assert kwargs["session_id"] == "telegram-12345-finance-assistant"
 
     async def test_write_restricted_to_owned_and_readable(self, monkeypatch):
         """Write-scope classifier sees only (scopes_owned ∩ readable)."""
@@ -472,7 +472,7 @@ class TestWritePath:
         assert reg.score.call_count == 1
         memory.add_turn.assert_awaited_once()
         write_sid = memory.add_turn.await_args.kwargs["session_id"]
-        assert write_sid == "voice:lr:house:butler"
+        assert write_sid == "voice-lr-house-butler"
 
     async def test_write_skipped_when_owned_and_readable_empty(self, monkeypatch):
         """Trust-bypass regression: if the channel's trust tier filters out
