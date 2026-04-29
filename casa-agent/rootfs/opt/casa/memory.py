@@ -533,6 +533,23 @@ class CachedMemoryProvider(MemoryProvider):
                     session_id, agent_role, exc,
                 )
 
+    async def cross_peer_context(
+        self,
+        observer_role: str,
+        query: str,
+        tokens: int,
+        user_peer: str = "nicola",
+    ) -> str:
+        # Spec M6 § 5.2: passthrough, no caching. The cache today
+        # exists for voice latency on get_context; cross-peer reads
+        # happen on text-channel turns at low volume per turn, and a
+        # correct cache key would have to include `query` — defeating
+        # the cache's purpose. Same shape as ensure_session and
+        # add_turn passthroughs above.
+        return await self._backend.cross_peer_context(
+            observer_role, query, tokens, user_peer,
+        )
+
 
 # ---------------------------------------------------------------------------
 # SqliteMemoryProvider (spec: 2026-04-17-sqlite-memory-2.2b)
