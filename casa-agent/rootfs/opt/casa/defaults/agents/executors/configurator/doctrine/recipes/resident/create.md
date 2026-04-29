@@ -74,3 +74,39 @@ For voice-only / `household-shared`-trust residents (today: butler/
 Tina), exclude `meta` from `scopes_readable`. Even if added, the
 trust filter at `agent.py:296` would drop it (meta requires
 `authenticated`); excluding it makes the intent explicit.
+
+## Cross-role recall tool (M6, v0.18.0)
+
+If the new resident should be able to consult another agent's
+accumulated memory of the user without delegating a full agent turn,
+include the tool in `tools.allowed` and configure the token budget:
+
+```yaml
+tools:
+  allowed:
+    - mcp__casa-framework__consult_other_agent_memory   # M6 — cross-role recall
+    # ... other tools
+
+memory:
+  token_budget: 4000
+  cross_peer_token_budget: 2000   # M6 — consult_other_agent_memory budget
+  # ... other memory fields
+```
+
+The tool reads `peer.context(target=user, search_query=query)` from
+Honcho — it does NOT spawn a turn against the other agent. Use it for
+"what does Finance know about my budget priorities?" — but for "what
+was my last invoice?" the resident should still call
+`delegate_to_agent("finance", ...)` because only the specialist's
+tools fetch live data.
+
+**Trust posture.** DO NOT add this tool to a voice-only /
+`household-shared`-trust resident's `tools.allowed`. The voice
+channel is open to guests; granting this tool there would let a
+guest pull a specialist's view of the user. Tina (butler) ships
+without it for this reason.
+
+Add the matching routing-rule paragraph to the resident's
+`prompts/system.md` so Claude knows when to use the tool vs
+`delegate_to_agent` (see the canonical Ellen paragraph for the
+template).
