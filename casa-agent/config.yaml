@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.18.2"
+version: "0.19.0"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 init: false
@@ -18,8 +18,7 @@ ports:
 ports_description:
   "18065/tcp": "External API (webhooks, invoke, Telegram webhook)"
 map:
-  - addon_config:rw
-  - config:ro
+  - all_addon_configs:rw
 options:
   # Secrets
   # Network
