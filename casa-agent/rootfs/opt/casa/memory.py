@@ -170,11 +170,12 @@ def _render_peer_context(context: object, observer_role: str) -> str:
     (str). No ``messages``, ``summary``, or ``peer_representation`` —
     those don't exist on Honcho's peer.context() return shape (spec §4).
     """
+    heading = f"## What {observer_role.capitalize()} knows about you (cross-role)"
     sections: list[str] = []
 
     peer_card = getattr(context, "peer_card", None)
     if peer_card:
-        lines = [f"## What {observer_role.capitalize()} knows about you (cross-role)"]
+        lines = [heading]
         lines.extend(f"- {item}" for item in peer_card)
         sections.append("\n".join(lines))
 
@@ -183,9 +184,7 @@ def _render_peer_context(context: object, observer_role: str) -> str:
         if sections:
             sections.append(representation)
         else:
-            sections.append(
-                f"## What {observer_role.capitalize()} knows about you (cross-role)\n\n{representation}"
-            )
+            sections.append(f"{heading}\n\n{representation}")
 
     return "\n\n".join(sections)
 
