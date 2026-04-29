@@ -349,6 +349,8 @@ async def test_get_context_emits_memory_call_log(stub_env, caplog):
     assert rec.summary_present is True
     assert rec.peer_repr_present is True
     assert rec.cache_hit is False
+    # M6 § 9 — call_type field distinguishes self vs cross_peer reads
+    assert getattr(rec, "call_type", None) == "self"
 
 
 async def test_get_context_memory_call_when_summary_missing(stub_env, caplog):
@@ -383,6 +385,8 @@ async def test_get_context_memory_call_when_summary_missing(stub_env, caplog):
     assert rec.summary_present is False
     assert rec.peer_repr_present is False
     assert rec.peer_count == 1
+    # M6 § 9 — call_type field distinguishes self vs cross_peer reads
+    assert getattr(rec, "call_type", None) == "self"
 
 
 async def test_cross_peer_context_renders_real_response_shape(stub_env):
@@ -443,3 +447,48 @@ async def test_cross_peer_context_renders_real_response_shape(stub_env):
     assert fp.context_calls == [
         ("nicola", "what does Finance know about my priorities", 2000),
     ]
+
+
+async def test_cross_peer_emits_memory_call_with_call_type_cross_peer(
+    stub_env, caplog,
+):
+    """M6 § 9 — cross-peer reads emit memory_call with call_type=
+    "cross_peer" and field reinterpretation per spec."""
+    import logging
+    from dataclasses import dataclass, field
+    from memory import HonchoMemoryProvider
+
+    p = HonchoMemoryProvider(api_url="http://h", api_key="k")
+    client: StubHoncho = p._client  # type: ignore[attr-defined]
+
+    @dataclass
+    class _PCtx:
+        peer_card: list = field(default_factory=lambda: ["a", "b", "c"])
+        representation: object = "some accumulated theory of mind"
+
+    class _Peer:
+        def __init__(self, name):
+            self.name = name
+            self._next = _PCtx()
+        def message(self, content):
+            return StubMessage(peer_name=self.name, content=content)
+        def context(self, target, search_query, tokens):
+            return self._next
+
+    client.peers["finance"] = _Peer("finance")
+
+    with caplog.at_level(logging.INFO, logger="memory"):
+        await p.cross_peer_context(
+            observer_role="finance", query="x", tokens=2000,
+        )
+
+    records = [r for r in caplog.records if r.message == "memory_call"]
+    assert len(records) == 1, f"expected 1 memory_call, got {len(records)}"
+    rec = records[0]
+    assert getattr(rec, "call_type", None) == "cross_peer"
+    assert rec.backend == "honcho"
+    assert rec.agent_role == "finance"
+    assert rec.peer_count == 3            # peer_card length
+    assert rec.summary_present is False   # no summary on peer.context
+    assert rec.peer_repr_present is True  # representation populated
+    assert rec.cache_hit is False

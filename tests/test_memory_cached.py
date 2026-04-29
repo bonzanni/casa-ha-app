@@ -310,3 +310,5 @@ async def test_get_context_cache_hit_emits_memory_call(caplog):
     assert rec.peer_count is None
     assert rec.summary_present is None
     assert rec.peer_repr_present is None
+    # M6 § 9 — call_type field distinguishes self vs cross_peer reads
+    assert getattr(rec, "call_type", None) == "self"

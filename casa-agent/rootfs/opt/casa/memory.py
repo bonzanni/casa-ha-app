@@ -294,6 +294,7 @@ class HonchoMemoryProvider(MemoryProvider):
                 "summary_present": bool(getattr(summary_obj, "content", None)),
                 "peer_repr_present": bool(getattr(ctx, "peer_representation", None)),
                 "cache_hit": False,
+                "call_type": "self",   # M6 § 9
             },
         )
         return rendered
@@ -321,6 +322,7 @@ class HonchoMemoryProvider(MemoryProvider):
         tokens: int,
         user_peer: str = "nicola",
     ) -> str:
+        t_start = time.perf_counter()
         try:
             peer = await _to_thread(self._client.peer, observer_role)
             ctx = await _to_thread(
@@ -334,8 +336,38 @@ class HonchoMemoryProvider(MemoryProvider):
                 "cross_peer_context failed for observer=%r user_peer=%r: %s",
                 observer_role, user_peer, exc,
             )
+            # No memory_call emission on error — operator sees the
+            # WARNING line; double-emitting on errors would falsify
+            # backend-success-rate dashboards.
             return ""
-        return _render_peer_context(ctx, observer_role)
+        rendered = _render_peer_context(ctx, observer_role)
+        # M3b/M6 telemetry — companion line on every successful Honcho
+        # backend call. Field reinterpretation per spec § 9:
+        #   peer_count       → len(peer_card) (no messages on peer.context)
+        #   summary_present  → False (no summary surface)
+        #   peer_repr_present → bool(representation) (semantic map)
+        #   cache_hit        → False (no caching for cross-peer)
+        #   call_type        → "cross_peer"
+        #   session_id       → synthetic peer-{observer_role}-{user_peer}
+        #                      (peer-level reads aren't bound to a session;
+        #                      the deterministic synthetic value keeps the
+        #                      log parser uniform — `peer-` prefix can't
+        #                      collide with real 4-segment session ids).
+        logger.info(
+            "memory_call",
+            extra={
+                "backend": "honcho",
+                "session_id": f"peer-{observer_role}-{user_peer}",
+                "agent_role": observer_role,
+                "t_ms": int((time.perf_counter() - t_start) * 1000),
+                "peer_count": len(getattr(ctx, "peer_card", None) or []),
+                "summary_present": False,
+                "peer_repr_present": bool(getattr(ctx, "representation", None)),
+                "cache_hit": False,
+                "call_type": "cross_peer",
+            },
+        )
+        return rendered
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +458,7 @@ class CachedMemoryProvider(MemoryProvider):
                     "summary_present": None,
                     "peer_repr_present": None,
                     "cache_hit": True,
+                    "call_type": "self",   # M6 § 9
                 },
             )
             return cached
@@ -447,6 +480,7 @@ class CachedMemoryProvider(MemoryProvider):
                         "summary_present": None,
                         "peer_repr_present": None,
                         "cache_hit": True,
+                        "call_type": "self",   # M6 § 9
                     },
                 )
                 return cached
@@ -633,6 +667,7 @@ class SqliteMemoryProvider(MemoryProvider):
                 "summary_present": False,
                 "peer_repr_present": False,
                 "cache_hit": False,
+                "call_type": "self",   # M6 § 9
             },
         )
         return rendered
