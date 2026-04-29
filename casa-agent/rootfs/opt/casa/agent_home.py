@@ -50,3 +50,37 @@ def provision_agent_home(
     settings_path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n",
                              encoding="utf-8")
     logger.info("agent-home provisioned: role=%s settings=%s", role, settings_path)
+
+
+def provision_all_homes(
+    *,
+    role_configs: dict,
+    specialist_configs: dict,
+    home_root: Path | str,
+    defaults_root: Path | str,
+) -> None:
+    """Provision an agent-home for every in_casa resident or specialist.
+
+    Iterates the union of `role_configs` and `specialist_configs`,
+    delegating each role to ``provision_agent_home``. Idempotent — safe
+    to call on every boot.
+
+    Executors are deliberately excluded: they run with
+    ``cwd=/addon_configs/casa-agent`` per
+    ``tools.py::_build_executor_options``, not from an
+    ``agent-home/<role>/`` directory. Adding executors here would create
+    empty unused dirs.
+
+    Each role's provisioning is wrapped in its own try/except so a
+    single malformed plugins.yaml cannot take down the boot — the
+    failing role is logged at WARNING and skipped; the rest continue.
+    """
+    for role in {**role_configs, **specialist_configs}:
+        try:
+            provision_agent_home(
+                role=role, home_root=home_root, defaults_root=defaults_root,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "agent-home provisioning failed for role=%s: %s", role, exc,
+            )
