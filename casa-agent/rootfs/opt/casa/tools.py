@@ -869,9 +869,7 @@ async def consult_other_agent_memory(args: dict) -> dict:
         # known-roles list to help the model self-correct
         registered: list[str] = list(_agent_role_map.keys())
         if _specialist_registry is not None:
-            registered += list(
-                getattr(_specialist_registry, "_configs", {}).keys()
-            )
+            registered += list(_specialist_registry.all_configs().keys())
         return _result({
             "status": "error",
             "kind": "unknown_role",
@@ -881,18 +879,16 @@ async def consult_other_agent_memory(args: dict) -> dict:
             ),
         })
 
+    empty_msg = (
+        f'No accumulated memory found for {role} matching "{query[:60]}".'
+    )
+
     # Resolve memory provider — same pattern as _run_delegated_agent
     # at tools.py:444 (M4b).
     memory_provider = getattr(agent_mod, "active_memory_provider", None)
     if memory_provider is None:
         # No memory backend configured — graceful empty
-        return _result({
-            "status": "ok",
-            "content": (
-                f'No accumulated memory found for {role} matching '
-                f'"{query[:60]}".'
-            ),
-        })
+        return _result({"status": "ok", "content": empty_msg})
 
     # Token budget: read from the calling resident's runtime.yaml.
     # The caller's role isn't directly available on the tool path
@@ -935,13 +931,7 @@ async def consult_other_agent_memory(args: dict) -> dict:
 
     # Spec § 6.4: preamble formatting
     if not rendered:
-        return _result({
-            "status": "ok",
-            "content": (
-                f'No accumulated memory found for {role} matching '
-                f'"{query[:60]}".'
-            ),
-        })
+        return _result({"status": "ok", "content": empty_msg})
     return _result({
         "status": "ok",
         "content": (
