@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.20.0] - 2026-04-29
+
+### Fixed
+- **E-6 / E-10**: `_effective_caller_role()` priority flip — `engagement_var`
+  now checked before `origin_var`. Configurator engagements can again call
+  `config_git_commit` and `casa_reload` without falling back to raw `git
+  commit` or "manual addon restart" workarounds.
+- **E-7**: `_deliver_turn` binds `engagement_var` for the duration of the
+  SDK loop. `emit_completion` now resolves the active engagement instead
+  of returning `not_in_engagement`.
+- **Bug 2 (sdk_session_id checkpoint timing)**: `InCasaDriver` now eagerly
+  persists `sdk_session_id` to the registry the first time
+  `client.session_id` becomes non-null, instead of waiting for the 24h
+  idle sweeper. An unclean shutdown mid-turn can no longer orphan an
+  engagement with `sdk_session_id: null`.
+
+### Changed
+- `InCasaDriver.__init__` gains a new keyword arg
+  `persist_session_id: Callable[[str, str], Awaitable[None]] | None`
+  (default `None`). The single caller (`casa_core.main`) is updated.
+  Pre-1.0 minor bump to signal the API change.
+
+### Internal
+- New `tests/test_role_gate_priority.py` (3 tests).
+- `tests/test_in_casa_driver.py` extended (4 tests).
+- `tests/test_engage_executor_tool.py` extended (1 leak-detection test).
+
 ## [0.19.0] - 2026-04-29 — Phase 0 / E-11: persistent addon-config mount
 
 **BREAKING — first boot of v0.19.0 wipes and reseeds the entire
