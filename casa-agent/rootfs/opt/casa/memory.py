@@ -314,6 +314,29 @@ class HonchoMemoryProvider(MemoryProvider):
             agent.message(assistant_text),
         ])
 
+    async def cross_peer_context(
+        self,
+        observer_role: str,
+        query: str,
+        tokens: int,
+        user_peer: str = "nicola",
+    ) -> str:
+        try:
+            peer = await _to_thread(self._client.peer, observer_role)
+            ctx = await _to_thread(
+                peer.context,
+                target=user_peer,
+                search_query=query,
+                tokens=tokens,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "cross_peer_context failed for observer=%r user_peer=%r: %s",
+                observer_role, user_peer, exc,
+            )
+            return ""
+        return _render_peer_context(ctx, observer_role)
+
 
 # ---------------------------------------------------------------------------
 # CachedMemoryProvider (voice latency strategy S1)
