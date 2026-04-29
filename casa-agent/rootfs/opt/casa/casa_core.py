@@ -1054,7 +1054,12 @@ async def main() -> None:
             engagement_supergroup_id=telegram_engagement_supergroup_id or None,
         )
         channel_manager.register(telegram_channel)
-        await telegram_channel.setup_engagement_features()
+        # NOTE: setup_engagement_features() needs the bot, which is only
+        # built once channel_manager.start_all() runs _rebuild(). We defer
+        # the call until after start_all() (see step 12 below). v0.18.2
+        # fix — was previously called here and silently failed with
+        # "'NoneType' object has no attribute 'get_me'", leaving
+        # engagement_permission_ok=False forever.
         logger.info(
             "Telegram channel registered (transport=%s, delivery=%s, chat_id=%s)",
             telegram_transport,
@@ -1450,6 +1455,20 @@ async def main() -> None:
 
     # 12. Start all channels
     await channel_manager.start_all()
+
+    # 12a. v0.18.2: now that the telegram bot is built (start_all → _rebuild
+    # populates self._app), we can probe `can_manage_topics` on the
+    # engagement supergroup. This MUST run after start_all() and not
+    # immediately after channel_manager.register() — the bot isn't created
+    # until _rebuild() fires.
+    _telegram_channel = channel_manager.get("telegram")
+    if _telegram_channel is not None:
+        try:
+            await _telegram_channel.setup_engagement_features()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Telegram engagement features setup failed: %s", exc,
+            )
 
     # 13. Agent loop tasks
     for name in list(agents.keys()) + ["telegram"]:
