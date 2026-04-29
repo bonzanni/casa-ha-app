@@ -337,6 +337,5 @@ class TestInCasaEngagementContext:
 
         await drv.start(rec, "hi", ClaudeAgentOptions(model="sonnet"))
         # Sanity: rec.sdk_session_id stays None because no callback was wired
-        # AND we don't write the in-place value when callback is None
-        # (Task-2 implementation note below).
+        # AND we don't write the in-place value when callback is None.
         assert rec.sdk_session_id is None

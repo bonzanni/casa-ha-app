@@ -167,6 +167,10 @@ class InCasaDriver(DriverProtocol):
                                 "Engagement %s persist_session_id failed: %s",
                                 engagement.id[:8], exc,
                             )
+                        # Update in-memory mirror unconditionally — this
+                        # suppresses hot-loop retries even when the registry
+                        # write failed. A failed write leaves the tombstone
+                        # stale; the idle sweeper re-persists on next sweep.
                         engagement.sdk_session_id = sid
                     if isinstance(sdk_msg, AssistantMessage):
                         for block in getattr(sdk_msg, "content", []):
