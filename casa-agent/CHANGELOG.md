@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.18.2] - 2026-04-29 — Engagement setup_engagement_features() ordering fix
+
+**Latent bug since v0.11.0 surfaced by v0.18.1.** Once `TELEGRAM_ENGAGEMENT_SUPERGROUP_ID` started actually reaching `TelegramChannel.__init__` (v0.18.1 fix), `setup_engagement_features()` ran the bot-permission check at startup — but `self._app` was still `None` because `channel_manager.start_all()` hadn't fired yet. The probe failed with `'NoneType' object has no attribute 'get_me'`, leaving `engagement_permission_ok = False` permanently. Every `engage_executor` / `delegate_to_agent(mode="interactive")` then returned the misleading "set telegram_engagement_supergroup_id in addon" error.
+
+### Fixed
+
+- **`casa_core.py`** — `telegram_channel.setup_engagement_features()` is now called AFTER `channel_manager.start_all()`, not immediately after `register()`. The bot isn't built until `_rebuild()` runs inside `start_all()`. The deferred call is wrapped in try/except + ERROR-log to avoid blocking startup if the supergroup probe fails for an unrelated reason (e.g., Telegram API outage).
+
+This was latent for ~7 months because v0.18.0 and earlier never actually exported `TELEGRAM_ENGAGEMENT_SUPERGROUP_ID` to the env (v0.11.0 schema-write regression that v0.18.1 fixed). Operators who set the option still hit the no-op early-return at `setup_engagement_features` line 634; the bug only manifests once the env var actually reaches `TelegramChannel.__init__`.
+
 ## [0.18.1] - 2026-04-29 — Engagement supergroup env-export fix + log_level option
 
 **Two operator-facing fixes discovered during M6 (v0.18.0) deploy verification.**
