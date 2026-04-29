@@ -20,6 +20,7 @@ export TELEGRAM_CHAT_ID="$(bashio::config 'telegram_chat_id')"
 _tg_transport="$(bashio::config 'telegram_transport')"
 export TELEGRAM_TRANSPORT="${_tg_transport:-polling}"
 export TELEGRAM_DELIVERY_MODE="$(bashio::config 'telegram_delivery_mode')"
+export TELEGRAM_ENGAGEMENT_SUPERGROUP_ID="$(bashio::config 'telegram_engagement_supergroup_id')"
 export WEBHOOK_SECRET="$(bashio::config 'webhook_secret')"
 export PRIMARY_AGENT_NAME="$(bashio::config 'primary_agent_name')"
 export VOICE_AGENT_NAME="$(bashio::config 'voice_agent_name')"
@@ -50,6 +51,14 @@ fi
 _casa_tz="$(bashio::config 'casa_tz')"
 if [ "$_casa_tz" != "null" ] && [ -n "$_casa_tz" ]; then
     export CASA_TZ="$_casa_tz"
+fi
+
+# v0.18.1: operator-facing log level. install_logging() at
+# casa_core.py:743 reads LOG_LEVEL env when set; falls back to INFO
+# when unset/null/empty.
+_log_level="$(bashio::config 'log_level')"
+if [ "$_log_level" != "null" ] && [ -n "$_log_level" ]; then
+    export LOG_LEVEL="$_log_level"
 fi
 
 # SUPERVISOR_TOKEN is injected automatically by the HA Supervisor.

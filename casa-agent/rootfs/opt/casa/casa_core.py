@@ -740,7 +740,9 @@ async def main() -> None:
     """Async entry point for the Casa add-on."""
 
     # 1. Logging (correlation ids + secret redaction, spec 5.2 §7).
-    install_logging()
+    _log_level_name = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+    _log_level = getattr(logging, _log_level_name, logging.INFO)
+    install_logging(level=_log_level)
     logger.info("Casa core starting up")
 
     # 1a. §8: universal op:// resolution for password-typed addon options.

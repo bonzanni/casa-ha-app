@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.18.0"
+version: "0.18.1"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 init: false
@@ -81,3 +81,4 @@ schema:
   enable_terminal: bool?
   scope_threshold: "float(0.0,1.0)?"
   casa_tz: str?
+  log_level: "list(debug|info|warning|error)?"

@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.18.1] - 2026-04-29 — Engagement supergroup env-export fix + log_level option
+
+**Two operator-facing fixes discovered during M6 (v0.18.0) deploy verification.**
+
+### Fixed
+
+- **`telegram_engagement_supergroup_id` no longer ignored at runtime.**
+  The `s6-overlay/s6-rc.d/svc-casa/run` script exported 4 of the 5
+  `telegram_*` config options to env vars but missed
+  `TELEGRAM_ENGAGEMENT_SUPERGROUP_ID`. This caused
+  `casa_core.py:1028` to read the empty env (default `"0"`),
+  parse to `0`, and pass `engagement_supergroup_id=None` to
+  `TelegramChannel`. Every engagement-tool call (`engage_executor`,
+  `delegate_to_agent` with `mode="interactive"`) returned the
+  "set telegram_engagement_supergroup_id in addon" error even when
+  the option was correctly set in the addon configuration.
+  Regression dates from v0.11.0 (engagement primitive ship); silent
+  for ~7 months because the manual Telegram smoke probe in v0.11.0
+  was performed by an operator who had also not yet set the option.
+  Regression test in `tests/test_run_script_env.py` parameterizes
+  every TELEGRAM_* env var the run script must export.
+
+### Added
+
+- **Operator-facing `log_level` addon option.** `list(debug|info|warning|error)?`
+  with INFO default. Wired through `svc-casa/run` (null-normalized
+  like `casa_tz` / `scope_threshold`) → `LOG_LEVEL` env var →
+  `casa_core.py::install_logging(level=...)`. Operators can now flip
+  to DEBUG via the HA UI without rebuilding the image.
+
 ## [0.18.0] - 2026-04-29 — Memory M6: cross-role recall
 
 **Adds `consult_other_agent_memory(role, query)` — a read-only MCP

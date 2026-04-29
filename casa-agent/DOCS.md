@@ -65,6 +65,7 @@ options panel) for finer control:
 |--------|-------------|
 | `enable_terminal` | Enable a web terminal accessible via the ingress panel. Default: `false`. |
 | `webhook_secret` | HMAC-SHA256 secret for authenticating webhook requests. Leave empty to skip verification. |
+| `log_level` | Log verbosity: `debug`, `info`, `warning`, or `error`. Default: `info`. Flip to `debug` for verbose troubleshooting without rebuilding the image. |
 
 ## How it works
 
