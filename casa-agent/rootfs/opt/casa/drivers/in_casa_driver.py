@@ -131,16 +131,24 @@ class InCasaDriver(DriverProtocol):
     async def _deliver_turn(
         self, engagement: EngagementRecord, prompt: str,
     ) -> None:
+        # Lazy import: tools imports engagement_registry; doing this at
+        # module top-level would create a circular import.
+        from tools import engagement_var
+
         client = self._clients[engagement.id]
         lock = self._locks[engagement.id]
         chunks: list[str] = []
-        async with lock:
-            await client.query(prompt)
-            async for sdk_msg in client.receive_response():
-                if isinstance(sdk_msg, AssistantMessage):
-                    for block in getattr(sdk_msg, "content", []):
-                        if isinstance(block, TextBlock):
-                            chunks.append(block.text)
+        token = engagement_var.set(engagement)
+        try:
+            async with lock:
+                await client.query(prompt)
+                async for sdk_msg in client.receive_response():
+                    if isinstance(sdk_msg, AssistantMessage):
+                        for block in getattr(sdk_msg, "content", []):
+                            if isinstance(block, TextBlock):
+                                chunks.append(block.text)
+        finally:
+            engagement_var.reset(token)
         text = "".join(chunks).strip()
         if text and engagement.topic_id is not None:
             await self._send_to_topic(engagement.topic_id, text)

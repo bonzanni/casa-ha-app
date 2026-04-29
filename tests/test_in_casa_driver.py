@@ -227,3 +227,38 @@ class TestInCasaResume:
         rec = _make_record()
         await drv.start(rec, "p", ClaudeAgentOptions(model="sonnet"))
         assert drv.get_session_id(rec) == "sess-xyz"
+
+
+class TestInCasaEngagementContext:
+    async def test_deliver_turn_sets_engagement_var_during_sdk_loop(self, monkeypatch):
+        """engagement_var is bound for the duration of receive_response()."""
+        from drivers.in_casa_driver import InCasaDriver
+        from tools import engagement_var
+
+        captured: list = []
+
+        class _FakeClient:
+            def __init__(self, options): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+
+            async def receive_response(self):
+                # Snapshot engagement_var while inside the loop
+                captured.append(engagement_var.get(None))
+                yield _mk_assistant("hi")
+
+            async def close(self): pass
+
+        monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+
+        drv = InCasaDriver(send_to_topic=AsyncMock())
+        rec = _make_record(role_or_type="configurator")
+
+        # Pre-state: unbound
+        assert engagement_var.get(None) is None
+        await drv.start(rec, "hi", ClaudeAgentOptions(model="sonnet"))
+        # Post-state: reset
+        assert engagement_var.get(None) is None
+        # During-state: was bound to rec
+        assert captured == [rec]
