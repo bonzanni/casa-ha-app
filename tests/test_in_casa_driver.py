@@ -227,3 +227,115 @@ class TestInCasaResume:
         rec = _make_record()
         await drv.start(rec, "p", ClaudeAgentOptions(model="sonnet"))
         assert drv.get_session_id(rec) == "sess-xyz"
+
+
+class TestInCasaEngagementContext:
+    async def test_deliver_turn_sets_engagement_var_during_sdk_loop(self, monkeypatch):
+        """engagement_var is bound for the duration of receive_response()."""
+        from drivers.in_casa_driver import InCasaDriver
+        from tools import engagement_var
+
+        captured: list = []
+
+        class _FakeClient:
+            def __init__(self, options): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+
+            async def receive_response(self):
+                # Snapshot engagement_var while inside the loop
+                captured.append(engagement_var.get(None))
+                yield _mk_assistant("hi")
+
+            async def close(self): pass
+
+        monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+
+        drv = InCasaDriver(send_to_topic=AsyncMock())
+        rec = _make_record(role_or_type="configurator")
+
+        # Pre-state: unbound
+        assert engagement_var.get(None) is None
+        await drv.start(rec, "hi", ClaudeAgentOptions(model="sonnet"))
+        # Post-state: reset
+        assert engagement_var.get(None) is None
+        # During-state: was bound to rec
+        assert captured == [rec]
+
+    async def test_deliver_turn_persists_session_id_on_first_message(self, monkeypatch):
+        """First non-null client.session_id triggers persist_session_id once."""
+        from drivers.in_casa_driver import InCasaDriver
+
+        class _FakeClient:
+            def __init__(self, options):
+                self.session_id = "sess-abc"
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+            async def receive_response(self):
+                yield _mk_assistant("hi")
+            async def close(self): pass
+
+        monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+
+        persist = AsyncMock()
+        drv = InCasaDriver(send_to_topic=AsyncMock(), persist_session_id=persist)
+        rec = _make_record()
+
+        await drv.start(rec, "hi", ClaudeAgentOptions(model="sonnet"))
+
+        persist.assert_awaited_once_with(rec.id, "sess-abc")
+        assert rec.sdk_session_id == "sess-abc"
+
+    async def test_deliver_turn_persist_idempotent_on_second_turn(self, monkeypatch):
+        """Subsequent _deliver_turn calls skip the callback when sid unchanged."""
+        from drivers.in_casa_driver import InCasaDriver
+
+        class _FakeClient:
+            def __init__(self, options):
+                self.session_id = "sess-abc"
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+            async def receive_response(self):
+                yield _mk_assistant("hi")
+            async def close(self): pass
+
+        monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+
+        persist = AsyncMock()
+        drv = InCasaDriver(send_to_topic=AsyncMock(), persist_session_id=persist)
+        rec = _make_record()
+
+        await drv.start(rec, "hi", ClaudeAgentOptions(model="sonnet"))
+        await drv.send_user_turn(rec, "another turn")
+
+        # Persist must fire exactly once across both turns.
+        assert persist.await_count == 1
+        assert rec.sdk_session_id == "sess-abc"
+
+    async def test_deliver_turn_persist_callback_optional(self, monkeypatch):
+        """Driver constructed with default persist_session_id=None runs cleanly."""
+        from drivers.in_casa_driver import InCasaDriver
+
+        class _FakeClient:
+            def __init__(self, options):
+                self.session_id = "sess-abc"
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+            async def receive_response(self):
+                yield _mk_assistant("hi")
+            async def close(self): pass
+
+        monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+
+        # No persist_session_id supplied — uses default None.
+        drv = InCasaDriver(send_to_topic=AsyncMock())
+        rec = _make_record()
+
+        await drv.start(rec, "hi", ClaudeAgentOptions(model="sonnet"))
+        # Sanity: rec.sdk_session_id stays None because no callback was wired
+        # AND we don't write the in-place value when callback is None.
+        assert rec.sdk_session_id is None

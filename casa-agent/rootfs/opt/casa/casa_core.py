@@ -1082,7 +1082,10 @@ async def main() -> None:
         if telegram_channel is not None:
             await telegram_channel.send_to_topic(thread_id, text)
 
-    engagement_driver = InCasaDriver(send_to_topic=_send_to_topic)
+    engagement_driver = InCasaDriver(
+        send_to_topic=_send_to_topic,
+        persist_session_id=engagement_registry.persist_session_id,
+    )
 
     # Expose on the agent module so tools.emit_completion / cancel_engagement
     # can find it without circular imports.

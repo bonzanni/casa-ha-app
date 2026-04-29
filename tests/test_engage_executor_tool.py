@@ -191,6 +191,63 @@ class TestEngageExecutorReal:
         payload = json.loads(r["content"][0]["text"])
         assert payload["kind"] == "no_origin"
 
+    async def test_does_not_leak_engagement_var_to_caller(
+        self, tmp_path, monkeypatch,
+    ):
+        """engage_executor must not bind engagement_var in the engager's scope.
+
+        The tool dispatches to driver.start, which (post-Phase-1) sets
+        engagement_var only inside _deliver_turn. The engager's task must
+        observe engagement_var == None both before and after the call.
+        """
+        from tools import engage_executor, engagement_var, init_tools
+        import agent as agent_mod
+
+        defn = _mock_executor_def()
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["configurator"])
+
+        er = MagicMock()
+        mock_rec = MagicMock()
+        mock_rec.id = "abcd1234" + "0" * 24
+        mock_rec.topic_id = 42
+        er.create = AsyncMock(return_value=mock_rec)
+        er.mark_error = AsyncMock()
+
+        channel = await _setup(reg, tmp_path=tmp_path)
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=er,
+            executor_registry=reg,
+        )
+        monkeypatch.setattr(
+            agent_mod, "active_engagement_driver",
+            MagicMock(start=AsyncMock()), raising=False,
+        )
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            assert engagement_var.get(None) is None  # pre-state
+            r = await engage_executor.handler({
+                "executor_type": "configurator",
+                "task": "t",
+                "context": "",
+            })
+            assert engagement_var.get(None) is None  # post-state
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        # Sanity: handler still completed with the expected envelope shape
+        payload = json.loads(r["content"][0]["text"])
+        assert payload["status"] == "pending"
+
 
 class TestEngageExecutorClaudeCode:
     @pytest.mark.skip(reason="TODO(Phase G): Full wiring test — covered by D-block E2E")

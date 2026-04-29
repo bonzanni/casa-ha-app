@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 TopicSender = Callable[[int, str], Awaitable[None]]
 """(topic_id, text) → None — the channel-side async post."""
 
+SessionIdPersister = Callable[[str, str], Awaitable[None]]
+"""(engagement_id, session_id) → None — registry persist hook.
+
+Matches engagement_registry.persist_session_id's bound-method signature."""
+
 
 class DriverNotAliveError(RuntimeError):
     """Raised when a turn is fed to a driver that has no open client."""
@@ -35,8 +40,14 @@ class InCasaDriver(DriverProtocol):
     imported from ``channels.telegram`` to keep the driver pure/testable.
     """
 
-    def __init__(self, *, send_to_topic: TopicSender) -> None:
+    def __init__(
+        self,
+        *,
+        send_to_topic: TopicSender,
+        persist_session_id: SessionIdPersister | None = None,
+    ) -> None:
         self._send_to_topic = send_to_topic
+        self._persist_session_id = persist_session_id
         self._clients: dict[str, ClaudeSDKClient] = {}
         self._ctx_stack: dict[str, Any] = {}
         # Per-engagement asyncio.Lock guards query/receive_response sequencing:
@@ -131,16 +142,42 @@ class InCasaDriver(DriverProtocol):
     async def _deliver_turn(
         self, engagement: EngagementRecord, prompt: str,
     ) -> None:
+        # Lazy import: tools imports engagement_registry; doing this at
+        # module top-level would create a circular import.
+        from tools import engagement_var
+
         client = self._clients[engagement.id]
         lock = self._locks[engagement.id]
         chunks: list[str] = []
-        async with lock:
-            await client.query(prompt)
-            async for sdk_msg in client.receive_response():
-                if isinstance(sdk_msg, AssistantMessage):
-                    for block in getattr(sdk_msg, "content", []):
-                        if isinstance(block, TextBlock):
-                            chunks.append(block.text)
+        token = engagement_var.set(engagement)
+        try:
+            async with lock:
+                await client.query(prompt)
+                async for sdk_msg in client.receive_response():
+                    sid = getattr(client, "session_id", None)
+                    if (
+                        sid
+                        and self._persist_session_id is not None
+                        and engagement.sdk_session_id != sid
+                    ):
+                        try:
+                            await self._persist_session_id(engagement.id, sid)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "Engagement %s persist_session_id failed: %s",
+                                engagement.id[:8], exc,
+                            )
+                        # Update in-memory mirror unconditionally — this
+                        # suppresses hot-loop retries even when the registry
+                        # write failed. A failed write leaves the tombstone
+                        # stale; the idle sweeper re-persists on next sweep.
+                        engagement.sdk_session_id = sid
+                    if isinstance(sdk_msg, AssistantMessage):
+                        for block in getattr(sdk_msg, "content", []):
+                            if isinstance(block, TextBlock):
+                                chunks.append(block.text)
+        finally:
+            engagement_var.reset(token)
         text = "".join(chunks).strip()
         if text and engagement.topic_id is not None:
             await self._send_to_topic(engagement.topic_id, text)
