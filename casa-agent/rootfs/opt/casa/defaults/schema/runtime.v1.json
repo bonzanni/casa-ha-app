@@ -23,11 +23,12 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "token_budget":    {"type": "integer", "minimum": 0, "default": 4000},
-        "read_strategy":   {"type": "string", "enum": ["per_turn", "cached"], "default": "per_turn"},
-        "scopes_owned":    {"type": "array", "items": {"type": "string"}, "default": []},
-        "scopes_readable": {"type": "array", "items": {"type": "string"}, "default": []},
-        "default_scope":   {"type": "string", "default": ""}
+        "token_budget":            {"type": "integer", "minimum": 0, "default": 4000},
+        "read_strategy":           {"type": "string", "enum": ["per_turn", "cached"], "default": "per_turn"},
+        "scopes_owned":            {"type": "array", "items": {"type": "string"}, "default": []},
+        "scopes_readable":         {"type": "array", "items": {"type": "string"}, "default": []},
+        "default_scope":           {"type": "string", "default": ""},
+        "cross_peer_token_budget": {"type": "integer", "minimum": 0, "default": 2000}
       }
     },
     "channels": {"type": "array", "items": {"type": "string"}, "default": []},

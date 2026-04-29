@@ -424,3 +424,33 @@ def test_assistant_delegates_include_butler():
     assert "butler" in delegate_roles, (
         f"assistant.delegates missing butler; got {delegate_roles}"
     )
+
+
+def test_runtime_yaml_loads_cross_peer_token_budget(tmp_path):
+    """M6 § 6.3: residents may declare memory.cross_peer_token_budget
+    in runtime.yaml; agent_loader populates MemoryConfig with it.
+
+    Default value is 2000 when omitted (spec § 6.3)."""
+    from agent_loader import load_agent_from_dir
+    from policies import load_policies
+
+    policies = load_policies(str(_policies_file(tmp_path / "policies")))
+
+    # Test 1: explicit value round-trips through the loader.
+    explicit_dir = _seed_resident(tmp_path / "agents_explicit", "assistant")
+    _w(explicit_dir / "runtime.yaml", """\
+        schema_version: 1
+        model: sonnet
+        tools:
+          allowed: [Read, Write]
+        memory:
+          cross_peer_token_budget: 4000
+        channels: [telegram]
+    """)
+    cfg_explicit = load_agent_from_dir(str(explicit_dir), policies=policies)
+    assert cfg_explicit.memory.cross_peer_token_budget == 4000
+
+    # Test 2: default value (2000) when the key is omitted.
+    default_dir = _seed_resident(tmp_path / "agents_default", "assistant")
+    cfg_default = load_agent_from_dir(str(default_dir), policies=policies)
+    assert cfg_default.memory.cross_peer_token_budget == 2000
