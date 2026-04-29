@@ -80,7 +80,7 @@ def provision_all_homes(
             provision_agent_home(
                 role=role, home_root=home_root, defaults_root=defaults_root,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — boot non-fatal; isolates one role from others
             logger.warning(
                 "agent-home provisioning failed for role=%s: %s", role, exc,
             )

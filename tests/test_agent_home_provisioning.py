@@ -118,11 +118,13 @@ def test_provision_all_homes_includes_residents_and_specialists(tmp_path: Path) 
 def test_provision_all_homes_excludes_executors(tmp_path: Path) -> None:
     """Executors are intentionally NOT provisioned an agent-home —
     they run with cwd=/addon_configs/casa-agent (see
-    tools.py::_build_executor_options:257). The helper signature
-    takes only role_configs + specialist_configs; if a future caller
-    accidentally passes executors here, this test guards against
-    silent shape drift by verifying no `configurator/` dir is created
-    when no plugins.yaml exists for it."""
+    tools.py::_build_executor_options:257). This test verifies the
+    helper is purely role-driven: it only creates dirs for roles
+    present in its inputs. Pass only `assistant`; assert no
+    `configurator/` or `finance/` dir spontaneously appears. (Does
+    NOT guard against a caller mistakenly placing an executor key in
+    role_configs/specialist_configs — that's a caller-side contract.)
+    """
     from agent_home import provision_all_homes
 
     home_root = tmp_path / "agent-home"
@@ -146,8 +148,8 @@ def test_provision_all_homes_continues_on_individual_failure(
 ) -> None:
     """If one role's plugins.yaml is malformed, that role fails its
     provisioning step — but every OTHER role must still get its
-    agent-home. Mirrors the production try/except wrapping at
-    casa_core.py:928-931 which catches BLE001 per role."""
+    agent-home. Exercises the per-role try/except inside
+    `agent_home.provision_all_homes` (the BLE001-noqa block)."""
     import logging
     from agent_home import provision_all_homes
 
