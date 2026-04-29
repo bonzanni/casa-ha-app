@@ -18,6 +18,7 @@ class RecordingProvider(MemoryProvider):
         self.get_calls = 0
         self.add_calls = 0
         self.ensure_calls = 0
+        self.cross_calls = 0
         self._queue: list[str] = []
         self._error_on_get: Exception | None = None
 
@@ -43,6 +44,12 @@ class RecordingProvider(MemoryProvider):
         user_peer="nicola",
     ):
         self.add_calls += 1
+
+    async def cross_peer_context(
+        self, observer_role, query, tokens, user_peer="nicola",
+    ):
+        self.cross_calls += 1
+        return ""
 
 
 async def _drain():
@@ -310,3 +317,45 @@ async def test_get_context_cache_hit_emits_memory_call(caplog):
     assert rec.peer_count is None
     assert rec.summary_present is None
     assert rec.peer_repr_present is None
+    # M6 § 9 — call_type field distinguishes self vs cross_peer reads
+    assert getattr(rec, "call_type", None) == "self"
+
+
+async def test_cached_provider_passes_through_cross_peer_context():
+    """M6 § 5.2: CachedMemoryProvider does NOT cache cross-peer reads
+    (search_query would have to be the cache key, defeating the
+    purpose). Behavior is plain passthrough — no cache mutation,
+    no double-emit."""
+    from memory import CachedMemoryProvider
+
+    class RecordingBackend:
+        def __init__(self):
+            self.calls: list[tuple] = []
+        async def ensure_session(self, *a, **kw): ...
+        async def get_context(self, *a, **kw): return ""
+        async def add_turn(self, *a, **kw): ...
+        async def cross_peer_context(
+            self, observer_role, query, tokens, user_peer="nicola",
+        ):
+            self.calls.append(
+                (observer_role, query, tokens, user_peer)
+            )
+            return f"<<{observer_role}/{query}>>"
+
+    backend = RecordingBackend()
+    cached = CachedMemoryProvider(backend)
+
+    out1 = await cached.cross_peer_context(
+        observer_role="finance", query="budget", tokens=2000,
+    )
+    out2 = await cached.cross_peer_context(
+        observer_role="finance", query="budget", tokens=2000,
+    )
+
+    # Backend invoked twice — no caching
+    assert len(backend.calls) == 2
+    assert out1 == "<<finance/budget>>"
+    assert out2 == "<<finance/budget>>"
+
+    # Cache untouched
+    assert cached._cache == {}

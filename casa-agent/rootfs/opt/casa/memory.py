@@ -12,10 +12,12 @@ from abc import ABC, abstractmethod
 class MemoryProvider(ABC):
     """Abstract memory backend.
 
-    Three methods:
-      * ``ensure_session`` — idempotent session + peer setup.
-      * ``get_context``    — rendered memory digest for the system prompt.
-      * ``add_turn``       — persist one user→assistant turn unconditionally.
+    Four methods:
+      * ``ensure_session``      — idempotent session + peer setup.
+      * ``get_context``         — rendered memory digest for the system prompt.
+      * ``add_turn``            — persist one user→assistant turn unconditionally.
+      * ``cross_peer_context``  — read another agent's accumulated representation
+                                  of the user, semantic-filtered by query.
 
     Storage is never filtered; write-scoping is a structural property of
     ``session_id`` + peer topology (spec §4.3). Disclosure decisions
@@ -62,6 +64,22 @@ class MemoryProvider(ABC):
         """Persist one user→assistant turn. ``user_text`` → ``user_peer``;
         ``assistant_text`` → ``agent_role``. Never filtered."""
 
+    @abstractmethod
+    async def cross_peer_context(
+        self,
+        observer_role: str,
+        query: str,
+        tokens: int,
+        user_peer: str = "nicola",
+    ) -> str:
+        """Return a rendered digest of ``observer_role``'s accumulated
+        representation of ``user_peer``, semantic-filtered by ``query``.
+
+        No session_id — Honcho's peer-level context aggregates across
+        all sessions where both peers participated. Empty string when
+        no representation exists yet (cold start) or on backend error
+        (graceful degradation, parity with ``get_context``)."""
+
 
 class NoOpMemory(MemoryProvider):
     """Stub provider when ``HONCHO_API_KEY`` is not configured."""
@@ -90,6 +108,15 @@ class NoOpMemory(MemoryProvider):
         user_peer: str = "nicola",
     ) -> None:
         return None
+
+    async def cross_peer_context(
+        self,
+        observer_role: str,
+        query: str,
+        tokens: int,
+        user_peer: str = "nicola",
+    ) -> str:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +156,35 @@ def _render(context: object) -> str:
         for m in messages:
             lines.append(f"[{m.peer_name}] {m.content}")
         sections.append("\n".join(lines))
+
+    return "\n\n".join(sections)
+
+
+def _render_peer_context(context: object, observer_role: str) -> str:
+    """Assemble a peer.context() result into a markdown digest.
+
+    Sections silently omitted when their source is empty —
+    parity with ``_render``'s no-placeholder doctrine.
+
+    Duck-typed: reads ``peer_card`` (list[str]) and ``representation``
+    (str). No ``messages``, ``summary``, or ``peer_representation`` —
+    those don't exist on Honcho's peer.context() return shape (spec §4).
+    """
+    heading = f"## What {observer_role.capitalize()} knows about you (cross-role)"
+    sections: list[str] = []
+
+    peer_card = getattr(context, "peer_card", None)
+    if peer_card:
+        lines = [heading]
+        lines.extend(f"- {item}" for item in peer_card)
+        sections.append("\n".join(lines))
+
+    representation = getattr(context, "representation", None)
+    if representation:
+        if sections:
+            sections.append(representation)
+        else:
+            sections.append(f"{heading}\n\n{representation}")
 
     return "\n\n".join(sections)
 
@@ -238,6 +294,7 @@ class HonchoMemoryProvider(MemoryProvider):
                 "summary_present": bool(getattr(summary_obj, "content", None)),
                 "peer_repr_present": bool(getattr(ctx, "peer_representation", None)),
                 "cache_hit": False,
+                "call_type": "self",   # M6 § 9
             },
         )
         return rendered
@@ -257,6 +314,60 @@ class HonchoMemoryProvider(MemoryProvider):
             user.message(user_text),
             agent.message(assistant_text),
         ])
+
+    async def cross_peer_context(
+        self,
+        observer_role: str,
+        query: str,
+        tokens: int,
+        user_peer: str = "nicola",
+    ) -> str:
+        t_start = time.perf_counter()
+        try:
+            peer = await _to_thread(self._client.peer, observer_role)
+            ctx = await _to_thread(
+                peer.context,
+                target=user_peer,
+                search_query=query,
+                tokens=tokens,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "cross_peer_context failed for observer=%r user_peer=%r: %s",
+                observer_role, user_peer, exc,
+            )
+            # No memory_call emission on error — operator sees the
+            # WARNING line; double-emitting on errors would falsify
+            # backend-success-rate dashboards.
+            return ""
+        rendered = _render_peer_context(ctx, observer_role)
+        # M3b/M6 telemetry — companion line on every successful Honcho
+        # backend call. Field reinterpretation per spec § 9:
+        #   peer_count       → len(peer_card) (no messages on peer.context)
+        #   summary_present  → False (no summary surface)
+        #   peer_repr_present → bool(representation) (semantic map)
+        #   cache_hit        → False (no caching for cross-peer)
+        #   call_type        → "cross_peer"
+        #   session_id       → synthetic peer-{observer_role}-{user_peer}
+        #                      (peer-level reads aren't bound to a session;
+        #                      the deterministic synthetic value keeps the
+        #                      log parser uniform — `peer-` prefix can't
+        #                      collide with real 4-segment session ids).
+        logger.info(
+            "memory_call",
+            extra={
+                "backend": "honcho",
+                "session_id": f"peer-{observer_role}-{user_peer}",
+                "agent_role": observer_role,
+                "t_ms": int((time.perf_counter() - t_start) * 1000),
+                "peer_count": len(getattr(ctx, "peer_card", None) or []),
+                "summary_present": False,
+                "peer_repr_present": bool(getattr(ctx, "representation", None)),
+                "cache_hit": False,
+                "call_type": "cross_peer",
+            },
+        )
+        return rendered
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +458,7 @@ class CachedMemoryProvider(MemoryProvider):
                     "summary_present": None,
                     "peer_repr_present": None,
                     "cache_hit": True,
+                    "call_type": "self",   # M6 § 9
                 },
             )
             return cached
@@ -368,6 +480,7 @@ class CachedMemoryProvider(MemoryProvider):
                         "summary_present": None,
                         "peer_repr_present": None,
                         "cache_hit": True,
+                        "call_type": "self",   # M6 § 9
                     },
                 )
                 return cached
@@ -419,6 +532,23 @@ class CachedMemoryProvider(MemoryProvider):
                     "CachedMemoryProvider refresh failed for %s/%s: %s",
                     session_id, agent_role, exc,
                 )
+
+    async def cross_peer_context(
+        self,
+        observer_role: str,
+        query: str,
+        tokens: int,
+        user_peer: str = "nicola",
+    ) -> str:
+        # Spec M6 § 5.2: passthrough, no caching. The cache today
+        # exists for voice latency on get_context; cross-peer reads
+        # happen on text-channel turns at low volume per turn, and a
+        # correct cache key would have to include `query` — defeating
+        # the cache's purpose. Same shape as ensure_session and
+        # add_turn passthroughs above.
+        return await self._backend.cross_peer_context(
+            observer_role, query, tokens, user_peer,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +684,7 @@ class SqliteMemoryProvider(MemoryProvider):
                 "summary_present": False,
                 "peer_repr_present": False,
                 "cache_hit": False,
+                "call_type": "self",   # M6 § 9
             },
         )
         return rendered
@@ -602,3 +733,16 @@ class SqliteMemoryProvider(MemoryProvider):
                 "UPDATE sessions SET last_active = ? WHERE session_id = ?",
                 (now, session_id),
             )
+
+    async def cross_peer_context(
+        self,
+        observer_role: str,
+        query: str,
+        tokens: int,
+        user_peer: str = "nicola",
+    ) -> str:
+        # Spec § 10 graceful-degradation contract: SQLite has no
+        # representation surface; cross-peer recall returns "" so
+        # callers consistently see "no memory" rather than a partial
+        # last-N digest that wouldn't be peer-perspective-attributed.
+        return ""

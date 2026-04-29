@@ -76,6 +76,7 @@ class MemoryConfig:
     scopes_owned: list[str] = field(default_factory=list)
     scopes_readable: list[str] = field(default_factory=list)
     default_scope: str = ""
+    cross_peer_token_budget: int = 2000   # M6 § 6.3
 
 
 @dataclass

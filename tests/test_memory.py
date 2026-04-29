@@ -16,12 +16,13 @@ def test_cannot_instantiate_abc():
 
 
 class FakeMemoryProvider(MemoryProvider):
-    """Minimal concrete provider used to exercise the 3-method surface."""
+    """Minimal concrete provider used to exercise the 4-method surface."""
 
     def __init__(self) -> None:
         self.ensure_calls: list[tuple[str, str, str]] = []
         self.get_calls: list[tuple[str, str, int, str | None, str]] = []
         self.add_calls: list[tuple[str, str, str, str, str]] = []
+        self.cross_calls: list[tuple[str, str, int, str]] = []
 
     async def ensure_session(
         self, session_id, agent_role, user_peer="nicola",
@@ -44,6 +45,12 @@ class FakeMemoryProvider(MemoryProvider):
         self.add_calls.append(
             (session_id, agent_role, user_text, assistant_text, user_peer)
         )
+
+    async def cross_peer_context(
+        self, observer_role, query, tokens, user_peer="nicola",
+    ):
+        self.cross_calls.append((observer_role, query, tokens, user_peer))
+        return ""
 
 
 async def test_fake_roundtrip_threads_user_peer():
@@ -87,3 +94,28 @@ async def test_noop_memory_returns_empty_and_stores_nothing():
     ctx = await mem.get_context("any", "assistant", tokens=4000)
     await mem.add_turn("any", "assistant", "u", "a")
     assert ctx == ""
+
+
+async def test_noop_cross_peer_context_returns_empty():
+    """Spec § 5.2: NoOpMemory returns "" — no Honcho key configured."""
+    from memory import NoOpMemory
+
+    p = NoOpMemory()
+    out = await p.cross_peer_context(
+        observer_role="finance",
+        query="what does Finance know about my budget priorities",
+        tokens=2000,
+    )
+    assert out == ""
+
+
+async def test_noop_cross_peer_context_accepts_user_peer_kwarg():
+    """Verify the default `user_peer="nicola"` is honored on NoOp without
+    raising — keeps the API surface symmetric with Honcho's impl."""
+    from memory import NoOpMemory
+
+    p = NoOpMemory()
+    out = await p.cross_peer_context(
+        observer_role="finance", query="x", tokens=2000, user_peer="nicola",
+    )
+    assert out == ""

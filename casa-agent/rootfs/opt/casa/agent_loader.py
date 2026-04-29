@@ -385,6 +385,7 @@ def _build_runtime_fields(
         scopes_owned=list(memory.get("scopes_owned") or []),
         scopes_readable=list(memory.get("scopes_readable") or []),
         default_scope=memory.get("default_scope", "") or "",
+        cross_peer_token_budget=int(memory.get("cross_peer_token_budget", 2000)),
     )
 
     session = runtime.get("session") or {}

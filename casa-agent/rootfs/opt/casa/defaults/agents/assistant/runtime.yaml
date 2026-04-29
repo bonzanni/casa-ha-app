@@ -9,6 +9,7 @@ tools:
     - Bash
     - Skill
     - mcp__casa-framework__cancel_engagement
+    - mcp__casa-framework__consult_other_agent_memory   # M6 — cross-role recall
     - mcp__casa-framework__delegate_to_agent
     - mcp__casa-framework__engage_executor
     - mcp__casa-framework__get_schedule
@@ -21,6 +22,7 @@ mcp_server_names:
   - casa-framework
 memory:
   token_budget: 4000
+  cross_peer_token_budget: 2000          # M6 — consult_other_agent_memory budget
   read_strategy: per_turn
   scopes_owned: [personal, business, finance]
   scopes_readable: [personal, business, finance, house, meta]

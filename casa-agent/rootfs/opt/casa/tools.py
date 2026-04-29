@@ -817,6 +817,130 @@ async def delegate_to_agent(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# consult_other_agent_memory — M6
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    "consult_other_agent_memory",
+    "Read another agent's accumulated memory of you, without delegating "
+    "a full agent turn.",
+    {"role": str, "query": str},
+)
+async def consult_other_agent_memory(args: dict) -> dict:
+    """Read another agent's accumulated memory of you, without
+    delegating a full agent turn.
+
+    Use for conversational / theory-of-mind recall:
+    - "What does Finance know about my budget priorities?"
+    - "What have we discussed with Health about my goals?"
+
+    Don't use for factual lookups that need the agent's tools:
+    - "What was the amount on my last invoice?" → use
+      delegate_to_agent("finance", ...) instead, since only
+      Finance's tools fetch the actual invoice.
+
+    Returns rendered markdown digest. Empty when the agent has no
+    accumulated memory yet (cold start) or the role isn't
+    registered.
+    """
+    import agent as agent_mod
+
+    role = args.get("role", "") or ""
+    query = args.get("query", "") or ""
+
+    # Spec § 6.2: structured-error returns, no exceptions to caller
+    if not query.strip():
+        return _result({
+            "status": "error",
+            "kind": "empty_query",
+            "message": "Error: query is required",
+        })
+
+    # Resolve registered roles for the validator. Same lookup
+    # delegate_to_agent uses (tools.py:634-637).
+    cfg = _agent_role_map.get(role) or (
+        _specialist_registry.get(role)
+        if _specialist_registry is not None else None
+    )
+    if cfg is None:
+        # Build available-roles list for the error message — matches
+        # delegate_to_agent's "no enabled agent" pattern but adds the
+        # known-roles list to help the model self-correct
+        registered: list[str] = list(_agent_role_map.keys())
+        if _specialist_registry is not None:
+            registered += list(_specialist_registry.all_configs().keys())
+        return _result({
+            "status": "error",
+            "kind": "unknown_role",
+            "message": (
+                f"Error: unknown specialist role {role!r}. "
+                f"Available roles: {sorted(set(registered))}"
+            ),
+        })
+
+    empty_msg = (
+        f'No accumulated memory found for {role} matching "{query[:60]}".'
+    )
+
+    # Resolve memory provider — same pattern as _run_delegated_agent
+    # at tools.py:444 (M4b).
+    memory_provider = getattr(agent_mod, "active_memory_provider", None)
+    if memory_provider is None:
+        # No memory backend configured — graceful empty
+        return _result({"status": "ok", "content": empty_msg})
+
+    # Token budget: read from the calling resident's runtime.yaml.
+    # The caller's role isn't directly available on the tool path
+    # (no origin_var.role like delegate_to_agent has), so resolve via
+    # the engaged agent's config map. The conventional caller is the
+    # assistant, but a future trusted resident could also invoke it —
+    # try origin_var first, fall back to the assistant default.
+    origin = agent_mod.origin_var.get(None) or {}
+    caller_role = origin.get("role", "assistant")
+    caller_cfg = _agent_role_map.get(caller_role)
+    tokens = (
+        getattr(getattr(caller_cfg, "memory", None),
+                "cross_peer_token_budget", 2000)
+        if caller_cfg is not None else 2000
+    )
+
+    t_start = time.perf_counter()
+    try:
+        rendered = await memory_provider.cross_peer_context(
+            observer_role=role,
+            query=query,
+            tokens=tokens,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "consult_other_agent_memory failed for role=%r: %s", role, exc,
+        )
+        rendered = ""
+
+    # Spec § 6.5: tool-level companion telemetry line
+    logger.info(
+        "consult_other_agent_memory_call",
+        extra={
+            "role": role,
+            "query_len": len(query),
+            "result_len": len(rendered),
+            "t_ms": int((time.perf_counter() - t_start) * 1000),
+        },
+    )
+
+    # Spec § 6.4: preamble formatting
+    if not rendered:
+        return _result({"status": "ok", "content": empty_msg})
+    return _result({
+        "status": "ok",
+        "content": (
+            f'Memory consult of {role} on "{query[:60]}":\n\n{rendered}'
+        ),
+    })
+
+
+# ---------------------------------------------------------------------------
 # get_schedule — Phase 3.3
 # ---------------------------------------------------------------------------
 
@@ -2351,6 +2475,7 @@ async def get_item_fields(args: dict) -> dict:
 CASA_TOOLS: tuple = (
     send_message,
     delegate_to_agent,
+    consult_other_agent_memory,    # M6 — peer-level cross-perspective read
     get_schedule,
     engage_executor,
     emit_completion,
