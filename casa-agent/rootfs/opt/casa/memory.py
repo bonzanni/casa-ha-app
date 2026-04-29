@@ -160,6 +160,36 @@ def _render(context: object) -> str:
     return "\n\n".join(sections)
 
 
+def _render_peer_context(context: object, observer_role: str) -> str:
+    """Assemble a peer.context() result into a markdown digest.
+
+    Sections silently omitted when their source is empty —
+    parity with ``_render``'s no-placeholder doctrine.
+
+    Duck-typed: reads ``peer_card`` (list[str]) and ``representation``
+    (str). No ``messages``, ``summary``, or ``peer_representation`` —
+    those don't exist on Honcho's peer.context() return shape (spec §4).
+    """
+    sections: list[str] = []
+
+    peer_card = getattr(context, "peer_card", None)
+    if peer_card:
+        lines = [f"## What {observer_role.capitalize()} knows about you (cross-role)"]
+        lines.extend(f"- {item}" for item in peer_card)
+        sections.append("\n".join(lines))
+
+    representation = getattr(context, "representation", None)
+    if representation:
+        if sections:
+            sections.append(representation)
+        else:
+            sections.append(
+                f"## What {observer_role.capitalize()} knows about you (cross-role)\n\n{representation}"
+            )
+
+    return "\n\n".join(sections)
+
+
 # ---------------------------------------------------------------------------
 # HonchoMemoryProvider (v3)
 # ---------------------------------------------------------------------------
