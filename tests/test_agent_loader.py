@@ -426,6 +426,62 @@ def test_assistant_delegates_include_butler():
     )
 
 
+def test_butler_does_not_have_consult_other_agent_memory_tool():
+    """Spec § 8 + M6 trust posture: Tina's voice channel is open to
+    guests. The cross-role recall tool MUST NOT appear in Tina's
+    tools.allowed even by accident — guests must not pull Finance's
+    view of Nicola via Tina."""
+    import yaml
+    from pathlib import Path
+
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "casa-agent/rootfs/opt/casa/defaults/agents/butler/runtime.yaml"
+    )
+    data = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
+    allowed = data["tools"]["allowed"]
+    assert "mcp__casa-framework__consult_other_agent_memory" not in allowed, (
+        f"butler.tools.allowed must NOT include consult_other_agent_memory; "
+        f"got {allowed}"
+    )
+
+
+def test_finance_does_not_have_consult_other_agent_memory_tool():
+    """Spec § 8: specialist-to-specialist cross-role recall is
+    operator-opt-in via Configurator, not shipped by default."""
+    import yaml
+    from pathlib import Path
+
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "casa-agent/rootfs/opt/casa/defaults/agents/specialists/finance/runtime.yaml"
+    )
+    data = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
+    allowed = data["tools"]["allowed"]
+    assert "mcp__casa-framework__consult_other_agent_memory" not in allowed, (
+        f"finance.tools.allowed must NOT include consult_other_agent_memory; "
+        f"got {allowed}"
+    )
+
+
+def test_assistant_has_consult_other_agent_memory_tool():
+    """Spec § 8: Ellen ships with the tool enabled — primary
+    cross-role recall surface."""
+    import yaml
+    from pathlib import Path
+
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "casa-agent/rootfs/opt/casa/defaults/agents/assistant/runtime.yaml"
+    )
+    data = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
+    allowed = data["tools"]["allowed"]
+    assert "mcp__casa-framework__consult_other_agent_memory" in allowed, (
+        f"assistant.tools.allowed must include consult_other_agent_memory; "
+        f"got {allowed}"
+    )
+
+
 def test_runtime_yaml_loads_cross_peer_token_budget(tmp_path):
     """M6 § 6.3: residents may declare memory.cross_peer_token_budget
     in runtime.yaml; agent_loader populates MemoryConfig with it.
