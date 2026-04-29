@@ -21,7 +21,11 @@ class StubSessionPeerConfig:
 
 @dataclass
 class StubMessage:
-    peer_name: str
+    """Mirror of honcho-ai v3 Message — `peer_id` matches the OpenAPI
+    components.schemas.Message field name (verified Context7 at
+    plan-write 2026-04-29). Pre-Phase-2 this used `peer_name`, mirroring
+    the SQLite-side shape; that wrong-shape stub is what hid E-1."""
+    peer_id: str
     content: str
 
 
@@ -30,7 +34,7 @@ class StubPeer:
         self.name = name
 
     def message(self, content: str) -> StubMessage:
-        return StubMessage(peer_name=self.name, content=content)
+        return StubMessage(peer_id=self.name, content=content)
 
 
 class StubSession:
@@ -182,9 +186,9 @@ async def test_add_turn_writes_user_and_assistant_messages(stub_env):
     session = client.sessions["telegram-1-assistant"]
     assert len(session.add_messages_calls) == 1
     msgs = session.add_messages_calls[0]
-    assert msgs[0].peer_name == "nicola"
+    assert msgs[0].peer_id == "nicola"
     assert msgs[0].content == "hi"
-    assert msgs[1].peer_name == "assistant"
+    assert msgs[1].peer_id == "assistant"
     assert msgs[1].content == "hello"
 
 
@@ -200,8 +204,8 @@ async def test_add_turn_voice_uses_voice_speaker(stub_env):
     client: StubHoncho = p._client  # type: ignore[attr-defined]
     session = client.sessions["voice-lr-butler"]
     msgs = session.add_messages_calls[0]
-    assert msgs[0].peer_name == "voice_speaker"
-    assert msgs[1].peer_name == "butler"
+    assert msgs[0].peer_id == "voice_speaker"
+    assert msgs[1].peer_id == "butler"
 
 
 async def test_get_context_renders_summary_and_peer_repr_when_honcho_returns_them(stub_env):
@@ -239,8 +243,8 @@ async def test_get_context_renders_summary_and_peer_repr_when_honcho_returns_the
 
     session._next_context = _Ctx(
         messages=[
-            StubMessage(peer_name="nicola", content="what's the weather"),
-            StubMessage(peer_name="assistant", content="sunny, 18C"),
+            StubMessage(peer_id="nicola", content="what's the weather"),
+            StubMessage(peer_id="assistant", content="sunny, 18C"),
         ],
         summary=_Summary(
             content="Earlier we discussed the user's morning routine.",
@@ -320,8 +324,8 @@ async def test_get_context_emits_memory_call_log(stub_env, caplog):
 
     session._next_context = _Ctx(
         messages=[
-            StubMessage(peer_name="nicola", content="hi"),
-            StubMessage(peer_name="assistant", content="hello"),
+            StubMessage(peer_id="nicola", content="hi"),
+            StubMessage(peer_id="assistant", content="hello"),
         ],
         summary=_Summary(content="prior chat"),
         peer_representation="user is friendly",
@@ -373,7 +377,7 @@ async def test_get_context_memory_call_when_summary_missing(stub_env, caplog):
         peer_card: list = field(default_factory=list)
 
     session._next_context = _Ctx(
-        messages=[StubMessage(peer_name="nicola", content="hi")],
+        messages=[StubMessage(peer_id="nicola", content="hi")],
     )
 
     with caplog.at_level(logging.INFO, logger="memory"):
@@ -418,7 +422,7 @@ async def test_cross_peer_context_renders_real_response_shape(stub_env):
             self.context_calls = []
             self._next = None
         def message(self, content):
-            return StubMessage(peer_name=self.name, content=content)
+            return StubMessage(peer_id=self.name, content=content)
         def context(self, target, search_query, tokens):
             self.context_calls.append((target, search_query, tokens))
             return self._next
@@ -471,7 +475,7 @@ async def test_cross_peer_emits_memory_call_with_call_type_cross_peer(
             self.name = name
             self._next = _PCtx()
         def message(self, content):
-            return StubMessage(peer_name=self.name, content=content)
+            return StubMessage(peer_id=self.name, content=content)
         def context(self, target, search_query, tokens):
             return self._next
 

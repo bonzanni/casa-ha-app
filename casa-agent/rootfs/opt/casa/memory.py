@@ -154,7 +154,10 @@ def _render(context: object) -> str:
     if messages:
         lines = ["## Recent exchanges"]
         for m in messages:
-            lines.append(f"[{m.peer_name}] {m.content}")
+            # Honcho v3 Message exposes `peer_id`; legacy _SqliteMsg uses
+            # `peer_name`. Prefer the modern shape; fall back for SQLite.
+            peer = getattr(m, "peer_id", None) or getattr(m, "peer_name", "?")
+            lines.append(f"[{peer}] {m.content}")
         sections.append("\n".join(lines))
 
     return "\n\n".join(sections)
