@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.21.0] - 2026-04-29 — Phase 2: specialist provisioning + memory peer_id
+
+### Fixed
+- **E-4** (HIGH): `casa_core.main`'s agent-home provisioning loop now iterates
+  every loaded in_casa **resident or specialist** agent, not residents only.
+  Specialists (e.g. `finance`) get their `/addon_configs/casa-agent/agent-home/<role>/`
+  directory created at boot, so delegations no longer fail with
+  `sdk_error (Working directory does not exist: ...)`. Loop refactored into
+  `agent_home.provision_all_homes()` for unit-testability. Executors remain
+  excluded (they run with `cwd=/addon_configs/casa-agent`).
+- **E-1** (MEDIUM): `memory._render()` now reads `peer_id` (Honcho v3 SDK
+  shape per OpenAPI `components.schemas.Message`) before falling back to
+  `peer_name` (legacy `_SqliteMsg`). Eliminates the
+  `'Message' object has no attribute 'peer_name'` AttributeError that
+  silently no-op'd M4b memory for every butler delegation on v0.20.0.
+
+### Internal
+- New helper `agent_home.provision_all_homes()` (3 unit tests in
+  `tests/test_agent_home_provisioning.py`).
+- Test stubs renamed to use `peer_id` (matches real Honcho SDK shape):
+  `StubMessage` in `tests/test_memory_honcho.py`, `FakeMessage` in
+  `tests/test_memory_render.py`. The wrong-shape stubs were why M3a's
+  "real-shape coverage" failed to catch E-1.
+- New regression tests `test_render_handles_honcho_v3_message_shape` and
+  `test_render_handles_sqlite_message_shape` in `tests/test_memory_render.py`.
+
 ## [0.20.0] - 2026-04-29
 
 ### Fixed
