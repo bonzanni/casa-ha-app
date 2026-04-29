@@ -40,7 +40,7 @@ class FakeSummary:
 
 @dataclass
 class FakeContext:
-    messages: list[FakeMessage]
+    messages: list  # duck-typed: peer_id or peer_name + content
     summary: FakeSummary | None = None
     peer_representation: str | None = None
     peer_card: list[str] | None = None
@@ -170,18 +170,6 @@ def test_render_peer_context_renders_both_sections():
     assert out.index("likes espresso") < out.index("User prioritizes")
 
 
-@dataclass
-class HonchoStyleMessage:
-    """Mirror of honcho-ai v3 Message — peer_id only, no peer_name.
-
-    Per Honcho OpenAPI components.schemas.Message: fields are id, content,
-    peer_id, session_id, metadata, created_at, workspace_id, token_count.
-    Confirmed via Context7 at plan-write 2026-04-29.
-    """
-    peer_id: str
-    content: str
-
-
 def test_render_handles_honcho_v3_message_shape():
     """E-1 regression: real Honcho Message exposes peer_id, not peer_name.
 
@@ -190,8 +178,8 @@ def test_render_handles_honcho_v3_message_shape():
     'specialist memory read failed for butler' on production v0.20.0.
     """
     ctx = FakeContext(messages=[
-        HonchoStyleMessage(peer_id="nicola", content="hi"),
-        HonchoStyleMessage(peer_id="butler", content="hello"),
+        FakeMessage("nicola", "hi"),
+        FakeMessage("butler", "hello"),
     ])
     out = _render(ctx)
     assert "## Recent exchanges" in out
