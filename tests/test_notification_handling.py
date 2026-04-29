@@ -46,6 +46,10 @@ class FakeMemory(MemoryProvider):
                        assistant_text, user_peer="nicola"):
         self.add.append((session_id, user_text, assistant_text))
 
+    async def cross_peer_context(self, observer_role, query, tokens,
+                                 user_peer="nicola"):
+        return ""
+
 
 class _FakeClient:
     captured_prompts: list[str] = []

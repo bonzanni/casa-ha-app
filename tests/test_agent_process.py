@@ -68,6 +68,7 @@ class FakeMemory(MemoryProvider):
         self.ensure: list[tuple] = []
         self.get: list[tuple] = []
         self.add: list[tuple] = []
+        self.cross: list[tuple] = []
 
     async def ensure_session(self, session_id, agent_role, user_peer="nicola"):
         self.ensure.append((session_id, agent_role, user_peer))
@@ -88,6 +89,12 @@ class FakeMemory(MemoryProvider):
         self.add.append(
             (session_id, agent_role, user_text, assistant_text, user_peer)
         )
+
+    async def cross_peer_context(
+        self, observer_role, query, tokens, user_peer="nicola",
+    ):
+        self.cross.append((observer_role, query, tokens, user_peer))
+        return ""
 
 
 class FakeClient:
