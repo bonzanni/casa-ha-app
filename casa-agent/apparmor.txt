@@ -44,9 +44,9 @@ profile casa-agent flags=(attach_disconnected,mediate_deleted) {
   /var/lib/nginx/** rw,
 
   # Persistent data and config
+  /addon_configs/ r,
   /addon_configs/casa-agent/** rwk,
   /data/** rwk,
-  /config/** r,
   /opt/casa/** rix,
 
   # Network
