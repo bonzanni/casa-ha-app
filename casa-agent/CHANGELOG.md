@@ -1,5 +1,91 @@
 # Changelog
 
+## [0.19.0] - 2026-04-29 — Phase 0 / E-11: persistent addon-config mount
+
+**BREAKING — first boot of v0.19.0 wipes and reseeds the entire
+`/addon_configs/casa-agent/` tree.**
+
+The previous map declaration paired `addon_config:rw` with `config:ro`,
+both of which target `/config` inside the container. HA Supervisor
+silently dropped `addon_config:rw` (the conflict loser), so
+`/addon_configs/casa-agent/` was never a real bind mount — it was a
+rootfs-overlay path that got wiped on every container rebuild. Every
+configurator commit, every manual edit under `/addon_configs/casa-agent/`,
+every plugin-marketplace install state, and every git history entry
+in the addon-config tree vanished on the next `ha apps restart`. See
+`docs/bug-review-2026-04-29-exploration.md` § E-11 for the full
+forensic write-up + live evidence (mount-table dump, boot-log seed
+trail, git-history collapse).
+
+### Changed (BREAKING)
+
+- **`casa-agent/config.yaml::map`** — replaced
+  `addon_config:rw` + `config:ro` with a single
+  `all_addon_configs:rw` directive. The container now sees
+  `/addon_configs/` as a real bind mount of the supervisor's
+  addon-configs root (`/mnt/data/supervisor/addon_configs/`), which
+  means `/addon_configs/casa-agent/` is finally a persistent
+  per-addon subdir surviving container rebuilds.
+- **First-boot reseed:** because the underlying mount source changes
+  from rootfs-overlay to bind mount, the existing `/addon_configs/casa-agent/`
+  contents are NOT migrated. `setup-configs.sh` re-seeds defaults on
+  first boot of v0.19.0 (per its existing `[ ! -d "$dst" ]`
+  idempotency gate). User-edited configs from prior versions (such as
+  `runtime.yaml::enabled: true` flags, custom `character.yaml` traits,
+  custom plugin installs, custom marketplace overlays, and the entire
+  in-tree git history under `/addon_configs/casa-agent/.git/`) WILL
+  be lost. Any post-v0.19.0 customizations made through the
+  configurator engagement path or by manual SSH edits will persist.
+
+### Removed
+
+- **`casa-agent/apparmor.txt`** — removed the dead `/config/** r,`
+  rule. Casa code has zero references to `/config/` (verified by
+  grep across `casa-agent/rootfs/`). The rule existed only to
+  service the dropped `config:ro` mount.
+
+### Added
+
+- **`casa-agent/apparmor.txt`** — added `/addon_configs/ r,` rule.
+  Defensive: under the new bind mount, the parent dir
+  `/addon_configs/` is a real mount point and `setup-configs.sh`'s
+  `mkdir -p` calls need read access to stat it. The existing
+  `/addon_configs/casa-agent/** rwk,` rule does not cover the parent.
+
+### Verification
+
+Live-N150 smoke (post-deploy):
+
+1. `mount | grep addon_config` → expect a line of the shape
+   `/dev/<X> on /addon_configs type <fstype>` (or a `bind` flag if
+   docker-info verbose). Pre-fix this returned nothing.
+2. Boot logs immediately after first `ha apps update` to v0.19.0 →
+   expect six `Seeded agent dir: <name>` lines (assistant, butler,
+   finance, configurator, hello-driver, plugin-developer) plus
+   `Initialized config git repo at /addon_configs/casa-agent` — proof
+   the seed path fired against an empty mount.
+3. Restart twice (`ha apps restart`); on the second boot, the seed
+   lines must NOT reappear (`[ ! -d "$dst" ]` is now true → no-op).
+   Pre-fix every restart re-seeded; post-fix only the first does.
+4. The user-edited `runtime.yaml::enabled: true` flag for finance
+   that was set on 2026-04-29 morning is GONE — must be re-set via
+   the configurator engagement path (or manual edit) post-deploy.
+   This is expected per the BREAKING note above.
+
+### Out of scope
+
+This is Phase 0 of the bugfix roadmap. Phases 1-6 are tracked in
+`docs/bug-review-2026-04-29-exploration.md` § "Suggested bugfix-roadmap shape".
+
+### Memory hooks
+
+After verification, add a memory entry summarizing the fix-shape
+choice (Option B `all_addon_configs:rw` over Option A `/config`
+repoint — see plan-doc rationale) and the live-deploy result. The
+memory entry `reference_v0_18_1_addon_config_fixes` is now stale
+(it referenced SHAs not present in master tip `04037d0`); revisit
+it post-ship to either correct or remove.
+
 ## [0.18.2] - 2026-04-29 — Engagement setup_engagement_features() ordering fix
 
 **Latent bug since v0.11.0 surfaced by v0.18.1.** Once `TELEGRAM_ENGAGEMENT_SUPERGROUP_ID` started actually reaching `TelegramChannel.__init__` (v0.18.1 fix), `setup_engagement_features()` ran the bot-permission check at startup — but `self._app` was still `None` because `channel_manager.start_all()` hadn't fired yet. The probe failed with `'NoneType' object has no attribute 'get_me'`, leaving `engagement_permission_ok = False` permanently. Every `engage_executor` / `delegate_to_agent(mode="interactive")` then returned the misleading "set telegram_engagement_supergroup_id in addon" error.
