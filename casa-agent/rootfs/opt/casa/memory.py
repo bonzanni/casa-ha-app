@@ -12,10 +12,12 @@ from abc import ABC, abstractmethod
 class MemoryProvider(ABC):
     """Abstract memory backend.
 
-    Three methods:
-      * ``ensure_session`` — idempotent session + peer setup.
-      * ``get_context``    — rendered memory digest for the system prompt.
-      * ``add_turn``       — persist one user→assistant turn unconditionally.
+    Four methods:
+      * ``ensure_session``      — idempotent session + peer setup.
+      * ``get_context``         — rendered memory digest for the system prompt.
+      * ``add_turn``            — persist one user→assistant turn unconditionally.
+      * ``cross_peer_context``  — read another agent's accumulated representation
+                                  of the user, semantic-filtered by query.
 
     Storage is never filtered; write-scoping is a structural property of
     ``session_id`` + peer topology (spec §4.3). Disclosure decisions
@@ -62,6 +64,22 @@ class MemoryProvider(ABC):
         """Persist one user→assistant turn. ``user_text`` → ``user_peer``;
         ``assistant_text`` → ``agent_role``. Never filtered."""
 
+    @abstractmethod
+    async def cross_peer_context(
+        self,
+        observer_role: str,
+        query: str,
+        tokens: int,
+        user_peer: str = "nicola",
+    ) -> str:
+        """Return a rendered digest of ``observer_role``'s accumulated
+        representation of ``user_peer``, semantic-filtered by ``query``.
+
+        No session_id — Honcho's peer-level context aggregates across
+        all sessions where both peers participated. Empty string when
+        no representation exists yet (cold start) or on backend error
+        (graceful degradation, parity with ``get_context``)."""
+
 
 class NoOpMemory(MemoryProvider):
     """Stub provider when ``HONCHO_API_KEY`` is not configured."""
@@ -90,6 +108,15 @@ class NoOpMemory(MemoryProvider):
         user_peer: str = "nicola",
     ) -> None:
         return None
+
+    async def cross_peer_context(
+        self,
+        observer_role: str,
+        query: str,
+        tokens: int,
+        user_peer: str = "nicola",
+    ) -> str:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -602,3 +629,16 @@ class SqliteMemoryProvider(MemoryProvider):
                 "UPDATE sessions SET last_active = ? WHERE session_id = ?",
                 (now, session_id),
             )
+
+    async def cross_peer_context(
+        self,
+        observer_role: str,
+        query: str,
+        tokens: int,
+        user_peer: str = "nicola",
+    ) -> str:
+        # Spec § 10 graceful-degradation contract: SQLite has no
+        # representation surface; cross-peer recall returns "" so
+        # callers consistently see "no memory" rather than a partial
+        # last-N digest that wouldn't be peer-perspective-attributed.
+        return ""

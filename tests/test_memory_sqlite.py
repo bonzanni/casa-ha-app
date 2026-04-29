@@ -456,3 +456,17 @@ async def test_get_context_memory_call_empty_session(caplog):
     rec = [r for r in caplog.records if r.message == "memory_call"][0]
     assert rec.peer_count == 0
     assert rec.backend == "sqlite"
+
+
+async def test_cross_peer_context_returns_empty_for_sqlite(tmp_path):
+    """Spec § 5.2 / § 10 graceful-degradation contract: SQLite has no
+    representation surface — cross_peer_context returns "" unconditionally."""
+    from memory import SqliteMemoryProvider
+
+    p = SqliteMemoryProvider(":memory:")
+    out = await p.cross_peer_context(
+        observer_role="finance",
+        query="what does Finance know about my budget priorities",
+        tokens=2000,
+    )
+    assert out == ""
