@@ -1014,11 +1014,20 @@ _PRIVILEGED_CONFIG_ROLES = frozenset({"configurator"})
 def _effective_caller_role() -> str | None:
     """Return the calling agent's role for authorisation checks.
 
-    Resolves SDK-path turns via ``origin_var`` and engagement-bridge
-    turns (claude_code executors) via ``engagement_var.role_or_type``.
-    Returns None if neither context is bound — in which case the tool
-    must refuse rather than fall back to permissive default.
+    Inside an active engagement (engagement_var set), the calling role
+    IS the engagement's role_or_type — this takes precedence over the
+    bus's origin_var.role, which inside in_casa engagements still
+    reflects the engager (Ellen's "assistant") because contextvars
+    inherit through the same async task.
+
+    Returns None if neither context is bound — caller must refuse rather
+    than fall back to a permissive default.
     """
+    eng = engagement_var.get(None)
+    if eng is not None:
+        r = getattr(eng, "role_or_type", None)
+        if r:
+            return r
     try:
         import agent as agent_mod
         origin = agent_mod.origin_var.get(None)
@@ -1028,9 +1037,6 @@ def _effective_caller_role() -> str | None:
                 return r
     except Exception:  # noqa: BLE001 - defensive against import-time issues
         pass
-    eng = engagement_var.get(None)
-    if eng is not None:
-        return getattr(eng, "role_or_type", None)
     return None
 
 
