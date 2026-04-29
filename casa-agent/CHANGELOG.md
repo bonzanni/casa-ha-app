@@ -1,5 +1,65 @@
 # Changelog
 
+## [0.18.0] - 2026-04-29 — Memory M6: cross-role recall
+
+**Adds `consult_other_agent_memory(role, query)` — a read-only MCP
+tool that lets a resident query another agent's accumulated
+theory-of-mind of the user without delegating a full agent turn.**
+
+### Added
+
+- **`MemoryProvider.cross_peer_context`** — 4th method on the ABC
+  at `memory.py`. `HonchoMemoryProvider` wraps Honcho v3's
+  `peer.context(target=user_peer, search_query=query)` primitive;
+  `NoOpMemory` and `SqliteMemoryProvider` return `""` per the
+  graceful-degradation contract; `CachedMemoryProvider` is
+  passthrough.
+- **`_render_peer_context` helper** — renders `peer.context()`'s
+  `peer_card` + `representation` shape under
+  `## What {Observer} knows about you (cross-role)`.
+- **`consult_other_agent_memory` MCP tool** — registered in
+  `tools.py` and exposed via `CASA_TOOLS`. Validates role against
+  the resident/specialist registry; structured-error strings on
+  bad input.
+- **`memory.cross_peer_token_budget`** — new field on resident
+  `runtime.yaml::memory` (default 2000 when unset). JSON-schema
+  additive update on `runtime.v1.json`.
+- **System prompt — Ellen's `prompts/system.md`** — new
+  "Cross-role memory recall" section teaches Case 1 (recall →
+  this tool) vs Case 2 (factual lookup → `delegate_to_agent`).
+- **Configurator doctrine** — `recipes/resident/create.md` and
+  `recipes/resident/update.md` updated to teach the new tool +
+  `cross_peer_token_budget` field.
+- **`memory_call` telemetry** — new `call_type: "self" | "cross_peer"`
+  field across all emission sites. New tool-side
+  `consult_other_agent_memory_call` info line with role / query_len /
+  result_len / t_ms.
+
+### Changed
+
+- **`MemoryProvider` ABC** — bumped from 3 methods to 4. Pre-1.0.0
+  license invoked, no backward-compat shim. Out-of-tree providers
+  (none today) would break loudly at import.
+- **Ellen (`assistant/runtime.yaml::tools.allowed`)** — gains
+  `mcp__casa-framework__consult_other_agent_memory`.
+- **`memory_call` log line** — adds `call_type` field across 5
+  emission sites in the same commit per arch-spec § 13 drift-risk
+  warning.
+
+### Trust posture
+
+- Tina (`butler`) and Finance (specialist) ship WITHOUT the tool —
+  guards Tina's guest-accessible voice channel and keeps
+  specialist-to-specialist consultation as an operator-opt-in
+  decision via Configurator. Regression tests at
+  `tests/test_agent_loader.py` guard the omissions structurally.
+
+### Spec / plan
+
+- `docs/superpowers/specs/2026-04-29-memory-m6-cross-role-recall-design.md`
+- `docs/superpowers/plans/2026-04-29-memory-m6-cross-role-recall.md`
+- Live arch spec § 16: `docs/superpowers/specs/2026-04-26-memory-architecture.md`
+
 ## [0.17.2] - 2026-04-28 — Scheduled trigger silence (F1 follow-up)
 
 **Fixes the v0.17.1 regression where every scheduled trigger fire
