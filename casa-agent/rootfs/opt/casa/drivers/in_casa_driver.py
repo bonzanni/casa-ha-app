@@ -148,7 +148,12 @@ class InCasaDriver(DriverProtocol):
 
         client = self._clients[engagement.id]
         lock = self._locks[engagement.id]
-        chunks: list[str] = []
+        # E-8: collect one entry per AssistantMessage and join with "\n\n"
+        # so multi-step executor turns render as discrete thoughts in the
+        # topic instead of a glued paragraph. Within a single
+        # AssistantMessage, TextBlocks are part of one model thought and
+        # are joined without separator.
+        messages: list[str] = []
         token = engagement_var.set(engagement)
         try:
             async with lock:
@@ -173,11 +178,14 @@ class InCasaDriver(DriverProtocol):
                         # stale; the idle sweeper re-persists on next sweep.
                         engagement.sdk_session_id = sid
                     if isinstance(sdk_msg, AssistantMessage):
-                        for block in getattr(sdk_msg, "content", []):
-                            if isinstance(block, TextBlock):
-                                chunks.append(block.text)
+                        msg_text = "".join(
+                            b.text for b in getattr(sdk_msg, "content", [])
+                            if isinstance(b, TextBlock)
+                        )
+                        if msg_text:
+                            messages.append(msg_text)
         finally:
             engagement_var.reset(token)
-        text = "".join(chunks).strip()
+        text = "\n\n".join(messages).strip()
         if text and engagement.topic_id is not None:
             await self._send_to_topic(engagement.topic_id, text)
