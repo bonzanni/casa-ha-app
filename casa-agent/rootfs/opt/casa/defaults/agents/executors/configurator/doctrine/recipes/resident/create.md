@@ -110,3 +110,19 @@ Add the matching routing-rule paragraph to the resident's
 `prompts/system.md` so Claude knows when to use the tool vs
 `delegate_to_agent` (see the canonical Ellen paragraph for the
 template).
+
+**Disabled-but-consultable specialist memory (Phase 5 / E-15, v0.26.1+):**
+A specialist that's bundled but `enabled: false` in user config has its
+peer-level Honcho memory persisted independently of operational
+enablement. Ellen (or any resident with `consult_other_agent_memory` in
+`tools.allowed`) can still call the tool against a disabled specialist's
+role name — the tool falls through to `cross_peer_context` and Honcho
+returns whatever `peer_card` / `representation` has accumulated from
+past delegations or earlier-enabled phases.
+
+This decouples memory readability from operational availability: an
+operator can disable Finance to stop new delegations from running while
+still allowing Ellen to recall what Finance previously knew. If you
+want a hard memory gate (disabled = unconsultable), open a follow-up
+to add a `cfg.allow_memory_when_disabled: bool` field on specialist
+runtime.yaml — currently out of scope per Phase 5 spec § 3.3.

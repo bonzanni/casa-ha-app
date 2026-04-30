@@ -542,3 +542,67 @@ class TestSummaryLog:
         msg = summary[0].message
         assert "enabled=[]" in msg
         assert "disabled=[]" in msg
+
+
+# ---------------------------------------------------------------------------
+# TestDisabledAccessors — Phase 5 / E-15 public accessors for disabled peers
+# ---------------------------------------------------------------------------
+
+
+class TestDisabledAccessors:
+    async def test_is_disabled_false_for_unknown_role(self, tmp_path):
+        from specialist_registry import SpecialistRegistry
+
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
+        reg.load()
+        assert reg.is_disabled("nonexistent") is False
+
+    async def test_is_disabled_true_for_bundled_disabled(self, tmp_path):
+        """A specialist with enabled:false in runtime.yaml lands in
+        _disabled_names; is_disabled returns True."""
+        from specialist_registry import SpecialistRegistry
+
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=False)
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
+        reg.load()
+        assert reg.is_disabled("finance") is True
+        assert reg.get("finance") is None  # confirm not enabled
+
+    async def test_is_disabled_false_for_enabled_specialist(self, tmp_path):
+        """An enabled specialist is NOT disabled — it's in _configs, not
+        _disabled_names. is_disabled returns False."""
+        from specialist_registry import SpecialistRegistry
+
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
+        reg.load()
+        assert reg.is_disabled("finance") is False
+        assert reg.get("finance") is not None
+
+    async def test_disabled_roles_returns_sorted_defensive_copy(self, tmp_path):
+        from specialist_registry import SpecialistRegistry
+
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "zeta", enabled=False)
+        _seed_specialist_dir(specialists, "alpha", enabled=False)
+        _seed_specialist_dir(specialists, "beta", enabled=False)
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
+        reg.load()
+
+        out = reg.disabled_roles()
+        assert out == ["alpha", "beta", "zeta"]
+        # Defensive copy — mutations don't bleed back.
+        out.append("intruder")
+        assert "intruder" not in reg._disabled_names
+        assert reg.disabled_roles() == ["alpha", "beta", "zeta"]

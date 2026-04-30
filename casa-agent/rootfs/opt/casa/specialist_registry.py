@@ -136,6 +136,23 @@ class SpecialistRegistry:
         """Return the enabled specialist config, or None."""
         return self._configs.get(agent_name)
 
+    def is_disabled(self, role: str) -> bool:
+        """True if ``role`` is bundled but disabled in user config.
+
+        Returns False for unknown roles and for enabled specialists.
+        Used by ``consult_other_agent_memory`` (M6) to fall through to
+        cross_peer_context for disabled-but-known specialists — memory
+        is data, enablement is operational.
+        """
+        return role in self._disabled_names
+
+    def disabled_roles(self) -> list[str]:
+        """Return a sorted list of disabled specialist role names.
+
+        Defensive copy — caller cannot mutate registry state.
+        """
+        return sorted(self._disabled_names)
+
     def all_configs(self) -> dict[str, "AgentConfig"]:
         """Return a snapshot of enabled specialist configs by role.
 

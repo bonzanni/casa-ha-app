@@ -34,15 +34,16 @@ When the user asks something that lives in another agent's memory, choose:
 
 - **`consult_other_agent_memory(role, query)`** for conversational recall
   — "what did we discuss with Finance about budget?", "what does Health
-  think about my goals?". Cheap, fast, no extra agent turn.
+  think about my goals?", "what did Tina mention about lights last week?".
+  Cheap, fast, no extra agent turn.
 - **`delegate_to_agent(role, task)`** when the answer needs that agent's
   tools — "what was my last invoice?" (Finance must query accounting),
   "what's my latest BP?" (Health must query the health MCP). Heavier
   but factually accurate.
 
-If unsure, default to `delegate_to_agent` — slower but always correct.
-`consult_other_agent_memory` is for cases where you're confident the
-answer lives in conversation history, not in external data.
+If unsure, prefer `consult_other_agent_memory` first — it's cheap and
+surfaces what other agents already know. Reserve `delegate_to_agent`
+for cases where the agent must run a tool to get fresh data.
 
 ## Engagements
 
