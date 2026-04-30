@@ -878,6 +878,49 @@ class TestResumeResilience:
         assert text == "pong"
         assert FakeClient.attempts == 2
 
+    async def test_sdk_retry_fresh_emits_telemetry(self, tmp_path, caplog):
+        """Bug 5: when the resume → ProcessError → fresh-retry path fires,
+        one structured INFO line records the event with exit_code,
+        prior_sid, and stderr_tail. Verifiable via caplog."""
+        import logging
+        from claude_agent_sdk import ProcessError
+
+        FakeClient.reset()
+        FakeClient.failure_schedule = [
+            ProcessError(
+                "CLI exit",
+                exit_code=1,
+                stderr="stale-session-error\nat line 42",
+            ),
+            None,
+        ]
+        FakeClient.response_text = "ok after retry"
+
+        reg = SessionRegistry(str(tmp_path / "sessions.json"))
+        await reg.register("telegram-202", "butler", "STALE-SID-1")
+
+        mem = FakeMemory()
+        agent = _make_agent_with_registry(mem, reg, role="butler")
+
+        with caplog.at_level(logging.INFO, logger="agent"):
+            with patch("agent.ClaudeSDKClient", FakeClient), \
+                 patch("retry.asyncio.sleep", new=AsyncMock()):
+                await agent._process(_msg("telegram", "202", "hi"))
+
+        msgs = [r.getMessage() for r in caplog.records if r.name == "agent"]
+        retry_lines = [m for m in msgs if "sdk_retry_fresh" in m]
+        assert len(retry_lines) == 1, (
+            f"expected exactly one sdk_retry_fresh INFO line; got: {retry_lines}"
+        )
+        line = retry_lines[0]
+        assert "exit_code=1" in line, line
+        assert "prior_sid=STALE-SID-1" in line, line
+        # stderr_tail truncated at 200 chars; newlines escaped to \\n
+        assert "stderr_tail=" in line, line
+        assert "stale-session-error" in line, line
+        # \n in stderr → \\n in tail
+        assert "\\n" in line, line
+
     async def test_fallback_uses_resume_none_on_second_attempt(self, tmp_path):
         """The second FakeClient construction must see options.resume=None."""
         from claude_agent_sdk import ProcessError

@@ -558,7 +558,7 @@ class Agent:
                 response_text, sdk_session_id, usage = await retry_sdk_call(
                     _attempt_sdk_turn, on_retry=self._log_retry,
                 )
-            except ProcessError:
+            except ProcessError as exc:
                 # claude CLI exited non-zero. If we were resuming a prior
                 # session, the most common cause (spec 5.8) is a stale
                 # sdk_session_id — the local conversation file under
@@ -566,6 +566,17 @@ class Agent:
                 # ``/data/sessions.json`` persisted. Clear and retry fresh.
                 if resume_session_id is None:
                     raise
+                # Phase 4b Bug 5: structured retry telemetry.
+                # exc.stderr is populated by Bug 4's stderr callback
+                # (subprocess_cli.py:472 + ProcessError._errors.py:25-37);
+                # truncate to a 200-char tail with newlines escaped so
+                # one log line stays scannable.
+                stderr_tail = (exc.stderr or "")[-200:].replace("\n", "\\n")
+                logger.info(
+                    "sdk_retry_fresh channel_key=%s exit_code=%s prior_sid=%s "
+                    "stderr_tail=%s",
+                    channel_key, exc.exit_code, resume_session_id, stderr_tail,
+                )
                 logger.warning(
                     "SDK resume failed (key=%s sid=%s); clearing and retrying fresh",
                     channel_key, resume_session_id,
