@@ -16,13 +16,14 @@ def test_cannot_instantiate_abc():
 
 
 class FakeMemoryProvider(MemoryProvider):
-    """Minimal concrete provider used to exercise the 4-method surface."""
+    """Minimal concrete provider used to exercise the 5-method surface."""
 
     def __init__(self) -> None:
         self.ensure_calls: list[tuple[str, str, str]] = []
-        self.get_calls: list[tuple[str, str, int, str | None, str]] = []
+        self.get_calls: list[tuple[str, int, str | None]] = []
         self.add_calls: list[tuple[str, str, str, str, str]] = []
         self.cross_calls: list[tuple[str, str, int, str]] = []
+        self.overlay_calls: list[tuple[str, str, str, int]] = []
 
     async def ensure_session(
         self, session_id, agent_role, user_peer="nicola",
@@ -30,13 +31,18 @@ class FakeMemoryProvider(MemoryProvider):
         self.ensure_calls.append((session_id, agent_role, user_peer))
 
     async def get_context(
-        self, session_id, agent_role, tokens,
-        search_query=None, user_peer="nicola",
+        self, session_id, tokens, search_query=None,
     ):
-        self.get_calls.append(
-            (session_id, agent_role, tokens, search_query, user_peer)
+        self.get_calls.append((session_id, tokens, search_query))
+        return f"ctx({session_id})"
+
+    async def peer_overlay_context(
+        self, observer_role, user_peer, search_query, tokens,
+    ):
+        self.overlay_calls.append(
+            (observer_role, user_peer, search_query, tokens)
         )
-        return f"ctx({session_id},{agent_role},{user_peer})"
+        return ""
 
     async def add_turn(
         self, session_id, agent_role, user_text, assistant_text,
@@ -57,7 +63,7 @@ async def test_fake_roundtrip_threads_user_peer():
     mem = FakeMemoryProvider()
     await mem.ensure_session("telegram-1-assistant", "assistant")
     ctx = await mem.get_context(
-        "telegram-1-assistant", "assistant", tokens=4000, search_query="hi",
+        "telegram-1-assistant", tokens=4000, search_query="hi",
     )
     await mem.add_turn(
         "telegram-1-assistant", "assistant", "hi", "hello",
@@ -66,13 +72,15 @@ async def test_fake_roundtrip_threads_user_peer():
     assert mem.ensure_calls == [
         ("telegram-1-assistant", "assistant", "nicola"),
     ]
+    # E-14 / Phase 5 § 2.5: get_context no longer takes agent_role or
+    # user_peer — peer-level overlay is split into peer_overlay_context.
     assert mem.get_calls == [
-        ("telegram-1-assistant", "assistant", 4000, "hi", "nicola"),
+        ("telegram-1-assistant", 4000, "hi"),
     ]
     assert mem.add_calls == [
         ("telegram-1-assistant", "assistant", "hi", "hello", "nicola"),
     ]
-    assert ctx == "ctx(telegram-1-assistant,assistant,nicola)"
+    assert ctx == "ctx(telegram-1-assistant)"
 
 
 async def test_fake_voice_user_peer_override():
@@ -91,7 +99,7 @@ async def test_fake_voice_user_peer_override():
 async def test_noop_memory_returns_empty_and_stores_nothing():
     mem = NoOpMemory()
     await mem.ensure_session("any", "assistant")
-    ctx = await mem.get_context("any", "assistant", tokens=4000)
+    ctx = await mem.get_context("any", tokens=4000)
     await mem.add_turn("any", "assistant", "u", "a")
     assert ctx == ""
 

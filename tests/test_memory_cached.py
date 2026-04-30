@@ -19,6 +19,7 @@ class RecordingProvider(MemoryProvider):
         self.add_calls = 0
         self.ensure_calls = 0
         self.cross_calls = 0
+        self.overlay_calls = 0
         self._queue: list[str] = []
         self._error_on_get: Exception | None = None
 
@@ -28,16 +29,19 @@ class RecordingProvider(MemoryProvider):
     async def ensure_session(self, session_id, agent_role, user_peer="nicola"):
         self.ensure_calls += 1
 
-    async def get_context(
-        self, session_id, agent_role, tokens,
-        search_query=None, user_peer="nicola",
-    ):
+    async def get_context(self, session_id, tokens, search_query=None):
         if self._error_on_get is not None:
             raise self._error_on_get
         self.get_calls += 1
         if self._queue:
             return self._queue.pop(0)
         return f"ctx#{self.get_calls}"
+
+    async def peer_overlay_context(
+        self, observer_role, user_peer, search_query, tokens,
+    ):
+        self.overlay_calls += 1
+        return ""
 
     async def add_turn(
         self, session_id, agent_role, user_text, assistant_text,
@@ -63,8 +67,8 @@ async def test_first_call_fetches_subsequent_calls_cached():
     backend.queue("first")
     cached = CachedMemoryProvider(backend)
 
-    out1 = await cached.get_context("s", "assistant", 100)
-    out2 = await cached.get_context("s", "assistant", 100)
+    out1 = await cached.get_context("s", 100)
+    out2 = await cached.get_context("s", 100)
 
     assert out1 == "first"
     assert out2 == "first"
@@ -76,8 +80,8 @@ async def test_search_query_does_not_participate_in_cache_key():
     backend.queue("first")
     cached = CachedMemoryProvider(backend)
 
-    await cached.get_context("s", "assistant", 100, search_query="a")
-    await cached.get_context("s", "assistant", 100, search_query="b")
+    await cached.get_context("s", 100, search_query="a")
+    await cached.get_context("s", 100, search_query="b")
 
     assert backend.get_calls == 1
 
@@ -87,9 +91,9 @@ async def test_distinct_keys_fetch_separately():
     backend.queue("a", "b", "c")
     cached = CachedMemoryProvider(backend)
 
-    await cached.get_context("s1", "assistant", 100)
-    await cached.get_context("s2", "assistant", 100)
-    await cached.get_context("s1", "butler", 100)
+    await cached.get_context("s1", 100)
+    await cached.get_context("s2", 100)
+    await cached.get_context("s1", 100)
 
     assert backend.get_calls == 3
 
@@ -99,11 +103,11 @@ async def test_add_turn_triggers_background_refresh():
     backend.queue("v1", "v2")
     cached = CachedMemoryProvider(backend)
 
-    await cached.get_context("s", "assistant", 100)
+    await cached.get_context("s", 100)
     await cached.add_turn("s", "assistant", "u", "a")
     await _drain()
 
-    out = await cached.get_context("s", "assistant", 100)
+    out = await cached.get_context("s", 100)
     assert out == "v2"
     assert backend.get_calls == 2
 
@@ -115,7 +119,7 @@ async def test_refresh_error_does_not_crash_and_keeps_stale_cache(caplog):
     backend.queue("v1")
     cached = CachedMemoryProvider(backend)
 
-    await cached.get_context("s", "assistant", 100)
+    await cached.get_context("s", 100)
     backend._error_on_get = RuntimeError("boom")
 
     with caplog.at_level(logging.WARNING):
@@ -123,7 +127,7 @@ async def test_refresh_error_does_not_crash_and_keeps_stale_cache(caplog):
         await _drain()
 
     # stale cache preserved, error logged
-    out = await cached.get_context("s", "assistant", 100)
+    out = await cached.get_context("s", 100)
     assert out == "v1"
     assert any("refresh" in r.message.lower() for r in caplog.records)
 
@@ -147,7 +151,7 @@ async def test_background_task_strongly_retained_during_flight():
     backend = RecordingProvider()
     backend.queue("v1")
     cached = CachedMemoryProvider(backend)
-    await cached.get_context("s", "assistant", 100)
+    await cached.get_context("s", 100)
 
     # Trigger refresh
     await cached.add_turn("s", "assistant", "u", "a")
@@ -166,7 +170,7 @@ class TestColdKeyDedup:
         cached = CachedMemoryProvider(backend)
 
         results = await asyncio.gather(
-            *(cached.get_context("s", "assistant", 100) for _ in range(10)),
+            *(cached.get_context("s", 100) for _ in range(10)),
         )
 
         assert backend.get_calls == 1
@@ -178,14 +182,10 @@ class TestColdKeyDedup:
         import time
 
         class SlowProvider(RecordingProvider):
-            async def get_context(
-                self, session_id, agent_role, tokens,
-                search_query=None, user_peer="nicola",
-            ):
+            async def get_context(self, session_id, tokens, search_query=None):
                 await asyncio.sleep(0.1)
                 return await super().get_context(
-                    session_id, agent_role, tokens,
-                    search_query=search_query, user_peer=user_peer,
+                    session_id, tokens, search_query=search_query,
                 )
 
         backend = SlowProvider()
@@ -194,11 +194,11 @@ class TestColdKeyDedup:
 
         t0 = time.perf_counter()
         await asyncio.gather(
-            cached.get_context("s1", "assistant", 100),
-            cached.get_context("s2", "assistant", 100),
-            cached.get_context("s3", "assistant", 100),
-            cached.get_context("s4", "assistant", 100),
-            cached.get_context("s5", "assistant", 100),
+            cached.get_context("s1", 100),
+            cached.get_context("s2", 100),
+            cached.get_context("s3", 100),
+            cached.get_context("s4", 100),
+            cached.get_context("s5", 100),
         )
         elapsed = time.perf_counter() - t0
 
@@ -211,10 +211,7 @@ class TestColdKeyDedup:
         started = asyncio.Event()
 
         class GatedProvider(RecordingProvider):
-            async def get_context(
-                self, session_id, agent_role, tokens,
-                search_query=None, user_peer="nicola",
-            ):
+            async def get_context(self, session_id, tokens, search_query=None):
                 self.get_calls += 1
                 started.set()
                 await gate.wait()
@@ -224,11 +221,11 @@ class TestColdKeyDedup:
         backend.queue("only")
         cached = CachedMemoryProvider(backend)
 
-        task_a = asyncio.create_task(cached.get_context("s", "assistant", 100))
+        task_a = asyncio.create_task(cached.get_context("s", 100))
         await started.wait()
         # First call is now inside the backend; start the second — it must
         # block on the key's lock, not launch a second backend call.
-        task_b = asyncio.create_task(cached.get_context("s", "assistant", 100))
+        task_b = asyncio.create_task(cached.get_context("s", 100))
         # Give task_b a chance to hit the lock.
         for _ in range(5):
             await asyncio.sleep(0)
@@ -245,10 +242,10 @@ class TestColdKeyDedup:
         backend.queue("a", "a2", "b2")
         cached = CachedMemoryProvider(backend)
 
-        await cached.get_context("s", "assistant", 100)
-        await cached.get_context("s", "assistant", 100)  # reuses lock
-        await cached.get_context("s", "butler", 100)
-        await cached.get_context("s2", "assistant", 100)
+        await cached.get_context("s", 100)
+        await cached.get_context("s", 100)  # reuses lock
+        await cached.get_context("s", 200)
+        await cached.get_context("s2", 100)
 
         assert backend.get_calls == 3
         assert len(cached._locks) == 3, (
@@ -267,7 +264,7 @@ async def test_get_context_cache_miss_does_not_emit_wrapper_log(caplog):
     cached = CachedMemoryProvider(inner)
 
     with caplog.at_level(logging.INFO, logger="memory"):
-        await cached.get_context("sid", "role", tokens=100)
+        await cached.get_context("sid", tokens=100)
 
     # RecordingProvider is a test stub and does NOT emit memory_call —
     # only real providers (Honcho/SQLite) do. So the count should be 0
@@ -295,11 +292,11 @@ async def test_get_context_cache_hit_emits_memory_call(caplog):
     cached = CachedMemoryProvider(inner)
 
     # Prime the cache (miss path).
-    await cached.get_context("sid", "role", tokens=100)
+    await cached.get_context("sid", tokens=100)
 
     # Now the hit path — this is the one we're asserting.
     with caplog.at_level(logging.INFO, logger="memory"):
-        await cached.get_context("sid", "role", tokens=100)
+        await cached.get_context("sid", tokens=100)
 
     records = [r for r in caplog.records if r.message == "memory_call"]
     assert len(records) == 1, (

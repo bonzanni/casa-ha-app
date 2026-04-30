@@ -63,24 +63,29 @@ def _mk_result(sid: str, usage: dict[str, int] | None = None) -> _SDKResultMessa
 
 
 class FakeMemory(MemoryProvider):
-    def __init__(self, context: str = "") -> None:
+    def __init__(self, context: str = "", overlay: str = "") -> None:
         self.context = context
+        self.overlay = overlay
         self.ensure: list[tuple] = []
         self.get: list[tuple] = []
         self.add: list[tuple] = []
         self.cross: list[tuple] = []
+        self.overlay_calls: list[tuple] = []
 
     async def ensure_session(self, session_id, agent_role, user_peer="nicola"):
         self.ensure.append((session_id, agent_role, user_peer))
 
-    async def get_context(
-        self, session_id, agent_role, tokens,
-        search_query=None, user_peer="nicola",
-    ):
-        self.get.append(
-            (session_id, agent_role, tokens, search_query, user_peer)
-        )
+    async def get_context(self, session_id, tokens, search_query=None):
+        self.get.append((session_id, tokens, search_query))
         return self.context
+
+    async def peer_overlay_context(
+        self, observer_role, user_peer, search_query, tokens,
+    ):
+        self.overlay_calls.append(
+            (observer_role, user_peer, search_query, tokens)
+        )
+        return self.overlay
 
     async def add_turn(
         self, session_id, agent_role, user_text, assistant_text,
@@ -204,8 +209,9 @@ async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("voice", "lr", "lights on"))
 
+    # Phase 5 / E-14: user_peer no longer threads through get_context;
+    # ensure_session and add_turn remain the load-bearing assertions.
     assert mem.ensure[0][2] == "voice_speaker"
-    assert mem.get[0][4] == "voice_speaker"
     for _ in range(5):
         await asyncio.sleep(0)
     assert mem.add[0][4] == "voice_speaker"
@@ -217,7 +223,9 @@ async def test_telegram_channel_uses_nicola_peer(tmp_path):
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
-    assert mem.get[0][4] == "nicola"
+    # Phase 5 / E-14: user_peer is asserted via ensure_session, not
+    # get_context (which no longer takes user_peer).
+    assert mem.ensure[0][2] == "nicola"
 
 
 async def test_system_prompt_contains_channel_context(tmp_path):
