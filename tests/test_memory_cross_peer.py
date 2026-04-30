@@ -42,9 +42,12 @@ class StubPeerWithContext:
         from test_memory_honcho import StubMessage  # local import OK
         return StubMessage(peer_name=self.name, content=content)
 
-    def context(self, target, search_query, tokens):
+    def context(self, target, search_query):
+        # Phase 5 / A.0: tokens kwarg dropped — honcho-ai 2.1.1's
+        # Peer.context() rejects it via @validate_call. cross_peer_context
+        # caps render-side instead.
         self.context_calls.append({
-            "target": target, "search_query": search_query, "tokens": tokens,
+            "target": target, "search_query": search_query,
         })
         return self._next_context
 
@@ -104,7 +107,8 @@ async def test_cross_peer_context_calls_peer_context_with_search_query(stub_env)
     call = finance_peer.context_calls[0]
     assert call["target"] == "nicola"
     assert call["search_query"] == "what does Finance know about my budget"
-    assert call["tokens"] == 2000
+    # Phase 5 / A.0: tokens kwarg dropped from peer.context() call
+    assert "tokens" not in call
 
 
 async def test_cross_peer_context_returns_empty_when_honcho_returns_empty(stub_env):
@@ -159,7 +163,8 @@ async def test_cross_peer_context_returns_empty_on_honcho_error(stub_env, caplog
 
     finance_peer = client.peer("finance")
 
-    def _raise(target, search_query, tokens):
+    def _raise(target, search_query):
+        # Phase 5 / A.0: signature matches the new tokens-less call shape.
         raise RuntimeError("simulated Honcho 503")
     finance_peer.context = _raise  # type: ignore[method-assign]
 

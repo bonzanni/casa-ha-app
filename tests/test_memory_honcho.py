@@ -51,11 +51,13 @@ class StubSession:
     def add_messages(self, messages):
         self.add_messages_calls.append(list(messages))
 
-    def context(self, tokens, peer_target, peer_perspective, search_query=None):
+    def context(self, tokens, search_query=None):
+        # Phase 5 — peer_target / peer_perspective dropped: get_context
+        # now issues a Honcho-native session.context() call with no
+        # peer-overlay parameters. Overlay fetch moved to
+        # peer_overlay_context (peer.context()).
         self.context_calls.append({
             "tokens": tokens,
-            "peer_target": peer_target,
-            "peer_perspective": peer_perspective,
             "search_query": search_query,
         })
         return self._next_context
@@ -124,33 +126,31 @@ async def test_ensure_session_voice_attributes_to_voice_speaker(stub_env):
     assert "nicola" not in names
 
 
-async def test_get_context_forwards_perspective_and_target(stub_env):
+async def test_get_context_does_not_pass_peer_target_or_perspective(stub_env):
+    """Phase 5 — get_context now omits peer_target/peer_perspective.
+    Peer overlay is fetched separately via peer_overlay_context.
+    Replaces the M2-era M3a forwards-perspective-and-target assertion."""
     from memory import HonchoMemoryProvider
 
     p = HonchoMemoryProvider(api_url="http://h", api_key="k")
     client: StubHoncho = p._client  # type: ignore[attr-defined]
-    # Prime a context the stub will return
-    session = client.session("telegram-1-assistant")
+    session = client.session("telegram-1-personal-assistant")
 
     @dataclass
     class _Ctx:
         messages: list = field(default_factory=list)
         summary: Any = None
-        peer_representation: Any = None
-        peer_card: list = field(default_factory=list)
 
-    session._next_context = _Ctx(peer_card=["x"])
-
-    out = await p.get_context(
-        "telegram-1-assistant", "assistant",
-        tokens=4000, search_query="hi",
+    session._next_context = _Ctx()
+    await p.get_context(
+        "telegram-1-personal-assistant",
+        tokens=600, search_query="hi",
     )
     call = session.context_calls[0]
-    assert call["peer_target"] == "nicola"
-    assert call["peer_perspective"] == "assistant"
-    assert call["tokens"] == 4000
+    assert call["tokens"] == 600
     assert call["search_query"] == "hi"
-    assert "## What I know about you" in out
+    assert "peer_target" not in call
+    assert "peer_perspective" not in call
 
 
 async def test_get_context_empty_returns_empty_string(stub_env):
@@ -164,12 +164,10 @@ async def test_get_context_empty_returns_empty_string(stub_env):
     class _Ctx:
         messages: list = field(default_factory=list)
         summary: Any = None
-        peer_representation: Any = None
-        peer_card: list = field(default_factory=list)
 
     session._next_context = _Ctx()
     out = await p.get_context(
-        "telegram-1-assistant", "assistant", tokens=100,
+        "telegram-1-assistant", tokens=100,
     )
     assert out == ""
 
@@ -208,22 +206,12 @@ async def test_add_turn_voice_uses_voice_speaker(stub_env):
     assert msgs[1].peer_id == "butler"
 
 
-async def test_get_context_renders_summary_and_peer_repr_when_honcho_returns_them(stub_env):
-    """M3a — closes the spec § 9 'real-Honcho-response coverage' gap.
-
-    Existing tests prime the SDK stub with summary=None /
-    peer_representation=None. This one populates both — plus a peer_card
-    bullet and recent messages — and asserts the rendered output
-    contains all four canonical sections from `_render`. Verifies the
-    end-to-end wiring SDK return → HonchoMemoryProvider.get_context →
-    _render → markdown digest, which is the integration contract spec
-    § 9 names but no test exercises today.
-
-    The duck-type matches honcho-ai==2.1.1's SessionContext (verified by
-    Task A.1) — `summary` is an object with `.content: str`,
-    `peer_representation` is `str | None`, `messages` is
-    `list[StubMessage]`, `peer_card` is `list[str]`.
-    """
+async def test_get_context_renders_summary_and_messages_when_honcho_returns_them(stub_env):
+    """Phase 5 — scope-only render contract. Verifies end-to-end wiring
+    SDK return → HonchoMemoryProvider.get_context → _render_session →
+    markdown digest. peer_card / peer_representation coverage has moved
+    to test_peer_overlay_context_renders_self_perspective_headings;
+    _render_session no longer emits those sections (A.3)."""
     from memory import HonchoMemoryProvider
 
     p = HonchoMemoryProvider(api_url="http://h", api_key="k")
@@ -238,8 +226,6 @@ async def test_get_context_renders_summary_and_peer_repr_when_honcho_returns_the
     class _Ctx:
         messages: list = field(default_factory=list)
         summary: Any = None
-        peer_representation: Any = None
-        peer_card: list = field(default_factory=list)
 
     session._next_context = _Ctx(
         messages=[
@@ -249,57 +235,46 @@ async def test_get_context_renders_summary_and_peer_repr_when_honcho_returns_the
         summary=_Summary(
             content="Earlier we discussed the user's morning routine.",
         ),
-        peer_representation=(
-            "User values brevity and prefers Celsius."
-        ),
-        peer_card=["lives in Amsterdam", "drinks oat milk"],
     )
 
     out = await p.get_context(
-        "telegram-1-domestic-assistant", "assistant",
+        "telegram-1-domestic-assistant",
         tokens=4000, search_query="what's the weather",
     )
 
-    # All four canonical sections present, in the order _render emits.
-    # _render's order is (memory.py:111-131): peer_card → summary →
-    # peer_representation → messages. Assert each substring AND assert
-    # ordering by index comparisons so a future _render reordering
-    # surfaces here, not silently in production.
-    idx_card = out.find("## What I know about you")
+    # Two scope-level sections present in _render_session order:
+    # summary → messages. peer_card / peer_representation MUST NOT
+    # appear (Phase 5 contract — those belong to peer_overlay_context).
     idx_summary = out.find("## Summary so far")
-    idx_perspective = out.find("## My perspective")
     idx_recent = out.find("## Recent exchanges")
-    assert idx_card != -1, f"missing peer_card section. out={out!r}"
     assert idx_summary != -1, f"missing summary section. out={out!r}"
-    assert idx_perspective != -1, f"missing peer_repr section. out={out!r}"
     assert idx_recent != -1, f"missing messages section. out={out!r}"
-    assert idx_card < idx_summary < idx_perspective < idx_recent
+    assert idx_summary < idx_recent
+    assert "## What I know about you" not in out
+    assert "## My perspective" not in out
 
-    # Content fidelity: verify each section carries the populated value
-    # (regression guard against a future _render that emits headers but
-    # drops bodies).
-    assert "- lives in Amsterdam" in out
-    assert "- drinks oat milk" in out
+    # Content fidelity
     assert "Earlier we discussed the user's morning routine." in out
-    assert "User values brevity and prefers Celsius." in out
     assert "[nicola] what's the weather" in out
     assert "[assistant] sunny, 18C" in out
 
-    # The SDK call still receives the right peer_target / peer_perspective
-    # / search_query forwarding (M2 baseline; reverify here so the new
-    # test is self-sufficient as a single-test sanity check).
+    # SDK call shape: tokens + search_query only (no peer_target/perspective)
     call = session.context_calls[0]
-    assert call["peer_target"] == "nicola"
-    assert call["peer_perspective"] == "assistant"
-    assert call["search_query"] == "what's the weather"
     assert call["tokens"] == 4000
+    assert call["search_query"] == "what's the weather"
+    assert "peer_target" not in call
+    assert "peer_perspective" not in call
 
 
 async def test_get_context_emits_memory_call_log(stub_env, caplog):
-    """M3b — Honcho.get_context must emit one `memory_call` log line per
-    call with backend, session_id, agent_role, t_ms, peer_count,
-    summary_present, peer_repr_present, cache_hit. Provider-level
+    """Phase 5 — get_context emits one `memory_call` line per call with
+    backend, session_id, agent_role="?", t_ms, peer_count,
+    summary_present, peer_repr_present=False, cache_hit. Provider-level
     emission so the SDK return is in scope for the present/count fields.
+
+    agent_role: peer overlay moved to peer_overlay_context, so role is
+    no longer threaded into get_context — emits literal "?".
+    peer_repr_present: False by construction on this scope-only path.
 
     Cache_hit is False on this path — wrapper-bypass emission tested in
     test_memory_cached.py."""
@@ -319,8 +294,6 @@ async def test_get_context_emits_memory_call_log(stub_env, caplog):
     class _Ctx:
         messages: list = field(default_factory=list)
         summary: Any = None
-        peer_representation: Any = None
-        peer_card: list = field(default_factory=list)
 
     session._next_context = _Ctx(
         messages=[
@@ -328,13 +301,11 @@ async def test_get_context_emits_memory_call_log(stub_env, caplog):
             StubMessage(peer_id="assistant", content="hello"),
         ],
         summary=_Summary(content="prior chat"),
-        peer_representation="user is friendly",
-        peer_card=[],
     )
 
     with caplog.at_level(logging.INFO, logger="memory"):
         await p.get_context(
-            "telegram-1-domestic-assistant", "assistant",
+            "telegram-1-domestic-assistant",
             tokens=2000, search_query="hi",
         )
 
@@ -347,20 +318,20 @@ async def test_get_context_emits_memory_call_log(stub_env, caplog):
     rec = records[0]
     assert rec.backend == "honcho"
     assert rec.session_id == "telegram-1-domestic-assistant"
-    assert rec.agent_role == "assistant"
+    assert rec.agent_role == "?"   # role no longer threaded to this layer
     assert isinstance(rec.t_ms, int) and rec.t_ms >= 0
     assert rec.peer_count == 2
     assert rec.summary_present is True
-    assert rec.peer_repr_present is True
+    assert rec.peer_repr_present is False   # no peer overlay on this path
     assert rec.cache_hit is False
     # M6 § 9 — call_type field distinguishes self vs cross_peer reads
     assert getattr(rec, "call_type", None) == "self"
 
 
 async def test_get_context_memory_call_when_summary_missing(stub_env, caplog):
-    """summary_present + peer_repr_present must be False when the SDK
-    returns None for those fields — distinct from absent (no logging
-    at all)."""
+    """summary_present must be False when the SDK returns None for that
+    field — distinct from absent (no logging at all). peer_repr_present
+    is always False on this scope-only path."""
     import logging
 
     from memory import HonchoMemoryProvider
@@ -373,8 +344,6 @@ async def test_get_context_memory_call_when_summary_missing(stub_env, caplog):
     class _Ctx:
         messages: list = field(default_factory=list)
         summary: Any = None
-        peer_representation: Any = None
-        peer_card: list = field(default_factory=list)
 
     session._next_context = _Ctx(
         messages=[StubMessage(peer_id="nicola", content="hi")],
@@ -382,7 +351,7 @@ async def test_get_context_memory_call_when_summary_missing(stub_env, caplog):
 
     with caplog.at_level(logging.INFO, logger="memory"):
         await p.get_context(
-            "telegram-1-domestic-assistant", "assistant", tokens=500,
+            "telegram-1-domestic-assistant", tokens=500,
         )
 
     rec = [r for r in caplog.records if r.message == "memory_call"][0]
@@ -423,8 +392,10 @@ async def test_cross_peer_context_renders_real_response_shape(stub_env):
             self._next = None
         def message(self, content):
             return StubMessage(peer_id=self.name, content=content)
-        def context(self, target, search_query, tokens):
-            self.context_calls.append((target, search_query, tokens))
+        def context(self, target, search_query):
+            # Phase 5 / A.0: tokens kwarg dropped — honcho-ai 2.1.1's
+            # Peer.context() rejects it via @validate_call.
+            self.context_calls.append((target, search_query))
             return self._next
 
     fp = _PeerWithContext("finance")
@@ -447,9 +418,9 @@ async def test_cross_peer_context_renders_real_response_shape(stub_env):
     assert "- prioritizes Q2 invoicing" in out
     assert "- ENPICOM primary client" in out
     assert "User asked Finance" in out
-    # SDK call shape verified
+    # SDK call shape verified — note no `tokens` (A.0 finding)
     assert fp.context_calls == [
-        ("nicola", "what does Finance know about my priorities", 2000),
+        ("nicola", "what does Finance know about my priorities"),
     ]
 
 
@@ -476,7 +447,8 @@ async def test_cross_peer_emits_memory_call_with_call_type_cross_peer(
             self._next = _PCtx()
         def message(self, content):
             return StubMessage(peer_id=self.name, content=content)
-        def context(self, target, search_query, tokens):
+        def context(self, target, search_query):
+            # Phase 5 / A.0: tokens kwarg dropped — see render-side cap.
             return self._next
 
     client.peers["finance"] = _Peer("finance")
@@ -495,4 +467,212 @@ async def test_cross_peer_emits_memory_call_with_call_type_cross_peer(
     assert rec.peer_count == 3            # peer_card length
     assert rec.summary_present is False   # no summary on peer.context
     assert rec.peer_repr_present is True  # representation populated
+    assert rec.cache_hit is False
+
+
+# --- Phase 5 peer_overlay_context tests -------------------------------------
+#
+# Stubs duplicated inline (parity with test_memory_cross_peer.py) so this file
+# stays self-contained: cross-file pytest fixture import via plain `from
+# test_memory_cross_peer import ...` works for symbols but not for `stub_env`
+# fixtures (those need conftest.py promotion to be cleanly reusable). The two
+# Stub classes below are <50 LOC; the duplication keeps fixture wiring local.
+
+
+@dataclass
+class StubPeerContext:
+    """Mirror of honcho-ai 2.1.1's peer.context() return shape (Phase 5).
+
+    Spec § 4 / A.0 probe: NO `messages`, `summary`, or `peer_representation`
+    field. Only `peer_card: list[str]` and `representation: str | None`.
+    """
+    peer_card: list = field(default_factory=list)
+    representation: object = None  # str | None
+
+
+class StubPeerWithContext:
+    """StubPeer extended with .context(target=, search_query=).
+
+    A.0 finding: honcho-ai 2.1.1 Peer.context() does NOT accept a `tokens`
+    kwarg. Stub omits it for parity with the real SDK.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.context_calls: list[dict[str, Any]] = []
+        self._next_context: Any = None
+
+    def message(self, content: str) -> StubMessage:
+        return StubMessage(peer_id=self.name, content=content)
+
+    def context(self, target, search_query):
+        self.context_calls.append({
+            "target": target, "search_query": search_query,
+        })
+        return self._next_context
+
+
+class StubHonchoWithPeerContext:
+    """Honcho client stub with peer.context() AND session.context() support.
+
+    Diverges from StubHonchoCrossPeer (test_memory_cross_peer.py) in that
+    `session()` is functional — peer_overlay_context tests never call it,
+    but a clean stub avoids the `AssertionError` shenanigans the M6
+    fixture used to prove peer-only-ness.
+    """
+
+    def __init__(self, api_key: str, base_url: str, workspace_id: str) -> None:
+        self.api_key = api_key
+        self.base_url = base_url
+        self.workspace_id = workspace_id
+        self.sessions: dict[str, StubSession] = {}
+        self.peers: dict[str, StubPeerWithContext] = {}
+
+    def session(self, session_id: str) -> StubSession:
+        self.sessions.setdefault(session_id, StubSession(session_id))
+        return self.sessions[session_id]
+
+    def peer(self, name: str) -> StubPeerWithContext:
+        self.peers.setdefault(name, StubPeerWithContext(name))
+        return self.peers[name]
+
+
+@pytest.fixture
+def stub_env_with_peer_context(monkeypatch):
+    """Patch memory module's Honcho symbol to a stub whose Peer has
+    .context(). Reuses StubSessionPeerConfig from this file."""
+    import memory
+
+    monkeypatch.setattr(memory, "Honcho", StubHonchoWithPeerContext, raising=True)
+    monkeypatch.setattr(
+        memory, "SessionPeerConfig", StubSessionPeerConfig, raising=True,
+    )
+    return memory
+
+
+async def test_peer_overlay_context_calls_peer_context_with_search_query(
+    stub_env_with_peer_context,
+):
+    """Spec § 2.5: peer_overlay_context wraps peer(observer_role)
+    .context(target=user_peer, search_query=q). NOTE: NO tokens kwarg
+    (A.0: honcho-ai 2.1.1 doesn't accept it; capped render-side)."""
+    from memory import HonchoMemoryProvider
+
+    p = HonchoMemoryProvider(api_url="http://h", api_key="k")
+    client = p._client  # type: ignore[attr-defined]
+    assistant_peer = client.peer("assistant")
+    assistant_peer._next_context = StubPeerContext()
+
+    await p.peer_overlay_context(
+        observer_role="assistant",
+        user_peer="nicola",
+        search_query="hi",
+        tokens=2000,
+    )
+
+    assert len(assistant_peer.context_calls) == 1
+    call = assistant_peer.context_calls[0]
+    assert call["target"] == "nicola"
+    assert call["search_query"] == "hi"
+    # A.0 finding: SDK doesn't accept tokens kwarg
+    assert "tokens" not in call
+
+
+async def test_peer_overlay_context_renders_self_perspective_headings(
+    stub_env_with_peer_context,
+):
+    """Spec § 2.6: overlay uses self-perspective ("What I know about you"
+    / "My perspective") NOT cross-role ("What X knows about you")."""
+    from memory import HonchoMemoryProvider
+
+    p = HonchoMemoryProvider(api_url="http://h", api_key="k")
+    client = p._client  # type: ignore[attr-defined]
+    assistant_peer = client.peer("assistant")
+    assistant_peer._next_context = StubPeerContext(
+        peer_card=["lives in Amsterdam", "drinks oat milk"],
+        representation="User values brevity.",
+    )
+    out = await p.peer_overlay_context(
+        observer_role="assistant",
+        user_peer="nicola",
+        search_query="x",
+        tokens=2000,
+    )
+    assert "## What I know about you" in out
+    assert "## My perspective" in out
+    assert "knows about you (cross-role)" not in out
+    assert "- lives in Amsterdam" in out
+    assert "- drinks oat milk" in out
+    assert "User values brevity." in out
+
+
+async def test_peer_overlay_context_returns_empty_on_honcho_error(
+    stub_env_with_peer_context, caplog,
+):
+    """Spec § 2.5: try/except wraps SDK call; exceptions log WARNING
+    and return "" — graceful-degradation parity with cross_peer_context."""
+    import logging
+
+    from memory import HonchoMemoryProvider
+
+    p = HonchoMemoryProvider(api_url="http://h", api_key="k")
+    client = p._client  # type: ignore[attr-defined]
+    assistant_peer = client.peer("assistant")
+
+    def _raise(target, search_query):
+        raise RuntimeError("simulated Honcho 503")
+    assistant_peer.context = _raise  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.WARNING, logger="memory"):
+        out = await p.peer_overlay_context(
+            observer_role="assistant",
+            user_peer="nicola",
+            search_query="x",
+            tokens=2000,
+        )
+    assert out == ""
+    assert any("peer_overlay_context" in r.message for r in caplog.records)
+
+
+async def test_peer_overlay_emits_memory_call_with_call_type_self_overlay(
+    stub_env_with_peer_context, caplog,
+):
+    """Spec § 2.9: memory_call emits call_type=self_overlay with peer-
+    interpretation of fields:
+        peer_count       → len(peer_card)
+        summary_present  → False
+        peer_repr_present → bool(representation)
+        cache_hit        → False
+        session_id       → "overlay-{observer_role}-{user_peer}"
+    """
+    import logging
+
+    from memory import HonchoMemoryProvider
+
+    p = HonchoMemoryProvider(api_url="http://h", api_key="k")
+    client = p._client  # type: ignore[attr-defined]
+    assistant_peer = client.peer("assistant")
+    assistant_peer._next_context = StubPeerContext(
+        peer_card=["a", "b", "c"],
+        representation="some accumulated facts",
+    )
+
+    with caplog.at_level(logging.INFO, logger="memory"):
+        await p.peer_overlay_context(
+            observer_role="assistant",
+            user_peer="nicola",
+            search_query="x",
+            tokens=2000,
+        )
+
+    records = [r for r in caplog.records if r.message == "memory_call"]
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.call_type == "self_overlay"
+    assert rec.backend == "honcho"
+    assert rec.session_id == "overlay-assistant-nicola"
+    assert rec.agent_role == "assistant"
+    assert rec.peer_count == 3
+    assert rec.summary_present is False
+    assert rec.peer_repr_present is True
     assert rec.cache_hit is False

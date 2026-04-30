@@ -309,39 +309,94 @@ class HonchoMemoryProvider(MemoryProvider):
     async def get_context(
         self,
         session_id: str,
-        agent_role: str,
         tokens: int,
         search_query: str | None = None,
-        user_peer: str = "nicola",
     ) -> str:
         t_start = time.perf_counter()
         session = await _to_thread(self._client.session, session_id)
         ctx = await _to_thread(
             session.context,
             tokens=tokens,
-            peer_target=user_peer,
-            peer_perspective=agent_role,
             search_query=search_query,
         )
         rendered = _render_session(ctx)
-        # M3b telemetry — one line per real backend call. peer_count is
-        # message count; summary_present / peer_repr_present are bools
-        # derived from the SDK return shape so operators can see WHEN
-        # Honcho actually populates these fields without re-running the
-        # render.
+        # Phase 5 — scope-level digest only (messages + summary). Peer-
+        # level overlay (peer_card + representation) moved to
+        # `peer_overlay_context`. agent_role / user_peer no longer
+        # threaded to this layer — the call is Honcho-native and the
+        # session_id already encodes scope. peer_repr_present is False
+        # by construction on this path.
         summary_obj = getattr(ctx, "summary", None)
         logger.info(
             "memory_call",
             extra={
                 "backend": "honcho",
                 "session_id": session_id,
-                "agent_role": agent_role,
+                "agent_role": "?",   # role no longer threaded to this layer
                 "t_ms": int((time.perf_counter() - t_start) * 1000),
                 "peer_count": len(getattr(ctx, "messages", None) or []),
                 "summary_present": bool(getattr(summary_obj, "content", None)),
-                "peer_repr_present": bool(getattr(ctx, "peer_representation", None)),
+                "peer_repr_present": False,   # no peer overlay on this path
                 "cache_hit": False,
                 "call_type": "self",   # M6 § 9
+            },
+        )
+        return rendered
+
+    async def peer_overlay_context(
+        self,
+        observer_role: str,
+        user_peer: str,
+        search_query: str,
+        tokens: int,
+    ) -> str:
+        t_start = time.perf_counter()
+        try:
+            peer = await _to_thread(self._client.peer, observer_role)
+            ctx = await _to_thread(
+                peer.context,
+                target=user_peer,
+                search_query=search_query,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "peer_overlay_context failed for observer=%r user_peer=%r: %s",
+                observer_role, user_peer, exc,
+            )
+            # No memory_call emission on error — operator sees the
+            # WARNING line; double-emitting on errors would falsify
+            # backend-success-rate dashboards.
+            return ""
+        rendered = _render_peer_overlay(ctx)
+        # A.0 finding: honcho-ai 2.1.1 Peer.context() does NOT accept a
+        # `tokens` kwarg (raises TypeError at @validate_call signature
+        # bind). Render then cap to tokens*4 chars (chars/4 estimator
+        # from tokens.py::estimate_tokens).
+        char_cap = tokens * 4
+        if len(rendered) > char_cap:
+            rendered = rendered[:char_cap]
+        # Phase 5 § 2.9 telemetry — companion shape to cross_peer_context.
+        # Field reinterpretation:
+        #   peer_count       → len(peer_card) (no messages on peer.context)
+        #   summary_present  → False (no summary surface)
+        #   peer_repr_present → bool(representation) (semantic map)
+        #   cache_hit        → False (no caching for overlay)
+        #   call_type        → "self_overlay"
+        #   session_id       → synthetic overlay-{observer_role}-{user_peer}
+        #                      (`overlay-` prefix can't collide with M6's
+        #                      `peer-` prefix or real 4-segment ids).
+        logger.info(
+            "memory_call",
+            extra={
+                "backend": "honcho",
+                "session_id": f"overlay-{observer_role}-{user_peer}",
+                "agent_role": observer_role,
+                "t_ms": int((time.perf_counter() - t_start) * 1000),
+                "peer_count": len(getattr(ctx, "peer_card", None) or []),
+                "summary_present": False,
+                "peer_repr_present": bool(getattr(ctx, "representation", None)),
+                "cache_hit": False,
+                "call_type": "self_overlay",
             },
         )
         return rendered
@@ -376,7 +431,6 @@ class HonchoMemoryProvider(MemoryProvider):
                 peer.context,
                 target=user_peer,
                 search_query=query,
-                tokens=tokens,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -388,6 +442,14 @@ class HonchoMemoryProvider(MemoryProvider):
             # backend-success-rate dashboards.
             return ""
         rendered = _render_peer_context(ctx, observer_role)
+        # A.0 finding: honcho-ai 2.1.1 Peer.context() rejects tokens kwarg
+        # (raises TypeError at @validate_call signature bind). Cap render-
+        # side instead — chars/4 estimator from tokens.py. Pre-A.4 the
+        # tokens=N call was masked by try/except: M6 had never been
+        # organically triggered in production (Finance peer disabled).
+        char_cap = tokens * 4
+        if len(rendered) > char_cap:
+            rendered = rendered[:char_cap]
         # M3b/M6 telemetry — companion line on every successful Honcho
         # backend call. Field reinterpretation per spec § 9:
         #   peer_count       → len(peer_card) (no messages on peer.context)
