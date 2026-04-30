@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -16,11 +16,17 @@ from claude_agent_sdk import (
 from drivers.driver_protocol import DriverProtocol
 from engagement_registry import EngagementRecord
 
+if TYPE_CHECKING:
+    from channels.telegram import TopicStreamHandle
+
 logger = logging.getLogger(__name__)
 
 
-TopicSender = Callable[[int, str], Awaitable[None]]
-"""(topic_id, text) → None — the channel-side async post."""
+TopicStreamFactory = Callable[[int], "TopicStreamHandle"]
+"""(topic_id) → TopicStreamHandle — channel-side per-turn streaming primitive.
+
+Returned handle exposes async ``emit(accumulated_text)`` and async
+``finalize(full_text)``. See channels.telegram.TopicStreamHandle."""
 
 SessionIdPersister = Callable[[str, str], Awaitable[None]]
 """(engagement_id, session_id) → None — registry persist hook.
@@ -35,18 +41,20 @@ class DriverNotAliveError(RuntimeError):
 class InCasaDriver(DriverProtocol):
     """Holds one ClaudeSDKClient per active engagement.
 
-    ``send_to_topic`` is the channel-side callback used to stream responses
-    into the Telegram topic (or the mock in tests). Injected rather than
-    imported from ``channels.telegram`` to keep the driver pure/testable.
+    ``topic_stream_factory`` is the channel-side factory that, given a
+    topic_id, returns a TopicStreamHandle. Each ``_deliver_turn`` builds
+    a fresh handle and emits AssistantMessage chunks progressively
+    (Phase 3b — Bug 1). Injected rather than imported from
+    ``channels.telegram`` to keep the driver pure/testable.
     """
 
     def __init__(
         self,
         *,
-        send_to_topic: TopicSender,
+        topic_stream_factory: TopicStreamFactory,
         persist_session_id: SessionIdPersister | None = None,
     ) -> None:
-        self._send_to_topic = send_to_topic
+        self._topic_stream_factory = topic_stream_factory
         self._persist_session_id = persist_session_id
         self._clients: dict[str, ClaudeSDKClient] = {}
         self._ctx_stack: dict[str, Any] = {}
@@ -148,12 +156,13 @@ class InCasaDriver(DriverProtocol):
 
         client = self._clients[engagement.id]
         lock = self._locks[engagement.id]
-        # E-8: collect one entry per AssistantMessage and join with "\n\n"
-        # so multi-step executor turns render as discrete thoughts in the
-        # topic instead of a glued paragraph. Within a single
-        # AssistantMessage, TextBlocks are part of one model thought and
-        # are joined without separator.
-        messages: list[str] = []
+        assert engagement.topic_id is not None
+        # Phase 3b: stream per-AssistantMessage rather than buffer the
+        # entire turn. Per-topic state (message_id, last_edit) lives on
+        # the handle for this turn only — each turn opens a fresh
+        # Telegram message in the topic.
+        stream = self._topic_stream_factory(engagement.topic_id)
+        accumulated = ""
         token = engagement_var.set(engagement)
         try:
             async with lock:
@@ -183,9 +192,13 @@ class InCasaDriver(DriverProtocol):
                             if isinstance(b, TextBlock)
                         )
                         if msg_text:
-                            messages.append(msg_text)
+                            accumulated = (
+                                f"{accumulated}\n\n{msg_text}"
+                                if accumulated else msg_text
+                            )
+                            await stream.emit(accumulated)
         finally:
             engagement_var.reset(token)
-        text = "\n\n".join(messages).strip()
-        if text and engagement.topic_id is not None:
-            await self._send_to_topic(engagement.topic_id, text)
+        final = accumulated.strip()
+        if final:
+            await stream.finalize(final)

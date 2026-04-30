@@ -31,6 +31,36 @@ def _mk_assistant(text: str) -> AssistantMessage:
         return m
 
 
+def _mk_factory_with_fake_handle():
+    """Return (factory, handle) where factory(topic_id) → handle.
+
+    handle.emit and handle.finalize are AsyncMocks for assertion."""
+    from unittest.mock import MagicMock as _MagicMock
+    handle = _MagicMock()
+    handle.emit = AsyncMock()
+    handle.finalize = AsyncMock()
+
+    def _factory(topic_id):
+        handle._topic_id_seen = topic_id
+        return handle
+
+    return _factory, handle
+
+
+def _mk_noop_factory():
+    """Factory that returns a fresh no-op handle each call. Used by
+    tests that don't care about output (cancel, resume, is_alive)."""
+    from unittest.mock import MagicMock as _MagicMock
+
+    def _factory(topic_id):
+        h = _MagicMock()
+        h.emit = AsyncMock()
+        h.finalize = AsyncMock()
+        return h
+
+    return _factory
+
+
 def _make_record(**overrides):
     from engagement_registry import EngagementRecord
 
@@ -74,8 +104,7 @@ class TestInCasaStart:
 
         monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
 
-        channel_sender = AsyncMock()
-        drv = InCasaDriver(send_to_topic=channel_sender)
+        drv = InCasaDriver(topic_stream_factory=_mk_noop_factory())
         rec = _make_record()
 
         await drv.start(rec, prompt="hi", options=ClaudeAgentOptions(model="sonnet"))
@@ -96,12 +125,15 @@ class TestInCasaStart:
 
         monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
 
-        sender = AsyncMock()
-        drv = InCasaDriver(send_to_topic=sender)
+        factory, handle = _mk_factory_with_fake_handle()
+        drv = InCasaDriver(topic_stream_factory=factory)
         rec = _make_record()
 
         await drv.start(rec, prompt="hi", options=ClaudeAgentOptions(model="sonnet"))
-        sender.assert_awaited_once_with(42, "Hello from Alex")
+        # Phase 3b: streaming → emit per-AssistantMessage + finalize once.
+        handle.emit.assert_awaited_once_with("Hello from Alex")
+        handle.finalize.assert_awaited_once_with("Hello from Alex")
+        assert handle._topic_id_seen == 42
 
     async def test_start_separates_multiple_assistant_messages_with_double_newline(
         self, monkeypatch,
@@ -125,26 +157,103 @@ class TestInCasaStart:
 
         monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
 
-        sender = AsyncMock()
-        drv = InCasaDriver(send_to_topic=sender)
+        factory, handle = _mk_factory_with_fake_handle()
+        drv = InCasaDriver(topic_stream_factory=factory)
         rec = _make_record()
 
         await drv.start(rec, prompt="hi", options=ClaudeAgentOptions(model="sonnet"))
 
-        sender.assert_awaited_once()
-        topic_id, text = sender.await_args.args
-        assert topic_id == 42
+        # Phase 3b: 3 emits (cumulative) + 1 finalize with full text.
+        assert handle.emit.await_count == 3
+        emits = [c.args[0] for c in handle.emit.await_args_list]
+        assert emits[0] == "Reading the doctrine files first."
+        assert emits[1] == (
+            "Reading the doctrine files first."
+            "\n\nNow let me look at Ellen's config files."
+        )
+        assert emits[2] == (
+            "Reading the doctrine files first."
+            "\n\nNow let me look at Ellen's config files."
+            "\n\nThe trait belongs in character.yaml."
+        )
+        handle.finalize.assert_awaited_once()
+        text = handle.finalize.await_args.args[0]
         # All three pieces present
         assert "Reading the doctrine files first." in text
         assert "Now let me look at Ellen's config files." in text
         assert "The trait belongs in character.yaml." in text
-        # The bug: pre-fix the text reads "...first.Now let me..." (glued).
-        assert "first.Now let me" not in text, (
-            f"E-8 not fixed: AssistantMessages glued without separator. Got: {text!r}"
-        )
-        # Positive: \n\n between successive AssistantMessages
+        # E-8 separator preserved
+        assert "first.Now let me" not in text
         assert "first.\n\nNow let me look" in text
         assert "config files.\n\nThe trait belongs" in text
+
+    async def test_start_streams_skips_assistant_message_with_no_text(
+        self, monkeypatch,
+    ):
+        """Phase 3b: AssistantMessage with no TextBlocks (e.g. only
+        ToolUseBlocks) produces no emit and no inserted blank line."""
+        from drivers.in_casa_driver import InCasaDriver
+
+        class _FakeClient:
+            def __init__(self, options): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+            async def receive_response(self):
+                yield _mk_assistant("Before tool call.")
+                empty = _mk_assistant("ignored")
+                empty.content = []  # type: ignore[attr-defined]
+                yield empty
+                yield _mk_assistant("After tool call.")
+            async def close(self): pass
+
+        monkeypatch.setattr(
+            "drivers.in_casa_driver.ClaudeSDKClient", _FakeClient,
+        )
+
+        factory, handle = _mk_factory_with_fake_handle()
+        drv = InCasaDriver(topic_stream_factory=factory)
+        rec = _make_record()
+
+        await drv.start(
+            rec, prompt="hi", options=ClaudeAgentOptions(model="sonnet"),
+        )
+
+        assert handle.emit.await_count == 2
+        emits = [c.args[0] for c in handle.emit.await_args_list]
+        assert emits[1] == "Before tool call.\n\nAfter tool call."
+        handle.finalize.assert_awaited_once_with(
+            "Before tool call.\n\nAfter tool call."
+        )
+
+    async def test_start_empty_turn_skips_finalize(self, monkeypatch):
+        """SDK yields zero AssistantMessages with text → no finalize call."""
+        from drivers.in_casa_driver import InCasaDriver
+
+        class _FakeClient:
+            def __init__(self, options): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+            async def receive_response(self):
+                if False:
+                    yield None  # pragma: no cover
+            async def close(self): pass
+
+        monkeypatch.setattr(
+            "drivers.in_casa_driver.ClaudeSDKClient", _FakeClient,
+        )
+
+        factory, handle = _mk_factory_with_fake_handle()
+        drv = InCasaDriver(topic_stream_factory=factory)
+        rec = _make_record()
+
+        await drv.start(
+            rec, prompt="hi", options=ClaudeAgentOptions(model="sonnet"),
+        )
+
+        handle.emit.assert_not_awaited()
+        handle.finalize.assert_not_awaited()
 
 
 class TestInCasaSendUserTurn:
@@ -165,22 +274,26 @@ class TestInCasaSendUserTurn:
 
         monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
 
-        sender = AsyncMock()
-        drv = InCasaDriver(send_to_topic=sender)
+        factory, handle = _mk_factory_with_fake_handle()
+        drv = InCasaDriver(topic_stream_factory=factory)
         rec = _make_record()
         await drv.start(rec, "system prompt", ClaudeAgentOptions(model="sonnet"))
         turns.clear()  # reset after start's initial delivery
+        # Reset emit/finalize tracking after the start-turn delivery so the
+        # send_user_turn assertions below see only the user-turn calls.
+        handle.emit.reset_mock()
+        handle.finalize.reset_mock()
 
         await drv.send_user_turn(rec, "user said X")
         assert turns == ["user said X"]
-        assert sender.await_count >= 1
-        last_call = sender.await_args_list[-1]
-        assert last_call.args == (42, "re:user said X")
+        # Phase 3b: emit + finalize for the user turn.
+        handle.finalize.assert_awaited_once()
+        assert handle.finalize.await_args.args[0] == "re:user said X"
 
     async def test_send_user_turn_raises_when_not_alive(self):
         from drivers.in_casa_driver import InCasaDriver, DriverNotAliveError
 
-        drv = InCasaDriver(send_to_topic=AsyncMock())
+        drv = InCasaDriver(topic_stream_factory=_mk_noop_factory())
         rec = _make_record()
         with pytest.raises(DriverNotAliveError):
             await drv.send_user_turn(rec, "x")
@@ -205,7 +318,7 @@ class TestInCasaCancel:
 
         monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
 
-        drv = InCasaDriver(send_to_topic=AsyncMock())
+        drv = InCasaDriver(topic_stream_factory=_mk_noop_factory())
         rec = _make_record()
         await drv.start(rec, "p", ClaudeAgentOptions(model="sonnet"))
         assert drv.is_alive(rec) is True
@@ -216,7 +329,7 @@ class TestInCasaCancel:
     async def test_cancel_is_idempotent(self):
         from drivers.in_casa_driver import InCasaDriver
 
-        drv = InCasaDriver(send_to_topic=AsyncMock())
+        drv = InCasaDriver(topic_stream_factory=_mk_noop_factory())
         rec = _make_record()
         # Not alive yet: must not raise.
         await drv.cancel(rec)
@@ -244,7 +357,7 @@ class TestInCasaResume:
 
         monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
 
-        drv = InCasaDriver(send_to_topic=AsyncMock())
+        drv = InCasaDriver(topic_stream_factory=_mk_noop_factory())
         rec = _make_record(sdk_session_id="sess-old")
         await drv.resume(rec, session_id="sess-old")
         assert drv.is_alive(rec) is True
@@ -266,7 +379,7 @@ class TestInCasaResume:
 
         monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
 
-        drv = InCasaDriver(send_to_topic=AsyncMock())
+        drv = InCasaDriver(topic_stream_factory=_mk_noop_factory())
         rec = _make_record()
         await drv.start(rec, "p", ClaudeAgentOptions(model="sonnet"))
         assert drv.get_session_id(rec) == "sess-xyz"
@@ -295,7 +408,7 @@ class TestInCasaEngagementContext:
 
         monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
 
-        drv = InCasaDriver(send_to_topic=AsyncMock())
+        drv = InCasaDriver(topic_stream_factory=_mk_noop_factory())
         rec = _make_record(role_or_type="configurator")
 
         # Pre-state: unbound
@@ -323,7 +436,7 @@ class TestInCasaEngagementContext:
         monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
 
         persist = AsyncMock()
-        drv = InCasaDriver(send_to_topic=AsyncMock(), persist_session_id=persist)
+        drv = InCasaDriver(topic_stream_factory=_mk_noop_factory(), persist_session_id=persist)
         rec = _make_record()
 
         await drv.start(rec, "hi", ClaudeAgentOptions(model="sonnet"))
@@ -348,7 +461,7 @@ class TestInCasaEngagementContext:
         monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
 
         persist = AsyncMock()
-        drv = InCasaDriver(send_to_topic=AsyncMock(), persist_session_id=persist)
+        drv = InCasaDriver(topic_stream_factory=_mk_noop_factory(), persist_session_id=persist)
         rec = _make_record()
 
         await drv.start(rec, "hi", ClaudeAgentOptions(model="sonnet"))
@@ -375,7 +488,7 @@ class TestInCasaEngagementContext:
         monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
 
         # No persist_session_id supplied — uses default None.
-        drv = InCasaDriver(send_to_topic=AsyncMock())
+        drv = InCasaDriver(topic_stream_factory=_mk_noop_factory())
         rec = _make_record()
 
         await drv.start(rec, "hi", ClaudeAgentOptions(model="sonnet"))
