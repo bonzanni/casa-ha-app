@@ -228,6 +228,96 @@ async def test_telegram_channel_uses_nicola_peer(tmp_path):
     assert mem.ensure[0][2] == "nicola"
 
 
+# ---------------------------------------------------------------------------
+# Phase 5 / E-14: peer-overlay assembly (spec § 2.7, § 2.9)
+# ---------------------------------------------------------------------------
+
+
+async def test_overlay_task_runs_alongside_scope_tasks(tmp_path):
+    """Spec § 2.7: 1 overlay task + N scope tasks under asyncio.gather."""
+    mem = FakeMemory(context="scope-content", overlay="overlay-content")
+    agent = _make_agent(mem, tmp_path, role="assistant")
+    with patch("agent.ClaudeSDKClient", FakeClient):
+        await agent._process(_msg("telegram", "123", "hi"))
+
+    # One overlay call (per turn) regardless of scope count.
+    assert len(mem.overlay_calls) == 1
+    # Sig: (observer_role, user_peer, search_query, tokens)
+    assert mem.overlay_calls[0][0] == "assistant"
+    assert mem.overlay_calls[0][1] == "nicola"
+    assert mem.overlay_calls[0][2] == "hi"
+    # Scope calls happen too — actual count depends on test scope-registry stub.
+    assert len(mem.get) >= 1
+
+
+async def test_overlay_block_present_when_overlay_non_empty(tmp_path):
+    """Assembled memory_blocks contains <peer_overlay> when overlay
+    digest is non-empty."""
+    mem = FakeMemory(context="", overlay="OVERLAY_TEXT")
+    agent = _make_agent(mem, tmp_path, role="assistant")
+
+    captured: dict[str, str] = {}
+
+    class _CapturingClient(FakeClient):
+        def __init__(self, options):
+            super().__init__(options)
+            captured["system"] = options.system_prompt
+
+    with patch("agent.ClaudeSDKClient", _CapturingClient):
+        await agent._process(_msg("telegram", "123", "hi"))
+
+    assert "<peer_overlay>" in captured["system"]
+    assert "OVERLAY_TEXT" in captured["system"]
+
+
+async def test_overlay_failure_does_not_poison_scope_reads(tmp_path, caplog):
+    """Overlay task raising → empty overlay digest, scope reads still
+    proceed (gather doesn't poison)."""
+    import logging
+
+    class FailingOverlayMemory(FakeMemory):
+        async def peer_overlay_context(
+            self, observer_role, user_peer, search_query, tokens,
+        ):
+            raise RuntimeError("simulated failure")
+
+    mem = FailingOverlayMemory(context="scope-still-works")
+    agent = _make_agent(mem, tmp_path, role="assistant")
+
+    captured: dict[str, str] = {}
+
+    class _CapturingClient(FakeClient):
+        def __init__(self, options):
+            super().__init__(options)
+            captured["system"] = options.system_prompt
+
+    with caplog.at_level(logging.WARNING, logger="agent"):
+        with patch("agent.ClaudeSDKClient", _CapturingClient):
+            await agent._process(_msg("telegram", "123", "hi"))
+
+    assert "<peer_overlay>" not in captured["system"]   # overlay omitted
+    assert "<memory_context" in captured["system"]      # scope present
+    assert any(
+        "Peer overlay call failed" in r.message for r in caplog.records
+    )
+
+
+async def test_peer_overlay_empty_logs_info_line(tmp_path, caplog):
+    """Spec § 7 Q4: empty overlay digest emits peer_overlay_empty INFO line."""
+    import logging
+    mem = FakeMemory(context="", overlay="")
+    agent = _make_agent(mem, tmp_path, role="assistant")
+
+    with caplog.at_level(logging.INFO, logger="agent"):
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            await agent._process(_msg("telegram", "123", "hi"))
+
+    records = [r for r in caplog.records if r.message == "peer_overlay_empty"]
+    assert len(records) == 1
+    assert records[0].observer_role == "assistant"
+    assert records[0].user_peer == "nicola"
+
+
 async def test_system_prompt_contains_channel_context(tmp_path):
     mem = FakeMemory(context="")
     agent = _make_agent(mem, tmp_path, role="assistant")

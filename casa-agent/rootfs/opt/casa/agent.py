@@ -347,9 +347,14 @@ class Agent:
                 ),
             })
 
-            # Per-scope get_context in parallel.
-            per_scope_tokens = max(
-                self.config.memory.token_budget // max(len(active), 1),
+            # Per-turn budget split: 40% for the deduped peer overlay, 60% for
+            # per-scope session reads. Constants per spec § 2.3 (Phase 5 —
+            # locked at plan-write Task A.0 against one live Ellen turn
+            # baseline).
+            overlay_budget = max(int(self.config.memory.token_budget * 0.4), 1)
+            per_scope_budget = max(
+                (self.config.memory.token_budget - overlay_budget)
+                // max(len(active), 1),
                 1,
             )
 
@@ -363,10 +368,8 @@ class Agent:
                     )
                     digest = await self._memory.get_context(
                         session_id=sid,
-                        agent_role=self.config.role,
-                        tokens=per_scope_tokens,
+                        tokens=per_scope_budget,
                         search_query=user_text,
-                        user_peer=user_peer,
                     )
                 except Exception:
                     logger.warning(
@@ -376,15 +379,59 @@ class Agent:
                     digest = ""
                 return scope, digest
 
-            digests = dict(await asyncio.gather(
-                *[_one_scope(s) for s in active]
-            ))
+            async def _overlay() -> str:
+                """One peer-level overlay read per turn — deduped across
+                all scopes by Honcho's peer-aggregation design (spec § 2.2)."""
+                try:
+                    return await self._memory.peer_overlay_context(
+                        observer_role=self.config.role,
+                        user_peer=user_peer,
+                        search_query=user_text,
+                        tokens=overlay_budget,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Peer overlay call failed for observer=%s user_peer=%s",
+                        self.config.role, user_peer,
+                    )
+                    return ""
 
-            # Budget-tracker record uses the summed prompt text.
-            memory_blocks = "\n".join(
-                f'<memory_context scope="{s}">\n{d}\n</memory_context>'
-                for s, d in digests.items() if d
+            # Run overlay + per-scope reads in parallel.
+            overlay_digest, *scope_pairs = await asyncio.gather(
+                _overlay(),
+                *[_one_scope(s) for s in active],
             )
+            digests = dict(scope_pairs)
+
+            # spec § 7 Q4 — log empty overlay so operators can spot the
+            # regime (Honcho deriver behind, fresh peer pair, etc.). INFO
+            # not WARNING.
+            if not overlay_digest:
+                logger.info(
+                    "peer_overlay_empty",
+                    extra={
+                        "observer_role": self.config.role,
+                        "user_peer": user_peer,
+                        "channel_key": channel_key,
+                    },
+                )
+
+            # Assemble — overlay first (durable identity), scopes last
+            # (recent conversation). Per spec § 7 Q2 — defer cache-read
+            # measurement to post-deploy; flip ordering in v0.26.x if
+            # cache_read regresses.
+            parts: list[str] = []
+            if overlay_digest:
+                parts.append(
+                    f"<peer_overlay>\n{overlay_digest}\n</peer_overlay>"
+                )
+            for scope, digest in digests.items():
+                if digest:
+                    parts.append(
+                        f'<memory_context scope="{scope}">\n{digest}\n</memory_context>'
+                    )
+            memory_blocks = "\n".join(parts)
+
             if memory_blocks:
                 self._budget_tracker.record(
                     f"{channel_key}-{self.config.role}",
