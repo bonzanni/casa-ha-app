@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.23.0] - 2026-04-30 — Phase 3b: engagement-topic streaming (Bug 1)
+
+### Fixed
+- **Bug 1** (HIGH): `InCasaDriver._deliver_turn` no longer buffers the
+  entire SDK turn before posting to the engagement topic. Each
+  `AssistantMessage` triggers a cumulative-text emit via the new
+  `TopicStreamHandle` (1-second per-topic throttle, edit-in-place via
+  Telegram `editMessageText`). Multi-step executor turns
+  (Read → Edit → validate → reply) now show progressive visibility
+  starting within seconds of the first model output, instead of 60-120s
+  of silence followed by a single batch dump. Mirrors Ellen's existing
+  `create_on_token` + `finalize_stream` pattern (`channels/telegram.py:739-859`)
+  but parameterised by `topic_id` instead of `chat_id`.
+
+### Internal
+- New `channels.telegram.TopicStreamHandle` class + `TelegramChannel.create_topic_stream(topic_id)` factory method (~120 lines).
+- `InCasaDriver.__init__` constructor signature change: `send_to_topic` kwarg removed; `topic_stream_factory` kwarg added. Pre-1.0.0 license; no shim.
+- `casa_core.main` rewires `engagement_driver` to pass the factory; `claude_code_driver` keeps its `send_to_topic` kwarg unchanged (E-12 deferred to Phase 4).
+- 8 new unit tests in `tests/test_telegram_topic_stream.py` covering first-emit / throttle / overflow / not-modified swallow / error logging.
+- 2 new tests in `tests/test_in_casa_driver.py::TestInCasaStart` covering streaming semantics + skip-on-empty-AssistantMessage.
+
+### Notes
+- **Out of scope:** tool-marker rendering during streaming (M1 confirmed in spec §3 Q6); per-message logger lines in `_deliver_turn` (Phase 4 / morning Bug 3); CLI subprocess stderr capture (Phase 4 / morning Bug 4); claude_code driver streaming (E-12, Phase 4).
+- **No engagement-data migration:** `engagements.json` schema unchanged; existing engagements (active or cancelled) read identically.
+
 ## [0.22.0] - 2026-04-30 — Phase 3a: cosmetic + cancel (E-2 + E-8 + E-13)
 
 ### Fixed
