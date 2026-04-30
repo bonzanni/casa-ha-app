@@ -512,3 +512,39 @@ class TestHandleUpdateConcurrencyRace:
         await asyncio.gather(ch.handle_update(u_a), ch.handle_update(u_b))
         assert b_routed.is_set()
         assert a_can_finish.is_set()
+
+
+class TestMessageHandlerWiring:
+    """E-13: the PTB MessageHandler must dispatch to handle_update so that
+    /cancel and other engagement commands posted to topics are intercepted
+    by the engagement-aware router. Pre-fix, MessageHandler routed to
+    _handle, which is engagement-unaware and forwarded /cancel to Ellen
+    (bug-review-2026-04-29-exploration.md § E-13).
+
+    The full _rebuild() bring-up path is hard to mock cleanly without a
+    real PTB Application; we assert the wiring at the source level.
+    Behavioral coverage of handle_update lives in TestSupergroupRouting
+    and TestSlashCommands above (514 lines of existing tests)."""
+
+    async def test_rebuild_registers_message_handler_with_handle_update(self):
+        import inspect
+        from channels.telegram import TelegramChannel
+
+        source = inspect.getsource(TelegramChannel._rebuild)
+        # The wiring must point at handle_update, not _handle.
+        assert "MessageHandler(filters.TEXT, self.handle_update)" in source, (
+            f"_rebuild must register MessageHandler with handle_update; "
+            f"current source excerpt:\n{source}"
+        )
+        # Defensive: catch a regression where someone re-introduces the
+        # engagement-unaware _handle wiring.
+        msg_handler_lines = [
+            line for line in source.splitlines()
+            if "MessageHandler(" in line
+        ]
+        assert msg_handler_lines, "no MessageHandler registration found in _rebuild"
+        for line in msg_handler_lines:
+            assert "self._handle" not in line, (
+                f"MessageHandler must not be wired to _handle "
+                f"(engagement-unaware). Got: {line.strip()}"
+            )

@@ -243,8 +243,12 @@ class TelegramChannel(Channel):
             builder = builder.base_url(f"{_bot_api_base}/bot")
             builder = builder.base_file_url(f"{_bot_api_base}/file/bot")
         app = builder.build()
+        # E-13: dispatch to handle_update (engagement-aware router) so
+        # that /cancel, /complete, /silent in engagement topics are
+        # intercepted. handle_update internally calls _handle for
+        # non-engagement chats (Ellen DM via _route_to_ellen).
         app.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle)
+            MessageHandler(filters.TEXT, self.handle_update)
         )
         app.add_error_handler(self._on_ptb_error)
         await app.initialize()
