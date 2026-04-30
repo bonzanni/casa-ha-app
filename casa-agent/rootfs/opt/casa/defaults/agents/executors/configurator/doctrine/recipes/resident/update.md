@@ -60,6 +60,22 @@ paragraph (Case 1: cross-role recall via this tool; Case 2: delegate
 when the answer needs the specialist's tools). Copy the canonical
 Ellen paragraph as a starting point.
 
+**Disabled-but-consultable specialist memory (Phase 5 / E-15, v0.26.1+):**
+When an operator flips a specialist's `enabled: true → false` (e.g.
+disabling Finance to stop new delegations), the specialist's peer-level
+Honcho memory is NOT torn down — it stays persisted in Honcho. Any
+resident with `consult_other_agent_memory` in `tools.allowed` can still
+recall what the disabled specialist previously knew about the user; the
+tool falls through to `cross_peer_context` instead of returning
+`unknown_role`.
+
+This is intentional: memory is data, enablement is operational. The
+trade-off (a disabled specialist's accumulated facts remain readable)
+is acknowledged in spec § 3.3. If a future deploy needs a hard gate
+(disabled = unconsultable), open a follow-up to add a
+`cfg.allow_memory_when_disabled: bool` field on the specialist's
+runtime.yaml — currently out of scope.
+
 ## Always
 
 - Commit.
