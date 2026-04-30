@@ -27,6 +27,7 @@ from marketplace_ops import (
     update_plugin_entry,
 )
 from honcho_ids import honcho_session_id
+from text_util import truncate_for_topic, TELEGRAM_TOPIC_NAME_BYTES
 from plugin_env_extractor import extract_env_vars
 from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — available for future use
 from system_requirements.orchestrator import install_requirements, OrchestrationError
@@ -672,10 +673,23 @@ async def delegate_to_agent(args: dict) -> dict:
             })
         # Open topic
         icon = _ICON_FOR_KIND.get(("specialist", agent_name), "🧵")
-        short_task = (task_text or "").splitlines()[0][:80].strip() or "engagement"
+        # E-9: compute body budget against the *rename* form (the
+        # wider total) so open and rename names share short_task and
+        # rename never has to re-truncate.
+        prefix = f"#[{agent_name}] "
+        rename_suffix = " · 12345678"  # rec.id[:8] is always 8 bytes
+        body_budget = (
+            TELEGRAM_TOPIC_NAME_BYTES
+            - len(prefix.encode("utf-8"))
+            - len(rename_suffix.encode("utf-8"))
+        )
+        first_line = (task_text or "").splitlines()[0]
+        short_task = truncate_for_topic(
+            first_line, byte_budget=body_budget,
+        ) or "engagement"
         try:
             topic_id = await channel.open_engagement_topic(
-                name=f"#[{agent_name}] {short_task}",
+                name=f"{prefix}{short_task}",
                 icon_emoji=icon,
             )
         except Exception as exc:  # noqa: BLE001
@@ -691,7 +705,7 @@ async def delegate_to_agent(args: dict) -> dict:
             await channel.bot.edit_forum_topic(
                 chat_id=channel.engagement_supergroup_id,
                 message_thread_id=topic_id,
-                name=f"#[{agent_name}] {short_task} · {rec.id[:8]}",
+                name=f"{prefix}{short_task} · {rec.id[:8]}",
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("edit_forum_topic rename failed: %s", exc)
@@ -1231,10 +1245,22 @@ async def engage_executor(args: dict) -> dict:
                         "options and verify the bot has can_manage_topics"),
         })
 
-    short_task = (task_text or "").splitlines()[0][:80].strip() or "engagement"
+    # E-9: same shape as delegate_to_agent — budget against the rename
+    # form (' | ' separator here, not ' · ').
+    prefix = f"#[{executor_type}] "
+    rename_suffix = " | 12345678"  # rec.id[:8] is always 8 bytes
+    body_budget = (
+        TELEGRAM_TOPIC_NAME_BYTES
+        - len(prefix.encode("utf-8"))
+        - len(rename_suffix.encode("utf-8"))
+    )
+    first_line = (task_text or "").splitlines()[0]
+    short_task = truncate_for_topic(
+        first_line, byte_budget=body_budget,
+    ) or "engagement"
     try:
         topic_id = await channel.open_engagement_topic(
-            name=f"#[{executor_type}] {short_task}",
+            name=f"{prefix}{short_task}",
             icon_emoji="tools",
         )
     except Exception as exc:  # noqa: BLE001
@@ -1252,7 +1278,7 @@ async def engage_executor(args: dict) -> dict:
         await channel.bot.edit_forum_topic(
             chat_id=channel.engagement_supergroup_id,
             message_thread_id=topic_id,
-            name=f"#[{executor_type}] {short_task} | {rec.id[:8]}",
+            name=f"{prefix}{short_task} | {rec.id[:8]}",
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("edit_forum_topic rename failed: %s", exc)
