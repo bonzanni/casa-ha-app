@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.28.0] - 2026-04-30 — E-16: Configurator plugin-tools gap
+
+Closes the Plan 4b consumer-side gap surfaced by the 2026-04-30 audit
+and exposed in `docs/exploration-testing-playbook.md::P12 step 3`.
+Until this ship, the Configurator could neither call the plugin
+install/remove tools (not in `tools.allowed`) nor walk the operator
+through the flow (no `recipes/plugin/` doctrine).
+
+### Changed
+
+- **`agents/executors/configurator/definition.yaml::tools.allowed`** —
+  added 10 plugin-lifecycle tools:
+  `marketplace_{add,remove,update,list}_plugin`, `install_casa_plugin`,
+  `uninstall_casa_plugin`, `verify_plugin_state`,
+  `set_plugin_env_reference`, `list_vault_items`, `get_item_fields`.
+  Excluded `verify_plugin_secrets` — its description marks it a
+  back-compat shim for `verify_plugin_state`.
+
+### Added
+
+- **`agents/executors/configurator/doctrine/recipes/plugin/`** — new
+  recipe directory. Four files, mirroring `recipes/trigger/` style:
+  - `install.md` — five-stage install flow (marketplace →
+    system-requirements → per-agent install → secrets → verify),
+    with reload + common-mistakes sections.
+  - `remove.md` — uninstall flow + optional full-removal sequence
+    (marketplace tear-down + secret unwiring).
+  - `marketplace.md` — marketplace-only operations (list, register,
+    update pin, unregister) with explicit reload-not-needed contract.
+  - `secrets.md` — `set_plugin_env_reference` + 1Password discovery
+    helpers (`list_vault_items`, `get_item_fields`).
+
+### Cross-refs
+
+- **`recipes/plugin/`** linked from `architecture.md` § "Configurator
+  MCP tools (v0.14.1)" and `reload.md` (added two rows: install/remove
+  and `set_plugin_env_reference` — both `hard` reload).
+
+### Tests
+
+No new test code. This ship is doctrine + allowed_tools surface only;
+no Python or YAML behavior changed beyond the configurator's
+self-described tool list. Plan 4b coverage for the underlying tools
+remains in place (`tests/test_marketplace_ops.py`,
+`tests/test_marketplace_tools.py`, `tests/test_install_casa_plugin.py`,
+`tests/test_verify_plugin_state.py`, `tests/test_plugin_env_conf.py`).
+`uninstall_casa_plugin`, `set_plugin_env_reference`, `list_vault_items`,
+and `get_item_fields` have no direct unit coverage but have been live
+since v0.14.1; the canonical end-to-end exercise is P12 in the
+exploration playbook.
+
+### Success signal
+
+Next exploration session reruns P12 step 3 (Configurator installs the
+`casa-probe-*` plugin into Ellen's `enabledPlugins`) end-to-end.
+Steps 4-7 (verify load, in-agent skill use, configurator removes,
+graceful degradation) become exercisable for the first time.
+
 ## [0.27.0] - 2026-04-30 — Phase 6: Polish (E-5 + E-9 + Bug 6)
 
 Closes the bug-review-2026-04-29 backlog. Three independent

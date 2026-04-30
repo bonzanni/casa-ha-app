@@ -238,6 +238,10 @@ never crashes boot).
 
 ### Configurator MCP tools (v0.14.1)
 
+These tools are wired into your `definition.yaml::tools.allowed` and
+exercised through the recipes under `recipes/plugin/` (install,
+remove, marketplace, secrets).
+
 Core:
 - `marketplace_add_plugin` — append entry to user marketplace + refresh CC.
 - `marketplace_remove_plugin` — remove from user marketplace.
@@ -255,6 +259,11 @@ Helpers:
 - `set_plugin_env_reference` — upsert `VAR=value` in plugin-env.conf.
 - `list_vault_items` — `op item list --format json` filtered.
 - `get_item_fields` — `op item get --format json` field metadata.
+
+See `recipes/plugin/install.md` for the canonical install flow,
+`recipes/plugin/remove.md` for uninstall, `recipes/plugin/marketplace.md`
+for marketplace-only operations, and `recipes/plugin/secrets.md` for
+wiring plugin env vars via 1Password references.
 
 ### 1P universal resolver
 

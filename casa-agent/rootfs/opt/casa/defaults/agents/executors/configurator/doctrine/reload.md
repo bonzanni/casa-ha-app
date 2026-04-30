@@ -28,6 +28,8 @@ Not every change needs a full addon restart. Choose the minimum reload that prop
 | Edit policies/disclosure.yaml | hard |
 | Create a NEW agent | hard |
 | Delete an agent | hard |
+| Install or remove a plugin (`install_casa_plugin` / `uninstall_casa_plugin`) | hard |
+| Set a plugin env var (`set_plugin_env_reference`) | hard |
 
 ## Order of operations
 
