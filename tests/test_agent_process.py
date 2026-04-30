@@ -449,6 +449,55 @@ class TestAssistantMessageSeparator:
         )
 
 
+class TestPhase4bDispatch:
+    """Phase 4b Bug 3 parity: Ellen's _attempt_sdk_turn dispatches
+    every SDK message kind through sdk_logging, identical shape to
+    the in_casa-driver path."""
+
+    async def test_attempt_sdk_turn_logs_per_message(
+        self, tmp_path, caplog,
+    ):
+        import logging
+        from claude_agent_sdk import (
+            AssistantMessage as _AM, ResultMessage as _RM,
+            SystemMessage as _SM, TextBlock as _TB,
+        )
+
+        class _RichFakeClient:
+            captured_options = None
+            def __init__(self, options):
+                _RichFakeClient.captured_options = options
+
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, text): pass
+
+            async def receive_response(self):
+                init = _SM.__new__(_SM)
+                init.subtype = "init"  # type: ignore[attr-defined]
+                init.data = {"model": "sonnet", "session_id": "abcdef12-fff"}  # type: ignore[attr-defined]
+                yield init
+                yield _mk_assistant("Hi.")
+                rm = _RM.__new__(_RM)
+                rm.session_id = "abcdef12-fff"  # type: ignore[attr-defined]
+                rm.usage = {"input_tokens": 50, "output_tokens": 5}  # type: ignore[attr-defined]
+                rm.num_turns = 1  # type: ignore[attr-defined]
+                rm.total_cost_usd = 0.0001  # type: ignore[attr-defined]
+                yield rm
+
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+
+        with caplog.at_level(logging.DEBUG, logger="sdk"):
+            with patch("agent.ClaudeSDKClient", _RichFakeClient):
+                await agent._process(_msg("telegram", "200", "hi"))
+
+        msgs = [r.getMessage() for r in caplog.records if r.name == "sdk"]
+        assert any("system_init" in m and "model=sonnet" in m for m in msgs), msgs
+        assert any("assistant_message idx=1" in m and "chars=3" in m for m in msgs), msgs
+        assert any("turn_done" in m and "turns=1" in m for m in msgs), msgs
+
+
 # ---------------------------------------------------------------------------
 # Correlation-id end-to-end (spec 5.2 §7.4)
 # ---------------------------------------------------------------------------
