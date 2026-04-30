@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.28.1] - 2026-04-30 — E-A: Telegram channel fully broken since v0.22.0
+
+Surfaced live during the 2026-04-30 afternoon exploration session
+(`docs/bug-review-2026-04-30-exploration.md`, E-A) on the very first
+DM probe. Every inbound Telegram update — DM to Ellen, supergroup-
+topic message, slash-command, originator check — has been dropped
+since v0.22.0 (Phase 3a, commit `7f58143`, 2026-04-30 morning) with a
+silent `WARNING channels.telegram: Telegram handler error (not
+retryable): TelegramChannel.handle_update() takes 2 positional
+arguments but 3 were given`. PTB returned 200 to the webhook caller,
+so smoke probes (`/invoke`, `/api/converse`) and master CI never
+noticed; the bug was load-bearing for ~half the exploration playbook
+(P4/P5/P6/P11/P12/P15 are all engagement-driven).
+
+### Fixed
+
+- **`casa-agent/rootfs/opt/casa/channels/telegram.py:479`** — added
+  the `_context: ContextTypes.DEFAULT_TYPE | None = None` parameter
+  to `handle_update`. PTB v20+ `MessageHandler` invokes its callback
+  with `(update, context)`; the missing parameter raised TypeError on
+  every Telegram update for ~10 hours. Context is unused — the
+  channel reads everything it needs from `update` and Casa's
+  bus/engagement registry — but the parameter must exist for PTB's
+  dispatch contract.
+
+### Tests
+
+- **`tests/test_telegram_engagement_routing.py::TestPTBDispatchContract`** —
+  two regression tests:
+  - `test_handle_update_accepts_ptb_two_arg_callback` — calls
+    `ch.handle_update(update, ptb_context)` directly, asserts no
+    TypeError.
+  - `test_handle_update_dispatched_through_ptb_message_handler` —
+    builds a real `MessageHandler(filters.TEXT, ch.handle_update)`
+    and walks a synthetic update through `handler.callback(update,
+    context)` exactly the way `Application.process_update` does.
+    The single-line difference between this test and the
+    `handle_update(u)` unit calls already in the file is what would
+    have caught E-A pre-ship.
+
+### Cross-refs
+
+- `docs/bug-review-2026-04-30-exploration.md::E-A` — full
+  forensic + suggested-fix-shape that drove this ship.
+- `docs/bug-review-2026-04-30-exploration.md::E-B` — companion
+  observability gap (`agent.py:374-378` swallows `Memory call failed`
+  exception without `exc_info=True`); not fixed in this ship —
+  filed for a follow-up session.
+
 ## [0.28.0] - 2026-04-30 — E-16: Configurator plugin-tools gap
 
 Closes the Plan 4b consumer-side gap surfaced by the 2026-04-30 audit

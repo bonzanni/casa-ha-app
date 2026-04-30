@@ -70,6 +70,55 @@ class TestSupergroupRouting:
         ch._driver_send_user_turn.assert_not_called()
 
 
+class TestPTBDispatchContract:
+    """E-A regression (v0.22.0..v0.28.0): PTB ``MessageHandler`` invokes
+    its callback as ``await callback(update, context)``. Pre-fix
+    ``handle_update`` declared ``(self, update)`` only, so every inbound
+    Telegram update raised ``TypeError: ... takes 2 positional arguments
+    but 3 were given`` — DM, supergroup-topic message, slash-command,
+    originator check, every Telegram surface alike. PTB swallowed the
+    TypeError into a ``logger.warning`` via ``_on_ptb_error`` and
+    returned 200 to the webhook caller, so smoke (`/invoke`,
+    `/api/converse`) and master CI never noticed.
+    """
+
+    async def test_handle_update_accepts_ptb_two_arg_callback(
+        self, fake_telegram_bot,
+    ):
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._route_to_ellen = AsyncMock()
+
+        u = _mk_update(chat_id=100, text="hi Ellen")
+        # PTB calls handlers with (update, context). The bound method
+        # therefore receives 3 positional args. handle_update MUST
+        # accept the trailing context arg (used or not). Pre-fix this
+        # raised TypeError: "takes 2 positional arguments but 3 were given".
+        ptb_context = MagicMock(name="CallbackContext")
+        await ch.handle_update(u, ptb_context)
+        ch._route_to_ellen.assert_awaited_once()
+
+    async def test_handle_update_supergroup_topic_with_ptb_context(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """Same regression coverage on the engagement-routing branch
+        (``_driver_send_user_turn``) so a future signature change that
+        only breaks one leg fails the test."""
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._driver_send_user_turn = AsyncMock()
+        ch._engagement_registry = engagement_fixture.registry
+        rec = engagement_fixture.active_record
+
+        u = _mk_update(chat_id=-1001, text="continue please", thread_id=rec.topic_id)
+        await ch.handle_update(u, MagicMock(name="CallbackContext"))
+        ch._driver_send_user_turn.assert_awaited_once()
+
+
 async def rec_with_session(registry, rec, session_id):
     await registry.persist_session_id(rec.id, session_id)
     await registry.mark_idle(rec.id)
