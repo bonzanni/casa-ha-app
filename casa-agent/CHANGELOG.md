@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.27.0] - 2026-04-30 — Phase 6: Polish (E-5 + E-9 + Bug 6)
+
+Closes the bug-review-2026-04-29 backlog. Three independent
+fixes; one ship.
+
+### Fixed
+
+- **E-5 — Ellen LLM arithmetic on finance failure.** New
+  `## Financial arithmetic` subsection in
+  `assistant/prompts/system.md` forbids Ellen from computing
+  financial figures herself. On `delegate_to_agent('finance')`
+  failure, Ellen now declines (*"I can't compute that without
+  Alex — let's try again once finance is reachable"*) rather
+  than producing an LLM-computed table or total. Architectural
+  invariant: no answer the user sees was computed by an LLM.
+- **E-9 — Telegram engagement topic title truncation.** New
+  `text_util.truncate_for_topic` helper with UTF-8 byte-strict
+  word-boundary truncation and Unicode ellipsis. Replaces four
+  `[:80]` hard slices in `tools.py` (delegate_to_agent +
+  engage_executor, open + rename). Topic names now fit the
+  128-byte Telegram Bot API limit and break on word boundaries.
+- **Bug 6 — Honcho `executor:<type>` regex rejection.** Swapped
+  `executor:<type>` → `executor-<type>` at three call sites in
+  `tools.py` (read in `_fetch_executor_archive`, write in
+  `_finalize_engagement`'s archive branch). Honcho v3 regex
+  `^[A-Za-z0-9_-]+$` rejects colon; M4 L3 cross-run memory
+  injection was effectively dark for executor engagements
+  (configurator, hello-driver, plugin-developer). No migration
+  needed — existing colon-keyed peers were unreachable.
+
+### Added
+
+- `casa-agent/rootfs/opt/casa/text_util.py` (new module).
+
+### Tests
+
+- New `tests/test_text_util.py` (6 unit tests for the helper).
+- Extended `tests/test_assistant_prompts.py` with the E-5 anchor
+  regression guard.
+- Extended `tests/test_delegate_to_agent_interactive.py` with a
+  long-task topic-name budget assertion.
+- Extended `tests/test_finalize_engagement.py` with the
+  executor-archive hyphen assertion.
+- Updated `tests/test_engage_executor_memory.py` colon → hyphen
+  at four assertion sites (Bug 6).
+
 ## [0.26.1] - 2026-04-30 — Phase 5: Memory hygiene (E-15)
 
 ### Changed
