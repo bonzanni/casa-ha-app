@@ -275,6 +275,24 @@ class TelegramChannel(Channel):
         # Publish the rebuilt app atomically.
         self._app = app
 
+        # E-F (v0.30.0): engagement-feature setup MUST run after
+        # `self._app = app`. Pre-fix, casa_core.py invoked this once at
+        # boot — but if that first `_rebuild` raised on `set_webhook`
+        # (transient network blip), `self._app` was never set, the boot
+        # call to `setup_engagement_features()` saw `self.bot is None`,
+        # raised AttributeError on `None.get_me()`, and left
+        # `engagement_permission_ok=False` permanently. Every subsequent
+        # supervisor-driven `_rebuild` succeeded, but no path re-ran the
+        # engagement setup. Tying it to `_rebuild` makes it self-healing
+        # on every successful rebuild. Idempotent — line 647 resets the
+        # flag at the start of each call.
+        try:
+            await self.setup_engagement_features()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "setup_engagement_features failed during _rebuild: %s", exc,
+            )
+
     # ------------------------------------------------------------------
     # Health probe + PTB error handler (spec 5.2 §4.2)
     # ------------------------------------------------------------------

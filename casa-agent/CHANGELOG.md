@@ -1,5 +1,100 @@
 # Changelog
 
+## [0.30.0] - 2026-04-30 — Bug bundle: E-F + M3-self peer_target
+
+Closes the two HIGH bugs filed in
+`docs/bug-review-2026-04-30-exploration3.md`. Single shipping sprint
+under pre-1.0.0 license; covers a first-boot race that left every
+engagement spawn refused as `engagement_not_configured` until manual
+restart, and a Honcho 2.1.1 contract change that has been silently
+dropping per-scope session digests on every Ellen DM since the M3
+landing.
+
+### Fixed
+
+- **E-F (HIGH) — `setup_engagement_features` boot-race.** Pre-fix,
+  `casa_core.py:1483` invoked `setup_engagement_features()` once at
+  boot, immediately after `channel_manager.start_all()`. If the first
+  `_rebuild` raised on `set_webhook` (transient first-boot DNS or
+  network blip), `self._app` was never set, the boot call hit
+  `None.get_me()`, and `engagement_permission_ok` stayed permanently
+  False until manual restart. The supervisor's eventual successful
+  rebuild populated `self._app`, but no path re-invoked
+  `setup_engagement_features()`. Net effect: every `engage_executor`
+  call returned `engagement_not_configured` — masking every
+  configurator/plugin-developer/UC1/UC3 engagement spawn (P4/P5/P8/P11/
+  P12/P15) on a fresh boot that hit any network blip. Fix in two parts:
+  (1) `casa-agent/rootfs/opt/casa/channels/telegram.py:_rebuild` —
+  `setup_engagement_features()` now runs as a tail step AFTER
+  `self._app = app`, so every successful rebuild (initial OR
+  supervisor-driven recovery) flips the permission flag automatically;
+  (2) `casa-agent/rootfs/opt/casa/casa_core.py` — removed the redundant
+  boot-time call. Belt-and-braces (3): `tools.py::engage_executor`
+  failure path now attempts one in-line `setup_engagement_features()`
+  retry when supergroup IS configured but the flag is still False —
+  self-healing on the user's first engagement attempt without waiting
+  for a probe-driven rebuild. Surfaced 2026-04-30 ~19:47Z exploration3
+  (cid `45cd9e00`); workaround verified live as `ha apps restart` at
+  21:36Z (cid `1cef7687`).
+
+- **M3-self (HIGH) — `Session.context()` peer_target requirement.**
+  Honcho 2.1.1's `Session.context()` validator rejects `search_query`
+  without a paired `peer_target` —
+  `ValueError: You must provide a peer_target when search_query is
+  provided`. `memory.py::HonchoMemoryProvider.get_context` was issuing
+  the SDK call without `peer_target`, so every per-scope session read
+  on every Ellen DM raised; v0.29.0's E-B `exc_info=True` exposed the
+  underlying exception (previously swallowed since the Honcho 2.1.1
+  upgrade ~10 days). Functionally, Ellen fell through to `digest=""`
+  on the M3-self path; peer_overlay carried continuity, but per-scope
+  session digest was silently absent. Fix at
+  `casa-agent/rootfs/opt/casa/memory.py:316-352` — thread `agent_role`
+  through the abstract / Honcho / Cached / Sqlite / NoOp providers,
+  and pass `peer_target=agent_role` to `session.context()` whenever
+  `search_query` is set (spec § 2.3 — session memory is agent-targeted).
+  Call sites updated: `agent.py::_one_scope` (the primary failing
+  caller) and `tools.py::_fetch_executor_archive` (telemetry-only on
+  the no-query path; consistency with the threaded contract).
+
+### Tests
+
+- `tests/test_memory_honcho.py` —
+  `test_get_context_passes_peer_target_when_agent_role_and_search_query`
+  asserts `peer_target=agent_role` is forwarded when both are
+  supplied;
+  `test_get_context_omits_peer_target_when_search_query_is_none`
+  asserts the no-query path stays minimal (Honcho only requires the
+  pairing on the search-query path).
+- `tests/test_telegram_reconnect.py::TestSetupEngagementFeaturesInRebuild` —
+  `test_first_set_webhook_fails_then_recovers_engagement_permission_flips_true`
+  reproduces the E-F race by failing `set_webhook` once, then asserts
+  `engagement_permission_ok=True` flips automatically after the
+  supervisor's recovery rebuild — no external retry step.
+  `test_setup_engagement_features_runs_after_app_is_published` is a
+  spy-based ordering invariant: `setup_engagement_features()` MUST
+  observe `self._app` already set when invoked.
+- `tests/test_engage_executor_tool.py` — two new cases cover the
+  defensive in-line retry: it fires once when supergroup is set but
+  the flag is False, and it does NOT fire when supergroup is unset
+  (the operator hasn't opted into engagements).
+- Provider mocks across `tests/test_memory.py`, `tests/test_memory_cached.py`,
+  `tests/test_agent_process.py`, `tests/test_engage_executor_memory.py`,
+  `tests/test_notification_handling.py` updated to accept the new
+  `agent_role` kwarg without changing call-shape assertions.
+
+### Notes
+
+- v0.29.0's E-E + E-D structural fixes were live-verified during
+  exploration3 light-cleanup workaround (cid `1cef7687`, blessed-MCP
+  path SHA `2b4ccab5`, no Bash fallback). E-F closure makes the
+  workaround unnecessary — every fresh boot should land
+  engagement-ready on the first successful `_rebuild`.
+- Cosmetic-only `CLIConnectionError('ProcessTransport is not ready
+  for writing')` from `claude_agent_sdk._internal.query.Query.
+  _handle_control_request` after `emit_completion` finalizes is
+  filed in `docs/bug-review-2026-04-30-exploration3.md` and deferred
+  to a future ship — engagement outcomes are unaffected.
+
 ## [0.29.0] - 2026-04-30 — Bug bundle: E-E + E-D + E-B + E-C
 
 Closes the four bugs filed in

@@ -20,7 +20,7 @@ class FakeMemoryProvider(MemoryProvider):
 
     def __init__(self) -> None:
         self.ensure_calls: list[tuple[str, str, str]] = []
-        self.get_calls: list[tuple[str, int, str | None]] = []
+        self.get_calls: list[tuple[str, int, str | None, str | None]] = []
         self.add_calls: list[tuple[str, str, str, str, str]] = []
         self.cross_calls: list[tuple[str, str, int, str]] = []
         self.overlay_calls: list[tuple[str, str, str, int]] = []
@@ -31,9 +31,9 @@ class FakeMemoryProvider(MemoryProvider):
         self.ensure_calls.append((session_id, agent_role, user_peer))
 
     async def get_context(
-        self, session_id, tokens, search_query=None,
+        self, session_id, tokens, search_query=None, agent_role=None,
     ):
-        self.get_calls.append((session_id, tokens, search_query))
+        self.get_calls.append((session_id, tokens, search_query, agent_role))
         return f"ctx({session_id})"
 
     async def peer_overlay_context(
@@ -72,10 +72,11 @@ async def test_fake_roundtrip_threads_user_peer():
     assert mem.ensure_calls == [
         ("telegram-1-assistant", "assistant", "nicola"),
     ]
-    # E-14 / Phase 5 § 2.5: get_context no longer takes agent_role or
-    # user_peer — peer-level overlay is split into peer_overlay_context.
+    # M3-self (v0.30.0): get_context now also accepts agent_role
+    # (forwarded as Honcho's peer_target). Caller didn't supply one
+    # here so the recorded value is None.
     assert mem.get_calls == [
-        ("telegram-1-assistant", 4000, "hi"),
+        ("telegram-1-assistant", 4000, "hi", None),
     ]
     assert mem.add_calls == [
         ("telegram-1-assistant", "assistant", "hi", "hello", "nicola"),

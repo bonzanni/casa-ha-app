@@ -41,23 +41,20 @@ async def test_returns_empty_when_archive_empty():
     kwargs = mp.get_context.await_args.kwargs
     assert kwargs["session_id"] == "telegram-42-executor-configurator"
     assert kwargs["tokens"] == 2000
-    # E-D (v0.29.0): MemoryProvider.get_context's signature dropped
-    # agent_role and user_peer in v0.26.0 (E-14). The caller here held
-    # the kwarg for three minor versions and silently TypeError'd on
-    # every executor spawn until v0.29.0.
-    assert "agent_role" not in kwargs, (
-        "E-D regression: _fetch_executor_archive must not pass "
-        "agent_role= to get_context — that kwarg was dropped in "
-        "v0.26.0 / E-14."
-    )
+    # M3-self (v0.30.0): agent_role is back in the signature — but with
+    # different semantics. v0.26.0 / E-14 dropped agent_role/user_peer
+    # because the abstract had bound them as overlay-fetch parameters
+    # (now relocated to peer_overlay_context). v0.30.0 reintroduces
+    # ONLY agent_role, threaded as Honcho's peer_target so semantic
+    # retrieval is scoped to the agent peer. user_peer remains dropped.
+    assert kwargs["agent_role"] == "executor-configurator"
     assert "user_peer" not in kwargs
 
 
 def test_get_context_signature_locks_kwargs():
     """Lock MemoryProvider.get_context's parameter set against future
-    drift. E-D regression: tools.py:1181 was passing agent_role= to
-    get_context, a kwarg dropped from the ABC in v0.26.0; every executor
-    engagement silently failed to load its archive. This introspection
+    drift. v0.30.0 / M3-self: agent_role is now expected (forwarded as
+    Honcho's peer_target). user_peer remains dropped. This introspection
     test catches any future caller-vs-ABC divergence at unit-test time
     rather than waiting for an exploration session."""
     import inspect
@@ -65,7 +62,7 @@ def test_get_context_signature_locks_kwargs():
 
     sig = inspect.signature(MemoryProvider.get_context)
     actual = set(sig.parameters.keys())
-    expected = {"self", "session_id", "tokens", "search_query"}
+    expected = {"self", "session_id", "tokens", "search_query", "agent_role"}
     assert actual == expected, (
         f"MemoryProvider.get_context kwargs drifted. "
         f"Expected {expected}, got {actual}. "
@@ -193,7 +190,7 @@ async def test_executor_archive_is_read_on_second_engagement(tmp_path):
             )
 
         async def get_context(self, *, session_id, tokens,
-                              search_query=None):
+                              search_query=None, agent_role=None):
             entries = archive.get(session_id, [])
             if not entries:
                 return ""
