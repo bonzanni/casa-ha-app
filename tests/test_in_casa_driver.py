@@ -366,6 +366,41 @@ class TestInCasaStart:
         assert emits[1] == "First.\n\nSecond."
         handle.finalize.assert_awaited_once_with("First.\n\nSecond.")
 
+    async def test_start_injects_stderr_callback(self, monkeypatch):
+        """Bug 4: in_casa_driver.start() must inject the stderr callback
+        on the options before ClaudeSDKClient is built. engagement_id
+        flows in via the engagement param."""
+        from drivers.in_casa_driver import InCasaDriver
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        captured: list = []
+
+        class _FakeClient:
+            def __init__(self, options):
+                captured.append(options)
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+            async def receive_response(self):
+                if False:
+                    yield None  # pragma: no cover
+            async def close(self): pass
+
+        monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+
+        drv = InCasaDriver(topic_stream_factory=_mk_noop_factory())
+        rec = _make_record()
+
+        await drv.start(
+            rec, prompt="hi", options=ClaudeAgentOptions(model="sonnet"),
+        )
+
+        assert captured, "_FakeClient never constructed"
+        assert callable(captured[0].stderr), (
+            "Phase 4b Bug 4: ClaudeAgentOptions.stderr must be set "
+            "by in_casa_driver.start() before ClaudeSDKClient is built"
+        )
+
 
 class TestInCasaSendUserTurn:
     async def test_send_user_turn_streams_reply_to_topic(self, monkeypatch):

@@ -162,6 +162,7 @@ class Observer:
         from claude_agent_sdk import (
             AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, TextBlock,
         )
+        import sdk_logging
         system = (
             "You are Ellen's observer. Decide whether to interject in the main "
             "chat about an in-flight engagement. Respond with STRICT JSON: "
@@ -186,7 +187,11 @@ class Observer:
         )
         out = ""
         try:
-            async with ClaudeSDKClient(options) as client:
+            async with ClaudeSDKClient(
+                sdk_logging.with_stderr_callback(
+                    options, engagement_id=rec.id[:8],
+                ),
+            ) as client:
                 await client.query(body)
                 async for msg in client.receive_response():
                     if isinstance(msg, AssistantMessage):

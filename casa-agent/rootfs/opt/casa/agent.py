@@ -487,7 +487,11 @@ class Agent:
                 idx = 0
                 started_ms = time.monotonic() * 1000
                 tool_names_by_id: dict[str, str] = {}
-                async with ClaudeSDKClient(options) as client:
+                async with ClaudeSDKClient(
+                    sdk_logging.with_stderr_callback(
+                        options, engagement_id=None,
+                    ),
+                ) as client:
                     await client.query(user_text)
                     async for sdk_msg in client.receive_response():
                         # Phase 4b dispatch — wrapped so a malformed block

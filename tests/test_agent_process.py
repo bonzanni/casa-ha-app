@@ -497,6 +497,26 @@ class TestPhase4bDispatch:
         assert any("assistant_message idx=1" in m and "chars=3" in m for m in msgs), msgs
         assert any("turn_done" in m and "turns=1" in m for m in msgs), msgs
 
+    async def test_attempt_sdk_turn_injects_stderr_callback(
+        self, tmp_path,
+    ):
+        """Bug 4: ClaudeAgentOptions passed to ClaudeSDKClient must
+        carry our stderr callback so the SDK pipes the CLI subprocess
+        stderr through subprocess_cli.connect()."""
+        FakeClient.reset()
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            await agent._process(_msg("telegram", "201", "hi"))
+
+        opts = FakeClient.captured_options
+        assert opts is not None, "FakeClient never received options"
+        assert callable(opts.stderr), (
+            "Phase 4b Bug 4: ClaudeAgentOptions.stderr must be set "
+            "to make_stderr_logger's callback before ClaudeSDKClient is built"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Correlation-id end-to-end (spec 5.2 §7.4)

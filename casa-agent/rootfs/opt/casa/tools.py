@@ -46,6 +46,7 @@ from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from error_kinds import _classify_error
 from mcp_registry import McpServerRegistry
+import sdk_logging
 from engagement_registry import EngagementRecord, EngagementRegistry
 from specialist_registry import (
     DelegationComplete,
@@ -476,7 +477,9 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
     text = ""
     token = agent_mod.origin_var.set(child_origin)
     try:
-        async with ClaudeSDKClient(options) as client:
+        async with ClaudeSDKClient(
+            sdk_logging.with_stderr_callback(options, engagement_id=None),
+        ) as client:
             await client.query(prompt)
             async for sdk_msg in client.receive_response():
                 if isinstance(sdk_msg, AssistantMessage):
@@ -1650,7 +1653,11 @@ async def _synthesize_answer(
     )
     prompt = f"Context:\n{context}\n\nQuestion: {question}"
     out = ""
-    async with ClaudeSDKClient(options) as client:
+    eng = engagement_var.get(None)
+    eng_id = eng.id[:8] if eng is not None else None
+    async with ClaudeSDKClient(
+        sdk_logging.with_stderr_callback(options, engagement_id=eng_id),
+    ) as client:
         await client.query(prompt)
         async for msg in client.receive_response():
             if isinstance(msg, AssistantMessage):

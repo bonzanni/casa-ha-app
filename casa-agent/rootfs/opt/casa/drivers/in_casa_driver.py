@@ -80,7 +80,11 @@ class InCasaDriver(DriverProtocol):
         assert engagement.topic_id is not None, (
             "in_casa driver requires a topic_id (got None)"
         )
-        client = ClaudeSDKClient(options)
+        client = ClaudeSDKClient(
+            sdk_logging.with_stderr_callback(
+                options, engagement_id=engagement.id[:8],
+            ),
+        )
         ctx = client.__aenter__()
         entered = await ctx if asyncio.iscoroutine(ctx) else ctx
         self._clients[engagement.id] = entered or client
@@ -134,7 +138,11 @@ class InCasaDriver(DriverProtocol):
             )
             return
         options = ClaudeAgentOptions(resume=session_id)
-        client = ClaudeSDKClient(options)
+        client = ClaudeSDKClient(
+            sdk_logging.with_stderr_callback(
+                options, engagement_id=engagement.id[:8],
+            ),
+        )
         entered = await client.__aenter__()
         self._clients[engagement.id] = entered or client
         self._ctx_stack[engagement.id] = client
