@@ -124,9 +124,9 @@ class BudgetTracker:
             ):
                 self._warned.add(session_id)
                 logger.warning(
-                    "Memory digest over budget for session %s: "
+                    "Memory digest exceeded expected envelope for session %s: "
                     "used=%d budget=%d (>1.1x for %d turns). "
-                    "Investigate the memory backend.",
+                    "Memory shape may have regressed.",
                     session_id,
                     used_tokens,
                     budget,
