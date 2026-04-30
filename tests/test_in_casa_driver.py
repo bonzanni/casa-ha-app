@@ -103,6 +103,49 @@ class TestInCasaStart:
         await drv.start(rec, prompt="hi", options=ClaudeAgentOptions(model="sonnet"))
         sender.assert_awaited_once_with(42, "Hello from Alex")
 
+    async def test_start_separates_multiple_assistant_messages_with_double_newline(
+        self, monkeypatch,
+    ):
+        """E-8: when the SDK emits multiple AssistantMessages in one turn
+        (typical executor with tool calls), the final text posted to topic
+        must have \\n\\n between AssistantMessage boundaries — not a glued
+        paragraph (bug-review-2026-04-29-exploration.md § E-8)."""
+        from drivers.in_casa_driver import InCasaDriver
+
+        class _FakeClient:
+            def __init__(self, options): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+            async def receive_response(self):
+                yield _mk_assistant("Reading the doctrine files first.")
+                yield _mk_assistant("Now let me look at Ellen's config files.")
+                yield _mk_assistant("The trait belongs in character.yaml.")
+            async def close(self): pass
+
+        monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+
+        sender = AsyncMock()
+        drv = InCasaDriver(send_to_topic=sender)
+        rec = _make_record()
+
+        await drv.start(rec, prompt="hi", options=ClaudeAgentOptions(model="sonnet"))
+
+        sender.assert_awaited_once()
+        topic_id, text = sender.await_args.args
+        assert topic_id == 42
+        # All three pieces present
+        assert "Reading the doctrine files first." in text
+        assert "Now let me look at Ellen's config files." in text
+        assert "The trait belongs in character.yaml." in text
+        # The bug: pre-fix the text reads "...first.Now let me..." (glued).
+        assert "first.Now let me" not in text, (
+            f"E-8 not fixed: AssistantMessages glued without separator. Got: {text!r}"
+        )
+        # Positive: \n\n between successive AssistantMessages
+        assert "first.\n\nNow let me look" in text
+        assert "config files.\n\nThe trait belongs" in text
+
 
 class TestInCasaSendUserTurn:
     async def test_send_user_turn_streams_reply_to_topic(self, monkeypatch):

@@ -494,11 +494,21 @@ class Agent:
                                 attempt_sid = sid
                             attempt_usage = extract_usage(sdk_msg)
                         elif isinstance(sdk_msg, AssistantMessage):
-                            for block in getattr(sdk_msg, "content", []):
-                                if isinstance(block, TextBlock):
-                                    attempt_text += block.text
-                                    if on_token is not None:
-                                        await on_token(attempt_text)
+                            # E-2: collect TextBlocks of THIS AssistantMessage
+                            # (within-message blocks are one model thought;
+                            # no separator between them). Insert "\n\n" only
+                            # at AssistantMessage boundaries so the streamed
+                            # message reads as discrete thoughts.
+                            msg_text = "".join(
+                                b.text for b in getattr(sdk_msg, "content", [])
+                                if isinstance(b, TextBlock)
+                            )
+                            if msg_text:
+                                if attempt_text:
+                                    attempt_text += "\n\n"
+                                attempt_text += msg_text
+                                if on_token is not None:
+                                    await on_token(attempt_text)
                 return attempt_text, attempt_sid, attempt_usage
 
             try:

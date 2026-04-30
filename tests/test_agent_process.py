@@ -399,6 +399,56 @@ class TestRetryIntegration:
         assert FakeClient.attempts == 2
 
 
+class TestAssistantMessageSeparator:
+    """E-2: Ellen's cumulative attempt_text must insert \\n\\n between
+    successive AssistantMessages, so the streamed message reads as discrete
+    thoughts rather than one glued paragraph
+    (bug-review-2026-04-29-exploration.md § E-2)."""
+
+    async def test_two_assistant_messages_get_double_newline_separator(
+        self, tmp_path,
+    ):
+        """Feed SDK with ack + final answer as two AssistantMessages; the
+        last on_token argument must contain '\\n\\n' between them."""
+
+        class _TwoMsgClient(FakeClient):
+            async def receive_response(self):
+                if self._scheduled is not None:
+                    raise self._scheduled
+                yield _mk_assistant("Let me ask Tina to pull the house state for you.")
+                yield _mk_assistant("Here's the snapshot: lights are off.")
+                yield _mk_result("sdk-sid-e2", usage=FakeClient.usage)
+
+        FakeClient.reset()
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+
+        seen: list[str] = []
+
+        async def on_token(txt: str) -> None:
+            seen.append(txt)
+
+        with patch("agent.ClaudeSDKClient", _TwoMsgClient):
+            msg = _msg("telegram", "123", "are the lights on?")
+            await agent._process(msg, on_token=on_token)
+
+        # on_token was called at least twice (once per AssistantMessage)
+        assert len(seen) >= 2, f"expected ≥2 on_token calls, got {len(seen)}: {seen}"
+        last = seen[-1]
+        # Both pieces present in the cumulative final
+        assert "Let me ask Tina" in last
+        assert "Here's the snapshot" in last
+        # The bug: pre-fix the cumulative reads "...for you.Here's..."
+        assert "for you.Here's" not in last, (
+            f"E-2 not fixed: ack and answer concatenated without separator. "
+            f"Final cumulative on_token text: {last!r}"
+        )
+        # Positive: \n\n between the two AssistantMessages
+        assert "for you.\n\nHere's the snapshot" in last, (
+            f"Expected '\\n\\n' between successive AssistantMessages. Got: {last!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Correlation-id end-to-end (spec 5.2 §7.4)
 # ---------------------------------------------------------------------------
