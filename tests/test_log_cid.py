@@ -234,6 +234,31 @@ class TestInstallLogging:
         assert "uvwxyz1234567890" not in line
         assert "***" in line  # redaction marker present, not just truncation
 
+    def test_otel_logger_quieted_to_warning(self, monkeypatch):
+        """Bug 7: install_logging must set the `opentelemetry` logger to
+        WARNING so that the SDK's DEBUG-level 'OTEL trace context
+        injection failed' traceback (logged inside
+        claude_agent_sdk._internal.transport.subprocess_cli) is never
+        emitted at Casa's prod DEBUG level (spec phase4 §5.2)."""
+        monkeypatch.delenv("LOG_FORMAT", raising=False)
+        # Pre-state: ensure logger is at default level (or below WARNING).
+        otel_logger = logging.getLogger("opentelemetry")
+        otel_logger.setLevel(logging.NOTSET)
+
+        try:
+            install_logging(stream=StringIO())
+            # The exact contract: a DEBUG log call on the OTEL logger
+            # must NOT propagate to handlers because the logger's
+            # effective level is WARNING.
+            assert otel_logger.getEffectiveLevel() == logging.WARNING, (
+                f"opentelemetry logger level not quieted: "
+                f"got {logging.getLevelName(otel_logger.getEffectiveLevel())}"
+            )
+        finally:
+            self._cleanup_casa()
+            # Restore default for subsequent tests.
+            otel_logger.setLevel(logging.NOTSET)
+
 
 class TestFormatDefaultIsJson:
     """5.5 item 4 — LOG_FORMAT unset now means JSON."""

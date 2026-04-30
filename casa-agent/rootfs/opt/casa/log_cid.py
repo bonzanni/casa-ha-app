@@ -205,3 +205,4 @@ def install_logging(
 
     root.setLevel(level)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("opentelemetry").setLevel(logging.WARNING)
