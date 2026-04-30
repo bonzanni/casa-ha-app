@@ -12,12 +12,17 @@ from abc import ABC, abstractmethod
 class MemoryProvider(ABC):
     """Abstract memory backend.
 
-    Four methods:
-      * ``ensure_session``      — idempotent session + peer setup.
-      * ``get_context``         — rendered memory digest for the system prompt.
-      * ``add_turn``            — persist one user→assistant turn unconditionally.
-      * ``cross_peer_context``  — read another agent's accumulated representation
-                                  of the user, semantic-filtered by query.
+    Five methods:
+      * ``ensure_session``       — idempotent session + peer setup.
+      * ``get_context``          — rendered scope-level digest (messages +
+                                   summary) for the system prompt.
+      * ``peer_overlay_context`` — rendered peer-level overlay (peer_card +
+                                   peer representation) for the
+                                   ``(observer_role, user_peer)`` pair,
+                                   cross-session, semantic-filtered.
+      * ``add_turn``             — persist one user→assistant turn unconditionally.
+      * ``cross_peer_context``   — read another agent's accumulated representation
+                                   of the user, semantic-filtered by query.
 
     Storage is never filtered; write-scoping is a structural property of
     ``session_id`` + peer topology (spec §4.3). Disclosure decisions
@@ -40,17 +45,32 @@ class MemoryProvider(ABC):
     async def get_context(
         self,
         session_id: str,
-        agent_role: str,
         tokens: int,
         search_query: str | None = None,
-        user_peer: str = "nicola",
     ) -> str:
-        """Return a rendered memory digest for the system prompt.
+        """Return a rendered scope-level digest (messages + summary only).
 
         Empty string if the session has no relevant content yet.
         ``search_query`` is the current user utterance (used by Honcho
-        for semantic retrieval). ``user_peer`` is the peer whose
-        perspective to target."""
+        for semantic retrieval). Peer-level overlay (peer_card + peer
+        representation) is NOT included here — see ``peer_overlay_context``."""
+
+    @abstractmethod
+    async def peer_overlay_context(
+        self,
+        observer_role: str,
+        user_peer: str,
+        search_query: str,
+        tokens: int,
+    ) -> str:
+        """Return a rendered peer-level overlay digest for the
+        ``(observer_role, user_peer)`` pair, semantic-filtered by
+        ``search_query``.
+
+        Cross-session — Honcho's peer.context() aggregates across all
+        sessions where both peers participate. Empty string when no
+        representation exists yet (cold start) or on backend error
+        (graceful degradation, parity with ``cross_peer_context``)."""
 
     @abstractmethod
     async def add_turn(
@@ -92,10 +112,17 @@ class NoOpMemory(MemoryProvider):
     async def get_context(
         self,
         session_id: str,
-        agent_role: str,
         tokens: int,
         search_query: str | None = None,
-        user_peer: str = "nicola",
+    ) -> str:
+        return ""
+
+    async def peer_overlay_context(
+        self,
+        observer_role: str,
+        user_peer: str,
+        search_query: str,
+        tokens: int,
     ) -> str:
         return ""
 
@@ -597,16 +624,14 @@ class _SqliteMsg:
 
 @dataclass
 class _SqliteCtx:
-    """Duck-typed shape consumed by ``_render``.
+    """Duck-typed shape consumed by ``_render_session``.
 
-    ``peer_card``, ``summary`` and ``peer_representation`` are always
-    absent on SQLite — graceful-degradation contract (M1.C, see
-    docs/superpowers/specs/2026-04-26-memory-architecture.md §10).
-    Honcho's SessionContext supplies them.
+    SQLite emits messages-only digests (no Honcho summary surface, no
+    peer-level data). Graceful-degradation contract per
+    docs/superpowers/specs/2026-04-26-memory-architecture.md §10.
     """
     messages: list[_SqliteMsg] = field(default_factory=list)
     summary: None = None
-    peer_representation: None = None
 
 
 class SqliteMemoryProvider(MemoryProvider):
@@ -665,13 +690,13 @@ class SqliteMemoryProvider(MemoryProvider):
             )
 
     async def get_context(
-        self, session_id: str, agent_role: str, tokens: int,
-        search_query: str | None = None, user_peer: str = "nicola",
+        self, session_id: str, tokens: int,
+        search_query: str | None = None,
     ) -> str:
         t_start = time.perf_counter()
         # search_query is ignored on SQLite (no semantic retrieval).
         rendered, peer_count = await asyncio.to_thread(
-            self._get_context_sync, session_id, tokens, user_peer,
+            self._get_context_sync, session_id, tokens,
         )
         # M3b telemetry — backend=sqlite always emits summary_present /
         # peer_repr_present False per the spec § 10 graceful-degradation
@@ -681,7 +706,7 @@ class SqliteMemoryProvider(MemoryProvider):
             extra={
                 "backend": "sqlite",
                 "session_id": session_id,
-                "agent_role": agent_role,
+                "agent_role": "?",
                 "t_ms": int((time.perf_counter() - t_start) * 1000),
                 "peer_count": peer_count,
                 "summary_present": False,
@@ -693,7 +718,7 @@ class SqliteMemoryProvider(MemoryProvider):
         return rendered
 
     def _get_context_sync(
-        self, session_id: str, tokens: int, user_peer: str,
+        self, session_id: str, tokens: int,
     ) -> tuple[str, int]:
         last_n = max(1, tokens // 40)
         msg_rows = self._conn.execute(
@@ -748,4 +773,17 @@ class SqliteMemoryProvider(MemoryProvider):
         # representation surface; cross-peer recall returns "" so
         # callers consistently see "no memory" rather than a partial
         # last-N digest that wouldn't be peer-perspective-attributed.
+        return ""
+
+    async def peer_overlay_context(
+        self,
+        observer_role: str,
+        user_peer: str,
+        search_query: str,
+        tokens: int,
+    ) -> str:
+        # Spec § 2.5 graceful-degradation contract: SQLite has no peer-level
+        # primitive (peer_card is a Honcho-deriver feature). Return "" so
+        # callers consistently see "no overlay" rather than partial or
+        # mis-attributed content.
         return ""
