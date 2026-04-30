@@ -183,7 +183,7 @@ async def test_second_turn_sees_first_turn_in_memory_context(tmp_path):
     await _drain(agent)
 
     ctx = await memory.get_context(
-        "telegram-n-personal-assistant", "assistant", tokens=4000,
+        "telegram-n-personal-assistant", tokens=4000,
     )
     assert "## Recent exchanges" in ctx
     assert "[nicola] first question" in ctx
