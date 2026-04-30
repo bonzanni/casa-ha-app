@@ -476,8 +476,18 @@ class TelegramChannel(Channel):
         """Default behavior for non-engagement chats: feed into existing _handle."""
         await self._handle(update, None)
 
-    async def handle_update(self, update) -> None:
-        """Single-arg entry-point. Routes by chat_id to engagement or Ellen."""
+    async def handle_update(
+        self, update, _context: ContextTypes.DEFAULT_TYPE | None = None
+    ) -> None:
+        """PTB MessageHandler entry-point. Routes by chat_id to engagement or Ellen.
+
+        The optional ``_context`` parameter exists so PTB's
+        ``Application.process_update`` can call this callback with its
+        ``(update, context)`` two-arg convention. Direct callers (and
+        the test suite) may invoke with just ``update``. The context
+        object itself is unused — the channel reads everything it needs
+        from ``update`` and Casa's bus/engagement registry.
+        """
         msg = getattr(update, "message", None)
         if msg is None:
             return
