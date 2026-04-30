@@ -1,15 +1,17 @@
-"""Tests for memory._render — SessionContext → markdown digest."""
+"""Tests for memory._render_session / _render_peer_overlay /
+_render_peer_context — render helpers split per Phase 5 spec § 2.6."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from memory import _render, _render_peer_context
+from memory import _render_session, _render_peer_context, _render_peer_overlay
 
 
 @dataclass
 class FakeMessage:
-    """Mirror of honcho-ai v3 Message used for the primary _render path.
+    """Mirror of honcho-ai v3 Message used for the primary
+    _render_session path.
 
     Field name `peer_id` matches the Honcho OpenAPI schema (verified
     Context7 at plan-write 2026-04-29). Pre-Phase-2, this stub used
@@ -25,9 +27,9 @@ class FakeMessage:
 class FakeSqliteMessage:
     """Mirror of memory._SqliteMsg — peer_name field, no peer_id.
 
-    Used to verify _render's SQLite-fallback branch still works after
-    Phase 2's defensive `getattr(m, "peer_id", None) or getattr(m,
-    "peer_name", "?")` change in memory.py.
+    Used to verify _render_session's SQLite-fallback branch still works
+    after Phase 2's defensive `getattr(m, "peer_id", None) or
+    getattr(m, "peer_name", "?")` change in memory.py.
     """
     peer_name: str
     content: str
@@ -51,14 +53,20 @@ class FakePeerContext:
     """Duck-typed stand-in for Honcho's peer.context() return shape.
 
     Only ``peer_card`` (list[str]) and ``representation`` (str | None) —
-    matches what `_render_peer_context` reads (spec §4)."""
+    matches what `_render_peer_context` and `_render_peer_overlay`
+    read (spec §4)."""
 
     peer_card: list[str] = field(default_factory=list)
     representation: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# _render_session — scope-level (messages + summary)
+# ---------------------------------------------------------------------------
+
+
 def test_empty_context_returns_empty_string():
-    out = _render(FakeContext(messages=[]))
+    out = _render_session(FakeContext(messages=[]))
     assert out == ""
 
 
@@ -67,7 +75,7 @@ def test_messages_only():
         FakeMessage("nicola", "hi"),
         FakeMessage("assistant", "hello"),
     ])
-    out = _render(ctx)
+    out = _render_session(ctx)
     assert "## Recent exchanges" in out
     assert "[nicola] hi" in out
     assert "[assistant] hello" in out
@@ -76,58 +84,146 @@ def test_messages_only():
     assert "## What I know about you" not in out
 
 
-def test_all_sections_present():
-    ctx = FakeContext(
-        messages=[FakeMessage("nicola", "hi")],
-        summary=FakeSummary("we talked about lights"),
-        peer_representation="User values brevity.",
-        peer_card=["prefers Celsius", "lives in Amsterdam"],
-    )
-    out = _render(ctx)
-    assert "## What I know about you" in out
-    assert "- prefers Celsius" in out
-    assert "- lives in Amsterdam" in out
-    assert "## Summary so far" in out
-    assert "we talked about lights" in out
-    assert "## My perspective" in out
-    assert "User values brevity." in out
-    assert "## Recent exchanges" in out
-    assert "[nicola] hi" in out
-
-
-def test_peer_card_alone():
-    ctx = FakeContext(messages=[], peer_card=["likes oat milk"])
-    out = _render(ctx)
-    assert out.startswith("## What I know about you")
-    assert "- likes oat milk" in out
-    assert "## Recent exchanges" not in out
-
-
 def test_summary_alone():
     ctx = FakeContext(messages=[], summary=FakeSummary("prior context"))
-    out = _render(ctx)
+    out = _render_session(ctx)
     assert "## Summary so far" in out
     assert "prior context" in out
 
 
-def test_peer_representation_alone():
-    ctx = FakeContext(messages=[], peer_representation="User prefers Dutch.")
-    out = _render(ctx)
+def test_summary_and_messages():
+    ctx = FakeContext(
+        messages=[FakeMessage("nicola", "hi")],
+        summary=FakeSummary("we talked about lights"),
+    )
+    out = _render_session(ctx)
+    assert "## Summary so far" in out
+    assert "we talked about lights" in out
+    assert "## Recent exchanges" in out
+    assert "[nicola] hi" in out
+    # peer-overlay sections are not part of session-level rendering
+    assert "## What I know about you" not in out
+    assert "## My perspective" not in out
+
+
+def test_render_session_drops_peer_card_and_representation():
+    """Regression guard — _render_session must NOT include peer-overlay
+    sections, even when those fields are present on the context object."""
+    ctx = FakeContext(
+        messages=[FakeMessage("nicola", "hi")],
+        summary=FakeSummary("prior chat"),
+        peer_representation="should not appear",
+        peer_card=["should not appear"],
+    )
+    out = _render_session(ctx)
+    assert "## What I know about you" not in out
+    assert "## My perspective" not in out
+    assert "should not appear" not in out
+    assert "## Summary so far" in out
+    assert "## Recent exchanges" in out
+
+
+def test_render_session_handles_honcho_v3_message_shape():
+    """E-1 regression: real Honcho Message exposes peer_id, not peer_name.
+
+    Before the fix, _render_session does `m.peer_name` and AttributeErrors
+    on the real SDK shape — which is why every butler delegation logged
+    'specialist memory read failed for butler' on production v0.20.0.
+    """
+    ctx = FakeContext(messages=[
+        FakeMessage("nicola", "hi"),
+        FakeMessage("butler", "hello"),
+    ])
+    out = _render_session(ctx)
+    assert "## Recent exchanges" in out
+    assert "[nicola] hi" in out
+    assert "[butler] hello" in out
+
+
+def test_render_session_handles_sqlite_message_shape():
+    """E-1 regression — SQLite branch of the peer_id/peer_name fallback.
+
+    _SqliteMsg (legacy in-process backend) keeps its `peer_name` field
+    after Phase 2; verify _render_session still routes through the
+    fallback branch correctly.
+    """
+    ctx = FakeContext(messages=[
+        FakeSqliteMessage(peer_name="nicola", content="hi"),
+    ])
+    out = _render_session(ctx)
+    assert "[nicola] hi" in out
+
+
+def test_render_session_message_without_either_field_uses_question_mark():
+    """E-1 defensive — neither peer_id nor peer_name → '?'.
+
+    Pure paranoia case; documents the second `getattr` default. Any
+    future refactor that breaks this assertion must be intentional.
+    """
+    @dataclass
+    class _Anonymous:
+        content: str
+
+    ctx = FakeContext(messages=[_Anonymous(content="ghost")])
+    out = _render_session(ctx)
+    assert "[?] ghost" in out
+
+
+# ---------------------------------------------------------------------------
+# _render_peer_overlay — peer-level self-overlay (peer_card +
+# representation, self-perspective heading scheme)
+# ---------------------------------------------------------------------------
+
+
+def test_render_peer_overlay_empty_returns_empty_string():
+    out = _render_peer_overlay(FakePeerContext())
+    assert out == ""
+
+
+def test_render_peer_overlay_peer_card_only():
+    ctx = FakePeerContext(peer_card=["likes oat milk", "lives in Amsterdam"])
+    out = _render_peer_overlay(ctx)
+    assert out.startswith("## What I know about you")
+    assert "- likes oat milk" in out
+    assert "- lives in Amsterdam" in out
+    assert "## My perspective" not in out
+
+
+def test_render_peer_overlay_representation_only():
+    ctx = FakePeerContext(representation="User prefers concise answers.")
+    out = _render_peer_overlay(ctx)
     assert "## My perspective" in out
-    assert "User prefers Dutch." in out
+    assert "User prefers concise answers." in out
 
 
-def test_empty_peer_card_omitted():
-    ctx = FakeContext(messages=[], peer_card=[])
-    out = _render(ctx)
+def test_render_peer_overlay_both_sections():
+    ctx = FakePeerContext(
+        peer_card=["prefers Celsius"],
+        representation="User values brevity.",
+    )
+    out = _render_peer_overlay(ctx)
+    idx_card = out.find("## What I know about you")
+    idx_persp = out.find("## My perspective")
+    assert idx_card != -1 and idx_persp != -1
+    assert idx_card < idx_persp
+
+
+def test_render_peer_overlay_empty_peer_card_omitted():
+    ctx = FakePeerContext(peer_card=[])
+    out = _render_peer_overlay(ctx)
     assert "## What I know about you" not in out
     assert out == ""
+
+
+# ---------------------------------------------------------------------------
+# _render_peer_context — peer-level cross-role overlay (M6, unchanged)
+# ---------------------------------------------------------------------------
 
 
 def test_render_peer_context_omits_empty_sections():
     """Empty peer.context() return → empty string, no placeholder.
 
-    Spec § 5.3: section omission rules parity with `_render`'s
+    Spec § 5.3: section omission rules parity with `_render_session`'s
     no-placeholder doctrine."""
     out = _render_peer_context(FakePeerContext(), observer_role="finance")
     assert out == ""
@@ -168,49 +264,3 @@ def test_render_peer_context_renders_both_sections():
     assert "User prioritizes Q2 invoicing" in out
     # the representation is appended after the peer_card section, not nested under it
     assert out.index("likes espresso") < out.index("User prioritizes")
-
-
-def test_render_handles_honcho_v3_message_shape():
-    """E-1 regression: real Honcho Message exposes peer_id, not peer_name.
-
-    Before the fix, _render does `m.peer_name` and AttributeErrors on the
-    real SDK shape — which is why every butler delegation logged
-    'specialist memory read failed for butler' on production v0.20.0.
-    """
-    ctx = FakeContext(messages=[
-        FakeMessage("nicola", "hi"),
-        FakeMessage("butler", "hello"),
-    ])
-    out = _render(ctx)
-    assert "## Recent exchanges" in out
-    assert "[nicola] hi" in out
-    assert "[butler] hello" in out
-
-
-def test_render_handles_sqlite_message_shape():
-    """E-1 regression — SQLite branch of the peer_id/peer_name fallback.
-
-    _SqliteMsg (legacy in-process backend) keeps its `peer_name` field
-    after Phase 2; verify _render still routes through the
-    fallback branch correctly.
-    """
-    ctx = FakeContext(messages=[
-        FakeSqliteMessage(peer_name="nicola", content="hi"),
-    ])
-    out = _render(ctx)
-    assert "[nicola] hi" in out
-
-
-def test_render_message_without_either_field_uses_question_mark():
-    """E-1 defensive — neither peer_id nor peer_name → '?'.
-
-    Pure paranoia case; documents the second `getattr` default. Any
-    future refactor that breaks this assertion must be intentional.
-    """
-    @dataclass
-    class _Anonymous:
-        content: str
-
-    ctx = FakeContext(messages=[_Anonymous(content="ghost")])
-    out = _render(ctx)
-    assert "[?] ghost" in out

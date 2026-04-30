@@ -151,31 +151,22 @@ class NoOpMemory(MemoryProvider):
 # ---------------------------------------------------------------------------
 
 
-def _render(context: object) -> str:
-    """Assemble a SessionContext into the markdown digest consumed by the
-    system prompt. Empty/missing sections are silently omitted — no
-    placeholder lines.
+def _render_session(context: object) -> str:
+    """Assemble a SessionContext into the markdown digest consumed by
+    the system prompt. Scope-level only (messages + summary). Peer-level
+    overlay (peer_card + peer_representation) belongs to
+    ``_render_peer_overlay``.
 
-    ``context`` is duck-typed: we read ``messages``, ``summary``,
-    ``peer_representation``, ``peer_card`` if present. Keeps the test
-    surface decoupled from the Honcho SDK types.
+    ``context`` is duck-typed: we read ``messages`` and ``summary`` if
+    present. Empty/missing sections are silently omitted — no
+    placeholder lines.
     """
     sections: list[str] = []
-
-    peer_card = getattr(context, "peer_card", None)
-    if peer_card:
-        lines = ["## What I know about you"]
-        lines.extend(f"- {item}" for item in peer_card)
-        sections.append("\n".join(lines))
 
     summary = getattr(context, "summary", None)
     summary_content = getattr(summary, "content", None) if summary else None
     if summary_content:
         sections.append(f"## Summary so far\n{summary_content}")
-
-    peer_repr = getattr(context, "peer_representation", None)
-    if peer_repr:
-        sections.append(f"## My perspective\n{peer_repr}")
 
     messages = getattr(context, "messages", None) or []
     if messages:
@@ -190,11 +181,37 @@ def _render(context: object) -> str:
     return "\n\n".join(sections)
 
 
+def _render_peer_overlay(context: object) -> str:
+    """Assemble a peer.context() result (self-overlay path) into the
+    markdown digest consumed by the system prompt. Peer-level only.
+
+    Empty/missing sections are silently omitted — no placeholder lines.
+
+    Duck-typed: reads ``peer_card`` (list[str]) and ``representation``
+    (str). Mirrors ``_render_peer_context`` but with the self-perspective
+    heading "What I know about you" / "My perspective" — these are
+    Ellen's accumulated facts about Nicola.
+    """
+    sections: list[str] = []
+
+    peer_card = getattr(context, "peer_card", None)
+    if peer_card:
+        lines = ["## What I know about you"]
+        lines.extend(f"- {item}" for item in peer_card)
+        sections.append("\n".join(lines))
+
+    representation = getattr(context, "representation", None)
+    if representation:
+        sections.append(f"## My perspective\n{representation}")
+
+    return "\n\n".join(sections)
+
+
 def _render_peer_context(context: object, observer_role: str) -> str:
     """Assemble a peer.context() result into a markdown digest.
 
     Sections silently omitted when their source is empty —
-    parity with ``_render``'s no-placeholder doctrine.
+    parity with ``_render_session``'s no-placeholder doctrine.
 
     Duck-typed: reads ``peer_card`` (list[str]) and ``representation``
     (str). No ``messages``, ``summary``, or ``peer_representation`` —
@@ -306,7 +323,7 @@ class HonchoMemoryProvider(MemoryProvider):
             peer_perspective=agent_role,
             search_query=search_query,
         )
-        rendered = _render(ctx)
+        rendered = _render_session(ctx)
         # M3b telemetry — one line per real backend call. peer_count is
         # message count; summary_present / peer_repr_present are bools
         # derived from the SDK return shape so operators can see WHEN
@@ -730,7 +747,7 @@ class SqliteMemoryProvider(MemoryProvider):
             _SqliteMsg(peer_name=r[0], content=r[1])
             for r in reversed(msg_rows)
         ]
-        return _render(_SqliteCtx(messages=messages)), len(messages)
+        return _render_session(_SqliteCtx(messages=messages)), len(messages)
 
     async def add_turn(
         self, session_id: str, agent_role: str,
