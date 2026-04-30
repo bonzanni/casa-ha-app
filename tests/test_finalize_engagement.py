@@ -147,3 +147,67 @@ async def test_finalize_writes_retention_for_claude_code_driver(
     import re
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
                         meta["retention_until"])
+
+
+async def test_executor_finalize_archives_under_hyphen_role_id(
+    tmp_path, monkeypatch,
+):
+    """Bug 6: _finalize_engagement's per-type executor archive branch
+    (tools.py:1525-1555 in master tip f3f72a1) writes under
+    agent_role='executor-<type>' (hyphen, not colon — Honcho regex
+    ^[A-Za-z0-9_-]+$ rejects colon)."""
+    import tools as tools_mod
+    from engagement_registry import EngagementRecord, EngagementRegistry
+    from tools import _finalize_engagement
+
+    reg = EngagementRegistry(
+        tombstone_path=str(tmp_path / "tomb.json"), bus=None,
+    )
+    rec = EngagementRecord(
+        id="eng2", kind="executor", role_or_type="configurator",
+        driver="in_casa", status="active", topic_id=None,
+        started_at=0.0, last_user_turn_ts=0.0, last_idle_reminder_ts=0.0,
+        completed_at=None, sdk_session_id=None,
+        origin={"channel": "telegram", "chat_id": "42",
+                "role": "assistant"},
+        task="t",
+    )
+    reg._records["eng2"] = rec
+
+    # Patch tools.py module globals so _finalize_engagement runs without
+    # a live channel manager / bus / engagement registry.
+    monkeypatch.setattr(tools_mod, "_engagement_registry", reg)
+    monkeypatch.setattr(tools_mod, "_channel_manager", None)
+    monkeypatch.setattr(tools_mod, "_bus", None)
+
+    memory = MagicMock()
+    memory.ensure_session = AsyncMock()
+    memory.add_turn = AsyncMock()
+
+    await _finalize_engagement(
+        rec, outcome="completed", text="done",
+        artifacts=[], next_steps=[], driver=None,
+        memory_provider=memory,
+    )
+
+    # _finalize_engagement makes two memory writes for kind="executor":
+    # the meta-scope summary first, then the executor-archive. The
+    # executor-archive write must use 'executor-<type>' (hyphen) — Bug 6
+    # is specifically about the second one. No call may use a colon.
+    es_roles = [
+        c.kwargs.get("agent_role")
+        for c in memory.ensure_session.await_args_list
+    ]
+    at_roles = [
+        c.kwargs.get("agent_role")
+        for c in memory.add_turn.await_args_list
+    ]
+    assert "executor-configurator" in es_roles, (
+        f"executor-archive ensure_session not found; got: {es_roles}"
+    )
+    assert "executor-configurator" in at_roles, (
+        f"executor-archive add_turn not found; got: {at_roles}"
+    )
+    for r in es_roles + at_roles:
+        if r is not None:
+            assert ":" not in r, f"colon-keyed Honcho id leaked: {r!r}"

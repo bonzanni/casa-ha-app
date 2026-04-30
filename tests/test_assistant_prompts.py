@@ -43,3 +43,27 @@ def test_system_prompt_keeps_both_recall_tools_visible(system_md_text):
     """The hedge inversion must NOT remove either tool from the prompt."""
     assert "consult_other_agent_memory" in system_md_text
     assert "delegate_to_agent" in system_md_text
+
+
+def test_system_prompt_forbids_llm_arithmetic_for_finance(system_md_text):
+    """Phase 6 / E-5: Ellen never performs financial arithmetic
+    herself; she always delegates to Alex (finance role) and, when
+    delegation fails, declines rather than producing an LLM-computed
+    answer. Anchor strings are load-bearing — accidental rewording
+    that breaks them is the regression this test catches."""
+    text = system_md_text.lower()
+    # Anchor 1: explicit "never compute" rule.
+    assert "never compute" in text or "never perform arithmetic" in text, (
+        "Ellen prompt must explicitly forbid LLM arithmetic for "
+        "financial figures — anchor phrase missing."
+    )
+    # Anchor 2: route to Alex / finance.
+    assert "alex" in text and "delegate" in text, (
+        "Ellen prompt must point at Alex / delegation as the way to "
+        "compute financial figures."
+    )
+    # Anchor 3: explicit decline behavior on delegation failure.
+    assert "without alex" in text or "finance is reachable" in text, (
+        "Ellen prompt must teach the user-facing decline shape on "
+        "delegation failure — anchor phrase missing."
+    )
