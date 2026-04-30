@@ -721,6 +721,14 @@ class TelegramChannel(Channel):
     # Outbound: block mode
     # ------------------------------------------------------------------
 
+    def create_topic_stream(self, topic_id: int) -> "TopicStreamHandle":
+        """Build a per-turn streaming handle bound to this topic.
+
+        Used by InCasaDriver to emit AssistantMessage chunks
+        progressively rather than buffering the whole turn (Bug 1).
+        """
+        return TopicStreamHandle(self, topic_id)
+
     async def send(self, message: str, context: dict[str, Any]) -> None:
         """Send a complete message (block mode fallback)."""
         if self._app is None:
@@ -864,6 +872,125 @@ class TelegramChannel(Channel):
 
 
 _TG_MAX_LENGTH = 4096
+
+
+class TopicStreamHandle:
+    """Per-engagement-topic streaming primitive used by InCasaDriver.
+
+    Mirrors the (chat_id-keyed) on_token / finalize_stream pattern that
+    Ellen uses on direct DMs (lines 739-859) but parameterised by
+    topic_id and bound to the engagement supergroup chat. State
+    (message_id, last_edit) lives for the duration of one SDK turn —
+    each turn opens a fresh Telegram message in the topic.
+    """
+
+    def __init__(self, channel: "TelegramChannel", topic_id: int) -> None:
+        self._channel = channel
+        self._topic_id = topic_id
+        self._message_id: int | None = None
+        self._last_edit: float = 0.0
+
+    async def emit(self, accumulated_text: str) -> None:
+        """Throttled cumulative-text emit. First call sends a new
+        message in the topic; subsequent calls edit-in-place,
+        throttled at _STREAM_THROTTLE seconds."""
+        bot = (
+            getattr(self._channel._app, "bot", None)
+            if self._channel._app else None
+        )
+        if bot is None:
+            return
+
+        now = time.monotonic()
+
+        if self._message_id is None:
+            try:
+                result = await bot.send_message(
+                    chat_id=self._channel.engagement_supergroup_id,
+                    message_thread_id=self._topic_id,
+                    text=accumulated_text,
+                )
+                self._message_id = result.message_id
+                self._last_edit = now
+            except TelegramError as exc:
+                logger.warning("Stream send failed: %s", exc)
+            return
+
+        if now - self._last_edit < _STREAM_THROTTLE:
+            return
+
+        if len(accumulated_text) > _TG_MAX_LENGTH:
+            return
+
+        try:
+            await bot.edit_message_text(
+                chat_id=self._channel.engagement_supergroup_id,
+                message_id=self._message_id,
+                text=accumulated_text,
+            )
+            self._last_edit = now
+        except TelegramError as exc:
+            if "not modified" not in str(exc).lower():
+                logger.warning("Stream edit failed: %s", exc)
+
+    async def finalize(self, full_text: str) -> None:
+        """Final edit (or send) once the SDK loop has drained. Handles
+        overflow by editing the first chunk and sending subsequent
+        chunks as fresh topic messages."""
+        bot = (
+            getattr(self._channel._app, "bot", None)
+            if self._channel._app else None
+        )
+        if bot is None:
+            return
+
+        if self._message_id is None:
+            for chunk in _split_message(full_text):
+                try:
+                    await bot.send_message(
+                        chat_id=self._channel.engagement_supergroup_id,
+                        message_thread_id=self._topic_id,
+                        text=chunk,
+                    )
+                except TelegramError as exc:
+                    logger.warning("Stream finalize send failed: %s", exc)
+            return
+
+        if len(full_text) <= _TG_MAX_LENGTH:
+            try:
+                await bot.edit_message_text(
+                    chat_id=self._channel.engagement_supergroup_id,
+                    message_id=self._message_id,
+                    text=full_text,
+                )
+            except TelegramError as exc:
+                if "not modified" not in str(exc).lower():
+                    logger.warning("Stream finalize edit failed: %s", exc)
+            return
+
+        chunks = _split_message(full_text)
+        try:
+            await bot.edit_message_text(
+                chat_id=self._channel.engagement_supergroup_id,
+                message_id=self._message_id,
+                text=chunks[0],
+            )
+        except TelegramError as exc:
+            if "not modified" not in str(exc).lower():
+                logger.warning(
+                    "Stream finalize overflow edit failed: %s", exc,
+                )
+        for chunk in chunks[1:]:
+            try:
+                await bot.send_message(
+                    chat_id=self._channel.engagement_supergroup_id,
+                    message_thread_id=self._topic_id,
+                    text=chunk,
+                )
+            except TelegramError as exc:
+                logger.warning(
+                    "Stream finalize overflow send failed: %s", exc,
+                )
 
 
 def _split_message(text: str) -> list[str]:
