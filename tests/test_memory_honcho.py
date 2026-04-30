@@ -51,15 +51,16 @@ class StubSession:
     def add_messages(self, messages):
         self.add_messages_calls.append(list(messages))
 
-    def context(self, tokens, search_query=None):
-        # Phase 5 — peer_target / peer_perspective dropped: get_context
-        # now issues a Honcho-native session.context() call with no
-        # peer-overlay parameters. Overlay fetch moved to
-        # peer_overlay_context (peer.context()).
-        self.context_calls.append({
-            "tokens": tokens,
-            "search_query": search_query,
-        })
+    def context(self, tokens, search_query=None, peer_target=None):
+        # M3-self (v0.30.0): Honcho 2.1.1 requires peer_target whenever
+        # search_query is provided. The provider now forwards agent_role
+        # as peer_target on the search_query path; on the None path,
+        # peer_target is also omitted to keep the call shape minimal.
+        # peer_perspective remains dropped (Phase 5).
+        call: dict[str, Any] = {"tokens": tokens, "search_query": search_query}
+        if peer_target is not None:
+            call["peer_target"] = peer_target
+        self.context_calls.append(call)
         return self._next_context
 
 
@@ -126,10 +127,11 @@ async def test_ensure_session_voice_attributes_to_voice_speaker(stub_env):
     assert "nicola" not in names
 
 
-async def test_get_context_does_not_pass_peer_target_or_perspective(stub_env):
-    """Phase 5 — get_context now omits peer_target/peer_perspective.
-    Peer overlay is fetched separately via peer_overlay_context.
-    Replaces the M2-era M3a forwards-perspective-and-target assertion."""
+async def test_get_context_passes_peer_target_when_agent_role_and_search_query(stub_env):
+    """M3-self (v0.30.0): when both agent_role and search_query are
+    provided, get_context MUST pass peer_target=agent_role to Honcho —
+    Honcho 2.1.1's Session.context() raises ValueError otherwise.
+    peer_perspective remains dropped (Phase 5)."""
     from memory import HonchoMemoryProvider
 
     p = HonchoMemoryProvider(api_url="http://h", api_key="k")
@@ -144,13 +146,39 @@ async def test_get_context_does_not_pass_peer_target_or_perspective(stub_env):
     session._next_context = _Ctx()
     await p.get_context(
         "telegram-1-personal-assistant",
-        tokens=600, search_query="hi",
+        tokens=600, search_query="hi", agent_role="assistant",
     )
     call = session.context_calls[0]
     assert call["tokens"] == 600
     assert call["search_query"] == "hi"
-    assert "peer_target" not in call
+    assert call["peer_target"] == "assistant"
     assert "peer_perspective" not in call
+
+
+async def test_get_context_omits_peer_target_when_search_query_is_none(stub_env):
+    """When search_query is None, peer_target must also be omitted —
+    Honcho 2.1.1 only requires the pairing when search_query is set, and
+    a bare peer_target on a no-query call is not the contract we want."""
+    from memory import HonchoMemoryProvider
+
+    p = HonchoMemoryProvider(api_url="http://h", api_key="k")
+    client: StubHoncho = p._client  # type: ignore[attr-defined]
+    session = client.session("telegram-1-personal-assistant")
+
+    @dataclass
+    class _Ctx:
+        messages: list = field(default_factory=list)
+        summary: Any = None
+
+    session._next_context = _Ctx()
+    await p.get_context(
+        "telegram-1-personal-assistant",
+        tokens=600, agent_role="assistant",
+    )
+    call = session.context_calls[0]
+    assert call["tokens"] == 600
+    assert call["search_query"] is None
+    assert "peer_target" not in call
 
 
 async def test_get_context_empty_returns_empty_string(stub_env):
@@ -240,6 +268,7 @@ async def test_get_context_renders_summary_and_messages_when_honcho_returns_them
     out = await p.get_context(
         "telegram-1-domestic-assistant",
         tokens=4000, search_query="what's the weather",
+        agent_role="assistant",
     )
 
     # Two scope-level sections present in _render_session order:
@@ -258,11 +287,12 @@ async def test_get_context_renders_summary_and_messages_when_honcho_returns_them
     assert "[nicola] what's the weather" in out
     assert "[assistant] sunny, 18C" in out
 
-    # SDK call shape: tokens + search_query only (no peer_target/perspective)
+    # SDK call shape: tokens + search_query + peer_target (M3-self,
+    # v0.30.0). peer_perspective remains dropped (Phase 5).
     call = session.context_calls[0]
     assert call["tokens"] == 4000
     assert call["search_query"] == "what's the weather"
-    assert "peer_target" not in call
+    assert call["peer_target"] == "assistant"
     assert "peer_perspective" not in call
 
 
@@ -306,7 +336,7 @@ async def test_get_context_emits_memory_call_log(stub_env, caplog):
     with caplog.at_level(logging.INFO, logger="memory"):
         await p.get_context(
             "telegram-1-domestic-assistant",
-            tokens=2000, search_query="hi",
+            tokens=2000, search_query="hi", agent_role="assistant",
         )
 
     # Exactly one memory_call line on this single get_context call.
@@ -318,7 +348,10 @@ async def test_get_context_emits_memory_call_log(stub_env, caplog):
     rec = records[0]
     assert rec.backend == "honcho"
     assert rec.session_id == "telegram-1-domestic-assistant"
-    assert rec.agent_role == "?"   # role no longer threaded to this layer
+    # M3-self (v0.30.0): agent_role is now threaded into get_context and
+    # surfaces in memory_call telemetry — operator can attribute reads
+    # to the originating agent peer.
+    assert rec.agent_role == "assistant"
     assert isinstance(rec.t_ms, int) and rec.t_ms >= 0
     assert rec.peer_count == 2
     assert rec.summary_present is True

@@ -663,6 +663,23 @@ async def delegate_to_agent(args: dict) -> dict:
             return _result({"status": "error", "kind": "no_channel_manager",
                             "message": "channel manager missing"})
         channel = _channel_manager.get(origin.get("channel", "telegram"))
+        # E-F (v0.30.0): if supergroup IS configured but
+        # engagement_permission_ok is still False, the boot-time setup may
+        # have lost a race with a transient network blip. The setup is now
+        # wired into _rebuild's tail (self-healing on every reconnect), but
+        # in the rare window where the user spawns an engagement before any
+        # rebuild has completed, attempt one in-line retry before giving up.
+        # Idempotent; cheap on success.
+        if (channel is not None
+                and getattr(channel, "engagement_supergroup_id", 0)
+                and not getattr(channel, "engagement_permission_ok", False)):
+            try:
+                await channel.setup_engagement_features()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "engage_executor: in-line setup_engagement_features "
+                    "retry failed: %s", exc,
+                )
         if (channel is None
                 or not getattr(channel, "engagement_supergroup_id", 0)
                 or not getattr(channel, "engagement_permission_ok", False)):
@@ -1181,6 +1198,11 @@ async def _fetch_executor_archive(
         digest = await memory_provider.get_context(
             session_id=session_id,
             tokens=token_budget,
+            # M3-self companion (v0.30.0): not strictly needed when
+            # search_query is None (peer_target is only required when
+            # search_query is set), but threading agent_role keeps the
+            # memory_call telemetry attributed to the correct peer.
+            agent_role=agent_role,
         )
     except Exception as exc:  # noqa: BLE001 — ARCH: same shape as 1246, 1407
         logger.warning(
@@ -1237,6 +1259,23 @@ async def engage_executor(args: dict) -> dict:
             "message": "channel manager missing",
         })
     channel = _channel_manager.get(origin.get("channel", "telegram"))
+    # E-F (v0.30.0): if supergroup IS configured but
+    # engagement_permission_ok is still False, the boot-time setup may
+    # have lost a race with a transient first-boot setWebhook NetworkError.
+    # The setup is now wired into _rebuild's tail (self-healing on every
+    # reconnect), but in the rare window where the user spawns an
+    # engagement before any rebuild has completed, attempt one in-line
+    # retry before giving up. Idempotent; cheap on success.
+    if (channel is not None
+            and getattr(channel, "engagement_supergroup_id", 0)
+            and not getattr(channel, "engagement_permission_ok", False)):
+        try:
+            await channel.setup_engagement_features()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "engage_executor: in-line setup_engagement_features "
+                "retry failed: %s", exc,
+            )
     if (channel is None
             or not getattr(channel, "engagement_supergroup_id", 0)
             or not getattr(channel, "engagement_permission_ok", False)):

@@ -132,6 +132,129 @@ class TestEngageExecutorReal:
         payload = json.loads(r["content"][0]["text"])
         assert payload["kind"] == "engagement_not_configured"
 
+    async def test_ef_inline_retry_recovers_from_first_boot_race(
+        self, tmp_path, monkeypatch,
+    ):
+        """E-F (v0.30.0) defensive: when supergroup IS configured but
+        engagement_permission_ok is still False (first-boot race lost
+        before _rebuild's tail setup ran), engage_executor must call
+        setup_engagement_features() once in-line. If that retry flips
+        the flag, the engagement proceeds normally — no manual restart
+        required.
+        """
+        from tools import engage_executor, init_tools
+        import agent as agent_mod
+
+        defn = _mock_executor_def()
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["configurator"])
+
+        # Channel with supergroup CONFIGURED but permission flag stuck
+        # False. The _setup() helper supports `channel_ok=True` (both
+        # set) and `channel_ok=False` (both cleared); we need the third
+        # state, so build the channel by hand.
+        channel = MagicMock()
+        channel.engagement_supergroup_id = -100123
+        channel.engagement_permission_ok = False
+        channel.open_engagement_topic = AsyncMock(return_value=42)
+        channel.bot = MagicMock()
+        channel.bot.edit_forum_topic = AsyncMock()
+
+        async def _flip_flag():
+            channel.engagement_permission_ok = True
+
+        channel.setup_engagement_features = AsyncMock(side_effect=_flip_flag)
+
+        # Wire the prompt template so build_prompt does not blow up.
+        p = tmp_path / "prompt.md"
+        p.write_text("You are {task}. Context: {context}.")
+        defn.prompt_template_path = str(p)
+
+        er = MagicMock()
+        mock_rec = MagicMock()
+        mock_rec.id = "abcd1234" + "0" * 24
+        mock_rec.topic_id = 42
+        er.create = AsyncMock(return_value=mock_rec)
+        er.mark_error = AsyncMock()
+
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=er,
+            executor_registry=reg,
+        )
+        monkeypatch.setattr(
+            agent_mod, "active_engagement_driver",
+            MagicMock(start=AsyncMock()), raising=False,
+        )
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "configurator", "task": "t", "context": "",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(r["content"][0]["text"])
+        # In-line retry was attempted — exactly once.
+        assert channel.setup_engagement_features.await_count == 1
+        # Retry succeeded (flag flipped) → engagement opened normally.
+        assert payload["status"] == "pending", payload
+        assert payload["topic_id"] == 42
+
+    async def test_ef_inline_retry_does_not_fire_when_supergroup_unset(self):
+        """E-F retry is gated on supergroup-configured-but-flag-False.
+        When supergroup is unset, no retry should fire — the operator
+        hasn't opted into engagements at all.
+        """
+        from tools import engage_executor
+        import agent as agent_mod
+
+        defn = _mock_executor_def()
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["configurator"])
+
+        # Build a channel with supergroup explicitly UNSET. Don't use
+        # _setup(channel_ok=False) because that doesn't expose the
+        # AsyncMock we want to assert on.
+        channel = MagicMock()
+        channel.engagement_supergroup_id = 0   # unset
+        channel.engagement_permission_ok = False
+        channel.setup_engagement_features = AsyncMock()
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        from tools import init_tools
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=MagicMock(),
+            executor_registry=reg,
+        )
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "configurator", "task": "t", "context": "",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(r["content"][0]["text"])
+        assert payload["kind"] == "engagement_not_configured"
+        # No retry attempted — supergroup is unset, no point.
+        assert channel.setup_engagement_features.await_count == 0
+
     async def test_happy_path_returns_pending(self, tmp_path, monkeypatch):
         from tools import engage_executor, init_tools
         import agent as agent_mod

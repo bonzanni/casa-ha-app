@@ -29,7 +29,9 @@ class RecordingProvider(MemoryProvider):
     async def ensure_session(self, session_id, agent_role, user_peer="nicola"):
         self.ensure_calls += 1
 
-    async def get_context(self, session_id, tokens, search_query=None):
+    async def get_context(
+        self, session_id, tokens, search_query=None, agent_role=None,
+    ):
         if self._error_on_get is not None:
             raise self._error_on_get
         self.get_calls += 1
@@ -182,10 +184,14 @@ class TestColdKeyDedup:
         import time
 
         class SlowProvider(RecordingProvider):
-            async def get_context(self, session_id, tokens, search_query=None):
+            async def get_context(
+                self, session_id, tokens,
+                search_query=None, agent_role=None,
+            ):
                 await asyncio.sleep(0.1)
                 return await super().get_context(
-                    session_id, tokens, search_query=search_query,
+                    session_id, tokens,
+                    search_query=search_query, agent_role=agent_role,
                 )
 
         backend = SlowProvider()
@@ -211,7 +217,10 @@ class TestColdKeyDedup:
         started = asyncio.Event()
 
         class GatedProvider(RecordingProvider):
-            async def get_context(self, session_id, tokens, search_query=None):
+            async def get_context(
+                self, session_id, tokens,
+                search_query=None, agent_role=None,
+            ):
                 self.get_calls += 1
                 started.set()
                 await gate.wait()

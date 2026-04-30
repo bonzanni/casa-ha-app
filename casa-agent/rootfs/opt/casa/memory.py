@@ -47,12 +47,18 @@ class MemoryProvider(ABC):
         session_id: str,
         tokens: int,
         search_query: str | None = None,
+        agent_role: str | None = None,
     ) -> str:
         """Return a rendered scope-level digest (messages + summary only).
 
         Empty string if the session has no relevant content yet.
         ``search_query`` is the current user utterance (used by Honcho
-        for semantic retrieval). Peer-level overlay (peer_card + peer
+        for semantic retrieval). ``agent_role`` is the agent peer name
+        (e.g. ``"assistant"``); it is forwarded as Honcho's
+        ``peer_target`` so semantic retrieval is scoped to that agent's
+        view of the session. v0.30.0 / M3-self: required when
+        ``search_query`` is non-empty — Honcho 2.1.1 raises
+        ``ValueError`` otherwise. Peer-level overlay (peer_card + peer
         representation) is NOT included here — see ``peer_overlay_context``."""
 
     @abstractmethod
@@ -114,6 +120,7 @@ class NoOpMemory(MemoryProvider):
         session_id: str,
         tokens: int,
         search_query: str | None = None,
+        agent_role: str | None = None,
     ) -> str:
         return ""
 
@@ -311,28 +318,35 @@ class HonchoMemoryProvider(MemoryProvider):
         session_id: str,
         tokens: int,
         search_query: str | None = None,
+        agent_role: str | None = None,
     ) -> str:
         t_start = time.perf_counter()
         session = await _to_thread(self._client.session, session_id)
-        ctx = await _to_thread(
-            session.context,
-            tokens=tokens,
-            search_query=search_query,
-        )
+        # M3-self (v0.30.0): Honcho 2.1.1's Session.context() validator
+        # rejects `search_query` without a paired `peer_target` —
+        # `ValueError: You must provide a peer_target when search_query
+        # is provided`. Passing peer_target=agent_role scopes semantic
+        # retrieval to that agent's view of the session (spec § 2.3).
+        # When search_query is None, peer_target is also omitted to keep
+        # the call shape minimal.
+        ctx_kwargs: dict[str, object] = {"tokens": tokens}
+        if search_query is not None:
+            ctx_kwargs["search_query"] = search_query
+            if agent_role is not None:
+                ctx_kwargs["peer_target"] = agent_role
+        ctx = await _to_thread(session.context, **ctx_kwargs)
         rendered = _render_session(ctx)
         # Phase 5 — scope-level digest only (messages + summary). Peer-
         # level overlay (peer_card + representation) moved to
-        # `peer_overlay_context`. agent_role / user_peer no longer
-        # threaded to this layer — the call is Honcho-native and the
-        # session_id already encodes scope. peer_repr_present is False
-        # by construction on this path.
+        # `peer_overlay_context`. peer_repr_present is False by
+        # construction on this path.
         summary_obj = getattr(ctx, "summary", None)
         logger.info(
             "memory_call",
             extra={
                 "backend": "honcho",
                 "session_id": session_id,
-                "agent_role": "?",   # role no longer threaded to this layer
+                "agent_role": agent_role or "?",
                 "t_ms": int((time.perf_counter() - t_start) * 1000),
                 "peer_count": len(getattr(ctx, "messages", None) or []),
                 "summary_present": bool(getattr(summary_obj, "content", None)),
@@ -543,6 +557,7 @@ class CachedMemoryProvider(MemoryProvider):
         session_id: str,
         tokens: int,
         search_query: str | None = None,
+        agent_role: str | None = None,
     ) -> str:
         t_start = time.perf_counter()
         key = (session_id, tokens)
@@ -559,7 +574,7 @@ class CachedMemoryProvider(MemoryProvider):
                 extra={
                     "backend": self._resolve_backend_name(self._backend),
                     "session_id": session_id,
-                    "agent_role": "?",
+                    "agent_role": agent_role or "?",
                     "t_ms": int((time.perf_counter() - t_start) * 1000),
                     "peer_count": None,
                     "summary_present": None,
@@ -581,7 +596,7 @@ class CachedMemoryProvider(MemoryProvider):
                     extra={
                         "backend": self._resolve_backend_name(self._backend),
                         "session_id": session_id,
-                        "agent_role": "?",
+                        "agent_role": agent_role or "?",
                         "t_ms": int((time.perf_counter() - t_start) * 1000),
                         "peer_count": None,
                         "summary_present": None,
@@ -592,7 +607,8 @@ class CachedMemoryProvider(MemoryProvider):
                 )
                 return cached
             fresh = await self._backend.get_context(
-                session_id, tokens, search_query=search_query,
+                session_id, tokens,
+                search_query=search_query, agent_role=agent_role,
             )
             self._cache[key] = fresh
         # Cache miss path — inner backend's get_context already emitted
@@ -779,9 +795,11 @@ class SqliteMemoryProvider(MemoryProvider):
     async def get_context(
         self, session_id: str, tokens: int,
         search_query: str | None = None,
+        agent_role: str | None = None,
     ) -> str:
         t_start = time.perf_counter()
-        # search_query is ignored on SQLite (no semantic retrieval).
+        # search_query / agent_role are ignored on SQLite (no semantic
+        # retrieval; messages are already structurally peer-attributed).
         rendered, peer_count = await asyncio.to_thread(
             self._get_context_sync, session_id, tokens,
         )

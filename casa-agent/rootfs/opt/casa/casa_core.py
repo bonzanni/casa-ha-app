@@ -1472,19 +1472,12 @@ async def main() -> None:
     # 12. Start all channels
     await channel_manager.start_all()
 
-    # 12a. v0.18.2: now that the telegram bot is built (start_all → _rebuild
-    # populates self._app), we can probe `can_manage_topics` on the
-    # engagement supergroup. This MUST run after start_all() and not
-    # immediately after channel_manager.register() — the bot isn't created
-    # until _rebuild() fires.
-    _telegram_channel = channel_manager.get("telegram")
-    if _telegram_channel is not None:
-        try:
-            await _telegram_channel.setup_engagement_features()  # type: ignore[attr-defined]
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "Telegram engagement features setup failed: %s", exc,
-            )
+    # 12a. E-F (v0.30.0): engagement-feature setup is now wired into
+    # TelegramChannel._rebuild() as a final step after `self._app = app`.
+    # Pre-fix, this boot-time call could fire before `_app` was populated
+    # if the first `set_webhook` blipped — leaving `engagement_permission_ok`
+    # permanently False until manual restart. The new location makes it
+    # self-healing on every successful rebuild. Removed redundant call here.
 
     # 13. Agent loop tasks
     for name in list(agents.keys()) + ["telegram"]:

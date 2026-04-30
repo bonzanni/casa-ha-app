@@ -75,8 +75,10 @@ class FakeMemory(MemoryProvider):
     async def ensure_session(self, session_id, agent_role, user_peer="nicola"):
         self.ensure.append((session_id, agent_role, user_peer))
 
-    async def get_context(self, session_id, tokens, search_query=None):
-        self.get.append((session_id, tokens, search_query))
+    async def get_context(
+        self, session_id, tokens, search_query=None, agent_role=None,
+    ):
+        self.get.append((session_id, tokens, search_query, agent_role))
         return self.context
 
     async def peer_overlay_context(

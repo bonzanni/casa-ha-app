@@ -370,6 +370,12 @@ class Agent:
                         session_id=sid,
                         tokens=per_scope_budget,
                         search_query=user_text,
+                        # M3-self (v0.30.0): forwarded as Honcho's
+                        # peer_target so semantic retrieval is scoped
+                        # to this agent's view of the session. Without
+                        # this, Honcho 2.1.1 raises ValueError on every
+                        # search_query-bearing call.
+                        agent_role=self.config.role,
                     )
                 except Exception:
                     # E-B (v0.29.0): exc_info=True — without this, the
