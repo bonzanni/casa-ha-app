@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    ResultMessage,
+    SystemMessage,
     TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
 )
 
 from drivers.driver_protocol import DriverProtocol
 from engagement_registry import EngagementRecord
+import sdk_logging
 
 if TYPE_CHECKING:
     from channels.telegram import TopicStreamHandle
@@ -158,11 +165,13 @@ class InCasaDriver(DriverProtocol):
         lock = self._locks[engagement.id]
         assert engagement.topic_id is not None
         # Phase 3b: stream per-AssistantMessage rather than buffer the
-        # entire turn. Per-topic state (message_id, last_edit) lives on
-        # the handle for this turn only — each turn opens a fresh
-        # Telegram message in the topic.
+        # entire turn.
         stream = self._topic_stream_factory(engagement.topic_id)
         accumulated = ""
+        idx = 0  # Phase 4b: per-turn AssistantMessage counter.
+        started_ms = time.monotonic() * 1000  # Phase 4b: turn duration anchor.
+        # Per-call tool name lookup so log_tool_result can render name=.
+        tool_names_by_id: dict[str, str] = {}
         token = engagement_var.set(engagement)
         try:
             async with lock:
@@ -181,11 +190,42 @@ class InCasaDriver(DriverProtocol):
                                 "Engagement %s persist_session_id failed: %s",
                                 engagement.id[:8], exc,
                             )
-                        # Update in-memory mirror unconditionally — this
-                        # suppresses hot-loop retries even when the registry
-                        # write failed. A failed write leaves the tombstone
-                        # stale; the idle sweeper re-persists on next sweep.
                         engagement.sdk_session_id = sid
+                    # Phase 4b dispatch — wrapped in try/except so a
+                    # malformed block does not abort the rest of the turn.
+                    try:
+                        if isinstance(sdk_msg, SystemMessage):
+                            sdk_logging.log_system_init(sdk_msg)
+                        elif isinstance(sdk_msg, AssistantMessage):
+                            idx += 1
+                            sdk_logging.log_assistant_message(sdk_msg, idx=idx)
+                            for block in getattr(sdk_msg, "content", []) or []:
+                                if isinstance(block, ToolUseBlock):
+                                    tool_names_by_id[
+                                        getattr(block, "id", "")
+                                    ] = getattr(block, "name", "?")
+                                    sdk_logging.log_tool_use(block, idx=idx)
+                        elif isinstance(sdk_msg, UserMessage):
+                            for block in getattr(sdk_msg, "content", []) or []:
+                                if isinstance(block, ToolResultBlock):
+                                    name = tool_names_by_id.get(
+                                        getattr(block, "tool_use_id", ""),
+                                        "",
+                                    )
+                                    sdk_logging.log_tool_result(
+                                        block, idx=idx, started_ms=started_ms,
+                                        name=name,
+                                    )
+                        elif isinstance(sdk_msg, ResultMessage):
+                            sdk_logging.log_turn_done(
+                                sdk_msg, started_ms=started_ms,
+                            )
+                    except Exception as dispatch_exc:  # noqa: BLE001
+                        logger.warning(
+                            "phase4b dispatch failed: %s", dispatch_exc,
+                            exc_info=True,
+                        )
+                    # Phase 3b streaming — unchanged.
                     if isinstance(sdk_msg, AssistantMessage):
                         msg_text = "".join(
                             b.text for b in getattr(sdk_msg, "content", [])

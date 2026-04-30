@@ -255,6 +255,117 @@ class TestInCasaStart:
         handle.emit.assert_not_awaited()
         handle.finalize.assert_not_awaited()
 
+    async def test_start_logs_per_message(self, monkeypatch, caplog):
+        """Phase 4b Bug 3: each SDK message kind triggers an
+        sdk_logging dispatch. SystemMessage(subtype=init) → DEBUG;
+        AssistantMessage → INFO + per-tool DEBUG; UserMessage with
+        ToolResultBlock → DEBUG; ResultMessage → INFO turn_done."""
+        import logging
+        from drivers.in_casa_driver import InCasaDriver
+        from claude_agent_sdk import (
+            AssistantMessage, SystemMessage, UserMessage, ResultMessage,
+            TextBlock, ToolUseBlock, ToolResultBlock, ClaudeAgentOptions,
+        )
+
+        text_block = MagicMock()
+        text_block.text = "Reading config."
+        text_block.__class__ = TextBlock
+
+        tool_use = MagicMock()
+        tool_use.name = "Read"
+        tool_use.input = {"file_path": "/x.yaml"}
+        tool_use.__class__ = ToolUseBlock
+
+        sys_init = MagicMock()
+        sys_init.subtype = "init"
+        sys_init.data = {"model": "sonnet", "session_id": "abc12345-xyz"}
+        sys_init.__class__ = SystemMessage
+
+        assistant = MagicMock()
+        assistant.content = [text_block, tool_use]
+        assistant.__class__ = AssistantMessage
+
+        result_block = MagicMock()
+        result_block.is_error = False
+        result_block.content = "ok"
+        result_block.__class__ = ToolResultBlock
+
+        user_with_tool_result = MagicMock()
+        user_with_tool_result.content = [result_block]
+        user_with_tool_result.__class__ = UserMessage
+
+        result = MagicMock()
+        result.num_turns = 1
+        result.total_cost_usd = 0.001
+        result.usage = {"input_tokens": 100, "output_tokens": 20}
+        result.__class__ = ResultMessage
+
+        class _FakeClient:
+            session_id = "abc12345-xyz-789"
+            def __init__(self, options): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+            async def receive_response(self):
+                yield sys_init
+                yield assistant
+                yield user_with_tool_result
+                yield result
+            async def close(self): pass
+
+        monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+
+        factory, _ = _mk_factory_with_fake_handle()
+        drv = InCasaDriver(topic_stream_factory=factory)
+        rec = _make_record()
+
+        with caplog.at_level(logging.DEBUG, logger="sdk"):
+            await drv.start(
+                rec, prompt="hi",
+                options=ClaudeAgentOptions(model="sonnet"),
+            )
+
+        msgs = [r.getMessage() for r in caplog.records if r.name == "sdk"]
+        assert any("system_init" in m and "model=sonnet" in m for m in msgs), msgs
+        assert any("assistant_message idx=1" in m and "tool_uses=1" in m for m in msgs), msgs
+        assert any("tool_use idx=1" in m and "name=Read" in m and "target=/x.yaml" in m for m in msgs), msgs
+        assert any("tool_result idx=1" in m and "ok=True" in m for m in msgs), msgs
+        assert any("turn_done" in m and "turns=1" in m for m in msgs), msgs
+
+    async def test_start_streaming_unchanged_after_phase4b(
+        self, monkeypatch,
+    ):
+        """Phase 4b Bug 3: the new dispatch must NOT regress Phase 3b's
+        per-AssistantMessage stream.emit + finalize semantics."""
+        from drivers.in_casa_driver import InCasaDriver
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        class _FakeClient:
+            def __init__(self, options): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+            async def receive_response(self):
+                yield _mk_assistant("First.")
+                yield _mk_assistant("Second.")
+            async def close(self): pass
+
+        monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+
+        factory, handle = _mk_factory_with_fake_handle()
+        drv = InCasaDriver(topic_stream_factory=factory)
+        rec = _make_record()
+
+        await drv.start(
+            rec, prompt="hi", options=ClaudeAgentOptions(model="sonnet"),
+        )
+
+        assert handle.emit.await_count == 2
+        emits = [c.args[0] for c in handle.emit.await_args_list]
+        assert emits[0] == "First."
+        assert emits[1] == "First.\n\nSecond."
+        handle.finalize.assert_awaited_once_with("First.\n\nSecond.")
+
 
 class TestInCasaSendUserTurn:
     async def test_send_user_turn_streams_reply_to_topic(self, monkeypatch):
