@@ -1151,12 +1151,12 @@ async def _fetch_executor_archive(
 
     Mirrors the WRITE site at ``tools.py:1383`` exactly:
     session_id = ``honcho_session_id(channel, chat_id, "executor", executor_type)``
-    agent_role = ``f"executor:{executor_type}"``.
+    agent_role = ``f"executor-{executor_type}"``.
     """
     if memory_provider is None:
         return ""
     session_id = honcho_session_id(channel, chat_id, "executor", executor_type)
-    agent_role = f"executor:{executor_type}"
+    agent_role = f"executor-{executor_type}"
     try:
         await memory_provider.ensure_session(
             session_id=session_id,
@@ -1545,11 +1545,11 @@ async def _finalize_engagement(
             })
             await memory_provider.ensure_session(
                 session_id=type_session,
-                agent_role=f"executor:{engagement.role_or_type}",
+                agent_role=f"executor-{engagement.role_or_type}",
             )
             await memory_provider.add_turn(
                 session_id=type_session,
-                agent_role=f"executor:{engagement.role_or_type}",
+                agent_role=f"executor-{engagement.role_or_type}",
                 user_text="(executor engagement summary)",
                 assistant_text=type_summary,
             )

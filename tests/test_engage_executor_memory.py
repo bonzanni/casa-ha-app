@@ -35,12 +35,12 @@ async def test_returns_empty_when_archive_empty():
     assert out == ""
     mp.ensure_session.assert_awaited_once_with(
         session_id="telegram-42-executor-configurator",
-        agent_role="executor:configurator",
+        agent_role="executor-configurator",
     )
     mp.get_context.assert_awaited_once()
     kwargs = mp.get_context.await_args.kwargs
     assert kwargs["session_id"] == "telegram-42-executor-configurator"
-    assert kwargs["agent_role"] == "executor:configurator"
+    assert kwargs["agent_role"] == "executor-configurator"
     assert kwargs["tokens"] == 2000
 
 
@@ -176,11 +176,11 @@ async def test_executor_archive_is_read_on_second_engagement(tmp_path):
     # Simulate by calling the same shape directly.
     await mp.ensure_session(
         session_id="telegram-42-executor-configurator",
-        agent_role="executor:configurator",
+        agent_role="executor-configurator",
     )
     await mp.add_turn(
         session_id="telegram-42-executor-configurator",
-        agent_role="executor:configurator",
+        agent_role="executor-configurator",
         user_text="(executor engagement summary)",
         assistant_text='{"task": "edit-scope", "outcome": "completed"}',
     )
