@@ -107,7 +107,36 @@ class TextBlock:
 
 
 @dataclass
+class ToolUseBlock:
+    """Phase 4b — Bug 3 dispatch surface. Real SDK shape: name, input dict,
+    optional id used to correlate with a ToolResultBlock."""
+
+    name: str = ""
+    input: dict[str, Any] = field(default_factory=dict)
+    id: str = ""
+
+
+@dataclass
+class ToolResultBlock:
+    """Phase 4b — Bug 3 dispatch surface. Mirrors the real SDK's
+    ToolResultBlock fields used by sdk_logging.log_tool_result."""
+
+    tool_use_id: str = ""
+    content: Any = None
+    is_error: bool | None = None
+
+
+@dataclass
 class AssistantMessage:
+    content: list[Any] = field(default_factory=list)
+
+
+@dataclass
+class UserMessage:
+    """Phase 4b — Bug 3 dispatch surface. Real SDK shape carries a list of
+    ToolResultBlocks when the assistant's tools have run; sdk_logging
+    iterates ``content`` looking for ToolResultBlock instances."""
+
     content: list[Any] = field(default_factory=list)
 
 
@@ -118,6 +147,9 @@ class ResultMessage:
     # Optional spec 5.2 §5 usage fields. Default empty so historical
     # E2E scenarios (no MOCK_SDK_USAGE_* env) keep working.
     usage: dict[str, int] = field(default_factory=dict)
+    # Phase 4b — sdk_logging.log_turn_done reads num_turns / total_cost_usd.
+    num_turns: int = 0
+    total_cost_usd: float = 0.0
 
 
 @dataclass
@@ -151,6 +183,10 @@ class ClaudeAgentOptions:
     # empty — masking the bug under unit tests (which use the host's real
     # SDK). See reference_mock_sdk_drift in memory for the v0.5.9 precedent.
     plugins: list[Any] = field(default_factory=list)
+    # Phase 4b — Bug 4 stderr callback field. sdk_logging.with_stderr_callback
+    # wraps the options struct via dataclasses.replace(options, stderr=cb);
+    # the mock's frozen=False default still requires the field to exist.
+    stderr: Any = None
 
 
 class ClaudeSDKClient:
@@ -293,6 +329,9 @@ __all__ = [
     "SdkMcpTool",
     "SystemMessage",
     "TextBlock",
+    "ToolResultBlock",
+    "ToolUseBlock",
+    "UserMessage",
     "tool",
     "create_sdk_mcp_server",
 ]

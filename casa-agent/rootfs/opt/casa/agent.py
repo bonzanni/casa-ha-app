@@ -21,6 +21,9 @@ from claude_agent_sdk import (
     ResultMessage,
     SystemMessage,
     TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
 )
 
 from plugins_binding import build_sdk_plugins
@@ -31,6 +34,7 @@ from config import AgentConfig
 from specialist_registry import DelegationComplete
 from hooks import resolve_hooks
 from log_cid import cid_var
+import sdk_logging
 from mcp_registry import McpServerRegistry
 from channel_trust import channel_trust, channel_trust_display, user_peer_for_channel
 from timekeeping import resolve_tz
@@ -471,18 +475,61 @@ class Agent:
 
             # 7. Query the SDK — retry transient faults (spec 5.2 §3). --------
             async def _attempt_sdk_turn() -> tuple[str, str | None, dict[str, int]]:
-                """Run one end-to-end SDK turn. Each attempt resets the
+                """Run one end-to-end SDK turn. Phase 4b: every SDK message
+                kind dispatches through sdk_logging in addition to the
+                E-2 streaming concat below. Each attempt resets the
                 streaming accumulator so ``on_token`` delivers cumulative
                 text from scratch if an earlier attempt failed mid-turn.
-                ``attempt_usage`` resets per attempt so a failed attempt's
-                partial usage cannot leak into the turn_done summary
-                (spec 5.2 §5.2)."""
+                """
                 attempt_text = ""
                 attempt_sid: str | None = resume_session_id
                 attempt_usage: dict[str, int] = {}
-                async with ClaudeSDKClient(options) as client:
+                idx = 0
+                started_ms = time.monotonic() * 1000
+                tool_names_by_id: dict[str, str] = {}
+                async with ClaudeSDKClient(
+                    sdk_logging.with_stderr_callback(
+                        options, engagement_id=None,
+                    ),
+                ) as client:
                     await client.query(user_text)
                     async for sdk_msg in client.receive_response():
+                        # Phase 4b dispatch — wrapped so a malformed block
+                        # cannot abort the turn (logged + continued).
+                        try:
+                            if isinstance(sdk_msg, SystemMessage):
+                                sdk_logging.log_system_init(sdk_msg)
+                            elif isinstance(sdk_msg, AssistantMessage):
+                                idx += 1
+                                sdk_logging.log_assistant_message(sdk_msg, idx=idx)
+                                for block in getattr(sdk_msg, "content", []) or []:
+                                    if isinstance(block, ToolUseBlock):
+                                        tool_names_by_id[
+                                            getattr(block, "id", "")
+                                        ] = getattr(block, "name", "?")
+                                        sdk_logging.log_tool_use(block, idx=idx)
+                            elif isinstance(sdk_msg, UserMessage):
+                                for block in getattr(sdk_msg, "content", []) or []:
+                                    if isinstance(block, ToolResultBlock):
+                                        name = tool_names_by_id.get(
+                                            getattr(block, "tool_use_id", ""),
+                                            "",
+                                        )
+                                        sdk_logging.log_tool_result(
+                                            block, idx=idx, started_ms=started_ms,
+                                            name=name,
+                                        )
+                            elif isinstance(sdk_msg, ResultMessage):
+                                sdk_logging.log_turn_done(
+                                    sdk_msg, started_ms=started_ms,
+                                )
+                        except Exception as dispatch_exc:  # noqa: BLE001
+                            logger.warning(
+                                "phase4b dispatch failed: %s", dispatch_exc,
+                                exc_info=True,
+                            )
+                        # Existing branches — session_id capture, usage,
+                        # E-2 streaming concat — unchanged.
                         if isinstance(sdk_msg, SystemMessage):
                             if getattr(sdk_msg, "subtype", None) == "init":
                                 data = getattr(sdk_msg, "data", {}) or {}
@@ -494,11 +541,7 @@ class Agent:
                                 attempt_sid = sid
                             attempt_usage = extract_usage(sdk_msg)
                         elif isinstance(sdk_msg, AssistantMessage):
-                            # E-2: collect TextBlocks of THIS AssistantMessage
-                            # (within-message blocks are one model thought;
-                            # no separator between them). Insert "\n\n" only
-                            # at AssistantMessage boundaries so the streamed
-                            # message reads as discrete thoughts.
+                            # E-2: collect TextBlocks of THIS AssistantMessage.
                             msg_text = "".join(
                                 b.text for b in getattr(sdk_msg, "content", [])
                                 if isinstance(b, TextBlock)
@@ -515,7 +558,7 @@ class Agent:
                 response_text, sdk_session_id, usage = await retry_sdk_call(
                     _attempt_sdk_turn, on_retry=self._log_retry,
                 )
-            except ProcessError:
+            except ProcessError as exc:
                 # claude CLI exited non-zero. If we were resuming a prior
                 # session, the most common cause (spec 5.8) is a stale
                 # sdk_session_id — the local conversation file under
@@ -523,6 +566,17 @@ class Agent:
                 # ``/data/sessions.json`` persisted. Clear and retry fresh.
                 if resume_session_id is None:
                     raise
+                # Phase 4b Bug 5: structured retry telemetry.
+                # exc.stderr is populated by Bug 4's stderr callback
+                # (subprocess_cli.py:472 + ProcessError._errors.py:25-37);
+                # truncate to a 200-char tail with newlines escaped so
+                # one log line stays scannable.
+                stderr_tail = (exc.stderr or "")[-200:].replace("\n", "\\n")
+                logger.info(
+                    "sdk_retry_fresh channel_key=%s exit_code=%s prior_sid=%s "
+                    "stderr_tail=%s",
+                    channel_key, exc.exit_code, resume_session_id, stderr_tail,
+                )
                 logger.warning(
                     "SDK resume failed (key=%s sid=%s); clearing and retrying fresh",
                     channel_key, resume_session_id,

@@ -361,3 +361,62 @@ class TestCancel:
 
         assert stopped == [rec.id]
         assert not (tmp_path / "svc" / f"engagement-{rec.id}").exists()
+
+
+class TestRelayLogLines:
+    """G5 — claude_code driver relays its per-engagement s6-log lines
+    into Casa's logger at DEBUG, on the same `subprocess_cli` logger
+    used by Bug 4's stderr callback."""
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="_tail_file uses path semantics that don't work cleanly on Windows",
+    )
+    async def test_relay_log_lines_emits_debug_per_line(
+        self, tmp_path, caplog,
+    ):
+        import asyncio
+        import logging
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        rec = _make_record()  # id="abc12345def67890"
+        log_file = tmp_path / "log-current"
+        log_file.write_text(
+            "first line\n"
+            "second line\n"
+            "Remote Control URL: https://example/123\n",
+            encoding="utf-8",
+        )
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            base_plugins_root=str(tmp_path / "base-plugins"),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="http://x",
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="subprocess_cli"):
+            task = asyncio.create_task(
+                drv._relay_log_lines(rec, log_path=str(log_file)),
+            )
+            # Give the tailer a beat to read all 3 lines + start polling.
+            await asyncio.sleep(0.3)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        recs = [r for r in caplog.records if r.name == "subprocess_cli"]
+        msgs = [r.getMessage() for r in recs]
+        assert any("first line" in m for m in msgs), msgs
+        assert any("second line" in m for m in msgs), msgs
+        assert any("Remote Control URL" in m for m in msgs), msgs
+        # Every relayed record carries engagement_id (first 8 chars of rec.id)
+        for r in recs:
+            assert getattr(r, "engagement_id", None) == "abc12345", (
+                f"missing engagement_id on relay record: {r.getMessage()}"
+            )
+        assert all(r.levelno == logging.DEBUG for r in recs), (
+            "relay must emit DEBUG, not INFO"
+        )

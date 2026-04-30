@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.25.0] - 2026-04-30 — Phase 4b: SDK observability
+
+### Added
+- **Bug 3** (HIGH): every SDK turn (in_casa engagement and Ellen DM)
+  emits per-message structured records. `assistant_message` and
+  `turn_done` at INFO; `tool_use`, `tool_result`, `system_init` at
+  DEBUG. Operators reading `docker logs` can reconstruct what the
+  assistant did without raising the global level. Logger: `sdk`.
+- **Bug 4** (HIGH): when the SDK CLI subprocess writes to stderr,
+  output appears in Casa's `docker logs` stream tagged with `cid`
+  and (where in scope) `engagement_id`. Six wiring sites covered:
+  `agent.py` Ellen turn, `in_casa_driver.start` + `.resume`,
+  `observer._decide_interjection`, `tools.delegate_to_agent`,
+  `tools._synthesize_answer`. Logger: `subprocess_cli`.
+- **Bug 5** (MEDIUM): when `agent._process`'s retry-fresh path fires
+  (resume sid stale → ProcessError → clear + retry), one INFO line
+  records the event with exit_code, prior_sid, stderr_tail. Logger:
+  `agent`. Closes Bug 5 by side-effect of Bug 4 (root cause now
+  visible) plus auditable retry telemetry.
+- **G5** — `claude_code` driver per-engagement s6-log file relayed
+  line-by-line into the `subprocess_cli` logger at DEBUG so when
+  E-12 (claude_code topic silence) is later tackled the diagnostic
+  data already exists.
+
+### Internal
+- New module `casa-agent/rootfs/opt/casa/sdk_logging.py` (~150 lines):
+  `log_system_init`, `log_assistant_message`, `log_tool_use`,
+  `log_tool_result`, `log_turn_done`, `make_stderr_logger`,
+  `with_stderr_callback`, `extract_tool_target`. All consumers call
+  through this module so log shape is identical and tested in one
+  place.
+- New `tests/test_sdk_logging.py` covers each function (17 tests).
+- `dataclasses.replace` pattern from agent.py (clearing `resume`)
+  reused for `with_stderr_callback`.
+- Spec doc-rot caught at plan-write: spec § 6.6 listed two
+  `ClaudeAgentOptions` construction sites; reality at master had six
+  `ClaudeSDKClient` sites. All six wired in this PR (memory
+  `feedback_pre_1_0_0_license` — additive change, no compat shims).
+
+### Notes
+- **Out of scope**: tool-marker rendering in topic (UX feature; future
+  phase); E-12 (claude_code driver topic silence — needs its own design
+  epic on whether to drop `--remote-control` vs design a tee); OTEL
+  collector / exporter wiring; structured event-bus emission for SDK
+  signals.
+- **No engagement-data migration**; no schema change.
+- **Performance**: the dispatch adds one logger.info + a few
+  logger.debug calls per turn (microsecond cost). G5 relay is DEBUG-only,
+  invisible in steady prod state.
+
 ## [0.24.0] - 2026-04-30 — Phase 4a: OTEL DEBUG-noise cleanup (Bug 7)
 
 ### Fixed

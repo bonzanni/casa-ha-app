@@ -449,6 +449,75 @@ class TestAssistantMessageSeparator:
         )
 
 
+class TestPhase4bDispatch:
+    """Phase 4b Bug 3 parity: Ellen's _attempt_sdk_turn dispatches
+    every SDK message kind through sdk_logging, identical shape to
+    the in_casa-driver path."""
+
+    async def test_attempt_sdk_turn_logs_per_message(
+        self, tmp_path, caplog,
+    ):
+        import logging
+        from claude_agent_sdk import (
+            AssistantMessage as _AM, ResultMessage as _RM,
+            SystemMessage as _SM, TextBlock as _TB,
+        )
+
+        class _RichFakeClient:
+            captured_options = None
+            def __init__(self, options):
+                _RichFakeClient.captured_options = options
+
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, text): pass
+
+            async def receive_response(self):
+                init = _SM.__new__(_SM)
+                init.subtype = "init"  # type: ignore[attr-defined]
+                init.data = {"model": "sonnet", "session_id": "abcdef12-fff"}  # type: ignore[attr-defined]
+                yield init
+                yield _mk_assistant("Hi.")
+                rm = _RM.__new__(_RM)
+                rm.session_id = "abcdef12-fff"  # type: ignore[attr-defined]
+                rm.usage = {"input_tokens": 50, "output_tokens": 5}  # type: ignore[attr-defined]
+                rm.num_turns = 1  # type: ignore[attr-defined]
+                rm.total_cost_usd = 0.0001  # type: ignore[attr-defined]
+                yield rm
+
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+
+        with caplog.at_level(logging.DEBUG, logger="sdk"):
+            with patch("agent.ClaudeSDKClient", _RichFakeClient):
+                await agent._process(_msg("telegram", "200", "hi"))
+
+        msgs = [r.getMessage() for r in caplog.records if r.name == "sdk"]
+        assert any("system_init" in m and "model=sonnet" in m for m in msgs), msgs
+        assert any("assistant_message idx=1" in m and "chars=3" in m for m in msgs), msgs
+        assert any("turn_done" in m and "turns=1" in m for m in msgs), msgs
+
+    async def test_attempt_sdk_turn_injects_stderr_callback(
+        self, tmp_path,
+    ):
+        """Bug 4: ClaudeAgentOptions passed to ClaudeSDKClient must
+        carry our stderr callback so the SDK pipes the CLI subprocess
+        stderr through subprocess_cli.connect()."""
+        FakeClient.reset()
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            await agent._process(_msg("telegram", "201", "hi"))
+
+        opts = FakeClient.captured_options
+        assert opts is not None, "FakeClient never received options"
+        assert callable(opts.stderr), (
+            "Phase 4b Bug 4: ClaudeAgentOptions.stderr must be set "
+            "to make_stderr_logger's callback before ClaudeSDKClient is built"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Correlation-id end-to-end (spec 5.2 §7.4)
 # ---------------------------------------------------------------------------
@@ -697,7 +766,12 @@ class TestTokenBudgetMonitoring:
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("voice", "lr", "lights on"))
 
-        rows = [r for r in caplog.records if "turn_done" in r.getMessage()]
+        # Phase 4b added an `sdk` logger turn_done line; this test asserts
+        # the `agent` logger's per-turn summary specifically.
+        rows = [
+            r for r in caplog.records
+            if r.name == "agent" and "turn_done" in r.getMessage()
+        ]
         assert len(rows) == 1
         msg = rows[0].getMessage()
         assert "role=butler" in msg
@@ -737,7 +811,12 @@ class TestTokenBudgetMonitoring:
             await agent._process(_msg("telegram", "123", "hi"))
 
         assert FakeClient.attempts == 2
-        rows = [r for r in caplog.records if "turn_done" in r.getMessage()]
+        # Phase 4b added an `sdk` logger turn_done line; the `agent` logger
+        # summary still fires once per overall _process call.
+        rows = [
+            r for r in caplog.records
+            if r.name == "agent" and "turn_done" in r.getMessage()
+        ]
         assert len(rows) == 1
         msg = rows[0].getMessage()
         # Only the second attempt's usage is in the line.
@@ -808,6 +887,49 @@ class TestResumeResilience:
 
         assert text == "pong"
         assert FakeClient.attempts == 2
+
+    async def test_sdk_retry_fresh_emits_telemetry(self, tmp_path, caplog):
+        """Bug 5: when the resume → ProcessError → fresh-retry path fires,
+        one structured INFO line records the event with exit_code,
+        prior_sid, and stderr_tail. Verifiable via caplog."""
+        import logging
+        from claude_agent_sdk import ProcessError
+
+        FakeClient.reset()
+        FakeClient.failure_schedule = [
+            ProcessError(
+                "CLI exit",
+                exit_code=1,
+                stderr="stale-session-error\nat line 42",
+            ),
+            None,
+        ]
+        FakeClient.response_text = "ok after retry"
+
+        reg = SessionRegistry(str(tmp_path / "sessions.json"))
+        await reg.register("telegram-202", "butler", "STALE-SID-1")
+
+        mem = FakeMemory()
+        agent = _make_agent_with_registry(mem, reg, role="butler")
+
+        with caplog.at_level(logging.INFO, logger="agent"):
+            with patch("agent.ClaudeSDKClient", FakeClient), \
+                 patch("retry.asyncio.sleep", new=AsyncMock()):
+                await agent._process(_msg("telegram", "202", "hi"))
+
+        msgs = [r.getMessage() for r in caplog.records if r.name == "agent"]
+        retry_lines = [m for m in msgs if "sdk_retry_fresh" in m]
+        assert len(retry_lines) == 1, (
+            f"expected exactly one sdk_retry_fresh INFO line; got: {retry_lines}"
+        )
+        line = retry_lines[0]
+        assert "exit_code=1" in line, line
+        assert "prior_sid=STALE-SID-1" in line, line
+        # stderr_tail truncated at 200 chars; newlines escaped to \\n
+        assert "stderr_tail=" in line, line
+        assert "stale-session-error" in line, line
+        # \n in stderr → \\n in tail
+        assert "\\n" in line, line
 
     async def test_fallback_uses_resume_none_on_second_attempt(self, tmp_path):
         """The second FakeClient construction must see options.resume=None."""

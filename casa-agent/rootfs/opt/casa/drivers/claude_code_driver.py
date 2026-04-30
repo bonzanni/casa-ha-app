@@ -254,6 +254,11 @@ class ClaudeCodeDriver(DriverProtocol):
         self._tasks[engagement.id] = [
             asyncio.create_task(self._capture_url(engagement, log_path=log_path)),
             asyncio.create_task(self._poll_respawns(engagement)),
+            # Phase 4b G5: relay every s6-log line into Casa's logger at
+            # DEBUG so operators have one greppable namespace for both
+            # drivers' CLI subprocess output. Independent tailer — the
+            # _capture_url task drops non-URL lines.
+            asyncio.create_task(self._relay_log_lines(engagement, log_path=log_path)),
         ]
 
     async def _capture_url(
@@ -287,6 +292,33 @@ class ClaudeCodeDriver(DriverProtocol):
                 engagement.topic_id,
                 f"Remote control: {url} — open in iOS app or browser "
                 f"to drive from anywhere.",
+            )
+
+    async def _relay_log_lines(
+        self, engagement: EngagementRecord, *, log_path: str,
+    ) -> None:
+        """Tail the per-engagement s6-log file and emit each line at DEBUG.
+
+        Phase 4b G5 — companion to Bug 4's stderr callback. Stderr from the
+        in_casa-driver path lands on the ``subprocess_cli`` logger via the
+        SDK callback (sdk_logging.make_stderr_logger); claude_code's CLI
+        subprocess merges its own stdout+stderr into s6-log
+        (engagement_run_template.sh ``exec 2>&1``). This task reuses
+        ``_tail_file`` so inode rotation is handled, and emits every line at
+        DEBUG so prod operators see nothing and debugging operators see
+        everything (single LOG_LEVEL=DEBUG flip).
+
+        Distinct from ``_capture_url`` — that task seeks the URL regex and
+        drops every other line. This task is the catch-all diagnostic
+        relay; both tasks share the same log_path but tail it
+        independently.
+        """
+        short = engagement.id[:8]
+        relay_logger = logging.getLogger("subprocess_cli")
+        async for line in _tail_file(log_path):
+            relay_logger.debug(
+                "stdout %s", line.rstrip("\n"),
+                extra={"engagement_id": short},
             )
 
     async def _poll_respawns(
