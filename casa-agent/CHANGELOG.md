@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.26.1] - 2026-04-30 — Phase 5: Memory hygiene (E-15)
+
+### Changed
+
+- **`consult_other_agent_memory` falls through to `cross_peer_context`** for disabled-but-known specialists. Memory is data, enablement is operational. Closes E-15 — live N150 verification of M6 cross_peer recall was BLOCKED on Finance disabled (per `project_memory_m6_shipped` Live N150 status). Now Ellen can recall a disabled specialist's accumulated memory.
+- **`assistant/prompts/system.md`** — hedge inverted. Ellen now prefers `consult_other_agent_memory` (cheap memory recall) and reserves `delegate_to_agent` for fresh-data cases. Tina added to the cross-role example list.
+
+### Added
+
+- **`SpecialistRegistry.is_disabled(role)` / `disabled_roles()`** public accessors. Surface for E-15's fall-through and any future code that needs to distinguish disabled-but-bundled from genuinely-unknown roles.
+- **Configurator doctrine** (resident/{create,update}.md) teaches operators that disabled specialists' peer-level memory remains consultable. Out-of-scope follow-up: optional `cfg.allow_memory_when_disabled: bool` for hard-gate semantics (deferred per spec § 3.3).
+- **Unknown-role error message** in `consult_other_agent_memory` now lists disabled roles in the available-roles list (so Ellen self-corrects instead of bouncing off `unknown_role` for legitimate disabled targets).
+
+### Spec / Plan
+
+- Spec: `docs/superpowers/specs/2026-04-30-phase5-memory-hygiene-design.md` (§3)
+- Plan: `docs/superpowers/plans/2026-04-30-phase5-memory-hygiene.md` (§B)
+
+### Verification
+
+- Local pytest (`-m "not docker and not slow"`, `tests/` scope): pass count + 7 new tests, 0 failed.
+- Smoke 3/3 PASS.
+- **Operator-driven Telegram probes** (manual, after deploy):
+  - Probe 1 — Tina recall: "what did Tina mention about lights last week?" → expect `memory_call call_type=cross_peer observer=butler`.
+  - Probe 2 — disabled-Finance recall: "what did Finance say about my Q1 invoices?" → expect `consult_other_agent_memory_call result_len > 0` (or = 0 if Honcho has no Finance peer-level data; success criterion is `unknown_role` NOT returned).
+
 ## [0.26.0] - 2026-04-30 — Phase 5: Memory hygiene (E-14)
 
 ### Changed (BREAKING — pre-1.0.0 license)
