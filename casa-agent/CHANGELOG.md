@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.24.0] - 2026-04-30 — Phase 4a: OTEL DEBUG-noise cleanup (Bug 7)
+
+### Fixed
+- **Bug 7** (LOW, cosmetic): the `claude_agent_sdk._internal.transport.subprocess_cli`
+  logger no longer emits an `OTEL trace context injection failed`
+  ModuleNotFoundError traceback on every CLI subprocess connect. Two
+  changes: (1) `opentelemetry-api>=1.20.0` joins `requirements.txt`
+  so the SDK's lazy `opentelemetry.propagate` import succeeds (no
+  exception swallowed → no DEBUG traceback emitted). (2)
+  `log_cid.install_logging` quiets the `opentelemetry` logger to
+  WARNING as belt-and-braces against future SDK paths that emit
+  through the same logger. Live evidence: 2026-04-30 06:40:22Z and
+  06:40:29Z N150 v0.23.0 cids `c8fcfca1` + `c3fae47c`.
+
+### Internal
+- Single new test `test_log_cid.py::TestInstallLogging::test_otel_logger_quieted_to_warning`
+  asserting the post-`install_logging()` effective level on the
+  `opentelemetry` logger.
+
+### Notes
+- **Out of scope:** Phase 4b (Bugs 3 + 4 + 5 + claude_code log relay
+  G5) ships separately as v0.25.0 with its own design surface.
+  E-12 (claude_code driver topic silence) remains deferred to its
+  own design epic.
+- Cosmetic-only release. No API or schema changes. No
+  config/options changes.
+
 ## [0.23.0] - 2026-04-30 — Phase 3b: engagement-topic streaming (Bug 1)
 
 ### Fixed
