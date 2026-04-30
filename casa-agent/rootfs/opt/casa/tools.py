@@ -866,13 +866,27 @@ async def consult_other_agent_memory(args: dict) -> dict:
         _specialist_registry.get(role)
         if _specialist_registry is not None else None
     )
-    if cfg is None:
+
+    # Phase 5 / E-15: a specialist that's bundled but disabled in user
+    # config has its peer-level Honcho memory persisted independently
+    # of operational enablement. Fall through to cross_peer_context
+    # rather than refusing the consult — memory is data, enablement is
+    # operational. Spec § 3.2.1 + memory project_memory_m6_shipped
+    # documents the cross_peer probe blocker on disabled peers.
+    is_disabled_peer = (
+        cfg is None
+        and _specialist_registry is not None
+        and _specialist_registry.is_disabled(role)
+    )
+    if cfg is None and not is_disabled_peer:
         # Build available-roles list for the error message — matches
         # delegate_to_agent's "no enabled agent" pattern but adds the
-        # known-roles list to help the model self-correct
+        # known-roles list to help the model self-correct.
         registered: list[str] = list(_agent_role_map.keys())
         if _specialist_registry is not None:
             registered += list(_specialist_registry.all_configs().keys())
+            # Disabled peers ARE consultable per § 3.2.1 — list them too.
+            registered += _specialist_registry.disabled_roles()
         return _result({
             "status": "error",
             "kind": "unknown_role",

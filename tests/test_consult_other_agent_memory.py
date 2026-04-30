@@ -91,6 +91,8 @@ def setup_tool(monkeypatch):
 
     class _FakeSpecRegistry:
         _configs = {"finance": _FakeAgentConfig(role="finance", channels=[])}
+        # Phase 5 / E-15: bundled but disabled — memory still consultable.
+        _disabled = {"health"}
 
         def get(self, name):
             return self._configs.get(name)
@@ -98,6 +100,13 @@ def setup_tool(monkeypatch):
         def all_configs(self):
             # M6 polish (600a801): tool now uses public all_configs()
             return dict(self._configs)
+
+        # Phase 5 / E-15 — public accessors for disabled-peer fall-through.
+        def is_disabled(self, name):
+            return name in self._disabled
+
+        def disabled_roles(self):
+            return sorted(self._disabled)
 
     monkeypatch.setattr(
         tools, "_agent_role_map", fake_role_map, raising=False,
@@ -193,3 +202,56 @@ async def test_logs_consult_call_with_role_and_t_ms(setup_tool, caplog):
     assert getattr(rec, "query_len", None) == 1
     assert getattr(rec, "result_len", None) > 0
     assert isinstance(getattr(rec, "t_ms", None), int)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 / E-15 — disabled-peer fall-through
+# ---------------------------------------------------------------------------
+
+
+async def test_disabled_peer_falls_through_to_cross_peer_context(setup_tool):
+    """Spec § 3.2.1: a disabled-but-known specialist's memory is
+    consultable. Tool falls through to cross_peer_context instead of
+    returning unknown_role."""
+    setup_tool["provider"].return_value = (
+        "## What Health knows about you (cross-role)\n"
+        "- exercises 4× a week"
+    )
+    tool = setup_tool["tool"]
+
+    out = await tool.handler({"role": "health", "query": "fitness goals"})
+    payload = json.loads(out["content"][0]["text"])
+
+    # Status is OK, not error — fall-through worked.
+    assert payload["status"] == "ok"
+    body = payload["content"]
+    assert 'Memory consult of health on "fitness goals"' in body
+    assert "## What Health knows about you (cross-role)" in body
+
+    # Provider was actually invoked with the disabled role's name.
+    assert len(setup_tool["provider"].calls) == 1
+    assert setup_tool["provider"].calls[0]["observer_role"] == "health"
+
+
+async def test_unknown_role_still_returns_error_not_fall_through(setup_tool):
+    """Regression: a role that's neither registered nor disabled still
+    returns unknown_role. Prevents the fall-through from eating
+    legitimate typos."""
+    tool = setup_tool["tool"]
+
+    out = await tool.handler({"role": "totally_made_up", "query": "anything"})
+    payload = json.loads(out["content"][0]["text"])
+    assert payload["status"] == "error"
+    assert payload["kind"] == "unknown_role"
+
+
+async def test_unknown_role_error_message_lists_disabled_roles(setup_tool):
+    """Spec § 3.2.1: disabled roles ARE consultable; the unknown_role
+    error must list them so Ellen can self-correct."""
+    tool = setup_tool["tool"]
+
+    out = await tool.handler({"role": "totally_made_up", "query": "x"})
+    payload = json.loads(out["content"][0]["text"])
+    assert payload["status"] == "error"
+    # 'health' is disabled but listed in available roles for visibility.
+    assert "health" in payload["message"]
