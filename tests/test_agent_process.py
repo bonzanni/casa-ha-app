@@ -766,7 +766,12 @@ class TestTokenBudgetMonitoring:
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("voice", "lr", "lights on"))
 
-        rows = [r for r in caplog.records if "turn_done" in r.getMessage()]
+        # Phase 4b added an `sdk` logger turn_done line; this test asserts
+        # the `agent` logger's per-turn summary specifically.
+        rows = [
+            r for r in caplog.records
+            if r.name == "agent" and "turn_done" in r.getMessage()
+        ]
         assert len(rows) == 1
         msg = rows[0].getMessage()
         assert "role=butler" in msg
@@ -806,7 +811,12 @@ class TestTokenBudgetMonitoring:
             await agent._process(_msg("telegram", "123", "hi"))
 
         assert FakeClient.attempts == 2
-        rows = [r for r in caplog.records if "turn_done" in r.getMessage()]
+        # Phase 4b added an `sdk` logger turn_done line; the `agent` logger
+        # summary still fires once per overall _process call.
+        rows = [
+            r for r in caplog.records
+            if r.name == "agent" and "turn_done" in r.getMessage()
+        ]
         assert len(rows) == 1
         msg = rows[0].getMessage()
         # Only the second attempt's usage is in the line.
