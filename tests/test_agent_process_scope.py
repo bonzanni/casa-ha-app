@@ -630,4 +630,101 @@ class TestScopeRouteEmission:
         # Type sanity:
         assert isinstance(rec.winner_score, float)
         assert isinstance(rec.threshold, float)
-        assert isinstance(rec.active, list)
+
+
+class TestMemoryFailureLogsExcInfo:
+    """E-B (v0.29.0): "Memory call failed" must carry exc_info=True so
+    the actual exception class + message reach production logs.
+
+    Pre-fix: every Ellen Telegram turn fired 5× WARNINGs (one per active
+    scope) with no recoverable exception data — root-cause investigation
+    blocked. The bug-review-2026-04-30-exploration2.md::E-B notes "the
+    exception class + message are unrecoverable from production logs."
+    """
+
+    async def test_one_scope_failure_includes_exc_info(self, caplog):
+        import logging
+        from agent import Agent
+        from bus import BusMessage, MessageType
+
+        memory = Mock()
+        memory.ensure_session = AsyncMock(
+            side_effect=TypeError(
+                "HonchoMemoryProvider.get_context() got an "
+                "unexpected keyword argument 'tokens'"
+            ),
+        )
+        memory.get_context = AsyncMock(return_value="never reached")
+        memory.add_turn = AsyncMock()
+        memory.peer_overlay_context = AsyncMock(return_value="")
+
+        reg = _make_scope_registry(
+            readable_out=["personal"],
+            active_out=["personal"],
+            argmax_out="personal",
+        )
+
+        cfg = _make_agent_config(default_scope="personal")
+        agent = _make_agent(cfg, memory, reg)
+
+        caplog.set_level(logging.WARNING, logger="agent")
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            await agent._process(_msg("telegram", "12345", "hello"))
+
+        records = [
+            r for r in caplog.records
+            if r.name == "agent" and "Memory call failed" in r.getMessage()
+        ]
+        assert records, (
+            "expected at least one 'Memory call failed' WARNING "
+            "but got: " + repr([r.getMessage() for r in caplog.records])
+        )
+        # E-B contract: exc_info must be populated so the underlying
+        # exception class + message are reachable from production logs.
+        rec = records[0]
+        assert rec.exc_info is not None, (
+            "E-B regression: Memory call failed warning lost exc_info=True; "
+            "production root-cause is blocked"
+        )
+        # Sanity: the captured exception is the one we raised.
+        assert rec.exc_info[0] is TypeError
+        assert "tokens" in str(rec.exc_info[1])
+
+    async def test_overlay_failure_includes_exc_info(self, caplog):
+        """E-B companion: peer_overlay_context warning also carries
+        exc_info — same observability rule."""
+        import logging
+        from agent import Agent
+        from bus import BusMessage, MessageType
+
+        memory = Mock()
+        memory.ensure_session = AsyncMock()
+        memory.get_context = AsyncMock(return_value="ok")
+        memory.add_turn = AsyncMock()
+        memory.peer_overlay_context = AsyncMock(
+            side_effect=RuntimeError("honcho 503"),
+        )
+
+        reg = _make_scope_registry(
+            readable_out=["personal"],
+            active_out=["personal"],
+            argmax_out="personal",
+        )
+
+        cfg = _make_agent_config(default_scope="personal")
+        agent = _make_agent(cfg, memory, reg)
+
+        caplog.set_level(logging.WARNING, logger="agent")
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            await agent._process(_msg("telegram", "12345", "hello"))
+
+        records = [
+            r for r in caplog.records
+            if r.name == "agent" and "Peer overlay call failed" in r.getMessage()
+        ]
+        assert records
+        rec = records[0]
+        assert rec.exc_info is not None, (
+            "E-B companion regression: Peer overlay warning lost exc_info"
+        )
+        assert rec.exc_info[0] is RuntimeError

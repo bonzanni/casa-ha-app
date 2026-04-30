@@ -372,9 +372,14 @@ class Agent:
                         search_query=user_text,
                     )
                 except Exception:
+                    # E-B (v0.29.0): exc_info=True — without this, the
+                    # exception class + message disappear, making it
+                    # impossible to root-cause M3-self failures from
+                    # production logs. The bug was confirmed firing 5×
+                    # per Ellen Telegram turn from v0.x to v0.28.1.
                     logger.warning(
                         "Memory call failed for scope=%s session=%s",
-                        scope, sid,
+                        scope, sid, exc_info=True,
                     )
                     digest = ""
                 return scope, digest
@@ -390,9 +395,11 @@ class Agent:
                         tokens=overlay_budget,
                     )
                 except Exception:
+                    # E-B companion: same observability rule applies to
+                    # the overlay read.
                     logger.warning(
                         "Peer overlay call failed for observer=%s user_peer=%s",
-                        self.config.role, user_peer,
+                        self.config.role, user_peer, exc_info=True,
                     )
                     return ""
 

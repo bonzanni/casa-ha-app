@@ -1,5 +1,153 @@
 # Changelog
 
+## [0.29.0] - 2026-04-30 — Bug bundle: E-E + E-D + E-B + E-C
+
+Closes the four bugs filed in
+`docs/bug-review-2026-04-30-exploration2.md`. Single shipping sprint
+under pre-1.0.0 license; covers a CRITICAL ContextVar regression that
+broke every in_casa configurator engagement since v0.20.0, a HIGH
+silent kwarg-drift dropping the M4 L3 executor archive since v0.26.0,
+a MEDIUM observability gap blocking M3-self root-cause investigation,
+and a CRITICAL deployment-visibility gap masking every
+`/opt/casa/defaults/` change shipped after first boot.
+
+### Fixed
+
+- **E-E (CRITICAL) — `engagement_var` ContextVar not propagating into
+  SDK tool dispatch.** Pre-fix, `InCasaDriver.start()` bound
+  `engagement_var` inside `_deliver_turn`, AFTER
+  `ClaudeSDKClient.__aenter__()` had already called
+  `claude_agent_sdk._internal.query.Query.start` — which spawns
+  `_read_task` via `loop.create_task(self._read_messages())`. Per
+  Python's asyncio semantics, `loop.create_task` captures the
+  CURRENT context at task-creation time; the SDK's inner task
+  therefore captured `engagement_var = None` and every tool callback
+  it dispatched (including the privileged
+  `config_git_commit` / `casa_reload` / `emit_completion`) saw
+  `_effective_caller_role()` return the engager's `origin_var.role`
+  ("assistant"), refusing all three. Net effect: every in_casa
+  configurator engagement orphaned silently from v0.20.0 to v0.28.1
+  (~5 days, missed because v0.20.0 / Phase 1's "manual configurator
+  engagement test pending operator" deferred line was never
+  discharged). Fix at
+  `casa-agent/rootfs/opt/casa/drivers/in_casa_driver.py:74-115` —
+  bind `engagement_var` BEFORE `client.__aenter__()` in `start()`,
+  reset in `finally`. Same pattern applied to `resume()` at
+  `:128-165`.
+
+- **E-D (HIGH) — `_fetch_executor_archive` passes stale `agent_role`
+  kwarg to `get_context()`.** v0.26.0 / E-14 dropped `agent_role` and
+  `user_peer` from `MemoryProvider.get_context`'s signature; v0.27.0 /
+  Bug 6 swept three call sites for the parallel `executor:<type>` →
+  `executor-<type>` regex but missed the `agent_role=agent_role`
+  kwarg drift here. Every executor engagement spawn (configurator,
+  plugin-developer, hello-driver) raised `TypeError` against the real
+  Honcho provider — silently swallowed by the function's `except
+  Exception` and logged as a one-line WARNING without `exc_info=True`.
+  M4 L3 cross-run executor memory was dark for every executor on
+  every spawn since v0.26.0. Fix at
+  `casa-agent/rootfs/opt/casa/tools.py:1179-1186` — drop
+  `agent_role=agent_role`; also added `exc_info=True` to the warning
+  for parity with E-B.
+
+- **E-B (MEDIUM) — `Memory call failed` swallowed without
+  `exc_info=True`.** Both warning sites in agent.py's per-turn memory
+  read (`agent.py:374-379` for per-scope `_one_scope`; `agent.py:391-397`
+  for `_overlay`) lost the underlying exception class + message,
+  blocking root-cause investigation of M3-self failures that fired
+  5× per Ellen Telegram turn from v0.x to v0.28.1. Fix is a single
+  `exc_info=True` keyword on each `logger.warning(...)` call.
+
+- **E-C (CRITICAL — visibility) — Persistent `/addon_configs/` never
+  re-seeds.** `seed_agent_dir()` in `setup-configs.sh:28-34` is
+  no-op when the destination dir already exists. After E-11's
+  persistent ext4 bind mount (v0.19.0), every default-side change
+  shipped via `/opt/casa/defaults/` after first boot was silently
+  dark. Three confirmed dark-state examples spanning v0.26.1 →
+  v0.27.0 → v0.28.0 (E-15 prompt-nudge missing, E-5 financial-
+  arithmetic anchor missing, E-16 configurator plugin tools +
+  recipes missing). Master CI runs against fresh volumes so the
+  upgrade-over-existing-overlay path has zero coverage. Fix at
+  `casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh:78-145`
+  — adds an `# === drift-check ===` block that walks
+  `/opt/casa/defaults/{agents,policies}/` vs the live overlay,
+  byte-compares each file via `diff -rq`, and logs WARNING per
+  drifted/missing file plus a one-line summary. Visibility-only;
+  operator decides when to run Phase Z (uninstall+reinstall). The
+  block is POSIX-clean (parallel to the existing seed-copy block)
+  so it can be unit-tested via `sh -c`.
+
+### Tests
+
+- **`tests/test_in_casa_driver.py::TestInCasaEngagementContext::test_engagement_var_propagates_into_sdk_inner_task`**
+  — models the SDK's `Query._read_task` spawn pattern (a fake client
+  whose `__aenter__` calls `loop.create_task` then snapshots
+  `engagement_var.get(None)` inside that task). Pre-fix the snapshot
+  is `[None]`; post-fix it is `[rec]`. Catches any future regression
+  of E-E.
+
+- **`tests/test_engage_executor_memory.py::test_returns_empty_when_archive_empty`**
+  updated to assert `"agent_role" not in kwargs` and
+  `"user_peer" not in kwargs` on the `get_context` call.
+- **`tests/test_engage_executor_memory.py::test_get_context_signature_locks_kwargs`**
+  — introspection-based regression test that asserts
+  `MemoryProvider.get_context`'s parameter set is exactly
+  `{self, session_id, tokens, search_query}`. Locks against future
+  caller-vs-ABC drift at unit-test time rather than waiting for an
+  exploration session to surface it.
+- **`tests/test_executor_archive_is_read_on_second_engagement`**
+  in-memory `_Mp` mock updated: dropped `agent_role` and
+  `user_peer` from its `get_context` signature.
+
+- **`tests/test_agent_process_scope.py::TestMemoryFailureLogsExcInfo`**
+  — two tests covering both warning sites:
+  `test_one_scope_failure_includes_exc_info` raises a TypeError from
+  `ensure_session` and asserts `caplog`-captured record has
+  `exc_info` populated with the original exception class + message;
+  `test_overlay_failure_includes_exc_info` does the same for
+  `peer_overlay_context`.
+
+- **`tests/test_setup_configs_drift_check.py`** — five tests against
+  the extracted drift-check block, mirroring the seed-copy test
+  shape. Covers: clean trees → INFO summary; drifted file → WARN +
+  `drifted=1`; missing file in live → WARN + `missing=1`;
+  operator-added file in live → ignored (no false-positive drift);
+  missing default dir → graceful early-return.
+
+### Cross-refs
+
+- `docs/bug-review-2026-04-30-exploration2.md::{E-B, E-C, E-D, E-E}`
+  — full forensic + suggested-fix-shape that drove this ship.
+- v0.20.0 / Phase 1 (commit `077714d`) — E-7's
+  `engagement_var.set` in `_deliver_turn` covered Ellen's path but
+  missed the SDK inner-task capture-at-`__aenter__` semantics.
+  Memory `project_phase1_engagement_context_shipped`'s "manual
+  configurator engagement test pending operator" note would have
+  caught E-E — discharged here.
+- v0.26.0 / E-14 (commit `b3dac55`) — `MemoryProvider` ABC reshape
+  that dropped `agent_role` from `get_context`. Memory
+  `project_phase5_e14_shipped`.
+- v0.19.0 / E-11 (commit `54ae912`) — addon_config map flip to
+  `all_addon_configs:rw` made `/addon_configs/casa-agent/`
+  persistent. E-C is the unintended consequence of that
+  persistence — every fix shipped after v0.19.0 to
+  `/opt/casa/defaults/` is silently dark on the live N150 until
+  operator wipe.
+
+### Success signal
+
+Next exploration session reruns
+`docs/exploration-testing-playbook.md` from P4.2 onwards. Expected:
+- **P4.2:** configurator engagement closes cleanly
+  (`status=completed`, `config_git_commit` + `emit_completion`
+  succeed); no Bash fallback.
+- **P5/P8/P11/P12/P15:** all unblocked from E-E.
+- **E-B:** turn-trace shows the actual exception class for every
+  `Memory call failed` warning (driving the next corrective ship).
+- **E-C:** boot logs show `drift_check missing-in-live` /
+  `drift_check drifted` WARN lines for any defaults the operator
+  hasn't wiped.
+
 ## [0.28.1] - 2026-04-30 — E-A: Telegram channel fully broken since v0.22.0
 
 Surfaced live during the 2026-04-30 afternoon exploration session

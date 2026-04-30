@@ -1163,9 +1163,11 @@ async def _fetch_executor_archive(
     rendered digest wrapped under a recognizable header, or "" when the
     archive is empty / provider is None / read fails.
 
-    Mirrors the WRITE site at ``tools.py:1383`` exactly:
-    session_id = ``honcho_session_id(channel, chat_id, "executor", executor_type)``
-    agent_role = ``f"executor-{executor_type}"``.
+    Mirrors the WRITE site at ``tools.py:1383`` for ``session_id`` and
+    ``agent_role`` on ``ensure_session``. ``get_context`` is session-only —
+    its signature dropped ``agent_role`` and ``user_peer`` in v0.26.0
+    (E-14). E-D (v0.29.0) removed the lingering ``agent_role=agent_role``
+    kwarg here that was a silent TypeError on every executor spawn.
     """
     if memory_provider is None:
         return ""
@@ -1178,13 +1180,12 @@ async def _fetch_executor_archive(
         )
         digest = await memory_provider.get_context(
             session_id=session_id,
-            agent_role=agent_role,
             tokens=token_budget,
         )
     except Exception as exc:  # noqa: BLE001 — ARCH: same shape as 1246, 1407
         logger.warning(
             "executor archive fetch failed for type=%s: %s",
-            executor_type, exc,
+            executor_type, exc, exc_info=True,
         )
         return ""
     if not digest:

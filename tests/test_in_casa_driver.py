@@ -532,6 +532,106 @@ class TestInCasaResume:
 
 
 class TestInCasaEngagementContext:
+    async def test_engagement_var_propagates_into_sdk_inner_task(self, monkeypatch):
+        """E-E (v0.29.0): the SDK's __aenter__ creates an inner asyncio Task
+        (claude_agent_sdk._internal.query.Query._read_task via
+        loop.create_task) which captures the current ContextVar copy at
+        creation time. Tool callbacks dispatched from that inner task
+        therefore see whatever engagement_var was bound to at __aenter__
+        time — NOT what the parent task binds later.
+
+        Pre-fix: engagement_var was bound inside _deliver_turn, AFTER
+        __aenter__. The SDK inner task captured engagement_var=None;
+        every privileged-tool dispatch saw _effective_caller_role()
+        return the engager's origin.role ("assistant") and refused.
+        Every in_casa configurator engagement orphaned silently from
+        v0.20.0 to v0.28.1.
+
+        Post-fix: start() binds engagement_var BEFORE __aenter__, so the
+        SDK inner task's captured context has the engagement record.
+
+        The fake client below models the real SDK pattern: __aenter__
+        spawns a task; inside that task we snapshot engagement_var.
+        Asserting on the snapshot proves the fix works."""
+        import asyncio as _asyncio
+        from drivers.in_casa_driver import InCasaDriver
+        from tools import engagement_var
+
+        inner_captured: list = []
+
+        class _SDKWithInnerTask:
+            def __init__(self, options):
+                self._inbox: _asyncio.Queue = _asyncio.Queue()
+                self._outbox: _asyncio.Queue = _asyncio.Queue()
+                self._task: _asyncio.Task | None = None
+
+            async def __aenter__(self):
+                # Same shape as Query.start in claude_agent_sdk:
+                # loop.create_task(self._read_messages()) — the new task
+                # captures the CURRENT context.
+                loop = _asyncio.get_running_loop()
+                self._task = loop.create_task(self._read_loop())
+                return self
+
+            async def __aexit__(self, *a):
+                await self._inbox.put(None)
+                if self._task is not None:
+                    try:
+                        await self._task
+                    except _asyncio.CancelledError:
+                        pass
+
+            async def _read_loop(self):
+                """Inside the SDK's inner task — this is where every tool
+                callback would be dispatched in the real SDK. Snapshot
+                engagement_var ONCE per prompt to model what the tool
+                callback would see."""
+                while True:
+                    item = await self._inbox.get()
+                    if item is None:
+                        return
+                    inner_captured.append(engagement_var.get(None))
+                    await self._outbox.put(item)
+
+            async def query(self, prompt):
+                await self._inbox.put(prompt)
+
+            async def receive_response(self):
+                text = await self._outbox.get()
+                yield _mk_assistant(f"echoed:{text}")
+
+            async def close(self):
+                await self._inbox.put(None)
+                if self._task is not None:
+                    try:
+                        await self._task
+                    except _asyncio.CancelledError:
+                        pass
+
+        monkeypatch.setattr(
+            "drivers.in_casa_driver.ClaudeSDKClient", _SDKWithInnerTask,
+        )
+
+        drv = InCasaDriver(topic_stream_factory=_mk_noop_factory())
+        rec = _make_record(role_or_type="configurator")
+
+        # Pre-state: engagement_var unbound in the parent task.
+        assert engagement_var.get(None) is None
+
+        await drv.start(rec, "p", ClaudeAgentOptions(model="sonnet"))
+
+        # The SDK inner task — created during __aenter__ — must have
+        # captured engagement_var bound to the engagement record. Pre-fix
+        # this was [None]; post-fix it is [rec].
+        assert inner_captured == [rec], (
+            "E-E regression: SDK inner task did not capture engagement_var. "
+            "Bind engagement_var BEFORE ClaudeSDKClient.__aenter__() in "
+            "InCasaDriver.start()."
+        )
+        # Parent task's binding must be cleared after start() returns —
+        # we don't leak it into surrounding turns.
+        assert engagement_var.get(None) is None
+
     async def test_deliver_turn_sets_engagement_var_during_sdk_loop(self, monkeypatch):
         """engagement_var is bound for the duration of receive_response()."""
         from drivers.in_casa_driver import InCasaDriver

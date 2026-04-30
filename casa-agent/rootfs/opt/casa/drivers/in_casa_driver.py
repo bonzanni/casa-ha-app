@@ -77,6 +77,18 @@ class InCasaDriver(DriverProtocol):
         prompt: str,
         options: ClaudeAgentOptions,
     ) -> None:
+        # E-E (v0.29.0): bind engagement_var BEFORE ClaudeSDKClient.__aenter__
+        # so the SDK's inner Query._read_task — created via loop.create_task
+        # in claude_agent_sdk._internal.query.Query.start — captures the
+        # engagement in its ContextVar copy. Tool callbacks dispatched from
+        # that inner task (and any spawn_task descendants) inherit the
+        # binding. Without this, _effective_caller_role() reads None and
+        # falls through to origin_var.role ("assistant" — Ellen's bus role
+        # via origin_var inherited along the parent task), every privileged
+        # tool refuses, and the engagement orphans. Lazy-imported to avoid
+        # circular import (tools imports engagement_registry).
+        from tools import engagement_var
+
         assert engagement.topic_id is not None, (
             "in_casa driver requires a topic_id (got None)"
         )
@@ -85,15 +97,23 @@ class InCasaDriver(DriverProtocol):
                 options, engagement_id=engagement.id[:8],
             ),
         )
-        ctx = client.__aenter__()
-        entered = await ctx if asyncio.iscoroutine(ctx) else ctx
-        self._clients[engagement.id] = entered or client
-        self._ctx_stack[engagement.id] = client  # for __aexit__
-        self._locks[engagement.id] = asyncio.Lock()
-        logger.info(
-            "Engagement %s driver=in_casa client opened", engagement.id[:8],
-        )
-        await self._deliver_turn(engagement, prompt)
+        token = engagement_var.set(engagement)
+        try:
+            ctx = client.__aenter__()
+            entered = await ctx if asyncio.iscoroutine(ctx) else ctx
+            self._clients[engagement.id] = entered or client
+            self._ctx_stack[engagement.id] = client  # for __aexit__
+            self._locks[engagement.id] = asyncio.Lock()
+            logger.info(
+                "Engagement %s driver=in_casa client opened",
+                engagement.id[:8],
+            )
+            await self._deliver_turn(engagement, prompt)
+        finally:
+            # Clear from the parent task. The SDK inner task already
+            # captured its own snapshot at __aenter__ time and is
+            # unaffected by this reset.
+            engagement_var.reset(token)
 
     async def send_user_turn(
         self, engagement: EngagementRecord, text: str,
@@ -131,6 +151,10 @@ class InCasaDriver(DriverProtocol):
         Caller (telegram routing path, after user turn in a suspended topic)
         handles retry + error surfacing. This method raises on failure.
         """
+        # E-E (v0.29.0): same propagation requirement as start() — the
+        # resumed client also creates a fresh _read_task during __aenter__.
+        from tools import engagement_var
+
         if self.is_alive(engagement):
             logger.warning(
                 "resume() called on engagement %s that is already alive",
@@ -143,14 +167,18 @@ class InCasaDriver(DriverProtocol):
                 options, engagement_id=engagement.id[:8],
             ),
         )
-        entered = await client.__aenter__()
-        self._clients[engagement.id] = entered or client
-        self._ctx_stack[engagement.id] = client
-        self._locks[engagement.id] = asyncio.Lock()
-        logger.info(
-            "Engagement %s resumed (session=%s)",
-            engagement.id[:8], session_id,
-        )
+        token = engagement_var.set(engagement)
+        try:
+            entered = await client.__aenter__()
+            self._clients[engagement.id] = entered or client
+            self._ctx_stack[engagement.id] = client
+            self._locks[engagement.id] = asyncio.Lock()
+            logger.info(
+                "Engagement %s resumed (session=%s)",
+                engagement.id[:8], session_id,
+            )
+        finally:
+            engagement_var.reset(token)
 
     def get_session_id(self, engagement: EngagementRecord) -> str | None:
         """Return the live client's session_id for persistence before cancel."""

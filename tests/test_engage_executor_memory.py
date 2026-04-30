@@ -40,8 +40,39 @@ async def test_returns_empty_when_archive_empty():
     mp.get_context.assert_awaited_once()
     kwargs = mp.get_context.await_args.kwargs
     assert kwargs["session_id"] == "telegram-42-executor-configurator"
-    assert kwargs["agent_role"] == "executor-configurator"
     assert kwargs["tokens"] == 2000
+    # E-D (v0.29.0): MemoryProvider.get_context's signature dropped
+    # agent_role and user_peer in v0.26.0 (E-14). The caller here held
+    # the kwarg for three minor versions and silently TypeError'd on
+    # every executor spawn until v0.29.0.
+    assert "agent_role" not in kwargs, (
+        "E-D regression: _fetch_executor_archive must not pass "
+        "agent_role= to get_context — that kwarg was dropped in "
+        "v0.26.0 / E-14."
+    )
+    assert "user_peer" not in kwargs
+
+
+def test_get_context_signature_locks_kwargs():
+    """Lock MemoryProvider.get_context's parameter set against future
+    drift. E-D regression: tools.py:1181 was passing agent_role= to
+    get_context, a kwarg dropped from the ABC in v0.26.0; every executor
+    engagement silently failed to load its archive. This introspection
+    test catches any future caller-vs-ABC divergence at unit-test time
+    rather than waiting for an exploration session."""
+    import inspect
+    from memory import MemoryProvider
+
+    sig = inspect.signature(MemoryProvider.get_context)
+    actual = set(sig.parameters.keys())
+    expected = {"self", "session_id", "tokens", "search_query"}
+    assert actual == expected, (
+        f"MemoryProvider.get_context kwargs drifted. "
+        f"Expected {expected}, got {actual}. "
+        f"If this is intentional, audit every call site (agent.py, "
+        f"tools.py::_fetch_executor_archive, tools.py::cross_peer_context) "
+        f"and update this test."
+    )
 
 
 async def test_returns_wrapped_block_when_archive_populated():
@@ -161,8 +192,8 @@ async def test_executor_archive_is_read_on_second_engagement(tmp_path):
                 (user_text, assistant_text),
             )
 
-        async def get_context(self, *, session_id, agent_role, tokens,
-                              search_query=None, user_peer="nicola"):
+        async def get_context(self, *, session_id, tokens,
+                              search_query=None):
             entries = archive.get(session_id, [])
             if not entries:
                 return ""
