@@ -81,6 +81,84 @@ fi
 # be wiped across updates in development mode. This keeps
 # setup-configs.sh lean. Revisit when v1.0.0 ships.
 
+# === drift-check: begin =========================================
+# E-C drift report (v0.29.0).
+#
+# The seed_agent_dir() helper above is no-op when the destination dir
+# already exists — meaning every default-side change shipped via
+# /opt/casa/defaults/ since the last operator wipe is silently dark on
+# this addon's persistent /addon_configs/casa-agent/ overlay. Master
+# CI runs against fresh volumes and never exercises the upgrade-over-
+# existing-overlay path, so this drift is invisible to all gates.
+#
+# Walks the agents/ + policies/ default trees, byte-compares each file
+# against its live counterpart, and logs WARNING per drifted or
+# missing-in-live file plus a one-line summary. Operator decides when
+# to wipe (Phase Z uninstall+reinstall per memory
+# feedback_phase_z_via_uninstall).
+#
+# See docs/bug-review-2026-04-30-exploration2.md::E-C for the v0.26.1 →
+# v0.27.0 → v0.28.0 dark-state evidence that drove this block.
+#
+# Pure POSIX sh (no `local`, no process substitution) so this block
+# can be unit-tested via `sh -c` parallel to the seed-copy block.
+
+# _dc_log_*: portable wrappers — bashio in production, printf in tests.
+_dc_log_warn() {
+    if command -v bashio >/dev/null 2>&1; then
+        bashio::log.warning "$*"
+    else
+        printf '[WARN] %s\n' "$*"
+    fi
+}
+_dc_log_info() {
+    if command -v bashio >/dev/null 2>&1; then
+        bashio::log.info "$*"
+    else
+        printf '[INFO] %s\n' "$*"
+    fi
+}
+
+drift_count=0
+missing_count=0
+DRIFT_TMP=$(mktemp 2>/dev/null || echo /tmp/casa-drift-check.$$)
+
+_drift_check_tree() {
+    _default_root=$1
+    _live_root=$2
+    [ -d "$_default_root" ] || return 0
+    [ -d "$_live_root" ] || return 0
+    # diff -rq lists "Only in DIR: NAME" for one-sided files and
+    # "Files A and B differ" for byte-mismatches. We ignore "Only in
+    # live" (operator-added files are not drift).
+    diff -rq "$_default_root" "$_live_root" > "$DRIFT_TMP" 2>/dev/null || true
+    while IFS= read -r _line; do
+        case "$_line" in
+            "Only in $_default_root"*)
+                _dc_log_warn "drift_check missing-in-live: $_line"
+                missing_count=$((missing_count + 1))
+                ;;
+            "Files "*" differ")
+                _dc_log_warn "drift_check drifted: $_line"
+                drift_count=$((drift_count + 1))
+                ;;
+        esac
+    done < "$DRIFT_TMP"
+}
+
+_drift_check_tree "$DEFAULTS_DIR/agents"   "$CONFIG_DIR/agents"
+_drift_check_tree "$DEFAULTS_DIR/policies" "$CONFIG_DIR/policies"
+
+if [ "$drift_count" -gt 0 ] || [ "$missing_count" -gt 0 ]; then
+    _dc_log_warn "drift_check report: drifted=$drift_count missing=$missing_count"
+    _dc_log_warn "drift_check: pre-1.0.0 wipe doctrine — run 'ha apps uninstall <slug> --remove-data' + reinstall to refresh defaults; operator-set options survive."
+else
+    _dc_log_info "drift_check report: clean (no drift vs defaults)"
+fi
+rm -f "$DRIFT_TMP"
+unset drift_count missing_count DRIFT_TMP _default_root _live_root _line
+# === drift-check: end ===========================================
+
 # Seed schemas (overwrite on every boot — schemas ship with the Casa
 # image and the image is the source of truth; hand-edits under
 # /addon_configs/casa-agent/schema/ get clobbered by design).
