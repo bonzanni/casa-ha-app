@@ -1080,14 +1080,25 @@ async def main() -> None:
     # Engagement infrastructure: InCasaDriver + Observer
     from drivers.in_casa_driver import InCasaDriver
 
+    # Phase 3b: in_casa engagements stream via TopicStreamHandle (per-turn
+    # edit-in-place, 1s throttle, mirror Ellen's create_on_token pattern
+    # in channels/telegram.py:739-859). Bug 1 fix.
+    def _topic_stream_factory(topic_id: int):
+        assert telegram_channel is not None, (
+            "InCasaDriver requires a configured telegram channel"
+        )
+        return telegram_channel.create_topic_stream(topic_id)
+
+    engagement_driver = InCasaDriver(
+        topic_stream_factory=_topic_stream_factory,
+        persist_session_id=engagement_registry.persist_session_id,
+    )
+
+    # claude_code driver still uses the buffered send_to_topic path
+    # (different driver, separate streaming work parked in Phase 4 / E-12).
     async def _send_to_topic(thread_id: int, text: str) -> None:
         if telegram_channel is not None:
             await telegram_channel.send_to_topic(thread_id, text)
-
-    engagement_driver = InCasaDriver(
-        send_to_topic=_send_to_topic,
-        persist_session_id=engagement_registry.persist_session_id,
-    )
 
     # Expose on the agent module so tools.emit_completion / cancel_engagement
     # can find it without circular imports.
