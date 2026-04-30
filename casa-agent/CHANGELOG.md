@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.22.0] - 2026-04-30 — Phase 3a: cosmetic + cancel (E-2 + E-8 + E-13)
+
+### Fixed
+- **E-2** (LOW): Ellen's cumulative `attempt_text` in `agent.py:_attempt_sdk_turn`
+  now inserts `\n\n` between successive `AssistantMessage` boundaries.
+  TextBlocks within the same AssistantMessage remain joined without separator
+  (one model thought). User-visible: delegation flows like "ack + Tina's
+  answer" now read as discrete paragraphs instead of glued strings.
+- **E-8** (MEDIUM): `InCasaDriver._deliver_turn` applies the same separator
+  pattern in the configurator's buffered topic-post path. Multi-step
+  executor turns ("Reading X. Now editing Y. Validating Z.") get clean
+  paragraph breaks. Streaming visibility is still Phase 3b.
+- **E-13** (HIGH): PTB `MessageHandler` registration now dispatches webhook
+  updates to `handle_update` (engagement-aware router) instead of `_handle`
+  (engagement-unaware bus-dispatch leaf). `/cancel`, `/complete`, and
+  `/silent` posted in engagement topics are now intercepted as documented;
+  previously they fell through to Ellen as plain turns. The engagement
+  routing logic itself was already complete and tested (514 lines of
+  pre-existing tests in `tests/test_telegram_engagement_routing.py`);
+  only the wiring at line 247 was wrong.
+
+### Notes
+- Phase 3b (Bug 1 — engagement-topic streaming silence) ships separately as
+  v0.23.0 with its own design spec at
+  `docs/superpowers/specs/2026-04-30-phase3b-engagement-streaming-design.md`.
+- Three orphan engagements (`52fa6ca8`, `9a78971d`, `c798e373`) from the
+  v0.18.x exploration session can now be cleaned up via `/cancel` in their
+  respective topics.
+
 ## [0.21.0] - 2026-04-29 — Phase 2: specialist provisioning + memory peer_id
 
 ### Fixed
