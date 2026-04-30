@@ -21,7 +21,7 @@ mcp_server_names:
   - homeassistant
   - casa-framework
 memory:
-  token_budget: 4000
+  token_budget: 5000                     # Phase 5 — honest envelope for 40/60 overlay/scope split
   cross_peer_token_budget: 2000          # M6 — consult_other_agent_memory budget
   read_strategy: per_turn
   scopes_owned: [personal, business, finance]

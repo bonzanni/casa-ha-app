@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.26.0] - 2026-04-30 — Phase 5: Memory hygiene (E-14)
+
+### Changed (BREAKING — pre-1.0.0 license)
+
+- **`MemoryProvider` ABC reshape**: `get_context(session_id, tokens, search_query)` drops `agent_role` and `user_peer` parameters; new abstract method `peer_overlay_context(observer_role, user_peer, search_query, tokens)` separates peer-level overlay reads from scope-level session reads.
+- **Ellen `memory.token_budget`**: 4000 → 5000. Honest envelope for the new 40/60 overlay/scope split (5 scopes × 600 + 2000 overlay = 5000).
+- **`BudgetTracker` warning text**: "Memory digest over budget … Investigate the memory backend." → "Memory digest exceeded expected envelope … Memory shape may have regressed." Reframe from cost cap to regression sentinel.
+- **`CachedMemoryProvider` cache key**: `(session_id, agent_role, tokens)` → `(session_id, tokens)`. `agent_role` is no longer threaded through this layer.
+
+### Added
+
+- **Honcho-native two-primitive split**: per-turn memory assembly runs ONE `peer.context(target=…, search_query=…)` call (deduped peer-level overlay) + N `session.context(tokens=scope_budget, search_query=…)` calls (per-scope messages + summary). Closes the 5× peer-overlay duplication that produced `used=6210 budget=4000` warnings every Ellen turn (E-14, `bug-review-2026-04-29-exploration.md:507-512`).
+- **`peer_overlay_context` method** on `HonchoMemoryProvider` (real impl) + `NoOpMemory` / `SqliteMemoryProvider` (graceful "" return) / `CachedMemoryProvider` (passthrough). Same fail-soft contract as M6's `cross_peer_context`.
+- **`memory_call` `call_type: "self_overlay"` telemetry** at the new emission site, parallel to existing `self` (per-scope) and `cross_peer` (M6). Synthetic `session_id: "overlay-{role}-{user}"` shape.
+- **`peer_overlay_empty` INFO log line** on empty overlay digest (cold start / Honcho deriver behind), per spec § 7 Q4.
+- **Render helper split**: `_render` → `_render_session` (messages + summary only) + new `_render_peer_overlay` (peer_card + representation, self-perspective headings).
+
+### Fixed
+
+- **E-14 — Memory token budget overflow** (MEDIUM, `bug-review-2026-04-29-exploration.md:500-527`). Live evidence: `WARNING tokens: Memory digest over budget for session telegram-1197017861-assistant: used=6210 budget=4000 (>1.1x for 3 turns).` Steady-state every Ellen turn. Now silent for first 3 turns post-deploy; envelope warning is reframed to fire only on memory-shape regressions.
+- **Latent M6 `cross_peer_context` bug** discovered during Task A.0's Honcho contract probe: `honcho-ai==2.1.1`'s `Peer.context()` rejects `tokens=N` kwarg (raises `TypeError` at signature bind via `@validate_call`). M6's `cross_peer_context` has been silently broken since shipped — `try/except` swallowed the TypeError, never fired organically (Finance disabled in production, no enabled non-Ellen peer with own memory). Fixed in this release: drop `tokens=N` from both `peer.context()` invocations, add render-side cap (chars/4) on rendered overlay. Unblocks E-15's Probe 2.
+
+### Spec / Plan
+
+- Spec: `docs/superpowers/specs/2026-04-30-phase5-memory-hygiene-design.md`
+- Plan: `docs/superpowers/plans/2026-04-30-phase5-memory-hygiene.md` (this plan, §A)
+
+### Verification
+
+- Local pytest (`-m "not docker and not slow"`, `tests/` scope): pass count + 12 new tests, 0 failed.
+- Smoke 3/3 PASS (healthz / turn-assistant / voice-sse).
+- N150 telemetry distribution: 1× `call_type=self_overlay` per turn + N× `call_type=self` per turn (vs prior shape of N× `call_type=self` only).
+- N150 `BudgetTracker` warning silent for first 3 Ellen turns post-deploy.
+
 ## [0.25.0] - 2026-04-30 — Phase 4b: SDK observability
 
 ### Added

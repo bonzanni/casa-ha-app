@@ -158,6 +158,11 @@ class TestBudgetTracker:
         msg = rows[0].getMessage()
         assert "4500" in msg
         assert "4000" in msg
+        # Phase 5 / E-14: tracker is reframed as a regression sentinel,
+        # not a cost cap. Guard the wording against accidental revert.
+        assert "exceeded expected envelope" in msg
+        assert "Memory shape may have regressed" in msg
+        assert "Investigate the memory backend" not in msg
 
     def test_warning_suppressed_for_subsequent_overruns_same_session(
         self, caplog,

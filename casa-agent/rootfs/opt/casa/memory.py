@@ -12,12 +12,17 @@ from abc import ABC, abstractmethod
 class MemoryProvider(ABC):
     """Abstract memory backend.
 
-    Four methods:
-      * ``ensure_session``      — idempotent session + peer setup.
-      * ``get_context``         — rendered memory digest for the system prompt.
-      * ``add_turn``            — persist one user→assistant turn unconditionally.
-      * ``cross_peer_context``  — read another agent's accumulated representation
-                                  of the user, semantic-filtered by query.
+    Five methods:
+      * ``ensure_session``       — idempotent session + peer setup.
+      * ``get_context``          — rendered scope-level digest (messages +
+                                   summary) for the system prompt.
+      * ``peer_overlay_context`` — rendered peer-level overlay (peer_card +
+                                   peer representation) for the
+                                   ``(observer_role, user_peer)`` pair,
+                                   cross-session, semantic-filtered.
+      * ``add_turn``             — persist one user→assistant turn unconditionally.
+      * ``cross_peer_context``   — read another agent's accumulated representation
+                                   of the user, semantic-filtered by query.
 
     Storage is never filtered; write-scoping is a structural property of
     ``session_id`` + peer topology (spec §4.3). Disclosure decisions
@@ -40,17 +45,32 @@ class MemoryProvider(ABC):
     async def get_context(
         self,
         session_id: str,
-        agent_role: str,
         tokens: int,
         search_query: str | None = None,
-        user_peer: str = "nicola",
     ) -> str:
-        """Return a rendered memory digest for the system prompt.
+        """Return a rendered scope-level digest (messages + summary only).
 
         Empty string if the session has no relevant content yet.
         ``search_query`` is the current user utterance (used by Honcho
-        for semantic retrieval). ``user_peer`` is the peer whose
-        perspective to target."""
+        for semantic retrieval). Peer-level overlay (peer_card + peer
+        representation) is NOT included here — see ``peer_overlay_context``."""
+
+    @abstractmethod
+    async def peer_overlay_context(
+        self,
+        observer_role: str,
+        user_peer: str,
+        search_query: str,
+        tokens: int,
+    ) -> str:
+        """Return a rendered peer-level overlay digest for the
+        ``(observer_role, user_peer)`` pair, semantic-filtered by
+        ``search_query``.
+
+        Cross-session — Honcho's peer.context() aggregates across all
+        sessions where both peers participate. Empty string when no
+        representation exists yet (cold start) or on backend error
+        (graceful degradation, parity with ``cross_peer_context``)."""
 
     @abstractmethod
     async def add_turn(
@@ -92,10 +112,17 @@ class NoOpMemory(MemoryProvider):
     async def get_context(
         self,
         session_id: str,
-        agent_role: str,
         tokens: int,
         search_query: str | None = None,
-        user_peer: str = "nicola",
+    ) -> str:
+        return ""
+
+    async def peer_overlay_context(
+        self,
+        observer_role: str,
+        user_peer: str,
+        search_query: str,
+        tokens: int,
     ) -> str:
         return ""
 
@@ -124,31 +151,22 @@ class NoOpMemory(MemoryProvider):
 # ---------------------------------------------------------------------------
 
 
-def _render(context: object) -> str:
-    """Assemble a SessionContext into the markdown digest consumed by the
-    system prompt. Empty/missing sections are silently omitted — no
-    placeholder lines.
+def _render_session(context: object) -> str:
+    """Assemble a SessionContext into the markdown digest consumed by
+    the system prompt. Scope-level only (messages + summary). Peer-level
+    overlay (peer_card + peer_representation) belongs to
+    ``_render_peer_overlay``.
 
-    ``context`` is duck-typed: we read ``messages``, ``summary``,
-    ``peer_representation``, ``peer_card`` if present. Keeps the test
-    surface decoupled from the Honcho SDK types.
+    ``context`` is duck-typed: we read ``messages`` and ``summary`` if
+    present. Empty/missing sections are silently omitted — no
+    placeholder lines.
     """
     sections: list[str] = []
-
-    peer_card = getattr(context, "peer_card", None)
-    if peer_card:
-        lines = ["## What I know about you"]
-        lines.extend(f"- {item}" for item in peer_card)
-        sections.append("\n".join(lines))
 
     summary = getattr(context, "summary", None)
     summary_content = getattr(summary, "content", None) if summary else None
     if summary_content:
         sections.append(f"## Summary so far\n{summary_content}")
-
-    peer_repr = getattr(context, "peer_representation", None)
-    if peer_repr:
-        sections.append(f"## My perspective\n{peer_repr}")
 
     messages = getattr(context, "messages", None) or []
     if messages:
@@ -163,11 +181,37 @@ def _render(context: object) -> str:
     return "\n\n".join(sections)
 
 
+def _render_peer_overlay(context: object) -> str:
+    """Assemble a peer.context() result (self-overlay path) into the
+    markdown digest consumed by the system prompt. Peer-level only.
+
+    Empty/missing sections are silently omitted — no placeholder lines.
+
+    Duck-typed: reads ``peer_card`` (list[str]) and ``representation``
+    (str). Mirrors ``_render_peer_context`` but with the self-perspective
+    heading "What I know about you" / "My perspective" — these are
+    Ellen's accumulated facts about Nicola.
+    """
+    sections: list[str] = []
+
+    peer_card = getattr(context, "peer_card", None)
+    if peer_card:
+        lines = ["## What I know about you"]
+        lines.extend(f"- {item}" for item in peer_card)
+        sections.append("\n".join(lines))
+
+    representation = getattr(context, "representation", None)
+    if representation:
+        sections.append(f"## My perspective\n{representation}")
+
+    return "\n\n".join(sections)
+
+
 def _render_peer_context(context: object, observer_role: str) -> str:
     """Assemble a peer.context() result into a markdown digest.
 
     Sections silently omitted when their source is empty —
-    parity with ``_render``'s no-placeholder doctrine.
+    parity with ``_render_session``'s no-placeholder doctrine.
 
     Duck-typed: reads ``peer_card`` (list[str]) and ``representation``
     (str). No ``messages``, ``summary``, or ``peer_representation`` —
@@ -265,39 +309,94 @@ class HonchoMemoryProvider(MemoryProvider):
     async def get_context(
         self,
         session_id: str,
-        agent_role: str,
         tokens: int,
         search_query: str | None = None,
-        user_peer: str = "nicola",
     ) -> str:
         t_start = time.perf_counter()
         session = await _to_thread(self._client.session, session_id)
         ctx = await _to_thread(
             session.context,
             tokens=tokens,
-            peer_target=user_peer,
-            peer_perspective=agent_role,
             search_query=search_query,
         )
-        rendered = _render(ctx)
-        # M3b telemetry — one line per real backend call. peer_count is
-        # message count; summary_present / peer_repr_present are bools
-        # derived from the SDK return shape so operators can see WHEN
-        # Honcho actually populates these fields without re-running the
-        # render.
+        rendered = _render_session(ctx)
+        # Phase 5 — scope-level digest only (messages + summary). Peer-
+        # level overlay (peer_card + representation) moved to
+        # `peer_overlay_context`. agent_role / user_peer no longer
+        # threaded to this layer — the call is Honcho-native and the
+        # session_id already encodes scope. peer_repr_present is False
+        # by construction on this path.
         summary_obj = getattr(ctx, "summary", None)
         logger.info(
             "memory_call",
             extra={
                 "backend": "honcho",
                 "session_id": session_id,
-                "agent_role": agent_role,
+                "agent_role": "?",   # role no longer threaded to this layer
                 "t_ms": int((time.perf_counter() - t_start) * 1000),
                 "peer_count": len(getattr(ctx, "messages", None) or []),
                 "summary_present": bool(getattr(summary_obj, "content", None)),
-                "peer_repr_present": bool(getattr(ctx, "peer_representation", None)),
+                "peer_repr_present": False,   # no peer overlay on this path
                 "cache_hit": False,
                 "call_type": "self",   # M6 § 9
+            },
+        )
+        return rendered
+
+    async def peer_overlay_context(
+        self,
+        observer_role: str,
+        user_peer: str,
+        search_query: str,
+        tokens: int,
+    ) -> str:
+        t_start = time.perf_counter()
+        try:
+            peer = await _to_thread(self._client.peer, observer_role)
+            ctx = await _to_thread(
+                peer.context,
+                target=user_peer,
+                search_query=search_query,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "peer_overlay_context failed for observer=%r user_peer=%r: %s",
+                observer_role, user_peer, exc,
+            )
+            # No memory_call emission on error — operator sees the
+            # WARNING line; double-emitting on errors would falsify
+            # backend-success-rate dashboards.
+            return ""
+        rendered = _render_peer_overlay(ctx)
+        # A.0 finding: honcho-ai 2.1.1 Peer.context() does NOT accept a
+        # `tokens` kwarg (raises TypeError at @validate_call signature
+        # bind). Render then cap to tokens*4 chars (chars/4 estimator
+        # from tokens.py::estimate_tokens).
+        char_cap = tokens * 4
+        if len(rendered) > char_cap:
+            rendered = rendered[:char_cap]
+        # Phase 5 § 2.9 telemetry — companion shape to cross_peer_context.
+        # Field reinterpretation:
+        #   peer_count       → len(peer_card) (no messages on peer.context)
+        #   summary_present  → False (no summary surface)
+        #   peer_repr_present → bool(representation) (semantic map)
+        #   cache_hit        → False (no caching for overlay)
+        #   call_type        → "self_overlay"
+        #   session_id       → synthetic overlay-{observer_role}-{user_peer}
+        #                      (`overlay-` prefix can't collide with M6's
+        #                      `peer-` prefix or real 4-segment ids).
+        logger.info(
+            "memory_call",
+            extra={
+                "backend": "honcho",
+                "session_id": f"overlay-{observer_role}-{user_peer}",
+                "agent_role": observer_role,
+                "t_ms": int((time.perf_counter() - t_start) * 1000),
+                "peer_count": len(getattr(ctx, "peer_card", None) or []),
+                "summary_present": False,
+                "peer_repr_present": bool(getattr(ctx, "representation", None)),
+                "cache_hit": False,
+                "call_type": "self_overlay",
             },
         )
         return rendered
@@ -332,7 +431,6 @@ class HonchoMemoryProvider(MemoryProvider):
                 peer.context,
                 target=user_peer,
                 search_query=query,
-                tokens=tokens,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -344,6 +442,14 @@ class HonchoMemoryProvider(MemoryProvider):
             # backend-success-rate dashboards.
             return ""
         rendered = _render_peer_context(ctx, observer_role)
+        # A.0 finding: honcho-ai 2.1.1 Peer.context() rejects tokens kwarg
+        # (raises TypeError at @validate_call signature bind). Cap render-
+        # side instead — chars/4 estimator from tokens.py. Pre-A.4 the
+        # tokens=N call was masked by try/except: M6 had never been
+        # organically triggered in production (Finance peer disabled).
+        char_cap = tokens * 4
+        if len(rendered) > char_cap:
+            rendered = rendered[:char_cap]
         # M3b/M6 telemetry — companion line on every successful Honcho
         # backend call. Field reinterpretation per spec § 9:
         #   peer_count       → len(peer_card) (no messages on peer.context)
@@ -381,11 +487,11 @@ class HonchoMemoryProvider(MemoryProvider):
 class CachedMemoryProvider(MemoryProvider):
     """Warm-cache + background-refresh wrapper around a concrete provider.
 
-    First call for a given ``(session_id, agent_role, tokens)`` key
-    fetches synchronously and caches the rendered string. Subsequent
-    calls return the cached value immediately. ``add_turn`` writes
-    through and fires a background refresh so the next read already
-    reflects the new turn — without blocking the caller.
+    First call for a given ``(session_id, tokens)`` key fetches
+    synchronously and caches the rendered string. Subsequent calls
+    return the cached value immediately. ``add_turn`` writes through
+    and fires a background refresh so the next read already reflects
+    the new turn — without blocking the caller.
 
     ``search_query`` is intentionally not part of the cache key: the
     cache is for low-latency paths (butler voice), which trade
@@ -394,8 +500,8 @@ class CachedMemoryProvider(MemoryProvider):
 
     def __init__(self, backend: "MemoryProvider") -> None:
         self._backend = backend
-        self._cache: dict[tuple[str, str, int], str] = {}
-        self._locks: dict[tuple[str, str, int], asyncio.Lock] = {}
+        self._cache: dict[tuple[str, int], str] = {}
+        self._locks: dict[tuple[str, int], asyncio.Lock] = {}
         self._bg_tasks: set[asyncio.Task] = set()
 
     @staticmethod
@@ -435,13 +541,11 @@ class CachedMemoryProvider(MemoryProvider):
     async def get_context(
         self,
         session_id: str,
-        agent_role: str,
         tokens: int,
         search_query: str | None = None,
-        user_peer: str = "nicola",
     ) -> str:
         t_start = time.perf_counter()
-        key = (session_id, agent_role, tokens)
+        key = (session_id, tokens)
         cached = self._cache.get(key)
         if cached is not None:
             # M3b — wrapper emits its own line on cache hit since the
@@ -455,7 +559,7 @@ class CachedMemoryProvider(MemoryProvider):
                 extra={
                     "backend": self._resolve_backend_name(self._backend),
                     "session_id": session_id,
-                    "agent_role": agent_role,
+                    "agent_role": "?",
                     "t_ms": int((time.perf_counter() - t_start) * 1000),
                     "peer_count": None,
                     "summary_present": None,
@@ -477,7 +581,7 @@ class CachedMemoryProvider(MemoryProvider):
                     extra={
                         "backend": self._resolve_backend_name(self._backend),
                         "session_id": session_id,
-                        "agent_role": agent_role,
+                        "agent_role": "?",
                         "t_ms": int((time.perf_counter() - t_start) * 1000),
                         "peer_count": None,
                         "summary_present": None,
@@ -488,8 +592,7 @@ class CachedMemoryProvider(MemoryProvider):
                 )
                 return cached
             fresh = await self._backend.get_context(
-                session_id, agent_role, tokens,
-                search_query=search_query, user_peer=user_peer,
+                session_id, tokens, search_query=search_query,
             )
             self._cache[key] = fresh
         # Cache miss path — inner backend's get_context already emitted
@@ -508,32 +611,26 @@ class CachedMemoryProvider(MemoryProvider):
         await self._backend.add_turn(
             session_id, agent_role, user_text, assistant_text, user_peer,
         )
-        task = asyncio.create_task(
-            self._refresh(session_id, agent_role, user_peer),
-        )
+        task = asyncio.create_task(self._refresh(session_id))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
-    async def _refresh(
-        self, session_id: str, agent_role: str, user_peer: str,
-    ) -> None:
-        # Refresh every (session_id, agent_role, tokens) entry we've
-        # already cached. Token-budget variations are uncommon in
-        # practice but we keep the cache coherent either way.
-        keys = [k for k in self._cache if k[0] == session_id
-                                       and k[1] == agent_role]
+    async def _refresh(self, session_id: str) -> None:
+        # Refresh every (session_id, tokens) entry we've already cached.
+        # Token-budget variations are uncommon in practice but we keep
+        # the cache coherent either way.
+        keys = [k for k in self._cache if k[0] == session_id]
         for key in keys:
-            _, _, tokens = key
+            _, tokens = key
             try:
                 fresh = await self._backend.get_context(
-                    session_id, agent_role, tokens,
-                    search_query=None, user_peer=user_peer,
+                    session_id, tokens, search_query=None,
                 )
                 self._cache[key] = fresh
             except Exception as exc:
                 logger.warning(
-                    "CachedMemoryProvider refresh failed for %s/%s: %s",
-                    session_id, agent_role, exc,
+                    "CachedMemoryProvider refresh failed for %s: %s",
+                    session_id, exc,
                 )
 
     async def cross_peer_context(
@@ -551,6 +648,23 @@ class CachedMemoryProvider(MemoryProvider):
         # add_turn passthroughs above.
         return await self._backend.cross_peer_context(
             observer_role, query, tokens, user_peer,
+        )
+
+    async def peer_overlay_context(
+        self,
+        observer_role: str,
+        user_peer: str,
+        search_query: str,
+        tokens: int,
+    ) -> str:
+        # Spec § 2.5: passthrough, no caching. Same rationale as
+        # cross_peer_context — search_query would have to be in the cache
+        # key, defeating the cache's purpose. The cache exists for voice
+        # latency on get_context; overlay reads happen at low volume per
+        # turn (one per agent turn, not per scope) and don't pay caching
+        # rent.
+        return await self._backend.peer_overlay_context(
+            observer_role, user_peer, search_query, tokens,
         )
 
 
@@ -597,16 +711,14 @@ class _SqliteMsg:
 
 @dataclass
 class _SqliteCtx:
-    """Duck-typed shape consumed by ``_render``.
+    """Duck-typed shape consumed by ``_render_session``.
 
-    ``peer_card``, ``summary`` and ``peer_representation`` are always
-    absent on SQLite — graceful-degradation contract (M1.C, see
-    docs/superpowers/specs/2026-04-26-memory-architecture.md §10).
-    Honcho's SessionContext supplies them.
+    SQLite emits messages-only digests (no Honcho summary surface, no
+    peer-level data). Graceful-degradation contract per
+    docs/superpowers/specs/2026-04-26-memory-architecture.md §10.
     """
     messages: list[_SqliteMsg] = field(default_factory=list)
     summary: None = None
-    peer_representation: None = None
 
 
 class SqliteMemoryProvider(MemoryProvider):
@@ -665,13 +777,13 @@ class SqliteMemoryProvider(MemoryProvider):
             )
 
     async def get_context(
-        self, session_id: str, agent_role: str, tokens: int,
-        search_query: str | None = None, user_peer: str = "nicola",
+        self, session_id: str, tokens: int,
+        search_query: str | None = None,
     ) -> str:
         t_start = time.perf_counter()
         # search_query is ignored on SQLite (no semantic retrieval).
         rendered, peer_count = await asyncio.to_thread(
-            self._get_context_sync, session_id, tokens, user_peer,
+            self._get_context_sync, session_id, tokens,
         )
         # M3b telemetry — backend=sqlite always emits summary_present /
         # peer_repr_present False per the spec § 10 graceful-degradation
@@ -681,7 +793,7 @@ class SqliteMemoryProvider(MemoryProvider):
             extra={
                 "backend": "sqlite",
                 "session_id": session_id,
-                "agent_role": agent_role,
+                "agent_role": "?",
                 "t_ms": int((time.perf_counter() - t_start) * 1000),
                 "peer_count": peer_count,
                 "summary_present": False,
@@ -693,7 +805,7 @@ class SqliteMemoryProvider(MemoryProvider):
         return rendered
 
     def _get_context_sync(
-        self, session_id: str, tokens: int, user_peer: str,
+        self, session_id: str, tokens: int,
     ) -> tuple[str, int]:
         last_n = max(1, tokens // 40)
         msg_rows = self._conn.execute(
@@ -705,7 +817,7 @@ class SqliteMemoryProvider(MemoryProvider):
             _SqliteMsg(peer_name=r[0], content=r[1])
             for r in reversed(msg_rows)
         ]
-        return _render(_SqliteCtx(messages=messages)), len(messages)
+        return _render_session(_SqliteCtx(messages=messages)), len(messages)
 
     async def add_turn(
         self, session_id: str, agent_role: str,
@@ -748,4 +860,17 @@ class SqliteMemoryProvider(MemoryProvider):
         # representation surface; cross-peer recall returns "" so
         # callers consistently see "no memory" rather than a partial
         # last-N digest that wouldn't be peer-perspective-attributed.
+        return ""
+
+    async def peer_overlay_context(
+        self,
+        observer_role: str,
+        user_peer: str,
+        search_query: str,
+        tokens: int,
+    ) -> str:
+        # Spec § 2.5 graceful-degradation contract: SQLite has no peer-level
+        # primitive (peer_card is a Honcho-deriver feature). Return "" so
+        # callers consistently see "no overlay" rather than partial or
+        # mis-attributed content.
         return ""

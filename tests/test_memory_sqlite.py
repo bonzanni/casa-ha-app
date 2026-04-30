@@ -303,7 +303,7 @@ async def test_get_context_empty_returns_empty_string():
 
     p = SqliteMemoryProvider(":memory:")
     await p.ensure_session("s", "assistant")
-    out = await p.get_context("s", "assistant", tokens=4000)
+    out = await p.get_context("s", tokens=4000)
     assert out == ""
 
 
@@ -315,7 +315,7 @@ async def test_get_context_renders_recent_exchanges_chronologically():
     await p.add_turn("s", "assistant", "q1", "a1")
     await p.add_turn("s", "assistant", "q2", "a2")
 
-    out = await p.get_context("s", "assistant", tokens=4000)
+    out = await p.get_context("s", tokens=4000)
     assert "## Recent exchanges" in out
     # Oldest first after chronological reverse.
     q1_pos = out.index("[nicola] q1")
@@ -332,7 +332,7 @@ async def test_get_context_truncates_by_token_budget():
     p = SqliteMemoryProvider(":memory:")
     await p.ensure_session("s", "assistant")
     await p.add_turn("s", "assistant", "q1", "a1")
-    out = await p.get_context("s", "assistant", tokens=40)
+    out = await p.get_context("s", tokens=40)
     assert "[assistant] a1" in out
     assert "[nicola] q1" not in out
 
@@ -343,7 +343,7 @@ async def test_get_context_minimum_one_row_when_budget_is_zero():
     p = SqliteMemoryProvider(":memory:")
     await p.ensure_session("s", "assistant")
     await p.add_turn("s", "assistant", "q1", "a1")
-    out = await p.get_context("s", "assistant", tokens=0)
+    out = await p.get_context("s", tokens=0)
     # max(1, 0) = 1 — we still see the most recent row.
     assert "[assistant] a1" in out
 
@@ -357,9 +357,9 @@ async def test_get_context_search_query_ignored():
     await p.ensure_session("s", "assistant")
     await p.add_turn("s", "assistant", "q1", "a1")
 
-    plain = await p.get_context("s", "assistant", tokens=4000)
+    plain = await p.get_context("s", tokens=4000)
     with_query = await p.get_context(
-        "s", "assistant", tokens=4000, search_query="anything",
+        "s", tokens=4000, search_query="anything",
     )
     assert plain == with_query
 
@@ -372,7 +372,7 @@ async def test_get_context_no_summary_or_perspective_sections():
     p = SqliteMemoryProvider(":memory:")
     await p.ensure_session("s", "assistant")
     await p.add_turn("s", "assistant", "q1", "a1")
-    out = await p.get_context("s", "assistant", tokens=4000)
+    out = await p.get_context("s", tokens=4000)
     assert "## Summary so far" not in out
     assert "## My perspective" not in out
 
@@ -399,7 +399,7 @@ async def test_butler_session_never_sees_assistant_session_messages():
     )
 
     out = await p.get_context(
-        "voice-lr-butler", "butler", tokens=4000, user_peer="voice_speaker",
+        "voice-lr-butler", tokens=4000,
     )
     assert "[voice_speaker] voice q" in out
     assert "[butler] voice a" in out
@@ -422,14 +422,17 @@ async def test_get_context_emits_memory_call_log(caplog):
     await p.add_turn(sid, "assistant", "more", "ok")
 
     with caplog.at_level(logging.INFO, logger="memory"):
-        await p.get_context(sid, "assistant", tokens=4000)
+        await p.get_context(sid, tokens=4000)
 
     records = [r for r in caplog.records if r.message == "memory_call"]
     assert len(records) == 1
     rec = records[0]
     assert rec.backend == "sqlite"
     assert rec.session_id == sid
-    assert rec.agent_role == "assistant"
+    # Phase 5 / A.1: agent_role no longer threaded to this layer; SQLite
+    # provider emits a literal "?" placeholder. Operators reading the
+    # log can pivot on session_id (which still encodes the role).
+    assert rec.agent_role == "?"
     assert isinstance(rec.t_ms, int) and rec.t_ms >= 0
     # Two add_turn calls × 2 messages each = 4 message rows.
     assert rec.peer_count == 4
@@ -452,7 +455,7 @@ async def test_get_context_memory_call_empty_session(caplog):
     await p.ensure_session(sid, "assistant")
 
     with caplog.at_level(logging.INFO, logger="memory"):
-        out = await p.get_context(sid, "assistant", tokens=200)
+        out = await p.get_context(sid, tokens=200)
 
     assert out == ""
     rec = [r for r in caplog.records if r.message == "memory_call"][0]
