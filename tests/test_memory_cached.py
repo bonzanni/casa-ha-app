@@ -93,7 +93,7 @@ async def test_distinct_keys_fetch_separately():
 
     await cached.get_context("s1", 100)
     await cached.get_context("s2", 100)
-    await cached.get_context("s1", 100)
+    await cached.get_context("s3", 100)
 
     assert backend.get_calls == 3
 
@@ -175,7 +175,7 @@ class TestColdKeyDedup:
 
         assert backend.get_calls == 1
         assert all(r == "shared" for r in results)
-        assert cached._cache[("s", "assistant", 100)] == "shared"
+        assert cached._cache[("s", 100)] == "shared"
 
     async def test_concurrent_cold_reads_distinct_keys_parallelize(self):
         """Each backend call sleeps 100 ms; 5 distinct keys in ~100 ms, not ~500."""
@@ -237,7 +237,7 @@ class TestColdKeyDedup:
         assert backend.get_calls == 1
 
     async def test_locks_dict_is_bounded_by_distinct_keys(self):
-        """Locks dict grows only with distinct (session_id, role, tokens) triples."""
+        """Locks dict grows only with distinct (session_id, tokens) pairs."""
         backend = RecordingProvider()
         backend.queue("a", "a2", "b2")
         cached = CachedMemoryProvider(backend)
@@ -309,7 +309,7 @@ async def test_get_context_cache_hit_emits_memory_call(caplog):
     # RecordingProvider is the test stub here.
     assert rec.backend == "recording"
     assert rec.session_id == "sid"
-    assert rec.agent_role == "role"
+    assert rec.agent_role == "?"
     assert isinstance(rec.t_ms, int) and rec.t_ms >= 0
     assert rec.peer_count is None
     assert rec.summary_present is None
@@ -355,4 +355,44 @@ async def test_cached_provider_passes_through_cross_peer_context():
     assert out2 == "<<finance/budget>>"
 
     # Cache untouched
+    assert cached._cache == {}
+
+
+async def test_cached_provider_passes_through_peer_overlay_context():
+    """Spec § 2.5: CachedMemoryProvider does NOT cache peer overlay
+    reads (search_query would have to be the cache key, defeating the
+    purpose). Behavior is plain passthrough — no cache mutation,
+    no double-emit."""
+    from memory import CachedMemoryProvider
+
+    class RecordingBackend:
+        def __init__(self):
+            self.calls: list[tuple] = []
+        async def ensure_session(self, *a, **kw): ...
+        async def get_context(self, *a, **kw): return ""
+        async def add_turn(self, *a, **kw): ...
+        async def cross_peer_context(self, *a, **kw): return ""
+        async def peer_overlay_context(
+            self, observer_role, user_peer, search_query, tokens,
+        ):
+            self.calls.append((observer_role, user_peer, search_query, tokens))
+            return f"<<{observer_role}/{user_peer}>>"
+
+    backend = RecordingBackend()
+    cached = CachedMemoryProvider(backend)
+
+    out1 = await cached.peer_overlay_context(
+        observer_role="assistant", user_peer="nicola",
+        search_query="hi", tokens=2000,
+    )
+    out2 = await cached.peer_overlay_context(
+        observer_role="assistant", user_peer="nicola",
+        search_query="hi", tokens=2000,
+    )
+
+    # Backend invoked twice — no caching.
+    assert len(backend.calls) == 2
+    assert out1 == "<<assistant/nicola>>"
+    assert out2 == "<<assistant/nicola>>"
+    # Cache untouched.
     assert cached._cache == {}

@@ -487,11 +487,11 @@ class HonchoMemoryProvider(MemoryProvider):
 class CachedMemoryProvider(MemoryProvider):
     """Warm-cache + background-refresh wrapper around a concrete provider.
 
-    First call for a given ``(session_id, agent_role, tokens)`` key
-    fetches synchronously and caches the rendered string. Subsequent
-    calls return the cached value immediately. ``add_turn`` writes
-    through and fires a background refresh so the next read already
-    reflects the new turn — without blocking the caller.
+    First call for a given ``(session_id, tokens)`` key fetches
+    synchronously and caches the rendered string. Subsequent calls
+    return the cached value immediately. ``add_turn`` writes through
+    and fires a background refresh so the next read already reflects
+    the new turn — without blocking the caller.
 
     ``search_query`` is intentionally not part of the cache key: the
     cache is for low-latency paths (butler voice), which trade
@@ -500,8 +500,8 @@ class CachedMemoryProvider(MemoryProvider):
 
     def __init__(self, backend: "MemoryProvider") -> None:
         self._backend = backend
-        self._cache: dict[tuple[str, str, int], str] = {}
-        self._locks: dict[tuple[str, str, int], asyncio.Lock] = {}
+        self._cache: dict[tuple[str, int], str] = {}
+        self._locks: dict[tuple[str, int], asyncio.Lock] = {}
         self._bg_tasks: set[asyncio.Task] = set()
 
     @staticmethod
@@ -541,13 +541,11 @@ class CachedMemoryProvider(MemoryProvider):
     async def get_context(
         self,
         session_id: str,
-        agent_role: str,
         tokens: int,
         search_query: str | None = None,
-        user_peer: str = "nicola",
     ) -> str:
         t_start = time.perf_counter()
-        key = (session_id, agent_role, tokens)
+        key = (session_id, tokens)
         cached = self._cache.get(key)
         if cached is not None:
             # M3b — wrapper emits its own line on cache hit since the
@@ -561,7 +559,7 @@ class CachedMemoryProvider(MemoryProvider):
                 extra={
                     "backend": self._resolve_backend_name(self._backend),
                     "session_id": session_id,
-                    "agent_role": agent_role,
+                    "agent_role": "?",
                     "t_ms": int((time.perf_counter() - t_start) * 1000),
                     "peer_count": None,
                     "summary_present": None,
@@ -583,7 +581,7 @@ class CachedMemoryProvider(MemoryProvider):
                     extra={
                         "backend": self._resolve_backend_name(self._backend),
                         "session_id": session_id,
-                        "agent_role": agent_role,
+                        "agent_role": "?",
                         "t_ms": int((time.perf_counter() - t_start) * 1000),
                         "peer_count": None,
                         "summary_present": None,
@@ -594,8 +592,7 @@ class CachedMemoryProvider(MemoryProvider):
                 )
                 return cached
             fresh = await self._backend.get_context(
-                session_id, agent_role, tokens,
-                search_query=search_query, user_peer=user_peer,
+                session_id, tokens, search_query=search_query,
             )
             self._cache[key] = fresh
         # Cache miss path — inner backend's get_context already emitted
@@ -614,32 +611,26 @@ class CachedMemoryProvider(MemoryProvider):
         await self._backend.add_turn(
             session_id, agent_role, user_text, assistant_text, user_peer,
         )
-        task = asyncio.create_task(
-            self._refresh(session_id, agent_role, user_peer),
-        )
+        task = asyncio.create_task(self._refresh(session_id))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
-    async def _refresh(
-        self, session_id: str, agent_role: str, user_peer: str,
-    ) -> None:
-        # Refresh every (session_id, agent_role, tokens) entry we've
-        # already cached. Token-budget variations are uncommon in
-        # practice but we keep the cache coherent either way.
-        keys = [k for k in self._cache if k[0] == session_id
-                                       and k[1] == agent_role]
+    async def _refresh(self, session_id: str) -> None:
+        # Refresh every (session_id, tokens) entry we've already cached.
+        # Token-budget variations are uncommon in practice but we keep
+        # the cache coherent either way.
+        keys = [k for k in self._cache if k[0] == session_id]
         for key in keys:
-            _, _, tokens = key
+            _, tokens = key
             try:
                 fresh = await self._backend.get_context(
-                    session_id, agent_role, tokens,
-                    search_query=None, user_peer=user_peer,
+                    session_id, tokens, search_query=None,
                 )
                 self._cache[key] = fresh
             except Exception as exc:
                 logger.warning(
-                    "CachedMemoryProvider refresh failed for %s/%s: %s",
-                    session_id, agent_role, exc,
+                    "CachedMemoryProvider refresh failed for %s: %s",
+                    session_id, exc,
                 )
 
     async def cross_peer_context(
@@ -657,6 +648,23 @@ class CachedMemoryProvider(MemoryProvider):
         # add_turn passthroughs above.
         return await self._backend.cross_peer_context(
             observer_role, query, tokens, user_peer,
+        )
+
+    async def peer_overlay_context(
+        self,
+        observer_role: str,
+        user_peer: str,
+        search_query: str,
+        tokens: int,
+    ) -> str:
+        # Spec § 2.5: passthrough, no caching. Same rationale as
+        # cross_peer_context — search_query would have to be in the cache
+        # key, defeating the cache's purpose. The cache exists for voice
+        # latency on get_context; overlay reads happen at low volume per
+        # turn (one per agent turn, not per scope) and don't pay caching
+        # rent.
+        return await self._backend.peer_overlay_context(
+            observer_role, user_peer, search_query, tokens,
         )
 
 
