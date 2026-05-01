@@ -230,6 +230,8 @@ async def provision_workspace(
         settings = translate_hooks_to_settings(
             hooks_yaml_data, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
         )
+        # L-1 (v0.34.2): merge permissions block from defn alongside hooks.
+        settings["permissions"] = _build_cc_permissions(defn)
         (ws / ".claude" / "settings.json").write_text(
             json.dumps(settings, indent=2), encoding="utf-8",
         )
