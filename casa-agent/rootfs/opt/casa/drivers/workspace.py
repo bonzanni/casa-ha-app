@@ -189,6 +189,13 @@ async def provision_workspace(
     ws = Path(engagements_root) / engagement_id
     ws.mkdir(parents=True, exist_ok=False)
 
+    # L-1 (v0.34.2): both legacy and template paths need hooks_yaml_data.
+    # Load once here; render_workspace_template + legacy branch share it.
+    hooks_yaml_data: dict = {}
+    if getattr(defn, "hooks_path", None) and os.path.isfile(defn.hooks_path):
+        with open(defn.hooks_path, "r", encoding="utf-8") as fh:
+            hooks_yaml_data = yaml.safe_load(fh) or {}
+
     # Plan 4b §16.3: if a workspace-template exists for this executor, render it
     # into the workspace root. This subsumes the old symlink-loop behavior.
     if (
@@ -220,10 +227,6 @@ async def provision_workspace(
 
         # .claude/settings.json with translated hooks (legacy path).
         (ws / ".claude").mkdir(exist_ok=True)
-        hooks_yaml_data: dict = {}
-        if getattr(defn, "hooks_path", None) and os.path.isfile(defn.hooks_path):
-            with open(defn.hooks_path, "r", encoding="utf-8") as fh:
-                hooks_yaml_data = yaml.safe_load(fh) or {}
         settings = translate_hooks_to_settings(
             hooks_yaml_data, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
         )
