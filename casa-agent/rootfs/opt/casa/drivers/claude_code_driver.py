@@ -86,6 +86,13 @@ class ClaudeCodeDriver(DriverProtocol):
                         token_budget=defn.memory.token_budget,
                     )
 
+                # L-1 (v0.34.2): pass workspace_template_root + plugins_yaml so
+                # claude_code executors with a workspace-template/ (e.g.
+                # plugin-developer) flow through the template path.
+                exec_dir = Path(defn.prompt_template_path).parent
+                template_root = exec_dir / "workspace-template"
+                plugins_yaml_path = exec_dir / "plugins.yaml"
+
                 # 1. Provision workspace (CLAUDE.md, .mcp.json, plugins, FIFO, meta).
                 ws = await provision_workspace(
                     engagements_root=self._engagements_root,
@@ -95,6 +102,12 @@ class ClaudeCodeDriver(DriverProtocol):
                     task=engagement.task,
                     context=engagement.origin.get("context", ""),
                     casa_framework_mcp_url=self._casa_framework_mcp_url,
+                    workspace_template_root=(
+                        template_root if template_root.is_dir() else None
+                    ),
+                    plugins_yaml=(
+                        plugins_yaml_path if plugins_yaml_path.is_file() else None
+                    ),
                     executor_memory=executor_memory_block,
                 )
                 write_casa_meta(
