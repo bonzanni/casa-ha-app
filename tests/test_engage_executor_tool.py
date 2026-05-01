@@ -109,11 +109,13 @@ class TestEngageExecutorReal:
         payload = json.loads(r["content"][0]["text"])
         assert payload["kind"] == "unknown_executor_type"
         # F-7 (v0.32.0): registry-rejected calls (e.g. disabled executor
-        # types) must surface as MCP isError so sdk_logging emits ok=False
+        # types) must surface as MCP is_error so sdk_logging emits ok=False
         # — the tool didn't actually spawn an engagement, even though
-        # Ellen's user-facing narration is graceful.
-        assert r.get("isError") is True, (
-            f"engage_executor must set isError=True for unknown/disabled "
+        # Ellen's user-facing narration is graceful. Key is snake_case
+        # because claude_agent_sdk reads ``result.get("is_error", False)``
+        # at the MCP-server boundary.
+        assert r.get("is_error") is True, (
+            f"engage_executor must set is_error=True for unknown/disabled "
             f"executor types. envelope keys: {sorted(r.keys())}"
         )
 
@@ -152,7 +154,7 @@ class TestEngageExecutorReal:
         payload = json.loads(r["content"][0]["text"])
         assert payload["status"] == "error"
         assert payload["kind"] == "unknown_executor_type"
-        assert r.get("isError") is True
+        assert r.get("is_error") is True
 
     async def test_engagement_not_configured(self):
         from tools import engage_executor
