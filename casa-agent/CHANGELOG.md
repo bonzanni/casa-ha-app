@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.33.1] - 2026-05-01 — Hotfix: G-2 defensive reload guard
+
+v0.33.0's doctrine-only fix for G-2 failed to converge live. Active
+verify on cid `a9313680` (2026-05-01 11:39:57Z): the configurator
+read the inverted-order `completion.md` + `reload.md`, then still
+skipped the `casa_reload` tool_use (idx=15 `config_git_commit` →
+idx=16 `emit_completion`, no reload between or after) and emitted
+the same false-positive narration ("Reload triggered to apply.")
+without the actual call. Same `committed but inert` failure mode as
+v0.32.x.
+
+### Fixed
+
+- **G-2 (MEDIUM, ringleader) — defensive reload guard.** Per kickoff
+  option (b) once the doctrine fix didn't converge, add a platform-
+  side post-condition check. New module-level
+  `_ENGAGEMENTS_PENDING_RELOAD: set[str]` in `tools.py` is populated
+  by `config_git_commit` when its return SHA is non-empty (real
+  commit landed) and drained by `casa_reload` /
+  `casa_reload_triggers` on success. `emit_completion` inspects the
+  set on `outcome=completed` entry — if the engagement is still
+  pending a reload, it logs a WARNING citing the engagement id and
+  force-calls `casa_reload.handler({})` BEFORE
+  `_finalize_engagement` so the bus message lands after the
+  Supervisor restart is scheduled (matching the existing
+  bus-persists-across-restart contract). The set is drained
+  unconditionally on every `emit_completion` exit to prevent stale
+  state on idempotent re-emit / outcome=error paths.
+  Tests:
+  `tests/test_emit_completion_defensive_reload.py` (4 cases):
+  - committed-without-reload force-calls + WARNING.
+  - reload-already-called skips force-call.
+  - no-commit skips force-call.
+  - outcome=error skips force-call (engagement bailed; reload
+    decision is the operator's, not the platform's).
+
 ## [0.33.0] - 2026-05-01 — Bug bundle: G-1 + G-2 + G-3 + G-4
 
 Bug bundle from `docs/bug-review-2026-05-01-exploration2.md`. Four

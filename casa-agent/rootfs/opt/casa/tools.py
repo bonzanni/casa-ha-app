@@ -157,6 +157,34 @@ _SYNC_WAIT_TIMEOUT_S: float = 60.0
 _MAX_DELEGATION_DEPTH: int = 1
 
 
+# G-2 hotfix (v0.33.1): defensive reload guard.
+#
+# v0.33.0's doctrine fix (invert canonical order to commit -> reload ->
+# emit_completion) failed to converge live (verify cid `a9313680`
+# 2026-05-01 11:39:57Z): model still skipped the reload tool_use after
+# reading the new completion.md + reload.md and emitted the same false-
+# positive narration ("Reload triggered to apply") without actually
+# calling casa_reload. Exploration2 G-2 reproduced unchanged.
+#
+# Per kickoff: "Recommend doing the doctrine fix first; add the
+# defensive guard only if doctrine fix doesn't converge after 2
+# retries." Reverification confirmed non-convergence on the first
+# active retry — we don't have budget to retry-and-pray, and the
+# operator-visible failure mode (artifact COMMITTED BUT INERT) is
+# severe.
+#
+# Mechanism: track per-engagement "did we still owe a reload at
+# emit_completion time?" via a module-level set, populated by
+# config_git_commit when the SHA points at a real commit, drained by
+# the reload tools, and inspected at emit_completion entry. If still
+# pending, force-call ``casa_reload`` (the safe-default — hard reload
+# is always correct, just slower than soft for triggers-only changes)
+# and emit a WARNING citing the engagement id. Force-called reload
+# happens BEFORE _finalize_engagement so the bus message lands after
+# the addon has been told to restart.
+_ENGAGEMENTS_PENDING_RELOAD: set[str] = set()
+
+
 def _is_transient_connection_error(exc: BaseException) -> bool:
     """True if ``exc`` looks like a transient connection-class failure.
 
@@ -1186,6 +1214,16 @@ async def config_git_commit(args: dict) -> dict:
         sha = await asyncio.to_thread(
             config_git.commit_config, config_dir, message,
         )
+        # G-2 hotfix (v0.33.1): mark this engagement as needing a
+        # reload before emit_completion. Drained by casa_reload /
+        # casa_reload_triggers; force-honored by emit_completion.
+        # `sha` is empty string when nothing actually changed (no-op
+        # commit) — only register the pending state when a real commit
+        # landed.
+        if sha:
+            eng = engagement_var.get(None)
+            if eng is not None:
+                _ENGAGEMENTS_PENDING_RELOAD.add(eng.id)
         return _result({"sha": sha, "message": message})
     except Exception as exc:  # noqa: BLE001
         return _result({
@@ -1225,6 +1263,11 @@ async def casa_reload(_: dict) -> dict:
     try:
         async with aiohttp.ClientSession(headers=headers) as s:
             async with s.post(url) as resp:
+                # G-2 hotfix (v0.33.1): reload satisfied for this
+                # engagement; drain pending state.
+                eng = engagement_var.get(None)
+                if eng is not None:
+                    _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
                 return _result({"supervisor_status": resp.status})
     except Exception as exc:  # noqa: BLE001
         return _result({
@@ -1804,6 +1847,47 @@ async def emit_completion(args: dict) -> dict:
     except Exception:
         pass
 
+    # G-2 hotfix (v0.33.1): defensive reload guard. If this engagement
+    # committed a real change via config_git_commit but never invoked
+    # casa_reload / casa_reload_triggers, force-call casa_reload now.
+    # The doctrine-only fix in v0.33.0 didn't change model behavior
+    # (verify cid `a9313680` 2026-05-01 11:39:57Z); this guard makes
+    # post-commit activation a platform invariant rather than a
+    # model-compliance contract. Force-call BEFORE _finalize_engagement
+    # so the bus message lands after the addon has been told to
+    # restart, mirroring the doctrine's own commit-reload-emit order.
+    if outcome == "completed" and engagement.id in _ENGAGEMENTS_PENDING_RELOAD:
+        logger.warning(
+            "Engagement %s emit_completion called with outstanding "
+            "reload obligation — config_git_commit landed but no "
+            "casa_reload(_triggers) was invoked. Force-calling "
+            "casa_reload to honor the post-commit activation contract "
+            "(G-2 v0.33.1 defensive guard).",
+            engagement.id[:8],
+        )
+        try:
+            # casa_reload is wrapped by @tool — call the underlying
+            # handler so we don't pay the SDK envelope-decoding round
+            # trip from inside Casa's own code path.
+            forced = await casa_reload.handler({})
+            logger.info(
+                "Engagement %s forced casa_reload result: %s",
+                engagement.id[:8],
+                json.loads(forced["content"][0]["text"])
+                if isinstance(forced, dict)
+                and isinstance(forced.get("content"), list)
+                and forced["content"]
+                else forced,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Engagement %s forced casa_reload raised: %s; "
+                "the artifact may remain INERT until manual reload",
+                engagement.id[:8], exc,
+            )
+        finally:
+            _ENGAGEMENTS_PENDING_RELOAD.discard(engagement.id)
+
     await _finalize_engagement(
         engagement,
         outcome=outcome,
@@ -1813,6 +1897,9 @@ async def emit_completion(args: dict) -> dict:
         driver=driver,
         memory_provider=memory_provider,
     )
+    # Drain on terminal paths (e.g., outcome=error or
+    # already-terminal short-circuit above) — the engagement is gone.
+    _ENGAGEMENTS_PENDING_RELOAD.discard(engagement.id)
     return _result({"status": "acknowledged"})
 
 
@@ -2025,6 +2112,11 @@ async def casa_reload_triggers(args: dict) -> dict:
             "message": str(exc),
         })
 
+    # G-2 hotfix (v0.33.1): reload satisfied for this engagement;
+    # drain pending state.
+    eng = engagement_var.get(None)
+    if eng is not None:
+        _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
     return _result({
         "status": "ok",
         "role": role,
