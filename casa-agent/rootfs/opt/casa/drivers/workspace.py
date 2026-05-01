@@ -207,6 +207,8 @@ async def provision_workspace(
             template_root=workspace_template_root,
             plugins_yaml=plugins_yaml,
             dest=ws,
+            defn=defn,
+            hooks_yaml_data=hooks_yaml_data,
             executor_type=defn.type,
             task=task,
             context=context,
@@ -366,6 +368,8 @@ def render_workspace_template(
     template_root: Path,
     plugins_yaml: Path,
     dest: Path,
+    defn=None,                               # ExecutorDefinition (Plan 4b §16.3 + L-1)
+    hooks_yaml_data: dict | None = None,     # L-1 (v0.34.2)
     executor_type: str,
     task: str,
     context: str,
@@ -375,6 +379,11 @@ def render_workspace_template(
     """Copy the executor's workspace-template/ subtree into `dest`, interpolate
     CLAUDE.md.tmpl → CLAUDE.md, and generate .claude/settings.json with
     enabledPlugins from plugins.yaml. Plan 4b §16.3.
+
+    L-1 (v0.34.2): when ``defn`` and ``hooks_yaml_data`` are provided, the
+    generated settings.json also includes a ``hooks`` block (from
+    ``translate_hooks_to_settings``) and a ``permissions`` block (from
+    ``_build_cc_permissions``).
     """
     if not template_root.is_dir():
         raise FileNotFoundError(f"workspace template missing: {template_root}")
@@ -405,13 +414,26 @@ def render_workspace_template(
         )
         (dest / "CLAUDE.md").write_text(text, encoding="utf-8")
 
-    # Generate .claude/settings.json::enabledPlugins from plugins.yaml.
+    # Generate .claude/settings.json from plugins.yaml.
+    # L-1 (v0.34.2): merge enabledPlugins + hooks + permissions into settings.json
+    # when defn + hooks_yaml_data are provided.
     claude_dir = dest / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
     settings_path = claude_dir / "settings.json"
     cfg = load_plugins_yaml(plugins_yaml)
-    enabled = {ref: True for ref in cfg.iter_refs()}
+    if defn is not None and hooks_yaml_data is not None:
+        hooks_block = translate_hooks_to_settings(
+            hooks_yaml_data, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
+        )
+        settings = {
+            "enabledPlugins": {ref: True for ref in cfg.iter_refs()},
+            "hooks": hooks_block.get("hooks", {}),
+            "permissions": _build_cc_permissions(defn),
+        }
+    else:
+        # Legacy callers that don't pass defn/hooks_yaml_data get enabledPlugins only.
+        settings = {"enabledPlugins": {ref: True for ref in cfg.iter_refs()}}
     settings_path.write_text(
-        json.dumps({"enabledPlugins": enabled}, indent=2, sort_keys=True) + "\n",
+        json.dumps(settings, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
