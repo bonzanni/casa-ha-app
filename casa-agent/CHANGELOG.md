@@ -1,5 +1,74 @@
 # Changelog
 
+## [0.34.1] - 2026-05-01 — Hotfix: K-1 (claude_code_driver auth)
+
+Hotfix for K-1 (HIGH) discovered in
+`docs/bug-review-2026-05-01-exploration4.md`. Plugin-developer (and
+hello-driver, and any future Tier-3 executor using `claude_code_driver`)
+has been latently broken since v0.13.0 (Plan 4a, 2026-04-23 — ~8 days)
+because the Claude Code OAuth token never propagated to the engagement
+subprocess. Surfaced when exploration session 4 retracted a disguised
+time-budget deferral on P12 (the canonical case for the playbook's new
+"Time is never a deferral reason" doctrine).
+
+### Fixed
+
+- **K-1 (HIGH, claude_code_driver auth) — engagement subprocesses had
+  no Claude API auth.** `setup-configs.sh` propagates `GITHUB_TOKEN`
+  to `/run/s6/container_environment/` so every s6-supervised child
+  (including engagement subprocesses launched via `with-contenv`)
+  inherits it. There was no equivalent block for `CLAUDE_CODE_OAUTH_TOKEN`
+  — the token was only exported into svc-casa's process env at
+  `svc-casa/run:13`, which feeds casa_core (in-process Claude API
+  calls work) but NOT child s6-rc services. Result: every
+  claude_code_driver subprocess started in workspace
+  `/data/engagements/<id>/.home/` with a fresh `.home/.claude.json`
+  and no `.credentials.json`, and the CC CLI's first turn produced
+  the literal text `"Not logged in · Please run /login"`. Engagement
+  hung in `status=active` until manually cancelled.
+
+  **Fix:** new `claude-oauth-token` block in `setup-configs.sh`
+  (between the `github-token` block and the `seed-copy` block).
+  Mirrors the GITHUB_TOKEN propagation: read `claude_oauth_token`
+  via bashio, op:// resolution via the same `op` CLI path, write
+  the resolved value to `/run/s6/container_environment/CLAUDE_CODE_OAUTH_TOKEN`
+  with mode 0600. If the option is unset/null, removes the target
+  file (defensive — fresh installs go directly to "anonymous"
+  state) and emits a WARNING that explicitly references K-1 so the
+  next time this fails, the operator finds the bug review.
+
+  **Tests:** new `tests/test_setup_configs_claude_oauth.py` (7
+  cases): raw-token write, empty-value file-removal, "null"-string
+  file-removal, op://-reference resolution via stubbed `op` CLI,
+  op:// without OP_SERVICE_ACCOUNT_TOKEN fails-safe, run template
+  doesn't UNSET the OAuth token, and a structural sanity-check
+  asserting block ordering vs github-token / seed-copy markers.
+
+### Process note
+
+The exploration4 session originally marked P12 (full plugin
+lifecycle e2e) DEFERRED with reasoning that boiled down to "ran out
+of time." Operator instructed retraction; new playbook doctrine
+"Time is never a deferral reason" was committed (inner docs commit
+`f975967`) before re-running. Re-running P12 immediately surfaced
+K-1 — the canonical example of why the rule matters. **A probe
+skipped on time grounds is, sometimes, a HIGH bug not yet found.**
+
+### J-1 (LOW, docs-only — also bundled)
+
+`memory/feedback_phase_z_default_recipe.md` updated with an
+empty-overlay verification step. The v0.34.0 ship's claimed Phase Z
+at 13:30Z did not actually wipe the overlay (every config file had
+pre-13:30Z mtimes), producing 4 doctrine drift WARNINGs at next
+boot (filed as I-1, now CLOSED). Adding `ls -A` empty-verify
+between rm and start prevents recurrence. No code change.
+
+### Carry-forward
+
+- **H-2** (LOW, third-party regression) — claude-agent-sdk
+  v0.1.72 still latest; recheck `gh release list --repo
+  anthropics/claude-agent-sdk-python` at next ship gate.
+
 ## [0.34.0] - 2026-05-01 — Bug bundle: H-1 + H-3
 
 Bug bundle from `docs/bug-review-2026-05-01-exploration3.md`. Two NEW
