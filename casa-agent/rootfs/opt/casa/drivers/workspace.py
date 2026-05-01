@@ -29,6 +29,34 @@ _TEMPLATE_PATH = os.path.join(
 # as ``plugin_env_conf._VAR_NAME_RE``.
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
+# L-1 (v0.34.2): valid CC permission patterns we forward into
+# engagement-scoped .claude/settings.json::permissions.allow.
+# Anything else (e.g. Casa-internal tool names) is dropped with a WARNING.
+_VALID_CC_PERMISSION_RE = re.compile(
+    r"^(Bash\(.+\)|Read|Write|Edit|Glob|Grep|Skill|mcp__.+)$"
+)
+
+
+def _build_cc_permissions(defn) -> dict:
+    """Build CC permissions block for engagement settings.json from ExecutorDefinition.
+
+    Filters ``defn.tools_allowed`` to entries matching valid CC permission
+    patterns; non-matching entries (e.g. Casa-internal tool names) are
+    dropped with a WARNING. ``permission_mode`` falls through to
+    ``"acceptEdits"`` when empty (matches ExecutorDefinition default).
+    """
+    allow: list[str] = []
+    for entry in defn.tools_allowed:
+        if _VALID_CC_PERMISSION_RE.match(entry):
+            allow.append(entry)
+        else:
+            logger.warning(
+                "executor %r: dropping tools_allowed entry %r — "
+                "not a valid CC permission pattern",
+                defn.type, entry,
+            )
+    return {"allow": allow, "defaultMode": defn.permission_mode or "acceptEdits"}
+
 
 class WorkspaceConfigError(ValueError):
     """Raised when ExecutorDefinition values would shell-inject the run script."""

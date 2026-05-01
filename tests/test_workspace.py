@@ -380,3 +380,70 @@ class TestProvisionWithHooks:
         assert entry["hooks"][0]["command"].endswith(
             "hook_proxy.sh casa_config_guard"
         )
+
+
+class TestBuildCcPermissions:
+    """L-1 fix: filter defn.tools_allowed to valid CC permission patterns."""
+
+    def _make_minimal_defn(self, tools_allowed, permission_mode="acceptEdits"):
+        from config import ExecutorDefinition
+        return ExecutorDefinition(
+            type="test-fixture",
+            description="test fixture twenty-character description here",
+            model="sonnet",
+            driver="claude_code",
+            tools_allowed=list(tools_allowed),
+            permission_mode=permission_mode,
+        )
+
+    def test_keeps_bash_parameterized(self):
+        from drivers.workspace import _build_cc_permissions
+        defn = self._make_minimal_defn(["Bash(git*)", "Bash(gh*)"])
+        out = _build_cc_permissions(defn)
+        assert out["allow"] == ["Bash(git*)", "Bash(gh*)"]
+
+    def test_keeps_bare_tool_names(self):
+        from drivers.workspace import _build_cc_permissions
+        defn = self._make_minimal_defn(
+            ["Read", "Write", "Edit", "Glob", "Grep", "Skill"]
+        )
+        out = _build_cc_permissions(defn)
+        assert out["allow"] == [
+            "Read", "Write", "Edit", "Glob", "Grep", "Skill",
+        ]
+
+    def test_keeps_mcp_prefixed(self):
+        from drivers.workspace import _build_cc_permissions
+        defn = self._make_minimal_defn(
+            ["mcp__casa-framework__emit_completion",
+             "mcp__casa-framework__query_engager"]
+        )
+        out = _build_cc_permissions(defn)
+        assert out["allow"] == [
+            "mcp__casa-framework__emit_completion",
+            "mcp__casa-framework__query_engager",
+        ]
+
+    def test_drops_invalid_with_warning(self, caplog):
+        import logging
+        from drivers.workspace import _build_cc_permissions
+        defn = self._make_minimal_defn(
+            ["Bash(git*)", "casa-internal-tool", "", "Read"]
+        )
+        with caplog.at_level(logging.WARNING, logger="drivers.workspace"):
+            out = _build_cc_permissions(defn)
+        assert out["allow"] == ["Bash(git*)", "Read"]
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 2
+
+    def test_default_mode_from_defn(self):
+        from drivers.workspace import _build_cc_permissions
+        defn = self._make_minimal_defn(["Read"], permission_mode="bypassPermissions")
+        out = _build_cc_permissions(defn)
+        assert out["defaultMode"] == "bypassPermissions"
+
+    def test_default_mode_falls_through_when_empty(self):
+        from drivers.workspace import _build_cc_permissions
+        defn = self._make_minimal_defn(["Read"], permission_mode="")
+        out = _build_cc_permissions(defn)
+        assert out["defaultMode"] == "acceptEdits"
