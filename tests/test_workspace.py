@@ -538,3 +538,37 @@ class TestBuildCcPermissions:
         defn = self._make_minimal_defn(["Read"], permission_mode="")
         out = _build_cc_permissions(defn)
         assert out["defaultMode"] == "acceptEdits"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo not meaningful on Windows")
+    async def test_home_dir_created_via_template_path(self, tmp_path):
+        """L-1: HOME dir must be created for both legacy and template paths."""
+        import json
+        from pathlib import Path
+        from drivers.workspace import provision_workspace
+
+        # Build a minimal workspace-template/ + plugins.yaml so template path fires.
+        defn = self._make_defn(tmp_path, executor_type="tpl-fixture")
+        exec_dir = tmp_path / "defaults-executors" / "tpl-fixture"
+        tpl_root = exec_dir / "workspace-template"
+        tpl_root.mkdir()
+        (tpl_root / "CLAUDE.md.tmpl").write_text(
+            "Tpl: type={executor_type} task={task}"
+        )
+        plugins_yaml = exec_dir / "plugins.yaml"
+        plugins_yaml.write_text(
+            "schema_version: 1\nplugins: []\n"
+        )
+
+        ws = tmp_path / "engagements"
+        ws.mkdir()
+        path = await provision_workspace(
+            engagements_root=str(ws),
+            base_plugins_root=str(tmp_path),
+            engagement_id="eng-tpl-home",
+            defn=defn, task="t", context="c",
+            casa_framework_mcp_url="http://x",
+            workspace_template_root=tpl_root,
+            plugins_yaml=plugins_yaml,
+        )
+        # Regression: HOME dir must exist even when template path fired.
+        assert (Path(path) / ".home" / ".claude" / "plugins").is_dir()

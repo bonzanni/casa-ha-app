@@ -236,8 +236,9 @@ async def provision_workspace(
             json.dumps(settings, indent=2), encoding="utf-8",
         )
 
-        # Per-engagement HOME dir (plugins symlinks removed in v0.14.x).
-        (ws / ".home" / ".claude" / "plugins").mkdir(parents=True)
+    # Per-engagement HOME dir (plugins symlinks removed in v0.14.x).
+    # L-1 (v0.34.2): hoisted outside the if/else so template path also gets it.
+    (ws / ".home" / ".claude" / "plugins").mkdir(parents=True)
 
     # 2. .mcp.json — point at Casa's MCP HTTP bridge with engagement id header.
     mcp_config = {"mcpServers": {
