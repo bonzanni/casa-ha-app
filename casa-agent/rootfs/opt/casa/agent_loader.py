@@ -118,20 +118,38 @@ _SCHEMA_BY_FILENAME: dict[str, str] = {
 
 
 def validate_config_repo(config_dir: str) -> list[str]:
-    """E-G v0.31.0 pre-commit gate. Walk *config_dir* for every
+    """E-G v0.31.0 pre-commit gate. Walk *config_dir/agents/* for every
     schema-bearing YAML file and return a list of error messages — one
     per file that fails schema validation. Empty list = all clean.
 
     Used by ``mcp__casa-framework__config_git_commit`` to refuse commits
     that would land schema-invalid YAML and FATAL the addon on next boot.
     The check uses the same ``_validate`` codepath as boot-time loading,
-    so a passing pre-commit gate guarantees a green boot validation.
+    so a passing pre-commit gate guarantees a green boot validation for
+    every agent the configurator can edit.
+
+    **Scope (v0.31.1).** Only the ``agents/`` subtree is walked. v0.31.0
+    walked the whole repo, but ``policies/disclosure.yaml`` reuses the
+    same filename as the per-agent ``disclosure.yaml`` while binding to
+    a DIFFERENT schema (``policy-disclosure.v1.json`` vs
+    ``disclosure.v1.json``). Filename-based mapping mis-applied the
+    agent schema to the policy file and falsely refused every commit
+    until the configurator fixed the (untouched, valid) policy file —
+    which it can't. The original E-G repro path is the configurator
+    inventing fields under ``agents/<role>/character.yaml`` so this
+    scoping is sufficient. Boot-time loaders for ``policies/*`` and
+    ``schema/*`` (``policies.py::load_policies`` and
+    ``scope_registry.py``) catch policy-side schema violations on their
+    own.
 
     Skips ``.git/`` and any file whose basename is not in
     ``_SCHEMA_BY_FILENAME`` (markdown, plain text, etc.).
     """
     errors: list[str] = []
-    for root, dirs, files in os.walk(config_dir):
+    agents_root = os.path.join(config_dir, "agents")
+    if not os.path.isdir(agents_root):
+        return errors
+    for root, dirs, files in os.walk(agents_root):
         if ".git" in dirs:
             dirs.remove(".git")
         for name in files:

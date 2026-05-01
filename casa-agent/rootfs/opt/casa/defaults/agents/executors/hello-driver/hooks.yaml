@@ -1,3 +1,3 @@
+schema_version: 1
 # hello-driver has no hook policies — baseline smoke only.
-PreToolUse: []
-PostToolUse: []
+pre_tool_use: []

@@ -1,5 +1,81 @@
 # Changelog
 
+## [0.31.1] - 2026-05-01 — Hotfix: validate_config_repo scoping + hello-driver/hooks.yaml seed
+
+Live N150 verify against v0.31.0's E-G gate exposed two follow-on
+issues that had to be fixed before the gate works for actual
+configurator engagements.
+
+### Fixed
+
+- **E-G follow-on (HIGH) — `validate_config_repo` walked the whole
+  repo and applied `_SCHEMA_BY_FILENAME` by basename only, so
+  `policies/disclosure.yaml` was validated against the per-agent
+  `disclosure.v1.json` schema instead of its actual schema
+  (`policy-disclosure.v1.json`). The two schemas have completely
+  different shapes — agent disclosure has a single top-level `policy:`
+  string, policy disclosure has a top-level `policies:` map of named
+  bundles. Validation rejected
+  `Additional properties are not allowed ('policies' was unexpected)`
+  on the (untouched, valid) live policies file, falsely refusing
+  every commit. Fix: scope the walk to `<config_dir>/agents/` only.
+  Boot-time `policies.py::load_policies` and `scope_registry.py`
+  catch policy-side schema violations on their own. The gate now
+  fires on its intended target (configurator hallucinating fields
+  under `agents/<role>/character.yaml`) without false positives on
+  policy files. Verified live during the v0.31.0 ship's E-G probe
+  (cid `4ee4013a`, configurator engagement `ef728344`): the gate
+  correctly refused the `TRAIT:` top-level key edit; the configurator
+  self-corrected to a valid edit inside the `card:` field; my v0.31.0
+  bug then blocked the valid commit. v0.31.1 lets that flow through.
+
+- **Latent hello-driver seed bug (LOW) — `defaults/agents/executors/
+  hello-driver/hooks.yaml`** shipped with `PreToolUse: []` /
+  `PostToolUse: []` (PascalCase, claude-code-driver style) but
+  `hooks.v1.json` requires `schema_version: 1` + `pre_tool_use: []`
+  (snake_case). The file would FATAL boot validation if hello-driver
+  were enabled. Latent because hello-driver is `enabled: false` by
+  default (per `project_3_5_plan4a_shipped`). Surfaced by v0.31.0's
+  `validate_config_repo` walk; the bug had been silently shipped since
+  the executor was first introduced. Fix: corrected to schema-conformant
+  shape.
+
+### Tests
+
+- `tests/test_agent_loader.py::TestValidateConfigRepo` — 2 new tests:
+  `test_no_agents_dir_returns_empty` (defensive: tool path must not
+  crash on a fresh repo without the agents/ subtree); `test_skips_policies_dir`
+  (regression-guard: realistic `policies/disclosure.yaml` with
+  `policies:` block must NOT trip the agent gate). Existing
+  `test_skips_dotgit_dir` updated to land its dotgit at
+  `agents/.git/` since the gate no longer walks the repo root.
+
+### Notes
+
+- v0.31.0 / E-H + caller-side regression-locker shipped clean and
+  was verified live: butler delegation cid `fec3a3a4` →
+  `Delegation 1529c6e6 → butler ok (11.03s)`; zero
+  `specialist memory read failed` WARNINGs in the 5min post-deploy
+  probe window. M4b specialist memory restored.
+- v0.31.0 / E-G ALSO shipped clean in its primary contract:
+  configurator's first commit attempt with the `TRAIT:` invented
+  key was correctly refused; configurator's full-context reasoning
+  trace shows the schema error message reached the model and the
+  model self-corrected to add the trait inside `card:` (the only
+  free-text field in the character schema). Net result on N150:
+  zero schema-invalid YAML landed in the inner addon_configs git.
+  v0.31.1 just unblocks the valid commit.
+- A pre-existing valid `card:` edit on `agents/assistant/
+  character.yaml` plus the configurator's accidental rewrite of
+  `agents/executors/hello-driver/hooks.yaml` (which corrected the
+  PascalCase shape — itself the latent bug fixed in this ship) are
+  both dirty in the live N150 working tree post-v0.31.1 deploy.
+  Recovery: either let the next configurator engagement commit the
+  card change (the now-valid hello-driver/hooks.yaml will land in
+  the same commit), or manually `git -C /addon_configs/casa-agent
+  checkout -- agents/assistant/character.yaml agents/executors/
+  hello-driver/hooks.yaml` to discard.
+
 ## [0.31.0] - 2026-05-01 — Bug bundle: E-G + E-H + Phase Z playbook corrections
 
 Closes the two HIGH bugs filed in
