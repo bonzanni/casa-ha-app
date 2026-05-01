@@ -179,7 +179,13 @@ class TestRenderRunScriptShellInjection:
 
 class TestProvisionWorkspace:
     def _make_defn(self, tmp_path, executor_type="hello-driver", plugins=None):
-        """Build an ExecutorDefinition stub for workspace tests."""
+        """Build an ExecutorDefinition stub for workspace tests.
+
+        Note: the default ``executor_type='hello-driver'`` is an incidental
+        label only — no on-disk hello-driver definition is loaded. Tests
+        construct the dataclass directly. The label could be any string;
+        kept for diff-minimal historical continuity.
+        """
         from config import ExecutorDefinition
 
         exec_dir = tmp_path / "defaults-executors" / executor_type
@@ -308,6 +314,130 @@ class TestProvisionWorkspace:
         server_cfg = mcp["mcpServers"]["casa-framework"]
         assert server_cfg["headers"] == {"X-Casa-Engagement-Id": "eng-hdr-test"}
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo not meaningful on Windows")
+    async def test_legacy_path_writes_permissions_allow_filtered(self, tmp_path):
+        """L-1: tools_allowed flows to settings.json::permissions.allow, filtered."""
+        import json
+        from pathlib import Path
+        from drivers.workspace import provision_workspace
+
+        defn = self._make_defn(tmp_path)
+        defn.tools_allowed = [
+            "Bash(git*)", "Read", "mcp__casa-framework__emit_completion",
+            "casa-internal-tool", "",
+        ]
+        defn.permission_mode = "acceptEdits"
+
+        ws = tmp_path / "engagements"
+        ws.mkdir()
+        path = await provision_workspace(
+            engagements_root=str(ws),
+            base_plugins_root=str(tmp_path),
+            engagement_id="eng-perm",
+            defn=defn, task="t", context="c",
+            casa_framework_mcp_url="http://x",
+        )
+        settings = json.loads(
+            (Path(path) / ".claude" / "settings.json").read_text()
+        )
+        assert "permissions" in settings
+        assert settings["permissions"]["allow"] == [
+            "Bash(git*)", "Read", "mcp__casa-framework__emit_completion",
+        ]
+        assert settings["permissions"]["defaultMode"] == "acceptEdits"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo not meaningful on Windows")
+    async def test_legacy_path_default_mode_from_defn(self, tmp_path):
+        """L-1: defn.permission_mode flows to settings.json::permissions.defaultMode."""
+        import json
+        from pathlib import Path
+        from drivers.workspace import provision_workspace
+
+        defn = self._make_defn(tmp_path)
+        defn.tools_allowed = ["Read"]
+        defn.permission_mode = "bypassPermissions"
+
+        ws = tmp_path / "engagements"
+        ws.mkdir()
+        path = await provision_workspace(
+            engagements_root=str(ws),
+            base_plugins_root=str(tmp_path),
+            engagement_id="eng-perm-mode",
+            defn=defn, task="t", context="c",
+            casa_framework_mcp_url="http://x",
+        )
+        settings = json.loads(
+            (Path(path) / ".claude" / "settings.json").read_text()
+        )
+        assert settings["permissions"]["defaultMode"] == "bypassPermissions"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo not meaningful on Windows")
+    async def test_legacy_path_preserves_hooks_alongside_permissions(self, tmp_path):
+        """L-1: existing hooks block coexists with new permissions block."""
+        import json
+        from pathlib import Path
+        from drivers.workspace import provision_workspace
+
+        defn = self._make_defn(tmp_path)
+        defn.tools_allowed = ["Read"]
+        # Write a hooks.yaml so translate_hooks_to_settings has something to do.
+        hooks_path = tmp_path / "defaults-executors" / "hello-driver" / "hooks.yaml"
+        hooks_path.write_text(
+            "schema_version: 1\n"
+            "pre_tool_use:\n"
+            "  - policy: block_dangerous_bash\n"
+        )
+        defn.hooks_path = str(hooks_path)
+
+        ws = tmp_path / "engagements"
+        ws.mkdir()
+        path = await provision_workspace(
+            engagements_root=str(ws),
+            base_plugins_root=str(tmp_path),
+            engagement_id="eng-both",
+            defn=defn, task="t", context="c",
+            casa_framework_mcp_url="http://x",
+        )
+        settings = json.loads(
+            (Path(path) / ".claude" / "settings.json").read_text()
+        )
+        assert "hooks" in settings
+        assert "permissions" in settings
+        assert "PreToolUse" in settings["hooks"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo not meaningful on Windows")
+    async def test_home_dir_created_via_template_path(self, tmp_path):
+        """L-1: HOME dir must be created for both legacy and template paths."""
+        from pathlib import Path
+        from drivers.workspace import provision_workspace
+
+        # Build a minimal workspace-template/ + plugins.yaml so template path fires.
+        defn = self._make_defn(tmp_path, executor_type="tpl-fixture")
+        exec_dir = tmp_path / "defaults-executors" / "tpl-fixture"
+        tpl_root = exec_dir / "workspace-template"
+        tpl_root.mkdir()
+        (tpl_root / "CLAUDE.md.tmpl").write_text(
+            "Tpl: type={executor_type} task={task}"
+        )
+        plugins_yaml = exec_dir / "plugins.yaml"
+        plugins_yaml.write_text(
+            "schema_version: 1\nplugins: []\n"
+        )
+
+        ws = tmp_path / "engagements"
+        ws.mkdir()
+        path = await provision_workspace(
+            engagements_root=str(ws),
+            base_plugins_root=str(tmp_path),
+            engagement_id="eng-tpl-home",
+            defn=defn, task="t", context="c",
+            casa_framework_mcp_url="http://x",
+            workspace_template_root=tpl_root,
+            plugins_yaml=plugins_yaml,
+        )
+        # Regression: HOME dir must exist even when template path fired.
+        assert (Path(path) / ".home" / ".claude" / "plugins").is_dir()
+
 
 class TestCasaMeta:
     def test_write_and_load_roundtrip(self, tmp_path):
@@ -380,3 +510,70 @@ class TestProvisionWithHooks:
         assert entry["hooks"][0]["command"].endswith(
             "hook_proxy.sh casa_config_guard"
         )
+
+
+class TestBuildCcPermissions:
+    """L-1 fix: filter defn.tools_allowed to valid CC permission patterns."""
+
+    def _make_minimal_defn(self, tools_allowed, permission_mode="acceptEdits"):
+        from config import ExecutorDefinition
+        return ExecutorDefinition(
+            type="test-fixture",
+            description="test fixture twenty-character description here",
+            model="sonnet",
+            driver="claude_code",
+            tools_allowed=list(tools_allowed),
+            permission_mode=permission_mode,
+        )
+
+    def test_keeps_bash_parameterized(self):
+        from drivers.workspace import _build_cc_permissions
+        defn = self._make_minimal_defn(["Bash(git*)", "Bash(gh*)"])
+        out = _build_cc_permissions(defn)
+        assert out["allow"] == ["Bash(git*)", "Bash(gh*)"]
+
+    def test_keeps_bare_tool_names(self):
+        from drivers.workspace import _build_cc_permissions
+        defn = self._make_minimal_defn(
+            ["Read", "Write", "Edit", "Glob", "Grep", "Skill"]
+        )
+        out = _build_cc_permissions(defn)
+        assert out["allow"] == [
+            "Read", "Write", "Edit", "Glob", "Grep", "Skill",
+        ]
+
+    def test_keeps_mcp_prefixed(self):
+        from drivers.workspace import _build_cc_permissions
+        defn = self._make_minimal_defn(
+            ["mcp__casa-framework__emit_completion",
+             "mcp__casa-framework__query_engager"]
+        )
+        out = _build_cc_permissions(defn)
+        assert out["allow"] == [
+            "mcp__casa-framework__emit_completion",
+            "mcp__casa-framework__query_engager",
+        ]
+
+    def test_drops_invalid_with_warning(self, caplog):
+        import logging
+        from drivers.workspace import _build_cc_permissions
+        defn = self._make_minimal_defn(
+            ["Bash(git*)", "casa-internal-tool", "", "Read"]
+        )
+        with caplog.at_level(logging.WARNING, logger="drivers.workspace"):
+            out = _build_cc_permissions(defn)
+        assert out["allow"] == ["Bash(git*)", "Read"]
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 2
+
+    def test_default_mode_from_defn(self):
+        from drivers.workspace import _build_cc_permissions
+        defn = self._make_minimal_defn(["Read"], permission_mode="bypassPermissions")
+        out = _build_cc_permissions(defn)
+        assert out["defaultMode"] == "bypassPermissions"
+
+    def test_default_mode_falls_through_when_empty(self):
+        from drivers.workspace import _build_cc_permissions
+        defn = self._make_minimal_defn(["Read"], permission_mode="")
+        out = _build_cc_permissions(defn)
+        assert out["defaultMode"] == "acceptEdits"

@@ -89,9 +89,9 @@ async def main():
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )
 
-    # Minimal ExecutorDefinition mirroring hello-driver
+    # Minimal ExecutorDefinition fixture for the engagement_D e2e (label is incidental, no on-disk executor matches)
     defn = ExecutorDefinition(
-        type="hello-driver", description="hello test driver harness xx",
+        type="test-fixture-driver", description="hello test driver harness xx",
         model="sonnet", driver="claude_code", enabled=True,
         tools_allowed=["mcp__casa-framework__emit_completion"],
         permission_mode="dontAsk", mcp_server_names=["casa-framework"],
@@ -100,7 +100,7 @@ async def main():
     pathlib.Path("/tmp/prompt.md").write_text("hi, task: {task}")
 
     rec = await reg.create(
-        kind="executor", role_or_type="hello-driver", driver="claude_code",
+        kind="executor", role_or_type="test-fixture-driver", driver="claude_code",
         task="say hi", origin={"channel": "telegram", "chat_id": "1"},
         topic_id=None,
     )
@@ -151,7 +151,7 @@ async def main():
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
-        type="hello-driver", description="hello test driver harness xx",
+        type="test-fixture-driver", description="hello test driver harness xx",
         model="sonnet", driver="claude_code", enabled=True,
         tools_allowed=["mcp__casa-framework__emit_completion"],
         permission_mode="dontAsk", mcp_server_names=["casa-framework"],
@@ -159,7 +159,7 @@ async def main():
     )
     pathlib.Path("/tmp/d2-prompt.md").write_text("hi")
     rec = await reg.create(
-        kind="executor", role_or_type="hello-driver", driver="claude_code",
+        kind="executor", role_or_type="test-fixture-driver", driver="claude_code",
         task="t", origin={"channel": "telegram", "chat_id": "1"}, topic_id=None,
     )
     await drv.start(rec, prompt="hi", options=defn)
@@ -199,7 +199,7 @@ async def main():
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
-        type="hello-driver", description="hello test driver harness xx",
+        type="test-fixture-driver", description="hello test driver harness xx",
         model="sonnet", driver="claude_code", enabled=True,
         tools_allowed=["mcp__casa-framework__emit_completion"],
         permission_mode="dontAsk", mcp_server_names=["casa-framework"],
@@ -207,7 +207,7 @@ async def main():
     )
     pathlib.Path("/tmp/d3-prompt.md").write_text("hi")
     rec = await reg.create(
-        kind="executor", role_or_type="hello-driver", driver="claude_code",
+        kind="executor", role_or_type="test-fixture-driver", driver="claude_code",
         task="t", origin={"channel": "telegram", "chat_id": "1"}, topic_id=None,
     )
     await drv.start(rec, prompt="hi", options=defn)
@@ -257,7 +257,7 @@ async def main():
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
-        type="hello-driver", description="hello test driver harness xx",
+        type="test-fixture-driver", description="hello test driver harness xx",
         model="sonnet", driver="claude_code", enabled=True,
         tools_allowed=["mcp__casa-framework__emit_completion"],
         permission_mode="dontAsk", mcp_server_names=["casa-framework"],
@@ -265,7 +265,7 @@ async def main():
     )
     pathlib.Path("/tmp/d4-prompt.md").write_text("hi")
     rec = await reg.create(
-        kind="executor", role_or_type="hello-driver", driver="claude_code",
+        kind="executor", role_or_type="test-fixture-driver", driver="claude_code",
         task="t", origin={"channel": "telegram", "chat_id": "1"}, topic_id=None,
     )
     await drv.start(rec, prompt="hi", options=defn)
@@ -313,7 +313,7 @@ async def main():
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
-        type="hello-driver", description="hello test driver harness xx",
+        type="test-fixture-driver", description="hello test driver harness xx",
         model="sonnet", driver="claude_code", enabled=True,
         tools_allowed=["mcp__casa-framework__emit_completion"],
         permission_mode="dontAsk", mcp_server_names=["casa-framework"],
@@ -321,7 +321,7 @@ async def main():
     )
     pathlib.Path("/tmp/d5-prompt.md").write_text("hi")
     rec = await reg.create(
-        kind="executor", role_or_type="hello-driver", driver="claude_code",
+        kind="executor", role_or_type="test-fixture-driver", driver="claude_code",
         task="t", origin={"channel": "telegram", "chat_id": "1"}, topic_id=None,
     )
     await drv.start(rec, prompt="hi", options=defn)
@@ -384,7 +384,7 @@ async def main():
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
-        type="hello-driver", description="hello test driver harness xx",
+        type="test-fixture-driver", description="hello test driver harness xx",
         model="sonnet", driver="claude_code", enabled=True,
         tools_allowed=["mcp__casa-framework__emit_completion"],
         permission_mode="dontAsk", mcp_server_names=["casa-framework"],
@@ -392,7 +392,7 @@ async def main():
     )
     pathlib.Path("/tmp/d6-prompt.md").write_text("hi")
     rec = await reg.create(
-        kind="executor", role_or_type="hello-driver", driver="claude_code",
+        kind="executor", role_or_type="test-fixture-driver", driver="claude_code",
         task="t", origin={"channel": "telegram", "chat_id": "1"}, topic_id=None,
     )
     await drv.start(rec, prompt="hi", options=defn)
@@ -481,7 +481,7 @@ async def main():
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
-        type="hello-driver", description="hello test driver harness xx",
+        type="test-fixture-driver", description="hello test driver harness xx",
         model="sonnet", driver="claude_code", enabled=True,
         tools_allowed=["mcp__casa-framework__emit_completion"],
         permission_mode="dontAsk", mcp_server_names=["casa-framework"],
@@ -489,7 +489,7 @@ async def main():
     )
     pathlib.Path("/tmp/d8-prompt.md").write_text("hi")
     rec = await reg.create(
-        kind="executor", role_or_type="hello-driver", driver="claude_code",
+        kind="executor", role_or_type="test-fixture-driver", driver="claude_code",
         task="t", origin={"channel": "telegram", "chat_id": "1"}, topic_id=None,
     )
     await drv.start(rec, prompt="hi", options=defn)

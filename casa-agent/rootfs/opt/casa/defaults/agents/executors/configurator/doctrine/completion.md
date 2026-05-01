@@ -54,6 +54,22 @@ Ellen's narration to the operator is accurate.
 
 `next_steps` is almost always empty for the configurator.
 
+## Status semantics
+
+`status` reflects the engagement-task outcome, NOT a sub-action outcome.
+
+When the engagement's task is to test a security probe (e.g. "verify
+path_scope denies a write to /etc/foo"), a successful denial means the
+task succeeded — emit `status="ok"`. Use `status="failed"` only when the
+engagement itself failed to complete its objective (subprocess crashed,
+required tool unavailable, contradictory state preventing progress).
+Use `status="partial"` if some objectives were met but others were not.
+
+The valid enum values are exactly `"ok" | "partial" | "failed" |
+"cancelled"`. Do NOT pass other strings (e.g. `"error"`) — the
+engagement registry will record an `emit_completion_error` outcome
+even though your sub-action narrative was correct.
+
 ## Hard-reload note
 
 `casa_reload()` returns `supervisor_status: 200, deferred: true`

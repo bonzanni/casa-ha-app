@@ -331,7 +331,7 @@ unset OP_TOK VAULT GH_TOKEN
 # svc-casa's process env (svc-casa/run:13), which feeds casa_core
 # itself but NOT s6-rc child services launched via `with-contenv`
 # (which read /run/s6/container_environment/). Result: every
-# claude_code_driver subprocess (plugin-developer, hello-driver) got
+# claude_code_driver subprocess (plugin-developer) got
 # "Not logged in · Please run /login" and produced no useful output.
 # Latently broken since v0.13.0 (Plan 4a) — ~8 days.
 #

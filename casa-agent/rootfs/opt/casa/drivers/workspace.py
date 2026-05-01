@@ -29,6 +29,34 @@ _TEMPLATE_PATH = os.path.join(
 # as ``plugin_env_conf._VAR_NAME_RE``.
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
+# L-1 (v0.34.2): valid CC permission patterns we forward into
+# engagement-scoped .claude/settings.json::permissions.allow.
+# Anything else (e.g. Casa-internal tool names) is dropped with a WARNING.
+_VALID_CC_PERMISSION_RE = re.compile(
+    r"^(Bash\(.+\)|Read|Write|Edit|Glob|Grep|Skill|mcp__.+)$"
+)
+
+
+def _build_cc_permissions(defn) -> dict:
+    """Build CC permissions block for engagement settings.json from ExecutorDefinition.
+
+    Filters ``defn.tools_allowed`` to entries matching valid CC permission
+    patterns; non-matching entries (e.g. Casa-internal tool names) are
+    dropped with a WARNING. ``permission_mode`` falls through to
+    ``"acceptEdits"`` when empty (matches ExecutorDefinition default).
+    """
+    allow: list[str] = []
+    for entry in defn.tools_allowed:
+        if _VALID_CC_PERMISSION_RE.match(entry):
+            allow.append(entry)
+        else:
+            logger.warning(
+                "executor %r: dropping tools_allowed entry %r — "
+                "not a valid CC permission pattern",
+                defn.type, entry,
+            )
+    return {"allow": allow, "defaultMode": defn.permission_mode or "acceptEdits"}
+
 
 class WorkspaceConfigError(ValueError):
     """Raised when ExecutorDefinition values would shell-inject the run script."""
@@ -161,6 +189,13 @@ async def provision_workspace(
     ws = Path(engagements_root) / engagement_id
     ws.mkdir(parents=True, exist_ok=False)
 
+    # L-1 (v0.34.2): both legacy and template paths need hooks_yaml_data.
+    # Load once here; render_workspace_template + legacy branch share it.
+    hooks_yaml_data: dict = {}
+    if getattr(defn, "hooks_path", None) and os.path.isfile(defn.hooks_path):
+        with open(defn.hooks_path, "r", encoding="utf-8") as fh:
+            hooks_yaml_data = yaml.safe_load(fh) or {}
+
     # Plan 4b §16.3: if a workspace-template exists for this executor, render it
     # into the workspace root. This subsumes the old symlink-loop behavior.
     if (
@@ -172,6 +207,8 @@ async def provision_workspace(
             template_root=workspace_template_root,
             plugins_yaml=plugins_yaml,
             dest=ws,
+            defn=defn,
+            hooks_yaml_data=hooks_yaml_data,
             executor_type=defn.type,
             task=task,
             context=context,
@@ -192,19 +229,18 @@ async def provision_workspace(
 
         # .claude/settings.json with translated hooks (legacy path).
         (ws / ".claude").mkdir(exist_ok=True)
-        hooks_yaml_data: dict = {}
-        if getattr(defn, "hooks_path", None) and os.path.isfile(defn.hooks_path):
-            with open(defn.hooks_path, "r", encoding="utf-8") as fh:
-                hooks_yaml_data = yaml.safe_load(fh) or {}
         settings = translate_hooks_to_settings(
             hooks_yaml_data, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
         )
+        # L-1 (v0.34.2): merge permissions block from defn alongside hooks.
+        settings["permissions"] = _build_cc_permissions(defn)
         (ws / ".claude" / "settings.json").write_text(
             json.dumps(settings, indent=2), encoding="utf-8",
         )
 
-        # Per-engagement HOME dir (plugins symlinks removed in v0.14.x).
-        (ws / ".home" / ".claude" / "plugins").mkdir(parents=True)
+    # Per-engagement HOME dir (plugins symlinks removed in v0.14.x).
+    # L-1 (v0.34.2): hoisted outside the if/else so template path also gets it.
+    (ws / ".home" / ".claude" / "plugins").mkdir(parents=True)
 
     # 2. .mcp.json — point at Casa's MCP HTTP bridge with engagement id header.
     mcp_config = {"mcpServers": {
@@ -332,6 +368,8 @@ def render_workspace_template(
     template_root: Path,
     plugins_yaml: Path,
     dest: Path,
+    defn,                                    # ExecutorDefinition (Plan 4b §16.3 + L-1)
+    hooks_yaml_data: dict,                   # L-1 (v0.34.2)
     executor_type: str,
     task: str,
     context: str,
@@ -340,7 +378,13 @@ def render_workspace_template(
 ) -> None:
     """Copy the executor's workspace-template/ subtree into `dest`, interpolate
     CLAUDE.md.tmpl → CLAUDE.md, and generate .claude/settings.json with
-    enabledPlugins from plugins.yaml. Plan 4b §16.3.
+    enabledPlugins + hooks + permissions from plugins.yaml and executor definition.
+    Plan 4b §16.3.
+
+    L-1 (v0.34.2): ``defn`` and ``hooks_yaml_data`` are REQUIRED. The generated
+    settings.json always includes a ``hooks`` block (from
+    ``translate_hooks_to_settings``) and a ``permissions`` block (from
+    ``_build_cc_permissions``).
     """
     if not template_root.is_dir():
         raise FileNotFoundError(f"workspace template missing: {template_root}")
@@ -371,13 +415,21 @@ def render_workspace_template(
         )
         (dest / "CLAUDE.md").write_text(text, encoding="utf-8")
 
-    # Generate .claude/settings.json::enabledPlugins from plugins.yaml.
+    # Generate .claude/settings.json from plugins.yaml.
+    # L-1 (v0.34.2): merge enabledPlugins + hooks + permissions into settings.json.
     claude_dir = dest / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
     settings_path = claude_dir / "settings.json"
     cfg = load_plugins_yaml(plugins_yaml)
-    enabled = {ref: True for ref in cfg.iter_refs()}
+    hooks_block = translate_hooks_to_settings(
+        hooks_yaml_data, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
+    )
+    settings = {
+        "enabledPlugins": {ref: True for ref in cfg.iter_refs()},
+        "hooks": hooks_block.get("hooks", {}),
+        "permissions": _build_cc_permissions(defn),
+    }
     settings_path.write_text(
-        json.dumps({"enabledPlugins": enabled}, indent=2, sort_keys=True) + "\n",
+        json.dumps(settings, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )

@@ -268,3 +268,24 @@ async def test_env_var_assignment_skipped_to_argv0():
             "tool_input": {"command": "FOO=bar BAR=baz rm -rf /tmp/x"}}
     result = await block_dangerous_commands(data, "tid-envassign", CTX)
     assert result is not None
+
+
+# ------------------------------------------------------------------
+# _normalize_path — L-2 (v0.34.2): single-slash absolute paths
+# ------------------------------------------------------------------
+
+
+class TestNormalizePathSingleSlash:
+    """L-2 (v0.34.2): _normalize_path must not produce double leading slash."""
+
+    def test_preserves_single_leading_slash(self):
+        from hooks import _normalize_path
+        assert _normalize_path("/addon_configs/foo") == "/addon_configs/foo"
+
+    def test_handles_dotdot_at_root(self):
+        from hooks import _normalize_path
+        assert _normalize_path("/foo/../bar") == "/bar"
+
+    def test_handles_relative_path_unchanged(self):
+        from hooks import _normalize_path
+        assert _normalize_path("foo/bar") == "foo/bar"

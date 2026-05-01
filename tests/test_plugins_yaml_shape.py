@@ -42,6 +42,8 @@ def test_agent_home_shape(tmp_path: Path, defaults_tree: Path) -> None:
 
 
 def test_workspace_template_shape(tmp_path: Path) -> None:
+    from config import ExecutorDefinition
+
     tmpl_root = tmp_path / "tmpl"
     (tmpl_root / ".claude").mkdir(parents=True)
     (tmpl_root / "CLAUDE.md.tmpl").write_text("x", encoding="utf-8")
@@ -53,11 +55,21 @@ def test_workspace_template_shape(tmp_path: Path) -> None:
         }),
         encoding="utf-8",
     )
+    defn = ExecutorDefinition(
+        type="plugin-developer",
+        description="test fixture twenty-character description here",
+        model="sonnet",
+        driver="claude_code",
+        tools_allowed=["Read"],
+        permission_mode="acceptEdits",
+    )
     dest = tmp_path / "ws"
     render_workspace_template(
         template_root=tmpl_root,
         plugins_yaml=plugins_yaml,
         dest=dest,
+        defn=defn,
+        hooks_yaml_data={},
         executor_type="plugin-developer",
         task="",
         context="",

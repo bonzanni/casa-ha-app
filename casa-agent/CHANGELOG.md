@@ -1,5 +1,92 @@
 # Changelog
 
+## [0.34.2] - 2026-05-01 — Bug bundle: L-1 + L-1b + L-2 + L-3 + remove hello-driver
+
+Closes 4 findings from
+`docs/bug-review-2026-05-01-deferred-probes.md` plus 1 latent bug
+surfaced during code review (L-1b).
+
+### Fixed
+
+- **L-1 (HIGH, claude_code engagement settings.json missing
+  `permissions.allow`).** `drivers/workspace.py` now materializes
+  `defn.tools_allowed` (filtered to valid CC permission patterns:
+  `Bash(...)`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Skill`,
+  `mcp__*`) + `defn.permission_mode` into engagement-scoped
+  `.claude/settings.json::permissions`, for both legacy and template
+  provisioning paths. `drivers/claude_code_driver.py` now passes
+  `workspace_template_root` + `plugins_yaml` so plugin-developer
+  flows through the template path (its
+  `workspace-template/CLAUDE.md.tmpl` becomes the engagement system
+  prompt). HOME dir creation lifted out of the if/else for parity.
+  Latently broken since v0.13.0 — every Bash invocation in
+  plugin-developer engagements got "This command requires approval"
+  with no TTY to escalate.
+
+- **L-1b (HIGH, hook_bridge translator silently dropped all hooks).**
+  `drivers/hook_bridge.py::translate_hooks_to_settings` was reading
+  PascalCase keys (`PreToolUse`, `PostToolUse`) but on-disk hooks.yaml
+  + the canonical schema (`defaults/schema/hooks.v1.json`) use
+  snake_case (`pre_tool_use`, `post_tool_use`). Result: every
+  claude_code engagement got `{"hooks": {}}` since v0.13.0. Sibling
+  of L-1: defense-in-depth (`block_dangerous_bash`, `path_scope`,
+  `casa_config_guard`) was completely absent for any claude_code
+  subprocess. Existing `test_hook_bridge.py` fixture used PascalCase
+  input — masked the bug. Fixed translator to read snake_case (still
+  emits PascalCase per CC settings.json shape); regression test loads
+  bundled `plugin-developer/hooks.yaml` and asserts non-empty
+  PreToolUse block.
+
+- **L-2 (LOW, cosmetic).** `hooks.py::_normalize_path` was producing
+  `"//addon_configs/..."` instead of `"/addon_configs/..."` in
+  path_scope deny payloads. Self-consistent on both sides of the
+  prefix comparison so the deny logic was unaffected; only display
+  cleaner now.
+
+- **L-3 (DOCTRINE).** Configurator's `completion.md` now has a
+  `## Status semantics` section explaining that `emit_completion`
+  `status="ok"` reflects engagement-task outcome (a hook-deny
+  correctly fired during a security probe is `ok`), and clarifying
+  that the valid enum is `"ok" | "partial" | "failed" |
+  "cancelled"` — not `"error"`.
+
+### Removed
+
+- **`hello-driver` test-harness executor.** Bundled defaults
+  (`defaults/agents/executors/hello-driver/`) deleted. Smoke harness
+  `test-local/smoke/test_claude_code_driver.sh` deleted. Comments in
+  `hook_bridge.py` and `setup-configs.sh` updated to drop
+  hello-driver references. Doctrine `scaffold.md` example listings
+  cleaned. With the L-1 call-site change, plugin-developer becomes
+  the only `claude_code` driver caller — hello-driver was never
+  user-facing and its only role was driver validation, now covered
+  by the plugin-developer P12 chain. Closes M-1 (FIFO subprocess
+  hang) by deletion.
+
+### Live verification
+
+- L-1: plugin-developer engagement built `casa-probe-2026-05-01-greet`
+  end-to-end (gh + git push round-trip) — every Bash call returned
+  ok=True. Engagement workspace `.claude/settings.json` carried
+  `permissions.allow` populated from defn + `permissions.defaultMode
+  = "acceptEdits"` + `hooks` block + `enabledPlugins`. Engagement
+  workspace CLAUDE.md was the structured `.tmpl` content.
+- L-1b: same engagement subprocess transcript shows PreToolUse hooks
+  fired (block_dangerous_bash + path_scope) — defense-in-depth live
+  on the only remaining claude_code executor.
+- L-2: P15.2 path_scope deny payload now shows
+  `'/addon_configs/...'` (single slash).
+
+### Test plan
+
+- 9 unit tests for L-1 helper + legacy/template path permissions.
+- 1 regression test in `test_hook_bridge.py` loads bundled
+  `plugin-developer/hooks.yaml` end-to-end.
+- 1 regression test in `test_workspace_template_renders.py` loads
+  bundled `plugin-developer/definition.yaml` + `hooks.yaml` +
+  `plugins.yaml` + `workspace-template/` end-to-end.
+- 4 unit/integration tests for L-2 single-slash output.
+
 ## [0.34.1] - 2026-05-01 — Hotfix: K-1 (claude_code_driver auth)
 
 Hotfix for K-1 (HIGH) discovered in

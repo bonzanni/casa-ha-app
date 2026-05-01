@@ -5,8 +5,8 @@ The CC hook shape is:
         {"type": "command", "command": "<proxy-script> <policy-name>"}
     ]}]}}
 
-Casa's hooks.yaml shape (per hello-driver & configurator defaults):
-    PreToolUse:
+Casa's hooks.yaml shape (per configurator + plugin-developer defaults):
+    pre_tool_use:
       - policy: casa_config_guard
         matcher: Write|Edit
 """
@@ -17,10 +17,18 @@ from __future__ import annotations
 def translate_hooks_to_settings(
     hooks_yaml: dict, *, proxy_script_path: str,
 ) -> dict:
-    """Convert Casa hooks.yaml -> CC settings.json shape."""
+    """Convert Casa hooks.yaml -> CC settings.json shape.
+
+    Reads snake_case keys (``pre_tool_use``, ``post_tool_use``) per
+    ``defaults/schema/hooks.v1.json``; emits PascalCase
+    (``PreToolUse``, ``PostToolUse``) per CC settings.json shape.
+    """
     out: dict = {"hooks": {}}
-    for event in ("PreToolUse", "PostToolUse"):
-        entries = hooks_yaml.get(event, []) or []
+    for snake, pascal in (
+        ("pre_tool_use", "PreToolUse"),
+        ("post_tool_use", "PostToolUse"),
+    ):
+        entries = hooks_yaml.get(snake, []) or []
         if not entries:
             continue
         out_entries = []
@@ -36,5 +44,5 @@ def translate_hooks_to_settings(
                     "command": f"{proxy_script_path} {policy}",
                 }],
             })
-        out["hooks"][event] = out_entries
+        out["hooks"][pascal] = out_entries
     return out
