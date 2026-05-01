@@ -78,3 +78,65 @@ class TestConfigGitCommitRoleGuard:
             agent_mod.origin_var.reset(tok)
         payload = json.loads(result["content"][0]["text"])
         assert payload["kind"] == "not_authorized"
+
+
+class TestConfigGitCommitSchemaGate:
+    """E-G v0.31.0 pre-commit schema-validation gate. The tool must
+    refuse a commit that would land schema-invalid YAML and FATAL the
+    addon on next boot. See `bug-review-2026-05-01-exploration.md` and
+    `project_eg_configurator_schema_invalid_yaml`."""
+
+    async def test_refuses_when_validation_errors_found(
+        self, configurator_origin,
+    ):
+        from tools import config_git_commit
+        with patch(
+            "agent_loader.validate_config_repo",
+            return_value=[
+                "/addon_configs/casa-agent/agents/assistant/character.yaml: "
+                "schema violation at (root): Additional properties are not "
+                "allowed ('TRAIT' was unexpected)",
+            ],
+        ), patch("config_git.commit_config") as mock_commit:
+            result = await config_git_commit.handler(
+                {"message": "add trait"},
+            )
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["status"] == "error"
+        assert payload["kind"] == "schema_invalid"
+        assert payload["errors"][0].endswith(
+            "Additional properties are not allowed ('TRAIT' was unexpected)"
+        )
+        # The git commit MUST NOT be reached when validation fails.
+        mock_commit.assert_not_called()
+
+    async def test_proceeds_when_validation_clean(self, configurator_origin):
+        from tools import config_git_commit
+        with patch(
+            "agent_loader.validate_config_repo", return_value=[],
+        ), patch(
+            "config_git.commit_config", return_value="abcd1234",
+        ) as mock_commit:
+            result = await config_git_commit.handler({"message": "ok"})
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["sha"] == "abcd1234"
+        assert payload["message"] == "ok"
+        mock_commit.assert_called_once()
+
+    async def test_aggregates_multiple_errors(self, configurator_origin):
+        """The error list surfaces every offending file at once so the
+        configurator can fix them all in one round-trip."""
+        from tools import config_git_commit
+        with patch(
+            "agent_loader.validate_config_repo",
+            return_value=[
+                "/p/character.yaml: schema violation at (root): bad1",
+                "/p/runtime.yaml: schema violation at (root): bad2",
+            ],
+        ), patch("config_git.commit_config") as mock_commit:
+            result = await config_git_commit.handler({"message": "bulk"})
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["kind"] == "schema_invalid"
+        assert len(payload["errors"]) == 2
+        assert "2 schema validation failure" in payload["message"]
+        mock_commit.assert_not_called()

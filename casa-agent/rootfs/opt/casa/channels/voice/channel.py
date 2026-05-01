@@ -466,7 +466,6 @@ class VoiceChannel(Channel):
                     agent_role=self.default_agent,
                     tokens=per_scope,
                     search_query=None,
-                    user_peer="voice_speaker",
                 )
             except Exception as exc:
                 logger.warning(

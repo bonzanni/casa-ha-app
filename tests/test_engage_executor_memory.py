@@ -72,6 +72,80 @@ def test_get_context_signature_locks_kwargs():
     )
 
 
+def test_get_context_callers_kwargs_match_signature():
+    """E-H caller-side regression-locker (v0.31.0). The signature-side
+    test above passes whenever the ABC is correct, but doesn't catch a
+    CALL site that still passes a stale kwarg. v0.26.0 dropped
+    ``user_peer`` from ``MemoryProvider.get_context``; v0.30.0
+    re-introduced ``agent_role``. The exploration session run on
+    2026-05-01 (v0.30.0) found the call at ``tools.py:454`` was never
+    audited and still passed ``user_peer=user_peer``, which was a silent
+    TypeError on every Ellen → specialist delegation since v0.26.0
+    (cid `3407a7fb`, log
+    ``HonchoMemoryProvider.get_context() got an unexpected keyword
+    argument 'user_peer'``). A second offender at
+    ``channels/voice/channel.py`` was found in the v0.31.0 fix audit.
+
+    This test AST-walks every ``.py`` file under ``rootfs/opt/casa/``
+    and asserts every ``.get_context(...)`` call's kwargs are a subset
+    of the locked allowlist. The check is lexical (matches any
+    attribute call ending in ``get_context``) — the ABC namespace is
+    distinct enough that no other class in the codebase shares the
+    method name today; if that ever changes, narrow the AST match.
+    """
+    import ast
+    import os
+
+    allowed = {"session_id", "tokens", "search_query", "agent_role"}
+
+    casa_root = os.path.normpath(os.path.join(
+        os.path.dirname(__file__), "..", "casa-agent", "rootfs", "opt", "casa",
+    ))
+    assert os.path.isdir(casa_root), (
+        f"could not locate casa source root: {casa_root}"
+    )
+
+    offenders: list[tuple[str, int, set[str]]] = []
+    for dirpath, _dirs, files in os.walk(casa_root):
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                tree = ast.parse(
+                    open(path, "r", encoding="utf-8").read(), filename=path,
+                )
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                # Match ANY attribute call ending in ``.get_context(...)``.
+                # Excludes the ABC method definition itself; that's a
+                # FunctionDef, not a Call.
+                if not (isinstance(func, ast.Attribute)
+                        and func.attr == "get_context"):
+                    continue
+                kwargs = {
+                    kw.arg for kw in node.keywords if kw.arg is not None
+                }
+                bad = kwargs - allowed
+                if bad:
+                    rel = os.path.relpath(path, casa_root)
+                    offenders.append((rel, node.lineno, bad))
+
+    assert not offenders, (
+        "MemoryProvider.get_context callers passing forbidden kwargs:\n"
+        + "\n".join(
+            f"  {rel}:{lineno} -> {sorted(bad)}"
+            for rel, lineno, bad in offenders
+        )
+        + f"\nAllowed kwargs: {sorted(allowed)}. "
+          f"Drop the offending kwargs at the call site."
+    )
+
+
 async def test_returns_wrapped_block_when_archive_populated():
     mp = MagicMock()
     mp.ensure_session = AsyncMock(return_value=None)

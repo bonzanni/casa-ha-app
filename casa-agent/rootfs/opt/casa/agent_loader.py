@@ -98,6 +98,54 @@ def _validate(data: dict[str, Any], schema_name: str, source: str) -> None:
         ) from exc
 
 
+# --- Pre-commit schema gate (E-G v0.31.0) ----------------------------------
+
+# Maps a schema-bearing YAML filename to the schema name in defaults/schema/.
+# Used by ``validate_config_repo`` as a pre-commit gate. Files outside this
+# map (markdown doctrine, plugin sources, READMEs, etc.) are skipped.
+_SCHEMA_BY_FILENAME: dict[str, str] = {
+    "character.yaml":      "character",
+    "voice.yaml":          "voice",
+    "response_shape.yaml": "response_shape",
+    "runtime.yaml":        "runtime",
+    "disclosure.yaml":     "disclosure",
+    "delegates.yaml":      "delegates",
+    "executors.yaml":      "executors",
+    "triggers.yaml":       "triggers",
+    "hooks.yaml":          "hooks",
+    "definition.yaml":     "executor",
+}
+
+
+def validate_config_repo(config_dir: str) -> list[str]:
+    """E-G v0.31.0 pre-commit gate. Walk *config_dir* for every
+    schema-bearing YAML file and return a list of error messages — one
+    per file that fails schema validation. Empty list = all clean.
+
+    Used by ``mcp__casa-framework__config_git_commit`` to refuse commits
+    that would land schema-invalid YAML and FATAL the addon on next boot.
+    The check uses the same ``_validate`` codepath as boot-time loading,
+    so a passing pre-commit gate guarantees a green boot validation.
+
+    Skips ``.git/`` and any file whose basename is not in
+    ``_SCHEMA_BY_FILENAME`` (markdown, plain text, etc.).
+    """
+    errors: list[str] = []
+    for root, dirs, files in os.walk(config_dir):
+        if ".git" in dirs:
+            dirs.remove(".git")
+        for name in files:
+            schema_name = _SCHEMA_BY_FILENAME.get(name)
+            if schema_name is None:
+                continue
+            path = os.path.join(root, name)
+            try:
+                _validate(_read_yaml(path), schema_name, path)
+            except LoadError as exc:
+                errors.append(str(exc))
+    return errors
+
+
 # --- File reader -----------------------------------------------------------
 
 
