@@ -1,5 +1,105 @@
 # Changelog
 
+## [0.34.0] - 2026-05-01 — Bug bundle: H-1 + H-3
+
+Bug bundle from `docs/bug-review-2026-05-01-exploration3.md`. Two NEW
+HIGH findings filed during the third exploration session against
+v0.33.1: H-1 (configurator engagement lifecycle race — every
+hard-reload workflow leaves a stuck `status=active` engagement and no
+user-DM completion message) + H-3 (soft reload of triggers on residents
+permanently broken since 2026-04-22 commit `e81f264`, surfaced 9 days
+later by v0.33.0's G-4 structured outcome=error logging). G-1/H-2
+third-party regression carries forward — claude-agent-sdk-python
+latest is still v0.1.72; no upstream CC CLI fix shipped.
+
+### Fixed
+
+- **H-1 (HIGH, configurator engagement lifecycle) — `casa_reload`
+  Supervisor restart races SDK subprocess.** The doctrine ordering
+  (`commit -> casa_reload -> emit_completion`) is correct for user
+  experience, but the platform-side race was: `casa_reload` POSTed
+  Supervisor's `addons/self/restart` synchronously, the POST returned
+  in <1s, and Supervisor scheduled an async container kill that
+  arrived ~13s later — cancelling the SDK subprocess BEFORE the model
+  could call `emit_completion`. Engagement stuck `status=active
+  completed_at=null sdk_session_id=null`, no `_finalize_engagement`,
+  no user-DM completion message. Reproduced 100% across 3 hard-reload
+  configurator engagements in exploration3 (P4.2 + P4.3 + P11.1).
+  **Fix:** when `casa_reload` is called inside an active engagement
+  (`engagement_var.get(None) is not None`), it now adds the
+  engagement id to a new module-level
+  `_ENGAGEMENTS_DEFERRED_HARD_RELOAD: set[str]`, drains the v0.33.1
+  G-2 PENDING_RELOAD obligation, and returns immediately with
+  `{supervisor_status: 200, deferred: true}` — NO Supervisor POST.
+  At the end of `_finalize_engagement` (after the bus message + Honcho
+  meta-summary have landed), if the deferred marker is present AND
+  `outcome=completed`, the platform performs the actual Supervisor
+  POST. The marker is drained on every terminal path
+  (completed/cancelled/error) to prevent stale state. Out-of-engagement
+  calls (operator-driven `/invoke`) still POST inline as before.
+  Doctrine `agents/executors/configurator/doctrine/{reload.md,completion.md}`
+  + recipes `specialist/create.md` + `plugin/install.md` updated to
+  describe the deferred-restart mechanism. `casa_reload` tool docstring
+  updated from "Only call AFTER emit_completion has been sent" to
+  "Call BEFORE emit_completion. The actual addon restart is deferred"
+  — pre-fix the docstring directly contradicted the doctrine.
+  Tests:
+  - `tests/test_h1_deferred_hard_reload.py` (8 cases) covering
+    in-engagement defer, out-of-engagement inline POST,
+    PENDING_RELOAD drain on call, and the four
+    `_finalize_engagement` outcome combinations.
+  - `tests/test_casa_reload_tool.py::test_configurator_engagement_var_path_allowed`
+    updated for new `deferred: True` shape.
+
+- **H-3 (HIGH, soft-reload broken for residents) —
+  `casa_reload_triggers` always failed for residents because
+  `agent_loader.load_agent_from_dir` was called with `policies=None`.**
+  Latent since commit `e81f264cae103722c75970f2186076eb351b1d98`
+  (2026-04-22, "feat(3.5-p3): casa_reload_triggers MCP tool"). 9 days.
+  Residents have `disclosure.yaml`; `agent_loader._compose_prompt`
+  raises `LoadError` when `disclosure is not None AND policies is
+  None`. The pre-fix unit tests only covered specialists (no
+  disclosure.yaml), so the bug slipped through. Surfaced by v0.33.0's
+  G-4 structured outcome=error logging in exploration3 P8.1 — prior
+  sessions hid the same failure mode as a silent error. **Fix:**
+  load `PolicyLibrary` fresh from disk on each call via
+  `policies.load_policies(/addon_configs/casa-agent/policies/disclosure.yaml)`
+  and thread it into `load_agent_from_dir`. Stateless — no
+  `init_tools` plumbing required. Returns a structured `load_error`
+  with a useful message if the policy file is missing.
+  Tests: `tests/test_casa_reload_triggers_resident.py` (3 cases —
+  resident-with-disclosure happy path, missing-policies-file load
+  error, specialist regression check).
+
+### Carry-forward (no Casa-side fix)
+
+- **H-2 (LOW, third-party regression).** Continuation of G-1 from
+  v0.33.x: CC CLI 2.1.126 still throws `'NoneType' object has no
+  attribute 'items'` on hook callbacks during Edit/tool_use; ~24
+  callbacks per Edit-using configurator engagement (UP from ~13 in
+  exploration2). Bytecode line unchanged at 9212. Latest
+  claude-agent-sdk-python release is still v0.1.72 (2026-05-01) —
+  no post-G-1 release shipped. Functionally harmless; operator log
+  noise + minor log-storage cost. Recheck `gh release list` at next
+  ship gate.
+
+### Verification recipe corrections (carry forward)
+
+The v0.33.1 verify recipe missed H-1 because it didn't inspect
+`engagements.json` post-restart. The new verify shapes:
+
+- **H-1 verify:** drive a configurator engagement that touches
+  `agents/assistant/character.yaml`. Assert: artifact lands +
+  activates AND `engagements.json` shows `status=completed
+  completed_at=<float>` AND user DM receives a "Done"-shape relay
+  via Ellen. The pre-fix recipe (just check that the addon restarted
+  + the artifact is on disk) is INSUFFICIENT.
+- **H-3 verify:** drive a configurator engagement that adds a trigger
+  to `agents/assistant/triggers.yaml`. Assert
+  `casa_reload_triggers(assistant)` returns `status=ok` with
+  `registered: [trigger_name]`. Check apscheduler has the new job
+  within ~5s. SOFT-RELOAD-ONLY path — no hard reload.
+
 ## [0.33.1] - 2026-05-01 — Hotfix: G-2 defensive reload guard
 
 v0.33.0's doctrine-only fix for G-2 failed to converge live. Active

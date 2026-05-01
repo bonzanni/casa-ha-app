@@ -116,12 +116,13 @@ loader caches (Claude Code SDK plugin discovery in particular). Canonical order:
     casa_reload()
     emit_completion(status="ok", text="Installed <name> on <roles>; ready=<bool>; committed SHA <sha>; called casa_reload to refresh SDK option builders.")
 
-`casa_reload()` returns ~immediately with `supervisor_status: 200` and
-schedules the actual restart asynchronously, so `emit_completion` has
-time to land on the bus (durable across restart) before the container
-is killed. Skipping the reload leaves the plugin installed on disk but
-**not surfaced in the running agents** — the new tools / skills /
-hooks do not appear until the next manual restart.
+`casa_reload()` returns immediately with `supervisor_status: 200,
+deferred: true`. The platform defers the actual Supervisor restart
+until after `emit_completion` runs and the engagement finalizes, so
+the user's "Done" relay always lands before the container is killed.
+Skipping the reload leaves the plugin installed on disk but **not
+surfaced in the running agents** — the new tools / skills / hooks do
+not appear until the next manual restart.
 
 ## Common mistakes
 

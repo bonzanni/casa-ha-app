@@ -84,7 +84,14 @@ class TestCasaReloadRoleGuard:
         assert payload["kind"] == "not_authorized"
 
     async def test_configurator_engagement_var_path_allowed(self):
-        """Engagement-bridge path: engagement_var bound, no origin_var."""
+        """Engagement-bridge path: engagement_var bound, no origin_var.
+
+        H-1 fix (v0.34.0): when called inside an active engagement,
+        casa_reload no longer POSTs Supervisor — it defers to
+        ``_finalize_engagement``. Goes past the role guard and returns
+        ``deferred: True`` without consulting SUPERVISOR_TOKEN.
+        """
+        import tools as tools_mod
         from tools import casa_reload, engagement_var
         from engagement_registry import EngagementRecord
 
@@ -96,12 +103,21 @@ class TestCasaReloadRoleGuard:
             sdk_session_id=None, origin={}, task="",
         )
         tok = engagement_var.set(rec)
+        deferred_marker_set: bool
         try:
             with patch.dict(os.environ, {}, clear=True):
                 result = await casa_reload.handler({})
+            deferred_marker_set = (
+                rec.id in tools_mod._ENGAGEMENTS_DEFERRED_HARD_RELOAD
+            )
         finally:
             engagement_var.reset(tok)
+            tools_mod._ENGAGEMENTS_DEFERRED_HARD_RELOAD.discard(rec.id)
         payload = json.loads(result["content"][0]["text"])
         # Goes past the role guard (else we'd see not_authorized);
-        # bounces on missing supervisor token instead.
-        assert payload["kind"] == "no_supervisor_token"
+        # defers without POSTing — no SUPERVISOR_TOKEN check needed.
+        assert payload["supervisor_status"] == 200
+        assert payload["deferred"] is True
+        # Marker must be set so _finalize_engagement performs the POST
+        # at the end of the engagement.
+        assert deferred_marker_set is True

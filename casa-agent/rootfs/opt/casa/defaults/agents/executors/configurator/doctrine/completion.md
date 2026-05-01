@@ -16,7 +16,14 @@ Every completion path is the same three tool calls, in this order:
 
 `casa_reload_triggers(role)` is in-process and returns immediately — no race.
 
-`casa_reload()` POSTs to Supervisor's `addons/self/restart` and returns ~immediately with `supervisor_status: 200`. Supervisor schedules the actual restart asynchronously. By the time the addon container is killed, your subsequent `emit_completion` call has already written the summary onto the bus, which persists across addon restart. Ellen reads it on her next turn after Casa comes back up.
+`casa_reload()` returns immediately with `supervisor_status: 200, deferred: true`.
+The platform defers the actual Supervisor restart POST until *after*
+`emit_completion` lands and the engagement finalizes — your subprocess
+will never observe the addon kill mid-flight. By the time the
+container is killed, your `emit_completion` call has already written
+the summary onto the bus, the user has received the "Done" relay, and
+Ellen has a complete record. Casa comes back up moments later with
+the new runtime.
 
 ## emit_completion payload
 
@@ -49,12 +56,13 @@ Ellen's narration to the operator is accurate.
 
 ## Hard-reload note
 
-`casa_reload()` returns `supervisor_status: 200` quickly, but the actual
-restart kills your subprocess seconds later. Your `emit_completion` call
-must still run promptly after the reload returns; do not interpose
-extra Read or Bash tool_uses between `casa_reload` and `emit_completion`
-or you may be killed before the bus write lands. Soft reload
-(`casa_reload_triggers`) has no such constraint.
+`casa_reload()` returns `supervisor_status: 200, deferred: true`
+immediately. The platform defers the actual Supervisor restart POST
+until after `emit_completion` runs and the engagement finalizes, so
+your subprocess is never killed mid-completion. There is no longer a
+race; you may interpose Read or Bash tool_uses between `casa_reload`
+and `emit_completion` if needed. Soft reload (`casa_reload_triggers`)
+likewise has no race.
 
 ## Cancellation
 

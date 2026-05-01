@@ -46,11 +46,14 @@ disk is right, but the running Casa keeps the prior runtime. The
 trigger never fires; the new agent never loads. See `completion.md` for
 the canonical full sequence.
 
-For hard reload, the addon will restart asynchronously a few seconds
-after `casa_reload()` returns. Your `emit_completion` call has time to
-land on the bus (which persists across restart) before the kill — but
-do not interpose extra Read/Bash tool_uses between `casa_reload` and
-`emit_completion`.
+For hard reload, `casa_reload()` returns immediately with
+`supervisor_status: 200, deferred: true`. The actual addon restart is
+deferred by the platform until *after* `emit_completion` lands and the
+engagement finalizes — there is no race. You will never observe the
+addon kill arriving inside your subprocess; it always lands after the
+engagement closes. Continue straight to `emit_completion`; you do not
+need to rush, and there is no longer any restriction on interposing
+extra tool_uses between `casa_reload` and `emit_completion`.
 
 ## When in doubt
 
