@@ -205,6 +205,10 @@ def _normalize_path(raw: str) -> str:
                 resolved.pop()
         elif part != ".":
             resolved.append(part)
+    # L-2 (v0.34.2): when the input was an absolute path, parts[0] == "/".
+    # Naive "/".join produces "//rest" — return "/rest" instead.
+    if resolved and resolved[0] == "/":
+        return "/" + "/".join(resolved[1:])
     return "/".join(resolved)
 
 

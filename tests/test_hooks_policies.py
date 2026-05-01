@@ -66,6 +66,24 @@ class TestPathScopeV2:
         result = await hook(data, "tid", CTX)
         assert result is not None and _decision(result) == "deny"
 
+    async def test_path_scope_deny_payload_uses_single_slash(self):
+        """L-2 (v0.34.2): deny string shows '/addon_configs/...' not '//addon_configs/...'."""
+        from hooks import make_path_scope_hook_v2
+        hook = make_path_scope_hook_v2(
+            writable=["/addon_configs/foo"],
+            readable=["/addon_configs/foo"],
+        )
+        result = await hook(
+            {"tool_name": "Write",
+             "tool_input": {"file_path": "/etc/something"}},
+            tool_use_id=None, context={},
+        )
+        # Hook returned a deny dict; string contents must show single-slash prefixes.
+        assert result is not None
+        payload = str(result)
+        assert "/addon_configs/foo" in payload
+        assert "//addon_configs/foo" not in payload
+
 
 class TestResolveHooks:
     def test_empty_hooks_config_resolves_empty_dict(self):
