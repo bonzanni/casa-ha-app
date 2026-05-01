@@ -456,7 +456,6 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
                     agent_role=cfg.role,
                     tokens=cfg.memory.token_budget,
                     search_query=task_text,
-                    user_peer=user_peer,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -1113,10 +1112,36 @@ async def config_git_commit(args: dict) -> dict:
         return _refuse_unprivileged("config_git_commit", caller)
 
     message = args.get("message") or "configurator: commit"
+    config_dir = "/addon_configs/casa-agent"
     try:
         import config_git
+        import agent_loader
+
+        # E-G (v0.31.0): pre-commit schema-validation gate. Refuse the
+        # commit if any schema-bearing YAML in the repo would fail
+        # boot-time agent_loader validation. Without this, the
+        # configurator can write structurally-valid but schema-invalid
+        # YAML (e.g., the v0.30.0 ``TRAIT:`` top-level-key repro) and
+        # the addon FATALs on next boot. See
+        # ``project_eg_configurator_schema_invalid_yaml`` and
+        # ``docs/bug-review-2026-05-01-exploration.md`` for the
+        # exploration-session repro.
+        errors = await asyncio.to_thread(
+            agent_loader.validate_config_repo, config_dir,
+        )
+        if errors:
+            return _result({
+                "status": "error",
+                "kind": "schema_invalid",
+                "message": (
+                    f"Refusing commit: {len(errors)} schema validation "
+                    f"failure(s). Fix the offending YAML and retry."
+                ),
+                "errors": errors,
+            })
+
         sha = await asyncio.to_thread(
-            config_git.commit_config, "/addon_configs/casa-agent", message,
+            config_git.commit_config, config_dir, message,
         )
         return _result({"sha": sha, "message": message})
     except Exception as exc:  # noqa: BLE001

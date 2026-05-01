@@ -144,7 +144,14 @@ async def test_token_budget_zero_skips_all_memory_calls(monkeypatch):
 
 async def test_token_budget_positive_calls_ensure_and_get_context(monkeypatch):
     """A memory-bearing specialist (token_budget>0) opens a Honcho session
-    keyed `f"{role}:{user_peer}"` and fetches with search_query=task_text."""
+    keyed `f"{role}:{user_peer}"` and fetches with search_query=task_text.
+
+    E-H (v0.31.0): get_context call no longer passes ``user_peer`` —
+    v0.26.0 / E-14 dropped it from the ABC. ``ensure_session`` legitimately
+    keeps user_peer (it provisions the Honcho peer pair). This test was
+    locking in the very kwarg drift that the v0.30.0 exploration session
+    surfaced as E-H; the assertion has been inverted to assert
+    ``user_peer`` is NOT in the get_context kwargs."""
     cfg = _specialist_cfg(role="finance", token_budget=4000)
     mp = _make_memory_provider(get_context_returns="")
     _patch_active_memory_provider(monkeypatch, mp)
@@ -165,9 +172,10 @@ async def test_token_budget_positive_calls_ensure_and_get_context(monkeypatch):
     kwargs = mp.get_context.await_args.kwargs
     assert kwargs["session_id"] == "finance-nicola"
     assert kwargs["agent_role"] == "finance"
-    assert kwargs["user_peer"] == "nicola"
     assert kwargs["tokens"] == 4000
     assert kwargs["search_query"] == "how is Q1 cashflow?"
+    # E-H: user_peer must NOT be passed to get_context (dropped v0.26.0).
+    assert "user_peer" not in kwargs
 
 
 async def test_digest_injected_as_memory_context_block(monkeypatch):

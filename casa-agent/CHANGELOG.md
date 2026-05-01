@@ -1,5 +1,122 @@
 # Changelog
 
+## [0.31.0] - 2026-05-01 — Bug bundle: E-G + E-H + Phase Z playbook corrections
+
+Closes the two HIGH bugs filed in
+`docs/bug-review-2026-05-01-exploration.md` (the first exploration
+session against v0.30.0) plus the playbook gaps that surfaced during
+the same session's Phase Z. Single shipping sprint under pre-1.0.0
+license; covers a stale `user_peer=` kwarg dark-spotting M4b
+specialist memory since v0.26.0, and a configurator-driven write of
+schema-invalid YAML that bricks the next boot until manual sed
+recovery.
+
+### Fixed
+
+- **E-H (HIGH) — `delegate_to_agent` passes stale `user_peer` kwarg
+  to `get_context`.** Pre-fix, `tools.py:454-460` (inside
+  `delegate_to_agent`'s specialist-memory-read block) called
+  `MemoryProvider.get_context(..., user_peer=user_peer)`, but
+  v0.26.0 / E-14 dropped `user_peer` from the abstract signature.
+  Every Ellen → specialist delegation since v0.26.0 (~3 days)
+  raised `TypeError: HonchoMemoryProvider.get_context() got an
+  unexpected keyword argument 'user_peer'`, was caught by
+  `except Exception` at line 461, logged a WARNING, and silently
+  degraded to empty memory context — every specialist (butler now;
+  finance, eventually) ran with M4b dark. Same kwarg-drift shape as
+  v0.29.0 / E-D and v0.30.0 / M3-self companion. Surfaced 2026-04-30
+  23:27:13Z exploration session (cid `3407a7fb`, P2.1 butler
+  delegation). Fix: drop `user_peer=user_peer` at `tools.py:459`.
+  **Audit found a second offender** at
+  `casa-agent/rootfs/opt/casa/channels/voice/channel.py:469` (voice
+  prewarm); the original 2026-05-01 audit was scoped to tools.py +
+  agent.py only and missed the voice channel. Fixed both in the same
+  ship; voice prewarm has been silently failing since v0.26.0 too,
+  caught by the same `except Exception` block at voice/channel.py:471.
+
+- **E-G (HIGH) — Configurator writes schema-invalid YAML keys
+  (CONFIRMED LIVE 2× on v0.29.0 + v0.30.0).** The configurator's
+  `mcp__casa-framework__config_git_commit` accepted any
+  structurally-valid YAML the agent produced and committed it to the
+  inner addon_configs git, with NO schema validation. The model
+  consistently invented YAML shapes — `TRAIT:` as a top-level key,
+  `traits: [...]` collection, etc. — that are not in the schema's
+  `additionalProperties: False` allowlist. Boot validation then
+  FATALed on the next addon restart with `agent_loader.LoadError:
+  schema violation at (root): Additional properties are not allowed
+  ('TRAIT' was unexpected)`. Two prior incidents (v0.29.0 P4.2-V3 cid
+  `1cef7687`; v0.30.0 P4.2 cid `cf9eb4cc`, engagement `15693b55`,
+  commit `5cd731ac`) bricked the addon until manual `sed -i '/^TRAIT: /d' ...`
+  recovery. Fix shape: pre-commit schema-validation gate. New
+  `agent_loader.validate_config_repo(config_dir)` walks the repo for
+  every schema-bearing YAML file (`character.yaml`, `voice.yaml`,
+  `runtime.yaml`, `disclosure.yaml`, `delegates.yaml`,
+  `executors.yaml`, `triggers.yaml`, `hooks.yaml`,
+  `response_shape.yaml`, executor `definition.yaml`) and runs the
+  same `_validate(...)` codepath boot uses, returning per-file error
+  messages on failure. `tools.py::config_git_commit` calls this
+  before `config_git.commit_config`; on any error, returns
+  `{"status": "error", "kind": "schema_invalid", "errors": [...]}`
+  WITHOUT committing — so the agent sees the schema error in its
+  tool_result and can fix the YAML on the next iteration instead of
+  bricking the addon on next boot. Defense-in-depth: same
+  `_validate` codepath as boot ⇒ a passing pre-commit gate
+  guarantees a green boot validation.
+
+### Tests
+
+- `tests/test_engage_executor_memory.py::test_get_context_callers_kwargs_match_signature`
+  — caller-side regression-locker. AST-walks every `.py` under
+  `casa-agent/rootfs/opt/casa/` and asserts every
+  `.get_context(...)` call's kwargs ⊆
+  `{session_id, tokens, search_query, agent_role}`. Verified to
+  FAIL with E-H present and PASS after the fix. Complements the
+  v0.29.0 signature-side `test_get_context_signature_locks_kwargs`,
+  which only catches ABC-side drift.
+- `tests/test_agent_loader.py::TestValidateConfigRepo` — 5 tests
+  covering the new `validate_config_repo` API: clean repo returns
+  empty list; the exact `TRAIT:` repro from the v0.30.0 P4.2 incident
+  is caught with the expected error shape; non-schema files
+  (markdown, plain text) are skipped; `.git/` is skipped; multiple
+  offenders aggregate.
+- `tests/test_config_git_commit_tool.py::TestConfigGitCommitSchemaGate` —
+  3 tests covering the tool wiring: tool refuses with
+  `kind: schema_invalid` when validation reports errors AND
+  `config_git.commit_config` is NOT called; tool proceeds to commit
+  when validation is clean; multiple errors aggregate in the
+  response payload with `len(errors)` reflected in the message.
+
+### Documentation
+
+- `docs/exploration-testing-playbook.md::Phase Z` — three
+  load-bearing corrections after the v0.30.0 ship's Phase Z burned
+  four operator secrets (rotation deferred per pre-1.0.0 latitude)
+  and FATALed on a leftover schema-invalid YAML: (a) options-backup
+  step with `{"options": {...}}` envelope wrap at backup time;
+  (b) **mandatory** `rm -rf /addon_configs/<slug>/*` step after
+  install, before first start (E-11 persistent overlay does NOT
+  survive uninstall — wait, it DOES survive, that's the whole
+  problem; was never wiped); (c) options-restore via Supervisor REST
+  API with envelope-shaped POST and `result`-only response extractor.
+  Defense-in-depth note added: prefer HA UI Configuration panel for
+  at-keyboard restores; reserve API path for unattended Phase Z.
+
+### Notes
+
+- v0.30.0's headline fixes (E-F engagement boot-race + M3-self
+  peer_target) were live-verified clean on a fresh organic boot
+  during the 2026-05-01 exploration session (engagement supergroup
+  permissions registered from `_rebuild`'s tail; every Ellen DM
+  produced `memory_call agent_role=assistant` across all 5 scopes).
+  Coverage 14/18 PASS or PASS-with-note; 1 PARTIAL; 3 DEFERRED
+  (configurator-write-risk pre-E-G fix, pre-existing NPM 502 from
+  container-IP change post-reinstall).
+- The v0.30.0 deploy hiccup mitigation
+  (`character.yaml.bak-pre-v030` orphan) is now obsolete: the
+  schema-validation gate prevents the class of bug that produced it.
+  The orphan was wiped in the post-probe Phase Z; a fresh install
+  carries no trace.
+
 ## [0.30.0] - 2026-04-30 — Bug bundle: E-F + M3-self peer_target
 
 Closes the two HIGH bugs filed in

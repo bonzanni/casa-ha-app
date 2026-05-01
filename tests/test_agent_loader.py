@@ -510,3 +510,112 @@ def test_runtime_yaml_loads_cross_peer_token_budget(tmp_path):
     default_dir = _seed_resident(tmp_path / "agents_default", "assistant")
     cfg_default = load_agent_from_dir(str(default_dir), policies=policies)
     assert cfg_default.memory.cross_peer_token_budget == 2000
+
+
+# ---------------------------------------------------------------------------
+# TestValidateConfigRepo (E-G v0.31.0 pre-commit gate)
+# ---------------------------------------------------------------------------
+
+
+class TestValidateConfigRepo:
+    """Pre-commit schema-validation gate for ``config_git_commit``. Repros
+    the v0.30.0 P4.2 finding: configurator wrote ``TRAIT:`` as a top-level
+    YAML key in character.yaml; ``additionalProperties: False`` rejects
+    it on next boot. The gate refuses such commits before they land."""
+
+    def test_clean_repo_returns_empty(self, tmp_path):
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "addon_configs" / "casa-agent"
+        _seed_resident(repo / "agents", "assistant")
+        _seed_specialist(repo / "agents", "finance")
+
+        errors = validate_config_repo(str(repo))
+        assert errors == []
+
+    def test_top_level_unknown_key_in_character_caught(self, tmp_path):
+        """Exact repro of the v0.30.0 / v0.29.0 P4.2 'TRAIT:' incident."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "addon_configs" / "casa-agent"
+        agent_dir = _seed_resident(repo / "agents", "assistant")
+
+        # Append the offending top-level key, mirroring the configurator's
+        # actual diff (commit 5cd731ac on 2026-04-30).
+        _w(agent_dir / "character.yaml", """\
+            schema_version: 1
+            name: Ellen
+            role: assistant
+            archetype: assistant
+            card: |
+              Peer summary.
+            prompt: |
+              You are Ellen.
+            TRAIT: greets warmly but keeps replies efficient.
+        """)
+
+        errors = validate_config_repo(str(repo))
+        assert len(errors) == 1
+        assert "character.yaml" in errors[0]
+        assert "TRAIT" in errors[0]
+        assert "schema violation" in errors[0]
+
+    def test_skips_non_schema_files(self, tmp_path):
+        """Markdown doctrine, plugin sources, READMEs etc. must NOT trip
+        the gate — they're outside the schema-bearing YAML allowlist."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "addon_configs" / "casa-agent"
+        _seed_resident(repo / "agents", "assistant")
+        _w(repo / "agents" / "assistant" / "prompts" / "system.md",
+           "Some prompt body — not schema-validated.\n")
+        _w(repo / "doctrine.md", "free-form notes\n")
+        _w(repo / "policies" / "scopes.yaml", "schema_version: 1\nscopes: []\n")
+
+        errors = validate_config_repo(str(repo))
+        assert errors == []
+
+    def test_skips_dotgit_dir(self, tmp_path):
+        """``.git/`` must NOT be walked — it can hold yaml-named blobs."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "addon_configs" / "casa-agent"
+        _seed_resident(repo / "agents", "assistant")
+        # Write a file inside .git that would FAIL validation if visited.
+        _w(repo / ".git" / "objects" / "character.yaml",
+           "TRAIT: garbage\n")
+
+        errors = validate_config_repo(str(repo))
+        assert errors == []
+
+    def test_aggregates_multiple_offenders(self, tmp_path):
+        """Multiple bad files all surface — caller sees the full picture."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "addon_configs" / "casa-agent"
+        agent_dir = _seed_resident(repo / "agents", "assistant")
+        _w(agent_dir / "character.yaml", """\
+            schema_version: 1
+            name: Ellen
+            role: assistant
+            archetype: assistant
+            card: x
+            prompt: x
+            BOGUS_A: 1
+        """)
+        spec_dir = _seed_specialist(repo / "agents", "finance")
+        _w(spec_dir / "character.yaml", """\
+            schema_version: 1
+            name: Alex
+            role: finance
+            archetype: finance
+            card: x
+            prompt: x
+            BOGUS_B: 2
+        """)
+
+        errors = validate_config_repo(str(repo))
+        assert len(errors) == 2
+        joined = "\n".join(errors)
+        assert "BOGUS_A" in joined
+        assert "BOGUS_B" in joined
