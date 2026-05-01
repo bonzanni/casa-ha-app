@@ -627,11 +627,18 @@ class CachedMemoryProvider(MemoryProvider):
         await self._backend.add_turn(
             session_id, agent_role, user_text, assistant_text, user_peer,
         )
-        task = asyncio.create_task(self._refresh(session_id))
+        # F-2 (v0.32.0): forward agent_role into _refresh so the post-turn
+        # cache refresh's `memory_call` line carries the real role instead
+        # of "?". The third call site missed by the v0.30.0 / M3-self ship
+        # — caller-side regression-locker (test_engage_executor_memory.py)
+        # locks kwargs to a subset, but doesn't assert agent_role is present.
+        task = asyncio.create_task(self._refresh(session_id, agent_role))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
-    async def _refresh(self, session_id: str) -> None:
+    async def _refresh(
+        self, session_id: str, agent_role: str | None = None,
+    ) -> None:
         # Refresh every (session_id, tokens) entry we've already cached.
         # Token-budget variations are uncommon in practice but we keep
         # the cache coherent either way.
@@ -641,6 +648,7 @@ class CachedMemoryProvider(MemoryProvider):
             try:
                 fresh = await self._backend.get_context(
                     session_id, tokens, search_query=None,
+                    agent_role=agent_role,
                 )
                 self._cache[key] = fresh
             except Exception as exc:

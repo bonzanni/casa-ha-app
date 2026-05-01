@@ -1,5 +1,88 @@
 # Changelog
 
+## [0.32.0] - 2026-05-02 — Bug bundle: F-2 + F-4 + F-5 + F-6 + F-7
+
+Bug bundle from `docs/bug-review-2026-05-02-exploration.md`. Five
+collateral findings filed during the first exploration session against
+v0.31.1 with NPM upstream finally bound. No HIGH-severity bugs in the
+bundle — one MEDIUM doctrine drift + four LOW (telemetry, intermittent,
+third-party, contract). F-1 (ha-prod-console plugin) and F-3 (HA MCP
+GetDateTime) deferred — out of Casa scope.
+
+### Fixed
+
+- **F-6 (MEDIUM, doctrine drift) — `defaults/agents/assistant/
+  executors.yaml` listed fictional `engagement` as a third
+  executor_type.** Ellen counted three executors and named "engagement"
+  as the third — but the executor registry has only two real types
+  (configurator + plugin-developer; hello-driver is `enabled: false` by
+  design). The third entry's `when:` text actually described
+  `delegate_to_agent(mode='interactive')` (a Tier 2 specialist primitive),
+  conceptually misclassified as a Tier 3 Executor. Fix: deleted the
+  fictional entry from the seed YAML; folded its sync-vs-interactive
+  delegation guidance into `defaults/agents/assistant/prompts/system.md`
+  under a new "Sync vs interactive delegation" subsection. Added a
+  regression test
+  (`test_executors_yaml_lists_only_real_registered_executor_types`)
+  that enumerates real executor directories and asserts the doctrine
+  list is a subset.
+
+- **F-2 (LOW, telemetry) — `CachedMemoryProvider._refresh` dropped
+  `agent_role`.** The v0.30.0 / M3-self ship threaded `agent_role`
+  through `agent.py::_one_scope` and v0.31.0 added a caller-side
+  regression-locker, but the locker only asserts the kwarg-set is a
+  *subset* of allowed — empty-kwargs callers passed trivially. The
+  third caller in `memory.py:642` (post-turn cache refresh, fired from
+  `add_turn` for every turn that hit the cache) emitted
+  `memory_call ... agent_role="?"` lines on every voice prewarm and
+  cached text-channel turn. Fix: plumbed `agent_role` from `add_turn`
+  into `_refresh`, then into the inner backend's `get_context` call.
+  Live evidence: voice-sse cid `d7378b64` from the 2026-05-02
+  exploration.
+
+- **F-7 (LOW, contract) — `engage_executor` returned `ok=True` for
+  registry-rejected calls.** The MCP envelope returned by the tool
+  carried no `isError` flag, so `sdk_logging.log_tool_result` emitted
+  `ok=True ms=...` even when the executor type was disabled or unknown.
+  Operator telemetry showed false-positive engagement spawns; user-
+  facing narration was already correct. Fix: `_result()` helper now
+  auto-detects `payload["status"] == "error"` and sets `isError: True`
+  on the envelope. Behavior is consistent across every status:error
+  return in tools.py — engage_executor was the surfaced symptom but
+  the contract gap was system-wide. Live evidence: P5 cid `20a903c3`
+  from the 2026-05-02 exploration (plugin-developer disabled).
+
+- **F-4 (LOW, intermittent) — engagement finalize meta-summary write
+  lost on Honcho TLS/SSL connection close.** The Honcho client reuses
+  HTTPS connections; on long idles the upstream may close the TLS
+  session, surfacing as `Connection error: TLS/SSL connection has been
+  closed (EOF)` on the next request. Engagement still finalized
+  `outcome=completed` (no user-visible impact) but the M4 meta-scope
+  summary was lost. Fix: added a one-shot retry on transient
+  connection-class errors at the meta-summary write site; non-
+  transient errors (schema rejects, programming bugs) skip the retry.
+  Live evidence: P4.2 cid `0fb4428d` engagement `9230dfd6` from the
+  2026-05-02 exploration.
+
+- **F-5 (LOW, third-party) — bundled CC CLI 2.1.112 hook callbacks
+  threw `'NoneType' object has no attribute 'items'`.** Three hooks
+  fired per Edit tool_use, each spewing ~6KB of minified JS source per
+  error. Turn completed successfully but logs were noisy. Fix: bumped
+  `claude-agent-sdk` from 0.1.61 → 0.1.72, which bundles CC CLI
+  2.1.126 (past the buggy 2.1.112 version). No SDK API drift; full
+  pytest passes (mod 2 known Windows installer flakes per memory
+  `reference_npm_winerror_test`).
+
+### Out of scope (filed, not fixed)
+
+- **F-1 (not Casa) — ha-prod-console plugin smoke skill logs HMAC
+  ERROR even when `webhook_auth_enabled: false`.** Fix belongs in the
+  ha-prod-console plugin's smoke skill, not Casa.
+- **F-3 — HA MCP `GetDateTime` returns `ok=False`.** Tool is shadowed
+  by SDK `<current_time>` injection; user-visible impact is zero.
+  Investigate against current HA MCP server release in a separate
+  session; possibly upstream.
+
 ## [0.31.1] - 2026-05-01 — Hotfix: validate_config_repo scoping + hello-driver/hooks.yaml seed
 
 Live N150 verify against v0.31.0's E-G gate exposed two follow-on

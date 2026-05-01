@@ -108,6 +108,51 @@ class TestEngageExecutorReal:
             agent_mod.origin_var.reset(token)
         payload = json.loads(r["content"][0]["text"])
         assert payload["kind"] == "unknown_executor_type"
+        # F-7 (v0.32.0): registry-rejected calls (e.g. disabled executor
+        # types) must surface as MCP isError so sdk_logging emits ok=False
+        # — the tool didn't actually spawn an engagement, even though
+        # Ellen's user-facing narration is graceful.
+        assert r.get("isError") is True, (
+            f"engage_executor must set isError=True for unknown/disabled "
+            f"executor types. envelope keys: {sorted(r.keys())}"
+        )
+
+    async def test_disabled_executor_type_returns_is_error(self):
+        """F-7 (v0.32.0): the registry strips disabled executor entries
+        from ``_defs``, so ``get(disabled_type)`` returns None and falls
+        through the same ``unknown_executor_type`` path as truly-unknown
+        names. The contract under test is the MCP envelope-level
+        ``isError`` flag, exercised here through the disabled-executor
+        live shape (P5 cid ``20a903c3`` from the 2026-05-02 exploration:
+        plugin-developer was bundled but disabled, ``ok=True ms=7284``
+        in the tool_result log even though no engagement spawned).
+        """
+        from tools import engage_executor
+        import agent as agent_mod
+
+        reg = MagicMock()
+        # Real ExecutorRegistry behavior: disabled types are excluded
+        # from _defs, so .get() returns None and .list_types() shows only
+        # the enabled set (which may include other types).
+        reg.get = MagicMock(return_value=None)
+        reg.list_types = MagicMock(return_value=["configurator"])
+        await _setup(reg)
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "plugin-developer",
+                "task": "build a thing", "context": "",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+        payload = json.loads(r["content"][0]["text"])
+        assert payload["status"] == "error"
+        assert payload["kind"] == "unknown_executor_type"
+        assert r.get("isError") is True
 
     async def test_engagement_not_configured(self):
         from tools import engage_executor

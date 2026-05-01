@@ -327,6 +327,71 @@ async def test_get_context_cache_hit_emits_memory_call(caplog):
     assert getattr(rec, "call_type", None) == "self"
 
 
+async def test_refresh_forwards_agent_role_to_backend():
+    """F-2 (v0.32.0): post-turn cache refresh must forward agent_role to
+    the inner backend so the resulting memory_call line carries the real
+    role instead of "?".
+
+    The 2026-05-02 exploration session caught
+    ``memory_call ... agent_role=? ... call_type=self`` lines on the
+    voice prewarm + post-turn refresh path because
+    ``CachedMemoryProvider._refresh`` was the third caller missed by
+    v0.30.0 / M3-self's plumb-through (the others — agent.py::_one_scope
+    and tools.py::_fetch_executor_archive — were fixed in v0.30.0/v0.31.0).
+    """
+    backend = RecordingProvider()
+    backend.queue("first")
+    cached = CachedMemoryProvider(backend)
+
+    # Prime the cache so _refresh has a key to refresh.
+    await cached.get_context("sid", 100, agent_role="butler")
+
+    # Reset the recorder around add_turn → _refresh.
+    backend.queue("second")
+    add_turn_role = "butler"
+    await cached.add_turn(
+        "sid", add_turn_role, "u", "a",
+    )
+    await _drain()
+
+    # The background refresh should have called the backend's
+    # get_context with agent_role=add_turn_role (not None / not "?").
+    # RecordingProvider doesn't capture kwargs by default — wrap to
+    # observe.
+    captured: list[dict] = []
+
+    class CapturingProvider(RecordingProvider):
+        async def get_context(
+            self, session_id, tokens, search_query=None, agent_role=None,
+        ):
+            captured.append({
+                "session_id": session_id,
+                "tokens": tokens,
+                "search_query": search_query,
+                "agent_role": agent_role,
+            })
+            return await super().get_context(
+                session_id, tokens,
+                search_query=search_query, agent_role=agent_role,
+            )
+
+    inner = CapturingProvider()
+    inner.queue("ctx1", "ctx2")
+    cached2 = CachedMemoryProvider(inner)
+    await cached2.get_context("sid2", 100, agent_role="butler")
+    await cached2.add_turn("sid2", "butler", "u", "a")
+    await _drain()
+
+    refresh_calls = [c for c in captured if c["search_query"] is None]
+    assert refresh_calls, (
+        "expected at least one _refresh-driven get_context call "
+        "(search_query=None) after add_turn"
+    )
+    assert all(c["agent_role"] == "butler" for c in refresh_calls), (
+        f"refresh-path get_context lost agent_role: {refresh_calls}"
+    )
+
+
 async def test_cached_provider_passes_through_cross_peer_context():
     """M6 § 5.2: CachedMemoryProvider does NOT cache cross-peer reads
     (search_query would have to be the cache key, defeating the

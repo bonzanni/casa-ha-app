@@ -157,9 +157,45 @@ _SYNC_WAIT_TIMEOUT_S: float = 60.0
 _MAX_DELEGATION_DEPTH: int = 1
 
 
-def _result(payload: dict) -> dict:
-    """Wrap a JSON-serializable payload as the tool's MCP content."""
-    return {"content": [{"type": "text", "text": json.dumps(payload)}]}
+def _is_transient_connection_error(exc: BaseException) -> bool:
+    """True if ``exc`` looks like a transient connection-class failure.
+
+    F-4 (v0.32.0): Honcho's HTTPX-backed client surfaces TLS/SSL closes
+    and connection-resets as opaque exception strings (the upstream
+    typing wraps them under generic exception classes). String-sniff is
+    the only portable check — narrow set of substrings to keep retries
+    scoped to genuinely transient failures.
+    """
+    msg = str(exc).lower()
+    needles = (
+        "tls/ssl connection has been closed",
+        "connection error",
+        "connection reset",
+        "connection aborted",
+        "remoteprotocolerror",
+        "server disconnected",
+    )
+    return any(n in msg for n in needles)
+
+
+def _result(payload: dict, *, is_error: bool | None = None) -> dict:
+    """Wrap a JSON-serializable payload as the tool's MCP content.
+
+    F-7 (v0.32.0): when ``payload["status"] == "error"`` (or the caller
+    explicitly passes ``is_error=True``), set ``isError: True`` on the
+    MCP envelope. Without this flag the SDK's ``ToolResultBlock`` defaults
+    ``is_error=False`` and ``sdk_logging.log_tool_result`` emits
+    ``ok=True`` even for failures — operators reading turn telemetry
+    would think a registry-rejected ``engage_executor`` actually spawned.
+    Auto-detection via ``payload["status"]`` keeps the existing call sites
+    untouched while making every error path consistently observable.
+    """
+    if is_error is None:
+        is_error = payload.get("status") == "error"
+    envelope: dict = {"content": [{"type": "text", "text": json.dumps(payload)}]}
+    if is_error:
+        envelope["isError"] = True
+    return envelope
 
 
 def _build_specialist_options(cfg) -> ClaudeAgentOptions:
@@ -1544,40 +1580,62 @@ async def _finalize_engagement(
 
     # 5. Write Ellen's meta-scope summary (best-effort)
     if memory_provider is not None:
-        try:
-            summary = json.dumps({
-                "kind": "engagement_summary",
-                "engagement_id": engagement.id,
-                "specialist_or_type": engagement.role_or_type,
-                "task": engagement.task,
-                "status": outcome,
-                "started_at": engagement.started_at,
-                "completed_at": now,
-                "duration_s": now - engagement.started_at,
-                "text": text,
-                "artifacts": artifacts,
-                "next_steps": next_steps,
-            })
-            # Use Ellen's meta session. The session_id convention is
-            # honcho_session_id(channel, chat_id, "meta", "assistant")
-            # — mirror plan-1 scope stack.
-            channel = engagement.origin.get("channel", "telegram")
-            chat_id = str(engagement.origin.get("chat_id", ""))
-            meta_sid = honcho_session_id(channel, chat_id, "meta", "assistant")
-            await memory_provider.ensure_session(
-                session_id=meta_sid,
-                agent_role="assistant",
-            )
-            await memory_provider.add_turn(
-                session_id=meta_sid,
-                agent_role="assistant",
-                user_text="(engagement summary written)",
-                assistant_text=summary,
-            )
-        except Exception as exc:  # noqa: BLE001
+        summary = json.dumps({
+            "kind": "engagement_summary",
+            "engagement_id": engagement.id,
+            "specialist_or_type": engagement.role_or_type,
+            "task": engagement.task,
+            "status": outcome,
+            "started_at": engagement.started_at,
+            "completed_at": now,
+            "duration_s": now - engagement.started_at,
+            "text": text,
+            "artifacts": artifacts,
+            "next_steps": next_steps,
+        })
+        # Use Ellen's meta session. The session_id convention is
+        # honcho_session_id(channel, chat_id, "meta", "assistant")
+        # — mirror plan-1 scope stack.
+        channel = engagement.origin.get("channel", "telegram")
+        chat_id = str(engagement.origin.get("chat_id", ""))
+        meta_sid = honcho_session_id(channel, chat_id, "meta", "assistant")
+
+        # F-4 (v0.32.0): the Honcho client's HTTPS connection is reused
+        # across calls; on long idles between turns the upstream may
+        # close the TLS session, surfacing as `Connection error: TLS/SSL
+        # connection has been closed (EOF)` on the next request. The
+        # Honcho client does not transparently reconnect, so a one-shot
+        # write at finalize time can lose the M4 meta-scope summary.
+        # Retry once on connection-class errors before giving up.
+        last_exc: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                await memory_provider.ensure_session(
+                    session_id=meta_sid,
+                    agent_role="assistant",
+                )
+                await memory_provider.add_turn(
+                    session_id=meta_sid,
+                    agent_role="assistant",
+                    user_text="(engagement summary written)",
+                    assistant_text=summary,
+                )
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt == 1 and _is_transient_connection_error(exc):
+                    logger.info(
+                        "finalize engagement %s: meta summary write hit "
+                        "transient connection error (%s), retrying once",
+                        engagement.id[:8], exc,
+                    )
+                    continue
+                break
+        if last_exc is not None:
             logger.warning(
                 "finalize engagement %s: meta summary write failed: %s",
-                engagement.id[:8], exc,
+                engagement.id[:8], last_exc,
             )
 
     # Plan 4a.1 §8.4: update .casa-meta.json with terminal status + retention_until.
