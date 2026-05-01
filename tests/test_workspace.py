@@ -179,7 +179,13 @@ class TestRenderRunScriptShellInjection:
 
 class TestProvisionWorkspace:
     def _make_defn(self, tmp_path, executor_type="hello-driver", plugins=None):
-        """Build an ExecutorDefinition stub for workspace tests."""
+        """Build an ExecutorDefinition stub for workspace tests.
+
+        Note: the default ``executor_type='hello-driver'`` is an incidental
+        label only — no on-disk hello-driver definition is loaded. Tests
+        construct the dataclass directly. The label could be any string;
+        kept for diff-minimal historical continuity.
+        """
         from config import ExecutorDefinition
 
         exec_dir = tmp_path / "defaults-executors" / executor_type
