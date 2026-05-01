@@ -11,10 +11,10 @@ Remove the matching entry. Leave `delegates: []` if it was the last.
 - Unwiring because the specialist is being DELETED: part of recipes/specialist/delete.md.
 - Unwiring because this resident shouldn't delegate (but another does): confirm which resident.
 
-## Reload
+## Reload — MANDATORY before emit_completion
 
-**Hard.**
+**Hard.** Canonical order:
 
     config_git_commit(message="unwire <target> from <resident>'s delegates")
-    emit_completion
     casa_reload()
+    emit_completion(status="ok", text="...committed SHA <sha>, called casa_reload to drop the delegate from the registry.")

@@ -71,12 +71,12 @@ CASA_REAL_EMBED=1 pytest tests/test_scope_routing_eval.py
 If a probe you expect to land in `<scope>` lands elsewhere, the corpus
 is wrong. Iterate with the user before committing.
 
-## Reload
+## Reload — MANDATORY before emit_completion
 
-**Hard** - fastembed classifier cache init at boot.
+**Hard** - fastembed classifier cache init at boot. Canonical order:
 
 ```python
 config_git_commit(message="update scopes: <scope> <add|remove> <keywords>")
-emit_completion(...)
 casa_reload()
+emit_completion(status="ok", text="...committed SHA <sha>, called casa_reload to rebuild the fastembed classifier cache.")
 ```

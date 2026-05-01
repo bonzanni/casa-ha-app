@@ -25,11 +25,14 @@ Edit agents/specialists/<role>/runtime.yaml::tools.allowed. Reload: **hard**. Al
 
 Edit agents/specialists/<role>/character.yaml. Reload: **hard**.
 
-## Always
+## Always — MANDATORY order
 
-- Commit via config_git_commit.
-- emit_completion with status=ok, text describing the change + commit SHA.
-- Then reload.
+1. Commit via `config_git_commit`.
+2. Reload (per `reload.md` — none / soft / hard) **before** emit_completion.
+3. `emit_completion` with status=ok, text describing the change + commit SHA + the reload that ran.
+
+Calling `emit_completion` before the reload leaves the change committed
+to YAML but inert in the running Casa. See `completion.md`.
 
 ## Edge cases
 

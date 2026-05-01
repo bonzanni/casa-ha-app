@@ -1351,3 +1351,46 @@ class TestScheduledSilence:
         assert stub.finalize_stream.call_count == 0
         assert result is not None
         assert result.content == text
+
+    async def test_silent_sentinel_suppresses_send_on_request_turn(
+        self, tmp_path,
+    ):
+        """G-3 (v0.33.0, exploration2): on a USER-driven REQUEST turn,
+        a bare `<silent/>` accumulated text must also suppress the send.
+
+        Pre-fix the suppression was scoped to MessageType.SCHEDULED, so
+        Ellen's outer turn after a configurator engagement (cid
+        `dcc3c30b` 2026-05-01) leaked the literal sentinel into a user
+        DM. Lifting the SCHEDULED-only gate generalizes the noop
+        contract."""
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+        stub = _StubChannel()
+        agent._channel_manager.register(stub)
+
+        with patch.object(
+            agent, "_process", AsyncMock(return_value="<silent/>"),
+        ):
+            result = await agent.handle_message(_request_msg())
+
+        assert stub.send.call_count == 0
+        assert stub.finalize_stream.call_count == 0
+        assert result is None
+
+    async def test_whitespace_suppresses_send_on_request_turn(self, tmp_path):
+        """G-3 (v0.33.0): whitespace-only accumulated text on a
+        USER-driven REQUEST turn must also suppress delivery, matching
+        the SCHEDULED behavior."""
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant")
+        stub = _StubChannel()
+        agent._channel_manager.register(stub)
+
+        with patch.object(
+            agent, "_process", AsyncMock(return_value="   \n  "),
+        ):
+            result = await agent.handle_message(_request_msg())
+
+        assert stub.send.call_count == 0
+        assert stub.finalize_stream.call_count == 0
+        assert result is None

@@ -255,6 +255,52 @@ class TestInCasaStart:
         handle.emit.assert_not_awaited()
         handle.finalize.assert_not_awaited()
 
+    async def test_start_empty_turn_logs_subprocess_terminated(
+        self, monkeypatch, caplog,
+    ):
+        """G-4 (v0.33.0): SDK yields zero AssistantMessages → driver
+        logs a structured `subprocess_terminated reason=...` warning so
+        operators have a starting signal for empty-turn / silent-failure
+        engagements (the exploration2 G-4 repro shape)."""
+        import logging
+        from drivers.in_casa_driver import InCasaDriver
+
+        class _FakeClient:
+            def __init__(self, options): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+            async def receive_response(self):
+                if False:
+                    yield None  # pragma: no cover
+            async def close(self): pass
+
+        monkeypatch.setattr(
+            "drivers.in_casa_driver.ClaudeSDKClient", _FakeClient,
+        )
+
+        factory, _handle = _mk_factory_with_fake_handle()
+        drv = InCasaDriver(topic_stream_factory=factory)
+        rec = _make_record()
+
+        with caplog.at_level(logging.WARNING, logger="drivers.in_casa_driver"):
+            await drv.start(
+                rec, prompt="hi",
+                options=ClaudeAgentOptions(model="sonnet"),
+            )
+
+        warn_lines = [
+            r for r in caplog.records
+            if "subprocess_terminated" in r.getMessage()
+        ]
+        assert warn_lines, (
+            "expected subprocess_terminated WARNING when SDK yields "
+            "zero AssistantMessages; got: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+        assert "reason=no_assistant_message" in warn_lines[0].getMessage()
+        assert warn_lines[0].levelno == logging.WARNING
+
     async def test_start_logs_per_message(self, monkeypatch, caplog):
         """Phase 4b Bug 3: each SDK message kind triggers an
         sdk_logging dispatch. SystemMessage(subtype=init) → DEBUG;

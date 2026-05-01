@@ -1,3 +1,6 @@
+# TODO G-1: bundled CC CLI throws 'NoneType has no attribute items'
+# from hook_0/1/2/3 during Edit tool_uses. 0.1.72 is latest as of
+# 2026-05-01; bump when upstream ships a fix.
 claude-agent-sdk==0.1.72
 honcho-ai==2.1.1
 python-telegram-bot==22.7

@@ -76,8 +76,13 @@ is acknowledged in spec § 3.3. If a future deploy needs a hard gate
 `cfg.allow_memory_when_disabled: bool` field on the specialist's
 runtime.yaml — currently out of scope.
 
-## Always
+## Always — MANDATORY order
 
-- Commit.
-- emit_completion.
-- Reload per reload.md.
+1. Commit via `config_git_commit`.
+2. Reload per `reload.md` — **before** emit_completion (canonical
+   order). Skip only for none-reload changes (prompts,
+   response_shape, scopes_readable additions).
+3. `emit_completion` with status=ok, text citing the SHA + the reload
+   that ran (or "no reload — none-scope change" if applicable).
+
+See `completion.md`.
