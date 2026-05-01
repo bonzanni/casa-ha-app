@@ -57,13 +57,24 @@ def executor_defaults(tmp_path: Path) -> Path:
 
 
 def test_renders_claude_md(tmp_path: Path, executor_defaults: Path) -> None:
+    from config import ExecutorDefinition
     from drivers.workspace import render_workspace_template
 
+    defn = ExecutorDefinition(
+        type="plugin-developer",
+        description="test fixture twenty-character description here",
+        model="sonnet",
+        driver="claude_code",
+        tools_allowed=["Read"],
+        permission_mode="acceptEdits",
+    )
     dest = tmp_path / "engagement"
     render_workspace_template(
         template_root=executor_defaults / "plugin-developer" / "workspace-template",
         plugins_yaml=executor_defaults / "plugin-developer" / "plugins.yaml",
         dest=dest,
+        defn=defn,
+        hooks_yaml_data={},
         executor_type="plugin-developer",
         task="build face-rec",
         context="targets=tina,ellen",
