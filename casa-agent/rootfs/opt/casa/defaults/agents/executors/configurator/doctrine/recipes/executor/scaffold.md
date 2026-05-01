@@ -10,8 +10,7 @@ break load.
 
 1. Explain the scope — executor types ship from the framework
    (`/opt/casa/defaults/agents/executors/<type>/`). The default set
-   today: configurator (you), hello-driver (Plan 4a smoke),
-   plugin-developer (Plan 4b).
+   today: configurator (you), plugin-developer (Plan 4b).
 2. Check if the user's actual need is a **specialist** (Tier 2,
    role-keyed helper). Usually it is — see
    `recipes/specialist/create.md`.
@@ -49,5 +48,5 @@ memory:
 ```
 
 The `memory:` block is optional. When omitted, the executor runs
-without prior-engagement context (the default for hello-driver and
+without prior-engagement context (the default for test fixtures and
 any future smoke executor).

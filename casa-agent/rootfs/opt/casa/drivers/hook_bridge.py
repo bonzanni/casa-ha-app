@@ -5,7 +5,7 @@ The CC hook shape is:
         {"type": "command", "command": "<proxy-script> <policy-name>"}
     ]}]}}
 
-Casa's hooks.yaml shape (per hello-driver & configurator defaults):
+Casa's hooks.yaml shape (per configurator + plugin-developer defaults):
     pre_tool_use:
       - policy: casa_config_guard
         matcher: Write|Edit
