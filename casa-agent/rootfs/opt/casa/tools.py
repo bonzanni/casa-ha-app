@@ -1715,10 +1715,33 @@ async def _finalize_engagement(
                 engagement.id[:8], exc,
             )
 
-    logger.info(
-        "Engagement %s finalized outcome=%s",
-        engagement.id[:8], outcome,
-    )
+    # G-4 (v0.33.0): surface the cause when outcome=error so operators
+    # have a starting point for triage. Pre-fix the only log line for
+    # this path was an unconditional `logger.info(... outcome=error)`
+    # with no reason — exploration2 found a configurator engagement
+    # finalized error 24s after system_init with zero log evidence of
+    # *why*. Upgrade to WARNING and pull whatever reason fields exist
+    # off the registry origin (mark_error stashes kind/message there)
+    # plus the text that the emit_completion caller (or the cancel
+    # path) passed in.
+    if outcome == "error":
+        error_kind = engagement.origin.get("error_kind") or "unknown"
+        error_message = engagement.origin.get("error_message") or ""
+        reason_from_text = (text or "").strip()
+        # Prefer registry-stored kind/message (set by mark_error before
+        # finalize), then fall back to the text the model emitted.
+        composite_reason = (
+            error_message or reason_from_text or "no_reason_provided"
+        )
+        logger.warning(
+            "Engagement %s finalized outcome=error kind=%s reason=%s",
+            engagement.id[:8], error_kind, composite_reason,
+        )
+    else:
+        logger.info(
+            "Engagement %s finalized outcome=%s",
+            engagement.id[:8], outcome,
+        )
 
 
 # ---------------------------------------------------------------------------

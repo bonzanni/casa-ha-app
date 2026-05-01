@@ -21,10 +21,10 @@ purpose and when are surfaced in the resident's system prompt - make them specif
 
 In agents/<resident-role>/runtime.yaml::tools.allowed, ensure mcp__casa-framework__delegate_to_agent is listed.
 
-## Reload
+## Reload — MANDATORY before emit_completion
 
-**Hard** - delegates.yaml is boot-cached.
+**Hard** - delegates.yaml is boot-cached. Canonical order:
 
     config_git_commit(message="wire <target> into <resident>'s delegates")
-    emit_completion
     casa_reload()
+    emit_completion(status="ok", text="...committed SHA <sha>, called casa_reload for delegates rebuild.")

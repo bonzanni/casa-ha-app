@@ -1,5 +1,90 @@
 # Changelog
 
+## [0.33.0] - 2026-05-01 — Bug bundle: G-1 + G-2 + G-3 + G-4
+
+Bug bundle from `docs/bug-review-2026-05-01-exploration2.md`. Four
+collateral findings filed during the second exploration session against
+v0.32.1: two MEDIUM (G-2 configurator doctrine compliance — ringleader,
+G-4 engagement-error reason logging) + two LOW (G-1 carrying-over CC
+CLI hook noise that v0.32.0 tried-but-failed to fix, G-3 sentinel-leak
+on user-driven turns).
+
+### Fixed
+
+- **G-2 (MEDIUM, doctrine compliance) — configurator narrated
+  `casa_reload(_triggers)(scope)` in completion-summary text but never
+  tool-called it before `emit_completion`.** Reproduced 100% across
+  P8 (trigger create) and P11 (specialist create) in exploration2.
+  Trigger + specialist commits landed schema-valid in YAML but never
+  activated in scheduler / agent registry — operator saw a "Done"
+  message that was empirically false ("committed but inert"). Fix is
+  doctrine-only: invert the canonical order in `completion.md`,
+  `reload.md`, and every `recipes/*` recipe so the reload step lands
+  BETWEEN `config_git_commit` and `emit_completion`. Pre-fix order was
+  `commit → emit_completion → reload`; the model treated
+  `emit_completion` as terminal and dropped step 3. Post-fix order is
+  `commit → reload → emit_completion`, making `emit_completion` the
+  natural terminal step AFTER the reload has run. New regression test
+  `tests/test_configurator_doctrine_reload_order.py` parametrizes over
+  every recipe and asserts the textual position of the first reload
+  tool_use precedes the first `emit_completion` call.
+
+- **G-4 (MEDIUM, configurator robustness) — engagement finalized
+  outcome=error 24s after subprocess `system_init` with zero log
+  evidence of why** (live: P8.2-followup cid `be9471b7` engagement
+  `fa3c1486` 2026-05-01 10:30:55Z). Fix splits the finalize log line:
+  outcome=error now emits at WARNING with structured `kind=` (from
+  registry origin's `error_kind`, populated by `mark_error`) and
+  `reason=` (text from emit_completion or registry message, with
+  `no_reason_provided` sentinel as fallback). Companion fix in
+  `drivers/in_casa_driver.py::_deliver_turn`: when the SDK loop
+  completes without producing any `AssistantMessage` frames, emit
+  `subprocess_terminated reason=no_assistant_message` at WARNING so
+  hook-deny / model-refusal / subprocess-crash paths surface
+  immediately instead of leaving operators chasing silent finalizes.
+  Tests: `tests/test_finalize_engagement_error_reason.py` (3 cases)
+  + `tests/test_in_casa_driver.py::test_start_empty_turn_logs_subprocess_terminated`.
+
+- **G-1 (LOW, third-party regression) — F-5 was a false-positive.**
+  v0.32.0's claude-agent-sdk 0.1.61 → 0.1.72 bump (CC CLI 2.1.112 →
+  2.1.126) was supposed to close F-5's `'NoneType' object has no
+  attribute 'items'` from hook_0/1/2/3 callbacks. Live verify in
+  exploration2 (P4.2 cid `9946b835`) showed 13 hook callback errors
+  during a single configurator engagement — same error class, bytecode
+  line moved from 8382 to 9212 only. v0.32.0's verify was a passive
+  10-min log scan with no Edit-using engagement active; the bug only
+  fires while the hook bridge is processing tool_use payloads. Fix:
+  no upstream patch available as of 2026-05-01 (claude-agent-sdk
+  v0.1.72 is the latest tag); added a TODO comment to
+  `casa-agent/requirements.txt` next to the pin. Active-verify recipe
+  pinned for the next ship: drive a configurator engagement that uses
+  Edit and assert `docker logs ... | grep -c "Error in hook callback
+  hook_" == 0`.
+
+- **G-3 (LOW, doctrine leak) — Ellen's outer turn echoed `<silent/>`
+  literally to operator DM** after a configurator engagement
+  (live: cid `dcc3c30b` 2026-05-01 10:27:02Z). The sentinel
+  suppression in `agent.py::_deliver_response` was scoped to
+  `MessageType.SCHEDULED` per
+  `reference_scheduled_silence_contract` — Ellen had absorbed the
+  heartbeat trigger's `<silent/>` doctrine via mid-engagement Read of
+  triggers.yaml and emitted it on her user-DM follow-up turn where the
+  gate did not fire. Fix lifts the SCHEDULED-only condition: any turn
+  whose accumulated text strips to `<silent/>` (or to whitespace) is
+  now suppressed regardless of trigger source. Tests:
+  `test_silent_sentinel_suppresses_send_on_request_turn` +
+  `test_whitespace_suppresses_send_on_request_turn` — verify both
+  shapes also gate user-driven REQUEST turns.
+
+### Not in this release
+
+- F-1 (ha-prod-console plugin smoke skill HMAC noise) — not Casa.
+- F-3 (HA MCP `GetDateTime ok=False`) — defer to next bug-review pass;
+  check HA MCP server's current release first.
+- policies/* schema validation gap (carried over from v0.31.1).
+- Configurator UX gap on multi-file pre-existing schema offenders
+  (carried over from v0.31.0).
+
 ## [0.32.1] - 2026-05-02 — Hotfix: F-7 envelope key snake_case
 
 v0.32.0's F-7 fix used `isError` (camelCase) on the MCP envelope dict.

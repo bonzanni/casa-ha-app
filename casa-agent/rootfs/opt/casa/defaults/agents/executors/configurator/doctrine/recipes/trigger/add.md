@@ -32,13 +32,15 @@ Triggers are per-agent scheduled or webhook-driven events. Residents only (speci
 
     You are <name>. The <trigger-name> trigger just fired. <Task description.>
 
-## Reload
+## Reload — MANDATORY before emit_completion
 
-**Soft** - casa_reload_triggers(role). No restart needed:
+**Soft** - casa_reload_triggers(role). No restart needed. Canonical order:
 
 1. config_git_commit(message="add <trigger-name> trigger to <role>")
-2. emit_completion
-3. casa_reload_triggers(role="<role>")
+2. casa_reload_triggers(role="<role>")
+3. emit_completion(status="ok", text="...committed SHA <sha>, reloaded triggers for <role>.")
+
+Skipping step 2 leaves the trigger committed to YAML but **NOT registered** in the live scheduler — it never fires. See completion.md for the full doctrine.
 
 ## Verify the cron syntax
 

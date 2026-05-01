@@ -71,15 +71,15 @@ Look at `secrets[*].status`. Every required var should report
 literals). `status: unresolved` with `reason: "not in plugin-env.conf"`
 means a `set_plugin_env_reference` call is still missing.
 
-## Reload
+## Reload — MANDATORY before emit_completion
 
 **Hard** — `plugin-env.conf` is read by the MCP-server bootstrapper
 when each agent's runtime is built. A live agent won't pick up a new
-secret until the next reload.
+secret until the next reload. Canonical order:
 
     config_git_commit(message="<plugin>: wire <VAR> via 1Password")
-    emit_completion(status="ok", text="Wired <VAR> for <plugin>; ready=<bool>.")
     casa_reload()
+    emit_completion(status="ok", text="Wired <VAR> for <plugin>; ready=<bool>; committed SHA <sha>; called casa_reload to refresh MCP-server env.")
 
 If you arrived here from the install flow, batch with the install's
 single commit + reload at the end — don't reload twice.
@@ -94,5 +94,6 @@ single commit + reload at the end — don't reload twice.
   else passes through verbatim.
 - Calling `list_vault_items` without a `query`. The vault dump can be
   several hundred items long; constrain the search.
-- Forgetting `casa_reload()`. The file on disk is correct but the
-  running MCP server keeps the prior env.
+- Forgetting `casa_reload()` between `config_git_commit` and
+  `emit_completion`. The file on disk is correct but the running MCP
+  server keeps the prior env.

@@ -31,14 +31,26 @@ Not every change needs a full addon restart. Choose the minimum reload that prop
 | Install or remove a plugin (`install_casa_plugin` / `uninstall_casa_plugin`) | hard |
 | Set a plugin env var (`set_plugin_env_reference`) | hard |
 
-## Order of operations
+## Order of operations — MANDATORY
 
 1. Make your file edits.
-2. Call config_git_commit(message=...).
-3. Call emit_completion(...) with the summary.
-4. Call the appropriate reload tool LAST. For hard reload, your own session will be terminated - Ellen verifies the reload on her next turn.
+2. Call `config_git_commit(message=...)`.
+3. Call the appropriate reload tool **before** `emit_completion`.
+4. Call `emit_completion(...)` with the summary.
 
-**Never call a reload tool before emit_completion.** The completion message rides the bus, which persists across restart. The reload tool call does not - if the reload kills your session first, Ellen has no structured summary.
+**Never call `emit_completion` BEFORE the reload step.** The model
+treats `emit_completion` as the terminal action; once it fires, the
+engagement closes and you do not get another chance to call the reload.
+A skipped reload leaves the artifact **committed but inert** — YAML on
+disk is right, but the running Casa keeps the prior runtime. The
+trigger never fires; the new agent never loads. See `completion.md` for
+the canonical full sequence.
+
+For hard reload, the addon will restart asynchronously a few seconds
+after `casa_reload()` returns. Your `emit_completion` call has time to
+land on the bus (which persists across restart) before the kill — but
+do not interpose extra Read/Bash tool_uses between `casa_reload` and
+`emit_completion`.
 
 ## When in doubt
 

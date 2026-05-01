@@ -211,14 +211,29 @@ class Agent:
             if handled:
                 text = ""  # suppress normal text delivery below
 
-        # Scheduled-trigger silence contract (spec 2026-04-28 §3.2 B.2).
-        # The agent's tokens are buffered by Fix B.1, so the prompt can
+        # Silence sentinel suppression — applies to ALL message types.
+        #
+        # Origin contract (spec 2026-04-28 §3.2 B.2): the agent's tokens
+        # for SCHEDULED turns are buffered by Fix B.1, so the prompt can
         # signal "do not send" via the literal sentinel `<silent/>` or
         # by producing only whitespace. Strict, exact-match-after-strip
-        # — substring matches are rejected by design (see spec §3.2
-        # rationale: prompt produces `<silent/>` followed by recanting
-        # text → send the whole thing).
-        if msg.type == MessageType.SCHEDULED and text:
+        # — substring matches are rejected by design (prompt produces
+        # `<silent/>` followed by recanting text → send the whole thing).
+        #
+        # G-3 (v0.33.0, exploration2): the suppression was originally
+        # scoped to `msg.type == MessageType.SCHEDULED`. Ellen's outer
+        # USER-driven turn after a configurator engagement (cid
+        # `dcc3c30b` 2026-05-01) accidentally absorbed the heartbeat
+        # trigger's `<silent/>` doctrine via mid-engagement Read of
+        # triggers.yaml and then emitted the bare sentinel as her own
+        # noop on the user DM, where this gate didn't fire. Lifting the
+        # SCHEDULED-only condition makes the behavior consistent: any
+        # turn whose entire output strips to `<silent/>` (or to
+        # whitespace) is a no-op, regardless of channel-trigger source.
+        # The cost of false suppression is zero in practice (no model
+        # legitimately emits the literal sentinel string to a user); the
+        # cost of operator-visible literal `<silent/>` is real-but-small.
+        if text:
             stripped = text.strip()
             if not stripped or stripped == "<silent/>":
                 text = ""

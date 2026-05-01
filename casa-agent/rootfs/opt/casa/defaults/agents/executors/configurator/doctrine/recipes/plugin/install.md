@@ -107,20 +107,21 @@ plugin-env entry, and the plugin's `.mcp.json` is in the agent's cache.
 If `ready: false`, the per-section status fields tell you what's
 missing — re-run the relevant earlier stage.
 
-## Reload
+## Reload — MANDATORY before emit_completion
 
 **Hard** — installing a plugin changes per-agent runtime state that the
-loader caches (Claude Code SDK plugin discovery in particular). Run a
-full reload after the install settles:
+loader caches (Claude Code SDK plugin discovery in particular). Canonical order:
 
     config_git_commit(message="install <name> plugin into <roles>")
-    emit_completion(status="ok", text="Installed <name> on <roles>; ready=<bool>.")
     casa_reload()
+    emit_completion(status="ok", text="Installed <name> on <roles>; ready=<bool>; committed SHA <sha>; called casa_reload to refresh SDK option builders.")
 
-`emit_completion` first so the operator sees a confirmation before the
-reload window. `casa_reload()` re-scans agent definitions and resets
-SDK option builders so the new `enabledPlugins` entry takes effect on
-the next turn.
+`casa_reload()` returns ~immediately with `supervisor_status: 200` and
+schedules the actual restart asynchronously, so `emit_completion` has
+time to land on the bus (durable across restart) before the container
+is killed. Skipping the reload leaves the plugin installed on disk but
+**not surfaced in the running agents** — the new tools / skills /
+hooks do not appear until the next manual restart.
 
 ## Common mistakes
 
@@ -130,8 +131,11 @@ the next turn.
 - Targeting a specialist or executor role. Plugin install only makes
   sense for residents (Tier 1) — they're the agents Claude Code SDK
   consumes plugins through.
-- Skipping `casa_reload()` after `config_git_commit`. The git tree on
-  disk is correct but the running Casa keeps the prior agent option
-  builders. Same trap as a YAML edit without reload (see `reload.md`).
+- Skipping `casa_reload()` between `config_git_commit` and
+  `emit_completion`. The git tree on disk is correct but the running
+  Casa keeps the prior agent option builders. Same trap as a YAML edit
+  without reload (see `reload.md`). The model often treats
+  `emit_completion` as the terminal step and skips the reload entirely
+  — don't.
 - Soft-reload (`casa_reload_triggers`) instead of hard. Triggers reload
   is for trigger YAML edits only — plugins need the full hard reload.

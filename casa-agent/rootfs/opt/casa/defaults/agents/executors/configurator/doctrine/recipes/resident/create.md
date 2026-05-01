@@ -31,13 +31,16 @@ Under /addon_configs/casa-agent/agents/<role>/:
 
 Scope rebalance may require editing another resident's memory.scopes_owned/readable. Same commit.
 
-## Reload
+## Reload — MANDATORY before emit_completion
 
-**Hard**, big one (scope registry rebuild).
+**Hard**, big one (scope registry rebuild). Canonical order:
 
 1. config_git_commit(message="add resident <role> with scope <scope>")
-2. emit_completion
-3. casa_reload()
+2. casa_reload()
+3. emit_completion(status="ok", text="Added resident <role>; committed SHA <sha>; called casa_reload to rebuild the scope registry.")
+
+Skipping the reload leaves the new resident on disk but **not in the
+live channel/scope routing** — see completion.md.
 
 ## Register handling for delegated turns
 

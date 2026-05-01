@@ -19,8 +19,10 @@ Common and allowed. casa_config_guard does NOT block deleting specialists.
     rm -rf /addon_configs/casa-agent/agents/specialists/<role>
 
 4. config_git_commit(message="remove <role> specialist + unwire delegates")
-5. emit_completion
-6. casa_reload() - **hard**.
+5. casa_reload() — **hard**.
+6. emit_completion(status="ok", text="Removed <role>; committed SHA <sha>; called casa_reload to drop the agent from the live registry.")
+
+Reload **before** emit_completion (canonical order — see completion.md). Skipping the reload leaves Ellen still trying to delegate to a deleted specialist until the next manual restart.
 
 ## What NOT to do
 

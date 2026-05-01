@@ -278,3 +278,19 @@ class InCasaDriver(DriverProtocol):
         final = accumulated.strip()
         if final:
             await stream.finalize(final)
+
+        # G-4 (v0.33.0): exploration2 found a configurator engagement
+        # that finalized outcome=error 24s after system_init with zero
+        # tool_uses inside the subprocess and no log evidence of why.
+        # When the SDK loop completes without producing any
+        # AssistantMessage frames (idx never incremented), surface the
+        # empty turn as a structured warning so operators have a
+        # starting signal. Causes include: hook payload synthesis denial
+        # (G-1 class), model refusal at system-prompt time, or
+        # subprocess crash between init and first message.
+        if idx == 0:
+            logger.warning(
+                "Engagement %s subprocess_terminated "
+                "reason=no_assistant_message",
+                engagement.id[:8],
+            )
