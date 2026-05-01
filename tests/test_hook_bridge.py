@@ -12,7 +12,7 @@ class TestHookBridgeTranslate:
         from drivers.hook_bridge import translate_hooks_to_settings
 
         hooks_yaml = {
-            "PreToolUse": [
+            "pre_tool_use": [
                 {"policy": "casa_config_guard", "matcher": "Write|Edit"},
                 {"policy": "commit_size_guard", "matcher": "Bash"},
             ],
@@ -39,3 +39,21 @@ class TestHookBridgeTranslate:
             {}, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
         )
         assert settings == {"hooks": {}}
+
+    def test_translates_bundled_plugin_developer_hooks_yaml(self):
+        """L-1b regression: bundled snake_case hooks.yaml must translate."""
+        import yaml
+        from pathlib import Path
+        from drivers.hook_bridge import translate_hooks_to_settings
+
+        here = Path(__file__).resolve().parent.parent
+        hooks_path = (
+            here / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults"
+            / "agents" / "executors" / "plugin-developer" / "hooks.yaml"
+        )
+        raw = yaml.safe_load(hooks_path.read_text(encoding="utf-8")) or {}
+        settings = translate_hooks_to_settings(
+            raw, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
+        )
+        assert "PreToolUse" in settings["hooks"]
+        assert len(settings["hooks"]["PreToolUse"]) >= 1
