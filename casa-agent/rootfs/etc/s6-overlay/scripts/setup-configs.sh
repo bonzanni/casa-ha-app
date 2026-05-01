@@ -324,6 +324,48 @@ fi
 unset OP_TOK VAULT GH_TOKEN
 # === github-token: end ==========================================
 
+# === claude-oauth-token: begin ==================================
+# K-1 (v0.34.1): propagate Claude Code OAuth token to engagement
+# subprocesses launched by claude_code_driver. Mirror of the
+# GITHUB_TOKEN block above. Pre-fix the token was only exported into
+# svc-casa's process env (svc-casa/run:13), which feeds casa_core
+# itself but NOT s6-rc child services launched via `with-contenv`
+# (which read /run/s6/container_environment/). Result: every
+# claude_code_driver subprocess (plugin-developer, hello-driver) got
+# "Not logged in · Please run /login" and produced no useful output.
+# Latently broken since v0.13.0 (Plan 4a) — ~8 days.
+#
+# bug-review-2026-05-01-exploration4.md::K-1 has the full evidence
+# chain. Fix shape: same op:// resolution path as GITHUB_TOKEN above,
+# write the (possibly-resolved) token to container_environment with
+# mode 0600.
+CC_OAUTH="$(bashio::config 'claude_oauth_token')"
+if [ -n "$CC_OAUTH" ] && [ "$CC_OAUTH" != "null" ]; then
+    case "$CC_OAUTH" in
+        op://*)
+            OP_TOK2="$(bashio::config 'onepassword_service_account_token')"
+            if [ -n "$OP_TOK2" ] && [ "$OP_TOK2" != "null" ]; then
+                CC_OAUTH=$(OP_SERVICE_ACCOUNT_TOKEN="$OP_TOK2" \
+                    op read "$CC_OAUTH" 2>/dev/null) || CC_OAUTH=""
+            else
+                CC_OAUTH=""
+            fi
+            unset OP_TOK2
+            ;;
+    esac
+fi
+if [ -n "$CC_OAUTH" ] && [ "$CC_OAUTH" != "null" ]; then
+    umask 077
+    printf "%s" "$CC_OAUTH" > /run/s6/container_environment/CLAUDE_CODE_OAUTH_TOKEN
+    umask 022
+    bashio::log.info "Claude OAuth: token propagated to engagement subprocesses"
+else
+    rm -f /run/s6/container_environment/CLAUDE_CODE_OAUTH_TOKEN
+    bashio::log.warning "Claude OAuth not configured — claude_code_driver engagements will fail (K-1)"
+fi
+unset CC_OAUTH
+# === claude-oauth-token: end ====================================
+
 # === seed-copy: begin ===========================================
 # v0.14.9: replace the boot install loop with a no-network seed copy.
 # /opt/claude-seed/ is image-baked at Dockerfile build time and contains
