@@ -182,19 +182,26 @@ def _result(payload: dict, *, is_error: bool | None = None) -> dict:
     """Wrap a JSON-serializable payload as the tool's MCP content.
 
     F-7 (v0.32.0): when ``payload["status"] == "error"`` (or the caller
-    explicitly passes ``is_error=True``), set ``isError: True`` on the
-    MCP envelope. Without this flag the SDK's ``ToolResultBlock`` defaults
+    explicitly passes ``is_error=True``), set ``is_error: True`` on the
+    envelope. Without this flag the SDK's ``ToolResultBlock`` defaults
     ``is_error=False`` and ``sdk_logging.log_tool_result`` emits
     ``ok=True`` even for failures — operators reading turn telemetry
     would think a registry-rejected ``engage_executor`` actually spawned.
     Auto-detection via ``payload["status"]`` keeps the existing call sites
     untouched while making every error path consistently observable.
+
+    The dict key MUST be ``is_error`` (snake_case): the Anthropic Agent
+    SDK's MCP server adapter reads
+    ``result.get("is_error", False)`` (see
+    ``claude_agent_sdk/__init__.py:512``) and converts to the MCP wire
+    field ``isError`` itself. Passing ``isError`` here gets silently
+    dropped on the way to the model.
     """
     if is_error is None:
         is_error = payload.get("status") == "error"
     envelope: dict = {"content": [{"type": "text", "text": json.dumps(payload)}]}
     if is_error:
-        envelope["isError"] = True
+        envelope["is_error"] = True
     return envelope
 
 

@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.32.1] - 2026-05-02 — Hotfix: F-7 envelope key snake_case
+
+v0.32.0's F-7 fix used `isError` (camelCase) on the MCP envelope dict.
+The Anthropic Agent SDK's MCP-server adapter reads
+`result.get("is_error", False)` (snake_case) at
+`claude_agent_sdk/__init__.py:512` and converts to the wire field
+`isError` itself — so our `isError` key was silently dropped and
+`engage_executor` for a disabled executor still showed `ok=True` in
+the cid trace (live evidence: cid `6f56682c` post-v0.32.0 deploy,
+`tool_result idx=3 name=mcp__casa-framework__engage_executor ok=True
+ms=9125` for `target=plugin-developer`).
+
+### Fixed
+
+- **F-7 (LOW, contract) — envelope key swap.** `_result()` now sets
+  `is_error: True` (snake_case) instead of `isError`. Test was
+  updated to assert on the correct key. Behavior is now wire-correct:
+  the SDK reads the dict, sets `ToolResultBlock.is_error=True`, and
+  `sdk_logging.log_tool_result` emits `ok=False`.
+
 ## [0.32.0] - 2026-05-02 — Bug bundle: F-2 + F-4 + F-5 + F-6 + F-7
 
 Bug bundle from `docs/bug-review-2026-05-02-exploration.md`. Five
