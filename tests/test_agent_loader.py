@@ -533,6 +533,50 @@ class TestValidateConfigRepo:
         errors = validate_config_repo(str(repo))
         assert errors == []
 
+    def test_no_agents_dir_returns_empty(self, tmp_path):
+        """Fresh repo without agents/ subtree (e.g., immediately after init
+        but before seed-copy) returns an empty error list rather than
+        raising. Defensive: validate_config_repo is called from a
+        privileged tool path and must not crash on edge filesystems."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "addon_configs" / "casa-agent"
+        repo.mkdir(parents=True)
+        errors = validate_config_repo(str(repo))
+        assert errors == []
+
+    def test_skips_policies_dir(self, tmp_path):
+        """v0.31.1 — policies/disclosure.yaml uses policy-disclosure.v1
+        which differs from agent disclosure.v1; filename-only mapping
+        falsely matched it as agent disclosure and blocked every commit.
+        Scope must skip policies/ entirely; boot-time policies.py
+        catches policy-side schema violations on its own."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "addon_configs" / "casa-agent"
+        _seed_resident(repo / "agents", "assistant")
+        # Realistic policies/disclosure.yaml uses the policy schema
+        # shape (top-level `policies:` block with named entries) which
+        # the AGENT disclosure schema rejects with
+        # `Additional properties are not allowed ('policies' was unexpected)`
+        _w(repo / "policies" / "disclosure.yaml", """\
+            schema_version: 1
+            policies:
+              standard:
+                categories:
+                  financial:
+                    required_trust: authenticated
+                    examples: [balances]
+                safe_on_any_channel: [device_state]
+                deflection_patterns:
+                  household_shared: "private."
+        """)
+
+        errors = validate_config_repo(str(repo))
+        assert errors == [], (
+            f"policies/* must be skipped by the agent gate; got {errors}"
+        )
+
     def test_top_level_unknown_key_in_character_caught(self, tmp_path):
         """Exact repro of the v0.30.0 / v0.29.0 P4.2 'TRAIT:' incident."""
         from agent_loader import validate_config_repo
@@ -576,13 +620,15 @@ class TestValidateConfigRepo:
         assert errors == []
 
     def test_skips_dotgit_dir(self, tmp_path):
-        """``.git/`` must NOT be walked — it can hold yaml-named blobs."""
+        """``.git/`` inside agents/ must NOT be walked — paranoia (a real
+        repo's .git would be at the config_dir root, but a buggy nested
+        copy could land schema-named blobs inside agents/)."""
         from agent_loader import validate_config_repo
 
         repo = tmp_path / "addon_configs" / "casa-agent"
         _seed_resident(repo / "agents", "assistant")
-        # Write a file inside .git that would FAIL validation if visited.
-        _w(repo / ".git" / "objects" / "character.yaml",
+        # Write a file inside agents/.git that would FAIL validation if visited.
+        _w(repo / "agents" / ".git" / "objects" / "character.yaml",
            "TRAIT: garbage\n")
 
         errors = validate_config_repo(str(repo))
