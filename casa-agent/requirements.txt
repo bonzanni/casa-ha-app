@@ -1,4 +1,4 @@
-claude-agent-sdk==0.1.61
+claude-agent-sdk==0.1.72
 honcho-ai==2.1.1
 python-telegram-bot==22.7
 aiohttp==3.13.5
