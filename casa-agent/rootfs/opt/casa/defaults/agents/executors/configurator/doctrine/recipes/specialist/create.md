@@ -106,12 +106,13 @@ The new specialist won't be callable until the resident's delegates.yaml lists i
 2. casa_reload()
 3. emit_completion(status="ok", text="Created specialist <role>; committed SHA <sha>; called casa_reload to re-scan agent_loader.")
 
-`casa_reload()` returns `supervisor_status: 200` ~immediately and
-schedules the addon restart asynchronously. Your `emit_completion`
-call lands on the bus (which persists across restart) before the
-container is killed. Skipping the reload leaves the new specialist on
-disk but **not in the live agent registry** — Ellen cannot delegate to
-it until the next manual restart. See completion.md.
+`casa_reload()` returns `supervisor_status: 200, deferred: true`
+immediately. The platform defers the actual Supervisor restart until
+after `emit_completion` runs and the engagement finalizes, so the
+"Done" relay reaches Ellen before the container is killed. Skipping
+the reload leaves the new specialist on disk but **not in the live
+agent registry** — Ellen cannot delegate to it until the next manual
+restart. See completion.md.
 
 ## Common mistakes
 

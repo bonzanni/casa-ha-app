@@ -179,10 +179,24 @@ _MAX_DELEGATION_DEPTH: int = 1
 # the reload tools, and inspected at emit_completion entry. If still
 # pending, force-call ``casa_reload`` (the safe-default — hard reload
 # is always correct, just slower than soft for triggers-only changes)
-# and emit a WARNING citing the engagement id. Force-called reload
-# happens BEFORE _finalize_engagement so the bus message lands after
-# the addon has been told to restart.
+# and emit a WARNING citing the engagement id.
 _ENGAGEMENTS_PENDING_RELOAD: set[str] = set()
+
+# H-1 fix (v0.34.0): casa_reload's Supervisor restart races the SDK
+# subprocess — the POST returns in <1s but Supervisor's container kill
+# arrives ~13s later, cancelling the SDK before the model can call
+# emit_completion. Result: engagement stuck status=active, no user-DM
+# completion message, _finalize_engagement never runs.
+#
+# Mechanism: when ``casa_reload`` is called inside an active engagement
+# (engagement_var bound), it does NOT POST to Supervisor. Instead it
+# adds engagement.id to this set and returns immediately. The actual
+# Supervisor POST is performed at the end of _finalize_engagement —
+# AFTER the bus-message write + Honcho meta-summary land — so the
+# user-DM "Done" relay survives the addon kill. Out-of-engagement
+# casa_reload calls (operator-triggered via /invoke) still POST
+# inline since there is no engagement to wait for.
+_ENGAGEMENTS_DEFERRED_HARD_RELOAD: set[str] = set()
 
 
 def _is_transient_connection_error(exc: BaseException) -> bool:
@@ -1240,8 +1254,9 @@ async def config_git_commit(args: dict) -> dict:
 
 @tool(
     "casa_reload",
-    "Restart the Casa addon via Supervisor. Your own session will be "
-    "terminated. Only call AFTER emit_completion has been sent. "
+    "Restart the Casa addon via Supervisor. Call BEFORE emit_completion. "
+    "The actual addon restart is deferred until after the engagement "
+    "finalizes so the bus message lands first. "
     "Restricted to the configurator executor role.",
     {},
 )
@@ -1250,6 +1265,34 @@ async def casa_reload(_: dict) -> dict:
     if caller not in _PRIVILEGED_CONFIG_ROLES:
         return _refuse_unprivileged("casa_reload", caller)
 
+    # H-1 fix (v0.34.0): when called inside an active engagement,
+    # defer the Supervisor POST until _finalize_engagement runs. The
+    # POST itself returns in <1s but Supervisor's container kill
+    # arrives ~13s later — observed live (exploration3 P4.2 + P4.3 +
+    # P11.1, 2026-05-01) cancelling the SDK subprocess BEFORE
+    # emit_completion / _finalize_engagement could run, leaving the
+    # engagement stuck status=active with no user-DM completion
+    # message. Drain the v0.33.1 G-2 pending-reload obligation
+    # (the model fulfilled the doctrine contract by calling us) and
+    # register a deferred-restart marker for _finalize_engagement to
+    # honor. Return immediately so the model can proceed to
+    # emit_completion without racing the kill.
+    eng = engagement_var.get(None)
+    if eng is not None:
+        _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
+        _ENGAGEMENTS_DEFERRED_HARD_RELOAD.add(eng.id)
+        return _result({
+            "supervisor_status": 200,
+            "deferred": True,
+            "message": (
+                "Hard reload deferred until engagement finalizes. "
+                "Continue with emit_completion."
+            ),
+        })
+
+    # Out-of-engagement path: e.g. operator-driven /invoke or any
+    # other context where there is no _finalize_engagement to wait
+    # for. POST inline as before.
     import aiohttp
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token:
@@ -1263,11 +1306,6 @@ async def casa_reload(_: dict) -> dict:
     try:
         async with aiohttp.ClientSession(headers=headers) as s:
             async with s.post(url) as resp:
-                # G-2 hotfix (v0.33.1): reload satisfied for this
-                # engagement; drain pending state.
-                eng = engagement_var.get(None)
-                if eng is not None:
-                    _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
                 return _result({"supervisor_status": resp.status})
     except Exception as exc:  # noqa: BLE001
         return _result({
@@ -1275,6 +1313,33 @@ async def casa_reload(_: dict) -> dict:
             "kind": "supervisor_error",
             "message": str(exc),
         })
+
+
+async def _post_supervisor_restart() -> dict:
+    """Internal helper used by ``_finalize_engagement`` to honor a
+    deferred hard-reload after the bus message + Honcho summary have
+    landed. Returns a result-shaped dict for logging; never raises.
+    """
+    import aiohttp
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if not token:
+        return {
+            "status": "error",
+            "kind": "no_supervisor_token",
+            "message": "SUPERVISOR_TOKEN not set - cannot restart addon",
+        }
+    headers = {"Authorization": f"Bearer {token}"}
+    url = "http://supervisor/addons/self/restart"
+    try:
+        async with aiohttp.ClientSession(headers=headers) as s:
+            async with s.post(url) as resp:
+                return {"supervisor_status": resp.status}
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "error",
+            "kind": "supervisor_error",
+            "message": str(exc),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1758,6 +1823,32 @@ async def _finalize_engagement(
                 engagement.id[:8], exc,
             )
 
+    # H-1 (v0.34.0): honor deferred hard-reload now that all bus +
+    # Honcho writes have landed. Only on outcome=completed — per
+    # ``completion.md`` doctrine line 61, a cancelled engagement does
+    # NOT need a reload (artifact is operator-pending). On
+    # outcome=error the engagement bailed; the reload decision is the
+    # operator's, not the platform's. Drain the marker on every path
+    # to prevent stale state from haunting an idempotent re-call or
+    # a follow-up engagement reusing the (very short) id slice.
+    deferred_pending = engagement.id in _ENGAGEMENTS_DEFERRED_HARD_RELOAD
+    _ENGAGEMENTS_DEFERRED_HARD_RELOAD.discard(engagement.id)
+    if outcome == "completed" and deferred_pending:
+        result = await _post_supervisor_restart()
+        if result.get("status") == "error":
+            logger.warning(
+                "finalize engagement %s: deferred Supervisor "
+                "restart failed: %s",
+                engagement.id[:8], result.get("message"),
+            )
+        else:
+            logger.info(
+                "finalize engagement %s: deferred Supervisor restart "
+                "POSTed (supervisor_status=%s); container kill arrives "
+                "asynchronously, the bus message is already on disk.",
+                engagement.id[:8], result.get("supervisor_status"),
+            )
+
     # G-4 (v0.33.0): surface the cause when outcome=error so operators
     # have a starting point for triage. Pre-fix the only log line for
     # this path was an unconditional `logger.info(... outcome=error)`
@@ -2089,9 +2180,38 @@ async def casa_reload_triggers(args: dict) -> dict:
             "message": f"no agent directory found for role={role!r}",
         })
 
+    # H-3 fix (v0.34.0): residents have ``disclosure.yaml`` and
+    # ``agent_loader._compose_prompt`` raises LoadError when
+    # ``disclosure is not None AND policies is None``. Pre-fix this
+    # tool always passed ``policies=None`` (latent since commit
+    # ``e81f264``, 2026-04-22 — 9 days), so soft reload of triggers
+    # for residents was permanently broken; surfaced 2026-05-01
+    # exploration3 P8.1 only because v0.33.0's G-4 structured
+    # outcome=error logging finally exposed the LoadError text.
+    # Re-load policies fresh from disk on every call (stateless,
+    # no need to thread through init_tools); harmless for specialists
+    # since ``_compose_prompt`` only consults ``policies`` when the
+    # agent has a ``disclosure.yaml``.
+    import policies as policies_module
+    policy_lib_path = os.path.join(base, "policies", "disclosure.yaml")
+    try:
+        policy_lib = await asyncio.to_thread(
+            policies_module.load_policies, policy_lib_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _result({
+            "status": "error",
+            "kind": "load_error",
+            "message": (
+                f"could not load PolicyLibrary from "
+                f"{policy_lib_path}: {exc}"
+            ),
+        })
+
     try:
         cfg = await asyncio.to_thread(
-            agent_loader.load_agent_from_dir, agent_dir, policies=None,
+            agent_loader.load_agent_from_dir,
+            agent_dir, policies=policy_lib,
         )
     except Exception as exc:  # noqa: BLE001
         return _result({
