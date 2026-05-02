@@ -176,3 +176,81 @@ async def dispatch(
             await rw.release_write()
         else:
             await rw.release_read()
+
+
+# ---------------------------------------------------------------------------
+# Per-scope handlers
+# ---------------------------------------------------------------------------
+
+import os
+from pathlib import Path
+
+
+async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]:
+    """Soft-reload triggers for one role. Ports tools.casa_reload_triggers body
+    to the runtime/dispatcher contract; full lineage in spec §3.
+    """
+    if not role:
+        raise ReloadError("role_required", "scope='triggers' requires role")
+
+    if runtime.trigger_registry is None:
+        raise ReloadError("not_initialized", "trigger registry not wired")
+
+    # Find the agent dir: residents at agents/<role>/, specialists at
+    # agents/specialists/<role>/. Mirrors tools.casa_reload_triggers.
+    base = runtime.config_dir
+    agents_dir = runtime.agents_dir
+    agent_dir: str | None = None
+    for candidate in (
+        os.path.join(agents_dir, role),
+        os.path.join(agents_dir, "specialists", role),
+    ):
+        if os.path.isdir(candidate):
+            agent_dir = candidate
+            break
+    if agent_dir is None:
+        raise ReloadError(
+            "unknown_role", f"no agent directory for role={role!r}",
+        )
+
+    # H-3 fix carry-forward (v0.34.0): always re-load policies from disk so
+    # residents with disclosure.yaml don't trip _compose_prompt's None guard.
+    import policies as policies_module
+    policy_lib_path = os.path.join(base, "policies", "disclosure.yaml")
+    try:
+        policy_lib = await asyncio.to_thread(
+            policies_module.load_policies, policy_lib_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ReloadError("load_error", f"policies: {exc}") from exc
+
+    import agent_loader
+    try:
+        cfg = await asyncio.to_thread(
+            agent_loader.load_agent_from_dir,
+            agent_dir, policies=policy_lib,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ReloadError("load_error", str(exc)) from exc
+
+    try:
+        await asyncio.to_thread(
+            runtime.trigger_registry.reregister_for,
+            role, list(cfg.triggers), list(cfg.channels),
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ReloadError("reregister_failed", str(exc)) from exc
+
+    # G-2 hotfix carry-forward: drain pending-reload guard if any.
+    try:
+        from tools import _ENGAGEMENTS_PENDING_RELOAD, engagement_var
+        eng = engagement_var.get(None)
+        if eng is not None:
+            _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
+    except Exception:  # noqa: BLE001 — best-effort
+        pass
+
+    return ["reregister_triggers"]
+
+
+register_handler("triggers", reload_triggers)

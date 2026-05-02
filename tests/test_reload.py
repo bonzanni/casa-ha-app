@@ -87,3 +87,51 @@ class TestLockSerialization:
         assert ordering[1].startswith("end:")
         assert ordering[2].startswith("start:")
         assert ordering[3].startswith("end:")
+
+
+class TestReloadTriggers:
+    async def test_unknown_role_raises_load_error(self, tmp_path):
+        from reload import dispatch, register_handler
+        from reload import reload_triggers  # implemented below
+        register_handler("triggers", reload_triggers)
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(tmp_path / "agents")
+        # No agents/<role>/ dir on disk
+        result = await dispatch("triggers", runtime=runtime, role="ghost")
+        assert result["status"] == "error"
+        assert result["kind"] == "unknown_role"
+
+    async def test_happy_path_calls_reregister(self, tmp_path, monkeypatch):
+        from reload import dispatch, register_handler, reload_triggers
+        register_handler("triggers", reload_triggers)
+        # Set up a fake agent dir with minimal files agent_loader expects.
+        agents_dir = tmp_path / "agents"
+        ellen_dir = agents_dir / "ellen"
+        ellen_dir.mkdir(parents=True)
+        # Stub load_agent_from_dir + load_policies via monkeypatch.
+        import reload as reload_mod
+        from types import SimpleNamespace
+        fake_cfg = SimpleNamespace(
+            triggers=[SimpleNamespace(name="t1")],
+            channels=["telegram"],
+        )
+        async def fake_load(*a, **kw): return None
+        monkeypatch.setattr(
+            "agent_loader.load_agent_from_dir",
+            lambda *a, **kw: fake_cfg,
+        )
+        monkeypatch.setattr(
+            "policies.load_policies",
+            lambda *a, **kw: MagicMock(),
+        )
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.trigger_registry.reregister_for = MagicMock()
+
+        result = await dispatch("triggers", runtime=runtime, role="ellen")
+        assert result["status"] == "ok"
+        runtime.trigger_registry.reregister_for.assert_called_once_with(
+            "ellen", [fake_cfg.triggers[0]], ["telegram"],
+        )
