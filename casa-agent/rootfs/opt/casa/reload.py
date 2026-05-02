@@ -647,3 +647,41 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
 
 
 register_handler("agents", reload_agents)
+
+
+async def reload_full(
+    runtime: Any, *, role: str | None = None, include_env: bool = False,
+) -> list[str]:
+    """Compose policies + agents + per-role agent (+ optional plugin_env).
+
+    Each sub-handler is invoked DIRECTLY (not via dispatch) so a single
+    `full`-scope lock guards the whole sequence — sub-handlers don't
+    re-enter the dispatcher's lock machinery.
+    """
+    actions: list[str] = []
+
+    # Policies — full cascade includes per-role re-load.
+    sub = await _HANDLERS["policies"](runtime, role=None)
+    actions += [f"policies:{a}" for a in sub]
+
+    # Agents — adds/evicts.
+    sub = await _HANDLERS["agents"](runtime, role=None)
+    actions += [f"agents:{a}" for a in sub]
+
+    # Per-role agent reload — picks up edits to runtime.yaml etc that the
+    # policies cascade re-loaded but where downstream wiring (triggers)
+    # might still need a fresh pass.
+    for r in list(runtime.role_configs.keys()) + list(
+        runtime.specialist_registry.all_configs().keys(),
+    ):
+        sub = await _HANDLERS["agent"](runtime, role=r)
+        actions += [f"agent:{r}:{a}" for a in sub]
+
+    if include_env:
+        sub = await _HANDLERS["plugin_env"](runtime, role=None)
+        actions += [f"plugin_env:{a}" for a in sub]
+
+    return actions
+
+
+register_handler("full", reload_full)

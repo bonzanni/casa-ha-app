@@ -373,3 +373,64 @@ class TestReloadAgents:
         assert "tina" not in runtime.role_configs
         assert "tina" not in runtime.agents
         runtime.bus.unregister.assert_any_call("tina")
+
+
+class TestReloadFull:
+    async def test_calls_other_handlers_in_order(self, monkeypatch):
+        from reload import dispatch, register_handler, reload_full
+        register_handler("full", reload_full)
+
+        called: list[str] = []
+
+        async def stub_policies(rt, *, role=None):
+            called.append("policies"); return ["p"]
+
+        async def stub_agents(rt, *, role=None):
+            called.append("agents"); return ["a"]
+
+        async def stub_agent(rt, *, role=None):
+            called.append(f"agent:{role}"); return ["x"]
+
+        async def stub_env(rt, *, role=None):
+            called.append("plugin_env"); return ["e"]
+
+        import reload as reload_mod
+        monkeypatch.setitem(reload_mod._HANDLERS, "policies", stub_policies)
+        monkeypatch.setitem(reload_mod._HANDLERS, "agents", stub_agents)
+        monkeypatch.setitem(reload_mod._HANDLERS, "agent", stub_agent)
+        monkeypatch.setitem(reload_mod._HANDLERS, "plugin_env", stub_env)
+        monkeypatch.setitem(reload_mod._HANDLERS, "full", reload_full)
+
+        runtime = _make_runtime()
+        runtime.role_configs = {"ellen": MagicMock(), "tina": MagicMock()}
+        runtime.specialist_registry.all_configs = lambda: {}
+
+        result = await dispatch("full", runtime=runtime, include_env=False)
+        assert result["status"] == "ok"
+        # Policies first, then agents, then per-role agent reload.
+        assert called[0] == "policies"
+        assert called[1] == "agents"
+        assert "agent:ellen" in called[2:]
+        assert "agent:tina" in called[2:]
+        assert "plugin_env" not in called  # include_env=False
+
+    async def test_include_env_calls_plugin_env(self, monkeypatch):
+        from reload import dispatch, register_handler, reload_full
+        register_handler("full", reload_full)
+
+        called: list[str] = []
+        async def stub(name):
+            async def _h(rt, *, role=None):
+                called.append(name); return [name]
+            return _h
+        import reload as reload_mod
+        for s in ("policies", "agents", "agent", "plugin_env"):
+            monkeypatch.setitem(reload_mod._HANDLERS, s, await stub(s))
+        monkeypatch.setitem(reload_mod._HANDLERS, "full", reload_full)
+
+        runtime = _make_runtime()
+        runtime.role_configs = {}
+        runtime.specialist_registry.all_configs = lambda: {}
+
+        await dispatch("full", runtime=runtime, include_env=True)
+        assert "plugin_env" in called
