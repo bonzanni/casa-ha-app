@@ -4,11 +4,11 @@ Residents own channels and are long-lived. Updating scoped fields is safe; touch
 
 ## Low-risk updates
 
-- Persona prompt - **none reload**.
-- Model - **hard reload**.
-- Response shape - **none reload**; voice - **hard**.
-- Adding a trigger - see recipes/trigger/add.md. **soft reload**.
-- Adding a delegate - see recipes/delegate/wire.md. **hard reload**.
+- Persona prompt - **no reload** (lazy-read per turn).
+- Model - `casa_reload(scope='agent', role=<role>)`.
+- Response shape - **no reload**; voice - `casa_reload(scope='agent', role=<role>)`.
+- Adding a trigger - see recipes/trigger/add.md. `casa_reload_triggers(role=<role>)`.
+- Adding a delegate - see recipes/delegate/wire.md. `casa_reload(scope='agent', role=<role>)`.
 
 ## Higher-risk updates (ask user explicitly)
 

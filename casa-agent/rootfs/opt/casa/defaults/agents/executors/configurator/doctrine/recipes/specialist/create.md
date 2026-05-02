@@ -100,19 +100,17 @@ The new specialist won't be callable until the resident's delegates.yaml lists i
 
 ## Reload — MANDATORY before emit_completion
 
-**Hard** - creating a new agent requires agent_loader re-scan. Canonical order:
+Creating a new agent requires the runtime to re-scan `agents/`. Use the
+`agents` scope. Canonical order:
 
 1. config_git_commit(message="add <role> specialist")
-2. casa_reload()
-3. emit_completion(status="ok", text="Created specialist <role>; committed SHA <sha>; called casa_reload to re-scan agent_loader.")
+2. casa_reload(scope="agents")
+3. emit_completion(status="ok", text="Created specialist <role>; committed SHA <sha>; called casa_reload(scope='agents') to register the new agent.")
 
-`casa_reload()` returns `supervisor_status: 200, deferred: true`
-immediately. The platform defers the actual Supervisor restart until
-after `emit_completion` runs and the engagement finalizes, so the
-"Done" relay reaches Ellen before the container is killed. Skipping
-the reload leaves the new specialist on disk but **not in the live
-agent registry** — Ellen cannot delegate to it until the next manual
-restart. See completion.md.
+`casa_reload(scope='agents')` returns `{status: "ok", ms: <int>, ...}`
+in <1s — in-process, no addon restart. Skipping the reload leaves the
+new specialist on disk but **not in the live agent registry** — Ellen
+cannot delegate to it until the next reload. See completion.md.
 
 ## Common mistakes
 
