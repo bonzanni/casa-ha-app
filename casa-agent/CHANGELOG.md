@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.35.2] - 2026-05-02 — Hotfix bundle: Q-1 + R-1 + S-1
+
+### Fixed
+- **MEDIUM Q-1: `casa_reload_triggers` returned a stale `registered`
+  list.** Triggers DID register in apscheduler and DID fire on
+  schedule, but `reload.py::reload_triggers` never wrote the fresh
+  cfg back into `runtime.role_configs[role]`, so the back-compat
+  consumer (`tools.casa_reload_triggers`) read the boot-time list.
+  Configurator hallucinated failure narratives on every trigger-add
+  (live evidence: P8.1 in exploration5, engagement `2cf6fb6f`
+  finalized `outcome=error` despite probe-p8-sched firing twice).
+  Fix mirrors the resident vs specialist branching of `reload_agent`
+  at `reload.py:339-348`. Adds `TestReloadTriggers` regression
+  coverage. Latent in v0.35.0.
+- **LOW R-1: configurator specialist-create recipe wrote a
+  non-existent default `cwd`.** Recipe template defaulted to
+  `cwd: /addon_configs/casa-agent/workspace` (a directory that does
+  not exist on disk); finance seed ships `cwd: ""`. Delegation to a
+  newly-created specialist failed with `sdk_error (Working directory
+  does not exist)`. Doctrine-only fix in
+  `defaults/agents/executors/configurator/doctrine/recipes/specialist/create.md`.
+  Live evidence: P11.2 in exploration5, cid `f032f185`. Latent since
+  configurator shipped (v0.12.0).
+- **LOW S-1: `agent_loader` rejected ANY unknown file in an agent
+  directory.** Editor-backup artifacts (`.bak`/`.swp`/`.tmp`/`.orig`/`*~`)
+  broke `casactl reload --scope=agent` with `LoadError: unknown
+  file(s)`. Footgun for ad-hoc N150 SSH edits using `sed -i.bak`.
+  Adds `_is_editor_backup()` helper that skips those suffixes,
+  parallel to the existing dotfile skip. Diagnostic for genuine
+  unknown files now mentions the whitelist + suggests `git restore`.
+  Live evidence: P19.7v1 in exploration5. Latent since agent_loader's
+  strict-mode shipped.
+
 ## [0.35.1] - 2026-05-02 — Hotfix: bus.register idempotent on queue
 
 ### Fixed

@@ -137,6 +137,96 @@ class TestReloadTriggers:
             "ellen", [fake_cfg.triggers[0]], ["telegram"],
         )
 
+    async def test_updates_runtime_role_configs_for_resident(
+        self, tmp_path, monkeypatch,
+    ):
+        """Q-1 regression: after dispatch('triggers'), the runtime
+        role_configs cache MUST reflect the new cfg.triggers - not the
+        boot-time list. Without this, tools.casa_reload_triggers
+        returns a stale `registered` field that misleads the LLM.
+        """
+        from reload import dispatch, register_handler, reload_triggers
+        register_handler("triggers", reload_triggers)
+
+        agents_dir = tmp_path / "agents"
+        ellen_dir = agents_dir / "ellen"
+        ellen_dir.mkdir(parents=True)
+
+        from types import SimpleNamespace
+        boot_cfg = SimpleNamespace(
+            triggers=[SimpleNamespace(name="boot-trigger")],
+            channels=["telegram"],
+        )
+        new_cfg = SimpleNamespace(
+            triggers=[
+                SimpleNamespace(name="boot-trigger"),
+                SimpleNamespace(name="probe-q1"),
+            ],
+            channels=["telegram"],
+        )
+        monkeypatch.setattr(
+            "agent_loader.load_agent_from_dir",
+            lambda *a, **kw: new_cfg,
+        )
+        monkeypatch.setattr(
+            "policies.load_policies",
+            lambda *a, **kw: MagicMock(),
+        )
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {"ellen": boot_cfg}
+        runtime.trigger_registry.reregister_for = MagicMock()
+
+        result = await dispatch("triggers", runtime=runtime, role="ellen")
+
+        assert result["status"] == "ok"
+        assert runtime.role_configs["ellen"] is new_cfg
+        names = [t.name for t in runtime.role_configs["ellen"].triggers]
+        assert names == ["boot-trigger", "probe-q1"]
+
+    async def test_specialist_branch_refreshes_registry(
+        self, tmp_path, monkeypatch,
+    ):
+        """Q-1 specialist symmetry: when the role lives under
+        agents/specialists/<role>/, dispatch('triggers') MUST trigger
+        a SpecialistRegistry refresh so the back-compat consumer sees
+        the post-reload state. Mirrors reload_agent's specialist branch
+        at reload.py:341-348.
+
+        (Specialists can't actually carry triggers per the file-set
+        rules - this test asserts the codepath fires for symmetry.)
+        """
+        from reload import dispatch, register_handler, reload_triggers
+        register_handler("triggers", reload_triggers)
+
+        agents_dir = tmp_path / "agents"
+        spec_dir = agents_dir / "specialists" / "finance"
+        spec_dir.mkdir(parents=True)
+
+        from types import SimpleNamespace
+        new_cfg = SimpleNamespace(triggers=[], channels=[])
+        monkeypatch.setattr(
+            "agent_loader.load_agent_from_dir",
+            lambda *a, **kw: new_cfg,
+        )
+        monkeypatch.setattr(
+            "policies.load_policies",
+            lambda *a, **kw: MagicMock(),
+        )
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {"ellen": SimpleNamespace(triggers=[])}
+        runtime.trigger_registry.reregister_for = MagicMock()
+        runtime.specialist_registry.load = MagicMock()
+
+        result = await dispatch("triggers", runtime=runtime, role="finance")
+
+        assert result["status"] == "ok"
+        assert "finance" not in runtime.role_configs
+        runtime.specialist_registry.load.assert_called_once_with()
+
 
 class TestReloadAgent:
     async def test_unknown_role_raises(self, tmp_path):
