@@ -32,16 +32,17 @@ it's a target that didn't have the plugin enabled in the first place.
 
 ## Reload — MANDATORY before emit_completion
 
-**Hard** — same reasoning as install. The Claude Code SDK caches
-plugin discovery per agent. Canonical order:
+Same reasoning as install. The Claude Code SDK caches plugin discovery
+per agent. Use the `agent` scope — once per target role. Canonical order:
 
     config_git_commit(message="remove <name> plugin from <roles>")
-    casa_reload()
-    emit_completion(status="ok", text="Removed <name> from <roles>; committed SHA <sha>; called casa_reload.")
+    # for each target role:
+    casa_reload(scope="agent", role=<role>)
+    emit_completion(status="ok", text="Removed <name> from <roles>; committed SHA <sha>; called casa_reload(scope='agent') per target.")
 
 Reload before emit_completion — see completion.md. Skipping the reload
 leaves the plugin's tools / skills / hooks still surfacing in agents
-until the next manual restart.
+until the next reload.
 
 ## Full removal (optional)
 
@@ -67,6 +68,7 @@ re-download. If the user wants a clean slate:
   uninstall still works (Claude Code's per-home `.claude/settings.json`
   is the source of truth there), but it's confusing — leave the
   marketplace tear-down for last.
-- Forgetting `casa_reload()` between `config_git_commit` and
-  `emit_completion`. Same trap as install — the disk is correct but
-  the running Casa keeps the prior plugin surface.
+- Forgetting `casa_reload(scope='agent', role=<role>)` between
+  `config_git_commit` and `emit_completion`. Same trap as install —
+  the disk is correct but the running Casa keeps the prior plugin
+  surface.

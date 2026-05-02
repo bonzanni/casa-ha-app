@@ -23,8 +23,9 @@ In agents/<resident-role>/runtime.yaml::tools.allowed, ensure mcp__casa-framewor
 
 ## Reload — MANDATORY before emit_completion
 
-**Hard** - delegates.yaml is boot-cached. Canonical order:
+`delegates.yaml` is part of the resident's AgentConfig — use the
+`agent` scope for that role. Canonical order:
 
     config_git_commit(message="wire <target> into <resident>'s delegates")
-    casa_reload()
-    emit_completion(status="ok", text="...committed SHA <sha>, called casa_reload for delegates rebuild.")
+    casa_reload(scope="agent", role="<resident>")
+    emit_completion(status="ok", text="...committed SHA <sha>, called casa_reload(scope='agent') for delegates rebuild.")

@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""casactl - operator CLI for in-process Casa reloads.
+
+Talks to /run/casa/internal.sock; same dispatch path as the
+casa_reload(scope=...) MCP tool. See doctrine reload.md.
+
+Usage:
+    casactl reload --scope=agent --role=ellen
+    casactl reload --scope=triggers --role=ellen
+    casactl reload --scope=policies
+    casactl reload --scope=plugin_env
+    casactl reload --scope=agents
+    casactl reload --scope=full [--include-env]
+    casactl restart-supervised
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import sys
+
+SOCKET_PATH = "/run/casa/internal.sock"
+
+
+def _post_via_unix_socket(path: str, body: dict) -> tuple[int, dict]:
+    """Minimal HTTP/1.0 POST over a unix domain socket - no aiohttp dep."""
+    payload = json.dumps(body).encode("utf-8")
+    request = (
+        f"POST {path} HTTP/1.0\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(payload)}\r\n"
+        f"\r\n"
+    ).encode("ascii") + payload
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.connect(SOCKET_PATH)
+        sock.sendall(request)
+        chunks: list[bytes] = []
+        while True:
+            chunk = sock.recv(8192)
+            if not chunk:
+                break
+            chunks.append(chunk)
+
+    raw = b"".join(chunks)
+    head, _, body_bytes = raw.partition(b"\r\n\r\n")
+    status_line = head.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+    try:
+        status_code = int(status_line.split()[1])
+    except (IndexError, ValueError):
+        status_code = 0
+    try:
+        parsed = json.loads(body_bytes.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        parsed = {"raw": body_bytes.decode("utf-8", errors="replace")}
+    return status_code, parsed
+
+
+def _cmd_reload(args: argparse.Namespace) -> int:
+    body = {
+        "scope": args.scope,
+        "role": args.role or "",
+        "include_env": args.include_env,
+    }
+    try:
+        status_code, result = _post_via_unix_socket("/admin/reload", body)
+    except FileNotFoundError:
+        print(f"error: socket not found at {SOCKET_PATH} - "
+              "is casa-main running?", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"error: socket connect failed: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        if result.get("status") == "ok":
+            ms = result.get("ms", "?")
+            actions = result.get("actions", [])
+            print(f"ok ({ms}ms) - actions: {', '.join(actions) or 'none'}")
+        else:
+            kind = result.get("kind", "error")
+            msg = result.get("message", "")
+            print(f"error: {kind} - {msg}", file=sys.stderr)
+
+    return 0 if result.get("status") == "ok" else 1
+
+
+def _cmd_restart_supervised(args: argparse.Namespace) -> int:
+    """Direct Supervisor POST - same as the MCP tool's out-of-engagement path."""
+    import urllib.request
+    import urllib.error
+    import os
+
+    token = os.environ.get("SUPERVISOR_TOKEN", "")
+    if not token:
+        print("error: SUPERVISOR_TOKEN not set", file=sys.stderr)
+        return 2
+    req = urllib.request.Request(
+        "http://supervisor/addons/self/restart",
+        method="POST",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            print(f"ok ({resp.status}) - addon restart requested")
+            return 0
+    except urllib.error.HTTPError as exc:
+        print(f"error: supervisor returned {exc.code}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"error: supervisor unreachable: {exc}", file=sys.stderr)
+        return 2
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="casactl",
+        description="Operator CLI for in-process Casa reloads.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    reload_p = sub.add_parser(
+        "reload", help="In-process reload at a given scope.",
+    )
+    reload_p.add_argument(
+        "--scope", required=True,
+        choices=["agent", "triggers", "policies",
+                 "plugin_env", "agents", "full"],
+    )
+    reload_p.add_argument("--role", default=None)
+    reload_p.add_argument("--include-env", action="store_true")
+    reload_p.add_argument("--json", action="store_true",
+                          help="Emit raw JSON result.")
+
+    sub.add_parser(
+        "restart-supervised",
+        help="Full Supervisor-driven addon restart (slow, ~10-15s).",
+    )
+
+    args = parser.parse_args()
+    if args.cmd == "reload":
+        return _cmd_reload(args)
+    if args.cmd == "restart-supervised":
+        return _cmd_restart_supervised(args)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

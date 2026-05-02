@@ -109,20 +109,23 @@ missing — re-run the relevant earlier stage.
 
 ## Reload — MANDATORY before emit_completion
 
-**Hard** — installing a plugin changes per-agent runtime state that the
-loader caches (Claude Code SDK plugin discovery in particular). Canonical order:
+Installing a plugin changes per-agent runtime state that the loader
+caches (Claude Code SDK plugin discovery in particular). Use the
+`agent` scope — once per target role. If Stage 4
+(`set_plugin_env_reference`) was called, FIRST call
+`casa_reload(scope='plugin_env')`. Canonical order:
 
     config_git_commit(message="install <name> plugin into <roles>")
-    casa_reload()
-    emit_completion(status="ok", text="Installed <name> on <roles>; ready=<bool>; committed SHA <sha>; called casa_reload to refresh SDK option builders.")
+    # if set_plugin_env_reference was called above:
+    casa_reload(scope="plugin_env")
+    # for each target role:
+    casa_reload(scope="agent", role=<role>)
+    emit_completion(status="ok", text="Installed <name> on <roles>; ready=<bool>; committed SHA <sha>; called casa_reload(scope='agent') per target.")
 
-`casa_reload()` returns immediately with `supervisor_status: 200,
-deferred: true`. The platform defers the actual Supervisor restart
-until after `emit_completion` runs and the engagement finalizes, so
-the user's "Done" relay always lands before the container is killed.
+`casa_reload(...)` returns in <1s — in-process, no addon restart.
 Skipping the reload leaves the plugin installed on disk but **not
 surfaced in the running agents** — the new tools / skills / hooks do
-not appear until the next manual restart.
+not appear until the next reload.
 
 ## Common mistakes
 
@@ -132,11 +135,11 @@ not appear until the next manual restart.
 - Targeting a specialist or executor role. Plugin install only makes
   sense for residents (Tier 1) — they're the agents Claude Code SDK
   consumes plugins through.
-- Skipping `casa_reload()` between `config_git_commit` and
-  `emit_completion`. The git tree on disk is correct but the running
-  Casa keeps the prior agent option builders. Same trap as a YAML edit
-  without reload (see `reload.md`). The model often treats
-  `emit_completion` as the terminal step and skips the reload entirely
-  — don't.
-- Soft-reload (`casa_reload_triggers`) instead of hard. Triggers reload
-  is for trigger YAML edits only — plugins need the full hard reload.
+- Skipping `casa_reload(scope='agent', role=<role>)` between
+  `config_git_commit` and `emit_completion`. The git tree on disk is
+  correct but the running Casa keeps the prior agent option builders.
+  Same trap as a YAML edit without reload (see `reload.md`). The model
+  often treats `emit_completion` as the terminal step and skips the
+  reload entirely — don't.
+- Wrong scope. `casa_reload_triggers` is for trigger YAML edits only;
+  plugins need `casa_reload(scope='agent', role=<role>)`.

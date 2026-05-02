@@ -134,3 +134,34 @@ def test_envelope_module_exports_constants() -> None:
     assert isinstance(mcp_envelope.PROTOCOL_VERSION, str)
     # Sanity: PROTOCOL_VERSION matches the MCP spec we target (per v0.13.1).
     assert mcp_envelope.PROTOCOL_VERSION == "2025-06-18"
+
+
+class TestNoArgToolsEmitObjectSchema:
+    """Tools with empty input_schema must emit
+    {"type": "object", "properties": {}} on the wire — bare {} is rejected
+    by CC v2.1.119+ strict validation (Bug O-1).
+
+    This class verifies the live tool objects (not a synthetic FakeTool)
+    declared elsewhere in the codebase. Pairs with
+    ``test_tool_schema_empty_dict_input`` above (which uses a fake) for
+    defense-in-depth.
+    """
+
+    def test_casa_restart_supervised_schema(self):
+        from mcp_envelope import _tool_schema
+        from tools import casa_restart_supervised
+        schema = _tool_schema(casa_restart_supervised)
+        assert schema["inputSchema"] == {
+            "type": "object", "properties": {}
+        }, (
+            f"casa_restart_supervised emitted {schema['inputSchema']!r}; "
+            "expected {'type': 'object', 'properties': {}} per O-1 fix"
+        )
+
+    def test_marketplace_list_plugins_schema(self):
+        from mcp_envelope import _tool_schema
+        from tools import marketplace_list_plugins
+        schema = _tool_schema(marketplace_list_plugins)
+        assert schema["inputSchema"] == {
+            "type": "object", "properties": {}
+        }

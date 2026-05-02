@@ -33,11 +33,13 @@ Scope rebalance may require editing another resident's memory.scopes_owned/reada
 
 ## Reload — MANDATORY before emit_completion
 
-**Hard**, big one (scope registry rebuild). Canonical order:
+Adding a resident requires the runtime to re-scan `agents/`. If the
+edit also touched `policies/scopes.yaml` (scope rebalance), use `full`
+to also rebuild the scope registry. Canonical order:
 
 1. config_git_commit(message="add resident <role> with scope <scope>")
-2. casa_reload()
-3. emit_completion(status="ok", text="Added resident <role>; committed SHA <sha>; called casa_reload to rebuild the scope registry.")
+2. casa_reload(scope="full")  *(or `agents` if no policies/*.yaml edits)*
+3. emit_completion(status="ok", text="Added resident <role>; committed SHA <sha>; called casa_reload(scope='full') to register the new agent.")
 
 Skipping the reload leaves the new resident on disk but **not in the
 live channel/scope routing** — see completion.md.

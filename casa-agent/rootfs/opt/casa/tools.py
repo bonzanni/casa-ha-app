@@ -77,6 +77,7 @@ _trigger_registry: "TriggerRegistry | None" = None
 _engagement_registry: EngagementRegistry | None = None
 _executor_registry: "ExecutorRegistry | None" = None
 _agent_registry = None  # AgentRegistry | None
+_runtime = None  # CasaRuntime | None — set by init_tools(runtime=...)
 engagement_var: ContextVar[EngagementRecord | None] = ContextVar(
     "engagement_var", default=None,
 )
@@ -93,6 +94,7 @@ def init_tools(
     trigger_registry=None,
     engagement_registry=None,
     executor_registry=None,
+    runtime=None,                         # NEW — Task C.1
 ) -> None:
     """Initialize module-level references used by tool implementations.
 
@@ -106,10 +108,14 @@ def init_tools(
 
     ``agent_role_map`` is a merged dict of role→AgentConfig covering both
     residents and specialists. If omitted, ``delegate_to_agent`` falls back
-    to resolving against ``specialist_registry`` alone (back-compat)."""
+    to resolving against ``specialist_registry`` alone (back-compat).
+
+    ``runtime`` is the CasaRuntime container. Optional during migration
+    (Task C.1); becomes required once all callsites use it (Task C.4).
+    """
     global _channel_manager, _bus, _specialist_registry, _mcp_registry, \
         _agent_role_map, _agent_registry, _trigger_registry, \
-        _engagement_registry, _executor_registry  # noqa: PLW0603
+        _engagement_registry, _executor_registry, _runtime  # noqa: PLW0603
     _channel_manager = channel_manager
     _bus = bus
     _specialist_registry = specialist_registry
@@ -119,6 +125,7 @@ def init_tools(
     _trigger_registry = trigger_registry
     _engagement_registry = engagement_registry
     _executor_registry = executor_registry
+    _runtime = runtime
 
 
 @tool(
@@ -1254,65 +1261,51 @@ async def config_git_commit(args: dict) -> dict:
 
 @tool(
     "casa_reload",
-    "Restart the Casa addon via Supervisor. Call BEFORE emit_completion. "
-    "The actual addon restart is deferred until after the engagement "
-    "finalizes so the bus message lands first. "
-    "Restricted to the configurator executor role.",
-    {},
+    "In-process reload of Casa runtime state at a given scope. "
+    "Valid scopes: 'agent' (requires role), 'triggers' (requires role), "
+    "'policies', 'plugin_env', 'agents', 'full'. Use 'full' as a "
+    "catch-all when unsure. Does NOT restart the addon - for that, see "
+    "casa_restart_supervised. Restricted to the configurator role.",
+    {"scope": str, "role": str, "include_env": bool},
 )
-async def casa_reload(_: dict) -> dict:
+async def casa_reload(args: dict) -> dict:
     caller = _effective_caller_role()
     if caller not in _PRIVILEGED_CONFIG_ROLES:
         return _refuse_unprivileged("casa_reload", caller)
 
-    # H-1 fix (v0.34.0): when called inside an active engagement,
-    # defer the Supervisor POST until _finalize_engagement runs. The
-    # POST itself returns in <1s but Supervisor's container kill
-    # arrives ~13s later — observed live (exploration3 P4.2 + P4.3 +
-    # P11.1, 2026-05-01) cancelling the SDK subprocess BEFORE
-    # emit_completion / _finalize_engagement could run, leaving the
-    # engagement stuck status=active with no user-DM completion
-    # message. Drain the v0.33.1 G-2 pending-reload obligation
-    # (the model fulfilled the doctrine contract by calling us) and
-    # register a deferred-restart marker for _finalize_engagement to
-    # honor. Return immediately so the model can proceed to
-    # emit_completion without racing the kill.
-    eng = engagement_var.get(None)
-    if eng is not None:
-        _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
-        _ENGAGEMENTS_DEFERRED_HARD_RELOAD.add(eng.id)
+    scope = (args.get("scope") or "").strip()
+    if not scope:
         return _result({
-            "supervisor_status": 200,
-            "deferred": True,
+            "status": "error", "kind": "scope_required",
             "message": (
-                "Hard reload deferred until engagement finalizes. "
-                "Continue with emit_completion."
+                "casa_reload requires a 'scope' argument. Valid: "
+                "'agent', 'triggers', 'policies', 'plugin_env', "
+                "'agents', 'full'. See doctrine/reload.md."
             ),
         })
 
-    # Out-of-engagement path: e.g. operator-driven /invoke or any
-    # other context where there is no _finalize_engagement to wait
-    # for. POST inline as before.
-    import aiohttp
-    token = os.environ.get("SUPERVISOR_TOKEN")
-    if not token:
+    role = (args.get("role") or "").strip() or None
+    include_env = bool(args.get("include_env", False))
+
+    import agent as agent_mod
+    runtime = getattr(agent_mod, "active_runtime", None)
+    if runtime is None:
         return _result({
-            "status": "error",
-            "kind": "no_supervisor_token",
-            "message": "SUPERVISOR_TOKEN not set - cannot restart addon",
+            "status": "error", "kind": "not_initialized",
+            "message": "CasaRuntime not bound - boot ordering bug",
         })
-    headers = {"Authorization": f"Bearer {token}"}
-    url = "http://supervisor/addons/self/restart"
-    try:
-        async with aiohttp.ClientSession(headers=headers) as s:
-            async with s.post(url) as resp:
-                return _result({"supervisor_status": resp.status})
-    except Exception as exc:  # noqa: BLE001
-        return _result({
-            "status": "error",
-            "kind": "supervisor_error",
-            "message": str(exc),
-        })
+
+    from reload import dispatch
+    result = await dispatch(
+        scope, runtime=runtime, role=role, include_env=include_env,
+    )
+
+    # Drain pending-reload guard if engagement-bound.
+    eng = engagement_var.get(None)
+    if eng is not None and result.get("status") == "ok":
+        _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
+
+    return _result(result)
 
 
 async def _post_supervisor_restart() -> dict:
@@ -1340,6 +1333,37 @@ async def _post_supervisor_restart() -> dict:
             "kind": "supervisor_error",
             "message": str(exc),
         }
+
+
+@tool(
+    "casa_restart_supervised",
+    "Full Supervisor-driven addon restart. Use ONLY when changes require "
+    "process-restart semantics (s6 service tree changes, addon "
+    "options.json mutations). For routine config edits, use "
+    "casa_reload(scope=...) instead. Restricted to the configurator role.",
+    {},
+)
+async def casa_restart_supervised(_: dict) -> dict:
+    caller = _effective_caller_role()
+    if caller not in _PRIVILEGED_CONFIG_ROLES:
+        return _refuse_unprivileged("casa_restart_supervised", caller)
+
+    eng = engagement_var.get(None)
+    if eng is not None:
+        # H-1 carry-forward: defer until _finalize_engagement.
+        _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
+        _ENGAGEMENTS_DEFERRED_HARD_RELOAD.add(eng.id)
+        return _result({
+            "supervisor_status": 200,
+            "deferred": True,
+            "message": (
+                "Supervisor restart deferred until engagement finalizes. "
+                "Continue with emit_completion."
+            ),
+        })
+
+    # Out-of-engagement (operator-driven /invoke etc): POST inline.
+    return _result(await _post_supervisor_restart())
 
 
 # ---------------------------------------------------------------------------
@@ -2144,104 +2168,47 @@ async def cancel_engagement(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# casa_reload_triggers - Plan 3 (soft reload for triggers.yaml edits only)
+# casa_reload_triggers - back-compat shim for Plan 3 soft-reload (now via dispatch)
 # ---------------------------------------------------------------------------
 
 
 @tool(
     "casa_reload_triggers",
     "Re-register triggers for one agent in-process (no addon restart). "
-    "Use when ONLY <role>/triggers.yaml changed. For anything else, use casa_reload.",
+    "Use when ONLY <role>/triggers.yaml changed. For other config "
+    "edits, use casa_reload(scope=...).",
     {"role": str},
 )
 async def casa_reload_triggers(args: dict) -> dict:
-    role = args["role"]
-    if _trigger_registry is None:
+    role = args.get("role")
+    if not role:
         return _result({
-            "status": "error",
-            "kind": "not_initialized",
-            "message": "trigger registry not wired",
+            "status": "error", "kind": "role_required",
+            "message": "casa_reload_triggers requires 'role'",
         })
 
-    import agent_loader
-    base = "/addon_configs/casa-agent"
-    agents_dir = os.path.join(base, "agents")
-    agent_dir = None
-    # Look in residents (top-level) and specialists/
-    for candidate in (os.path.join(agents_dir, role),
-                      os.path.join(agents_dir, "specialists", role)):
-        if os.path.isdir(candidate):
-            agent_dir = candidate
-            break
-    if agent_dir is None:
+    import agent as agent_mod
+    runtime = getattr(agent_mod, "active_runtime", None)
+    if runtime is None:
         return _result({
-            "status": "error",
-            "kind": "unknown_role",
-            "message": f"no agent directory found for role={role!r}",
+            "status": "error", "kind": "not_initialized",
+            "message": "CasaRuntime not bound - boot ordering bug",
         })
 
-    # H-3 fix (v0.34.0): residents have ``disclosure.yaml`` and
-    # ``agent_loader._compose_prompt`` raises LoadError when
-    # ``disclosure is not None AND policies is None``. Pre-fix this
-    # tool always passed ``policies=None`` (latent since commit
-    # ``e81f264``, 2026-04-22 — 9 days), so soft reload of triggers
-    # for residents was permanently broken; surfaced 2026-05-01
-    # exploration3 P8.1 only because v0.33.0's G-4 structured
-    # outcome=error logging finally exposed the LoadError text.
-    # Re-load policies fresh from disk on every call (stateless,
-    # no need to thread through init_tools); harmless for specialists
-    # since ``_compose_prompt`` only consults ``policies`` when the
-    # agent has a ``disclosure.yaml``.
-    import policies as policies_module
-    policy_lib_path = os.path.join(base, "policies", "disclosure.yaml")
-    try:
-        policy_lib = await asyncio.to_thread(
-            policies_module.load_policies, policy_lib_path,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _result({
-            "status": "error",
-            "kind": "load_error",
-            "message": (
-                f"could not load PolicyLibrary from "
-                f"{policy_lib_path}: {exc}"
-            ),
-        })
-
-    try:
-        cfg = await asyncio.to_thread(
-            agent_loader.load_agent_from_dir,
-            agent_dir, policies=policy_lib,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _result({
-            "status": "error",
-            "kind": "load_error",
-            "message": str(exc),
-        })
-
-    try:
-        await asyncio.to_thread(
-            _trigger_registry.reregister_for,
-            role, list(cfg.triggers), list(cfg.channels),
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _result({
-            "status": "error",
-            "kind": "reregister_failed",
-            "message": str(exc),
-        })
-
-    # G-2 hotfix (v0.33.1): reload satisfied for this engagement;
-    # drain pending state.
-    eng = engagement_var.get(None)
-    if eng is not None:
-        _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
-    return _result({
-        "status": "ok",
-        "role": role,
-        "registered": [t.name for t in cfg.triggers],
-    })
+    from reload import dispatch
+    result = await dispatch("triggers", runtime=runtime, role=role)
+    if result.get("status") == "ok":
+        result.setdefault("role", role)
+        # Back-compat: emit registered=[trigger_names] from runtime.role_configs / specialists
+        try:
+            cfg = runtime.role_configs.get(role)
+            if cfg is None:
+                cfg = runtime.specialist_registry.all_configs().get(role)
+            if cfg is not None and getattr(cfg, "triggers", None):
+                result["registered"] = [t.name for t in cfg.triggers]
+        except Exception:  # noqa: BLE001 — best-effort surfacing
+            pass
+    return _result(result)
 
 
 # ---------------------------------------------------------------------------
@@ -2901,6 +2868,7 @@ CASA_TOOLS: tuple = (
     query_engager,
     config_git_commit,
     casa_reload,
+    casa_restart_supervised,            # NEW — Task D.2
     casa_reload_triggers,
     list_engagement_workspaces,
     delete_engagement_workspace,
