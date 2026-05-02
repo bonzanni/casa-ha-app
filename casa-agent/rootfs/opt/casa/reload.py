@@ -241,6 +241,19 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("reregister_failed", str(exc)) from exc
 
+    # Q-1 fix (v0.35.2): refresh the runtime cache so back-compat
+    # consumers (tools.casa_reload_triggers emits `registered=[...]`
+    # by reading runtime.role_configs[role].triggers) see the
+    # post-reload state, not the boot-time list. Mirrors the resident
+    # vs specialist branching of reload_agent at lines 339-348.
+    if role in runtime.role_configs:
+        runtime.role_configs[role] = cfg
+    else:
+        try:
+            await asyncio.to_thread(runtime.specialist_registry.load)
+        except Exception as exc:  # noqa: BLE001
+            raise ReloadError("specialist_reload_failed", str(exc)) from exc
+
     # G-2 hotfix carry-forward: drain pending-reload guard if any.
     try:
         from tools import _ENGAGEMENTS_PENDING_RELOAD, engagement_var
