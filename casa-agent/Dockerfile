@@ -85,7 +85,8 @@ COPY rootfs /
 RUN chmod +x /etc/s6-overlay/scripts/*.sh \
     && find /etc/s6-overlay/s6-rc.d -name 'run' -o -name 'finish' \
     | xargs chmod +x \
-    && chmod +x /opt/casa/scripts/*.sh
+    && chmod +x /opt/casa/scripts/*.sh \
+    && chmod +x /usr/local/bin/casactl
 
 # --- Seed-marketplace build (§3.2 + §10.1 + spike §Gate 3) -------------------
 
