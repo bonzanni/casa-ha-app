@@ -101,6 +101,29 @@ def test_tool_schema_passthrough_dict() -> None:
     assert schema["inputSchema"]["properties"]["x"] == {"type": "string"}
 
 
+def test_tool_schema_empty_dict_input() -> None:
+    """O-1 regression: no-arg tools declared with @tool(name, desc, {})
+    must emit `inputSchema = {"type":"object","properties":{}}`.
+    Empty dict is falsy, so prior code short-circuited the dict-of-types
+    branch and passed {} through unchanged; CC v2.1.119 strict-validates
+    and rejects the entire tools/list payload when `inputSchema.type`
+    is missing. Affects casa_reload + marketplace_list_plugins."""
+    from mcp_envelope import _tool_schema
+
+    class _FakeTool:
+        name = "no_arg_tool"
+        description = "Takes no arguments."
+        input_schema = {}
+        handler = None
+
+    schema = _tool_schema(_FakeTool())
+    assert schema == {
+        "name": "no_arg_tool",
+        "description": "Takes no arguments.",
+        "inputSchema": {"type": "object", "properties": {}},
+    }
+
+
 def test_envelope_module_exports_constants() -> None:
     """VERSION + PROTOCOL_VERSION are exported (svc_casa_mcp + the public
     fallback both consume them)."""
