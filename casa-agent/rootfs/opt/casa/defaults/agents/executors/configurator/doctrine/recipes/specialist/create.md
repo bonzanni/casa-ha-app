@@ -63,7 +63,7 @@ Optional: hooks.yaml.
       tag_dialect: square_brackets
     voice_errors: {}
     channels: []
-    cwd: /addon_configs/casa-agent/workspace
+    cwd: ""
 
 **CRITICAL** for specialists: memory.token_budget 0, memory.scopes_owned [], session.strategy ephemeral, channels []. Loader REJECTS specialists violating these.
 
