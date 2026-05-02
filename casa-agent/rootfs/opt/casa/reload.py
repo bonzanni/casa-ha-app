@@ -381,3 +381,92 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
 
 
 register_handler("agent", reload_agent)
+
+
+async def _reload_role_after_policies(runtime: Any, role: str) -> None:
+    """Re-load one role's AgentConfig + Agent with the new policy_lib.
+
+    Used by reload_policies — does the agent-scope work without holding
+    the agent-scope lock (caller already holds the policies lock; agent
+    re-loads here are sequential).
+    """
+    # Determine tier
+    base = runtime.config_dir
+    agents_dir = runtime.agents_dir
+    resident_dir = os.path.join(agents_dir, role)
+    specialist_dir = os.path.join(agents_dir, "specialists", role)
+    if os.path.isdir(resident_dir):
+        agent_dir = resident_dir
+        tier = "resident"
+    elif os.path.isdir(specialist_dir):
+        agent_dir = specialist_dir
+        tier = "specialist"
+    else:
+        return  # role disappeared between scan and re-load — silently skip
+
+    import agent_loader
+    new_cfg = await asyncio.to_thread(
+        agent_loader.load_agent_from_dir,
+        agent_dir, policies=runtime.policy_lib,
+    )
+    new_agent = await asyncio.to_thread(
+        _construct_agent, cfg=new_cfg, runtime=runtime,
+    )
+    if tier == "resident":
+        runtime.role_configs[role] = new_cfg
+    runtime.agents[role] = new_agent
+    runtime.bus.register(role, new_agent.handle_message)
+
+
+async def reload_policies(runtime: Any, *, role: str | None = None) -> list[str]:
+    """Reload policies/disclosure.yaml + policies/scopes.yaml; cascade
+    to per-role AgentConfig rebuild so agents pick up the new policy_lib.
+    """
+    base = runtime.config_dir
+    actions: list[str] = []
+
+    import policies as policies_module
+    policy_lib_path = os.path.join(base, "policies", "disclosure.yaml")
+    try:
+        new_policy_lib = await asyncio.to_thread(
+            policies_module.load_policies, policy_lib_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ReloadError("load_error", f"policies: {exc}") from exc
+
+    import scope_registry as sr_mod
+    scopes_path = os.path.join(base, "policies", "scopes.yaml")
+    try:
+        new_scope_lib = await asyncio.to_thread(
+            sr_mod.load_scope_library, scopes_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ReloadError("load_error", f"scopes: {exc}") from exc
+
+    threshold = float(os.environ.get("CASA_SCOPE_THRESHOLD", "0.35"))
+    new_scope_registry = sr_mod.ScopeRegistry(new_scope_lib, threshold=threshold)
+    try:
+        await new_scope_registry.prepare()
+    except Exception as exc:  # noqa: BLE001
+        raise ReloadError("embed_error", f"scope embedding: {exc}") from exc
+
+    # Stage swaps in locals; commit to runtime atomically.
+    runtime.policy_lib = new_policy_lib
+    runtime.scope_registry = new_scope_registry
+    actions += ["reload_policy_lib", "rebuild_scope_registry"]
+
+    # Cascade: re-load each role's Agent so new policy_lib propagates.
+    role_list = list(runtime.role_configs.keys()) + list(
+        runtime.specialist_registry.all_configs().keys()
+    )
+    for r in role_list:
+        try:
+            await _reload_role_after_policies(runtime, r)
+        except Exception as exc:  # noqa: BLE001 — one role's failure shouldn't kill the rest
+            logger.warning("policies cascade: role=%s failed: %s", r, exc)
+    actions.append(f"cascaded_to_{len(role_list)}_roles")
+
+    return actions
+
+
+register_handler("policies", reload_policies)

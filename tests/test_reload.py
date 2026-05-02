@@ -216,3 +216,46 @@ class TestReloadAgent:
         assert result["kind"] == "load_error"
         # Old agent still in place.
         assert runtime.agents["ellen"] is old_agent
+
+
+class TestReloadPolicies:
+    async def test_rebuilds_scope_registry_and_swaps_agents(
+        self, tmp_path, monkeypatch,
+    ):
+        from reload import dispatch, register_handler, reload_policies
+        from types import SimpleNamespace
+        register_handler("policies", reload_policies)
+
+        # Stub the scope_registry rebuild path.
+        new_scope_lib = MagicMock()
+        new_scope_registry = MagicMock()
+        new_scope_registry.prepare = MagicMock(return_value=asyncio.sleep(0))
+        new_scope_registry._degraded = False
+
+        new_policy_lib = MagicMock()
+
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: new_policy_lib)
+        monkeypatch.setattr("scope_registry.load_scope_library",
+                            lambda *a, **kw: new_scope_lib)
+        monkeypatch.setattr("scope_registry.ScopeRegistry",
+                            lambda *a, **kw: new_scope_registry)
+        # No-op for per-role re-load
+        async def fake_dispatch(scope, *, runtime, role=None, **kw):
+            return {"status": "ok", "actions": []}
+        # Patch _reload_role_after_policies (helper) to avoid real load.
+        import reload as reload_mod
+        called_roles: list[str] = []
+        async def fake_reload_role(runtime, role):
+            called_roles.append(role)
+        monkeypatch.setattr(reload_mod, "_reload_role_after_policies", fake_reload_role)
+
+        runtime = _make_runtime()
+        runtime.role_configs = {"ellen": MagicMock(), "tina": MagicMock()}
+        runtime.specialist_registry.all_configs = lambda: {}
+
+        result = await dispatch("policies", runtime=runtime)
+        assert result["status"] == "ok"
+        assert runtime.policy_lib is new_policy_lib
+        assert runtime.scope_registry is new_scope_registry
+        assert sorted(called_roles) == ["ellen", "tina"]
