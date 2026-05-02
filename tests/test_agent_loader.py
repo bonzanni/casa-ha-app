@@ -190,6 +190,60 @@ class TestStrictMode:
         cfg = load_agent_from_dir(str(agent_dir), policies=policies)
         assert cfg.role == "assistant"
 
+    @pytest.mark.parametrize(
+        "backup_name",
+        [
+            "character.yaml.bak",
+            "runtime.yaml.swp",
+            "voice.yaml.tmp",
+            "response_shape.yaml.orig",
+            "runtime.yaml~",
+        ],
+    )
+    def test_editor_backups_skipped(self, tmp_path, backup_name):
+        """S-1 regression: sed -i.bak / vim .swp / *~ MUST NOT trip
+        strict-mode. The agent on disk is still valid; the editor
+        artifact is process state, not configuration."""
+        from agent_loader import load_agent_from_dir
+        from policies import load_policies
+
+        agent_dir = _seed_resident(tmp_path / "agents", "assistant")
+        _w(agent_dir / backup_name, "ignored editor artifact")
+        policies = load_policies(str(_policies_file(tmp_path / "policies")))
+
+        cfg = load_agent_from_dir(str(agent_dir), policies=policies)
+        assert cfg.role == "assistant"
+
+    def test_genuine_unknown_file_still_raises(self, tmp_path):
+        """S-1 negative: real unknown files (no backup suffix) MUST
+        still raise. The whitelist must not be a wildcard."""
+        from agent_loader import load_agent_from_dir, LoadError
+        from policies import load_policies
+
+        agent_dir = _seed_resident(tmp_path / "agents", "assistant")
+        _w(agent_dir / "extra.yaml", "schema_version: 1\n")
+        policies = load_policies(str(_policies_file(tmp_path / "policies")))
+
+        with pytest.raises(LoadError, match="extra.yaml"):
+            load_agent_from_dir(str(agent_dir), policies=policies)
+
+    def test_unknown_file_diagnostic_mentions_recovery(self, tmp_path):
+        """S-1 UX: diagnostic message MUST point operators at the
+        recovery path (mention editor-backup whitelist + git restore)."""
+        from agent_loader import load_agent_from_dir, LoadError
+        from policies import load_policies
+
+        agent_dir = _seed_resident(tmp_path / "agents", "assistant")
+        _w(agent_dir / "extra.yaml", "schema_version: 1\n")
+        policies = load_policies(str(_policies_file(tmp_path / "policies")))
+
+        with pytest.raises(LoadError) as exc_info:
+            load_agent_from_dir(str(agent_dir), policies=policies)
+
+        msg = str(exc_info.value)
+        assert ".bak" in msg, f"diagnostic should mention editor backups: {msg!r}"
+        assert "git" in msg.lower(), f"diagnostic should mention git restore: {msg!r}"
+
     def test_wrong_schema_version_raises(self, tmp_path):
         from agent_loader import load_agent_from_dir, LoadError
         from policies import load_policies

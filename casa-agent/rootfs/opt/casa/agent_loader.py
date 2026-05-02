@@ -63,6 +63,20 @@ TIER_FILES["executor"] = {
                   "response_shape.yaml", "voice.yaml", "triggers.yaml"},
 }
 
+# S-1 fix (v0.35.2): editor backup artifacts that strict-load tolerates.
+# Covers sed -i.bak (.bak), vim swap files (.swp), atomic rename temp
+# files (.tmp), and "*~" originals from various editors. The agent dir's
+# "real" config is still in the un-suffixed files; the backups are
+# process state from in-progress edits or unclean shutdowns and must
+# not break casactl reload.
+_EDITOR_BACKUP_SUFFIXES = (".bak", ".swp", ".tmp", ".orig")
+
+
+def _is_editor_backup(name: str) -> bool:
+    """Return True for editor-process artifacts that strict-load skips."""
+    return name.endswith(_EDITOR_BACKUP_SUFFIXES) or name.endswith("~")
+
+
 _DELEGATE_MCP_TOOL = "mcp__casa-framework__delegate_to_agent"
 
 
@@ -192,6 +206,8 @@ def _check_file_set(agent_dir: str, tier: str, role: str) -> None:
     for entry in os.listdir(agent_dir):
         if entry.startswith("."):
             continue  # dotfiles skipped per spec
+        if _is_editor_backup(entry):
+            continue  # S-1: editor backups (.bak/.swp/.tmp/.orig/~)
         if os.path.isdir(os.path.join(agent_dir, entry)):
             continue  # subdirectories are not config files (e.g. prompts/)
         on_disk.add(entry)
@@ -215,7 +231,9 @@ def _check_file_set(agent_dir: str, tier: str, role: str) -> None:
     if unknown:
         raise LoadError(
             f"agent {role!r} ({tier}): unknown file(s) in directory: "
-            f"{sorted(unknown)}",
+            f"{sorted(unknown)}. Hint: editor backups "
+            f"(.bak/.swp/.tmp/.orig/~) are tolerated; remove other "
+            f"unknown files or restore the directory from git.",
         )
 
 
