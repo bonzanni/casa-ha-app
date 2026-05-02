@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.35.1] - 2026-05-02 — Hotfix: bus.register idempotent on queue
+
+### Fixed
+- **HIGH: post-`scope=agent` reload broke turn dispatch.** v0.35.0
+  live verify on N150 hung every `/invoke/assistant` turn until 504
+  after `casactl reload --scope=agent --role=...`.  Root cause:
+  `MessageBus.register()` always replaced `self.queues[name]` with a
+  fresh `asyncio.PriorityQueue`. The reload handler called
+  `bus.register` to rebind the per-role handler — which orphaned the
+  running `run_agent_loop` task on the old queue while every new
+  `bus.send()` landed on the new queue. The existing dispatch loop
+  already supports handler rebinding via `bus.handlers[name]`
+  (intentional, per the in-source comment); the queue replacement was
+  always wrong for that case.  Fix: `register()` is now idempotent on
+  queue creation. Adds `TestRegisterIdempotent` regression coverage in
+  `tests/test_bus.py`. Latent in v0.35.0 (2 hours).
+
 ## [0.35.0] - 2026-05-02 — Granular in-process reload
 
 ### Added

@@ -61,8 +61,16 @@ class MessageBus:
         self._seq: int = 0
 
     def register(self, name: str, handler: Handler | None = None) -> None:
-        """Register an agent (queue + optional handler)."""
-        self.queues[name] = asyncio.PriorityQueue()
+        """Register an agent (queue + optional handler).
+
+        Idempotent on the queue: re-registering an existing name only
+        rebinds the handler, preserving the queue so a running
+        ``run_agent_loop`` task continues to consume from it. This is
+        the contract granular reload (v0.35.0+) relies on — replacing
+        the queue would orphan the dispatch loop and hang every turn.
+        """
+        if name not in self.queues:
+            self.queues[name] = asyncio.PriorityQueue()
         self.handlers[name] = handler
 
     async def send(self, msg: BusMessage) -> None:

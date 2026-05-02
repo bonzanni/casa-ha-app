@@ -377,3 +377,71 @@ class TestDispatchCid:
             for t in (loop, obs):
                 with pytest.raises(asyncio.CancelledError):
                     await t
+
+
+class TestRegisterIdempotent:
+    """Granular reload (v0.35.1) — re-registering an existing role must
+    rebind the handler WITHOUT replacing the queue. Replacing the queue
+    orphans the running ``run_agent_loop`` task on the old queue while
+    new ``send()`` calls land on the new queue, hanging every turn.
+
+    Bug surfaced in v0.35.0 live verify (2026-05-02): after
+    ``casactl reload --scope=agent --role=assistant``,
+    ``POST /invoke/assistant`` hung until 504 because the dispatch loop
+    was reading from a queue no producer wrote to anymore.
+    """
+
+    async def test_reregister_preserves_queue_and_rebinds_handler(self):
+        bus = MessageBus()
+        first_calls: list[str] = []
+        second_calls: list[str] = []
+
+        async def first(msg):
+            first_calls.append(msg.content)
+
+        async def second(msg):
+            second_calls.append(msg.content)
+
+        bus.register("b", first)
+        original_queue = bus.queues["b"]
+
+        bus.register("b", second)
+        # Queue identity preserved → existing run_agent_loop tasks see
+        # subsequent sends.
+        assert bus.queues["b"] is original_queue
+        # Handler rebound → next dispatch hits the new function.
+        assert bus.handlers["b"] is second
+
+    async def test_reregister_does_not_orphan_dispatch_loop(self):
+        """End-to-end: queue/loop survives a re-register and the new
+        handler receives messages sent after the rebind."""
+        bus = MessageBus()
+        old_calls: list[str] = []
+        new_calls: list[str] = []
+
+        async def old(msg):
+            old_calls.append(msg.content)
+
+        async def new(msg):
+            new_calls.append(msg.content)
+
+        bus.register("b", old)
+        loop_task = asyncio.create_task(bus.run_agent_loop("b"))
+        try:
+            await bus.send(_msg(content="pre-rebind"))
+            await asyncio.sleep(0.05)
+            assert old_calls == ["pre-rebind"]
+
+            # Simulate reload_agent's atomic-swap step.
+            bus.register("b", new)
+            await bus.send(_msg(content="post-rebind"))
+            await asyncio.sleep(0.05)
+
+            # Old handler stayed at one call; new one received the
+            # second message via the same queue.
+            assert old_calls == ["pre-rebind"]
+            assert new_calls == ["post-rebind"]
+        finally:
+            loop_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await loop_task
