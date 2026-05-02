@@ -77,6 +77,7 @@ _trigger_registry: "TriggerRegistry | None" = None
 _engagement_registry: EngagementRegistry | None = None
 _executor_registry: "ExecutorRegistry | None" = None
 _agent_registry = None  # AgentRegistry | None
+_runtime = None  # CasaRuntime | None — set by init_tools(runtime=...)
 engagement_var: ContextVar[EngagementRecord | None] = ContextVar(
     "engagement_var", default=None,
 )
@@ -93,6 +94,7 @@ def init_tools(
     trigger_registry=None,
     engagement_registry=None,
     executor_registry=None,
+    runtime=None,                         # NEW — Task C.1
 ) -> None:
     """Initialize module-level references used by tool implementations.
 
@@ -106,10 +108,14 @@ def init_tools(
 
     ``agent_role_map`` is a merged dict of role→AgentConfig covering both
     residents and specialists. If omitted, ``delegate_to_agent`` falls back
-    to resolving against ``specialist_registry`` alone (back-compat)."""
+    to resolving against ``specialist_registry`` alone (back-compat).
+
+    ``runtime`` is the CasaRuntime container. Optional during migration
+    (Task C.1); becomes required once all callsites use it (Task C.4).
+    """
     global _channel_manager, _bus, _specialist_registry, _mcp_registry, \
         _agent_role_map, _agent_registry, _trigger_registry, \
-        _engagement_registry, _executor_registry  # noqa: PLW0603
+        _engagement_registry, _executor_registry, _runtime  # noqa: PLW0603
     _channel_manager = channel_manager
     _bus = bus
     _specialist_registry = specialist_registry
@@ -119,6 +125,7 @@ def init_tools(
     _trigger_registry = trigger_registry
     _engagement_registry = engagement_registry
     _executor_registry = executor_registry
+    _runtime = runtime
 
 
 @tool(
