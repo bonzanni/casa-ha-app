@@ -19,6 +19,7 @@ tools:
     - mcp__casa-framework__config_git_commit
     - mcp__casa-framework__casa_reload
     - mcp__casa-framework__casa_reload_triggers
+    - mcp__casa-framework__casa_restart_supervised
     - mcp__casa-framework__query_engager
     - mcp__casa-framework__emit_completion
     # Plugin lifecycle (Plan 4b §7) — see doctrine/recipes/plugin/.
