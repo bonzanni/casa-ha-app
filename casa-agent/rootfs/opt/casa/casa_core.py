@@ -905,6 +905,31 @@ async def main() -> None:
     agent_registry = AgentRegistry.build(
         residents=role_configs, specialists=specialist_configs,
     )
+    # Task C.2: build the CasaRuntime container.
+    from runtime import CasaRuntime
+    runtime = CasaRuntime(
+        agents={},                            # populated below at line ~984
+        role_configs=role_configs,
+        specialist_registry=specialist_registry,
+        executor_registry=executor_registry,
+        engagement_registry=engagement_registry,
+        agent_registry=agent_registry,
+        trigger_registry=trigger_registry,
+        mcp_registry=mcp_registry,
+        scope_registry=None,                  # set after step 3.2 ScopeRegistry build
+        session_registry=session_registry,
+        channel_manager=channel_manager,
+        bus=bus,
+        engagement_driver=None,               # set after step 10 InCasaDriver build
+        claude_code_driver=None,              # set after step 10b ClaudeCodeDriver build
+        memory_provider=base_memory,
+        policy_lib=policy_lib,
+        base_memory=base_memory,
+        config_dir=CONFIG_DIR,
+        agents_dir=agents_dir,
+        home_root="/addon_configs/casa-agent/agent-home",
+        defaults_root="/opt/casa",
+    )
     init_tools(
         channel_manager, bus, specialist_registry, mcp_registry,
         agent_role_map=_build_role_registry(
@@ -914,6 +939,7 @@ async def main() -> None:
         trigger_registry=trigger_registry,
         engagement_registry=engagement_registry,
         executor_registry=executor_registry,
+        runtime=runtime,
     )
     casa_tools_config = create_casa_tools()
     mcp_registry.register_sdk("casa-framework", casa_tools_config)
@@ -940,6 +966,7 @@ async def main() -> None:
     scope_threshold = float(os.environ.get("CASA_SCOPE_THRESHOLD", "0.35"))
     scope_registry = ScopeRegistry(scope_lib, threshold=scope_threshold)
     await scope_registry.prepare()
+    runtime.scope_registry = scope_registry
     if scope_registry._degraded:
         logger.warning(
             "ScopeRegistry running in DEGRADED mode — fan-out to all readable scopes"
@@ -989,6 +1016,8 @@ async def main() -> None:
             cfg.model,
             cfg.memory.read_strategy,
         )
+
+    runtime.agents = agents  # share the dict reference; reload handlers mutate this directly.
 
     assistant_role = "assistant"
 
@@ -1106,6 +1135,7 @@ async def main() -> None:
     agent_mod.active_engagement_driver = engagement_driver
     agent_mod.active_memory_provider = base_memory    # already constructed above
     agent_mod.active_executor_registry = executor_registry
+    runtime.engagement_driver = engagement_driver
 
     # Plan 4a: claude_code driver. Shares send_to_topic with in_casa.
     from drivers.claude_code_driver import ClaudeCodeDriver
@@ -1136,6 +1166,9 @@ async def main() -> None:
         ))
     claude_code_driver._publish_bus_event = _publish_driver_bus_event
     agent_mod.active_claude_code_driver = claude_code_driver
+    runtime.claude_code_driver = claude_code_driver
+    # Stash runtime on agent module so reload handlers and tools find it.
+    agent_mod.active_runtime = runtime
 
     # Plan 4a: boot replay for claude_code engagements.
     try:
