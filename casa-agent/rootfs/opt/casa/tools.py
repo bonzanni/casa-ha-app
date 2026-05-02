@@ -2168,104 +2168,47 @@ async def cancel_engagement(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# casa_reload_triggers - Plan 3 (soft reload for triggers.yaml edits only)
+# casa_reload_triggers - back-compat shim for Plan 3 soft-reload (now via dispatch)
 # ---------------------------------------------------------------------------
 
 
 @tool(
     "casa_reload_triggers",
     "Re-register triggers for one agent in-process (no addon restart). "
-    "Use when ONLY <role>/triggers.yaml changed. For anything else, use casa_reload.",
+    "Use when ONLY <role>/triggers.yaml changed. For other config "
+    "edits, use casa_reload(scope=...).",
     {"role": str},
 )
 async def casa_reload_triggers(args: dict) -> dict:
-    role = args["role"]
-    if _trigger_registry is None:
+    role = args.get("role")
+    if not role:
         return _result({
-            "status": "error",
-            "kind": "not_initialized",
-            "message": "trigger registry not wired",
+            "status": "error", "kind": "role_required",
+            "message": "casa_reload_triggers requires 'role'",
         })
 
-    import agent_loader
-    base = "/addon_configs/casa-agent"
-    agents_dir = os.path.join(base, "agents")
-    agent_dir = None
-    # Look in residents (top-level) and specialists/
-    for candidate in (os.path.join(agents_dir, role),
-                      os.path.join(agents_dir, "specialists", role)):
-        if os.path.isdir(candidate):
-            agent_dir = candidate
-            break
-    if agent_dir is None:
+    import agent as agent_mod
+    runtime = getattr(agent_mod, "active_runtime", None)
+    if runtime is None:
         return _result({
-            "status": "error",
-            "kind": "unknown_role",
-            "message": f"no agent directory found for role={role!r}",
+            "status": "error", "kind": "not_initialized",
+            "message": "CasaRuntime not bound - boot ordering bug",
         })
 
-    # H-3 fix (v0.34.0): residents have ``disclosure.yaml`` and
-    # ``agent_loader._compose_prompt`` raises LoadError when
-    # ``disclosure is not None AND policies is None``. Pre-fix this
-    # tool always passed ``policies=None`` (latent since commit
-    # ``e81f264``, 2026-04-22 — 9 days), so soft reload of triggers
-    # for residents was permanently broken; surfaced 2026-05-01
-    # exploration3 P8.1 only because v0.33.0's G-4 structured
-    # outcome=error logging finally exposed the LoadError text.
-    # Re-load policies fresh from disk on every call (stateless,
-    # no need to thread through init_tools); harmless for specialists
-    # since ``_compose_prompt`` only consults ``policies`` when the
-    # agent has a ``disclosure.yaml``.
-    import policies as policies_module
-    policy_lib_path = os.path.join(base, "policies", "disclosure.yaml")
-    try:
-        policy_lib = await asyncio.to_thread(
-            policies_module.load_policies, policy_lib_path,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _result({
-            "status": "error",
-            "kind": "load_error",
-            "message": (
-                f"could not load PolicyLibrary from "
-                f"{policy_lib_path}: {exc}"
-            ),
-        })
-
-    try:
-        cfg = await asyncio.to_thread(
-            agent_loader.load_agent_from_dir,
-            agent_dir, policies=policy_lib,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _result({
-            "status": "error",
-            "kind": "load_error",
-            "message": str(exc),
-        })
-
-    try:
-        await asyncio.to_thread(
-            _trigger_registry.reregister_for,
-            role, list(cfg.triggers), list(cfg.channels),
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _result({
-            "status": "error",
-            "kind": "reregister_failed",
-            "message": str(exc),
-        })
-
-    # G-2 hotfix (v0.33.1): reload satisfied for this engagement;
-    # drain pending state.
-    eng = engagement_var.get(None)
-    if eng is not None:
-        _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
-    return _result({
-        "status": "ok",
-        "role": role,
-        "registered": [t.name for t in cfg.triggers],
-    })
+    from reload import dispatch
+    result = await dispatch("triggers", runtime=runtime, role=role)
+    if result.get("status") == "ok":
+        result.setdefault("role", role)
+        # Back-compat: emit registered=[trigger_names] from runtime.role_configs / specialists
+        try:
+            cfg = runtime.role_configs.get(role)
+            if cfg is None:
+                cfg = runtime.specialist_registry.all_configs().get(role)
+            if cfg is not None and getattr(cfg, "triggers", None):
+                result["registered"] = [t.name for t in cfg.triggers]
+        except Exception:  # noqa: BLE001 — best-effort surfacing
+            pass
+    return _result(result)
 
 
 # ---------------------------------------------------------------------------
