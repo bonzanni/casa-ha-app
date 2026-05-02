@@ -61,12 +61,15 @@ async def start_internal_unix_runner(
     tool_dispatch: dict,
     engagement_registry,
     hook_policies: dict,
+    runtime=None,
 ) -> "web.AppRunner":
     """Build and start a second aiohttp AppRunner bound to a Unix socket.
 
     Routes:
       POST /internal/tools/call    -> _make_internal_tools_call_handler(...)
       POST /internal/hooks/resolve -> _make_internal_hooks_resolve_handler(...)
+      POST /admin/reload           -> build_admin_reload_handler(...)
+        (Task E.1 -- casactl operator CLI dispatch)
 
     Returns the AppRunner so the caller can `await runner.cleanup()` on
     shutdown. We register an `on_cleanup` hook on the internal app that
@@ -93,6 +96,7 @@ async def start_internal_unix_runner(
     from internal_handlers import (
         _make_internal_tools_call_handler,
         _make_internal_hooks_resolve_handler,
+        build_admin_reload_handler,
     )
 
     internal_app = web.Application()
@@ -106,6 +110,12 @@ async def start_internal_unix_runner(
     internal_app.router.add_post(
         "/internal/hooks/resolve",
         _make_internal_hooks_resolve_handler(hook_policies=hook_policies),
+    )
+    # Task E.1 (granular-reload plan): casactl operator CLI POSTs here
+    # over the unix socket. Same dispatch path as the casa_reload MCP tool.
+    internal_app.router.add_post(
+        "/admin/reload",
+        build_admin_reload_handler(runtime=runtime),
     )
 
     async def _unlink_socket_on_cleanup(_app: web.Application) -> None:
@@ -1498,6 +1508,7 @@ async def main() -> None:
         tool_dispatch=_internal_tool_dispatch,
         engagement_registry=engagement_registry,
         hook_policies=_internal_hook_policies,
+        runtime=runtime,
     )
     # Track for shutdown.
     runners: list[web.AppRunner] = [runner, internal_runner]

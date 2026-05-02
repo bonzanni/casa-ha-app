@@ -189,3 +189,75 @@ def _make_internal_hooks_resolve_handler(
         return web.json_response(result)
 
     return handler
+
+
+# ---------------------------------------------------------------------------
+# /admin/reload handler factory (Task E.1, granular-reload plan)
+# ---------------------------------------------------------------------------
+
+
+def build_admin_reload_handler(*, runtime):
+    """Factory -- returns an aiohttp handler that dispatches reload calls.
+
+    Used by the internal-socket aiohttp app (registered in
+    ``casa_core.start_internal_unix_runner``). Operator CLI ``casactl``
+    POSTs to ``/admin/reload`` over the unix socket; same dispatch path
+    as the ``casa_reload(scope=...)`` MCP tool.
+
+    If ``runtime`` is None at registration time, the handler falls back
+    to ``agent.active_runtime`` at request time. This handles the case
+    where the route is registered before ``casa_core.main`` has bound
+    ``active_runtime`` (boot ordering).
+
+    ``reload.dispatch`` is looked up per-request (not at factory time)
+    so tests can monkeypatch ``reload.dispatch`` after the route has
+    been registered.
+    """
+    async def handler(request: web.Request) -> web.Response:
+        import reload as reload_mod
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response(
+                {"status": "error", "kind": "bad_json",
+                 "message": "POST body must be JSON"},
+                status=400,
+            )
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {"status": "error", "kind": "bad_json",
+                 "message": "POST body must be a JSON object"},
+                status=400,
+            )
+
+        scope = (payload.get("scope") or "").strip()
+        if not scope:
+            return web.json_response(
+                {"status": "error", "kind": "scope_required",
+                 "message": "missing 'scope' field"},
+                status=400,
+            )
+        role_raw = payload.get("role")
+        role = role_raw.strip() if isinstance(role_raw, str) else None
+        if role == "":
+            role = None
+        include_env = bool(payload.get("include_env", False))
+
+        active = runtime
+        if active is None:
+            import agent as agent_mod
+            active = getattr(agent_mod, "active_runtime", None)
+        if active is None:
+            return web.json_response(
+                {"status": "error", "kind": "not_initialized",
+                 "message": "CasaRuntime not bound"},
+                status=500,
+            )
+
+        result = await reload_mod.dispatch(
+            scope, runtime=active, role=role, include_env=include_env,
+        )
+        status_code = 200 if result.get("status") == "ok" else 500
+        return web.json_response(result, status=status_code)
+
+    return handler
