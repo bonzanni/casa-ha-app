@@ -1,0 +1,89 @@
+"""Tests for reload.py dispatcher + per-scope handlers."""
+from __future__ import annotations
+
+import asyncio
+import json
+from unittest.mock import MagicMock
+
+import pytest
+
+pytestmark = pytest.mark.asyncio
+
+
+def _make_runtime():
+    from runtime import CasaRuntime
+    return CasaRuntime(
+        agents={}, role_configs={}, specialist_registry=MagicMock(),
+        executor_registry=MagicMock(), engagement_registry=MagicMock(),
+        agent_registry=MagicMock(), trigger_registry=MagicMock(),
+        mcp_registry=MagicMock(), scope_registry=MagicMock(),
+        session_registry=MagicMock(), channel_manager=MagicMock(),
+        bus=MagicMock(), engagement_driver=MagicMock(),
+        claude_code_driver=MagicMock(), memory_provider=MagicMock(),
+        policy_lib=MagicMock(), base_memory=MagicMock(),
+        config_dir="/x", agents_dir="/x/agents",
+        home_root="/x/home", defaults_root="/opt/casa",
+    )
+
+
+class TestDispatchUnknownScope:
+    async def test_returns_error_envelope(self):
+        from reload import dispatch
+        runtime = _make_runtime()
+        result = await dispatch("nope", runtime=runtime)
+        assert result["status"] == "error"
+        assert result["kind"] == "unknown_scope"
+        assert "nope" in result["message"]
+
+    async def test_includes_scope_and_ms(self):
+        from reload import dispatch
+        runtime = _make_runtime()
+        result = await dispatch("nope", runtime=runtime)
+        assert result["scope"] == "nope"
+        assert "ms" in result and result["ms"] >= 0
+
+
+class TestReloadError:
+    async def test_reload_error_caught_and_converted(self, monkeypatch):
+        # Inject a fake handler that raises ReloadError; dispatch must
+        # convert to result envelope.
+        from reload import ReloadError, dispatch
+        import reload as reload_mod
+
+        async def boom(runtime, role=None):
+            raise ReloadError("synthetic", "deliberate failure")
+
+        monkeypatch.setitem(reload_mod._HANDLERS, "synthetic_scope", boom)
+        runtime = _make_runtime()
+        result = await dispatch("synthetic_scope", runtime=runtime)
+        assert result["status"] == "error"
+        assert result["kind"] == "synthetic"
+        assert result["message"] == "deliberate failure"
+
+
+class TestLockSerialization:
+    async def test_same_scope_serializes(self, monkeypatch):
+        # Two concurrent dispatches for the same scope must run sequentially.
+        from reload import dispatch
+        import reload as reload_mod
+
+        ordering: list[str] = []
+
+        async def slow_handler(runtime, role=None):
+            ordering.append(f"start:{role}")
+            await asyncio.sleep(0.05)
+            ordering.append(f"end:{role}")
+            return ["did_work"]
+
+        monkeypatch.setitem(reload_mod._HANDLERS, "test_scope", slow_handler)
+        # Both calls share the role-less lock-key for test_scope.
+        runtime = _make_runtime()
+        await asyncio.gather(
+            dispatch("test_scope", runtime=runtime, role="a"),
+            dispatch("test_scope", runtime=runtime, role="b"),
+        )
+        # No interleaving possible if locks work — second start AFTER first end.
+        assert ordering[0].startswith("start:")
+        assert ordering[1].startswith("end:")
+        assert ordering[2].startswith("start:")
+        assert ordering[3].startswith("end:")
