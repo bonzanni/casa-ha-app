@@ -470,3 +470,48 @@ async def reload_policies(runtime: Any, *, role: str | None = None) -> list[str]
 
 
 register_handler("policies", reload_policies)
+
+
+# Snapshot of last-applied plugin-env keys, used to detect deletions.
+_PLUGIN_ENV_LAST_KEYS: set[str] = set()
+
+
+async def reload_plugin_env(runtime: Any, *, role: str | None = None) -> list[str]:
+    """Re-source plugin-env.conf into os.environ.
+
+    Resolves op:// references via secrets_resolver. Computes the diff
+    against the last-applied key set and pops any that are now absent.
+    """
+    global _PLUGIN_ENV_LAST_KEYS
+    import plugin_env_conf
+    from secrets_resolver import resolve as resolve_secret
+
+    try:
+        entries = await asyncio.to_thread(plugin_env_conf.read_entries)
+    except Exception as exc:  # noqa: BLE001
+        raise ReloadError("read_error", f"plugin-env.conf: {exc}") from exc
+
+    new_keys: set[str] = set(entries.keys())
+    actions: list[str] = []
+
+    for var, raw in entries.items():
+        try:
+            resolved = await asyncio.to_thread(resolve_secret, raw)
+        except RuntimeError as exc:
+            logger.warning("plugin-env: %s op:// resolution failed: %s", var, exc)
+            resolved = raw  # fall through with literal — same as boot path
+        os.environ[var] = resolved
+    actions.append(f"set_{len(entries)}_vars")
+
+    # Drop keys present last time but absent now.
+    dropped = _PLUGIN_ENV_LAST_KEYS - new_keys
+    for var in dropped:
+        os.environ.pop(var, None)
+    if dropped:
+        actions.append(f"dropped_{len(dropped)}_vars")
+
+    _PLUGIN_ENV_LAST_KEYS = new_keys
+    return actions
+
+
+register_handler("plugin_env", reload_plugin_env)

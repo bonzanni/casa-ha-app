@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -259,3 +260,42 @@ class TestReloadPolicies:
         assert runtime.policy_lib is new_policy_lib
         assert runtime.scope_registry is new_scope_registry
         assert sorted(called_roles) == ["ellen", "tina"]
+
+
+class TestReloadPluginEnv:
+    async def test_resolves_and_pushes_to_environ(self, monkeypatch):
+        from reload import dispatch, register_handler, reload_plugin_env
+        register_handler("plugin_env", reload_plugin_env)
+
+        monkeypatch.setattr("plugin_env_conf.read_entries",
+                            lambda: {"FOO": "bar", "BAZ": "op://x"})
+        monkeypatch.setattr("secrets_resolver.resolve",
+                            lambda v: "RESOLVED" if "op://" in v else v)
+        monkeypatch.delenv("FOO", raising=False)
+        monkeypatch.delenv("BAZ", raising=False)
+
+        runtime = _make_runtime()
+        result = await dispatch("plugin_env", runtime=runtime)
+        assert result["status"] == "ok"
+        assert os.environ["FOO"] == "bar"
+        assert os.environ["BAZ"] == "RESOLVED"
+
+    async def test_removes_dropped_keys(self, monkeypatch):
+        from reload import dispatch, register_handler, reload_plugin_env
+        register_handler("plugin_env", reload_plugin_env)
+
+        # First call: FOO + BAR present; remember snapshot.
+        monkeypatch.setattr("plugin_env_conf.read_entries",
+                            lambda: {"FOO": "1", "BAR": "2"})
+        monkeypatch.setattr("secrets_resolver.resolve", lambda v: v)
+        runtime = _make_runtime()
+        await dispatch("plugin_env", runtime=runtime)
+        assert os.environ.get("FOO") == "1"
+        assert os.environ.get("BAR") == "2"
+
+        # Second call: FOO only — BAR must be popped.
+        monkeypatch.setattr("plugin_env_conf.read_entries",
+                            lambda: {"FOO": "1"})
+        await dispatch("plugin_env", runtime=runtime)
+        assert os.environ.get("FOO") == "1"
+        assert "BAR" not in os.environ
