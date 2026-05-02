@@ -1,5 +1,93 @@
 # Changelog
 
+## [0.34.3] - 2026-05-02 — Hotfix: O-1 + O-3 (P12 plugin lifecycle unblock)
+
+Hotfix for two HIGH bugs surfaced by the 2026-05-02 P12 full plugin
+lifecycle exploration session against v0.34.2 (`docs/bug-review-2026-05-02-p12-fulllifecycle.md`).
+Both latent since v0.14.1 (Plan 4b ship, 2026-04-25 — ~7 days). Together
+they unblock the P12 chain end-to-end: plugin-developer can now call
+casa-framework MCP tools, and Casa-installed plugins now surface in
+resident SDK subprocesses.
+
+### Fixed
+
+- **O-1 (HIGH, mcp_envelope serializes no-arg tools with empty
+  `inputSchema: {}`).** `mcp_envelope.py::_tool_schema` had a
+  `raw and …` short-circuit on the dict-of-types branch that fails
+  for empty dicts (Python falsy semantics). No-arg tools — declared
+  via `@tool(name, desc, {})` — fell through to the passthrough
+  branch and emitted `inputSchema: {}` instead of
+  `{"type":"object","properties":{}}`. CC v2.1.119 strict-validates
+  and rejects the entire `tools/list` payload with `Invalid input:
+  expected "object"`, so plugin-developer subprocesses could connect
+  to svc-casa-mcp + see capabilities but could not call ANY
+  casa-framework MCP tool — `mcp__casa-framework__emit_completion`
+  etc. returned `No such tool available`. Affected tools today:
+  `casa_reload` + `marketplace_list_plugins` (both no-arg). Latent
+  since v0.14.1 because K-1 + L-1 verifications never reached
+  `emit_completion` (Bash invocations only); P12 was the first
+  end-to-end exercise. Fix: drop the `raw and ` short-circuit so
+  `{}` falls through the dict-of-types branch and emits the correct
+  shape.
+
+- **O-3 (HIGH, plugins_binding filters out project-scope plugins).**
+  `plugins_binding.build_sdk_plugins` shells out to `claude plugin
+  list --json` from `HOME=cc-home` and filtered by
+  `e.get("enabled")`. But Casa installs at `--scope project` to
+  per-role `agent-home/<role>/.claude/settings.json`. The CLI
+  evaluates the `enabled` field against the calling HOME's
+  settings.json — for a cc-home call, that's cc-home's settings,
+  which doesn't list any project-scope plugin from agent-home.
+  Result: every Casa-installed plugin reported as `enabled: false`
+  from cc-home → binding filtered it out → resident SDK subprocesses
+  never saw Casa-installed plugins. Symptom: Ellen called
+  `Skill(target=<plugin>:<skill>)` → `tool_result ok=False`. Latent
+  since v0.14.1; P12.5 was the first end-to-end skill-use exercise.
+  Fix: `build_sdk_plugins` accepts an optional `role` kwarg; when
+  provided (residents at `agent.py:524`), project-scope entries
+  whose `projectPath == /addon_configs/casa-agent/agent-home/<role>`
+  are included regardless of the CLI's `enabled` field; user-scope
+  entries still honour the `enabled` check. When `role` is None
+  (specialists + executors at `tools.py:270` and `:321` — neither
+  carries plugins per `install.md` doctrine), project-scope entries
+  are filtered out entirely, preserving v0.34.2 behavior.
+
+### Test plan
+
+- 1 new unit test in `tests/test_mcp_envelope.py` for the empty
+  `input_schema={}` case; pre-existing dict-of-types and passthrough
+  cases unchanged and still passing (8 → 9 tests in this file).
+- 3 new unit tests in `tests/test_binding_layer.py` covering the
+  role-based project-scope filter: matching role includes the
+  project plugin, mismatched role excludes it, no-role drops all
+  project-scope entries (preserves v0.34.2 specialist + executor
+  behavior). Pre-existing 4 cases continue to pass under the
+  no-role branch (4 → 7 tests in this file).
+
+### Live verification (planned)
+
+- O-1: drive a fresh plugin-developer engagement end-to-end on N150
+  post-deploy. Expect `mcp__casa-framework__emit_completion` to
+  succeed (NOT `No such tool available`); engagement should finalize
+  via emit_completion path, NOT via topic `/complete` slash command.
+- O-3: configurator-install a probe plugin into Ellen, then DM Ellen
+  to use the plugin's skill. Expect `Skill(target=<plugin>:<skill>)
+  ok=True` and Ellen's reply to be the actual skill output (not a
+  graceful-degradation "skill not found" narration).
+
+### Carry-forward
+
+- N-1 + N-2 (webhook trigger reload + name-agnostic handler) —
+  reproduced this session, both already in `ROADMAP-backlog.md`.
+  Address in v0.35.0.
+- E-12 (claude_code driver doesn't stream incremental progress to
+  engagement topic) — observed live this session as ~6min approval-
+  gate silence. Already-deferred backlog.
+- H-2 (claude-agent-sdk hook callback errors) — third-party.
+  v0.1.72 still latest at session start; recheck `gh release list
+  --repo anthropics/claude-agent-sdk-python --limit 3` at next ship
+  gate.
+
 ## [0.34.2] - 2026-05-01 — Bug bundle: L-1 + L-1b + L-2 + L-3 + remove hello-driver
 
 Closes 4 findings from

@@ -525,6 +525,7 @@ class Agent:
                 home="/addon_configs/casa-agent/cc-home",
                 shared_cache="/addon_configs/casa-agent/cc-home/.claude/plugins",
                 seed="/opt/claude-seed",
+                role=self.config.role,
             )
 
             # "Skill" is a valid allowed_tools entry (spike §Key learning 4);

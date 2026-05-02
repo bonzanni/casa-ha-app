@@ -79,13 +79,16 @@ def _tool_schema(tool: Any) -> dict[str, Any]:
     """
     ischema: dict[str, Any]
     raw = tool.input_schema
-    # The dict-of-types case: every value is a Python type. The pre-built
-    # JSON Schema case: at least one value is itself a dict (e.g.
-    # {"type": "string"}). We use the latter as the discriminator.
-    if isinstance(raw, dict) and raw and not any(
+    # The dict-of-types case: empty dict (no-arg tools — O-1) or every
+    # value is a Python type. The pre-built JSON Schema case: at least
+    # one value is itself a dict (e.g. {"type": "string"}). We use the
+    # latter as the discriminator.
+    if isinstance(raw, dict) and not any(
         isinstance(v, dict) for v in raw.values()
     ):
-        # dict-of-types — translate.
+        # dict-of-types — translate. Empty dict yields properties={}, which
+        # is the correct shape for no-arg tools (CC v2.1.119 rejects bare
+        # `inputSchema: {}` because the `type` field is missing).
         props = {name: _py_type_to_json(ty) for name, ty in raw.items()}
         ischema = {"type": "object", "properties": props}
     elif isinstance(raw, dict):
