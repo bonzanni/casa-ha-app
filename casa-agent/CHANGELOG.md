@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.35.0] - 2026-05-02 — Granular in-process reload
+
+### Added
+- **Granular in-process reload.** `casa_reload(scope=...)` replaces the
+  no-arg Supervisor-restart shape. Six scopes: `agent`, `triggers`,
+  `policies`, `plugin_env`, `agents`, `full`. Configurator engagements
+  reload state in <1s instead of ~10–15s. See
+  `defaults/agents/executors/configurator/doctrine/reload.md` and spec
+  `docs/superpowers/specs/2026-05-02-granular-reload-design.md`.
+- **`casa_restart_supervised` MCP tool** for the rare cases that need a
+  full process restart (s6 service-tree edits, addon options mutations).
+- **`casactl` operator CLI** at `/usr/local/bin/casactl` — same dispatch
+  path as the MCP tool. `casactl reload --scope=... [--role=...]` /
+  `casactl restart-supervised`.
+- **`POST /admin/reload` route** on the internal aiohttp app
+  (`/run/casa/internal.sock`).
+
+### Changed
+- **`casa_reload()` no-arg shape removed** (pre-1.0 license — no
+  back-compat shim). Doctrine carries the rename.
+- **`casa_reload_triggers(role=...)`** kept as a back-compat alias for
+  `casa_reload(scope='triggers', role=...)`.
+- **`CasaRuntime` dataclass** introduced as the canonical container for
+  process-global Casa state; `init_tools(runtime=...)` is now the
+  primary wiring point.
+
+### Doctrine + playbook
+- `executors/configurator/doctrine/reload.md` rewritten.
+- All `recipes/**/*.md` updated for new tool shape.
+- `docs/exploration-testing-playbook.md` adds `casactl reload` recipes.
+
 ## [0.34.3] - 2026-05-02 — Hotfix: O-1 + O-3 (P12 plugin lifecycle unblock)
 
 Hotfix for two HIGH bugs surfaced by the 2026-05-02 P12 full plugin
