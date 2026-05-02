@@ -299,3 +299,77 @@ class TestReloadPluginEnv:
         await dispatch("plugin_env", runtime=runtime)
         assert os.environ.get("FOO") == "1"
         assert "BAR" not in os.environ
+
+
+class TestReloadAgents:
+    async def test_adds_new_resident(self, tmp_path, monkeypatch):
+        from reload import dispatch, register_handler, reload_agents
+        from types import SimpleNamespace
+        register_handler("agents", reload_agents)
+
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "ellen").mkdir()       # known
+        (agents_dir / "newcomer").mkdir()    # added on disk
+
+        new_cfg = SimpleNamespace(
+            role="newcomer",
+            character=SimpleNamespace(name="Newcomer", card=""),
+            triggers=[], channels=[],
+            memory=SimpleNamespace(read_strategy="per_turn"),
+        )
+
+        def fake_load(d, **kw):
+            return new_cfg if "newcomer" in d else MagicMock(role="ellen")
+
+        monkeypatch.setattr("agent_loader.load_agent_from_dir", fake_load)
+        monkeypatch.setattr("policies.load_policies", lambda *a, **kw: MagicMock())
+        provisioned: list[str] = []
+        monkeypatch.setattr(
+            "agent_home.provision_agent_home",
+            lambda *, role, home_root, defaults_root: provisioned.append(role),
+        )
+        import reload as reload_mod
+        monkeypatch.setattr(reload_mod, "_construct_agent",
+                            lambda **kw: MagicMock())
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {"ellen": MagicMock()}
+        runtime.specialist_registry.all_configs = lambda: {}
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        assert "newcomer" in runtime.role_configs
+        assert "newcomer" in runtime.agents
+        assert "newcomer" in provisioned
+        # ellen still there — no double-load
+        assert "ellen" in runtime.role_configs
+
+    async def test_evicts_deleted_resident(self, tmp_path, monkeypatch):
+        from reload import dispatch, register_handler, reload_agents
+        register_handler("agents", reload_agents)
+
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "ellen").mkdir()  # ellen still on disk
+        # tina was in role_configs but no dir on disk → evict.
+
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: MagicMock())
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {"ellen": MagicMock(), "tina": MagicMock()}
+        runtime.agents = {"ellen": MagicMock(), "tina": MagicMock()}
+        runtime.specialist_registry.all_configs = lambda: {}
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        assert "tina" not in runtime.role_configs
+        assert "tina" not in runtime.agents
+        runtime.bus.unregister.assert_any_call("tina")

@@ -515,3 +515,135 @@ async def reload_plugin_env(runtime: Any, *, role: str | None = None) -> list[st
 
 
 register_handler("plugin_env", reload_plugin_env)
+
+
+async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
+    """Scan agents/ for new/deleted residents + agents/specialists/ for
+    new/deleted specialists. Add or evict accordingly.
+    """
+    actions: list[str] = []
+    base = runtime.config_dir
+    agents_dir = runtime.agents_dir
+
+    import policies as policies_module
+    policy_lib_path = os.path.join(base, "policies", "disclosure.yaml")
+    try:
+        policy_lib = await asyncio.to_thread(
+            policies_module.load_policies, policy_lib_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ReloadError("load_error", f"policies: {exc}") from exc
+
+    import agent_loader
+    import agent_home
+
+    # ---- Residents ----
+    on_disk_residents = set()
+    if os.path.isdir(agents_dir):
+        for ent in os.scandir(agents_dir):
+            if ent.is_dir() and ent.name not in (
+                "specialists", "executors",
+            ):
+                on_disk_residents.add(ent.name)
+
+    known_residents = set(runtime.role_configs.keys())
+
+    # Add new residents
+    for r in on_disk_residents - known_residents:
+        try:
+            new_cfg = await asyncio.to_thread(
+                agent_loader.load_agent_from_dir,
+                os.path.join(agents_dir, r),
+                policies=policy_lib,
+            )
+            await asyncio.to_thread(
+                agent_home.provision_agent_home,
+                role=r,
+                home_root=runtime.home_root,
+                defaults_root=runtime.defaults_root,
+            )
+            new_agent = await asyncio.to_thread(
+                _construct_agent, cfg=new_cfg, runtime=runtime,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reload_agents: failed to add %s: %s", r, exc)
+            continue
+        runtime.role_configs[r] = new_cfg
+        runtime.agents[r] = new_agent
+        runtime.bus.register(r, new_agent.handle_message)
+        actions.append(f"added_{r}")
+
+    # Evict deleted residents
+    for r in known_residents - on_disk_residents:
+        runtime.role_configs.pop(r, None)
+        runtime.agents.pop(r, None)
+        try:
+            runtime.bus.unregister(r)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reload_agents: bus.unregister(%s) failed: %s", r, exc)
+        actions.append(f"evicted_{r}")
+
+    # ---- Specialists ----
+    specialists_dir = os.path.join(agents_dir, "specialists")
+    on_disk_specialists = set()
+    if os.path.isdir(specialists_dir):
+        for ent in os.scandir(specialists_dir):
+            if ent.is_dir():
+                on_disk_specialists.add(ent.name)
+
+    # Defer to specialist_registry's own re-scan, then diff.
+    try:
+        await asyncio.to_thread(runtime.specialist_registry.load)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("specialist_registry.load failed: %s", exc)
+
+    known_specialists = set(runtime.specialist_registry.all_configs().keys())
+
+    # New specialists need agent-home + Agent construction; eviction is
+    # handled by the registry's own load() (tombstone-tracked).
+    for s in on_disk_specialists - set(runtime.agents.keys()):
+        cfg = runtime.specialist_registry.all_configs().get(s)
+        if cfg is None:
+            continue
+        try:
+            await asyncio.to_thread(
+                agent_home.provision_agent_home,
+                role=s,
+                home_root=runtime.home_root,
+                defaults_root=runtime.defaults_root,
+            )
+            new_agent = await asyncio.to_thread(
+                _construct_agent, cfg=cfg, runtime=runtime,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reload_agents: failed to add specialist %s: %s", s, exc)
+            continue
+        runtime.agents[s] = new_agent
+        runtime.bus.register(s, new_agent.handle_message)
+        actions.append(f"added_specialist_{s}")
+
+    # Evict missing specialists from runtime.agents (registry already
+    # forgot them via its own load()).
+    for s in (set(runtime.agents.keys()) & known_residents) - on_disk_residents:
+        # No-op — handled in resident block above.
+        pass
+    for s in set(runtime.agents.keys()) - on_disk_residents - on_disk_specialists:
+        runtime.agents.pop(s, None)
+        try:
+            runtime.bus.unregister(s)
+        except Exception:  # noqa: BLE001
+            pass
+        actions.append(f"evicted_specialist_{s}")
+
+    # Rebuild agent_registry with fresh state.
+    from agent_registry import AgentRegistry
+    runtime.agent_registry = AgentRegistry.build(
+        residents=runtime.role_configs,
+        specialists=runtime.specialist_registry.all_configs(),
+    )
+    actions.append("rebuild_agent_registry")
+
+    return actions
+
+
+register_handler("agents", reload_agents)
