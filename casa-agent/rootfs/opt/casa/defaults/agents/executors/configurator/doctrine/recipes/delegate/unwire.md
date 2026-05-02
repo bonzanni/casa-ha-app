@@ -13,8 +13,9 @@ Remove the matching entry. Leave `delegates: []` if it was the last.
 
 ## Reload — MANDATORY before emit_completion
 
-**Hard.** Canonical order:
+`delegates.yaml` is part of the resident's AgentConfig — use the
+`agent` scope for that role. Canonical order:
 
     config_git_commit(message="unwire <target> from <resident>'s delegates")
-    casa_reload()
-    emit_completion(status="ok", text="...committed SHA <sha>, called casa_reload to drop the delegate from the registry.")
+    casa_reload(scope="agent", role="<resident>")
+    emit_completion(status="ok", text="...committed SHA <sha>, called casa_reload(scope='agent') to drop the delegate from the registry.")

@@ -73,10 +73,11 @@ is wrong. Iterate with the user before committing.
 
 ## Reload — MANDATORY before emit_completion
 
-**Hard** - fastembed classifier cache init at boot. Canonical order:
+Use the `policies` scope. The fastembed classifier cache rebuilds
+in-process (~500ms). Canonical order:
 
 ```python
 config_git_commit(message="update scopes: <scope> <add|remove> <keywords>")
-casa_reload()
-emit_completion(status="ok", text="...committed SHA <sha>, called casa_reload to rebuild the fastembed classifier cache.")
+casa_reload(scope="policies")
+emit_completion(status="ok", text="...committed SHA <sha>, called casa_reload(scope='policies') to rebuild the fastembed classifier cache.")
 ```
