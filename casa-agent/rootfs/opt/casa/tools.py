@@ -1335,6 +1335,37 @@ async def _post_supervisor_restart() -> dict:
         }
 
 
+@tool(
+    "casa_restart_supervised",
+    "Full Supervisor-driven addon restart. Use ONLY when changes require "
+    "process-restart semantics (s6 service tree changes, addon "
+    "options.json mutations). For routine config edits, use "
+    "casa_reload(scope=...) instead. Restricted to the configurator role.",
+    {},
+)
+async def casa_restart_supervised(_: dict) -> dict:
+    caller = _effective_caller_role()
+    if caller not in _PRIVILEGED_CONFIG_ROLES:
+        return _refuse_unprivileged("casa_restart_supervised", caller)
+
+    eng = engagement_var.get(None)
+    if eng is not None:
+        # H-1 carry-forward: defer until _finalize_engagement.
+        _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
+        _ENGAGEMENTS_DEFERRED_HARD_RELOAD.add(eng.id)
+        return _result({
+            "supervisor_status": 200,
+            "deferred": True,
+            "message": (
+                "Supervisor restart deferred until engagement finalizes. "
+                "Continue with emit_completion."
+            ),
+        })
+
+    # Out-of-engagement (operator-driven /invoke etc): POST inline.
+    return _result(await _post_supervisor_restart())
+
+
 # ---------------------------------------------------------------------------
 # engage_executor — Plan 3 real impl (configurator + future Tier 3 types)
 # ---------------------------------------------------------------------------
@@ -2894,6 +2925,7 @@ CASA_TOOLS: tuple = (
     query_engager,
     config_git_commit,
     casa_reload,
+    casa_restart_supervised,            # NEW — Task D.2
     casa_reload_triggers,
     list_engagement_workspaces,
     delete_engagement_workspace,
