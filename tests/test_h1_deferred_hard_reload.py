@@ -73,11 +73,16 @@ class TestCasaReloadDefers:
     """The tool body's branch on engagement_var presence."""
 
     async def test_in_engagement_does_not_post(self, _drain_deferred_set):
-        """When called inside an active engagement, casa_reload must
-        not POST Supervisor. It must return ``deferred: True`` and
-        register the engagement id in the deferred-restart set."""
+        """When called inside an active engagement, casa_restart_supervised
+        must not POST Supervisor. It must return ``deferred: True`` and
+        register the engagement id in the deferred-restart set.
+
+        v0.35.0 note: the old no-arg ``casa_reload()`` shape moved to
+        ``casa_restart_supervised``. The H-1 defer behavior carries
+        forward unchanged on the new tool.
+        """
         import tools as tools_mod
-        from tools import casa_reload, engagement_var
+        from tools import casa_restart_supervised, engagement_var
         from engagement_registry import EngagementRecord
 
         rec = EngagementRecord(
@@ -93,7 +98,7 @@ class TestCasaReloadDefers:
         try:
             with patch.dict(os.environ, {"SUPERVISOR_TOKEN": "x"}):
                 with patch("aiohttp.ClientSession", return_value=session_cm):
-                    result = await casa_reload.handler({})
+                    result = await casa_restart_supervised.handler({})
         finally:
             engagement_var.reset(tok)
 
@@ -102,8 +107,8 @@ class TestCasaReloadDefers:
         assert payload["deferred"] is True
         assert "deferred until engagement finalizes" in payload["message"]
         assert post_calls == [], (
-            "casa_reload must NOT POST Supervisor when called inside "
-            f"an engagement; got POST calls: {post_calls}"
+            "casa_restart_supervised must NOT POST Supervisor when "
+            f"called inside an engagement; got POST calls: {post_calls}"
         )
         assert rec.id in tools_mod._ENGAGEMENTS_DEFERRED_HARD_RELOAD
 
@@ -111,11 +116,11 @@ class TestCasaReloadDefers:
         self, _drain_deferred_set,
     ):
         """The doctrine contract is fulfilled the moment the model
-        calls casa_reload. The v0.33.1 G-2 PENDING_RELOAD set must be
-        drained for this engagement so emit_completion's defensive
-        guard does not double-fire."""
+        calls casa_restart_supervised. The v0.33.1 G-2 PENDING_RELOAD
+        set must be drained for this engagement so emit_completion's
+        defensive guard does not double-fire."""
         import tools as tools_mod
-        from tools import casa_reload, engagement_var
+        from tools import casa_restart_supervised, engagement_var
         from engagement_registry import EngagementRecord
 
         rec = EngagementRecord(
@@ -130,13 +135,13 @@ class TestCasaReloadDefers:
 
         tok = engagement_var.set(rec)
         try:
-            await casa_reload.handler({})
+            await casa_restart_supervised.handler({})
         finally:
             engagement_var.reset(tok)
 
         assert rec.id not in tools_mod._ENGAGEMENTS_PENDING_RELOAD, (
-            "calling casa_reload inside the engagement must drain "
-            "the v0.33.1 pending-reload obligation"
+            "calling casa_restart_supervised inside the engagement must "
+            "drain the v0.33.1 pending-reload obligation"
         )
         assert rec.id in tools_mod._ENGAGEMENTS_DEFERRED_HARD_RELOAD
 
@@ -150,14 +155,14 @@ class TestCasaReloadDefers:
         deferred-path.
         """
         import agent as agent_mod
-        from tools import casa_reload
+        from tools import casa_restart_supervised
 
         session_cm, post_calls = _mock_supervisor_session(200)
         tok = agent_mod.origin_var.set({"role": "configurator"})
         try:
             with patch.dict(os.environ, {"SUPERVISOR_TOKEN": "x"}):
                 with patch("aiohttp.ClientSession", return_value=session_cm):
-                    result = await casa_reload.handler({})
+                    result = await casa_restart_supervised.handler({})
         finally:
             agent_mod.origin_var.reset(tok)
 
@@ -168,8 +173,8 @@ class TestCasaReloadDefers:
             f"marker; got: {payload}"
         )
         assert post_calls == ["http://supervisor/addons/self/restart"], (
-            "out-of-engagement casa_reload must POST Supervisor "
-            f"synchronously; got: {post_calls}"
+            "out-of-engagement casa_restart_supervised must POST "
+            f"Supervisor synchronously; got: {post_calls}"
         )
 
 
