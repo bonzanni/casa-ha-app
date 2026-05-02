@@ -254,3 +254,130 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
 
 
 register_handler("triggers", reload_triggers)
+
+
+def _construct_agent(*, cfg, runtime):
+    """Factory wrapper so tests can monkeypatch construction.
+
+    Mirrors the per-role Agent construction in casa_core.main:
+    wraps base_memory by strategy (shared logic exists at
+    casa_core._wrap_memory_for_strategy — keep using that for parity).
+    """
+    from agent import Agent
+    from casa_core import _wrap_memory_for_strategy
+    sqlite_warning_emitted = [False]
+    agent_memory = _wrap_memory_for_strategy(
+        runtime.base_memory,
+        role=cfg.role,
+        strategy=cfg.memory.read_strategy,
+        sqlite_warning_emitted=sqlite_warning_emitted,
+    )
+    return Agent(
+        config=cfg, memory=agent_memory,
+        session_registry=runtime.session_registry,
+        mcp_registry=runtime.mcp_registry,
+        channel_manager=runtime.channel_manager,
+        scope_registry=runtime.scope_registry,
+        agent_registry=runtime.agent_registry,
+    )
+
+
+async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
+    """Atomic-swap reload of a single role's Agent + AgentConfig.
+
+    Tier detection: residents at agents/<role>/, specialists at
+    agents/specialists/<role>/. ``unknown_role`` if neither exists.
+    """
+    if not role:
+        raise ReloadError("role_required", "scope='agent' requires role")
+
+    base = runtime.config_dir
+    agents_dir = runtime.agents_dir
+
+    resident_dir = os.path.join(agents_dir, role)
+    specialist_dir = os.path.join(agents_dir, "specialists", role)
+    if os.path.isdir(resident_dir):
+        agent_dir = resident_dir
+        tier = "resident"
+    elif os.path.isdir(specialist_dir):
+        agent_dir = specialist_dir
+        tier = "specialist"
+    else:
+        raise ReloadError(
+            "unknown_role", f"no agent directory for role={role!r}",
+        )
+
+    import policies as policies_module
+    policy_lib_path = os.path.join(base, "policies", "disclosure.yaml")
+    try:
+        policy_lib = await asyncio.to_thread(
+            policies_module.load_policies, policy_lib_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ReloadError("load_error", f"policies: {exc}") from exc
+
+    import agent_loader
+    try:
+        new_cfg = await asyncio.to_thread(
+            agent_loader.load_agent_from_dir, agent_dir, policies=policy_lib,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ReloadError("load_error", str(exc)) from exc
+
+    actions = ["load_config"]
+
+    # Construct new Agent instance OUTSIDE the swap window.
+    try:
+        new_agent = await asyncio.to_thread(
+            _construct_agent, cfg=new_cfg, runtime=runtime,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ReloadError("construct_failed", str(exc)) from exc
+    actions.append("construct_agent")
+
+    # --- ATOMIC SWAP WINDOW ---
+    if tier == "resident":
+        runtime.role_configs[role] = new_cfg
+    else:
+        # SpecialistRegistry update — re-scan the dir to refresh in-memory
+        # config dict. Mirrors specialist_registry.load() pattern but just
+        # for one role.
+        try:
+            await asyncio.to_thread(runtime.specialist_registry.load)
+        except Exception as exc:  # noqa: BLE001
+            raise ReloadError("specialist_reload_failed", str(exc)) from exc
+    runtime.agents[role] = new_agent
+    runtime.bus.register(role, new_agent.handle_message)
+    actions.append("reregister_bus")
+
+    # Rebuild agent_registry from current state.
+    from agent_registry import AgentRegistry
+    runtime.agent_registry = AgentRegistry.build(
+        residents=runtime.role_configs,
+        specialists=runtime.specialist_registry.all_configs(),
+    )
+    actions.append("rebuild_agent_registry")
+
+    # Re-register triggers for that role only.
+    try:
+        await asyncio.to_thread(
+            runtime.trigger_registry.reregister_for,
+            role, list(new_cfg.triggers), list(new_cfg.channels),
+        )
+        actions.append("reregister_triggers")
+    except Exception as exc:  # noqa: BLE001 — log but don't fail the swap
+        logger.warning("trigger reregister failed for role=%s: %s", role, exc)
+
+    # Drain pending-reload guard if any.
+    try:
+        from tools import _ENGAGEMENTS_PENDING_RELOAD, engagement_var
+        eng = engagement_var.get(None)
+        if eng is not None:
+            _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
+    except Exception:  # noqa: BLE001
+        pass
+
+    return actions
+
+
+register_handler("agent", reload_agent)

@@ -135,3 +135,84 @@ class TestReloadTriggers:
         runtime.trigger_registry.reregister_for.assert_called_once_with(
             "ellen", [fake_cfg.triggers[0]], ["telegram"],
         )
+
+
+class TestReloadAgent:
+    async def test_unknown_role_raises(self, tmp_path):
+        from reload import dispatch, register_handler, reload_agent
+        register_handler("agent", reload_agent)
+        runtime = _make_runtime()
+        runtime.agents_dir = str(tmp_path / "agents")
+        result = await dispatch("agent", runtime=runtime, role="ghost")
+        assert result["status"] == "error"
+        assert result["kind"] == "unknown_role"
+
+    async def test_resident_atomic_swap(self, tmp_path, monkeypatch):
+        from reload import dispatch, register_handler, reload_agent
+        from types import SimpleNamespace
+        register_handler("agent", reload_agent)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "ellen").mkdir(parents=True)
+
+        # The new AgentConfig + Agent we'll observe post-swap.
+        new_cfg = SimpleNamespace(role="ellen",
+                                  character=SimpleNamespace(name="Ellen-2", card=""),
+                                  triggers=[], channels=[])
+        new_agent = MagicMock()
+        new_agent.handle_message = MagicMock()
+
+        monkeypatch.setattr(
+            "agent_loader.load_agent_from_dir",
+            lambda *a, **kw: new_cfg,
+        )
+        monkeypatch.setattr(
+            "policies.load_policies",
+            lambda *a, **kw: MagicMock(),
+        )
+        # Patch reload_agent's Agent constructor to return our spy.
+        import reload as reload_mod
+        monkeypatch.setattr(reload_mod, "_construct_agent", lambda *a, **kw: new_agent)
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs["ellen"] = SimpleNamespace(
+            role="ellen",
+            character=SimpleNamespace(name="Ellen", card=""),
+        )
+        old_agent = MagicMock()
+        runtime.agents["ellen"] = old_agent
+
+        result = await dispatch("agent", runtime=runtime, role="ellen")
+        assert result["status"] == "ok"
+        # Atomic-swap completed.
+        assert runtime.agents["ellen"] is new_agent
+        # Bus was rebound.
+        runtime.bus.register.assert_any_call("ellen", new_agent.handle_message)
+        # role_configs updated.
+        assert runtime.role_configs["ellen"] is new_cfg
+
+    async def test_load_failure_leaves_runtime_untouched(self, tmp_path, monkeypatch):
+        from reload import dispatch, register_handler, reload_agent
+        register_handler("agent", reload_agent)
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "ellen").mkdir(parents=True)
+
+        def boom(*a, **kw):
+            raise RuntimeError("yaml is broken")
+
+        monkeypatch.setattr("agent_loader.load_agent_from_dir", boom)
+        monkeypatch.setattr("policies.load_policies", lambda *a, **kw: MagicMock())
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        old_agent = MagicMock()
+        runtime.agents["ellen"] = old_agent
+
+        result = await dispatch("agent", runtime=runtime, role="ellen")
+        assert result["status"] == "error"
+        assert result["kind"] == "load_error"
+        # Old agent still in place.
+        assert runtime.agents["ellen"] is old_agent
