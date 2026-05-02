@@ -52,7 +52,14 @@ Bumps the `source.sha` and `version` fields, then refreshes Claude Code's
 view. The next `install_casa_plugin` for this plugin pulls the new ref.
 **Updating the pin does not reinstall existing homes** — operators who
 want the new ref live must `uninstall_casa_plugin` + `install_casa_plugin`
-in sequence (or call `casa_reload()` if the new ref is already cached).
+in sequence (or call `casa_reload(scope='agent', role=<role>)` per home
+if the new ref is already cached).
+
+## No reload for marketplace edits
+
+Marketplace JSON is read on demand by `marketplace_list_plugins`; no
+reload is required after `marketplace_add_plugin`,
+`marketplace_remove_plugin`, or `marketplace_update_plugin` alone.
 
 ## Unregister an entry
 
