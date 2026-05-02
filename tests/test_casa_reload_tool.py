@@ -1,4 +1,4 @@
-"""Tests for casa_reload - Supervisor addon restart."""
+"""Tests for casa_reload — scope-dispatching in-process reload (v0.35.0+)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture
 def configurator_origin():
-    """Set origin_var so the role guard (Bug 7 fix) lets the call through."""
+    """Set origin_var so the role guard lets the call through."""
     import agent as agent_mod
     tok = agent_mod.origin_var.set({"role": "configurator"})
     try:
@@ -23,39 +23,81 @@ def configurator_origin():
 
 
 class TestCasaReloadTool:
-    async def test_happy_path_returns_status(self, configurator_origin):
+    async def test_no_arg_returns_scope_required(self, configurator_origin):
         from tools import casa_reload
-        fake_resp = MagicMock()
-        fake_resp.status = 200
-        fake_resp.__aenter__ = AsyncMock(return_value=fake_resp)
-        fake_resp.__aexit__ = AsyncMock(return_value=None)
-        session_cm = MagicMock()
-        session_cm.__aenter__ = AsyncMock(return_value=session_cm)
-        session_cm.__aexit__ = AsyncMock(return_value=None)
-        session_cm.post = MagicMock(return_value=fake_resp)
-        with patch.dict(os.environ, {"SUPERVISOR_TOKEN": "x"}):
-            with patch("aiohttp.ClientSession", return_value=session_cm):
-                result = await casa_reload.handler({})
-        payload = json.loads(result["content"][0]["text"])
-        assert payload["supervisor_status"] == 200
-
-    async def test_missing_token_returns_error(self, configurator_origin):
-        from tools import casa_reload
-        with patch.dict(os.environ, {}, clear=True):
-            result = await casa_reload.handler({})
+        result = await casa_reload.handler({})
         payload = json.loads(result["content"][0]["text"])
         assert payload["status"] == "error"
-        assert payload["kind"] == "no_supervisor_token"
+        assert payload["kind"] == "scope_required"
+
+
+class TestCasaReloadScope:
+    async def test_unknown_scope_returns_error(
+        self, configurator_origin, monkeypatch,
+    ):
+        # Stub agent.active_runtime + reload.dispatch.
+        import agent as agent_mod
+        runtime_mock = MagicMock()
+        agent_mod.active_runtime = runtime_mock
+
+        from tools import casa_reload
+        result = await casa_reload.handler({"scope": "nope"})
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["status"] == "error"
+        # The dispatcher itself returns kind='unknown_scope' for unknown handlers;
+        # here we accept either an early local guard or the dispatcher's response.
+        assert payload["kind"] in ("unknown_scope", "scope_required") or "scope" in payload["message"].lower()
+
+    async def test_no_scope_arg_returns_error(self, configurator_origin):
+        from tools import casa_reload
+        result = await casa_reload.handler({})
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["status"] == "error"
+        assert payload["kind"] == "scope_required"
+
+    async def test_dispatch_calls_reload_module(
+        self, configurator_origin, monkeypatch,
+    ):
+        import agent as agent_mod
+        from tools import casa_reload
+
+        runtime_mock = MagicMock()
+        agent_mod.active_runtime = runtime_mock
+
+        captured = {}
+
+        async def fake_dispatch(scope, *, runtime, role=None, include_env=False):
+            captured.update(scope=scope, role=role, include_env=include_env)
+            return {"status": "ok", "scope": scope, "role": role,
+                    "ms": 1, "actions": ["fake"]}
+        monkeypatch.setattr("reload.dispatch", fake_dispatch)
+
+        result = await casa_reload.handler({"scope": "agent", "role": "ellen"})
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["status"] == "ok"
+        assert payload["scope"] == "agent"
+        assert payload["role"] == "ellen"
+        assert captured == {"scope": "agent", "role": "ellen", "include_env": False}
+
+    async def test_runtime_not_initialized(self, configurator_origin, monkeypatch):
+        # If active_runtime is None, the tool returns not_initialized.
+        import agent as agent_mod
+        agent_mod.active_runtime = None
+        from tools import casa_reload
+        result = await casa_reload.handler({"scope": "full"})
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["status"] == "error"
+        assert payload["kind"] == "not_initialized"
 
 
 class TestCasaReloadRoleGuard:
-    """Bug 7 (v0.14.6): casa_reload must refuse non-configurator callers
-    even if their runtime.yaml::tools.allowed lists it. Defense in depth."""
+    """Role guard still applies — a non-configurator caller is refused
+    even if they pass a valid scope."""
 
     async def test_no_origin_no_engagement_refused(self):
         from tools import casa_reload
         # No origin_var, no engagement_var bound — refuse.
-        result = await casa_reload.handler({})
+        result = await casa_reload.handler({"scope": "full"})
         payload = json.loads(result["content"][0]["text"])
         assert payload["status"] == "error"
         assert payload["kind"] == "not_authorized"
@@ -65,7 +107,7 @@ class TestCasaReloadRoleGuard:
         from tools import casa_reload
         tok = agent_mod.origin_var.set({"role": "assistant"})
         try:
-            result = await casa_reload.handler({})
+            result = await casa_reload.handler({"scope": "full"})
         finally:
             agent_mod.origin_var.reset(tok)
         payload = json.loads(result["content"][0]["text"])
@@ -77,47 +119,8 @@ class TestCasaReloadRoleGuard:
         from tools import casa_reload
         tok = agent_mod.origin_var.set({"role": "finance"})
         try:
-            result = await casa_reload.handler({})
+            result = await casa_reload.handler({"scope": "full"})
         finally:
             agent_mod.origin_var.reset(tok)
         payload = json.loads(result["content"][0]["text"])
         assert payload["kind"] == "not_authorized"
-
-    async def test_configurator_engagement_var_path_allowed(self):
-        """Engagement-bridge path: engagement_var bound, no origin_var.
-
-        H-1 fix (v0.34.0): when called inside an active engagement,
-        casa_reload no longer POSTs Supervisor — it defers to
-        ``_finalize_engagement``. Goes past the role guard and returns
-        ``deferred: True`` without consulting SUPERVISOR_TOKEN.
-        """
-        import tools as tools_mod
-        from tools import casa_reload, engagement_var
-        from engagement_registry import EngagementRecord
-
-        rec = EngagementRecord(
-            id="eng-1", kind="executor", role_or_type="configurator",
-            driver="claude_code", status="active", topic_id=1,
-            started_at=0.0, last_user_turn_ts=0.0,
-            last_idle_reminder_ts=0.0, completed_at=None,
-            sdk_session_id=None, origin={}, task="",
-        )
-        tok = engagement_var.set(rec)
-        deferred_marker_set: bool
-        try:
-            with patch.dict(os.environ, {}, clear=True):
-                result = await casa_reload.handler({})
-            deferred_marker_set = (
-                rec.id in tools_mod._ENGAGEMENTS_DEFERRED_HARD_RELOAD
-            )
-        finally:
-            engagement_var.reset(tok)
-            tools_mod._ENGAGEMENTS_DEFERRED_HARD_RELOAD.discard(rec.id)
-        payload = json.loads(result["content"][0]["text"])
-        # Goes past the role guard (else we'd see not_authorized);
-        # defers without POSTing — no SUPERVISOR_TOKEN check needed.
-        assert payload["supervisor_status"] == 200
-        assert payload["deferred"] is True
-        # Marker must be set so _finalize_engagement performs the POST
-        # at the end of the engagement.
-        assert deferred_marker_set is True

@@ -1261,65 +1261,51 @@ async def config_git_commit(args: dict) -> dict:
 
 @tool(
     "casa_reload",
-    "Restart the Casa addon via Supervisor. Call BEFORE emit_completion. "
-    "The actual addon restart is deferred until after the engagement "
-    "finalizes so the bus message lands first. "
-    "Restricted to the configurator executor role.",
-    {},
+    "In-process reload of Casa runtime state at a given scope. "
+    "Valid scopes: 'agent' (requires role), 'triggers' (requires role), "
+    "'policies', 'plugin_env', 'agents', 'full'. Use 'full' as a "
+    "catch-all when unsure. Does NOT restart the addon - for that, see "
+    "casa_restart_supervised. Restricted to the configurator role.",
+    {"scope": str, "role": str, "include_env": bool},
 )
-async def casa_reload(_: dict) -> dict:
+async def casa_reload(args: dict) -> dict:
     caller = _effective_caller_role()
     if caller not in _PRIVILEGED_CONFIG_ROLES:
         return _refuse_unprivileged("casa_reload", caller)
 
-    # H-1 fix (v0.34.0): when called inside an active engagement,
-    # defer the Supervisor POST until _finalize_engagement runs. The
-    # POST itself returns in <1s but Supervisor's container kill
-    # arrives ~13s later — observed live (exploration3 P4.2 + P4.3 +
-    # P11.1, 2026-05-01) cancelling the SDK subprocess BEFORE
-    # emit_completion / _finalize_engagement could run, leaving the
-    # engagement stuck status=active with no user-DM completion
-    # message. Drain the v0.33.1 G-2 pending-reload obligation
-    # (the model fulfilled the doctrine contract by calling us) and
-    # register a deferred-restart marker for _finalize_engagement to
-    # honor. Return immediately so the model can proceed to
-    # emit_completion without racing the kill.
-    eng = engagement_var.get(None)
-    if eng is not None:
-        _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
-        _ENGAGEMENTS_DEFERRED_HARD_RELOAD.add(eng.id)
+    scope = (args.get("scope") or "").strip()
+    if not scope:
         return _result({
-            "supervisor_status": 200,
-            "deferred": True,
+            "status": "error", "kind": "scope_required",
             "message": (
-                "Hard reload deferred until engagement finalizes. "
-                "Continue with emit_completion."
+                "casa_reload requires a 'scope' argument. Valid: "
+                "'agent', 'triggers', 'policies', 'plugin_env', "
+                "'agents', 'full'. See doctrine/reload.md."
             ),
         })
 
-    # Out-of-engagement path: e.g. operator-driven /invoke or any
-    # other context where there is no _finalize_engagement to wait
-    # for. POST inline as before.
-    import aiohttp
-    token = os.environ.get("SUPERVISOR_TOKEN")
-    if not token:
+    role = (args.get("role") or "").strip() or None
+    include_env = bool(args.get("include_env", False))
+
+    import agent as agent_mod
+    runtime = getattr(agent_mod, "active_runtime", None)
+    if runtime is None:
         return _result({
-            "status": "error",
-            "kind": "no_supervisor_token",
-            "message": "SUPERVISOR_TOKEN not set - cannot restart addon",
+            "status": "error", "kind": "not_initialized",
+            "message": "CasaRuntime not bound - boot ordering bug",
         })
-    headers = {"Authorization": f"Bearer {token}"}
-    url = "http://supervisor/addons/self/restart"
-    try:
-        async with aiohttp.ClientSession(headers=headers) as s:
-            async with s.post(url) as resp:
-                return _result({"supervisor_status": resp.status})
-    except Exception as exc:  # noqa: BLE001
-        return _result({
-            "status": "error",
-            "kind": "supervisor_error",
-            "message": str(exc),
-        })
+
+    from reload import dispatch
+    result = await dispatch(
+        scope, runtime=runtime, role=role, include_env=include_env,
+    )
+
+    # Drain pending-reload guard if engagement-bound.
+    eng = engagement_var.get(None)
+    if eng is not None and result.get("status") == "ok":
+        _ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
+
+    return _result(result)
 
 
 async def _post_supervisor_restart() -> dict:
