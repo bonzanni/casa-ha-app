@@ -54,6 +54,13 @@ class TriggerRegistry:
         self._seen_webhook_paths: set[str] = set()
         self._specs_by_job_id: dict[str, TriggerSpec] = {}
         self._webhook_paths_by_role: dict[str, list[str]] = {}
+        # N-1 + N-2 (v0.36.0): per-boot allowlist of webhook trigger names
+        # → role. The wildcard /webhook/{name} handler in casa_core consults
+        # this to 404 unknown names and dispatch knowns to the registered
+        # role. Maintained alongside _webhook_paths_by_role so reregister_for
+        # naturally evicts removed names.
+        self._webhook_targets: dict[str, str] = {}
+        self._webhook_names_by_role: dict[str, list[str]] = {}
 
     def register_agent(
         self,
@@ -143,6 +150,13 @@ class TriggerRegistry:
         self._specs_by_job_id[job_id] = trig
 
     def _register_webhook(self, role: str, trig: TriggerSpec) -> None:
+        # N-1 + N-2 (v0.36.0): the wildcard /webhook/{name} handler in
+        # casa_core dispatches webhook traffic via the allowlist below;
+        # the per-trigger router.add_post is a best-effort registration
+        # for non-/webhook/<name> paths added at boot. Post-boot adds
+        # (in-process reload) hit a frozen aiohttp router and used to
+        # raise; now we swallow and rely on the wildcard handler so
+        # casa_reload(scope=triggers) succeeds for webhook triggers.
         async def _handler(request: web.Request) -> web.Response:
             logger.info(
                 "Webhook trigger fired: agent=%s name=%s path=%s",
@@ -168,8 +182,28 @@ class TriggerRegistry:
             await self._bus.send(msg)
             return web.json_response({"status": "accepted"})
 
-        self._app.router.add_post(trig.path, _handler)
+        try:
+            self._app.router.add_post(trig.path, _handler)
+        except RuntimeError as exc:
+            # aiohttp raises "Cannot register a resource into frozen
+            # router" once startup completes. Acceptable for in-process
+            # reload — wildcard handler still routes by name.
+            logger.debug(
+                "skip per-path webhook route for agent=%s name=%s path=%s "
+                "(router frozen, dispatch via wildcard /webhook/{name}): %s",
+                role, trig.name, trig.path, exc,
+            )
         self._webhook_paths_by_role.setdefault(role, []).append(trig.path)
+        self._webhook_targets[trig.name] = role
+        self._webhook_names_by_role.setdefault(role, []).append(trig.name)
+
+    def get_webhook_target(self, name: str) -> str | None:
+        """Return the role registered for a webhook trigger ``name``,
+        or ``None`` if no such trigger is currently registered. Consulted
+        by the wildcard ``/webhook/{name}`` handler in casa_core to 404
+        unknown names and dispatch knowns to the right role.
+        """
+        return self._webhook_targets.get(name)
 
     def reregister_for(
         self,
@@ -201,6 +235,17 @@ class TriggerRegistry:
             # aiohttp has no supported public "remove route" API. Callers
             # should avoid reusing webhook paths across re-registrations.
         self._webhook_paths_by_role[role] = []
+
+        # N-2 (v0.36.0): evict this role's webhook names from the
+        # allowlist so a removed webhook trigger naturally 404s on the
+        # wildcard handler post-reload.
+        for name in self._webhook_names_by_role.get(role, []):
+            # Only evict if THIS role still owns the name (defensive
+            # against name collisions across roles, which register_agent
+            # itself doesn't currently prevent for webhooks).
+            if self._webhook_targets.get(name) == role:
+                self._webhook_targets.pop(name, None)
+        self._webhook_names_by_role[role] = []
 
         self.register_agent(role, triggers, channels)
 
