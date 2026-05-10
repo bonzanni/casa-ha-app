@@ -596,6 +596,82 @@ def _maybe_register_n8n(
     return mcp_registry.resolve(["n8n-workflows"]).get("n8n-workflows")
 
 
+def _make_webhook_handler(
+    *,
+    webhook_rate_limiter: Any,
+    webhook_secret: str,
+    trigger_registry: Any,
+    default_role: str,
+    bus: Any,
+):
+    """Build the wildcard ``/webhook/{name}`` handler.
+
+    The handler:
+
+    * applies the global rate limit (shared bucket with /invoke/{agent}),
+    * verifies the HMAC-SHA256 signature when ``webhook_secret`` is set
+      (so unknown names cannot leak via 404 vs 401 timing),
+    * looks up ``name`` in ``trigger_registry.get_webhook_target(name)``
+      — returns 404 ``{"error": "unknown webhook"}`` for unknowns
+      (N-2, v0.36.0),
+    * dispatches a SCHEDULED bus message to the registered role, falling
+      back to ``default_role`` only when the registry returns the
+      sentinel ``"__assistant_default__"`` (kept for forward parity if
+      we want a public open dispatch later — currently unused).
+
+    Extracted from ``main()`` so it is unit-testable; see
+    ``tests/test_webhook_handler.py``.
+    """
+
+    def _verify(request: web.Request, body: bytes) -> bool:
+        if not webhook_secret:
+            return True
+        sig = request.headers.get("X-Webhook-Signature", "")
+        expected = hmac.new(
+            webhook_secret.encode(), body, hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(sig, expected)
+
+    async def webhook_handler(request: web.Request) -> web.Response:
+        limited = rate_limit_response(webhook_rate_limiter, "global")
+        if limited is not None:
+            return limited
+
+        body = await request.read()
+        if not _verify(request, body):
+            return web.json_response(
+                {"error": "invalid signature"}, status=401,
+            )
+
+        name = request.match_info.get("name", "")
+        target_role = trigger_registry.get_webhook_target(name)
+        if target_role is None:
+            return web.json_response(
+                {"error": "unknown webhook"}, status=404,
+            )
+
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = body.decode("utf-8", errors="replace")
+
+        msg = BusMessage(
+            type=MessageType.SCHEDULED,
+            source="webhook",
+            target=target_role,
+            content=f"Webhook '{name}' triggered with payload: {payload}",
+            channel="webhook",
+            context={
+                "webhook_name": name,
+                "cid": request.get("cid") or new_cid(),
+            },
+        )
+        await bus.send(msg)
+        return web.json_response({"status": "accepted"})
+
+    return webhook_handler
+
+
 def build_invoke_message(
     agent_role: str,
     prompt: str,
@@ -1288,32 +1364,17 @@ async def main() -> None:
         ).hexdigest()
         return hmac.compare_digest(sig, expected)
 
-    async def webhook_handler(request: web.Request) -> web.Response:
-        """Handle named webhook invocations (POST /webhook/{name})."""
-        limited = rate_limit_response(webhook_rate_limiter, "global")
-        if limited is not None:
-            return limited
-
-        body = await request.read()
-        if not _verify_webhook(request, body):
-            return web.json_response({"error": "invalid signature"}, status=401)
-
-        name = request.match_info.get("name", "")
-        try:
-            payload = await request.json()
-        except Exception:
-            payload = body.decode("utf-8", errors="replace")
-
-        msg = BusMessage(
-            type=MessageType.SCHEDULED,
-            source="webhook",
-            target=assistant_role,
-            content=f"Webhook '{name}' triggered with payload: {payload}",
-            channel="webhook",
-            context={"webhook_name": name, "cid": request["cid"]},
-        )
-        await bus.send(msg)
-        return web.json_response({"status": "accepted"})
+    # N-1 + N-2 (v0.36.0): wildcard /webhook/{name} consults the trigger
+    # registry's per-boot allowlist. Unknown names → 404; known names
+    # dispatch to the registered role (no longer hardcoded to
+    # assistant_role).
+    webhook_handler = _make_webhook_handler(
+        webhook_rate_limiter=webhook_rate_limiter,
+        webhook_secret=webhook_secret,
+        trigger_registry=trigger_registry,
+        default_role=assistant_role,
+        bus=bus,
+    )
 
     async def invoke_handler(request: web.Request) -> web.Response:
         """Direct agent invocation (POST /invoke/{agent})."""

@@ -185,6 +185,109 @@ class TestWebhook:
                                channels=["webhook"])
 
 
+class TestWebhookAllowlist:
+    """N-1 + N-2 (v0.36.0). Webhook triggers are dispatched via the
+    wildcard ``/webhook/{name}`` handler in casa_core; the per-trigger
+    ``router.add_post`` call is best-effort because aiohttp freezes the
+    router after startup. The registry exposes a name-to-role allowlist
+    so the wildcard handler can 404 unknowns and dispatch knowns to the
+    correct role.
+    """
+
+    async def test_get_webhook_target_returns_role_after_register(self):
+        from trigger_registry import TriggerRegistry
+
+        sched = _make_scheduler()
+        app = web.Application()
+        bus = _make_bus()
+        reg = TriggerRegistry(scheduler=sched, app=app, bus=bus)
+
+        reg.register_agent(
+            "assistant", [_trigger_webhook(name="probe")],
+            channels=["webhook"],
+        )
+        assert reg.get_webhook_target("probe") == "assistant"
+
+    async def test_get_webhook_target_unknown_returns_none(self):
+        from trigger_registry import TriggerRegistry
+
+        sched = _make_scheduler()
+        app = web.Application()
+        bus = _make_bus()
+        reg = TriggerRegistry(scheduler=sched, app=app, bus=bus)
+
+        assert reg.get_webhook_target("never-registered") is None
+
+    async def test_reregister_for_clears_then_repopulates(self):
+        """Removing a webhook trigger via reregister_for makes the name
+        invalid (returns None); adding a new one makes it valid."""
+        from config import TriggerSpec
+        from trigger_registry import TriggerRegistry
+
+        sched = _make_scheduler()
+        app = web.Application()
+        bus = _make_bus()
+        reg = TriggerRegistry(scheduler=sched, app=app, bus=bus)
+
+        reg.register_agent(
+            "assistant",
+            [TriggerSpec(name="old", type="webhook", path="/webhook/old")],
+            channels=["webhook"],
+        )
+        assert reg.get_webhook_target("old") == "assistant"
+
+        reg.reregister_for(
+            "assistant",
+            [TriggerSpec(name="new", type="webhook", path="/webhook/new")],
+            channels=["webhook"],
+        )
+        assert reg.get_webhook_target("old") is None
+        assert reg.get_webhook_target("new") == "assistant"
+
+    async def test_register_tolerates_frozen_router(self):
+        """N-1 fix: post-boot ``register_agent`` for a webhook trigger
+        must NOT raise even though aiohttp's router is frozen. The route
+        add is best-effort; the wildcard handler dispatches via the
+        allowlist."""
+        from trigger_registry import TriggerRegistry
+
+        sched = _make_scheduler()
+        app = web.Application()
+        bus = _make_bus()
+        # Drive the app through AppRunner.setup() which is what production
+        # does — that's the lifecycle step that freezes the router and is
+        # what made post-boot register_agent raise pre-N-1.
+        runner = web.AppRunner(app)
+        await runner.setup()
+        try:
+            reg = TriggerRegistry(scheduler=sched, app=app, bus=bus)
+
+            # No raise:
+            reg.register_agent(
+                "assistant", [_trigger_webhook(name="post-boot")],
+                channels=["webhook"],
+            )
+            assert reg.get_webhook_target("post-boot") == "assistant"
+        finally:
+            await runner.cleanup()
+
+    async def test_get_webhook_target_returns_specialist_role(self):
+        """Webhook triggers can be registered to non-assistant roles
+        (specialists, other residents). Allowlist preserves the role."""
+        from trigger_registry import TriggerRegistry
+
+        sched = _make_scheduler()
+        app = web.Application()
+        bus = _make_bus()
+        reg = TriggerRegistry(scheduler=sched, app=app, bus=bus)
+
+        reg.register_agent(
+            "butler", [_trigger_webhook(name="b1", path="/webhook/b1")],
+            channels=["webhook"],
+        )
+        assert reg.get_webhook_target("b1") == "butler"
+
+
 # ---------------------------------------------------------------------------
 # TestValidation
 # ---------------------------------------------------------------------------
