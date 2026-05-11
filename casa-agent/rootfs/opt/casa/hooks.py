@@ -175,8 +175,14 @@ def _command_is_dangerous(command: str, *, _depth: int = 0) -> str | None:
 
 HookCallback = Callable[
     [dict[str, Any], str | None, dict[str, Any]],
-    Awaitable[dict[str, Any] | None],
+    Awaitable[dict[str, Any]],
 ]
+# H-2 (v0.36.1): no-op paths return ``{}`` not ``None``. The SDK's
+# ``_convert_hook_output_for_cli`` calls ``hook_output.items()``
+# unconditionally; ``None`` violates the typed ``HookJSONOutput`` contract
+# and emits 73+ ``Error in hook callback`` lines per ~30-min engagement.
+# Operationally equivalent (SDK treats ``{}`` the same as ``None`` for
+# decision purposes) but type-compliant.
 
 
 def _deny(reason: str) -> dict[str, Any]:
@@ -221,7 +227,7 @@ async def block_dangerous_commands(
     input_data: dict[str, Any],
     tool_use_id: str | None,
     context: dict[str, Any],
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     """Block Bash commands that contain dangerous primitives.
 
     Uses an argv-aware matcher (see ``_command_is_dangerous``) so that
@@ -231,13 +237,13 @@ async def block_dangerous_commands(
     """
     tool_name = input_data.get("tool_name", "")
     if tool_name != "Bash":
-        return None
+        return {}
 
     command = input_data.get("tool_input", {}).get("command", "")
     reason = _command_is_dangerous(command)
     if reason is not None:
         return _deny(f"Blocked by safety hook: {reason}")
-    return None
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -268,10 +274,10 @@ def make_path_scope_hook_v2(
         input_data: dict[str, Any],
         tool_use_id: str | None,
         context: dict[str, Any],
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         tool_name = input_data.get("tool_name", "")
         if tool_name not in ("Read", "Write", "Edit"):
-            return None
+            return {}
         raw = input_data.get("tool_input", {}).get("file_path", "")
         norm = _normalize_path(raw)
 
@@ -287,7 +293,7 @@ def make_path_scope_hook_v2(
                     f"path_scope: Read denied — {raw!r} outside "
                     f"readable prefixes {readable}"
                 )
-        return None
+        return {}
 
     return _hook
 
@@ -320,7 +326,7 @@ def make_casa_config_guard_hook(
         input_data: dict[str, Any],
         tool_use_id: str | None,
         context: dict[str, Any],
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         tool_name = input_data.get("tool_name", "")
         if tool_name in ("Write", "Edit"):
             raw = input_data.get("tool_input", {}).get("file_path", "")
@@ -342,7 +348,7 @@ def make_casa_config_guard_hook(
                     "destructive to remove; ask the user explicitly in the "
                     "engagement topic and retry only if they say yes."
                 )
-        return None
+        return {}
 
     return _hook
 
@@ -379,10 +385,10 @@ def make_commit_size_guard_hook(*, max_files: int) -> HookCallback:
         input_data: dict[str, Any],
         tool_use_id: str | None,
         context: dict[str, Any],
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         tool_name = input_data.get("tool_name", "")
         if tool_name not in ("Write", "Edit"):
-            return None
+            return {}
         count = _git_porcelain_count()
         if count > max_files:
             return _deny(
@@ -391,7 +397,7 @@ def make_commit_size_guard_hook(*, max_files: int) -> HookCallback:
                 f"current batch, then continue. If you must commit more "
                 f"than {max_files} files atomically, ask the user first."
             )
-        return None
+        return {}
 
     return _hook
 
@@ -432,16 +438,16 @@ def make_self_containment_guard() -> HookCallback:
         input_data: dict[str, Any],
         tool_use_id: str | None,
         context: dict[str, Any],
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         if input_data.get("tool_name") != "Bash":
-            return None
+            return {}
         cmd = input_data.get("tool_input", {}).get("command", "")
         if not re.match(r"\s*git\s+push\b", cmd):
-            return None
+            return {}
 
         cwd = Path(input_data.get("cwd") or os.getcwd())
         if not cwd.is_dir():
-            return None
+            return {}
 
         findings: list[str] = []
         for root, dirs, files in os.walk(cwd):
@@ -467,7 +473,7 @@ def make_self_containment_guard() -> HookCallback:
                 + "\nDeclare via casa.systemRequirements or use ${CLAUDE_PLUGIN_ROOT}. "
                 "Override with --allow-anti-pattern only if false positive."
             )
-        return None
+        return {}
 
     return hook
 
