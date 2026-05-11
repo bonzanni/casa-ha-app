@@ -33,7 +33,7 @@ def plugin_repo(tmp_path: Path) -> Path:
     return repo
 
 
-async def _run_policy(input_data: dict) -> dict | None:
+async def _run_policy(input_data: dict) -> dict:
     factory = HOOK_POLICIES["self_containment_guard"]["factory"]
     hook = factory()
     return await hook(input_data, None, {})
@@ -42,7 +42,7 @@ async def _run_policy(input_data: dict) -> dict | None:
 class TestSelfContainmentGuard:
     async def test_clean_repo_allows(self, plugin_repo: Path) -> None:
         result = await _run_policy(_build_git_push_input(plugin_repo))
-        assert result is None, f"unexpected deny: {result}"
+        assert result == {}, f"unexpected deny: {result}"
 
     async def test_readme_please_install_blocks(self, plugin_repo: Path) -> None:
         _write(plugin_repo / "README.md", "# x\nplease install ffmpeg manually.\n")
@@ -71,7 +71,7 @@ class TestSelfContainmentGuard:
             "cwd": str(plugin_repo),
         }
         result = await _run_policy(input_data)
-        assert result is None
+        assert result == {}
 
     async def test_registered_in_hook_policies(self) -> None:
         assert "self_containment_guard" in HOOK_POLICIES

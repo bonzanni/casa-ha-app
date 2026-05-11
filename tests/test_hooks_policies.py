@@ -24,7 +24,7 @@ class TestPathScopeV2:
         data = {"tool_name": "Write",
                 "tool_input": {"file_path":
                     "/addon_configs/casa-agent/workspace/note.txt"}}
-        assert await hook(data, "tid", CTX) is None
+        assert await hook(data, "tid", CTX) == {}
 
     async def test_writable_denies_write_outside_prefix(self):
         from hooks import make_path_scope_hook_v2
@@ -45,7 +45,7 @@ class TestPathScopeV2:
         )
         data = {"tool_name": "Read",
                 "tool_input": {"file_path": "/addon_configs/something"}}
-        assert await hook(data, "tid", CTX) is None
+        assert await hook(data, "tid", CTX) == {}
 
     async def test_readable_denies_read_outside_prefix(self):
         from hooks import make_path_scope_hook_v2
@@ -182,3 +182,128 @@ def test_resolve_hooks_still_builds_HookMatcher():
     matcher = resolved["PreToolUse"][0]
     assert hasattr(matcher, "matcher") and hasattr(matcher, "hooks")
     assert matcher.matcher == "Bash"
+
+
+# --- H-2 (v0.36.1) — no-op paths return empty dict, never None ---------------
+#
+# The SDK's `_convert_hook_output_for_cli` (claude_agent_sdk/_internal/query.py)
+# calls `hook_output.items()` unconditionally. The typed contract is
+# `HookCallback = Callable[..., Awaitable[HookJSONOutput]]` where
+# `HookJSONOutput = AsyncHookJSONOutput | SyncHookJSONOutput` — both TypedDicts
+# with all fields `NotRequired`. Returning `None` from a no-op branch violates
+# the contract and produces 73+ `Error in hook callback hook_X: 'NoneType'
+# object has no attribute 'items'` per ~30-min engagement window.
+#
+# Fix: every HookCallback no-op path returns `{}` instead of `None`. Operationally
+# equivalent (the SDK treats both as "no decision") but type-compliant.
+# -----------------------------------------------------------------------------
+
+
+class TestHookNoopReturnsEmptyDict:
+    """H-2 regression: every HookCallback returns {} (not None) on no-op paths."""
+
+    async def test_block_dangerous_commands_safe_command(self):
+        from hooks import block_dangerous_commands
+        result = await block_dangerous_commands(
+            {"tool_name": "Bash", "tool_input": {"command": "ls -la /tmp"}},
+            None, {},
+        )
+        assert result == {}, f"expected empty dict, got {result!r}"
+
+    async def test_block_dangerous_commands_non_bash(self):
+        from hooks import block_dangerous_commands
+        result = await block_dangerous_commands(
+            {"tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}},
+            None, {},
+        )
+        assert result == {}, f"expected empty dict, got {result!r}"
+
+    async def test_path_scope_allowed_write(self):
+        from hooks import make_path_scope_hook_v2
+        hook = make_path_scope_hook_v2(
+            writable=["/addon_configs/casa-agent/workspace"],
+            readable=["/addon_configs/casa-agent/workspace"],
+        )
+        result = await hook(
+            {"tool_name": "Write",
+             "tool_input": {"file_path":
+                 "/addon_configs/casa-agent/workspace/note.txt"}},
+            None, {},
+        )
+        assert result == {}, f"expected empty dict, got {result!r}"
+
+    async def test_path_scope_non_file_tool(self):
+        from hooks import make_path_scope_hook_v2
+        hook = make_path_scope_hook_v2(writable=[], readable=[])
+        result = await hook(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            None, {},
+        )
+        assert result == {}, f"expected empty dict, got {result!r}"
+
+    async def test_casa_config_guard_allowed_write(self):
+        from hooks import make_casa_config_guard_hook
+        hook = make_casa_config_guard_hook(
+            forbid_write_paths=["/data"],
+            forbid_delete_residents=True,
+        )
+        result = await hook(
+            {"tool_name": "Write",
+             "tool_input": {"file_path":
+                 "/addon_configs/casa-agent/agents/specialists/x/character.yaml"}},
+            None, {},
+        )
+        assert result == {}, f"expected empty dict, got {result!r}"
+
+    async def test_casa_config_guard_safe_bash(self):
+        from hooks import make_casa_config_guard_hook
+        hook = make_casa_config_guard_hook(
+            forbid_write_paths=[],
+            forbid_delete_residents=True,
+        )
+        result = await hook(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "ls /addon_configs"}},
+            None, {},
+        )
+        assert result == {}, f"expected empty dict, got {result!r}"
+
+    async def test_commit_size_guard_under_threshold(self):
+        from unittest.mock import patch
+        from hooks import make_commit_size_guard_hook
+        hook = make_commit_size_guard_hook(max_files=20)
+        with patch("hooks._git_porcelain_count", return_value=5):
+            result = await hook(
+                {"tool_name": "Write",
+                 "tool_input": {"file_path":
+                     "/addon_configs/casa-agent/agents/x.yaml"}},
+                None, {},
+            )
+        assert result == {}, f"expected empty dict, got {result!r}"
+
+    async def test_commit_size_guard_non_write(self):
+        from hooks import make_commit_size_guard_hook
+        hook = make_commit_size_guard_hook(max_files=1)
+        result = await hook(
+            {"tool_name": "Read", "tool_input": {"file_path": "/x"}},
+            None, {},
+        )
+        assert result == {}, f"expected empty dict, got {result!r}"
+
+    async def test_self_containment_guard_non_bash(self):
+        from hooks import make_self_containment_guard
+        hook = make_self_containment_guard()
+        result = await hook(
+            {"tool_name": "Read", "tool_input": {"file_path": "/x"}},
+            None, {},
+        )
+        assert result == {}, f"expected empty dict, got {result!r}"
+
+    async def test_self_containment_guard_non_git_push(self):
+        from hooks import make_self_containment_guard
+        hook = make_self_containment_guard()
+        result = await hook(
+            {"tool_name": "Bash", "tool_input": {"command": "ls -la"}},
+            None, {},
+        )
+        assert result == {}, f"expected empty dict, got {result!r}"

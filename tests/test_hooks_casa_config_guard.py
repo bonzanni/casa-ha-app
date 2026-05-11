@@ -44,7 +44,7 @@ class TestCasaConfigGuard:
             {"tool_name": "Write", "tool_input": {"file_path": "/addon_configs/casa-agent/agents/specialists/x/character.yaml"}},
             None, {},
         )
-        assert out is None
+        assert out == {}
 
     async def test_blocks_bash_rm_resident(self):
         from hooks import make_casa_config_guard_hook
@@ -69,7 +69,7 @@ class TestCasaConfigGuard:
             {"tool_name": "Bash", "tool_input": {"command": "rm -rf /addon_configs/casa-agent/agents/specialists/fitness"}},
             None, {},
         )
-        assert out is None
+        assert out == {}
 
     async def test_registered_in_hook_policies(self):
         from hooks import HOOK_POLICIES

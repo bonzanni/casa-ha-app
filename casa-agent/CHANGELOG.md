@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.36.1] - 2026-05-11 — Hotfix: H-2 (hook callbacks return {} not None)
+
+### Fixed
+- **LOW H-2: Casa hook callbacks return `None` from no-op paths, violating
+  the SDK's `HookJSONOutput` typed contract.** The SDK's
+  `_convert_hook_output_for_cli` (`claude_agent_sdk/_internal/query.py`)
+  calls `hook_output.items()` unconditionally — returning `None` emits
+  `'NoneType' object has no attribute 'items'` to stderr ~73× per
+  ~30-min engagement window across `block_dangerous_commands`,
+  `make_path_scope_hook_v2`, `make_casa_config_guard_hook`,
+  `make_commit_size_guard_hook`, and `make_self_containment_guard`.
+  Operationally harmless (the SDK error-responds back to the CLI which
+  proceeds normally; deny payloads still route correctly per
+  exploration5 P15) so this is purely log hygiene. Originally filed as
+  upstream-blocked; 2026-05-10 triage during v0.36.0 confirmed the SDK
+  is unchanged 0.1.72 → 0.1.80, fix is Casa-side. Changed every
+  HookCallback no-op `return None` → `return {}`; tightened the
+  `HookCallback` type alias and `_hook` return annotations from
+  `dict[str, Any] | None` → `dict[str, Any]`. 10 new regression tests
+  in `TestHookNoopReturnsEmptyDict` lock the contract per factory; the
+  HTTP-proxy layer at `internal_handlers.py:_make_internal_hooks_resolve_handler`
+  keeps its defensive `None → {}` translation for third-party callbacks.
+
 ## [0.35.2] - 2026-05-02 — Hotfix bundle: Q-1 + R-1 + S-1
 
 ### Fixed

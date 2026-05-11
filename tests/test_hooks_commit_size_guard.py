@@ -18,7 +18,7 @@ class TestCommitSizeGuard:
                 {"tool_name": "Write", "tool_input": {"file_path": "/addon_configs/casa-agent/agents/x.yaml"}},
                 None, {},
             )
-        assert out is None
+        assert out == {}
 
     async def test_above_threshold_denies(self):
         from hooks import make_commit_size_guard_hook
@@ -39,7 +39,7 @@ class TestCommitSizeGuard:
             {"tool_name": "Read", "tool_input": {"file_path": "/x"}},
             None, {},
         )
-        assert out is None
+        assert out == {}
 
     async def test_registered(self):
         from hooks import HOOK_POLICIES

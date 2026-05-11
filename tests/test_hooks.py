@@ -31,13 +31,13 @@ async def test_block_rm_rf():
 async def test_allow_safe_command():
     data = {"tool_name": "Bash", "tool_input": {"command": "ls -la /tmp"}}
     result = await block_dangerous_commands(data, "tid-2", CTX)
-    assert result is None
+    assert result == {}
 
 
 async def test_skip_non_bash_tools():
     data = {"tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}}
     result = await block_dangerous_commands(data, "tid-3", CTX)
-    assert result is None
+    assert result == {}
 
 
 async def test_block_ssh():
@@ -79,7 +79,7 @@ async def test_v2_writable_allows_write_under_prefix():
     data = {"tool_name": "Write",
             "tool_input": {"file_path":
                 "/addon_configs/casa-agent/workspace/note.txt"}}
-    assert await hook(data, "tid-20", CTX) is None
+    assert await hook(data, "tid-20", CTX) == {}
 
 
 async def test_v2_writable_denies_write_outside():
@@ -103,7 +103,7 @@ async def test_v2_readable_allows_read():
     )
     data = {"tool_name": "Read",
             "tool_input": {"file_path": "/addon_configs/casa-agent/agents/butler/character.yaml"}}
-    assert await hook(data, "tid-22", CTX) is None
+    assert await hook(data, "tid-22", CTX) == {}
 
 
 async def test_v2_traversal_blocked():
@@ -123,7 +123,7 @@ async def test_v2_non_file_tool_skipped():
     from hooks import make_path_scope_hook_v2
     hook = make_path_scope_hook_v2(writable=[], readable=[])
     data = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
-    assert await hook(data, "tid-24", CTX) is None
+    assert await hook(data, "tid-24", CTX) == {}
 
 
 # ------------------------------------------------------------------
@@ -168,7 +168,7 @@ async def test_rm_recursive_force_all_blocked(cmd):
 async def test_safe_rm_variants_allowed(cmd):
     data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
     result = await block_dangerous_commands(data, "tid-rm-safe", CTX)
-    assert result is None, f"unexpectedly blocked: {cmd!r}"
+    assert result == {}, f"unexpectedly blocked: {cmd!r}"
 
 
 @pytest.mark.parametrize("cmd", [
@@ -250,7 +250,7 @@ async def test_curl_get_allowed():
     """Plain GET requests are not blocked by this hook."""
     data = {"tool_name": "Bash",
             "tool_input": {"command": "curl https://example.com/api"}}
-    assert await block_dangerous_commands(data, "tid-curl-get", CTX) is None
+    assert await block_dangerous_commands(data, "tid-curl-get", CTX) == {}
 
 
 async def test_malformed_quotes_does_not_crash():
