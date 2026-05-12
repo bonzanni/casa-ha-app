@@ -824,6 +824,58 @@ class TelegramChannel(Channel):
         )
         return msg.message_id
 
+    async def update_topic_state(
+        self, *, engagement_id: str, new_state: str,
+    ) -> None:
+        """E-12 (v0.37.0) Task 23: re-render the topic title with ``new_state``.
+
+        Reuses the existing role_or_type + ``task`` stored on the
+        ``EngagementRecord``. Idempotent — when ``new_state`` is identical to
+        the persisted ``current_state_emoji`` it's a no-op. Unknown
+        ``new_state`` values are also no-ops (defensive). Persistence of the
+        new emoji happens after a successful edit_forum_topic so a transient
+        Telegram failure doesn't desync the record from what's on the wire.
+        """
+        from channels.state_emoji import (
+            STATE_EMOJI, compose_topic_title, concise_task,
+        )
+        if self._engagement_registry is None:
+            return
+        rec = self._engagement_registry.get(engagement_id)
+        if rec is None or rec.topic_id is None:
+            return
+        new_emoji = STATE_EMOJI.get(new_state)
+        if new_emoji is None or new_emoji == rec.current_state_emoji:
+            return
+
+        title = compose_topic_title(
+            state=new_state, role=rec.role_or_type,
+            short_task=concise_task(rec.task or ""),
+        )
+        if not self.engagement_supergroup_id:
+            return
+        try:
+            await self.bot.edit_forum_topic(
+                chat_id=self.engagement_supergroup_id,
+                message_thread_id=rec.topic_id,
+                name=title,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "U3 update_topic_state edit_forum_topic failed (engagement=%s "
+                "state=%s): %s", engagement_id[:8], new_state, exc,
+            )
+            return
+        try:
+            await self._engagement_registry.set_channel_state(
+                engagement_id, current_state_emoji=new_emoji,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "U3 set_channel_state(%s, %s) failed: %s",
+                engagement_id[:8], new_emoji, exc,
+            )
+
     async def close_topic_with_check(self, thread_id: int) -> None:
         """Close the topic and flip its icon emoji to ✅."""
         if not self.engagement_supergroup_id:

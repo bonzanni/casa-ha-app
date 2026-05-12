@@ -1650,7 +1650,7 @@ async def _finalize_engagement(
                 engagement.id, kind="emit_completion_error", message=text,
             )
 
-    # 2. Post completion message into the topic (if any) and close it
+    # 2. Post completion message into the topic (if any), flip U3 state, close.
     if engagement.topic_id is not None and _channel_manager is not None:
         tch = _channel_manager.get(engagement.origin.get("channel", "telegram"))
         if tch is not None:
@@ -1664,6 +1664,25 @@ async def _finalize_engagement(
                     "finalize engagement %s: send_to_topic failed: %s",
                     engagement.id[:8], exc,
                 )
+            # E-12 (v0.37.0) Task 23: U3 terminal state — flip the topic title
+            # to <state-emoji>·<role-emoji> <task> before closing so the
+            # closed-topic sidebar carries the outcome at a glance.
+            terminal_state = {
+                "completed": "completed",
+                "cancelled": "cancelled",
+                "error": "failed",
+                "failed": "failed",
+            }.get(outcome)
+            if terminal_state is not None and hasattr(tch, "update_topic_state"):
+                try:
+                    await tch.update_topic_state(
+                        engagement_id=engagement.id, new_state=terminal_state,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "finalize engagement %s: U3 state update failed: %s",
+                        engagement.id[:8], exc,
+                    )
             try:
                 await tch.close_topic_with_check(thread_id=engagement.topic_id)
             except Exception as exc:  # noqa: BLE001

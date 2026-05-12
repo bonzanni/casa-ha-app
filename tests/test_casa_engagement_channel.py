@@ -189,8 +189,11 @@ class TestPermissionRequest:
         await channel_server.handle_permission_request({
             "request_id": "rid-min", "tool_name": "Bash",
         })
-        assert sent, "handler must still post a keyboard prompt"
-        _, payload = sent[0]
+        keyboard_call = next(
+            (p, pl) for p, pl in sent
+            if p == "/internal/channel/post_inline_keyboard"
+        )
+        _, payload = keyboard_call
         assert payload["request_id"] == "rid-min"
 
     async def test_notification_handler_registered_on_inner_server(
@@ -252,3 +255,80 @@ class TestPermissionVerdictEmission:
         await channel_server._emit_permission_notification({
             "request_id": "rid-1", "verdict": "allow",
         })
+
+
+class TestU3StateTransitionsFromChannelServer:
+    """Phase 2 Task 23: channel server flips state on permission_request +
+    verdict via /internal/channel/update_state."""
+
+    async def test_permission_request_flips_to_awaiting_before_keyboard(
+        self, channel_server, monkeypatch,
+    ):
+        sent: list[tuple[str, dict]] = []
+
+        async def fake_post(path, payload):
+            sent.append((path, dict(payload)))
+            return {"ok": True}
+
+        monkeypatch.setattr(channel_server, "_internal_post", fake_post)
+        await channel_server.handle_permission_request({
+            "request_id": "rid-1", "tool_name": "Bash",
+        })
+
+        # Order matters: U3 flip first (visible to operator), then keyboard.
+        paths = [p for p, _ in sent]
+        assert paths.index("/internal/channel/update_state") < paths.index(
+            "/internal/channel/post_inline_keyboard",
+        )
+        update_payload = next(
+            pl for p, pl in sent if p == "/internal/channel/update_state"
+        )
+        assert update_payload["new_state"] == "awaiting"
+
+    async def test_emit_permission_notification_flips_back_to_active(
+        self, channel_server, monkeypatch,
+    ):
+        from unittest.mock import AsyncMock
+        fake_session = AsyncMock()
+        channel_server._CURRENT_SESSION = fake_session
+        sent: list[tuple[str, dict]] = []
+
+        async def fake_post(path, payload):
+            sent.append((path, dict(payload)))
+            return {"ok": True}
+
+        monkeypatch.setattr(channel_server, "_internal_post", fake_post)
+
+        await channel_server._emit_permission_notification({
+            "request_id": "rid-2", "verdict": "allow",
+        })
+
+        # Notification fired and state flipped back to active.
+        fake_session.send_notification.assert_awaited_once()
+        active_calls = [
+            (p, pl) for p, pl in sent
+            if p == "/internal/channel/update_state"
+            and pl.get("new_state") == "active"
+        ]
+        assert active_calls, f"got calls: {sent}"
+
+    async def test_state_transition_post_failure_is_swallowed(
+        self, channel_server, monkeypatch,
+    ):
+        """A transient state-update failure must not block the verdict path."""
+        from unittest.mock import AsyncMock
+        fake_session = AsyncMock()
+        channel_server._CURRENT_SESSION = fake_session
+
+        async def exploding_post(path, payload):
+            if path == "/internal/channel/update_state":
+                raise RuntimeError("socket gone")
+            return {"ok": True}
+
+        monkeypatch.setattr(channel_server, "_internal_post", exploding_post)
+        # Should not raise.
+        await channel_server._emit_permission_notification({
+            "request_id": "rid-3", "verdict": "deny",
+        })
+        # Verdict still delivered.
+        fake_session.send_notification.assert_awaited_once()

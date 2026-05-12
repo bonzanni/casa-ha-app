@@ -171,3 +171,117 @@ class TestInlineCallbackPermissionVerdict:
         )
         await ch._on_inline_callback(update, context=None)
         update.callback_query.answer.assert_awaited_once()
+
+
+class TestUpdateTopicState:
+    """E-12 (v0.37.0) Task 23: TelegramChannel.update_topic_state."""
+
+    async def test_update_state_edits_topic_title(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        from channels.telegram import TelegramChannel
+        # The engagement_fixture creates only a registry record with
+        # topic_id=555. Pre-create the forum topic on the fake bot so
+        # update_topic_state's edit_forum_topic finds it.
+        await fake_telegram_bot.create_forum_topic(
+            chat_id=-1001, name="🟢·🤖 t",
+        )
+        # The fake's auto-assigned thread id starts at 1001; manually align
+        # the fixture's topic_id to that value.
+        rec = engagement_fixture.active_record
+        rec.topic_id = 1001
+
+        ch = TelegramChannel(
+            bot=fake_telegram_bot, chat_id=100, engagement_supergroup_id=-1001,
+        )
+        ch._engagement_registry = engagement_fixture.registry
+
+        await ch.update_topic_state(
+            engagement_id=rec.id, new_state="awaiting",
+        )
+
+        sg = fake_telegram_bot._supergroups[-1001]
+        topic = sg.topics[1001]
+        assert topic.name.startswith("🟡·"), f"got {topic.name!r}"
+
+    async def test_update_state_is_noop_when_state_unchanged(
+        self, fake_telegram_bot, engagement_fixture, monkeypatch,
+    ):
+        from channels.telegram import TelegramChannel
+        ch = TelegramChannel(
+            bot=fake_telegram_bot, chat_id=100, engagement_supergroup_id=-1001,
+        )
+        ch._engagement_registry = engagement_fixture.registry
+        rec = engagement_fixture.active_record
+        # Seed the registry with current_state_emoji=🟡 already.
+        await engagement_fixture.registry.set_channel_state(
+            rec.id, current_state_emoji="🟡",
+        )
+
+        # Sanity: edit_forum_topic shouldn't be called.
+        from unittest.mock import AsyncMock
+        ef = AsyncMock()
+        monkeypatch.setattr(fake_telegram_bot, "edit_forum_topic", ef)
+
+        await ch.update_topic_state(
+            engagement_id=rec.id, new_state="awaiting",
+        )
+        ef.assert_not_awaited()
+
+    async def test_update_state_unknown_state_drops_silently(
+        self, fake_telegram_bot, engagement_fixture, monkeypatch,
+    ):
+        from channels.telegram import TelegramChannel
+        ch = TelegramChannel(
+            bot=fake_telegram_bot, chat_id=100, engagement_supergroup_id=-1001,
+        )
+        ch._engagement_registry = engagement_fixture.registry
+        rec = engagement_fixture.active_record
+
+        from unittest.mock import AsyncMock
+        ef = AsyncMock()
+        monkeypatch.setattr(fake_telegram_bot, "edit_forum_topic", ef)
+
+        await ch.update_topic_state(
+            engagement_id=rec.id, new_state="not-a-real-state",
+        )
+        ef.assert_not_awaited()
+
+    async def test_update_state_unknown_engagement_drops_silently(
+        self, fake_telegram_bot, engagement_fixture, monkeypatch,
+    ):
+        from channels.telegram import TelegramChannel
+        ch = TelegramChannel(
+            bot=fake_telegram_bot, chat_id=100, engagement_supergroup_id=-1001,
+        )
+        ch._engagement_registry = engagement_fixture.registry
+
+        from unittest.mock import AsyncMock
+        ef = AsyncMock()
+        monkeypatch.setattr(fake_telegram_bot, "edit_forum_topic", ef)
+
+        await ch.update_topic_state(
+            engagement_id="does-not-exist", new_state="awaiting",
+        )
+        ef.assert_not_awaited()
+
+    async def test_update_state_persists_current_state_emoji(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        from channels.telegram import TelegramChannel
+        await fake_telegram_bot.create_forum_topic(
+            chat_id=-1001, name="🟢·🤖 t",
+        )
+        rec = engagement_fixture.active_record
+        rec.topic_id = 1001
+
+        ch = TelegramChannel(
+            bot=fake_telegram_bot, chat_id=100, engagement_supergroup_id=-1001,
+        )
+        ch._engagement_registry = engagement_fixture.registry
+        assert rec.current_state_emoji is None  # baseline
+
+        await ch.update_topic_state(
+            engagement_id=rec.id, new_state="awaiting",
+        )
+        assert rec.current_state_emoji == "🟡"

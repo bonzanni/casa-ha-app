@@ -364,3 +364,106 @@ async def test_executor_finalize_archives_under_hyphen_role_id(
     for r in es_roles + at_roles:
         if r is not None:
             assert ":" not in r, f"colon-keyed Honcho id leaked: {r!r}"
+
+
+class TestFinalizeU3Transition:
+    """E-12 (v0.37.0) Task 23: terminal-state U3 flip from _finalize_engagement."""
+
+    async def _make_setup(self, outcome, tmp_path):
+        from engagement_registry import EngagementRegistry
+        from tools import _finalize_engagement, init_tools
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="plugin-developer",
+            driver="claude_code", task="t",
+            origin={"role": "assistant", "channel": "telegram",
+                    "chat_id": "12345"},
+            topic_id=42,
+        )
+
+        telegram = MagicMock()
+        telegram.send_to_topic = AsyncMock()
+        telegram.close_topic_with_check = AsyncMock()
+        telegram.update_topic_state = AsyncMock()
+        cm = MagicMock()
+        cm.get.return_value = telegram
+        bus = MagicMock()
+        bus.notify = AsyncMock()
+
+        init_tools(
+            channel_manager=cm, bus=bus,
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=reg,
+        )
+
+        memory = MagicMock()
+        memory.ensure_session = AsyncMock()
+        memory.add_turn = AsyncMock()
+
+        driver = MagicMock()
+        driver.cancel = AsyncMock()
+
+        await _finalize_engagement(
+            rec, outcome=outcome, text="x", artifacts=[],
+            next_steps=[], driver=driver, memory_provider=memory,
+        )
+        return telegram, rec
+
+    async def test_completed_flips_topic_to_completed(self, tmp_path):
+        telegram, rec = await self._make_setup("completed", tmp_path)
+        telegram.update_topic_state.assert_awaited_once_with(
+            engagement_id=rec.id, new_state="completed",
+        )
+
+    async def test_cancelled_flips_topic_to_cancelled(self, tmp_path):
+        telegram, rec = await self._make_setup("cancelled", tmp_path)
+        telegram.update_topic_state.assert_awaited_once_with(
+            engagement_id=rec.id, new_state="cancelled",
+        )
+
+    async def test_error_flips_topic_to_failed(self, tmp_path):
+        telegram, rec = await self._make_setup("error", tmp_path)
+        telegram.update_topic_state.assert_awaited_once_with(
+            engagement_id=rec.id, new_state="failed",
+        )
+
+    async def test_state_update_failure_does_not_block_close(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+        from tools import _finalize_engagement, init_tools
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="plugin-developer",
+            driver="claude_code", task="t",
+            origin={"role": "assistant", "channel": "telegram",
+                    "chat_id": "12345"},
+            topic_id=42,
+        )
+
+        telegram = MagicMock()
+        telegram.send_to_topic = AsyncMock()
+        telegram.close_topic_with_check = AsyncMock()
+        telegram.update_topic_state = AsyncMock(
+            side_effect=RuntimeError("telegram down"),
+        )
+        cm = MagicMock()
+        cm.get.return_value = telegram
+
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=reg,
+        )
+
+        memory = MagicMock()
+        memory.ensure_session = AsyncMock()
+        memory.add_turn = AsyncMock()
+
+        await _finalize_engagement(
+            rec, outcome="completed", text="x", artifacts=[],
+            next_steps=[], driver=None, memory_provider=memory,
+        )
+        # Close still happened despite the state-update failure.
+        telegram.close_topic_with_check.assert_awaited_once()
+        assert rec.status == "completed"

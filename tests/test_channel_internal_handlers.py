@@ -384,3 +384,80 @@ async def test_permission_verdict_bad_json_returns_error(
             data="not json", headers={"Content-Type": "application/json"},
         )
         assert (await resp.json()) == {"ok": False, "error": "bad_json"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — /internal/channel/update_state (Task 23)
+# ---------------------------------------------------------------------------
+
+
+class _StateTrackingChannel(_FakeChannel):
+    """Captures update_topic_state calls so tests can assert on them."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.state_transitions: list[dict[str, Any]] = []
+
+    async def update_topic_state(self, *, engagement_id: str, new_state: str):
+        self.state_transitions.append(
+            {"engagement_id": engagement_id, "new_state": new_state},
+        )
+
+
+async def test_update_state_calls_telegram_helper(app_factory) -> None:
+    """Task 23: /internal/channel/update_state forwards to
+    TelegramChannel.update_topic_state for the per-engagement title edit."""
+    ch = _StateTrackingChannel()
+    app, ch, _reg = app_factory(channel=ch)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/update_state",
+            json={"engagement_id": "eng-1", "new_state": "awaiting"},
+        )
+        assert (await resp.json()) == {"ok": True}
+
+    assert ch.state_transitions == [
+        {"engagement_id": "eng-1", "new_state": "awaiting"},
+    ]
+
+
+async def test_update_state_unknown_state_is_dropped_gracefully(
+    app_factory,
+) -> None:
+    """Unknown state shouldn't raise — channel helper logs + drops."""
+    class _NoopChannel(_FakeChannel):
+        async def update_topic_state(self, *, engagement_id, new_state):
+            return
+
+    app, _ch, _reg = app_factory(channel=_NoopChannel())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/update_state",
+            json={"engagement_id": "eng-1", "new_state": "made-up"},
+        )
+        # The handler is forgiving — the channel decides what's a valid state.
+        assert (await resp.json()) == {"ok": True}
+
+
+async def test_update_state_bad_json_returns_error(app_factory) -> None:
+    app, _ch, _reg = app_factory(channel=_StateTrackingChannel())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/update_state",
+            data="not json", headers={"Content-Type": "application/json"},
+        )
+        assert (await resp.json()) == {"ok": False, "error": "bad_json"}
+
+
+async def test_update_state_channel_failure_returns_error(app_factory) -> None:
+    class _ExplodingChannel(_FakeChannel):
+        async def update_topic_state(self, *, engagement_id, new_state):
+            raise RuntimeError("edit_forum_topic timeout")
+
+    app, _ch, _reg = app_factory(channel=_ExplodingChannel())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/update_state",
+            json={"engagement_id": "eng-1", "new_state": "awaiting"},
+        )
+        assert (await resp.json()) == {"ok": False, "error": "update_failed"}

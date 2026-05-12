@@ -161,21 +161,45 @@ def _build_perm_buttons(request_id: str) -> list[list[dict[str, str]]]:
     ]]
 
 
+async def _post_state_transition(new_state: str) -> None:
+    """Best-effort POST /internal/channel/update_state.
+
+    Failures are logged but never propagate — a transient unavailability of
+    the casa-main socket must not stall the per-engagement MCP server's tool
+    dispatch.
+    """
+    try:
+        await _internal_post(
+            "/internal/channel/update_state",
+            {"new_state": new_state},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "update_state(%s) failed: %s", new_state, exc,
+        )
+
+
 async def handle_permission_request(params: dict[str, Any]) -> None:
     """U1: render the operator-facing permission prompt for a tool call.
 
     Receives ``notifications/claude/channel/permission_request`` params:
-    ``{request_id, tool_name, description?, input_preview?}``. Renders an
-    inline-keyboard prompt in the engagement topic via casa-main; the verdict
-    travels back via ``CallbackQueryHandler`` → ``permission_verdict`` queue →
-    long-poll drain → ``notifications/claude/channel/permission`` (delivered
-    elsewhere in Phase 2 Task 21).
+    ``{request_id, tool_name, description?, input_preview?}``. Flips the U3
+    topic title to ``awaiting`` (🟡) so the operator notices the engagement
+    is blocked; renders an inline-keyboard prompt in the engagement topic
+    via casa-main; the verdict travels back via ``CallbackQueryHandler`` →
+    ``permission_verdict`` queue → long-poll drain →
+    ``notifications/claude/channel/permission`` (Task 21).
     """
     rid = params["request_id"]
     tool = params.get("tool_name", "(unknown)")
     desc = params.get("description") or ""
     preview = params.get("input_preview") or ""
 
+    # 1. U3 state flip — best-effort, runs first so the title is in 🟡 before
+    #    the keyboard appears (cosmetic ordering — visible to operator).
+    await _post_state_transition("awaiting")
+
+    # 2. Render the keyboard prompt.
     body_lines: list[str] = [f"Claude wants to use: *{tool}*"]
     if desc:
         body_lines.append("")
@@ -314,6 +338,12 @@ async def _emit_permission_notification(payload: dict[str, Any]) -> None:
             "send_notification failed for permission verdict (rid=%s): %s",
             payload.get("request_id"), exc,
         )
+        return
+
+    # U3 state flip back to active — best-effort. Runs AFTER the notification
+    # so a transient socket hiccup on the state-update path doesn't delay
+    # the verdict reaching Claude (which is what unblocks the engagement).
+    await _post_state_transition("active")
 
 
 async def _drain_permission_verdicts() -> None:

@@ -251,15 +251,59 @@ def _make_permission_pending() -> Handler:
     return handler
 
 
+def _make_update_state(telegram_channel: Any) -> Handler:
+    """POST /internal/channel/update_state — channel server → casa-main.
+
+    Phase 2 (Task 23): the per-engagement channel server flips the topic
+    title's state emoji (awaiting / active) via this handler when permission
+    is requested / verdict received. Terminal-state transitions (completed /
+    failed / cancelled) come from ``_finalize_engagement`` directly via the
+    same ``update_topic_state`` helper on the channel — no internal POST
+    needed in that path.
+
+    Body shape: ``{engagement_id, new_state}``. Channel decides which states
+    are meaningful (this handler just forwards). Failure returns
+    ``update_failed`` so the caller can decide whether to retry.
+    """
+
+    async def handler(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad_json"})
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "bad_json"})
+
+        eng_id = body.get("engagement_id")
+        new_state = body.get("new_state")
+        if not eng_id or not new_state:
+            return web.json_response({"ok": False, "error": "bad_params"})
+
+        try:
+            await telegram_channel.update_topic_state(
+                engagement_id=eng_id, new_state=new_state,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "update_state failed (engagement=%s state=%s): %s",
+                eng_id, new_state, exc,
+            )
+            return web.json_response({"ok": False, "error": "update_failed"})
+
+        return web.json_response({"ok": True})
+
+    return handler
+
+
 def _make_channel_handlers(
     *, telegram_channel: Any, engagement_registry: Any,
 ) -> dict[str, Handler]:
     """Return a path → handler dict for /internal/channel/* POSTs.
 
     Phase 1: ``send_to_topic``.
-    Phase 2: ``post_inline_keyboard`` (Task 19), ``permission_verdict`` (Task 21).
-    Phase 2+ will extend with ``update_state`` (Task 23), ``set_progress``,
-    ``typing``, etc. — see spec §A.3.
+    Phase 2: ``post_inline_keyboard`` (Task 19), ``permission_verdict`` (Task 21),
+    ``update_state`` (Task 23).
+    Phase 2+ will extend with ``set_progress``, ``typing``, etc. — see spec §A.3.
     """
     return {
         "/internal/channel/send_to_topic": _make_send_to_topic(
@@ -272,6 +316,9 @@ def _make_channel_handlers(
         ),
         "/internal/channel/permission_verdict": _make_permission_verdict(
             engagement_registry=engagement_registry,
+        ),
+        "/internal/channel/update_state": _make_update_state(
+            telegram_channel=telegram_channel,
         ),
     }
 
