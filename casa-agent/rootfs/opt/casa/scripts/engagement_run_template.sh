@@ -33,7 +33,11 @@ if [ -f "/data/engagements/{ID}/.session_id" ]; then
   RESUME_FLAG="--resume $(cat /data/engagements/{ID}/.session_id)"
 fi
 
+# E-12 (v0.37.0): --channels server:casa-engagement-channel binds the
+# per-engagement Channels MCP server defined in workspace .mcp.json.
+# Composes with --remote-control (verified §A.3 of the spec).
 exec claude --remote-control "engagement-{ID_SHORT}" \
+            --channels server:casa-engagement-channel \
             $RESUME_FLAG \
             --permission-mode {PERMISSION_MODE} \
             {ADD_DIR_FLAGS}

@@ -68,6 +68,18 @@ class TestRenderRunScript:
         assert "mkdir -p /var/log/casa-engagement-xxxxxxxxxxxxxxxx" in script
         assert "exec s6-log n20 s1000000 /var/log/casa-engagement-xxxxxxxxxxxxxxxx" in script
 
+    def test_render_run_script_contains_channels_flag(self):
+        """E-12 (v0.37.0): --channels server:casa-engagement-channel."""
+        from drivers.workspace import render_run_script
+        script = render_run_script(
+            engagement_id="abcd1234-eng-id",
+            permission_mode="acceptEdits",
+            extra_dirs=[],
+        )
+        assert "--channels server:casa-engagement-channel" in script
+        # Sanity: --remote-control still present (--channels composes with it).
+        assert "--remote-control" in script
+
 
 class TestRenderRunScriptShellInjection:
     """Bug 4 + Bug 5 (v0.14.6): extra_dirs and extra_env keys must not
