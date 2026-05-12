@@ -25,12 +25,16 @@ def channel_server():
     """Force a fresh re-import of the channel server module per test.
 
     Uses the explicit ``_configure_for_test`` seam to populate
-    ``ENGAGEMENT_ID`` directly, avoiding argv-driven magic.
+    ``ENGAGEMENT_ID`` directly, avoiding argv-driven magic. Also installs the
+    Phase 2 permission-notification handler on the inner low-level Server so
+    tests can assert end-to-end registration without exercising
+    ``_run_with_channel_capabilities`` (which would block on stdio).
     """
     sys.modules.pop("channels.casa_engagement_channel", None)
     module = importlib.import_module("channels.casa_engagement_channel")
     module._configure_for_test("deadbeef-test")
     assert module.ENGAGEMENT_ID == "deadbeef-test"
+    module._register_permission_notification_handler()
     yield module
     sys.modules.pop("channels.casa_engagement_channel", None)
 
@@ -111,3 +115,90 @@ class TestChannelServerSkeleton:
             assert payload.get("engagement_id") == "deadbeef-test"
         assert captured[0]["text"] == "one"
         assert captured[1]["text"] == "two"
+
+
+class TestPermissionRequest:
+    """Phase 2 Task 18: permission_request notification → inline keyboard."""
+
+    async def test_perm_buttons_callback_data_within_64_bytes(self, channel_server):
+        """U1 §9 failure mode: callback_data must fit Telegram's 64-byte limit."""
+        buttons = channel_server._build_perm_buttons("a" * 32)
+        for row in buttons:
+            for btn in row:
+                assert len(btn["callback_data"].encode("utf-8")) <= 64
+
+    async def test_perm_buttons_raise_when_request_id_blows_budget(
+        self, channel_server,
+    ):
+        """Defensive: oversized request_id → ValueError, not silent truncation."""
+        import pytest
+        with pytest.raises(ValueError, match="exceeds"):
+            channel_server._build_perm_buttons("x" * 100)
+
+    async def test_perm_buttons_shape_matches_spec(self, channel_server):
+        buttons = channel_server._build_perm_buttons("rid-001")
+        assert buttons == [[
+            {"text": "✅ Allow", "callback_data": "perm:allow:rid-001"},
+            {"text": "❌ Deny", "callback_data": "perm:deny:rid-001"},
+        ]]
+
+    async def test_permission_request_renders_inline_keyboard(
+        self, channel_server, monkeypatch,
+    ):
+        """U1: permission_request notification posts an inline-keyboard prompt."""
+        sent = []
+
+        async def fake_post(path, payload):
+            sent.append((path, dict(payload)))
+            return {"ok": True}
+
+        monkeypatch.setattr(channel_server, "_internal_post", fake_post)
+
+        await channel_server.handle_permission_request({
+            "request_id": "rid-001",
+            "tool_name": "Bash",
+            "description": "create github repo bonzanni/casa-probe-foo",
+            "input_preview": "gh repo create bonzanni/casa-probe-foo --public",
+        })
+
+        keyboard_calls = [
+            (p, pl) for p, pl in sent
+            if p == "/internal/channel/post_inline_keyboard"
+        ]
+        assert keyboard_calls, f"got paths: {[p for p, _ in sent]}"
+        path, payload = keyboard_calls[0]
+        assert payload["request_id"] == "rid-001"
+        assert "Bash" in payload["text"]
+        assert payload["buttons"] == [[
+            {"text": "✅ Allow", "callback_data": "perm:allow:rid-001"},
+            {"text": "❌ Deny", "callback_data": "perm:deny:rid-001"},
+        ]]
+
+    async def test_permission_request_missing_optional_fields(
+        self, channel_server, monkeypatch,
+    ):
+        """U1: description / input_preview are optional — handler tolerates absence."""
+        sent = []
+
+        async def fake_post(path, payload):
+            sent.append((path, dict(payload)))
+            return {"ok": True}
+
+        monkeypatch.setattr(channel_server, "_internal_post", fake_post)
+
+        await channel_server.handle_permission_request({
+            "request_id": "rid-min", "tool_name": "Bash",
+        })
+        assert sent, "handler must still post a keyboard prompt"
+        _, payload = sent[0]
+        assert payload["request_id"] == "rid-min"
+
+    async def test_notification_handler_registered_on_inner_server(
+        self, channel_server,
+    ):
+        """The PermissionRequestNotification class is registered on the
+        low-level inner server's notification_handlers map."""
+        low_level = channel_server._resolve_mcp_server()
+        assert low_level is not None
+        cls = channel_server.PermissionRequestNotification
+        assert cls in low_level.notification_handlers

@@ -30,14 +30,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
-from typing import Any
+from contextlib import AsyncExitStack
+from typing import Any, Literal, Union
 
 import aiohttp
 import anyio
 from aiohttp import UnixConnector
 from mcp.server.fastmcp import FastMCP
+from mcp.server.session import ServerSession
 from mcp.server.stdio import stdio_server
+from mcp.types import ClientNotification, Notification
+from pydantic import RootModel
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +133,122 @@ async def reply(chat_id: str, text: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Permission relay (U1) — Phase 2
+# ---------------------------------------------------------------------------
+
+# Telegram inline-button callback_data byte limit (§9 of the spec; also asserted
+# by Bot API docs).
+_CALLBACK_DATA_MAX = 64
+
+
+def _build_perm_buttons(request_id: str) -> list[list[dict[str, str]]]:
+    """Build the [✅ Allow][❌ Deny] inline-keyboard row for a permission prompt.
+
+    Raises ``ValueError`` if any callback_data would exceed Telegram's 64-byte
+    limit (e.g. a pathologically long ``request_id``). The caller is expected
+    to keep ``request_id`` short (uuid4 hex = 32 bytes → max 43-byte cd).
+    """
+    allow_cd = f"perm:allow:{request_id}"
+    deny_cd = f"perm:deny:{request_id}"
+    for cd in (allow_cd, deny_cd):
+        if len(cd.encode("utf-8")) > _CALLBACK_DATA_MAX:
+            raise ValueError(
+                f"callback_data {cd!r} exceeds {_CALLBACK_DATA_MAX} bytes",
+            )
+    return [[
+        {"text": "✅ Allow", "callback_data": allow_cd},
+        {"text": "❌ Deny", "callback_data": deny_cd},
+    ]]
+
+
+async def handle_permission_request(params: dict[str, Any]) -> None:
+    """U1: render the operator-facing permission prompt for a tool call.
+
+    Receives ``notifications/claude/channel/permission_request`` params:
+    ``{request_id, tool_name, description?, input_preview?}``. Renders an
+    inline-keyboard prompt in the engagement topic via casa-main; the verdict
+    travels back via ``CallbackQueryHandler`` → ``permission_verdict`` queue →
+    long-poll drain → ``notifications/claude/channel/permission`` (delivered
+    elsewhere in Phase 2 Task 21).
+    """
+    rid = params["request_id"]
+    tool = params.get("tool_name", "(unknown)")
+    desc = params.get("description") or ""
+    preview = params.get("input_preview") or ""
+
+    body_lines: list[str] = [f"Claude wants to use: *{tool}*"]
+    if desc:
+        body_lines.append("")
+        body_lines.append(desc)
+    if preview:
+        body_lines.append("")
+        body_lines.append(f"```\n{preview}\n```")
+    body = "\n".join(body_lines)
+
+    buttons = _build_perm_buttons(rid)
+    await _internal_post(
+        "/internal/channel/post_inline_keyboard",
+        {
+            "request_id": rid,
+            "text": body,
+            "buttons": buttons,
+            "parse_mode": "MarkdownV2",
+        },
+    )
+
+
+class PermissionRequestNotification(
+    Notification[dict, Literal["notifications/claude/channel/permission_request"]]
+):
+    """Custom MCP notification declared by ``claude/channel/permission``.
+
+    The CLI sends this when a tool call hits a permission gate that should
+    relay through the channel UI instead of being auto-resolved by
+    ``permission_mode``. Params shape per §9 of the spec:
+    ``{request_id, tool_name, description?, input_preview?}``.
+    """
+
+    method: Literal["notifications/claude/channel/permission_request"] = (
+        "notifications/claude/channel/permission_request"
+    )
+    params: dict
+
+
+def _build_wider_notification_root_model() -> type[RootModel]:
+    """Build a ``RootModel[Union[<existing>, PermissionRequestNotification]]``.
+
+    Extends ``ClientNotification``'s root union so the BaseSession message loop
+    validates and dispatches our custom notification class instead of warn-and-
+    dropping it.
+    """
+    base_union = ClientNotification.model_fields["root"].annotation
+    return RootModel[Union[base_union, PermissionRequestNotification]]
+
+
+async def _on_permission_request_notification(
+    notification: PermissionRequestNotification,
+) -> None:
+    """Bridge from the inner Server's notification dispatch to our handler."""
+    await handle_permission_request(dict(notification.params))
+
+
+def _register_permission_notification_handler() -> None:
+    """Install the permission-request handler on the inner low-level Server.
+
+    Idempotent — calling more than once just overwrites the same entry.
+    """
+    low_level = _resolve_mcp_server()
+    if low_level is None:  # pragma: no cover — defensive only
+        logger.warning(
+            "no inner mcp Server available — permission notification disabled",
+        )
+        return
+    low_level.notification_handlers[PermissionRequestNotification] = (
+        _on_permission_request_notification
+    )
+
+
+# ---------------------------------------------------------------------------
 # Test helpers (public API used by tests/test_casa_engagement_channel.py).
 # ---------------------------------------------------------------------------
 
@@ -170,12 +293,43 @@ def _resolve_mcp_server():
     return getattr(server, "_mcp_server", None) or getattr(server, "server", None)
 
 
+_WIDER_NOTIFICATION_ROOT_MODEL: type[RootModel] | None = None
+
+
+def _widen_session_notification_type() -> None:
+    """Monkey-patch ``ServerSession.__init__`` so its message loop accepts our
+    custom ``PermissionRequestNotification`` instead of warn-and-dropping it.
+
+    The upstream ``ClientNotification`` union is closed — adding new methods is
+    not exposed as a public hook in this mcp version (see §A.6.1 findings).
+    We patch once per process; subsequent calls are no-ops. We only ever spawn
+    one ServerSession per stdio process, so the patch's blast radius is
+    self-contained.
+    """
+    global _WIDER_NOTIFICATION_ROOT_MODEL
+    if _WIDER_NOTIFICATION_ROOT_MODEL is not None:
+        return
+    _WIDER_NOTIFICATION_ROOT_MODEL = _build_wider_notification_root_model()
+
+    original_init = ServerSession.__init__
+
+    def patched_init(self, *args, **kwargs):  # noqa: ANN001 — mirror upstream
+        original_init(self, *args, **kwargs)
+        # Widen the receive type so notifications/claude/channel/* parse instead
+        # of being dropped as unknown-method validation failures.
+        self._receive_notification_type = _WIDER_NOTIFICATION_ROOT_MODEL
+
+    ServerSession.__init__ = patched_init  # type: ignore[method-assign]
+
+
 async def _run_with_channel_capabilities() -> None:
     """Run the FastMCP server over stdio with channel experimental capabilities.
 
     Replaces ``FastMCP.run_stdio_async`` because the upstream coroutine
     hard-codes a no-arg ``create_initialization_options()`` call and we need
     to inject ``experimental_capabilities`` so the CLI sees ``claude/channel``.
+    Additionally registers the permission-request notification handler and
+    widens session-level notification parsing (see ``_widen_session_notification_type``).
     """
     low_level = _resolve_mcp_server()
     if low_level is None:
@@ -183,6 +337,8 @@ async def _run_with_channel_capabilities() -> None:
             "FastMCP did not expose an underlying mcp Server "
             "(neither _mcp_server nor server attribute present)",
         )
+    _widen_session_notification_type()
+    _register_permission_notification_handler()
     async with stdio_server() as (read_stream, write_stream):
         await low_level.run(
             read_stream,
