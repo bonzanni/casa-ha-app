@@ -427,3 +427,123 @@ class TestEngageExecutorClaudeCode:
         # See TestEngageExecutorConfigurator for the setup pattern. The real
         # coverage lands in the E2E D-block against the mock CLI.
         pass
+
+
+class TestU3TopicTitle:
+    """E-12 (v0.37.0) Task 22: U3 state-encoded topic title at engagement open.
+
+    Spec §6.3: ``<state-emoji>·<role-emoji> <concise task>`` — no engagement-id
+    suffix (the role emoji + concise task carry disambiguation).
+    """
+
+    async def test_engage_executor_opens_topic_with_state_encoded_title(
+        self, tmp_path, monkeypatch,
+    ):
+        from tools import engage_executor, init_tools
+        import agent as agent_mod
+
+        defn = _mock_executor_def(type="plugin-developer")
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["plugin-developer"])
+
+        er = MagicMock()
+        mock_rec = MagicMock()
+        mock_rec.id = "abcd1234" + "0" * 24
+        mock_rec.topic_id = 42
+        er.create = AsyncMock(return_value=mock_rec)
+        er.mark_error = AsyncMock()
+        er.set_channel_state = AsyncMock()
+
+        channel = await _setup(reg, tmp_path=tmp_path)
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=er,
+            executor_registry=reg,
+        )
+        monkeypatch.setattr(
+            agent_mod, "active_engagement_driver",
+            MagicMock(start=AsyncMock()), raising=False,
+        )
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            await engage_executor.handler({
+                "executor_type": "plugin-developer",
+                "task": "Please add a Skill for the casa-probe-foo plugin",
+                "context": "none",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        # 1. open_engagement_topic called with the U3-shaped title.
+        channel.open_engagement_topic.assert_awaited_once()
+        kwargs = channel.open_engagement_topic.await_args.kwargs
+        name = kwargs["name"]
+        assert name.startswith("🟢·🛠 "), f"got {name!r}"
+        assert "Skill" in name
+        # No engagement-id suffix.
+        assert " | " not in name
+        # 2. set_channel_state(current_state_emoji="🟢") persisted.
+        er.set_channel_state.assert_awaited()
+        emoji_calls = [
+            kw.get("current_state_emoji")
+            for _, kw in er.set_channel_state.await_args_list
+        ]
+        assert "🟢" in emoji_calls
+
+    async def test_engage_executor_unknown_role_falls_back_to_robot_emoji(
+        self, tmp_path, monkeypatch,
+    ):
+        """role_emoji() returns 🤖 for unknown executor_type — never raises."""
+        from tools import engage_executor, init_tools
+        import agent as agent_mod
+
+        defn = _mock_executor_def(type="exotic-future-type")
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["exotic-future-type"])
+
+        er = MagicMock()
+        mock_rec = MagicMock()
+        mock_rec.id = "x" * 32
+        mock_rec.topic_id = 7
+        er.create = AsyncMock(return_value=mock_rec)
+        er.mark_error = AsyncMock()
+        er.set_channel_state = AsyncMock()
+
+        channel = await _setup(reg, tmp_path=tmp_path)
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=er,
+            executor_registry=reg,
+        )
+        monkeypatch.setattr(
+            agent_mod, "active_engagement_driver",
+            MagicMock(start=AsyncMock()), raising=False,
+        )
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            await engage_executor.handler({
+                "executor_type": "exotic-future-type",
+                "task": "do the new thing",
+                "context": "",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        kwargs = channel.open_engagement_topic.await_args.kwargs
+        assert kwargs["name"].startswith("🟢·🤖 ")

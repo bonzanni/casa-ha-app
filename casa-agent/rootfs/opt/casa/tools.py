@@ -1485,22 +1485,20 @@ async def engage_executor(args: dict) -> dict:
                         "options and verify the bot has can_manage_topics"),
         })
 
-    # E-9: same shape as delegate_to_agent — budget against the rename
-    # form (' | ' separator here, not ' · ').
-    prefix = f"#[{executor_type}] "
-    rename_suffix = " | 12345678"  # rec.id[:8] is always 8 bytes
-    body_budget = (
-        TELEGRAM_TOPIC_NAME_BYTES
-        - len(prefix.encode("utf-8"))
-        - len(rename_suffix.encode("utf-8"))
+    # E-12 (v0.37.0) Task 22: U3 state-encoded topic title.
+    # ``<state-emoji>·<role-emoji> <concise task>`` per spec §6.3 — no
+    # engagement-id suffix (role emoji + concise task disambiguate).
+    from channels.state_emoji import (
+        STATE_EMOJI, compose_topic_title, concise_task,
     )
     first_line = (task_text or "").splitlines()[0]
-    short_task = truncate_for_topic(
-        first_line, byte_budget=body_budget,
-    ) or "engagement"
+    short_task = concise_task(first_line) or "engagement"
+    topic_name = compose_topic_title(
+        state="active", role=executor_type, short_task=short_task,
+    )
     try:
         topic_id = await channel.open_engagement_topic(
-            name=f"{prefix}{short_task}",
+            name=topic_name,
             icon_emoji="tools",
         )
     except Exception as exc:  # noqa: BLE001
@@ -1514,14 +1512,14 @@ async def engage_executor(args: dict) -> dict:
         task=task_text, origin=dict(origin), topic_id=topic_id,
     )
 
+    # Persist the initial state emoji so Task 23 ``update_topic_state`` knows
+    # whether it needs to edit the title (no-op when state didn't change).
     try:
-        await channel.bot.edit_forum_topic(
-            chat_id=channel.engagement_supergroup_id,
-            message_thread_id=topic_id,
-            name=f"{prefix}{short_task} | {rec.id[:8]}",
+        await _engagement_registry.set_channel_state(
+            rec.id, current_state_emoji=STATE_EMOJI["active"],
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("edit_forum_topic rename failed: %s", exc)
+        logger.warning("set_channel_state(active) failed: %s", exc)
 
     # Read + interpolate prompt template (needed by both driver paths —
     # in_casa: options.system_prompt; claude_code: CLAUDE.md body).
@@ -1652,7 +1650,7 @@ async def _finalize_engagement(
                 engagement.id, kind="emit_completion_error", message=text,
             )
 
-    # 2. Post completion message into the topic (if any) and close it
+    # 2. Post completion message into the topic (if any), flip U3 state, close.
     if engagement.topic_id is not None and _channel_manager is not None:
         tch = _channel_manager.get(engagement.origin.get("channel", "telegram"))
         if tch is not None:
@@ -1666,6 +1664,25 @@ async def _finalize_engagement(
                     "finalize engagement %s: send_to_topic failed: %s",
                     engagement.id[:8], exc,
                 )
+            # E-12 (v0.37.0) Task 23: U3 terminal state — flip the topic title
+            # to <state-emoji>·<role-emoji> <task> before closing so the
+            # closed-topic sidebar carries the outcome at a glance.
+            terminal_state = {
+                "completed": "completed",
+                "cancelled": "cancelled",
+                "error": "failed",
+                "failed": "failed",
+            }.get(outcome)
+            if terminal_state is not None and hasattr(tch, "update_topic_state"):
+                try:
+                    await tch.update_topic_state(
+                        engagement_id=engagement.id, new_state=terminal_state,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "finalize engagement %s: U3 state update failed: %s",
+                        engagement.id[:8], exc,
+                    )
             try:
                 await tch.close_topic_with_check(thread_id=engagement.topic_id)
             except Exception as exc:  # noqa: BLE001

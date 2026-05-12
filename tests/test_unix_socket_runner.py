@@ -142,3 +142,68 @@ async def test_unix_runner_creates_parent_dir_if_missing() -> None:
             assert mode == 0o700
         finally:
             await runner.cleanup()
+
+
+async def test_unix_runner_serves_channel_send_to_topic() -> None:
+    """E-12 (v0.37.0): /internal/channel/send_to_topic is wired onto
+    the unix-socket app when telegram_channel is provided."""
+    from casa_core import start_internal_unix_runner
+    from unittest.mock import AsyncMock
+    from types import SimpleNamespace
+
+    class _Channel:
+        engagement_supergroup_id = -100
+        send_to_topic = AsyncMock(return_value=9001)
+
+    class _Reg:
+        def get(self, eid):
+            if eid == "eng-1":
+                return SimpleNamespace(id=eid, topic_id=42, status="active")
+            return None
+
+    with tempfile.TemporaryDirectory() as td:
+        sock = os.path.join(td, "internal.sock")
+        runner = await start_internal_unix_runner(
+            socket_path=sock,
+            tool_dispatch={},
+            engagement_registry=_Reg(),
+            hook_policies={},
+            telegram_channel=_Channel(),
+        )
+        try:
+            connector = aiohttp.UnixConnector(path=sock)
+            async with aiohttp.ClientSession(connector=connector) as sess:
+                async with sess.post(
+                    "http://unix/internal/channel/send_to_topic",
+                    json={"engagement_id": "eng-1", "text": "hello operator"},
+                ) as resp:
+                    assert resp.status == 200
+                    body = await resp.json()
+                    assert body == {"ok": True, "message_id": 9001}
+        finally:
+            await runner.cleanup()
+
+
+async def test_unix_runner_skips_channel_routes_when_no_telegram() -> None:
+    """E-12 fallback: telegram_channel=None means /internal/channel/*
+    routes are NOT registered (returns 404 instead of 500)."""
+    from casa_core import start_internal_unix_runner
+    with tempfile.TemporaryDirectory() as td:
+        sock = os.path.join(td, "internal.sock")
+        runner = await start_internal_unix_runner(
+            socket_path=sock,
+            tool_dispatch={},
+            engagement_registry=_FakeReg(),
+            hook_policies={},
+            # telegram_channel intentionally omitted.
+        )
+        try:
+            connector = aiohttp.UnixConnector(path=sock)
+            async with aiohttp.ClientSession(connector=connector) as sess:
+                async with sess.post(
+                    "http://unix/internal/channel/send_to_topic",
+                    json={"engagement_id": "x", "text": "y"},
+                ) as resp:
+                    assert resp.status == 404
+        finally:
+            await runner.cleanup()

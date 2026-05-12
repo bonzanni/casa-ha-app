@@ -85,6 +85,25 @@ def _install_telegram_stubs() -> None:
     tg.BotCommand = _FakeBotCommand
     tg.BotCommandScopeChat = _FakeBotCommandScopeChat
 
+    # v0.37.0 E-12 (Phase 2): inline-keyboard primitives — minimal value-shape
+    # stubs that preserve the constructor kwargs so tests can inspect them.
+    class _FakeInlineKeyboardButton:
+        def __init__(self, text, *, callback_data=None, url=None, **kw):
+            self.text = text
+            self.callback_data = callback_data
+            self.url = url
+
+    class _FakeInlineKeyboardMarkup:
+        def __init__(self, inline_keyboard):
+            self.inline_keyboard = inline_keyboard
+
+    tg.InlineKeyboardButton = _FakeInlineKeyboardButton
+    tg.InlineKeyboardMarkup = _FakeInlineKeyboardMarkup
+
+    # python-telegram-bot also surfaces CallbackQueryHandler from telegram.ext;
+    # ext stubs are a MagicMock above, so this just lives there too.
+    tg_ext.CallbackQueryHandler = MagicMock()
+
     sys.modules["telegram"] = tg
     sys.modules["telegram.constants"] = tg_const
     sys.modules["telegram.error"] = tg_err

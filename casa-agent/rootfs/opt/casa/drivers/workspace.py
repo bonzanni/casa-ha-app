@@ -248,7 +248,20 @@ async def provision_workspace(
             "type": "http",
             "url": casa_framework_mcp_url,
             "headers": {"X-Casa-Engagement-Id": engagement_id},
-        }
+        },
+        # E-12 (v0.37.0): per-engagement stdio channel server for
+        # operator UX (reply, ask, set_progress, permission relay).
+        # Spec: docs/superpowers/specs/2026-05-12-e12-claude_code-channels.md.
+        "casa-engagement-channel": {
+            "command": "/opt/casa/venv/bin/python",
+            "args": [
+                "/opt/casa/channels/casa_engagement_channel.py",
+                "--engagement-id", engagement_id,
+            ],
+            "env": {
+                "CASA_INTERNAL_SOCKET": "/run/casa/internal.sock",
+            },
+        },
     }}
     (ws / ".mcp.json").write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
 
