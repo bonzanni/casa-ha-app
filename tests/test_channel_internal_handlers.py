@@ -160,3 +160,101 @@ async def test_send_to_topic_missing_topic_id_returns_error(
         assert body == {"ok": False, "error": "no_topic_bound"}
 
     assert ch.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — /internal/channel/post_inline_keyboard (Task 19)
+# ---------------------------------------------------------------------------
+
+
+async def test_post_inline_keyboard_routes_to_topic(app_factory) -> None:
+    """Handler resolves engagement_id, builds an InlineKeyboardMarkup with the
+    operator buttons, and forwards reply_markup + parse_mode to the channel."""
+    app, ch, _reg = app_factory()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/post_inline_keyboard",
+            json={
+                "engagement_id": "eng-1",
+                "text": "approve?",
+                "buttons": [[
+                    {"text": "✅ Allow", "callback_data": "perm:allow:rid"},
+                    {"text": "❌ Deny", "callback_data": "perm:deny:rid"},
+                ]],
+                "parse_mode": "MarkdownV2",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    assert len(ch.calls) == 1
+    call = ch.calls[0]
+    assert call["topic_id"] == 42
+    assert call["text"] == "approve?"
+    reply_markup = call["kwargs"].get("reply_markup")
+    assert reply_markup is not None
+    # _FakeInlineKeyboardMarkup exposes .inline_keyboard.
+    rows = reply_markup.inline_keyboard
+    assert len(rows) == 1 and len(rows[0]) == 2
+    assert rows[0][0].text == "✅ Allow"
+    assert rows[0][0].callback_data == "perm:allow:rid"
+    assert rows[0][1].text == "❌ Deny"
+    assert rows[0][1].callback_data == "perm:deny:rid"
+    assert call["kwargs"].get("parse_mode") == "MarkdownV2"
+
+
+async def test_post_inline_keyboard_supports_url_buttons(app_factory) -> None:
+    """U6: buttons with ``url=`` (no callback_data) round-trip through to TG."""
+    app, ch, _reg = app_factory()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/post_inline_keyboard",
+            json={
+                "engagement_id": "eng-1",
+                "text": "open remote",
+                "buttons": [[
+                    {"text": "🌐 Open Remote Control",
+                     "url": "https://rc.example/abc"},
+                ]],
+            },
+        )
+        assert resp.status == 200
+    btn = ch.calls[0]["kwargs"]["reply_markup"].inline_keyboard[0][0]
+    assert btn.url == "https://rc.example/abc"
+    assert btn.callback_data is None
+
+
+async def test_post_inline_keyboard_unknown_engagement_returns_error(
+    app_factory,
+) -> None:
+    reg = _FakeRegistry()
+    reg.set_record("eng-1", None)
+    app, ch, _reg = app_factory(registry=reg)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/post_inline_keyboard",
+            json={"engagement_id": "missing", "text": "x",
+                  "buttons": [[{"text": "a", "callback_data": "b"}]]},
+        )
+        body = await resp.json()
+        assert body == {"ok": False, "error": "unknown_engagement"}
+    assert ch.calls == []
+
+
+async def test_post_inline_keyboard_send_failure_returns_error(
+    app_factory,
+) -> None:
+    class _ExplodingChannel(_FakeChannel):
+        async def send_to_topic(self, thread_id, text, **kwargs):
+            raise RuntimeError("telegram down")
+
+    app, ch, _reg = app_factory(channel=_ExplodingChannel())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/post_inline_keyboard",
+            json={"engagement_id": "eng-1", "text": "x",
+                  "buttons": [[{"text": "a", "callback_data": "b"}]]},
+        )
+        body = await resp.json()
+        assert body == {"ok": False, "error": "send_failed"}

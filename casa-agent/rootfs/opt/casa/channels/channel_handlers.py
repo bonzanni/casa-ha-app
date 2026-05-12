@@ -93,18 +93,83 @@ def _make_send_to_topic(
     return handler
 
 
+def _make_post_inline_keyboard(
+    telegram_channel: Any, engagement_registry: Any,
+) -> Handler:
+    """Build the aiohttp POST handler for /internal/channel/post_inline_keyboard.
+
+    Phase 2 (Task 19): renders an inline-keyboard prompt in the engagement
+    topic. The channel server uses this for U1 permission relay (Task 18) and
+    Phase 4 U6 pinned-block Remote Control button.
+
+    Body shape: ``{engagement_id, text, buttons: [[{text, callback_data?,
+    url?}, ...], ...], parse_mode?, request_id?}``. ``request_id`` is logged
+    by the channel server for traceability but ignored by this layer.
+    """
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    async def handler(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad_json"})
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "bad_json"})
+
+        engagement_id = body.get("engagement_id")
+        topic_id, err = _resolve_topic(engagement_registry, engagement_id)
+        if err is not None:
+            return web.json_response({"ok": False, "error": err})
+
+        rows = body.get("buttons") or []
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    text=btn["text"],
+                    callback_data=btn.get("callback_data"),
+                    url=btn.get("url"),
+                )
+                for btn in row
+            ]
+            for row in rows
+        ])
+
+        try:
+            msg_id = await telegram_channel.send_to_topic(
+                topic_id,
+                body.get("text") or "",
+                reply_markup=keyboard,
+                parse_mode=body.get("parse_mode"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "post_inline_keyboard failed for engagement=%s topic=%s: %s",
+                engagement_id, topic_id, exc,
+            )
+            return web.json_response({"ok": False, "error": "send_failed"})
+
+        return web.json_response({"ok": True, "message_id": msg_id})
+
+    return handler
+
+
 def _make_channel_handlers(
     *, telegram_channel: Any, engagement_registry: Any,
 ) -> dict[str, Handler]:
-    """Return a path → handler dict for /internal/channel/*.
+    """Return a path → handler dict for /internal/channel/* POSTs.
 
-    Phase 1: only ``/internal/channel/send_to_topic``. Phase 2+ will extend
-    this dict with handlers for ``post_inline_keyboard``,
-    ``permission_verdict``, ``set_progress``, ``update_state``, ``typing``,
-    etc. — see spec §A.3.
+    Phase 1: ``send_to_topic``.
+    Phase 2: ``post_inline_keyboard`` (Task 19).
+    Phase 2+ will extend this dict with handlers for ``permission_verdict``
+    (Task 21), ``update_state`` (Task 23), ``set_progress``, ``typing``, etc.
+    — see spec §A.3.
     """
     return {
         "/internal/channel/send_to_topic": _make_send_to_topic(
+            telegram_channel=telegram_channel,
+            engagement_registry=engagement_registry,
+        ),
+        "/internal/channel/post_inline_keyboard": _make_post_inline_keyboard(
             telegram_channel=telegram_channel,
             engagement_registry=engagement_registry,
         ),
