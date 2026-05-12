@@ -202,3 +202,53 @@ class TestPermissionRequest:
         assert low_level is not None
         cls = channel_server.PermissionRequestNotification
         assert cls in low_level.notification_handlers
+
+
+class TestPermissionVerdictEmission:
+    """Phase 2 Task 21: drain queue + emit notifications/claude/channel/permission."""
+
+    async def test_emit_permission_notification_sends_via_session(
+        self, channel_server,
+    ):
+        from unittest.mock import AsyncMock
+        fake_session = AsyncMock()
+        channel_server._CURRENT_SESSION = fake_session
+
+        await channel_server._emit_permission_notification({
+            "request_id": "rid-7", "verdict": "allow", "operator_id": 42,
+        })
+
+        fake_session.send_notification.assert_awaited_once()
+        sent = fake_session.send_notification.await_args.args[0]
+        # Wire-shape check via model_dump (what BaseSession.send_notification
+        # uses internally).
+        dumped = sent.model_dump(by_alias=True, mode="json", exclude_none=True)
+        assert dumped == {
+            "method": "notifications/claude/channel/permission",
+            "params": {"request_id": "rid-7", "verdict": "allow"},
+        }
+
+    async def test_emit_permission_notification_drops_operator_id(
+        self, channel_server,
+    ):
+        """operator_id is intentionally stripped from the wire payload — Claude
+        only needs request_id + verdict to resume the gated tool call."""
+        from unittest.mock import AsyncMock
+        fake_session = AsyncMock()
+        channel_server._CURRENT_SESSION = fake_session
+
+        await channel_server._emit_permission_notification({
+            "request_id": "rid-1", "verdict": "deny", "operator_id": 999,
+        })
+        sent = fake_session.send_notification.await_args.args[0]
+        assert "operator_id" not in sent.params
+
+    async def test_emit_permission_notification_handles_missing_session(
+        self, channel_server, caplog,
+    ):
+        """If no session is live (e.g. shutdown race), emit logs + drops."""
+        channel_server._CURRENT_SESSION = None
+        # Should not raise.
+        await channel_server._emit_permission_notification({
+            "request_id": "rid-1", "verdict": "allow",
+        })

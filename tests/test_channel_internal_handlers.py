@@ -258,3 +258,129 @@ async def test_post_inline_keyboard_send_failure_returns_error(
         )
         body = await resp.json()
         assert body == {"ok": False, "error": "send_failed"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — permission verdict queue + long-poll drain (Task 21)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def channel_full_app_factory():
+    """Build an aiohttp app with BOTH POST handlers from _make_channel_handlers
+    AND the GET handlers from _make_channel_get_handlers (Task 21's
+    /internal/channel/permission_pending lives in the GET family).
+
+    Also resets the module-level _PERMISSION_QUEUES so tests don't bleed
+    state into each other.
+    """
+    from channels.channel_handlers import (
+        _make_channel_handlers,
+        _make_channel_get_handlers,
+        _PERMISSION_QUEUES,
+    )
+
+    _PERMISSION_QUEUES.clear()
+
+    def make(channel=None, registry=None):
+        ch = channel or _FakeChannel()
+        reg = registry or _FakeRegistry()
+        post_handlers = _make_channel_handlers(
+            telegram_channel=ch, engagement_registry=reg,
+        )
+        get_handlers = _make_channel_get_handlers(engagement_registry=reg)
+        app = web.Application()
+        for path, h in post_handlers.items():
+            app.router.add_post(path, h)
+        for path, h in get_handlers.items():
+            app.router.add_get(path, h)
+        return app, ch, reg
+
+    yield make
+    _PERMISSION_QUEUES.clear()
+
+
+async def test_permission_verdict_queues_then_pending_drains(
+    channel_full_app_factory,
+) -> None:
+    app, _ch, _reg = channel_full_app_factory()
+    async with TestClient(TestServer(app)) as client:
+        # 1. casa-main posts the verdict (channel CallbackQueryHandler →
+        #    /internal/channel/permission_verdict).
+        post_resp = await client.post(
+            "/internal/channel/permission_verdict",
+            json={"engagement_id": "eng-1", "request_id": "rid-001",
+                  "verdict": "allow", "operator_id": 999},
+        )
+        assert (await post_resp.json()) == {"ok": True}
+
+        # 2. Channel server long-polls /internal/channel/permission_pending
+        #    and gets the verdict.
+        get_resp = await client.get(
+            "/internal/channel/permission_pending"
+            "?engagement_id=eng-1&timeout_s=5",
+        )
+        assert (await get_resp.json()) == {
+            "request_id": "rid-001",
+            "verdict": "allow",
+            "operator_id": 999,
+        }
+
+        # 3. Drained — a second poll with short timeout returns empty.
+        get_resp2 = await client.get(
+            "/internal/channel/permission_pending"
+            "?engagement_id=eng-1&timeout_s=0",
+        )
+        assert (await get_resp2.json()) == {}
+
+
+async def test_permission_pending_long_poll_returns_empty_on_timeout(
+    channel_full_app_factory,
+) -> None:
+    """No verdict queued + timeout_s=0 → empty dict (so the channel server's
+    drain loop can re-poll without crash-looping)."""
+    app, _ch, _reg = channel_full_app_factory()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/internal/channel/permission_pending"
+            "?engagement_id=eng-1&timeout_s=0",
+        )
+        assert (await resp.json()) == {}
+
+
+async def test_permission_pending_missing_engagement_id_returns_empty(
+    channel_full_app_factory,
+) -> None:
+    app, _ch, _reg = channel_full_app_factory()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/internal/channel/permission_pending")
+        assert (await resp.json()) == {}
+
+
+async def test_permission_verdict_unknown_engagement_returns_error(
+    channel_full_app_factory,
+) -> None:
+    reg = _FakeRegistry()
+    reg.set_record("eng-1", None)  # so registry.get("eng-1") returns None
+    app, _ch, _reg = channel_full_app_factory(registry=reg)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/permission_verdict",
+            json={"engagement_id": "eng-1", "request_id": "rid-001",
+                  "verdict": "allow", "operator_id": 999},
+        )
+        assert (await resp.json()) == {
+            "ok": False, "error": "unknown_engagement",
+        }
+
+
+async def test_permission_verdict_bad_json_returns_error(
+    channel_full_app_factory,
+) -> None:
+    app, _ch, _reg = channel_full_app_factory()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/permission_verdict",
+            data="not json", headers={"Content-Type": "application/json"},
+        )
+        assert (await resp.json()) == {"ok": False, "error": "bad_json"}

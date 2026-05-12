@@ -18,7 +18,9 @@ Error codes (Phase 1):
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections import defaultdict
 from typing import Any, Awaitable, Callable
 
 from aiohttp import web
@@ -26,6 +28,18 @@ from aiohttp import web
 logger = logging.getLogger(__name__)
 
 Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
+
+
+# ---------------------------------------------------------------------------
+# Module-level state — permission verdict queue
+# ---------------------------------------------------------------------------
+#
+# casa-main's CallbackQueryHandler posts onto /internal/channel/permission_verdict;
+# the per-engagement channel server long-polls /internal/channel/permission_pending
+# and drains entries to emit notifications/claude/channel/permission back to
+# Claude. Module-level since both handlers live in the same process.
+
+_PERMISSION_QUEUES: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
 
 
 # ---------------------------------------------------------------------------
@@ -153,16 +167,99 @@ def _make_post_inline_keyboard(
     return handler
 
 
+def _make_permission_verdict(engagement_registry: Any) -> Handler:
+    """POST /internal/channel/permission_verdict — casa-main → channel server.
+
+    Phase 2 (Task 21): CallbackQueryHandler posts here when an operator taps
+    the U1 inline-keyboard verdict button. Pushes onto the per-engagement
+    queue; the channel server's long-poll drain pulls it and emits
+    ``notifications/claude/channel/permission`` to Claude.
+
+    Body shape: ``{engagement_id, request_id, verdict, operator_id?}``.
+    Response: ``{ok: bool, error?: <code>}``.
+
+    Error codes: ``bad_json``, ``missing_engagement_id``, ``missing_request_id``,
+    ``missing_verdict``, ``unknown_engagement``.
+    """
+
+    async def handler(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad_json"})
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "bad_json"})
+
+        eng_id = body.get("engagement_id")
+        if not eng_id:
+            return web.json_response(
+                {"ok": False, "error": "missing_engagement_id"},
+            )
+        request_id = body.get("request_id")
+        if not request_id:
+            return web.json_response(
+                {"ok": False, "error": "missing_request_id"},
+            )
+        verdict = body.get("verdict")
+        if verdict not in ("allow", "deny"):
+            return web.json_response(
+                {"ok": False, "error": "missing_verdict"},
+            )
+        if engagement_registry.get(eng_id) is None:
+            return web.json_response(
+                {"ok": False, "error": "unknown_engagement"},
+            )
+
+        await _PERMISSION_QUEUES[eng_id].put({
+            "request_id": request_id,
+            "verdict": verdict,
+            "operator_id": body.get("operator_id"),
+        })
+        return web.json_response({"ok": True})
+
+    return handler
+
+
+def _make_permission_pending() -> Handler:
+    """GET /internal/channel/permission_pending — channel server long-poll.
+
+    Phase 2 (Task 21): the per-engagement channel server polls this with
+    ``?engagement_id=<id>&timeout_s=<seconds>`` (default 25s). Returns
+    ``{}`` on timeout so the server can re-poll without inferring an error.
+
+    On verdict arrival, returns ``{request_id, verdict, operator_id}``.
+    """
+
+    async def handler(request: web.Request) -> web.Response:
+        eng_id = request.query.get("engagement_id")
+        if not eng_id:
+            return web.json_response({})
+        try:
+            timeout_s = float(request.query.get("timeout_s", "25"))
+        except ValueError:
+            timeout_s = 25.0
+        # ``defaultdict[asyncio.Queue]`` materialises a queue on first lookup;
+        # this is fine because the verdict-poster also keys by engagement_id
+        # and both producers/consumers run in the same loop.
+        q = _PERMISSION_QUEUES[eng_id]
+        try:
+            verdict = await asyncio.wait_for(q.get(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            return web.json_response({})
+        return web.json_response(verdict)
+
+    return handler
+
+
 def _make_channel_handlers(
     *, telegram_channel: Any, engagement_registry: Any,
 ) -> dict[str, Handler]:
     """Return a path → handler dict for /internal/channel/* POSTs.
 
     Phase 1: ``send_to_topic``.
-    Phase 2: ``post_inline_keyboard`` (Task 19).
-    Phase 2+ will extend this dict with handlers for ``permission_verdict``
-    (Task 21), ``update_state`` (Task 23), ``set_progress``, ``typing``, etc.
-    — see spec §A.3.
+    Phase 2: ``post_inline_keyboard`` (Task 19), ``permission_verdict`` (Task 21).
+    Phase 2+ will extend with ``update_state`` (Task 23), ``set_progress``,
+    ``typing``, etc. — see spec §A.3.
     """
     return {
         "/internal/channel/send_to_topic": _make_send_to_topic(
@@ -173,4 +270,26 @@ def _make_channel_handlers(
             telegram_channel=telegram_channel,
             engagement_registry=engagement_registry,
         ),
+        "/internal/channel/permission_verdict": _make_permission_verdict(
+            engagement_registry=engagement_registry,
+        ),
+    }
+
+
+def _make_channel_get_handlers(
+    *, engagement_registry: Any,
+) -> dict[str, Handler]:
+    """Return a path → handler dict for /internal/channel/* GETs.
+
+    Phase 2 (Task 21): ``permission_pending`` long-poll. Kept separate from
+    the POST family so the casa_core wiring can add them via ``router.add_get``
+    rather than ``router.add_post``.
+    """
+    # engagement_registry isn't strictly needed by the GET handler today, but
+    # keeping the symmetric (engagement_registry=) signature lets a future
+    # GET (e.g. /internal/channel/status?engagement_id=) reuse it without
+    # adding another factory.
+    del engagement_registry
+    return {
+        "/internal/channel/permission_pending": _make_permission_pending(),
     }

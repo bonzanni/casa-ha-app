@@ -129,16 +129,26 @@ async def start_internal_unix_runner(
     # Only registered if a TelegramChannel instance is available (production
     # boots always have one; some test paths pass None).
     if telegram_channel is not None:
-        from channels.channel_handlers import _make_channel_handlers
+        from channels.channel_handlers import (
+            _make_channel_handlers,
+            _make_channel_get_handlers,
+        )
         channel_handlers = _make_channel_handlers(
             telegram_channel=telegram_channel,
             engagement_registry=engagement_registry,
         )
         for path, handler_fn in channel_handlers.items():
             internal_app.router.add_post(path, handler_fn)
+        channel_get_handlers = _make_channel_get_handlers(
+            engagement_registry=engagement_registry,
+        )
+        for path, handler_fn in channel_get_handlers.items():
+            internal_app.router.add_get(path, handler_fn)
         logger.info(
-            "E-12: registered %d /internal/channel/* routes (paths: %s)",
-            len(channel_handlers), sorted(channel_handlers.keys()),
+            "E-12: registered %d POST + %d GET /internal/channel/* routes "
+            "(POST: %s; GET: %s)",
+            len(channel_handlers), len(channel_get_handlers),
+            sorted(channel_handlers.keys()), sorted(channel_get_handlers.keys()),
         )
 
     async def _unlink_socket_on_cleanup(_app: web.Application) -> None:

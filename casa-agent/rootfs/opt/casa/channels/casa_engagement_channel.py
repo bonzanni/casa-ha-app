@@ -214,6 +214,24 @@ class PermissionRequestNotification(
     params: dict
 
 
+class PermissionVerdictNotification(
+    Notification[dict, Literal["notifications/claude/channel/permission"]]
+):
+    """Outbound (server → CLI) notification carrying the operator's verdict.
+
+    Sent in response to a ``permission_request`` whose ``request_id`` matches.
+    Params shape: ``{request_id, verdict}`` where ``verdict ∈ {"allow", "deny"}``.
+    BaseSession.send_notification only calls ``.model_dump()`` on this object —
+    there's no validation against ServerNotification's union, so this custom
+    class round-trips through stdio as plain JSON-RPC.
+    """
+
+    method: Literal["notifications/claude/channel/permission"] = (
+        "notifications/claude/channel/permission"
+    )
+    params: dict
+
+
 def _build_wider_notification_root_model() -> type[RootModel]:
     """Build a ``RootModel[Union[<existing>, PermissionRequestNotification]]``.
 
@@ -246,6 +264,100 @@ def _register_permission_notification_handler() -> None:
     low_level.notification_handlers[PermissionRequestNotification] = (
         _on_permission_request_notification
     )
+
+
+# ---------------------------------------------------------------------------
+# Permission verdict drain + outbound notification (Task 21)
+# ---------------------------------------------------------------------------
+
+# Set by the patched ServerSession.__init__; consumed by
+# ``_emit_permission_notification`` to issue ``notifications/claude/channel/permission``.
+_CURRENT_SESSION: Any | None = None
+
+# How long each long-poll waits before returning empty + retrying. Kept shorter
+# than the casa-main side's default (25s) so the channel server can quickly
+# notice if the connection drops.
+_PERMISSION_POLL_TIMEOUT_S = 25.0
+
+# Backoff after an unexpected drain failure (e.g. socket disappeared during
+# rebuild). Capped at ``_PERMISSION_DRAIN_BACKOFF_MAX`` so we don't busy-spin.
+_PERMISSION_DRAIN_BACKOFF_INITIAL = 1.0
+_PERMISSION_DRAIN_BACKOFF_MAX = 30.0
+
+
+async def _emit_permission_notification(payload: dict[str, Any]) -> None:
+    """Send ``notifications/claude/channel/permission`` to Claude carrying the
+    verdict that the operator delivered via Telegram.
+
+    ``payload`` shape (from ``_PERMISSION_QUEUES`` drain):
+    ``{request_id, verdict, operator_id?}``. ``operator_id`` is dropped from
+    the wire envelope — Claude only needs the verdict + request_id to resume.
+    """
+    session = _CURRENT_SESSION
+    if session is None:
+        logger.error(
+            "no live session — verdict %s lost (request_id=%s)",
+            payload.get("verdict"), payload.get("request_id"),
+        )
+        return
+
+    notification = PermissionVerdictNotification(
+        params={
+            "request_id": payload["request_id"],
+            "verdict": payload["verdict"],
+        },
+    )
+    try:
+        await session.send_notification(notification)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "send_notification failed for permission verdict (rid=%s): %s",
+            payload.get("request_id"), exc,
+        )
+
+
+async def _drain_permission_verdicts() -> None:
+    """Long-poll casa-main's verdict queue and emit each verdict to Claude.
+
+    Started by ``main()`` as an asyncio background task. Exits cleanly on
+    ``CancelledError``; all other exceptions log + back off so a transient
+    socket failure during casa-main reconnect does not kill the drain loop.
+    """
+    if ENGAGEMENT_ID is None:  # pragma: no cover — defensive
+        logger.error("permission drain not started: ENGAGEMENT_ID unset")
+        return
+
+    backoff = _PERMISSION_DRAIN_BACKOFF_INITIAL
+    while True:
+        try:
+            connector = UnixConnector(path=INTERNAL_SOCKET)
+            async with aiohttp.ClientSession(connector=connector) as sess:
+                async with sess.get(
+                    f"http://localhost/internal/channel/permission_pending"
+                    f"?engagement_id={ENGAGEMENT_ID}"
+                    f"&timeout_s={int(_PERMISSION_POLL_TIMEOUT_S)}",
+                    timeout=aiohttp.ClientTimeout(
+                        total=_PERMISSION_POLL_TIMEOUT_S + 5,
+                    ),
+                ) as resp:
+                    resp.raise_for_status()
+                    payload = await resp.json()
+            backoff = _PERMISSION_DRAIN_BACKOFF_INITIAL
+            if not payload:
+                continue  # idle long-poll cycle, no verdict ready
+            await _emit_permission_notification(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "permission drain failure: %s — sleeping %.1fs",
+                exc, backoff,
+            )
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
+            backoff = min(backoff * 2, _PERMISSION_DRAIN_BACKOFF_MAX)
 
 
 # ---------------------------------------------------------------------------
@@ -314,10 +426,14 @@ def _widen_session_notification_type() -> None:
     original_init = ServerSession.__init__
 
     def patched_init(self, *args, **kwargs):  # noqa: ANN001 — mirror upstream
+        global _CURRENT_SESSION
         original_init(self, *args, **kwargs)
         # Widen the receive type so notifications/claude/channel/* parse instead
         # of being dropped as unknown-method validation failures.
         self._receive_notification_type = _WIDER_NOTIFICATION_ROOT_MODEL
+        # Stash the session so _emit_permission_notification can issue outbound
+        # notifications/claude/channel/permission without re-resolving it.
+        _CURRENT_SESSION = self
 
     ServerSession.__init__ = patched_init  # type: ignore[method-assign]
 
@@ -340,13 +456,23 @@ async def _run_with_channel_capabilities() -> None:
     _widen_session_notification_type()
     _register_permission_notification_handler()
     async with stdio_server() as (read_stream, write_stream):
-        await low_level.run(
-            read_stream,
-            write_stream,
-            low_level.create_initialization_options(
-                experimental_capabilities=declared_capabilities(),
-            ),
+        drain_task = asyncio.create_task(
+            _drain_permission_verdicts(), name="permission-drain",
         )
+        try:
+            await low_level.run(
+                read_stream,
+                write_stream,
+                low_level.create_initialization_options(
+                    experimental_capabilities=declared_capabilities(),
+                ),
+            )
+        finally:
+            drain_task.cancel()
+            try:
+                await drain_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 # ---------------------------------------------------------------------------
