@@ -31,7 +31,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import sys
 from typing import Any
 
 import aiohttp
@@ -81,21 +80,21 @@ async def _internal_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     if "engagement_id" not in body and ENGAGEMENT_ID is not None:
         body["engagement_id"] = ENGAGEMENT_ID
 
+    connector = UnixConnector(path=INTERNAL_SOCKET)
     delays = (0.5, 1.0, 2.0)
     last_exc: BaseException | None = None
-    for attempt, delay in enumerate(delays):
-        try:
-            connector = UnixConnector(path=INTERNAL_SOCKET)
-            async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession(connector=connector) as session:
+        for attempt, delay in enumerate(delays):
+            try:
                 async with session.post(
                     f"http://localhost{path}", json=body,
                 ) as resp:
                     resp.raise_for_status()
                     return await resp.json()
-        except (aiohttp.ClientError, OSError) as exc:
-            last_exc = exc
-            if attempt < len(delays) - 1:
-                await asyncio.sleep(delay)
+            except (aiohttp.ClientError, OSError) as exc:
+                last_exc = exc
+                if attempt < len(delays) - 1:
+                    await asyncio.sleep(delay)
     assert last_exc is not None
     raise last_exc
 
@@ -124,27 +123,35 @@ async def reply(chat_id: str, text: str) -> dict[str, Any]:
 # Test helpers (public API used by tests/test_casa_engagement_channel.py).
 # ---------------------------------------------------------------------------
 
-async def list_tools() -> list:
-    """Return the list of registered tools (each has a ``.name`` attribute)."""
+async def _list_tools_for_tests() -> list:
+    """Test-only helper — DO NOT call from runtime tool-dispatch flow.
+
+    Return the list of registered tools (each has a ``.name`` attribute).
+    """
     return await server.list_tools()
 
 
-async def invoke_tool(name: str, args: dict[str, Any]) -> Any:
-    """Invoke the registered tool function directly with ``**args``.
+async def _invoke_tool_for_tests(name: str, args: dict[str, Any]) -> Any:
+    """Test-only helper — DO NOT call from runtime tool-dispatch flow.
 
-    Bypasses FastMCP's wire-format wrapping so tests can assert on the raw
-    Python return value. Uses the ``_tool_manager`` accessor; falls back to
-    ``call_tool`` if a future mcp rename hides it.
+    Invoke the registered tool function directly with ``**args``. Bypasses
+    FastMCP's wire-format wrapping so tests can assert on the raw Python
+    return value. Uses the ``_tool_manager`` accessor; falls back to
+    ``call_tool`` only when the ``_tool_manager`` attr is missing entirely
+    (a future mcp rename). When ``_tool_manager`` exists but the requested
+    tool is not registered, raises ``KeyError`` rather than silently routing
+    through ``call_tool``.
     """
     tm = getattr(server, "_tool_manager", None)
     if tm is not None:
         tool = tm.get_tool(name)
-        if tool is not None:
-            fn = tool.fn
-            result = fn(**args)
-            if asyncio.iscoroutine(result):
-                result = await result
-            return result
+        if tool is None:
+            raise KeyError(f"tool {name!r} not registered")
+        fn = tool.fn
+        result = fn(**args)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result
     return await server.call_tool(name, args)
 
 
@@ -202,18 +209,19 @@ def main(argv: list[str] | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pytest-friendly bottom block: populate ENGAGEMENT_ID from argv without
-# entering the stdio run loop when imported under pytest.
+# Test-only seam: populate module state directly without entering run loop.
 # ---------------------------------------------------------------------------
 
-if ENGAGEMENT_ID is None and "pytest" in sys.modules:
-    try:
-        _parsed, _unknown = _build_arg_parser().parse_known_args(sys.argv[1:])
-        ENGAGEMENT_ID = _parsed.engagement_id
-    except SystemExit:
-        # argparse exits on missing required args; tests that need
-        # ENGAGEMENT_ID set seed sys.argv via the channel_server fixture.
-        pass
+def _configure_for_test(engagement_id: str, *, internal_socket: str | None = None) -> None:
+    """Test-only seam — populate module state directly without entering run-loop.
+
+    Production code never calls this; tests use it after re-importing the module
+    with a fresh argv patch.
+    """
+    global ENGAGEMENT_ID, INTERNAL_SOCKET
+    ENGAGEMENT_ID = engagement_id
+    if internal_socket is not None:
+        INTERNAL_SOCKET = internal_socket
 
 
 if __name__ == "__main__":  # pragma: no cover

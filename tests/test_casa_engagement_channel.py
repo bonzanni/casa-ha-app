@@ -21,19 +21,15 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture
-def channel_server(monkeypatch):
+def channel_server():
     """Force a fresh re-import of the channel server module per test.
 
-    The module reads ``--engagement-id`` from ``sys.argv`` at import time
-    (via the pytest-friendly bottom block). We seed argv before importing
-    so ENGAGEMENT_ID is populated without entering the stdio run loop.
+    Uses the explicit ``_configure_for_test`` seam to populate
+    ``ENGAGEMENT_ID`` directly, avoiding argv-driven magic.
     """
-    monkeypatch.setattr(
-        sys, "argv",
-        ["casa_engagement_channel", "--engagement-id", "deadbeef-test"],
-    )
     sys.modules.pop("channels.casa_engagement_channel", None)
     module = importlib.import_module("channels.casa_engagement_channel")
+    module._configure_for_test("deadbeef-test")
     assert module.ENGAGEMENT_ID == "deadbeef-test"
     yield module
     sys.modules.pop("channels.casa_engagement_channel", None)
@@ -41,7 +37,7 @@ def channel_server(monkeypatch):
 
 class TestChannelServerSkeleton:
     async def test_reply_tool_registered(self, channel_server):
-        tools = await channel_server.list_tools()
+        tools = await channel_server._list_tools_for_tests()
         names = [t.name for t in tools]
         assert "reply" in names
 
@@ -61,7 +57,7 @@ class TestChannelServerSkeleton:
 
         monkeypatch.setattr(channel_server, "_internal_post", fake_post)
 
-        result = await channel_server.invoke_tool(
+        result = await channel_server._invoke_tool_for_tests(
             "reply", {"chat_id": "ignored", "text": "hello"},
         )
 
@@ -83,10 +79,10 @@ class TestChannelServerSkeleton:
 
         monkeypatch.setattr(channel_server, "_internal_post", fake_post)
 
-        await channel_server.invoke_tool(
+        await channel_server._invoke_tool_for_tests(
             "reply", {"chat_id": "11111", "text": "one"},
         )
-        await channel_server.invoke_tool(
+        await channel_server._invoke_tool_for_tests(
             "reply", {"chat_id": "99999", "text": "two"},
         )
 
