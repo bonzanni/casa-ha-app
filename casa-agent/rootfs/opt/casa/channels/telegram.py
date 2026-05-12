@@ -715,15 +715,24 @@ class TelegramChannel(Channel):
         )
         return topic.message_thread_id
 
-    async def send_to_topic(self, thread_id: int, text: str) -> None:
-        """Post a message into the given forum-supergroup topic."""
+    async def send_to_topic(
+        self, thread_id: int, text: str, **kwargs,
+    ) -> int:
+        """Post a message into the given forum-supergroup topic.
+
+        Returns the Telegram ``message_id`` of the posted message.
+        ``kwargs`` is forwarded to ``bot.send_message`` (used by Phase 2+
+        callers passing ``reply_markup`` for inline keyboards, etc.).
+        """
         if not self.engagement_supergroup_id:
             raise RuntimeError("engagement supergroup not configured")
-        await self.bot.send_message(
+        msg = await self.bot.send_message(
             chat_id=self.engagement_supergroup_id,
             text=text,
             message_thread_id=thread_id,
+            **kwargs,
         )
+        return msg.message_id
 
     async def close_topic_with_check(self, thread_id: int) -> None:
         """Close the topic and flip its icon emoji to ✅."""
