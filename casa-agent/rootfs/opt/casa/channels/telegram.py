@@ -25,6 +25,7 @@ from telegram.constants import ChatAction
 from telegram.error import NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -249,6 +250,12 @@ class TelegramChannel(Channel):
         # non-engagement chats (Ellen DM via _route_to_ellen).
         app.add_handler(
             MessageHandler(filters.TEXT, self.handle_update)
+        )
+        # E-12 (v0.37.0) Task 20: U1 permission verdicts arrive as inline-keyboard
+        # callbacks. CallbackQueryHandler with no pattern matches all callback_data;
+        # _on_inline_callback parses by prefix and ignores unknown shapes.
+        app.add_handler(
+            CallbackQueryHandler(self._on_inline_callback)
         )
         app.add_error_handler(self._on_ptb_error)
         await app.initialize()
@@ -634,6 +641,89 @@ class TelegramChannel(Channel):
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("main-feed redirect send failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # E-12 (v0.37.0) Task 20: inline-keyboard callback dispatch
+    # ------------------------------------------------------------------
+
+    async def _on_inline_callback(
+        self, update: Any, context: Any = None,
+    ) -> None:
+        """Dispatch inline-keyboard callbacks (U1 perm verdict, U6 URL noop, …).
+
+        Telegram requires ``callback_query.answer()`` regardless of outcome so
+        the client-side spinner clears. After that, parse the ``callback_data``
+        prefix and route — unknown / malformed prefixes are silently dropped
+        (already logged at the trace level).
+
+        Resolves topic_id → engagement_id locally; the POST to
+        ``/internal/channel/permission_verdict`` carries ``engagement_id``
+        directly so the casa-main handler (Task 21) doesn't need to redo the
+        lookup.
+        """
+        cq = update.callback_query
+        try:
+            await cq.answer()
+        except Exception as exc:  # noqa: BLE001 — defensive, never propagate
+            logger.warning("callback_query.answer failed: %s", exc)
+
+        data = (cq.data or "")
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[0] != "perm" or parts[1] not in ("allow", "deny"):
+            logger.debug("inline callback dropped (data=%r)", data)
+            return
+        verdict, request_id = parts[1], parts[2]
+        if not request_id:
+            return
+
+        thread_id = getattr(cq.message, "message_thread_id", None)
+        if thread_id is None or self._engagement_registry is None:
+            logger.warning(
+                "inline callback dropped: no thread_id or registry "
+                "(thread_id=%s)", thread_id,
+            )
+            return
+        rec = self._engagement_registry.by_topic_id(thread_id)
+        if rec is None:
+            logger.warning(
+                "inline callback dropped: unknown topic_id=%s (verdict=%s)",
+                thread_id, verdict,
+            )
+            return
+
+        payload = {
+            "request_id": request_id,
+            "verdict": verdict,
+            "engagement_id": rec.id,
+            "operator_id": getattr(cq.from_user, "id", None),
+        }
+        try:
+            await self._internal_post(
+                "/internal/channel/permission_verdict", payload,
+            )
+        except Exception as exc:  # noqa: BLE001 — never propagate into PTB loop
+            logger.warning(
+                "permission_verdict internal POST failed (engagement=%s rid=%s): %s",
+                rec.id[:8], request_id, exc,
+            )
+
+    async def _internal_post(self, path: str, payload: dict) -> dict:
+        """Dispatch an internal-handler call from inside casa-main.
+
+        Used by handlers that need to round-trip into the internal-handler
+        family that the per-engagement MCP server also uses. Implemented as
+        an HTTP call over the casa-main Unix socket for symmetry with the
+        engagement-side ``_internal_post`` in ``casa_engagement_channel`` —
+        a future optimization could swap to a direct callable dispatch, but
+        the wire-level path is the simplest correct shape today.
+        """
+        import aiohttp
+        connector = aiohttp.UnixConnector(path="/run/casa/internal.sock")
+        async with aiohttp.ClientSession(connector=connector) as sess:
+            async with sess.post(
+                f"http://localhost{path}", json=payload,
+            ) as resp:
+                return await resp.json()
 
     # ------------------------------------------------------------------
     # Bot accessor (supports test injection via bot= kwarg)
