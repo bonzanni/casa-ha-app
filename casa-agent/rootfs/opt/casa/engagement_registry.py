@@ -69,6 +69,10 @@ class EngagementRecord:
     sdk_session_id: str | None
     origin: dict[str, Any]
     task: str
+    # E-12 (v0.37.0): channel-side state for in-place edits across restarts.
+    pinned_message_id: int | None = None
+    progress_message_id: int | None = None
+    current_state_emoji: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +141,9 @@ class EngagementRegistry:
                     sdk_session_id=row.get("sdk_session_id"),
                     origin=dict(row.get("origin") or {}),
                     task=row.get("task", ""),
+                    pinned_message_id=row.get("pinned_message_id"),
+                    progress_message_id=row.get("progress_message_id"),
+                    current_state_emoji=row.get("current_state_emoji"),
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed engagement row: %s", exc)
@@ -179,6 +186,9 @@ class EngagementRegistry:
                 "sdk_session_id": rec.sdk_session_id,
                 "origin": dict(rec.origin),
                 "task": rec.task,
+                "pinned_message_id": rec.pinned_message_id,
+                "progress_message_id": rec.progress_message_id,
+                "current_state_emoji": rec.current_state_emoji,
             })
         try:
             await asyncio.to_thread(self._write_tombstone, snapshot)
@@ -289,6 +299,32 @@ class EngagementRegistry:
             if rec is None:
                 return
             rec.sdk_session_id = session_id
+            await self._write_tombstone_locked()
+
+    async def set_channel_state(
+        self,
+        engagement_id: str,
+        *,
+        pinned_message_id: int | None = None,
+        progress_message_id: int | None = None,
+        current_state_emoji: str | None = None,
+    ) -> None:
+        """E-12 (v0.37.0): update the channel-state subset on a record.
+
+        Each kwarg is applied only if not None; omitting an arg leaves the
+        current value untouched. Unknown ``engagement_id`` is a no-op (matches
+        the other mutators' tolerance for stale callers).
+        """
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            if pinned_message_id is not None:
+                rec.pinned_message_id = pinned_message_id
+            if progress_message_id is not None:
+                rec.progress_message_id = progress_message_id
+            if current_state_emoji is not None:
+                rec.current_state_emoji = current_state_emoji
             await self._write_tombstone_locked()
 
     async def sweep_idle_and_suspend(

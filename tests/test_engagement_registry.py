@@ -170,3 +170,81 @@ class TestRegistryStateTransitions:
         rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
         await reg.update_last_idle_reminder(rec.id, ts=5000.0)
         assert rec.last_idle_reminder_ts == 5000.0
+
+
+class TestChannelStateFields:
+    """E-12 (v0.37.0): EngagementRecord carries channel-side state."""
+
+    async def test_record_has_channel_fields_with_defaults(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "engagements.json"), bus=None,
+        )
+        rec = await reg.create(
+            kind="executor", role_or_type="plugin-developer",
+            driver="claude_code", task="t", origin={}, topic_id=42,
+        )
+        assert rec.pinned_message_id is None
+        assert rec.progress_message_id is None
+        assert rec.current_state_emoji is None
+
+    async def test_set_channel_state_persists_each_field(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "engagements.json"), bus=None,
+        )
+        rec = await reg.create(
+            kind="executor", role_or_type="plugin-developer",
+            driver="claude_code", task="t", origin={}, topic_id=42,
+        )
+        await reg.set_channel_state(
+            rec.id, pinned_message_id=100, progress_message_id=101,
+            current_state_emoji="🟢",
+        )
+        assert rec.pinned_message_id == 100
+        assert rec.progress_message_id == 101
+        assert rec.current_state_emoji == "🟢"
+
+    async def test_set_channel_state_leaves_omitted_fields_untouched(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "engagements.json"), bus=None,
+        )
+        rec = await reg.create(
+            kind="executor", role_or_type="plugin-developer",
+            driver="claude_code", task="t", origin={}, topic_id=42,
+        )
+        await reg.set_channel_state(rec.id, pinned_message_id=100)
+        await reg.set_channel_state(rec.id, current_state_emoji="🟡")
+        assert rec.pinned_message_id == 100
+        assert rec.progress_message_id is None
+        assert rec.current_state_emoji == "🟡"
+
+    async def test_channel_fields_round_trip_through_tombstone(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+        tombstone = tmp_path / "engagements.json"
+        reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="plugin-developer",
+            driver="claude_code", task="t", origin={}, topic_id=42,
+        )
+        await reg.set_channel_state(
+            rec.id, pinned_message_id=42, progress_message_id=43,
+            current_state_emoji="🟢",
+        )
+
+        reg2 = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        await reg2.load()
+        rec2 = reg2.get(rec.id)
+        assert rec2 is not None
+        assert rec2.pinned_message_id == 42
+        assert rec2.progress_message_id == 43
+        assert rec2.current_state_emoji == "🟢"
+
+    async def test_set_channel_state_unknown_engagement_noop(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "engagements.json"), bus=None,
+        )
+        # Should not raise.
+        await reg.set_channel_state("does-not-exist", pinned_message_id=1)
