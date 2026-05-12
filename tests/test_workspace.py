@@ -438,6 +438,39 @@ class TestProvisionWorkspace:
         # Regression: HOME dir must exist even when template path fired.
         assert (Path(path) / ".home" / ".claude" / "plugins").is_dir()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo not meaningful on Windows")
+    async def test_provision_workspace_renders_casa_engagement_channel_mcp(
+        self, tmp_path,
+    ):
+        """E-12 (v0.37.0): .mcp.json contains casa-engagement-channel stdio entry."""
+        import json
+        from pathlib import Path
+        from drivers.workspace import provision_workspace
+        eng_id = "abcd1234-test-uuid-segment-padding"  # any string; treated opaque
+        defn = self._make_defn(tmp_path)
+        base = tmp_path / "base-plugins"
+        base.mkdir()
+        (base / "superpowers").mkdir()
+        ws = tmp_path / "engagements"
+        ws.mkdir()
+        path = await provision_workspace(
+            engagements_root=str(ws),
+            base_plugins_root=str(base),
+            engagement_id=eng_id,
+            defn=defn, task="t", context="c",
+            casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
+        )
+        mcp = json.loads((Path(path) / ".mcp.json").read_text())
+        assert "casa-framework" in mcp["mcpServers"]  # existing entry untouched
+        assert "casa-engagement-channel" in mcp["mcpServers"]
+        entry = mcp["mcpServers"]["casa-engagement-channel"]
+        assert entry["command"] == "/opt/casa/venv/bin/python"
+        assert entry["args"] == [
+            "/opt/casa/channels/casa_engagement_channel.py",
+            "--engagement-id", eng_id,
+        ]
+        assert entry["env"]["CASA_INTERNAL_SOCKET"] == "/run/casa/internal.sock"
+
 
 class TestCasaMeta:
     def test_write_and_load_roundtrip(self, tmp_path):
