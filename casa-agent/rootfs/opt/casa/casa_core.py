@@ -62,6 +62,7 @@ async def start_internal_unix_runner(
     engagement_registry,
     hook_policies: dict,
     runtime=None,
+    telegram_channel=None,
 ) -> "web.AppRunner":
     """Build and start a second aiohttp AppRunner bound to a Unix socket.
 
@@ -70,6 +71,11 @@ async def start_internal_unix_runner(
       POST /internal/hooks/resolve -> _make_internal_hooks_resolve_handler(...)
       POST /admin/reload           -> build_admin_reload_handler(...)
         (Task E.1 -- casactl operator CLI dispatch)
+      POST /internal/channel/*     -> channels.channel_handlers._make_channel_handlers(...)
+        (E-12 v0.37.0 -- only registered when ``telegram_channel`` is not None;
+         Phase 1 exposes just /internal/channel/send_to_topic. Tests and any
+         fallback boot path without telegram skip this family entirely, so a
+         POST to /internal/channel/* on those runners returns 404.)
 
     Returns the AppRunner so the caller can `await runner.cleanup()` on
     shutdown. We register an `on_cleanup` hook on the internal app that
@@ -117,6 +123,23 @@ async def start_internal_unix_runner(
         "/admin/reload",
         build_admin_reload_handler(runtime=runtime),
     )
+
+    # E-12 (v0.37.0): /internal/channel/* family — POSTed by per-engagement
+    # casa-engagement-channel MCP servers proxying outbound traffic to Telegram.
+    # Only registered if a TelegramChannel instance is available (production
+    # boots always have one; some test paths pass None).
+    if telegram_channel is not None:
+        from channels.channel_handlers import _make_channel_handlers
+        channel_handlers = _make_channel_handlers(
+            telegram_channel=telegram_channel,
+            engagement_registry=engagement_registry,
+        )
+        for path, handler_fn in channel_handlers.items():
+            internal_app.router.add_post(path, handler_fn)
+        logger.info(
+            "E-12: registered %d /internal/channel/* routes (paths: %s)",
+            len(channel_handlers), sorted(channel_handlers.keys()),
+        )
 
     async def _unlink_socket_on_cleanup(_app: web.Application) -> None:
         try:
@@ -1564,12 +1587,17 @@ async def main() -> None:
     _internal_tool_dispatch = {
         t.name: t.handler for t in _CASA_TOOLS_FOR_INTERNAL
     }
+    # E-12 (v0.37.0): pass the live TelegramChannel built at line ~1162 so
+    # start_internal_unix_runner can register the /internal/channel/* family.
+    # `telegram_channel` is the local variable; None when no TELEGRAM_TOKEN is
+    # set (test/fallback boots), in which case the channel routes are skipped.
     internal_runner = await start_internal_unix_runner(
         socket_path="/run/casa/internal.sock",
         tool_dispatch=_internal_tool_dispatch,
         engagement_registry=engagement_registry,
         hook_policies=_internal_hook_policies,
         runtime=runtime,
+        telegram_channel=telegram_channel,
     )
     # Track for shutdown.
     runners: list[web.AppRunner] = [runner, internal_runner]
