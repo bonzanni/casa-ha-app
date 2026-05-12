@@ -42,7 +42,6 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.session import ServerSession
 from mcp.server.stdio import stdio_server
 from mcp.types import ClientNotification, Notification
-from pydantic import RootModel
 
 logger = logging.getLogger(__name__)
 
@@ -256,15 +255,28 @@ class PermissionVerdictNotification(
     params: dict
 
 
-def _build_wider_notification_root_model() -> type[RootModel]:
-    """Build a ``RootModel[Union[<existing>, PermissionRequestNotification]]``.
+def _build_wider_notification_root_model() -> type[ClientNotification]:
+    """Build a ``ClientNotification`` subclass with a widened root union.
 
-    Extends ``ClientNotification``'s root union so the BaseSession message loop
-    validates and dispatches our custom notification class instead of warn-and-
-    dropping it.
+    Returning a ``ClientNotification`` *subclass* (not a free ``RootModel``)
+    is load-bearing: ``Server._handle_message`` routes notifications with
+    ``case types.ClientNotification(root=notify):``. A free
+    ``RootModel[Union[...]]`` parses validation but fails the isinstance
+    relationship — the message would be silently dropped at dispatch. The
+    subclass widens the union *and* keeps the isinstance edge intact.
+
+    Verified live 2026-05-12 on N150: stdio probe sent
+    ``notifications/claude/channel/permission_request`` and observed
+    ``mcp.server.lowlevel.server`` log line
+    ``Received message: root=PermissionRequestNotification(...)`` followed
+    by silent drop — confirming the bug before this fix.
     """
     base_union = ClientNotification.model_fields["root"].annotation
-    return RootModel[Union[base_union, PermissionRequestNotification]]
+
+    class ChannelClientNotification(ClientNotification):
+        root: Union[base_union, PermissionRequestNotification]  # type: ignore[valid-type]
+
+    return ChannelClientNotification
 
 
 async def _on_permission_request_notification(
@@ -435,7 +447,7 @@ def _resolve_mcp_server():
     return getattr(server, "_mcp_server", None) or getattr(server, "server", None)
 
 
-_WIDER_NOTIFICATION_ROOT_MODEL: type[RootModel] | None = None
+_WIDER_NOTIFICATION_ROOT_MODEL: type[ClientNotification] | None = None
 
 
 def _widen_session_notification_type() -> None:

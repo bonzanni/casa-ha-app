@@ -206,6 +206,25 @@ class TestPermissionRequest:
         cls = channel_server.PermissionRequestNotification
         assert cls in low_level.notification_handlers
 
+    async def test_widened_notification_model_is_clientnotification_subclass(
+        self, channel_server,
+    ):
+        """Regression for the 2026-05-12 dispatch bug: a free
+        ``RootModel[Union[...]]`` parses validation but ``Server._handle_message``
+        match-cases on ``types.ClientNotification(...)`` — anything that isn't
+        a ClientNotification subclass is silently dropped. Verified live on
+        N150 stdio probe before this guard test was added.
+        """
+        from mcp.types import ClientNotification
+        wider = channel_server._build_wider_notification_root_model()
+        assert issubclass(wider, ClientNotification)
+        v = wider.model_validate({
+            "method": "notifications/claude/channel/permission_request",
+            "params": {"request_id": "rid-1", "tool_name": "Bash"},
+        })
+        assert isinstance(v, ClientNotification)
+        assert type(v.root) is channel_server.PermissionRequestNotification
+
 
 class TestPermissionVerdictEmission:
     """Phase 2 Task 21: drain queue + emit notifications/claude/channel/permission."""
