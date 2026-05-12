@@ -46,6 +46,25 @@ class TestChannelServerSkeleton:
         assert isinstance(caps, dict)
         assert "claude/channel" in caps
 
+    async def test_capability_includes_claude_channel_permission(self, channel_server):
+        """Phase 2 (Task 17): claude/channel/permission added to capabilities."""
+        caps = channel_server.declared_capabilities()
+        assert "claude/channel/permission" in caps
+
+    async def test_initialization_options_carry_experimental_capabilities(
+        self, channel_server,
+    ):
+        """End-to-end (§A.6.1): the bootstrap injects experimental caps
+        into the inner Server's InitializationOptions."""
+        low_level = channel_server._resolve_mcp_server()
+        assert low_level is not None
+        opts = low_level.create_initialization_options(
+            experimental_capabilities=channel_server.declared_capabilities(),
+        )
+        experimental = opts.capabilities.experimental or {}
+        assert "claude/channel" in experimental
+        assert "claude/channel/permission" in experimental
+
     async def test_reply_forwards_to_internal_socket(
         self, channel_server, monkeypatch,
     ):

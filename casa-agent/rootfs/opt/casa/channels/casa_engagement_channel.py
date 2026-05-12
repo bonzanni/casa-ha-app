@@ -58,10 +58,16 @@ server: FastMCP = FastMCP("casa-engagement-channel", instructions=INSTRUCTIONS)
 def declared_capabilities() -> dict[str, dict]:
     """Experimental capabilities advertised in MCP InitializationOptions.
 
-    Phase 1 declares only ``claude/channel``. Phase 2 will add
-    ``claude/channel/permission`` once the permission relay lands.
+    Phase 2 (v0.37.0) declares both ``claude/channel`` (outbound: reply/ask/
+    set_progress tools and topic-state notifications) and
+    ``claude/channel/permission`` (inbound: ``notifications/claude/channel/
+    permission_request`` → outbound: ``notifications/claude/channel/permission``
+    verdict relay).
     """
-    return {"claude/channel": {}}
+    return {
+        "claude/channel": {},
+        "claude/channel/permission": {},
+    }
 
 
 # ---------------------------------------------------------------------------
