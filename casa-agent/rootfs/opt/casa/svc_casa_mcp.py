@@ -66,7 +66,7 @@ async def _forward_to_internal(
     path: str,                  # "/internal/tools/call" or "/internal/hooks/resolve"
     body: dict[str, Any],
     socket_path: str = INTERNAL_SOCKET_PATH,
-    timeout_s: float = 10.0,
+    timeout_s: float | None = 10.0,
 ) -> tuple[int, dict[str, Any]]:
     """POST `body` to the casa-main internal handler over Unix socket.
 
@@ -74,6 +74,12 @@ async def _forward_to_internal(
     if the socket is missing or the connection is refused — the caller maps
     that to the appropriate user-facing error (casa_temporarily_unavailable
     for tools/call, fail-closed deny for hooks/resolve).
+
+    Pass ``timeout_s=None`` to disable the client-side total timeout — the
+    /hooks/resolve route does this so casa-main's policy-driven timeout
+    (declared in ``hooks.yaml`` per policy, e.g. 600s for
+    ``engagement_permission_relay``) is the only effective gate. A hardcoded
+    short timeout here truncates human-in-the-loop relays.
     """
     connector = aiohttp.UnixConnector(path=socket_path)
     timeout = aiohttp.ClientTimeout(total=timeout_s)
@@ -203,9 +209,15 @@ def _build_hooks_handler(*, forward_to_internal: ForwardCallable):
             )
 
         try:
+            # timeout_s=None: defer to casa-main's policy-driven timeout
+            # (e.g. engagement_permission_relay declares 600s in hooks.yaml).
+            # A short forwarder timeout here truncates human-in-the-loop
+            # permission relays and lands the engagement in an inconsistent
+            # state (verdict arrives later with no waiter).
             _status, result = await forward_to_internal(
                 path="/internal/hooks/resolve",
                 body=body,
+                timeout_s=None,
             )
         except aiohttp.ClientConnectorError as exc:
             logger.warning(
@@ -216,19 +228,25 @@ def _build_hooks_handler(*, forward_to_internal: ForwardCallable):
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
                     "permissionDecisionReason":
-                        "casa unreachable (svc->main socket down)",
+                        "Permission relay unavailable: casa-main internal "
+                        "socket is down. The tool was not run. Retry shortly "
+                        "or check addon logs.",
                 }},
             )
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.warning(
                 "svc_casa_mcp /hooks/resolve: forwarding error: %s", exc,
             )
+            reason = (
+                f"Permission relay failed: forwarder error talking to "
+                f"casa-main ({type(exc).__name__}: {exc or 'no detail'}). "
+                f"The tool was not run."
+            )
             return web.json_response(
                 {"hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
-                    "permissionDecisionReason":
-                        f"hook forward error: {exc}",
+                    "permissionDecisionReason": reason,
                 }},
             )
 

@@ -1,5 +1,65 @@
 # Changelog
 
+## [0.37.5] - 2026-05-13 — Bug-bundle: E-1 + F-1 + A-3-bis
+
+Bundles the four findings from `docs/bug-review-2026-05-13-exploration2.md`.
+The load-bearing one is E-1: the v0.37.2/v0.37.3 C-1 PreToolUse permission
+relay was contract-incomplete because the svc-layer forwarder cut off
+operator response after 10s regardless of the policy's declared
+`timeout: 600`. Yesterday's GREEN live-verify for C-1 (5 sequential Allow
+taps on engagement `986f254e`) was operator-hand-speed-bound; synthetic
+LAN probes reliably exceeded the 10s window and reproduced a fail-closed
+deny with empty error reason.
+
+### Fixed
+
+- **HIGH E-1: `/hooks/resolve` forwarder timeout truncated permission relay.**
+  `svc_casa_mcp._forward_to_internal` defaulted `timeout_s=10.0` and
+  `_build_hooks_handler` did not override it. Result: any operator
+  response taking >10s caused `engagement_permission_relay` to fail-closed
+  deny with an empty `asyncio.TimeoutError()` reason; the actual verdict
+  arrived later with no waiter and was silently dropped, leaving the
+  engagement in a Schrödinger state (agent narrates success, topic shows
+  🟢, tool actually failed). Fix: `_build_hooks_handler` now passes
+  `timeout_s=None` so casa-main's policy-driven timeout (declared per
+  hook in `hooks.yaml`, e.g. 600s for `engagement_permission_relay`) is
+  the only effective gate. tools/call path keeps the 10s default (no
+  human-in-the-loop). Five new tests in `test_svc_casa_mcp.py` cover
+  the contract.
+
+- **MEDIUM F-1: Agent misnarrated hook errors as success.**
+  Two changes:
+  (1) `svc_casa_mcp._build_hooks_handler` deny reasons rewritten as
+  actionable text. Old `"hook forward error: "` (empty `str(exc)` on
+  TimeoutError) replaced with `"Permission relay failed: forwarder error
+  talking to casa-main (<ExcType>: <detail>). The tool was not run."` and
+  the socket-unreachable variant gets a parallel message ending in
+  `"The tool was not run. Retry shortly or check addon logs."`.
+  (2) New "Tool results: honest failure narration" section in
+  `defaults/agents/executors/plugin-developer/prompt.md` instructing the
+  executor to treat `is_error=true` as failure verbatim, even when the
+  error text mentions "hook" or "permission relay" — those words are not
+  a signal the call succeeded.
+
+- **LOW A-3-bis: Ellen still produced legacy `#[role]` topic references.**
+  v0.37.1's prompt update added a description of the new U3 topic shape
+  (bubble icon + state-prefixed title) but didn't explicitly forbid the
+  old format. Reproduced twice in 2026-05-13 exploration2 ("Head to the
+  Engagements supergroup, topic `#[plugin-developer] curl probe`").
+  `defaults/agents/assistant/prompts/system.md` now carries an explicit
+  anti-pattern paragraph forbidding `#[role]`, `#[role:topic]`, and
+  `[role] topic-name` constructions.
+
+### Documented
+
+- **D-1 attribution (housekeeping).** Wire shape for engagement topic
+  icons is spec-compliant as of v0.37.1 (commit `800a3516`): numeric
+  `icon_custom_emoji_id` from `getForumTopicIconStickers`, state-prefixed
+  title only. 2026-05-13 exploration2 confirmed the wire shape on the
+  N150. Visual rendering pending operator-attended supergroup
+  inspection. Memory `project_v037_1_bug_bundle_shipped` updated to
+  move D-1 out of the "deferred to operator verify" list.
+
 ## [0.37.1] - 2026-05-13 — Bug-bundle: D-1 + B-1 + B-1b + A-1 + A-2 + A-3
 
 Catches up the addon version from 0.36.1 → 0.37.1 (the v0.37.0
