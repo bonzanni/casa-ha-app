@@ -183,3 +183,25 @@ class TestVerdictRelay:
         assert "operator timeout" in _reason(result)
         # State returned to active even on timeout.
         assert tg.state_calls[-1] == (eid, "active")
+
+    async def test_stale_verdict_drained(self):
+        from hooks import make_engagement_permission_relay
+        eid = "1" * 32
+        reg = _FakeRegistry({eid: _FakeRecord()})
+        tg = _FakeTelegramChannel()
+        q = asyncio.Queue()
+        # Stale verdict from previous timed-out request.
+        await q.put({"request_id": "stale_rid", "verdict": "allow"})
+        # Real verdict for current request.
+        await q.put({"request_id": "current_rid", "verdict": "allow"})
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg,
+            queues={eid: q}, timeout_s=1.0,
+        )
+        result = await hook(
+            {"tool_name": "Bash", "tool_input": {"command": "x"},
+             "cwd": f"/data/engagements/{eid}",
+             "tool_use_id": "current_rid"},
+            None, {},
+        )
+        assert result == {}, "current verdict honoured, stale dropped"
