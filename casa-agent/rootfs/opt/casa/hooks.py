@@ -716,9 +716,13 @@ def make_engagement_permission_relay(
             except Exception as exc:  # noqa: BLE001
                 return _deny(f"keyboard post failed: {exc}")
 
-            q = queues.get(eng_id)
-            if q is None:
-                return _deny("no permission queue for engagement")
+            # v0.37.3 hotfix: ``_PERMISSION_QUEUES`` is a
+            # ``defaultdict(asyncio.Queue)`` — use ``[]`` so the queue is
+            # created on first hook fire (mirrors the producer side at
+            # ``_make_permission_verdict``). Earlier ``.get()`` returned
+            # None on the first fire, instantly denying the call before the
+            # operator could tap.
+            q = queues[eng_id]
 
             try:
                 verdict = await asyncio.wait_for(

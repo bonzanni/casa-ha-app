@@ -206,16 +206,26 @@ class TestVerdictRelay:
         )
         assert result == {}, "current verdict honoured, stale dropped"
 
-    async def test_no_queue_for_engagement(self):
+    async def test_defaultdict_first_fire_does_not_instant_deny(self):
+        """v0.37.3 regression: production passes a ``defaultdict(asyncio.Queue)``.
+        The hook must wait on the auto-created queue for the timeout window,
+        NOT instant-deny.
+
+        Pre-v0.37.3 the hook used ``queues.get(eng_id)`` which returned None
+        on first fire (defaultdict's factory only triggers on ``[]``), so
+        every first non-allow-listed tool call was denied before the operator
+        could tap. Verified live on N150 with engagement 4f0a3d6e.
+        """
+        import collections
         from hooks import make_engagement_permission_relay
         eid = "3" * 32
         reg = _FakeRegistry({eid: _FakeRecord()})
         tg = _FakeTelegramChannel()
-        # NB: queues dict doesn't have an entry for eid.
+        queues = collections.defaultdict(asyncio.Queue)
+        # Nothing put on the queue — hook must wait the full timeout window.
         hook = make_engagement_permission_relay(
             engagement_registry=reg, telegram_channel=tg,
-            queues={},  # empty
-            timeout_s=1.0,
+            queues=queues, timeout_s=0.1,
         )
         result = await hook(
             {"tool_name": "Bash", "tool_input": {"command": "x"},
@@ -223,9 +233,14 @@ class TestVerdictRelay:
              "tool_use_id": "rid"},
             None, {},
         )
+        # Must be operator timeout, not "no permission queue".
         assert _decision(result) == "deny"
-        assert "no permission queue" in _reason(result)
-        # State returned to active even with no queue.
+        assert "operator timeout" in _reason(result), (
+            f"expected timeout deny, got: {_reason(result)!r}"
+        )
+        # The queue must have been created via the [] auto-create.
+        assert eid in queues
+        # State returned to active even on timeout.
         assert tg.state_calls[-1] == (eid, "active")
 
 
