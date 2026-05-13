@@ -27,7 +27,6 @@ from marketplace_ops import (
     update_plugin_entry,
 )
 from honcho_ids import honcho_session_id
-from text_util import truncate_for_topic, TELEGRAM_TOPIC_NAME_BYTES
 from plugin_env_extractor import extract_env_vars
 from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — available for future use
 from system_requirements.orchestrator import install_requirements, OrchestrationError
@@ -1473,9 +1472,10 @@ async def engage_executor(args: dict) -> dict:
                         "options and verify the bot has can_manage_topics"),
         })
 
-    # E-12 (v0.37.0) Task 22: U3 state-encoded topic title.
-    # ``<state-emoji>·<role-emoji> <concise task>`` per spec §6.3 — no
-    # engagement-id suffix (role emoji + concise task disambiguate).
+    # E-12 (v0.37.0) + v0.37.1 D-1: U3 state-encoded topic title.
+    # ``<state-emoji> <concise task>`` per spec §6.3 — the role icon
+    # is delivered via the bubble (icon_custom_emoji_id from
+    # channels.topic_icons.icon_id_for_role), not the title text.
     from channels.state_emoji import (
         STATE_EMOJI, compose_topic_title, concise_task,
     )
