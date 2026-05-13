@@ -41,6 +41,11 @@ Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
 _PERMISSION_QUEUES: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
 
+# v0.37.2 (C-1): public alias for consumers outside this module
+# (the engagement_permission_relay hook in casa_core wires the same
+# dict so the Telegram callback producer + hook consumer share state).
+PERMISSION_QUEUES = _PERMISSION_QUEUES
+
 
 # ---------------------------------------------------------------------------
 # Helpers

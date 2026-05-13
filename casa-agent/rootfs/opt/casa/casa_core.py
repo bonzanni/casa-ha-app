@@ -501,6 +501,36 @@ def _build_cc_hook_policies(hook_policies: dict) -> dict:
     return cc_policies
 
 
+def _wire_engagement_permission_relay(
+    cc_hook_policies: dict,
+    *,
+    engagement_registry,
+    telegram_channel,
+) -> dict:
+    """Inject engagement_permission_relay into a built cc_hook_policies dict.
+
+    v0.37.2 (C-1): the relay needs live ``engagement_registry`` +
+    ``telegram_channel`` + per-engagement ``PERMISSION_QUEUES`` (shared with
+    the Telegram callback producer in ``channel_handlers``), so it can't be
+    wired via the parameter-free factory pattern used by HOOK_POLICIES.
+    Inject it directly into the built ``(matcher, callback)`` dict instead.
+
+    Mutates and returns ``cc_hook_policies`` for caller convenience.
+    """
+    from hooks import make_engagement_permission_relay
+    from channels.channel_handlers import PERMISSION_QUEUES
+
+    cc_hook_policies["engagement_permission_relay"] = (
+        r".*",
+        make_engagement_permission_relay(
+            engagement_registry=engagement_registry,
+            telegram_channel=telegram_channel,
+            queues=PERMISSION_QUEUES,
+        ),
+    )
+    return cc_hook_policies
+
+
 _STATUS_PAGE = """\
 <!DOCTYPE html>
 <html lang="en"><head>
@@ -1545,6 +1575,13 @@ async def main() -> None:
     # pointing here. Removed in v0.14.2 or later (one-release migration).
     from hooks import HOOK_POLICIES as _HOOK_POLICIES
     _cc_hook_policies = _build_cc_hook_policies(_HOOK_POLICIES)
+    # v0.37.2 (C-1): engagement_permission_relay needs live deps that the
+    # parameter-free factory pattern can't supply; inject via the helper.
+    _wire_engagement_permission_relay(
+        _cc_hook_policies,
+        engagement_registry=engagement_registry,
+        telegram_channel=telegram_channel,
+    )
     app.router.add_post(
         "/hooks/resolve",
         _make_public_hooks_fallback_handler(hook_policies=_cc_hook_policies),
@@ -1593,6 +1630,13 @@ async def main() -> None:
     # in-process by the public-8099 fallback (route registrations above).
     from hooks import HOOK_POLICIES as _HOOK_POLICIES_FOR_INTERNAL
     _internal_hook_policies = _build_cc_hook_policies(_HOOK_POLICIES_FOR_INTERNAL)
+    # v0.37.2 (C-1): mirror the public-8099 wiring on the internal-socket
+    # path consumed by svc-casa-mcp.
+    _wire_engagement_permission_relay(
+        _internal_hook_policies,
+        engagement_registry=engagement_registry,
+        telegram_channel=telegram_channel,
+    )
     from tools import CASA_TOOLS as _CASA_TOOLS_FOR_INTERNAL
     _internal_tool_dispatch = {
         t.name: t.handler for t in _CASA_TOOLS_FOR_INTERNAL
