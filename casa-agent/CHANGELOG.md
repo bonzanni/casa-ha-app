@@ -1,5 +1,69 @@
 # Changelog
 
+## [0.37.1] - 2026-05-13 — Bug-bundle: D-1 + B-1 + B-1b + A-1 + A-2 + A-3
+
+Catches up the addon version from 0.36.1 → 0.37.1 (the v0.37.0
+Phase 2 E-12 source landed on master 2026-05-12 without a release
+artefact; this release bundles those Phase 2 changes plus the
+six findings from `docs/bug-review-2026-05-13-exploration.md`).
+
+### Fixed
+
+- **HIGH D-1: Engagement topic icons silently broken since v0.37.0.**
+  Telegram's Bot API requires a numeric `custom_emoji_id` from
+  `getForumTopicIconStickers` for `icon_custom_emoji_id`; Casa was
+  passing literal chars (`'tools'`, `'✅'`). Result: bubble fell
+  back to default blue chrome AND the leading state emoji was
+  silently stripped from the topic name. New `channels/topic_icons.py`
+  module owns the locked role → custom_emoji_id map (📁 configurator,
+  💻 plugin-developer, 💰 finance, 🤖 default), verified live
+  against N150's curated set on 2026-05-13. `compose_topic_title`
+  now emits `<state> <task>` (role lives in the bubble).
+  `close_topic_with_check` renamed to `close_topic` and no longer
+  flips the icon. Specialist engagement open path harmonised to
+  U3 format (was legacy `#[<role>] <task> · id8`).
+
+- **MEDIUM B-1: Executor schema rejects `permission_mode: auto`.**
+  Casa's `executor.v1.json` enum was stuck on a 4-mode list
+  (`acceptEdits`, `bypassPermissions`, `default`, `plan`) but CC
+  CLI 2.1.119 supports 6 modes (adds `auto` and `dontAsk`).
+  Enum expanded to match.
+
+- **MEDIUM B-1b: One broken executor YAML wiped the entire registry.**
+  `load_all_executors` now returns `(loaded, failed)`; per-executor
+  parse errors are isolated (catches `LoadError`, `OSError`,
+  `ValueError`, `TypeError`, `yaml.YAMLError`). `ExecutorRegistry.load`
+  logs each failure at ERROR and continues. New log shape
+  `Executors: loaded=[...] failed=[...] disabled=[...]`
+  distinguishes "no executors configured" from "all executors
+  broken".
+
+- **MEDIUM A-1: No granular reload scope for ExecutorRegistry.**
+  New 7th scope `executors` (`casa_reload(scope='executors')` /
+  `casactl reload --scope=executors`) re-scans `executors/` and
+  rebuilds the registry. Included in `reload_full` before the
+  per-role agent loop. New `doctrine/recipes/executor/{enable,
+  disable,edit-definition}.md` and a 7th row in the doctrine
+  scopes table.
+
+- **MEDIUM A-2: Residents echo stale memory of system state.**
+  Ellen + butler `system.md` now include a "Stale system-state in
+  memory" section: any time memory says a capability is missing
+  and the user re-asks, always retry the tool call rather than
+  relaying the memory'd "no" verbatim.
+
+- **LOW A-3: Ellen's prompt referenced legacy `#[role] <task>`
+  topic format.** Updated to U3 wording (icon in bubble, state in
+  title prefix).
+
+### Deferred
+
+- **HIGH C-1** — CC CLI 2.1.119 does not emit
+  `notifications/claude/channel/permission_request` for actual
+  permission gates during real engagements; the U1 inline-keyboard
+  relay is non-operational under real workloads. Spike + fix in
+  a follow-up session.
+
 ## [0.36.1] - 2026-05-11 — Hotfix: H-2 (hook callbacks return {} not None)
 
 ### Fixed
