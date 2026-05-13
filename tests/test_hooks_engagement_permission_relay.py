@@ -205,3 +205,35 @@ class TestVerdictRelay:
             None, {},
         )
         assert result == {}, "current verdict honoured, stale dropped"
+
+
+class TestKeyboardFailure:
+    async def test_keyboard_post_raises(self):
+        from hooks import make_engagement_permission_relay
+        eid = "2" * 32
+
+        class _BrokenTg:
+            def __init__(self):
+                self.state_calls = []
+            async def update_topic_state(self, *, engagement_id, new_state):
+                self.state_calls.append((engagement_id, new_state))
+            async def post_perm_keyboard(self, **kw):
+                raise RuntimeError("network down")
+
+        tg = _BrokenTg()
+        hook = make_engagement_permission_relay(
+            engagement_registry=_FakeRegistry({eid: _FakeRecord()}),
+            telegram_channel=tg, queues={eid: asyncio.Queue()},
+            timeout_s=1.0,
+        )
+        result = await hook(
+            {"tool_name": "Bash", "tool_input": {"command": "x"},
+             "cwd": f"/data/engagements/{eid}",
+             "tool_use_id": "rid"},
+            None, {},
+        )
+        assert _decision(result) == "deny"
+        assert "keyboard post failed" in _reason(result)
+        assert "network down" in _reason(result)
+        # State returned to active even on keyboard failure.
+        assert tg.state_calls[-1] == (eid, "active")
