@@ -209,6 +209,11 @@ async def main():
         engagement_supergroup_id=supergroup,
     )
     await ch._rebuild()
+    # v0.37.1 D-1: update_topic_state (called inside _finalize_engagement)
+    # reads ch._engagement_registry to look up the record's task/current
+    # state emoji. Without this wire it early-returns and the title
+    # never gets the ✅ state prefix.
+    ch._engagement_registry = reg
 
     # Minimal bus that captures NOTIFICATIONs.
     class StubBus:
