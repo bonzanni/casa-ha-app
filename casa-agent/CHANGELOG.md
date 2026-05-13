@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.37.6] - 2026-05-13 — Hotfix: CI tier1-smoke + tier2-functional boot timeout
+
+Closes the pre-existing CI red that started intermittently after v0.36.1
+and became 100% reliable from v0.37.1 onward. Every fresh container in
+`test-local/Dockerfile.test` was downloading `intfloat/multilingual-e5-large`
+(~2.24GB) on boot because `scope_registry.py` calls
+`TextEmbedding(model_name=...)` without a `cache_dir`, and the image had
+neither `FASTEMBED_CACHE_PATH` set nor the model pre-cached. The download
+routinely exceeded the 30s `/healthz` wait_healthy ceiling between
+`agent-home provisioned: role=butler` and `ScopeRegistry ready`.
+
+### Fixed
+
+- **CI: fastembed model pre-cached in test image.** `test-local/Dockerfile.test`
+  now sets `ENV FASTEMBED_CACHE_PATH=/opt/casa/fastembed-cache` and adds a
+  build-time `RUN python3 -c "TextEmbedding(model_name='intfloat/multilingual-e5-large')"`
+  warm-up. The env var is honored by both build-time RUN and runtime
+  container (fastembed's `define_cache_dir` reads it) so the model is
+  baked into a Docker layer and reused, not re-downloaded per container.
+  Image gains ~2.5GB but boot now reaches `/healthz` in seconds. No
+  production image change (N150 has persistent caches across restarts).
+
 ## [0.37.5] - 2026-05-13 — Bug-bundle: E-1 + F-1 + A-3-bis
 
 Bundles the four findings from `docs/bug-review-2026-05-13-exploration2.md`.
