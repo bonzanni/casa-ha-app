@@ -80,6 +80,63 @@ fi
 # defaults; the overlay at /addon_configs/casa-agent/ is expected to
 # be wiped across updates in development mode. This keeps
 # setup-configs.sh lean. Revisit when v1.0.0 ships.
+#
+# Narrow exception: v0.37.4 c1-relay-migration (below) injects the
+# engagement_permission_relay PreToolUse policy into pre-existing
+# claude_code executor hooks.yaml files that the seed-copy
+# directory-level skip leaves untouched. Required because the v0.37.2
+# C-1 fix is a runtime contract (no operator keyboard = silent broken
+# permission relay); a wipe-on-update would work but burns operator
+# state for every install path. Idempotent grep-then-append; no
+# version-gated shims, no marker files, no backups — same lean shape
+# as the seed-copy block. Remove when v1.0.0 ships and the migration
+# doctrine takes over.
+
+# === c1-relay-migration: begin ==================================
+# v0.37.4: backfill engagement_permission_relay into pre-existing
+# claude_code executor hooks.yaml files. See spec
+# 2026-05-13-c1-permission-relay-fix.md §4.6, memory
+# project_v037_2_v037_3_c1_shipped.md follow-up #1, and
+# reference_migrations_vs_seed_order (seed_agent_dir is dir-level
+# no-op when the executor dir already exists, so file-level edits
+# need a migration).
+
+# _crm_log: portable wrapper — bashio in production, printf in tests.
+# Defined locally because the seed-copy's _sc_log is declared later
+# in this script.
+_crm_log() { if command -v bashio >/dev/null 2>&1; then bashio::log.info "$*"; else printf '[INFO] %s\n' "$*"; fi; }
+
+if [ -d "$CONFIG_DIR/agents/executors" ]; then
+    for _crm_exec_dir in "$CONFIG_DIR/agents/executors"/*/; do
+        [ -d "$_crm_exec_dir" ] || continue
+        _crm_hooks="$_crm_exec_dir/hooks.yaml"
+        _crm_def="$_crm_exec_dir/definition.yaml"
+        [ -f "$_crm_hooks" ] || continue
+        [ -f "$_crm_def" ] || continue
+        # Driver gate: only claude_code executors get this policy. The
+        # hook resolves engagement-id from cwd against
+        # ^/data/engagements/<32-hex>$ which only claude_code
+        # subprocess cwd matches — in_casa drivers (e.g. configurator)
+        # would deny every tool call.
+        grep -qE '^driver:[[:space:]]*claude_code[[:space:]]*$' "$_crm_def" || continue
+        # Idempotency gate: the policy name appears nowhere else in
+        # a normal hooks.yaml, so a substring grep is sufficient and
+        # cheaper than YAML parsing.
+        grep -q 'engagement_permission_relay' "$_crm_hooks" && continue
+        # Append the stanza + marker comment. Relies on pre_tool_use
+        # being the last (or only) top-level key — true for all
+        # shipped defaults pre-v0.37.2.
+        cat >> "$_crm_hooks" <<'CASA_C1_RELAY_EOF'
+  # casa-migration:c1-relay
+  - policy: engagement_permission_relay
+    matcher: ".*"
+    timeout: 600
+CASA_C1_RELAY_EOF
+        _crm_log "Migrated $(basename "$_crm_exec_dir") hooks.yaml: added engagement_permission_relay"
+    done
+    unset _crm_exec_dir _crm_hooks _crm_def
+fi
+# === c1-relay-migration: end ====================================
 
 # === drift-check: begin =========================================
 # E-C drift report (v0.29.0).
