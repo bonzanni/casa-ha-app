@@ -62,3 +62,45 @@ class TestBashSpec:
             "Bash(npm*)", "Bash",
             {"command": "npm install && echo ok"},
         ) is True
+
+
+class TestFilePathSpec:
+    def test_edit_under_prefix(self):
+        from cc_tool_pattern import matches
+        assert matches(
+            "Edit(/data/engagements/*)", "Edit",
+            {"file_path": "/data/engagements/abc/foo.py"},
+        ) is True
+
+    def test_edit_outside_prefix(self):
+        from cc_tool_pattern import matches
+        assert matches(
+            "Edit(/data/engagements/*)", "Edit",
+            {"file_path": "/etc/passwd"},
+        ) is False
+
+    def test_write_glob(self):
+        from cc_tool_pattern import matches
+        # fnmatch.fnmatchcase ``*`` is NOT path-segment-aware: it matches
+        # across ``/`` just like any other char. So ``*.md`` matches the
+        # full string ``/tmp/foo.md``. Documented under §4.1 best-effort
+        # semantics — operators who want path-segment safety must spell
+        # the prefix explicitly (see test_write_with_anchored_glob).
+        assert matches(
+            "Write(*.md)", "Write",
+            {"file_path": "/tmp/foo.md"},
+        ) is True
+
+    def test_write_with_anchored_glob(self):
+        from cc_tool_pattern import matches
+        assert matches(
+            "Write(/tmp/*)", "Write",
+            {"file_path": "/tmp/foo.md"},
+        ) is True
+
+    def test_glob_pattern_field(self):
+        from cc_tool_pattern import matches
+        assert matches(
+            "Glob(*.py)", "Glob",
+            {"pattern": "*.py"},
+        ) is True
