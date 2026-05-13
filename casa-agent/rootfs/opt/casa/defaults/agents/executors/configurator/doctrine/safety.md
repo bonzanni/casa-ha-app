@@ -31,17 +31,3 @@ The bus receives your emit_completion before any reload - even if the reload goe
 ## One rule you shouldn't forget
 
 **Commit THEN reload.** Always.
-
-## Operator approval for non-allow-listed tools
-
-Casa enforces a permission gate on every tool call. Tools matching your
-`tools.allowed` patterns run with no prompt. Tools that do NOT match
-raise a `[Allow] [Deny]` inline keyboard in this engagement's
-Telegram topic; your call blocks until the operator taps a button (or
-10 min elapses, treated as deny).
-
-When you see "Operator denied via Telegram" in a tool result, the
-operator has rejected that specific call. Acknowledge in your next
-turn, then either retry with a different tool, describe what you
-would have done so the operator can decide whether to approve, or
-ask the operator directly via `mcp__casa-engagement-channel__reply`.

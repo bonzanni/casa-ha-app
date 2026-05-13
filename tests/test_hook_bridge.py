@@ -133,13 +133,18 @@ class TestTimeoutPassthrough:
         assert "timeout" not in cc_hook
 
     def test_bundled_engagement_permission_relay_has_600s_timeout(self):
-        """Bundled C-1 policy must surface timeout=600 in CC settings."""
+        """Bundled C-1 policy must surface timeout=600 in CC settings.
+
+        v0.37.4: only claude_code-driver executors carry this policy.
+        Configurator was reverted (driver: in_casa — the hook's cwd
+        resolver can't match its tool calls; see spec §4.6).
+        """
         import yaml
         from pathlib import Path
         from drivers.hook_bridge import translate_hooks_to_settings
 
         here = Path(__file__).resolve().parent.parent
-        for executor in ("plugin-developer", "configurator"):
+        for executor in ("plugin-developer",):
             hooks_path = (
                 here / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults"
                 / "agents" / "executors" / executor / "hooks.yaml"
@@ -164,3 +169,28 @@ class TestTimeoutPassthrough:
                 f"{executor}: expected timeout=600, got "
                 f"{cc_hook.get('timeout')!r}"
             )
+
+    def test_configurator_does_not_carry_relay_policy(self):
+        """v0.37.4: configurator's bundled defaults must NOT include
+        engagement_permission_relay — its driver: in_casa setup means
+        the hook's cwd-based engagement resolver cannot match its tool
+        calls, and including it would deny every configurator tool
+        call. See memory project_v037_2_v037_3_c1_shipped.md
+        follow-up #2."""
+        import yaml
+        from pathlib import Path
+
+        here = Path(__file__).resolve().parent.parent
+        hooks_path = (
+            here / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults"
+            / "agents" / "executors" / "configurator" / "hooks.yaml"
+        )
+        raw = yaml.safe_load(hooks_path.read_text(encoding="utf-8")) or {}
+        policies = [
+            entry.get("policy")
+            for entry in raw.get("pre_tool_use", [])
+        ]
+        assert "engagement_permission_relay" not in policies, (
+            "configurator must not carry engagement_permission_relay — "
+            "wrong driver (in_casa vs claude_code); see spec §4.6"
+        )
