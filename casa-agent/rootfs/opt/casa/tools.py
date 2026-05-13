@@ -1250,9 +1250,9 @@ async def config_git_commit(args: dict) -> dict:
     "casa_reload",
     "In-process reload of Casa runtime state at a given scope. "
     "Valid scopes: 'agent' (requires role), 'triggers' (requires role), "
-    "'policies', 'plugin_env', 'agents', 'full'. Use 'full' as a "
-    "catch-all when unsure. Does NOT restart the addon - for that, see "
-    "casa_restart_supervised. Restricted to the configurator role.",
+    "'policies', 'plugin_env', 'agents', 'executors', 'full'. Use 'full' "
+    "as a catch-all when unsure. Does NOT restart the addon - for that, "
+    "see casa_restart_supervised. Restricted to the configurator role.",
     {"scope": str, "role": str, "include_env": bool},
 )
 async def casa_reload(args: dict) -> dict:
@@ -1267,7 +1267,7 @@ async def casa_reload(args: dict) -> dict:
             "message": (
                 "casa_reload requires a 'scope' argument. Valid: "
                 "'agent', 'triggers', 'policies', 'plugin_env', "
-                "'agents', 'full'. See doctrine/reload.md."
+                "'agents', 'executors', 'full'. See doctrine/reload.md."
             ),
         })
 
