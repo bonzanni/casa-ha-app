@@ -1,6 +1,6 @@
 # Reload granularity
 
-Casa supports in-process reload at six scopes. None of them restart the
+Casa supports in-process reload at seven scopes. None of them restart the
 addon. For changes that genuinely need a process restart, use
 `casa_restart_supervised` (rare).
 
