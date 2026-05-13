@@ -23,7 +23,7 @@ tools:
     - Glob
     - Grep
     - Skill
-  permission_mode: acceptEdits
+  permission_mode: auto
 mcp_server_names:
   - casa-framework
 idle_reminder_days: 7

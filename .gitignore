@@ -14,3 +14,4 @@ docs/
 test-local/options.json
 test-local/fixtures/**/workspace/
 test-local/fixtures/**/data/
+venv_test/

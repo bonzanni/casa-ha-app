@@ -685,6 +685,16 @@ def make_engagement_permission_relay(
             return _deny(
                 f"unknown or inactive engagement: {eng_id[:8]}"
             )
+        # G-1 v0.37.7: short-circuit on autonomous permission modes. The
+        # executor's ``permission_mode`` in definition.yaml encodes operator
+        # intent; when ``auto`` or ``bypassPermissions`` the CC CLI is meant
+        # to proceed without operator approval — surfacing a Telegram
+        # keyboard would defeat the purpose (and hang the engagement when no
+        # operator is at the keyboard). ``acceptEdits`` and ``default`` still
+        # fall through to the allow-list + relay path.
+        mode = getattr(rec, "permission_mode", "acceptEdits") or "acceptEdits"
+        if mode in ("auto", "bypassPermissions"):
+            return {}
         # Allow-list snapshot from engagement creation (spec §3.5).
         allowed = tuple(getattr(rec, "tools_allowed", ()) or ())
         if matches_any(

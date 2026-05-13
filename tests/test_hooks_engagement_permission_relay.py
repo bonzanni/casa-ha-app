@@ -18,9 +18,11 @@ def _reason(result: dict) -> str:
 
 
 class _FakeRecord:
-    def __init__(self, status="active", tools_allowed=()):
+    def __init__(self, status="active", tools_allowed=(),
+                 permission_mode="acceptEdits"):
         self.status = status
         self.tools_allowed = tuple(tools_allowed)
+        self.permission_mode = permission_mode
 
 
 class _FakeRegistry:
@@ -242,6 +244,141 @@ class TestVerdictRelay:
         assert eid in queues
         # State returned to active even on timeout.
         assert tg.state_calls[-1] == (eid, "active")
+
+
+class TestPermissionModeShortCircuit:
+    """G-1 v0.37.7: executors with permission_mode={auto,bypassPermissions}
+    bypass the relay hook so autonomous (no-operator-at-keyboard) runs work.
+    acceptEdits and default still fall through to the allow-list + relay
+    pipeline.
+    """
+
+    async def test_auto_short_circuits_without_keyboard(self):
+        from hooks import make_engagement_permission_relay
+        eid = "a" * 32
+        reg = _FakeRegistry({
+            eid: _FakeRecord(tools_allowed=(),  # empty -> would normally relay
+                             permission_mode="auto"),
+        })
+        tg = _FakeTelegramChannel()
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg,
+            queues={}, timeout_s=0.01,
+        )
+        result = await hook(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"},
+             "cwd": f"/data/engagements/{eid}",
+             "tool_use_id": "tuse_auto"},
+            None, {},
+        )
+        assert result == {}
+        # No keyboard ever posted, no state transitions emitted.
+        assert tg.keyboard_calls == []
+        assert tg.state_calls == []
+
+    async def test_bypass_permissions_short_circuits(self):
+        from hooks import make_engagement_permission_relay
+        eid = "b" * 32
+        reg = _FakeRegistry({
+            eid: _FakeRecord(tools_allowed=(),
+                             permission_mode="bypassPermissions"),
+        })
+        tg = _FakeTelegramChannel()
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg,
+            queues={}, timeout_s=0.01,
+        )
+        result = await hook(
+            {"tool_name": "Write",
+             "tool_input": {"file_path": "/tmp/x", "content": "y"},
+             "cwd": f"/data/engagements/{eid}",
+             "tool_use_id": "tuse_bp"},
+            None, {},
+        )
+        assert result == {}
+        assert tg.keyboard_calls == []
+        assert tg.state_calls == []
+
+    async def test_accept_edits_falls_through_to_relay(self):
+        from hooks import make_engagement_permission_relay
+        eid = "c" * 32
+        reg = _FakeRegistry({
+            eid: _FakeRecord(tools_allowed=(),  # nothing allow-listed
+                             permission_mode="acceptEdits"),
+        })
+        tg = _FakeTelegramChannel()
+        q = asyncio.Queue()  # no verdict — let it time out
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg,
+            queues={eid: q}, timeout_s=0.05,
+        )
+        result = await hook(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"},
+             "cwd": f"/data/engagements/{eid}",
+             "tool_use_id": "tuse_ae"},
+            None, {},
+        )
+        # acceptEdits MUST take the relay path: keyboard posted, then
+        # operator-timeout deny lands.
+        assert _decision(result) == "deny"
+        assert "operator timeout" in _reason(result)
+        assert len(tg.keyboard_calls) == 1
+        assert tg.state_calls[0] == (eid, "awaiting")
+        assert tg.state_calls[-1] == (eid, "active")
+
+    async def test_default_mode_falls_through_to_relay(self):
+        from hooks import make_engagement_permission_relay
+        eid = "d" * 32
+        reg = _FakeRegistry({
+            eid: _FakeRecord(tools_allowed=(),
+                             permission_mode="default"),
+        })
+        tg = _FakeTelegramChannel()
+        q = asyncio.Queue()
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg,
+            queues={eid: q}, timeout_s=0.05,
+        )
+        result = await hook(
+            {"tool_name": "Edit",
+             "tool_input": {"file_path": "/x", "old_string": "a",
+                            "new_string": "b"},
+             "cwd": f"/data/engagements/{eid}",
+             "tool_use_id": "tuse_def"},
+            None, {},
+        )
+        assert _decision(result) == "deny"
+        assert "operator timeout" in _reason(result)
+        assert len(tg.keyboard_calls) == 1
+
+    async def test_missing_permission_mode_defaults_to_relay(self):
+        """Defensive: records loaded from a pre-v0.37.7 tombstone may not
+        carry permission_mode. The hook must default such records to the
+        relay path (current behaviour), NOT silently bypass.
+        """
+        from hooks import make_engagement_permission_relay
+        eid = "e" * 32
+
+        class _OldRecord:
+            status = "active"
+            tools_allowed = ()
+            # No permission_mode attribute at all.
+
+        reg = _FakeRegistry({eid: _OldRecord()})
+        tg = _FakeTelegramChannel()
+        q = asyncio.Queue()
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg,
+            queues={eid: q}, timeout_s=0.05,
+        )
+        result = await hook(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"},
+             "cwd": f"/data/engagements/{eid}",
+             "tool_use_id": "tuse_old"},
+            None, {},
+        )
+        assert _decision(result) == "deny"
+        assert "operator timeout" in _reason(result)
 
 
 class TestKeyboardFailure:

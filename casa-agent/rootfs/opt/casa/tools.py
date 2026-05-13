@@ -1499,6 +1499,7 @@ async def engage_executor(args: dict) -> dict:
         kind="executor", role_or_type=executor_type, driver=defn.driver,
         task=task_text, origin=dict(origin), topic_id=topic_id,
         tools_allowed=tuple(defn.tools_allowed or ()),
+        permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
     )
 
     # Persist the initial state emoji so Task 23 ``update_topic_state`` knows

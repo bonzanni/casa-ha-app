@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.37.7] - 2026-05-13 — Hotfix bundle: G-1 + G-2 + playbook doc-fixes
+
+Closes two HIGH findings from `docs/bug-review-2026-05-13-exploration3.md`
+plus the coupled seed flip for plugin-developer's default permission_mode,
+and three doc-fixes to the exploration playbook.
+
+### Fixed
+
+- **HIGH G-1: `permission_mode: auto` now suppresses the C-1 relay hook.**
+  `engagement_permission_relay` in `hooks.py` short-circuits with `{}`
+  when the engagement's executor was created with
+  `permission_mode in {auto, bypassPermissions}`. Plumbed via a new
+  `EngagementRecord.permission_mode` field, snapshotted at engagement
+  creation from `ExecutorDefinition.permission_mode` (mirrors the
+  existing `tools_allowed` snapshot pattern). `acceptEdits` and
+  `default` modes still fall through to the allow-list + Telegram relay
+  pipeline. Autonomous claude_code engagements (P5/P12 in the
+  exploration playbook) no longer block on the first ToolSearch
+  permission prompt.
+- **HIGH G-2: `casa_reload(scope=agent role=<new>)` now provisions
+  agent-home.** Previously only `scope=agents` (plural — the diff-based
+  adds/evicts path) called `agent_home.provision_agent_home`; the
+  granular per-role scope used by the configurator's
+  `recipes/specialist/create.md` flow skipped it, so the first
+  `delegate_to_agent target=<new>` failed with
+  `Working directory does not exist: /addon_configs/casa-agent/agent-home/<role>`.
+  Moved provisioning into `reload._construct_agent` so it fires
+  regardless of which reload scope triggered the construction
+  (idempotent — no-op on existing dirs).
+- **Coupled seed: plugin-developer ships `permission_mode: auto`.**
+  `casa-agent/rootfs/opt/casa/defaults/agents/executors/plugin-developer/definition.yaml`
+  flipped from `acceptEdits` to `auto` per operator directive
+  (2026-05-13). Now operationally effective via G-1 — plugin-developer
+  engagements run autonomously by default.
+
+### Doc
+
+- **Playbook P14 — two-line `turn_done` contract.** `sdk_logging` and
+  `agent.py` emit two independent lines (sdk: cost/latency; agent:
+  role/channel/tokens), not the single-line shape the spec implied.
+- **Playbook P19 — `>=90s` timeout on post-reload turn probes.** The
+  bare 60s urllib timeout is too tight for post-`scope=full` cold
+  starts (17-19s on top of `policies:rebuild_scope_registry` +
+  `agent:*:construct_agent`). Use the smoke skill OR `>=90s`. The
+  `bus.register` idempotency regression is only confirmed when a `>=90s`
+  retry also fails.
+- **Playbook P20.2 — U3 title format.** Role-emoji is in the topic-icon
+  bubble (`icon_custom_emoji_id`), not inline in the title text. State
+  emoji prefixes the title.
+
 ## [0.37.6] - 2026-05-13 — Hotfix: CI tier1-smoke + tier2-functional boot timeout
 
 Closes the pre-existing CI red that started intermittently after v0.36.1
