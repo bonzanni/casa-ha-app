@@ -707,6 +707,71 @@ class TelegramChannel(Channel):
                 rec.id[:8], request_id, exc,
             )
 
+    # ------------------------------------------------------------------
+    # v0.37.2 (C-1): permission-relay keyboard composer
+    # ------------------------------------------------------------------
+
+    async def post_perm_keyboard(
+        self,
+        *,
+        engagement_id: str,
+        request_id: str,
+        tool_name: str,
+        tool_input: dict,
+    ) -> int | None:
+        """Post the ✅/❌ permission-relay keyboard to an engagement topic.
+
+        Called by ``engagement_permission_relay`` hook (spec §4.4). Resolves
+        the topic_id from ``engagement_registry``. ``send_to_topic`` returns
+        the message_id (or None on failure); we pass it through.
+        """
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        rec = self._engagement_registry.get(engagement_id)
+        if rec is None or rec.topic_id is None:
+            logger.warning(
+                "post_perm_keyboard: unknown engagement or no topic_id "
+                "(engagement=%s)", engagement_id[:8],
+            )
+            return None
+
+        body_lines = [f"Claude wants to use: *{tool_name}*"]
+        preview = self._build_perm_preview(tool_name, tool_input)
+        if preview:
+            body_lines.append("")
+            body_lines.append(f"```\n{preview}\n```")
+        body = "\n".join(body_lines)
+
+        kbd = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                text="✅ Allow",
+                callback_data=f"perm:allow:{request_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Deny",
+                callback_data=f"perm:deny:{request_id}",
+            ),
+        ]])
+
+        return await self.send_to_topic(
+            rec.topic_id, body,
+            reply_markup=kbd,
+            parse_mode="MarkdownV2",
+        )
+
+    @staticmethod
+    def _build_perm_preview(tool_name: str, tool_input: dict) -> str:
+        """Render a short, single-line preview of the tool's identifying field."""
+        if tool_name == "Bash":
+            return str(tool_input.get("command", ""))[:200]
+        if tool_name in ("Edit", "Write", "Read", "Glob", "Grep"):
+            return str(
+                tool_input.get("file_path") or tool_input.get("pattern") or ""
+            )[:200]
+        if tool_name.startswith("mcp__"):
+            return ""  # MCP tool calls — no useful primary field
+        return ""
+
     async def _internal_post(self, path: str, payload: dict) -> dict:
         """Dispatch an internal-handler call from inside casa-main.
 
