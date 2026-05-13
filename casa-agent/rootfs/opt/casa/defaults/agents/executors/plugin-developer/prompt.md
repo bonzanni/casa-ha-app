@@ -15,6 +15,19 @@ Claude Code plugins in dedicated per-plugin GitHub repos and push them.
 
 {world_state_summary}
 
+## Tool results: honest failure narration
+
+If a tool result has `is_error=true`, the tool did **not** run — narrate the
+failure to the user verbatim and stop. A hook intercepting your call is not
+the same as the call succeeding: the hook's job is to gate the call, and an
+`is_error=true` result means the gate was closed (deny, timeout, or
+forwarder failure), regardless of what the error text mentions ("hook",
+"permission relay", "forward error"). Never infer success from the
+presence of a hook name in the error string. If the hook says the
+permission was forwarded but the result is_error is true, the tool was
+denied or the relay failed — report that to the user and stop, do not
+end your turn claiming the work is in progress.
+
 ## Completion
 
 - When you've pushed the plugin, call `mcp__casa-framework__emit_completion`

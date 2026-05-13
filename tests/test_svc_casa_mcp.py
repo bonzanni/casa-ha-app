@@ -186,7 +186,7 @@ async def test_svc_hooks_resolve_forwards_body_to_internal() -> None:
 
 
 async def test_svc_hooks_resolve_socket_unreachable_fails_closed() -> None:
-    """Hook fail-closed on transport error: deny."""
+    """Hook fail-closed on transport error: deny with actionable reason (F-1)."""
     import aiohttp
 
     async def _fwd_raises(**_):
@@ -201,8 +201,128 @@ async def test_svc_hooks_resolve_socket_unreachable_fails_closed() -> None:
             json={"policy": "anything", "payload": {"tool_name": "Bash"}},
         )
         body = await resp.json()
+        reason = body["hookSpecificOutput"]["permissionDecisionReason"]
         assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
-        assert "casa" in body["hookSpecificOutput"]["permissionDecisionReason"].lower()
+        # F-1: reason must signal failure unambiguously so the model
+        # doesn't narrate hook errors as success.
+        assert "permission relay" in reason.lower()
+        assert "tool was not run" in reason.lower()
+        assert "casa" in reason.lower()
+
+
+async def test_svc_hooks_resolve_forwards_with_no_client_timeout() -> None:
+    """E-1: /hooks/resolve must defer to casa-main's policy-driven timeout.
+
+    The svc-layer forwarder must call ``forward_to_internal`` with
+    ``timeout_s=None`` so a slow operator-in-the-loop relay (e.g.
+    ``engagement_permission_relay`` with policy ``timeout: 600``) is not
+    truncated by a hardcoded 10s client-side timeout.
+    """
+    captured: dict = {}
+
+    async def _fwd(**kwargs):
+        captured.update(kwargs)
+        return 200, {"hookSpecificOutput": {"permissionDecision": "allow"}}
+    app = _make_svc_app(tools=[], forward_call=_fwd)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/hooks/resolve",
+            json={
+                "policy": "engagement_permission_relay",
+                "payload": {"tool_name": "Bash"},
+            },
+        )
+        body = await resp.json()
+        assert body["hookSpecificOutput"]["permissionDecision"] == "allow"
+    # E-1 contract: forwarder timeout disabled in the hooks path.
+    assert "timeout_s" in captured, (
+        "/hooks/resolve must pass timeout_s explicitly to defer to casa-main"
+    )
+    assert captured["timeout_s"] is None, (
+        f"E-1 regression: expected timeout_s=None, got {captured['timeout_s']!r}"
+    )
+
+
+async def test_svc_hooks_resolve_slow_forwarder_does_not_time_out() -> None:
+    """E-1: a forwarder that takes longer than the old 10s default must
+    still complete successfully — the policy-driven timeout on casa-main
+    is the only effective gate."""
+    import asyncio
+    started = asyncio.get_event_loop().time()
+
+    async def _slow_fwd(**_):
+        # 0.2s — well under any reasonable test timeout, but proves we
+        # don't depend on the legacy 10s default. The contract assertion
+        # (timeout_s=None) is in the companion test above.
+        await asyncio.sleep(0.2)
+        return 200, {"hookSpecificOutput": {"permissionDecision": "allow"}}
+    app = _make_svc_app(tools=[], forward_call=_slow_fwd)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/hooks/resolve",
+            json={"policy": "x", "payload": {"tool_name": "Bash"}},
+        )
+        body = await resp.json()
+    elapsed = asyncio.get_event_loop().time() - started
+    assert body["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert elapsed >= 0.2  # forwarder actually slept; not bypassed
+
+
+async def test_svc_hooks_resolve_forwarder_error_reason_is_actionable() -> None:
+    """F-1: forwarder error (timeout / ClientError) must produce an
+    actionable deny reason — the previous empty 'hook forward error: '
+    confused the model into narrating success.
+
+    NOTE: with E-1 (timeout_s=None) shipped, the asyncio.TimeoutError
+    branch will only fire if casa-main itself returns/closes within its
+    own deadline; this test still pins the message format for any
+    aiohttp.ClientError that might surface (e.g. payload, response,
+    connection-reset).
+    """
+    import aiohttp
+
+    async def _fwd_raises(**_):
+        raise aiohttp.ClientPayloadError("simulated payload error")
+    app = _make_svc_app(tools=[], forward_call=_fwd_raises)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/hooks/resolve",
+            json={"policy": "anything", "payload": {"tool_name": "Bash"}},
+        )
+        body = await resp.json()
+        reason = body["hookSpecificOutput"]["permissionDecisionReason"]
+        assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "permission relay failed" in reason.lower()
+        assert "tool was not run" in reason.lower()
+        # Exception class name MUST leak for operator debugging — the old
+        # path produced an empty "hook forward error: " on TimeoutError.
+        assert "ClientPayloadError" in reason
+
+
+async def test_svc_tools_call_keeps_default_short_timeout() -> None:
+    """E-1 scope guard: the tools/call route must NOT inherit the hooks
+    path's timeout_s=None. Model-driven tool calls have no human in the
+    loop, so the short default is correct there."""
+    captured: dict = {}
+
+    async def _fwd(**kwargs):
+        captured.update(kwargs)
+        return 200, {"content": [{"type": "text", "text": "ok"}]}
+    app = _make_svc_app(tools=[_DummyTool()], forward_call=_fwd)
+    async with TestClient(TestServer(app)) as client:
+        await client.post(
+            "/mcp/casa-framework",
+            json={
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {"name": "ok", "arguments": {}},
+            },
+        )
+    # tools/call must NOT explicitly set timeout_s (defer to the
+    # forwarder's default 10s).
+    assert "timeout_s" not in captured, (
+        "tools/call should rely on the default forwarder timeout, "
+        f"got explicit timeout_s={captured.get('timeout_s')!r}"
+    )
 
 
 async def test_svc_get_returns_405() -> None:
