@@ -686,7 +686,52 @@ def make_engagement_permission_relay(
             input_data.get("tool_input") or {},
         ):
             return {}  # pass-through: CC's allow-rule approves
-        # Subsequent tasks fill out the keyboard + queue path.
-        return _deny("not yet implemented")
+
+        # Not allow-listed — post inline keyboard and await operator verdict.
+        cc_tool_use_id = input_data.get("tool_use_id") or ""
+        rid = cc_tool_use_id[:32] or uuid.uuid4().hex
+        tool_name = input_data.get("tool_name", "")
+        tool_input = input_data.get("tool_input") or {}
+
+        await telegram_channel.update_topic_state(
+            engagement_id=eng_id, new_state="awaiting",
+        )
+        try:
+            await telegram_channel.post_perm_keyboard(
+                engagement_id=eng_id,
+                request_id=rid,
+                tool_name=tool_name,
+                tool_input=tool_input,
+            )
+        except Exception as exc:  # noqa: BLE001
+            await telegram_channel.update_topic_state(
+                engagement_id=eng_id, new_state="active",
+            )
+            return _deny(f"keyboard post failed: {exc}")
+
+        q = queues.get(eng_id)
+        if q is None:
+            await telegram_channel.update_topic_state(
+                engagement_id=eng_id, new_state="active",
+            )
+            return _deny("no permission queue for engagement")
+
+        try:
+            verdict = await asyncio.wait_for(
+                _await_matching_verdict(q, rid),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            await telegram_channel.update_topic_state(
+                engagement_id=eng_id, new_state="active",
+            )
+            return _deny(f"operator timeout ({int(timeout_s)}s)")
+
+        await telegram_channel.update_topic_state(
+            engagement_id=eng_id, new_state="active",
+        )
+        if verdict == "allow":
+            return {}
+        return _deny("operator denied via Telegram")
 
     return _hook

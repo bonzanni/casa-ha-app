@@ -109,3 +109,35 @@ class TestEngagementResolution:
         )
         # tools_allowed=("Read",) so it should pass-through
         assert result == {}
+
+
+class TestVerdictRelay:
+    async def test_happy_path_allow(self):
+        from hooks import make_engagement_permission_relay
+        eid = "d" * 32
+        reg = _FakeRegistry({eid: _FakeRecord(tools_allowed=())})
+        tg = _FakeTelegramChannel()
+        q = asyncio.Queue()
+        await q.put({"request_id": "tuse_12345", "verdict": "allow"})
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg,
+            telegram_channel=tg,
+            queues={eid: q},
+            timeout_s=1.0,
+        )
+        result = await hook(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "curl example.com"},
+             "cwd": f"/data/engagements/{eid}",
+             "tool_use_id": "tuse_12345"},
+            None, {},
+        )
+        assert result == {}
+        # State transitioned: awaiting first, then active.
+        assert tg.state_calls == [(eid, "awaiting"), (eid, "active")]
+        # Keyboard was posted exactly once with the right request_id.
+        assert len(tg.keyboard_calls) == 1
+        kw = tg.keyboard_calls[0]
+        assert kw["engagement_id"] == eid
+        assert kw["request_id"] == "tuse_12345"
+        assert kw["tool_name"] == "Bash"
