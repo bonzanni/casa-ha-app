@@ -57,3 +57,55 @@ class TestUnknownContext:
         )
         assert _decision(result) == "deny"
         assert "engagement context" in _reason(result)
+
+
+class TestEngagementResolution:
+    async def test_engagement_not_in_registry(self):
+        from hooks import make_engagement_permission_relay
+        hook = make_engagement_permission_relay(
+            engagement_registry=_FakeRegistry(),
+            telegram_channel=_FakeTelegramChannel(),
+            queues={},
+        )
+        cwd = "/data/engagements/" + "a" * 32
+        result = await hook(
+            {"tool_name": "Read", "tool_input": {}, "cwd": cwd},
+            None, {},
+        )
+        assert _decision(result) == "deny"
+        assert "unknown or inactive" in _reason(result)
+
+    async def test_inactive_engagement(self):
+        from hooks import make_engagement_permission_relay
+        eid = "b" * 32
+        reg = _FakeRegistry({eid: _FakeRecord(status="completed")})
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg,
+            telegram_channel=_FakeTelegramChannel(),
+            queues={},
+        )
+        result = await hook(
+            {"tool_name": "Read", "tool_input": {},
+             "cwd": f"/data/engagements/{eid}"},
+            None, {},
+        )
+        assert _decision(result) == "deny"
+        assert "unknown or inactive" in _reason(result)
+
+    async def test_cwd_subdir_resolves_and_allow_listed(self):
+        from hooks import make_engagement_permission_relay
+        eid = "c" * 32
+        reg = _FakeRegistry({eid: _FakeRecord(tools_allowed=("Read",))})
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg,
+            telegram_channel=_FakeTelegramChannel(),
+            queues={},
+        )
+        # cwd is a sub-directory of the engagement workspace — should still resolve.
+        result = await hook(
+            {"tool_name": "Read", "tool_input": {},
+             "cwd": f"/data/engagements/{eid}/src"},
+            None, {},
+        )
+        # tools_allowed=("Read",) so it should pass-through
+        assert result == {}

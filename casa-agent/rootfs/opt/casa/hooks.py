@@ -677,7 +677,16 @@ def make_engagement_permission_relay(
             return _deny(
                 f"unknown or inactive engagement: {eng_id[:8]}"
             )
-        # Subsequent tasks fill out the allow-list + keyboard + queue path.
+        # Allow-list snapshot from engagement creation (spec §3.5).
+        from cc_tool_pattern import matches_any
+        allowed = tuple(getattr(rec, "tools_allowed", ()) or ())
+        if matches_any(
+            allowed,
+            input_data.get("tool_name", ""),
+            input_data.get("tool_input") or {},
+        ):
+            return {}  # pass-through: CC's allow-rule approves
+        # Subsequent tasks fill out the keyboard + queue path.
         return _deny("not yet implemented")
 
     return _hook
