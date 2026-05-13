@@ -1498,6 +1498,7 @@ async def engage_executor(args: dict) -> dict:
     rec = await _engagement_registry.create(
         kind="executor", role_or_type=executor_type, driver=defn.driver,
         task=task_text, origin=dict(origin), topic_id=topic_id,
+        tools_allowed=tuple(defn.tools_allowed or ()),
     )
 
     # Persist the initial state emoji so Task 23 ``update_topic_state`` knows
