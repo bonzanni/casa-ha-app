@@ -21,7 +21,7 @@ class TestCancelEngagement:
             task="t", origin={"role": "assistant", "channel": "telegram"},
             topic_id=42,
         )
-        tch = MagicMock(); tch.send_to_topic = AsyncMock(); tch.close_topic_with_check = AsyncMock()
+        tch = MagicMock(); tch.send_to_topic = AsyncMock(); tch.close_topic = AsyncMock()
         cm = MagicMock(); cm.get.return_value = tch
         bus = MagicMock(); bus.notify = AsyncMock()
         init_tools(
@@ -84,7 +84,7 @@ async def test_cancel_writes_meta_scope_summary(tmp_path, monkeypatch):
 
     tch = MagicMock()
     tch.send_to_topic = AsyncMock()
-    tch.close_topic_with_check = AsyncMock()
+    tch.close_topic = AsyncMock()
     cm = MagicMock()
     cm.get.return_value = tch
     bus = MagicMock()

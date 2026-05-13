@@ -524,3 +524,73 @@ class TestReloadFull:
 
         await dispatch("full", runtime=runtime, include_env=True)
         assert "plugin_env" in called
+
+
+class TestExecutorsScope:
+    """A-1: 7th reload scope for ExecutorRegistry."""
+
+    async def test_executors_scope_calls_registry_load(self):
+        from reload import dispatch
+        runtime = _make_runtime()
+        # Drive the registry mock to assert load() was awaited.
+        runtime.executor_registry.load = MagicMock()
+        result = await dispatch("executors", runtime=runtime)
+        assert result["status"] == "ok"
+        assert result["scope"] == "executors"
+        assert result["actions"] == ["rebuild_executor_registry"]
+        runtime.executor_registry.load.assert_called_once()
+
+    async def test_executors_scope_registry_raises_becomes_load_error(self):
+        from reload import dispatch
+        runtime = _make_runtime()
+        runtime.executor_registry.load = MagicMock(
+            side_effect=RuntimeError("synthetic")
+        )
+        result = await dispatch("executors", runtime=runtime)
+        assert result["status"] == "error"
+        assert result["kind"] == "load_error"
+        assert "synthetic" in result["message"]
+
+    async def test_full_scope_includes_executors_rebuild(self, monkeypatch):
+        """reload_full chains executors BEFORE per-role agent reload."""
+        from reload import dispatch
+        import reload as reload_mod
+
+        # Capture handler invocation order.
+        order: list[str] = []
+
+        async def fake_policies(runtime, role=None):
+            order.append("policies")
+            return ["pol"]
+
+        async def fake_agents(runtime, role=None):
+            order.append("agents")
+            return ["ag"]
+
+        async def fake_executors(runtime, role=None):
+            order.append("executors")
+            return ["rebuild_executor_registry"]
+
+        async def fake_agent(runtime, role=None):
+            order.append(f"agent:{role}")
+            return ["a_load"]
+
+        monkeypatch.setitem(reload_mod._HANDLERS, "policies", fake_policies)
+        monkeypatch.setitem(reload_mod._HANDLERS, "agents", fake_agents)
+        monkeypatch.setitem(reload_mod._HANDLERS, "executors", fake_executors)
+        monkeypatch.setitem(reload_mod._HANDLERS, "agent", fake_agent)
+
+        runtime = _make_runtime()
+        runtime.role_configs = {"assistant": MagicMock()}
+        runtime.specialist_registry.all_configs = MagicMock(return_value={})
+
+        result = await dispatch("full", runtime=runtime)
+        assert result["status"] == "ok"
+        # executors must precede per-role agent reload.
+        executors_idx = order.index("executors")
+        agent_idx = order.index("agent:assistant")
+        assert executors_idx < agent_idx
+        assert any(
+            a == "executors:rebuild_executor_registry"
+            for a in result["actions"]
+        )

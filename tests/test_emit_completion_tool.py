@@ -21,7 +21,7 @@ class TestEmitCompletionHandler:
             task="t", origin={"role": "assistant", "channel": "telegram"},
             topic_id=42,
         )
-        tch = MagicMock(); tch.send_to_topic = AsyncMock(); tch.close_topic_with_check = AsyncMock()
+        tch = MagicMock(); tch.send_to_topic = AsyncMock(); tch.close_topic = AsyncMock()
         cm = MagicMock(); cm.get.return_value = tch
         bus = MagicMock(); bus.notify = AsyncMock()
         init_tools(
@@ -64,7 +64,7 @@ class TestEmitCompletionHandler:
             task="t", origin={"role": "assistant", "channel": "telegram"},
             topic_id=42,
         )
-        tch = MagicMock(); tch.send_to_topic = AsyncMock(); tch.close_topic_with_check = AsyncMock()
+        tch = MagicMock(); tch.send_to_topic = AsyncMock(); tch.close_topic = AsyncMock()
         cm = MagicMock(); cm.get.return_value = tch
         bus = MagicMock(); bus.notify = AsyncMock()
         init_tools(
@@ -99,7 +99,7 @@ class TestEmitCompletionIdempotency:
         )
         tch = MagicMock()
         tch.send_to_topic = AsyncMock()
-        tch.close_topic_with_check = AsyncMock()
+        tch.close_topic = AsyncMock()
         cm = MagicMock()
         cm.get.return_value = tch
         bus = MagicMock()
@@ -124,7 +124,7 @@ class TestEmitCompletionIdempotency:
             assert rec.status == "completed"
 
             # Snapshot side-effect counts after the legitimate first call.
-            close_calls_before = tch.close_topic_with_check.await_count
+            close_calls_before = tch.close_topic.await_count
             notify_calls_before = bus.notify.await_count
 
             # Re-emit (the bug scenario).
@@ -138,7 +138,7 @@ class TestEmitCompletionIdempotency:
         assert payload2["kind"] == "already_terminal"
 
         # Critical assertion: side effects did NOT fire a second time.
-        assert tch.close_topic_with_check.await_count == close_calls_before
+        assert tch.close_topic.await_count == close_calls_before
         assert bus.notify.await_count == notify_calls_before
 
     async def test_re_emit_after_cancel_is_noop(self, tmp_path):
@@ -155,5 +155,5 @@ class TestEmitCompletionIdempotency:
         payload = json.loads(res["content"][0]["text"])
         assert payload["kind"] == "already_terminal"
         # Topic close / bus.notify NEVER fired.
-        assert tch.close_topic_with_check.await_count == 0
+        assert tch.close_topic.await_count == 0
         assert bus.notify.await_count == 0

@@ -25,7 +25,7 @@ class TestFinalizeEngagement:
 
         telegram = MagicMock()
         telegram.send_to_topic = AsyncMock()
-        telegram.close_topic_with_check = AsyncMock()
+        telegram.close_topic = AsyncMock()
         cm = MagicMock()
         cm.get.return_value = telegram
         bus = MagicMock()
@@ -49,7 +49,7 @@ class TestFinalizeEngagement:
         )
 
         # Topic closed + icon flipped
-        telegram.close_topic_with_check.assert_awaited_once_with(thread_id=42)
+        telegram.close_topic.assert_awaited_once_with(thread_id=42)
         # Completion message posted in topic
         telegram.send_to_topic.assert_awaited()
         # NOTIFICATION sent to Ellen
@@ -75,7 +75,7 @@ class TestFinalizeEngagement:
 
         telegram = MagicMock()
         telegram.send_to_topic = AsyncMock()
-        telegram.close_topic_with_check = AsyncMock()
+        telegram.close_topic = AsyncMock()
         cm = MagicMock()
         cm.get.return_value = telegram
         bus = MagicMock()
@@ -124,7 +124,7 @@ async def test_meta_summary_write_retries_once_on_tls_eof(tmp_path, caplog):
 
     telegram = MagicMock()
     telegram.send_to_topic = AsyncMock()
-    telegram.close_topic_with_check = AsyncMock()
+    telegram.close_topic = AsyncMock()
     cm = MagicMock()
     cm.get.return_value = telegram
     bus = MagicMock()
@@ -207,7 +207,7 @@ async def test_meta_summary_write_does_not_retry_on_non_transient_error(tmp_path
 
     telegram = MagicMock()
     telegram.send_to_topic = AsyncMock()
-    telegram.close_topic_with_check = AsyncMock()
+    telegram.close_topic = AsyncMock()
     cm = MagicMock()
     cm.get.return_value = telegram
     bus = MagicMock()
@@ -384,7 +384,7 @@ class TestFinalizeU3Transition:
 
         telegram = MagicMock()
         telegram.send_to_topic = AsyncMock()
-        telegram.close_topic_with_check = AsyncMock()
+        telegram.close_topic = AsyncMock()
         telegram.update_topic_state = AsyncMock()
         cm = MagicMock()
         cm.get.return_value = telegram
@@ -443,7 +443,7 @@ class TestFinalizeU3Transition:
 
         telegram = MagicMock()
         telegram.send_to_topic = AsyncMock()
-        telegram.close_topic_with_check = AsyncMock()
+        telegram.close_topic = AsyncMock()
         telegram.update_topic_state = AsyncMock(
             side_effect=RuntimeError("telegram down"),
         )
@@ -465,5 +465,5 @@ class TestFinalizeU3Transition:
             next_steps=[], driver=None, memory_provider=memory,
         )
         # Close still happened despite the state-update failure.
-        telegram.close_topic_with_check.assert_awaited_once()
+        telegram.close_topic.assert_awaited_once()
         assert rec.status == "completed"

@@ -30,10 +30,18 @@ class ExecutorRegistry:
 
         base = os.path.dirname(self._dir)
         try:
-            found = load_all_executors(base)
+            found, failed = load_all_executors(base)
         except LoadError as exc:
-            logger.error("Executor load failed: %s", exc)
-            found = {}
+            # Collection-level error (e.g. executors_root unreadable).
+            logger.error("Executor load failed at collection level: %s", exc)
+            found, failed = {}, []
+
+        # v0.37.1 B-1b: per-file failures don't poison siblings.
+        for name, err in failed:
+            logger.error(
+                "Executor %r failed to load: %s; other executors continue",
+                name, err,
+            )
 
         for type_name, defn in found.items():
             if not defn.enabled:
@@ -47,8 +55,9 @@ class ExecutorRegistry:
             )
 
         logger.info(
-            "Executors: enabled=%s disabled=%s",
+            "Executors: loaded=%s failed=%s disabled=%s",
             sorted(self._defs.keys()),
+            sorted(n for n, _ in failed),
             sorted(self._disabled),
         )
 

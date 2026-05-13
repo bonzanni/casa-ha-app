@@ -36,14 +36,16 @@ class TestLoadAllExecutors:
     def test_empty_dir_returns_empty(self, tmp_path):
         from agent_loader import load_all_executors
         os.makedirs(tmp_path / "executors", exist_ok=True)
-        out = load_all_executors(str(tmp_path))
+        out, failed = load_all_executors(str(tmp_path))
         assert out == {}
+        assert failed == []
 
     def test_happy_path_one_type(self, tmp_path):
         from agent_loader import load_all_executors
         base = tmp_path / "executors"
         _write_exec(str(base), "configurator")
-        out = load_all_executors(str(tmp_path))
+        out, failed = load_all_executors(str(tmp_path))
+        assert failed == []
         assert "configurator" in out
         d = out["configurator"]
         assert d.type == "configurator"
@@ -52,8 +54,10 @@ class TestLoadAllExecutors:
         assert d.enabled is True
         assert d.prompt_template_path.endswith("prompt.md")
 
-    def test_schema_violation_raises(self, tmp_path):
-        from agent_loader import load_all_executors, LoadError
+    def test_schema_violation_reports_failed(self, tmp_path):
+        """v0.37.1 B-1b: per-file isolation — schema violation lands
+        on ``failed`` instead of raising LoadError out of the loop."""
+        from agent_loader import load_all_executors
         base = tmp_path / "executors"
         bad = textwrap.dedent("""\
             schema_version: 1
@@ -63,11 +67,14 @@ class TestLoadAllExecutors:
             driver: in_casa
         """)
         _write_exec(str(base), "bad", defn_yaml=bad)
-        with pytest.raises(LoadError):
-            load_all_executors(str(tmp_path))
+        out, failed = load_all_executors(str(tmp_path))
+        assert out == {}
+        assert len(failed) == 1
+        assert failed[0][0] == "bad"
 
-    def test_missing_prompt_raises(self, tmp_path):
-        from agent_loader import load_all_executors, LoadError
+    def test_missing_prompt_reports_failed(self, tmp_path):
+        """v0.37.1 B-1b: missing prompt.md is per-file failure, not raise."""
+        from agent_loader import load_all_executors
         base = tmp_path / "executors"
         d = str(base / "x")
         os.makedirs(d)
@@ -79,8 +86,10 @@ class TestLoadAllExecutors:
                 model: sonnet
                 driver: in_casa
             """))
-        with pytest.raises(LoadError):
-            load_all_executors(str(tmp_path))
+        out, failed = load_all_executors(str(tmp_path))
+        assert out == {}
+        assert len(failed) == 1
+        assert failed[0][0] == "x"
 
 
 class TestExecutorDefinitionPlan4aFields:
@@ -98,7 +107,7 @@ class TestExecutorDefinitionPlan4aFields:
         )
         (ex_dir / "prompt.md").write_text("hi")
 
-        result = load_all_executors(str(tmp_path))
+        result, _failed = load_all_executors(str(tmp_path))
         defn = result["myx"]
 
         assert defn.extra_dirs == []
@@ -122,7 +131,8 @@ class TestExecutorDefinitionPlan4aFields:
         )
         (ex_dir / "prompt.md").write_text("hi")
 
-        defn = load_all_executors(str(tmp_path))["myx"]
+        loaded, _failed = load_all_executors(str(tmp_path))
+        defn = loaded["myx"]
 
         assert defn.extra_dirs == ["/data/casa-plugins-repo"]
         assert defn.mirror_chat_to_topic is False
@@ -142,7 +152,8 @@ class TestExecutorDefinitionPlan4aFields:
         (ex_dir / "prompt.md").write_text("hi")
         (ex_dir / "plugins").mkdir()        # the positive-path trigger
 
-        defn = load_all_executors(str(tmp_path))["myx"]
+        loaded, _failed = load_all_executors(str(tmp_path))
+        defn = loaded["myx"]
 
         # plugins_dir resolves to the absolute plugins/ path inside the executor dir.
         expected = str(ex_dir / "plugins")

@@ -662,14 +662,45 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
 register_handler("agents", reload_agents)
 
 
+async def reload_executors(
+    runtime: Any, *, role: str | None = None,
+) -> list[str]:
+    """v0.37.1 A-1: re-scan executors/ and rebuild ExecutorRegistry.
+
+    Picks up adds, deletes, enabled-flag flips, permission_mode
+    changes, allowed_tools edits, prompt path changes — anything
+    that lives in the executor's `definition.yaml` or its sibling
+    files. ~30ms in steady state.
+
+    Closes the v0.35.0+ contract gap where executor lifecycle
+    changes required a Supervisor restart.
+    """
+    try:
+        await asyncio.to_thread(runtime.executor_registry.load)
+    except Exception as exc:  # noqa: BLE001
+        raise ReloadError("load_error", f"executors: {exc}") from exc
+    return ["rebuild_executor_registry"]
+
+
+register_handler("executors", reload_executors)
+
+
 async def reload_full(
     runtime: Any, *, role: str | None = None, include_env: bool = False,
 ) -> list[str]:
-    """Compose policies + agents + per-role agent (+ optional plugin_env).
+    """Compose policies + agents + executors + per-role agent
+    (+ optional plugin_env).
 
-    Each sub-handler is invoked DIRECTLY (not via dispatch) so a single
-    `full`-scope lock guards the whole sequence — sub-handlers don't
-    re-enter the dispatcher's lock machinery.
+    Each sub-handler is invoked DIRECTLY (not via dispatch) so a
+    single ``full``-scope lock guards the whole sequence —
+    sub-handlers don't re-enter the dispatcher's lock machinery.
+
+    Order rationale: executors before per-role agent reload because
+    ``engage_executor`` lookups go through the ExecutorRegistry; if
+    an operator edits an executor definition and a resident
+    delegate-list at the same time, we want the executor refresh to
+    land first so any subsequent delegate is dispatching against
+    fresh state.
     """
     actions: list[str] = []
 
@@ -677,13 +708,15 @@ async def reload_full(
     sub = await _HANDLERS["policies"](runtime, role=None)
     actions += [f"policies:{a}" for a in sub]
 
-    # Agents — adds/evicts.
+    # Agents — adds/evicts residents + specialists.
     sub = await _HANDLERS["agents"](runtime, role=None)
     actions += [f"agents:{a}" for a in sub]
 
-    # Per-role agent reload — picks up edits to runtime.yaml etc that the
-    # policies cascade re-loaded but where downstream wiring (triggers)
-    # might still need a fresh pass.
+    # v0.37.1 A-1: executors — picks up definition.yaml edits + adds/deletes.
+    sub = await _HANDLERS["executors"](runtime, role=None)
+    actions += [f"executors:{a}" for a in sub]
+
+    # Per-role agent reload.
     for r in list(runtime.role_configs.keys()) + list(
         runtime.specialist_registry.all_configs().keys(),
     ):

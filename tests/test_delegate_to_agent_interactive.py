@@ -113,7 +113,14 @@ class TestInteractiveMode:
     ):
         """E-9 regression: a 500-char task must not produce a topic
         name >128 UTF-8 bytes (Telegram createForumTopic limit) AND
-        must not slice mid-word."""
+        must not slice mid-word.
+
+        v0.37.1 D-1: the post-create edit_forum_topic rename block is
+        gone — the specialist path now uses the U3 title format
+        directly at open_engagement_topic time. concise_task() already
+        bounds the body to U3_TASK_BYTE_BUDGET; truncate_for_topic
+        appends '…' inside concise_task when truncation kicks in.
+        """
         import agent as agent_mod
         from engagement_registry import EngagementRegistry
         from tools import delegate_to_agent, init_tools
@@ -168,21 +175,12 @@ class TestInteractiveMode:
         open_name = open_kwargs["name"]
         assert len(open_name.encode("utf-8")) <= 128
         # E-9: when the task is longer than the budget, the topic name
-        # MUST end with the '…' ellipsis added by truncate_for_topic.
-        # The pre-fix [:80] hard slice never produces an ellipsis, so
-        # this assertion fails before the helper is wired in.
+        # MUST end with the '…' ellipsis added by truncate_for_topic
+        # (invoked indirectly via concise_task).
         assert open_name.endswith("…"), (
             f"E-9: helper not invoked (no ellipsis); got {open_name!r}"
         )
 
-        # And the rename (edit_forum_topic) must also fit + end on '…'.
-        tch.bot.edit_forum_topic.assert_awaited_once()
-        rename_kwargs = tch.bot.edit_forum_topic.await_args.kwargs
-        rename_name = rename_kwargs["name"]
-        assert len(rename_name.encode("utf-8")) <= 128
-        # Rename keeps the truncated short_task and appends the id; the
-        # body before " · " or " | " must still bear the '…' marker.
-        body_section = rename_name.rsplit(" · ", 1)[0].rsplit(" | ", 1)[0]
-        assert body_section.endswith("…"), (
-            f"E-9: rename body lost ellipsis; got {rename_name!r}"
-        )
+        # v0.37.1 D-1: post-create edit_forum_topic rename is gone —
+        # the U3 title is set at open time, no follow-up rename.
+        tch.bot.edit_forum_topic.assert_not_called()

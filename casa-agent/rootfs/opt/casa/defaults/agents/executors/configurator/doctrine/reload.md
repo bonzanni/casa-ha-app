@@ -1,10 +1,10 @@
 # Reload granularity
 
-Casa supports in-process reload at six scopes. None of them restart the
+Casa supports in-process reload at seven scopes. None of them restart the
 addon. For changes that genuinely need a process restart, use
 `casa_restart_supervised` (rare).
 
-## Six reload scopes
+## Seven reload scopes
 
 | `scope` | Tool | Downtime | Required `role` | When to use |
 |---|---|---|---|---|
@@ -13,6 +13,7 @@ addon. For changes that genuinely need a process restart, use
 | `policies` | `casa_reload(scope='policies')` | <1s | no | `policies/disclosure.yaml` or `policies/scopes.yaml` edits |
 | `plugin_env` | `casa_reload(scope='plugin_env')` | <1s | no | `set_plugin_env_reference` calls / `plugin-env.conf` edits |
 | `agents` | `casa_reload(scope='agents')` | <1s | no | created or deleted ANY resident or specialist directory under `agents/` |
+| `executors` | `casa_reload(scope='executors')` | <1s | no | executor `definition.yaml` edits; create/delete an executor; flip `enabled` / `permission_mode` / `tools.allowed` on an executor |
 | `full` | `casa_reload(scope='full')` | <1s | no | catch-all when unsure or multiple categories edited |
 
 `casa_restart_supervised` (~10-15s) is reserved for s6 service-tree
@@ -35,6 +36,9 @@ changes, addon options.json mutations, or kernel concerns.
 | Edit hooks.yaml | `agent` for that role |
 | Edit policies/scopes.yaml | `policies` |
 | Edit policies/disclosure.yaml | `policies` |
+| Edit an executor's `definition.yaml` | `executors` |
+| Create or delete an executor | `executors` |
+| Edit an executor's `prompt.md` / `hooks.yaml` / `observer.yaml` / `doctrine/*` | none (lazy-read per turn) |
 | Create a NEW resident or specialist | `agents` |
 | Delete a resident or specialist | `agents` |
 | `install_casa_plugin` for a role | `agent` for that role |
@@ -66,6 +70,8 @@ your subprocess being killed mid-emission.
 - Touched a single role's other YAMLs → `agent` for that role.
 - Touched policies/*.yaml → `policies`.
 - Created or deleted an agent → `agents`.
+- Edited an executor's `definition.yaml` (enable / permission_mode / allowed tools / model) → `executors`.
+- Created or deleted an executor → `executors`.
 - Touched `plugin-env.conf` (via `set_plugin_env_reference`) → `plugin_env`.
 - Touched anything else, or multiple of the above → `full`.
 - Need a process restart (rare) → `casa_restart_supervised`.

@@ -716,96 +716,112 @@ def load_all_specialists(
     return found
 
 
-def load_all_executors(base_dir: str) -> dict[str, "ExecutorDefinition"]:
-    """Scan ``<base_dir>/executors/*/`` and return loaded executors.
+def load_all_executors(
+    base_dir: str,
+) -> tuple[dict[str, "ExecutorDefinition"], list[tuple[str, str]]]:
+    """Scan ``<base_dir>/executors/*/`` and return ``(loaded, failed)``.
 
     Each executor dir must contain ``definition.yaml`` and ``prompt.md``.
-    ``hooks.yaml`` and ``observer.yaml`` are optional. Raises
-    :class:`LoadError` on any schema violation, missing required file,
-    or forbidden file.
+    ``hooks.yaml`` and ``observer.yaml`` are optional.
+
+    v0.37.1 B-1b: per-file isolation — a single broken executor
+    (schema violation, missing required file, forbidden file, prompt
+    file missing, directory/type mismatch) does NOT prevent its
+    siblings from loading. The broken one is reported in ``failed`` as
+    ``(name, error_message)``; the caller (typically
+    :meth:`ExecutorRegistry.load`) decides whether to log/raise.
+
+    A collection-level error (e.g. ``executors_root`` missing) still
+    short-circuits with an empty ``(out, failed)`` per the existing
+    early-return contract.
     """
     from config import ExecutorDefinition, resolve_model
 
     executors_root = os.path.join(base_dir, "executors")
     out: dict[str, ExecutorDefinition] = {}
+    failed: list[tuple[str, str]] = []
     if not os.path.isdir(executors_root):
-        return out
+        return out, failed
 
     for entry in sorted(os.listdir(executors_root)):
         exec_dir = os.path.join(executors_root, entry)
         if not os.path.isdir(exec_dir):
             continue
 
-        present = {
-            f for f in os.listdir(exec_dir)
-            if os.path.isfile(os.path.join(exec_dir, f))
-        }
-        rules = TIER_FILES["executor"]
-        missing = rules["required"] - present
-        if missing:
-            raise LoadError(
-                f"executor {entry!r}: missing required file(s) {sorted(missing)}"
+        try:
+            present = {
+                f for f in os.listdir(exec_dir)
+                if os.path.isfile(os.path.join(exec_dir, f))
+            }
+            rules = TIER_FILES["executor"]
+            missing = rules["required"] - present
+            if missing:
+                raise LoadError(
+                    f"executor {entry!r}: missing required file(s) {sorted(missing)}"
+                )
+            forbidden = present & rules["forbidden"]
+            if forbidden:
+                raise LoadError(
+                    f"executor {entry!r}: forbidden file(s) present {sorted(forbidden)}"
+                )
+
+            defn_path = os.path.join(exec_dir, "definition.yaml")
+            defn = _read_yaml(defn_path)
+            _validate(defn, "executor", defn_path)
+
+            tools = defn.get("tools") or {}
+            doctrine_name = defn.get("doctrine_dir", "doctrine")
+            doctrine_abs = os.path.join(exec_dir, doctrine_name)
+
+            hooks_name = defn.get("hooks_file", "hooks.yaml")
+            hooks_abs = (os.path.join(exec_dir, hooks_name)
+                         if hooks_name in present else None)
+
+            observer_name = defn.get("observer_policy_file", "observer.yaml")
+            observer_abs = (os.path.join(exec_dir, observer_name)
+                            if observer_name in present else None)
+
+            prompt_name = defn.get("prompt_template_file", "prompt.md")
+            prompt_abs = os.path.join(exec_dir, prompt_name)
+            if not os.path.isfile(prompt_abs):
+                raise LoadError(
+                    f"executor {entry!r}: prompt template file "
+                    f"{prompt_name!r} not found"
+                )
+
+            memory_block = defn.get("memory") or {}
+            d = ExecutorDefinition(
+                type=defn["type"],
+                description=defn["description"],
+                model=resolve_model(defn["model"]),
+                driver=defn["driver"],
+                enabled=defn.get("enabled", True),
+                tools_allowed=list(tools.get("allowed", [])),
+                tools_disallowed=list(tools.get("disallowed", [])),
+                permission_mode=tools.get("permission_mode", "acceptEdits"),
+                mcp_server_names=list(defn.get("mcp_server_names", [])),
+                idle_reminder_days=int(defn.get("idle_reminder_days", 7)),
+                prompt_template_path=prompt_abs,
+                hooks_path=hooks_abs,
+                observer_policy_path=observer_abs,
+                doctrine_dir=doctrine_abs,
+                # Plan 4a additions
+                extra_dirs=list(defn.get("extra_dirs", [])),
+                mirror_chat_to_topic=bool(defn.get("mirror_chat_to_topic", True)),
+                plugins_dir=(os.path.join(exec_dir, "plugins")
+                            if os.path.isdir(os.path.join(exec_dir, "plugins"))
+                            else ""),
+                # M4 addition (engagement memory)
+                memory=_build_executor_memory(memory_block),
             )
-        forbidden = present & rules["forbidden"]
-        if forbidden:
-            raise LoadError(
-                f"executor {entry!r}: forbidden file(s) present {sorted(forbidden)}"
-            )
+            if d.type != entry:
+                raise LoadError(
+                    f"executor directory {entry!r} holds definition with "
+                    f"type={d.type!r} - mismatch"
+                )
+            out[d.type] = d
+        except (LoadError, OSError, ValueError, TypeError, yaml.YAMLError) as exc:
+            failed.append((entry, str(exc)))
+            continue
 
-        defn_path = os.path.join(exec_dir, "definition.yaml")
-        defn = _read_yaml(defn_path)
-        _validate(defn, "executor", defn_path)
-
-        tools = defn.get("tools") or {}
-        doctrine_name = defn.get("doctrine_dir", "doctrine")
-        doctrine_abs = os.path.join(exec_dir, doctrine_name)
-
-        hooks_name = defn.get("hooks_file", "hooks.yaml")
-        hooks_abs = (os.path.join(exec_dir, hooks_name)
-                     if hooks_name in present else None)
-
-        observer_name = defn.get("observer_policy_file", "observer.yaml")
-        observer_abs = (os.path.join(exec_dir, observer_name)
-                        if observer_name in present else None)
-
-        prompt_name = defn.get("prompt_template_file", "prompt.md")
-        prompt_abs = os.path.join(exec_dir, prompt_name)
-        if not os.path.isfile(prompt_abs):
-            raise LoadError(
-                f"executor {entry!r}: prompt template file "
-                f"{prompt_name!r} not found"
-            )
-
-        memory_block = defn.get("memory") or {}
-        d = ExecutorDefinition(
-            type=defn["type"],
-            description=defn["description"],
-            model=resolve_model(defn["model"]),
-            driver=defn["driver"],
-            enabled=defn.get("enabled", True),
-            tools_allowed=list(tools.get("allowed", [])),
-            tools_disallowed=list(tools.get("disallowed", [])),
-            permission_mode=tools.get("permission_mode", "acceptEdits"),
-            mcp_server_names=list(defn.get("mcp_server_names", [])),
-            idle_reminder_days=int(defn.get("idle_reminder_days", 7)),
-            prompt_template_path=prompt_abs,
-            hooks_path=hooks_abs,
-            observer_policy_path=observer_abs,
-            doctrine_dir=doctrine_abs,
-            # Plan 4a additions
-            extra_dirs=list(defn.get("extra_dirs", [])),
-            mirror_chat_to_topic=bool(defn.get("mirror_chat_to_topic", True)),
-            plugins_dir=(os.path.join(exec_dir, "plugins")
-                        if os.path.isdir(os.path.join(exec_dir, "plugins"))
-                        else ""),
-            # M4 addition (engagement memory)
-            memory=_build_executor_memory(memory_block),
-        )
-        if d.type != entry:
-            raise LoadError(
-                f"executor directory {entry!r} holds definition with "
-                f"type={d.type!r} - mismatch"
-            )
-        out[d.type] = d
-
-    return out
+    return out, failed

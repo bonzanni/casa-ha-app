@@ -100,7 +100,7 @@ def test_load_all_executors_parses_memory_block(tmp_path):
     )
     (exec_dir / "prompt.md").write_text("hello {task}", encoding="utf-8")
 
-    out = load_all_executors(str(base))
+    out, _failed = load_all_executors(str(base))
     assert "configurator" in out
     assert out["configurator"].memory.enabled is True
     assert out["configurator"].memory.token_budget == 1500
@@ -122,6 +122,6 @@ def test_load_all_executors_defaults_memory_when_block_absent(tmp_path):
     )
     (exec_dir / "prompt.md").write_text("hello {task}", encoding="utf-8")
 
-    out = load_all_executors(str(base))
+    out, _failed = load_all_executors(str(base))
     assert out["smoke"].memory.enabled is False
     assert out["smoke"].memory.token_budget == 2000

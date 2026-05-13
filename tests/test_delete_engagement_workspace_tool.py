@@ -185,7 +185,7 @@ async def test_force_delete_writes_meta_scope_summary(tmp_path, monkeypatch):
 
     tch = MagicMock()
     tch.send_to_topic = AsyncMock()
-    tch.close_topic_with_check = AsyncMock()
+    tch.close_topic = AsyncMock()
     cm = MagicMock()
     cm.get.return_value = tch
     bus = MagicMock()
