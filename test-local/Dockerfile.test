@@ -49,6 +49,18 @@ ENV PATH="/opt/casa/venv/bin:${PATH}"
 COPY casa-agent/requirements.txt /tmp/
 RUN /opt/casa/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
 
+# Pre-cache the fastembed model used by ScopeRegistry. Without this, every
+# fresh container boot has to download ~600MB of model weights via fastembed
+# → huggingface_hub, which on CI runners routinely exceeds the 30s
+# /healthz wait_healthy ceiling and stalls boot between `agent-home
+# provisioned: role=butler` and `ScopeRegistry ready`.
+#
+# scope_registry.py calls TextEmbedding(model_name=...) without a cache_dir
+# arg, so fastembed.common.utils.define_cache_dir honors FASTEMBED_CACHE_PATH
+# from the environment (otherwise default /tmp/fastembed_cache).
+ENV FASTEMBED_CACHE_PATH=/opt/casa/fastembed-cache
+RUN python3 -c "from fastembed import TextEmbedding; TextEmbedding(model_name='intfloat/multilingual-e5-large')"
+
 # E2E: swap the real Claude Agent SDK for the offline mock.
 COPY test-local/mock-claude-sdk /tmp/mock-claude-sdk
 RUN /opt/casa/venv/bin/pip install --no-cache-dir --force-reinstall --no-deps /tmp/mock-claude-sdk \

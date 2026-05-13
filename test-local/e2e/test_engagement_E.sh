@@ -209,6 +209,11 @@ async def main():
         engagement_supergroup_id=supergroup,
     )
     await ch._rebuild()
+    # v0.37.1 D-1: update_topic_state (called inside _finalize_engagement)
+    # reads ch._engagement_registry to look up the record's task/current
+    # state emoji. Without this wire it early-returns and the title
+    # never gets the ✅ state prefix.
+    ch._engagement_registry = reg
 
     # Minimal bus that captures NOTIFICATIONs.
     class StubBus:
@@ -242,13 +247,16 @@ async def main():
         driver=StubDriver(), memory_provider=None,
     )
 
-    # Inspect mock TG: topic must be closed with ✅ icon.
+    # Inspect mock TG: topic must be closed with ✅ in the title prefix.
+    # v0.37.1 D-1: bubble icon is set once at open (role-based, numeric
+    # custom_emoji_id) and never edited. State transition lives in the
+    # title — compose_topic_title returns "✅ <short_task>" on completion.
     import urllib.request
     with urllib.request.urlopen(os.environ["MOCK_TG_BASE"] + "/_inspect") as r:
         state = json.loads(r.read())
     topic = state["topics"][str(tid)]
     assert topic["closed"] is True, f"topic not closed: {topic}"
-    assert topic["icon_custom_emoji_id"] == "✅", f"icon wrong: {topic}"
+    assert topic["name"].startswith("✅"), f"title missing ✅ state prefix: {topic}"
     # Bus got one NOTIFICATION targeting assistant.
     assert len(bus.notifs) == 1, f"bus notifs: {len(bus.notifs)}"
     assert bus.notifs[0].target == "assistant"
@@ -739,12 +747,14 @@ async def main():
     assert reg.get(rec.id).status == "completed", \
         f"status: {reg.get(rec.id).status}"
 
-    # 9. Topic closed with ✅ in mock TG.
+    # 9. Topic closed with ✅ in the title prefix (v0.37.1 D-1: bubble
+    #    stays as role icon for life of engagement; state lives in the
+    #    title via update_topic_state → compose_topic_title).
     with urllib.request.urlopen(os.environ["MOCK_TG_BASE"] + "/_inspect") as r:
         state = json.loads(r.read())
     topic = state["topics"][str(tid)]
     assert topic["closed"] is True, f"topic not closed after finalize: {topic}"
-    assert topic["icon_custom_emoji_id"] == "✅", f"icon wrong: {topic}"
+    assert topic["name"].startswith("✅"), f"title missing ✅ state prefix: {topic}"
 
     # 10. Exactly one NOTIFICATION went out, targeting Ellen (the default resident).
     assert len(bus.notifs) == 1, f"expected 1 notif, got {len(bus.notifs)}"
@@ -831,6 +841,16 @@ async def main():
     assert "resident" in spec.get("permissionDecisionReason", "").lower(), \
         f"E-10.1 deny reason missing 'resident': {spec}"
 
+    # Helper: a hook "didn't deny" if it returned no decision (None or {})
+    # or a non-deny hookSpecificOutput. v0.36.1 H-2 changed the no-op return
+    # from None to {} so the SDK's dict-conversion can't trip; both shapes
+    # mean "no policy decision applied — proceed".
+    def _denied(decision):
+        if decision in (None, {}):
+            return False
+        spec = (decision.get("hookSpecificOutput") or {}) if isinstance(decision, dict) else {}
+        return spec.get("permissionDecision") == "deny"
+
     # 3. Hook must NOT deny specialist-subtree deletions (not a resident).
     allow_specialist = {
         "tool_name": "Bash",
@@ -839,7 +859,7 @@ async def main():
         },
     }
     out = await hook(allow_specialist, "tuid-2", {})
-    assert out is None, f"E-10.2 specialist path wrongly denied: {out}"
+    assert not _denied(out), f"E-10.2 specialist path wrongly denied: {out}"
 
     # 3b. Hook must NOT deny executor-subtree deletions either.
     allow_executor = {
@@ -849,12 +869,12 @@ async def main():
         },
     }
     out = await hook(allow_executor, "tuid-3", {})
-    assert out is None, f"E-10.2 executor path wrongly denied: {out}"
+    assert not _denied(out), f"E-10.2 executor path wrongly denied: {out}"
 
     # 3c. A benign Bash command must pass straight through.
     benign = {"tool_name": "Bash", "tool_input": {"command": "ls -la /tmp"}}
     out = await hook(benign, "tuid-4", {})
-    assert out is None, f"E-10.2 benign bash wrongly denied: {out}"
+    assert not _denied(out), f"E-10.2 benign bash wrongly denied: {out}"
 
     # 4. butler/ directory still exists on disk (hook didn't somehow delete it,
     #    and the deny-decision is structural; the SDK would have aborted the
