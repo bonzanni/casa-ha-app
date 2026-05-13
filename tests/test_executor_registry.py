@@ -59,3 +59,42 @@ class TestExecutorRegistry:
         r = ExecutorRegistry(str(tmp_path / "nope"))
         r.load()
         assert r.list_types() == []
+
+
+class TestExecutorRegistryFailedLogging:
+    def test_failed_executor_logged_but_others_load(self, tmp_path, caplog):
+        """B-1b regression — one broken executor must not wipe the registry."""
+        import os
+        import textwrap
+        from executor_registry import ExecutorRegistry
+
+        # configurator: valid
+        _write(str(tmp_path), "configurator")
+        # plugin-developer: broken (permission_mode typo)
+        broken = textwrap.dedent("""\
+            schema_version: 1
+            type: plugin-developer
+            description: A reasonably long description that meets minLength 20.
+            model: sonnet
+            driver: claude_code
+            enabled: true
+            tools:
+              allowed: [Read]
+              permission_mode: acceptedits
+        """)
+        d = os.path.join(str(tmp_path), "executors", "plugin-developer")
+        os.makedirs(os.path.join(d, "doctrine"), exist_ok=True)
+        with open(os.path.join(d, "definition.yaml"), "w") as fh:
+            fh.write(broken)
+        with open(os.path.join(d, "prompt.md"), "w") as fh:
+            fh.write("Hello.")
+
+        r = ExecutorRegistry(str(tmp_path / "executors"))
+        with caplog.at_level("ERROR", logger="executor_registry"):
+            r.load()
+        # configurator loaded; plugin-developer failed but logged.
+        assert r.list_types() == ["configurator"]
+        assert any(
+            "plugin-developer" in rec.message and "permission_mode" in rec.message
+            for rec in caplog.records if rec.levelname == "ERROR"
+        )

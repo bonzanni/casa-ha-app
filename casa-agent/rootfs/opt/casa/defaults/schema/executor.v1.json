@@ -17,7 +17,7 @@
       "properties": {
         "allowed": {"type": "array", "items": {"type": "string"}, "default": []},
         "disallowed": {"type": "array", "items": {"type": "string"}, "default": []},
-        "permission_mode": {"enum": ["default", "acceptEdits", "bypassPermissions", "plan"], "default": "acceptEdits"}
+        "permission_mode": {"enum": ["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"], "default": "acceptEdits"}
       }
     },
     "mcp_server_names": {"type": "array", "items": {"type": "string"}, "default": []},
