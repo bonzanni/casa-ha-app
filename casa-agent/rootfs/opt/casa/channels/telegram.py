@@ -770,6 +770,17 @@ class TelegramChannel(Channel):
                 )
                 return
             self.engagement_permission_ok = True
+            # v0.37.1 D-1: boot-time diagnostic for the topic-icon map.
+            # Non-fatal — logged only if any of our IDs rotated out of
+            # Telegram's curated set.
+            try:
+                from channels import topic_icons
+                await topic_icons.verify_against_telegram(self.bot)
+            except Exception as exc:  # noqa: BLE001 — diagnostic only
+                logger.info(
+                    "Engagement supergroup %s: topic_icons verifier "
+                    "failed (%s); proceeding", self.engagement_supergroup_id, exc,
+                )
         except Exception as exc:
             logger.error(
                 "Engagement supergroup %s: bot-permissions check failed: %s",
@@ -789,19 +800,25 @@ class TelegramChannel(Channel):
         )
 
     async def open_engagement_topic(
-        self, *, name: str, icon_emoji: str | None = None,
+        self, *, name: str, role: str = "",
     ) -> int:
         """Create a Telegram forum topic in the engagement supergroup.
 
-        Returns the ``message_thread_id``. Raises RuntimeError if the
-        supergroup is not configured.
+        v0.37.1 D-1: ``role`` resolves to a numeric ``custom_emoji_id``
+        via ``channels.topic_icons.icon_id_for_role`` and is sent as
+        ``icon_custom_emoji_id``. Unknown roles fall back to the
+        default (🤖) icon — the helper never returns None.
+
+        Returns the ``message_thread_id``. Raises ``RuntimeError`` if
+        the supergroup is not configured.
         """
         if not self.engagement_supergroup_id:
             raise RuntimeError("engagement supergroup not configured")
+        from channels.topic_icons import icon_id_for_role
         topic = await self.bot.create_forum_topic(
             chat_id=self.engagement_supergroup_id,
             name=name,
-            icon_custom_emoji_id=icon_emoji,
+            icon_custom_emoji_id=icon_id_for_role(role),
         )
         return topic.message_thread_id
 
@@ -849,7 +866,7 @@ class TelegramChannel(Channel):
             return
 
         title = compose_topic_title(
-            state=new_state, role=rec.role_or_type,
+            state=new_state,
             short_task=concise_task(rec.task or ""),
         )
         if not self.engagement_supergroup_id:
@@ -876,25 +893,30 @@ class TelegramChannel(Channel):
                 engagement_id[:8], new_emoji, exc,
             )
 
-    async def close_topic_with_check(self, thread_id: int) -> None:
-        """Close the topic and flip its icon emoji to ✅."""
+    async def close_topic(self, thread_id: int) -> None:
+        """Close a forum topic (v0.37.1 D-1 rename + simplification).
+
+        Previously named ``close_topic_with_check`` and flipped the
+        bubble icon to ``"✅"`` on close. That was a literal-char value
+        rather than the required numeric ``custom_emoji_id``, so it
+        silently failed and also stripped the leading char from the
+        topic name. v0.37.1: bubble stays as the role icon for the
+        engagement's whole lifecycle; state lives in the title (set
+        by ``update_topic_state`` upstream). Body simplifies to a
+        plain ``close_forum_topic``.
+        """
         if not self.engagement_supergroup_id:
             raise RuntimeError("engagement supergroup not configured")
         try:
-            await self.bot.edit_forum_topic(
+            await self.bot.close_forum_topic(
                 chat_id=self.engagement_supergroup_id,
                 message_thread_id=thread_id,
-                icon_custom_emoji_id="✅",
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "edit_forum_topic failed for thread=%s: %s",
+                "close_forum_topic failed for thread=%s: %s",
                 thread_id, exc,
             )
-        await self.bot.close_forum_topic(
-            chat_id=self.engagement_supergroup_id,
-            message_thread_id=thread_id,
-        )
 
     # ------------------------------------------------------------------
     # Outbound: block mode

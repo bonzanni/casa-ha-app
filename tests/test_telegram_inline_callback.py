@@ -183,8 +183,10 @@ class TestUpdateTopicState:
         # The engagement_fixture creates only a registry record with
         # topic_id=555. Pre-create the forum topic on the fake bot so
         # update_topic_state's edit_forum_topic finds it.
+        # v0.37.1 D-1: title format is now "<state> <task>" (role is on
+        # the bubble, not in the title).
         await fake_telegram_bot.create_forum_topic(
-            chat_id=-1001, name="🟢·🤖 t",
+            chat_id=-1001, name="🟢 t",
         )
         # The fake's auto-assigned thread id starts at 1001; manually align
         # the fixture's topic_id to that value.
@@ -202,7 +204,7 @@ class TestUpdateTopicState:
 
         sg = fake_telegram_bot._supergroups[-1001]
         topic = sg.topics[1001]
-        assert topic.name.startswith("🟡·"), f"got {topic.name!r}"
+        assert topic.name.startswith("🟡"), f"got {topic.name!r}"
 
     async def test_update_state_is_noop_when_state_unchanged(
         self, fake_telegram_bot, engagement_fixture, monkeypatch,

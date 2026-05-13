@@ -432,8 +432,9 @@ class TestEngageExecutorClaudeCode:
 class TestU3TopicTitle:
     """E-12 (v0.37.0) Task 22: U3 state-encoded topic title at engagement open.
 
-    Spec §6.3: ``<state-emoji>·<role-emoji> <concise task>`` — no engagement-id
-    suffix (the role emoji + concise task carry disambiguation).
+    Spec §6.3 (revised v0.37.1 D-1): ``<state-emoji> <concise task>`` — no
+    engagement-id suffix. The role icon now lives on the bubble (numeric
+    custom_emoji_id via channels.topic_icons), not in the title text.
     """
 
     async def test_engage_executor_opens_topic_with_state_encoded_title(
@@ -486,10 +487,15 @@ class TestU3TopicTitle:
         channel.open_engagement_topic.assert_awaited_once()
         kwargs = channel.open_engagement_topic.await_args.kwargs
         name = kwargs["name"]
-        assert name.startswith("🟢·🛠 "), f"got {name!r}"
+        # v0.37.1 D-1: title is "<state> <task>" — role icon is on the
+        # bubble (kwargs["role"]), not in the title.
+        assert name.startswith("🟢 "), f"got {name!r}"
         assert "Skill" in name
         # No engagement-id suffix.
         assert " | " not in name
+        # Role is passed as a kwarg (resolves to numeric custom_emoji_id
+        # inside open_engagement_topic).
+        assert kwargs["role"] == "plugin-developer"
         # 2. set_channel_state(current_state_emoji="🟢") persisted.
         er.set_channel_state.assert_awaited()
         emoji_calls = [
@@ -501,7 +507,8 @@ class TestU3TopicTitle:
     async def test_engage_executor_unknown_role_falls_back_to_robot_emoji(
         self, tmp_path, monkeypatch,
     ):
-        """role_emoji() returns 🤖 for unknown executor_type — never raises."""
+        """v0.37.1 D-1: unknown executor_type → bubble falls back to
+        DEFAULT_ROLE_ID (🤖). Title format no longer encodes the role."""
         from tools import engage_executor, init_tools
         import agent as agent_mod
 
@@ -546,4 +553,8 @@ class TestU3TopicTitle:
             agent_mod.origin_var.reset(token)
 
         kwargs = channel.open_engagement_topic.await_args.kwargs
-        assert kwargs["name"].startswith("🟢·🤖 ")
+        # Title is just "<state> <task>" — role no longer in title.
+        assert kwargs["name"].startswith("🟢 ")
+        # Role passes through verbatim; open_engagement_topic resolves
+        # it to DEFAULT_ROLE_ID via icon_id_for_role.
+        assert kwargs["role"] == "exotic-future-type"

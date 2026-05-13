@@ -95,7 +95,7 @@ async def main():
     # Stand up the PTB Application against the mock TG URL.
     await ch._rebuild()
     ch._engagement_registry = reg
-    tid = await ch.open_engagement_topic(name="E-1 test topic", icon_emoji=None)
+    tid = await ch.open_engagement_topic(name="E-1 test topic")
     rec = await reg.create(
         kind="specialist", role_or_type="finance", driver="in_casa",
         task="E-1 task", origin={"channel": "telegram", "chat_id": "999"},
@@ -159,7 +159,7 @@ async def main():
     ch._engagement_driver = drv
     ch._driver_send_user_turn = drv.send_user_turn
 
-    tid = await ch.open_engagement_topic(name="E-2", icon_emoji=None)
+    tid = await ch.open_engagement_topic(name="E-2")
     rec = await reg.create(kind="specialist", role_or_type="finance",
                             driver="in_casa", task="", origin={"channel":"telegram"},
                             topic_id=tid)
@@ -227,7 +227,7 @@ async def main():
     tools._bus = bus
     tools._channel_manager = cm
 
-    tid = await ch.open_engagement_topic(name="E-3", icon_emoji=None)
+    tid = await ch.open_engagement_topic(name="E-3")
     rec = await reg.create(kind="specialist", role_or_type="finance",
                             driver="in_casa", task="",
                             origin={"channel":"telegram", "role":"assistant"},
@@ -317,7 +317,7 @@ async def main():
         )
     ch._finalize_cancel = _finalize_cancel
 
-    tid = await ch.open_engagement_topic(name="E-4", icon_emoji=None)
+    tid = await ch.open_engagement_topic(name="E-4")
     rec = await reg.create(kind="specialist", role_or_type="finance",
                             driver="in_casa", task="",
                             origin={"channel":"telegram","role":"assistant"},
@@ -380,7 +380,7 @@ async def main():
     ch._engagement_registry = reg
     ch._observer = obs
 
-    tid = await ch.open_engagement_topic(name="E-5", icon_emoji=None)
+    tid = await ch.open_engagement_topic(name="E-5")
     rec = await reg.create(kind="specialist", role_or_type="finance",
                             driver="in_casa", task="",
                             origin={"channel":"telegram"}, topic_id=tid)
@@ -496,7 +496,7 @@ async def main():
     ch._engagement_driver = drv
     ch._driver_send_user_turn = drv.send_user_turn
 
-    tid = await ch.open_engagement_topic(name="E-7", icon_emoji=None)
+    tid = await ch.open_engagement_topic(name="E-7")
     rec = await reg.create(kind="specialist", role_or_type="finance",
                             driver="in_casa", task="",
                             origin={"channel":"telegram"}, topic_id=tid)
@@ -702,7 +702,7 @@ async def main():
     #    unit tests.)
     tid = await ch.open_engagement_topic(
         name="#[configurator] add test_trigger to assistant",
-        icon_emoji="tools",
+        role="configurator",
     )
     assert tid is not None, "open_engagement_topic returned None"
     rec = await reg.create(
@@ -889,7 +889,7 @@ async def main():
         async def cancel(self, rec): pass
 
     tid = await ch.open_engagement_topic(
-        name="#[configurator] delete butler", icon_emoji="tools",
+        name="#[configurator] delete butler", role="configurator",
     )
     rec = await reg.create(
         kind="executor", role_or_type="configurator", driver="in_casa",

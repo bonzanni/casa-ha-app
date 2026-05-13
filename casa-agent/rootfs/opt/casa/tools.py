@@ -57,12 +57,6 @@ from specialist_registry import (
 
 logger = logging.getLogger(__name__)
 
-# Icon map for interactive engagement topic naming.
-_ICON_FOR_KIND: dict[tuple[str, str], str] = {
-    ("specialist", "finance"): "💰",
-    # Plan 3+ adds ("executor", "configurator"): "⚙️", etc.
-}
-
 # Plan 4a.1 §8: workspace retention for claude_code driver engagements.
 _ENGAGEMENTS_ROOT = "/data/engagements"
 _WORKSPACE_RETENTION_DAYS = 7
@@ -779,26 +773,21 @@ async def delegate_to_agent(args: dict) -> dict:
                 "message": ("set telegram_engagement_supergroup_id in addon "
                             "options and verify the bot has can_manage_topics"),
             })
-        # Open topic
-        icon = _ICON_FOR_KIND.get(("specialist", agent_name), "🧵")
-        # E-9: compute body budget against the *rename* form (the
-        # wider total) so open and rename names share short_task and
-        # rename never has to re-truncate.
-        prefix = f"#[{agent_name}] "
-        rename_suffix = " · 12345678"  # rec.id[:8] is always 8 bytes
-        body_budget = (
-            TELEGRAM_TOPIC_NAME_BYTES
-            - len(prefix.encode("utf-8"))
-            - len(rename_suffix.encode("utf-8"))
+        # v0.37.1 D-1: U3 title format for specialist engagements too
+        # (was legacy `#[<role>] <task> · <id8>`). Bubble carries the
+        # role icon via icon_id_for_role; title is `<state> <task>`.
+        from channels.state_emoji import (
+            STATE_EMOJI, compose_topic_title, concise_task,
         )
         first_line = (task_text or "").splitlines()[0]
-        short_task = truncate_for_topic(
-            first_line, byte_budget=body_budget,
-        ) or "engagement"
+        short_task = concise_task(first_line) or "engagement"
+        topic_name = compose_topic_title(
+            state="active", short_task=short_task,
+        )
         try:
             topic_id = await channel.open_engagement_topic(
-                name=f"{prefix}{short_task}",
-                icon_emoji=icon,
+                name=topic_name,
+                role=agent_name,
             )
         except Exception as exc:  # noqa: BLE001
             return _result({"status": "error", "kind": "topic_create_failed",
@@ -808,15 +797,14 @@ async def delegate_to_agent(args: dict) -> dict:
             kind="specialist", role_or_type=agent_name, driver="in_casa",
             task=task_text, origin=dict(origin), topic_id=topic_id,
         )
-        # Rename the topic to include the short engagement id for disambiguation
+        # Persist initial state emoji so update_topic_state knows
+        # whether it needs to edit the title (no-op when state didn't change).
         try:
-            await channel.bot.edit_forum_topic(
-                chat_id=channel.engagement_supergroup_id,
-                message_thread_id=topic_id,
-                name=f"{prefix}{short_task} · {rec.id[:8]}",
+            await _engagement_registry.set_channel_state(
+                rec.id, current_state_emoji=STATE_EMOJI["active"],
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("edit_forum_topic rename failed: %s", exc)
+            logger.warning("set_channel_state(active) failed: %s", exc)
 
         # Build options + start driver
         options = _build_specialist_options(cfg)
@@ -1494,12 +1482,12 @@ async def engage_executor(args: dict) -> dict:
     first_line = (task_text or "").splitlines()[0]
     short_task = concise_task(first_line) or "engagement"
     topic_name = compose_topic_title(
-        state="active", role=executor_type, short_task=short_task,
+        state="active", short_task=short_task,
     )
     try:
         topic_id = await channel.open_engagement_topic(
             name=topic_name,
-            icon_emoji="tools",
+            role=executor_type,
         )
     except Exception as exc:  # noqa: BLE001
         return _result({
@@ -1684,10 +1672,10 @@ async def _finalize_engagement(
                         engagement.id[:8], exc,
                     )
             try:
-                await tch.close_topic_with_check(thread_id=engagement.topic_id)
+                await tch.close_topic(thread_id=engagement.topic_id)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "finalize engagement %s: close_topic_with_check failed: %s",
+                    "finalize engagement %s: close_topic failed: %s",
                     engagement.id[:8], exc,
                 )
 

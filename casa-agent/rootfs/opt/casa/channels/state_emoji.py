@@ -22,8 +22,6 @@ STATE_EMOJI: dict[str, str] = {
 ROLE_EMOJI: dict[str, str] = {
     "configurator": "⚙️",
     "plugin-developer": "🛠",
-    "casa-builder": "🏗",
-    "automation-builder": "🔁",
 }
 
 _DEFAULT_ROLE_EMOJI = "🤖"
@@ -38,7 +36,7 @@ PROGRESS_GLYPH: dict[str, str] = {
 }
 
 # §6.3 byte budget for U3 task body (tightened from TELEGRAM_TOPIC_NAME_BYTES=128).
-U3_TASK_BYTE_BUDGET = 22
+U3_TASK_BYTE_BUDGET = 26
 
 _LEADING_FILLER_RE = re.compile(
     r"^(?:please|can you|i need you to|help me|could you|"
@@ -51,7 +49,13 @@ _TRAILING_PUNCT_RE = re.compile(r"[\.!\?:,;]+$")
 
 
 def role_emoji(executor_type: str) -> str:
-    """§6.3: fall back to 🤖 for unknown executor types (never raises)."""
+    """Fall back to 🤖 for unknown executor types (never raises).
+
+    Kept for non-topic contexts (logs, doctrine snippets) even
+    though as of v0.37.1 the topic-title composer no longer uses
+    it — the topic bubble carries the role icon (see
+    ``channels.topic_icons``) and the title carries state + task.
+    """
     return ROLE_EMOJI.get(executor_type, _DEFAULT_ROLE_EMOJI)
 
 
@@ -73,11 +77,12 @@ def concise_task(task: str) -> str:
     return truncate_for_topic(s, byte_budget=U3_TASK_BYTE_BUDGET)
 
 
-def compose_topic_title(*, state: str, role: str, short_task: str) -> str:
-    """Compose '<state>·<role> <short_task>' per §6.3.
+def compose_topic_title(*, state: str, short_task: str) -> str:
+    """Compose '<state> <short_task>' per spec §6.3 (revised v0.37.1).
 
-    Unknown ``state`` falls back to 🟢 (active) — never raises.
+    The role emoji is no longer in the title — the bubble carries it
+    via ``channels.topic_icons.icon_id_for_role``. Unknown ``state``
+    falls back to 🟢 (active) — never raises.
     """
     se = STATE_EMOJI.get(state, STATE_EMOJI["active"])
-    re_ = role_emoji(role)
-    return f"{se}·{re_} {short_task}".rstrip()
+    return f"{se} {short_task}".rstrip()
