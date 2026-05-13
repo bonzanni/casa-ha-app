@@ -820,7 +820,7 @@ def load_all_executors(
                     f"type={d.type!r} - mismatch"
                 )
             out[d.type] = d
-        except LoadError as exc:
+        except (LoadError, OSError, ValueError, TypeError, yaml.YAMLError) as exc:
             failed.append((entry, str(exc)))
             continue
 

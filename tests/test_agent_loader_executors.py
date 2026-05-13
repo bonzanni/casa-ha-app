@@ -339,3 +339,31 @@ class TestLoadAllExecutorsIsolation:
         assert loaded == {}
         assert len(failed) == 1
         assert "prompt" in failed[0][1].lower()
+
+
+class TestLoadAllExecutorsBroadIsolation:
+    """v0.37.1 B-1b: per-file isolation must catch more than LoadError.
+
+    The pre-validate code path (`_read_yaml`, `int()` casts on
+    fields, `ExecutorDefinition` construction) can raise YAMLError,
+    ValueError, OSError, TypeError before the schema validator
+    even runs. Those used to escape the per-executor loop and wipe
+    the entire registry. v0.37.1 widens the catch.
+    """
+
+    def test_corrupt_yaml_does_not_wipe_registry(self, tmp_path):
+        import os
+        from agent_loader import load_all_executors
+        # configurator: valid
+        _write_minimal_executor(str(tmp_path), "configurator")
+        # plugin-developer: definition.yaml is not parseable YAML
+        d = os.path.join(str(tmp_path), "executors", "plugin-developer")
+        os.makedirs(os.path.join(d, "doctrine"), exist_ok=True)
+        with open(os.path.join(d, "definition.yaml"), "w", encoding="utf-8") as fh:
+            fh.write("schema_version: 1\ntype: : : : invalid yaml: [\n")
+        with open(os.path.join(d, "prompt.md"), "w", encoding="utf-8") as fh:
+            fh.write("Hello.")
+        loaded, failed = load_all_executors(str(tmp_path))
+        assert list(loaded.keys()) == ["configurator"]
+        assert len(failed) == 1
+        assert failed[0][0] == "plugin-developer"

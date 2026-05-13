@@ -90,7 +90,7 @@ class TestExecutorRegistryFailedLogging:
             fh.write("Hello.")
 
         r = ExecutorRegistry(str(tmp_path / "executors"))
-        with caplog.at_level("ERROR", logger="executor_registry"):
+        with caplog.at_level("INFO", logger="executor_registry"):
             r.load()
         # configurator loaded; plugin-developer failed but logged.
         assert r.list_types() == ["configurator"]
@@ -98,3 +98,11 @@ class TestExecutorRegistryFailedLogging:
             "plugin-developer" in rec.message and "permission_mode" in rec.message
             for rec in caplog.records if rec.levelname == "ERROR"
         )
+        assert any(
+            "loaded=" in rec.message
+            and "failed=" in rec.message
+            and "configurator" in rec.message
+            and "plugin-developer" in rec.message
+            for rec in caplog.records
+            if rec.levelname == "INFO"
+        ), "expected final summary log line with loaded=/failed=/disabled= shape"
