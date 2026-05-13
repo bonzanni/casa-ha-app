@@ -162,3 +162,24 @@ class TestVerdictRelay:
         assert _decision(result) == "deny"
         assert "operator denied" in _reason(result)
         assert tg.state_calls == [(eid, "awaiting"), (eid, "active")]
+
+    async def test_timeout(self):
+        from hooks import make_engagement_permission_relay
+        eid = "f" * 32
+        reg = _FakeRegistry({eid: _FakeRecord()})
+        tg = _FakeTelegramChannel()
+        q = asyncio.Queue()  # no verdict pushed
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg,
+            queues={eid: q}, timeout_s=0.1,
+        )
+        result = await hook(
+            {"tool_name": "Bash", "tool_input": {"command": "curl x"},
+             "cwd": f"/data/engagements/{eid}",
+             "tool_use_id": "tuse_T"},
+            None, {},
+        )
+        assert _decision(result) == "deny"
+        assert "operator timeout" in _reason(result)
+        # State returned to active even on timeout.
+        assert tg.state_calls[-1] == (eid, "active")
