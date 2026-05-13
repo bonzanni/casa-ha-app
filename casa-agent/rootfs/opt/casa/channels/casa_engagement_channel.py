@@ -1,29 +1,20 @@
-"""casa-engagement-channel: per-engagement stdio MCP server (v0.37.0 Phase 1).
+"""casa-engagement-channel: per-engagement stdio MCP server (v0.37.2).
 
 Launched by the ``claude_code`` driver via ``--channels server:<name>`` on the
 ``claude`` CLI subprocess. Supplies operator-facing tools that route through
 casa-main's Unix-socket internal handler at ``/internal/channel/send_to_topic``,
 which fans out to Telegram (or any future channel) by topic.
 
-Phase 1 surface (this module):
+Surface (v0.37.2):
 - ``reply(chat_id, text)`` — append a message to the engagement's operator topic.
   ``chat_id`` is accepted for SDK compatibility but NEVER forwarded (D2 locked).
-- ``declared_capabilities()`` — returns ``{"claude/channel": {}}`` so the
-  MCP InitializationOptions advertise the channel capability to the CLI.
+- ``declared_capabilities()`` — returns ``{"claude/channel": {}}``.
 
-Phase 2 adds ``ask`` + ``set_progress`` and the permission relay; Phase 3 lands
-the full INSTRUCTIONS prompt and any required state machine.
-
-Implementation notes (see §A.6.1 of the build-time findings spec):
-- ``FastMCP`` does NOT expose ``capabilities.experimental`` as a settable
-  attribute; ``instructions`` is a read-only property. We pass instructions via
-  the constructor kwarg and inject ``experimental_capabilities`` by calling
-  ``server._mcp_server.create_initialization_options(...)`` from our own
-  stdio bootstrap (replacing ``FastMCP.run_stdio_async`` which hard-codes a
-  no-arg call).
-- ``_mcp_server`` is an undocumented attribute. A defensive
-  ``_resolve_mcp_server()`` helper falls back to ``server.server`` so a future
-  mcp rename does not break us.
+Permission relay is handled by the casa-main PreToolUse hook
+``engagement_permission_relay`` (v0.37.2; C-1). Earlier versions
+attempted to relay via ``notifications/claude/channel/permission_request``
+from the CLI — that path was retired in v0.37.2 because CC CLI 2.1.x
+does not emit that notification under any tested permission_mode.
 """
 
 from __future__ import annotations
@@ -62,16 +53,13 @@ server: FastMCP = FastMCP("casa-engagement-channel", instructions=INSTRUCTIONS)
 def declared_capabilities() -> dict[str, dict]:
     """Experimental capabilities advertised in MCP InitializationOptions.
 
-    Phase 2 (v0.37.0) declares both ``claude/channel`` (outbound: reply/ask/
-    set_progress tools and topic-state notifications) and
-    ``claude/channel/permission`` (inbound: ``notifications/claude/channel/
-    permission_request`` → outbound: ``notifications/claude/channel/permission``
-    verdict relay).
+    v0.37.2: declares only ``claude/channel`` (outbound reply tool +
+    topic-state notifications). The ``claude/channel/permission``
+    capability was retired in v0.37.2 (C-1) — permission relay now flows
+    through the casa-main PreToolUse hook ``engagement_permission_relay``
+    (see ``docs/superpowers/specs/2026-05-13-c1-permission-relay-fix.md``).
     """
-    return {
-        "claude/channel": {},
-        "claude/channel/permission": {},
-    }
+    return {"claude/channel": {}}
 
 
 # ---------------------------------------------------------------------------
