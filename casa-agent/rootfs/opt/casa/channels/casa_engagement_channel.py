@@ -33,15 +33,13 @@ import asyncio
 import logging
 import os
 from contextlib import AsyncExitStack
-from typing import Any, Literal, Union
+from typing import Any
 
 import aiohttp
 import anyio
 from aiohttp import UnixConnector
 from mcp.server.fastmcp import FastMCP
-from mcp.server.session import ServerSession
 from mcp.server.stdio import stdio_server
-from mcp.types import ClientNotification, Notification
 
 logger = logging.getLogger(__name__)
 
@@ -152,48 +150,6 @@ async def _post_state_transition(new_state: str) -> None:
         logger.warning(
             "update_state(%s) failed: %s", new_state, exc,
         )
-
-
-class PermissionVerdictNotification(
-    Notification[dict, Literal["notifications/claude/channel/permission"]]
-):
-    """Outbound (server → CLI) notification carrying the operator's verdict.
-
-    Sent in response to a ``permission_request`` whose ``request_id`` matches.
-    Params shape: ``{request_id, verdict}`` where ``verdict ∈ {"allow", "deny"}``.
-    BaseSession.send_notification only calls ``.model_dump()`` on this object —
-    there's no validation against ServerNotification's union, so this custom
-    class round-trips through stdio as plain JSON-RPC.
-    """
-
-    method: Literal["notifications/claude/channel/permission"] = (
-        "notifications/claude/channel/permission"
-    )
-    params: dict
-
-
-def _build_wider_notification_root_model() -> type[ClientNotification]:
-    """Build a ``ClientNotification`` subclass with a widened root union.
-
-    Returning a ``ClientNotification`` *subclass* (not a free ``RootModel``)
-    is load-bearing: ``Server._handle_message`` routes notifications with
-    ``case types.ClientNotification(root=notify):``. A free
-    ``RootModel[Union[...]]`` parses validation but fails the isinstance
-    relationship — the message would be silently dropped at dispatch. The
-    subclass widens the union *and* keeps the isinstance edge intact.
-
-    Verified live 2026-05-12 on N150: stdio probe sent
-    ``notifications/claude/channel/permission_request`` and observed
-    ``mcp.server.lowlevel.server`` log line
-    ``Received message: root=PermissionRequestNotification(...)`` followed
-    by silent drop — confirming the bug before this fix.
-    """
-    base_union = ClientNotification.model_fields["root"].annotation
-
-    class ChannelClientNotification(ClientNotification):
-        root: Union[base_union, PermissionRequestNotification]  # type: ignore[valid-type]
-
-    return ChannelClientNotification
 
 
 # ---------------------------------------------------------------------------
@@ -341,39 +297,6 @@ def _resolve_mcp_server():
     return getattr(server, "_mcp_server", None) or getattr(server, "server", None)
 
 
-_WIDER_NOTIFICATION_ROOT_MODEL: type[ClientNotification] | None = None
-
-
-def _widen_session_notification_type() -> None:
-    """Monkey-patch ``ServerSession.__init__`` so its message loop accepts our
-    custom ``PermissionRequestNotification`` instead of warn-and-dropping it.
-
-    The upstream ``ClientNotification`` union is closed — adding new methods is
-    not exposed as a public hook in this mcp version (see §A.6.1 findings).
-    We patch once per process; subsequent calls are no-ops. We only ever spawn
-    one ServerSession per stdio process, so the patch's blast radius is
-    self-contained.
-    """
-    global _WIDER_NOTIFICATION_ROOT_MODEL
-    if _WIDER_NOTIFICATION_ROOT_MODEL is not None:
-        return
-    _WIDER_NOTIFICATION_ROOT_MODEL = _build_wider_notification_root_model()
-
-    original_init = ServerSession.__init__
-
-    def patched_init(self, *args, **kwargs):  # noqa: ANN001 — mirror upstream
-        global _CURRENT_SESSION
-        original_init(self, *args, **kwargs)
-        # Widen the receive type so notifications/claude/channel/* parse instead
-        # of being dropped as unknown-method validation failures.
-        self._receive_notification_type = _WIDER_NOTIFICATION_ROOT_MODEL
-        # Stash the session so _emit_permission_notification can issue outbound
-        # notifications/claude/channel/permission without re-resolving it.
-        _CURRENT_SESSION = self
-
-    ServerSession.__init__ = patched_init  # type: ignore[method-assign]
-
-
 async def _run_with_channel_capabilities() -> None:
     """Run the FastMCP server over stdio with channel experimental capabilities.
 
@@ -389,7 +312,6 @@ async def _run_with_channel_capabilities() -> None:
             "FastMCP did not expose an underlying mcp Server "
             "(neither _mcp_server nor server attribute present)",
         )
-    _widen_session_notification_type()
     async with stdio_server() as (read_stream, write_stream):
         drain_task = asyncio.create_task(
             _drain_permission_verdicts(), name="permission-drain",
