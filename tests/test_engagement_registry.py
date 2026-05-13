@@ -287,3 +287,50 @@ class TestToolsAllowedField:
             tools_allowed=allow,
         )
         assert rec.tools_allowed == allow
+
+    async def test_tombstone_round_trip(self, tmp_path, bus):
+        from engagement_registry import EngagementRegistry
+        path = str(tmp_path / "engagements.json")
+        reg1 = EngagementRegistry(tombstone_path=path, bus=bus)
+        await reg1.load()
+        await reg1.create(
+            kind="executor",
+            role_or_type="plugin-developer",
+            driver="claude_code",
+            task="t",
+            origin={},
+            topic_id=None,
+            tools_allowed=("Bash(npm*)", "Read"),
+        )
+        # Fresh registry reading the same tombstone:
+        reg2 = EngagementRegistry(tombstone_path=path, bus=bus)
+        await reg2.load()
+        ids = list(reg2._records)
+        assert len(ids) == 1
+        rec = reg2._records[ids[0]]
+        assert rec.tools_allowed == ("Bash(npm*)", "Read")
+
+    async def test_pre_v0_37_2_tombstone_loads_with_empty(self, tmp_path, bus):
+        """Back-compat: tombstones written before v0.37.2 lack the field."""
+        import json
+        from engagement_registry import EngagementRegistry
+        path = tmp_path / "engagements.json"
+        path.write_text(json.dumps([{
+            "id": "a" * 32,
+            "kind": "executor",
+            "role_or_type": "plugin-developer",
+            "driver": "claude_code",
+            "status": "active",
+            "topic_id": 42,
+            "started_at": 1700000000.0,
+            "last_user_turn_ts": 1700000000.0,
+            "last_idle_reminder_ts": 0.0,
+            "completed_at": None,
+            "sdk_session_id": None,
+            "origin": {},
+            "task": "legacy",
+        }]))
+        reg = EngagementRegistry(tombstone_path=str(path), bus=bus)
+        await reg.load()
+        rec = reg._records["a" * 32]
+        assert rec.tools_allowed == ()

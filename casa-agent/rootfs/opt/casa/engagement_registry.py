@@ -147,6 +147,7 @@ class EngagementRegistry:
                     pinned_message_id=row.get("pinned_message_id"),
                     progress_message_id=row.get("progress_message_id"),
                     current_state_emoji=row.get("current_state_emoji"),
+                    tools_allowed=tuple(row.get("tools_allowed") or ()),
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed engagement row: %s", exc)
@@ -192,6 +193,7 @@ class EngagementRegistry:
                 "pinned_message_id": rec.pinned_message_id,
                 "progress_message_id": rec.progress_message_id,
                 "current_state_emoji": rec.current_state_emoji,
+                "tools_allowed": list(rec.tools_allowed),
             })
         try:
             await asyncio.to_thread(self._write_tombstone, snapshot)
