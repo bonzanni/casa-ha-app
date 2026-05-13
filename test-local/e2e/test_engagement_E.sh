@@ -242,13 +242,16 @@ async def main():
         driver=StubDriver(), memory_provider=None,
     )
 
-    # Inspect mock TG: topic must be closed with ✅ icon.
+    # Inspect mock TG: topic must be closed with ✅ in the title prefix.
+    # v0.37.1 D-1: bubble icon is set once at open (role-based, numeric
+    # custom_emoji_id) and never edited. State transition lives in the
+    # title — compose_topic_title returns "✅ <short_task>" on completion.
     import urllib.request
     with urllib.request.urlopen(os.environ["MOCK_TG_BASE"] + "/_inspect") as r:
         state = json.loads(r.read())
     topic = state["topics"][str(tid)]
     assert topic["closed"] is True, f"topic not closed: {topic}"
-    assert topic["icon_custom_emoji_id"] == "✅", f"icon wrong: {topic}"
+    assert topic["name"].startswith("✅"), f"title missing ✅ state prefix: {topic}"
     # Bus got one NOTIFICATION targeting assistant.
     assert len(bus.notifs) == 1, f"bus notifs: {len(bus.notifs)}"
     assert bus.notifs[0].target == "assistant"
@@ -739,12 +742,14 @@ async def main():
     assert reg.get(rec.id).status == "completed", \
         f"status: {reg.get(rec.id).status}"
 
-    # 9. Topic closed with ✅ in mock TG.
+    # 9. Topic closed with ✅ in the title prefix (v0.37.1 D-1: bubble
+    #    stays as role icon for life of engagement; state lives in the
+    #    title via update_topic_state → compose_topic_title).
     with urllib.request.urlopen(os.environ["MOCK_TG_BASE"] + "/_inspect") as r:
         state = json.loads(r.read())
     topic = state["topics"][str(tid)]
     assert topic["closed"] is True, f"topic not closed after finalize: {topic}"
-    assert topic["icon_custom_emoji_id"] == "✅", f"icon wrong: {topic}"
+    assert topic["name"].startswith("✅"), f"title missing ✅ state prefix: {topic}"
 
     # 10. Exactly one NOTIFICATION went out, targeting Ellen (the default resident).
     assert len(bus.notifs) == 1, f"expected 1 notif, got {len(bus.notifs)}"
