@@ -275,7 +275,31 @@ def _construct_agent(*, cfg, runtime):
     Mirrors the per-role Agent construction in casa_core.main:
     wraps base_memory by strategy (shared logic exists at
     casa_core._wrap_memory_for_strategy — keep using that for parity).
+
+    G-2 v0.37.7: idempotently provision the agent-home for ``cfg.role``
+    BEFORE constructing the Agent. The Agent's cwd resolves to
+    ``/addon_configs/casa-agent/agent-home/<role>`` (agent.py:518-521);
+    when the configurator creates a new specialist and calls
+    ``casa_reload(scope=agent role=<new>)`` (granular per-role scope),
+    the agent-home dir wasn't being created — only the scope=agents
+    path provisioned it. Idempotent on existing dirs; cheap mkdir.
     """
+    import agent_home
+    try:
+        agent_home.provision_agent_home(
+            role=cfg.role,
+            home_root=runtime.home_root,
+            defaults_root=runtime.defaults_root,
+        )
+    except Exception as exc:  # noqa: BLE001 — provisioning is best-effort
+        # If provisioning fails the Agent will still try to run with a
+        # missing home; surface in logs but don't block construction —
+        # we preserve the prior failure mode (SDK error) for visibility
+        # rather than swallowing the call here.
+        logger.warning(
+            "provision_agent_home failed for role=%s: %s", cfg.role, exc,
+        )
+
     from agent import Agent
     from casa_core import _wrap_memory_for_strategy
     sqlite_warning_emitted = [False]

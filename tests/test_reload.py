@@ -308,6 +308,81 @@ class TestReloadAgent:
         # Old agent still in place.
         assert runtime.agents["ellen"] is old_agent
 
+    async def test_scope_agent_provisions_agent_home_for_new_role(
+        self, tmp_path, monkeypatch,
+    ):
+        """G-2 v0.37.7: configurator's
+        ``casa_reload(scope=agent role=<new>)`` for a freshly-created
+        specialist must produce ``<home_root>/<role>/.claude/settings.json``.
+
+        Before the fix, only ``scope=agents`` (plural — the diff-based
+        adds/evicts path) provisioned the agent-home; the granular
+        per-role scope skipped it, and the first ``delegate_to_agent``
+        failed with ``Working directory does not exist:
+        /addon_configs/casa-agent/agent-home/<role>``. The fix moves
+        provisioning into ``_construct_agent`` so it fires regardless of
+        which scope triggered the construction.
+        """
+        from reload import dispatch, register_handler, reload_agent
+        from types import SimpleNamespace
+        register_handler("agent", reload_agent)
+
+        # Disk layout: assistant (resident) + butler (resident) +
+        # specialists/probe (the new role under test).
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "assistant").mkdir(parents=True)
+        (agents_dir / "butler").mkdir(parents=True)
+        (agents_dir / "specialists" / "probe").mkdir(parents=True)
+        home_root = tmp_path / "home"
+        defaults_root = tmp_path / "defaults"
+
+        new_cfg = SimpleNamespace(
+            role="probe",
+            character=SimpleNamespace(name="Probe", card=""),
+            triggers=[], channels=[],
+            memory=SimpleNamespace(read_strategy="per_turn"),
+        )
+        monkeypatch.setattr(
+            "agent_loader.load_agent_from_dir",
+            lambda *a, **kw: new_cfg,
+        )
+        monkeypatch.setattr(
+            "policies.load_policies",
+            lambda *a, **kw: MagicMock(),
+        )
+        # Let `_construct_agent` run for real (so provision_agent_home
+        # fires). Stub the Agent class + memory wrapper used inside.
+        monkeypatch.setattr("agent.Agent", lambda **kw: MagicMock())
+        monkeypatch.setattr(
+            "casa_core._wrap_memory_for_strategy",
+            lambda *a, **kw: MagicMock(),
+        )
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.home_root = str(home_root)
+        runtime.defaults_root = str(defaults_root)
+        runtime.role_configs = {
+            "assistant": MagicMock(), "butler": MagicMock(),
+        }
+        runtime.agents = {
+            "assistant": MagicMock(), "butler": MagicMock(),
+        }
+        # specialist tier path through reload_agent.
+        runtime.specialist_registry.load = MagicMock()
+        runtime.specialist_registry.all_configs = lambda: {"probe": new_cfg}
+
+        result = await dispatch("agent", runtime=runtime, role="probe")
+        assert result["status"] == "ok", result
+        # The fix: agent-home was provisioned even though scope=agent
+        # (not scope=agents) triggered the construction.
+        settings_path = home_root / "probe" / ".claude" / "settings.json"
+        assert settings_path.is_file(), (
+            f"expected agent-home settings.json at {settings_path}; "
+            "scope=agent did not call provision_agent_home"
+        )
+
 
 class TestReloadPolicies:
     async def test_rebuilds_scope_registry_and_swaps_agents(

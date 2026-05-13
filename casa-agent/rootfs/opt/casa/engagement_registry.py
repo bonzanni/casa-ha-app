@@ -76,6 +76,10 @@ class EngagementRecord:
     # C-1 v0.37.2: snapshot of executor's tools.allowed at engagement
     # creation. Drives the engagement_permission_relay hook (spec §3.5).
     tools_allowed: tuple[str, ...] = ()
+    # G-1 v0.37.7: snapshot of executor's permission_mode at engagement
+    # creation. When "auto" or "bypassPermissions" the relay hook
+    # short-circuits without surfacing a permission keyboard.
+    permission_mode: str = "acceptEdits"
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +152,7 @@ class EngagementRegistry:
                     progress_message_id=row.get("progress_message_id"),
                     current_state_emoji=row.get("current_state_emoji"),
                     tools_allowed=tuple(row.get("tools_allowed") or ()),
+                    permission_mode=row.get("permission_mode") or "acceptEdits",
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed engagement row: %s", exc)
@@ -194,6 +199,7 @@ class EngagementRegistry:
                 "progress_message_id": rec.progress_message_id,
                 "current_state_emoji": rec.current_state_emoji,
                 "tools_allowed": list(rec.tools_allowed),
+                "permission_mode": rec.permission_mode,
             })
         try:
             await asyncio.to_thread(self._write_tombstone, snapshot)
@@ -215,6 +221,7 @@ class EngagementRegistry:
         origin: dict[str, Any],
         topic_id: int | None,
         tools_allowed: tuple[str, ...] | list[str] = (),
+        permission_mode: str = "acceptEdits",
     ) -> EngagementRecord:
         engagement_id = uuid.uuid4().hex
         now = time.time()
@@ -233,6 +240,7 @@ class EngagementRegistry:
             origin=dict(origin),
             task=task,
             tools_allowed=tuple(tools_allowed),
+            permission_mode=permission_mode or "acceptEdits",
         )
         async with self._lock:
             self._records[engagement_id] = rec
