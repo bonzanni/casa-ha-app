@@ -141,3 +141,24 @@ class TestVerdictRelay:
         assert kw["engagement_id"] == eid
         assert kw["request_id"] == "tuse_12345"
         assert kw["tool_name"] == "Bash"
+
+    async def test_happy_path_deny(self):
+        from hooks import make_engagement_permission_relay
+        eid = "e" * 32
+        reg = _FakeRegistry({eid: _FakeRecord()})
+        tg = _FakeTelegramChannel()
+        q = asyncio.Queue()
+        await q.put({"request_id": "tuse_xyz", "verdict": "deny"})
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg,
+            queues={eid: q}, timeout_s=1.0,
+        )
+        result = await hook(
+            {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"},
+             "cwd": f"/data/engagements/{eid}",
+             "tool_use_id": "tuse_xyz"},
+            None, {},
+        )
+        assert _decision(result) == "deny"
+        assert "operator denied" in _reason(result)
+        assert tg.state_calls == [(eid, "awaiting"), (eid, "active")]
