@@ -841,6 +841,16 @@ async def main():
     assert "resident" in spec.get("permissionDecisionReason", "").lower(), \
         f"E-10.1 deny reason missing 'resident': {spec}"
 
+    # Helper: a hook "didn't deny" if it returned no decision (None or {})
+    # or a non-deny hookSpecificOutput. v0.36.1 H-2 changed the no-op return
+    # from None to {} so the SDK's dict-conversion can't trip; both shapes
+    # mean "no policy decision applied — proceed".
+    def _denied(decision):
+        if decision in (None, {}):
+            return False
+        spec = (decision.get("hookSpecificOutput") or {}) if isinstance(decision, dict) else {}
+        return spec.get("permissionDecision") == "deny"
+
     # 3. Hook must NOT deny specialist-subtree deletions (not a resident).
     allow_specialist = {
         "tool_name": "Bash",
@@ -849,7 +859,7 @@ async def main():
         },
     }
     out = await hook(allow_specialist, "tuid-2", {})
-    assert out is None, f"E-10.2 specialist path wrongly denied: {out}"
+    assert not _denied(out), f"E-10.2 specialist path wrongly denied: {out}"
 
     # 3b. Hook must NOT deny executor-subtree deletions either.
     allow_executor = {
@@ -859,12 +869,12 @@ async def main():
         },
     }
     out = await hook(allow_executor, "tuid-3", {})
-    assert out is None, f"E-10.2 executor path wrongly denied: {out}"
+    assert not _denied(out), f"E-10.2 executor path wrongly denied: {out}"
 
     # 3c. A benign Bash command must pass straight through.
     benign = {"tool_name": "Bash", "tool_input": {"command": "ls -la /tmp"}}
     out = await hook(benign, "tuid-4", {})
-    assert out is None, f"E-10.2 benign bash wrongly denied: {out}"
+    assert not _denied(out), f"E-10.2 benign bash wrongly denied: {out}"
 
     # 4. butler/ directory still exists on disk (hook didn't somehow delete it,
     #    and the deny-decision is structural; the SDK would have aborted the
