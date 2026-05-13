@@ -9,11 +9,18 @@ registry. Payload shape follows the SDK's
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import re
 import shlex
+import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable
+
+from cc_tool_pattern import matches_any
+
+_logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Forbidden shell commands (argv-aware)
@@ -593,3 +600,140 @@ def resolve_hooks(
         ))
 
     return {"PreToolUse": matchers}
+
+
+# ---------------------------------------------------------------------------
+# v0.37.2 (C-1): engagement_permission_relay
+#
+# Spec: docs/superpowers/specs/2026-05-13-c1-permission-relay-fix.md §4.2, §4.3
+#
+# A PreToolUse hook that resolves the engagement from cwd, checks the
+# engagement's frozen ``tools_allowed`` snapshot, and either passes through
+# (return ``{}``) or relays the request to the operator via a Telegram
+# inline keyboard, awaiting their verdict on a per-engagement asyncio.Queue.
+# ---------------------------------------------------------------------------
+
+
+# Telegram callback_data is capped at 64 bytes; the keyboard prefix is
+# "perm:allow:" or "perm:deny:" (11 bytes), so the request_id must be
+# <= 53 bytes. We cap at 32 to leave headroom and align with hex UUIDs.
+_RID_MAX_LEN = 32
+
+
+_ENG_CWD_RE = re.compile(
+    r"^/data/engagements/([0-9a-f]{32})(?:/.*)?$"
+)
+
+
+def _engagement_id_from_cwd(cwd: str) -> str | None:
+    """Extract the 32-hex engagement id from a cwd path.
+
+    Returns None when cwd is not under ``/data/engagements/<id>/...``.
+    """
+    m = _ENG_CWD_RE.match(cwd or "")
+    return m.group(1) if m else None
+
+
+async def _await_matching_verdict(q: asyncio.Queue, expected_rid: str) -> str:
+    """Drain stale entries from the queue; return the verdict for ``expected_rid``.
+
+    Defence-in-depth: a late operator click for a previously-timed-out
+    permission could otherwise approve the wrong subsequent tool call.
+    """
+    while True:
+        item = await q.get()
+        if item.get("request_id") != expected_rid:
+            _logger.info(
+                "discarding stale permission verdict rid=%s (expected %s)",
+                item.get("request_id"), expected_rid,
+            )
+            continue
+        return item.get("verdict") or "deny"
+
+
+def make_engagement_permission_relay(
+    *,
+    engagement_registry: Any,
+    telegram_channel: Any,
+    queues: dict,
+    timeout_s: float = 600.0,
+) -> HookCallback:
+    """Build the PreToolUse hook that relays non-allow-listed tool calls
+    through the engagement's Telegram inline-keyboard.
+
+    Args:
+        engagement_registry: registry exposing ``.get(engagement_id) -> record | None``.
+        telegram_channel: object with async ``update_topic_state(*, engagement_id, new_state)``
+            and ``post_perm_keyboard(*, engagement_id, request_id, tool_name, tool_input)``.
+        queues: dict mapping engagement_id -> ``asyncio.Queue`` of verdict items
+            (each item shaped ``{"request_id": str, "verdict": "allow"|"deny",
+            "operator_id": int | None}``).
+        timeout_s: how long to wait for the operator before treating as deny.
+    """
+
+    async def _hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        cwd = input_data.get("cwd") or ""
+        eng_id = _engagement_id_from_cwd(cwd)
+        if eng_id is None:
+            return _deny("engagement context not found")
+        rec = engagement_registry.get(eng_id)
+        if rec is None or getattr(rec, "status", None) != "active":
+            return _deny(
+                f"unknown or inactive engagement: {eng_id[:8]}"
+            )
+        # Allow-list snapshot from engagement creation (spec §3.5).
+        allowed = tuple(getattr(rec, "tools_allowed", ()) or ())
+        if matches_any(
+            allowed,
+            input_data.get("tool_name", ""),
+            input_data.get("tool_input") or {},
+        ):
+            return {}  # pass-through: CC's allow-rule approves
+
+        # Not allow-listed — post inline keyboard and await operator verdict.
+        cc_tool_use_id = input_data.get("tool_use_id") or ""
+        rid = cc_tool_use_id[:_RID_MAX_LEN] or uuid.uuid4().hex
+        tool_name = input_data.get("tool_name", "")
+        tool_input = input_data.get("tool_input") or {}
+
+        await telegram_channel.update_topic_state(
+            engagement_id=eng_id, new_state="awaiting",
+        )
+        # CancelledError-safe: ensure 'active' is restored on every exit path,
+        # including engagement cancellation mid-await. (Code-review #1.)
+        try:
+            try:
+                await telegram_channel.post_perm_keyboard(
+                    engagement_id=eng_id,
+                    request_id=rid,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return _deny(f"keyboard post failed: {exc}")
+
+            q = queues.get(eng_id)
+            if q is None:
+                return _deny("no permission queue for engagement")
+
+            try:
+                verdict = await asyncio.wait_for(
+                    _await_matching_verdict(q, rid),
+                    timeout=timeout_s,
+                )
+            except asyncio.TimeoutError:
+                return _deny(f"operator timeout ({timeout_s:g}s)")
+
+            if verdict == "allow":
+                return {}
+            return _deny("operator denied via Telegram")
+        finally:
+            await telegram_channel.update_topic_state(
+                engagement_id=eng_id, new_state="active",
+            )
+
+    return _hook

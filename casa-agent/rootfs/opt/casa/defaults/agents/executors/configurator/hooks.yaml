@@ -17,3 +17,6 @@ pre_tool_use:
       - /opt/casa
   - policy: commit_size_guard
     max_files: 20
+  - policy: engagement_permission_relay
+    matcher: ".*"
+    timeout: 600       # 10 min - operator-response budget (C-1 spec §4.6)

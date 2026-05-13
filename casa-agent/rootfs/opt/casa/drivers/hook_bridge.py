@@ -37,12 +37,18 @@ def translate_hooks_to_settings(
             matcher = e.get("matcher", ".*")
             if not policy:
                 continue
+            cc_hook: dict = {
+                "type": "command",
+                "command": f"{proxy_script_path} {policy}",
+            }
+            # Pass-through optional per-hook timeout (seconds). CC's default
+            # is 60s; engagement_permission_relay needs ~600s for the
+            # operator-response window (C-1 spec §4.6).
+            if "timeout" in e and e["timeout"] is not None:
+                cc_hook["timeout"] = int(e["timeout"])
             out_entries.append({
                 "matcher": matcher,
-                "hooks": [{
-                    "type": "command",
-                    "command": f"{proxy_script_path} {policy}",
-                }],
+                "hooks": [cc_hook],
             })
         out["hooks"][pascal] = out_entries
     return out

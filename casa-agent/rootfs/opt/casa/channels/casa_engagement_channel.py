@@ -1,29 +1,20 @@
-"""casa-engagement-channel: per-engagement stdio MCP server (v0.37.0 Phase 1).
+"""casa-engagement-channel: per-engagement stdio MCP server (v0.37.2).
 
 Launched by the ``claude_code`` driver via ``--channels server:<name>`` on the
 ``claude`` CLI subprocess. Supplies operator-facing tools that route through
 casa-main's Unix-socket internal handler at ``/internal/channel/send_to_topic``,
 which fans out to Telegram (or any future channel) by topic.
 
-Phase 1 surface (this module):
+Surface (v0.37.2):
 - ``reply(chat_id, text)`` — append a message to the engagement's operator topic.
   ``chat_id`` is accepted for SDK compatibility but NEVER forwarded (D2 locked).
-- ``declared_capabilities()`` — returns ``{"claude/channel": {}}`` so the
-  MCP InitializationOptions advertise the channel capability to the CLI.
+- ``declared_capabilities()`` — returns ``{"claude/channel": {}}``.
 
-Phase 2 adds ``ask`` + ``set_progress`` and the permission relay; Phase 3 lands
-the full INSTRUCTIONS prompt and any required state machine.
-
-Implementation notes (see §A.6.1 of the build-time findings spec):
-- ``FastMCP`` does NOT expose ``capabilities.experimental`` as a settable
-  attribute; ``instructions`` is a read-only property. We pass instructions via
-  the constructor kwarg and inject ``experimental_capabilities`` by calling
-  ``server._mcp_server.create_initialization_options(...)`` from our own
-  stdio bootstrap (replacing ``FastMCP.run_stdio_async`` which hard-codes a
-  no-arg call).
-- ``_mcp_server`` is an undocumented attribute. A defensive
-  ``_resolve_mcp_server()`` helper falls back to ``server.server`` so a future
-  mcp rename does not break us.
+Permission relay is handled by the casa-main PreToolUse hook
+``engagement_permission_relay`` (v0.37.2; C-1). Earlier versions
+attempted to relay via ``notifications/claude/channel/permission_request``
+from the CLI — that path was retired in v0.37.2 because CC CLI 2.1.x
+does not emit that notification under any tested permission_mode.
 """
 
 from __future__ import annotations
@@ -33,15 +24,13 @@ import asyncio
 import logging
 import os
 from contextlib import AsyncExitStack
-from typing import Any, Literal, Union
+from typing import Any
 
 import aiohttp
 import anyio
 from aiohttp import UnixConnector
 from mcp.server.fastmcp import FastMCP
-from mcp.server.session import ServerSession
 from mcp.server.stdio import stdio_server
-from mcp.types import ClientNotification, Notification
 
 logger = logging.getLogger(__name__)
 
@@ -64,16 +53,13 @@ server: FastMCP = FastMCP("casa-engagement-channel", instructions=INSTRUCTIONS)
 def declared_capabilities() -> dict[str, dict]:
     """Experimental capabilities advertised in MCP InitializationOptions.
 
-    Phase 2 (v0.37.0) declares both ``claude/channel`` (outbound: reply/ask/
-    set_progress tools and topic-state notifications) and
-    ``claude/channel/permission`` (inbound: ``notifications/claude/channel/
-    permission_request`` → outbound: ``notifications/claude/channel/permission``
-    verdict relay).
+    v0.37.2: declares only ``claude/channel`` (outbound reply tool +
+    topic-state notifications). The ``claude/channel/permission``
+    capability was retired in v0.37.2 (C-1) — permission relay now flows
+    through the casa-main PreToolUse hook ``engagement_permission_relay``
+    (see ``docs/superpowers/specs/2026-05-13-c1-permission-relay-fix.md``).
     """
-    return {
-        "claude/channel": {},
-        "claude/channel/permission": {},
-    }
+    return {"claude/channel": {}}
 
 
 # ---------------------------------------------------------------------------
@@ -132,277 +118,6 @@ async def reply(chat_id: str, text: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Permission relay (U1) — Phase 2
-# ---------------------------------------------------------------------------
-
-# Telegram inline-button callback_data byte limit (§9 of the spec; also asserted
-# by Bot API docs).
-_CALLBACK_DATA_MAX = 64
-
-
-def _build_perm_buttons(request_id: str) -> list[list[dict[str, str]]]:
-    """Build the [✅ Allow][❌ Deny] inline-keyboard row for a permission prompt.
-
-    Raises ``ValueError`` if any callback_data would exceed Telegram's 64-byte
-    limit (e.g. a pathologically long ``request_id``). The caller is expected
-    to keep ``request_id`` short (uuid4 hex = 32 bytes → max 43-byte cd).
-    """
-    allow_cd = f"perm:allow:{request_id}"
-    deny_cd = f"perm:deny:{request_id}"
-    for cd in (allow_cd, deny_cd):
-        if len(cd.encode("utf-8")) > _CALLBACK_DATA_MAX:
-            raise ValueError(
-                f"callback_data {cd!r} exceeds {_CALLBACK_DATA_MAX} bytes",
-            )
-    return [[
-        {"text": "✅ Allow", "callback_data": allow_cd},
-        {"text": "❌ Deny", "callback_data": deny_cd},
-    ]]
-
-
-async def _post_state_transition(new_state: str) -> None:
-    """Best-effort POST /internal/channel/update_state.
-
-    Failures are logged but never propagate — a transient unavailability of
-    the casa-main socket must not stall the per-engagement MCP server's tool
-    dispatch.
-    """
-    try:
-        await _internal_post(
-            "/internal/channel/update_state",
-            {"new_state": new_state},
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "update_state(%s) failed: %s", new_state, exc,
-        )
-
-
-async def handle_permission_request(params: dict[str, Any]) -> None:
-    """U1: render the operator-facing permission prompt for a tool call.
-
-    Receives ``notifications/claude/channel/permission_request`` params:
-    ``{request_id, tool_name, description?, input_preview?}``. Flips the U3
-    topic title to ``awaiting`` (🟡) so the operator notices the engagement
-    is blocked; renders an inline-keyboard prompt in the engagement topic
-    via casa-main; the verdict travels back via ``CallbackQueryHandler`` →
-    ``permission_verdict`` queue → long-poll drain →
-    ``notifications/claude/channel/permission`` (Task 21).
-    """
-    rid = params["request_id"]
-    tool = params.get("tool_name", "(unknown)")
-    desc = params.get("description") or ""
-    preview = params.get("input_preview") or ""
-
-    # 1. U3 state flip — best-effort, runs first so the title is in 🟡 before
-    #    the keyboard appears (cosmetic ordering — visible to operator).
-    await _post_state_transition("awaiting")
-
-    # 2. Render the keyboard prompt.
-    body_lines: list[str] = [f"Claude wants to use: *{tool}*"]
-    if desc:
-        body_lines.append("")
-        body_lines.append(desc)
-    if preview:
-        body_lines.append("")
-        body_lines.append(f"```\n{preview}\n```")
-    body = "\n".join(body_lines)
-
-    buttons = _build_perm_buttons(rid)
-    await _internal_post(
-        "/internal/channel/post_inline_keyboard",
-        {
-            "request_id": rid,
-            "text": body,
-            "buttons": buttons,
-            "parse_mode": "MarkdownV2",
-        },
-    )
-
-
-class PermissionRequestNotification(
-    Notification[dict, Literal["notifications/claude/channel/permission_request"]]
-):
-    """Custom MCP notification declared by ``claude/channel/permission``.
-
-    The CLI sends this when a tool call hits a permission gate that should
-    relay through the channel UI instead of being auto-resolved by
-    ``permission_mode``. Params shape per §9 of the spec:
-    ``{request_id, tool_name, description?, input_preview?}``.
-    """
-
-    method: Literal["notifications/claude/channel/permission_request"] = (
-        "notifications/claude/channel/permission_request"
-    )
-    params: dict
-
-
-class PermissionVerdictNotification(
-    Notification[dict, Literal["notifications/claude/channel/permission"]]
-):
-    """Outbound (server → CLI) notification carrying the operator's verdict.
-
-    Sent in response to a ``permission_request`` whose ``request_id`` matches.
-    Params shape: ``{request_id, verdict}`` where ``verdict ∈ {"allow", "deny"}``.
-    BaseSession.send_notification only calls ``.model_dump()`` on this object —
-    there's no validation against ServerNotification's union, so this custom
-    class round-trips through stdio as plain JSON-RPC.
-    """
-
-    method: Literal["notifications/claude/channel/permission"] = (
-        "notifications/claude/channel/permission"
-    )
-    params: dict
-
-
-def _build_wider_notification_root_model() -> type[ClientNotification]:
-    """Build a ``ClientNotification`` subclass with a widened root union.
-
-    Returning a ``ClientNotification`` *subclass* (not a free ``RootModel``)
-    is load-bearing: ``Server._handle_message`` routes notifications with
-    ``case types.ClientNotification(root=notify):``. A free
-    ``RootModel[Union[...]]`` parses validation but fails the isinstance
-    relationship — the message would be silently dropped at dispatch. The
-    subclass widens the union *and* keeps the isinstance edge intact.
-
-    Verified live 2026-05-12 on N150: stdio probe sent
-    ``notifications/claude/channel/permission_request`` and observed
-    ``mcp.server.lowlevel.server`` log line
-    ``Received message: root=PermissionRequestNotification(...)`` followed
-    by silent drop — confirming the bug before this fix.
-    """
-    base_union = ClientNotification.model_fields["root"].annotation
-
-    class ChannelClientNotification(ClientNotification):
-        root: Union[base_union, PermissionRequestNotification]  # type: ignore[valid-type]
-
-    return ChannelClientNotification
-
-
-async def _on_permission_request_notification(
-    notification: PermissionRequestNotification,
-) -> None:
-    """Bridge from the inner Server's notification dispatch to our handler."""
-    await handle_permission_request(dict(notification.params))
-
-
-def _register_permission_notification_handler() -> None:
-    """Install the permission-request handler on the inner low-level Server.
-
-    Idempotent — calling more than once just overwrites the same entry.
-    """
-    low_level = _resolve_mcp_server()
-    if low_level is None:  # pragma: no cover — defensive only
-        logger.warning(
-            "no inner mcp Server available — permission notification disabled",
-        )
-        return
-    low_level.notification_handlers[PermissionRequestNotification] = (
-        _on_permission_request_notification
-    )
-
-
-# ---------------------------------------------------------------------------
-# Permission verdict drain + outbound notification (Task 21)
-# ---------------------------------------------------------------------------
-
-# Set by the patched ServerSession.__init__; consumed by
-# ``_emit_permission_notification`` to issue ``notifications/claude/channel/permission``.
-_CURRENT_SESSION: Any | None = None
-
-# How long each long-poll waits before returning empty + retrying. Kept shorter
-# than the casa-main side's default (25s) so the channel server can quickly
-# notice if the connection drops.
-_PERMISSION_POLL_TIMEOUT_S = 25.0
-
-# Backoff after an unexpected drain failure (e.g. socket disappeared during
-# rebuild). Capped at ``_PERMISSION_DRAIN_BACKOFF_MAX`` so we don't busy-spin.
-_PERMISSION_DRAIN_BACKOFF_INITIAL = 1.0
-_PERMISSION_DRAIN_BACKOFF_MAX = 30.0
-
-
-async def _emit_permission_notification(payload: dict[str, Any]) -> None:
-    """Send ``notifications/claude/channel/permission`` to Claude carrying the
-    verdict that the operator delivered via Telegram.
-
-    ``payload`` shape (from ``_PERMISSION_QUEUES`` drain):
-    ``{request_id, verdict, operator_id?}``. ``operator_id`` is dropped from
-    the wire envelope — Claude only needs the verdict + request_id to resume.
-    """
-    session = _CURRENT_SESSION
-    if session is None:
-        logger.error(
-            "no live session — verdict %s lost (request_id=%s)",
-            payload.get("verdict"), payload.get("request_id"),
-        )
-        return
-
-    notification = PermissionVerdictNotification(
-        params={
-            "request_id": payload["request_id"],
-            "verdict": payload["verdict"],
-        },
-    )
-    try:
-        await session.send_notification(notification)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception(
-            "send_notification failed for permission verdict (rid=%s): %s",
-            payload.get("request_id"), exc,
-        )
-        return
-
-    # U3 state flip back to active — best-effort. Runs AFTER the notification
-    # so a transient socket hiccup on the state-update path doesn't delay
-    # the verdict reaching Claude (which is what unblocks the engagement).
-    await _post_state_transition("active")
-
-
-async def _drain_permission_verdicts() -> None:
-    """Long-poll casa-main's verdict queue and emit each verdict to Claude.
-
-    Started by ``main()`` as an asyncio background task. Exits cleanly on
-    ``CancelledError``; all other exceptions log + back off so a transient
-    socket failure during casa-main reconnect does not kill the drain loop.
-    """
-    if ENGAGEMENT_ID is None:  # pragma: no cover — defensive
-        logger.error("permission drain not started: ENGAGEMENT_ID unset")
-        return
-
-    backoff = _PERMISSION_DRAIN_BACKOFF_INITIAL
-    while True:
-        try:
-            connector = UnixConnector(path=INTERNAL_SOCKET)
-            async with aiohttp.ClientSession(connector=connector) as sess:
-                async with sess.get(
-                    f"http://localhost/internal/channel/permission_pending"
-                    f"?engagement_id={ENGAGEMENT_ID}"
-                    f"&timeout_s={int(_PERMISSION_POLL_TIMEOUT_S)}",
-                    timeout=aiohttp.ClientTimeout(
-                        total=_PERMISSION_POLL_TIMEOUT_S + 5,
-                    ),
-                ) as resp:
-                    resp.raise_for_status()
-                    payload = await resp.json()
-            backoff = _PERMISSION_DRAIN_BACKOFF_INITIAL
-            if not payload:
-                continue  # idle long-poll cycle, no verdict ready
-            await _emit_permission_notification(payload)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "permission drain failure: %s — sleeping %.1fs",
-                exc, backoff,
-            )
-            try:
-                await asyncio.sleep(backoff)
-            except asyncio.CancelledError:
-                raise
-            backoff = min(backoff * 2, _PERMISSION_DRAIN_BACKOFF_MAX)
-
-
-# ---------------------------------------------------------------------------
 # Test helpers (public API used by tests/test_casa_engagement_channel.py).
 # ---------------------------------------------------------------------------
 
@@ -447,47 +162,12 @@ def _resolve_mcp_server():
     return getattr(server, "_mcp_server", None) or getattr(server, "server", None)
 
 
-_WIDER_NOTIFICATION_ROOT_MODEL: type[ClientNotification] | None = None
-
-
-def _widen_session_notification_type() -> None:
-    """Monkey-patch ``ServerSession.__init__`` so its message loop accepts our
-    custom ``PermissionRequestNotification`` instead of warn-and-dropping it.
-
-    The upstream ``ClientNotification`` union is closed — adding new methods is
-    not exposed as a public hook in this mcp version (see §A.6.1 findings).
-    We patch once per process; subsequent calls are no-ops. We only ever spawn
-    one ServerSession per stdio process, so the patch's blast radius is
-    self-contained.
-    """
-    global _WIDER_NOTIFICATION_ROOT_MODEL
-    if _WIDER_NOTIFICATION_ROOT_MODEL is not None:
-        return
-    _WIDER_NOTIFICATION_ROOT_MODEL = _build_wider_notification_root_model()
-
-    original_init = ServerSession.__init__
-
-    def patched_init(self, *args, **kwargs):  # noqa: ANN001 — mirror upstream
-        global _CURRENT_SESSION
-        original_init(self, *args, **kwargs)
-        # Widen the receive type so notifications/claude/channel/* parse instead
-        # of being dropped as unknown-method validation failures.
-        self._receive_notification_type = _WIDER_NOTIFICATION_ROOT_MODEL
-        # Stash the session so _emit_permission_notification can issue outbound
-        # notifications/claude/channel/permission without re-resolving it.
-        _CURRENT_SESSION = self
-
-    ServerSession.__init__ = patched_init  # type: ignore[method-assign]
-
-
 async def _run_with_channel_capabilities() -> None:
     """Run the FastMCP server over stdio with channel experimental capabilities.
 
     Replaces ``FastMCP.run_stdio_async`` because the upstream coroutine
     hard-codes a no-arg ``create_initialization_options()`` call and we need
     to inject ``experimental_capabilities`` so the CLI sees ``claude/channel``.
-    Additionally registers the permission-request notification handler and
-    widens session-level notification parsing (see ``_widen_session_notification_type``).
     """
     low_level = _resolve_mcp_server()
     if low_level is None:
@@ -495,26 +175,14 @@ async def _run_with_channel_capabilities() -> None:
             "FastMCP did not expose an underlying mcp Server "
             "(neither _mcp_server nor server attribute present)",
         )
-    _widen_session_notification_type()
-    _register_permission_notification_handler()
     async with stdio_server() as (read_stream, write_stream):
-        drain_task = asyncio.create_task(
-            _drain_permission_verdicts(), name="permission-drain",
+        await low_level.run(
+            read_stream,
+            write_stream,
+            low_level.create_initialization_options(
+                experimental_capabilities=declared_capabilities(),
+            ),
         )
-        try:
-            await low_level.run(
-                read_stream,
-                write_stream,
-                low_level.create_initialization_options(
-                    experimental_capabilities=declared_capabilities(),
-                ),
-            )
-        finally:
-            drain_task.cancel()
-            try:
-                await drain_task
-            except (asyncio.CancelledError, Exception):
-                pass
 
 
 # ---------------------------------------------------------------------------

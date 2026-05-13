@@ -289,3 +289,46 @@ class TestNormalizePathSingleSlash:
     def test_handles_relative_path_unchanged(self):
         from hooks import _normalize_path
         assert _normalize_path("foo/bar") == "foo/bar"
+
+
+# ------------------------------------------------------------------
+# v0.37.2 (C-1): engagement_permission_relay wired into casa_core
+# ------------------------------------------------------------------
+
+
+class TestEngagementPermissionRelayWired:
+    """v0.37.2 (C-1): the relay policy is wired into casa_core's built
+    cc_hook_policies dict via ``_wire_engagement_permission_relay``.
+
+    The wiring helper is invoked from ``casa_core.main()`` at two sites
+    (public-8099 fallback + internal-socket). The smoke verifies the
+    helper produces a dict entry shaped correctly: name +
+    ``.*`` matcher + an awaitable callback.
+    """
+
+    def test_policy_registered_under_correct_name_and_matcher(self):
+        from unittest.mock import MagicMock
+        from casa_core import _wire_engagement_permission_relay
+
+        policies: dict = {}
+        _wire_engagement_permission_relay(
+            policies,
+            engagement_registry=MagicMock(),
+            telegram_channel=MagicMock(),
+        )
+
+        assert "engagement_permission_relay" in policies
+        matcher, cb = policies["engagement_permission_relay"]
+        assert matcher == r".*"
+        assert callable(cb)
+
+    def test_wiring_uses_shared_permission_queues(self):
+        """The relay consumes the same per-engagement queue dict that the
+        Telegram callback handler (``_make_permission_verdict``) populates;
+        otherwise verdicts never reach the hook."""
+        from channels.channel_handlers import (
+            PERMISSION_QUEUES,
+            _PERMISSION_QUEUES,
+        )
+
+        assert PERMISSION_QUEUES is _PERMISSION_QUEUES
