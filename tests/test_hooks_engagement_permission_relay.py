@@ -206,6 +206,28 @@ class TestVerdictRelay:
         )
         assert result == {}, "current verdict honoured, stale dropped"
 
+    async def test_no_queue_for_engagement(self):
+        from hooks import make_engagement_permission_relay
+        eid = "3" * 32
+        reg = _FakeRegistry({eid: _FakeRecord()})
+        tg = _FakeTelegramChannel()
+        # NB: queues dict doesn't have an entry for eid.
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg,
+            queues={},  # empty
+            timeout_s=1.0,
+        )
+        result = await hook(
+            {"tool_name": "Bash", "tool_input": {"command": "x"},
+             "cwd": f"/data/engagements/{eid}",
+             "tool_use_id": "rid"},
+            None, {},
+        )
+        assert _decision(result) == "deny"
+        assert "no permission queue" in _reason(result)
+        # State returned to active even with no queue.
+        assert tg.state_calls[-1] == (eid, "active")
+
 
 class TestKeyboardFailure:
     async def test_keyboard_post_raises(self):

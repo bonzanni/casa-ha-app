@@ -18,6 +18,8 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable
 
+from cc_tool_pattern import matches_any
+
 _logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -612,6 +614,12 @@ def resolve_hooks(
 # ---------------------------------------------------------------------------
 
 
+# Telegram callback_data is capped at 64 bytes; the keyboard prefix is
+# "perm:allow:" or "perm:deny:" (11 bytes), so the request_id must be
+# <= 53 bytes. We cap at 32 to leave headroom and align with hex UUIDs.
+_RID_MAX_LEN = 32
+
+
 _ENG_CWD_RE = re.compile(
     r"^/data/engagements/([0-9a-f]{32})(?:/.*)?$"
 )
@@ -678,7 +686,6 @@ def make_engagement_permission_relay(
                 f"unknown or inactive engagement: {eng_id[:8]}"
             )
         # Allow-list snapshot from engagement creation (spec §3.5).
-        from cc_tool_pattern import matches_any
         allowed = tuple(getattr(rec, "tools_allowed", ()) or ())
         if matches_any(
             allowed,
@@ -689,49 +696,44 @@ def make_engagement_permission_relay(
 
         # Not allow-listed — post inline keyboard and await operator verdict.
         cc_tool_use_id = input_data.get("tool_use_id") or ""
-        rid = cc_tool_use_id[:32] or uuid.uuid4().hex
+        rid = cc_tool_use_id[:_RID_MAX_LEN] or uuid.uuid4().hex
         tool_name = input_data.get("tool_name", "")
         tool_input = input_data.get("tool_input") or {}
 
         await telegram_channel.update_topic_state(
             engagement_id=eng_id, new_state="awaiting",
         )
+        # CancelledError-safe: ensure 'active' is restored on every exit path,
+        # including engagement cancellation mid-await. (Code-review #1.)
         try:
-            await telegram_channel.post_perm_keyboard(
-                engagement_id=eng_id,
-                request_id=rid,
-                tool_name=tool_name,
-                tool_input=tool_input,
-            )
-        except Exception as exc:  # noqa: BLE001
+            try:
+                await telegram_channel.post_perm_keyboard(
+                    engagement_id=eng_id,
+                    request_id=rid,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return _deny(f"keyboard post failed: {exc}")
+
+            q = queues.get(eng_id)
+            if q is None:
+                return _deny("no permission queue for engagement")
+
+            try:
+                verdict = await asyncio.wait_for(
+                    _await_matching_verdict(q, rid),
+                    timeout=timeout_s,
+                )
+            except asyncio.TimeoutError:
+                return _deny(f"operator timeout ({timeout_s:g}s)")
+
+            if verdict == "allow":
+                return {}
+            return _deny("operator denied via Telegram")
+        finally:
             await telegram_channel.update_topic_state(
                 engagement_id=eng_id, new_state="active",
             )
-            return _deny(f"keyboard post failed: {exc}")
-
-        q = queues.get(eng_id)
-        if q is None:
-            await telegram_channel.update_topic_state(
-                engagement_id=eng_id, new_state="active",
-            )
-            return _deny("no permission queue for engagement")
-
-        try:
-            verdict = await asyncio.wait_for(
-                _await_matching_verdict(q, rid),
-                timeout=timeout_s,
-            )
-        except asyncio.TimeoutError:
-            await telegram_channel.update_topic_state(
-                engagement_id=eng_id, new_state="active",
-            )
-            return _deny(f"operator timeout ({int(timeout_s)}s)")
-
-        await telegram_channel.update_topic_state(
-            engagement_id=eng_id, new_state="active",
-        )
-        if verdict == "allow":
-            return {}
-        return _deny("operator denied via Telegram")
 
     return _hook
