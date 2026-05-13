@@ -73,6 +73,9 @@ class EngagementRecord:
     pinned_message_id: int | None = None
     progress_message_id: int | None = None
     current_state_emoji: str | None = None
+    # C-1 v0.37.2: snapshot of executor's tools.allowed at engagement
+    # creation. Drives the engagement_permission_relay hook (spec §3.5).
+    tools_allowed: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +212,7 @@ class EngagementRegistry:
         task: str,
         origin: dict[str, Any],
         topic_id: int | None,
+        tools_allowed: tuple[str, ...] | list[str] = (),
     ) -> EngagementRecord:
         engagement_id = uuid.uuid4().hex
         now = time.time()
@@ -226,6 +230,7 @@ class EngagementRegistry:
             sdk_session_id=None,
             origin=dict(origin),
             task=task,
+            tools_allowed=tuple(tools_allowed),
         )
         async with self._lock:
             self._records[engagement_id] = rec

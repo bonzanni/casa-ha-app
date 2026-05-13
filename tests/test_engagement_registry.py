@@ -248,3 +248,42 @@ class TestChannelStateFields:
         )
         # Should not raise.
         await reg.set_channel_state("does-not-exist", pinned_message_id=1)
+
+
+@pytest.fixture
+def bus():
+    return None  # registry tolerates None per its docstring
+
+
+@pytest.fixture
+def registry(tmp_path, bus):
+    from engagement_registry import EngagementRegistry
+    return EngagementRegistry(
+        tombstone_path=str(tmp_path / "engagements.json"), bus=bus,
+    )
+
+
+class TestToolsAllowedField:
+    async def test_default_empty_tuple(self, registry):
+        rec = await registry.create(
+            kind="executor",
+            role_or_type="plugin-developer",
+            driver="claude_code",
+            task="probe",
+            origin={},
+            topic_id=None,
+        )
+        assert rec.tools_allowed == ()
+
+    async def test_create_accepts_tools_allowed(self, registry):
+        allow = ("Bash(npm*)", "Read", "Edit(/data/engagements/*)")
+        rec = await registry.create(
+            kind="executor",
+            role_or_type="plugin-developer",
+            driver="claude_code",
+            task="probe",
+            origin={},
+            topic_id=None,
+            tools_allowed=allow,
+        )
+        assert rec.tools_allowed == allow
