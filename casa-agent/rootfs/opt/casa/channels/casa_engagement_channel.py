@@ -135,30 +135,6 @@ async def reply(chat_id: str, text: str) -> dict[str, Any]:
 # Permission relay (U1) — Phase 2
 # ---------------------------------------------------------------------------
 
-# Telegram inline-button callback_data byte limit (§9 of the spec; also asserted
-# by Bot API docs).
-_CALLBACK_DATA_MAX = 64
-
-
-def _build_perm_buttons(request_id: str) -> list[list[dict[str, str]]]:
-    """Build the [✅ Allow][❌ Deny] inline-keyboard row for a permission prompt.
-
-    Raises ``ValueError`` if any callback_data would exceed Telegram's 64-byte
-    limit (e.g. a pathologically long ``request_id``). The caller is expected
-    to keep ``request_id`` short (uuid4 hex = 32 bytes → max 43-byte cd).
-    """
-    allow_cd = f"perm:allow:{request_id}"
-    deny_cd = f"perm:deny:{request_id}"
-    for cd in (allow_cd, deny_cd):
-        if len(cd.encode("utf-8")) > _CALLBACK_DATA_MAX:
-            raise ValueError(
-                f"callback_data {cd!r} exceeds {_CALLBACK_DATA_MAX} bytes",
-            )
-    return [[
-        {"text": "✅ Allow", "callback_data": allow_cd},
-        {"text": "❌ Deny", "callback_data": deny_cd},
-    ]]
-
 
 async def _post_state_transition(new_state: str) -> None:
     """Best-effort POST /internal/channel/update_state.
@@ -176,65 +152,6 @@ async def _post_state_transition(new_state: str) -> None:
         logger.warning(
             "update_state(%s) failed: %s", new_state, exc,
         )
-
-
-async def handle_permission_request(params: dict[str, Any]) -> None:
-    """U1: render the operator-facing permission prompt for a tool call.
-
-    Receives ``notifications/claude/channel/permission_request`` params:
-    ``{request_id, tool_name, description?, input_preview?}``. Flips the U3
-    topic title to ``awaiting`` (🟡) so the operator notices the engagement
-    is blocked; renders an inline-keyboard prompt in the engagement topic
-    via casa-main; the verdict travels back via ``CallbackQueryHandler`` →
-    ``permission_verdict`` queue → long-poll drain →
-    ``notifications/claude/channel/permission`` (Task 21).
-    """
-    rid = params["request_id"]
-    tool = params.get("tool_name", "(unknown)")
-    desc = params.get("description") or ""
-    preview = params.get("input_preview") or ""
-
-    # 1. U3 state flip — best-effort, runs first so the title is in 🟡 before
-    #    the keyboard appears (cosmetic ordering — visible to operator).
-    await _post_state_transition("awaiting")
-
-    # 2. Render the keyboard prompt.
-    body_lines: list[str] = [f"Claude wants to use: *{tool}*"]
-    if desc:
-        body_lines.append("")
-        body_lines.append(desc)
-    if preview:
-        body_lines.append("")
-        body_lines.append(f"```\n{preview}\n```")
-    body = "\n".join(body_lines)
-
-    buttons = _build_perm_buttons(rid)
-    await _internal_post(
-        "/internal/channel/post_inline_keyboard",
-        {
-            "request_id": rid,
-            "text": body,
-            "buttons": buttons,
-            "parse_mode": "MarkdownV2",
-        },
-    )
-
-
-class PermissionRequestNotification(
-    Notification[dict, Literal["notifications/claude/channel/permission_request"]]
-):
-    """Custom MCP notification declared by ``claude/channel/permission``.
-
-    The CLI sends this when a tool call hits a permission gate that should
-    relay through the channel UI instead of being auto-resolved by
-    ``permission_mode``. Params shape per §9 of the spec:
-    ``{request_id, tool_name, description?, input_preview?}``.
-    """
-
-    method: Literal["notifications/claude/channel/permission_request"] = (
-        "notifications/claude/channel/permission_request"
-    )
-    params: dict
 
 
 class PermissionVerdictNotification(
@@ -277,29 +194,6 @@ def _build_wider_notification_root_model() -> type[ClientNotification]:
         root: Union[base_union, PermissionRequestNotification]  # type: ignore[valid-type]
 
     return ChannelClientNotification
-
-
-async def _on_permission_request_notification(
-    notification: PermissionRequestNotification,
-) -> None:
-    """Bridge from the inner Server's notification dispatch to our handler."""
-    await handle_permission_request(dict(notification.params))
-
-
-def _register_permission_notification_handler() -> None:
-    """Install the permission-request handler on the inner low-level Server.
-
-    Idempotent — calling more than once just overwrites the same entry.
-    """
-    low_level = _resolve_mcp_server()
-    if low_level is None:  # pragma: no cover — defensive only
-        logger.warning(
-            "no inner mcp Server available — permission notification disabled",
-        )
-        return
-    low_level.notification_handlers[PermissionRequestNotification] = (
-        _on_permission_request_notification
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +390,6 @@ async def _run_with_channel_capabilities() -> None:
             "(neither _mcp_server nor server attribute present)",
         )
     _widen_session_notification_type()
-    _register_permission_notification_handler()
     async with stdio_server() as (read_stream, write_stream):
         drain_task = asyncio.create_task(
             _drain_permission_verdicts(), name="permission-drain",
