@@ -1,5 +1,58 @@
 # Changelog
 
+## [0.37.12] - 2026-05-14 — Hotfix: policies/* schema validation + backlog cleanup
+
+Closes the carried-over `policies/* schema validation gap` (filed v0.31.1,
+2026-05-01) and clears three stale backlog entries that already shipped in
+v0.37.5 but were never struck from `docs/ROADMAP-backlog.md`.
+
+### Fixed
+
+- **LOW policies/* schema validation gap.** `validate_config_repo` is
+  now path-aware: in addition to walking `agents/`, it walks `policies/`
+  and validates `disclosure.yaml` against `policy-disclosure.v1.json`
+  (NOT the agent `disclosure.v1.json` — same basename, different schema)
+  and `scopes.yaml` against `policy-scopes.v2.json`. The configurator
+  can edit both files per its doctrine; without this gate, schema-
+  invalid YAML committed there FATALs the addon on next boot in
+  `policies.py::load_policies` or `scope_registry.py`. Same blast
+  radius as the original E-G repro (v0.30.0 P4.2 `TRAIT:` incident)
+  but for a different file class. New `_SCHEMA_BY_POLICY_FILE` map
+  stores `(schema_name, version)` tuples; `_load_schema(name, version)`
+  takes an optional version suffix (default `v1`) so `policy-scopes`'s
+  `.v2.json` loads correctly. The original v0.31.0 walk had a flat
+  basename map that mis-applied the agent schema to `policies/
+  disclosure.yaml` and falsely refused every commit; v0.31.1 scoped to
+  agents/ only as a stopgap, which left this gap open until v0.37.12.
+
+### Housekeeping
+
+- **Backlog cleanup.** Three entries already shipped in v0.37.5 (PR #57,
+  master `36d772c4`) but stayed in `ROADMAP-backlog.md`: F-1 MEDIUM
+  (plugin-developer prompt for honest `is_error=true` failure
+  narration), A-3-bis LOW (assistant prompt anti-pattern forbidding
+  `#[role]` constructions), and the D-1-followup attribution (already
+  documented in the v0.37.1 and v0.37.5 archive entries). Struck.
+- **F-3 triage carry-forward.** N150 confirmed on HA core `2026.5.1`
+  (latest, no GetDateTime failure path in source). No active
+  reproduction in recent logs — the tool fires only when an agent
+  selects it. Backlog entry updated with current state; re-test via
+  a dedicated probe session in a future exploration.
+
+### Tests
+
+- `tests/test_agent_loader.py::TestValidateConfigRepo` gains three new
+  cases (`test_invalid_policies_disclosure_caught`,
+  `test_valid_policies_scopes_passes`,
+  `test_invalid_policies_scopes_caught`) and renames the existing
+  `test_skips_policies_dir` → `test_valid_policies_disclosure_passes`
+  to reflect the new walk semantics. `test_skips_non_schema_files`
+  adjusted: its previous `policies/scopes.yaml` fixture targeted the
+  old "policies are skipped entirely" contract and would now fail
+  validation, replaced with `policies/README.md` to keep the
+  "non-schema files don't trip the gate" assertion intact. Local
+  pytest non-slow non-docker 1533 PASS, 68 SKIP, 22 deselected.
+
 ## [0.37.11] - 2026-05-14 — Hotfix: DE-1 e2e harness shape mismatch
 
 Surgical hotfix for the master-CI tier2-functional / Delegation E-block
