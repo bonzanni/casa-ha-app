@@ -90,16 +90,23 @@ class LoadError(Exception):
 _SCHEMA_CACHE: dict[str, dict[str, Any]] = {}
 
 
-def _load_schema(name: str) -> dict[str, Any]:
-    if name not in _SCHEMA_CACHE:
-        path = os.path.join(SCHEMA_DIR, f"{name}.v1.json")
+def _load_schema(name: str, version: str = "v1") -> dict[str, Any]:
+    cache_key = f"{name}.{version}"
+    if cache_key not in _SCHEMA_CACHE:
+        path = os.path.join(SCHEMA_DIR, f"{cache_key}.json")
         with open(path, "r", encoding="utf-8") as fh:
-            _SCHEMA_CACHE[name] = json.load(fh)
-    return _SCHEMA_CACHE[name]
+            _SCHEMA_CACHE[cache_key] = json.load(fh)
+    return _SCHEMA_CACHE[cache_key]
 
 
-def _validate(data: dict[str, Any], schema_name: str, source: str) -> None:
-    schema = _load_schema(schema_name)
+def _validate(
+    data: dict[str, Any],
+    schema_name: str,
+    source: str,
+    *,
+    version: str = "v1",
+) -> None:
+    schema = _load_schema(schema_name, version)
     try:
         jsonschema.validate(data, schema)
     except jsonschema.ValidationError as exc:
@@ -114,9 +121,10 @@ def _validate(data: dict[str, Any], schema_name: str, source: str) -> None:
 
 # --- Pre-commit schema gate (E-G v0.31.0) ----------------------------------
 
-# Maps a schema-bearing YAML filename to the schema name in defaults/schema/.
-# Used by ``validate_config_repo`` as a pre-commit gate. Files outside this
-# map (markdown doctrine, plugin sources, READMEs, etc.) are skipped.
+# Maps a schema-bearing YAML filename in ``agents/<role>/`` to the schema name
+# in defaults/schema/. Used by ``validate_config_repo`` as a pre-commit gate.
+# Files outside this map (markdown doctrine, plugin sources, READMEs, etc.)
+# are skipped.
 _SCHEMA_BY_FILENAME: dict[str, str] = {
     "character.yaml":      "character",
     "voice.yaml":          "voice",
@@ -130,51 +138,77 @@ _SCHEMA_BY_FILENAME: dict[str, str] = {
     "definition.yaml":     "executor",
 }
 
+# Maps a filename in ``policies/`` to (schema_name, version). Separate from
+# ``_SCHEMA_BY_FILENAME`` because ``policies/disclosure.yaml`` reuses the
+# same basename as ``agents/<role>/disclosure.yaml`` while binding to a
+# DIFFERENT schema (``policy-disclosure.v1.json`` vs ``disclosure.v1.json``).
+# ``policy-scopes`` is at .v2 — every other schema is .v1.
+_SCHEMA_BY_POLICY_FILE: dict[str, tuple[str, str]] = {
+    "disclosure.yaml": ("policy-disclosure", "v1"),
+    "scopes.yaml":     ("policy-scopes",     "v2"),
+}
+
 
 def validate_config_repo(config_dir: str) -> list[str]:
-    """E-G v0.31.0 pre-commit gate. Walk *config_dir/agents/* for every
-    schema-bearing YAML file and return a list of error messages — one
-    per file that fails schema validation. Empty list = all clean.
+    """E-G v0.31.0 pre-commit gate. Walk schema-bearing YAML in
+    *config_dir/agents/* and *config_dir/policies/* and return a list of
+    error messages — one per file that fails schema validation. Empty
+    list = all clean.
 
     Used by ``mcp__casa-framework__config_git_commit`` to refuse commits
     that would land schema-invalid YAML and FATAL the addon on next boot.
     The check uses the same ``_validate`` codepath as boot-time loading,
     so a passing pre-commit gate guarantees a green boot validation for
-    every agent the configurator can edit.
+    every file the configurator can edit.
 
-    **Scope (v0.31.1).** Only the ``agents/`` subtree is walked. v0.31.0
-    walked the whole repo, but ``policies/disclosure.yaml`` reuses the
-    same filename as the per-agent ``disclosure.yaml`` while binding to
-    a DIFFERENT schema (``policy-disclosure.v1.json`` vs
-    ``disclosure.v1.json``). Filename-based mapping mis-applied the
-    agent schema to the policy file and falsely refused every commit
-    until the configurator fixed the (untouched, valid) policy file —
-    which it can't. The original E-G repro path is the configurator
-    inventing fields under ``agents/<role>/character.yaml`` so this
-    scoping is sufficient. Boot-time loaders for ``policies/*`` and
-    ``schema/*`` (``policies.py::load_policies`` and
-    ``scope_registry.py``) catch policy-side schema violations on their
-    own.
+    **Agents/ walk.** Recursive; ``.git/`` skipped. Basename lookup in
+    ``_SCHEMA_BY_FILENAME``. The original E-G repro path is the
+    configurator inventing fields under ``agents/<role>/character.yaml``.
 
-    Skips ``.git/`` and any file whose basename is not in
-    ``_SCHEMA_BY_FILENAME`` (markdown, plain text, etc.).
+    **Policies/ walk (v0.37.12).** Top-level only; the configurator's
+    doctrine lists ``policies/disclosure.yaml`` and ``policies/scopes.yaml``
+    as editable. Path-aware lookup in ``_SCHEMA_BY_POLICY_FILE`` —
+    ``policies/disclosure.yaml`` reuses the basename of the per-agent
+    file but binds to ``policy-disclosure.v1.json``; v0.31.0's flat
+    basename map mis-applied the agent schema there and falsely refused
+    every commit (closed in v0.31.1 by scoping agents/ only, which left
+    the policies/ blast radius open until v0.37.12).
+
+    Skips ``.git/`` and any file whose basename is not in either map
+    (markdown, plain text, etc.).
     """
     errors: list[str] = []
+
     agents_root = os.path.join(config_dir, "agents")
-    if not os.path.isdir(agents_root):
-        return errors
-    for root, dirs, files in os.walk(agents_root):
-        if ".git" in dirs:
-            dirs.remove(".git")
-        for name in files:
-            schema_name = _SCHEMA_BY_FILENAME.get(name)
-            if schema_name is None:
+    if os.path.isdir(agents_root):
+        for root, dirs, files in os.walk(agents_root):
+            if ".git" in dirs:
+                dirs.remove(".git")
+            for name in files:
+                schema_name = _SCHEMA_BY_FILENAME.get(name)
+                if schema_name is None:
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    _validate(_read_yaml(path), schema_name, path)
+                except LoadError as exc:
+                    errors.append(str(exc))
+
+    policies_root = os.path.join(config_dir, "policies")
+    if os.path.isdir(policies_root):
+        for name in os.listdir(policies_root):
+            mapping = _SCHEMA_BY_POLICY_FILE.get(name)
+            if mapping is None:
                 continue
-            path = os.path.join(root, name)
+            path = os.path.join(policies_root, name)
+            if not os.path.isfile(path):
+                continue
+            schema_name, version = mapping
             try:
-                _validate(_read_yaml(path), schema_name, path)
+                _validate(_read_yaml(path), schema_name, path, version=version)
             except LoadError as exc:
                 errors.append(str(exc))
+
     return errors
 
 

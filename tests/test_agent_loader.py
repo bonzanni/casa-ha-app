@@ -619,20 +619,18 @@ class TestValidateConfigRepo:
         errors = validate_config_repo(str(repo))
         assert errors == []
 
-    def test_skips_policies_dir(self, tmp_path):
-        """v0.31.1 — policies/disclosure.yaml uses policy-disclosure.v1
-        which differs from agent disclosure.v1; filename-only mapping
-        falsely matched it as agent disclosure and blocked every commit.
-        Scope must skip policies/ entirely; boot-time policies.py
-        catches policy-side schema violations on its own."""
+    def test_valid_policies_disclosure_passes(self, tmp_path):
+        """v0.37.12 — policies/disclosure.yaml is now actively validated
+        (against policy-disclosure.v1, NOT the agent disclosure schema).
+        A valid file must pass cleanly. Historical note: v0.31.0 walked
+        the whole repo with a flat basename map and mis-applied the
+        agent schema here; v0.31.1 scoped to agents/ only as a stopgap;
+        v0.37.12 introduces a path-aware policies/ walk so the
+        configurator can't ship schema-invalid policy YAML."""
         from agent_loader import validate_config_repo
 
         repo = tmp_path / "addon_configs" / "casa-agent"
         _seed_resident(repo / "agents", "assistant")
-        # Realistic policies/disclosure.yaml uses the policy schema
-        # shape (top-level `policies:` block with named entries) which
-        # the AGENT disclosure schema rejects with
-        # `Additional properties are not allowed ('policies' was unexpected)`
         _w(repo / "policies" / "disclosure.yaml", """\
             schema_version: 1
             policies:
@@ -648,8 +646,84 @@ class TestValidateConfigRepo:
 
         errors = validate_config_repo(str(repo))
         assert errors == [], (
-            f"policies/* must be skipped by the agent gate; got {errors}"
+            f"valid policies/disclosure.yaml must pass; got {errors}"
         )
+
+    def test_invalid_policies_disclosure_caught(self, tmp_path):
+        """policies/disclosure.yaml with a top-level unknown key fails
+        ``additionalProperties: False`` on policy-disclosure.v1 and is
+        surfaced by the gate. Repro of the E-G class of bug applied to
+        policies/."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "addon_configs" / "casa-agent"
+        _seed_resident(repo / "agents", "assistant")
+        _w(repo / "policies" / "disclosure.yaml", """\
+            schema_version: 1
+            policies:
+              standard:
+                categories:
+                  financial:
+                    required_trust: authenticated
+                    examples: [balances]
+                safe_on_any_channel: [device_state]
+                deflection_patterns:
+                  household_shared: "private."
+            BOGUS_POLICY_KEY: surprise
+        """)
+
+        errors = validate_config_repo(str(repo))
+        assert len(errors) == 1
+        assert "disclosure.yaml" in errors[0]
+        assert "BOGUS_POLICY_KEY" in errors[0]
+        assert "schema violation" in errors[0]
+
+    def test_valid_policies_scopes_passes(self, tmp_path):
+        """policies/scopes.yaml binds to policy-scopes.v2 (note: v2, not
+        v1) — the gate must load the right schema version."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "addon_configs" / "casa-agent"
+        _seed_resident(repo / "agents", "assistant")
+        _w(repo / "policies" / "scopes.yaml", """\
+            schema_version: 2
+            scopes:
+              finance:
+                minimum_trust: authenticated
+                kind: topical
+                description: Money matters, invoices, balances, payments.
+              household:
+                minimum_trust: household-shared
+                kind: topical
+                description: Shared family logistics, schedules, groceries.
+        """)
+
+        errors = validate_config_repo(str(repo))
+        assert errors == [], (
+            f"valid policies/scopes.yaml must pass; got {errors}"
+        )
+
+    def test_invalid_policies_scopes_caught(self, tmp_path):
+        """policies/scopes.yaml with an invalid ``minimum_trust`` enum
+        value fails policy-scopes.v2 and is surfaced by the gate."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "addon_configs" / "casa-agent"
+        _seed_resident(repo / "agents", "assistant")
+        _w(repo / "policies" / "scopes.yaml", """\
+            schema_version: 2
+            scopes:
+              finance:
+                minimum_trust: NOT_A_REAL_TRUST_LEVEL
+                kind: topical
+                description: Money matters, invoices, balances, payments.
+        """)
+
+        errors = validate_config_repo(str(repo))
+        assert len(errors) == 1
+        assert "scopes.yaml" in errors[0]
+        assert "NOT_A_REAL_TRUST_LEVEL" in errors[0]
+        assert "schema violation" in errors[0]
 
     def test_top_level_unknown_key_in_character_caught(self, tmp_path):
         """Exact repro of the v0.30.0 / v0.29.0 P4.2 'TRAIT:' incident."""
@@ -688,7 +762,8 @@ class TestValidateConfigRepo:
         _w(repo / "agents" / "assistant" / "prompts" / "system.md",
            "Some prompt body — not schema-validated.\n")
         _w(repo / "doctrine.md", "free-form notes\n")
-        _w(repo / "policies" / "scopes.yaml", "schema_version: 1\nscopes: []\n")
+        # README inside policies/ is not a schema-bearing file.
+        _w(repo / "policies" / "README.md", "free-form policy notes\n")
 
         errors = validate_config_repo(str(repo))
         assert errors == []
