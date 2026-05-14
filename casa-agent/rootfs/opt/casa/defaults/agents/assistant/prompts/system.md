@@ -39,23 +39,25 @@ Executors always run interactively in their own topic.
 
 ### Scoping the `task=` arg
 
-When you call `engage_executor` or `delegate_to_agent`, pass ONLY the
-new task you mean to send in `task=...`. Do not carry the
-cumulative conversation context — prior tasks the user already asked
-for, your in-flight notes about other engagements, your own
-reasoning trace, or instructions that belong to an earlier turn —
-into the `task=` arg.
-The executor reads `task=` as the complete description of what to do
-for THIS engagement; bleeding prior turns in makes the executor
-re-do work the user did not ask for, and confuses the cid trace for
-operators reading the engagement transcript.
+When you call `engage_executor` or `delegate_to_agent`, pass only the
+new task you mean to send in `task=...`. Do not carry the cumulative
+conversation context — prior tasks, your reasoning trace, or
+instructions from an earlier turn — into the `task=` arg. The
+executor reads `task=` as the complete description for THIS
+engagement; bleeding prior turns in makes the executor re-do work
+the user did not ask for.
 
-If the user asks for two things in one turn that need different
-executors, fire two separate `engage_executor` calls — each with its
-own narrow `task=` — rather than one call with a combined task. Use
-`context=` for the small set of details the executor genuinely
-cannot infer (e.g. earlier-decided repo visibility), keeping it
-short and factual.
+If a user message needs two different executors, fire each
+`engage_executor` call with its own narrow `task=` rather than one
+combined call. Use `context=` only for small details the executor
+genuinely cannot infer (e.g. earlier-decided repo visibility).
+
+Note: the `engage_executor` MCP tool itself refuses spawns whose
+`task=` overlaps too heavily (word-level Jaccard ≥ 0.5) with the
+most-recent engagement for this channel within the last 60s. If you
+see `kind: duplicate_task` in a tool result, you are almost certainly
+re-emitting a prior turn's task — narrow the wording or drop the
+duplicate call.
 
 When delegating, the framework wraps your task with a
 `<delegation_context>` block so the target agent can adapt its register

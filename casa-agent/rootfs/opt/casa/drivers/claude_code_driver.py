@@ -22,14 +22,13 @@ from engagement_registry import EngagementRecord
 
 logger = logging.getLogger(__name__)
 _URL_REGEX = re.compile(r"Remote Control URL:\s+(https?://\S+)")
-# O-5 (v0.37.9): match `system_init session_id=<uuid>` (Casa-side
-# sdk_logging format) AND JSON-shaped variants the claude CLI emits on
-# stdout. The capture group lifts the UUID itself; the rest of the
-# regex is intentionally permissive to absorb both `session_id=`,
-# `session_id: `, `"session_id":"…"`, and quoted forms.
-_SESSION_ID_REGEX = re.compile(
-    r'session_id["\s:=]+"?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}'
-    r'-[0-9a-f]{4}-[0-9a-f]{12})',
+# P31 (v0.37.10): match a UUID as a complete filename stem — the
+# claude CLI names its session-storage files ``<uuid>.jsonl``. Replaces
+# v0.37.9's free-text session_id regex (which tailed a log file that
+# never gets created in production; see bug-review-2026-05-14-exploration6).
+_UUID_REGEX = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}'
+    r'-[0-9a-f]{4}-[0-9a-f]{12}$',
     re.IGNORECASE,
 )
 
@@ -289,13 +288,14 @@ class ClaudeCodeDriver(DriverProtocol):
             # drivers' CLI subprocess output. Independent tailer — the
             # _capture_url task drops non-URL lines.
             asyncio.create_task(self._relay_log_lines(engagement, log_path=log_path)),
-            # O-5 (v0.37.9): capture the SDK session_id and persist it
-            # so the run-script's `--resume $(cat .session_id)` plumbing
-            # picks up after a Casa restart. Without this, mid-engagement
-            # restarts leave the engagement in a zombie state.
-            asyncio.create_task(
-                self._capture_session_id(engagement, log_path=log_path),
-            ),
+            # P31 (v0.37.10): capture the SDK session_id by watching the
+            # claude CLI's own session-storage directory (NOT log_path —
+            # that file is never created in production; see
+            # bug-review-2026-05-14-exploration6.md::O-5). Persists the
+            # UUID to ``<workspace>/.session_id`` so the run script's
+            # ``--resume $(cat .session_id)`` plumbing picks up after a
+            # Casa restart.
+            asyncio.create_task(self._capture_session_id(engagement)),
         ]
 
     async def _capture_url(
@@ -359,56 +359,100 @@ class ClaudeCodeDriver(DriverProtocol):
             )
 
     async def _capture_session_id(
-        self, engagement: EngagementRecord, *, log_path: str,
+        self, engagement: EngagementRecord, *,
+        poll_interval_s: float = 0.5,
     ) -> None:
-        """O-5 (v0.37.9): tail the per-engagement s6-log for the SDK's
-        ``system_init session_id=<sid>`` line and persist the UUID to
-        ``<workspace>/.session_id`` so a subsequent boot-replay's
+        """P31 (v0.37.10): watch the claude CLI's own session-storage
+        directory for the first ``<uuid>.jsonl`` file. The filename
+        (minus extension) IS the SDK session UUID. Persist to
+        ``<workspace>/.session_id`` so a boot-replay's
         ``--resume $(cat .session_id)`` flag carries the conversation
         forward.
 
-        One-shot: returns after the first UUID-shaped session_id appears
-        in the log. The SDK emits the same id at every subsequent turn
-        boundary, but we already have it, and re-writing would risk
-        thrashing the file mid-CLI-read on the run script's resume path.
-        Re-spawns of the engagement on s6 restart see the persisted file
-        and resume cleanly — see ``engagement_run_template.sh``.
+        Replaces v0.37.9's s6-log tailing approach: that path tailed
+        ``/var/log/casa-engagement-<id>/current`` which is never
+        created in production (the s6-rc service dir's log/ subdir
+        lacks producer-for / consumer-for wiring, so s6-rc-compile
+        doesn't wire the producer-consumer pipe). Bug-review:
+        ``docs/bug-review-2026-05-14-exploration6.md::O-5``.
 
-        Atomic write: temp-file + ``os.replace`` so a Casa crash mid-
-        write cannot leave a half-truncated ``.session_id`` that the
-        run script would feed to ``claude --resume <truncated>``.
+        Claude CLI session storage layout (HOME=<ws>/.home, CWD=<ws>):
+
+            <ws>/.home/.claude/projects/-data-engagements-<id>/<uuid>.jsonl
+
+        The directory-name encoding replaces ``/`` with ``-`` in the
+        workspace path (claude CLI native behavior).
+
+        One-shot: returns after the first UUID-named .jsonl is found.
+        Re-spawns on s6 restart see the persisted file and resume
+        cleanly — see ``engagement_run_template.sh``.
+
+        Atomic write: temp-file + ``os.replace`` so a Casa crash
+        mid-write cannot leave a half-truncated ``.session_id``.
         """
         short = engagement.id[:8]
         ws = Path(self._engagements_root) / engagement.id
         target = ws / ".session_id"
         tmp = ws / ".session_id.tmp"
-        async for line in _tail_file(log_path):
-            m = _SESSION_ID_REGEX.search(line)
-            if m is None:
-                continue
-            sid = m.group(1)
-            try:
-                tmp.write_text(sid + "\n", encoding="utf-8")
-                os.replace(tmp, target)
-            except OSError as exc:
-                logger.warning(
-                    "engagement %s session_id persist failed: %s",
-                    short, exc,
-                )
-                return
-            logger.info(
-                "engagement %s captured sdk session_id %s",
-                short, sid[:8],
-            )
-            if self._persist_session_id is not None:
+        projects_dir = (
+            ws / ".home" / ".claude" / "projects"
+            / f"-data-engagements-{engagement.id}"
+        )
+        while True:
+            sid = self._scan_projects_dir_for_sid(projects_dir)
+            if sid is not None:
                 try:
-                    await self._persist_session_id(engagement.id, sid)
-                except Exception as exc:  # noqa: BLE001
+                    tmp.write_text(sid + "\n", encoding="utf-8")
+                    os.replace(tmp, target)
+                except OSError as exc:
                     logger.warning(
-                        "engagement %s persist_session_id callback failed: %s",
+                        "engagement %s session_id persist failed: %s",
                         short, exc,
                     )
-            return
+                    return
+                logger.info(
+                    "engagement %s captured sdk session_id %s",
+                    short, sid[:8],
+                )
+                if self._persist_session_id is not None:
+                    try:
+                        await self._persist_session_id(engagement.id, sid)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "engagement %s persist_session_id callback "
+                            "failed: %s", short, exc,
+                        )
+                return
+            await asyncio.sleep(poll_interval_s)
+
+    @staticmethod
+    def _scan_projects_dir_for_sid(projects_dir: Path) -> str | None:
+        """Return the oldest UUID-named .jsonl in projects_dir, or None.
+
+        Sort by mtime ascending so the first session file (the one
+        spawned by the initial CLI start) wins over any later ones the
+        CLI might write on a resume retry.
+        """
+        try:
+            if not projects_dir.is_dir():
+                return None
+            candidates: list[tuple[float, str]] = []
+            for p in projects_dir.iterdir():
+                if p.suffix != ".jsonl":
+                    continue
+                stem = p.stem
+                if _UUID_REGEX.match(stem) is None:
+                    continue
+                try:
+                    candidates.append((p.stat().st_mtime, stem))
+                except OSError:
+                    continue
+            if not candidates:
+                return None
+            candidates.sort()
+            return candidates[0][1]
+        except OSError:
+            return None
 
     async def _poll_respawns(
         self, engagement: EngagementRecord, *, interval_s: float = 5.0,
