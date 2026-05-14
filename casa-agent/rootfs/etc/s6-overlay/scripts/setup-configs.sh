@@ -265,12 +265,16 @@ if [ ! -f "$DATA_DIR/sessions.json" ]; then
 fi
 
 # Persist CC CLI conversation transcripts across container rebuilds.
-# The bundled CC CLI uses $HOME=/root → ~/.claude/projects/<cwd-encoded>/<sid>.jsonl;
-# /root/ is wiped on every rebuild, so the SDK's --resume <sid> path fails on
-# every first turn after a deploy (sessions.json under /data/ persists, but the
-# transcript files vanish — see agent.py resume-recovery comment). Symlink the
-# projects dir to a path under /addon_configs/ (persistent volume) so transcripts
-# survive rebuilds and resume just works.
+# As of v0.37.8 (H-1), HOME is propagated to cc-home via
+# /run/s6/container_environment/HOME (see claude-home-propagation
+# block below), so the CC CLI writes transcripts to
+# cc-home/.claude/projects/ directly. This defensive symlink at
+# /root/.claude/projects remains as belt-and-braces in case anything
+# is ever invoked with explicit HOME=/root (the prior default).
+# Pre-v0.37.8 history: CC CLI used $HOME=/root → /root/.claude/projects;
+# /root/ is wiped on every rebuild, so --resume <sid> failed on the
+# first turn after a deploy (sessions.json persisted, transcript file
+# did not — see agent.py resume-recovery comment).
 PERSIST_PROJECTS="$CONFIG_DIR/cc-home/.claude/projects"
 mkdir -p "$PERSIST_PROJECTS" /root/.claude
 if [ -e /root/.claude/projects ] && [ ! -L /root/.claude/projects ]; then
