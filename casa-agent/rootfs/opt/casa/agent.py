@@ -639,7 +639,8 @@ class Agent:
                 # claude CLI exited non-zero. If we were resuming a prior
                 # session, the most common cause (spec 5.8) is a stale
                 # sdk_session_id — the local conversation file under
-                # ``/root/.claude/`` was wiped (rebuild) while
+                # ``cc-home/.claude/projects/`` (was ``/root/.claude/``
+                # pre-v0.37.8 H-1) was wiped (rebuild) while
                 # ``/data/sessions.json`` persisted. Clear and retry fresh.
                 if resume_session_id is None:
                     raise

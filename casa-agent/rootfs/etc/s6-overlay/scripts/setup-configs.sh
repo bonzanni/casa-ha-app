@@ -265,12 +265,16 @@ if [ ! -f "$DATA_DIR/sessions.json" ]; then
 fi
 
 # Persist CC CLI conversation transcripts across container rebuilds.
-# The bundled CC CLI uses $HOME=/root → ~/.claude/projects/<cwd-encoded>/<sid>.jsonl;
-# /root/ is wiped on every rebuild, so the SDK's --resume <sid> path fails on
-# every first turn after a deploy (sessions.json under /data/ persists, but the
-# transcript files vanish — see agent.py resume-recovery comment). Symlink the
-# projects dir to a path under /addon_configs/ (persistent volume) so transcripts
-# survive rebuilds and resume just works.
+# As of v0.37.8 (H-1), HOME is propagated to cc-home via
+# /run/s6/container_environment/HOME (see claude-home-propagation
+# block below), so the CC CLI writes transcripts to
+# cc-home/.claude/projects/ directly. This defensive symlink at
+# /root/.claude/projects remains as belt-and-braces in case anything
+# is ever invoked with explicit HOME=/root (the prior default).
+# Pre-v0.37.8 history: CC CLI used $HOME=/root → /root/.claude/projects;
+# /root/ is wiped on every rebuild, so --resume <sid> failed on the
+# first turn after a deploy (sessions.json persisted, transcript file
+# did not — see agent.py resume-recovery comment).
 PERSIST_PROJECTS="$CONFIG_DIR/cc-home/.claude/projects"
 mkdir -p "$PERSIST_PROJECTS" /root/.claude
 if [ -e /root/.claude/projects ] && [ ! -L /root/.claude/projects ]; then
@@ -422,6 +426,24 @@ else
 fi
 unset CC_OAUTH
 # === claude-oauth-token: end ====================================
+
+# === claude-home-propagation: begin =============================
+# H-1 (v0.37.8): propagate HOME=cc-home to every s6-supervised
+# service + child subprocess. K-1 (v0.34.1) lesson — a shell-level
+# `export HOME=...` (line 322) only governs setup-configs.sh's own
+# `claude plugin marketplace add` / `claude plugin enable` calls.
+# casa-main and svc-casa-mcp boot with HOME=/root unless we write
+# to /run/s6/container_environment/. Without this, any claude
+# binary subprocess spawned from casa-main (install_casa_plugin
+# and the three marketplace_* MCP tools in tools.py) reads
+# /root/.claude/plugins/known_marketplaces.json (empty) instead
+# of cc-home's, breaking plugin install. Configurator papered
+# over it by improvising a `claude plugin marketplace add` Bash
+# call mid-engagement — see bug-review-2026-05-13-exploration4.md::H-1.
+printf '%s' "/addon_configs/casa-agent/cc-home" \
+    > /run/s6/container_environment/HOME
+bashio::log.info "HOME propagated to s6 services: /addon_configs/casa-agent/cc-home"
+# === claude-home-propagation: end ===============================
 
 # === seed-copy: begin ===========================================
 # v0.14.9: replace the boot install loop with a no-network seed copy.
