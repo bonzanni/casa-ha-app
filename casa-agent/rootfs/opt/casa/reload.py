@@ -634,6 +634,18 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("specialist_registry.load failed: %s", exc)
 
+    # O-2b (v0.37.9): surface per-specialist load failures so casactl
+    # callers see them. The registry's load() catches per-dir LoadError
+    # internally to keep siblings loading; without surfacing here a
+    # malformed new specialist would return ok=True with no trace in
+    # the action trail.
+    try:
+        for name, err in runtime.specialist_registry.load_failures():
+            actions.append(f"failed:{name}:{err}")
+    except AttributeError:
+        # Pre-v0.37.9 registry mock without load_failures(); legacy path.
+        pass
+
     known_specialists = set(runtime.specialist_registry.all_configs().keys())
 
     # New specialists need agent-home + Agent construction; eviction is
@@ -698,12 +710,32 @@ async def reload_executors(
 
     Closes the v0.35.0+ contract gap where executor lifecycle
     changes required a Supervisor restart.
+
+    O-2a (v0.37.9): residents cache their `<executors>` system-prompt
+    block (rendered from ``self.config.executors`` at construct_agent
+    time). Re-running the registry load alone leaves residents holding
+    stale prompts until the next agent-scope reload. Fan out to
+    ``reload_agent`` per resident so the cached state regenerates.
+    Specialists are NOT in the fan-out — they don't see executors.
+    Per-resident sub-actions are surfaced with prefix ``agent:<role>:``
+    so casactl output makes the cascade visible.
     """
     try:
         await asyncio.to_thread(runtime.executor_registry.load)
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("load_error", f"executors: {exc}") from exc
-    return ["rebuild_executor_registry"]
+    actions: list[str] = ["rebuild_executor_registry"]
+
+    for r in list(runtime.role_configs.keys()):
+        try:
+            sub = await _HANDLERS["agent"](runtime, role=r)
+            actions += [f"agent:{r}:{a}" for a in sub]
+        except ReloadError as exc:
+            actions.append(f"agent:{r}:failed:{exc.kind}:{exc.message}")
+        except Exception as exc:  # noqa: BLE001
+            actions.append(f"agent:{r}:failed:{exc}")
+
+    return actions
 
 
 register_handler("executors", reload_executors)

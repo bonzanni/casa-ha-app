@@ -232,6 +232,14 @@ def _result(payload: dict, *, is_error: bool | None = None) -> dict:
     Auto-detection via ``payload["status"]`` keeps the existing call sites
     untouched while making every error path consistently observable.
 
+    O-1 (v0.37.9): also recognise ``payload["ok"] is False`` so the
+    install/uninstall plugin envelopes (which use ``{"ok": False,
+    "error": ...}`` instead of ``{"status": "error", ...}``) surface as
+    MCP errors too. Live evidence (2026-05-14 P29.1 cid ``52240634``):
+    ``tool_result name=install_casa_plugin ok=True ms=12594`` for a
+    ``plugin_not_in_marketplace`` failure — telemetry reported the
+    failure as success, contradicting F-7's intent.
+
     The dict key MUST be ``is_error`` (snake_case): the Anthropic Agent
     SDK's MCP server adapter reads
     ``result.get("is_error", False)`` (see
@@ -240,7 +248,10 @@ def _result(payload: dict, *, is_error: bool | None = None) -> dict:
     dropped on the way to the model.
     """
     if is_error is None:
-        is_error = payload.get("status") == "error"
+        is_error = (
+            payload.get("status") == "error"
+            or payload.get("ok") is False
+        )
     envelope: dict = {"content": [{"type": "text", "text": json.dumps(payload)}]}
     if is_error:
         envelope["is_error"] = True

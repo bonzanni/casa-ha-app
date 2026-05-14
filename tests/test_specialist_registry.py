@@ -119,10 +119,15 @@ class TestValidation:
         with caplog.at_level(logging.ERROR):
             reg.load()
         assert reg.get("bogus") is None
+        # O-2b (v0.37.9): per-specialist load failures log via
+        # ``Specialist %r failed to load: …`` and are also tracked in
+        # ``load_failures()`` for reload to surface to casactl.
         assert any(
-            "load failed" in r.message.lower()
+            "failed to load" in r.message.lower()
             for r in caplog.records
         )
+        failures = reg.load_failures()
+        assert any(name == "bogus" for name, _ in failures)
 
     async def test_accepts_non_zero_token_budget(self, tmp_path, caplog):
         """M4b: specialists may opt into Honcho memory by setting

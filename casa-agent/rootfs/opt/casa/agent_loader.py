@@ -692,15 +692,31 @@ def load_all_agents(
 
 def load_all_specialists(
     specialists_dir: str,
-) -> dict[str, AgentConfig]:
+) -> tuple[dict[str, AgentConfig], list[tuple[str, str]]]:
     """Walk *specialists_dir* for specialist directories.
 
     Specialists never reference the policy library (taxonomy §4.4: the
     delegating resident owns the disclosure layer).
+
+    Returns ``(found, failed)``:
+      * ``found`` — ``{role: AgentConfig}`` for valid specialists.
+      * ``failed`` — list of ``(name, error_message)`` tuples for
+        per-specialist load errors.
+
+    O-2b (v0.37.9): per-specialist isolation. Mirrors the
+    ``load_all_executors`` v0.37.1 B-1b pattern — one malformed
+    specialist directory does NOT prevent its siblings from loading,
+    and the registry can surface failures to ``casactl reload`` callers
+    instead of swallowing them in a single ``except LoadError``.
+
+    Collection-level errors (non-directory file under specialists/) still
+    raise ``LoadError`` as before — only single-dir load failures are
+    isolated.
     """
     found: dict[str, AgentConfig] = {}
+    failed: list[tuple[str, str]] = []
     if not os.path.isdir(specialists_dir):
-        return found
+        return found, failed
     for entry in sorted(os.listdir(specialists_dir)):
         if entry.startswith("."):
             continue
@@ -711,9 +727,13 @@ def load_all_specialists(
                 f"specialist is a directory; flat YAML files are no longer "
                 f"supported"
             )
-        cfg = load_agent_from_dir(path, policies=None)
+        try:
+            cfg = load_agent_from_dir(path, policies=None)
+        except LoadError as exc:
+            failed.append((entry, str(exc)))
+            continue
         found[cfg.role] = cfg
-    return found
+    return found, failed
 
 
 def load_all_executors(

@@ -133,3 +133,35 @@ def test_system_prompt_teaches_sync_vs_interactive_delegation(system_md_text):
         "system prompt must reference the Engagements supergroup as "
         "the destination for interactive delegations."
     )
+
+
+def test_system_prompt_forbids_engage_executor_context_bleed(system_md_text):
+    """O-6 (v0.37.9): Ellen's ``engage_executor`` ``task=`` arg must
+    carry ONLY the new task description — not the cumulative
+    conversation context with prior tasks bleeding through.
+
+    Live evidence: 2026-05-14 P27.2 cid ``093a02c7`` — Ellen's single
+    turn spawned BOTH configurator AND plugin-developer engagements,
+    and the configurator engagement received P27.1's rename task
+    description instead of P27.2's repo creation task. Cause: Ellen's
+    SDK conversation history carried the prior task into the new
+    engage_executor call. This guard catches accidental revert of the
+    prompt-side mitigation.
+    """
+    text = system_md_text.lower()
+    # Anchor phrase from the v0.37.9 prompt fix — match the spirit of the
+    # rule without over-binding the exact wording so editorial polish
+    # remains possible.
+    assert "only" in text and "engage_executor" in text, (
+        "system prompt must include ONLY-the-new-task guidance for "
+        "engage_executor calls."
+    )
+    assert (
+        "do not carry" in text
+        or "do not include" in text
+        or "do not bleed" in text
+        or "without bleeding" in text
+    ), (
+        "system prompt must forbid bleeding prior conversation context "
+        "into engage_executor's task arg."
+    )

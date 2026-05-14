@@ -80,6 +80,27 @@ class TestRenderRunScript:
         # Sanity: --remote-control still present (--channels composes with it).
         assert "--remote-control" in script
 
+    def test_render_run_script_consumes_persisted_session_id(self):
+        """O-5 (v0.37.9): the run script must read ``.session_id`` from
+        the workspace and pass it via ``--resume`` so a Casa restart
+        mid-engagement does NOT lose conversation context.
+
+        Pairs with TestSessionIdCapture in test_claude_code_driver.py —
+        the writer task captures the UUID from s6-log; this test asserts
+        the run-script half of the contract reads it back.
+        """
+        from drivers.workspace import render_run_script
+        eid = "abcd1234567890123456789012345678"
+        script = render_run_script(
+            engagement_id=eid,
+            permission_mode="acceptEdits",
+            extra_dirs=[],
+        )
+        # The shell idiom: if .session_id exists, build --resume <sid>.
+        assert f"/data/engagements/{eid}/.session_id" in script
+        assert "--resume $(cat" in script
+        assert "$RESUME_FLAG" in script
+
 
 class TestRenderRunScriptShellInjection:
     """Bug 4 + Bug 5 (v0.14.6): extra_dirs and extra_env keys must not
