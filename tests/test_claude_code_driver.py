@@ -296,36 +296,48 @@ class TestURLCapture:
 
 
 class TestSessionIdCapture:
-    """O-5 (v0.37.9): capture the SDK session_id from s6-log and persist it
-    to ``<workspace>/.session_id`` so boot-replay's ``--resume`` plumbing
-    picks it up after a Casa restart.
+    """P31 (v0.37.10): watch claude CLI's own session storage dir for new
+    ``<uuid>.jsonl`` files. The filename (minus extension) IS the SDK
+    session UUID. Persist to ``<workspace>/.session_id`` atomically so
+    boot-replay's ``--resume`` plumbing picks it up after a Casa restart.
 
-    Pre-v0.37.9 a mid-engagement Casa restart left UNDERGOING engagements
-    in zombie state: the s6 service respawned the claude CLI fresh
-    (``.session_id`` did not exist), so the user's "continue" message
-    landed on a CLI with no prior conversation context. Live evidence:
-    2026-05-14 P25.4 cid ``7a9cba59`` — engagement ``44389d8a`` had its
-    user turn delivered but no SDK tool_use lines fired in the 7 minutes
-    following.
+    Replaces v0.37.9's s6-log tailing approach which was non-functional
+    in production: the s6-rc service dir's log/ subdir lacked the
+    producer-for / consumer-for wiring required to compile the
+    producer-consumer pair, so ``/var/log/casa-engagement-<id>/current``
+    was never created. Live evidence: 2026-05-14 exploration6 — both
+    engagements ``28fdeb04`` and ``3e44c2cf`` saw zero session_id writes.
+
+    Claude CLI session storage layout (HOME=<ws>/.home, CWD=<ws>):
+
+        <ws>/.home/.claude/projects/-data-engagements-<id>/<uuid>.jsonl
+
+    The directory-name encoding replaces ``/`` with ``-`` in the
+    workspace path (claude CLI native behavior).
     """
 
-    async def test_writes_session_id_on_first_match(self, tmp_path):
+    @staticmethod
+    def _projects_dir(ws):
+        """Mirror the encoding the claude CLI uses for cwd directory names."""
+        return ws / ".home" / ".claude" / "projects" / (
+            f"-data-engagements-{ws.name}"
+        )
+
+    async def test_writes_session_id_on_first_jsonl(self, tmp_path):
+        """Happy path: claude CLI creates the projects dir with a single
+        ``<uuid>.jsonl`` file. Watcher persists the UUID to
+        ``<ws>/.session_id`` and invokes ``persist_session_id`` callback.
+        """
         from drivers.claude_code_driver import ClaudeCodeDriver
 
-        # Workspace must exist — capture writes .session_id into it.
         rec = _make_record()
         ws = tmp_path / rec.id
         ws.mkdir()
-
-        # Pre-populate the s6-log with a system_init line. The capture
-        # task tails the file via _tail_file (same primitive as
-        # _capture_url) so pre-existing content is read on startup.
-        log = tmp_path / "log"
+        projects = self._projects_dir(ws)
+        projects.mkdir(parents=True)
         sid = "8ab67de0-1234-5678-9abc-def012345678"
-        log.write_text(
-            "boot...\n"
-            f"system_init model=claude-opus-4-7 session_id={sid}\n"
-            "more...\n",
+        (projects / f"{sid}.jsonl").write_text(
+            '{"type":"system_init","session_id":"' + sid + '"}\n',
             encoding="utf-8",
         )
 
@@ -342,9 +354,7 @@ class TestSessionIdCapture:
             persist_session_id=fake_persist,
         )
 
-        task = asyncio.create_task(
-            drv._capture_session_id(rec, log_path=str(log))
-        )
+        task = asyncio.create_task(drv._capture_session_id(rec))
         await asyncio.sleep(0.3)
         task.cancel()
         try:
@@ -363,23 +373,19 @@ class TestSessionIdCapture:
             f"with (engagement_id, session_id); got {persisted!r}"
         )
 
-    async def test_ignores_subsequent_session_id_lines(self, tmp_path):
-        """Only the FIRST session_id is captured per engagement — the SDK
-        emits the same id at every assistant turn boundary, but we must
-        not thrash ``.session_id`` and waste persist_session_id calls."""
+    async def test_waits_for_projects_dir_to_appear(self, tmp_path):
+        """Projects dir does not exist at watcher start (claude CLI has
+        not spawned yet — there is a small window between s6 starting
+        the service and the CLI writing its first jsonl). Watcher polls
+        until the directory + file appear.
+        """
         from drivers.claude_code_driver import ClaudeCodeDriver
 
         rec = _make_record()
         ws = tmp_path / rec.id
         ws.mkdir()
-        log = tmp_path / "log"
-        sid_a = "11111111-2222-3333-4444-555555555555"
-        sid_b = "66666666-7777-8888-9999-aaaaaaaaaaaa"  # ignored
-        log.write_text(
-            f"system_init session_id={sid_a}\n"
-            f"system_init session_id={sid_b}\n",
-            encoding="utf-8",
-        )
+        projects = self._projects_dir(ws)
+        # Don't create projects yet — let the watcher poll.
 
         persisted: list[tuple[str, str]] = []
 
@@ -394,9 +400,60 @@ class TestSessionIdCapture:
             persist_session_id=fake_persist,
         )
 
-        task = asyncio.create_task(
-            drv._capture_session_id(rec, log_path=str(log))
+        task = asyncio.create_task(drv._capture_session_id(rec))
+
+        # Claude CLI starts up after 0.2s and writes its jsonl.
+        await asyncio.sleep(0.2)
+        projects.mkdir(parents=True)
+        sid = "11111111-2222-3333-4444-555555555555"
+        (projects / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+
+        # Give the poller a beat to notice.
+        await asyncio.sleep(0.4)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert (ws / ".session_id").read_text(encoding="utf-8").strip() == sid
+        assert persisted == [(rec.id, sid)]
+
+    async def test_ignores_non_uuid_filenames(self, tmp_path):
+        """Watcher must only accept UUID-shaped filenames (claude CLI's
+        session files). Other files in the projects dir (logs, locks,
+        partial writes) must NOT be persisted as session_ids."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        rec = _make_record()
+        ws = tmp_path / rec.id
+        ws.mkdir()
+        projects = self._projects_dir(ws)
+        projects.mkdir(parents=True)
+        # Decoy files that look superficially like jsonl but are NOT
+        # valid UUIDs. The watcher must skip these.
+        (projects / "log.jsonl").write_text("{}\n", encoding="utf-8")
+        (projects / "lockfile.jsonl").write_text("{}\n", encoding="utf-8")
+
+        persisted: list[tuple[str, str]] = []
+
+        async def fake_persist(engagement_id: str, session_id: str) -> None:
+            persisted.append((engagement_id, session_id))
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            base_plugins_root=str(tmp_path),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="x",
+            persist_session_id=fake_persist,
         )
+
+        task = asyncio.create_task(drv._capture_session_id(rec))
+        await asyncio.sleep(0.3)
+
+        # Now drop in a real UUID-named file.
+        sid = "abcdef00-0000-0000-0000-000000000000"
+        (projects / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
         await asyncio.sleep(0.3)
         task.cancel()
         try:
@@ -404,23 +461,24 @@ class TestSessionIdCapture:
         except asyncio.CancelledError:
             pass
 
-        # First session_id wins; second one is ignored.
-        assert (ws / ".session_id").read_text(encoding="utf-8").strip() == sid_a
-        assert persisted == [(rec.id, sid_a)]
+        # The decoy files were ignored; the UUID-named file was captured.
+        assert (ws / ".session_id").read_text(encoding="utf-8").strip() == sid
+        assert persisted == [(rec.id, sid)]
 
     async def test_atomic_write_via_temp_rename(self, tmp_path):
-        """A partial-write crash mid-tail must NOT leave a half-written
+        """A partial-write crash must NOT leave a half-written
         ``.session_id`` that a subsequent boot-replay would feed to
-        ``claude --resume <truncated>``. Verify the writer uses
-        temp+rename atomicity."""
+        ``claude --resume <truncated>``. Verify temp+rename atomicity
+        (no leftover ``.session_id.tmp`` in workspace)."""
         from drivers.claude_code_driver import ClaudeCodeDriver
 
         rec = _make_record()
         ws = tmp_path / rec.id
         ws.mkdir()
-        log = tmp_path / "log"
-        sid = "abcdef00-0000-0000-0000-000000000000"
-        log.write_text(f"system_init session_id={sid}\n", encoding="utf-8")
+        projects = self._projects_dir(ws)
+        projects.mkdir(parents=True)
+        sid = "deadbeef-0000-0000-0000-000000000000"
+        (projects / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
 
         drv = ClaudeCodeDriver(
             engagements_root=str(tmp_path),
@@ -430,9 +488,7 @@ class TestSessionIdCapture:
             persist_session_id=None,  # None tolerated — no registry hook in test
         )
 
-        task = asyncio.create_task(
-            drv._capture_session_id(rec, log_path=str(log))
-        )
+        task = asyncio.create_task(drv._capture_session_id(rec))
         await asyncio.sleep(0.3)
         task.cancel()
         try:
@@ -440,11 +496,8 @@ class TestSessionIdCapture:
         except asyncio.CancelledError:
             pass
 
-        # No leftover temp file from atomic-write pattern.
         leftovers = [p.name for p in ws.iterdir() if p.name.startswith(".session_id")]
         assert ".session_id" in leftovers
-        # Implementation may use a temp like .session_id.tmp; if so, it
-        # must be renamed (not left behind).
         tmp_leftovers = [n for n in leftovers if n != ".session_id"]
         assert tmp_leftovers == [], (
             f"atomic-write temp file leaked into workspace: {tmp_leftovers!r}"

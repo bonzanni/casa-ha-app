@@ -419,6 +419,190 @@ class TestEngageExecutorReal:
         assert payload["status"] == "pending"
 
 
+class TestDuplicateTaskGuard:
+    """P32 (v0.37.10): tool-level guard against engage_executor
+    cumulative-context bleed. When a back-to-back assistant turn fires
+    a duplicate engage_executor call (re-emitting the prior turn's
+    task), the second call must be refused with kind=duplicate_task.
+
+    Live evidence: docs/bug-review-2026-05-14-exploration6.md::O-6 —
+    Ellen's O-6.2 turn fired two engage_executor calls in a single
+    assistant message; the first carried the O-6.1 rename task.
+
+    The guard uses Jaccard word similarity against the most-recent
+    engagement for the same (channel, chat_id) within a 60s window.
+    Computed in tools.py over the real engagement_registry, so this
+    test uses a real registry (not MagicMock).
+    """
+
+    async def _real_registry(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+        return EngagementRegistry(
+            tombstone_path=str(tmp_path / "engagements.json"), bus=None,
+        )
+
+    async def _setup_with_real_registry(
+        self, tmp_path, monkeypatch, *, prompt="t",
+    ):
+        from tools import engage_executor, init_tools
+        import agent as agent_mod
+
+        registry = await self._real_registry(tmp_path)
+
+        defn = _mock_executor_def()
+        # Real prompt file so build path doesn't crash.
+        p = tmp_path / "prompt.md"
+        p.write_text(prompt)
+        defn.prompt_template_path = str(p)
+
+        exec_reg = MagicMock()
+        exec_reg.get = MagicMock(return_value=defn)
+        exec_reg.list_types = MagicMock(return_value=["configurator"])
+
+        channel = MagicMock()
+        channel.engagement_supergroup_id = -100123
+        channel.engagement_permission_ok = True
+        channel.open_engagement_topic = AsyncMock(return_value=42)
+        channel.bot = MagicMock()
+        channel.bot.edit_forum_topic = AsyncMock()
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=registry,
+            executor_registry=exec_reg,
+        )
+        monkeypatch.setattr(
+            agent_mod, "active_engagement_driver",
+            MagicMock(start=AsyncMock()), raising=False,
+        )
+        return engage_executor, registry, channel
+
+    async def test_distinct_tasks_both_succeed(self, tmp_path, monkeypatch):
+        """Sanity: two engage_executor calls with non-overlapping tasks
+        in the same channel/session must both succeed."""
+        import agent as agent_mod
+        engage_executor, registry, _ = await self._setup_with_real_registry(
+            tmp_path, monkeypatch,
+        )
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r1 = await engage_executor.handler({
+                "executor_type": "configurator",
+                "task": "rename the agent name from its current value to Ellen-A and back",
+                "context": "",
+            })
+            r2 = await engage_executor.handler({
+                "executor_type": "configurator",
+                "task": "build a brand new repo for the casa probe artifact bundle",
+                "context": "",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        p1 = json.loads(r1["content"][0]["text"])
+        p2 = json.loads(r2["content"][0]["text"])
+        assert p1["status"] == "pending"
+        assert p2["status"] == "pending"
+        # Both engagements landed in the registry.
+        assert len(registry._records) == 2
+
+    async def test_duplicate_task_blocked(self, tmp_path, monkeypatch):
+        """The load-bearing case: a back-to-back duplicate task is
+        refused with kind=duplicate_task. Two configurator spawns with
+        near-identical task text must result in exactly one engagement
+        in the registry; the second returns is_error=True."""
+        import agent as agent_mod
+        engage_executor, registry, _ = await self._setup_with_real_registry(
+            tmp_path, monkeypatch,
+        )
+        task1 = (
+            "rename the agent name from its current value to Ellen-A and "
+            "then back to the default"
+        )
+        # Near-duplicate (identical lead, slight phrasing variation) —
+        # the bleed pattern observed live in exploration6.
+        task2 = (
+            "rename the agent name from its current value to Ellen-A and "
+            "then back to the default value"
+        )
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r1 = await engage_executor.handler({
+                "executor_type": "configurator",
+                "task": task1, "context": "",
+            })
+            r2 = await engage_executor.handler({
+                "executor_type": "configurator",
+                "task": task2, "context": "",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        p1 = json.loads(r1["content"][0]["text"])
+        p2 = json.loads(r2["content"][0]["text"])
+        assert p1["status"] == "pending"
+        assert p2["status"] == "error", (
+            f"second engage_executor with duplicate task must be refused, "
+            f"got {p2!r}"
+        )
+        assert p2["kind"] == "duplicate_task"
+        # MCP envelope must carry is_error=True so sdk_logging emits ok=False.
+        assert r2.get("is_error") is True
+        # Exactly one engagement landed.
+        assert len(registry._records) == 1
+
+    async def test_other_channel_does_not_block(self, tmp_path, monkeypatch):
+        """A duplicate task in a DIFFERENT channel must not block the
+        new spawn. Cross-channel isolation."""
+        import agent as agent_mod
+        engage_executor, registry, _ = await self._setup_with_real_registry(
+            tmp_path, monkeypatch,
+        )
+        task = (
+            "rename the agent name from its current value to Ellen-A and "
+            "then back to the default"
+        )
+        token1 = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r1 = await engage_executor.handler({
+                "executor_type": "configurator",
+                "task": task, "context": "",
+            })
+        finally:
+            agent_mod.origin_var.reset(token1)
+
+        # Different channel — guard must not block.
+        token2 = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "discord",
+            "chat_id": "c1", "cid": "y", "user_text": "hi",
+        })
+        try:
+            r2 = await engage_executor.handler({
+                "executor_type": "configurator",
+                "task": task, "context": "",
+            })
+        finally:
+            agent_mod.origin_var.reset(token2)
+
+        p1 = json.loads(r1["content"][0]["text"])
+        p2 = json.loads(r2["content"][0]["text"])
+        assert p1["status"] == "pending"
+        assert p2["status"] == "pending"
+        assert len(registry._records) == 2
+
+
 class TestEngageExecutorClaudeCode:
     @pytest.mark.skip(reason="TODO(Phase G): Full wiring test — covered by D-block E2E")
     async def test_dispatches_to_claude_code_driver(self, monkeypatch, tmp_path):

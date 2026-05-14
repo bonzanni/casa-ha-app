@@ -171,6 +171,45 @@ class EngagementRegistry:
         rec_id = self._topic_index.get(topic_id)
         return self._records.get(rec_id) if rec_id else None
 
+    def recent_for_origin(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        max_age_s: float,
+        now: float | None = None,
+    ) -> EngagementRecord | None:
+        """P32 (v0.37.10): return the most-recent engagement (by
+        ``started_at``) for this ``(channel, chat_id)`` started within
+        the last ``max_age_s`` seconds, regardless of status.
+
+        Includes completed / cancelled / errored engagements that are
+        still resident in memory — the tombstone drops them on
+        terminal-state transitions but ``_records`` retains until the
+        process exits. The duplicate-task guard at the
+        ``engage_executor`` call site uses this to refuse spawns that
+        overlap with whichever task was spawned last.
+
+        ``chat_id`` is coerced via ``str()`` for the compare; channel
+        adapters may store the value as int (telegram) or str.
+        """
+        if now is None:
+            now = time.time()
+        cutoff = now - max_age_s
+        candidates: list[EngagementRecord] = []
+        for rec in self._records.values():
+            if rec.origin.get("channel", "") != channel:
+                continue
+            if str(rec.origin.get("chat_id", "")) != chat_id:
+                continue
+            if rec.started_at < cutoff:
+                continue
+            candidates.append(rec)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda r: r.started_at, reverse=True)
+        return candidates[0]
+
     # -- Persist helper ---------------------------------------------------
 
     async def _write_tombstone_locked(self) -> None:

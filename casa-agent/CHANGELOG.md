@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.37.10] - 2026-05-14 — Hotfix bundle: P31 + P32
+
+Closes the 2 regressions filed in `docs/bug-review-2026-05-14-exploration6.md`
+(one MEDIUM, one LOW) when 3 of 5 v0.37.9 fixes verified clean but
+O-5 + O-6 were re-opened as P31 + P32.
+
+### Fixed
+
+- **MEDIUM P31: claude_code session_id is now captured reliably.** The
+  v0.37.9 O-5 fix tailed `/var/log/casa-engagement-<id>/current` but
+  that log file is never created in production — the s6-rc service
+  dir's `log/` subdir lacks the `producer-for` / `consumer-for`
+  wiring required to compile the producer-consumer pipe, so claude
+  CLI's stdout goes to a pipe with no reader. Latent infrastructure
+  gap since v0.13.0 Plan 4a. Live evidence: 2026-05-14 exploration6
+  engagements `28fdeb04` + `3e44c2cf` — `.session_id` never written,
+  `/var/log/casa-engagement-<id>/` never exists, post-restart claude
+  CLI runs as a fresh SDK session. Fix:
+  `ClaudeCodeDriver._capture_session_id` now watches the claude CLI's
+  own session storage at
+  `<ws>/.home/.claude/projects/-data-engagements-<id>/<uuid>.jsonl`
+  — that file IS reliably written, and the filename (minus `.jsonl`)
+  IS the session UUID. Persists atomically to `<ws>/.session_id`. The
+  deeper s6-rc producer-consumer wiring fix that would also unlock
+  Phase 4b G5 log relay + remote-control URL notice is backlogged
+  for a v0.38.x design pass.
+- **LOW P32: engage_executor now refuses duplicate-task spawns at the
+  tool layer.** The v0.37.9 O-6 fix added a prompt section forbidding
+  context bleed but the SDK conversation context's natural inertia to
+  re-emit the prior turn's task overpowered it. Live evidence:
+  2026-05-14 exploration6 O-6.2 turn — Ellen fired TWO `engage_executor`
+  calls in one assistant message, the first a wrong configurator with
+  `context="Probe O-6.1"` running the prior turn's rename task.
+  Fix: a new `_jaccard_task_similarity` helper at the `engage_executor`
+  MCP call site refuses spawns whose `task=` overlaps with the
+  most-recent engagement for this `(channel, chat_id)` within 60s at
+  word-level Jaccard ≥ 0.5. The refused envelope carries
+  `kind: duplicate_task` with the offending engagement's id so the
+  caller knows what to do. The v0.37.9 prompt section is retained as
+  documentation but its strong-claim anchors ("ONLY", "Do not carry",
+  "fire two separate engage_executor calls") are softened — the
+  tool-level guard is the real enforcement, prompt is advisory.
+  New `EngagementRegistry.recent_for_origin` query method.
+
+### Tests
+
+- 9 new tests (+2 driver session-id, +5 registry `recent_for_origin`,
+  +3 engage_executor duplicate-task guard). v0.37.9 session-id capture
+  tests rewritten for the new projects-dir watch approach.
+
+### Notes
+
+- The 3 v0.37.9 fixes that verified clean in exploration6 (O-1, O-2a,
+  O-2b) are unchanged. O-3 (cross-channel memory) remains deferred
+  to v0.38.0.
+- Latent infrastructure gap: Phase 4b G5 "claude_code log relay"
+  (`_relay_log_lines`) and "Remote control URL" topic notice
+  (`_capture_url`) are also non-functional in production due to the
+  same s6-rc producer-consumer wiring gap. Both backlogged with P31
+  Option A for a v0.38.x design pass.
+
 ## [0.37.9] - 2026-05-14 — Hotfix bundle: O-1 + O-2a + O-2b + O-4 + O-5 + O-6
 
 Closes 5 findings from `docs/bug-review-2026-05-14-p21-p30.md` (one

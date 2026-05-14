@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -1368,6 +1369,34 @@ async def casa_restart_supervised(_: dict) -> dict:
 # engage_executor — Plan 3 real impl (configurator + future Tier 3 types)
 # ---------------------------------------------------------------------------
 
+# P32 (v0.37.10): duplicate-task guard. Refuses a new engage_executor
+# spawn whose ``task=`` overlaps with the most-recent engagement in the
+# same channel/chat_id within ``_DUPLICATE_TASK_MAX_AGE_S`` seconds at a
+# word-level Jaccard >= ``_DUPLICATE_TASK_JACCARD_THRESHOLD``. Guards
+# against the cumulative-context bleed pattern observed in
+# ``docs/bug-review-2026-05-14-exploration6.md::O-6``: Ellen's
+# back-to-back tool calls re-emitting a prior turn's task as a stale
+# second engage_executor argument.
+_DUPLICATE_TASK_JACCARD_THRESHOLD = 0.5
+_DUPLICATE_TASK_MAX_AGE_S = 60.0
+_TASK_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _task_tokens(text: str) -> set[str]:
+    return set(_TASK_TOKEN_RE.findall((text or "").lower()))
+
+
+def _jaccard_task_similarity(a: str, b: str) -> float:
+    """Word-level Jaccard similarity on lowercased alphanumeric tokens.
+
+    Returns 0.0 for empty inputs. Used by the P32 duplicate-task guard
+    at the ``engage_executor`` MCP call site.
+    """
+    ta, tb = _task_tokens(a), _task_tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
 
 async def _fetch_executor_archive(
     *, memory_provider, channel: str, chat_id: str,
@@ -1482,6 +1511,45 @@ async def engage_executor(args: dict) -> dict:
             "message": ("set telegram_engagement_supergroup_id in addon "
                         "options and verify the bot has can_manage_topics"),
         })
+
+    # P32 (v0.37.10): refuse duplicate-task spawns. Compare against the
+    # most-recent engagement for the same channel/chat_id within the
+    # last _DUPLICATE_TASK_MAX_AGE_S seconds; if word-level Jaccard
+    # overlap >= _DUPLICATE_TASK_JACCARD_THRESHOLD, return an error
+    # envelope. Guards against the cumulative-context bleed pattern
+    # observed in bug-review-2026-05-14-exploration6.md::O-6 (back-to-back
+    # Ellen turns re-emitting the prior turn's task). isinstance check
+    # falls through gracefully when the registry is a MagicMock in unit
+    # tests; production callers always pass a real EngagementRegistry.
+    if _engagement_registry is not None and hasattr(
+        _engagement_registry, "recent_for_origin",
+    ):
+        try:
+            prior = _engagement_registry.recent_for_origin(
+                channel=origin.get("channel", "telegram"),
+                chat_id=str(origin.get("chat_id", "")),
+                max_age_s=_DUPLICATE_TASK_MAX_AGE_S,
+            )
+        except Exception as exc:  # noqa: BLE001 — defensive in mock-driven tests
+            logger.debug("recent_for_origin lookup skipped: %s", exc)
+            prior = None
+        if isinstance(prior, EngagementRecord):
+            sim = _jaccard_task_similarity(prior.task, task_text)
+            if sim >= _DUPLICATE_TASK_JACCARD_THRESHOLD:
+                age_s = int(time.time() - prior.started_at)
+                return _result({
+                    "status": "error", "kind": "duplicate_task",
+                    "message": (
+                        f"engage_executor refused: task overlaps with "
+                        f"engagement {prior.id[:8]} "
+                        f"({prior.role_or_type}, started {age_s}s ago) "
+                        f"at Jaccard {sim:.2f} >= "
+                        f"{_DUPLICATE_TASK_JACCARD_THRESHOLD}. "
+                        f"You may be re-emitting a prior turn's task. "
+                        f"If you mean a new task, narrow the task= text. "
+                        f"If you mean to retry, /cancel {prior.id[:8]} first."
+                    ),
+                })
 
     # E-12 (v0.37.0) + v0.37.1 D-1: U3 state-encoded topic title.
     # ``<state-emoji> <concise task>`` per spec §6.3 — the role icon
