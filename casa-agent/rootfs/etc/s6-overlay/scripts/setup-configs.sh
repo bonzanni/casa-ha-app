@@ -423,6 +423,24 @@ fi
 unset CC_OAUTH
 # === claude-oauth-token: end ====================================
 
+# === claude-home-propagation: begin =============================
+# H-1 (v0.37.8): propagate HOME=cc-home to every s6-supervised
+# service + child subprocess. K-1 (v0.34.1) lesson — a shell-level
+# `export HOME=...` (line 322) only governs setup-configs.sh's own
+# `claude plugin marketplace add` / `claude plugin enable` calls.
+# casa-main and svc-casa-mcp boot with HOME=/root unless we write
+# to /run/s6/container_environment/. Without this, any claude
+# binary subprocess spawned from casa-main (install_casa_plugin
+# and the three marketplace_* MCP tools in tools.py) reads
+# /root/.claude/plugins/known_marketplaces.json (empty) instead
+# of cc-home's, breaking plugin install. Configurator papered
+# over it by improvising a `claude plugin marketplace add` Bash
+# call mid-engagement — see bug-review-2026-05-13-exploration4.md::H-1.
+printf '%s' "/addon_configs/casa-agent/cc-home" \
+    > /run/s6/container_environment/HOME
+bashio::log.info "HOME propagated to s6 services: /addon_configs/casa-agent/cc-home"
+# === claude-home-propagation: end ===============================
+
 # === seed-copy: begin ===========================================
 # v0.14.9: replace the boot install loop with a no-network seed copy.
 # /opt/claude-seed/ is image-baked at Dockerfile build time and contains
