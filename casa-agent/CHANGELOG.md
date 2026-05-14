@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.37.11] - 2026-05-14 — Hotfix: DE-1 e2e harness shape mismatch
+
+Surgical hotfix for the master-CI tier2-functional / Delegation E-block
+failure that has been red since v0.37.9 (PR #61, run 25871932172) and
+remained red after v0.37.10 (PR #62, run 25880387018). No product change.
+
+### Fixed
+
+- **DE-1 e2e harness: tuple-destructure `load_all_specialists` return
+  value.** v0.37.9's O-2b fix promoted `load_all_specialists`'s return
+  shape from `dict[str, AgentConfig]` to `tuple[dict, list]` (per-
+  specialist isolation, mirroring v0.37.1 B-1b's `load_all_executors`
+  pattern). Product callers (`casa_core.py`, `agent_registry.py`) were
+  updated; the DE-1 e2e harness was missed. Result: every master CI run
+  since v0.37.9 failed with `ValueError: dictionary update sequence
+  element #0 has length 1; 2 is required` at `merged.update(
+  specialist_configs)`. Filed 2026-05-14 in
+  `docs/bug-review-2026-05-14-exploration7.md`. One-line fix at
+  `test-local/e2e/test_delegation_E.sh:93`:
+  `specialist_configs, _failed = load_all_specialists(...)`.
+
+### Notes
+
+- This is a test-harness fix only. Product code on master has been
+  correct since v0.37.9; production (N150) ran healthy on 0.37.10
+  through exploration7's operator-attended verifies (P31 + P32 + O-1
+  all GREEN end-to-end). Not reverted per `feedback_ship_gate_doctrine`
+  "revert if red" because reverting v0.37.9 + v0.37.10 would lose 7
+  real bug fixes for a 1-line test-script issue.
+
 ## [0.37.10] - 2026-05-14 — Hotfix bundle: P31 + P32
 
 Closes the 2 regressions filed in `docs/bug-review-2026-05-14-exploration6.md`

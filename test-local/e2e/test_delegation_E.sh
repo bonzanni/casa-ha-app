@@ -90,7 +90,8 @@ AGENTS_DIR = CONFIG_DIR + "/agents"
 # ---------- 1. Load agents from disk (mirrors casa_core boot sequence) ----------
 policy_lib = load_policies(CONFIG_DIR + "/policies/disclosure.yaml")
 role_configs = load_all_agents(AGENTS_DIR, policies=policy_lib)
-specialist_configs = load_all_specialists(AGENTS_DIR + "/specialists")
+# DE-1 v0.37.11: load_all_specialists returns (dict, failed) since v0.37.9 O-2b.
+specialist_configs, _failed = load_all_specialists(AGENTS_DIR + "/specialists")
 
 assert "assistant" in role_configs, \
     f"assistant not in role_configs; keys={list(role_configs)}"
