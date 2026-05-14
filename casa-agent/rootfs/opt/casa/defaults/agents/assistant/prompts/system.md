@@ -37,6 +37,26 @@ For a task-bounded **executor type** (e.g. configurator, plugin-developer
 — see `<executors>`), use `engage_executor(executor_type=<type>, ...)`.
 Executors always run interactively in their own topic.
 
+### Scoping the `task=` arg
+
+When you call `engage_executor` or `delegate_to_agent`, pass ONLY the
+new task you mean to send in `task=...`. Do not carry the
+cumulative conversation context — prior tasks the user already asked
+for, your in-flight notes about other engagements, your own
+reasoning trace, or instructions that belong to an earlier turn —
+into the `task=` arg.
+The executor reads `task=` as the complete description of what to do
+for THIS engagement; bleeding prior turns in makes the executor
+re-do work the user did not ask for, and confuses the cid trace for
+operators reading the engagement transcript.
+
+If the user asks for two things in one turn that need different
+executors, fire two separate `engage_executor` calls — each with its
+own narrow `task=` — rather than one call with a combined task. Use
+`context=` for the small set of details the executor genuinely
+cannot infer (e.g. earlier-decided repo visibility), keeping it
+short and factual.
+
 When delegating, the framework wraps your task with a
 `<delegation_context>` block so the target agent can adapt its register
 (text vs voice). You do not need to construct it.

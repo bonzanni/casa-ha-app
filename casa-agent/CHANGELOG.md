@@ -1,5 +1,79 @@
 # Changelog
 
+## [0.37.9] - 2026-05-14 — Hotfix bundle: O-1 + O-2a + O-2b + O-4 + O-5 + O-6
+
+Closes 5 findings from `docs/bug-review-2026-05-14-p21-p30.md` (one
+MEDIUM, four LOW). O-3 (cross-channel memory) is deferred to a v0.38.0
+brainstorm — it's an architectural design choice, not a hotfix.
+
+### Fixed
+
+- **MEDIUM O-5: claude_code engagements now survive Casa restarts.**
+  Boot-replay used to restore the s6 service but lose conversation
+  context — the run script's `--resume $(cat .session_id)` plumbing
+  shipped without a writer, so every restart spawned the CLI fresh.
+  Live evidence: 2026-05-14 P25 cid `7a9cba59` — engagement `44389d8a`
+  zombied for 7 minutes after a mid-engagement Casa restart.
+  Fix: `ClaudeCodeDriver._capture_session_id` tails the per-engagement
+  s6-log for `system_init session_id=<uuid>`, persists it atomically
+  to `<workspace>/.session_id` (temp+os.replace), and invokes the
+  `persist_session_id` callback so `EngagementRecord.sdk_session_id`
+  stays in lockstep with the on-disk file. `casa_core` now wires
+  `engagement_registry.persist_session_id` into the driver constructor.
+- **LOW O-1: install/uninstall plugin failures now surface as MCP errors.**
+  `_result()` auto-detected `is_error` only when `payload["status"] ==
+  "error"`, so the `{"ok": False, "error": ...}` envelope used by
+  `install_casa_plugin` and `uninstall_casa_plugin` landed as `ok=True`
+  in `sdk_logging.log_tool_result` telemetry — contradicting F-7
+  v0.32.0 intent. Extended the auto-detect to also recognise
+  `payload.get("ok") is False`. Live evidence: 2026-05-14 P29.1 cid
+  `52240634` saw `tool_result name=install_casa_plugin ok=True ms=12594`
+  for a plugin-not-in-marketplace failure.
+- **LOW O-2a: `--scope=executors` now refreshes residents' cached
+  prompts.** `reload_executors` previously only called
+  `executor_registry.load()`, leaving residents with a stale
+  `<executors>` system-prompt block (rendered from
+  `self.config.executors` at construct_agent time). Fan-out to
+  `reload_agent` for each resident regenerates that state. Live
+  evidence: 2026-05-14 P22 row5b — Ellen said "No" to "is pd enabled?"
+  between an executor-scope reload and the next agent-scope reload.
+- **LOW O-2b: specialist load failures now surface in casactl output.**
+  `agent_loader.load_all_specialists` returns `(found, failed)` with
+  per-specialist isolation (mirroring `load_all_executors` v0.37.1
+  B-1b), `SpecialistRegistry.load_failures()` exposes them, and
+  `reload_agents` appends `failed:<role>:<msg>` entries to the action
+  trail. Pre-fix, a malformed new specialist returned `ok=True` with no
+  trace — operator had to grep addon logs. Live evidence: 2026-05-14
+  P22 row 4 first attempt — probe22 missing `response_shape.yaml` +
+  `voice.yaml`, reload returned `ok=True`.
+- **LOW O-4: playbook P21 step 2 reworded.** Engagement subprocesses
+  have workspace-scoped HOME by design (per `drivers/workspace.py`
+  `render_run_script` template). The H-1 verify path is `casa-main` +
+  `svc-casa-mcp` `/proc/<pid>/environ`, NOT the engagement subprocess.
+  Updated `docs/exploration-playbook/blocks/G-lifecycle.md`.
+- **LOW O-6: Ellen now scopes engage_executor `task=` to the new task.**
+  Prompt section added to `defaults/agents/assistant/prompts/system.md`
+  forbidding context bleed from prior conversation turns into the
+  `task=` arg. Live evidence: 2026-05-14 P27.2 cid `093a02c7` — Ellen
+  spawned BOTH configurator AND pd in one turn, the configurator
+  engagement received P27.1's rename task description instead of
+  P27.2's repo creation task.
+
+### Tests
+
++9 vs v0.37.8 baseline (1514 → 1523 PASS):
+- `test_install_casa_plugin.py::test_install_plugin_failure_envelope_is_error`
+- `test_reload.py::TestExecutorsScope::test_executors_scope_fans_out_to_residents`
+- `test_reload.py::TestReloadAgents::test_surfaces_specialist_load_failures`
+- `test_agent_loader.py::TestLoadAllSpecialists::test_per_specialist_isolation`
+- `test_claude_code_driver.py::TestSessionIdCapture` (3 tests)
+- `test_workspace.py::test_render_run_script_consumes_persisted_session_id`
+- `test_assistant_prompts.py::test_system_prompt_forbids_engage_executor_context_bleed`
+
+Existing `test_specialist_registry.py::test_rejects_non_empty_channels`
+and `test_agent_loader.py::TestLoadAllSpecialists::test_finds_specialist`
+updated for the new per-specialist isolation contract.
+
 ## [0.37.8] - 2026-05-14 — Hotfix: H-1 (HOME propagation) + N-1 (playbook 7-scope fix)
 
 Closes the two findings from `docs/bug-review-2026-05-13-exploration4.md`:

@@ -539,6 +539,63 @@ class TestReloadAgents:
         assert "tina" not in runtime.agents
         runtime.bus.unregister.assert_any_call("tina")
 
+    async def test_surfaces_specialist_load_failures(
+        self, tmp_path, monkeypatch,
+    ):
+        """O-2b (v0.37.9): when a specialist directory fails to load
+        (e.g. missing required file), reload_agents must surface the
+        failure in the returned actions list. Pre-v0.37.9 the registry
+        swallowed LoadError via logger.error and reload returned
+        ok=True with no trace of the failed specialist — operators
+        running ``casactl reload --scope=agents`` had no way to know
+        their new specialist did not land without grepping addon logs.
+
+        Live evidence: 2026-05-14 P22 row 4 first attempt — probe22
+        specialist missing response_shape.yaml + voice.yaml, registry
+        logged ERROR but reload returned ok=True.
+        """
+        from reload import dispatch, register_handler, reload_agents
+        register_handler("agents", reload_agents)
+
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "ellen").mkdir()
+        specialists_dir = agents_dir / "specialists"
+        specialists_dir.mkdir()
+        (specialists_dir / "broken").mkdir()  # no files — load will fail
+
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: MagicMock(role="ellen"))
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {"ellen": MagicMock()}
+        runtime.agents = {"ellen": MagicMock()}
+
+        # Real registry behavior: load() catches per-specialist LoadError
+        # and records it as a load failure. The stub mimics this contract.
+        runtime.specialist_registry.load = MagicMock()
+        runtime.specialist_registry.all_configs = MagicMock(return_value={})
+        runtime.specialist_registry.load_failures = MagicMock(return_value=[
+            ("broken", "missing required file(s): ['runtime.yaml']"),
+        ])
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        # Action trail must include a failed:<role>:<msg> entry.
+        failed_actions = [
+            a for a in result["actions"] if a.startswith("failed:")
+        ]
+        assert failed_actions, (
+            f"reload_agents must surface specialist load failures in "
+            f"actions; got {result['actions']!r}"
+        )
+        assert any("broken" in a for a in failed_actions)
+        assert any("runtime.yaml" in a for a in failed_actions)
+
 
 class TestReloadFull:
     async def test_calls_other_handlers_in_order(self, monkeypatch):
@@ -612,8 +669,59 @@ class TestExecutorsScope:
         result = await dispatch("executors", runtime=runtime)
         assert result["status"] == "ok"
         assert result["scope"] == "executors"
+        # O-2a (v0.37.9): rebuild_executor_registry is first; per-resident
+        # reload_agent fan-out follows so cached system-prompt state
+        # regenerates. role_configs is empty in this fixture, so the only
+        # action remains the registry rebuild.
         assert result["actions"] == ["rebuild_executor_registry"]
         runtime.executor_registry.load.assert_called_once()
+
+    async def test_executors_scope_fans_out_to_residents(self, monkeypatch):
+        """O-2a (v0.37.9): after rebuilding the executor registry,
+        reload_executors must call ``reload_agent`` for each resident so
+        the resident's cached ``<executors>`` system-prompt block (built
+        from a snapshot at construct_agent time) regenerates. Without
+        this, an operator who flips ``enabled: true`` on a previously-
+        disabled executor and runs ``casactl reload --scope=executors``
+        sees the registry rebuild but Ellen's prompt block stays stale
+        until the next ``--scope=agent`` fires.
+
+        Live evidence: 2026-05-14 P22 row5b — Ellen replied "No" to
+        "is plugin-developer enabled?" between an executor scope reload
+        and the next agent-scope reload, contradicting the live
+        registry state.
+        """
+        from reload import dispatch
+        import reload as reload_mod
+
+        # Stub the executors handler so it just records and returns the
+        # registry-rebuild action; we want to assert the fan-out shape
+        # at the dispatcher level, not re-run executor_registry.load.
+        runtime = _make_runtime()
+        runtime.role_configs = {"assistant": MagicMock(), "butler": MagicMock()}
+
+        fan_out_calls: list[str] = []
+
+        async def fake_agent(rt, role=None):
+            fan_out_calls.append(role)
+            return ["load_config", "construct_agent", "reregister_bus"]
+
+        monkeypatch.setitem(reload_mod._HANDLERS, "agent", fake_agent)
+        runtime.executor_registry.load = MagicMock()
+
+        result = await dispatch("executors", runtime=runtime)
+
+        assert result["status"] == "ok"
+        # Each resident must have been refreshed.
+        assert sorted(fan_out_calls) == ["assistant", "butler"]
+        # Action trail surfaces the per-resident sub-actions with prefix.
+        assert "rebuild_executor_registry" in result["actions"]
+        for role in ("assistant", "butler"):
+            for sub in ("load_config", "construct_agent", "reregister_bus"):
+                assert f"agent:{role}:{sub}" in result["actions"], (
+                    f"expected agent:{role}:{sub} in actions, got "
+                    f"{result['actions']!r}"
+                )
 
     async def test_executors_scope_registry_raises_becomes_load_error(self):
         from reload import dispatch

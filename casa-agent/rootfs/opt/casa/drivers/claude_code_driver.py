@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -21,8 +22,22 @@ from engagement_registry import EngagementRecord
 
 logger = logging.getLogger(__name__)
 _URL_REGEX = re.compile(r"Remote Control URL:\s+(https?://\S+)")
+# O-5 (v0.37.9): match `system_init session_id=<uuid>` (Casa-side
+# sdk_logging format) AND JSON-shaped variants the claude CLI emits on
+# stdout. The capture group lifts the UUID itself; the rest of the
+# regex is intentionally permissive to absorb both `session_id=`,
+# `session_id: `, `"session_id":"…"`, and quoted forms.
+_SESSION_ID_REGEX = re.compile(
+    r'session_id["\s:=]+"?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}'
+    r'-[0-9a-f]{4}-[0-9a-f]{12})',
+    re.IGNORECASE,
+)
 
 TopicSender = Callable[[int, str], Awaitable[None]]
+SessionIdPersister = Callable[[str, str], Awaitable[None]]
+"""(engagement_id, session_id) → None — registry persist hook.
+
+Matches engagement_registry.persist_session_id's bound-method signature."""
 
 
 class ClaudeCodeDriver(DriverProtocol):
@@ -35,11 +50,13 @@ class ClaudeCodeDriver(DriverProtocol):
         base_plugins_root: str,
         send_to_topic: TopicSender,
         casa_framework_mcp_url: str,
+        persist_session_id: SessionIdPersister | None = None,
     ) -> None:
         self._engagements_root = engagements_root
         self._base_plugins_root = base_plugins_root
         self._send_to_topic = send_to_topic
         self._casa_framework_mcp_url = casa_framework_mcp_url
+        self._persist_session_id = persist_session_id
         # Per-engagement background tasks (URL capture, respawn poller).
         self._tasks: dict[str, list[asyncio.Task]] = {}
         self._last_turn_ts: dict[str, float] = {}
@@ -272,6 +289,13 @@ class ClaudeCodeDriver(DriverProtocol):
             # drivers' CLI subprocess output. Independent tailer — the
             # _capture_url task drops non-URL lines.
             asyncio.create_task(self._relay_log_lines(engagement, log_path=log_path)),
+            # O-5 (v0.37.9): capture the SDK session_id and persist it
+            # so the run-script's `--resume $(cat .session_id)` plumbing
+            # picks up after a Casa restart. Without this, mid-engagement
+            # restarts leave the engagement in a zombie state.
+            asyncio.create_task(
+                self._capture_session_id(engagement, log_path=log_path),
+            ),
         ]
 
     async def _capture_url(
@@ -333,6 +357,58 @@ class ClaudeCodeDriver(DriverProtocol):
                 "stdout %s", line.rstrip("\n"),
                 extra={"engagement_id": short},
             )
+
+    async def _capture_session_id(
+        self, engagement: EngagementRecord, *, log_path: str,
+    ) -> None:
+        """O-5 (v0.37.9): tail the per-engagement s6-log for the SDK's
+        ``system_init session_id=<sid>`` line and persist the UUID to
+        ``<workspace>/.session_id`` so a subsequent boot-replay's
+        ``--resume $(cat .session_id)`` flag carries the conversation
+        forward.
+
+        One-shot: returns after the first UUID-shaped session_id appears
+        in the log. The SDK emits the same id at every subsequent turn
+        boundary, but we already have it, and re-writing would risk
+        thrashing the file mid-CLI-read on the run script's resume path.
+        Re-spawns of the engagement on s6 restart see the persisted file
+        and resume cleanly — see ``engagement_run_template.sh``.
+
+        Atomic write: temp-file + ``os.replace`` so a Casa crash mid-
+        write cannot leave a half-truncated ``.session_id`` that the
+        run script would feed to ``claude --resume <truncated>``.
+        """
+        short = engagement.id[:8]
+        ws = Path(self._engagements_root) / engagement.id
+        target = ws / ".session_id"
+        tmp = ws / ".session_id.tmp"
+        async for line in _tail_file(log_path):
+            m = _SESSION_ID_REGEX.search(line)
+            if m is None:
+                continue
+            sid = m.group(1)
+            try:
+                tmp.write_text(sid + "\n", encoding="utf-8")
+                os.replace(tmp, target)
+            except OSError as exc:
+                logger.warning(
+                    "engagement %s session_id persist failed: %s",
+                    short, exc,
+                )
+                return
+            logger.info(
+                "engagement %s captured sdk session_id %s",
+                short, sid[:8],
+            )
+            if self._persist_session_id is not None:
+                try:
+                    await self._persist_session_id(engagement.id, sid)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "engagement %s persist_session_id callback failed: %s",
+                        short, exc,
+                    )
+            return
 
     async def _poll_respawns(
         self, engagement: EngagementRecord, *, interval_s: float = 5.0,

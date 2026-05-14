@@ -75,22 +75,39 @@ class SpecialistRegistry:
         self._tombstone_path = tombstone_path
         self._configs: dict[str, AgentConfig] = {}
         self._disabled_names: set[str] = set()
+        self._load_failures: list[tuple[str, str]] = []
         self._delegations: dict[str, DelegationRecord] = {}
         self._lock = asyncio.Lock()
 
     # -- Loading / validation -------------------------------------------------
 
     def load(self) -> None:
-        """Scan ``self._dir`` for specialist directories and register valid ones."""
+        """Scan ``self._dir`` for specialist directories and register valid ones.
+
+        O-2b (v0.37.9): per-specialist failures are tracked in
+        :attr:`_load_failures` (also retrievable via :meth:`load_failures`)
+        so :mod:`reload` can surface them to ``casactl`` callers. One
+        malformed specialist does not poison its siblings — see
+        :func:`agent_loader.load_all_specialists`.
+        """
         from agent_loader import LoadError, load_all_specialists
 
         self._configs.clear()
         self._disabled_names.clear()
+        self._load_failures = []
         try:
-            found = load_all_specialists(self._dir)
+            found, failed = load_all_specialists(self._dir)
         except LoadError as exc:
-            logger.error("Specialist load failed: %s", exc)
-            found = {}
+            # Collection-level error (e.g. non-directory under specialists/).
+            logger.error("Specialist load failed at collection level: %s", exc)
+            found, failed = {}, [("(collection)", str(exc))]
+
+        for name, err in failed:
+            logger.error(
+                "Specialist %r failed to load: %s; other specialists continue",
+                name, err,
+            )
+            self._load_failures.append((name, err))
 
         for role, cfg in found.items():
             if not self._validate_tier2_shape(cfg, role):
@@ -103,10 +120,20 @@ class SpecialistRegistry:
             logger.info("Specialist %r loaded (model=%s)", role, cfg.model)
 
         logger.info(
-            "Specialists: enabled=%s disabled=%s",
+            "Specialists: enabled=%s disabled=%s failed=%s",
             sorted(self._configs.keys()),
             sorted(self._disabled_names),
+            sorted(n for n, _ in self._load_failures),
         )
+
+    def load_failures(self) -> list[tuple[str, str]]:
+        """Return per-specialist load failures from the last :meth:`load`.
+
+        Defensive copy — callers cannot mutate registry state. Each entry
+        is ``(directory_name, error_message)``. Empty list means the last
+        load saw no per-specialist errors.
+        """
+        return list(self._load_failures)
 
     def _validate_tier2_shape(
         self, cfg: AgentConfig, role: str,

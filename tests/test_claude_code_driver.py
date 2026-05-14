@@ -295,6 +295,162 @@ class TestURLCapture:
         assert sender.await_count == 1
 
 
+class TestSessionIdCapture:
+    """O-5 (v0.37.9): capture the SDK session_id from s6-log and persist it
+    to ``<workspace>/.session_id`` so boot-replay's ``--resume`` plumbing
+    picks it up after a Casa restart.
+
+    Pre-v0.37.9 a mid-engagement Casa restart left UNDERGOING engagements
+    in zombie state: the s6 service respawned the claude CLI fresh
+    (``.session_id`` did not exist), so the user's "continue" message
+    landed on a CLI with no prior conversation context. Live evidence:
+    2026-05-14 P25.4 cid ``7a9cba59`` — engagement ``44389d8a`` had its
+    user turn delivered but no SDK tool_use lines fired in the 7 minutes
+    following.
+    """
+
+    async def test_writes_session_id_on_first_match(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        # Workspace must exist — capture writes .session_id into it.
+        rec = _make_record()
+        ws = tmp_path / rec.id
+        ws.mkdir()
+
+        # Pre-populate the s6-log with a system_init line. The capture
+        # task tails the file via _tail_file (same primitive as
+        # _capture_url) so pre-existing content is read on startup.
+        log = tmp_path / "log"
+        sid = "8ab67de0-1234-5678-9abc-def012345678"
+        log.write_text(
+            "boot...\n"
+            f"system_init model=claude-opus-4-7 session_id={sid}\n"
+            "more...\n",
+            encoding="utf-8",
+        )
+
+        persisted: list[tuple[str, str]] = []
+
+        async def fake_persist(engagement_id: str, session_id: str) -> None:
+            persisted.append((engagement_id, session_id))
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            base_plugins_root=str(tmp_path),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="x",
+            persist_session_id=fake_persist,
+        )
+
+        task = asyncio.create_task(
+            drv._capture_session_id(rec, log_path=str(log))
+        )
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        session_file = ws / ".session_id"
+        assert session_file.exists(), (
+            f".session_id file must be written to workspace dir "
+            f"({ws}); contents of dir: {list(ws.iterdir())}"
+        )
+        assert session_file.read_text(encoding="utf-8").strip() == sid
+        assert persisted == [(rec.id, sid)], (
+            f"persist_session_id callback must be invoked exactly once "
+            f"with (engagement_id, session_id); got {persisted!r}"
+        )
+
+    async def test_ignores_subsequent_session_id_lines(self, tmp_path):
+        """Only the FIRST session_id is captured per engagement — the SDK
+        emits the same id at every assistant turn boundary, but we must
+        not thrash ``.session_id`` and waste persist_session_id calls."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        rec = _make_record()
+        ws = tmp_path / rec.id
+        ws.mkdir()
+        log = tmp_path / "log"
+        sid_a = "11111111-2222-3333-4444-555555555555"
+        sid_b = "66666666-7777-8888-9999-aaaaaaaaaaaa"  # ignored
+        log.write_text(
+            f"system_init session_id={sid_a}\n"
+            f"system_init session_id={sid_b}\n",
+            encoding="utf-8",
+        )
+
+        persisted: list[tuple[str, str]] = []
+
+        async def fake_persist(engagement_id: str, session_id: str) -> None:
+            persisted.append((engagement_id, session_id))
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            base_plugins_root=str(tmp_path),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="x",
+            persist_session_id=fake_persist,
+        )
+
+        task = asyncio.create_task(
+            drv._capture_session_id(rec, log_path=str(log))
+        )
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # First session_id wins; second one is ignored.
+        assert (ws / ".session_id").read_text(encoding="utf-8").strip() == sid_a
+        assert persisted == [(rec.id, sid_a)]
+
+    async def test_atomic_write_via_temp_rename(self, tmp_path):
+        """A partial-write crash mid-tail must NOT leave a half-written
+        ``.session_id`` that a subsequent boot-replay would feed to
+        ``claude --resume <truncated>``. Verify the writer uses
+        temp+rename atomicity."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        rec = _make_record()
+        ws = tmp_path / rec.id
+        ws.mkdir()
+        log = tmp_path / "log"
+        sid = "abcdef00-0000-0000-0000-000000000000"
+        log.write_text(f"system_init session_id={sid}\n", encoding="utf-8")
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            base_plugins_root=str(tmp_path),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="x",
+            persist_session_id=None,  # None tolerated — no registry hook in test
+        )
+
+        task = asyncio.create_task(
+            drv._capture_session_id(rec, log_path=str(log))
+        )
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # No leftover temp file from atomic-write pattern.
+        leftovers = [p.name for p in ws.iterdir() if p.name.startswith(".session_id")]
+        assert ".session_id" in leftovers
+        # Implementation may use a temp like .session_id.tmp; if so, it
+        # must be renamed (not left behind).
+        tmp_leftovers = [n for n in leftovers if n != ".session_id"]
+        assert tmp_leftovers == [], (
+            f"atomic-write temp file leaked into workspace: {tmp_leftovers!r}"
+        )
+
+
 class TestRespawnPoller:
     async def test_emits_bus_event_on_pid_change(self, monkeypatch, tmp_path):
         from drivers.claude_code_driver import ClaudeCodeDriver

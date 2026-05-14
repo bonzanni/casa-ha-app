@@ -421,8 +421,28 @@ class TestLoadAllSpecialists:
         specialists_root = tmp_path / "specialists"
         _seed_specialist(specialists_root, "finance")
 
-        found = load_all_specialists(str(specialists_root))
+        found, failed = load_all_specialists(str(specialists_root))
         assert "finance" in found
+        assert failed == []
+
+    def test_per_specialist_isolation(self, tmp_path):
+        """O-2b (v0.37.9): one malformed specialist does NOT prevent its
+        siblings from loading; the bad one is recorded in ``failed``.
+        Mirrors the v0.37.1 B-1b ``load_all_executors`` pattern."""
+        from agent_loader import load_all_specialists
+
+        specialists_root = tmp_path / "specialists"
+        _seed_specialist(specialists_root, "finance")
+        # Sibling directory with no required files → load fails.
+        (specialists_root / "broken").mkdir()
+
+        found, failed = load_all_specialists(str(specialists_root))
+        assert "finance" in found
+        assert any(name == "broken" for name, _ in failed)
+        # Error message must name the missing required file so the
+        # operator can see what went wrong.
+        broken_msg = next(err for name, err in failed if name == "broken")
+        assert "runtime.yaml" in broken_msg
 
 
 # ---------------------------------------------------------------------------

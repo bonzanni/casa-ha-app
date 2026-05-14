@@ -1302,6 +1302,12 @@ async def main() -> None:
         base_plugins_root="/opt/casa/claude-plugins/base",
         send_to_topic=_send_to_topic,
         casa_framework_mcp_url=_casa_framework_mcp_url,
+        # O-5 (v0.37.9): capture-and-persist SDK session_id so a Casa
+        # restart mid-engagement preserves conversation continuity.
+        # The driver writes <workspace>/.session_id from its log-tail
+        # capture; this hook keeps EngagementRecord.sdk_session_id in
+        # lockstep with the on-disk file the run script reads on resume.
+        persist_session_id=engagement_registry.persist_session_id,
     )
 
     # Wire bus sink so subprocess_respawn events reach the observer.

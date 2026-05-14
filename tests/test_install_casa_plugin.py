@@ -57,6 +57,34 @@ def test_install_plugin_not_in_marketplace(user_mkt) -> None:
     assert result["error"] == "plugin_not_in_marketplace"
 
 
+async def test_install_plugin_failure_envelope_is_error(user_mkt) -> None:
+    """O-1 (v0.37.9): `install_casa_plugin` returns `{ok: False, ...}` on
+    failure; the MCP envelope must set ``is_error: True`` so
+    ``sdk_logging.log_tool_result`` emits ``ok=False`` in turn telemetry.
+
+    Pre-v0.37.9 `_result()` only auto-detected `status == "error"`, so the
+    `{ok: False, ...}` shape used by install/uninstall paths landed as
+    `ok=True` in operator-visible logs — contradicting F-7 v0.32.0 intent.
+    Live evidence: 2026-05-14 P29.1 cid `52240634` saw
+    `tool_result idx=10 name=mcp__casa-framework__install_casa_plugin
+    ok=True ms=12594` despite the payload being a plugin-not-in-marketplace
+    failure.
+    """
+    from tools import install_casa_plugin
+    envelope = await install_casa_plugin.handler({
+        "plugin_name": "does-not-exist",
+        "targets": ["assistant"],
+    })
+    assert envelope.get("is_error") is True, (
+        f"install_casa_plugin failure must set is_error=True on the "
+        f"MCP envelope so sdk_logging.log_tool_result emits ok=False. "
+        f"envelope keys: {sorted(envelope.keys())}"
+    )
+    payload = json.loads(envelope["content"][0]["text"])
+    assert payload["ok"] is False
+    assert payload["error"] == "plugin_not_in_marketplace"
+
+
 @patch("tools.subprocess.run")
 def test_install_stage2_failure_triggers_rollback(mock_run, user_mkt, tmp_path: Path, monkeypatch) -> None:
     """When agent-home install fails AND there are system-requirements outcomes,
