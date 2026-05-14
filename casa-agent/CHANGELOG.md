@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.37.8] - 2026-05-14 — Hotfix: H-1 (HOME propagation) + N-1 (playbook 7-scope fix)
+
+Closes the two findings from `docs/bug-review-2026-05-13-exploration4.md`:
+**MEDIUM H-1** (configurator narrating a per-engagement `claude plugin
+marketplace add` workaround during plugin install) and **LOW N-1**
+(playbook P19 listed 6 reload scopes when `reload.py:709` registers 7).
+
+### Fixed
+
+- **MEDIUM H-1: `HOME=cc-home` now propagated to s6-supervised services.**
+  setup-configs.sh writes `/addon_configs/casa-agent/cc-home` to
+  `/run/s6/container_environment/HOME`, mirroring the existing
+  GITHUB_TOKEN / CLAUDE_CODE_OAUTH_TOKEN / PATH propagation pattern.
+  K-1 (v0.34.1) is the standing lesson: shell-level `export HOME=...`
+  (setup-configs.sh:322) only governs the script's own claude calls;
+  s6 services need `/run/s6/container_environment/`. Without this,
+  casa-main + svc-casa-mcp booted with HOME=/root, so the 6
+  `subprocess.run(["claude", "plugin", ...])` call sites in `tools.py`
+  (install_casa_plugin, uninstall_casa_plugin, marketplace_add_plugin,
+  marketplace_remove_plugin, marketplace_update_plugin — two of these
+  call `claude plugin install/uninstall`, four call `claude plugin
+  marketplace update`) read `/root/.claude/plugins/known_marketplaces.json`
+  (empty) instead of `cc-home/.claude/plugins/known_marketplaces.json`.
+  The configurator improvised a `Bash(claude plugin marketplace add ...)`
+  workaround mid-engagement to make installs succeed — that workaround
+  is no longer needed. 1 new test (`tests/test_setup_configs_claude_home.py`)
+  mirrors the K-1 precedent.
+
+- **LOW N-1: playbook documents `casactl --scope=executors` (7th scope).**
+  `docs/exploration-testing-playbook.md::P19` and the "Granular reload
+  via `casactl`" scope table both listed 6 scopes when `reload.py:709`
+  has registered `executors` as a 7th since v0.37.1. `casactl --help`
+  and `configurator/doctrine/reload.md` already listed all 7 — only
+  the playbook was stale. Doc-only.
+
+### Changed (cosmetic)
+
+- `setup-configs.sh:267-273` and `agent.py:642` comments refreshed
+  to reflect post-H-1 reality (HOME=cc-home instead of HOME=/root).
+  Defensive `/root/.claude/projects` symlink + SDK-resume recovery
+  logic unchanged.
+
+---
+
 ## [0.37.7] - 2026-05-13 — Hotfix bundle: G-1 + G-2 + playbook doc-fixes
 
 Closes two HIGH findings from `docs/bug-review-2026-05-13-exploration3.md`
