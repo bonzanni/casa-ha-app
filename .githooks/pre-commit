@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Leak guard: never let the private docs/ tree be committed into this PUBLIC add-on repo.
+#
+# docs/ is an intentionally-private, separate inner git repo (its own remote) and is
+# gitignored here. The only ways it could leak into a public commit are `git add -f docs/`
+# or removing the .gitignore line. This hook refuses any commit that stages docs/.
+#
+# Installed by `make setup` (which sets `git config core.hooksPath .githooks`).
+set -euo pipefail
+
+staged="$(git diff --cached --name-only)"
+# Match both files under docs/ (^docs/) and docs staged as a submodule gitlink (^docs$).
+if printf '%s\n' "$staged" | grep -qE '^docs(/|$)'; then
+  echo "✋ pre-commit: refusing to commit docs/ into this PUBLIC add-on repo." >&2
+  echo "   docs/ is a PRIVATE inner repo, intentionally excluded from this public repo." >&2
+  echo "   You likely ran 'git add -f docs'. Unstage it with:  git reset HEAD -- docs" >&2
+  exit 1
+fi
+exit 0
