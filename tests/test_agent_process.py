@@ -846,11 +846,13 @@ class TestTokenBudgetMonitoring:
         ]
         assert len(rows) == 1, [r.getMessage() for r in rows]
 
-    async def test_turn_done_log_carries_usage_fields(
+    async def test_turn_tokens_log_carries_usage_fields(
         self, tmp_path, caplog,
     ):
-        """One INFO-level turn_done line per successful _process call,
-        with the usage fields the SDK reported. No cost field."""
+        """One INFO-level turn_tokens line per successful _process call,
+        with the usage fields the SDK reported. No cost field.
+        (G-fix 2026-05-29: the agent-logger summary prefix is now
+        ``turn_tokens``, disjoint from the sdk logger's ``turn_done``.)"""
         import logging as _logging
         FakeClient.reset()
         FakeClient.usage = {
@@ -867,10 +869,10 @@ class TestTokenBudgetMonitoring:
             await agent._process(_msg("voice", "lr", "lights on"))
 
         # Phase 4b added an `sdk` logger turn_done line; this test asserts
-        # the `agent` logger's per-turn summary specifically.
+        # the `agent` logger's per-turn summary specifically (now `turn_tokens`).
         rows = [
             r for r in caplog.records
-            if r.name == "agent" and "turn_done" in r.getMessage()
+            if r.name == "agent" and "turn_tokens" in r.getMessage()
         ]
         assert len(rows) == 1
         msg = rows[0].getMessage()

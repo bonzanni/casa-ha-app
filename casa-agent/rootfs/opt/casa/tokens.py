@@ -146,12 +146,18 @@ def format_turn_summary(
     channel: str,
     usage: dict[str, int],
 ) -> str:
-    """Render the per-turn ``turn_done`` log line.
+    """Render the per-turn ``turn_tokens`` log line.
 
     Format::
 
-        turn_done role=<role> channel=<channel> \
+        turn_tokens role=<role> channel=<channel> \
             input=<n> output=<n> cache_read=<n> cache_write=<n>
+
+    G-fix (2026-05-29): renamed the prefix from ``turn_done`` to
+    ``turn_tokens`` so it no longer collides with the SDK logger's own
+    ``turn_done`` line (``sdk_logging.log_turn_done``: turns/cost/ms).
+    The two carry disjoint fields; sharing a prefix confused log
+    aggregation. See current-state-spec D15.
 
     ``cache_read`` and ``cache_write`` are split (not aggregated):
     cache_read reflects prompt-cache hits (cheap, fast); cache_write
@@ -165,6 +171,6 @@ def format_turn_summary(
     cr = int(usage.get("cache_read_input_tokens", 0) or 0)
     cw = int(usage.get("cache_creation_input_tokens", 0) or 0)
     return (
-        f"turn_done role={role} channel={channel} "
+        f"turn_tokens role={role} channel={channel} "
         f"input={inp} output={out} cache_read={cr} cache_write={cw}"
     )

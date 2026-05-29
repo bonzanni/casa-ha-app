@@ -240,7 +240,7 @@ class TestFormatTurnSummary:
         }
         line = format_turn_summary("butler", "voice", usage)
         assert line == (
-            "turn_done role=butler channel=voice "
+            "turn_tokens role=butler channel=voice "
             "input=1203 output=82 cache_read=8021 cache_write=0"
         )
 
@@ -271,6 +271,6 @@ class TestFormatTurnSummary:
         # extract_usage always fills the four keys, but be defensive.
         line = format_turn_summary("assistant", "telegram", {})
         assert line == (
-            "turn_done role=assistant channel=telegram "
+            "turn_tokens role=assistant channel=telegram "
             "input=0 output=0 cache_read=0 cache_write=0"
         )
