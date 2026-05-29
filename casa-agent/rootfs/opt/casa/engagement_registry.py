@@ -335,6 +335,12 @@ class EngagementRegistry:
             if rec is None:
                 return
             rec.last_user_turn_ts = ts
+            # C-fix (2026-05-29): reset the idle-reminder debounce so the next
+            # reminder tracks *activity* (the N-day-since-last-turn threshold)
+            # rather than the 7-day-since-last-reminder refire clock. Without
+            # this, a re-engaged specialist (3 d threshold < 7 d refire) gets
+            # its second reminder a few days late. See current-state-spec D7.
+            rec.last_idle_reminder_ts = 0.0
             if rec.status == "idle":
                 rec.status = "active"
             await self._write_tombstone_locked()

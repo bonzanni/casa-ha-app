@@ -1,6 +1,31 @@
 # Changelog
 
-## [0.37.12] - 2026-05-14 — Hotfix: policies/* schema validation + backlog cleanup
+## [0.37.13] - 2026-05-29 — Hotfix: idle-reminder reset (C) + turn_done log de-collision (G)
+
+Two small fixes surfaced by the current-state-spec accuracy pass (Open questions
+C and G; discrepancy log D7 and D15). No behavioural change to any happy path.
+
+### Fixed
+
+- **Idle-reminder debounce now resets on a user turn (D7 / Open-Q C).**
+  `EngagementRegistry.update_user_turn()` now sets `last_idle_reminder_ts = 0.0`
+  alongside `last_user_turn_ts`. Previously the debounce was only cleared
+  post-fire, so a re-engaged **specialist** (3-day reminder threshold < 7-day
+  refire window) got its second idle reminder on the "7 days since last
+  reminder" clock instead of the "3 days since last activity" threshold —
+  delaying it a few days. The reminder now tracks activity as intended. The
+  common case (a user reply dropping `idle_s` below threshold) was already
+  fine; this only affects the specialist re-engagement edge.
+
+- **`turn_done` log-line name collision resolved (D15 / Open-Q G).** Two log
+  lines fired per assistant turn sharing the `turn_done` prefix but carrying
+  disjoint fields: the SDK logger's `turn_done turns=/cost_usd=/ms=` and the
+  per-turn token summary's `turn_done role=/cache_read=/cache_write=`. The
+  token-summary line (`tokens.format_turn_summary`, emitted on the `agent`
+  logger) is renamed **`turn_tokens`**, so log aggregation no longer conflates
+  the two. No fields changed; only the prefix. The SDK `turn_done` line is
+  unchanged.
+
 
 Closes the carried-over `policies/* schema validation gap` (filed v0.31.1,
 2026-05-01) and clears three stale backlog entries that already shipped in
