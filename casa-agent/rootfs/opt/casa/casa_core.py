@@ -37,6 +37,7 @@ from memory import (
     NoOpMemory,
     SqliteMemoryProvider,
 )
+from semantic_memory import SemanticMemory
 from policies import load_policies
 from session_registry import SessionRegistry
 from session_sweeper import SessionSweeper
@@ -822,6 +823,40 @@ def resolve_memory_backend_choice(env: dict[str, str]) -> _MemoryChoice:
         )
 
     return _MemoryChoice(backend="sqlite", db_path=db_path)
+
+
+@_dataclass
+class _SemanticMemoryChoice:
+    """Long-term (SemanticMemory) backend pick — separate from the legacy
+    MemoryProvider _MemoryChoice during migration (spec §5)."""
+    backend: str            # hindsight | noop
+    base_url: str = ""
+
+
+def resolve_semantic_memory_choice(env: dict[str, str]) -> _SemanticMemoryChoice:
+    """Resolve the SemanticMemory backend. ``MEMORY_BACKEND=hindsight`` requires
+    ``HINDSIGHT_API_URL`` (no hardcoded ``hindsight`` host — spec §8.8); anything
+    else → noop."""
+    backend = env.get("MEMORY_BACKEND", "").strip().lower()
+    base_url = env.get("HINDSIGHT_API_URL", "").strip()
+    if backend == "hindsight":
+        if not base_url:
+            raise ValueError(
+                "MEMORY_BACKEND=hindsight requires HINDSIGHT_API_URL "
+                "(Hindsight is reached via its hassio alias/IP, not 'hindsight')"
+            )
+        return _SemanticMemoryChoice(backend="hindsight", base_url=base_url)
+    return _SemanticMemoryChoice(backend="noop")
+
+
+def build_semantic_memory(choice: _SemanticMemoryChoice) -> "SemanticMemory":
+    from semantic_memory import NoOpSemanticMemory
+    if choice.backend == "hindsight":
+        from hindsight_memory import HindsightSemanticMemory
+        logger.info("Hindsight semantic memory initialized (url=%s)", choice.base_url)
+        return HindsightSemanticMemory(base_url=choice.base_url)
+    logger.info("Semantic memory: NoOp (long-term disabled)")
+    return NoOpSemanticMemory()
 
 
 def _wrap_memory_for_strategy(
