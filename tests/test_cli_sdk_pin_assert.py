@@ -36,3 +36,37 @@ def test_sdk_pin_is_exact_and_current() -> None:
     assert sdk_lines[0].strip() == f"claude-agent-sdk=={SDK_VERSION}", (
         f"expected claude-agent-sdk=={SDK_VERSION}, got {sdk_lines[0].strip()!r}"
     )
+
+
+import shutil
+import subprocess
+
+
+@pytest.fixture(scope="session")
+def _pin_image_tag() -> str:
+    return "casa-agent:local-clipin"
+
+
+@pytest.fixture(scope="session")
+def _build_pin_image(_pin_image_tag: str) -> None:
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    subprocess.run(
+        ["docker", "build",
+         "--build-arg", "BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:bookworm",
+         "-t", _pin_image_tag, "-f", "casa-agent/Dockerfile", "casa-agent/"],
+        check=True,
+    )
+
+
+@pytest.mark.docker
+def test_image_claude_cli_version(_pin_image_tag: str, _build_pin_image: None) -> None:
+    r = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "/bin/sh", _pin_image_tag,
+         "-c", "claude --version"],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, f"claude --version failed: {r.stderr}"
+    assert CLI_VERSION in r.stdout, (
+        f"image claude version {r.stdout.strip()!r} != pinned {CLI_VERSION}"
+    )
