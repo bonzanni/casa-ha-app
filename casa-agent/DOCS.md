@@ -33,13 +33,13 @@ Casa runs always-on AI agents inside your Home Assistant instance. The primary a
 By default, Casa persists conversation history to a local SQLite
 database at `/data/memory.sqlite`. Set `HONCHO_API_KEY` to use the
 Honcho cloud backend instead (adds semantic retrieval + peer
-representations). Set `MEMORY_BACKEND=noop` if you want no memory at
-all.
+representations). Set `MEMORY_BACKEND=noop` if you want no memory at all.
 
 | Option | Description |
 |--------|-------------|
 | `honcho_api_url` | Honcho API URL. Defaults to `https://api.honcho.dev`. |
 | `honcho_api_key` | Honcho API key. When set, enables the Honcho cloud backend (overrides SQLite default). |
+| `hindsight_api_url` | Internal base URL for the self-hosted Hindsight add-on (e.g. `http://5884eb17-hindsight:8888` or its IP like `http://172.30.33.6:8888`), reached via Hindsight's hassio network alias or IP — not the bare hostname `hindsight`. **Reserved: not yet active** — the Hindsight long-term-memory backend is being introduced over several releases; setting this alone has no effect yet. Leave empty. |
 
 The following env vars can be set via the add-on environment (not the
 options panel) for finer control:
