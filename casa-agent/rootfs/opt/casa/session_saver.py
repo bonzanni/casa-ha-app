@@ -4,10 +4,14 @@ retain items, and the idempotent save_session entry point. Retains whole ended
 conversations to Hindsight at session granularity (short-term covers live turns)."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import timedelta
 from typing import Any
+
+from claude_agent_sdk import get_session_messages
+from hindsight_ids import bank_id
 
 logger = logging.getLogger(__name__)
 
@@ -64,3 +68,44 @@ def transcript_to_items(
             "document_id": f"{sdk_session_id}:{idx}",
         })
     return items
+
+
+async def save_session(
+    channel_key: str, registry, semantic_memory, *, role: str, directory: str,
+    user_peer: str,
+) -> bool:
+    """Idempotently retain an ended session to long-term memory (spec §4.2).
+    Atomically claims the entry (try_begin_save); on success retains the
+    transcript and removes the entry; on failure releases the claim for retry.
+    Returns True iff the session was successfully processed (retain performed, or
+    skipped for an empty transcript); False if the claim could not be taken or
+    the retain failed."""
+    if not await registry.try_begin_save(channel_key):
+        return False  # missing or already being saved (reaper/next-turn race)
+    entry = registry.get(channel_key)
+    if entry is None:
+        # Invariant violation: we just claimed it under lock, so it should exist.
+        logger.error("save_session: entry for %s vanished after claim — releasing", channel_key)
+        await registry.clear_save_claim(channel_key)
+        return False
+    sid = entry.get("sdk_session_id")
+    write_scope = entry.get("write_scope")
+    if not sid or not write_scope:
+        # Legitimate: no SDK session or no classified scope — nothing to retain.
+        logger.debug("save_session: %s has no sid/write_scope — releasing claim", channel_key)
+        await registry.clear_save_claim(channel_key)
+        return False
+    try:
+        messages = await asyncio.to_thread(get_session_messages, sid, directory)
+        items = transcript_to_items(
+            messages, sdk_session_id=sid, write_scope=write_scope, user_peer=user_peer,
+        )
+        if items:
+            # async_=True: retain off the critical path (accepted, not awaited to completion)
+            await semantic_memory.retain(bank_id("casa", role), items, async_=True)
+        await registry.finish_save(channel_key)
+        return True
+    except Exception as exc:  # noqa: BLE001 — never crash a save; reaper retries
+        logger.warning("save_session failed for %s: %s — will retry", channel_key, exc)
+        await registry.clear_save_claim(channel_key)
+        return False
