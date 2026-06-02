@@ -2,9 +2,13 @@
 # stderr-callback exception-isolation fix (sdk_logging.with_stderr_callback
 # relies on the SDK swallowing callback exceptions). The pip pin also pins
 # the SDK-bundled CLI used by residents + the in_casa driver; the global npm
-# claude CLI is pinned to the matching version in Dockerfile. G-1 (the
-# hook_0..3 'NoneType has no attribute items' crash) is expected fixed by
-# this range — re-verify during the bump (run an Edit tool_use end-to-end).
+# claude CLI is pinned to the matching version in Dockerfile.
+# G-1 ('NoneType has no attribute items' from hook_0..3 on Edit) is NOT an
+# upstream fix: verified 0.2.87 still does hook_output.items() with no None
+# guard (_internal/query.py:_convert_hook_output_for_cli, call site ~:452).
+# It is mitigated Casa-side by H-2 (v0.36.1) — every hook callback returns
+# {} / _deny(...), never None (hooks.py:187-192). So this bump neither fixes
+# nor regresses G-1; Casa is immune on both 0.1.72 and 0.2.87.
 claude-agent-sdk==0.2.87
 honcho-ai==2.1.1
 python-telegram-bot==22.7
