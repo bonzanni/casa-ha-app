@@ -13,6 +13,19 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 
+def render_mental_models(response: dict[str, Any]) -> str:
+    """Render a mental-model list response into a digest. Tolerant of the
+    list key name (``mental_models``/``models``/``items``)."""
+    resp = response or {}
+    models = resp.get("mental_models") or resp.get("models") or resp.get("items") or []
+    lines: list[str] = []
+    for m in models:
+        content = (m.get("content") or "").strip() if isinstance(m, dict) else ""
+        if content:
+            lines.append(content)
+    return "\n\n".join(lines)
+
+
 def render_recall(response: dict[str, Any]) -> str:
     """Render a Hindsight recall response into a markdown digest.
 

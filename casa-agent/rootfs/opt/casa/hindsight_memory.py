@@ -14,7 +14,7 @@ from typing import Any
 import aiohttp
 
 from hindsight_ids import bank_id as _validate_bank_id  # fail-fast on bad ids
-from semantic_memory import SemanticMemory, render_recall
+from semantic_memory import SemanticMemory, render_mental_models, render_recall
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +49,6 @@ class HindsightSemanticMemory(SemanticMemory):
             {"async": async_, "items": items},
         )
 
-    # ------------------------------------------------------------------
-    # Stubs for abstract methods implemented in Tasks 4-5.
-    # These bodies are replaced by the real implementations in later tasks.
-    # ------------------------------------------------------------------
-
     async def recall(
         self, bank: str, query: str, *, tags: list[str], max_tokens: int,
         types: tuple[str, ...] = _DEFAULT_TYPES,
@@ -70,9 +65,18 @@ class HindsightSemanticMemory(SemanticMemory):
         return render_recall(resp)
 
     async def profile(self, bank: str) -> str:
-        raise NotImplementedError("profile: implemented in Task 4")
+        _validate_bank_id(bank)
+        resp = await self._request(
+            "GET", f"/v1/default/banks/{bank}/mental-models", None,
+        )
+        return render_mental_models(resp)
 
     async def cross_recall(
         self, bank: str, query: str, *, max_tokens: int, budget: str = "low",
     ) -> str:
-        raise NotImplementedError("cross_recall: implemented in Task 5")
+        # Cross-agent read = recall against another role's bank, no tag filter.
+        # tags=[] inherits recall's tags_match="any" (unfiltered); keep them in
+        # sync if recall's default changes.
+        return await self.recall(
+            bank, query, tags=[], max_tokens=max_tokens, budget=budget,
+        )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from semantic_memory import NoOpSemanticMemory, SemanticMemory, render_recall
+from semantic_memory import NoOpSemanticMemory, SemanticMemory, render_mental_models, render_recall
 
 pytestmark = [pytest.mark.unit]
 
@@ -30,6 +30,27 @@ async def test_noop_reads_return_empty_string() -> None:
     assert await mem.recall("casa-assistant", "q", tags=["house"], max_tokens=512) == ""
     assert await mem.profile("casa-assistant") == ""
     assert await mem.cross_recall("casa-butler", "q", max_tokens=256) == ""
+
+
+def test_render_mental_models_empty() -> None:
+    assert render_mental_models({"mental_models": []}) == ""
+    assert render_mental_models({}) == ""
+
+
+def test_render_mental_models_formats_entries() -> None:
+    resp = {"mental_models": [
+        {"content": "Nicola: terse, prefers metric units."},
+        {"content": "Guest mode disables personal data."},
+    ]}
+    out = render_mental_models(resp)
+    assert "terse" in out
+    assert "Guest mode" in out
+    assert "None" not in out
+
+
+def test_render_mental_models_tolerates_alt_keys() -> None:
+    assert "terse" in render_mental_models({"models": [{"content": "terse"}]})
+    assert "terse" in render_mental_models({"items": [{"content": "terse"}]})
 
 
 def test_render_recall_empty() -> None:
