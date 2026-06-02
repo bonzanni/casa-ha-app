@@ -13,6 +13,21 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 
+def render_recall(response: dict[str, Any]) -> str:
+    """Render a Hindsight recall response into a markdown digest.
+
+    Shape (spec §8 findings): ``{"results": [{"text": str, "type": str,
+    "tags": [str], ...}, ...]}``. One bullet per fact; empty/missing →
+    empty string (no placeholder lines)."""
+    results = (response or {}).get("results") or []
+    lines: list[str] = []
+    for r in results:
+        text = (r.get("text") or "").strip()
+        if text:
+            lines.append(f"- {text}")
+    return "\n".join(lines)
+
+
 class SemanticMemory(ABC):
     """Long-term memory backend. Banks are addressed by id (see hindsight_ids)."""
 
