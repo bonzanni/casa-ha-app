@@ -12,7 +12,7 @@ RUN apt-get update \
          nodejs npm git nginx-light jq yq curl ca-certificates unzip \
          openssh-client \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g @anthropic-ai/claude-code \
+    && npm install -g @anthropic-ai/claude-code@2.1.150 \
     && npm cache clean --force
 
 # Plan 4a: Tier 1 baseline plugin packs for claude_code driver.

@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.38.0] - 2026-06-02 — Hygiene: pin claude CLI + bump claude-agent-sdk 0.1.72 → 0.2.87
+
+Decoupled version-hygiene PR (memory re-architecture spec §6). No memory-layer or
+behavioural changes to any happy path.
+
+### Changed
+
+- Bumped `claude-agent-sdk` `0.1.72` → `0.2.87` (`requirements.txt`), gaining the
+  v0.2.82 stderr-callback exception-isolation fix that `sdk_logging.with_stderr_callback`
+  already assumes. The pip pin also pins the SDK-bundled CLI used by the residents +
+  `in_casa` driver.
+- Pinned the global `@anthropic-ai/claude-code` npm CLI to `2.1.150` (`Dockerfile`) —
+  the version `claude-agent-sdk==0.2.87` bundles — so the two CLI consumers (SDK-bundled
+  vs the global `claude` used by plugin management + the `claude_code` driver) no longer
+  drift.
+
+### Added
+
+- `tests/test_cli_sdk_pin_assert.py` — static guard that the CLI install stays pinned and
+  the SDK pin stays exact, plus a docker assertion that the pinned `claude --version`
+  lands in the built image.
+
 ## [0.37.13] - 2026-05-29 — Hotfix: idle-reminder reset (C) + turn_done log de-collision (G)
 
 Two small fixes surfaced by the current-state-spec accuracy pass (Open questions
