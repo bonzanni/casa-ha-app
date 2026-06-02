@@ -391,15 +391,22 @@ class TestSdkSessionPrune:
     async def test_prune_called_once_per_eviction_when_sdk_exposes_method(
         self, tmp_path, monkeypatch,
     ):
-        """If claude_agent_sdk.delete_session exists, it is awaited once per
-        evicted sdk_session_id.
-        """
-        import claude_agent_sdk  # mock SDK — already on sys.path in tests
+        """_sdk_delete_session (the test seam) is called once per evicted
+        sdk_session_id with the right session id. Eviction is the source of
+        truth regardless of how the underlying SDK is invoked.
 
-        prune = AsyncMock()
-        monkeypatch.setattr(
-            claude_agent_sdk, "delete_session", prune, raising=False,
-        )
+        (Previously used AsyncMock on claude_agent_sdk.delete_session directly;
+        updated to the new contract where _sdk_delete_session is the test seam
+        and the call is dispatched via asyncio.to_thread, §3.4.1.)
+        """
+        import session_sweeper
+
+        calls = []
+
+        def fake_delete(session_id, directory=None):
+            calls.append(session_id)
+
+        monkeypatch.setattr(session_sweeper, "_sdk_delete_session", fake_delete)
 
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
@@ -416,14 +423,17 @@ class TestSdkSessionPrune:
         )
         await sweeper._sweep_once()
 
-        called_with = sorted(call.args[0] for call in prune.await_args_list)
-        assert called_with == ["sdk-1", "sdk-2"]
+        # Both entries must be evicted from the registry (the invariant that matters).
+        assert reg.all_entries() == {}
+        # And the delete seam is called once per evicted session id.
+        assert sorted(calls) == ["sdk-1", "sdk-2"]
 
     async def test_prune_missing_method_is_silent_noop(
         self, tmp_path, monkeypatch,
     ):
-        """If the SDK does not expose delete_session, the sweep still
-        completes successfully — no errors, no warnings.
+        """If the lazy import or delete call inside _sdk_delete_session raises
+        (e.g. the SDK does not expose delete_session), the reap is silently
+        swallowed and eviction still happens — no errors, no warnings surfaced.
         """
         import claude_agent_sdk
 
@@ -451,13 +461,17 @@ class TestSdkSessionPrune:
     ):
         """A buggy SDK-side delete must not stop the sweep mid-pass or
         re-surface the entry in the registry.
+
+        Patches the _sdk_delete_session seam with a sync function that raises,
+        exercising the except-Exception path in _reap_transcript. Eviction must
+        still happen — the reap failure is best-effort and swallowed silently.
         """
-        import claude_agent_sdk
+        import session_sweeper
 
-        async def boom(sid):
-            raise RuntimeError(f"SDK rejected {sid}")
+        def boom(session_id, directory=None):
+            raise RuntimeError(f"SDK rejected {session_id}")
 
-        monkeypatch.setattr(claude_agent_sdk, "delete_session", boom, raising=False)
+        monkeypatch.setattr(session_sweeper, "_sdk_delete_session", boom)
 
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
@@ -554,3 +568,122 @@ class TestLifecycle:
         await asyncio.sleep(0)
         await sweeper.stop()  # must not raise, must not hang
         assert sweeper._task is None
+
+
+# ---------------------------------------------------------------------------
+# Transcript reaper — _reap_transcript / _sdk_delete_session
+# ---------------------------------------------------------------------------
+
+
+class TestTranscriptReaper:
+    async def test_reaper_calls_delete_session_with_directory(self, monkeypatch):
+        import session_sweeper
+
+        calls = []
+
+        def fake_delete(session_id, directory=None):
+            calls.append((session_id, directory))
+
+        monkeypatch.setattr(session_sweeper, "_sdk_delete_session", fake_delete, raising=False)
+        await session_sweeper._reap_transcript("sid-7", "/addon_configs/casa-agent/agent-home/assistant")
+        assert calls == [("sid-7", "/addon_configs/casa-agent/agent-home/assistant")]
+
+    async def test_freshness_guard_keeps_recent_voice_entry_alive(self, tmp_path):
+        """A voice entry that is inside its freshness window must NOT be evicted
+        even if the nominal TTL has been exceeded (spec §3.4(3)).
+
+        voice freshness_window defaults to 30 minutes. We construct a sweeper
+        with a tiny TTL (1 second) and a 'now' that is 10 seconds past last_active
+        — well past the ttl but inside the 30-minute freshness window.
+        guard = max(ttl, freshness_window) == freshness_window → entry survives.
+        """
+        path = str(tmp_path / "sessions.json")
+        reg = SessionRegistry(path)
+
+        base_time = datetime(2026, 4, 18, 12, 0, 0, tzinfo=timezone.utc)
+        last_active = base_time
+        # 'now' is 10 seconds later — past 1-second ttl, but inside 30-min freshness
+        now = base_time + timedelta(seconds=10)
+
+        async with reg._lock:
+            reg._data["voice-user-123"] = {
+                "agent": "assistant",
+                "sdk_session_id": "sdk-voice-fresh",
+                "last_active": last_active.isoformat(),
+            }
+            await reg._save_locked()
+
+        sweeper = SessionSweeper(
+            registry=reg,
+            # ttl of 1 second — entry is past this
+            session_ttl_days=0,  # will produce timedelta(0), guard will use freshness
+            webhook_session_ttl_days=0,
+            sweep_interval_hours=6,
+            now=lambda: now,
+        )
+        # Patch session_ttl to a tiny value so we can test below freshness_window
+        sweeper._session_ttl = timedelta(seconds=1)
+        sweeper._webhook_ttl = timedelta(seconds=1)
+
+        await sweeper._sweep_once()
+
+        # The voice entry must survive because freshness_window("voice") == 30 min
+        assert reg.get("voice-user-123") is not None, (
+            "Voice entry inside its freshness window must not be evicted"
+        )
+
+    async def test_sweep_threads_per_role_directory_into_reaper(
+        self, tmp_path, monkeypatch,
+    ):
+        """The sweep must pass each evicted entry's role directory to the reaper.
+
+        Seeds two cold entries with distinct agent roles, constructs the sweeper
+        with a directory_for lambda, and asserts the recorded (session_id, directory)
+        pairs match each entry's role.
+        """
+        import session_sweeper
+
+        recorded: list[tuple[str, str | None]] = []
+
+        def fake_delete(session_id, directory=None):
+            recorded.append((session_id, directory))
+
+        monkeypatch.setattr(session_sweeper, "_sdk_delete_session", fake_delete)
+
+        path = str(tmp_path / "sessions.json")
+        reg = SessionRegistry(path)
+        now = datetime(2026, 4, 18, tzinfo=timezone.utc)
+        old = now - timedelta(days=60)
+
+        # Seed two entries with distinct roles.
+        async with reg._lock:
+            reg._data["telegram-sdk-a"] = {
+                "agent": "assistant",
+                "sdk_session_id": "sdk-a",
+                "last_active": old.isoformat(),
+            }
+            reg._data["telegram-sdk-b"] = {
+                "agent": "butler",
+                "sdk_session_id": "sdk-b",
+                "last_active": old.isoformat(),
+            }
+            await reg._save_locked()
+
+        sweeper = SessionSweeper(
+            registry=reg,
+            session_ttl_days=30,
+            webhook_session_ttl_days=1,
+            sweep_interval_hours=6,
+            now=lambda: now,
+            directory_for=lambda role: f"/home/{role}",
+        )
+        await sweeper._sweep_once()
+
+        # Both entries must be evicted.
+        assert reg.all_entries() == {}
+
+        # Reaper must have received the per-role directory for each session.
+        assert sorted(recorded) == [
+            ("sdk-a", "/home/assistant"),
+            ("sdk-b", "/home/butler"),
+        ]

@@ -3,9 +3,11 @@
 Stops `SessionRegistry.sessions.json` from growing unbounded. Every
 `sweep_interval_hours` (default 6) a background task wakes up, iterates
 the registry under its 5.1 lock, drops entries whose `last_active` is
-older than the configured TTL, persists the reduced registry, and
-best-effort attempts to prune the corresponding SDK session on
-Anthropic's side if the SDK exposes a `delete_session` call.
+older than the configured TTL (or freshness window, whichever is larger —
+spec §3.4(3)), persists the reduced registry, and hard-deletes the
+on-disk transcript via the SDK's ``delete_session(sid, directory)``
+(spec §3.4.1 — Casa owns transcript reaping; the CLI's cleanupPeriodDays
+sweep never fires under Casa's SDK invocation, §8.6).
 
 Pure policy module — no transport imports. Reaches into internal
 `SessionRegistry` attributes (`_lock`, `_data`, `_save_locked`) by
@@ -23,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from session_registry import SessionRegistry
+from session_saver import freshness_window
 
 logger = logging.getLogger(__name__)
 
@@ -61,30 +64,22 @@ def _parse_last_active(value: object) -> datetime | None:
         return None
 
 
-async def _prune_sdk_session(sdk_session_id: str) -> None:
-    """Best-effort SDK-side session cleanup.
+def _sdk_delete_session(session_id: str, directory: str | None = None) -> None:
+    """Thin wrapper over the SDK hard-delete (extracted for test seam)."""
+    from claude_agent_sdk import delete_session
+    delete_session(session_id, directory)
 
-    Looks up `claude_agent_sdk.delete_session` via `getattr`. If the
-    SDK does not expose one (today: always), this is a no-op. If it
-    does, the call is awaited (or invoked sync-ly if it is not a
-    coroutine) and any exception is swallowed at DEBUG level — the
-    eviction in the local registry is the source of truth.
-    """
-    try:
-        import claude_agent_sdk as _sdk
-    except ImportError:
-        return
-    fn = getattr(_sdk, "delete_session", None)
-    if fn is None or not callable(fn):
+
+async def _reap_transcript(sdk_session_id: str, directory: str | None) -> None:
+    """Hard-delete the on-disk transcript for an evicted session (spec §3.4.1 —
+    Casa owns transcript reaping; the CLI's cleanupPeriodDays never fires under
+    our SDK invocation, §8.6). Best-effort: a failure must not block eviction."""
+    if not sdk_session_id:
         return
     try:
-        result = fn(sdk_session_id)
-        if asyncio.iscoroutine(result):
-            await result
+        await asyncio.to_thread(_sdk_delete_session, sdk_session_id, directory)
     except Exception as exc:  # noqa: BLE001 — best-effort
-        logger.debug(
-            "SDK delete_session(%s) failed: %s", sdk_session_id, exc,
-        )
+        logger.debug("transcript reap delete_session(%s) failed: %s", sdk_session_id, exc)
 
 
 class SessionSweeper:
@@ -110,12 +105,14 @@ class SessionSweeper:
         webhook_session_ttl_days: int = _DEFAULT_WEBHOOK_SESSION_TTL_DAYS,
         sweep_interval_hours: float = _SWEEP_INTERVAL_HOURS,
         now: Callable[[], datetime] | None = None,
+        directory_for: Callable[[str], str] | None = None,
     ) -> None:
         self._registry = registry
         self._session_ttl = timedelta(days=session_ttl_days)
         self._webhook_ttl = timedelta(days=webhook_session_ttl_days)
         self._interval_s = sweep_interval_hours * 3600.0
         self._now = now or (lambda: datetime.now(timezone.utc))
+        self._dir_for = directory_for or (lambda role: f"/addon_configs/casa-agent/agent-home/{role}")
         self._task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
@@ -172,9 +169,9 @@ class SessionSweeper:
             return
 
     async def _sweep_once(self) -> None:
-        """Run one full sweep: classify + evict under lock, then prune SDK."""
+        """Run one full sweep: classify + evict under lock, then reap transcripts."""
         now = self._now()
-        to_evict: list[tuple[str, str]] = []  # (key, sdk_session_id)
+        to_evict: list[tuple[str, str, str]] = []  # (key, sdk_session_id, role)
 
         async with self._registry._lock:
             for key, entry in self._registry._data.items():
@@ -182,30 +179,32 @@ class SessionSweeper:
                 last_active = _parse_last_active(entry.get("last_active"))
 
                 if last_active is None:
-                    to_evict.append((key, str(entry.get("sdk_session_id") or "")))
+                    to_evict.append((key, str(entry.get("sdk_session_id") or ""), entry.get("agent", "assistant")))
                     continue
 
                 if channel == "webhook" and _is_uuid_scope(scope_id):
                     ttl = self._webhook_ttl
                 else:
                     ttl = self._session_ttl
+                if channel in ("voice", "telegram"):
+                    guard = max(ttl, freshness_window(channel))
+                else:
+                    guard = ttl
 
-                if now - last_active > ttl:
-                    to_evict.append(
-                        (key, str(entry.get("sdk_session_id") or "")),
-                    )
+                if now - last_active > guard:
+                    to_evict.append((key, str(entry.get("sdk_session_id") or ""), entry.get("agent", "assistant")))
 
             if not to_evict:
-                return  # no save, no SDK-prune work
+                return  # no save, no transcript-reap work
 
-            for key, _sdk_sid in to_evict:
+            for key, _sdk_sid, _role in to_evict:
                 self._registry._data.pop(key, None)
             await self._registry._save_locked()
 
         logger.info("Session sweep evicted %d entr(y|ies)", len(to_evict))
 
-        # SDK-side prune happens OUTSIDE the lock — best-effort, never
+        # Transcript reap happens OUTSIDE the lock — best-effort, never
         # blocks the registry.
-        for _key, sdk_sid in to_evict:
+        for _key, sdk_sid, role in to_evict:
             if sdk_sid:
-                await _prune_sdk_session(sdk_sid)
+                await _reap_transcript(sdk_sid, self._dir_for(role))
