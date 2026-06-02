@@ -38,3 +38,21 @@ async def test_retain_validates_bank_id() -> None:
     with pytest.raises(ValueError):
         await mem.retain("casa/finance", [{"content": "x"}])  # bad bank id
     mem._request.assert_not_awaited()
+
+
+async def test_recall_posts_verified_shape_and_renders() -> None:
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._request = AsyncMock(return_value={"results": [
+        {"text": "Nicola keeps the thermostat at 20C.", "type": "world", "tags": ["house"]},
+    ]})
+    out = await mem.recall("casa-assistant", "thermostat?", tags=["house"], max_tokens=512, budget="low")
+    method, path, payload = mem._request.await_args.args
+    assert method == "POST"
+    assert path == "/v1/default/banks/casa-assistant/memories/recall"
+    assert payload["query"] == "thermostat?"
+    assert payload["tags"] == ["house"]
+    assert payload["tags_match"] == "any"
+    assert payload["max_tokens"] == 512
+    assert payload["budget"] == "low"
+    assert "world" in payload["types"]        # spec §8.9 — must not drop world
+    assert "thermostat at 20C" in out         # rendered digest

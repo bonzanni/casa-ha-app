@@ -56,10 +56,18 @@ class HindsightSemanticMemory(SemanticMemory):
 
     async def recall(
         self, bank: str, query: str, *, tags: list[str], max_tokens: int,
-        types: tuple[str, ...] = ("world", "experience", "observation"),
+        types: tuple[str, ...] = _DEFAULT_TYPES,
         tags_match: str = "any", budget: str = "mid",
     ) -> str:
-        raise NotImplementedError("recall: implemented in Task 4")
+        _validate_bank_id(bank)
+        resp = await self._request(
+            "POST", f"/v1/default/banks/{bank}/memories/recall",
+            {
+                "query": query, "tags": tags, "tags_match": tags_match,
+                "max_tokens": max_tokens, "types": list(types), "budget": budget,
+            },
+        )
+        return render_recall(resp)
 
     async def profile(self, bank: str) -> str:
         raise NotImplementedError("profile: implemented in Task 4")
