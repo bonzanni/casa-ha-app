@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.38.0"
+version: "0.39.0"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 init: false
@@ -34,6 +34,7 @@ options:
   telegram_delivery_mode: "stream"
   honcho_api_url: "https://api.honcho.dev"
   honcho_api_key: ""
+  hindsight_api_url: ""
   onepassword_service_account_token: ""
   onepassword_default_vault: "Casa"
   webhook_auth_enabled: false
@@ -68,6 +69,7 @@ schema:
   telegram_delivery_mode: "list(stream|block)?"
   honcho_api_url: url?
   honcho_api_key: password?
+  hindsight_api_url: str?
   onepassword_service_account_token: password?
   onepassword_default_vault: str?
   webhook_auth_enabled: bool?

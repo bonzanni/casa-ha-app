@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.39.0] - 2026-06-03 — Memory re-arch (1/3): SemanticMemory seam (inert)
+
+First step of the memory re-architecture (design spec §5). Introduces the long-term
+**SemanticMemory** seam and a self-hosted Hindsight HTTP client as building blocks.
+**No runtime behaviour change** — the seam is constructed and fully unit-tested but is
+*not yet wired* into the agent read/write path (that lands in the save/load steps), and
+long-term Hindsight memory is **not yet user-selectable** (`hindsight_api_url` is reserved).
+
+### Added
+
+- `SemanticMemory` ABC (`retain` / `recall` / `profile` / `cross_recall`) with a
+  `NoOpSemanticMemory` degraded implementation and pure `render_recall` /
+  `render_mental_models` renderers (`semantic_memory.py`).
+- `HindsightSemanticMemory` — an `aiohttp` client for the self-hosted Hindsight bank API
+  (`/v1/default/banks/{bank}/...`), with fail-fast `bank_id` validation
+  (`hindsight_memory.py`, `hindsight_ids.py`).
+- `resolve_semantic_memory_choice()` + `build_semantic_memory()` in `casa_core.py`,
+  added alongside the existing memory-backend resolution (`main()` and the legacy
+  `MemoryProvider` path are unchanged).
+- New add-on option `hindsight_api_url` → `HINDSIGHT_API_URL` env (configurable Hindsight
+  base URL, reached via the add-on's hassio network alias/IP — never the bare host
+  `hindsight`). **Reserved: not yet active.**
+
 ## [0.38.0] - 2026-06-02 — Hygiene: pin claude CLI + bump claude-agent-sdk 0.1.72 → 0.2.87
 
 Decoupled version-hygiene PR (memory re-architecture spec §6). No memory-layer or
