@@ -90,6 +90,7 @@ class FreshnessReaper:
                 await self._save(
                     key, self._reg, self._sem, role=role,
                     directory=self._dir_for(role), user_peer=user_peer,
+                    channel=channel,
                 )
             except asyncio.CancelledError:
                 raise

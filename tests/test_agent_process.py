@@ -1489,12 +1489,13 @@ class TestSaveBeforeOverwrite:
         save_calls: list[dict] = []
 
         async def _fake_save(channel_key, session_registry, semantic_memory,
-                             *, role, directory, user_peer):
+                             *, role, directory, user_peer, channel):
             save_calls.append({
                 "channel_key": channel_key,
                 "role": role,
                 "directory": directory,
                 "user_peer": user_peer,
+                "channel": channel,
             })
 
         monkeypatch.setattr(agent_mod, "save_session", _fake_save)
@@ -1525,6 +1526,7 @@ class TestSaveBeforeOverwrite:
         assert call["role"] == "assistant", call
         assert call["directory"].endswith("agent-home/assistant"), call
         assert call["user_peer"] == "nicola", call
+        assert call["channel"] == "telegram", call
 
     async def test_save_session_not_called_on_resume_path(self, tmp_path, monkeypatch):
         """When the registry holds a fresh entry (idle < 12 h), _resume_decision
@@ -1535,7 +1537,7 @@ class TestSaveBeforeOverwrite:
         save_calls: list[dict] = []
 
         async def _fake_save(channel_key, session_registry, semantic_memory,
-                             *, role, directory, user_peer):
+                             *, role, directory, user_peer, channel):
             save_calls.append({"channel_key": channel_key})
 
         monkeypatch.setattr(agent_mod, "save_session", _fake_save)

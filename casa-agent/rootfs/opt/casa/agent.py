@@ -455,6 +455,7 @@ class Agent:
                 await save_session(
                     channel_key, self._session_registry, self._semantic_memory,
                     role=self.config.role, directory=agent_home, user_peer=user_peer,
+                    channel=msg.channel,
                 )
             # else ("new", False): no prior entry → nothing to save
 

@@ -1,5 +1,5 @@
 # casa-agent/rootfs/opt/casa/session_saver.py
-"""Long-term save orchestration (spec §4.2): freshness windows, transcript →
+"""Long-term save orchestration (design §4.2): freshness windows, transcript →
 retain items, and the idempotent save_session entry point. Retains whole ended
 conversations to Hindsight at session granularity (short-term covers live turns)."""
 from __future__ import annotations
@@ -10,9 +10,11 @@ import os
 from datetime import timedelta
 from typing import Any
 
+from channel_policy import writes_to_bank
 from channel_trust import user_peer_for_channel
 from claude_agent_sdk import get_session_messages
 from hindsight_ids import bank_id
+from tier_classifier import classify_tier
 
 logger = logging.getLogger(__name__)
 
@@ -49,22 +51,24 @@ def _message_text(message: Any) -> str:
     return ""
 
 
-def transcript_to_items(
-    messages: list, *, sdk_session_id: str, write_scope: str, user_peer: str,
+async def transcript_to_items(
+    messages: list, *, sdk_session_id: str, user_peer: str,
 ) -> list[dict[str, Any]]:
-    """Turn an SDK transcript (get_session_messages output) into Hindsight
-    retain items (spec §4.2). One item per text-bearing user/assistant turn;
-    deterministic ``document_id`` = ``f"{sid}:{idx}"`` so a re-retain is
-    idempotent (Hindsight upsert is destructive-replace — spec §8)."""
+    """Turn an SDK transcript into Hindsight retain items (design §4.2; tier model
+    §2.4). One item per text-bearing turn, each classified at its TRUE sensitivity
+    tier (default-private on uncertainty) and tagged ``[tier]`` — Hindsight tags are
+    document-granular, so per-item is the finest partition available. Deterministic
+    ``document_id`` = ``f"{sid}:{idx}"`` keeps a re-retain idempotent."""
     items: list[dict[str, Any]] = []
     for idx, m in enumerate(messages):
         text = _message_text(getattr(m, "message", None))
         if not text:
             continue
         speaker = user_peer if getattr(m, "type", "") == "user" else "assistant"
+        tier = await classify_tier(text)
         items.append({
             "content": text,
-            "tags": [write_scope],
+            "tags": [tier],
             "metadata": {"speaker": speaker},
             "document_id": f"{sdk_session_id}:{idx}",
         })
@@ -73,37 +77,33 @@ def transcript_to_items(
 
 async def save_session(
     channel_key: str, registry, semantic_memory, *, role: str, directory: str,
-    user_peer: str,
+    user_peer: str, channel: str,
 ) -> bool:
-    """Idempotently retain an ended session to long-term memory (spec §4.2).
-    Atomically claims the entry (try_begin_save); on success retains the
-    transcript and removes the entry; on failure releases the claim for retry.
-    Returns True iff the session was successfully processed (retain performed, or
-    skipped for an empty transcript); False if the claim could not be taken or
-    the retain failed."""
+    """Idempotently retain an ended session to long-term memory (design §4.2; tier
+    model §2.4). Channels that fail write-trust (voice — recall-only) persist
+    nothing. Atomically claims the entry; on success retains the per-item
+    tier-tagged transcript to the shared ``casa`` bank and removes the entry."""
+    if not writes_to_bank(channel):
+        return False  # recall-only channel (e.g. voice): never persists facts
     if not await registry.try_begin_save(channel_key):
         return False  # missing or already being saved (reaper/next-turn race)
     entry = registry.get(channel_key)
     if entry is None:
-        # Invariant violation: we just claimed it under lock, so it should exist.
         logger.error("save_session: entry for %s vanished after claim — releasing", channel_key)
         await registry.clear_save_claim(channel_key)
         return False
     sid = entry.get("sdk_session_id")
-    write_scope = entry.get("write_scope")
-    if not sid or not write_scope:
-        # Legitimate: no SDK session or no classified scope — nothing to retain.
-        logger.debug("save_session: %s has no sid/write_scope — releasing claim", channel_key)
+    if not sid:
+        logger.debug("save_session: %s has no sid — releasing claim", channel_key)
         await registry.clear_save_claim(channel_key)
         return False
     try:
         messages = await asyncio.to_thread(get_session_messages, sid, directory)
-        items = transcript_to_items(
-            messages, sdk_session_id=sid, write_scope=write_scope, user_peer=user_peer,
+        items = await transcript_to_items(
+            messages, sdk_session_id=sid, user_peer=user_peer,
         )
         if items:
-            # async_=True: retain off the critical path (accepted, not awaited to completion)
-            await semantic_memory.retain(bank_id("casa", role), items, async_=True)
+            await semantic_memory.retain(bank_id("casa"), items, async_=True)
         await registry.finish_save(channel_key)
         return True
     except Exception as exc:  # noqa: BLE001 — never crash a save; reaper retries
@@ -115,7 +115,7 @@ async def save_session(
 async def reset_channel(
     channel_key: str, registry, semantic_memory, *, channel: str,
 ) -> None:
-    """Explicit reset (spec §4.2 #2, correction C2): retain the current session,
+    """Explicit reset (design §4.2 #2, correction C2): retain the current session,
     then drop the pointer so the next turn starts fresh. Role + transcript
     directory are derived from the registry entry (the caller — e.g. the Telegram
     channel — does not need to know them). If there is no entry there is nothing
@@ -131,6 +131,6 @@ async def reset_channel(
     # was a no-op (nothing to retain).
     await save_session(
         channel_key, registry, semantic_memory,
-        role=role, directory=directory, user_peer=user_peer,
+        role=role, directory=directory, user_peer=user_peer, channel=channel,
     )
     await registry.remove(channel_key)
