@@ -10,6 +10,7 @@ import os
 from datetime import timedelta
 from typing import Any
 
+from channel_trust import user_peer_for_channel
 from claude_agent_sdk import get_session_messages
 from hindsight_ids import bank_id
 
@@ -109,3 +110,27 @@ async def save_session(
         logger.warning("save_session failed for %s: %s — will retry", channel_key, exc)
         await registry.clear_save_claim(channel_key)
         return False
+
+
+async def reset_channel(
+    channel_key: str, registry, semantic_memory, *, channel: str,
+) -> None:
+    """Explicit reset (spec §4.2 #2, correction C2): retain the current session,
+    then drop the pointer so the next turn starts fresh. Role + transcript
+    directory are derived from the registry entry (the caller — e.g. the Telegram
+    channel — does not need to know them). If there is no entry there is nothing
+    to save; just return (the caller still acks)."""
+    entry = registry.get(channel_key)
+    if entry is None:
+        return
+    role = entry.get("agent", "assistant")
+    directory = f"/addon_configs/casa-agent/agent-home/{role}"
+    user_peer = user_peer_for_channel(channel)
+    # save_session is idempotent and removes the entry on a successful retain;
+    # remove() afterwards guarantees the pointer is cleared even when the save
+    # was a no-op (nothing to retain).
+    await save_session(
+        channel_key, registry, semantic_memory,
+        role=role, directory=directory, user_peer=user_peer,
+    )
+    await registry.remove(channel_key)

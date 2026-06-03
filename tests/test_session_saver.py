@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from session_saver import freshness_window, save_session, transcript_to_items
+from session_saver import freshness_window, reset_channel, save_session, transcript_to_items
 
 pytestmark = [pytest.mark.unit]
 
@@ -125,3 +125,25 @@ async def test_save_session_no_write_scope_releases_claim(tmp_path):
     assert ok is False
     sem.retain.assert_not_awaited()
     assert not reg.get("voice-r1").get("consolidated_at")  # claim released, entry kept
+
+
+async def test_reset_channel_saves_then_clears(tmp_path):
+    from session_registry import SessionRegistry
+    reg = SessionRegistry(str(tmp_path / "s.json"))
+    await reg.register("telegram-42", "assistant", "sid-9")
+    await reg.record_write_scope("telegram-42", "house")
+    sem = AsyncMock()
+    msgs = [type("M", (), {"type": "user", "message": {"content": "remember X"}})()]
+    with patch("session_saver.get_session_messages", return_value=msgs):
+        await reset_channel("telegram-42", reg, sem, channel="telegram")
+    sem.retain.assert_awaited_once()        # saved before clearing
+    assert reg.get("telegram-42") is None   # pointer cleared → next turn starts fresh
+
+
+async def test_reset_channel_no_entry_is_noop(tmp_path):
+    from session_registry import SessionRegistry
+    reg = SessionRegistry(str(tmp_path / "s.json"))
+    sem = AsyncMock()
+    await reset_channel("telegram-99", reg, sem, channel="telegram")
+    sem.retain.assert_not_awaited()         # nothing to save
+    assert reg.get("telegram-99") is None

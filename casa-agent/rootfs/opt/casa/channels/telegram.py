@@ -148,6 +148,8 @@ class TelegramChannel(Channel):
         self._engagement_driver = None
         self._finalize_cancel = None
         self._finalize_complete_user = None
+        self._session_registry = None   # wired in main() (Task 9); /new reset
+        self._semantic_memory = None    # wired in main() (Task 9); /new reset
         self._main_feed_redirect_seen: set[int] = set()
         # Per-topic handler lock (Bug 10, v0.14.7). aiohttp dispatches
         # handle_update concurrently per Bot-API update; without this,
@@ -454,6 +456,28 @@ class TelegramChannel(Channel):
             return
 
         chat_id = str(update.effective_chat.id) if update.effective_chat else self.chat_id
+
+        # /new reset — intercept before rate-limiting or bus dispatch (spec §4.2 #2, C2).
+        text = (update.message.text or "").strip()
+        if text == "/new" or text.startswith("/new "):
+            if self._session_registry is not None and self._semantic_memory is not None:
+                from session_registry import build_session_key
+                from session_saver import reset_channel
+                channel_key = build_session_key("telegram", chat_id)
+                await reset_channel(
+                    channel_key, self._session_registry, self._semantic_memory,
+                    channel="telegram",
+                )
+            if self._app is not None:
+                try:
+                    await self._app.bot.send_message(
+                        chat_id=chat_id,
+                        text="Starting fresh — I still remember what matters.",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("/new ack send to chat_id=%s failed: %s", chat_id, exc)
+            return  # do NOT feed /new to the agent
+
         user = update.effective_user
         user_name = user.first_name if user else "unknown"
 
