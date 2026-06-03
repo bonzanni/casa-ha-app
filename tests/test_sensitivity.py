@@ -36,3 +36,27 @@ def test_voice_channel_clearance_is_friends():
 def test_unknown_channel_defaults_to_private_clearance():
     assert clearance_for_channel("telegram") == "private"
     assert clearance_for_channel("something-else") == "private"
+
+
+# ---------------------------------------------------------------------------
+# parse_tier + SENSITIVITY_PROMPT (design §2.4)
+# ---------------------------------------------------------------------------
+from sensitivity import parse_tier, SENSITIVITY_PROMPT
+
+
+def test_parse_tier_extracts_known_tier_case_insensitive():
+    assert parse_tier("private") == "private"
+    assert parse_tier("Tier: FAMILY") == "family"
+    assert parse_tier("  friends \n") == "friends"
+    assert parse_tier("public.") == "public"
+
+
+def test_parse_tier_returns_none_on_unparseable():
+    assert parse_tier("") is None
+    assert parse_tier("banana") is None
+    assert parse_tier(None) is None  # type: ignore[arg-type]
+
+
+def test_prompt_names_all_four_tiers():
+    for tier in ("public", "friends", "family", "private"):
+        assert tier in SENSITIVITY_PROMPT
