@@ -20,7 +20,6 @@ from aiohttp import web
 from agent import _classify_error
 from bus import BusMessage, MessageBus, MessageType
 from channels import Channel
-from honcho_ids import honcho_session_id
 from log_cid import new_cid
 from rate_limit import RateLimiter
 from channels.voice.prosodic import ProsodicSplitter
@@ -446,32 +445,11 @@ class VoiceChannel(Channel):
         cfg = self._agent_configs.get(self.default_agent)
         if cfg is None:
             return
-        scopes = list(getattr(getattr(cfg, "memory", None), "scopes_readable", []) or [])
-        if not scopes:
-            return
-        total_budget = getattr(getattr(cfg, "memory", None), "token_budget", 800)
-        per_scope = max(total_budget // max(len(scopes), 1), 1)
-        for scope in scopes:
-            session_id = honcho_session_id(
-                "voice", scope_id, scope, self.default_agent,
-            )
-            try:
-                await self._memory.ensure_session(
-                    session_id=session_id,
-                    agent_role=self.default_agent,
-                    user_peer="voice_speaker",
-                )
-                await self._memory.get_context(
-                    session_id=session_id,
-                    agent_role=self.default_agent,
-                    tokens=per_scope,
-                    search_query=None,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Voice prewarm failed for %s scope=%s: %s",
-                    scope_id, scope, exc,
-                )
+        from hindsight_ids import bank_id
+        try:
+            await self._memory.profile(bank_id("casa", self.default_agent))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Voice prewarm (profile) failed for %s: %s", scope_id, exc)
 
 
 async def _write_sse(response: web.StreamResponse, event: str, data: dict) -> None:
