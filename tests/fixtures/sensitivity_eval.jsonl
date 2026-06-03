@@ -1,0 +1,25 @@
+{"fact": "Nicola's monthly net salary is around 5,000 EUR deposited on the 27th.", "channel": "telegram", "expected_tier": "private", "note": "income"}
+{"fact": "The ENPICOM invoice is usually 4,200 EUR plus 21% VAT.", "channel": "telegram", "expected_tier": "private", "note": "finance/client amount"}
+{"fact": "Nicola is on medication for high blood pressure.", "channel": "telegram", "expected_tier": "private", "note": "health"}
+{"fact": "Nicola's bank is ING, account ending 4471.", "channel": "telegram", "expected_tier": "private", "note": "account detail"}
+{"fact": "Nicola changes the 'consulting hours' line on every invoice.", "channel": "telegram", "expected_tier": "private", "note": "finance pattern"}
+{"fact": "Nicola and his partner are planning a mediation meeting.", "channel": "telegram", "expected_tier": "private", "note": "intimate"}
+{"fact": "Nicola's work calendar shows a board meeting Thursday 10:00.", "channel": "telegram", "expected_tier": "private", "note": "work-sensitive"}
+{"fact": "Nicola is interviewing for a new CTO role.", "channel": "telegram", "expected_tier": "private", "note": "sensitive career"}
+{"fact": "The family is going to Sardinia the first week of August.", "channel": "telegram", "expected_tier": "family", "note": "family logistics"}
+{"fact": "The kids' school pickup moves to 15:30 on Wednesdays.", "channel": "telegram", "expected_tier": "family", "note": "household schedule"}
+{"fact": "Grandma is coming to stay for two weeks in September.", "channel": "telegram", "expected_tier": "family", "note": "family plan"}
+{"fact": "The family prefers vegetarian dinners on weekdays.", "channel": "voice", "expected_tier": "family", "note": "household pref"}
+{"fact": "Nicola's daughter has a peanut allergy.", "channel": "telegram", "expected_tier": "family", "note": "health but family-shared"}
+{"fact": "The spare-room door sticks and needs planing.", "channel": "voice", "expected_tier": "friends", "note": "house maintenance"}
+{"fact": "Nicola likes the living-room thermostat at 20 degrees.", "channel": "voice", "expected_tier": "friends", "note": "comfort pref"}
+{"fact": "The good coffee beans are in the left pantry cupboard.", "channel": "voice", "expected_tier": "friends", "note": "household location"}
+{"fact": "Guests should park on the street, not the driveway.", "channel": "voice", "expected_tier": "friends", "note": "house rule for visitors"}
+{"fact": "The guest wifi network is 'CasaGuest'.", "channel": "voice", "expected_tier": "friends", "note": "shared with visitors"}
+{"fact": "The family dog, Biscuit, is fed twice a day.", "channel": "voice", "expected_tier": "friends", "note": "pet care, sitter-relevant"}
+{"fact": "The boiler service contract renews in March.", "channel": "voice", "expected_tier": "friends", "note": "household admin"}
+{"fact": "Bin collection is Tuesday mornings.", "channel": "voice", "expected_tier": "public", "note": "non-confidential municipal"}
+{"fact": "The nearest pharmacy closes at 19:00.", "channel": "voice", "expected_tier": "public", "note": "general info"}
+{"fact": "The living room is repainted sage green.", "channel": "voice", "expected_tier": "public", "note": "non-sensitive"}
+{"fact": "The house thermostat brand is Tado.", "channel": "voice", "expected_tier": "public", "note": "device fact"}
+{"fact": "The kitchen tap is a Grohe Minta.", "channel": "voice", "expected_tier": "public", "note": "device fact"}
