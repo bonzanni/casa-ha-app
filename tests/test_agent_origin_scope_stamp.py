@@ -90,17 +90,21 @@ async def test_origin_var_carries_argmax_scope_after_compute():
 
     captured: dict = {}
 
-    async def capture_origin(*, session_id, agent_role, user_peer):
-        # Fired during _one_scope which runs AFTER `active` is computed
-        # AFTER the M2.G6 origin_var re-set we're testing.
-        snapshot = agent_mod.origin_var.get(None) or {}
-        captured["origin"] = dict(snapshot)
-        return None
+    class _CapturingSemanticMemory:
+        """§4.3 read-path double. recall() fires AFTER `active` is computed
+        and AFTER the M2.G6 origin_var scope re-set — the same ordering the
+        legacy per-scope ensure_session capture relied on."""
 
+        async def profile(self, bank):
+            return ""
+
+        async def recall(self, bank, query, *, tags, max_tokens, **kw):
+            snapshot = agent_mod.origin_var.get(None) or {}
+            captured["origin"] = dict(snapshot)
+            return ""
+
+    sem = _CapturingSemanticMemory()
     memory = Mock()
-    memory.ensure_session = AsyncMock(side_effect=capture_origin)
-    memory.get_context = AsyncMock(return_value="")
-    memory.add_turn = AsyncMock()
 
     # Stub scope_registry — finance dominates.
     reg = Mock()
@@ -138,6 +142,7 @@ async def test_origin_var_carries_argmax_scope_after_compute():
         mcp_registry=Mock(resolve=Mock(return_value={})),
         channel_manager=Mock(),
         scope_registry=reg,
+        semantic_memory=sem,
     )
 
     msg = BusMessage(
@@ -152,7 +157,7 @@ async def test_origin_var_carries_argmax_scope_after_compute():
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(msg)
 
-    # The capture fires inside _one_scope which runs AFTER our re-set.
+    # The capture fires inside recall() which runs AFTER our re-set.
     assert "scope" in captured.get("origin", {}), (
         "_process did not stamp 'scope' onto origin_var after computing "
         f"active scopes. captured={captured.get('origin')!r}"

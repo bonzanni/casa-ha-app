@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from contextvars import ContextVar
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -39,7 +39,7 @@ from mcp_registry import McpServerRegistry
 from channel_trust import channel_trust, channel_trust_display, user_peer_for_channel
 from timekeeping import resolve_tz
 from memory import MemoryProvider
-from honcho_ids import honcho_session_id
+from hindsight_ids import bank_id
 from session_saver import freshness_window, save_session
 from semantic_memory import NoOpSemanticMemory, SemanticMemory
 from session_registry import SessionRegistry, build_session_key
@@ -135,6 +135,24 @@ def _resume_decision(
     if last is not None and (now - last) <= freshness_window(channel):
         return ("resume", False)
     return ("new", True)
+
+
+@dataclass(frozen=True)
+class _LoadPlan:
+    push_overlay: bool   # GET mental-model overlay precedes the turn
+    auto_recall: bool    # auto-run a query-specific recall on the opening utterance
+
+
+def _plan_load(channel: str, *, is_fresh_session: bool) -> _LoadPlan:
+    """Spec §4.3 channel-aware load. Overlay is pushed only at fresh-session-start
+    (it rides along on resume). Voice never auto-recalls (the multi-strategy + rerank
+    recall must not sit on the first-utterance critical path); voice uses the
+    recall_memory pull tool instead."""
+    if not is_fresh_session:
+        return _LoadPlan(push_overlay=False, auto_recall=False)
+    if channel == "voice":
+        return _LoadPlan(push_overlay=True, auto_recall=False)
+    return _LoadPlan(push_overlay=True, auto_recall=True)
 
 
 class Agent:
@@ -387,102 +405,66 @@ class Agent:
                 ),
             })
 
-            # Per-turn budget split: 40% for the deduped peer overlay, 60% for
-            # per-scope session reads. Constants per spec § 2.3 (Phase 5 —
-            # locked at plan-write Task A.0 against one live Ellen turn
-            # baseline).
-            overlay_budget = max(int(self.config.memory.token_budget * 0.4), 1)
-            per_scope_budget = max(
-                (self.config.memory.token_budget - overlay_budget)
-                // max(len(active), 1),
-                1,
+            # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at
+            # /addon_configs/casa-agent/agent-home/<role>/; configured cwd on
+            # Config stays as an override for legacy tests.
+            agent_home = (
+                self.config.cwd
+                or f"/addon_configs/casa-agent/agent-home/{self.config.role}"
             )
 
-            async def _one_scope(scope: str) -> tuple[str, str]:
-                sid = honcho_session_id(channel_key, scope, self.config.role)
-                try:
-                    await self._memory.ensure_session(
-                        session_id=sid,
-                        agent_role=self.config.role,
-                        user_peer=user_peer,
-                    )
-                    digest = await self._memory.get_context(
-                        session_id=sid,
-                        tokens=per_scope_budget,
-                        search_query=user_text,
-                        # M3-self (v0.30.0): forwarded as Honcho's
-                        # peer_target so semantic retrieval is scoped
-                        # to this agent's view of the session. Without
-                        # this, Honcho 2.1.1 raises ValueError on every
-                        # search_query-bearing call.
-                        agent_role=self.config.role,
-                    )
-                except Exception:
-                    # E-B (v0.29.0): exc_info=True — without this, the
-                    # exception class + message disappear, making it
-                    # impossible to root-cause M3-self failures from
-                    # production logs. The bug was confirmed firing 5×
-                    # per Ellen Telegram turn from v0.x to v0.28.1.
-                    logger.warning(
-                        "Memory call failed for scope=%s session=%s",
-                        scope, sid, exc_info=True,
-                    )
-                    digest = ""
-                return scope, digest
-
-            async def _overlay() -> str:
-                """One peer-level overlay read per turn — deduped across
-                all scopes by Honcho's peer-aggregation design (spec § 2.2)."""
-                try:
-                    return await self._memory.peer_overlay_context(
-                        observer_role=self.config.role,
-                        user_peer=user_peer,
-                        search_query=user_text,
-                        tokens=overlay_budget,
-                    )
-                except Exception:
-                    # E-B companion: same observability rule applies to
-                    # the overlay read.
-                    logger.warning(
-                        "Peer overlay call failed for observer=%s user_peer=%s",
-                        self.config.role, user_peer, exc_info=True,
-                    )
-                    return ""
-
-            # Run overlay + per-scope reads in parallel.
-            overlay_digest, *scope_pairs = await asyncio.gather(
-                _overlay(),
-                *[_one_scope(s) for s in active],
+            # SDK resume / save-before-overwrite (spec §3.3/§4.2) — runs BEFORE
+            # the memory-context build so the load plan can key on whether this
+            # is a fresh session (resume_session_id is None).
+            existing = self._session_registry.get(channel_key)
+            decision, save_old = _resume_decision(
+                msg.channel, existing, datetime.now(timezone.utc),
             )
-            digests = dict(scope_pairs)
-
-            # spec § 7 Q4 — log empty overlay so operators can spot the
-            # regime (Honcho deriver behind, fresh peer pair, etc.). INFO
-            # not WARNING.
-            if not overlay_digest:
-                logger.info(
-                    "peer_overlay_empty",
-                    extra={
-                        "observer_role": self.config.role,
-                        "user_peer": user_peer,
-                        "channel_key": channel_key,
-                    },
+            resume_session_id: str | None = None
+            if decision == "resume":
+                resume_session_id = existing.get("sdk_session_id")
+                await self._session_registry.touch(channel_key)
+            elif save_old:
+                # next-turn-after-gap: retain the cold prior session BEFORE we
+                # overwrite its registry pointer with the new SDK session.
+                await save_session(
+                    channel_key, self._session_registry, self._semantic_memory,
+                    role=self.config.role, directory=agent_home, user_peer=user_peer,
                 )
+            # else ("new", False): no prior entry → nothing to save
 
-            # Assemble — overlay first (durable identity), scopes last
-            # (recent conversation). Per spec § 7 Q2 — defer cache-read
-            # measurement to post-deploy; flip ordering in v0.26.x if
-            # cache_read regresses.
+            # 2b. Memory context (spec §4.3) — channel-aware load on the
+            # SemanticMemory seam: a cheap mental-model overlay at fresh-session
+            # start, plus (text only) one tagged recall over the readable scopes.
+            is_fresh = resume_session_id is None
+            load_plan = _plan_load(msg.channel, is_fresh_session=is_fresh)
+            bank = bank_id("casa", self.config.role)
+            overlay_digest = ""
+            facts = ""
+            if load_plan.push_overlay:
+                try:
+                    overlay_digest = await self._semantic_memory.profile(bank)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "profile overlay failed for role=%s", self.config.role,
+                        exc_info=True,
+                    )
+            if load_plan.auto_recall:
+                try:
+                    facts = await self._semantic_memory.recall(
+                        bank, user_text, tags=list(readable),
+                        max_tokens=self.config.memory.token_budget,
+                        budget="mid",  # auto_recall is always non-voice (see _plan_load); voice uses the recall_memory pull tool at budget=low
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "recall failed for role=%s", self.config.role, exc_info=True,
+                    )
             parts: list[str] = []
             if overlay_digest:
-                parts.append(
-                    f"<peer_overlay>\n{overlay_digest}\n</peer_overlay>"
-                )
-            for scope, digest in digests.items():
-                if digest:
-                    parts.append(
-                        f'<memory_context scope="{scope}">\n{digest}\n</memory_context>'
-                    )
+                parts.append(f"<peer_overlay>\n{overlay_digest}\n</peer_overlay>")
+            if facts:
+                parts.append(f"<memory_context>\n{facts}\n</memory_context>")
             memory_blocks = "\n".join(parts)
 
             if memory_blocks:
@@ -528,32 +510,6 @@ class Agent:
 
             # 5. Hooks — resolved from hooks.yaml at load time by agent_loader.
             hooks = self._resolved_hooks
-
-            # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at
-            # /addon_configs/casa-agent/agent-home/<role>/; configured cwd on
-            # Config stays as an override for legacy tests.
-            agent_home = (
-                self.config.cwd
-                or f"/addon_configs/casa-agent/agent-home/{self.config.role}"
-            )
-
-            # 6. SDK resume / save-before-overwrite (spec §3.3/§4.2) ----------
-            existing = self._session_registry.get(channel_key)
-            decision, save_old = _resume_decision(
-                msg.channel, existing, datetime.now(timezone.utc),
-            )
-            resume_session_id: str | None = None
-            if decision == "resume":
-                resume_session_id = existing.get("sdk_session_id")
-                await self._session_registry.touch(channel_key)
-            elif save_old:
-                # next-turn-after-gap: retain the cold prior session BEFORE we
-                # overwrite its registry pointer with the new SDK session.
-                await save_session(
-                    channel_key, self._session_registry, self._semantic_memory,
-                    role=self.config.role, directory=agent_home, user_peer=user_peer,
-                )
-            # else ("new", False): no prior entry → nothing to save
 
             # Binding layer — SDK does NOT auto-consume enabledPlugins; we
             # build the `plugins=[...]` list from `claude plugin list --json`.
