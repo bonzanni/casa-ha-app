@@ -62,25 +62,48 @@ def parse_tier(text: str | None) -> str | None:
     return m.group(1).lower() if m else None
 
 
-# First-draft classification prompt. CONVERGED with the maintainer in a later task — treat
-# this wording as provisional; the eval set is the source of truth for correctness.
+# Classification prompt — converged with the maintainer via the eval session (2026-06-03).
+# The eval set (tests/fixtures/sensitivity_eval.jsonl) is the regression source of truth;
+# keep this prompt and that set in sync. Calibration note: `friends` is the BROAD default —
+# do not over-escalate.
 SENSITIVITY_PROMPT = """\
-You classify a single fact about the user (or their household) into ONE access tier,
-deciding WHO should be allowed to recall it later. Judge sensitivity, not topic.
+You assign a single fact about the user (or their household) to ONE access tier, deciding
+WHO the user would let recall it later. Judge by "who would the user naturally share this
+with?", NOT by topic.
 
-Tiers (most to least sensitive):
-- private  — only the user. Finances, health, account details, intimate or sensitive
-             personal matters, anything that would be harmful or embarrassing if others
-             learned it.
-- family   — the user's household/family may know, but not friends. Family logistics,
-             relationships, plans, mildly sensitive household matters.
-- friends  — people the user invites in / talks to the home agent may know. Non-sensitive
-             preferences and shared context (e.g. "likes the thermostat at 20°C").
-- public   — no confidentiality at all; safe for anyone.
+Tiers, most to least sensitive:
+- private  — only the user. Money/income/expenses (even household — treat finances as
+             private); medical diagnoses, treatments, medications, mental-health matters;
+             personal-account credentials (email, bank); intimate or relationship matters;
+             undisclosed or in-progress personal decisions; identity-document-level details.
+- family   — NARROW. Shared-SPACE secrets/credentials the household needs but friends should
+             not have (e.g. the home alarm code, the main wifi password), and genuinely
+             family-internal sensitive matters (e.g. a relative's private difficulty).
+             NOT general household logistics, and NOT money.
+- friends  — the DEFAULT for ordinary, mildly-personal, socially-shareable facts: preferences
+             (thermostat at 20°C), travel/whereabouts and holiday plans, kids' names/ages,
+             birthdays, allergies and other safety info, everyday household logistics (school
+             pickup times, visitors, weekly dinners), the guest wifi, pets. Anyone the user
+             talks to in the home is friends-or-closer.
+- public   — impersonal, general-knowledge, harmless to anyone: bin-collection day, local
+             shop hours, device brands/models, the user's professional role/employer, the
+             colour the living room is painted.
 
 Rules:
-- When in doubt, choose the MORE private tier (a leak is worse than forgetting).
-- Classify the fact's content, independent of where it was said.
+1. Judge "who would the user share this with?" — not the topic. A topic is not a tier
+   (e.g. medical: an allergy is safety info → friends/public; a diagnosis/medication/
+   mental-health matter → private).
+2. Money and finances are private, even when household-scoped.
+3. Tier a secret by what it protects: a personal-account credential → private; a
+   shared-space/household secret → family; a guest-facing secret → friends.
+4. PII that could verify identity or enable social engineering (e.g. birthdate) is at
+   least friends — never public.
+5. Undisclosed / in-progress personal matters lean more private.
+6. Do NOT over-escalate: friends is the right home for most personal-but-shareable facts.
+   Reserve family for shared-space secrets / family-internal sensitive matters, and private
+   for genuinely sensitive things.
+7. Only when you are genuinely unsure after applying the above, choose the more private
+   tier (a leak is worse than forgetting).
 
 Respond with ONLY the single tier word: private, family, friends, or public.
 Fact:
