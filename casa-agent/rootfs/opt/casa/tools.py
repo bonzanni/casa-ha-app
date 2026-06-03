@@ -1082,6 +1082,61 @@ async def consult_other_agent_memory(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# recall_memory — spec §4.3
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    "recall_memory",
+    "Search your long-term memory for facts relevant to a query.",
+    {"query": str},
+)
+async def recall_memory(args: dict) -> dict:
+    """On-demand semantic recall against the agent's own role bank (spec §4.3).
+    Voice uses budget=low so the rerank never stalls the turn."""
+    import agent as agent_mod
+
+    query = (args.get("query") or "").strip()
+    if not query:
+        return _result({"status": "error", "kind": "empty_query",
+                        "message": "Error: query is required"})
+    sem = getattr(agent_mod, "active_semantic_memory", None)
+    if sem is None:
+        return _result({"status": "ok", "memory": ""})  # not wired / cold
+
+    origin = agent_mod.origin_var.get(None) or {}
+    role = origin.get("role", "assistant")
+    channel = origin.get("channel", "telegram")
+    caller_cfg = _agent_role_map.get(role)
+
+    # Readable scopes — same trust filter the read path uses (agent.py:360-364).
+    readable: list[str] = []
+    scope_reg = getattr(agent_mod, "active_scope_registry", None)
+    if caller_cfg is not None and scope_reg is not None:
+        from channel_trust import channel_trust
+        readable = scope_reg.filter_readable(
+            list(getattr(getattr(caller_cfg, "memory", None), "scopes_readable", []) or []),
+            channel_trust(channel),
+        )
+
+    budget = "low" if channel == "voice" else "mid"
+    tokens = (
+        getattr(getattr(caller_cfg, "memory", None), "token_budget", 2000)
+        if caller_cfg else 2000
+    )
+    from hindsight_ids import bank_id
+    try:
+        digest = await sem.recall(
+            bank_id("casa", role), query,
+            tags=readable, max_tokens=tokens, budget=budget,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("recall_memory failed for role=%r: %s", role, exc)
+        digest = ""
+    return _result({"status": "ok", "memory": digest})
+
+
+# ---------------------------------------------------------------------------
 # get_schedule — Phase 3.3
 # ---------------------------------------------------------------------------
 
@@ -2950,6 +3005,7 @@ CASA_TOOLS: tuple = (
     send_message,
     delegate_to_agent,
     consult_other_agent_memory,    # M6 — peer-level cross-perspective read
+    recall_memory,                 # §4.3 — own-role semantic recall
     get_schedule,
     engage_executor,
     emit_completion,
