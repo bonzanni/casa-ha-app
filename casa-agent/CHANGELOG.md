@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.41.0] - 2026-06-03 — Memory re-arch (3/3): resident long-term recall on Hindsight
+
+Final step of the **resident** memory re-architecture (design spec §4.3). The resident
+agents' READ path now runs on the SemanticMemory seam: a cheap mental-model **overlay**
+(`profile`) at fresh-session start + a single relevance-ranked **recall** over the
+readable scopes (replacing the per-scope `get_context` fan-out), plus a `recall_memory`
+pull tool and the cross-agent consult re-implemented on `cross_recall`. Combined with
+v0.40.0's save path, a `MEMORY_BACKEND=hindsight` instance now both **writes and reads**
+its long-term memory on the self-hosted Hindsight add-on.
+
+**Scope note:** this completes the RESIDENT memory model. The specialist / executor /
+engagement memory subsystem (delegation, executors, engagements) still runs on the legacy
+`MemoryProvider` (Honcho/SQLite) — migrating it onto the seam, and the full retirement of
+`MemoryProvider` + Honcho + SQLite, is a **deferred follow-up** (the spec designed only the
+resident model). Honcho/SQLite options therefore remain. Without `MEMORY_BACKEND=hindsight`,
+residents have no long-term recall (short-term conversation continuity is unaffected — it
+is owned by the SDK session).
+
+### Added
+
+- `recall_memory` pull tool — on-demand semantic recall against the agent's own role bank,
+  trust-filtered by readable scope; voice uses `budget=low` so the cross-encoder rerank
+  never stalls the first utterance.
+- `agent.active_semantic_memory` + `agent.active_scope_registry` handles, wired in `main()`
+  (the latter also fixes the status dashboard's scope display, previously always "(none)").
+
+### Changed
+
+- Resident read path (`agent.py`): `peer_overlay_context` → `profile` overlay (pushed only
+  at fresh-session start; rides along on resume), and the per-scope `get_context` fan-out →
+  one channel-aware `recall(tags=<readable scopes>)`. Text channels auto-recall the opening
+  utterance; voice pushes the prewarmed overlay only and recalls on demand via the tool.
+- `consult_other_agent_memory` now reads via `SemanticMemory.cross_recall` against the
+  target role's Hindsight bank (was `MemoryProvider.cross_peer_context`).
+- Voice prewarmer warms the cheap `profile` overlay instead of the per-scope session
+  fan-out; `VoiceChannel`'s memory handle is now the SemanticMemory seam.
+
 ## [0.40.0] - 2026-06-03 — Memory re-arch (2/3): long-term save on Hindsight
 
 Second step of the memory re-architecture (design spec §4.2). Wires the

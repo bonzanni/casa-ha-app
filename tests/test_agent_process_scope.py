@@ -113,7 +113,36 @@ def _make_scope_registry(*, readable_out, active_out, argmax_out):
     return reg
 
 
-def _make_agent(cfg, memory, scope_registry):
+class FakeSemanticMemory:
+    """SemanticMemory double for the §4.3 read path (profile + recall).
+
+    Not a SemanticMemory subclass — _process only calls .profile()/.recall(),
+    so a duck-typed recorder suffices and keeps these scope-routing tests
+    focused on the read contract."""
+
+    def __init__(self, overlay: str = "", facts: str = "") -> None:
+        self._overlay = overlay
+        self._facts = facts
+        self.profile_calls: list[str] = []
+        self.recall_calls: list[dict] = []
+
+    async def recall(
+        self, bank, query, *, tags, max_tokens,
+        types=("world", "experience", "observation"),
+        tags_match="any", budget="mid",
+    ):
+        self.recall_calls.append({
+            "bank": bank, "query": query, "tags": tags,
+            "max_tokens": max_tokens, "budget": budget,
+        })
+        return self._facts
+
+    async def profile(self, bank):
+        self.profile_calls.append(bank)
+        return self._overlay
+
+
+def _make_agent(cfg, memory, scope_registry, semantic_memory=None):
     from session_registry import SessionRegistry
     from mcp_registry import McpServerRegistry
     from channels import ChannelManager
@@ -129,6 +158,7 @@ def _make_agent(cfg, memory, scope_registry):
         mcp_registry=Mock(resolve=Mock(return_value={})),
         channel_manager=Mock(),
         scope_registry=scope_registry,
+        semantic_memory=semantic_memory or FakeSemanticMemory(),
     )
 
 
@@ -149,12 +179,13 @@ def _msg(channel: str, chat_id: str, text: str = "ping") -> BusMessage:
 
 
 class TestReadPath:
-    async def test_fan_out_one_scope(self):
-        """Active=[finance] → exactly one get_context call to a finance session."""
+    async def test_single_recall_tagged_with_readable_scopes(self):
+        """§4.3: the per-scope Honcho fan-out is retired. A fresh TEXT turn
+        issues exactly ONE recall against the role's bank, tagged with the
+        full readable scope set (trust-filtered), not one read per active
+        scope. (Supersedes the old test_fan_out_one_scope.)"""
         memory = Mock()
-        memory.ensure_session = AsyncMock()
-        memory.get_context = AsyncMock(return_value="finance digest")
-        memory.add_turn = AsyncMock()
+        sem = FakeSemanticMemory(facts="finance digest")
 
         reg = _make_scope_registry(
             readable_out=["personal", "business", "finance", "house"],
@@ -163,21 +194,23 @@ class TestReadPath:
         )
 
         cfg = _make_agent_config(default_scope="personal")
-        agent = _make_agent(cfg, memory, reg)
+        agent = _make_agent(cfg, memory, reg, semantic_memory=sem)
 
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("telegram", "12345", "how much for the plumber?"))
 
-        assert memory.get_context.call_count == 1
-        called_sid = memory.get_context.call_args.kwargs["session_id"]
-        assert called_sid == "telegram-12345-finance-assistant"
+        assert len(sem.recall_calls) == 1
+        call = sem.recall_calls[0]
+        assert call["bank"] == "casa-assistant"
+        assert call["query"] == "how much for the plumber?"
+        # Tags are the readable set (not the active subset) — one tagged recall.
+        assert call["tags"] == ["personal", "business", "finance", "house"]
 
-    async def test_fan_out_two_scopes_parallel(self):
-        """Active=[finance, house] → two get_context calls, one per scope."""
+    async def test_recall_count_independent_of_active_scope_count(self):
+        """§4.3: even with multiple active scopes the read issues a SINGLE
+        recall (no per-scope fan-out). (Supersedes test_fan_out_two_scopes_parallel.)"""
         memory = Mock()
-        memory.ensure_session = AsyncMock()
-        memory.get_context = AsyncMock(return_value="d")
-        memory.add_turn = AsyncMock()
+        sem = FakeSemanticMemory(facts="d")
 
         reg = _make_scope_registry(
             readable_out=["personal", "business", "finance", "house"],
@@ -186,17 +219,14 @@ class TestReadPath:
         )
 
         cfg = _make_agent_config(default_scope="personal")
-        agent = _make_agent(cfg, memory, reg)
+        agent = _make_agent(cfg, memory, reg, semantic_memory=sem)
 
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("telegram", "12345", "x"))
 
-        session_ids_called = [
-            c.kwargs["session_id"] for c in memory.get_context.call_args_list
-        ]
-        assert sorted(session_ids_called) == [
-            "telegram-12345-finance-assistant",
-            "telegram-12345-house-assistant",
+        assert len(sem.recall_calls) == 1
+        assert sem.recall_calls[0]["tags"] == [
+            "personal", "business", "finance", "house",
         ]
 
     async def test_trust_filters_unreadable_scopes(self):
@@ -248,12 +278,12 @@ class TestReadPath:
         )
         memory.add_turn.assert_not_called()
 
-    async def test_memory_context_includes_scope_attribute(self):
-        """When digest is non-empty, system prompt has scope= attribute."""
+    async def test_memory_context_wraps_recall_without_scope_attribute(self):
+        """§4.3: the recall digest is wrapped in a flat <memory_context>
+        block — the legacy per-scope scope= attribute is gone (recall is a
+        single tagged read, not a per-scope fan-out)."""
         memory = Mock()
-        memory.ensure_session = AsyncMock()
-        memory.get_context = AsyncMock(return_value="some context data")
-        memory.add_turn = AsyncMock()
+        sem = FakeSemanticMemory(facts="some context data")
 
         reg = _make_scope_registry(
             readable_out=["personal"],
@@ -262,13 +292,14 @@ class TestReadPath:
         )
 
         cfg = _make_agent_config(default_scope="personal")
-        agent = _make_agent(cfg, memory, reg)
+        agent = _make_agent(cfg, memory, reg, semantic_memory=sem)
 
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("telegram", "12345", "hello"))
 
         prompt = FakeClient.captured_options.system_prompt
-        assert '<memory_context scope="personal">' in prompt
+        assert "<memory_context>" in prompt
+        assert "scope=" not in prompt
         assert "some context data" in prompt
 
 
@@ -646,30 +677,30 @@ class TestScopeRouteEmission:
 
 
 class TestMemoryFailureLogsExcInfo:
-    """E-B (v0.29.0): "Memory call failed" must carry exc_info=True so
-    the actual exception class + message reach production logs.
+    """E-B observability rule, carried onto the §4.3 SemanticMemory seam:
+    both read-path failures ("recall failed" and "profile overlay failed")
+    must carry exc_info=True so the underlying exception class + message
+    reach production logs.
 
-    Pre-fix: every Ellen Telegram turn fired 5× WARNINGs (one per active
-    scope) with no recoverable exception data — root-cause investigation
-    blocked. The bug-review-2026-04-30-exploration2.md::E-B notes "the
-    exception class + message are unrecoverable from production logs."
+    Pre-fix history: the legacy per-scope read fired WARNINGs with no
+    recoverable exception data (bug-review-2026-04-30-exploration2.md::E-B).
+    The seam keeps the same contract on its two read calls.
     """
 
-    async def test_one_scope_failure_includes_exc_info(self, caplog):
+    async def test_recall_failure_includes_exc_info(self, caplog):
         import logging
         from agent import Agent
         from bus import BusMessage, MessageType
 
         memory = Mock()
-        memory.ensure_session = AsyncMock(
-            side_effect=TypeError(
-                "HonchoMemoryProvider.get_context() got an "
-                "unexpected keyword argument 'tokens'"
-            ),
-        )
-        memory.get_context = AsyncMock(return_value="never reached")
-        memory.add_turn = AsyncMock()
-        memory.peer_overlay_context = AsyncMock(return_value="")
+
+        class _FailRecall(FakeSemanticMemory):
+            async def recall(self, *a, **kw):
+                raise TypeError(
+                    "Hindsight recall got an unexpected keyword argument"
+                )
+
+        sem = _FailRecall()
 
         reg = _make_scope_registry(
             readable_out=["personal"],
@@ -678,7 +709,7 @@ class TestMemoryFailureLogsExcInfo:
         )
 
         cfg = _make_agent_config(default_scope="personal")
-        agent = _make_agent(cfg, memory, reg)
+        agent = _make_agent(cfg, memory, reg, semantic_memory=sem)
 
         caplog.set_level(logging.WARNING, logger="agent")
         with patch("agent.ClaudeSDKClient", FakeClient):
@@ -686,37 +717,34 @@ class TestMemoryFailureLogsExcInfo:
 
         records = [
             r for r in caplog.records
-            if r.name == "agent" and "Memory call failed" in r.getMessage()
+            if r.name == "agent" and "recall failed" in r.getMessage()
         ]
         assert records, (
-            "expected at least one 'Memory call failed' WARNING "
+            "expected at least one 'recall failed' WARNING "
             "but got: " + repr([r.getMessage() for r in caplog.records])
         )
-        # E-B contract: exc_info must be populated so the underlying
-        # exception class + message are reachable from production logs.
         rec = records[0]
         assert rec.exc_info is not None, (
-            "E-B regression: Memory call failed warning lost exc_info=True; "
+            "E-B regression: recall failed warning lost exc_info=True; "
             "production root-cause is blocked"
         )
-        # Sanity: the captured exception is the one we raised.
         assert rec.exc_info[0] is TypeError
-        assert "tokens" in str(rec.exc_info[1])
+        assert "keyword argument" in str(rec.exc_info[1])
 
-    async def test_overlay_failure_includes_exc_info(self, caplog):
-        """E-B companion: peer_overlay_context warning also carries
+    async def test_profile_overlay_failure_includes_exc_info(self, caplog):
+        """E-B companion: the profile() overlay warning also carries
         exc_info — same observability rule."""
         import logging
         from agent import Agent
         from bus import BusMessage, MessageType
 
         memory = Mock()
-        memory.ensure_session = AsyncMock()
-        memory.get_context = AsyncMock(return_value="ok")
-        memory.add_turn = AsyncMock()
-        memory.peer_overlay_context = AsyncMock(
-            side_effect=RuntimeError("honcho 503"),
-        )
+
+        class _FailProfile(FakeSemanticMemory):
+            async def profile(self, bank):
+                raise RuntimeError("hindsight 503")
+
+        sem = _FailProfile(facts="ok")
 
         reg = _make_scope_registry(
             readable_out=["personal"],
@@ -725,7 +753,7 @@ class TestMemoryFailureLogsExcInfo:
         )
 
         cfg = _make_agent_config(default_scope="personal")
-        agent = _make_agent(cfg, memory, reg)
+        agent = _make_agent(cfg, memory, reg, semantic_memory=sem)
 
         caplog.set_level(logging.WARNING, logger="agent")
         with patch("agent.ClaudeSDKClient", FakeClient):
@@ -733,11 +761,11 @@ class TestMemoryFailureLogsExcInfo:
 
         records = [
             r for r in caplog.records
-            if r.name == "agent" and "Peer overlay call failed" in r.getMessage()
+            if r.name == "agent" and "profile overlay failed" in r.getMessage()
         ]
         assert records
         rec = records[0]
         assert rec.exc_info is not None, (
-            "E-B companion regression: Peer overlay warning lost exc_info"
+            "E-B companion regression: profile overlay warning lost exc_info"
         )
         assert rec.exc_info[0] is RuntimeError

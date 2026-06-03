@@ -63,6 +63,7 @@ class _DummyMemory:
     async def ensure_session(self, *a, **kw): return None
     async def get_context(self, *a, **kw): return ""
     async def add_turn(self, *a, **kw): return None
+    async def profile(self, bank: str) -> str: return ""
 
 
 @pytest.fixture

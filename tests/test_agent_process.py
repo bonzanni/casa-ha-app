@@ -14,6 +14,7 @@ from channels import ChannelManager
 from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
 from mcp_registry import McpServerRegistry
 from memory import MemoryProvider
+from semantic_memory import SemanticMemory
 from session_registry import SessionRegistry
 
 from claude_agent_sdk import (
@@ -104,6 +105,45 @@ class FakeMemory(MemoryProvider):
         return ""
 
 
+class FakeSemanticMemory(SemanticMemory):
+    """SemanticMemory double for the §4.3 read path.
+
+    ``profile`` returns the mental-model overlay (rendered as <peer_overlay>);
+    ``recall`` returns the query-specific facts digest (rendered as
+    <memory_context>). Calls are recorded so tests can assert the channel-aware
+    load contract (overlay at fresh-session start; recall text-only)."""
+
+    def __init__(self, overlay: str = "", facts: str = "") -> None:
+        self._overlay = overlay
+        self._facts = facts
+        self.profile_calls: list[str] = []
+        self.recall_calls: list[dict] = []
+        self.retain_calls: list[tuple] = []
+        self.cross_calls: list[dict] = []
+
+    async def retain(self, bank, items, *, async_=True):
+        self.retain_calls.append((bank, items, async_))
+
+    async def recall(
+        self, bank, query, *, tags, max_tokens,
+        types=("world", "experience", "observation"),
+        tags_match="any", budget="mid",
+    ):
+        self.recall_calls.append({
+            "bank": bank, "query": query, "tags": tags,
+            "max_tokens": max_tokens, "budget": budget,
+        })
+        return self._facts
+
+    async def profile(self, bank):
+        self.profile_calls.append(bank)
+        return self._overlay
+
+    async def cross_recall(self, bank, query, *, max_tokens, budget="low"):
+        self.cross_calls.append({"bank": bank, "query": query})
+        return ""
+
+
 class FakeClient:
     """Minimal ClaudeSDKClient substitute with per-attempt behaviour.
 
@@ -156,6 +196,7 @@ def _make_agent(
     memory: MemoryProvider,
     tmp_path,
     role: str = "assistant",
+    semantic_memory: SemanticMemory | None = None,
 ) -> Agent:
     cfg = AgentConfig(
         role=role,
@@ -178,6 +219,7 @@ def _make_agent(
         mcp_registry=McpServerRegistry(),
         channel_manager=ChannelManager(),
         scope_registry=_mk_scope_registry_stub(),
+        semantic_memory=semantic_memory or FakeSemanticMemory(),
     )
 
 
@@ -193,13 +235,18 @@ def _msg(channel: str, chat_id: str, text: str = "ping") -> BusMessage:
 
 
 async def test_session_id_is_channel_plus_role(tmp_path):
+    # §4.3: the read path no longer fans out per-scope Honcho sessions; it
+    # recalls once against the role's bank. The channel+role session-key
+    # contract is now asserted via the registry write_scope record.
     mem = FakeMemory()
-    agent = _make_agent(mem, tmp_path, role="assistant")
+    sem = FakeSemanticMemory(facts="recall digest")
+    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
-    assert mem.ensure[0][0] == "telegram-123-personal-assistant"
-    assert mem.get[0][0] == "telegram-123-personal-assistant"
+    # Fresh telegram session → one bank recall keyed to this role.
+    assert len(sem.recall_calls) == 1
+    assert sem.recall_calls[0]["bank"] == "casa-assistant"
     # Session-granularity save model: per-turn add_turn is retired. The
     # dominant write_scope is recorded on the registry entry instead, and
     # no per-turn memory write happens.
@@ -210,32 +257,39 @@ async def test_session_id_is_channel_plus_role(tmp_path):
 
 
 async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
+    # §4.3: the per-turn read no longer threads a user_peer (no ensure_session
+    # / per-turn add_turn). The voice-speaker peer is carried into save_session
+    # at session end instead. On the read side, a fresh voice session pushes
+    # the overlay but NEVER auto-recalls (voice keeps the multi-strategy recall
+    # off the first-utterance critical path). write_scope still records.
     mem = FakeMemory()
-    agent = _make_agent(mem, tmp_path, role="butler")
+    sem = FakeSemanticMemory(overlay="OVERLAY")
+    agent = _make_agent(mem, tmp_path, role="butler", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("voice", "lr", "lights on"))
 
-    # Phase 5 / E-14: user_peer no longer threads through get_context;
-    # ensure_session remains the load-bearing peer assertion. Per-turn
-    # add_turn is retired (session-granularity save model), so the
-    # voice-speaker peer is now carried into save_session at session end,
-    # not into a per-turn write.
-    assert mem.ensure[0][2] == "voice_speaker"
+    assert len(sem.profile_calls) == 1   # overlay pushed at fresh start
+    assert sem.recall_calls == []        # voice never auto-recalls
     assert mem.add == []
     entry = agent._session_registry.get("voice-lr")
     assert entry is not None
     assert entry.get("write_scope") == "personal"
 
 
-async def test_telegram_channel_uses_nicola_peer(tmp_path):
+async def test_telegram_channel_autorecalls_on_fresh_session(tmp_path):
+    # §4.3: the user_peer (nicola) is a save-path concern now (carried into
+    # save_session), no longer threaded through the per-turn read. The
+    # read-path contract for a fresh TEXT channel is: push the overlay AND
+    # auto-recall the opening utterance against the role's bank.
     mem = FakeMemory()
-    agent = _make_agent(mem, tmp_path, role="assistant")
+    sem = FakeSemanticMemory(overlay="O", facts="F")
+    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
-    # Phase 5 / E-14: user_peer is asserted via ensure_session, not
-    # get_context (which no longer takes user_peer).
-    assert mem.ensure[0][2] == "nicola"
+    assert len(sem.profile_calls) == 1          # overlay pushed
+    assert len(sem.recall_calls) == 1           # telegram auto-recalls
+    assert sem.recall_calls[0]["query"] == "hi"
 
 
 # ---------------------------------------------------------------------------
@@ -243,28 +297,34 @@ async def test_telegram_channel_uses_nicola_peer(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-async def test_overlay_task_runs_alongside_scope_tasks(tmp_path):
-    """Spec § 2.7: 1 overlay task + N scope tasks under asyncio.gather."""
-    mem = FakeMemory(context="scope-content", overlay="overlay-content")
-    agent = _make_agent(mem, tmp_path, role="assistant")
+async def test_fresh_text_turn_pushes_overlay_and_recalls(tmp_path):
+    """Spec §4.3: a fresh TEXT turn pushes the mental-model overlay
+    (profile) AND runs one query-specific recall over the readable scopes.
+    Supersedes the old "1 overlay + N per-scope reads under gather" shape —
+    the per-scope fan-out is gone; recall is a single tagged call."""
+    mem = FakeMemory()
+    sem = FakeSemanticMemory(overlay="overlay-content", facts="recall-content")
+    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
-    # One overlay call (per turn) regardless of scope count.
-    assert len(mem.overlay_calls) == 1
-    # Sig: (observer_role, user_peer, search_query, tokens)
-    assert mem.overlay_calls[0][0] == "assistant"
-    assert mem.overlay_calls[0][1] == "nicola"
-    assert mem.overlay_calls[0][2] == "hi"
-    # Scope calls happen too — actual count depends on test scope-registry stub.
-    assert len(mem.get) >= 1
+    # One overlay (profile) call per fresh turn, keyed to the role's bank.
+    assert sem.profile_calls == ["casa-assistant"]
+    # One recall call: query == utterance, tags == readable scopes, mid budget.
+    assert len(sem.recall_calls) == 1
+    call = sem.recall_calls[0]
+    assert call["bank"] == "casa-assistant"
+    assert call["query"] == "hi"
+    assert call["tags"] == ["personal"]   # readable from the scope-registry stub
+    assert call["budget"] == "mid"
 
 
 async def test_overlay_block_present_when_overlay_non_empty(tmp_path):
-    """Assembled memory_blocks contains <peer_overlay> when overlay
-    digest is non-empty."""
-    mem = FakeMemory(context="", overlay="OVERLAY_TEXT")
-    agent = _make_agent(mem, tmp_path, role="assistant")
+    """Assembled memory_blocks contains <peer_overlay> when the profile
+    overlay digest is non-empty (spec §4.3)."""
+    mem = FakeMemory()
+    sem = FakeSemanticMemory(overlay="OVERLAY_TEXT")
+    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
 
     captured: dict[str, str] = {}
 
@@ -280,19 +340,19 @@ async def test_overlay_block_present_when_overlay_non_empty(tmp_path):
     assert "OVERLAY_TEXT" in captured["system"]
 
 
-async def test_overlay_failure_does_not_poison_scope_reads(tmp_path, caplog):
-    """Overlay task raising → empty overlay digest, scope reads still
-    proceed (gather doesn't poison)."""
+async def test_overlay_failure_does_not_poison_recall(tmp_path, caplog):
+    """profile() raising → overlay omitted, but the recall still proceeds
+    and lands in the prompt (spec §4.3 — the two reads are independent)."""
     import logging
 
-    class FailingOverlayMemory(FakeMemory):
-        async def peer_overlay_context(
-            self, observer_role, user_peer, search_query, tokens,
-        ):
+    class FailingProfileMemory(FakeSemanticMemory):
+        async def profile(self, bank):
+            self.profile_calls.append(bank)
             raise RuntimeError("simulated failure")
 
-    mem = FailingOverlayMemory(context="scope-still-works")
-    agent = _make_agent(mem, tmp_path, role="assistant")
+    mem = FakeMemory()
+    sem = FailingProfileMemory(facts="recall-still-works")
+    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
 
     captured: dict[str, str] = {}
 
@@ -306,26 +366,19 @@ async def test_overlay_failure_does_not_poison_scope_reads(tmp_path, caplog):
             await agent._process(_msg("telegram", "123", "hi"))
 
     assert "<peer_overlay>" not in captured["system"]   # overlay omitted
-    assert "<memory_context" in captured["system"]      # scope present
+    assert "<memory_context>" in captured["system"]     # recall present
+    assert "recall-still-works" in captured["system"]
     assert any(
-        "Peer overlay call failed" in r.message for r in caplog.records
+        "profile overlay failed" in r.message for r in caplog.records
     )
 
 
-async def test_peer_overlay_empty_logs_info_line(tmp_path, caplog):
-    """Spec § 7 Q4: empty overlay digest emits peer_overlay_empty INFO line."""
-    import logging
-    mem = FakeMemory(context="", overlay="")
-    agent = _make_agent(mem, tmp_path, role="assistant")
-
-    with caplog.at_level(logging.INFO, logger="agent"):
-        with patch("agent.ClaudeSDKClient", FakeClient):
-            await agent._process(_msg("telegram", "123", "hi"))
-
-    records = [r for r in caplog.records if r.message == "peer_overlay_empty"]
-    assert len(records) == 1
-    assert records[0].observer_role == "assistant"
-    assert records[0].user_peer == "nicola"
+# NOTE (§4.3 read-path rewire): test_peer_overlay_empty_logs_info_line was
+# dropped here. It asserted the legacy `peer_overlay_empty` INFO line emitted
+# by the old MemoryProvider.peer_overlay_context read path. The SemanticMemory
+# seam's `profile()` overlay has no empty-digest observability line (it would
+# need to be designed + added deliberately, not inferred), so this assertion
+# has no equivalent on the new contract. No replacement is invented.
 
 
 async def test_system_prompt_contains_channel_context(tmp_path):
@@ -342,18 +395,26 @@ async def test_system_prompt_contains_channel_context(tmp_path):
 
 
 async def test_system_prompt_memory_context_only_when_nonempty(tmp_path):
-    mem = FakeMemory(context="")
-    agent = _make_agent(mem, tmp_path, role="assistant")
+    # §4.3: <memory_context> now wraps the single recall digest (no per-scope
+    # scope= attribute). Empty recall → no block; non-empty → block + content.
+    mem = FakeMemory()
+    sem = FakeSemanticMemory(facts="")
+    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
     assert "<memory_context>" not in FakeClient.captured_options.system_prompt
 
-    mem2 = FakeMemory(context="## Recent\n[nicola] hi")
-    agent2 = _make_agent(mem2, tmp_path, role="assistant")
-    with patch("agent.ClaudeSDKClient", FakeClient):
+    # Force a FRESH session so recall fires (the first turn above persisted a
+    # registry entry into the shared sessions.json, which would otherwise
+    # resume and skip the recall under §4.3).
+    sem2 = FakeSemanticMemory(facts="## Recent\n[nicola] hi")
+    agent2 = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem2)
+    with patch("agent.ClaudeSDKClient", FakeClient), \
+         patch("agent._resume_decision", return_value=("new", False)):
         await agent2._process(_msg("telegram", "123", "hi"))
     prompt2 = FakeClient.captured_options.system_prompt
-    assert "<memory_context scope=" in prompt2
+    assert "<memory_context>" in prompt2
+    assert "scope=" not in prompt2          # per-scope attribute is gone
     assert "[nicola] hi" in prompt2
 
 
@@ -377,17 +438,18 @@ async def test_write_scope_recorded_on_registry_no_per_turn_write(tmp_path):
 async def test_memory_failure_does_not_break_response(tmp_path, caplog):
     import logging
 
-    class BrokenMemory(FakeMemory):
-        async def get_context(self, *a, **kw):
-            raise RuntimeError("honcho down")
+    class BrokenSemanticMemory(FakeSemanticMemory):
+        async def recall(self, *a, **kw):
+            raise RuntimeError("hindsight down")
 
-    mem = BrokenMemory()
-    agent = _make_agent(mem, tmp_path, role="assistant")
+    mem = FakeMemory()
+    sem = BrokenSemanticMemory()
+    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         with caplog.at_level(logging.WARNING):
             out = await agent._process(_msg("telegram", "123", "hi"))
     assert out == "pong"
-    assert any("memory" in r.message.lower() for r in caplog.records)
+    assert any("recall failed" in r.message.lower() for r in caplog.records)
     prompt = FakeClient.captured_options.system_prompt
     assert "<memory_context>" not in prompt
     assert "<channel_context>" in prompt
@@ -766,7 +828,9 @@ class TestTokenBudgetMonitoring:
         self, tmp_path,
     ):
         """The recorder should see one call per turn with the digest
-        size estimated from the memory_context return value."""
+        size estimated from the assembled memory_blocks (spec §4.3:
+        the recall facts wrapped in <memory_context>)."""
+        from tokens import estimate_tokens
         FakeClient.reset()
         FakeClient.usage = {
             "input_tokens": 100,
@@ -774,10 +838,11 @@ class TestTokenBudgetMonitoring:
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
         }
-        # 8000 chars → 2000 token-estimate, well under the 1000 budget
-        # (so we get the recorder call without tripping the warning yet).
-        mem = FakeMemory(context="x" * 8000)
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        facts = "x" * 8000
+        # Overlay empty so the recorded block is exactly the recall context.
+        sem = FakeSemanticMemory(overlay="", facts=facts)
+        mem = FakeMemory()
+        agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
 
         observed: list[tuple[str, int, int]] = []
         original_record = agent._budget_tracker.record
@@ -789,7 +854,10 @@ class TestTokenBudgetMonitoring:
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("telegram", "123", "hi"))
 
-        assert observed == [("telegram-123-assistant", 2013, 1000)]
+        expected = estimate_tokens(
+            f"<memory_context>\n{facts}\n</memory_context>"
+        )
+        assert observed == [("telegram-123-assistant", expected, 1000)]
 
     async def test_broken_memory_skips_recorder(self, tmp_path):
         """When get_context raises, we proceed without memory and must
@@ -825,11 +893,16 @@ class TestTokenBudgetMonitoring:
             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
         }
         # 5000-token estimate vs 1000 budget → overrun.
-        mem = FakeMemory(context="x" * 20000)
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        # §4.3: recall (and thus the oversized memory_blocks) only fires on a
+        # FRESH session, so force every turn fresh — the budget streak is keyed
+        # on channel_key+role, which is stable across these five fresh turns.
+        mem = FakeMemory()
+        sem = FakeSemanticMemory(facts="x" * 20000)
+        agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
 
         caplog.set_level(_logging.WARNING, logger="tokens")
-        with patch("agent.ClaudeSDKClient", FakeClient):
+        with patch("agent.ClaudeSDKClient", FakeClient), \
+             patch("agent._resume_decision", return_value=("new", False)):
             for _ in range(5):
                 await agent._process(_msg("telegram", "123", "hi"))
 
@@ -953,6 +1026,7 @@ def _make_agent_with_registry(
         mcp_registry=McpServerRegistry(),
         channel_manager=ChannelManager(),
         scope_registry=_mk_scope_registry_stub(),
+        semantic_memory=FakeSemanticMemory(),
     )
 
 
@@ -1484,4 +1558,49 @@ class TestSaveBeforeOverwrite:
 
         assert save_calls == [], (
             f"save_session must not be called on the resume path; got {save_calls}"
+        )
+
+    async def test_resumed_session_skips_overlay_and_recall(
+        self, tmp_path, monkeypatch,
+    ):
+        """Spec §4.3: on a resumed session (is_fresh=False), _plan_load
+        returns push_overlay=False, auto_recall=False. The overlay and
+        per-turn recall are BOTH skipped — the overlay rides along on the
+        resumed SDK thread; no auto-recall fires."""
+        import agent as agent_mod
+        from datetime import datetime, timedelta, timezone
+
+        # Monkeypatch save_session so the save-before-overwrite path can't
+        # accidentally fire and muddy the assertion.
+        monkeypatch.setattr(agent_mod, "save_session", AsyncMock())
+        FakeClient.reset()
+
+        reg = SessionRegistry(str(tmp_path / "sessions.json"))
+        # Seed a FRESH entry: sdk_session_id present, last_active just 5 min ago
+        # → _resume_decision returns ("resume", False) → is_fresh=False.
+        fresh_ts = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        reg._data["telegram-789"] = {
+            "agent": "assistant",
+            "sdk_session_id": "live-sid-resume",
+            "last_active": fresh_ts,
+        }
+
+        fake = FakeSemanticMemory(overlay="should-not-appear", facts="should-not-appear")
+        mem = FakeMemory()
+        agent = _make_agent_with_registry(mem, reg, role="assistant")
+        # Replace the NoOp semantic memory with our tracking fake.
+        agent._semantic_memory = fake
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            await agent._process(_msg("telegram", "789", "hi"))
+
+        assert fake.profile_calls == [], (
+            "profile() must not be called on a resumed session (overlay rides "
+            f"along on the thread); got: {fake.profile_calls}"
+        )
+        assert fake.recall_calls == [], (
+            "recall() must not be called on a resumed session (no auto-recall "
+            f"on resume path); got: {fake.recall_calls}"
         )
