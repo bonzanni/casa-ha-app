@@ -163,7 +163,13 @@ class SessionRegistry:
 
     async def _save_locked(self) -> None:
         """Persist current data. Caller MUST hold ``self._lock``."""
-        data = dict(self._data)  # snapshot for thread safety
+        # Per-entry copy, not a shallow dict() of the outer map: the write runs
+        # in a thread (the lock is released while we await it), so a concurrent
+        # mutator that acquires the lock could otherwise mutate an inner entry
+        # dict mid-serialize. The save model relies on write_scope/consolidated_at
+        # persisting atomically (crash-safety, spec §4.2 / C3). Entries are flat
+        # str→str|None maps, so a one-level copy is sufficient and cheap.
+        data = {k: dict(v) for k, v in self._data.items()}
         await asyncio.to_thread(self._write, data)
 
     def _write(self, data: dict[str, dict[str, Any]]) -> None:

@@ -1610,7 +1610,8 @@ async def main() -> None:
             "honcho": "Honcho",
             "sqlite": "SQLite",
             "noop": "none",
-        }[mem_choice.backend]
+            "hindsight": "Hindsight",
+        }.get(mem_choice.backend, mem_choice.backend)
         system_rows += _row(
             "Memory", mem_type, "on" if mem_choice.backend != "noop" else "off",
         )
