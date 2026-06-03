@@ -27,6 +27,7 @@ from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig
 from config_git import init_repo, snapshot_manual_edits
+from freshness_reaper import FreshnessReaper
 from log_cid import install_logging, new_cid
 from casa_core_middleware import cid_middleware, CasaAccessLogger
 from mcp_registry import McpServerRegistry
@@ -771,7 +772,7 @@ def build_invoke_message(
 # Memory backend selection (spec 2.2b §2)
 # ------------------------------------------------------------------
 
-_VALID_MEMORY_BACKENDS = ("honcho", "sqlite", "noop")
+_VALID_MEMORY_BACKENDS = ("honcho", "sqlite", "noop", "hindsight")
 
 
 from dataclasses import dataclass as _dataclass
@@ -792,7 +793,9 @@ def resolve_memory_backend_choice(env: dict[str, str]) -> _MemoryChoice:
 
     Order:
       1. Explicit ``MEMORY_BACKEND`` wins. ``honcho`` without
-         ``HONCHO_API_KEY`` raises. Invalid values raise.
+         ``HONCHO_API_KEY`` raises. Invalid values raise. ``hindsight`` is
+         valid: the LEGACY read path is then NoOp (long-term memory is handled
+         by SemanticMemory/Hindsight via ``resolve_semantic_memory_choice``).
       2. Else ``HONCHO_API_KEY`` → ``honcho``.
       3. Else ``sqlite`` (fresh-install default).
     """
@@ -988,9 +991,31 @@ async def main() -> None:
                 mem_choice.db_path, exc,
             )
             base_memory = NoOpMemory()
+    elif mem_choice.backend == "hindsight":
+        # MEMORY_BACKEND=hindsight: long-term memory is served by Hindsight via
+        # the SemanticMemory seam (built below); the LEGACY read path has no
+        # backend, so base_memory is NoOp (cold legacy reads) until the load
+        # plan migrates reads onto SemanticMemory. Writes (the reaper's retain)
+        # are active now (spec §4.2, C4 Option A).
+        base_memory = NoOpMemory()
+        logger.info("MEMORY_BACKEND=hindsight: legacy read path is NoOp; long-term via Hindsight (save active)")
     else:  # noop
         base_memory = NoOpMemory()
         logger.info("MEMORY_BACKEND=noop; using no-op memory")
+
+    # Long-term semantic memory (spec §5/§4.2). Coexists with base_memory (the
+    # legacy read path) until the load plan migrates reads off MemoryProvider.
+    semantic_memory = build_semantic_memory(resolve_semantic_memory_choice(dict(os.environ)))
+
+    def _agent_home_dir(role: str) -> str:
+        """Resident transcript cwd (encoded-cwd dir for get_session_messages /
+        delete_session). Matches agent.py's agent_home WHEN ``config.cwd`` is
+        unset — the prod default (all shipped configs have ``cwd: ""``). If a
+        resident ever sets a non-empty ``config.cwd``, its transcript lands
+        there instead and the reaper/save would look in the wrong dir; keep
+        ``config.cwd`` empty for residents. (Formula also duplicated in
+        session_sweeper/session_saver/agent.py — consolidate in a cleanup.)"""
+        return f"/addon_configs/casa-agent/agent-home/{role}"
 
     # 3. Message bus
     bus = MessageBus()
@@ -1004,6 +1029,12 @@ async def main() -> None:
         webhook_session_ttl_days=_env_int_or(
             "WEBHOOK_SESSION_TTL_DAYS", 1, min_value=1,
         ),
+        directory_for=_agent_home_dir,
+    )
+    freshness_reaper = FreshnessReaper(
+        registry=session_registry,
+        semantic_memory=semantic_memory,
+        directory_for=_agent_home_dir,
     )
 
     # 5. MCP server registry
@@ -1185,6 +1216,7 @@ async def main() -> None:
         agent = Agent(
             config=cfg,
             memory=agent_memory,
+            semantic_memory=semantic_memory,
             session_registry=session_registry,
             mcp_registry=mcp_registry,
             channel_manager=channel_manager,
@@ -1385,6 +1417,8 @@ async def main() -> None:
         telegram_channel._engagement_registry = engagement_registry
         telegram_channel._engagement_driver = engagement_driver
         telegram_channel._observer = observer
+        telegram_channel._session_registry = session_registry
+        telegram_channel._semantic_memory = semantic_memory
 
         async def _driver_send_user_turn(rec, text):
             if rec.driver == "claude_code":
@@ -1758,6 +1792,7 @@ async def main() -> None:
     # raising RuntimeError on every fire (silent regression from v0.13.0).
     # Pass the coroutine functions directly with kwargs.
     session_sweeper.start()
+    freshness_reaper.start()
     scheduler.add_job(
         engagement_registry.sweep_idle_and_suspend,
         kwargs={"driver": engagement_driver},
@@ -1805,6 +1840,7 @@ async def main() -> None:
     logger.info("Shutting down...")
     scheduler.shutdown(wait=False)
     await session_sweeper.stop()
+    await freshness_reaper.stop()
 
     for task in loop_tasks:
         task.cancel()
