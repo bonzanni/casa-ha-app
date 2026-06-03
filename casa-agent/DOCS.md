@@ -39,7 +39,7 @@ representations). Set `MEMORY_BACKEND=noop` if you want no memory at all.
 |--------|-------------|
 | `honcho_api_url` | Honcho API URL. Defaults to `https://api.honcho.dev`. |
 | `honcho_api_key` | Honcho API key. When set, enables the Honcho cloud backend (overrides SQLite default). |
-| `hindsight_api_url` | Internal base URL for the self-hosted Hindsight add-on (e.g. `http://5884eb17-hindsight:8888` or its IP), reached via the add-on's hassio network alias/IP — not the bare host `hindsight`. Set together with `MEMORY_BACKEND=hindsight` to enable long-term **save** to Hindsight (the freshness reaper retains ended conversations). Long-term **recall** (reads) lands in a later release; until then a hindsight-selected instance writes facts but does not yet read them back. Leave empty to keep long-term memory disabled. |
+| `hindsight_api_url` | Internal base URL for the self-hosted Hindsight add-on (e.g. `http://5884eb17-hindsight:8888` or its IP), reached via the add-on's hassio network alias/IP — not the bare host `hindsight`. Set together with `MEMORY_BACKEND=hindsight` to put the resident agents' long-term semantic memory on Hindsight — both **save** (the freshness reaper retains ended conversations) and **recall** (a mental-model overlay + relevance-ranked recall on the read path, plus a `recall_memory` pull tool). Leave empty to keep long-term memory disabled (short-term conversation continuity still works via the SDK session). |
 
 The following env vars can be set via the add-on environment (not the
 options panel) for finer control:
