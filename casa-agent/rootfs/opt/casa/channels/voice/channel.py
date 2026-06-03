@@ -25,7 +25,7 @@ from rate_limit import RateLimiter
 from channels.voice.prosodic import ProsodicSplitter
 from channels.voice.session import VoiceSessionPool
 from channels.voice.tts_adapter import TagDialectAdapter
-from memory import MemoryProvider
+from semantic_memory import SemanticMemory
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ class VoiceChannel(Channel):
         sse_path: str,
         ws_path: str,
         agent_configs: Mapping[str, Any],
-        memory: MemoryProvider,
+        memory: SemanticMemory,
         idle_timeout: int,
         sse_enabled: bool = True,
         ws_enabled: bool = True,

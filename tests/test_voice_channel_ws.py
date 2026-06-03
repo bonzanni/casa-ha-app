@@ -44,6 +44,7 @@ async def ws_app():
     memory.ensure_session = AsyncMock(return_value=None)
     memory.get_context = AsyncMock(return_value="")
     memory.add_turn = AsyncMock(return_value=None)
+    memory.profile = AsyncMock(return_value="")
 
     ch = VoiceChannel(
         bus=bus, default_agent="butler", webhook_secret="",
@@ -83,17 +84,17 @@ class TestWSTurn:
             assert "block" in got
             assert got[-1] == "done"
             # Prewarm fired at least once.
-            assert memory.ensure_session.await_count >= 1
+            assert memory.profile.await_count >= 1
 
     async def test_stt_start_dedup(self, ws_app):
         client, _, memory, channel = ws_app
 
         # Make prewarm block so the first task is still live when the second
         # stt_start arrives (otherwise the first may finish between frames).
-        ensure_block = asyncio.Event()
-        async def slow_ensure(*args, **kwargs):
-            await ensure_block.wait()
-        memory.ensure_session = slow_ensure
+        profile_block = asyncio.Event()
+        async def slow_profile(*a, **k):
+            await profile_block.wait()
+        memory.profile = slow_profile
 
         async with client.ws_connect("/api/converse/ws") as ws:
             await ws.send_json({"type": "stt_start", "scope_id": "s"})
@@ -103,7 +104,7 @@ class TestWSTurn:
             assert sess is not None
             assert sess.prewarm_task is not None
             # Release so the ws handler can close cleanly.
-            ensure_block.set()
+            profile_block.set()
 
     async def test_cancel_stops_in_flight(self, ws_app):
         client, bus, _, channel = ws_app
@@ -153,6 +154,7 @@ async def voice_ws_app_with_limiter(request):
     memory.ensure_session = AsyncMock(return_value=None)
     memory.get_context = AsyncMock(return_value="")
     memory.add_turn = AsyncMock(return_value=None)
+    memory.profile = AsyncMock(return_value="")
 
     limiter = RateLimiter(capacity=capacity, window_s=60.0)
 
