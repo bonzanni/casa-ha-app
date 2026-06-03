@@ -23,7 +23,7 @@ from claude_agent_sdk import (
     TextBlock as _SDKTextBlock,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 def _mk_scope_registry_stub():
@@ -244,9 +244,9 @@ async def test_session_id_is_channel_plus_role(tmp_path):
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
-    # Fresh telegram session → one bank recall keyed to this role.
+    # Fresh telegram session → one bank recall keyed to the shared casa bank.
     assert len(sem.recall_calls) == 1
-    assert sem.recall_calls[0]["bank"] == "casa-assistant"
+    assert sem.recall_calls[0]["bank"] == "casa"
     # Session-granularity save model: per-turn add_turn is retired. The
     # dominant write_scope is recorded on the registry entry instead, and
     # no per-turn memory write happens.
@@ -259,16 +259,17 @@ async def test_session_id_is_channel_plus_role(tmp_path):
 async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
     # §4.3: the per-turn read no longer threads a user_peer (no ensure_session
     # / per-turn add_turn). The voice-speaker peer is carried into save_session
-    # at session end instead. On the read side, a fresh voice session pushes
-    # the overlay but NEVER auto-recalls (voice keeps the multi-strategy recall
-    # off the first-utterance critical path). write_scope still records.
+    # at session end instead. On the read side, a fresh voice turn pushes NO
+    # overlay (blocked by clearance — voice=friends, overlay is private-only)
+    # and NEVER auto-recalls (voice keeps the multi-strategy recall off the
+    # first-utterance critical path). write_scope still records.
     mem = FakeMemory()
     sem = FakeSemanticMemory(overlay="OVERLAY")
     agent = _make_agent(mem, tmp_path, role="butler", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("voice", "lr", "lights on"))
 
-    assert len(sem.profile_calls) == 1   # overlay pushed at fresh start
+    assert len(sem.profile_calls) == 0   # voice clearance < private → overlay blocked
     assert sem.recall_calls == []        # voice never auto-recalls
     assert mem.add == []
     entry = agent._session_registry.get("voice-lr")
@@ -308,14 +309,15 @@ async def test_fresh_text_turn_pushes_overlay_and_recalls(tmp_path):
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
-    # One overlay (profile) call per fresh turn, keyed to the role's bank.
-    assert sem.profile_calls == ["casa-assistant"]
-    # One recall call: query == utterance, tags == readable scopes, mid budget.
+    # One overlay (profile) call per fresh turn, keyed to the shared casa bank.
+    assert sem.profile_calls == ["casa"]
+    # One recall call: query == utterance, tags == sensitivity tiers readable at
+    # telegram clearance (private → all four tiers), mid budget.
     assert len(sem.recall_calls) == 1
     call = sem.recall_calls[0]
-    assert call["bank"] == "casa-assistant"
+    assert call["bank"] == "casa"
     assert call["query"] == "hi"
-    assert call["tags"] == ["personal"]   # readable from the scope-registry stub
+    assert call["tags"] == ["public", "friends", "family", "private"]
     assert call["budget"] == "mid"
 
 
@@ -980,10 +982,10 @@ class TestTokenBudgetMonitoring:
 
         assert FakeClient.attempts == 2
         # Phase 4b added an `sdk` logger turn_done line; the `agent` logger
-        # summary still fires once per overall _process call.
+        # summary still fires once per overall _process call (now `turn_tokens`).
         rows = [
             r for r in caplog.records
-            if r.name == "agent" and "turn_done" in r.getMessage()
+            if r.name == "agent" and "turn_tokens" in r.getMessage()
         ]
         assert len(rows) == 1
         msg = rows[0].getMessage()

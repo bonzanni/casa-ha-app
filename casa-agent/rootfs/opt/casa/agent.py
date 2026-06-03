@@ -40,6 +40,7 @@ from channel_trust import channel_trust, channel_trust_display, user_peer_for_ch
 from timekeeping import resolve_tz
 from memory import MemoryProvider
 from hindsight_ids import bank_id
+from sensitivity import clearance_for_channel, readable_tiers
 from session_saver import freshness_window, save_session
 from semantic_memory import NoOpSemanticMemory, SemanticMemory
 from session_registry import SessionRegistry, build_session_key
@@ -149,12 +150,34 @@ def _plan_load(channel: str, *, is_fresh_session: bool) -> _LoadPlan:
     """Spec §4.3 channel-aware load. Overlay is pushed only at fresh-session-start
     (it rides along on resume). Voice never auto-recalls (the multi-strategy + rerank
     recall must not sit on the first-utterance critical path); voice uses the
-    recall_memory pull tool instead."""
+    recall_memory pull tool instead. Note: even when push_overlay is True the overlay
+    is additionally gated by ``_overlay_allowed(channel)`` at the call site — a channel
+    without ``private`` clearance (e.g. voice = friends) never actually receives the
+    overlay regardless of this plan."""
     if not is_fresh_session:
         return _LoadPlan(push_overlay=False, auto_recall=False)
     if channel == "voice":
         return _LoadPlan(push_overlay=True, auto_recall=False)
     return _LoadPlan(push_overlay=True, auto_recall=True)
+
+
+def _memory_bank() -> str:
+    """The single shared long-term bank (design §2.1). Role no longer partitions
+    memory — sensitivity tiers do."""
+    return bank_id("casa")
+
+
+def _recall_tier_tags(channel: str) -> list[str]:
+    """Tiers a turn on ``channel`` may recall = readable_tiers(clearance). The sole
+    read-side access gate (design §2.3)."""
+    return readable_tiers(clearance_for_channel(channel))
+
+
+def _overlay_allowed(channel: str) -> bool:
+    """The bank-level mental-model overlay cannot be tier-filtered, so it is pushed
+    ONLY at ``private`` clearance — a context that may already see everything
+    (design §2.3). At any lower clearance it would leak across tiers."""
+    return clearance_for_channel(channel) == "private"
 
 
 class Agent:
@@ -440,10 +463,10 @@ class Agent:
             # start, plus (text only) one tagged recall over the readable scopes.
             is_fresh = resume_session_id is None
             load_plan = _plan_load(msg.channel, is_fresh_session=is_fresh)
-            bank = bank_id("casa", self.config.role)
+            bank = _memory_bank()
             overlay_digest = ""
             facts = ""
-            if load_plan.push_overlay:
+            if load_plan.push_overlay and _overlay_allowed(msg.channel):
                 try:
                     overlay_digest = await self._semantic_memory.profile(bank)
                 except Exception:  # noqa: BLE001
@@ -454,7 +477,7 @@ class Agent:
             if load_plan.auto_recall:
                 try:
                     facts = await self._semantic_memory.recall(
-                        bank, user_text, tags=list(readable),
+                        bank, user_text, tags=_recall_tier_tags(msg.channel),
                         max_tokens=self.config.memory.token_budget,
                         budget="mid",  # auto_recall is always non-voice (see _plan_load); voice uses the recall_memory pull tool at budget=low
                     )

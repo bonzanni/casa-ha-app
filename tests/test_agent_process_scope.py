@@ -20,7 +20,7 @@ from claude_agent_sdk import (
     TextBlock as _SDKTextBlock,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 # ---------------------------------------------------------------------------
@@ -179,11 +179,11 @@ def _msg(channel: str, chat_id: str, text: str = "ping") -> BusMessage:
 
 
 class TestReadPath:
-    async def test_single_recall_tagged_with_readable_scopes(self):
+    async def test_single_recall_tagged_with_readable_tiers(self):
         """§4.3: the per-scope Honcho fan-out is retired. A fresh TEXT turn
         issues exactly ONE recall against the role's bank, tagged with the
-        full readable scope set (trust-filtered), not one read per active
-        scope. (Supersedes the old test_fan_out_one_scope.)"""
+        sensitivity tiers readable at the channel's clearance (clearance-filtered),
+        not one read per active scope. (Supersedes the old test_fan_out_one_scope.)"""
         memory = Mock()
         sem = FakeSemanticMemory(facts="finance digest")
 
@@ -201,10 +201,11 @@ class TestReadPath:
 
         assert len(sem.recall_calls) == 1
         call = sem.recall_calls[0]
-        assert call["bank"] == "casa-assistant"
+        assert call["bank"] == "casa"
         assert call["query"] == "how much for the plumber?"
-        # Tags are the readable set (not the active subset) — one tagged recall.
-        assert call["tags"] == ["personal", "business", "finance", "house"]
+        # Tags are sensitivity tiers readable at telegram clearance (private →
+        # all four tiers), not the scope-registry readable set.
+        assert call["tags"] == ["public", "friends", "family", "private"]
 
     async def test_recall_count_independent_of_active_scope_count(self):
         """§4.3: even with multiple active scopes the read issues a SINGLE
@@ -225,8 +226,10 @@ class TestReadPath:
             await agent._process(_msg("telegram", "12345", "x"))
 
         assert len(sem.recall_calls) == 1
+        # Tags are sensitivity tiers at telegram clearance (private → all four
+        # tiers) — independent of how many active scopes the scope-registry finds.
         assert sem.recall_calls[0]["tags"] == [
-            "personal", "business", "finance", "house",
+            "public", "friends", "family", "private",
         ]
 
     async def test_trust_filters_unreadable_scopes(self):
