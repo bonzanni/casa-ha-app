@@ -1,8 +1,15 @@
 """End-to-end Agent._process loop against SqliteMemoryProvider.
 
 Uses a real :memory: DB + the same stubbed SDK pattern as
-tests/test_agent_process.py. Verifies messages are actually persisted
-after the background add_turn task runs.
+tests/test_agent_process.py.
+
+Task 7 (spec §4.2): the per-turn `add_turn` write is retired in favour of
+session-granularity saves. The agent no longer persists rows on each turn —
+it records the turn's dominant ``write_scope`` on the SessionRegistry entry,
+and the transcript is retained at session end via ``save_session`` (which
+needs a real SDK transcript, out of scope for this unit fake). These tests
+therefore assert: (a) the channel→scope routing lands the right ``write_scope``
+on the registry, and (b) NO rows are written to the provider per turn.
 """
 
 from __future__ import annotations
@@ -139,7 +146,13 @@ async def _drain(agent: Agent | None = None) -> None:
         await asyncio.sleep(0)
 
 
-async def test_telegram_turn_persists_nicola_and_assistant_rows(tmp_path):
+def _row_count(memory) -> int:
+    return memory._conn.execute(
+        "SELECT COUNT(*) FROM messages",
+    ).fetchone()[0]
+
+
+async def test_telegram_turn_records_scope_and_writes_no_rows(tmp_path):
     memory = SqliteMemoryProvider(":memory:")
     agent = _make_agent(memory, tmp_path, role="assistant")
 
@@ -147,15 +160,15 @@ async def test_telegram_turn_persists_nicola_and_assistant_rows(tmp_path):
         await agent._process(_msg("telegram", "nicola", "hello"))
     await _drain(agent)
 
-    rows = memory._conn.execute(
-        "SELECT peer_name, content FROM messages "
-        "WHERE session_id = ? ORDER BY id ASC",
-        ("telegram-nicola-personal-assistant",),
-    ).fetchall()
-    assert rows == [("nicola", "hello"), ("assistant", "hi, Nicola")]
+    # Per-turn write retired: no rows persisted by the turn.
+    assert _row_count(memory) == 0
+    # Channel→scope routing lands the dominant scope on the registry entry.
+    entry = agent._session_registry.get("telegram-nicola")
+    assert entry is not None
+    assert entry.get("write_scope") == "personal"
 
 
-async def test_voice_turn_attributes_to_voice_speaker(tmp_path):
+async def test_voice_turn_records_scope_and_writes_no_rows(tmp_path):
     memory = SqliteMemoryProvider(":memory:")
     agent = _make_agent(memory, tmp_path, role="butler")
 
@@ -163,18 +176,17 @@ async def test_voice_turn_attributes_to_voice_speaker(tmp_path):
         await agent._process(_msg("voice", "livingroom", "lights on"))
     await _drain(agent)
 
-    rows = memory._conn.execute(
-        "SELECT peer_name, content FROM messages "
-        "WHERE session_id = ? ORDER BY id ASC",
-        ("voice-livingroom-personal-butler",),
-    ).fetchall()
-    assert rows == [
-        ("voice_speaker", "lights on"),
-        ("butler", "hi, Nicola"),
-    ]
+    assert _row_count(memory) == 0
+    entry = agent._session_registry.get("voice-livingroom")
+    assert entry is not None
+    assert entry.get("write_scope") == "personal"
 
 
-async def test_second_turn_sees_first_turn_in_memory_context(tmp_path):
+async def test_turn_does_not_persist_to_provider(tmp_path):
+    """The agent no longer writes turns to the MemoryProvider; a follow-up
+    get_context therefore finds nothing the turn put there (the SDK session
+    owns short-term recency now, and long-term retain happens at session
+    end via save_session)."""
     memory = SqliteMemoryProvider(":memory:")
     agent = _make_agent(memory, tmp_path, role="assistant")
 
@@ -185,5 +197,5 @@ async def test_second_turn_sees_first_turn_in_memory_context(tmp_path):
     ctx = await memory.get_context(
         "telegram-n-personal-assistant", tokens=4000,
     )
-    assert "## Recent exchanges" in ctx
-    assert "[nicola] first question" in ctx
+    assert "first question" not in ctx
+    assert _row_count(memory) == 0
