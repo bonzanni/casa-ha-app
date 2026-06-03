@@ -1,6 +1,26 @@
 # Changelog
 
-## [0.41.0] - 2026-06-03 — Memory re-arch (3/3): resident long-term recall on Hindsight
+## [0.42.0] - 2026-06-03 — Tiered memory access (1/4): sensitivity-tier classifier foundation
+
+First step of the tiered-memory-access work (design `2026-06-03-tiered-memory-access-design`):
+the accuracy-critical classifier foundation, shipped **inert** (not yet wired into the turn
+flow — that lands in the tier-model step). Long-term memory access will be gated by a
+per-fact **sensitivity tier** rather than domain, since retrieval is already semantic.
+
+### Added
+
+- `sensitivity.py` — the access-tier vocabulary: a `private ⊃ family ⊃ friends ⊃ public`
+  ladder (`TIERS`), `readable_tiers(clearance)`, `apply_ceiling(tier, ceiling)`,
+  `clearance_for_channel` (voice = `friends`), `parse_tier`, and `SENSITIVITY_PROMPT` — a
+  classification prompt **converged with the maintainer** via an interactive eval session
+  (friends is the broad default; finances/diagnoses-meds-mental-health/personal-account
+  secrets/intimate/identity-PII → private; family is narrow — shared-space secrets +
+  family-internal sensitive; public = impersonal general knowledge).
+- `tests/fixtures/sensitivity_eval.jsonl` — a 35-fact, all-tier **eval set** (the
+  maintainer-graded ground truth) + a schema unit test and a `slow`, credential-gated
+  live-LLM accuracy regression harness (threshold 0.90), kept out of the fast unit gate.
+
+Inert: nothing imports `sensitivity.py` at runtime yet. No behavioural change.
 
 Final step of the **resident** memory re-architecture (design spec §4.3). The resident
 agents' READ path now runs on the SemanticMemory seam: a cheap mental-model **overlay**
