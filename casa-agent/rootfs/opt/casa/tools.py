@@ -435,8 +435,11 @@ async def _specialist_add_turn_bg(
 ) -> None:
     """Persist one specialist turn in the background.
 
-    Mirrors Agent._add_turn_bg at agent.py:595-617: try/except, log on
-    failure, never surface (the caller has already returned text)."""
+    Best-effort background write (try/except, log on failure, never surface —
+    the caller has already returned text). This is the specialist/engagement
+    memory path on the legacy MemoryProvider; it is retired with MemoryProvider
+    in the load plan. (The resident per-turn write was replaced by
+    session-granularity save in agent.py.)"""
     try:
         await memory_provider.add_turn(
             session_id=session_id,

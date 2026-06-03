@@ -7,7 +7,7 @@ import logging
 import time
 from contextvars import ContextVar
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
@@ -40,6 +40,8 @@ from channel_trust import channel_trust, channel_trust_display, user_peer_for_ch
 from timekeeping import resolve_tz
 from memory import MemoryProvider
 from honcho_ids import honcho_session_id
+from session_saver import freshness_window, save_session
+from semantic_memory import NoOpSemanticMemory, SemanticMemory
 from session_registry import SessionRegistry, build_session_key
 from retry import retry_sdk_call
 from tokens import (
@@ -115,6 +117,26 @@ def _render_executors_block(executors) -> str:
     return "\n".join(lines)
 
 
+def _resume_decision(
+    channel: str, entry: dict | None, now: datetime,
+) -> tuple[str, bool]:
+    """Spec §3.3/§4.2: resume iff an entry exists and is within its channel
+    freshness window; otherwise start new — and if a stale entry with a live
+    sdk_session_id exists, signal save-before-overwrite (next-turn-after-gap).
+    Returns (decision, save_old): decision in {"resume","new"}; save_old True
+    only when starting new over a stale-but-present session."""
+    if not entry or not entry.get("sdk_session_id"):
+        return ("new", False)
+    la = entry.get("last_active")
+    try:
+        last = datetime.fromisoformat(la) if isinstance(la, str) else None
+    except ValueError:
+        last = None
+    if last is not None and (now - last) <= freshness_window(channel):
+        return ("resume", False)
+    return ("new", True)
+
+
 class Agent:
     """A Casa agent backed by the Claude Agent SDK."""
 
@@ -127,9 +149,11 @@ class Agent:
         channel_manager: ChannelManager,
         scope_registry: "ScopeRegistry",
         agent_registry=None,
+        semantic_memory: SemanticMemory | None = None,
     ) -> None:
         self.config = config
         self._memory = memory
+        self._semantic_memory: SemanticMemory = semantic_memory or NoOpSemanticMemory()
         self._session_registry = session_registry
         self._mcp_registry = mcp_registry
         self._channel_manager = channel_manager
@@ -505,13 +529,6 @@ class Agent:
             # 5. Hooks — resolved from hooks.yaml at load time by agent_loader.
             hooks = self._resolved_hooks
 
-            # 6. SDK resume --------------------------------------------------
-            existing = self._session_registry.get(channel_key)
-            resume_session_id: str | None = None
-            if existing:
-                resume_session_id = existing.get("sdk_session_id")
-                await self._session_registry.touch(channel_key)
-
             # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at
             # /addon_configs/casa-agent/agent-home/<role>/; configured cwd on
             # Config stays as an override for legacy tests.
@@ -519,6 +536,24 @@ class Agent:
                 self.config.cwd
                 or f"/addon_configs/casa-agent/agent-home/{self.config.role}"
             )
+
+            # 6. SDK resume / save-before-overwrite (spec §3.3/§4.2) ----------
+            existing = self._session_registry.get(channel_key)
+            decision, save_old = _resume_decision(
+                msg.channel, existing, datetime.now(timezone.utc),
+            )
+            resume_session_id: str | None = None
+            if decision == "resume":
+                resume_session_id = existing.get("sdk_session_id")
+                await self._session_registry.touch(channel_key)
+            elif save_old:
+                # next-turn-after-gap: retain the cold prior session BEFORE we
+                # overwrite its registry pointer with the new SDK session.
+                await save_session(
+                    channel_key, self._session_registry, self._semantic_memory,
+                    role=self.config.role, directory=agent_home, user_peer=user_peer,
+                )
+            # else ("new", False): no prior entry → nothing to save
 
             # Binding layer — SDK does NOT auto-consume enabledPlugins; we
             # build the `plugins=[...]` list from `claude plugin list --json`.
@@ -712,14 +747,6 @@ class Agent:
                         write_scope = self._scope_registry.argmax_scope(
                             write_scores, self.config.memory.default_scope,
                         )
-                    write_sid = honcho_session_id(
-                        channel_key, write_scope, self.config.role,
-                    )
-                    task = asyncio.create_task(self._add_turn_bg(
-                        write_sid, self.config.role, user_text, response_text, user_peer,
-                    ))
-                    self._bg_tasks.add(task)
-                    task.add_done_callback(self._bg_tasks.discard)
 
             # --- 3.2 observability ----------------------------------------
             total_ms = int((time.perf_counter() - scope_start_t) * 1000)
@@ -742,41 +769,21 @@ class Agent:
                 },
             )
 
-            # 9. SessionRegistry — only SDK session id now. --------------------
+            # 9. SessionRegistry — SDK session id + dominant write_scope. -------
             if sdk_session_id:
                 await self._session_registry.register(
                     channel_key=channel_key,
                     agent=self.config.role,
                     sdk_session_id=sdk_session_id,
                 )
+                # register() rewrites the entry dict, so record the scope AFTER
+                # it (spec §4.2 — the freshness reaper tags the retain with this).
+                if write_scope != "-":
+                    await self._session_registry.record_write_scope(channel_key, write_scope)
 
             return response_text or None
         finally:
             origin_var.reset(origin_token)
-
-    async def _add_turn_bg(
-        self,
-        session_id: str,
-        agent_role: str,
-        user_text: str,
-        assistant_text: str,
-        user_peer: str,
-    ) -> None:
-        """Persist a turn in the background. Exceptions are caught and
-        logged — never surfaced to the user (the response has already
-        been delivered). Spec §11."""
-        try:
-            await self._memory.add_turn(
-                session_id=session_id,
-                agent_role=agent_role,
-                user_text=user_text,
-                assistant_text=assistant_text,
-                user_peer=user_peer,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Memory add_turn failed in background: %s", exc,
-            )
 
     def _log_retry(self, attempt: int, exc: Exception, delay_ms: int) -> None:
         """Emit a single WARNING per retry event (spec 5.2 §3.2)."""

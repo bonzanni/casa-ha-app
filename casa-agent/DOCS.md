@@ -39,14 +39,14 @@ representations). Set `MEMORY_BACKEND=noop` if you want no memory at all.
 |--------|-------------|
 | `honcho_api_url` | Honcho API URL. Defaults to `https://api.honcho.dev`. |
 | `honcho_api_key` | Honcho API key. When set, enables the Honcho cloud backend (overrides SQLite default). |
-| `hindsight_api_url` | Internal base URL for the self-hosted Hindsight add-on (e.g. `http://5884eb17-hindsight:8888` or its IP like `http://172.30.33.6:8888`), reached via Hindsight's hassio network alias or IP — not the bare hostname `hindsight`. **Reserved: not yet active** — the Hindsight long-term-memory backend is being introduced over several releases; setting this alone has no effect yet. Leave empty. |
+| `hindsight_api_url` | Internal base URL for the self-hosted Hindsight add-on (e.g. `http://5884eb17-hindsight:8888` or its IP), reached via the add-on's hassio network alias/IP — not the bare host `hindsight`. Set together with `MEMORY_BACKEND=hindsight` to enable long-term **save** to Hindsight (the freshness reaper retains ended conversations). Long-term **recall** (reads) lands in a later release; until then a hindsight-selected instance writes facts but does not yet read them back. Leave empty to keep long-term memory disabled. |
 
 The following env vars can be set via the add-on environment (not the
 options panel) for finer control:
 
 | Env var | Purpose | Default |
 |---|---|---|
-| `MEMORY_BACKEND` | Force a specific backend (`honcho` / `sqlite` / `noop`). Fails fast on typos. | unset (auto-resolves) |
+| `MEMORY_BACKEND` | Force a specific backend (`honcho` / `hindsight` / `sqlite` / `noop`). Fails fast on typos. | unset (auto-resolves) |
 | `MEMORY_DB_PATH` | SQLite file location. | `/data/memory.sqlite` |
 
 ### Optional -- Agents

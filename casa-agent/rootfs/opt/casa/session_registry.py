@@ -110,6 +110,47 @@ class SessionRegistry:
                 entry.pop("sdk_session_id", None)
                 await self._save_locked()
 
+    async def record_write_scope(self, channel_key: str, scope: str) -> None:
+        """Record the turn's dominant write-scope so a post-hoc reaper can
+        tag the retain (spec §4.2 — write_scope is otherwise never persisted)."""
+        async with self._lock:
+            entry = self._data.get(channel_key)
+            if entry is not None:
+                entry["write_scope"] = scope
+                await self._save_locked()
+
+    async def try_begin_save(self, channel_key: str) -> bool:
+        """Atomically claim a session for saving. Returns True for the first
+        caller (sets ``consolidated_at``), False if missing or already claimed.
+        The ``consolidated_at`` marker persists (it is saved to disk); a save
+        that crashes after claiming but before ``finish_save`` leaves the marker
+        set — the FreshnessReaper's stale-claim recovery (a later task) detects a
+        marker older than its retry window and re-opens the claim. ``finish_save``
+        removes the entry only on success."""
+        async with self._lock:
+            entry = self._data.get(channel_key)
+            if entry is None or entry.get("consolidated_at"):
+                return False
+            entry["consolidated_at"] = datetime.now(timezone.utc).isoformat()
+            await self._save_locked()
+            return True
+
+    async def finish_save(self, channel_key: str) -> None:
+        """Remove the entry after a successful retain (the session is now
+        long-term). Idempotent."""
+        async with self._lock:
+            self._data.pop(channel_key, None)
+            await self._save_locked()
+
+    async def clear_save_claim(self, channel_key: str) -> None:
+        """Release a save claim after a FAILED retain so the next reaper cycle
+        retries. Keeps the entry."""
+        async with self._lock:
+            entry = self._data.get(channel_key)
+            if entry is not None and "consolidated_at" in entry:
+                entry.pop("consolidated_at", None)
+                await self._save_locked()
+
     async def save(self) -> None:
         """Public save: acquires the lock.
 
@@ -122,7 +163,13 @@ class SessionRegistry:
 
     async def _save_locked(self) -> None:
         """Persist current data. Caller MUST hold ``self._lock``."""
-        data = dict(self._data)  # snapshot for thread safety
+        # Per-entry copy, not a shallow dict() of the outer map: the write runs
+        # in a thread (the lock is released while we await it), so a concurrent
+        # mutator that acquires the lock could otherwise mutate an inner entry
+        # dict mid-serialize. The save model relies on write_scope/consolidated_at
+        # persisting atomically (crash-safety, spec §4.2 / C3). Entries are flat
+        # str→str|None maps, so a one-level copy is sufficient and cheap.
+        data = {k: dict(v) for k, v in self._data.items()}
         await asyncio.to_thread(self._write, data)
 
     def _write(self, data: dict[str, dict[str, Any]]) -> None:

@@ -43,7 +43,6 @@ bash test-local/e2e/test_voice_sse.sh
 | `e2e/test_voice_sse.sh` | 1 | SSE transport for `/api/converse` |
 | `e2e/test_voice_ws.sh` | 1 | WebSocket transport for `/api/converse/ws` (needs host `pip install aiohttp`) |
 | `e2e/test_invoke_sessions.sh` | 2 | per-invoke session isolation |
-| `e2e/test_sqlite_memory.sh` | 2 | sqlite-backed memory layer |
 | `e2e/test_external_surface.sh` | 2 | external HTTP surface on port 18065 |
 | `e2e/test_specialist_delegation.sh` | 2 | role-keyed specialist delegation |
 | `e2e/test_scheduling.sh` | 2 | scheduled-task primitives |

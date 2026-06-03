@@ -200,9 +200,13 @@ async def test_session_id_is_channel_plus_role(tmp_path):
 
     assert mem.ensure[0][0] == "telegram-123-personal-assistant"
     assert mem.get[0][0] == "telegram-123-personal-assistant"
-    for _ in range(5):
-        await asyncio.sleep(0)
-    assert mem.add[0][0] == "telegram-123-personal-assistant"
+    # Session-granularity save model: per-turn add_turn is retired. The
+    # dominant write_scope is recorded on the registry entry instead, and
+    # no per-turn memory write happens.
+    assert mem.add == []
+    entry = agent._session_registry.get("telegram-123")
+    assert entry is not None
+    assert entry.get("write_scope") == "personal"
 
 
 async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
@@ -212,11 +216,15 @@ async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
         await agent._process(_msg("voice", "lr", "lights on"))
 
     # Phase 5 / E-14: user_peer no longer threads through get_context;
-    # ensure_session and add_turn remain the load-bearing assertions.
+    # ensure_session remains the load-bearing peer assertion. Per-turn
+    # add_turn is retired (session-granularity save model), so the
+    # voice-speaker peer is now carried into save_session at session end,
+    # not into a per-turn write.
     assert mem.ensure[0][2] == "voice_speaker"
-    for _ in range(5):
-        await asyncio.sleep(0)
-    assert mem.add[0][4] == "voice_speaker"
+    assert mem.add == []
+    entry = agent._session_registry.get("voice-lr")
+    assert entry is not None
+    assert entry.get("write_scope") == "personal"
 
 
 async def test_telegram_channel_uses_nicola_peer(tmp_path):
@@ -349,17 +357,21 @@ async def test_system_prompt_memory_context_only_when_nonempty(tmp_path):
     assert "[nicola] hi" in prompt2
 
 
-async def test_add_turn_runs_as_background_task(tmp_path):
+async def test_write_scope_recorded_on_registry_no_per_turn_write(tmp_path):
+    """Session-granularity save model (spec §4.2): the agent no longer does a
+    per-turn memory write; it records the turn's dominant write_scope on the
+    registry entry, and the actual retain happens at session end."""
     mem = FakeMemory()
     agent = _make_agent(mem, tmp_path, role="assistant")
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
     assert FakeClient.response_text == "pong"
-    for _ in range(5):
-        await asyncio.sleep(0)
-    assert mem.add[0][2] == "hi"
-    assert mem.add[0][3] == "pong"
+    # No per-turn add_turn write happens any more.
+    assert mem.add == []
+    entry = agent._session_registry.get("telegram-123")
+    assert entry is not None
+    assert entry.get("write_scope") == "personal"
 
 
 async def test_memory_failure_does_not_break_response(tmp_path, caplog):
@@ -381,37 +393,18 @@ async def test_memory_failure_does_not_break_response(tmp_path, caplog):
     assert "<channel_context>" in prompt
 
 
-async def test_add_turn_failure_logs_warning(tmp_path, caplog):
-    import logging
-
-    class BrokenAdd(FakeMemory):
-        async def add_turn(self, *a, **kw):
-            raise RuntimeError("honcho write down")
-
-    mem = BrokenAdd()
-    agent = _make_agent(mem, tmp_path, role="assistant")
-    with patch("agent.ClaudeSDKClient", FakeClient):
-        with caplog.at_level(logging.WARNING):
-            out = await agent._process(_msg("telegram", "123", "hi"))
-    assert out == "pong"
-    for _ in range(5):
-        await asyncio.sleep(0)
-    assert any(
-        "add_turn" in r.message.lower() for r in caplog.records
-    )
-
-
-async def test_agent_retains_add_turn_task_strong_reference(tmp_path):
-    mem = FakeMemory()
-    agent = _make_agent(mem, tmp_path, role="assistant")
-    with patch("agent.ClaudeSDKClient", FakeClient):
-        await agent._process(_msg("telegram", "123", "hi"))
-
-    # Task completed and callback fired, set is now empty.
-    # The strong reference ensures the task didn't GC while pending.
-    assert len(agent._bg_tasks) == 0
-    # Confirm the add_turn was persisted (proves the task ran).
-    assert len(mem.add) == 1
+# NOTE (Task 7, spec §4.2): the per-turn `add_turn` write and its background
+# task wrapper (`_add_turn_bg`) were retired in favour of session-granularity
+# saves. Two tests that exercised that removed machinery were dropped here:
+#   - test_add_turn_failure_logs_warning: asserted the now-deleted
+#     `_add_turn_bg` try/except logged a warning when add_turn raised. The
+#     agent no longer calls add_turn per turn, so the path is gone.
+#   - test_agent_retains_add_turn_task_strong_reference: asserted the
+#     background add_turn task was strongly referenced in `_bg_tasks`. The
+#     write is now an inline `record_write_scope` await (no spawned task).
+# Per-turn write coverage is replaced by the registry-write_scope assertions
+# in test_write_scope_recorded_on_registry_no_per_turn_write (this file) and
+# the scope-routing assertions in test_agent_process_scope.py.
 
 
 class TestRetryIntegration:
@@ -1396,3 +1389,99 @@ class TestScheduledSilence:
         assert stub.send.call_count == 0
         assert stub.finalize_stream.call_count == 0
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# TestSaveBeforeOverwrite — spec §4.2 C1, Task 7
+# ---------------------------------------------------------------------------
+
+
+class TestSaveBeforeOverwrite:
+    """_process must await save_session exactly once, before opening a new
+    SDK session, when a cold prior session exists (spec §4.2 save-before-
+    overwrite branch).  The pure helper _resume_decision is already unit-
+    tested in test_agent_save_path.py; this class covers the load-bearing
+    call inside _process itself."""
+
+    async def test_save_session_called_on_cold_path(self, tmp_path, monkeypatch):
+        """When the registry holds a stale telegram entry (idle > 12 h),
+        _resume_decision returns ("new", True) and _process must await
+        save_session once with the correct positional / keyword args."""
+        import agent as agent_mod
+        from datetime import datetime, timedelta, timezone
+
+        save_calls: list[dict] = []
+
+        async def _fake_save(channel_key, session_registry, semantic_memory,
+                             *, role, directory, user_peer):
+            save_calls.append({
+                "channel_key": channel_key,
+                "role": role,
+                "directory": directory,
+                "user_peer": user_peer,
+            })
+
+        monkeypatch.setattr(agent_mod, "save_session", _fake_save)
+        FakeClient.reset()
+
+        reg = SessionRegistry(str(tmp_path / "sessions.json"))
+        # Inject a stale entry: sdk_session_id present, last_active > 12 h ago.
+        stale_ts = (
+            datetime.now(timezone.utc) - timedelta(hours=13)
+        ).isoformat()
+        reg._data["telegram-123"] = {
+            "agent": "assistant",
+            "sdk_session_id": "old-stale-sid",
+            "last_active": stale_ts,
+        }
+
+        mem = FakeMemory()
+        agent = _make_agent_with_registry(mem, reg, role="assistant")
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            await agent._process(_msg("telegram", "123", "hi"))
+
+        assert len(save_calls) == 1, (
+            f"expected save_session called once on cold path; got {len(save_calls)} calls"
+        )
+        call = save_calls[0]
+        assert call["channel_key"] == "telegram-123", call
+        assert call["role"] == "assistant", call
+        assert call["directory"].endswith("agent-home/assistant"), call
+        assert call["user_peer"] == "nicola", call
+
+    async def test_save_session_not_called_on_resume_path(self, tmp_path, monkeypatch):
+        """When the registry holds a fresh entry (idle < 12 h), _resume_decision
+        returns ("resume", False) and _process must NOT call save_session."""
+        import agent as agent_mod
+        from datetime import datetime, timedelta, timezone
+
+        save_calls: list[dict] = []
+
+        async def _fake_save(channel_key, session_registry, semantic_memory,
+                             *, role, directory, user_peer):
+            save_calls.append({"channel_key": channel_key})
+
+        monkeypatch.setattr(agent_mod, "save_session", _fake_save)
+        FakeClient.reset()
+
+        reg = SessionRegistry(str(tmp_path / "sessions.json"))
+        # Fresh entry: last_active just 5 minutes ago → resume, no save.
+        fresh_ts = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        reg._data["telegram-456"] = {
+            "agent": "assistant",
+            "sdk_session_id": "fresh-live-sid",
+            "last_active": fresh_ts,
+        }
+
+        mem = FakeMemory()
+        agent = _make_agent_with_registry(mem, reg, role="assistant")
+
+        with patch("agent.ClaudeSDKClient", FakeClient):
+            await agent._process(_msg("telegram", "456", "hi"))
+
+        assert save_calls == [], (
+            f"save_session must not be called on the resume path; got {save_calls}"
+        )

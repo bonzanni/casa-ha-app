@@ -46,8 +46,6 @@ jobs:
         run: docker build -f test-local/Dockerfile.test -t casa-test .
       - name: Invoke sessions
         run: bash test-local/e2e/test_invoke_sessions.sh
-      - name: SQLite memory
-        run: bash test-local/e2e/test_sqlite_memory.sh
       - name: External surface
         run: bash test-local/e2e/test_external_surface.sh
       - name: Delegation

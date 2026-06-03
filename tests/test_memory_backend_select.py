@@ -58,6 +58,20 @@ def test_explicit_noop_returns_noop():
     assert choice.backend == "noop"
 
 
+def test_explicit_hindsight_returns_hindsight_without_raising():
+    """C4: MEMORY_BACKEND=hindsight is a valid legacy-resolver pick (does NOT
+    raise). The legacy read path is mapped to NoOp in main(); long-term memory
+    is served by SemanticMemory/Hindsight (spec §4.2, C4 Option A)."""
+    from casa_core import resolve_memory_backend_choice
+
+    choice = resolve_memory_backend_choice(env={"MEMORY_BACKEND": "hindsight"})
+    assert choice.backend == "hindsight"
+    # NB: the SEMANTIC resolver (resolve_semantic_memory_choice) separately
+    # enforces HINDSIGHT_API_URL when MEMORY_BACKEND=hindsight — see
+    # tests/test_semantic_memory_resolve.py. This legacy-resolver test only
+    # asserts the value is accepted (no crash).
+
+
 def test_invalid_memory_backend_raises():
     from casa_core import resolve_memory_backend_choice
 

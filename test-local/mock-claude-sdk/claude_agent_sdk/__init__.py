@@ -319,6 +319,41 @@ class ProcessError(Exception):
         super().__init__(message)
 
 
+# --- Session API (0.2.x) -------------------------------------------------
+# The long-term-save path imports these at module top-level
+# (session_saver.get_session_messages, session_sweeper.delete_session). The
+# offline harness has no persisted transcript, so they are inert: read returns
+# an empty transcript (the save path then retains nothing) and delete is a
+# recorded no-op. Mirrors the real 0.2.87 surface so casa_core imports cleanly.
+@dataclass
+class SessionMessage:
+    """Mock of claude_agent_sdk.SessionMessage. The save path reads ``.type``
+    ('user'|'assistant') and ``.message`` (Any)."""
+
+    type: str = "user"
+    message: Any = None
+    uuid: str = ""
+    session_id: str = ""
+    parent_tool_use_id: str | None = None
+
+
+def get_session_messages(
+    session_id: str, directory: str | None = None,
+    limit: int | None = None, offset: int = 0,
+) -> list["SessionMessage"]:
+    """Mock: no persisted transcript offline → empty list (callers handle it)."""
+    _log({"event": "get_session_messages",
+          "session_id": session_id, "directory": directory})
+    return []
+
+
+def delete_session(session_id: str, directory: str | None = None) -> None:
+    """Mock: no real transcript file to delete — record the call and no-op."""
+    _log({"event": "delete_session",
+          "session_id": session_id, "directory": directory})
+    return None
+
+
 __all__ = [
     "AssistantMessage",
     "ClaudeAgentOptions",
@@ -327,6 +362,7 @@ __all__ = [
     "ProcessError",
     "ResultMessage",
     "SdkMcpTool",
+    "SessionMessage",
     "SystemMessage",
     "TextBlock",
     "ToolResultBlock",
@@ -334,4 +370,6 @@ __all__ = [
     "UserMessage",
     "tool",
     "create_sdk_mcp_server",
+    "delete_session",
+    "get_session_messages",
 ]

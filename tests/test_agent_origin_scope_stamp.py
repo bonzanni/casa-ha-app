@@ -133,6 +133,7 @@ async def test_origin_var_carries_argmax_scope_after_compute():
             get=Mock(return_value=None),
             touch=AsyncMock(),
             register=AsyncMock(),
+            record_write_scope=AsyncMock(),
         ),
         mcp_registry=Mock(resolve=Mock(return_value={})),
         channel_manager=Mock(),

@@ -124,6 +124,7 @@ def _make_agent(cfg, memory, scope_registry):
             get=Mock(return_value=None),
             touch=AsyncMock(),
             register=AsyncMock(),
+            record_write_scope=AsyncMock(),
         ),
         mcp_registry=Mock(resolve=Mock(return_value={})),
         channel_manager=Mock(),
@@ -222,7 +223,7 @@ class TestReadPath:
         assert args[1] == "household-shared"
 
     async def test_write_uses_default_scope(self):
-        """Interim write path uses default_scope session ID."""
+        """Write path records the default_scope on the registry entry."""
         memory = Mock()
         memory.ensure_session = AsyncMock()
         memory.get_context = AsyncMock(return_value="")
@@ -240,13 +241,12 @@ class TestReadPath:
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("telegram", "12345", "hello"))
 
-        # Drain background tasks
-        for _ in range(5):
-            await asyncio.sleep(0)
-
-        assert memory.add_turn.call_count == 1
-        write_sid = memory.add_turn.call_args.kwargs["session_id"]
-        assert write_sid == "telegram-12345-personal-assistant"
+        # Session-granularity save model: per-turn add_turn is retired; the
+        # dominant write_scope is recorded on the registry entry instead.
+        agent._session_registry.record_write_scope.assert_awaited_once_with(
+            "telegram-12345", "personal",
+        )
+        memory.add_turn.assert_not_called()
 
     async def test_memory_context_includes_scope_attribute(self):
         """When digest is non-empty, system prompt has scope= attribute."""
@@ -304,7 +304,8 @@ class TestWritePath:
                 memory=memory,
                 session_registry=Mock(get=Mock(return_value=None),
                                       touch=AsyncMock(),
-                                      register=AsyncMock()),
+                                      register=AsyncMock(),
+                                      record_write_scope=AsyncMock()),
                 mcp_registry=Mock(resolve=Mock(return_value={})),
                 channel_manager=Mock(),
                 scope_registry=reg,
@@ -315,12 +316,12 @@ class TestWritePath:
                 content="plumber?", channel="telegram", context={"chat_id": "12345"},
             ))
 
-        # Drain background add_turn.
-        await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
-
-        memory.add_turn.assert_awaited_once()
-        kwargs = memory.add_turn.await_args.kwargs
-        assert kwargs["session_id"] == "telegram-12345-finance-assistant"
+        # Session-granularity save model: the classified argmax scope is
+        # recorded on the registry entry (no per-turn add_turn).
+        agent._session_registry.record_write_scope.assert_awaited_once_with(
+            "telegram-12345", "finance",
+        )
+        memory.add_turn.assert_not_called()
 
     async def test_write_restricted_to_owned_and_readable(self, monkeypatch):
         """Write-scope classifier sees only (scopes_owned ∩ readable)."""
@@ -349,7 +350,8 @@ class TestWritePath:
                 memory=memory,
                 session_registry=Mock(get=Mock(return_value=None),
                                       touch=AsyncMock(),
-                                      register=AsyncMock()),
+                                      register=AsyncMock(),
+                                      record_write_scope=AsyncMock()),
                 mcp_registry=Mock(resolve=Mock(return_value={})),
                 channel_manager=Mock(),
                 scope_registry=reg,
@@ -394,7 +396,8 @@ class TestWritePath:
                 memory=memory,
                 session_registry=Mock(get=Mock(return_value=None),
                                       touch=AsyncMock(),
-                                      register=AsyncMock()),
+                                      register=AsyncMock(),
+                                      record_write_scope=AsyncMock()),
                 mcp_registry=Mock(resolve=Mock(return_value={})),
                 channel_manager=Mock(),
                 scope_registry=reg,
@@ -407,8 +410,10 @@ class TestWritePath:
         await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
 
         # Empty assistant text ⇒ no write (spec §14.3 acceptable either way;
-        # v0.8.0 preserves today's behaviour — gate on response_text truthy).
+        # gate on response_text truthy). write_scope stays "-" so the registry
+        # entry is NOT tagged with a scope.
         assert memory.add_turn.await_count == 0
+        agent._session_registry.record_write_scope.assert_not_called()
 
     async def test_single_owned_scope_skips_write_classify(self, monkeypatch):
         """Butler (voice) with scopes_owned=[house] should NOT call score()
@@ -457,7 +462,8 @@ class TestWritePath:
                 config=cfg, memory=memory,
                 session_registry=Mock(get=Mock(return_value=None),
                                       touch=AsyncMock(),
-                                      register=AsyncMock()),
+                                      register=AsyncMock(),
+                                      record_write_scope=AsyncMock()),
                 mcp_registry=Mock(resolve=Mock(return_value={})),
                 channel_manager=Mock(), scope_registry=reg,
             )
@@ -470,9 +476,11 @@ class TestWritePath:
 
         # Only the READ-path score() call; no write-side score()
         assert reg.score.call_count == 1
-        memory.add_turn.assert_awaited_once()
-        write_sid = memory.add_turn.await_args.kwargs["session_id"]
-        assert write_sid == "voice-lr-house-butler"
+        # Single owned scope → recorded directly on the registry entry.
+        agent._session_registry.record_write_scope.assert_awaited_once_with(
+            "voice-lr", "house",
+        )
+        memory.add_turn.assert_not_called()
 
     async def test_write_skipped_when_owned_and_readable_empty(self, monkeypatch):
         """Trust-bypass regression: if the channel's trust tier filters out
@@ -506,7 +514,8 @@ class TestWritePath:
                 memory=memory,
                 session_registry=Mock(get=Mock(return_value=None),
                                       touch=AsyncMock(),
-                                      register=AsyncMock()),
+                                      register=AsyncMock(),
+                                      record_write_scope=AsyncMock()),
                 mcp_registry=Mock(resolve=Mock(return_value={})),
                 channel_manager=Mock(),
                 scope_registry=reg,
@@ -520,9 +529,11 @@ class TestWritePath:
 
         # owned∩readable is empty → no write. The classifier score() call
         # for the write step should also be skipped (only the read-side
-        # score() call should appear).
+        # score() call should appear). write_scope stays "-" so the registry
+        # entry is NOT tagged.
         assert memory.add_turn.await_count == 0
         assert reg.score.call_count == 1  # read-only; no write-side score
+        agent._session_registry.record_write_scope.assert_not_called()
 
 
 class TestObservability:
@@ -553,7 +564,8 @@ class TestObservability:
                 memory=memory,
                 session_registry=Mock(get=Mock(return_value=None),
                                       touch=AsyncMock(),
-                                      register=AsyncMock()),
+                                      register=AsyncMock(),
+                                      record_write_scope=AsyncMock()),
                 mcp_registry=Mock(resolve=Mock(return_value={})),
                 channel_manager=Mock(),
                 scope_registry=reg,
@@ -607,7 +619,8 @@ class TestScopeRouteEmission:
                 memory=memory,
                 session_registry=Mock(get=Mock(return_value=None),
                                       touch=AsyncMock(),
-                                      register=AsyncMock()),
+                                      register=AsyncMock(),
+                                      record_write_scope=AsyncMock()),
                 mcp_registry=Mock(resolve=Mock(return_value={})),
                 channel_manager=Mock(),
                 scope_registry=reg,

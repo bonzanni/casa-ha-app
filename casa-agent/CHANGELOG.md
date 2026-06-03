@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.40.0] - 2026-06-03 — Memory re-arch (2/3): long-term save on Hindsight
+
+Second step of the memory re-architecture (design spec §4.2). Wires the
+session-granularity **long-term save** path onto the SemanticMemory seam: ended
+conversations are retained to the self-hosted Hindsight add-on. **Saves are active** when
+`MEMORY_BACKEND=hindsight` + `hindsight_api_url` are set; long-term **recall** (reads)
+lands in the next step (3/3), so a hindsight-selected instance writes facts but does not
+yet read them back.
+
+**Behaviour change for non-Hindsight backends:** residents no longer write memory
+per-turn on ANY backend (the per-turn `add_turn` is gone). Short-term continuity is
+unaffected — it is owned by the per-channel SDK session, which resumes as before. But the
+legacy Honcho/SQLite stores are no longer written by residents (they still serve reads
+until retired in step 3/3), so a `sqlite`/`honcho`/`noop` instance has **no resident
+long-term memory** until you switch to `MEMORY_BACKEND=hindsight`. Specialist/engagement
+memory writes are unchanged. (This is the spec §7 "cold cut" — `Hindsight` is the only
+backend with active long-term writes from v0.40.0 on.)
+
+### Added
+
+- **Freshness reaper** (`freshness_reaper.py`) — the primary save trigger: a background
+  task that sweeps at boot then ~hourly and retains any conversation idle past its
+  per-channel freshness window (voice ~30 min, telegram ~12 h; env-overridable via
+  `FRESHNESS_VOICE_MINUTES` / `FRESHNESS_TELEGRAM_HOURS`), with crash-safe stale-claim
+  recovery.
+- Session-granularity save (`session_saver.py`): `save_session` (idempotent retain under
+  an atomic registry claim), `transcript_to_items` (SDK transcript → Hindsight items with
+  a deterministic `document_id`), `freshness_window`, and the `/new` `reset_channel`.
+- Explicit `/new` reset on Telegram — retains the current conversation, then starts fresh
+  ("Starting fresh — I still remember what matters.").
+- Registry save-support fields + atomic helpers (`session_registry.py`): dominant
+  `write_scope` and a `consolidated_at` save-claim guarding the reaper/next-turn race.
+- `MEMORY_BACKEND=hindsight` is now a valid backend (the legacy read path runs cold/NoOp;
+  long-term save is served by Hindsight via the SemanticMemory seam).
+
+### Changed
+
+- `agent.py` no longer persists memory per turn (the `add_turn` write is removed). It
+  records the turn's dominant write-scope on the session registry, and the freshness
+  reaper retains the whole conversation once it goes cold. The resume-vs-new decision now
+  honours the per-channel freshness window and saves a cold prior session before opening a
+  new one (next-turn-after-gap).
+- The session sweeper now hard-deletes an evicted session's on-disk transcript via the
+  SDK's `delete_session(sid, directory)` (replacing the dead `_prune_sdk_session`, which
+  would have armed on the 0.2.87 SDK), guarded so a conversation inside its freshness
+  window is never evicted.
+
 ## [0.39.0] - 2026-06-03 — Memory re-arch (1/3): SemanticMemory seam (inert)
 
 First step of the memory re-architecture (design spec §5). Introduces the long-term
