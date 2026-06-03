@@ -76,8 +76,10 @@ Tiers, most to least sensitive:
              private); medical diagnoses, treatments, medications, mental-health matters;
              personal-account credentials (email, bank); intimate or relationship matters;
              undisclosed or in-progress personal decisions; identity-document-level details.
-- family   — NARROW. Shared-SPACE secrets/credentials the household needs but friends should
-             not have (e.g. the home alarm code, the main wifi password), and genuinely
+- family   — NARROW. Secrets/credentials for a SHARED SPACE the household relies on but
+             friends should not have: the home alarm/disarm code, the MAIN wifi password.
+             These are family — NOT private (they are not personal-account logins) and NOT
+             friends (the main network/alarm is not guest-facing). Also genuinely
              family-internal sensitive matters (e.g. a relative's private difficulty).
              NOT general household logistics, and NOT money.
 - friends  — the DEFAULT for ordinary, mildly-personal, socially-shareable facts: preferences
@@ -86,16 +88,19 @@ Tiers, most to least sensitive:
              pickup times, visitors, weekly dinners), the guest wifi, pets. Anyone the user
              talks to in the home is friends-or-closer.
 - public   — impersonal, general-knowledge, harmless to anyone: bin-collection day, local
-             shop hours, device brands/models, the user's professional role/employer, the
-             colour the living room is painted.
+             shop hours, the make/model/brand of a household device (thermostat, tap,
+             appliance — a brand name is not personal), the user's professional role/employer,
+             the colour the living room is painted.
 
 Rules:
 1. Judge "who would the user share this with?" — not the topic. A topic is not a tier
    (e.g. medical: an allergy is safety info → friends/public; a diagnosis/medication/
    mental-health matter → private).
-2. Money and finances are private, even when household-scoped.
-3. Tier a secret by what it protects: a personal-account credential → private; a
-   shared-space/household secret → family; a guest-facing secret → friends.
+2. Money and finances are private, even when household-scoped — amounts, accounts, AND
+   invoicing/billing patterns or habits (how the user bills, what lines they put on invoices).
+3. Tier a secret by what it protects: a PERSONAL-ACCOUNT credential (email/bank login) →
+   private; a SHARED-SPACE household secret (alarm code, MAIN wifi password) → family; a
+   GUEST-facing secret (guest wifi) → friends.
 4. PII that could verify identity or enable social engineering (e.g. birthdate) is at
    least friends — never public.
 5. Undisclosed / in-progress personal matters lean more private.
