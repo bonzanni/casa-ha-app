@@ -55,3 +55,9 @@ async def test_recall_memory_empty_query_errors(monkeypatch):
     monkeypatch.setattr(agent_mod, "active_semantic_memory", AsyncMock(), raising=False)
     res = await tools.recall_memory.handler({"query": "  "})
     assert "error" in _text(res).lower()
+
+
+def test_agent_exposes_semantic_and_scope_handles():
+    import agent
+    assert hasattr(agent, "active_semantic_memory")
+    assert hasattr(agent, "active_scope_registry")

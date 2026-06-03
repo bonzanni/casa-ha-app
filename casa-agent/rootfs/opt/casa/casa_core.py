@@ -1350,6 +1350,8 @@ async def main() -> None:
     import agent as agent_mod
     agent_mod.active_engagement_driver = engagement_driver
     agent_mod.active_memory_provider = base_memory    # already constructed above
+    agent_mod.active_semantic_memory = semantic_memory   # resident long-term (Hindsight seam)
+    agent_mod.active_scope_registry = scope_registry      # readable-scope tags for recall_memory
     agent_mod.active_executor_registry = executor_registry
     runtime.engagement_driver = engagement_driver
 
@@ -1478,7 +1480,7 @@ async def main() -> None:
             sse_path=voice_sse_path,
             ws_path=voice_ws_path,
             agent_configs=role_configs,
-            memory=base_memory,
+            memory=semantic_memory,
             idle_timeout=voice_idle_timeout,
             sse_enabled=voice_sse_enabled,
             ws_enabled=voice_ws_enabled,

@@ -61,6 +61,8 @@ active_memory_provider = None     # MemoryProvider | None, set by casa_core.main
 active_executor_registry = None   # ExecutorRegistry | None, set by casa_core.main
 active_claude_code_driver = None  # ClaudeCodeDriver | None, set by casa_core.main
 active_runtime = None             # CasaRuntime | None, set by casa_core.main (Task C.3)
+active_semantic_memory = None     # SemanticMemory | None, set by casa_core.main
+active_scope_registry = None      # ScopeRegistry | None, set by casa_core.main
 
 # Phase 3.1: delegating-turn origin. Set by Agent._process for the
 # duration of a turn so the `delegate_to_agent` tool handler can read
