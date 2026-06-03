@@ -1024,11 +1024,8 @@ async def consult_other_agent_memory(args: dict) -> dict:
         f'No accumulated memory found for {role} matching "{query[:60]}".'
     )
 
-    # Resolve memory provider — same pattern as _run_delegated_agent
-    # at tools.py:444 (M4b).
-    memory_provider = getattr(agent_mod, "active_memory_provider", None)
-    if memory_provider is None:
-        # No memory backend configured — graceful empty
+    sem = getattr(agent_mod, "active_semantic_memory", None)
+    if sem is None:
         return _result({"status": "ok", "content": empty_msg})
 
     # Token budget: read from the calling resident's runtime.yaml.
@@ -1048,10 +1045,9 @@ async def consult_other_agent_memory(args: dict) -> dict:
 
     t_start = time.perf_counter()
     try:
-        rendered = await memory_provider.cross_peer_context(
-            observer_role=role,
-            query=query,
-            tokens=tokens,
+        from hindsight_ids import bank_id
+        rendered = await sem.cross_recall(
+            bank_id("casa", role), query, max_tokens=tokens, budget="low",
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
