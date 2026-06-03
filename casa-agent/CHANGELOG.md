@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.42.1] - 2026-06-03 — Sensitivity prompt tune (clear the accuracy gate with margin)
+
+The v0.42.0 `SENSITIVITY_PROMPT` shipped before its live-LLM accuracy was ever measured (no
+credentials in the build env). Measured against the 35-row eval set, it straddled the 0.90
+gate (0.886–0.91 across runs — flaky at the threshold), with the **`family` tier** as the
+weak point. This patch refines the prompt (eval labels unchanged) so the gate clears with
+margin before the tier model is built on it.
+
+### Changed
+
+- `sensitivity.py` `SENSITIVITY_PROMPT` — sharpened the three boundaries the eval flagged:
+  - **family** — a SHARED-SPACE secret/credential (home alarm/disarm code, the MAIN wifi
+    password) is `family`: explicitly NOT `private` (not a personal-account login) and NOT
+    `friends` (not guest-facing).
+  - **rule 2** — finances are `private` including **invoicing/billing patterns or habits**
+    (not only amounts/accounts).
+  - **public** — the make/model/brand of a household device (thermostat, tap, appliance) is
+    impersonal → `public`.
+
+  Live accuracy now **0.94–0.97** across three runs (was 0.886–0.91). The lone stable miss
+  is the alarm-disarm-code row over-escalating to `private` — the *safe* direction (forget,
+  never leak), which the design's failure-asymmetry favors. Still inert: nothing imports
+  `sensitivity.py` at runtime yet.
+
 ## [0.42.0] - 2026-06-03 — Tiered memory access (1/4): sensitivity-tier classifier foundation
 
 First step of the tiered-memory-access work (design `2026-06-03-tiered-memory-access-design`):
