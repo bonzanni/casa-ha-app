@@ -702,33 +702,9 @@ class Agent:
                     sdk_session_id,
                 )
 
-            # 8. Classify + persist — off the critical path. -----------------
-            write_scope: str = "-"
-            if response_text:
-                # Scope-classify the full exchange over (owned ∩ readable).
-                # Empty intersection = channel's trust tier forbids every
-                # scope the agent owns. Persisting to default_scope would
-                # leak the exchange into a scope the channel can't see —
-                # skip the write instead.
-                owned_and_readable = [
-                    s for s in self.config.memory.scopes_owned if s in readable
-                ]
-                if owned_and_readable:
-                    # Skip the classify round-trip when there's only one
-                    # candidate — the argmax is trivially that scope, so
-                    # a 90 ms ONNX forward pass would buy us nothing.
-                    # This is the common butler (voice, owns=[house])
-                    # case.
-                    if len(owned_and_readable) == 1:
-                        write_scope = owned_and_readable[0]
-                    else:
-                        write_scores = self._scope_registry.score(
-                            f"{user_text}\n{response_text}",
-                            owned_and_readable,
-                        )
-                        write_scope = self._scope_registry.argmax_scope(
-                            write_scores, self.config.memory.default_scope,
-                        )
+            # 8. Persist — the freshness reaper classifies each retained item at
+            # its true sensitivity tier off the critical path (tier model §2.4);
+            # nothing to compute or record per-turn here.
 
             # --- 3.2 observability ----------------------------------------
             total_ms = int((time.perf_counter() - scope_start_t) * 1000)
@@ -740,7 +716,6 @@ class Agent:
                     "channel": msg.channel,
                     "role": self.config.role,
                     "active": list(active),
-                    "write": write_scope,
                     "winner": winner,
                     "winner_score": winner_score,
                     "second_score": second_score,
@@ -751,17 +726,13 @@ class Agent:
                 },
             )
 
-            # 9. SessionRegistry — SDK session id + dominant write_scope. -------
+            # 9. SessionRegistry — record the SDK session id for resume + save.
             if sdk_session_id:
                 await self._session_registry.register(
                     channel_key=channel_key,
                     agent=self.config.role,
                     sdk_session_id=sdk_session_id,
                 )
-                # register() rewrites the entry dict, so record the scope AFTER
-                # it (spec §4.2 — the freshness reaper tags the retain with this).
-                if write_scope != "-":
-                    await self._session_registry.record_write_scope(channel_key, write_scope)
 
             return response_text or None
         finally:

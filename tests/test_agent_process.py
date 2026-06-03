@@ -236,8 +236,7 @@ def _msg(channel: str, chat_id: str, text: str = "ping") -> BusMessage:
 
 async def test_session_id_is_channel_plus_role(tmp_path):
     # §4.3: the read path no longer fans out per-scope Honcho sessions; it
-    # recalls once against the role's bank. The channel+role session-key
-    # contract is now asserted via the registry write_scope record.
+    # recalls once against the role's bank.
     mem = FakeMemory()
     sem = FakeSemanticMemory(facts="recall digest")
     agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
@@ -247,13 +246,10 @@ async def test_session_id_is_channel_plus_role(tmp_path):
     # Fresh telegram session → one bank recall keyed to the shared casa bank.
     assert len(sem.recall_calls) == 1
     assert sem.recall_calls[0]["bank"] == "casa"
-    # Session-granularity save model: per-turn add_turn is retired. The
-    # dominant write_scope is recorded on the registry entry instead, and
-    # no per-turn memory write happens.
+    # Session-granularity save model: per-turn add_turn is retired.
     assert mem.add == []
     entry = agent._session_registry.get("telegram-123")
     assert entry is not None
-    assert entry.get("write_scope") == "personal"
 
 
 async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
@@ -262,7 +258,7 @@ async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
     # at session end instead. On the read side, a fresh voice turn pushes NO
     # overlay (blocked by clearance — voice=friends, overlay is private-only)
     # and NEVER auto-recalls (voice keeps the multi-strategy recall off the
-    # first-utterance critical path). write_scope still records.
+    # first-utterance critical path).
     mem = FakeMemory()
     sem = FakeSemanticMemory(overlay="OVERLAY")
     agent = _make_agent(mem, tmp_path, role="butler", semantic_memory=sem)
@@ -274,7 +270,6 @@ async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
     assert mem.add == []
     entry = agent._session_registry.get("voice-lr")
     assert entry is not None
-    assert entry.get("write_scope") == "personal"
 
 
 async def test_telegram_channel_autorecalls_on_fresh_session(tmp_path):
@@ -420,23 +415,6 @@ async def test_system_prompt_memory_context_only_when_nonempty(tmp_path):
     assert "[nicola] hi" in prompt2
 
 
-async def test_write_scope_recorded_on_registry_no_per_turn_write(tmp_path):
-    """Session-granularity save model (spec §4.2): the agent no longer does a
-    per-turn memory write; it records the turn's dominant write_scope on the
-    registry entry, and the actual retain happens at session end."""
-    mem = FakeMemory()
-    agent = _make_agent(mem, tmp_path, role="assistant")
-    with patch("agent.ClaudeSDKClient", FakeClient):
-        await agent._process(_msg("telegram", "123", "hi"))
-
-    assert FakeClient.response_text == "pong"
-    # No per-turn add_turn write happens any more.
-    assert mem.add == []
-    entry = agent._session_registry.get("telegram-123")
-    assert entry is not None
-    assert entry.get("write_scope") == "personal"
-
-
 async def test_memory_failure_does_not_break_response(tmp_path, caplog):
     import logging
 
@@ -464,11 +442,10 @@ async def test_memory_failure_does_not_break_response(tmp_path, caplog):
 #     `_add_turn_bg` try/except logged a warning when add_turn raised. The
 #     agent no longer calls add_turn per turn, so the path is gone.
 #   - test_agent_retains_add_turn_task_strong_reference: asserted the
-#     background add_turn task was strongly referenced in `_bg_tasks`. The
-#     write is now an inline `record_write_scope` await (no spawned task).
-# Per-turn write coverage is replaced by the registry-write_scope assertions
-# in test_write_scope_recorded_on_registry_no_per_turn_write (this file) and
-# the scope-routing assertions in test_agent_process_scope.py.
+#     background add_turn task was strongly referenced in `_bg_tasks`. That
+#     machinery is gone; session-granularity saves are handled by the reaper.
+# The per-turn write_scope classification was subsequently removed in Task 6
+# (tier model); tiering now lives in the freshness reaper off the critical path.
 
 
 class TestRetryIntegration:

@@ -1,5 +1,5 @@
-"""Spec §4.2 #3 (next-turn-after-gap) + write_scope recording. Tests the
-extracted pure helper agent._resume_decision rather than a full SDK turn."""
+"""Spec §4.2 #3 (next-turn-after-gap). Tests the extracted pure helper
+agent._resume_decision rather than a full SDK turn."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone

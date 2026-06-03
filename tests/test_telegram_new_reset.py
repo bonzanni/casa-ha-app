@@ -88,7 +88,6 @@ class TestTelegramNewReset:
 
         reg = SessionRegistry(str(tmp_path / "s.json"))
         await reg.register("telegram-42", "assistant", "sid-1")
-        await reg.record_write_scope("telegram-42", "house")
         sem = AsyncMock()
         msgs = [
             type("M", (), {"type": "user", "message": {"content": "remember X"}})()
@@ -107,7 +106,6 @@ class TestTelegramNewReset:
 
         reg = SessionRegistry(str(tmp_path / "s.json"))
         await reg.register("telegram-42", "assistant", "sid-1")
-        await reg.record_write_scope("telegram-42", "house")
         sem = AsyncMock()
         msgs = [
             type("M", (), {"type": "user", "message": {"content": "hi"}})()
@@ -128,7 +126,6 @@ class TestTelegramNewReset:
 
         reg = SessionRegistry(str(tmp_path / "s.json"))
         await reg.register("telegram-42", "assistant", "sid-1")
-        await reg.record_write_scope("telegram-42", "house")
         sem = AsyncMock()
         msgs = [
             type("M", (), {"type": "user", "message": {"content": "hi"}})()
@@ -146,7 +143,6 @@ class TestTelegramNewReset:
 
         reg = SessionRegistry(str(tmp_path / "s.json"))
         await reg.register("telegram-42", "assistant", "sid-1")
-        await reg.record_write_scope("telegram-42", "house")
         sem = AsyncMock()
         msgs = [
             type("M", (), {"type": "user", "message": {"content": "important data"}})()

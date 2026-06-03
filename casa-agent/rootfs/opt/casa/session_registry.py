@@ -110,15 +110,6 @@ class SessionRegistry:
                 entry.pop("sdk_session_id", None)
                 await self._save_locked()
 
-    async def record_write_scope(self, channel_key: str, scope: str) -> None:
-        """Record the turn's dominant write-scope so a post-hoc reaper can
-        tag the retain (spec §4.2 — write_scope is otherwise never persisted)."""
-        async with self._lock:
-            entry = self._data.get(channel_key)
-            if entry is not None:
-                entry["write_scope"] = scope
-                await self._save_locked()
-
     async def try_begin_save(self, channel_key: str) -> bool:
         """Atomically claim a session for saving. Returns True for the first
         caller (sets ``consolidated_at``), False if missing or already claimed.
@@ -166,7 +157,7 @@ class SessionRegistry:
         # Per-entry copy, not a shallow dict() of the outer map: the write runs
         # in a thread (the lock is released while we await it), so a concurrent
         # mutator that acquires the lock could otherwise mutate an inner entry
-        # dict mid-serialize. The save model relies on write_scope/consolidated_at
+        # dict mid-serialize. The save model relies on sdk_session_id/consolidated_at
         # persisting atomically (crash-safety, spec §4.2 / C3). Entries are flat
         # str→str|None maps, so a one-level copy is sufficient and cheap.
         data = {k: dict(v) for k, v in self._data.items()}
