@@ -45,7 +45,6 @@ test-tier1: build
 test-tier2: test-tier1
 	cd $(ROOT) && python -m pytest tests/ -m "unit and not docker and not slow"
 	cd $(ROOT) && bash test-local/e2e/test_invoke_sessions.sh
-	cd $(ROOT) && bash test-local/e2e/test_sqlite_memory.sh
 	cd $(ROOT) && bash test-local/e2e/test_external_surface.sh
 	cd $(ROOT) && bash test-local/e2e/test_specialist_delegation.sh
 	cd $(ROOT) && bash test-local/e2e/test_scheduling.sh

@@ -7,8 +7,16 @@ session-granularity **long-term save** path onto the SemanticMemory seam: ended
 conversations are retained to the self-hosted Hindsight add-on. **Saves are active** when
 `MEMORY_BACKEND=hindsight` + `hindsight_api_url` are set; long-term **recall** (reads)
 lands in the next step (3/3), so a hindsight-selected instance writes facts but does not
-yet read them back. Without `MEMORY_BACKEND=hindsight`, behaviour is unchanged (the legacy
-memory backend still serves reads, and nothing is retained to Hindsight).
+yet read them back.
+
+**Behaviour change for non-Hindsight backends:** residents no longer write memory
+per-turn on ANY backend (the per-turn `add_turn` is gone). Short-term continuity is
+unaffected — it is owned by the per-channel SDK session, which resumes as before. But the
+legacy Honcho/SQLite stores are no longer written by residents (they still serve reads
+until retired in step 3/3), so a `sqlite`/`honcho`/`noop` instance has **no resident
+long-term memory** until you switch to `MEMORY_BACKEND=hindsight`. Specialist/engagement
+memory writes are unchanged. (This is the spec §7 "cold cut" — `Hindsight` is the only
+backend with active long-term writes from v0.40.0 on.)
 
 ### Added
 
