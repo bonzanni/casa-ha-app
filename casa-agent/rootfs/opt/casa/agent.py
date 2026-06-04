@@ -41,7 +41,7 @@ from timekeeping import resolve_tz
 from memory import MemoryProvider
 from hindsight_ids import bank_id
 from sensitivity import clearance_for_channel, readable_tiers
-from session_saver import freshness_window, save_session
+from session_saver import freshness_window, retain_cold_session, save_session
 from semantic_memory import NoOpSemanticMemory, SemanticMemory
 from session_registry import SessionRegistry, build_session_key
 from retry import retry_sdk_call
@@ -202,7 +202,7 @@ class Agent:
         self._channel_manager = channel_manager
         self._scope_registry = scope_registry
         self._agent_registry = agent_registry
-        self._bg_tasks: set[asyncio.Task] = set()
+        self._bg_tasks: set[asyncio.Task] = set()  # background cold-session retains
         # Per-(session_id) over-budget streak tracker (spec 5.2 §5.2).
         # Per-instance so assistant (4000) and butler (800) budgets stay
         # isolated even when the same channel serves both roles.
@@ -450,13 +450,17 @@ class Agent:
                 resume_session_id = existing.get("sdk_session_id")
                 await self._session_registry.touch(channel_key)
             elif save_old:
-                # next-turn-after-gap: retain the cold prior session BEFORE we
-                # overwrite its registry pointer with the new SDK session.
-                await save_session(
-                    channel_key, self._session_registry, self._semantic_memory,
-                    role=self.config.role, directory=agent_home, user_peer=user_peer,
-                    channel=msg.channel,
-                )
+                # next-turn-after-gap: register() below will overwrite this channel's
+                # pointer with the new SDK session, so capture the OLD sid now and
+                # retain it in the BACKGROUND (per-item classification runs off the
+                # hot path — tier model §2.4). This is claim-free / registry-decoupled
+                # so it cannot race the register() rewrite. (save_session — which
+                # claims the registry — is intentionally NOT used here.)
+                old_sid = (existing or {}).get("sdk_session_id")
+                if old_sid:
+                    self._spawn_cold_retain(
+                        old_sid, agent_home, user_peer, msg.channel,
+                    )
             # else ("new", False): no prior entry → nothing to save
 
             # 2b. Memory context (spec §4.3) — channel-aware load on the
@@ -737,6 +741,23 @@ class Agent:
             return response_text or None
         finally:
             origin_var.reset(origin_token)
+
+    def _spawn_cold_retain(
+        self, sid: str, directory: str, user_peer: str, channel: str,
+    ) -> None:
+        """Retain a cold prior session in the background (claim-free; cannot race
+        register()). Tracked so it isn't GC'd; failures are swallowed in
+        retain_cold_session and never reach the turn."""
+        task = asyncio.create_task(
+            retain_cold_session(
+                sid=sid, role=self.config.role, directory=directory,
+                user_peer=user_peer, channel=channel,
+                semantic_memory=self._semantic_memory,
+            ),
+            name=f"cold-retain-{sid}",
+        )
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     def _log_retry(self, attempt: int, exc: Exception, delay_ms: int) -> None:
         """Emit a single WARNING per retry event (spec 5.2 §3.2)."""

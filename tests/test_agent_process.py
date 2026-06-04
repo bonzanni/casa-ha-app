@@ -1450,31 +1450,51 @@ class TestScheduledSilence:
 
 
 class TestSaveBeforeOverwrite:
-    """_process must await save_session exactly once, before opening a new
-    SDK session, when a cold prior session exists (spec §4.2 save-before-
-    overwrite branch).  The pure helper _resume_decision is already unit-
-    tested in test_agent_save_path.py; this class covers the load-bearing
-    call inside _process itself."""
+    """_process schedules a background claim-free retain (via _spawn_cold_retain)
+    when a cold prior session exists (spec §4.2 save-before-overwrite branch,
+    tier model §2.4). The pure helper _resume_decision is already unit-tested in
+    test_agent_save_path.py; this class covers the load-bearing call inside
+    _process itself.
 
-    async def test_save_session_called_on_cold_path(self, tmp_path, monkeypatch):
+    NOTE (Task 8, tier model §2.4): the gap branch no longer awaits save_session
+    synchronously. Doing so would race register() — save_session claims the registry
+    entry via try_begin_save/finish_save, while register() overwrites the same
+    channel_key. Instead _process captures the OLD sid before register() fires and
+    hands it to _spawn_cold_retain, which runs retain_cold_session in the background
+    (claim-free, registry-decoupled). This keeps per-item LLM classification off
+    the turn's hot path. The original intent — "cold prior session IS persisted on
+    the next turn" — is preserved; only the mechanism changed."""
+
+    async def test_cold_path_schedules_background_retain_with_old_sid(
+        self, tmp_path, monkeypatch,
+    ):
         """When the registry holds a stale telegram entry (idle > 12 h),
-        _resume_decision returns ("new", True) and _process must await
-        save_session once with the correct positional / keyword args."""
+        _resume_decision returns ("new", True) and _process must schedule a
+        background retain via _spawn_cold_retain, passing the OLD sdk_session_id
+        captured BEFORE register() overwrites the entry. save_session must NOT
+        be called (it would race register() on the same channel_key)."""
         import agent as agent_mod
         from datetime import datetime, timedelta, timezone
 
-        save_calls: list[dict] = []
+        retain_calls: list[dict] = []
 
-        async def _fake_save(channel_key, session_registry, semantic_memory,
-                             *, role, directory, user_peer, channel):
-            save_calls.append({
-                "channel_key": channel_key,
+        async def _fake_retain_cold(
+            *, sid, role, directory, user_peer, channel, semantic_memory,
+        ):
+            retain_calls.append({
+                "sid": sid,
                 "role": role,
                 "directory": directory,
                 "user_peer": user_peer,
                 "channel": channel,
             })
 
+        save_calls: list = []
+
+        async def _fake_save(*a, **kw):
+            save_calls.append(kw)
+
+        monkeypatch.setattr(agent_mod, "retain_cold_session", _fake_retain_cold)
         monkeypatch.setattr(agent_mod, "save_session", _fake_save)
         FakeClient.reset()
 
@@ -1495,11 +1515,21 @@ class TestSaveBeforeOverwrite:
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("telegram", "123", "hi"))
 
-        assert len(save_calls) == 1, (
-            f"expected save_session called once on cold path; got {len(save_calls)} calls"
+        # Drain any background tasks so retain_cold_session can complete.
+        if agent._bg_tasks:
+            await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
+
+        # save_session must NOT be called on the cold path (it races register()).
+        assert save_calls == [], (
+            f"save_session must NOT be called on the cold path (races register()); "
+            f"got: {save_calls}"
         )
-        call = save_calls[0]
-        assert call["channel_key"] == "telegram-123", call
+        # retain_cold_session must have been called with the OLD sid.
+        assert len(retain_calls) == 1, (
+            f"expected retain_cold_session called once on cold path; got {len(retain_calls)} calls"
+        )
+        call = retain_calls[0]
+        assert call["sid"] == "old-stale-sid", call
         assert call["role"] == "assistant", call
         assert call["directory"].endswith("agent-home/assistant"), call
         assert call["user_peer"] == "nicola", call

@@ -112,6 +112,34 @@ async def save_session(
         return False
 
 
+async def retain_cold_session(
+    *, sid: str, role: str, directory: str, user_peer: str, channel: str,
+    semantic_memory,
+) -> None:
+    """Retain a specific cold SDK session's transcript to the shared ``casa`` bank,
+    OFF the turn's critical path and DECOUPLED from the session registry (no
+    try_begin_save/finish_save). Used by the next-turn-after-gap path, where the
+    registry entry for this channel is about to be overwritten by the new session —
+    so a registry-claiming save (save_session) would race register(); this does not
+    touch the registry at all. Channels failing write-trust (voice) retain nothing.
+    document_id=sid:idx keeps the retain idempotent."""
+    # role is accepted for caller-symmetry with save_session (which also takes role)
+    # and reserved for future per-role filtering; it is not used in the body today.
+    if not writes_to_bank(channel):
+        return
+    if not sid:  # defensive: the gap call site already guards, but this is a public API
+        return
+    try:
+        messages = await asyncio.to_thread(get_session_messages, sid, directory)
+        items = await transcript_to_items(
+            messages, sdk_session_id=sid, user_peer=user_peer,
+        )
+        if items:
+            await semantic_memory.retain(bank_id("casa"), items, async_=True)
+    except Exception:  # noqa: BLE001 — background; never surface to the turn
+        logger.warning("background cold-session retain failed for sid=%s", sid, exc_info=True)
+
+
 async def reset_channel(
     channel_key: str, registry, semantic_memory, *, channel: str,
 ) -> None:
