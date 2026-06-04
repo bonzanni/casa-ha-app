@@ -1343,47 +1343,21 @@ def _jaccard_task_similarity(a: str, b: str) -> float:
 
 
 async def _fetch_executor_archive(
-    *, memory_provider, channel: str, chat_id: str,
-    executor_type: str, token_budget: int,
+    *, task: str, origin_channel: str, token_budget: int,
 ) -> str:
-    """Read the per-(channel, chat, executor_type) archive of prior
-    engagement summaries via Honcho's ``session.context``. Returns the
-    rendered digest wrapped under a recognizable header, or "" when the
-    archive is empty / provider is None / read fails.
-
-    Mirrors the WRITE site at ``tools.py:1383`` for ``session_id`` and
-    ``agent_role`` on ``ensure_session``. ``get_context`` is session-only —
-    its signature dropped ``agent_role`` and ``user_peer`` in v0.26.0
-    (E-14). E-D (v0.29.0) removed the lingering ``agent_role=agent_role``
-    kwarg here that was a silent TypeError on every executor spawn.
-    """
-    if memory_provider is None:
+    """Read prior-engagement "lessons" as a SEMANTIC recall against the shared
+    ``casa`` bank, keyed on the current ``task`` and filtered to the originating
+    engagement's read-clearance (design §3, plan 3). Returns the digest under a
+    recognizable header, or "" when memory is unavailable / the recall is empty.
+    Best-effort: ``delegated_recall`` swallows its own errors."""
+    import agent as agent_mod
+    sem = getattr(agent_mod, "active_semantic_memory", None)
+    if sem is None:
         return ""
-    session_id = honcho_session_id(channel, chat_id, "executor", executor_type)
-    agent_role = f"executor-{executor_type}"
-    try:
-        await memory_provider.ensure_session(
-            session_id=session_id,
-            agent_role=agent_role,
-        )
-        digest = await memory_provider.get_context(
-            session_id=session_id,
-            tokens=token_budget,
-            # M3-self companion (v0.30.0): not strictly needed when
-            # search_query is None (peer_target is only required when
-            # search_query is set), but threading agent_role keeps the
-            # memory_call telemetry attributed to the correct peer.
-            agent_role=agent_role,
-        )
-    except Exception as exc:  # noqa: BLE001 — ARCH: same shape as 1246, 1407
-        logger.warning(
-            "executor archive fetch failed for type=%s: %s",
-            executor_type, exc, exc_info=True,
-        )
-        return ""
-    if not digest:
-        return ""
-    return f"## Prior engagements (lessons learned)\n{digest}"
+    digest = await delegated_recall(
+        sem, query=task, origin_channel=origin_channel, max_tokens=token_budget,
+    )
+    return f"## Prior engagements (lessons learned)\n{digest}" if digest else ""
 
 
 @tool(
@@ -1551,16 +1525,14 @@ async def engage_executor(args: dict) -> dict:
 
     world_state = _build_world_state_summary()
 
-    # M4 L3: per-executor archive injection. Skipped when the executor
-    # type hasn't opted in (defn.memory.enabled=False is the default).
+    # Semantic-recall memory injection (design §3, plan 3): when the executor
+    # opts in (defn.memory.enabled=True, off by default), fetch prior-engagement
+    # lessons from the shared `casa` bank at the origin channel's read-clearance.
     executor_memory_block = ""
     if defn.memory.enabled:
-        memory_provider = getattr(agent_mod, "active_memory_provider", None)
         executor_memory_block = await _fetch_executor_archive(
-            memory_provider=memory_provider,
-            channel=origin.get("channel", "telegram"),
-            chat_id=str(origin.get("chat_id", "")),
-            executor_type=executor_type,
+            task=task_text,
+            origin_channel=origin.get("channel", "telegram"),
             token_budget=defn.memory.token_budget,
         )
 
