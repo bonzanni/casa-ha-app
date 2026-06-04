@@ -28,7 +28,13 @@ async def classify_tier(content: str) -> str:
 
     opts = sdk.ClaudeAgentOptions(
         system_prompt=SENSITIVITY_PROMPT, max_turns=1, allowed_tools=[],
-        permission_mode="bypassPermissions",
+        # NOT bypassPermissions: that makes the SDK pass
+        # ``--dangerously-skip-permissions`` to the bundled ``claude`` CLI, which
+        # refuses to run as root/sudo — and HA add-ons run as root, so the call
+        # fails and every item silently defaults to ``private``. With
+        # ``allowed_tools=[]`` there is nothing to approve, so acceptEdits (the
+        # mode the rest of casa runs as root) never prompts and works.
+        permission_mode="acceptEdits",
     )
     reply = ""
     try:

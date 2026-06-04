@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.45.1] - 2026-06-04 — Fix: tier classifier runs as root
+
+### Fixed
+
+- **`tier_classifier` no longer uses `permission_mode="bypassPermissions"`** (→ `acceptEdits`).
+  `bypassPermissions` makes the SDK pass `--dangerously-skip-permissions` to the bundled
+  `claude` CLI, which **refuses to run as root/sudo** — and HA add-ons run as root, so every
+  classification call failed and silently defaulted to `private` (leak-safe but over-restrictive:
+  *all* new long-term memories ended up `private`, and the logs flooded). With `allowed_tools=[]`
+  there is nothing to approve, so `acceptEdits` (the mode the rest of Casa runs as root) is
+  equivalent and works. Found live on the N150 right after the v0.45.0 deploy. A regression guard
+  test now asserts the classifier never uses `bypassPermissions`.
+
 ## [0.45.0] - 2026-06-04 — Tiered memory access (4/4): full legacy retirement
 
 Completes the tiered-memory re-architecture by **deleting the entire legacy memory stack**.
