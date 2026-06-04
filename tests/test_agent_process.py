@@ -23,7 +23,7 @@ from claude_agent_sdk import (
     TextBlock as _SDKTextBlock,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 def _mk_scope_registry_stub():
@@ -236,44 +236,40 @@ def _msg(channel: str, chat_id: str, text: str = "ping") -> BusMessage:
 
 async def test_session_id_is_channel_plus_role(tmp_path):
     # §4.3: the read path no longer fans out per-scope Honcho sessions; it
-    # recalls once against the role's bank. The channel+role session-key
-    # contract is now asserted via the registry write_scope record.
+    # recalls once against the role's bank.
     mem = FakeMemory()
     sem = FakeSemanticMemory(facts="recall digest")
     agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
-    # Fresh telegram session → one bank recall keyed to this role.
+    # Fresh telegram session → one bank recall keyed to the shared casa bank.
     assert len(sem.recall_calls) == 1
-    assert sem.recall_calls[0]["bank"] == "casa-assistant"
-    # Session-granularity save model: per-turn add_turn is retired. The
-    # dominant write_scope is recorded on the registry entry instead, and
-    # no per-turn memory write happens.
+    assert sem.recall_calls[0]["bank"] == "casa"
+    # Session-granularity save model: per-turn add_turn is retired.
     assert mem.add == []
     entry = agent._session_registry.get("telegram-123")
     assert entry is not None
-    assert entry.get("write_scope") == "personal"
 
 
 async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
     # §4.3: the per-turn read no longer threads a user_peer (no ensure_session
     # / per-turn add_turn). The voice-speaker peer is carried into save_session
-    # at session end instead. On the read side, a fresh voice session pushes
-    # the overlay but NEVER auto-recalls (voice keeps the multi-strategy recall
-    # off the first-utterance critical path). write_scope still records.
+    # at session end instead. On the read side, a fresh voice turn pushes NO
+    # overlay (blocked by clearance — voice=friends, overlay is private-only)
+    # and NEVER auto-recalls (voice keeps the multi-strategy recall off the
+    # first-utterance critical path).
     mem = FakeMemory()
     sem = FakeSemanticMemory(overlay="OVERLAY")
     agent = _make_agent(mem, tmp_path, role="butler", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("voice", "lr", "lights on"))
 
-    assert len(sem.profile_calls) == 1   # overlay pushed at fresh start
+    assert len(sem.profile_calls) == 0   # voice clearance < private → overlay blocked
     assert sem.recall_calls == []        # voice never auto-recalls
     assert mem.add == []
     entry = agent._session_registry.get("voice-lr")
     assert entry is not None
-    assert entry.get("write_scope") == "personal"
 
 
 async def test_telegram_channel_autorecalls_on_fresh_session(tmp_path):
@@ -308,14 +304,15 @@ async def test_fresh_text_turn_pushes_overlay_and_recalls(tmp_path):
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
-    # One overlay (profile) call per fresh turn, keyed to the role's bank.
-    assert sem.profile_calls == ["casa-assistant"]
-    # One recall call: query == utterance, tags == readable scopes, mid budget.
+    # One overlay (profile) call per fresh turn, keyed to the shared casa bank.
+    assert sem.profile_calls == ["casa"]
+    # One recall call: query == utterance, tags == sensitivity tiers readable at
+    # telegram clearance (private → all four tiers), mid budget.
     assert len(sem.recall_calls) == 1
     call = sem.recall_calls[0]
-    assert call["bank"] == "casa-assistant"
+    assert call["bank"] == "casa"
     assert call["query"] == "hi"
-    assert call["tags"] == ["personal"]   # readable from the scope-registry stub
+    assert call["tags"] == ["public", "friends", "family", "private"]
     assert call["budget"] == "mid"
 
 
@@ -418,23 +415,6 @@ async def test_system_prompt_memory_context_only_when_nonempty(tmp_path):
     assert "[nicola] hi" in prompt2
 
 
-async def test_write_scope_recorded_on_registry_no_per_turn_write(tmp_path):
-    """Session-granularity save model (spec §4.2): the agent no longer does a
-    per-turn memory write; it records the turn's dominant write_scope on the
-    registry entry, and the actual retain happens at session end."""
-    mem = FakeMemory()
-    agent = _make_agent(mem, tmp_path, role="assistant")
-    with patch("agent.ClaudeSDKClient", FakeClient):
-        await agent._process(_msg("telegram", "123", "hi"))
-
-    assert FakeClient.response_text == "pong"
-    # No per-turn add_turn write happens any more.
-    assert mem.add == []
-    entry = agent._session_registry.get("telegram-123")
-    assert entry is not None
-    assert entry.get("write_scope") == "personal"
-
-
 async def test_memory_failure_does_not_break_response(tmp_path, caplog):
     import logging
 
@@ -462,11 +442,10 @@ async def test_memory_failure_does_not_break_response(tmp_path, caplog):
 #     `_add_turn_bg` try/except logged a warning when add_turn raised. The
 #     agent no longer calls add_turn per turn, so the path is gone.
 #   - test_agent_retains_add_turn_task_strong_reference: asserted the
-#     background add_turn task was strongly referenced in `_bg_tasks`. The
-#     write is now an inline `record_write_scope` await (no spawned task).
-# Per-turn write coverage is replaced by the registry-write_scope assertions
-# in test_write_scope_recorded_on_registry_no_per_turn_write (this file) and
-# the scope-routing assertions in test_agent_process_scope.py.
+#     background add_turn task was strongly referenced in `_bg_tasks`. That
+#     machinery is gone; session-granularity saves are handled by the reaper.
+# The per-turn write_scope classification was subsequently removed in Task 6
+# (tier model); tiering now lives in the freshness reaper off the critical path.
 
 
 class TestRetryIntegration:
@@ -980,10 +959,10 @@ class TestTokenBudgetMonitoring:
 
         assert FakeClient.attempts == 2
         # Phase 4b added an `sdk` logger turn_done line; the `agent` logger
-        # summary still fires once per overall _process call.
+        # summary still fires once per overall _process call (now `turn_tokens`).
         rows = [
             r for r in caplog.records
-            if r.name == "agent" and "turn_done" in r.getMessage()
+            if r.name == "agent" and "turn_tokens" in r.getMessage()
         ]
         assert len(rows) == 1
         msg = rows[0].getMessage()
@@ -1471,30 +1450,51 @@ class TestScheduledSilence:
 
 
 class TestSaveBeforeOverwrite:
-    """_process must await save_session exactly once, before opening a new
-    SDK session, when a cold prior session exists (spec §4.2 save-before-
-    overwrite branch).  The pure helper _resume_decision is already unit-
-    tested in test_agent_save_path.py; this class covers the load-bearing
-    call inside _process itself."""
+    """_process schedules a background claim-free retain (via _spawn_cold_retain)
+    when a cold prior session exists (spec §4.2 save-before-overwrite branch,
+    tier model §2.4). The pure helper _resume_decision is already unit-tested in
+    test_agent_save_path.py; this class covers the load-bearing call inside
+    _process itself.
 
-    async def test_save_session_called_on_cold_path(self, tmp_path, monkeypatch):
+    NOTE (Task 8, tier model §2.4): the gap branch no longer awaits save_session
+    synchronously. Doing so would race register() — save_session claims the registry
+    entry via try_begin_save/finish_save, while register() overwrites the same
+    channel_key. Instead _process captures the OLD sid before register() fires and
+    hands it to _spawn_cold_retain, which runs retain_cold_session in the background
+    (claim-free, registry-decoupled). This keeps per-item LLM classification off
+    the turn's hot path. The original intent — "cold prior session IS persisted on
+    the next turn" — is preserved; only the mechanism changed."""
+
+    async def test_cold_path_schedules_background_retain_with_old_sid(
+        self, tmp_path, monkeypatch,
+    ):
         """When the registry holds a stale telegram entry (idle > 12 h),
-        _resume_decision returns ("new", True) and _process must await
-        save_session once with the correct positional / keyword args."""
+        _resume_decision returns ("new", True) and _process must schedule a
+        background retain via _spawn_cold_retain, passing the OLD sdk_session_id
+        captured BEFORE register() overwrites the entry. save_session must NOT
+        be called (it would race register() on the same channel_key)."""
         import agent as agent_mod
         from datetime import datetime, timedelta, timezone
 
-        save_calls: list[dict] = []
+        retain_calls: list[dict] = []
 
-        async def _fake_save(channel_key, session_registry, semantic_memory,
-                             *, role, directory, user_peer):
-            save_calls.append({
-                "channel_key": channel_key,
+        async def _fake_retain_cold(
+            *, sid, role, directory, user_peer, channel, semantic_memory,
+        ):
+            retain_calls.append({
+                "sid": sid,
                 "role": role,
                 "directory": directory,
                 "user_peer": user_peer,
+                "channel": channel,
             })
 
+        save_calls: list = []
+
+        async def _fake_save(*a, **kw):
+            save_calls.append(kw)
+
+        monkeypatch.setattr(agent_mod, "retain_cold_session", _fake_retain_cold)
         monkeypatch.setattr(agent_mod, "save_session", _fake_save)
         FakeClient.reset()
 
@@ -1515,14 +1515,25 @@ class TestSaveBeforeOverwrite:
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("telegram", "123", "hi"))
 
-        assert len(save_calls) == 1, (
-            f"expected save_session called once on cold path; got {len(save_calls)} calls"
+        # Drain any background tasks so retain_cold_session can complete.
+        if agent._bg_tasks:
+            await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
+
+        # save_session must NOT be called on the cold path (it races register()).
+        assert save_calls == [], (
+            f"save_session must NOT be called on the cold path (races register()); "
+            f"got: {save_calls}"
         )
-        call = save_calls[0]
-        assert call["channel_key"] == "telegram-123", call
+        # retain_cold_session must have been called with the OLD sid.
+        assert len(retain_calls) == 1, (
+            f"expected retain_cold_session called once on cold path; got {len(retain_calls)} calls"
+        )
+        call = retain_calls[0]
+        assert call["sid"] == "old-stale-sid", call
         assert call["role"] == "assistant", call
         assert call["directory"].endswith("agent-home/assistant"), call
         assert call["user_peer"] == "nicola", call
+        assert call["channel"] == "telegram", call
 
     async def test_save_session_not_called_on_resume_path(self, tmp_path, monkeypatch):
         """When the registry holds a fresh entry (idle < 12 h), _resume_decision
@@ -1533,7 +1544,7 @@ class TestSaveBeforeOverwrite:
         save_calls: list[dict] = []
 
         async def _fake_save(channel_key, session_registry, semantic_memory,
-                             *, role, directory, user_peer):
+                             *, role, directory, user_peer, channel):
             save_calls.append({"channel_key": channel_key})
 
         monkeypatch.setattr(agent_mod, "save_session", _fake_save)

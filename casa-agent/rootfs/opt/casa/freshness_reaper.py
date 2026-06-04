@@ -1,8 +1,10 @@
 # casa-agent/rootfs/opt/casa/freshness_reaper.py
 """Primary long-term-save trigger (spec §4.2 #1). A background pass on a fixed
 ~hourly cadence (and once at boot) scans the registry; any conversational entry
-idle past its channel's freshness window and not yet saved is retained via
-save_session. Safe because a past-freshness session is never resumed (§3.3).
+idle past its channel's freshness window is handled by channel type: cold entries
+on write-trusted channels (telegram) are retained via save_fn; cold entries on
+recall-only channels (voice) are dropped from the registry (not persisted). Safe
+because a past-freshness session is never resumed (§3.3).
 
 C3: a save that crashes between claim and finish strands the entry with a
 ``consolidated_at`` marker; a marker older than the stale threshold (~2× the reap
@@ -14,6 +16,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
+from channel_policy import writes_to_bank
 from channel_trust import user_peer_for_channel
 from session_saver import freshness_window, save_session
 
@@ -28,8 +31,9 @@ class FreshnessReaper:
     """Primary long-term-save trigger for conversational sessions.
 
     Runs a sweep at boot (to catch sessions that went cold during downtime) then
-    once every ``interval_s`` seconds.  Any conversational entry idle past its
-    channel's freshness window and not yet saved is retained via ``save_fn``.
+    once every ``interval_s`` seconds.  Cold entries are handled by channel type:
+    write-trusted channels (telegram) are retained via ``save_fn``; recall-only
+    channels (voice) are dropped from the registry (not persisted).
     Injectable ``now``/``save_fn`` make the class fully testable without I/O.
     Includes C3 stale-claim recovery: a ``consolidated_at`` marker older than
     ``_STALE_CLAIM_MULTIPLIER × interval_s`` is treated as a crashed save and
@@ -85,11 +89,17 @@ class FreshnessReaper:
                         await self._reg.clear_save_claim(key)
                     else:
                         continue  # a save is genuinely in-flight → let it finish
+                if not writes_to_bank(channel):
+                    # Recall-only channel (voice): nothing to persist; drop the cold
+                    # pointer so the registry does not accumulate dead voice entries.
+                    await self._reg.remove(key)
+                    continue
                 role = entry.get("agent", "assistant")
                 user_peer = user_peer_for_channel(channel)
                 await self._save(
                     key, self._reg, self._sem, role=role,
                     directory=self._dir_for(role), user_peer=user_peer,
+                    channel=channel,
                 )
             except asyncio.CancelledError:
                 raise

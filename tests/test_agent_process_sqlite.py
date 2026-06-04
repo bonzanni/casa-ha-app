@@ -4,12 +4,10 @@ Uses a real :memory: DB + the same stubbed SDK pattern as
 tests/test_agent_process.py.
 
 Task 7 (spec §4.2): the per-turn `add_turn` write is retired in favour of
-session-granularity saves. The agent no longer persists rows on each turn —
-it records the turn's dominant ``write_scope`` on the SessionRegistry entry,
-and the transcript is retained at session end via ``save_session`` (which
-needs a real SDK transcript, out of scope for this unit fake). These tests
-therefore assert: (a) the channel→scope routing lands the right ``write_scope``
-on the registry, and (b) NO rows are written to the provider per turn.
+session-granularity saves. The agent no longer persists rows on each turn;
+the transcript is retained at session end via ``save_session`` (which needs a
+real SDK transcript, out of scope for this unit fake). These tests assert that
+NO rows are written to the provider per turn.
 """
 
 from __future__ import annotations
@@ -152,7 +150,7 @@ def _row_count(memory) -> int:
     ).fetchone()[0]
 
 
-async def test_telegram_turn_records_scope_and_writes_no_rows(tmp_path):
+async def test_telegram_turn_writes_no_rows(tmp_path):
     memory = SqliteMemoryProvider(":memory:")
     agent = _make_agent(memory, tmp_path, role="assistant")
 
@@ -162,13 +160,12 @@ async def test_telegram_turn_records_scope_and_writes_no_rows(tmp_path):
 
     # Per-turn write retired: no rows persisted by the turn.
     assert _row_count(memory) == 0
-    # Channel→scope routing lands the dominant scope on the registry entry.
+    # Registry entry exists (session registered for later reaper save).
     entry = agent._session_registry.get("telegram-nicola")
     assert entry is not None
-    assert entry.get("write_scope") == "personal"
 
 
-async def test_voice_turn_records_scope_and_writes_no_rows(tmp_path):
+async def test_voice_turn_writes_no_rows(tmp_path):
     memory = SqliteMemoryProvider(":memory:")
     agent = _make_agent(memory, tmp_path, role="butler")
 
@@ -179,7 +176,6 @@ async def test_voice_turn_records_scope_and_writes_no_rows(tmp_path):
     assert _row_count(memory) == 0
     entry = agent._session_registry.get("voice-livingroom")
     assert entry is not None
-    assert entry.get("write_scope") == "personal"
 
 
 async def test_turn_does_not_persist_to_provider(tmp_path):

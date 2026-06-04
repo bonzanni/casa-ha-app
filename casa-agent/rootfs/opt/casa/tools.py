@@ -1088,7 +1088,7 @@ async def consult_other_agent_memory(args: dict) -> dict:
     {"query": str},
 )
 async def recall_memory(args: dict) -> dict:
-    """On-demand semantic recall against the agent's own role bank (spec §4.3).
+    """On-demand semantic recall against the shared 'casa' bank, filtered by the channel's tier clearance (spec §4.3).
     Voice uses budget=low so the rerank never stalls the turn."""
     import agent as agent_mod
 
@@ -1105,15 +1105,9 @@ async def recall_memory(args: dict) -> dict:
     channel = origin.get("channel", "telegram")
     caller_cfg = _agent_role_map.get(role)
 
-    # Readable scopes — same trust filter the read path uses (agent.py:360-364).
-    readable: list[str] = []
-    scope_reg = getattr(agent_mod, "active_scope_registry", None)
-    if caller_cfg is not None and scope_reg is not None:
-        from channel_trust import channel_trust
-        readable = scope_reg.filter_readable(
-            list(getattr(getattr(caller_cfg, "memory", None), "scopes_readable", []) or []),
-            channel_trust(channel),
-        )
+    # Tier clearance — the same read-side gate the turn path uses (design §2.3).
+    from sensitivity import clearance_for_channel, readable_tiers
+    tags = readable_tiers(clearance_for_channel(channel))
 
     budget = "low" if channel == "voice" else "mid"
     tokens = (
@@ -1123,8 +1117,8 @@ async def recall_memory(args: dict) -> dict:
     from hindsight_ids import bank_id
     try:
         digest = await sem.recall(
-            bank_id("casa", role), query,
-            tags=readable, max_tokens=tokens, budget=budget,
+            bank_id("casa"), query,
+            tags=tags, max_tokens=tokens, budget=budget,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("recall_memory failed for role=%r: %s", role, exc)
@@ -3001,7 +2995,7 @@ CASA_TOOLS: tuple = (
     send_message,
     delegate_to_agent,
     consult_other_agent_memory,    # M6 — peer-level cross-perspective read
-    recall_memory,                 # §4.3 — own-role semantic recall
+    recall_memory,                 # §4.3 — shared-bank semantic recall (tier-clearance filtered)
     get_schedule,
     engage_executor,
     emit_completion,

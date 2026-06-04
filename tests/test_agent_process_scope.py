@@ -20,7 +20,7 @@ from claude_agent_sdk import (
     TextBlock as _SDKTextBlock,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +153,6 @@ def _make_agent(cfg, memory, scope_registry, semantic_memory=None):
             get=Mock(return_value=None),
             touch=AsyncMock(),
             register=AsyncMock(),
-            record_write_scope=AsyncMock(),
         ),
         mcp_registry=Mock(resolve=Mock(return_value={})),
         channel_manager=Mock(),
@@ -179,11 +178,11 @@ def _msg(channel: str, chat_id: str, text: str = "ping") -> BusMessage:
 
 
 class TestReadPath:
-    async def test_single_recall_tagged_with_readable_scopes(self):
+    async def test_single_recall_tagged_with_readable_tiers(self):
         """§4.3: the per-scope Honcho fan-out is retired. A fresh TEXT turn
         issues exactly ONE recall against the role's bank, tagged with the
-        full readable scope set (trust-filtered), not one read per active
-        scope. (Supersedes the old test_fan_out_one_scope.)"""
+        sensitivity tiers readable at the channel's clearance (clearance-filtered),
+        not one read per active scope. (Supersedes the old test_fan_out_one_scope.)"""
         memory = Mock()
         sem = FakeSemanticMemory(facts="finance digest")
 
@@ -201,10 +200,11 @@ class TestReadPath:
 
         assert len(sem.recall_calls) == 1
         call = sem.recall_calls[0]
-        assert call["bank"] == "casa-assistant"
+        assert call["bank"] == "casa"
         assert call["query"] == "how much for the plumber?"
-        # Tags are the readable set (not the active subset) — one tagged recall.
-        assert call["tags"] == ["personal", "business", "finance", "house"]
+        # Tags are sensitivity tiers readable at telegram clearance (private →
+        # all four tiers), not the scope-registry readable set.
+        assert call["tags"] == ["public", "friends", "family", "private"]
 
     async def test_recall_count_independent_of_active_scope_count(self):
         """§4.3: even with multiple active scopes the read issues a SINGLE
@@ -225,8 +225,10 @@ class TestReadPath:
             await agent._process(_msg("telegram", "12345", "x"))
 
         assert len(sem.recall_calls) == 1
+        # Tags are sensitivity tiers at telegram clearance (private → all four
+        # tiers) — independent of how many active scopes the scope-registry finds.
         assert sem.recall_calls[0]["tags"] == [
-            "personal", "business", "finance", "house",
+            "public", "friends", "family", "private",
         ]
 
     async def test_trust_filters_unreadable_scopes(self):
@@ -252,8 +254,9 @@ class TestReadPath:
         assert args[0] == ["personal", "business", "finance", "house"]
         assert args[1] == "household-shared"
 
-    async def test_write_uses_default_scope(self):
-        """Write path records the default_scope on the registry entry."""
+    async def test_per_turn_add_turn_is_retired(self):
+        """Session-granularity save model: per-turn add_turn is retired (no
+        write happens on the turn path — the reaper retains at session end)."""
         memory = Mock()
         memory.ensure_session = AsyncMock()
         memory.get_context = AsyncMock(return_value="")
@@ -271,11 +274,6 @@ class TestReadPath:
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("telegram", "12345", "hello"))
 
-        # Session-granularity save model: per-turn add_turn is retired; the
-        # dominant write_scope is recorded on the registry entry instead.
-        agent._session_registry.record_write_scope.assert_awaited_once_with(
-            "telegram-12345", "personal",
-        )
         memory.add_turn.assert_not_called()
 
     async def test_memory_context_wraps_recall_without_scope_attribute(self):
@@ -301,270 +299,6 @@ class TestReadPath:
         assert "<memory_context>" in prompt
         assert "scope=" not in prompt
         assert "some context data" in prompt
-
-
-class TestWritePath:
-    async def test_classify_writes_to_argmax(self, monkeypatch):
-        """Classify full exchange → write_scope = argmax."""
-        from agent import Agent, ClaudeSDKClient
-        from bus import BusMessage, MessageType
-
-        memory = Mock()
-        memory.ensure_session = AsyncMock()
-        memory.get_context = AsyncMock(return_value="d")
-        memory.add_turn = AsyncMock()
-
-        # score() is called twice (read + write); make the WRITE call
-        # favour finance by returning different dicts on 2nd call.
-        reg = Mock()
-        reg.filter_readable = Mock(return_value=["personal", "business", "finance", "house"])
-        reg.score = Mock(side_effect=[
-            {"personal": 1, "business": 1, "finance": 1, "house": 1},   # read
-            {"personal": 0.1, "business": 0.1, "finance": 0.9, "house": 0.2},   # write
-        ])
-        reg.active_from_scores = Mock(return_value=["finance"])
-        reg.argmax_scope = Mock(return_value="finance")
-        reg.cache_stats = Mock(return_value=(0, 1))
-
-        with patch("agent.ClaudeSDKClient", FakeClient):
-            FakeClient.reset()
-            FakeClient.response_text = "€450 to Van der Berg"
-
-            agent = Agent(
-                config=_make_agent_config(),
-                memory=memory,
-                session_registry=Mock(get=Mock(return_value=None),
-                                      touch=AsyncMock(),
-                                      register=AsyncMock(),
-                                      record_write_scope=AsyncMock()),
-                mcp_registry=Mock(resolve=Mock(return_value={})),
-                channel_manager=Mock(),
-                scope_registry=reg,
-            )
-
-            await agent._process(BusMessage(
-                type=MessageType.CHANNEL_IN, source="telegram", target="assistant",
-                content="plumber?", channel="telegram", context={"chat_id": "12345"},
-            ))
-
-        # Session-granularity save model: the classified argmax scope is
-        # recorded on the registry entry (no per-turn add_turn).
-        agent._session_registry.record_write_scope.assert_awaited_once_with(
-            "telegram-12345", "finance",
-        )
-        memory.add_turn.assert_not_called()
-
-    async def test_write_restricted_to_owned_and_readable(self, monkeypatch):
-        """Write-scope classifier sees only (scopes_owned ∩ readable)."""
-        from agent import Agent, ClaudeSDKClient
-        from bus import BusMessage, MessageType
-
-        memory = Mock()
-        memory.ensure_session = AsyncMock()
-        memory.get_context = AsyncMock(return_value="")
-        memory.add_turn = AsyncMock()
-
-        reg = Mock()
-        # Trust permits all readable scopes
-        reg.filter_readable = Mock(return_value=["personal", "business", "finance", "house"])
-        reg.score = Mock(return_value={"personal": 1, "business": 1, "finance": 1, "house": 1})
-        reg.active_from_scores = Mock(return_value=["personal"])
-        reg.argmax_scope = Mock(return_value="personal")
-        reg.cache_stats = Mock(return_value=(0, 1))
-
-        with patch("agent.ClaudeSDKClient", FakeClient):
-            FakeClient.reset()
-            FakeClient.response_text = "ok"
-
-            agent = Agent(
-                config=_make_agent_config(),   # owned=[personal, business, finance]
-                memory=memory,
-                session_registry=Mock(get=Mock(return_value=None),
-                                      touch=AsyncMock(),
-                                      register=AsyncMock(),
-                                      record_write_scope=AsyncMock()),
-                mcp_registry=Mock(resolve=Mock(return_value={})),
-                channel_manager=Mock(),
-                scope_registry=reg,
-            )
-
-            await agent._process(BusMessage(
-                type=MessageType.CHANNEL_IN, source="telegram", target="assistant",
-                content="hi", channel="telegram", context={"chat_id": "12345"},
-            ))
-        await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
-
-        # The 2nd score() call (for write) was invoked with owned∩readable:
-        # owned = [personal, business, finance]; readable = [personal, business, finance, house]
-        # → intersection = [personal, business, finance]
-        write_call = reg.score.call_args_list[1]
-        # Signature: score(text, scopes)
-        assert sorted(write_call.args[1]) == ["business", "finance", "personal"]
-
-    async def test_empty_assistant_text_does_not_write(self, monkeypatch):
-        """SDK returns empty string → no add_turn call (gate remains on response_text)."""
-        from agent import Agent, ClaudeSDKClient
-        from bus import BusMessage, MessageType
-
-        memory = Mock()
-        memory.ensure_session = AsyncMock()
-        memory.get_context = AsyncMock(return_value="")
-        memory.add_turn = AsyncMock()
-
-        reg = Mock()
-        reg.filter_readable = Mock(return_value=["personal", "house"])
-        reg.score = Mock(return_value={"personal": 1.0, "house": 0.1})
-        reg.active_from_scores = Mock(return_value=["personal"])
-        reg.argmax_scope = Mock(return_value="personal")
-        reg.cache_stats = Mock(return_value=(0, 1))
-
-        with patch("agent.ClaudeSDKClient", FakeClient):
-            FakeClient.reset()
-            FakeClient.response_text = ""  # empty
-
-            agent = Agent(
-                config=_make_agent_config(),
-                memory=memory,
-                session_registry=Mock(get=Mock(return_value=None),
-                                      touch=AsyncMock(),
-                                      register=AsyncMock(),
-                                      record_write_scope=AsyncMock()),
-                mcp_registry=Mock(resolve=Mock(return_value={})),
-                channel_manager=Mock(),
-                scope_registry=reg,
-            )
-
-            await agent._process(BusMessage(
-                type=MessageType.CHANNEL_IN, source="telegram", target="assistant",
-                content="anything", channel="telegram", context={"chat_id": "12345"},
-            ))
-        await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
-
-        # Empty assistant text ⇒ no write (spec §14.3 acceptable either way;
-        # gate on response_text truthy). write_scope stays "-" so the registry
-        # entry is NOT tagged with a scope.
-        assert memory.add_turn.await_count == 0
-        agent._session_registry.record_write_scope.assert_not_called()
-
-    async def test_single_owned_scope_skips_write_classify(self, monkeypatch):
-        """Butler (voice) with scopes_owned=[house] should NOT call score()
-        on the write path — argmax over a 1-element list is trivially that
-        element, so the ONNX forward pass is pure waste."""
-        from agent import Agent, ClaudeSDKClient
-        from bus import BusMessage, MessageType
-        from config import (
-            AgentConfig, CharacterConfig, MemoryConfig, SessionConfig,
-            ToolsConfig, VoiceConfig, ResponseShapeConfig,
-        )
-
-        memory = Mock()
-        memory.ensure_session = AsyncMock()
-        memory.get_context = AsyncMock(return_value="")
-        memory.add_turn = AsyncMock()
-
-        # Butler config — owns only house.
-        cfg = AgentConfig(role="butler")
-        cfg.character = CharacterConfig(name="Tina", archetype="", card="", prompt="SYS")
-        cfg.voice = VoiceConfig()
-        cfg.response_shape = ResponseShapeConfig()
-        cfg.system_prompt = "SYS"
-        cfg.tools = ToolsConfig(allowed=["Read"], permission_mode="acceptEdits")
-        cfg.memory = MemoryConfig(
-            token_budget=800, read_strategy="cached",
-            scopes_owned=["house"], scopes_readable=["house"],
-            default_scope="house",
-        )
-        cfg.session = SessionConfig(strategy="pooled", idle_timeout=300)
-        cfg.channels = ["voice"]
-        cfg.model = "haiku"
-
-        reg = Mock()
-        reg.filter_readable = Mock(return_value=["house"])
-        reg.score = Mock(return_value={"house": 0.9})
-        reg.active_from_scores = Mock(return_value=["house"])
-        reg.argmax_scope = Mock(return_value="house")
-        reg.cache_stats = Mock(return_value=(0, 1))
-
-        with patch("agent.ClaudeSDKClient", FakeClient):
-            FakeClient.reset()
-            FakeClient.response_text = "done"
-
-            agent = Agent(
-                config=cfg, memory=memory,
-                session_registry=Mock(get=Mock(return_value=None),
-                                      touch=AsyncMock(),
-                                      register=AsyncMock(),
-                                      record_write_scope=AsyncMock()),
-                mcp_registry=Mock(resolve=Mock(return_value={})),
-                channel_manager=Mock(), scope_registry=reg,
-            )
-
-            await agent._process(BusMessage(
-                type=MessageType.CHANNEL_IN, source="voice", target="butler",
-                content="lights off", channel="voice", context={"chat_id": "lr"},
-            ))
-        await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
-
-        # Only the READ-path score() call; no write-side score()
-        assert reg.score.call_count == 1
-        # Single owned scope → recorded directly on the registry entry.
-        agent._session_registry.record_write_scope.assert_awaited_once_with(
-            "voice-lr", "house",
-        )
-        memory.add_turn.assert_not_called()
-
-    async def test_write_skipped_when_owned_and_readable_empty(self, monkeypatch):
-        """Trust-bypass regression: if the channel's trust tier filters out
-        every scope the agent owns, the write path must NOT fall back to
-        default_scope (which would leak the exchange into a scope the
-        channel can't see). Skip the write entirely."""
-        from agent import Agent, ClaudeSDKClient
-        from bus import BusMessage, MessageType
-
-        memory = Mock()
-        memory.ensure_session = AsyncMock()
-        memory.get_context = AsyncMock(return_value="")
-        memory.add_turn = AsyncMock()
-
-        # Webhook (external-authenticated) against assistant:
-        # readable reduced to [house]; owned = [personal, business, finance];
-        # intersection is empty.
-        reg = Mock()
-        reg.filter_readable = Mock(return_value=["house"])
-        reg.score = Mock(return_value={"house": 0.1})
-        reg.active_from_scores = Mock(return_value=["house"])
-        reg.argmax_scope = Mock(return_value="house")
-        reg.cache_stats = Mock(return_value=(0, 1))
-
-        with patch("agent.ClaudeSDKClient", FakeClient):
-            FakeClient.reset()
-            FakeClient.response_text = "reply from assistant"
-
-            agent = Agent(
-                config=_make_agent_config(),   # owned=[personal, business, finance]
-                memory=memory,
-                session_registry=Mock(get=Mock(return_value=None),
-                                      touch=AsyncMock(),
-                                      register=AsyncMock(),
-                                      record_write_scope=AsyncMock()),
-                mcp_registry=Mock(resolve=Mock(return_value={})),
-                channel_manager=Mock(),
-                scope_registry=reg,
-            )
-
-            await agent._process(BusMessage(
-                type=MessageType.CHANNEL_IN, source="webhook", target="assistant",
-                content="probe", channel="webhook", context={"chat_id": "ext1"},
-            ))
-        await asyncio.gather(*list(agent._bg_tasks), return_exceptions=True)
-
-        # owned∩readable is empty → no write. The classifier score() call
-        # for the write step should also be skipped (only the read-side
-        # score() call should appear). write_scope stays "-" so the registry
-        # entry is NOT tagged.
-        assert memory.add_turn.await_count == 0
-        assert reg.score.call_count == 1  # read-only; no write-side score
-        agent._session_registry.record_write_scope.assert_not_called()
 
 
 class TestObservability:
@@ -595,8 +329,7 @@ class TestObservability:
                 memory=memory,
                 session_registry=Mock(get=Mock(return_value=None),
                                       touch=AsyncMock(),
-                                      register=AsyncMock(),
-                                      record_write_scope=AsyncMock()),
+                                      register=AsyncMock()),
                 mcp_registry=Mock(resolve=Mock(return_value={})),
                 channel_manager=Mock(),
                 scope_registry=reg,
@@ -616,12 +349,11 @@ class TestObservability:
         assert rec.role == "assistant"
         assert rec.channel == "telegram"
         assert set(rec.active) == {"finance", "house"}
-        assert rec.write == "finance"
         assert isinstance(rec.t_ms, int)
 
 
 class TestScopeRouteEmission:
-    """Verify agent.py:567 emits a parser-shaped scope_route record."""
+    """Verify agent.py emits a parser-shaped scope_route record."""
 
     async def test_emits_structured_fields_via_extra(self, caplog):
         import logging
@@ -650,8 +382,7 @@ class TestScopeRouteEmission:
                 memory=memory,
                 session_registry=Mock(get=Mock(return_value=None),
                                       touch=AsyncMock(),
-                                      register=AsyncMock(),
-                                      record_write_scope=AsyncMock()),
+                                      register=AsyncMock()),
                 mcp_registry=Mock(resolve=Mock(return_value={})),
                 channel_manager=Mock(),
                 scope_registry=reg,
@@ -667,10 +398,11 @@ class TestScopeRouteEmission:
         records = [r for r in caplog.records if r.message == "scope_route"]
         assert len(records) == 1, [r.message for r in caplog.records]
         rec = records[0]
-        # Required-by-parser fields:
-        for key in ("channel", "role", "active", "write", "winner",
+        # Required-by-parser fields (write removed — tiering lives in the reaper):
+        for key in ("channel", "role", "active", "winner",
                     "winner_score", "second_score", "threshold"):
             assert hasattr(rec, key), f"missing extra: {key}"
+        assert not hasattr(rec, "write"), "write field removed from scope_route log"
         # Type sanity:
         assert isinstance(rec.winner_score, float)
         assert isinstance(rec.threshold, float)

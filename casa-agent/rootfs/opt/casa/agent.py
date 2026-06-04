@@ -40,7 +40,8 @@ from channel_trust import channel_trust, channel_trust_display, user_peer_for_ch
 from timekeeping import resolve_tz
 from memory import MemoryProvider
 from hindsight_ids import bank_id
-from session_saver import freshness_window, save_session
+from sensitivity import clearance_for_channel, readable_tiers
+from session_saver import freshness_window, retain_cold_session, save_session
 from semantic_memory import NoOpSemanticMemory, SemanticMemory
 from session_registry import SessionRegistry, build_session_key
 from retry import retry_sdk_call
@@ -149,12 +150,34 @@ def _plan_load(channel: str, *, is_fresh_session: bool) -> _LoadPlan:
     """Spec §4.3 channel-aware load. Overlay is pushed only at fresh-session-start
     (it rides along on resume). Voice never auto-recalls (the multi-strategy + rerank
     recall must not sit on the first-utterance critical path); voice uses the
-    recall_memory pull tool instead."""
+    recall_memory pull tool instead. Note: even when push_overlay is True the overlay
+    is additionally gated by ``_overlay_allowed(channel)`` at the call site — a channel
+    without ``private`` clearance (e.g. voice = friends) never actually receives the
+    overlay regardless of this plan."""
     if not is_fresh_session:
         return _LoadPlan(push_overlay=False, auto_recall=False)
     if channel == "voice":
         return _LoadPlan(push_overlay=True, auto_recall=False)
     return _LoadPlan(push_overlay=True, auto_recall=True)
+
+
+def _memory_bank() -> str:
+    """The single shared long-term bank (design §2.1). Role no longer partitions
+    memory — sensitivity tiers do."""
+    return bank_id("casa")
+
+
+def _recall_tier_tags(channel: str) -> list[str]:
+    """Tiers a turn on ``channel`` may recall = readable_tiers(clearance). The sole
+    read-side access gate (design §2.3)."""
+    return readable_tiers(clearance_for_channel(channel))
+
+
+def _overlay_allowed(channel: str) -> bool:
+    """The bank-level mental-model overlay cannot be tier-filtered, so it is pushed
+    ONLY at ``private`` clearance — a context that may already see everything
+    (design §2.3). At any lower clearance it would leak across tiers."""
+    return clearance_for_channel(channel) == "private"
 
 
 class Agent:
@@ -179,7 +202,7 @@ class Agent:
         self._channel_manager = channel_manager
         self._scope_registry = scope_registry
         self._agent_registry = agent_registry
-        self._bg_tasks: set[asyncio.Task] = set()
+        self._bg_tasks: set[asyncio.Task] = set()  # background cold-session retains
         # Per-(session_id) over-budget streak tracker (spec 5.2 §5.2).
         # Per-instance so assistant (4000) and butler (800) budgets stay
         # isolated even when the same channel serves both roles.
@@ -427,12 +450,17 @@ class Agent:
                 resume_session_id = existing.get("sdk_session_id")
                 await self._session_registry.touch(channel_key)
             elif save_old:
-                # next-turn-after-gap: retain the cold prior session BEFORE we
-                # overwrite its registry pointer with the new SDK session.
-                await save_session(
-                    channel_key, self._session_registry, self._semantic_memory,
-                    role=self.config.role, directory=agent_home, user_peer=user_peer,
-                )
+                # next-turn-after-gap: register() below will overwrite this channel's
+                # pointer with the new SDK session, so capture the OLD sid now and
+                # retain it in the BACKGROUND (per-item classification runs off the
+                # hot path — tier model §2.4). This is claim-free / registry-decoupled
+                # so it cannot race the register() rewrite. (save_session — which
+                # claims the registry — is intentionally NOT used here.)
+                old_sid = (existing or {}).get("sdk_session_id")
+                if old_sid:
+                    self._spawn_cold_retain(
+                        old_sid, agent_home, user_peer, msg.channel,
+                    )
             # else ("new", False): no prior entry → nothing to save
 
             # 2b. Memory context (spec §4.3) — channel-aware load on the
@@ -440,10 +468,10 @@ class Agent:
             # start, plus (text only) one tagged recall over the readable scopes.
             is_fresh = resume_session_id is None
             load_plan = _plan_load(msg.channel, is_fresh_session=is_fresh)
-            bank = bank_id("casa", self.config.role)
+            bank = _memory_bank()
             overlay_digest = ""
             facts = ""
-            if load_plan.push_overlay:
+            if load_plan.push_overlay and _overlay_allowed(msg.channel):
                 try:
                     overlay_digest = await self._semantic_memory.profile(bank)
                 except Exception:  # noqa: BLE001
@@ -454,7 +482,7 @@ class Agent:
             if load_plan.auto_recall:
                 try:
                     facts = await self._semantic_memory.recall(
-                        bank, user_text, tags=list(readable),
+                        bank, user_text, tags=_recall_tier_tags(msg.channel),
                         max_tokens=self.config.memory.token_budget,
                         budget="mid",  # auto_recall is always non-voice (see _plan_load); voice uses the recall_memory pull tool at budget=low
                     )
@@ -678,33 +706,9 @@ class Agent:
                     sdk_session_id,
                 )
 
-            # 8. Classify + persist — off the critical path. -----------------
-            write_scope: str = "-"
-            if response_text:
-                # Scope-classify the full exchange over (owned ∩ readable).
-                # Empty intersection = channel's trust tier forbids every
-                # scope the agent owns. Persisting to default_scope would
-                # leak the exchange into a scope the channel can't see —
-                # skip the write instead.
-                owned_and_readable = [
-                    s for s in self.config.memory.scopes_owned if s in readable
-                ]
-                if owned_and_readable:
-                    # Skip the classify round-trip when there's only one
-                    # candidate — the argmax is trivially that scope, so
-                    # a 90 ms ONNX forward pass would buy us nothing.
-                    # This is the common butler (voice, owns=[house])
-                    # case.
-                    if len(owned_and_readable) == 1:
-                        write_scope = owned_and_readable[0]
-                    else:
-                        write_scores = self._scope_registry.score(
-                            f"{user_text}\n{response_text}",
-                            owned_and_readable,
-                        )
-                        write_scope = self._scope_registry.argmax_scope(
-                            write_scores, self.config.memory.default_scope,
-                        )
+            # 8. Persist — the freshness reaper classifies each retained item at
+            # its true sensitivity tier off the critical path (tier model §2.4);
+            # nothing to compute or record per-turn here.
 
             # --- 3.2 observability ----------------------------------------
             total_ms = int((time.perf_counter() - scope_start_t) * 1000)
@@ -716,7 +720,6 @@ class Agent:
                     "channel": msg.channel,
                     "role": self.config.role,
                     "active": list(active),
-                    "write": write_scope,
                     "winner": winner,
                     "winner_score": winner_score,
                     "second_score": second_score,
@@ -727,21 +730,34 @@ class Agent:
                 },
             )
 
-            # 9. SessionRegistry — SDK session id + dominant write_scope. -------
+            # 9. SessionRegistry — record the SDK session id for resume + save.
             if sdk_session_id:
                 await self._session_registry.register(
                     channel_key=channel_key,
                     agent=self.config.role,
                     sdk_session_id=sdk_session_id,
                 )
-                # register() rewrites the entry dict, so record the scope AFTER
-                # it (spec §4.2 — the freshness reaper tags the retain with this).
-                if write_scope != "-":
-                    await self._session_registry.record_write_scope(channel_key, write_scope)
 
             return response_text or None
         finally:
             origin_var.reset(origin_token)
+
+    def _spawn_cold_retain(
+        self, sid: str, directory: str, user_peer: str, channel: str,
+    ) -> None:
+        """Retain a cold prior session in the background (claim-free; cannot race
+        register()). Tracked so it isn't GC'd; failures are swallowed in
+        retain_cold_session and never reach the turn."""
+        task = asyncio.create_task(
+            retain_cold_session(
+                sid=sid, role=self.config.role, directory=directory,
+                user_peer=user_peer, channel=channel,
+                semantic_memory=self._semantic_memory,
+            ),
+            name=f"cold-retain-{sid}",
+        )
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     def _log_retry(self, attempt: int, exc: Exception, delay_ms: int) -> None:
         """Emit a single WARNING per retry event (spec 5.2 §3.2)."""
