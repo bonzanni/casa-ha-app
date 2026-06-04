@@ -20,7 +20,7 @@ failure; you handle stages 4-5 explicitly.
    reproducibility; `main` is acceptable for a probe.
 4. **Targets?** One or more agent roles (e.g. `assistant`, `butler`).
    Each target must already have an agent home at
-   `/addon_configs/casa-agent/agent-home/<role>/`. Residents only —
+   `/config/agent-home/<role>/`. Residents only —
    specialists and executors don't carry plugins.
 5. **One-line description?** Stored in the marketplace entry; shown
    later by `marketplace_list_plugins`.
@@ -54,7 +54,7 @@ See `recipes/plugin/marketplace.md` for marketplace-only operations.
     )
 
 `install_casa_plugin` runs system-requirements provisioning first
-(Stage 2 — populates `/addon_configs/casa-agent/tools/` and writes
+(Stage 2 — populates `/config/tools/` and writes
 `system-requirements.yaml`), then `claude plugin install --scope project`
 in each target's `agent-home/<role>/` (Stage 3 — flips the role's
 `enabledPlugins` map). On Stage-3 failure the tool rolls back Stage 2
@@ -90,7 +90,7 @@ For each var, ask the user whether to bind to a 1Password reference
 
 A literal value is also valid (`op_ref_or_value="<plain-value>"`); the
 `set_plugin_env_reference` tool just upserts the line into
-`/addon_configs/casa-agent/plugin-env.conf`. Casa resolves `op://...`
+`/config/plugin-env.conf`. Casa resolves `op://...`
 references at MCP-server-start time via the 1P universal resolver — see
 `architecture.md` § "1P universal resolver".
 

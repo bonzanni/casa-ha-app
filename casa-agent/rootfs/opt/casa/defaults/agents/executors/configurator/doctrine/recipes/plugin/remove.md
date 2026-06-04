@@ -2,7 +2,7 @@
 
 Reverses `recipes/plugin/install.md`. Stage 3 only — leaves the
 marketplace entry, the system-requirements binaries in
-`/addon_configs/casa-agent/tools/`, and any `plugin-env.conf` lines
+`/config/tools/`, and any `plugin-env.conf` lines
 in place. To clean those too, see § "Full removal" below.
 
 ## Ask the user

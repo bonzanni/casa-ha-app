@@ -18,7 +18,7 @@ sealed bundle. Best for: pure-Python or pure-Node plugins. Use
 
 **casa.systemRequirements** — declare a third-party CLI your MCP server
 shells out to (`aws`, `kubectl`, `terraform`, `ffmpeg` (via tarball), …).
-Casa installs into `/addon_configs/casa-agent/tools/`. Use this for any
+Casa installs into `/config/tools/`. Use this for any
 non-baseline CLI. Three strategies available: `tarball`, `venv`, `npm`.
 
 **Vendoring** — small pure-Python deps only. Avoid; MCPB is nearly always

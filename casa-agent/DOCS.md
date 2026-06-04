@@ -93,7 +93,7 @@ curl -X POST http://homeassistant.local:8080/invoke/ellen \
 
 ## Agent configuration
 
-Agent YAML files are stored in `/addon_configs/casa-agent/agents/`. Default configs are created on first boot and never overwritten. You can edit them freely.
+Agent YAML files are stored in `/config/agents/`. Default configs are created on first boot and never overwritten. You can edit them freely.
 
 Each agent config supports: `name`, `role`, `model`, `personality`, `tools`, `mcp_server_names`, `memory`, `session`, `channels`, `tts`, `voice_errors`, and `cwd`. See the default `assistant.yaml` for a full example.
 
@@ -355,7 +355,7 @@ Hard reload: Ellen verifies the reload landed on her resumed turn, then narrates
 
 ### Recipe discovery
 
-Configurator reads short markdown recipes from its own doctrine tree at `/addon_configs/casa-agent/agents/executors/configurator/doctrine/`. Edit these recipes to customize per-instance (e.g., add house rules).
+Configurator reads short markdown recipes from its own doctrine tree at `/config/agents/executors/configurator/doctrine/`. Edit these recipes to customize per-instance (e.g., add house rules).
 
 ### Troubleshooting
 
@@ -374,8 +374,8 @@ dispatch until you opt in.
 
 To enable one:
 
-1. Open your Home Assistant addon config folder at
-   `/addon_configs/<addon-uuid>/agents/specialists/`.
+1. Open the Casa addon config folder at `/config/agents/specialists/`
+   (host path: `/addon_configs/{REPO}_casa-agent/agents/specialists/`).
 2. Edit the specialist's YAML file (for example `finance.yaml`).
 3. Change `enabled: false` to `enabled: true`.
 4. Restart the Casa addon.
@@ -560,7 +560,7 @@ registered at boot:
   land here, Configurator mutates.
 
 Each in_casa agent gets a project-scope settings dir at
-`/addon_configs/casa-agent/agent-home/<role>/.claude/settings.json` with
+`/config/agent-home/<role>/.claude/settings.json` with
 `enabledPlugins` keyed as `<plugin>@<marketplace>`.
 
 ## 1Password integration (v0.14.1)
@@ -572,7 +572,7 @@ self-reference. Set `onepassword_default_vault` to the vault name (default
 `telegram_bot_token`, `webhook_secret`) accepts either
 plaintext OR an `op://` reference.
 
-Plugin env vars resolved via `plugin-env.conf` (`/addon_configs/casa-agent/plugin-env.conf`),
+Plugin env vars resolved via `plugin-env.conf` (`/config/plugin-env.conf`),
 managed by Configurator.
 
 ## Plugin-developer (v0.14.1)

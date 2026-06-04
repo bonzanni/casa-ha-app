@@ -1,7 +1,7 @@
 # Recipe: manage the user marketplace
 
 The user marketplace lives at
-`/addon_configs/casa-agent/cc-home/.claude/plugins/marketplaces/casa-plugins/`
+`/config/cc-home/.claude/plugins/marketplaces/casa-plugins/`
 and lists every plugin Casa knows about. `install_casa_plugin` only
 operates on plugins already in the marketplace, so adding/updating
 marketplace entries is a precondition for the install flow. Most of

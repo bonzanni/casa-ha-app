@@ -3,7 +3,7 @@
 Most plugins that ship MCP servers declare environment variables in
 their `.mcp.json` (API keys, host overrides, vault references). Casa
 resolves those at MCP-server-start time from
-`/addon_configs/casa-agent/plugin-env.conf` via the 1P universal
+`/config/plugin-env.conf` via the 1P universal
 resolver — `op://...` references are resolved to plaintext, plain
 values pass through unchanged.
 

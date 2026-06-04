@@ -9,8 +9,8 @@ policies/disclosure.yaml and per-resident disclosure.yaml control what memory it
 
 ## Files
 
-- /addon_configs/casa-agent/policies/disclosure.yaml - global fallback.
-- /addon_configs/casa-agent/agents/<resident-role>/disclosure.yaml - per-resident override.
+- /config/policies/disclosure.yaml - global fallback.
+- /config/agents/<resident-role>/disclosure.yaml - per-resident override.
 
 ## Format
 

@@ -43,7 +43,7 @@ to YAML but inert in the running Casa. See `completion.md`.
 A stateless specialist has `memory.token_budget: 0` in its
 `runtime.yaml`. To enable shared-bank memory:
 
-1. Edit `/addon_configs/casa-agent/agents/specialists/<role>/runtime.yaml`:
+1. Edit `/config/agents/specialists/<role>/runtime.yaml`:
    ```yaml
    memory:
      token_budget: 4000      # any positive int; resident parity is fine to start

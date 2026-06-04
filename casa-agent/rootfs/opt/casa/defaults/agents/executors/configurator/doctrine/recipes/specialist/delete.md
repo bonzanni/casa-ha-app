@@ -11,12 +11,12 @@ Common and allowed. casa_config_guard does NOT block deleting specialists.
 
 1. Find all references:
 
-    grep -r "<role>" /addon_configs/casa-agent/agents/*/delegates.yaml
+    grep -r "<role>" /config/agents/*/delegates.yaml
 
 2. For each resident delegating to this specialist, remove the entry from their delegates.yaml. See recipes/delegate/unwire.md.
 3. Delete the directory:
 
-    rm -rf /addon_configs/casa-agent/agents/specialists/<role>
+    rm -rf /config/agents/specialists/<role>
 
 4. config_git_commit(message="remove <role> specialist + unwire delegates")
 5. casa_reload(scope="agents")
