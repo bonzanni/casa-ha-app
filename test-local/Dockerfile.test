@@ -66,7 +66,7 @@ RUN find /etc/s6-overlay/s6-rc.d -name 'up' -o -name 'run' -o -name 'finish' \
 # `docker run -v ...` time; CI builds get the placeholder-populated example.
 COPY test-local/options.json.example /data/options.json
 
-RUN mkdir -p /addon_configs/casa-agent /data/sdk-sessions \
+RUN mkdir -p /config /data/sdk-sessions \
              /etc/s6-overlay/scripts
 
 # --- Override oneshot init scripts (no bashio in test mode) ---
@@ -113,7 +113,7 @@ RUN printf '#!/bin/sh\nfor i in $(seq 1 60); do\n  nc -z 127.0.0.1 8099 2>/dev/n
     && chmod +x /etc/s6-overlay/s6-rc.d/svc-nginx/run
 
 # svc-ttyd: read from options.json instead of bashio
-RUN printf '#!/bin/sh\nENABLED=$(jq -r ".enable_terminal // false" /data/options.json)\nif [ "$ENABLED" != "true" ]; then\n  echo "[INFO] Web terminal disabled."\n  exec sleep infinity\nfi\nexec ttyd --writable --interface 127.0.0.1 --port 7681 --base-path /terminal --cwd /addon_configs/casa-agent bash\n' \
+RUN printf '#!/bin/sh\nENABLED=$(jq -r ".enable_terminal // false" /data/options.json)\nif [ "$ENABLED" != "true" ]; then\n  echo "[INFO] Web terminal disabled."\n  exec sleep infinity\nfi\nexec ttyd --writable --interface 127.0.0.1 --port 7681 --base-path /terminal --cwd /config bash\n' \
     > /etc/s6-overlay/s6-rc.d/svc-ttyd/run \
     && chmod +x /etc/s6-overlay/s6-rc.d/svc-ttyd/run
 

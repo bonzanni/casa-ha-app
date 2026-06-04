@@ -41,7 +41,7 @@ read -p "    Press enter after you see the completion summary... "
 
 echo "Step 5: Verify trigger landed (SSH to the HA host):"
 echo "  ssh <ha-host> sudo -n docker exec addon_c071ea9c_casa-agent \\"
-echo "    cat /addon_configs/casa-agent/agents/assistant/triggers.yaml"
+echo "    cat /config/agents/assistant/triggers.yaml"
 read -p "    Press enter after manual verification... "
 
 echo "Step 6: Verify Ellen narrated the outcome in 1:1 chat"

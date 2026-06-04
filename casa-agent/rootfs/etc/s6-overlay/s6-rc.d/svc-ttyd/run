@@ -15,5 +15,5 @@ exec ttyd \
     --interface 127.0.0.1 \
     --port 7681 \
     --base-path /terminal \
-    --cwd /addon_configs/casa-agent \
+    --cwd /config \
     bash

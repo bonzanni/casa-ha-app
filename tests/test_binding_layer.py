@@ -28,7 +28,7 @@ SAMPLE_LIST_JSON = json.dumps([
         "version": "0.1.0",
         "scope": "user",
         "enabled": True,
-        "installPath": "/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins/face-rec/0.1.0",
+        "installPath": "/config/cc-home/.claude/plugins/cache/casa-plugins/face-rec/0.1.0",
         "installedAt": "2026-04-24T00:00:00Z",
         "lastUpdated": "2026-04-24T00:00:00Z",
     },
@@ -37,7 +37,7 @@ SAMPLE_LIST_JSON = json.dumps([
         "version": "0.0.1",
         "scope": "user",
         "enabled": False,
-        "installPath": "/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins/disabled/0.0.1",
+        "installPath": "/config/cc-home/.claude/plugins/cache/casa-plugins/disabled/0.0.1",
         "installedAt": "2026-04-24T00:00:00Z",
         "lastUpdated": "2026-04-24T00:00:00Z",
     },
@@ -57,7 +57,7 @@ def test_build_sdk_plugins_happy_path(mock_run, tmp_path: Path) -> None:
 
     assert plugins == [
         {"type": "local", "path": "/opt/claude-seed/cache/casa-plugins-defaults/superpowers/5.0.7"},
-        {"type": "local", "path": "/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins/face-rec/0.1.0"},
+        {"type": "local", "path": "/config/cc-home/.claude/plugins/cache/casa-plugins/face-rec/0.1.0"},
     ]
     # env passed to subprocess.run includes HOME / CACHE_DIR / SEED_DIR
     env = mock_run.call_args.kwargs["env"]
@@ -111,7 +111,7 @@ SAMPLE_LIST_JSON_WITH_PROJECT_SCOPE = json.dumps([
         "version": "0.0.1",
         "scope": "user",
         "enabled": False,
-        "installPath": "/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins/user-disabled/0.0.1",
+        "installPath": "/config/cc-home/.claude/plugins/cache/casa-plugins/user-disabled/0.0.1",
     },
     # Project-scope plugin installed into the assistant role (Casa --scope project).
     # CLI reports enabled=false because cc-home's settings.json doesn't list it,
@@ -121,8 +121,8 @@ SAMPLE_LIST_JSON_WITH_PROJECT_SCOPE = json.dumps([
         "version": "1.0.0",
         "scope": "project",
         "enabled": False,
-        "installPath": "/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins/casa-probe-greet/1.0.0",
-        "projectPath": "/addon_configs/casa-agent/agent-home/assistant",
+        "installPath": "/config/cc-home/.claude/plugins/cache/casa-plugins/casa-probe-greet/1.0.0",
+        "projectPath": "/config/agent-home/assistant",
     },
     # Project-scope plugin installed into a DIFFERENT role (butler).
     # The assistant binding must not pick this up.
@@ -131,8 +131,8 @@ SAMPLE_LIST_JSON_WITH_PROJECT_SCOPE = json.dumps([
         "version": "0.0.1",
         "scope": "project",
         "enabled": False,
-        "installPath": "/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins/butler-only-plugin/0.0.1",
-        "projectPath": "/addon_configs/casa-agent/agent-home/butler",
+        "installPath": "/config/cc-home/.claude/plugins/cache/casa-plugins/butler-only-plugin/0.0.1",
+        "projectPath": "/config/agent-home/butler",
     },
 ])
 
@@ -140,7 +140,7 @@ SAMPLE_LIST_JSON_WITH_PROJECT_SCOPE = json.dumps([
 @patch("plugins_binding.subprocess.run")
 def test_build_sdk_plugins_role_includes_matching_project_scope(mock_run, tmp_path: Path) -> None:
     """O-3 regression: when role is provided, project-scope plugins whose
-    projectPath matches /addon_configs/casa-agent/agent-home/<role> must
+    projectPath matches /config/agent-home/<role> must
     be included regardless of the CLI's `enabled` field (which is
     evaluated against cc-home's settings.json, not against the project's
     own settings.json, so it always reports False for Casa-installed
@@ -159,7 +159,7 @@ def test_build_sdk_plugins_role_includes_matching_project_scope(mock_run, tmp_pa
     # NOT: the user-scope-disabled, NOT the butler-project-scope.
     assert plugins == [
         {"type": "local", "path": "/opt/claude-seed/cache/casa-plugins-defaults/superpowers/5.0.7"},
-        {"type": "local", "path": "/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins/casa-probe-greet/1.0.0"},
+        {"type": "local", "path": "/config/cc-home/.claude/plugins/cache/casa-plugins/casa-probe-greet/1.0.0"},
     ]
 
 
@@ -181,7 +181,7 @@ def test_build_sdk_plugins_role_omits_other_role_project_scope(mock_run, tmp_pat
 
     assert plugins == [
         {"type": "local", "path": "/opt/claude-seed/cache/casa-plugins-defaults/superpowers/5.0.7"},
-        {"type": "local", "path": "/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins/butler-only-plugin/0.0.1"},
+        {"type": "local", "path": "/config/cc-home/.claude/plugins/cache/casa-plugins/butler-only-plugin/0.0.1"},
     ]
 
 

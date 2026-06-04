@@ -56,7 +56,7 @@ pass "C-3b each chat_id-less invoke gets its own session"
 
 log "C-4: cc-home has 5 default plugins after boot (seed-copy verified)"
 plugin_count=$(docker exec "$NAME" sh -c \
-    'export HOME=/addon_configs/casa-agent/cc-home; \
+    'export HOME=/config/cc-home; \
      claude plugin list --json' \
     | python3 -c "import json,sys; d=json.load(sys.stdin); en=sum(1 for p in d if p.get('enabled')); print(f'{len(d)}/{en}')")
 # Format is "<total>/<enabled>". Both must be 5 — count alone isn't enough,

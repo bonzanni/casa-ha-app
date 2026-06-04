@@ -259,8 +259,8 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
     resolved_hooks = resolve_hooks(cfg.hooks, default_cwd=cfg.cwd)
 
     sdk_plugins = build_sdk_plugins(
-        home="/addon_configs/casa-agent/cc-home",
-        shared_cache="/addon_configs/casa-agent/cc-home/.claude/plugins",
+        home="/config/cc-home",
+        shared_cache="/config/cc-home/.claude/plugins",
         seed="/opt/claude-seed",
     )
 
@@ -278,7 +278,7 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
         mcp_servers=mcp_servers if mcp_servers else {},
         hooks=resolved_hooks,
         cwd=(cfg.cwd
-             or f"/addon_configs/casa-agent/agent-home/{getattr(cfg, 'role', 'unknown')}"),
+             or f"/config/agent-home/{getattr(cfg, 'role', 'unknown')}"),
         resume=None,
         setting_sources=["project"],
         plugins=sdk_plugins,
@@ -302,7 +302,7 @@ def _build_executor_options(defn) -> ClaudeAgentOptions:
             raw = yaml.safe_load(fh) or {}
         hooks_cfg = HooksConfig(pre_tool_use=list(raw.get("pre_tool_use") or []))
 
-    resolved_hooks = resolve_hooks(hooks_cfg, default_cwd="/addon_configs/casa-agent")
+    resolved_hooks = resolve_hooks(hooks_cfg, default_cwd="/config")
 
     if _mcp_registry is not None:
         mcp_servers = _mcp_registry.resolve(defn.mcp_server_names)
@@ -310,8 +310,8 @@ def _build_executor_options(defn) -> ClaudeAgentOptions:
         mcp_servers = {}
 
     sdk_plugins = build_sdk_plugins(
-        home="/addon_configs/casa-agent/cc-home",
-        shared_cache="/addon_configs/casa-agent/cc-home/.claude/plugins",
+        home="/config/cc-home",
+        shared_cache="/config/cc-home/.claude/plugins",
         seed="/opt/claude-seed",
     )
 
@@ -321,7 +321,7 @@ def _build_executor_options(defn) -> ClaudeAgentOptions:
 
     # Executors (in_casa driver — Configurator, future Tier-3) operate on
     # the addon-config root rather than an agent-home, because their
-    # mutation surface spans /addon_configs/casa-agent/ (agents/, marketplace/,
+    # mutation surface spans /config/ (agents/, marketplace/,
     # plugin-env.conf, etc.).
     return ClaudeAgentOptions(
         model=defn.model,
@@ -332,7 +332,7 @@ def _build_executor_options(defn) -> ClaudeAgentOptions:
         max_turns=200,
         mcp_servers=mcp_servers if mcp_servers else {},
         hooks=resolved_hooks,
-        cwd="/addon_configs/casa-agent",
+        cwd="/config",
         resume=None,
         setting_sources=["project"],
         plugins=sdk_plugins,
@@ -356,7 +356,7 @@ def _build_world_state_summary() -> str:
     lines.append(f"Enabled specialists:  {', '.join(specialists) or '(none)'}")
 
     residents: list[str] = []
-    agents_dir = "/addon_configs/casa-agent/agents"
+    agents_dir = "/config/agents"
     try:
         if os.path.isdir(agents_dir):
             for name in sorted(os.listdir(agents_dir)):
@@ -377,7 +377,7 @@ def _build_world_state_summary() -> str:
     lines.append(f"Enabled executors:    {', '.join(exec_types) or '(none)'}")
 
     version = "unknown"
-    for candidate in ("/opt/casa/VERSION", "/addon_configs/casa-agent/VERSION"):
+    for candidate in ("/opt/casa/VERSION", "/config/VERSION"):
         try:
             with open(candidate) as fh:
                 version = fh.read().strip()
@@ -972,7 +972,7 @@ def _refuse_unprivileged(tool_name: str, caller: str | None) -> dict:
 
 @tool(
     "config_git_commit",
-    "Stage and commit all tracked changes under /addon_configs/casa-agent/. "
+    "Stage and commit all tracked changes under /config/. "
     "Returns the commit SHA (empty if nothing changed). "
     "Restricted to the configurator executor role.",
     {"message": str},
@@ -983,7 +983,7 @@ async def config_git_commit(args: dict) -> dict:
         return _refuse_unprivileged("config_git_commit", caller)
 
     message = args.get("message") or "configurator: commit"
-    config_dir = "/addon_configs/casa-agent"
+    config_dir = "/config"
     try:
         import config_git
         import agent_loader
@@ -2256,8 +2256,8 @@ def _tool_marketplace_list_plugins() -> dict:
 # Plan 4b §7.3 / §4.3.3: install_casa_plugin two-stage commit
 # ---------------------------------------------------------------------------
 
-_INSTALL_LOCK = "/addon_configs/casa-agent/cc-home/.claude/plugins/.install.lock"
-_AGENT_HOME_ROOT = Path("/addon_configs/casa-agent/agent-home")
+_INSTALL_LOCK = "/config/cc-home/.claude/plugins/.install.lock"
+_AGENT_HOME_ROOT = Path("/config/agent-home")
 
 
 def _tool_install_casa_plugin(
@@ -2285,7 +2285,7 @@ def _tool_install_casa_plugin(
             outcomes = install_requirements(
                 plugin_name=plugin_name,
                 requirements=reqs,
-                tools_root=Path("/addon_configs/casa-agent/tools"),
+                tools_root=Path("/config/tools"),
             )
         except OrchestrationError as exc:
             return {"ok": False, "error": "system_requirements_failed", "detail": str(exc)}
@@ -2324,7 +2324,7 @@ def _tool_install_casa_plugin(
 
     # 5. Extract required env vars from cached plugin's .mcp.json.
     cache_root = Path(
-        "/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins"
+        "/config/cc-home/.claude/plugins/cache/casa-plugins"
     )
     mcp_json = next(
         iter(cache_root.glob(f"{plugin_name}/*/.mcp.json")),
@@ -2459,7 +2459,7 @@ def _tool_verify_plugin_state(
     data = read_manifest()
     tool_entries = [p for p in data["plugins"] if p["name"] == plugin_name]
 
-    tools_bin = _tools_bin if _tools_bin is not None else Path("/addon_configs/casa-agent/tools/bin")
+    tools_bin = _tools_bin if _tools_bin is not None else Path("/config/tools/bin")
     tools_status = []
     for t in tool_entries:
         vb = t.get("verify_bin", "")
@@ -2472,7 +2472,7 @@ def _tool_verify_plugin_state(
                                  "reason": f"{vb} not in tools/bin"})
 
     cache_root = _cache_root if _cache_root is not None else Path(
-        "/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins"
+        "/config/cc-home/.claude/plugins/cache/casa-plugins"
     )
     mcp_json = next(iter(cache_root.glob(f"{plugin_name}/*/.mcp.json")), None)
     required = extract_env_vars(mcp_json) if mcp_json else set()

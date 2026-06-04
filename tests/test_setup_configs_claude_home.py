@@ -1,7 +1,7 @@
 """H-1 (v0.37.8): the claude-home-propagation block in setup-configs.sh.
 
 casa-main and svc-casa-mcp boot with HOME=/root unless setup-configs.sh
-writes HOME=/addon_configs/casa-agent/cc-home to
+writes HOME=/config/cc-home to
 /run/s6/container_environment/HOME. Without this, the runtime claude
 binary (called by install_casa_plugin / uninstall_casa_plugin / the
 three marketplace_* MCP tools) reads /root/.claude/plugins/ and fails
@@ -20,7 +20,7 @@ pytestmark = pytest.mark.unit
 
 
 SETUP_CONFIGS = Path("casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh")
-CC_HOME = "/addon_configs/casa-agent/cc-home"
+CC_HOME = "/config/cc-home"
 
 
 def _extract_home_block() -> str:
@@ -117,6 +117,6 @@ def test_setup_configs_writes_home_to_container_environment_markers_present() ->
     """
     script = SETUP_CONFIGS.read_text(encoding="utf-8")
     assert "/run/s6/container_environment/HOME" in script
-    assert "/addon_configs/casa-agent/cc-home" in script
+    assert "/config/cc-home" in script
     assert "claude-home-propagation: begin" in script
     assert "claude-home-propagation: end" in script

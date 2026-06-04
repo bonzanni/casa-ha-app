@@ -58,7 +58,7 @@ run_harness() {
 # DE-1 — Registry wiring + sync delegation + interactive-rejection.
 #
 # The harness initialises tools itself (via init_tools) by loading agents from
-# /addon_configs/casa-agent/agents — the same directory that casa_core uses at
+# /config/agents — the same directory that casa_core uses at
 # boot. This validates the full wiring path (Tasks 5/7/11) as it would execute
 # inside the running add-on.
 #
@@ -84,7 +84,7 @@ from tools import init_tools
 import tools
 import agent as agent_mod
 
-CONFIG_DIR = "/addon_configs/casa-agent"
+CONFIG_DIR = "/config"
 AGENTS_DIR = CONFIG_DIR + "/agents"
 
 # ---------- 1. Load agents from disk (mirrors casa_core boot sequence) ----------

@@ -22,7 +22,7 @@ export HOME="/data/engagements/{ID}/.home"
 export CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1
 # Plan 4b §B.9: plugin seed + shared cache dirs for CC plugin resolution.
 export CLAUDE_CODE_PLUGIN_SEED_DIR="/opt/claude-seed"
-export CLAUDE_CODE_PLUGIN_CACHE_DIR="/addon_configs/casa-agent/cc-home/.claude/plugins"
+export CLAUDE_CODE_PLUGIN_CACHE_DIR="/config/cc-home/.claude/plugins"
 {EXTRA_EXPORT}
 cd "/data/engagements/{ID}"
 

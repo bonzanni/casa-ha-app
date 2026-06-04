@@ -1,4 +1,4 @@
-"""Read/write /addon_configs/casa-agent/plugin-env.conf (§5.5).
+"""Read/write /config/plugin-env.conf (§5.5).
 
 File is mode 0600. Preserves comments. set_entry upserts a single VAR=value line.
 """
@@ -8,7 +8,7 @@ import os
 import re
 from pathlib import Path
 
-PLUGIN_ENV_CONF_PATH: Path = Path("/addon_configs/casa-agent/plugin-env.conf")
+PLUGIN_ENV_CONF_PATH: Path = Path("/config/plugin-env.conf")
 
 _HEADER = (
     "# Managed by Configurator. Edit via Configurator to avoid sync loss.\n"

@@ -317,7 +317,7 @@ def _has_prefix(norm: str, prefixes: list[str]) -> bool:
 
 _RESIDENT_RM_RE = re.compile(
     r"\brm\s+(-[a-zA-Z]+\s+)*"
-    r"/addon_configs/casa-agent/agents/(?!specialists/|executors/)[^/\s]+"
+    r"/config/agents/(?!specialists/|executors/)[^/\s]+"
 )
 
 
@@ -365,7 +365,7 @@ def make_casa_config_guard_hook(
 # ---------------------------------------------------------------------------
 
 
-def _git_porcelain_count(repo_dir: str = "/addon_configs/casa-agent") -> int:
+def _git_porcelain_count(repo_dir: str = "/config") -> int:
     """Return the number of lines in ``git status --porcelain``.
 
     Isolated for testability - tests monkeypatch this function.

@@ -276,7 +276,7 @@ def _construct_agent(*, cfg, runtime):
 
     G-2 v0.37.7: idempotently provision the agent-home for ``cfg.role``
     BEFORE constructing the Agent. The Agent's cwd resolves to
-    ``/addon_configs/casa-agent/agent-home/<role>`` (agent.py:518-521);
+    ``/config/agent-home/<role>`` (agent.py:518-521);
     when the configurator creates a new specialist and calls
     ``casa_reload(scope=agent role=<new>)`` (granular per-role scope),
     the agent-home dir wasn't being created — only the scope=agents

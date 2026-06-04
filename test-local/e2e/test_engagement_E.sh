@@ -606,8 +606,8 @@ curl -s -X POST "http://localhost:${MOCK_PORT}/_reset" >/dev/null
 # Seed a writable triggers.yaml path in the container so the stub driver can
 # mimic the Configurator's "add a trigger" edit.
 MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c \
-    "mkdir -p /addon_configs/casa-agent/agents/assistant && \
-     printf 'triggers: []\n' > /addon_configs/casa-agent/agents/assistant/triggers.yaml"
+    "mkdir -p /config/agents/assistant && \
+     printf 'triggers: []\n' > /config/agents/assistant/triggers.yaml"
 
 read -r -d '' E9_PY <<'PY' || true
 import asyncio, os, sys, json
@@ -663,7 +663,7 @@ async def main():
             self.turns.append(text)
             if text.strip().lower().startswith("yes"):
                 # Simulate the Configurator's Write tool patching triggers.yaml.
-                path = "/addon_configs/casa-agent/agents/assistant/triggers.yaml"
+                path = "/config/agents/assistant/triggers.yaml"
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write(
                         "triggers:\n"
@@ -775,7 +775,7 @@ run_harness "E-9" "$E9_PY"
 # driver inside the container (mirrors what the real Configurator does via
 # its Write tool).
 assert_file_contains "$NAME" \
-    "/addon_configs/casa-agent/agents/assistant/triggers.yaml" \
+    "/config/agents/assistant/triggers.yaml" \
     "test_trigger" \
     "E-9 triggers.yaml contains test_trigger after completion"
 
@@ -791,7 +791,7 @@ pass "E-9 configurator executor engagement: topic + routing + completion wired"
 # configurator proposes rm -rf → hook denies → configurator emits cancel).
 #
 # Assertion points:
-#   1. hook denies   rm -rf /addon_configs/casa-agent/agents/butler
+#   1. hook denies   rm -rf /config/agents/butler
 #      → permissionDecision == "deny"
 #   2. hook allows   non-resident paths (specialists/ subtree + benign bash)
 #      → hook returns None
@@ -805,8 +805,8 @@ curl -s -X POST "http://localhost:${MOCK_PORT}/_reset" >/dev/null
 # Seed a butler resident directory so the "still exists after deny" check has
 # something to look at (mirrors a real installation with an enabled resident).
 MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c \
-    "mkdir -p /addon_configs/casa-agent/agents/butler && \
-     printf 'role: butler\n' > /addon_configs/casa-agent/agents/butler/runtime.yaml"
+    "mkdir -p /config/agents/butler && \
+     printf 'role: butler\n' > /config/agents/butler/runtime.yaml"
 
 read -r -d '' E10_PY <<'PY' || true
 import asyncio, os, sys
@@ -830,7 +830,7 @@ async def main():
     deny_input = {
         "tool_name": "Bash",
         "tool_input": {
-            "command": "rm -rf /addon_configs/casa-agent/agents/butler",
+            "command": "rm -rf /config/agents/butler",
         },
     }
     deny_out = await hook(deny_input, "tuid-1", {})
@@ -855,7 +855,7 @@ async def main():
     allow_specialist = {
         "tool_name": "Bash",
         "tool_input": {
-            "command": "rm -rf /addon_configs/casa-agent/agents/specialists/foo",
+            "command": "rm -rf /config/agents/specialists/foo",
         },
     }
     out = await hook(allow_specialist, "tuid-2", {})
@@ -865,7 +865,7 @@ async def main():
     allow_executor = {
         "tool_name": "Bash",
         "tool_input": {
-            "command": "rm -rf /addon_configs/casa-agent/agents/executors/foo",
+            "command": "rm -rf /config/agents/executors/foo",
         },
     }
     out = await hook(allow_executor, "tuid-3", {})
@@ -879,7 +879,7 @@ async def main():
     # 4. butler/ directory still exists on disk (hook didn't somehow delete it,
     #    and the deny-decision is structural; the SDK would have aborted the
     #    tool call before the rm ever ran).
-    butler_dir = "/addon_configs/casa-agent/agents/butler"
+    butler_dir = "/config/agents/butler"
     assert os.path.isdir(butler_dir), f"E-10.3 butler dir missing: {butler_dir}"
 
     # 5. Simulate the tail of the cancelled path: configurator's proposed
@@ -950,7 +950,7 @@ run_harness "E-10" "$E10_PY"
 
 # Cross-boundary filesystem check: butler dir is untouched.
 MSYS_NO_PATHCONV=1 docker exec "$NAME" test -d \
-    /addon_configs/casa-agent/agents/butler \
+    /config/agents/butler \
     || fail "E-10.3 butler dir missing after harness (should still exist)"
 
 pass "E-10 hook denies resident rm + cancelled NOTIFICATION wired"

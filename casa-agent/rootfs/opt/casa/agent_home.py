@@ -1,6 +1,6 @@
 """Agent-home directory provisioning for in_casa agents.
 
-Creates /addon_configs/casa-agent/agent-home/<role>/.claude/settings.json
+Creates /config/agent-home/<role>/.claude/settings.json
 with `enabledPlugins` seeded from defaults/agents/<role>/plugins.yaml.
 Idempotent — preserves user-added entries (P-3 drift policy).
 """
@@ -66,7 +66,7 @@ def provision_all_homes(
     to call on every boot.
 
     Executors are deliberately excluded: they run with
-    ``cwd=/addon_configs/casa-agent`` per
+    ``cwd=/config`` per
     ``tools.py::_build_executor_options``, not from an
     ``agent-home/<role>/`` directory. Adding executors here would create
     empty unused dirs.

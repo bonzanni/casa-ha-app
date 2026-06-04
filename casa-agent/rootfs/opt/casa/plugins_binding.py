@@ -37,7 +37,7 @@ def build_sdk_plugins(
 
     When ``role`` is provided (residents — agent.py call-site), project-scope
     entries whose ``projectPath`` matches
-    ``/addon_configs/casa-agent/agent-home/<role>`` are included regardless
+    ``/config/agent-home/<role>`` are included regardless
     of the CLI's ``enabled`` field. The CLI evaluates ``enabled`` against
     the calling HOME's settings.json (cc-home), not against the project's
     own ``agent-home/<role>/.claude/settings.json``, so for Casa's
@@ -95,7 +95,7 @@ def build_sdk_plugins(
         )
 
     expected_project_path = (
-        f"/addon_configs/casa-agent/agent-home/{role}" if role else None
+        f"/config/agent-home/{role}" if role else None
     )
 
     plugins: list[dict[str, str]] = []

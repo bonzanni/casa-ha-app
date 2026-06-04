@@ -1,7 +1,7 @@
 #!/bin/sh
 # Test override: reads options.json directly instead of bashio.
 # Structurally mirrors casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh.
-CONFIG_DIR="/addon_configs/casa-agent"
+CONFIG_DIR="/config"
 DATA_DIR="/data"
 DEFAULTS_DIR="/opt/casa/defaults"
 
@@ -145,7 +145,7 @@ fi
 # `claude plugin install` lines. This block populates cc-home from the
 # seed so e2e/test_invoke_sessions.sh::C-4 sees the 5 default plugins.
 SEED_DIR="${SEED_DIR:-/opt/claude-seed}"
-CC_HOME="${CC_HOME:-/addon_configs/casa-agent/cc-home}"
+CC_HOME="${CC_HOME:-/config/cc-home}"
 CC_PLUGINS_DIR="$CC_HOME/.claude/plugins"
 
 if [ -d "$SEED_DIR" ] && [ ! -f "$CC_PLUGINS_DIR/installed_plugins.json" ]; then
