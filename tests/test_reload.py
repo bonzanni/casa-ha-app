@@ -17,7 +17,7 @@ def _make_runtime():
         agents={}, role_configs={}, specialist_registry=MagicMock(),
         executor_registry=MagicMock(), engagement_registry=MagicMock(),
         agent_registry=MagicMock(), trigger_registry=MagicMock(),
-        mcp_registry=MagicMock(), scope_registry=MagicMock(),
+        mcp_registry=MagicMock(),
         session_registry=MagicMock(), channel_manager=MagicMock(),
         bus=MagicMock(), engagement_driver=MagicMock(),
         claude_code_driver=MagicMock(), memory_provider=MagicMock(),
@@ -385,30 +385,16 @@ class TestReloadAgent:
 
 
 class TestReloadPolicies:
-    async def test_rebuilds_scope_registry_and_swaps_agents(
+    async def test_reloads_policy_lib_and_swaps_agents(
         self, tmp_path, monkeypatch,
     ):
         from reload import dispatch, register_handler, reload_policies
-        from types import SimpleNamespace
         register_handler("policies", reload_policies)
-
-        # Stub the scope_registry rebuild path.
-        new_scope_lib = MagicMock()
-        new_scope_registry = MagicMock()
-        new_scope_registry.prepare = MagicMock(return_value=asyncio.sleep(0))
-        new_scope_registry._degraded = False
 
         new_policy_lib = MagicMock()
 
         monkeypatch.setattr("policies.load_policies",
                             lambda *a, **kw: new_policy_lib)
-        monkeypatch.setattr("scope_registry.load_scope_library",
-                            lambda *a, **kw: new_scope_lib)
-        monkeypatch.setattr("scope_registry.ScopeRegistry",
-                            lambda *a, **kw: new_scope_registry)
-        # No-op for per-role re-load
-        async def fake_dispatch(scope, *, runtime, role=None, **kw):
-            return {"status": "ok", "actions": []}
         # Patch _reload_role_after_policies (helper) to avoid real load.
         import reload as reload_mod
         called_roles: list[str] = []
@@ -423,7 +409,6 @@ class TestReloadPolicies:
         result = await dispatch("policies", runtime=runtime)
         assert result["status"] == "ok"
         assert runtime.policy_lib is new_policy_lib
-        assert runtime.scope_registry is new_scope_registry
         assert sorted(called_roles) == ["ellen", "tina"]
 
 
@@ -723,7 +708,7 @@ class TestExecutorsScope:
                     f"{result['actions']!r}"
                 )
 
-    async def test_executors_scope_registry_raises_becomes_load_error(self):
+    async def test_executors_load_raises_becomes_load_error(self):
         from reload import dispatch
         runtime = _make_runtime()
         runtime.executor_registry.load = MagicMock(

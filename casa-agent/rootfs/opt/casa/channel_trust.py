@@ -1,7 +1,6 @@
 """Channel trust attribution for Casa agents.
 
-`channel_trust()` returns the CANONICAL trust token used by
-scope_registry for the (trust × scope.minimum_trust) filter.
+`channel_trust()` returns the CANONICAL trust token for a channel.
 `channel_trust_display()` returns the human-readable form for
 rendering inside the <channel_context> system-prompt block.
 

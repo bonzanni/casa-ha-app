@@ -25,7 +25,6 @@ if TYPE_CHECKING:
     from mcp_registry import McpServerRegistry
     from memory import MemoryProvider
     from policies import PolicyLibrary
-    from scope_registry import ScopeRegistry
     from session_registry import SessionRegistry
     from specialist_registry import SpecialistRegistry
     from trigger_registry import TriggerRegistry
@@ -38,8 +37,8 @@ class CasaRuntime:
     Mutability contract:
     - ``agents`` and ``role_configs`` are MUTATED by reload handlers
       (atomic-swap of role keys).
-    - Registry attrs (``agent_registry``, ``scope_registry``,
-      ``policy_lib``) are REPLACED by reload handlers (rebind).
+    - Registry attrs (``agent_registry``, ``policy_lib``) are
+      REPLACED by reload handlers (rebind).
     - Channel/bus/driver attrs are read-only after boot.
     - Path attrs (``config_dir``, ``agents_dir``, ``home_root``,
       ``defaults_root``) are read-only after boot.
@@ -56,7 +55,6 @@ class CasaRuntime:
     agent_registry: "AgentRegistry"
     trigger_registry: "TriggerRegistry"
     mcp_registry: "McpServerRegistry"
-    scope_registry: "ScopeRegistry"
     session_registry: "SessionRegistry"
 
     # Channels + bus + drivers (boot-fixed)

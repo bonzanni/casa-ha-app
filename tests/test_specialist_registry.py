@@ -21,7 +21,6 @@ def _seed_specialist_dir(
     *,
     enabled: bool = True,
     channels: list[str] | None = None,
-    scopes_owned: list[str] | None = None,
     strategy: str = "ephemeral",
     token_budget: int = 0,
 ) -> Path:
@@ -40,7 +39,6 @@ def _seed_specialist_dir(
     (d / "voice.yaml").write_text("schema_version: 1\n", encoding="utf-8")
     (d / "response_shape.yaml").write_text("schema_version: 1\n", encoding="utf-8")
     channels_part = channels if channels is not None else []
-    scopes_part = scopes_owned if scopes_owned is not None else []
     (d / "runtime.yaml").write_text(textwrap.dedent(f"""\
         schema_version: 1
         model: sonnet
@@ -50,7 +48,6 @@ def _seed_specialist_dir(
         channels: {channels_part}
         memory:
           token_budget: {token_budget}
-          scopes_owned: {scopes_part}
         session:
           strategy: {strategy}
     """), encoding="utf-8")
@@ -163,22 +160,6 @@ class TestValidation:
         with caplog.at_level(logging.ERROR):
             reg.load()
         assert reg.get("sticky") is None
-
-    async def test_rejects_scopes_owned(self, tmp_path, caplog):
-        import logging
-        from specialist_registry import SpecialistRegistry
-
-        specialists = tmp_path / "specialists"
-        specialists.mkdir()
-        _seed_specialist_dir(specialists, "owner", scopes_owned=["finance"])
-        reg = SpecialistRegistry(str(specialists),
-                                 tombstone_path=str(tmp_path / "del.json"))
-        with caplog.at_level(logging.ERROR):
-            reg.load()
-        assert reg.get("owner") is None
-        assert any(
-            "scopes_owned" in r.message for r in caplog.records
-        )
 
     async def test_stray_flat_yaml_rejected(self, tmp_path, caplog):
         """Flat-YAML files inside specialists/ are rejected by the new

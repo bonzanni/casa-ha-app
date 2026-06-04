@@ -81,11 +81,11 @@ class TestDriftCheck:
         (live / "agents" / "assistant" / "prompts" / "system.md").write_text(
             "be helpful\n", encoding="utf-8",
         )
-        (defaults / "policies" / "scopes.yaml").write_text(
-            "default_scope: personal\n", encoding="utf-8",
+        (defaults / "policies" / "disclosure.yaml").write_text(
+            "policy: standard\n", encoding="utf-8",
         )
-        (live / "policies" / "scopes.yaml").write_text(
-            "default_scope: personal\n", encoding="utf-8",
+        (live / "policies" / "disclosure.yaml").write_text(
+            "policy: standard\n", encoding="utf-8",
         )
 
         rc, out, err = _run_block(defaults, live)

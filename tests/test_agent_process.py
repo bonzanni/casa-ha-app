@@ -26,17 +26,6 @@ from claude_agent_sdk import (
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
-def _mk_scope_registry_stub():
-    from unittest.mock import Mock
-    reg = Mock()
-    reg.filter_readable.return_value = ["personal"]
-    reg.score.return_value = {"personal": 1.0}
-    reg.active_from_scores.return_value = ["personal"]
-    reg.argmax_scope.return_value = "personal"
-    reg.cache_stats.return_value = (0, 1)
-    return reg
-
-
 def _mk_text_block(text: str) -> _SDKTextBlock:
     """Instantiate whatever TextBlock shape the installed SDK uses."""
     try:
@@ -202,9 +191,6 @@ def _make_agent(
         memory=MemoryConfig(
             token_budget=1000,
             read_strategy="per_turn",
-            scopes_readable=["personal"],
-            scopes_owned=["personal"],
-            default_scope="personal",
         ),
     )
     return Agent(
@@ -213,7 +199,6 @@ def _make_agent(
         session_registry=SessionRegistry(str(tmp_path / "sessions.json")),
         mcp_registry=McpServerRegistry(),
         channel_manager=ChannelManager(),
-        scope_registry=_mk_scope_registry_stub(),
         semantic_memory=semantic_memory or FakeSemanticMemory(),
     )
 
@@ -988,9 +973,6 @@ def _make_agent_with_registry(
         memory=MemoryConfig(
             token_budget=1000,
             read_strategy="per_turn",
-            scopes_readable=["personal"],
-            scopes_owned=["personal"],
-            default_scope="personal",
         ),
     )
     return Agent(
@@ -999,7 +981,6 @@ def _make_agent_with_registry(
         session_registry=registry,
         mcp_registry=McpServerRegistry(),
         channel_manager=ChannelManager(),
-        scope_registry=_mk_scope_registry_stub(),
         semantic_memory=FakeSemanticMemory(),
     )
 

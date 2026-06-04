@@ -17,7 +17,7 @@ def _runtime_with(tmp_path, *, trigger_registry=None):
         executor_registry=MagicMock(), engagement_registry=MagicMock(),
         agent_registry=MagicMock(),
         trigger_registry=trigger_registry,
-        mcp_registry=MagicMock(), scope_registry=MagicMock(),
+        mcp_registry=MagicMock(),
         session_registry=MagicMock(), channel_manager=MagicMock(),
         bus=MagicMock(), engagement_driver=MagicMock(),
         claude_code_driver=MagicMock(), memory_provider=MagicMock(),

@@ -298,20 +298,6 @@ else
     rm -f "$SECRET_FILE"
 fi
 
-# ------------------------------------------------------------------
-# 3.2: opportunistic embedding-model pre-warm (non-fatal if offline).
-# ------------------------------------------------------------------
-
-if [ ! -d "$DATA_DIR/fastembed" ]; then
-    mkdir -p "$DATA_DIR/fastembed"
-    bashio::log.info "Priming fastembed cache at $DATA_DIR/fastembed (first boot)"
-    FASTEMBED_CACHE_PATH="$DATA_DIR/fastembed" python3 -c "
-from fastembed import TextEmbedding
-TextEmbedding(model_name='intfloat/multilingual-e5-large')
-print('fastembed model cached')
-" 2>&1 || bashio::log.warning "fastembed pre-warm failed; ScopeRegistry will retry at Python init or degrade"
-fi
-
 # --- Plan 4b: plugin consumer infrastructure bootstrap ----------------------
 
 # Seed the user-writable marketplace overlay (idempotent — only if absent).

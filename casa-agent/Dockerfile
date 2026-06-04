@@ -3,8 +3,9 @@ FROM ${BUILD_FROM}
 
 # Base: ghcr.io/home-assistant/{arch}-base-debian:bookworm (glibc-based,
 # ships s6-overlay + bashio). We migrated from alpine-python:3.12 in
-# v0.8.1 because fastembed>=0.4 depends on onnxruntime, which has no
-# musl wheels on PyPI.
+# v0.8.1 originally because onnxruntime (a fastembed dependency) has no
+# musl wheels on PyPI. That ONNX dependency was retired with
+# scope-routing; the glibc base is kept.
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

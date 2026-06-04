@@ -22,9 +22,6 @@ mcp_server_names:
 memory:
   token_budget: 5000                     # Phase 5 — honest envelope for 40/60 overlay/scope split
   read_strategy: per_turn
-  scopes_owned: [personal, business, finance]
-  scopes_readable: [personal, business, finance, house, meta]
-  default_scope: personal
 channels:
   - telegram
   - webhook

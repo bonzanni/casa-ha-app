@@ -34,7 +34,6 @@ Everything you edit lives under `/addon_configs/casa-agent/`:
           observer.yaml            # optional
           doctrine/                # your own knowledge base
     policies/
-      scopes.yaml
       disclosure.yaml
     schema/
       *.v1.json                    # READ-ONLY - editing breaks loaders
@@ -45,8 +44,8 @@ Read-only to you (hook-blocked): `/data/**` (runtime state), `/addon_configs/cas
 
 | Tier | Name | What it is | Where it lives |
 |---|---|---|---|
-| 1 | Resident | Long-lived agent owning a channel (Ellen=telegram+voice, Tina=voice). Has scopes, memory budget, delegates (to residents and specialists). | agents/<role>/ |
-| 2 | Specialist | Role-keyed helper (e.g. finance/Alex). Called by residents via delegate_to_agent. No channel, no scopes_owned, ephemeral session. | agents/specialists/<role>/ |
+| 1 | Resident | Long-lived agent owning a channel (Ellen=telegram+voice, Tina=voice). Has memory budget, delegates (to residents and specialists). | agents/<role>/ |
+| 2 | Specialist | Role-keyed helper (e.g. finance/Alex). Called by residents via delegate_to_agent. No channel, ephemeral session. | agents/specialists/<role>/ |
 | 3 | Executor | Task-bounded, ephemeral agent (e.g. you - configurator). Engaged via engage_executor. Runs in a dedicated Telegram topic. | agents/executors/<type>/ |
 
 Any resident may delegate (`delegate_to_agent`) to any other agent listed in its `delegates.yaml`. Only the assistant (Ellen) may engage executors via `executors.yaml`.
@@ -74,22 +73,13 @@ agent_loader.py enforces these rules. Adding a forbidden file or removing a requ
 
 ## Memory wiring per tier (v0.16.0 — Memory M4)
 
-Residents (Tier 1) own per-scope sessions and read summaries from the
-`meta` system scope each turn. Specialists (Tier 2) were stateless per
-delegation through v0.16.0 — *Specialist memory (M4b, v0.17.0)* below
-documents the per-`(role, user_peer)` Honcho memory opt-in. Tier 3
-Executors are ephemeral per engagement, but may opt in to a
+Residents (Tier 1) carry long-term memory and read a recall digest each
+turn (clearance-gated by the channel's trust). Specialists (Tier 2) were
+stateless per delegation through v0.16.0 — *Specialist memory (M4b,
+v0.17.0)* below documents the per-`(role, user_peer)` memory opt-in. Tier
+3 Executors are ephemeral per engagement, but may opt in to a
 per-(channel, chat, executor_type) **archive** of prior engagement
 summaries.
-
-**Scope kinds.** `policies/scopes.yaml` v2 declares each scope with
-`kind: topical | system`:
-
-- `kind: topical` — embedded by fastembed; classifier picks active scopes
-  per turn against the user utterance. `description` required.
-- `kind: system` — always-on for any agent that includes the scope in
-  `scopes_readable` and clears the trust gate. No embedding, no classifier
-  routing. `description` forbidden. Only `meta` is system today.
 
 **Executor memory opt-in.** A Tier 3 executor's `definition.yaml` may
 include:
@@ -111,9 +101,8 @@ prompt under "## Prior engagements (lessons learned)".
 ## Specialist memory (M4b, v0.17.0)
 
 Specialists carry **per-`(role, user_peer)` Honcho memory** —
-channel-agnostic, scope-agnostic, mixed-domain. Session id is
-`f"{role}-{user_peer}"` (2-segment, distinct from residents'
-4-segment `{channel}-{chat_id}-{scope}-{role}`). Both shapes are
+channel-agnostic, mixed-domain. Session id is
+`f"{role}-{user_peer}"` (2-segment). It is
 built via `honcho_session_id` to satisfy Honcho's
 `^[A-Za-z0-9_-]+$` server-side regex.
 
@@ -124,11 +113,8 @@ the user. `search_query` retrieval at read time is scoped to the
 specialist's own corpus — denser per token than searching a
 coordinator's mixed-domain memory.
 
-Specialists do **not** participate in scope partitioning; their
-`scopes_owned` and `scopes_readable` MUST stay empty
-(`agent_loader.py:562-573` enforces this). Specialists also do **not**
-participate in trust filtering at the memory layer — trust is one
-level up at the resident's `delegates` decision.
+Specialists do **not** participate in trust filtering at the memory
+layer — trust is one level up at the resident's `delegates` decision.
 
 Enabling memory on a specialist: set `memory.token_budget > 0` in
 `runtime.yaml`. Disabling: set `token_budget: 0` (back to stateless;

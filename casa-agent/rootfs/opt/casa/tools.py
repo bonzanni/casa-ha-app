@@ -376,14 +376,6 @@ def _build_world_state_summary() -> str:
         exec_types = []
     lines.append(f"Enabled executors:    {', '.join(exec_types) or '(none)'}")
 
-    try:
-        import agent as agent_mod
-        scope_reg = getattr(agent_mod, "active_scope_registry", None)
-        scopes = sorted(scope_reg._scopes.keys()) if scope_reg else []
-    except Exception:  # noqa: BLE001
-        scopes = []
-    lines.append(f"Scopes:               {', '.join(scopes) or '(none)'}")
-
     version = "unknown"
     for candidate in ("/opt/casa/VERSION", "/addon_configs/casa-agent/VERSION"):
         try:
@@ -1860,7 +1852,7 @@ async def _synthesize_answer(
 @tool(
     "query_engager",
     "Ask the engaging agent a question. Returns synthesized answer from the "
-    "engager's scope-filtered memory, or status=unknown. Callable only from "
+    "engager's clearance-filtered memory, or status=unknown. Callable only from "
     "inside an active engagement.",
     {"question": str, "max_tokens": int},
 )

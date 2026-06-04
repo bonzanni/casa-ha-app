@@ -6,9 +6,9 @@
 
 # Base: ghcr.io/home-assistant/amd64-base-debian:bookworm
 # Migrated from alpine-python:3.12 in v0.8.5 — mirrors the main
-# casa-agent/Dockerfile migration shipped in v0.8.1. fastembed>=0.4
-# depends on onnxruntime, which ships manylinux wheels only (no
-# musllinux), so the Alpine base can't install the test dependencies.
+# casa-agent/Dockerfile migration shipped in v0.8.1 (originally to get
+# onnxruntime manylinux wheels, which Alpine/musl couldn't install). The
+# ONNX dependency was retired with scope-routing; the glibc base is kept.
 #
 # Digest pinned 2026-04-21. Refresh deliberately:
 #   docker buildx imagetools inspect \
@@ -48,18 +48,6 @@ ENV PATH="/opt/casa/venv/bin:${PATH}"
 
 COPY casa-agent/requirements.txt /tmp/
 RUN /opt/casa/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
-
-# Pre-cache the fastembed model used by ScopeRegistry. Without this, every
-# fresh container boot has to download ~600MB of model weights via fastembed
-# → huggingface_hub, which on CI runners routinely exceeds the 30s
-# /healthz wait_healthy ceiling and stalls boot between `agent-home
-# provisioned: role=butler` and `ScopeRegistry ready`.
-#
-# scope_registry.py calls TextEmbedding(model_name=...) without a cache_dir
-# arg, so fastembed.common.utils.define_cache_dir honors FASTEMBED_CACHE_PATH
-# from the environment (otherwise default /tmp/fastembed_cache).
-ENV FASTEMBED_CACHE_PATH=/opt/casa/fastembed-cache
-RUN python3 -c "from fastembed import TextEmbedding; TextEmbedding(model_name='intfloat/multilingual-e5-large')"
 
 # E2E: swap the real Claude Agent SDK for the offline mock.
 COPY test-local/mock-claude-sdk /tmp/mock-claude-sdk

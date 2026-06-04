@@ -8,7 +8,7 @@ mutation between boot-state and the reload call.
 self-review, a fully-real e2e (real ``agent_loader.load_agent_from_dir``
 through real ``Agent`` construction) requires a complete schema-validated
 agent tree (character + voice + response_shape + runtime + disclosure +
-real ``PolicyLibrary`` + scope_registry + ``_wrap_memory_for_strategy``
+real ``PolicyLibrary`` + ``_wrap_memory_for_strategy``
 plumbing — well over 100 LOC of harness). The plan's spec §7 contract is
 "edit YAML on disk -> dispatch -> assert new state in runtime"; that
 contract is what this test enforces. ``agent_loader.load_agent_from_dir``
@@ -52,7 +52,6 @@ def _make_runtime(tmp_path: Path):
         agent_registry=MagicMock(),
         trigger_registry=MagicMock(),
         mcp_registry=MagicMock(),
-        scope_registry=MagicMock(),
         session_registry=MagicMock(),
         channel_manager=MagicMock(),
         bus=MagicMock(),

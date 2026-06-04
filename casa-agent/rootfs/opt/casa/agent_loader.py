@@ -142,10 +142,8 @@ _SCHEMA_BY_FILENAME: dict[str, str] = {
 # ``_SCHEMA_BY_FILENAME`` because ``policies/disclosure.yaml`` reuses the
 # same basename as ``agents/<role>/disclosure.yaml`` while binding to a
 # DIFFERENT schema (``policy-disclosure.v1.json`` vs ``disclosure.v1.json``).
-# ``policy-scopes`` is at .v2 — every other schema is .v1.
 _SCHEMA_BY_POLICY_FILE: dict[str, tuple[str, str]] = {
     "disclosure.yaml": ("policy-disclosure", "v1"),
-    "scopes.yaml":     ("policy-scopes",     "v2"),
 }
 
 
@@ -166,8 +164,8 @@ def validate_config_repo(config_dir: str) -> list[str]:
     configurator inventing fields under ``agents/<role>/character.yaml``.
 
     **Policies/ walk (v0.37.12).** Top-level only; the configurator's
-    doctrine lists ``policies/disclosure.yaml`` and ``policies/scopes.yaml``
-    as editable. Path-aware lookup in ``_SCHEMA_BY_POLICY_FILE`` —
+    doctrine lists ``policies/disclosure.yaml`` as editable. Path-aware
+    lookup in ``_SCHEMA_BY_POLICY_FILE`` —
     ``policies/disclosure.yaml`` reuses the basename of the per-agent
     file but binds to ``policy-disclosure.v1.json``; v0.31.0's flat
     basename map mis-applied the agent schema there and falsely refused
@@ -500,9 +498,6 @@ def _build_runtime_fields(
     cfg.memory = MemoryConfig(
         token_budget=int(memory.get("token_budget", 4000)),
         read_strategy=memory.get("read_strategy", "per_turn"),
-        scopes_owned=list(memory.get("scopes_owned") or []),
-        scopes_readable=list(memory.get("scopes_readable") or []),
-        default_scope=memory.get("default_scope", "") or "",
         cross_peer_token_budget=int(memory.get("cross_peer_token_budget", 2000)),
     )
 
@@ -653,43 +648,6 @@ def load_agent_from_dir(
             f"runtime.yaml tools.allowed is missing "
             f"{_DELEGATE_MCP_TOOL!r}"
         )
-
-    # --- 3.2 scope validation -------------------------------------------
-    mem = cfg.memory
-    if tier == "resident":
-        if mem.scopes_readable:
-            # scopes_owned ⊆ scopes_readable
-            missing = set(mem.scopes_owned) - set(mem.scopes_readable)
-            if missing:
-                raise LoadError(
-                    f"agent {role_from_path!r}: memory.scopes_owned must be a "
-                    f"subset of memory.scopes_readable; missing from readable: "
-                    f"{sorted(missing)}"
-                )
-            # default_scope required and must be in scopes_owned
-            if not mem.default_scope:
-                raise LoadError(
-                    f"agent {role_from_path!r}: memory.default_scope is "
-                    f"required when scopes_readable is non-empty"
-                )
-            if mem.default_scope not in mem.scopes_owned:
-                raise LoadError(
-                    f"agent {role_from_path!r}: memory.default_scope "
-                    f"{mem.default_scope!r} must be in scopes_owned "
-                    f"{mem.scopes_owned}"
-                )
-    else:  # specialist
-        if mem.default_scope:
-            raise LoadError(
-                f"agent {role_from_path!r}: specialist must not declare "
-                f"memory.default_scope"
-            )
-        if mem.scopes_owned or mem.scopes_readable:
-            # This is already enforced upstream per 3.1 but re-assert.
-            raise LoadError(
-                f"agent {role_from_path!r}: specialist must not declare "
-                f"memory.scopes_owned or memory.scopes_readable"
-            )
 
     # Compose the system prompt.
     cfg.system_prompt = _compose_prompt(cfg, policies)

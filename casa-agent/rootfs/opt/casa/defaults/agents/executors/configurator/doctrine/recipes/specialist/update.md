@@ -48,8 +48,6 @@ in its `runtime.yaml`. To turn it into a memory-bearing peer:
    memory:
      token_budget: 4000      # any positive int; resident parity is fine to start
      read_strategy: per_turn
-     scopes_owned: []
-     scopes_readable: []
    ```
 2. Reload via `reload_agents`.
 3. The next `delegate_to_agent` call to this specialist opens a fresh

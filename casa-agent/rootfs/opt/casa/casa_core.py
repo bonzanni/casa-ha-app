@@ -1131,7 +1131,6 @@ async def main() -> None:
         agent_registry=agent_registry,
         trigger_registry=trigger_registry,
         mcp_registry=mcp_registry,
-        scope_registry=None,                  # set after step 3.2 ScopeRegistry build
         session_registry=session_registry,
         channel_manager=channel_manager,
         bus=bus,
@@ -1173,25 +1172,6 @@ async def main() -> None:
         defaults_root=Path("/opt/casa"),
     )
 
-    # 3.2: scope registry — loads scopes.yaml, embeds descriptions.
-    from scope_registry import load_scope_library, ScopeRegistry
-    scope_lib = load_scope_library(
-        os.path.join(CONFIG_DIR, "policies", "scopes.yaml"),
-    )
-    scope_threshold = float(os.environ.get("CASA_SCOPE_THRESHOLD", "0.35"))
-    scope_registry = ScopeRegistry(scope_lib, threshold=scope_threshold)
-    await scope_registry.prepare()
-    runtime.scope_registry = scope_registry
-    if scope_registry._degraded:
-        logger.warning(
-            "ScopeRegistry running in DEGRADED mode — fan-out to all readable scopes"
-        )
-    else:
-        logger.info(
-            "ScopeRegistry ready — embedded %d scopes (threshold=%.2f)",
-            len(scope_lib.names()), scope_threshold,
-        )
-
     if "assistant" not in role_configs:
         raise RuntimeError(
             f"No agent with role 'assistant' found in {agents_dir}. "
@@ -1220,7 +1200,6 @@ async def main() -> None:
             session_registry=session_registry,
             mcp_registry=mcp_registry,
             channel_manager=channel_manager,
-            scope_registry=scope_registry,
             agent_registry=agent_registry,
         )
         bus.register(role, agent.handle_message)
@@ -1351,7 +1330,6 @@ async def main() -> None:
     agent_mod.active_engagement_driver = engagement_driver
     agent_mod.active_memory_provider = base_memory    # already constructed above
     agent_mod.active_semantic_memory = semantic_memory   # resident long-term (Hindsight seam)
-    agent_mod.active_scope_registry = scope_registry      # readable-scope tags for recall_memory
     agent_mod.active_executor_registry = executor_registry
     runtime.engagement_driver = engagement_driver
 

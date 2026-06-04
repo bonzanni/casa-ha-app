@@ -1,6 +1,6 @@
 # Recipe: create a new specialist
 
-A Specialist is a Tier 2 agent, role-keyed (e.g. finance, fitness). Residents invoke specialists via delegate_to_agent. Specialists are ephemeral - no persistent session, no scopes_owned.
+A Specialist is a Tier 2 agent, role-keyed (e.g. finance, fitness). Residents invoke specialists via delegate_to_agent. Specialists are ephemeral - no persistent session.
 
 ## Ask the user
 
@@ -53,9 +53,6 @@ Optional: hooks.yaml.
     memory:
       token_budget: 0
       read_strategy: per_turn
-      scopes_owned: []
-      scopes_readable: []
-      default_scope: ""
     session:
       strategy: ephemeral
       idle_timeout: 0
@@ -65,7 +62,7 @@ Optional: hooks.yaml.
     channels: []
     cwd: ""
 
-**CRITICAL** for specialists: memory.token_budget 0, memory.scopes_owned [], session.strategy ephemeral, channels []. Loader REJECTS specialists violating these.
+**CRITICAL** for specialists: session.strategy ephemeral, channels []. Loader REJECTS specialists violating these.
 
 ### prompts/system.md
 
@@ -122,15 +119,13 @@ cannot delegate to it until the next reload. See completion.md.
 ## Memory-bearing specialist (M4b, v0.17.0)
 
 Specialists are per-`(role, user_peer)` Honcho peers — channel-agnostic
-and scope-agnostic. To opt a specialist into memory, set
+and mixed-domain. To opt a specialist into memory, set
 `memory.token_budget > 0` in `runtime.yaml`:
 
 ```yaml
 memory:
   token_budget: 4000        # 0 = stateless (legacy); >0 enables Honcho memory
   read_strategy: per_turn   # cached not yet supported for specialists
-  scopes_owned: []          # MUST stay empty — specialists don't partition by scope
-  scopes_readable: []       # MUST stay empty — specialists don't partition by scope
 ```
 
 The session id is `f"{role}-{user_peer}"` (e.g. `finance-nicola`).
