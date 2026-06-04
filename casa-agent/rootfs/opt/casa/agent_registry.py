@@ -81,5 +81,12 @@ class AgentRegistry:
     def name_to_role(self, name: str) -> str | None:
         return self._name_lower_to_role.get((name or "").strip().lower())
 
+    def is_known(self, role: str) -> bool:
+        """True if ``role`` is a currently-known agent — a resident or an
+        ENABLED specialist. A bundled-but-disabled (``enabled: false``) or
+        removed specialist is absent here, so callers can use this to avoid
+        advertising / acting on an agent that is not actually callable."""
+        return role in self._role_to_known
+
     def all_known(self) -> list[KnownAgent]:
         return list(self._role_to_known.values())

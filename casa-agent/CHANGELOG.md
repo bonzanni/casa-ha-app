@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.46.2] - 2026-06-04 — Fix: disabled specialists no longer advertised in a resident's delegate list
+
+### Fixed
+
+- **A `delegates.yaml` entry pointing at a disabled specialist is no longer shown to the resident.**
+  The `<delegates>` system-prompt block was rendered straight from the static `delegates.yaml`, with
+  no cross-check against the enabled-specialist registry — so a specialist set `enabled: false` (but
+  still listed as a delegate) was advertised to e.g. Ellen, who would then try to delegate and get
+  an `unknown_agent` rejection from the tool. `_render_delegates_block` now filters delegates through
+  the live `AgentRegistry` (residents + **enabled** specialists only, via new `AgentRegistry.is_known`);
+  a disabled/removed specialist is neither advertised nor callable. Back-compat preserved (no registry
+  → render all). Regression test added.
+
 ## [0.46.1] - 2026-06-04 — Fix: `hindsight_api_url` actually enables long-term memory
 
 ### Fixed
