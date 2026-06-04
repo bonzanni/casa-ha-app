@@ -70,13 +70,3 @@ async def test_profile_gets_mental_models() -> None:
     assert payload is None
     assert "terse" in out
 
-
-async def test_cross_recall_targets_other_bank() -> None:
-    mem = HindsightSemanticMemory(base_url="http://hs:8888")
-    mem._request = AsyncMock(return_value={"results": [{"text": "Budget is tight.", "type": "world"}]})
-    out = await mem.cross_recall("casa-finance", "budget?", max_tokens=256)
-    _, path, payload = mem._request.await_args.args
-    assert path == "/v1/default/banks/casa-finance/memories/recall"
-    assert payload["tags"] == []          # cross_recall = no tag filter (its defining semantic)
-    assert payload["budget"] == "low"     # cross reads default cheap
-    assert "Budget is tight" in out

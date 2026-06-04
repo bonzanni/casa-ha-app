@@ -71,12 +71,3 @@ class HindsightSemanticMemory(SemanticMemory):
         )
         return render_mental_models(resp)
 
-    async def cross_recall(
-        self, bank: str, query: str, *, max_tokens: int, budget: str = "low",
-    ) -> str:
-        # Cross-agent read = recall against another role's bank, no tag filter.
-        # tags=[] inherits recall's tags_match="any" (unfiltered); keep them in
-        # sync if recall's default changes.
-        return await self.recall(
-            bank, query, tags=[], max_tokens=max_tokens, budget=budget,
-        )
