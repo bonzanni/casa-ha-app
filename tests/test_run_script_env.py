@@ -48,3 +48,27 @@ def test_run_script_exports_log_level():
     handling) so install_logging() defaults to INFO when unset."""
     script = _read_run_script()
     assert "LOG_LEVEL" in script, "Missing LOG_LEVEL handling in svc-casa/run"
+
+
+def test_run_script_derives_memory_backend_from_hindsight_url():
+    """v0.46.1: setting `hindsight_api_url` must turn long-term memory ON.
+
+    `casa_core.resolve_semantic_memory_choice` requires
+    `MEMORY_BACKEND=hindsight` (anything else → noop) AND nothing else in the
+    add-on sets `MEMORY_BACKEND` — so `svc-casa/run` derives it inside the
+    `hindsight_api_url` conditional. Without this, the URL option alone leaves
+    casa on noop and long-term memory is unreachable. Regression guard."""
+    script = _read_run_script()
+    # MEMORY_BACKEND must be exported...
+    assert "export MEMORY_BACKEND=" in script, (
+        "svc-casa/run must export MEMORY_BACKEND (else hindsight is unreachable)"
+    )
+    # ...and it must be derived to "hindsight" inside the hindsight_api_url block,
+    # i.e. between the `if [ "$_hindsight_url" ... ]` guard and its closing `fi`.
+    start = script.index("_hindsight_url=")
+    block = script[start:script.index("\nfi", start)]
+    assert "export HINDSIGHT_API_URL=" in block
+    assert 'export MEMORY_BACKEND="${MEMORY_BACKEND:-hindsight}"' in block, (
+        "MEMORY_BACKEND=hindsight must be derived inside the hindsight_api_url "
+        "conditional so the URL is the single toggle"
+    )

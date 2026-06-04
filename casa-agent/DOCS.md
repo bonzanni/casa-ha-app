@@ -36,14 +36,14 @@ is enabled by pointing Casa at a self-hosted **Hindsight** add-on.
 
 | Option | Description |
 |--------|-------------|
-| `hindsight_api_url` | Internal base URL for the self-hosted Hindsight add-on (e.g. `http://5884eb17-hindsight:8888` or its IP), reached via the add-on's hassio network alias/IP — not the bare host `hindsight`. Set together with `MEMORY_BACKEND=hindsight` to put the agents' long-term semantic memory on Hindsight — both **save** (the freshness reaper retains ended conversations, each item tier-classified) and **recall** (a mental-model overlay + relevance-ranked recall on the read path, plus a `recall_memory` pull tool). Leave empty to keep long-term memory disabled (short-term continuity still works via the SDK session). |
+| `hindsight_api_url` | Internal base URL for the self-hosted Hindsight add-on (e.g. `http://5884eb17-hindsight:8888` or its IP), reached via the add-on's hassio network alias/IP — not the bare host `hindsight`. **This is the single toggle for long-term memory: set it to turn long-term semantic memory ON** (the add-on auto-derives `MEMORY_BACKEND=hindsight`) — both **save** (the freshness reaper retains ended conversations, each item tier-classified) and **recall** (a mental-model overlay + relevance-ranked recall on the read path, plus a `recall_memory` pull tool). **Leave empty to keep long-term memory disabled** (short-term continuity still works via the SDK session). |
 
-The following env var can be set via the add-on environment (not the
-options panel):
+The following env var is **auto-derived** from `hindsight_api_url` and rarely needs
+setting by hand:
 
 | Env var | Purpose | Default |
 |---|---|---|
-| `MEMORY_BACKEND` | Long-term memory backend: `hindsight` (requires `hindsight_api_url`) or `noop` (disabled). Any other value resolves to `noop`. | unset (→ `noop`) |
+| `MEMORY_BACKEND` | Long-term memory backend: `hindsight` or `noop` (disabled). **Auto-set to `hindsight` by the add-on whenever `hindsight_api_url` is non-empty**; otherwise unset → `noop`. Any unrecognized value → `noop`. You normally just set `hindsight_api_url`. | derived from `hindsight_api_url` |
 
 ### Optional -- Agents
 
@@ -151,7 +151,7 @@ When `enable_terminal` is enabled, a web terminal is available at the `/terminal
 - **Add-on won't start**: Check the log for "claude_oauth_token is required". You must set the token before starting.
 - **No Telegram messages**: Verify `telegram_bot_token` and `telegram_chat_id` are correct. The bot must have been started (`/start` in Telegram).
 - **Engagements won't open (`engagement_not_configured`)**: See the "Troubleshooting engagements" subsection under [Engagements (v0.11.0)](#engagements-v0110) — most common cause is the bot missing "Manage topics" admin permission in the engagement supergroup.
-- **Long-term memory not working**: Long-term recall requires `MEMORY_BACKEND=hindsight` plus a reachable `hindsight_api_url`. If recall is empty, check container logs for Hindsight connection errors (and that the Hindsight add-on is running). Without it, only short-term per-session continuity works; set `MEMORY_BACKEND=noop` to disable long-term memory explicitly.
+- **Long-term memory not working**: Long-term recall requires the `hindsight_api_url` option to be set to a reachable Hindsight add-on (which auto-enables `MEMORY_BACKEND=hindsight`). If recall is empty, check that `hindsight_api_url` is set and the Hindsight add-on is running, and check container logs for Hindsight connection errors. With `hindsight_api_url` empty, only short-term per-session continuity works.
 - **502 errors on ingress**: The Python process may still be starting. Wait up to 60 seconds after add-on start.
 
 ## Engagements (v0.11.0)
