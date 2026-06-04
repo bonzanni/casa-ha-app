@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.43.0] - 2026-06-04 — Tiered memory access (2/4): tier model
+
+Long-term memory moves onto a **sensitivity-tier access model over one shared Hindsight bank**
+(`casa`), replacing the per-role banks + domain-scope tags of v0.39–v0.41. Two independent
+axes (design `2026-06-03-tiered-memory-access-design`, revised 2026-06-04):
+
+- **Read-clearance** — *who may see a fact*. Per channel: voice = `friends`, a private
+  Telegram DM = `private`. Recall is a single `recall("casa", text, tags=readable_tiers(
+  clearance))`; the un-tier-filterable mental-model **overlay** (`profile`) is pushed **only at
+  `private` clearance**. A `private` fact is therefore invisible to voice — including on a later
+  friends-present voice night.
+- **Write-trust** — *may we believe & store a fact*. Per channel, distinct from clearance.
+  Authenticated channels (Telegram) classify **each retained message-item at its true
+  sensitivity tier** (`tier_classifier`, eval-validated `SENSITIVITY_PROMPT`, default-`private`
+  on uncertainty) in the **background save path** — off the turn's hot path. **Voice is
+  recall-only**: it has no speaker recognition yet, so it writes nothing (it cannot poison the
+  trusted store with a guest's words / a friend's joke).
+
+### Added
+
+- `tier_classifier.py` — per-item tier classifier (one-shot SDK query over the converged
+  `SENSITIVITY_PROMPT`; leak-safe `private` default on blank/unparseable/error). Runs in the
+  reaper / backgrounded gap-retain, never on the turn's critical path.
+- `channel_policy.py` — `writes_to_bank(channel)` write-trust predicate (voice → recall-only;
+  unknown channels fail safe to no-write).
+- `session_saver.retain_cold_session(...)` — a **claim-free, registry-decoupled** background
+  retain for the next-turn-after-gap path, so the prior session's classify+retain runs off the
+  new turn's hot path and cannot race the registry pointer rewrite.
+
+### Changed
+
+- **One shared bank `casa`** for all roles (was per-role `casa-{role}`); item tags are now
+  **sensitivity tiers**, not domain scopes. Read path, the `recall_memory` pull tool, the save
+  reaper, and the gap-retain all use the shared bank + clearance helpers.
+- Overlay (`profile`) gated to `private` clearance; voice no longer receives it (the obsolete
+  per-role voice **prewarm** was removed).
+- The freshness reaper saves authenticated channels only and **drops cold voice entries**
+  (registry hygiene) instead of persisting them.
+
+### Removed
+
+- The per-turn ONNX **`write_scope`** classification and its registry recording
+  (`SessionRegistry.record_write_scope`) — tiering now happens per-item in the background save
+  path. (The read-side scope routing / `origin_var["scope"]`, the ONNX classifier, `fastembed`,
+  and the legacy `MemoryProvider` stack are deliberately retained for the later retirement
+  plans.)
+
 ## [0.42.1] - 2026-06-03 — Sensitivity prompt tune (clear the accuracy gate with margin)
 
 The v0.42.0 `SENSITIVITY_PROMPT` shipped before its live-LLM accuracy was ever measured (no
