@@ -33,6 +33,7 @@ from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — availa
 from system_requirements.orchestrator import install_requirements, OrchestrationError
 from system_requirements.manifest import add_plugin_entry as add_manifest
 from plugins_binding import build_sdk_plugins
+from delegated_memory import delegated_recall, retain_delegated
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -262,10 +263,10 @@ def _result(payload: dict, *, is_error: bool | None = None) -> dict:
 def _build_specialist_options(cfg) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for a Tier 2 specialist invocation.
 
-    Specialists carry per-``(role, user_peer)`` Honcho memory (M4b,
-    v0.17.0); SDK-level session resume stays disabled (``resume=None``)
-    because memory enters the specialist via prompt injection in
-    :func:`_run_delegated_agent`, not via SDK continuity. Hooks are
+    Specialist memory is injected via prompt in :func:`_run_delegated_agent`
+    (shared ``casa`` bank); SDK-level session resume stays disabled
+    (``resume=None``) — memory enters via prompt injection, not SDK
+    continuity. Hooks are
     resolved from the specialist's own ``cfg.hooks``. MCP servers are
     resolved via the shared registry — same pattern as
     :meth:`Agent._process` (agent.py step 4). Degrades to empty-dict
@@ -418,85 +419,9 @@ def _build_world_state_summary() -> str:
     return "\n".join(lines)
 
 
-# M4b: specialist memory write-path bg-task anchoring (parity with
-# Agent._bg_tasks at agent.py:133). Module-level so it persists
-# across delegate_to_agent calls.
+# Specialist memory write-path bg-task anchoring (parity with Agent._bg_tasks
+# at agent.py:133). Module-level so it persists across delegate_to_agent calls.
 _specialist_bg_tasks: set[asyncio.Task[Any]] = set()
-
-
-async def _specialist_add_turn_bg(
-    *,
-    memory_provider: Any,
-    session_id: str,
-    agent_role: str,
-    user_text: str,
-    assistant_text: str,
-    user_peer: str,
-) -> None:
-    """Persist one specialist turn in the background.
-
-    Best-effort background write (try/except, log on failure, never surface —
-    the caller has already returned text). This is the specialist/engagement
-    memory path on the legacy MemoryProvider; it is retired with MemoryProvider
-    in the load plan. (The resident per-turn write was replaced by
-    session-granularity save in agent.py.)"""
-    try:
-        await memory_provider.add_turn(
-            session_id=session_id,
-            agent_role=agent_role,
-            user_text=user_text,
-            assistant_text=assistant_text,
-            user_peer=user_peer,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "specialist memory add_turn failed for session=%s role=%s: %s",
-            session_id, agent_role, exc,
-        )
-
-
-async def _specialist_meta_write_bg(
-    *,
-    memory_provider: Any,
-    parent_origin: dict[str, Any],
-    specialist_role: str,
-    task_text: str,
-    assistant_text: str,
-) -> None:
-    """Write a one-line specialist-call summary to the parent's meta session.
-
-    Mirrors _finalize_engagement's meta-write (tools.py:1326-1338) for
-    inline delegate_to_agent calls, with task and reply truncated to
-    200 chars per side (the engagement-finalize meta-write is untruncated;
-    this helper introduces the per-summary cap as new M4b policy). Gives
-    Ellen a unified view of specialist activity independent of which scope
-    her own turn wrote to.
-    """
-    channel = str(parent_origin.get("channel") or "")
-    chat_id = str(parent_origin.get("chat_id") or "")
-    parent_role = str(parent_origin.get("role") or "assistant")
-    if not channel or not chat_id:
-        return  # No parent context to attribute to (cron / boot replay).
-    meta_sid = honcho_session_id(channel, chat_id, "meta", parent_role)
-    user_text = f"delegated to {specialist_role}: {task_text[:200]}"
-    asst_text = f"{specialist_role} → {assistant_text[:200]}"
-    try:
-        await memory_provider.ensure_session(
-            session_id=meta_sid,
-            agent_role=parent_role,
-            user_peer="nicola",
-        )
-        await memory_provider.add_turn(
-            session_id=meta_sid,
-            agent_role=parent_role,
-            user_text=user_text,
-            assistant_text=asst_text,
-            user_peer="nicola",
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "specialist meta-write failed for sid=%s: %s", meta_sid, exc,
-        )
 
 
 async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
@@ -534,36 +459,17 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
     else:
         body_tail = f"Task: {task_text}"
 
-    # M4b: optional specialist memory read.
-    # Opt-in via cfg.memory.token_budget > 0. Session keyed
-    # via honcho_session_id(role, user_peer) — channel-agnostic,
-    # scope-agnostic, per-peer.
+    # Specialist memory read on the shared `casa` bank, at the PARENT context's
+    # read-clearance (design §3, plan 3). Opt-in via cfg.memory.token_budget > 0.
     memory_block = ""
-    user_peer = "nicola"
-    session_id = honcho_session_id(cfg.role, user_peer)
-    memory_provider = None
     if cfg.memory.token_budget > 0:
-        memory_provider = getattr(agent_mod, "active_memory_provider", None)
-        if memory_provider is not None:
-            try:
-                await memory_provider.ensure_session(
-                    session_id=session_id,
-                    agent_role=cfg.role,
-                    user_peer=user_peer,
-                )
-                digest = await memory_provider.get_context(
-                    session_id=session_id,
-                    agent_role=cfg.role,
-                    tokens=cfg.memory.token_budget,
-                    search_query=task_text,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "specialist memory read failed for %s (%s); "
-                    "continuing with no memory context",
-                    cfg.role, exc,
-                )
-                digest = ""
+        sem = getattr(agent_mod, "active_semantic_memory", None)
+        if sem is not None:
+            digest = await delegated_recall(
+                sem, query=task_text,
+                origin_channel=str(parent.get("channel", "")),
+                max_tokens=cfg.memory.token_budget,
+            )
             if digest:
                 memory_block = (
                     f'<memory_context agent="{cfg.role}">\n'
@@ -589,31 +495,21 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
     finally:
         agent_mod.origin_var.reset(token)
 
-    # M4b: write the turn back to specialist memory in the background.
-    if (cfg.memory.token_budget > 0
-            and text
-            and memory_provider is not None):
-        task = asyncio.create_task(_specialist_add_turn_bg(
-            memory_provider=memory_provider,
-            session_id=session_id,
-            agent_role=cfg.role,
-            user_text=task_text,
-            assistant_text=text,
-            user_peer=user_peer,
-        ))
-        _specialist_bg_tasks.add(task)
-        task.add_done_callback(_specialist_bg_tasks.discard)
-
-        # M4b: optional meta-write so Ellen sees specialist activity.
-        meta_task = asyncio.create_task(_specialist_meta_write_bg(
-            memory_provider=memory_provider,
-            parent_origin=parent,
-            specialist_role=cfg.role,
-            task_text=task_text,
-            assistant_text=text,
-        ))
-        _specialist_bg_tasks.add(meta_task)
-        meta_task.add_done_callback(_specialist_bg_tasks.discard)
+    # Specialist write: one explicit tier-classified retain of the exchange to
+    # the shared bank, gated by the PARENT channel's write-trust (voice → no
+    # write) — design §3, plan 3. Ephemeral specialists have no session
+    # registry, so the freshness reaper never sees them; the retain is explicit.
+    if cfg.memory.token_budget > 0 and text:
+        sem = getattr(agent_mod, "active_semantic_memory", None)
+        if sem is not None:
+            cid = str(parent.get("cid", "-"))
+            bg = asyncio.create_task(retain_delegated(
+                sem, origin_channel=str(parent.get("channel", "")),
+                doc_prefix=f"delegation:{cid}:{cfg.role}",
+                turns=[("user", task_text), ("assistant", text)],
+            ))
+            _specialist_bg_tasks.add(bg)
+            bg.add_done_callback(_specialist_bg_tasks.discard)
 
     return text
 
