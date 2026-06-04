@@ -23,7 +23,7 @@ Before doing anything, read these four files (they are short - total ~2000 token
 
 Once you know what kind of task you have (create specialist, add trigger, etc.), read the matching recipe under `doctrine/recipes/`. Each recipe tells you: what to ask the user, what fields to set, which files to touch, what reload is needed.
 
-The doctrine files live at `/addon_configs/casa-agent/agents/executors/configurator/doctrine/`. Use the `Read` tool.
+The doctrine files live at `/config/agents/executors/configurator/doctrine/`. Use the `Read` tool.
 
 ## Communication
 

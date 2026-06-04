@@ -374,11 +374,11 @@ class Agent:
         })
         try:
             # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at
-            # /addon_configs/casa-agent/agent-home/<role>/; configured cwd on
+            # /config/agent-home/<role>/; configured cwd on
             # Config stays as an override for legacy tests.
             agent_home = (
                 self.config.cwd
-                or f"/addon_configs/casa-agent/agent-home/{self.config.role}"
+                or f"/config/agent-home/{self.config.role}"
             )
 
             # SDK resume / save-before-overwrite (spec §3.3/§4.2) — runs BEFORE
@@ -487,8 +487,8 @@ class Agent:
             # Binding layer — SDK does NOT auto-consume enabledPlugins; we
             # build the `plugins=[...]` list from `claude plugin list --json`.
             sdk_plugins = build_sdk_plugins(
-                home="/addon_configs/casa-agent/cc-home",
-                shared_cache="/addon_configs/casa-agent/cc-home/.claude/plugins",
+                home="/config/cc-home",
+                shared_cache="/config/cc-home/.claude/plugins",
                 seed="/opt/claude-seed",
                 role=self.config.role,
             )

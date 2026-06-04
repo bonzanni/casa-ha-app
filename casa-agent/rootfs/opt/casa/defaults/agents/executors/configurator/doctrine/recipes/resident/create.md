@@ -14,7 +14,7 @@ Confirm explicitly. Wait for "yes, do that" before proceeding.
 
 ## Files to create
 
-Under /addon_configs/casa-agent/agents/<role>/:
+Under /config/agents/<role>/:
 
 1. character.yaml
 2. runtime.yaml

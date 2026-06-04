@@ -15,7 +15,7 @@ Before creating anything, confirm these (ask in the topic):
 
 ## Files to create
 
-Under /addon_configs/casa-agent/agents/specialists/<role>/:
+Under /config/agents/specialists/<role>/:
 
 1. character.yaml
 2. runtime.yaml

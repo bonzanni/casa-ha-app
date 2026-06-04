@@ -112,7 +112,7 @@ class SessionSweeper:
         self._webhook_ttl = timedelta(days=webhook_session_ttl_days)
         self._interval_s = sweep_interval_hours * 3600.0
         self._now = now or (lambda: datetime.now(timezone.utc))
-        self._dir_for = directory_for or (lambda role: f"/addon_configs/casa-agent/agent-home/{role}")
+        self._dir_for = directory_for or (lambda role: f"/config/agent-home/{role}")
         self._task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------

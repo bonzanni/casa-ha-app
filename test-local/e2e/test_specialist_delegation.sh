@@ -42,8 +42,8 @@ wait_healthy "$NAME"
 # finance/ dir seeded to user config via the seed_agent_dir helper.
 # MSYS_NO_PATHCONV=1 prevents Git Bash from rewriting the container-side
 # path to a Windows one.
-MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /addon_configs/casa-agent/agents/specialists/finance/runtime.yaml \
-    || fail "D-1: finance/ was not seeded to /addon_configs"
+MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /config/agents/specialists/finance/runtime.yaml \
+    || fail "D-1: finance/ was not seeded to /config"
 
 # Per-specialist disabled log line present (post-cut shape — no file=...).
 assert_log_contains "$NAME" "Specialist 'finance' bundled but disabled"
@@ -79,7 +79,7 @@ FIXTURE_HASH_BEFORE=$(_dir_hash "$TMP_D2/agents/specialists/finance")
 
 MSYS_NO_PATHCONV=1 docker run -d --rm --name "$NAME" \
     -p "${HOST_PORT}:8080" \
-    -v "${TMP_D2}:/addon_configs/casa-agent" \
+    -v "${TMP_D2}:/config" \
     "$IMAGE" >/dev/null
 wait_healthy "$NAME"
 
@@ -165,9 +165,9 @@ MSYS_NO_PATHCONV=1 docker run -d --rm --name "$NAME" \
 wait_healthy "$NAME"
 
 # Both dirs seeded to user config (the seed_agent_dir ran for each).
-MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /addon_configs/casa-agent/agents/specialists/finance/runtime.yaml \
+MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /config/agents/specialists/finance/runtime.yaml \
     || fail "D-3: finance/ was not seeded"
-MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /addon_configs/casa-agent/agents/specialists/health/runtime.yaml \
+MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /config/agents/specialists/health/runtime.yaml \
     || fail "D-3: health/ was not seeded"
 
 # Per-specialist disabled log line for health (post-cut shape — no file=...).

@@ -2,9 +2,9 @@
 
 ## Directory layout
 
-Everything you edit lives under `/addon_configs/casa-agent/`:
+Everything you edit lives under `/config/`:
 
-    /addon_configs/casa-agent/
+    /config/
     agents/
       <resident-role>/               # flat - tier 1 (e.g. assistant, butler)
         character.yaml
@@ -38,7 +38,7 @@ Everything you edit lives under `/addon_configs/casa-agent/`:
     schema/
       *.v1.json                    # READ-ONLY - editing breaks loaders
 
-Read-only to you (hook-blocked): `/data/**` (runtime state), `/addon_configs/casa-agent/schema/**`, `/opt/casa/**`.
+Read-only to you (hook-blocked): `/data/**` (runtime state), `/config/schema/**`, `/opt/casa/**`.
 
 ## Tier taxonomy
 
@@ -151,14 +151,14 @@ Casa uses Claude Code's native plugin machinery via a two-marketplace model.
   Contains: superpowers, plugin-dev, skill-creator, mcp-server-dev, document-skills.
   Configurator MUST NOT mutate this marketplace.
 - **`casa-plugins`** — user-writable. Catalog at
-  `/addon_configs/casa-agent/marketplace/.claude-plugin/marketplace.json`.
+  `/config/marketplace/.claude-plugin/marketplace.json`.
   Configurator mutates via `marketplace_ops` helpers (add/remove/update).
 
 ### Plugin cache
 
 - Seed cache: `/opt/claude-seed/cache/casa-plugins-defaults/<plugin>/<version>/`
   (read-only, baked into image).
-- User cache: `/addon_configs/casa-agent/cc-home/.claude/plugins/cache/casa-plugins/<plugin>/<version>/`
+- User cache: `/config/cc-home/.claude/plugins/cache/casa-plugins/<plugin>/<version>/`
   (managed by `claude plugin install --scope user`).
 
 ### Binding layer
@@ -171,7 +171,7 @@ Casa uses Claude Code's native plugin machinery via a two-marketplace model.
 ### Per-agent enablement
 
 Each in_casa agent has a project-scope settings.json at
-`/addon_configs/casa-agent/agent-home/<role>/.claude/settings.json` with:
+`/config/agent-home/<role>/.claude/settings.json` with:
 
 ```json
 {"enabledPlugins": {"<plugin>@<marketplace>": true}}
@@ -190,7 +190,7 @@ is rendered per engagement via `drivers.workspace.render_workspace_template`.
 
 ### Plugin environment variables
 
-`/addon_configs/casa-agent/plugin-env.conf` — POSIX `VAR=value` lines,
+`/config/plugin-env.conf` — POSIX `VAR=value` lines,
 mode 0600, managed by Configurator via `set_plugin_env_reference` MCP tool.
 Values accept `op://vault/item/field` references; resolved at boot by
 `secrets_resolver.resolve`. Sourced into the addon process env before
@@ -205,12 +205,12 @@ Plugins may declare `casa.systemRequirements` in their marketplace entry:
 - `{type: npm, package, verify_bin}` — `npm install --prefix` + .bin symlink.
 - `{type: apt}` — **REJECTED at marketplace-add time** (§4.3.2 / P-10).
 
-Install into `/addon_configs/casa-agent/tools/` with symlinks in `tools/bin/`
+Install into `/config/tools/` with symlinks in `tools/bin/`
 (on `PATH` via `/run/s6/container_environment/PATH`).
 
 ### Manifest + reconciler
 
-`/addon_configs/casa-agent/system-requirements.yaml` records
+`/config/system-requirements.yaml` records
 `{name, winning_strategy, install_dir, verify_bin, pin_sha256?, pin_version?, declared_at}`
 for every installed requirement. `setup-configs.sh` invokes
 `scripts/reconcile_system_requirements.py` at each boot to check

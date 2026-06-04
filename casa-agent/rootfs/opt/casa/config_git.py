@@ -1,4 +1,4 @@
-"""Git-backed history for ``/addon_configs/casa-agent/``.
+"""Git-backed history for ``/config/``.
 
 Local-only repo: no remote, no push. The builder agent in Spec Y uses
 ``commit_config`` on every write and ``restore_file`` to roll back.

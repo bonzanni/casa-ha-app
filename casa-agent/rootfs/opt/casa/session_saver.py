@@ -152,7 +152,7 @@ async def reset_channel(
     if entry is None:
         return
     role = entry.get("agent", "assistant")
-    directory = f"/addon_configs/casa-agent/agent-home/{role}"
+    directory = f"/config/agent-home/{role}"
     user_peer = user_peer_for_channel(channel)
     # save_session is idempotent and removes the entry on a successful retain;
     # remove() afterwards guarantees the pointer is cleared even when the save

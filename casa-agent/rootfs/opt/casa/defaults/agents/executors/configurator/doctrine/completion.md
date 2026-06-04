@@ -33,7 +33,7 @@ the new runtime.
         artifacts=[
             {
                 "kind": "commit",
-                "repo": "/addon_configs/casa-agent",
+                "repo": "/config",
                 "sha": "<from config_git_commit>",
                 "files_changed": ["agents/specialists/fitness/character.yaml", ...],
             },

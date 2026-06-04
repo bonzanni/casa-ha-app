@@ -1,11 +1,11 @@
-"""Read/write /addon_configs/casa-agent/system-requirements.yaml (P-7 schema)."""
+"""Read/write /config/system-requirements.yaml (P-7 schema)."""
 from __future__ import annotations
 
 from pathlib import Path
 
 import yaml
 
-MANIFEST_PATH: Path = Path("/addon_configs/casa-agent/system-requirements.yaml")
+MANIFEST_PATH: Path = Path("/config/system-requirements.yaml")
 
 
 def read_manifest() -> dict:

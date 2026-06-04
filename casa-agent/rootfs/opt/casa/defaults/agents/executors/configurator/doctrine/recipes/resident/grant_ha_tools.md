@@ -15,7 +15,7 @@ Without these, `http://supervisor/core/api/mcp` returns 404 and tool calls fail 
 
 ## Step 1 — Server-level grant in `runtime.yaml`
 
-Edit `/addon_configs/casa-agent/agents/<role>/runtime.yaml`:
+Edit `/config/agents/<role>/runtime.yaml`:
 
 ```yaml
 tools:

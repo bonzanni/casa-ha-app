@@ -3,7 +3,7 @@
 export BASHIO_LOG_NO_COLORS=true
 export NO_COLOR=1
 
-CONFIG_DIR="/addon_configs/casa-agent"
+CONFIG_DIR="/config"
 DATA_DIR="/data"
 DEFAULTS_DIR="/opt/casa/defaults"
 
@@ -27,7 +27,7 @@ mkdir -p "$CONFIG_DIR/agents" \
 
 seed_agent_dir() {
     local src="$1"   # e.g. /opt/casa/defaults/agents/butler
-    local dst="$2"   # e.g. /addon_configs/casa-agent/agents/butler
+    local dst="$2"   # e.g. /config/agents/butler
     if [ -d "$src" ] && [ ! -d "$dst" ]; then
         cp -r "$src" "$dst"
         bashio::log.info "Seeded agent dir: $(basename "$dst")"
@@ -70,7 +70,7 @@ fi
 
 # Pre-1.0.0 doctrine (see memory/feedback_ship_gate_doctrine.md): no
 # migration blocks in this script. Breaking changes just update the
-# defaults; the overlay at /addon_configs/casa-agent/ is expected to
+# defaults; the overlay at /config/ is expected to
 # be wiped across updates in development mode. This keeps
 # setup-configs.sh lean. Revisit when v1.0.0 ships.
 #
@@ -137,7 +137,7 @@ fi
 # The seed_agent_dir() helper above is no-op when the destination dir
 # already exists — meaning every default-side change shipped via
 # /opt/casa/defaults/ since the last operator wipe is silently dark on
-# this addon's persistent /addon_configs/casa-agent/ overlay. Master
+# this addon's persistent /config/ overlay. Master
 # CI runs against fresh volumes and never exercises the upgrade-over-
 # existing-overlay path, so this drift is invisible to all gates.
 #
@@ -211,7 +211,7 @@ unset drift_count missing_count DRIFT_TMP _default_root _live_root _line
 
 # Seed schemas (overwrite on every boot — schemas ship with the Casa
 # image and the image is the source of truth; hand-edits under
-# /addon_configs/casa-agent/schema/ get clobbered by design).
+# /config/schema/ get clobbered by design).
 if [ -d "$DEFAULTS_DIR/schema" ]; then
     cp "$DEFAULTS_DIR/schema"/*.json "$CONFIG_DIR/schema/" 2>/dev/null || true
     bashio::log.info "Refreshed schema files"
@@ -294,15 +294,15 @@ fi
 # --- Plan 4b: plugin consumer infrastructure bootstrap ----------------------
 
 # Seed the user-writable marketplace overlay (idempotent — only if absent).
-if [ ! -f /addon_configs/casa-agent/marketplace/.claude-plugin/marketplace.json ]; then
-    mkdir -p /addon_configs/casa-agent/marketplace/.claude-plugin
+if [ ! -f /config/marketplace/.claude-plugin/marketplace.json ]; then
+    mkdir -p /config/marketplace/.claude-plugin
     cp /opt/casa/defaults/marketplace-user/.claude-plugin/marketplace.json \
-       /addon_configs/casa-agent/marketplace/.claude-plugin/marketplace.json
-    bashio::log.info "Seeded user marketplace at /addon_configs/casa-agent/marketplace/"
+       /config/marketplace/.claude-plugin/marketplace.json
+    bashio::log.info "Seeded user marketplace at /config/marketplace/"
 fi
 
 # Ensure casa-main's HOME is cc-home (required by binding layer + CC CLI).
-export HOME=/addon_configs/casa-agent/cc-home
+export HOME=/config/cc-home
 mkdir -p "$HOME/.claude"
 
 # Trigger seed-marketplace auto-register into cc-home's in-memory view.
@@ -317,10 +317,10 @@ ANTHROPIC_API_KEY=sk-ant-bootstrap-noop \
 #   Required so `<name>@casa-plugins-defaults` install refs in defaults/agents/**/plugins.yaml
 #   resolve. Without this, the install loop below silently fails for every default plugin
 #   (CC CLI: 'Plugin "<name>" not found in marketplace "casa-plugins-defaults"').
-# - casa-plugins: user-writable overlay at /addon_configs/casa-agent/marketplace/.
+# - casa-plugins: user-writable overlay at /config/marketplace/.
 claude plugin marketplace add /opt/casa/defaults/marketplace-defaults/ \
   --scope user 2>/dev/null || true
-claude plugin marketplace add /addon_configs/casa-agent/marketplace/ \
+claude plugin marketplace add /config/marketplace/ \
   --scope user 2>/dev/null || true
 
 # For every plugin referenced by defaults/agents/**/plugins.yaml,
@@ -328,7 +328,7 @@ claude plugin marketplace add /addon_configs/casa-agent/marketplace/ \
 # (used by the binding layer in /opt/casa/plugins_binding.py) sees it.
 # An advisory flock serializes against any concurrent Configurator
 # install_casa_plugin calls (spike §Key learning 5).
-INSTALL_LOCK=/addon_configs/casa-agent/cc-home/.claude/plugins/.install.lock
+INSTALL_LOCK=/config/cc-home/.claude/plugins/.install.lock
 mkdir -p "$(dirname "$INSTALL_LOCK")"
 
 # === github-token: begin ========================================
@@ -419,9 +419,9 @@ unset CC_OAUTH
 # of cc-home's, breaking plugin install. Configurator papered
 # over it by improvising a `claude plugin marketplace add` Bash
 # call mid-engagement — see bug-review-2026-05-13-exploration4.md::H-1.
-printf '%s' "/addon_configs/casa-agent/cc-home" \
+printf '%s' "/config/cc-home" \
     > /run/s6/container_environment/HOME
-bashio::log.info "HOME propagated to s6 services: /addon_configs/casa-agent/cc-home"
+bashio::log.info "HOME propagated to s6 services: /config/cc-home"
 # === claude-home-propagation: end ===============================
 
 # === seed-copy: begin ===========================================
@@ -437,7 +437,7 @@ bashio::log.info "HOME propagated to s6 services: /addon_configs/casa-agent/cc-h
 # in a future image, fall back to full copy + installPath rewrite per
 # spec §4 option (b).
 SEED_DIR="${SEED_DIR:-/opt/claude-seed}"
-CC_HOME="${CC_HOME:-/addon_configs/casa-agent/cc-home}"
+CC_HOME="${CC_HOME:-/config/cc-home}"
 CC_PLUGINS_DIR="$CC_HOME/.claude/plugins"
 
 # _sc_log: portable wrapper — uses bashio in production, printf in test envs.
@@ -493,7 +493,7 @@ fi
 # s6-supervised service (casa-main, svc-casa-mcp, engagements). Writing to
 # /run/s6/container_environment/PATH is how s6-overlay propagates env to
 # children; /etc/profile.d/* is NOT sourced by non-interactive services.
-TOOLS_ROOT=/addon_configs/casa-agent/tools
+TOOLS_ROOT=/config/tools
 TOOLS_BIN="$TOOLS_ROOT/bin"
 mkdir -p "$TOOLS_BIN"
 
@@ -511,8 +511,8 @@ rm -f /etc/profile.d/casa-tools.sh
 # Reconciler runs the declared install strategy for every plugin tool that is
 # missing after upgrade (persistent volume survives, but failures / user-wipes
 # happen). Non-blocking — degrades affected plugins, never crashes boot.
-MANIFEST=/addon_configs/casa-agent/system-requirements.yaml
-STATUS_FILE=/addon_configs/casa-agent/system-requirements.status.yaml
+MANIFEST=/config/system-requirements.yaml
+STATUS_FILE=/config/system-requirements.status.yaml
 if [ -f "$MANIFEST" ]; then
     python3 /opt/casa/scripts/reconcile_system_requirements.py \
         --manifest "$MANIFEST" \

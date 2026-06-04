@@ -5,13 +5,13 @@ Hooks run BEFORE your tool call. If a hook denies, you'll see a message starting
 ## Fully blocked (no override)
 
 - Write/Edit anywhere under /data/** - runtime state; touching it corrupts memory.
-- Write/Edit under /addon_configs/casa-agent/schema/** - authoritative code; breaks load path.
+- Write/Edit under /config/schema/** - authoritative code; breaks load path.
 - Write/Edit under /opt/casa/** - addon source tree.
 - rm -rf, shutdown, reboot, dd if=, curl with POST/data, ssh, scp in Bash.
 
 ## Destructive-adjacent (ask the user first)
 
-- rm -rf /addon_configs/casa-agent/agents/<resident> - removing a resident. Hook denies by default.
+- rm -rf /config/agents/<resident> - removing a resident. Hook denies by default.
 - Any change to policies/scopes.yaml - classifier is trained on this corpus. Show the user the diff before committing.
 - Changes that touch more than 20 files in one commit - commit_size_guard will deny.
 

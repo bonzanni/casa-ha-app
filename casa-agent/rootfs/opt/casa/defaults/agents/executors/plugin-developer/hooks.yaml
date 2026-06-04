@@ -7,7 +7,7 @@ pre_tool_use:
     readable:
       - /data/engagements/
       - /opt/claude-seed
-      - /addon_configs/casa-agent/cc-home/.claude/plugins/cache
+      - /config/cc-home/.claude/plugins/cache
   - policy: commit_size_guard
     max_files: 50
   - policy: self_containment_guard

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boot-time reconciliation of /addon_configs/casa-agent/tools/ (§4.3.4)."""
+"""Boot-time reconciliation of /config/tools/ (§4.3.4)."""
 from __future__ import annotations
 
 import argparse

@@ -1,6 +1,6 @@
 """User-marketplace mutations (Plan 4b §3 + §7.1).
 
-All operations target `/addon_configs/casa-agent/marketplace/.claude-plugin/marketplace.json`.
+All operations target `/config/marketplace/.claude-plugin/marketplace.json`.
 The seed-managed `casa-plugins-defaults` marketplace is OUT OF BOUNDS
 here by design — CC enforces read-only, Configurator tools never call this
 module against it.
@@ -14,7 +14,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 USER_MARKETPLACE_PATH: Path = Path(
-    "/addon_configs/casa-agent/marketplace/.claude-plugin/marketplace.json"
+    "/config/marketplace/.claude-plugin/marketplace.json"
 )
 
 

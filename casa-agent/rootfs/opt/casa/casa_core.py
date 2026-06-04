@@ -40,7 +40,7 @@ from trigger_registry import TriggerRegistry
 
 logger = logging.getLogger(__name__)
 
-CONFIG_DIR = "/addon_configs/casa-agent"
+CONFIG_DIR = "/config"
 DATA_DIR = "/data"
 
 
@@ -894,7 +894,7 @@ async def main() -> None:
         there instead and the reaper/save would look in the wrong dir; keep
         ``config.cwd`` empty for residents. (Formula also duplicated in
         session_sweeper/session_saver/agent.py — consolidate in a cleanup.)"""
-        return f"/addon_configs/casa-agent/agent-home/{role}"
+        return f"/config/agent-home/{role}"
 
     # 3. Message bus
     bus = MessageBus()
@@ -1018,7 +1018,7 @@ async def main() -> None:
         policy_lib=policy_lib,
         config_dir=CONFIG_DIR,
         agents_dir=agents_dir,
-        home_root="/addon_configs/casa-agent/agent-home",
+        home_root="/config/agent-home",
         defaults_root="/opt/casa",
     )
     init_tools(
@@ -1045,7 +1045,7 @@ async def main() -> None:
     provision_all_homes(
         role_configs=role_configs,
         specialist_configs=specialist_configs,
-        home_root=Path("/addon_configs/casa-agent/agent-home"),
+        home_root=Path("/config/agent-home"),
         defaults_root=Path("/opt/casa"),
     )
 
