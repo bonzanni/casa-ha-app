@@ -35,7 +35,6 @@ import sdk_logging
 from mcp_registry import McpServerRegistry
 from channel_trust import channel_trust_display, user_peer_for_channel
 from timekeeping import resolve_tz
-from memory import MemoryProvider
 from hindsight_ids import bank_id
 from sensitivity import clearance_for_channel, readable_tiers
 from session_saver import freshness_window, retain_cold_session, save_session
@@ -168,7 +167,6 @@ class Agent:
     def __init__(
         self,
         config: AgentConfig,
-        memory: MemoryProvider,
         session_registry: SessionRegistry,
         mcp_registry: McpServerRegistry,
         channel_manager: ChannelManager,
@@ -176,7 +174,6 @@ class Agent:
         semantic_memory: SemanticMemory | None = None,
     ) -> None:
         self.config = config
-        self._memory = memory
         self._semantic_memory: SemanticMemory = semantic_memory or NoOpSemanticMemory()
         self._session_registry = session_registry
         self._mcp_registry = mcp_registry

@@ -1183,19 +1183,9 @@ async def main() -> None:
     agents: dict[str, Agent] = {}
     loop_tasks: list[asyncio.Task] = []
 
-    sqlite_warning_emitted = [False]
-
     for role, cfg in role_configs.items():
-        agent_memory = _wrap_memory_for_strategy(
-            base_memory,
-            role=role,
-            strategy=cfg.memory.read_strategy,
-            sqlite_warning_emitted=sqlite_warning_emitted,
-        )
-
         agent = Agent(
             config=cfg,
-            memory=agent_memory,
             semantic_memory=semantic_memory,
             session_registry=session_registry,
             mcp_registry=mcp_registry,

@@ -13,7 +13,6 @@ from bus import BusMessage, MessageType
 from channels import ChannelManager
 from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
 from mcp_registry import McpServerRegistry
-from memory import MemoryProvider
 from semantic_memory import SemanticMemory
 from session_registry import SessionRegistry
 
@@ -50,48 +49,6 @@ def _mk_result(sid: str, usage: dict[str, int] | None = None) -> _SDKResultMessa
     if usage is not None:
         m.usage = usage  # type: ignore[attr-defined]
     return m
-
-
-class FakeMemory(MemoryProvider):
-    def __init__(self, context: str = "", overlay: str = "") -> None:
-        self.context = context
-        self.overlay = overlay
-        self.ensure: list[tuple] = []
-        self.get: list[tuple] = []
-        self.add: list[tuple] = []
-        self.cross: list[tuple] = []
-        self.overlay_calls: list[tuple] = []
-
-    async def ensure_session(self, session_id, agent_role, user_peer="nicola"):
-        self.ensure.append((session_id, agent_role, user_peer))
-
-    async def get_context(
-        self, session_id, tokens, search_query=None, agent_role=None,
-    ):
-        self.get.append((session_id, tokens, search_query, agent_role))
-        return self.context
-
-    async def peer_overlay_context(
-        self, observer_role, user_peer, search_query, tokens,
-    ):
-        self.overlay_calls.append(
-            (observer_role, user_peer, search_query, tokens)
-        )
-        return self.overlay
-
-    async def add_turn(
-        self, session_id, agent_role, user_text, assistant_text,
-        user_peer="nicola",
-    ):
-        self.add.append(
-            (session_id, agent_role, user_text, assistant_text, user_peer)
-        )
-
-    async def cross_peer_context(
-        self, observer_role, query, tokens, user_peer="nicola",
-    ):
-        self.cross.append((observer_role, query, tokens, user_peer))
-        return ""
 
 
 class FakeSemanticMemory(SemanticMemory):
@@ -177,7 +134,6 @@ class FakeClient:
 
 
 def _make_agent(
-    memory: MemoryProvider,
     tmp_path,
     role: str = "assistant",
     semantic_memory: SemanticMemory | None = None,
@@ -195,7 +151,6 @@ def _make_agent(
     )
     return Agent(
         config=cfg,
-        memory=memory,
         session_registry=SessionRegistry(str(tmp_path / "sessions.json")),
         mcp_registry=McpServerRegistry(),
         channel_manager=ChannelManager(),
@@ -217,17 +172,14 @@ def _msg(channel: str, chat_id: str, text: str = "ping") -> BusMessage:
 async def test_session_id_is_channel_plus_role(tmp_path):
     # §4.3: the read path no longer fans out per-scope Honcho sessions; it
     # recalls once against the role's bank.
-    mem = FakeMemory()
     sem = FakeSemanticMemory(facts="recall digest")
-    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
+    agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
     # Fresh telegram session → one bank recall keyed to the shared casa bank.
     assert len(sem.recall_calls) == 1
     assert sem.recall_calls[0]["bank"] == "casa"
-    # Session-granularity save model: per-turn add_turn is retired.
-    assert mem.add == []
     entry = agent._session_registry.get("telegram-123")
     assert entry is not None
 
@@ -239,15 +191,13 @@ async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
     # overlay (blocked by clearance — voice=friends, overlay is private-only)
     # and NEVER auto-recalls (voice keeps the multi-strategy recall off the
     # first-utterance critical path).
-    mem = FakeMemory()
     sem = FakeSemanticMemory(overlay="OVERLAY")
-    agent = _make_agent(mem, tmp_path, role="butler", semantic_memory=sem)
+    agent = _make_agent(tmp_path, role="butler", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("voice", "lr", "lights on"))
 
     assert len(sem.profile_calls) == 0   # voice clearance < private → overlay blocked
     assert sem.recall_calls == []        # voice never auto-recalls
-    assert mem.add == []
     entry = agent._session_registry.get("voice-lr")
     assert entry is not None
 
@@ -257,9 +207,8 @@ async def test_telegram_channel_autorecalls_on_fresh_session(tmp_path):
     # save_session), no longer threaded through the per-turn read. The
     # read-path contract for a fresh TEXT channel is: push the overlay AND
     # auto-recall the opening utterance against the role's bank.
-    mem = FakeMemory()
     sem = FakeSemanticMemory(overlay="O", facts="F")
-    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
+    agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
@@ -278,9 +227,8 @@ async def test_fresh_text_turn_pushes_overlay_and_recalls(tmp_path):
     (profile) AND runs one query-specific recall over the readable scopes.
     Supersedes the old "1 overlay + N per-scope reads under gather" shape —
     the per-scope fan-out is gone; recall is a single tagged call."""
-    mem = FakeMemory()
     sem = FakeSemanticMemory(overlay="overlay-content", facts="recall-content")
-    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
+    agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
@@ -299,9 +247,8 @@ async def test_fresh_text_turn_pushes_overlay_and_recalls(tmp_path):
 async def test_overlay_block_present_when_overlay_non_empty(tmp_path):
     """Assembled memory_blocks contains <peer_overlay> when the profile
     overlay digest is non-empty (spec §4.3)."""
-    mem = FakeMemory()
     sem = FakeSemanticMemory(overlay="OVERLAY_TEXT")
-    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
+    agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
 
     captured: dict[str, str] = {}
 
@@ -327,9 +274,8 @@ async def test_overlay_failure_does_not_poison_recall(tmp_path, caplog):
             self.profile_calls.append(bank)
             raise RuntimeError("simulated failure")
 
-    mem = FakeMemory()
     sem = FailingProfileMemory(facts="recall-still-works")
-    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
+    agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
 
     captured: dict[str, str] = {}
 
@@ -359,8 +305,7 @@ async def test_overlay_failure_does_not_poison_recall(tmp_path, caplog):
 
 
 async def test_system_prompt_contains_channel_context(tmp_path):
-    mem = FakeMemory(context="")
-    agent = _make_agent(mem, tmp_path, role="assistant")
+    agent = _make_agent(tmp_path, role="assistant")
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
@@ -374,9 +319,8 @@ async def test_system_prompt_contains_channel_context(tmp_path):
 async def test_system_prompt_memory_context_only_when_nonempty(tmp_path):
     # §4.3: <memory_context> now wraps the single recall digest (no per-scope
     # scope= attribute). Empty recall → no block; non-empty → block + content.
-    mem = FakeMemory()
     sem = FakeSemanticMemory(facts="")
-    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
+    agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
     assert "<memory_context>" not in FakeClient.captured_options.system_prompt
@@ -385,7 +329,7 @@ async def test_system_prompt_memory_context_only_when_nonempty(tmp_path):
     # registry entry into the shared sessions.json, which would otherwise
     # resume and skip the recall under §4.3).
     sem2 = FakeSemanticMemory(facts="## Recent\n[nicola] hi")
-    agent2 = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem2)
+    agent2 = _make_agent(tmp_path, role="assistant", semantic_memory=sem2)
     with patch("agent.ClaudeSDKClient", FakeClient), \
          patch("agent._resume_decision", return_value=("new", False)):
         await agent2._process(_msg("telegram", "123", "hi"))
@@ -402,9 +346,8 @@ async def test_memory_failure_does_not_break_response(tmp_path, caplog):
         async def recall(self, *a, **kw):
             raise RuntimeError("hindsight down")
 
-    mem = FakeMemory()
     sem = BrokenSemanticMemory()
-    agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
+    agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
     with patch("agent.ClaudeSDKClient", FakeClient):
         with caplog.at_level(logging.WARNING):
             out = await agent._process(_msg("telegram", "123", "hi"))
@@ -439,8 +382,7 @@ class TestRetryIntegration:
         # Fail first attempt; succeed second.
         FakeClient.failure_schedule = [exc, None]
 
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
         with patch("agent.ClaudeSDKClient", FakeClient), \
              patch("retry.asyncio.sleep", new=AsyncMock()):
             text = await agent._process(_msg("telegram", "123", "hi"))
@@ -454,8 +396,7 @@ class TestRetryIntegration:
             RuntimeError("429 rate limit"),
             None,
         ]
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
         with patch("agent.ClaudeSDKClient", FakeClient), \
              patch("retry.asyncio.sleep", new=AsyncMock()):
             text = await agent._process(_msg("telegram", "123", "hi"))
@@ -465,8 +406,7 @@ class TestRetryIntegration:
     async def test_unknown_exception_does_not_retry(self, tmp_path):
         FakeClient.reset()
         FakeClient.failure_schedule = [ValueError("bad input")]
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
         with patch("agent.ClaudeSDKClient", FakeClient), \
              patch("retry.asyncio.sleep", new=AsyncMock()):
             with pytest.raises(ValueError):
@@ -476,8 +416,7 @@ class TestRetryIntegration:
     async def test_cancellation_propagates_without_retry(self, tmp_path):
         FakeClient.reset()
         FakeClient.failure_schedule = [asyncio.CancelledError()]
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
         with patch("agent.ClaudeSDKClient", FakeClient), \
              patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
             with pytest.raises(asyncio.CancelledError):
@@ -493,8 +432,7 @@ class TestRetryIntegration:
         exc = CLIConnectionError("upstream reset")
         FakeClient.failure_schedule = [exc, None]
 
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="butler")
+        agent = _make_agent(tmp_path, role="butler")
 
         seen_tokens: list[str] = []
         async def on_token(txt: str) -> None:
@@ -534,8 +472,7 @@ class TestAssistantMessageSeparator:
                 yield _mk_result("sdk-sid-e2", usage=FakeClient.usage)
 
         FakeClient.reset()
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
 
         seen: list[str] = []
 
@@ -599,8 +536,7 @@ class TestPhase4bDispatch:
                 rm.total_cost_usd = 0.0001  # type: ignore[attr-defined]
                 yield rm
 
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
 
         with caplog.at_level(logging.DEBUG, logger="sdk"):
             with patch("agent.ClaudeSDKClient", _RichFakeClient):
@@ -618,8 +554,7 @@ class TestPhase4bDispatch:
         carry our stderr callback so the SDK pipes the CLI subprocess
         stderr through subprocess_cli.connect()."""
         FakeClient.reset()
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
 
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("telegram", "201", "hi"))
@@ -674,8 +609,7 @@ class TestCorrelationId:
 
         FakeClient.reset()
         FakeClient.response_text = "pong"
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
 
         bus = MessageBus()
         bus.register("assistant", agent.handle_message)
@@ -727,8 +661,7 @@ class TestCorrelationId:
 
         FakeClient.reset()
         FakeClient.response_text = "pong"
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
 
         bus = MessageBus()
         bus.register("assistant", agent.handle_message)
@@ -800,8 +733,7 @@ class TestTokenBudgetMonitoring:
         facts = "x" * 8000
         # Overlay empty so the recorded block is exactly the recall context.
         sem = FakeSemanticMemory(overlay="", facts=facts)
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
+        agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
 
         observed: list[tuple[str, int, int]] = []
         original_record = agent._budget_tracker.record
@@ -818,28 +750,6 @@ class TestTokenBudgetMonitoring:
         )
         assert observed == [("telegram-123-assistant", expected, 1000)]
 
-    async def test_broken_memory_skips_recorder(self, tmp_path):
-        """When get_context raises, we proceed without memory and must
-        NOT call record (no digest to measure)."""
-        class BrokenMemory(FakeMemory):
-            async def get_context(self, *a, **kw):
-                raise RuntimeError("honcho down")
-
-        FakeClient.reset()
-        FakeClient.usage = {
-            "input_tokens": 0, "output_tokens": 0,
-            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
-        }
-        agent = _make_agent(BrokenMemory(), tmp_path, role="assistant")
-        observed: list[tuple] = []
-        agent._budget_tracker.record = lambda *a: observed.append(a)  # type: ignore[method-assign]
-
-        with patch("agent.ClaudeSDKClient", FakeClient):
-            out = await agent._process(_msg("telegram", "123", "hi"))
-
-        assert out == "pong"
-        assert observed == []
-
     async def test_three_consecutive_overruns_emit_one_warning(
         self, tmp_path, caplog,
     ):
@@ -855,9 +765,8 @@ class TestTokenBudgetMonitoring:
         # §4.3: recall (and thus the oversized memory_blocks) only fires on a
         # FRESH session, so force every turn fresh — the budget streak is keyed
         # on channel_key+role, which is stable across these five fresh turns.
-        mem = FakeMemory()
         sem = FakeSemanticMemory(facts="x" * 20000)
-        agent = _make_agent(mem, tmp_path, role="assistant", semantic_memory=sem)
+        agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
 
         caplog.set_level(_logging.WARNING, logger="tokens")
         with patch("agent.ClaudeSDKClient", FakeClient), \
@@ -886,8 +795,7 @@ class TestTokenBudgetMonitoring:
             "cache_read_input_tokens": 5021,
             "cache_creation_input_tokens": 3000,
         }
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="butler")
+        agent = _make_agent(tmp_path, role="butler")
 
         caplog.set_level(_logging.INFO, logger="agent")
         with patch("agent.ClaudeSDKClient", FakeClient):
@@ -929,8 +837,7 @@ class TestTokenBudgetMonitoring:
             CLIConnectionError("upstream reset"), None,
         ]
 
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
 
         caplog.set_level(_logging.INFO, logger="agent")
         with patch("agent.ClaudeSDKClient", FakeClient), \
@@ -957,7 +864,6 @@ class TestTokenBudgetMonitoring:
 
 
 def _make_agent_with_registry(
-    memory: MemoryProvider,
     registry: SessionRegistry,
     role: str = "butler",
 ) -> Agent:
@@ -977,7 +883,6 @@ def _make_agent_with_registry(
     )
     return Agent(
         config=cfg,
-        memory=memory,
         session_registry=registry,
         mcp_registry=McpServerRegistry(),
         channel_manager=ChannelManager(),
@@ -1002,8 +907,7 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         await reg.register("voice-probe-scope", "butler", "stale-sid-abc")
 
-        mem = FakeMemory()
-        agent = _make_agent_with_registry(mem, reg, role="butler")
+        agent = _make_agent_with_registry(reg, role="butler")
 
         with patch("agent.ClaudeSDKClient", FakeClient), \
              patch("retry.asyncio.sleep", new=AsyncMock()):
@@ -1033,8 +937,7 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         await reg.register("telegram-202", "butler", "STALE-SID-1")
 
-        mem = FakeMemory()
-        agent = _make_agent_with_registry(mem, reg, role="butler")
+        agent = _make_agent_with_registry(reg, role="butler")
 
         with caplog.at_level(logging.INFO, logger="agent"):
             with patch("agent.ClaudeSDKClient", FakeClient), \
@@ -1075,8 +978,7 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         await reg.register("voice-probe-scope", "butler", "stale-sid-abc")
 
-        mem = FakeMemory()
-        agent = _make_agent_with_registry(mem, reg, role="butler")
+        agent = _make_agent_with_registry(reg, role="butler")
 
         with patch("agent.ClaudeSDKClient", _CapturingFakeClient), \
              patch("retry.asyncio.sleep", new=AsyncMock()):
@@ -1096,8 +998,7 @@ class TestResumeResilience:
         ]
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
-        mem = FakeMemory()
-        agent = _make_agent_with_registry(mem, reg, role="butler")
+        agent = _make_agent_with_registry(reg, role="butler")
 
         with patch("agent.ClaudeSDKClient", FakeClient), \
              patch("retry.asyncio.sleep", new=AsyncMock()):
@@ -1120,8 +1021,7 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         await reg.register("voice-probe-scope", "butler", "stale-sid-xyz")
 
-        mem = FakeMemory()
-        agent = _make_agent_with_registry(mem, reg, role="butler")
+        agent = _make_agent_with_registry(reg, role="butler")
 
         with patch("agent.ClaudeSDKClient", FakeClient), \
              patch("retry.asyncio.sleep", new=AsyncMock()):
@@ -1147,8 +1047,7 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         await reg.register("voice-probe-scope", "butler", "stale-sid-xyz")
 
-        mem = FakeMemory()
-        agent = _make_agent_with_registry(mem, reg, role="butler")
+        agent = _make_agent_with_registry(reg, role="butler")
 
         caplog.set_level(_logging.WARNING, logger="agent")
         with patch("agent.ClaudeSDKClient", FakeClient), \
@@ -1190,8 +1089,7 @@ class TestOriginVar:
                 async for m in super().receive_response():
                     yield m
 
-        mem = FakeMemory()
-        a = _make_agent(mem, tmp_path, role="assistant")
+        a = _make_agent(tmp_path, role="assistant")
         msg = _msg("telegram", "777", "hello")
         with patch("agent.ClaudeSDKClient", CapturingClient):
             await a._process(msg)
@@ -1223,8 +1121,7 @@ class TestOriginVar:
                 async for m in super().receive_response():
                     yield m
 
-        mem = FakeMemory()
-        a = _make_agent(mem, tmp_path, role="butler")
+        a = _make_agent(tmp_path, role="butler")
         msg = _msg("voice", "living-room", "lights on")
         with patch("agent.ClaudeSDKClient", SpawningClient):
             await a._process(msg)
@@ -1292,8 +1189,7 @@ class TestScheduledSilence:
         """Spec §3.2 B.1: SCHEDULED must NOT receive a streaming
         callback. The Telegram channel sends the first token as a new
         chat message; suppressing on_token is the load-bearing fix."""
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
         stub = _StubChannel()
         agent._channel_manager.register(stub)
 
@@ -1306,8 +1202,7 @@ class TestScheduledSilence:
 
     async def test_request_still_streams(self, tmp_path):
         """Spec §3.2 B.1 non-goal: streaming for REQUEST is unchanged."""
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
         stub = _StubChannel()
         agent._channel_manager.register(stub)
 
@@ -1322,8 +1217,7 @@ class TestScheduledSilence:
         """Spec §3.2 B.2: text == '<silent/>' (after strip) must
         suppress channel.send / finalize_stream and produce no
         BusMessage downstream."""
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
         stub = _StubChannel()
         agent._channel_manager.register(stub)
 
@@ -1339,8 +1233,7 @@ class TestScheduledSilence:
     async def test_whitespace_suppresses_send(self, tmp_path):
         """Spec §3.2 B.2: empty / whitespace-only text suppresses
         delivery the same way as the explicit sentinel."""
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
         stub = _StubChannel()
         agent._channel_manager.register(stub)
 
@@ -1356,8 +1249,7 @@ class TestScheduledSilence:
     async def test_real_text_passes_through(self, tmp_path):
         """Spec §3.2 B.2: any non-sentinel, non-empty text reaches the
         channel and emits a RESPONSE BusMessage with the same body."""
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
         stub = _StubChannel()
         agent._channel_manager.register(stub)
 
@@ -1387,8 +1279,7 @@ class TestScheduledSilence:
         `dcc3c30b` 2026-05-01) leaked the literal sentinel into a user
         DM. Lifting the SCHEDULED-only gate generalizes the noop
         contract."""
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
         stub = _StubChannel()
         agent._channel_manager.register(stub)
 
@@ -1405,8 +1296,7 @@ class TestScheduledSilence:
         """G-3 (v0.33.0): whitespace-only accumulated text on a
         USER-driven REQUEST turn must also suppress delivery, matching
         the SCHEDULED behavior."""
-        mem = FakeMemory()
-        agent = _make_agent(mem, tmp_path, role="assistant")
+        agent = _make_agent(tmp_path, role="assistant")
         stub = _StubChannel()
         agent._channel_manager.register(stub)
 
@@ -1485,8 +1375,7 @@ class TestSaveBeforeOverwrite:
             "last_active": stale_ts,
         }
 
-        mem = FakeMemory()
-        agent = _make_agent_with_registry(mem, reg, role="assistant")
+        agent = _make_agent_with_registry(reg, role="assistant")
 
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("telegram", "123", "hi"))
@@ -1537,8 +1426,7 @@ class TestSaveBeforeOverwrite:
             "last_active": fresh_ts,
         }
 
-        mem = FakeMemory()
-        agent = _make_agent_with_registry(mem, reg, role="assistant")
+        agent = _make_agent_with_registry(reg, role="assistant")
 
         with patch("agent.ClaudeSDKClient", FakeClient):
             await agent._process(_msg("telegram", "456", "hi"))
@@ -1575,8 +1463,7 @@ class TestSaveBeforeOverwrite:
         }
 
         fake = FakeSemanticMemory(overlay="should-not-appear", facts="should-not-appear")
-        mem = FakeMemory()
-        agent = _make_agent_with_registry(mem, reg, role="assistant")
+        agent = _make_agent_with_registry(reg, role="assistant")
         # Replace the NoOp semantic memory with our tracking fake.
         agent._semantic_memory = fake
 
@@ -1591,3 +1478,8 @@ class TestSaveBeforeOverwrite:
             "recall() must not be called on a resumed session (no auto-recall "
             f"on resume path); got: {fake.recall_calls}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Structural contract: Agent.__init__ must not accept memory param
+# ---------------------------------------------------------------------------

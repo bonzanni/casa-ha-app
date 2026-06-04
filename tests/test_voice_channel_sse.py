@@ -159,7 +159,6 @@ async def agent_error_voice_app(tmp_path):
 
     agent = Agent(
         config=cfg,
-        memory=_DummyMemory(),
         session_registry=SessionRegistry(str(tmp_path / "sessions.json")),
         mcp_registry=McpServerRegistry(),
         channel_manager=channel_manager,

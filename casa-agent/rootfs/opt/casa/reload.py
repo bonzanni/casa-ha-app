@@ -272,9 +272,7 @@ register_handler("triggers", reload_triggers)
 def _construct_agent(*, cfg, runtime):
     """Factory wrapper so tests can monkeypatch construction.
 
-    Mirrors the per-role Agent construction in casa_core.main:
-    wraps base_memory by strategy (shared logic exists at
-    casa_core._wrap_memory_for_strategy — keep using that for parity).
+    Mirrors the per-role Agent construction in casa_core.main.
 
     G-2 v0.37.7: idempotently provision the agent-home for ``cfg.role``
     BEFORE constructing the Agent. The Agent's cwd resolves to
@@ -301,16 +299,8 @@ def _construct_agent(*, cfg, runtime):
         )
 
     from agent import Agent
-    from casa_core import _wrap_memory_for_strategy
-    sqlite_warning_emitted = [False]
-    agent_memory = _wrap_memory_for_strategy(
-        runtime.base_memory,
-        role=cfg.role,
-        strategy=cfg.memory.read_strategy,
-        sqlite_warning_emitted=sqlite_warning_emitted,
-    )
     return Agent(
-        config=cfg, memory=agent_memory,
+        config=cfg,
         session_registry=runtime.session_registry,
         mcp_registry=runtime.mcp_registry,
         channel_manager=runtime.channel_manager,

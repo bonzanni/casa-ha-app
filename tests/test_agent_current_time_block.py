@@ -107,8 +107,6 @@ class TestAgentProcessInjects:
         from channels import ChannelManager
         from mcp_registry import McpServerRegistry
         from session_registry import SessionRegistry
-        from memory import NoOpMemory
-
         cfg = AgentConfig(
             role="assistant",
             model="claude-sonnet-4-6",
@@ -122,7 +120,6 @@ class TestAgentProcessInjects:
 
         agent = agent_mod.Agent(
             config=cfg,
-            memory=NoOpMemory(),
             session_registry=SessionRegistry(str(tmp_path / "sessions.json")),
             mcp_registry=McpServerRegistry(),
             channel_manager=ChannelManager(),
