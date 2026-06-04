@@ -23,7 +23,6 @@ if TYPE_CHECKING:
     from engagement_registry import EngagementRegistry
     from executor_registry import ExecutorRegistry
     from mcp_registry import McpServerRegistry
-    from memory import MemoryProvider
     from policies import PolicyLibrary
     from session_registry import SessionRegistry
     from specialist_registry import SpecialistRegistry
@@ -62,11 +61,9 @@ class CasaRuntime:
     bus: "MessageBus"
     engagement_driver: Any  # InCasaDriver — avoid import cycle
     claude_code_driver: Any  # ClaudeCodeDriver — avoid import cycle
-    memory_provider: "MemoryProvider"
 
-    # Policy + base memory (boot-fixed)
+    # Policy (boot-fixed)
     policy_lib: "PolicyLibrary"
-    base_memory: "MemoryProvider"
 
     # Paths (boot-fixed)
     config_dir: str

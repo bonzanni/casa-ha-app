@@ -20,8 +20,8 @@ def _make_runtime():
         mcp_registry=MagicMock(),
         session_registry=MagicMock(), channel_manager=MagicMock(),
         bus=MagicMock(), engagement_driver=MagicMock(),
-        claude_code_driver=MagicMock(), memory_provider=MagicMock(),
-        policy_lib=MagicMock(), base_memory=MagicMock(),
+        claude_code_driver=MagicMock(),
+        policy_lib=MagicMock(),
         config_dir="/x", agents_dir="/x/agents",
         home_root="/x/home", defaults_root="/opt/casa",
     )
@@ -351,12 +351,8 @@ class TestReloadAgent:
             lambda *a, **kw: MagicMock(),
         )
         # Let `_construct_agent` run for real (so provision_agent_home
-        # fires). Stub the Agent class + memory wrapper used inside.
+        # fires). Stub the Agent class used inside.
         monkeypatch.setattr("agent.Agent", lambda **kw: MagicMock())
-        monkeypatch.setattr(
-            "casa_core._wrap_memory_for_strategy",
-            lambda *a, **kw: MagicMock(),
-        )
 
         runtime = _make_runtime()
         runtime.config_dir = str(tmp_path)

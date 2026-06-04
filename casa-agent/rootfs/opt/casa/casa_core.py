@@ -8,7 +8,6 @@ import hmac
 import logging
 import os
 import signal
-import sqlite3
 import sys
 import uuid
 from pathlib import Path
@@ -31,13 +30,6 @@ from freshness_reaper import FreshnessReaper
 from log_cid import install_logging, new_cid
 from casa_core_middleware import cid_middleware, CasaAccessLogger
 from mcp_registry import McpServerRegistry
-from memory import (
-    CachedMemoryProvider,
-    HonchoMemoryProvider,
-    MemoryProvider,
-    NoOpMemory,
-    SqliteMemoryProvider,
-)
 from semantic_memory import SemanticMemory
 from policies import load_policies
 from session_registry import SessionRegistry
@@ -772,66 +764,12 @@ def build_invoke_message(
 # Memory backend selection (spec 2.2b §2)
 # ------------------------------------------------------------------
 
-_VALID_MEMORY_BACKENDS = ("honcho", "sqlite", "noop", "hindsight")
-
-
 from dataclasses import dataclass as _dataclass
 
 
 @_dataclass
-class _MemoryChoice:
-    """Declarative memory-backend pick. ``main()`` turns this into a
-    concrete ``MemoryProvider`` instance."""
-    backend: str                       # honcho | sqlite | noop
-    db_path: str = "/data/memory.sqlite"
-    honcho_api_key: str = ""
-    honcho_api_url: str = "https://api.honcho.dev"
-
-
-def resolve_memory_backend_choice(env: dict[str, str]) -> _MemoryChoice:
-    """Resolve ``MEMORY_BACKEND`` + keys into a backend choice.
-
-    Order:
-      1. Explicit ``MEMORY_BACKEND`` wins. ``honcho`` without
-         ``HONCHO_API_KEY`` raises. Invalid values raise. ``hindsight`` is
-         valid: the LEGACY read path is then NoOp (long-term memory is handled
-         by SemanticMemory/Hindsight via ``resolve_semantic_memory_choice``).
-      2. Else ``HONCHO_API_KEY`` → ``honcho``.
-      3. Else ``sqlite`` (fresh-install default).
-    """
-    backend = env.get("MEMORY_BACKEND", "").strip().lower()
-    api_key = env.get("HONCHO_API_KEY", "")
-    api_url = env.get("HONCHO_API_URL", "https://api.honcho.dev")
-    db_path = env.get("MEMORY_DB_PATH", "/data/memory.sqlite")
-
-    if backend:
-        if backend not in _VALID_MEMORY_BACKENDS:
-            raise ValueError(
-                f"Invalid MEMORY_BACKEND={backend!r}; "
-                f"must be one of {_VALID_MEMORY_BACKENDS}"
-            )
-        if backend == "honcho" and not api_key:
-            raise ValueError(
-                "MEMORY_BACKEND=honcho requires HONCHO_API_KEY to be set"
-            )
-        return _MemoryChoice(
-            backend=backend, db_path=db_path,
-            honcho_api_key=api_key, honcho_api_url=api_url,
-        )
-
-    if api_key:
-        return _MemoryChoice(
-            backend="honcho", db_path=db_path,
-            honcho_api_key=api_key, honcho_api_url=api_url,
-        )
-
-    return _MemoryChoice(backend="sqlite", db_path=db_path)
-
-
-@_dataclass
 class _SemanticMemoryChoice:
-    """Long-term (SemanticMemory) backend pick — separate from the legacy
-    MemoryProvider _MemoryChoice during migration (spec §5)."""
+    """Long-term (SemanticMemory) backend pick: hindsight | noop."""
     backend: str            # hindsight | noop
     base_url: str = ""
 
@@ -849,6 +787,8 @@ def resolve_semantic_memory_choice(env: dict[str, str]) -> _SemanticMemoryChoice
                 "(Hindsight is reached via its hassio alias/IP, not 'hindsight')"
             )
         return _SemanticMemoryChoice(backend="hindsight", base_url=base_url)
+    if backend and backend != "noop":
+        logger.warning("MEMORY_BACKEND=%r unrecognized; using noop", backend)
     return _SemanticMemoryChoice(backend="noop")
 
 
@@ -860,33 +800,6 @@ def build_semantic_memory(choice: _SemanticMemoryChoice) -> "SemanticMemory":
         return HindsightSemanticMemory(base_url=choice.base_url)
     logger.info("Semantic memory: NoOp (long-term disabled)")
     return NoOpSemanticMemory()
-
-
-def _wrap_memory_for_strategy(
-    backend: MemoryProvider,
-    role: str,
-    strategy: str,
-    sqlite_warning_emitted: list[bool],
-) -> MemoryProvider:
-    """Apply the per-agent ``read_strategy`` to *backend*.
-
-    ``sqlite_warning_emitted`` is a one-element mutable flag used to
-    emit the "SQLite backend — caching not applied" line at most once
-    per process start (spec §2).
-    """
-    if strategy == "cached":
-        if isinstance(backend, SqliteMemoryProvider):
-            if not sqlite_warning_emitted[0]:
-                logger.info(
-                    "SQLite backend — caching not applied "
-                    "(native reads are <1 ms)"
-                )
-                sqlite_warning_emitted[0] = True
-            return backend
-        return CachedMemoryProvider(backend)
-
-    # per_turn
-    return backend
 
 
 # ------------------------------------------------------------------
@@ -939,7 +852,6 @@ async def main() -> None:
     from secrets_resolver import resolve as _resolve_secret
     _PASSWORD_ENV_VARS = (
         "CLAUDE_CODE_OAUTH_TOKEN",
-        "HONCHO_API_KEY",
         "TELEGRAM_BOT_TOKEN",
         "WEBHOOK_SECRET",
     )
@@ -970,41 +882,8 @@ async def main() -> None:
                 _var, _exc,
             )
 
-    # 2. Memory
-    base_memory: MemoryProvider
-    mem_choice = resolve_memory_backend_choice(dict(os.environ))
-    if mem_choice.backend == "honcho":
-        base_memory = HonchoMemoryProvider(
-            api_url=mem_choice.honcho_api_url,
-            api_key=mem_choice.honcho_api_key,
-        )
-        logger.info("Honcho v3 memory provider initialized")
-    elif mem_choice.backend == "sqlite":
-        try:
-            base_memory = SqliteMemoryProvider(mem_choice.db_path)
-            logger.info(
-                "SQLite memory provider initialized (path=%s)", mem_choice.db_path,
-            )
-        except (sqlite3.OperationalError, OSError) as exc:
-            logger.error(
-                "SQLite memory init failed (path=%s): %s — degrading to no-op",
-                mem_choice.db_path, exc,
-            )
-            base_memory = NoOpMemory()
-    elif mem_choice.backend == "hindsight":
-        # MEMORY_BACKEND=hindsight: long-term memory is served by Hindsight via
-        # the SemanticMemory seam (built below); the LEGACY read path has no
-        # backend, so base_memory is NoOp (cold legacy reads) until the load
-        # plan migrates reads onto SemanticMemory. Writes (the reaper's retain)
-        # are active now (spec §4.2, C4 Option A).
-        base_memory = NoOpMemory()
-        logger.info("MEMORY_BACKEND=hindsight: legacy read path is NoOp; long-term via Hindsight (save active)")
-    else:  # noop
-        base_memory = NoOpMemory()
-        logger.info("MEMORY_BACKEND=noop; using no-op memory")
-
-    # Long-term semantic memory (spec §5/§4.2). Coexists with base_memory (the
-    # legacy read path) until the load plan migrates reads off MemoryProvider.
+    # 2. Long-term semantic memory (spec §5/§4.2): the only memory path —
+    # Hindsight or noop (resolve_semantic_memory_choice).
     semantic_memory = build_semantic_memory(resolve_semantic_memory_choice(dict(os.environ)))
 
     def _agent_home_dir(role: str) -> str:
@@ -1136,9 +1015,7 @@ async def main() -> None:
         bus=bus,
         engagement_driver=None,               # set after step 10 InCasaDriver build
         claude_code_driver=None,              # set after step 10b ClaudeCodeDriver build
-        memory_provider=base_memory,
         policy_lib=policy_lib,
-        base_memory=base_memory,
         config_dir=CONFIG_DIR,
         agents_dir=agents_dir,
         home_root="/addon_configs/casa-agent/agent-home",
@@ -1318,7 +1195,6 @@ async def main() -> None:
     # can find it without circular imports.
     import agent as agent_mod
     agent_mod.active_engagement_driver = engagement_driver
-    agent_mod.active_memory_provider = base_memory    # already constructed above
     agent_mod.active_semantic_memory = semantic_memory   # resident long-term (Hindsight seam)
     agent_mod.active_executor_registry = executor_registry
     runtime.engagement_driver = engagement_driver
@@ -1576,15 +1452,12 @@ async def main() -> None:
             system_rows += _row("Public URL", public_url, "on")
         else:
             system_rows += _row("Public URL", "not set", "off")
-        mem_type = {
-            "honcho": "Honcho",
-            "sqlite": "SQLite",
-            "noop": "none",
-            "hindsight": "Hindsight",
-        }.get(mem_choice.backend, mem_choice.backend)
-        system_rows += _row(
-            "Memory", mem_type, "on" if mem_choice.backend != "noop" else "off",
-        )
+        try:
+            _sem_backend = resolve_semantic_memory_choice(dict(os.environ)).backend
+        except Exception:  # noqa: BLE001 — dashboard must never crash on a memory misconfig
+            _sem_backend = "noop"
+        mem_type = {"hindsight": "Hindsight", "noop": "none"}.get(_sem_backend, _sem_backend)
+        system_rows += _row("Memory", mem_type, "on" if _sem_backend != "noop" else "off")
         system_rows += _row("Webhook auth", "enabled" if webhook_secret else "disabled",
                             "on" if webhook_secret else "off")
         total_triggers = sum(len(cfg.triggers) for cfg in role_configs.values())

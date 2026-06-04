@@ -54,7 +54,6 @@ logger = logging.getLogger(__name__)
 # Module-level driver/provider/registry references written by casa_core.main
 # so tool handlers can reach them without circular imports.
 active_engagement_driver = None   # InCasaDriver | None, set by casa_core.main
-active_memory_provider = None     # MemoryProvider | None, set by casa_core.main
 active_executor_registry = None   # ExecutorRegistry | None, set by casa_core.main
 active_claude_code_driver = None  # ClaudeCodeDriver | None, set by casa_core.main
 active_runtime = None             # CasaRuntime | None, set by casa_core.main (Task C.3)
