@@ -83,18 +83,15 @@ class TestWSTurn:
                     break
             assert "block" in got
             assert got[-1] == "done"
-            # Prewarm fired at least once.
-            assert memory.profile.await_count >= 1
+            # profile() must NOT be called on voice turns — overlay is not
+            # pushed at 'friends' clearance; the overlay prewarm was removed.
+            assert memory.profile.await_count == 0
 
-    async def test_stt_start_dedup(self, ws_app):
+    async def test_stt_start_ensures_session(self, ws_app):
+        """stt_start ensures a VoiceSession is created in the pool; sending
+        it twice is idempotent (same session, no duplicate tasks).  The
+        obsolete overlay prewarm has been removed — no profile() is called."""
         client, _, memory, channel = ws_app
-
-        # Make prewarm block so the first task is still live when the second
-        # stt_start arrives (otherwise the first may finish between frames).
-        profile_block = asyncio.Event()
-        async def slow_profile(*a, **k):
-            await profile_block.wait()
-        memory.profile = slow_profile
 
         async with client.ws_connect("/api/converse/ws") as ws:
             await ws.send_json({"type": "stt_start", "scope_id": "s"})
@@ -102,9 +99,10 @@ class TestWSTurn:
             await asyncio.sleep(0.05)
             sess = channel.pool.get("s")
             assert sess is not None
-            assert sess.prewarm_task is not None
-            # Release so the ws handler can close cleanly.
-            profile_block.set()
+            # No prewarm task — schedule_prewarm is no longer called.
+            assert sess.prewarm_task is None
+            # No profile() call — overlay not used for voice.
+            assert memory.profile.await_count == 0
 
     async def test_cancel_stops_in_flight(self, ws_app):
         client, bus, _, channel = ws_app

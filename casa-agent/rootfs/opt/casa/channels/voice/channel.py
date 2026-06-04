@@ -317,9 +317,8 @@ class VoiceChannel(Channel):
 
             if t == "stt_start":
                 scope_id = frame.get("scope_id") or "anon"
-                self.pool.schedule_prewarm(
-                    scope_id, lambda s=scope_id: self._prewarm(s),
-                )
+                # register scope for idle-sweep/dedup; no memory prewarm (overlay unused at voice's friends clearance)
+                self.pool.ensure(scope_id)
                 continue
 
             if t == "stage":
@@ -440,17 +439,6 @@ class VoiceChannel(Channel):
                 "kind": _classify_error(exc).value,
                 "spoken": adapter.render(line) if line else "",
             })
-
-    async def _prewarm(self, scope_id: str) -> None:
-        cfg = self._agent_configs.get(self.default_agent)
-        if cfg is None:
-            return
-        from hindsight_ids import bank_id
-        try:
-            await self._memory.profile(bank_id("casa", self.default_agent))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Voice prewarm (profile) failed for %s: %s", scope_id, exc)
-
 
 async def _write_sse(response: web.StreamResponse, event: str, data: dict) -> None:
     payload = (
