@@ -2,8 +2,8 @@
 
 Symmetric with :mod:`session_registry` and :mod:`mcp_registry`.
 Scans a directory for per-specialist YAML files, validates the Tier 2
-shape (no channels, zero token budget, ephemeral session, no
-scopes_owned), honours the new ``enabled: bool`` field, and exposes a
+shape (no channels, zero token budget, ephemeral session), honours the
+new ``enabled: bool`` field, and exposes a
 runtime lookup used by the ``delegate_to_agent`` framework tool.
 
 Also holds the in-flight delegation table (in-memory + ``/data/
@@ -149,12 +149,6 @@ class SpecialistRegistry:
             logger.error(
                 "Rejecting specialist %r: session.strategy must be 'ephemeral' "
                 "(got %r).", role, cfg.session.strategy,
-            )
-            return False
-        if cfg.memory.scopes_owned:
-            logger.error(
-                "Rejecting specialist %r: memory.scopes_owned must be empty "
-                "(specialists own no scope).", role,
             )
             return False
         return True

@@ -38,7 +38,7 @@ Claude Code's view stays in sync. Returns `{added: bool, entry?, error?}`.
 `casa_system_requirements` mirrors the plugin's `plugin.json::casa.systemRequirements`
 block. Without it, `install_casa_plugin`'s Stage 2 is a no-op for the
 plugin — fine for plugins that ship pure markdown/skills, required
-for plugins that need binaries (NPM packages, Python venvs, fastembed
+for plugins that need binaries (NPM packages, Python venvs, model
 weights, etc.).
 
 ## Update the pin

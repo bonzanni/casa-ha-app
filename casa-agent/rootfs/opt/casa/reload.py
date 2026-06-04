@@ -272,9 +272,7 @@ register_handler("triggers", reload_triggers)
 def _construct_agent(*, cfg, runtime):
     """Factory wrapper so tests can monkeypatch construction.
 
-    Mirrors the per-role Agent construction in casa_core.main:
-    wraps base_memory by strategy (shared logic exists at
-    casa_core._wrap_memory_for_strategy — keep using that for parity).
+    Mirrors the per-role Agent construction in casa_core.main.
 
     G-2 v0.37.7: idempotently provision the agent-home for ``cfg.role``
     BEFORE constructing the Agent. The Agent's cwd resolves to
@@ -301,20 +299,11 @@ def _construct_agent(*, cfg, runtime):
         )
 
     from agent import Agent
-    from casa_core import _wrap_memory_for_strategy
-    sqlite_warning_emitted = [False]
-    agent_memory = _wrap_memory_for_strategy(
-        runtime.base_memory,
-        role=cfg.role,
-        strategy=cfg.memory.read_strategy,
-        sqlite_warning_emitted=sqlite_warning_emitted,
-    )
     return Agent(
-        config=cfg, memory=agent_memory,
+        config=cfg,
         session_registry=runtime.session_registry,
         mcp_registry=runtime.mcp_registry,
         channel_manager=runtime.channel_manager,
-        scope_registry=runtime.scope_registry,
         agent_registry=runtime.agent_registry,
     )
 
@@ -456,8 +445,8 @@ async def _reload_role_after_policies(runtime: Any, role: str) -> None:
 
 
 async def reload_policies(runtime: Any, *, role: str | None = None) -> list[str]:
-    """Reload policies/disclosure.yaml + policies/scopes.yaml; cascade
-    to per-role AgentConfig rebuild so agents pick up the new policy_lib.
+    """Reload policies/disclosure.yaml; cascade to per-role AgentConfig
+    rebuild so agents pick up the new policy_lib.
     """
     base = runtime.config_dir
     actions: list[str] = []
@@ -471,26 +460,9 @@ async def reload_policies(runtime: Any, *, role: str | None = None) -> list[str]
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("load_error", f"policies: {exc}") from exc
 
-    import scope_registry as sr_mod
-    scopes_path = os.path.join(base, "policies", "scopes.yaml")
-    try:
-        new_scope_lib = await asyncio.to_thread(
-            sr_mod.load_scope_library, scopes_path,
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise ReloadError("load_error", f"scopes: {exc}") from exc
-
-    threshold = float(os.environ.get("CASA_SCOPE_THRESHOLD", "0.35"))
-    new_scope_registry = sr_mod.ScopeRegistry(new_scope_lib, threshold=threshold)
-    try:
-        await new_scope_registry.prepare()
-    except Exception as exc:  # noqa: BLE001
-        raise ReloadError("embed_error", f"scope embedding: {exc}") from exc
-
     # Stage swaps in locals; commit to runtime atomically.
     runtime.policy_lib = new_policy_lib
-    runtime.scope_registry = new_scope_registry
-    actions += ["reload_policy_lib", "rebuild_scope_registry"]
+    actions += ["reload_policy_lib"]
 
     # Cascade: re-load each role's Agent so new policy_lib propagates.
     role_list = list(runtime.role_configs.keys()) + list(

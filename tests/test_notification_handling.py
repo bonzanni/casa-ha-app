@@ -13,48 +13,10 @@ from channels import ChannelManager
 from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
 from specialist_registry import DelegationComplete
 from mcp_registry import McpServerRegistry
-from memory import MemoryProvider
 from session_registry import SessionRegistry
 
 pytestmark = pytest.mark.asyncio
 
-
-def _mk_scope_registry_stub():
-    from unittest.mock import Mock
-    reg = Mock()
-    reg.filter_readable.return_value = ["personal"]
-    reg.score.return_value = {"personal": 1.0}
-    reg.active_from_scores.return_value = ["personal"]
-    reg.argmax_scope.return_value = "personal"
-    reg.cache_stats.return_value = (0, 1)
-    return reg
-
-
-class FakeMemory(MemoryProvider):
-    def __init__(self, context: str = "") -> None:
-        self.context = context
-        self.add: list[tuple] = []
-
-    async def ensure_session(self, session_id, agent_role, user_peer="nicola"):
-        pass
-
-    async def get_context(
-        self, session_id, tokens, search_query=None, agent_role=None,
-    ):
-        return self.context
-
-    async def peer_overlay_context(
-        self, observer_role, user_peer, search_query, tokens,
-    ):
-        return ""
-
-    async def add_turn(self, session_id, agent_role, user_text,
-                       assistant_text, user_peer="nicola"):
-        self.add.append((session_id, user_text, assistant_text))
-
-    async def cross_peer_context(self, observer_role, query, tokens,
-                                 user_peer="nicola"):
-        return ""
 
 
 class _FakeClient:
@@ -117,11 +79,10 @@ def _make_agent(tmp_path, role="assistant") -> Agent:
         memory=MemoryConfig(token_budget=1000),
     )
     return Agent(
-        config=cfg, memory=FakeMemory(),
+        config=cfg,
         session_registry=SessionRegistry(str(tmp_path / "sess.json")),
         mcp_registry=McpServerRegistry(),
         channel_manager=ChannelManager(),
-        scope_registry=_mk_scope_registry_stub(),
     )
 
 

@@ -5,32 +5,60 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any
+
+_SESSION_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_SESSION_KEY_MAX = 100  # mirrors the server-side max_length from the former upstream dependency
+
+
+def _build_key(*parts: str) -> str:
+    """Join ``parts`` with ``-`` into a resource-name-safe key.
+
+    Each part must be a non-empty ``str`` matching ``[A-Za-z0-9_-]+``; the
+    joined result must be ≤ 100 chars. Raises ``ValueError`` otherwise.
+    Silent sanitization is intentionally NOT supported (a ``:`` or any other
+    out-of-charset char fails fast). Replaces the former upstream session-id
+    builder dependency; output format is unchanged.
+    """
+    if not parts:
+        raise ValueError("_build_key requires at least one part")
+    for i, part in enumerate(parts):
+        if not isinstance(part, str):
+            raise ValueError(f"part {i} must be str, got {type(part).__name__}")
+        if not part:
+            raise ValueError(f"part {i} is empty")
+        if not _SESSION_KEY_RE.fullmatch(part):
+            raise ValueError(
+                f"part {i}={part!r} contains characters outside [A-Za-z0-9_-]"
+            )
+    joined = "-".join(parts)
+    if len(joined) > _SESSION_KEY_MAX:
+        raise ValueError(f"session key {joined!r} is {len(joined)} chars; max {_SESSION_KEY_MAX}")
+    return joined
 
 
 def build_session_key(channel: str, scope_id: str | int | None) -> str:
     """Build a canonical channel key of the form ``{channel}-{scope_id}``.
 
     Used internally by :class:`SessionRegistry` (JSON-on-disk dict
-    keyed by this string) AND as the channel-key prefix for Honcho
-    session ids (see :func:`honcho_ids.honcho_session_id`).
+    keyed by this string) AND as the channel-key prefix for session ids
+    (see :func:`_build_key`).
 
     ``scope_id`` may be ``int`` (Telegram ``chat_id``) or ``str``
     (voice ``scope_id``); coerced to ``str``. ``None`` or falsy values
     map to ``"default"``.
 
     Raises ``ValueError`` when ``channel`` is empty or when either
-    part contains characters outside ``[A-Za-z0-9_-]`` (Honcho's
-    server-side resource-name regex). The pre-fix ``:`` separator is
-    forbidden in inputs to prevent silent regression to invalid ids.
+    part contains characters outside ``[A-Za-z0-9_-]``. The ``:``
+    separator is forbidden in inputs to prevent silent regression to
+    invalid ids.
     """
-    from honcho_ids import honcho_session_id
-
     if not channel:
         raise ValueError("channel is required")
     sid = scope_id if scope_id else "default"
-    return honcho_session_id(channel, str(sid))
+    return _build_key(channel, str(sid))
 
 
 class SessionRegistry:
@@ -58,10 +86,8 @@ class SessionRegistry:
     ) -> None:
         """Register (or overwrite) a session entry and persist.
 
-        The Honcho session ID is *not* tracked here in the v0.17.1
-        topology: it is derived at call time as
-        ``honcho_session_id(channel_key, scope, role)`` (see
-        ``honcho_ids.honcho_session_id``).
+        The session ID is *not* tracked here in the v0.17.1
+        topology: it is derived at call time via :func:`_build_key`.
         """
         async with self._lock:
             self._data[channel_key] = {

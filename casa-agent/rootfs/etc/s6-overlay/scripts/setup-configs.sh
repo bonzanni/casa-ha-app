@@ -68,13 +68,6 @@ if [ ! -f "$CONFIG_DIR/policies/disclosure.yaml" ] \
     bashio::log.info "Seeded policies/disclosure.yaml"
 fi
 
-if [ ! -f "$CONFIG_DIR/policies/scopes.yaml" ] \
-   && [ -f "$DEFAULTS_DIR/policies/scopes.yaml" ]; then
-    cp "$DEFAULTS_DIR/policies/scopes.yaml" \
-       "$CONFIG_DIR/policies/scopes.yaml"
-    bashio::log.info "Seeded policies/scopes.yaml"
-fi
-
 # Pre-1.0.0 doctrine (see memory/feedback_ship_gate_doctrine.md): no
 # migration blocks in this script. Breaking changes just update the
 # defaults; the overlay at /addon_configs/casa-agent/ is expected to
@@ -296,20 +289,6 @@ if bashio::config.true 'webhook_auth_enabled'; then
     bashio::log.info "Webhook authentication enabled."
 else
     rm -f "$SECRET_FILE"
-fi
-
-# ------------------------------------------------------------------
-# 3.2: opportunistic embedding-model pre-warm (non-fatal if offline).
-# ------------------------------------------------------------------
-
-if [ ! -d "$DATA_DIR/fastembed" ]; then
-    mkdir -p "$DATA_DIR/fastembed"
-    bashio::log.info "Priming fastembed cache at $DATA_DIR/fastembed (first boot)"
-    FASTEMBED_CACHE_PATH="$DATA_DIR/fastembed" python3 -c "
-from fastembed import TextEmbedding
-TextEmbedding(model_name='intfloat/multilingual-e5-large')
-print('fastembed model cached')
-" 2>&1 || bashio::log.warning "fastembed pre-warm failed; ScopeRegistry will retry at Python init or degrade"
 fi
 
 # --- Plan 4b: plugin consumer infrastructure bootstrap ----------------------

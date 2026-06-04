@@ -1,7 +1,6 @@
 """Channel trust attribution for Casa agents.
 
-`channel_trust()` returns the CANONICAL trust token used by
-scope_registry for the (trust × scope.minimum_trust) filter.
+`channel_trust()` returns the CANONICAL trust token for a channel.
 `channel_trust_display()` returns the human-readable form for
 rendering inside the <channel_context> system-prompt block.
 
@@ -35,7 +34,7 @@ _CHANNEL_TRUST_DISPLAY: dict[str, str] = {
 
 
 def user_peer_for_channel(channel: str) -> str:
-    """Return the Honcho peer that owns user-text from *channel*."""
+    """Return the peer name that owns user-text from *channel*."""
     return _USER_PEER_BY_CHANNEL.get(channel, "nicola")
 
 

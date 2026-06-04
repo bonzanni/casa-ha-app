@@ -27,8 +27,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/common.sh"
 
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
-# Cold-boot fastembed download (~30-60s in CI, longer locally) means default
-# 30s is too tight. Override only if caller didn't already set BOOT_TIMEOUT.
+# Cold-boot provisioning (agent-homes, plugin seed) can exceed the default
+# 30s locally. Override only if caller didn't already set BOOT_TIMEOUT.
 export BOOT_TIMEOUT="${BOOT_TIMEOUT:-180}"
 MOCK_HA_PORT="${MOCK_HA_PORT:-8200}"
 MOCK_HA_PID=""

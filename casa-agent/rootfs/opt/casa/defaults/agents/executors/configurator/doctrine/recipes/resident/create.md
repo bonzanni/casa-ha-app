@@ -1,18 +1,16 @@
 # Recipe: create a new resident
 
-RARE. Tier 1 agents are usually enough (Ellen + Tina). Adding a third rebalances scopes and channels.
+RARE. Tier 1 agents are usually enough (Ellen + Tina). Adding a third rebalances channels.
 
 ## Ask the user
 
 1. **Why?** Is a specialist the right answer instead?
 2. **Role name?** Lowercase.
 3. **Channels?** telegram, voice, both? Must be configured on HA side.
-4. **Scopes owned?** This is zero-sum - ownership moves from another resident. Be explicit.
-5. **Scopes readable?** Can overlap with another resident's owned.
-6. **Session strategy?** durable (like Ellen) or ephemeral.
-7. **Token budget?**
+4. **Session strategy?** durable (like Ellen) or ephemeral.
+5. **Token budget?**
 
-Confirm the rebalance explicitly. Wait for "yes, do that" before proceeding.
+Confirm explicitly. Wait for "yes, do that" before proceeding.
 
 ## Files to create
 
@@ -27,22 +25,17 @@ Under /addon_configs/casa-agent/agents/<role>/:
 7. prompts/system.md
 8. Optional: triggers.yaml, hooks.yaml
 
-## Also update the OTHER resident
-
-Scope rebalance may require editing another resident's memory.scopes_owned/readable. Same commit.
-
 ## Reload — MANDATORY before emit_completion
 
-Adding a resident requires the runtime to re-scan `agents/`. If the
-edit also touched `policies/scopes.yaml` (scope rebalance), use `full`
-to also rebuild the scope registry. Canonical order:
+Adding a resident requires the runtime to re-scan `agents/`. Use the
+`agents` scope. Canonical order:
 
-1. config_git_commit(message="add resident <role> with scope <scope>")
-2. casa_reload(scope="full")  *(or `agents` if no policies/*.yaml edits)*
-3. emit_completion(status="ok", text="Added resident <role>; committed SHA <sha>; called casa_reload(scope='full') to register the new agent.")
+1. config_git_commit(message="add resident <role>")
+2. casa_reload(scope="agents")
+3. emit_completion(status="ok", text="Added resident <role>; committed SHA <sha>; called casa_reload(scope='agents') to register the new agent.")
 
 Skipping the reload leaves the new resident on disk but **not in the
-live channel/scope routing** — see completion.md.
+live channel routing** — see completion.md.
 
 ## Register handling for delegated turns
 
@@ -52,30 +45,3 @@ agent's `delegate_to_agent` call, the calling channel is text → answer in
 conversational text register; voice → answer in spoken register. See
 butler/prompts/system.md for the canonical paragraph; copy or adapt it
 when authoring a new resident.
-
-## Engagement-memory readability (M4, v0.16.0)
-
-If the new resident may be a target of `engage_executor` engagements
-(today: only assistant/Ellen, but a future second resident could
-acquire that capability), include `meta` in `memory.scopes_readable`:
-
-```yaml
-memory:
-  scopes_readable: [<your-topical-scopes>, meta]
-  scopes_owned:    [<your-topical-scopes>]   # NOT meta
-  default_scope:   <your-default-topical-scope>
-```
-
-`meta` is the system scope where `_finalize_engagement` writes
-engagement summaries (specialist + executor). Including it in
-`scopes_readable` makes Ellen's "what did Configurator just do?" /
-"what did Finance say?" turns answerable.
-
-DO NOT add `meta` to `scopes_owned` — meta is exclusively
-tool-written. Routing the resident's own `add_turn` to meta would
-dilute the engagement-summary signal with conversational noise.
-
-For voice-only / `household-shared`-trust residents (today: butler/
-Tina), exclude `meta` from `scopes_readable`. Even if added, the
-trust filter at `agent.py:296` would drop it (meta requires
-`authenticated`); excluding it makes the intent explicit.

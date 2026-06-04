@@ -23,9 +23,7 @@ if TYPE_CHECKING:
     from engagement_registry import EngagementRegistry
     from executor_registry import ExecutorRegistry
     from mcp_registry import McpServerRegistry
-    from memory import MemoryProvider
     from policies import PolicyLibrary
-    from scope_registry import ScopeRegistry
     from session_registry import SessionRegistry
     from specialist_registry import SpecialistRegistry
     from trigger_registry import TriggerRegistry
@@ -38,8 +36,8 @@ class CasaRuntime:
     Mutability contract:
     - ``agents`` and ``role_configs`` are MUTATED by reload handlers
       (atomic-swap of role keys).
-    - Registry attrs (``agent_registry``, ``scope_registry``,
-      ``policy_lib``) are REPLACED by reload handlers (rebind).
+    - Registry attrs (``agent_registry``, ``policy_lib``) are
+      REPLACED by reload handlers (rebind).
     - Channel/bus/driver attrs are read-only after boot.
     - Path attrs (``config_dir``, ``agents_dir``, ``home_root``,
       ``defaults_root``) are read-only after boot.
@@ -56,7 +54,6 @@ class CasaRuntime:
     agent_registry: "AgentRegistry"
     trigger_registry: "TriggerRegistry"
     mcp_registry: "McpServerRegistry"
-    scope_registry: "ScopeRegistry"
     session_registry: "SessionRegistry"
 
     # Channels + bus + drivers (boot-fixed)
@@ -64,11 +61,9 @@ class CasaRuntime:
     bus: "MessageBus"
     engagement_driver: Any  # InCasaDriver — avoid import cycle
     claude_code_driver: Any  # ClaudeCodeDriver — avoid import cycle
-    memory_provider: "MemoryProvider"
 
-    # Policy + base memory (boot-fixed)
+    # Policy (boot-fixed)
     policy_lib: "PolicyLibrary"
-    base_memory: "MemoryProvider"
 
     # Paths (boot-fixed)
     config_dir: str

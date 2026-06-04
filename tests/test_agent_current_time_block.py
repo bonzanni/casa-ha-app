@@ -74,7 +74,7 @@ class TestAgentProcessInjects:
     """Integration-style test: hit Agent._process via the production path."""
 
     @pytest.mark.asyncio
-    async def test_process_emits_block_via_live_path(self, monkeypatch, tmp_path):
+    async def test_process_emits_block_via_live_path(self, tmp_path):
         from unittest.mock import MagicMock, patch
 
         import agent as agent_mod
@@ -107,9 +107,6 @@ class TestAgentProcessInjects:
         from channels import ChannelManager
         from mcp_registry import McpServerRegistry
         from session_registry import SessionRegistry
-        from memory import NoOpMemory
-        from scope_registry import ScopeRegistry, ScopeLibrary
-
         cfg = AgentConfig(
             role="assistant",
             model="claude-sonnet-4-6",
@@ -118,28 +115,14 @@ class TestAgentProcessInjects:
             tools=ToolsConfig(allowed=[]),
             memory=MemoryConfig(
                 token_budget=0,
-                scopes_readable=["personal"],
-                scopes_owned=["personal"],
-                default_scope="personal",
             ),
         )
-        scope_lib = ScopeLibrary(scopes={})
-        scope_reg = ScopeRegistry(scope_lib, threshold=0.35)
-        monkeypatch.setattr(scope_reg, "filter_readable", lambda r, t: r)
-        monkeypatch.setattr(scope_reg, "score", lambda q, s: [])
-        monkeypatch.setattr(scope_reg, "active_from_scores",
-                            lambda sc, d: [d] if d else [])
-        # M4: agent._process now partitions readable into system/topical
-        # via scope_registry.kind(); empty ScopeLibrary would raise.
-        monkeypatch.setattr(scope_reg, "kind", lambda s: "topical")
 
         agent = agent_mod.Agent(
             config=cfg,
-            memory=NoOpMemory(),
             session_registry=SessionRegistry(str(tmp_path / "sessions.json")),
             mcp_registry=McpServerRegistry(),
             channel_manager=ChannelManager(),
-            scope_registry=scope_reg,
         )
 
         with patch("agent.ClaudeSDKClient", _FakeClient):

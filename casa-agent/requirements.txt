@@ -10,13 +10,11 @@
 # {} / _deny(...), never None (hooks.py:187-192). So this bump neither fixes
 # nor regresses G-1; Casa is immune on both 0.1.72 and 0.2.87.
 claude-agent-sdk==0.2.87
-honcho-ai==2.1.1
 python-telegram-bot==22.7
 aiohttp==3.13.5
 apscheduler==3.11.2
 pyyaml==6.0.3
 jsonschema==4.23.0
-fastembed>=0.4,<0.5
 opentelemetry-api>=1.20.0
 # E-12 (v0.37.0): Channels MCP capability — used by casa_engagement_channel.
 # Build-time probe (docs/superpowers/specs/2026-05-12-e12-claude_code-channels-A6-findings.md

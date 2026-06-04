@@ -622,53 +622,6 @@ class TestValidateConfigRepo:
         assert "BOGUS_POLICY_KEY" in errors[0]
         assert "schema violation" in errors[0]
 
-    def test_valid_policies_scopes_passes(self, tmp_path):
-        """policies/scopes.yaml binds to policy-scopes.v2 (note: v2, not
-        v1) — the gate must load the right schema version."""
-        from agent_loader import validate_config_repo
-
-        repo = tmp_path / "addon_configs" / "casa-agent"
-        _seed_resident(repo / "agents", "assistant")
-        _w(repo / "policies" / "scopes.yaml", """\
-            schema_version: 2
-            scopes:
-              finance:
-                minimum_trust: authenticated
-                kind: topical
-                description: Money matters, invoices, balances, payments.
-              household:
-                minimum_trust: household-shared
-                kind: topical
-                description: Shared family logistics, schedules, groceries.
-        """)
-
-        errors = validate_config_repo(str(repo))
-        assert errors == [], (
-            f"valid policies/scopes.yaml must pass; got {errors}"
-        )
-
-    def test_invalid_policies_scopes_caught(self, tmp_path):
-        """policies/scopes.yaml with an invalid ``minimum_trust`` enum
-        value fails policy-scopes.v2 and is surfaced by the gate."""
-        from agent_loader import validate_config_repo
-
-        repo = tmp_path / "addon_configs" / "casa-agent"
-        _seed_resident(repo / "agents", "assistant")
-        _w(repo / "policies" / "scopes.yaml", """\
-            schema_version: 2
-            scopes:
-              finance:
-                minimum_trust: NOT_A_REAL_TRUST_LEVEL
-                kind: topical
-                description: Money matters, invoices, balances, payments.
-        """)
-
-        errors = validate_config_repo(str(repo))
-        assert len(errors) == 1
-        assert "scopes.yaml" in errors[0]
-        assert "NOT_A_REAL_TRUST_LEVEL" in errors[0]
-        assert "schema violation" in errors[0]
-
     def test_top_level_unknown_key_in_character_caught(self, tmp_path):
         """Exact repro of the v0.30.0 / v0.29.0 P4.2 'TRAIT:' incident."""
         from agent_loader import validate_config_repo

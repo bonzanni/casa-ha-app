@@ -10,7 +10,7 @@ addon. For changes that genuinely need a process restart, use
 |---|---|---|---|---|
 | `agent` | `casa_reload(scope='agent', role=...)` | <1s | yes | character/runtime/delegates/disclosure/voice/hooks/response_shape edits for ONE role; plugin install/uninstall on ONE role |
 | `triggers` | `casa_reload_triggers(role=...)` | <1s | yes | triggers.yaml edits for an EXISTING agent (legacy alias for `casa_reload(scope='triggers', role=...)`) |
-| `policies` | `casa_reload(scope='policies')` | <1s | no | `policies/disclosure.yaml` or `policies/scopes.yaml` edits |
+| `policies` | `casa_reload(scope='policies')` | <1s | no | `policies/disclosure.yaml` edits |
 | `plugin_env` | `casa_reload(scope='plugin_env')` | <1s | no | `set_plugin_env_reference` calls / `plugin-env.conf` edits |
 | `agents` | `casa_reload(scope='agents')` | <1s | no | created or deleted ANY resident or specialist directory under `agents/` |
 | `executors` | `casa_reload(scope='executors')` | <1s | no | executor `definition.yaml` edits; create/delete an executor; flip `enabled` / `permission_mode` / `tools.allowed` on an executor |
@@ -34,7 +34,6 @@ changes, addon options.json mutations, or kernel concerns.
 | Edit disclosure.yaml | `agent` for that role |
 | Edit voice.yaml | `agent` for that role |
 | Edit hooks.yaml | `agent` for that role |
-| Edit policies/scopes.yaml | `policies` |
 | Edit policies/disclosure.yaml | `policies` |
 | Edit an executor's `definition.yaml` | `executors` |
 | Create or delete an executor | `executors` |

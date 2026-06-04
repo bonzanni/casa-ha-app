@@ -1,6 +1,6 @@
 # Recipe: create a new specialist
 
-A Specialist is a Tier 2 agent, role-keyed (e.g. finance, fitness). Residents invoke specialists via delegate_to_agent. Specialists are ephemeral - no persistent session, no scopes_owned.
+A Specialist is a Tier 2 agent, role-keyed (e.g. finance, fitness). Residents invoke specialists via delegate_to_agent. Specialists are ephemeral - no persistent session.
 
 ## Ask the user
 
@@ -53,9 +53,6 @@ Optional: hooks.yaml.
     memory:
       token_budget: 0
       read_strategy: per_turn
-      scopes_owned: []
-      scopes_readable: []
-      default_scope: ""
     session:
       strategy: ephemeral
       idle_timeout: 0
@@ -65,7 +62,7 @@ Optional: hooks.yaml.
     channels: []
     cwd: ""
 
-**CRITICAL** for specialists: memory.token_budget 0, memory.scopes_owned [], session.strategy ephemeral, channels []. Loader REJECTS specialists violating these.
+**CRITICAL** for specialists: session.strategy ephemeral, channels []. Loader REJECTS specialists violating these.
 
 ### prompts/system.md
 
@@ -119,29 +116,23 @@ cannot delegate to it until the next reload. See completion.md.
 - Including channels: [telegram] - loader rejects.
 - Copying a resident's disclosure.yaml - loader rejects.
 
-## Memory-bearing specialist (M4b, v0.17.0)
+## Memory-bearing specialist
 
-Specialists are per-`(role, user_peer)` Honcho peers — channel-agnostic
-and scope-agnostic. To opt a specialist into memory, set
-`memory.token_budget > 0` in `runtime.yaml`:
+To opt a specialist into memory, set `memory.token_budget > 0` in
+`runtime.yaml`:
 
 ```yaml
 memory:
-  token_budget: 4000        # 0 = stateless (legacy); >0 enables Honcho memory
+  token_budget: 4000        # 0 = stateless; >0 enables shared-bank recall/retain
   read_strategy: per_turn   # cached not yet supported for specialists
-  scopes_owned: []          # MUST stay empty — specialists don't partition by scope
-  scopes_readable: []       # MUST stay empty — specialists don't partition by scope
 ```
 
-The session id is `f"{role}-{user_peer}"` (e.g. `finance-nicola`).
-Built via `honcho_ids.honcho_session_id(role, user_peer)` — direct
-f-string concatenation is forbidden because Honcho's server regex
-rejects characters outside `[A-Za-z0-9_-]`.
-
-Specialists become richer over time at their own domain reasoning;
-Honcho's `peer_representation` accumulates the specialist's
-theory-of-mind of the user across all delegate-call channels.
+Memory is automatic once `token_budget > 0`. Each `delegate_to_agent`
+call triggers a clearance-gated recall pass against the shared `casa`
+Hindsight bank; saves are tier-classified and written back to the same
+bank. There is no per-role session to manage.
 
 Trust gating happens one level up: a specialist is callable from a
 channel iff some resident on that channel has it in `delegates`.
-Once invoked, the specialist's full unified memory is in scope.
+Once invoked, the specialist reads from the shared bank at the
+engagement's inherited clearance.

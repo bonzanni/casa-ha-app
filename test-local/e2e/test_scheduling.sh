@@ -5,8 +5,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=common.sh
 . "$HERE/common.sh"
 
-# fastembed loads a ~300 MB ONNX model on first boot; CI runners with fast
-# network load it in ~20s but local Docker-Desktop may need longer.
+# Cold-boot provisioning can run longer on local Docker-Desktop than on CI.
 # Extend the healthz timeout beyond the default 30s so we don't race.
 BOOT_TIMEOUT=90
 

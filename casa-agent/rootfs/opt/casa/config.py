@@ -73,9 +73,6 @@ _VALID_READ_STRATEGIES = ("per_turn", "cached")
 class MemoryConfig:
     token_budget: int = 4000
     read_strategy: str = "per_turn"
-    scopes_owned: list[str] = field(default_factory=list)
-    scopes_readable: list[str] = field(default_factory=list)
-    default_scope: str = ""
     cross_peer_token_budget: int = 2000   # M6 § 6.3
 
 
@@ -205,7 +202,7 @@ class ExecutorDefinition:
     """Tier 3 Executor type definition.
 
     Materially different shape from AgentConfig: no session, no
-    scopes_owned, no channels. Mirrors spec section 5.2 YAML.
+    channels. Mirrors spec section 5.2 YAML.
     """
     type: str
     description: str

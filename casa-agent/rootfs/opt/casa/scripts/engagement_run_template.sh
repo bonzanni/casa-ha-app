@@ -14,7 +14,7 @@ exec 2>&1
 # Sensitive env vars — never forwarded to the subprocess.
 # Update this list in the same commit whenever a new sensitive env var
 # lands in Dockerfile / svc-casa/run / HA options / Supervisor context.
-unset TELEGRAM_BOT_TOKEN HONCHO_API_KEY WEBHOOK_SECRET \
+unset TELEGRAM_BOT_TOKEN WEBHOOK_SECRET \
       SUPERVISOR_TOKEN HASSIO_TOKEN \
       {EXTRA_UNSET}
 

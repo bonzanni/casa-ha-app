@@ -34,7 +34,6 @@ Everything you edit lives under `/addon_configs/casa-agent/`:
           observer.yaml            # optional
           doctrine/                # your own knowledge base
     policies/
-      scopes.yaml
       disclosure.yaml
     schema/
       *.v1.json                    # READ-ONLY - editing breaks loaders
@@ -45,8 +44,8 @@ Read-only to you (hook-blocked): `/data/**` (runtime state), `/addon_configs/cas
 
 | Tier | Name | What it is | Where it lives |
 |---|---|---|---|
-| 1 | Resident | Long-lived agent owning a channel (Ellen=telegram+voice, Tina=voice). Has scopes, memory budget, delegates (to residents and specialists). | agents/<role>/ |
-| 2 | Specialist | Role-keyed helper (e.g. finance/Alex). Called by residents via delegate_to_agent. No channel, no scopes_owned, ephemeral session. | agents/specialists/<role>/ |
+| 1 | Resident | Long-lived agent owning a channel (Ellen=telegram+voice, Tina=voice). Has memory budget, delegates (to residents and specialists). | agents/<role>/ |
+| 2 | Specialist | Role-keyed helper (e.g. finance/Alex). Called by residents via delegate_to_agent. No channel, ephemeral session. | agents/specialists/<role>/ |
 | 3 | Executor | Task-bounded, ephemeral agent (e.g. you - configurator). Engaged via engage_executor. Runs in a dedicated Telegram topic. | agents/executors/<type>/ |
 
 Any resident may delegate (`delegate_to_agent`) to any other agent listed in its `delegates.yaml`. Only the assistant (Ellen) may engage executors via `executors.yaml`.
@@ -74,22 +73,13 @@ agent_loader.py enforces these rules. Adding a forbidden file or removing a requ
 
 ## Memory wiring per tier (v0.16.0 — Memory M4)
 
-Residents (Tier 1) own per-scope sessions and read summaries from the
-`meta` system scope each turn. Specialists (Tier 2) were stateless per
-delegation through v0.16.0 — *Specialist memory (M4b, v0.17.0)* below
-documents the per-`(role, user_peer)` Honcho memory opt-in. Tier 3
-Executors are ephemeral per engagement, but may opt in to a
+Residents (Tier 1) carry long-term memory and read a recall digest each
+turn (clearance-gated by the channel's trust). Specialists (Tier 2) were
+stateless per delegation through v0.16.0 — *Specialist memory (M4b,
+v0.17.0)* below documents the per-`(role, user_peer)` memory opt-in. Tier
+3 Executors are ephemeral per engagement, but may opt in to a
 per-(channel, chat, executor_type) **archive** of prior engagement
 summaries.
-
-**Scope kinds.** `policies/scopes.yaml` v2 declares each scope with
-`kind: topical | system`:
-
-- `kind: topical` — embedded by fastembed; classifier picks active scopes
-  per turn against the user utterance. `description` required.
-- `kind: system` — always-on for any agent that includes the scope in
-  `scopes_readable` and clears the trust gate. No embedding, no classifier
-  routing. `description` forbidden. Only `meta` is system today.
 
 **Executor memory opt-in.** A Tier 3 executor's `definition.yaml` may
 include:
@@ -98,41 +88,33 @@ include:
       enabled: true       # default false
       token_budget: 2000
 
-When `enabled: true`, `engage_executor` reads the archive at
-`{channel}-{chat_id}-executor-{type}` (built via `honcho_session_id`) and substitutes the digest into the
-prompt template's `{executor_memory}` slot before driver dispatch. The
-archive is populated by `_finalize_engagement` (one summary per terminal
-engagement) — no separate writer code.
+When `enabled: true`, `engage_executor` reads the archive via
+semantic recall against the shared `casa` bank at the engagement's
+clearance and substitutes the digest into the prompt template's
+`{executor_memory}` slot before driver dispatch. The archive is populated
+by `_finalize_engagement` (one summary per terminal engagement) — no
+separate writer code.
 
 For Configurator (you), `memory.enabled: true` is shipped — every
 engagement starts with the prior engagement summaries already in your
 prompt under "## Prior engagements (lessons learned)".
 
-## Specialist memory (M4b, v0.17.0)
+## Specialist memory
 
-Specialists carry **per-`(role, user_peer)` Honcho memory** —
-channel-agnostic, scope-agnostic, mixed-domain. Session id is
-`f"{role}-{user_peer}"` (2-segment, distinct from residents'
-4-segment `{channel}-{chat_id}-{scope}-{role}`). Both shapes are
-built via `honcho_session_id` to satisfy Honcho's
-`^[A-Za-z0-9_-]+$` server-side regex.
+Specialists read and write the **shared `casa` Hindsight bank** via
+clearance-gated recall and sensitivity-tier-classified retain — there
+is no per-role Honcho session and no `honcho_session_id`. Memory is
+channel-agnostic and scoped by the recall query at read time.
 
-Honcho's existing `observe_others=True`-on-agent-peer setup
-(`memory.py:185-204`) populates `peer_representation` automatically
-over time, giving each specialist a domain-narrow theory-of-mind of
-the user. `search_query` retrieval at read time is scoped to the
-specialist's own corpus — denser per token than searching a
-coordinator's mixed-domain memory.
-
-Specialists do **not** participate in scope partitioning; their
-`scopes_owned` and `scopes_readable` MUST stay empty
-(`agent_loader.py:562-573` enforces this). Specialists also do **not**
-participate in trust filtering at the memory layer — trust is one
-level up at the resident's `delegates` decision.
+Trust filtering happens one level up: a specialist is callable from a
+channel iff some resident on that channel lists it in `delegates`.
+Once invoked, the specialist's recall draws from the shared bank at
+the engagement's inherited clearance.
 
 Enabling memory on a specialist: set `memory.token_budget > 0` in
-`runtime.yaml`. Disabling: set `token_budget: 0` (back to stateless;
-prior session messages stay in Honcho but are no longer read).
+`runtime.yaml`. Each `delegate_to_agent` call then triggers a recall
+pass against the shared bank. Disabling: set `token_budget: 0` (back
+to stateless).
 
 ## MCP service topology (v0.14.0)
 
@@ -267,7 +249,7 @@ wiring plugin env vars via 1Password references.
 
 ### 1P universal resolver
 
-All password-typed addon options (`claude_oauth_token`, `honcho_api_key`,
+All password-typed addon options (`claude_oauth_token`,
 `telegram_bot_token`, `webhook_secret`, `github_token`) accept
 `op://vault/item/field` references. Resolved at boot by
 `secrets_resolver.resolve` (lru_cache, shells `op read`).

@@ -8,10 +8,7 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
-
-if TYPE_CHECKING:
-    from scope_registry import ScopeRegistry
+from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -36,9 +33,8 @@ from hooks import resolve_hooks
 from log_cid import cid_var
 import sdk_logging
 from mcp_registry import McpServerRegistry
-from channel_trust import channel_trust, channel_trust_display, user_peer_for_channel
+from channel_trust import channel_trust_display, user_peer_for_channel
 from timekeeping import resolve_tz
-from memory import MemoryProvider
 from hindsight_ids import bank_id
 from sensitivity import clearance_for_channel, readable_tiers
 from session_saver import freshness_window, retain_cold_session, save_session
@@ -58,12 +54,10 @@ logger = logging.getLogger(__name__)
 # Module-level driver/provider/registry references written by casa_core.main
 # so tool handlers can reach them without circular imports.
 active_engagement_driver = None   # InCasaDriver | None, set by casa_core.main
-active_memory_provider = None     # MemoryProvider | None, set by casa_core.main
 active_executor_registry = None   # ExecutorRegistry | None, set by casa_core.main
 active_claude_code_driver = None  # ClaudeCodeDriver | None, set by casa_core.main
 active_runtime = None             # CasaRuntime | None, set by casa_core.main (Task C.3)
 active_semantic_memory = None     # SemanticMemory | None, set by casa_core.main
-active_scope_registry = None      # ScopeRegistry | None, set by casa_core.main
 
 # Phase 3.1: delegating-turn origin. Set by Agent._process for the
 # duration of a turn so the `delegate_to_agent` tool handler can read
@@ -75,20 +69,6 @@ origin_var: ContextVar[dict | None] = ContextVar("origin_var", default=None)
 
 # Type alias for the streaming callback
 OnTokenCallback = Callable[[str], Awaitable[None]]
-
-
-def _winner_pair(scores: dict[str, float]) -> tuple[str | None, float, float]:
-    """Pick (winner, winner_score, second_score) from a scope-score dict.
-
-    Returns (None, 0.0, 0.0) when scores is empty (e.g., trust filter
-    pruned every readable scope).
-    """
-    if not scores:
-        return None, 0.0, 0.0
-    sorted_pairs = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-    winner, winner_score = sorted_pairs[0]
-    second_score = sorted_pairs[1][1] if len(sorted_pairs) > 1 else 0.0
-    return winner, float(winner_score), float(second_score)
 
 
 def _render_delegates_block(delegates, registry) -> str:
@@ -186,21 +166,17 @@ class Agent:
     def __init__(
         self,
         config: AgentConfig,
-        memory: MemoryProvider,
         session_registry: SessionRegistry,
         mcp_registry: McpServerRegistry,
         channel_manager: ChannelManager,
-        scope_registry: "ScopeRegistry",
         agent_registry=None,
         semantic_memory: SemanticMemory | None = None,
     ) -> None:
         self.config = config
-        self._memory = memory
         self._semantic_memory: SemanticMemory = semantic_memory or NoOpSemanticMemory()
         self._session_registry = session_registry
         self._mcp_registry = mcp_registry
         self._channel_manager = channel_manager
-        self._scope_registry = scope_registry
         self._agent_registry = agent_registry
         self._bg_tasks: set[asyncio.Task] = set()  # background cold-session retains
         # Per-(session_id) over-budget streak tracker (spec 5.2 §5.2).
@@ -397,39 +373,6 @@ class Agent:
             "user_text": user_text,
         })
         try:
-            scope_start_t = time.perf_counter()
-
-            # --- 3.2 scope routing: compute readable × active set ----------
-            trust_token = channel_trust(msg.channel)
-            readable = self._scope_registry.filter_readable(
-                list(self.config.memory.scopes_readable),
-                trust_token,
-            )
-            # M4: Partition. System scopes (kind: system) are always-on after
-            # the trust filter — no classifier routing, no embedding lookup.
-            # Topical scopes (kind: topical) go through the embedding score()
-            # + active_from_scores() pipeline as before.
-            system_readable = [
-                s for s in readable if self._scope_registry.kind(s) == "system"
-            ]
-            topical_readable = [
-                s for s in readable if self._scope_registry.kind(s) == "topical"
-            ]
-            scores = self._scope_registry.score(user_text, topical_readable)
-            active_topical = self._scope_registry.active_from_scores(
-                scores, self.config.memory.default_scope,
-            )
-            active = system_readable + active_topical
-            # M2.G6: argmax over topical-only scores. System scopes have no
-            # embedding (no description); they can never be the rooted
-            # write/origin scope. Argmax picks the engager's actual domain.
-            origin_var.set({
-                **(origin_var.get() or {}),
-                "scope": self._scope_registry.argmax_scope(
-                    scores, self.config.memory.default_scope,
-                ),
-            })
-
             # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at
             # /addon_configs/casa-agent/agent-home/<role>/; configured cwd on
             # Config stays as an override for legacy tests.
@@ -465,7 +408,7 @@ class Agent:
 
             # 2b. Memory context (spec §4.3) — channel-aware load on the
             # SemanticMemory seam: a cheap mental-model overlay at fresh-session
-            # start, plus (text only) one tagged recall over the readable scopes.
+            # start, plus (text only) one recall filtered by channel clearance tier.
             is_fresh = resume_session_id is None
             load_plan = _plan_load(msg.channel, is_fresh_session=is_fresh)
             bank = _memory_bank()
@@ -709,26 +652,6 @@ class Agent:
             # 8. Persist — the freshness reaper classifies each retained item at
             # its true sensitivity tier off the critical path (tier model §2.4);
             # nothing to compute or record per-turn here.
-
-            # --- 3.2 observability ----------------------------------------
-            total_ms = int((time.perf_counter() - scope_start_t) * 1000)
-            hits, misses = self._scope_registry.cache_stats()
-            winner, winner_score, second_score = _winner_pair(scores)
-            logger.info(
-                "scope_route",
-                extra={
-                    "channel": msg.channel,
-                    "role": self.config.role,
-                    "active": list(active),
-                    "winner": winner,
-                    "winner_score": winner_score,
-                    "second_score": second_score,
-                    "threshold": self._scope_registry.threshold,
-                    "t_ms": total_ms,
-                    "embed_cache_hits": hits,
-                    "embed_cache_total": hits + misses,
-                },
-            )
 
             # 9. SessionRegistry — record the SDK session id for resume + save.
             if sdk_session_id:

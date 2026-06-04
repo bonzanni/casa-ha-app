@@ -4,6 +4,8 @@ import pytest
 
 from session_registry import build_session_key
 
+pytestmark = [pytest.mark.unit]
+
 
 def test_simple_key():
     assert build_session_key("telegram", "1197017861") == "telegram-1197017861"
@@ -50,3 +52,23 @@ def test_scope_id_with_colon_rejected():
 def test_scope_id_with_whitespace_rejected():
     with pytest.raises(ValueError, match=r"outside \[A-Za-z0-9_-\]"):
         build_session_key("telegram", "with space")
+
+
+def test_build_session_key_format_unchanged():
+    assert build_session_key("telegram", "123") == "telegram-123"
+    assert build_session_key("telegram", 123) == "telegram-123"
+    assert build_session_key("voice", None) == "voice-default"
+
+
+def test_build_session_key_rejects_bad_charset():
+    with pytest.raises(ValueError):
+        build_session_key("tele:gram", "1")   # ':' is out of charset
+    with pytest.raises(ValueError):
+        build_session_key("", "1")             # empty channel
+
+
+def test_session_registry_no_honcho_ids_dependency():
+    import inspect
+    import session_registry
+    src = inspect.getsource(session_registry)
+    assert "honcho_ids" not in src and "honcho_session_id" not in src

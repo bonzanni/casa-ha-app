@@ -1,8 +1,8 @@
 """Voice session bookkeeping — pool + idle sweep + prewarm dedup.
 
 Pool is process-local. Cleared on restart. Eviction cancels any live
-prewarm task but does NOT evict the remote Honcho session (those are
-persistent).
+prewarm task but does NOT flush the shared Hindsight bank (persistent,
+channel-independent).
 """
 
 from __future__ import annotations

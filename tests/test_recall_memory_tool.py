@@ -54,7 +54,6 @@ async def test_recall_memory_empty_query_errors(monkeypatch):
     assert "error" in _text(res).lower()
 
 
-def test_agent_exposes_semantic_and_scope_handles():
+def test_agent_exposes_semantic_handle():
     import agent
     assert hasattr(agent, "active_semantic_memory")
-    assert hasattr(agent, "active_scope_registry")
