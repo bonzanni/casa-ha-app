@@ -68,13 +68,6 @@ if [ ! -f "$CONFIG_DIR/policies/disclosure.yaml" ] \
     bashio::log.info "Seeded policies/disclosure.yaml"
 fi
 
-if [ ! -f "$CONFIG_DIR/policies/scopes.yaml" ] \
-   && [ -f "$DEFAULTS_DIR/policies/scopes.yaml" ]; then
-    cp "$DEFAULTS_DIR/policies/scopes.yaml" \
-       "$CONFIG_DIR/policies/scopes.yaml"
-    bashio::log.info "Seeded policies/scopes.yaml"
-fi
-
 # Pre-1.0.0 doctrine (see memory/feedback_ship_gate_doctrine.md): no
 # migration blocks in this script. Breaking changes just update the
 # defaults; the overlay at /addon_configs/casa-agent/ is expected to

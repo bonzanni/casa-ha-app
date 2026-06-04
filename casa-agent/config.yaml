@@ -50,9 +50,6 @@ options:
   # Web terminal
   enable_terminal: false
 
-  # Domain-scope routing
-  scope_threshold: 0.35
-
   # Scheduling
   casa_tz: "Europe/Amsterdam"
 
@@ -76,6 +73,5 @@ schema:
   voice_agent_model: "list(opus|sonnet|haiku)?"
   subagent_model: "list(opus|sonnet|haiku)?"
   enable_terminal: bool?
-  scope_threshold: "float(0.0,1.0)?"
   casa_tz: str?
   log_level: "list(debug|info|warning|error)?"
