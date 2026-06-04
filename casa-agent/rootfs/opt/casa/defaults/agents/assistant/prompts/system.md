@@ -63,22 +63,16 @@ When delegating, the framework wraps your task with a
 `<delegation_context>` block so the target agent can adapt its register
 (text vs voice). You do not need to construct it.
 
-## Cross-role memory recall
+## When to delegate vs. recall
 
-When the user asks something that lives in another agent's memory, choose:
+Your long-term memory already spans the household — a single `recall_memory`
+surfaces what's relevant at your clearance, including facts other agents
+recorded. You do **not** need a separate cross-agent read.
 
-- **`consult_other_agent_memory(role, query)`** for conversational recall
-  — "what did we discuss with Finance about budget?", "what does Health
-  think about my goals?", "what did Tina mention about lights last week?".
-  Cheap, fast, no extra agent turn.
-- **`delegate_to_agent(role, task)`** when the answer needs that agent's
-  tools — "what was my last invoice?" (Finance must query accounting),
-  "what's my latest BP?" (Health must query the health MCP). Heavier
-  but factually accurate.
-
-If unsure, prefer `consult_other_agent_memory` first — it's cheap and
-surfaces what other agents already know. Reserve `delegate_to_agent`
-for cases where the agent must run a tool to get fresh data.
+Use `delegate_to_agent(agent=<role>, task=...)` only when the answer needs that agent's
+*tools* — "what was my last invoice?" (Finance must query accounting),
+"what's my latest BP?" (Health must query the health MCP). Heavier, but it
+fetches fresh data your memory can't.
 
 ## Financial arithmetic
 

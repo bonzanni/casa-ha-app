@@ -244,7 +244,7 @@ async def main():
     await tools._finalize_engagement(
         rec, outcome="completed", text="all done",
         artifacts=[], next_steps=[],
-        driver=StubDriver(), memory_provider=None,
+        driver=StubDriver(),
     )
 
     # Inspect mock TG: topic must be closed with ✅ in the title prefix.
@@ -321,7 +321,7 @@ async def main():
         await tools._finalize_engagement(
             rec, outcome="cancelled", text=f"Cancelled by {reason}.",
             artifacts=[], next_steps=[],
-            driver=drv, memory_provider=None,
+            driver=drv,
         )
     ch._finalize_cancel = _finalize_cancel
 
@@ -677,7 +677,7 @@ async def main():
                     rec, outcome="completed",
                     text="added test_trigger to assistant",
                     artifacts=[path], next_steps=[],
-                    driver=self, memory_provider=None,
+                    driver=self,
                 )
         async def cancel(self, rec): self._alive.pop(rec.id, None)
         async def resume(self, rec, sid): self._alive[rec.id] = True
@@ -922,7 +922,7 @@ async def main():
         rec, outcome="cancelled",
         text="resident deletion denied by casa_config_guard",
         artifacts=[], next_steps=[],
-        driver=StubDriver(), memory_provider=None,
+        driver=StubDriver(),
     )
 
     # Assertion point 4: NOTIFICATION emitted with cancelled-shaped content.

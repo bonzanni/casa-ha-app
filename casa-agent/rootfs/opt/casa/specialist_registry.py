@@ -167,9 +167,8 @@ class SpecialistRegistry:
         """True if ``role`` is bundled but disabled in user config.
 
         Returns False for unknown roles and for enabled specialists.
-        Used by ``consult_other_agent_memory`` (M6) to fall through to
-        cross_peer_context for disabled-but-known specialists — memory
-        is data, enablement is operational.
+        Disabled-but-known specialists are still distinguishable from
+        unknown roles (memory is data, enablement is operational).
         """
         return role in self._disabled_names
 

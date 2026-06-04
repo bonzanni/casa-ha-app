@@ -216,7 +216,6 @@ class TestFinalizeEngagementHonorsDeferred:
                 await _finalize_engagement(
                     rec, outcome="completed", text="done.",
                     artifacts=[], next_steps=[], driver=None,
-                    memory_provider=None,
                 )
 
         assert post_calls == ["http://supervisor/addons/self/restart"], (
@@ -261,7 +260,6 @@ class TestFinalizeEngagementHonorsDeferred:
                 await _finalize_engagement(
                     rec, outcome="cancelled", text="aborted.",
                     artifacts=[], next_steps=[], driver=None,
-                    memory_provider=None,
                 )
 
         assert post_calls == [], (
@@ -300,7 +298,6 @@ class TestFinalizeEngagementHonorsDeferred:
                 await _finalize_engagement(
                     rec, outcome="error", text="bailed.",
                     artifacts=[], next_steps=[], driver=None,
-                    memory_provider=None,
                 )
 
         assert post_calls == []
@@ -337,7 +334,6 @@ class TestFinalizeEngagementHonorsDeferred:
                 await _finalize_engagement(
                     rec, outcome="completed", text="no-op.",
                     artifacts=[], next_steps=[], driver=None,
-                    memory_provider=None,
                 )
 
         assert post_calls == [], (

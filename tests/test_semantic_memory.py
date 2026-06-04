@@ -29,7 +29,6 @@ async def test_noop_reads_return_empty_string() -> None:
     mem = NoOpSemanticMemory()
     assert await mem.recall("casa-assistant", "q", tags=["house"], max_tokens=512) == ""
     assert await mem.profile("casa-assistant") == ""
-    assert await mem.cross_recall("casa-butler", "q", max_tokens=256) == ""
 
 
 def test_render_mental_models_empty() -> None:

@@ -86,19 +86,15 @@ class ClaudeCodeDriver(DriverProtocol):
                 # Forward-compat — no claude_code executor opts in today, but
                 # threading the slot now means a future memory-enabled
                 # claude_code executor (e.g. claude_code-flavoured
-                # configurator) works without further plumbing. Lazy imports
-                # avoid a top-level cycle (drivers ← agent ← drivers).
+                # configurator) works without further plumbing. Lazy import
+                # of tools avoids a top-level cycle (drivers ← agent ← drivers);
+                # _fetch_executor_archive lazily imports agent itself.
                 executor_memory_block = ""
                 if defn.memory.enabled:
-                    import agent as agent_mod
                     from tools import _fetch_executor_archive
                     executor_memory_block = await _fetch_executor_archive(
-                        memory_provider=getattr(
-                            agent_mod, "active_memory_provider", None,
-                        ),
-                        channel=engagement.origin.get("channel", "telegram"),
-                        chat_id=str(engagement.origin.get("chat_id", "")),
-                        executor_type=defn.type,
+                        task=engagement.task,
+                        origin_channel=engagement.origin.get("channel", "telegram"),
                         token_budget=defn.memory.token_budget,
                     )
 

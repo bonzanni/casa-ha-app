@@ -22,17 +22,18 @@ class TestQueryEngager:
                               "chat_id": "c1"},
             topic_id=42,
         )
-        memory = MagicMock()
-        memory.get_context = AsyncMock(return_value="Lesina paid in March.")
         bus = MagicMock(); bus.notify = AsyncMock()
         init_tools(
             channel_manager=MagicMock(), bus=bus,
             specialist_registry=MagicMock(), mcp_registry=MagicMock(),
             trigger_registry=MagicMock(), engagement_registry=reg,
         )
-        # Inject memory provider via the well-known attribute
+        # Inject a recording semantic-memory fake whose recall returns context.
+        memory = MagicMock()
+        memory.recall = AsyncMock(return_value="Lesina paid in March.")
         import agent as agent_mod
-        agent_mod.active_memory_provider = memory
+        monkeypatch.setattr(agent_mod, "active_semantic_memory", memory,
+                            raising=False)
 
         # Monkey-patch the constrained LLM helper
         async def _fake_synth(question, context, max_tokens):
@@ -60,16 +61,18 @@ class TestQueryEngager:
                               "chat_id": "c1"},
             topic_id=42,
         )
-        memory = MagicMock()
-        memory.get_context = AsyncMock(return_value="")
         bus = MagicMock(); bus.notify = AsyncMock()
         init_tools(
             channel_manager=MagicMock(), bus=bus,
             specialist_registry=MagicMock(), mcp_registry=MagicMock(),
             trigger_registry=MagicMock(), engagement_registry=reg,
         )
+        # Empty recall → query_engager returns unknown before synth runs.
+        memory = MagicMock()
+        memory.recall = AsyncMock(return_value="")
         import agent as agent_mod
-        agent_mod.active_memory_provider = memory
+        monkeypatch.setattr(agent_mod, "active_semantic_memory", memory,
+                            raising=False)
         monkeypatch.setattr("tools._synthesize_answer", AsyncMock(return_value="UNKNOWN"))
 
         token = engagement_var.set(rec)

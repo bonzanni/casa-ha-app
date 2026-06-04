@@ -56,7 +56,7 @@ async def test_outcome_error_emits_warning_with_reason(tmp_path, caplog):
             rec, outcome="error",
             text="schema validation failed: extra key TRAIT",
             artifacts=[], next_steps=[],
-            driver=None, memory_provider=None,
+            driver=None,
         )
 
     finalize_lines = [
@@ -106,7 +106,7 @@ async def test_outcome_error_handles_empty_text(tmp_path, caplog):
         await _finalize_engagement(
             rec, outcome="error", text="",
             artifacts=[], next_steps=[],
-            driver=None, memory_provider=None,
+            driver=None,
         )
 
     finalize_lines = [
@@ -145,7 +145,7 @@ async def test_outcome_completed_stays_at_info_level(tmp_path, caplog):
         await _finalize_engagement(
             rec, outcome="completed", text="all good",
             artifacts=[], next_steps=[],
-            driver=None, memory_provider=None,
+            driver=None,
         )
 
     completed_lines = [

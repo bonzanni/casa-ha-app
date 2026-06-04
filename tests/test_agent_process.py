@@ -119,7 +119,6 @@ class FakeSemanticMemory(SemanticMemory):
         self.profile_calls: list[str] = []
         self.recall_calls: list[dict] = []
         self.retain_calls: list[tuple] = []
-        self.cross_calls: list[dict] = []
 
     async def retain(self, bank, items, *, async_=True):
         self.retain_calls.append((bank, items, async_))
@@ -138,10 +137,6 @@ class FakeSemanticMemory(SemanticMemory):
     async def profile(self, bank):
         self.profile_calls.append(bank)
         return self._overlay
-
-    async def cross_recall(self, bank, query, *, max_tokens, budget="low"):
-        self.cross_calls.append({"bank": bank, "query": query})
-        return ""
 
 
 class FakeClient:

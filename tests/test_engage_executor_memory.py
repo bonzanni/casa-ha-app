@@ -1,54 +1,31 @@
-"""Unit coverage for _fetch_executor_archive (M4 L3)."""
+"""Unit coverage for executor-memory integration (M4 L3).
+
+Triage note (collapse 4/7):
+- ``_fetch_executor_archive`` was rewritten to use semantic recall (delegated_memory)
+  instead of a per-executor Honcho session. The five tests that drove the OLD
+  provider behavior (``memory_provider=``, ``ensure_session``/``get_context``
+  round-trips, provider-raises path) were DELETED — they tested REMOVED behavior
+  now fully covered by ``test_executor_memory_tiers.py``.
+
+Surviving tests:
+  - ``test_get_context_signature_locks_kwargs``  }  lock MemoryProvider.get_context's
+  - ``test_get_context_callers_kwargs_match_signature``  }  ABC + call-site kwargs (still valid;
+      MemoryProvider survives until plan 4; engagement/query_engager paths still call it).
+  - ``test_substitutes_executor_memory_slot_when_memory_enabled`` — template {executor_memory}
+      slot substitution (pure string op, no _fetch_executor_archive call).
+  - ``test_workspace_legacy_path_substitutes_executor_memory`` — provision_workspace threads
+      executor_memory= through to CLAUDE.md; pre-existing _Defn._tools_allowed gap unrelated
+      to this task (workspace.py added tools_allowed after this test was written).
+"""
 
 from __future__ import annotations
 
 import sys
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from tools import _fetch_executor_archive
-
 
 pytestmark = pytest.mark.asyncio
-
-
-async def test_returns_empty_when_provider_none():
-    out = await _fetch_executor_archive(
-        memory_provider=None,
-        channel="telegram", chat_id="42",
-        executor_type="configurator", token_budget=2000,
-    )
-    assert out == ""
-
-
-async def test_returns_empty_when_archive_empty():
-    mp = MagicMock()
-    mp.ensure_session = AsyncMock(return_value=None)
-    mp.get_context = AsyncMock(return_value="")
-
-    out = await _fetch_executor_archive(
-        memory_provider=mp,
-        channel="telegram", chat_id="42",
-        executor_type="configurator", token_budget=2000,
-    )
-    assert out == ""
-    mp.ensure_session.assert_awaited_once_with(
-        session_id="telegram-42-executor-configurator",
-        agent_role="executor-configurator",
-    )
-    mp.get_context.assert_awaited_once()
-    kwargs = mp.get_context.await_args.kwargs
-    assert kwargs["session_id"] == "telegram-42-executor-configurator"
-    assert kwargs["tokens"] == 2000
-    # M3-self (v0.30.0): agent_role is back in the signature — but with
-    # different semantics. v0.26.0 / E-14 dropped agent_role/user_peer
-    # because the abstract had bound them as overlay-fetch parameters
-    # (now relocated to peer_overlay_context). v0.30.0 reintroduces
-    # ONLY agent_role, threaded as Honcho's peer_target so semantic
-    # retrieval is scoped to the agent peer. user_peer remains dropped.
-    assert kwargs["agent_role"] == "executor-configurator"
-    assert "user_peer" not in kwargs
 
 
 def test_get_context_signature_locks_kwargs():
@@ -67,7 +44,7 @@ def test_get_context_signature_locks_kwargs():
         f"MemoryProvider.get_context kwargs drifted. "
         f"Expected {expected}, got {actual}. "
         f"If this is intentional, audit every call site (agent.py, "
-        f"tools.py::_fetch_executor_archive, tools.py::cross_peer_context) "
+        f"tools.py::cross_peer_context) "
         f"and update this test."
     )
 
@@ -146,35 +123,6 @@ def test_get_context_callers_kwargs_match_signature():
     )
 
 
-async def test_returns_wrapped_block_when_archive_populated():
-    mp = MagicMock()
-    mp.ensure_session = AsyncMock(return_value=None)
-    mp.get_context = AsyncMock(
-        return_value="## Recent exchanges\n- prior task done\n",
-    )
-
-    out = await _fetch_executor_archive(
-        memory_provider=mp,
-        channel="telegram", chat_id="42",
-        executor_type="configurator", token_budget=2000,
-    )
-    assert out.startswith("## Prior engagements (lessons learned)\n")
-    assert "prior task done" in out
-
-
-async def test_returns_empty_when_provider_raises():
-    mp = MagicMock()
-    mp.ensure_session = AsyncMock(side_effect=RuntimeError("honcho boom"))
-    mp.get_context = AsyncMock(return_value="never reached")
-
-    out = await _fetch_executor_archive(
-        memory_provider=mp,
-        channel="telegram", chat_id="42",
-        executor_type="configurator", token_budget=2000,
-    )
-    assert out == ""
-
-
 def test_substitutes_executor_memory_slot_when_memory_enabled(monkeypatch, tmp_path):
     """engage_executor build_prompt path interpolates {executor_memory}.
 
@@ -217,6 +165,8 @@ async def test_workspace_legacy_path_substitutes_executor_memory(tmp_path):
         type = "x"
         prompt_template_path = str(tmp_path / "prompt.md")
         hooks_path = None
+        tools_allowed: list[str] = []
+        permission_mode = "acceptEdits"
     (tmp_path / "prompt.md").write_text(
         "task={task} mem={executor_memory}\n", encoding="utf-8",
     )
@@ -239,60 +189,3 @@ async def test_workspace_legacy_path_substitutes_executor_memory(tmp_path):
     claude_md = (eng_root / "abc12345" / "CLAUDE.md").read_text(encoding="utf-8")
     assert "task=dotask" in claude_md
     assert "mem=## Prior\nbody" in claude_md
-
-
-async def test_executor_archive_is_read_on_second_engagement(tmp_path):
-    """First engagement writes to the archive; second reads it.
-
-    Drives the read+write contract end-to-end against an in-memory mock
-    memory_provider. Doesn't exercise engage_executor's full topic-
-    creation path — that requires a Telegram channel mock + engagement
-    registry, which is out of scope for the L3 contract test.
-    """
-    # In-memory archive: session_id → list of (user, assistant) tuples.
-    archive: dict[str, list[tuple[str, str]]] = {}
-
-    class _Mp:
-        async def ensure_session(self, *, session_id, agent_role,
-                                 user_peer="nicola"):
-            archive.setdefault(session_id, [])
-
-        async def add_turn(self, *, session_id, agent_role,
-                           user_text, assistant_text, user_peer="nicola"):
-            archive.setdefault(session_id, []).append(
-                (user_text, assistant_text),
-            )
-
-        async def get_context(self, *, session_id, tokens,
-                              search_query=None, agent_role=None):
-            entries = archive.get(session_id, [])
-            if not entries:
-                return ""
-            return "## Recent exchanges\n" + "\n".join(
-                f"- {u} → {a}" for u, a in entries
-            )
-
-    mp = _Mp()
-
-    # First "engagement": the WRITE side of _finalize_engagement.
-    # Simulate by calling the same shape directly.
-    await mp.ensure_session(
-        session_id="telegram-42-executor-configurator",
-        agent_role="executor-configurator",
-    )
-    await mp.add_turn(
-        session_id="telegram-42-executor-configurator",
-        agent_role="executor-configurator",
-        user_text="(executor engagement summary)",
-        assistant_text='{"task": "edit-scope", "outcome": "completed"}',
-    )
-
-    # Second engagement: the READ side via _fetch_executor_archive.
-    out = await _fetch_executor_archive(
-        memory_provider=mp,
-        channel="telegram", chat_id="42",
-        executor_type="configurator", token_budget=2000,
-    )
-    assert "Prior engagements (lessons learned)" in out
-    assert "edit-scope" in out
-    assert "completed" in out

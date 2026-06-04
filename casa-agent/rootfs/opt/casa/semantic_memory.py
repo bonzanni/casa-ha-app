@@ -65,12 +65,6 @@ class SemanticMemory(ABC):
     async def profile(self, bank: str) -> str:
         """Return the bank's mental-model overlay digest (cheap GET, no LLM)."""
 
-    @abstractmethod
-    async def cross_recall(
-        self, bank: str, query: str, *, max_tokens: int, budget: str = "low",
-    ) -> str:
-        """Recall against another role's ``bank`` (on-demand cross-agent read)."""
-
 
 class NoOpSemanticMemory(SemanticMemory):
     """Degraded backend: retain is silent, reads return ''. The agent then
@@ -89,9 +83,4 @@ class NoOpSemanticMemory(SemanticMemory):
         return ""
 
     async def profile(self, bank: str) -> str:
-        return ""
-
-    async def cross_recall(
-        self, bank: str, query: str, *, max_tokens: int, budget: str = "low",
-    ) -> str:
         return ""

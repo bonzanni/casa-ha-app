@@ -152,10 +152,12 @@ async def test_force_deletes_idle(tmp_path, monkeypatch):
 
 
 async def test_force_delete_writes_meta_scope_summary(tmp_path, monkeypatch):
-    """M2.G4 — force=True on a still-live engagement must write the
-    summary before pulling the workspace. Pre-fix passed memory_provider
-    =None to _finalize_engagement so force-delete was silent."""
+    """M2.G4 (rewritten for the shared-bank rearch) — force=True on a
+    still-live engagement must write a summary before pulling the workspace.
+    The regression intent is preserved: force-delete is NOT silent."""
     import sys
+    import agent as agent_mod
+    import delegated_memory
     from engagement_registry import EngagementRegistry
     from tools import delete_engagement_workspace, init_tools
 
@@ -173,12 +175,25 @@ async def test_force_delete_writes_meta_scope_summary(tmp_path, monkeypatch):
     )
     # Engagement starts in 'active' (live) status — force=True path.
 
-    mp = MagicMock()
-    mp.ensure_session = AsyncMock(return_value=None)
-    mp.add_turn = AsyncMock(return_value=None)
+    # Recording semantic-memory fake exposed on the agent module the way
+    # the production singleton would be.
+    class _Sem:
+        def __init__(self):
+            self.retain_calls = []
+
+        async def retain(self, bank, items, *, async_=True):
+            self.retain_calls.append({"bank": bank, "items": items})
+
+    sem = _Sem()
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", sem, raising=False)
+
+    async def _fake_classify(text):
+        return "private"
+
+    monkeypatch.setattr(delegated_memory, "classify_tier", _fake_classify)
 
     fake_agent_mod = MagicMock()
-    fake_agent_mod.active_memory_provider = mp
+    fake_agent_mod.active_semantic_memory = sem
     fake_agent_mod.active_engagement_driver = None
     fake_agent_mod.active_claude_code_driver = None
     monkeypatch.setitem(sys.modules, "agent", fake_agent_mod)
@@ -202,8 +217,22 @@ async def test_force_delete_writes_meta_scope_summary(tmp_path, monkeypatch):
     payload = json.loads(res["content"][0]["text"])
     assert payload["status"] == "ok"
 
-    meta_sid = "telegram-456-meta-assistant"
-    assert any(
-        c.kwargs.get("session_id") == meta_sid
-        for c in mp.add_turn.await_args_list
-    ), f"expected add_turn({meta_sid!r}); got {mp.add_turn.await_args_list}"
+    # A structured engagement summary was retained on the shared `casa` bank
+    # with status=='cancelled' — force-delete finalises as cancelled,
+    # confirming that force-delete is NOT silent.
+    assert sem.retain_calls, "expected a retain on force-delete; got none"
+    summaries = [
+        json.loads(i["content"])
+        for c in sem.retain_calls for i in c["items"]
+    ]
+    eng_summary = next(
+        (s for s in summaries if s.get("kind") == "engagement_summary"),
+        None,
+    )
+    assert eng_summary is not None, (
+        f"expected engagement_summary in retain; got: {summaries}"
+    )
+    assert eng_summary["status"] == "cancelled", (
+        f"force-delete finalises as cancelled; got: {eng_summary['status']}"
+    )
+    assert eng_summary["engagement_id"] == rec.id

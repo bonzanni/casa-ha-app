@@ -1436,7 +1436,7 @@ async def main() -> None:
             await _finalize_engagement(
                 rec, outcome="cancelled", text=f"Cancelled by {reason}.",
                 artifacts=[], next_steps=[],
-                driver=driver, memory_provider=base_memory,
+                driver=driver,
             )
         telegram_channel._finalize_cancel = _finalize_cancel
 
@@ -1447,7 +1447,7 @@ async def main() -> None:
             await _finalize_engagement(
                 rec, outcome="completed", text="User-marked complete.",
                 artifacts=[], next_steps=[],
-                driver=driver, memory_provider=base_memory,
+                driver=driver,
             )
         telegram_channel._finalize_complete_user = _finalize_complete_user
 

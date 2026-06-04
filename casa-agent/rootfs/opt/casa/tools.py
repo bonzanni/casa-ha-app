@@ -27,12 +27,12 @@ from marketplace_ops import (
     remove_plugin_entry,
     update_plugin_entry,
 )
-from honcho_ids import honcho_session_id
 from plugin_env_extractor import extract_env_vars
 from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — available for future use
 from system_requirements.orchestrator import install_requirements, OrchestrationError
 from system_requirements.manifest import add_plugin_entry as add_manifest
 from plugins_binding import build_sdk_plugins
+from delegated_memory import delegated_recall, retain_delegated
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -193,32 +193,11 @@ _ENGAGEMENTS_PENDING_RELOAD: set[str] = set()
 # (engagement_var bound), it does NOT POST to Supervisor. Instead it
 # adds engagement.id to this set and returns immediately. The actual
 # Supervisor POST is performed at the end of _finalize_engagement —
-# AFTER the bus-message write + Honcho meta-summary land — so the
+# AFTER the bus-message write + engagement-summary retain land — so the
 # user-DM "Done" relay survives the addon kill. Out-of-engagement
 # casa_reload calls (operator-triggered via /invoke) still POST
 # inline since there is no engagement to wait for.
 _ENGAGEMENTS_DEFERRED_HARD_RELOAD: set[str] = set()
-
-
-def _is_transient_connection_error(exc: BaseException) -> bool:
-    """True if ``exc`` looks like a transient connection-class failure.
-
-    F-4 (v0.32.0): Honcho's HTTPX-backed client surfaces TLS/SSL closes
-    and connection-resets as opaque exception strings (the upstream
-    typing wraps them under generic exception classes). String-sniff is
-    the only portable check — narrow set of substrings to keep retries
-    scoped to genuinely transient failures.
-    """
-    msg = str(exc).lower()
-    needles = (
-        "tls/ssl connection has been closed",
-        "connection error",
-        "connection reset",
-        "connection aborted",
-        "remoteprotocolerror",
-        "server disconnected",
-    )
-    return any(n in msg for n in needles)
 
 
 def _result(payload: dict, *, is_error: bool | None = None) -> dict:
@@ -262,10 +241,10 @@ def _result(payload: dict, *, is_error: bool | None = None) -> dict:
 def _build_specialist_options(cfg) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for a Tier 2 specialist invocation.
 
-    Specialists carry per-``(role, user_peer)`` Honcho memory (M4b,
-    v0.17.0); SDK-level session resume stays disabled (``resume=None``)
-    because memory enters the specialist via prompt injection in
-    :func:`_run_delegated_agent`, not via SDK continuity. Hooks are
+    Specialist memory is injected via prompt in :func:`_run_delegated_agent`
+    (shared ``casa`` bank); SDK-level session resume stays disabled
+    (``resume=None``) — memory enters via prompt injection, not SDK
+    continuity. Hooks are
     resolved from the specialist's own ``cfg.hooks``. MCP servers are
     resolved via the shared registry — same pattern as
     :meth:`Agent._process` (agent.py step 4). Degrades to empty-dict
@@ -418,85 +397,9 @@ def _build_world_state_summary() -> str:
     return "\n".join(lines)
 
 
-# M4b: specialist memory write-path bg-task anchoring (parity with
-# Agent._bg_tasks at agent.py:133). Module-level so it persists
-# across delegate_to_agent calls.
+# Specialist memory write-path bg-task anchoring (parity with Agent._bg_tasks
+# at agent.py:133). Module-level so it persists across delegate_to_agent calls.
 _specialist_bg_tasks: set[asyncio.Task[Any]] = set()
-
-
-async def _specialist_add_turn_bg(
-    *,
-    memory_provider: Any,
-    session_id: str,
-    agent_role: str,
-    user_text: str,
-    assistant_text: str,
-    user_peer: str,
-) -> None:
-    """Persist one specialist turn in the background.
-
-    Best-effort background write (try/except, log on failure, never surface —
-    the caller has already returned text). This is the specialist/engagement
-    memory path on the legacy MemoryProvider; it is retired with MemoryProvider
-    in the load plan. (The resident per-turn write was replaced by
-    session-granularity save in agent.py.)"""
-    try:
-        await memory_provider.add_turn(
-            session_id=session_id,
-            agent_role=agent_role,
-            user_text=user_text,
-            assistant_text=assistant_text,
-            user_peer=user_peer,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "specialist memory add_turn failed for session=%s role=%s: %s",
-            session_id, agent_role, exc,
-        )
-
-
-async def _specialist_meta_write_bg(
-    *,
-    memory_provider: Any,
-    parent_origin: dict[str, Any],
-    specialist_role: str,
-    task_text: str,
-    assistant_text: str,
-) -> None:
-    """Write a one-line specialist-call summary to the parent's meta session.
-
-    Mirrors _finalize_engagement's meta-write (tools.py:1326-1338) for
-    inline delegate_to_agent calls, with task and reply truncated to
-    200 chars per side (the engagement-finalize meta-write is untruncated;
-    this helper introduces the per-summary cap as new M4b policy). Gives
-    Ellen a unified view of specialist activity independent of which scope
-    her own turn wrote to.
-    """
-    channel = str(parent_origin.get("channel") or "")
-    chat_id = str(parent_origin.get("chat_id") or "")
-    parent_role = str(parent_origin.get("role") or "assistant")
-    if not channel or not chat_id:
-        return  # No parent context to attribute to (cron / boot replay).
-    meta_sid = honcho_session_id(channel, chat_id, "meta", parent_role)
-    user_text = f"delegated to {specialist_role}: {task_text[:200]}"
-    asst_text = f"{specialist_role} → {assistant_text[:200]}"
-    try:
-        await memory_provider.ensure_session(
-            session_id=meta_sid,
-            agent_role=parent_role,
-            user_peer="nicola",
-        )
-        await memory_provider.add_turn(
-            session_id=meta_sid,
-            agent_role=parent_role,
-            user_text=user_text,
-            assistant_text=asst_text,
-            user_peer="nicola",
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "specialist meta-write failed for sid=%s: %s", meta_sid, exc,
-        )
 
 
 async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
@@ -534,36 +437,17 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
     else:
         body_tail = f"Task: {task_text}"
 
-    # M4b: optional specialist memory read.
-    # Opt-in via cfg.memory.token_budget > 0. Session keyed
-    # via honcho_session_id(role, user_peer) — channel-agnostic,
-    # scope-agnostic, per-peer.
+    # Specialist memory read on the shared `casa` bank, at the PARENT context's
+    # read-clearance (design §3, plan 3). Opt-in via cfg.memory.token_budget > 0.
     memory_block = ""
-    user_peer = "nicola"
-    session_id = honcho_session_id(cfg.role, user_peer)
-    memory_provider = None
     if cfg.memory.token_budget > 0:
-        memory_provider = getattr(agent_mod, "active_memory_provider", None)
-        if memory_provider is not None:
-            try:
-                await memory_provider.ensure_session(
-                    session_id=session_id,
-                    agent_role=cfg.role,
-                    user_peer=user_peer,
-                )
-                digest = await memory_provider.get_context(
-                    session_id=session_id,
-                    agent_role=cfg.role,
-                    tokens=cfg.memory.token_budget,
-                    search_query=task_text,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "specialist memory read failed for %s (%s); "
-                    "continuing with no memory context",
-                    cfg.role, exc,
-                )
-                digest = ""
+        sem = getattr(agent_mod, "active_semantic_memory", None)
+        if sem is not None:
+            digest = await delegated_recall(
+                sem, query=task_text,
+                origin_channel=str(parent.get("channel", "")),
+                max_tokens=cfg.memory.token_budget,
+            )
             if digest:
                 memory_block = (
                     f'<memory_context agent="{cfg.role}">\n'
@@ -589,31 +473,21 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
     finally:
         agent_mod.origin_var.reset(token)
 
-    # M4b: write the turn back to specialist memory in the background.
-    if (cfg.memory.token_budget > 0
-            and text
-            and memory_provider is not None):
-        task = asyncio.create_task(_specialist_add_turn_bg(
-            memory_provider=memory_provider,
-            session_id=session_id,
-            agent_role=cfg.role,
-            user_text=task_text,
-            assistant_text=text,
-            user_peer=user_peer,
-        ))
-        _specialist_bg_tasks.add(task)
-        task.add_done_callback(_specialist_bg_tasks.discard)
-
-        # M4b: optional meta-write so Ellen sees specialist activity.
-        meta_task = asyncio.create_task(_specialist_meta_write_bg(
-            memory_provider=memory_provider,
-            parent_origin=parent,
-            specialist_role=cfg.role,
-            task_text=task_text,
-            assistant_text=text,
-        ))
-        _specialist_bg_tasks.add(meta_task)
-        meta_task.add_done_callback(_specialist_bg_tasks.discard)
+    # Specialist write: one explicit tier-classified retain of the exchange to
+    # the shared bank, gated by the PARENT channel's write-trust (voice → no
+    # write) — design §3, plan 3. Ephemeral specialists have no session
+    # registry, so the freshness reaper never sees them; the retain is explicit.
+    if cfg.memory.token_budget > 0 and text:
+        sem = getattr(agent_mod, "active_semantic_memory", None)
+        if sem is not None:
+            cid = str(parent.get("cid", "-"))
+            bg = asyncio.create_task(retain_delegated(
+                sem, origin_channel=str(parent.get("channel", "")),
+                doc_prefix=f"delegation:{cid}:{cfg.role}",
+                turns=[("user", task_text), ("assistant", text)],
+            ))
+            _specialist_bg_tasks.add(bg)
+            bg.add_done_callback(_specialist_bg_tasks.discard)
 
     return text
 
@@ -944,140 +818,6 @@ async def delegate_to_agent(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# consult_other_agent_memory — M6
-# ---------------------------------------------------------------------------
-
-
-@tool(
-    "consult_other_agent_memory",
-    "Read another agent's accumulated memory of you, without delegating "
-    "a full agent turn.",
-    {"role": str, "query": str},
-)
-async def consult_other_agent_memory(args: dict) -> dict:
-    """Read another agent's accumulated memory of you, without
-    delegating a full agent turn.
-
-    Use for conversational / theory-of-mind recall:
-    - "What does Finance know about my budget priorities?"
-    - "What have we discussed with Health about my goals?"
-
-    Don't use for factual lookups that need the agent's tools:
-    - "What was the amount on my last invoice?" → use
-      delegate_to_agent("finance", ...) instead, since only
-      Finance's tools fetch the actual invoice.
-
-    Returns rendered markdown digest. Empty when the agent has no
-    accumulated memory yet (cold start) or the role isn't
-    registered.
-    """
-    import agent as agent_mod
-
-    role = args.get("role", "") or ""
-    query = args.get("query", "") or ""
-
-    # Spec § 6.2: structured-error returns, no exceptions to caller
-    if not query.strip():
-        return _result({
-            "status": "error",
-            "kind": "empty_query",
-            "message": "Error: query is required",
-        })
-
-    # Resolve registered roles for the validator. Same lookup
-    # delegate_to_agent uses (tools.py:634-637).
-    cfg = _agent_role_map.get(role) or (
-        _specialist_registry.get(role)
-        if _specialist_registry is not None else None
-    )
-
-    # Phase 5 / E-15: a specialist that's bundled but disabled in user
-    # config has its peer-level Honcho memory persisted independently
-    # of operational enablement. Fall through to cross_peer_context
-    # rather than refusing the consult — memory is data, enablement is
-    # operational. Spec § 3.2.1 + memory project_memory_m6_shipped
-    # documents the cross_peer probe blocker on disabled peers.
-    is_disabled_peer = (
-        cfg is None
-        and _specialist_registry is not None
-        and _specialist_registry.is_disabled(role)
-    )
-    if cfg is None and not is_disabled_peer:
-        # Build available-roles list for the error message — matches
-        # delegate_to_agent's "no enabled agent" pattern but adds the
-        # known-roles list to help the model self-correct.
-        registered: list[str] = list(_agent_role_map.keys())
-        if _specialist_registry is not None:
-            registered += list(_specialist_registry.all_configs().keys())
-            # Disabled peers ARE consultable per § 3.2.1 — list them too.
-            registered += _specialist_registry.disabled_roles()
-        return _result({
-            "status": "error",
-            "kind": "unknown_role",
-            "message": (
-                f"Error: unknown specialist role {role!r}. "
-                f"Available roles: {sorted(set(registered))}"
-            ),
-        })
-
-    empty_msg = (
-        f'No accumulated memory found for {role} matching "{query[:60]}".'
-    )
-
-    sem = getattr(agent_mod, "active_semantic_memory", None)
-    if sem is None:
-        return _result({"status": "ok", "content": empty_msg})
-
-    # Token budget: read from the calling resident's runtime.yaml.
-    # The caller's role isn't directly available on the tool path
-    # (no origin_var.role like delegate_to_agent has), so resolve via
-    # the engaged agent's config map. The conventional caller is the
-    # assistant, but a future trusted resident could also invoke it —
-    # try origin_var first, fall back to the assistant default.
-    origin = agent_mod.origin_var.get(None) or {}
-    caller_role = origin.get("role", "assistant")
-    caller_cfg = _agent_role_map.get(caller_role)
-    tokens = (
-        getattr(getattr(caller_cfg, "memory", None),
-                "cross_peer_token_budget", 2000)
-        if caller_cfg is not None else 2000
-    )
-
-    t_start = time.perf_counter()
-    try:
-        from hindsight_ids import bank_id
-        rendered = await sem.cross_recall(
-            bank_id("casa", role), query, max_tokens=tokens, budget="low",
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "consult_other_agent_memory failed for role=%r: %s", role, exc,
-        )
-        rendered = ""
-
-    # Spec § 6.5: tool-level companion telemetry line
-    logger.info(
-        "consult_other_agent_memory_call",
-        extra={
-            "role": role,
-            "query_len": len(query),
-            "result_len": len(rendered),
-            "t_ms": int((time.perf_counter() - t_start) * 1000),
-        },
-    )
-
-    # Spec § 6.4: preamble formatting
-    if not rendered:
-        return _result({"status": "ok", "content": empty_msg})
-    return _result({
-        "status": "ok",
-        "content": (
-            f'Memory consult of {role} on "{query[:60]}":\n\n{rendered}'
-        ),
-    })
-
-
-# ---------------------------------------------------------------------------
 # recall_memory — spec §4.3
 # ---------------------------------------------------------------------------
 
@@ -1357,7 +1097,7 @@ async def casa_reload(args: dict) -> dict:
 
 async def _post_supervisor_restart() -> dict:
     """Internal helper used by ``_finalize_engagement`` to honor a
-    deferred hard-reload after the bus message + Honcho summary have
+    deferred hard-reload after the bus message + engagement-summary retain have
     landed. Returns a result-shaped dict for logging; never raises.
     """
     import aiohttp
@@ -1447,47 +1187,21 @@ def _jaccard_task_similarity(a: str, b: str) -> float:
 
 
 async def _fetch_executor_archive(
-    *, memory_provider, channel: str, chat_id: str,
-    executor_type: str, token_budget: int,
+    *, task: str, origin_channel: str, token_budget: int,
 ) -> str:
-    """Read the per-(channel, chat, executor_type) archive of prior
-    engagement summaries via Honcho's ``session.context``. Returns the
-    rendered digest wrapped under a recognizable header, or "" when the
-    archive is empty / provider is None / read fails.
-
-    Mirrors the WRITE site at ``tools.py:1383`` for ``session_id`` and
-    ``agent_role`` on ``ensure_session``. ``get_context`` is session-only —
-    its signature dropped ``agent_role`` and ``user_peer`` in v0.26.0
-    (E-14). E-D (v0.29.0) removed the lingering ``agent_role=agent_role``
-    kwarg here that was a silent TypeError on every executor spawn.
-    """
-    if memory_provider is None:
+    """Read prior-engagement "lessons" as a SEMANTIC recall against the shared
+    ``casa`` bank, keyed on the current ``task`` and filtered to the originating
+    engagement's read-clearance (design §3, plan 3). Returns the digest under a
+    recognizable header, or "" when memory is unavailable / the recall is empty.
+    Best-effort: ``delegated_recall`` swallows its own errors."""
+    import agent as agent_mod
+    sem = getattr(agent_mod, "active_semantic_memory", None)
+    if sem is None:
         return ""
-    session_id = honcho_session_id(channel, chat_id, "executor", executor_type)
-    agent_role = f"executor-{executor_type}"
-    try:
-        await memory_provider.ensure_session(
-            session_id=session_id,
-            agent_role=agent_role,
-        )
-        digest = await memory_provider.get_context(
-            session_id=session_id,
-            tokens=token_budget,
-            # M3-self companion (v0.30.0): not strictly needed when
-            # search_query is None (peer_target is only required when
-            # search_query is set), but threading agent_role keeps the
-            # memory_call telemetry attributed to the correct peer.
-            agent_role=agent_role,
-        )
-    except Exception as exc:  # noqa: BLE001 — ARCH: same shape as 1246, 1407
-        logger.warning(
-            "executor archive fetch failed for type=%s: %s",
-            executor_type, exc, exc_info=True,
-        )
-        return ""
-    if not digest:
-        return ""
-    return f"## Prior engagements (lessons learned)\n{digest}"
+    digest = await delegated_recall(
+        sem, query=task, origin_channel=origin_channel, max_tokens=token_budget,
+    )
+    return f"## Prior engagements (lessons learned)\n{digest}" if digest else ""
 
 
 @tool(
@@ -1655,16 +1369,14 @@ async def engage_executor(args: dict) -> dict:
 
     world_state = _build_world_state_summary()
 
-    # M4 L3: per-executor archive injection. Skipped when the executor
-    # type hasn't opted in (defn.memory.enabled=False is the default).
+    # Semantic-recall memory injection (design §3, plan 3): when the executor
+    # opts in (defn.memory.enabled=True, off by default), fetch prior-engagement
+    # lessons from the shared `casa` bank at the origin channel's read-clearance.
     executor_memory_block = ""
     if defn.memory.enabled:
-        memory_provider = getattr(agent_mod, "active_memory_provider", None)
         executor_memory_block = await _fetch_executor_archive(
-            memory_provider=memory_provider,
-            channel=origin.get("channel", "telegram"),
-            chat_id=str(origin.get("chat_id", "")),
-            executor_type=executor_type,
+            task=task_text,
+            origin_channel=origin.get("channel", "telegram"),
             token_budget=defn.memory.token_budget,
         )
 
@@ -1746,10 +1458,9 @@ async def _finalize_engagement(
     artifacts: list[str],
     next_steps: list[dict],
     driver: Any | None,
-    memory_provider: Any | None,
 ) -> None:
-    """End an engagement: update registry, close topic, NOTIFY Ellen, write
-    Ellen's meta-scope summary.
+    """End an engagement: update registry, close topic, NOTIFY Ellen,
+    retain a tier-classified engagement summary on the shared ``casa`` bank.
 
     Never raises on channel/memory side-effects — logs warnings and continues
     so the registry always reaches a terminal state.
@@ -1851,8 +1562,14 @@ async def _finalize_engagement(
                 engagement.id[:8], exc,
             )
 
-    # 5. Write Ellen's meta-scope summary (best-effort)
-    if memory_provider is not None:
+    # 5. Retain a structured engagement summary on the shared `casa` bank,
+    #    tier-classified and gated by the origin channel's write-trust (voice →
+    #    nothing) — design §3, plan 3. The post-back NOTIFICATION above is the
+    #    durable record for the engager; this is the structured one-shot the
+    #    maintainer chose to keep.
+    import agent as agent_mod
+    sem = getattr(agent_mod, "active_semantic_memory", None)
+    if sem is not None:
         summary = json.dumps({
             "kind": "engagement_summary",
             "engagement_id": engagement.id,
@@ -1866,50 +1583,11 @@ async def _finalize_engagement(
             "artifacts": artifacts,
             "next_steps": next_steps,
         })
-        # Use Ellen's meta session. The session_id convention is
-        # honcho_session_id(channel, chat_id, "meta", "assistant")
-        # — mirror plan-1 scope stack.
-        channel = engagement.origin.get("channel", "telegram")
-        chat_id = str(engagement.origin.get("chat_id", ""))
-        meta_sid = honcho_session_id(channel, chat_id, "meta", "assistant")
-
-        # F-4 (v0.32.0): the Honcho client's HTTPS connection is reused
-        # across calls; on long idles between turns the upstream may
-        # close the TLS session, surfacing as `Connection error: TLS/SSL
-        # connection has been closed (EOF)` on the next request. The
-        # Honcho client does not transparently reconnect, so a one-shot
-        # write at finalize time can lose the M4 meta-scope summary.
-        # Retry once on connection-class errors before giving up.
-        last_exc: Exception | None = None
-        for attempt in (1, 2):
-            try:
-                await memory_provider.ensure_session(
-                    session_id=meta_sid,
-                    agent_role="assistant",
-                )
-                await memory_provider.add_turn(
-                    session_id=meta_sid,
-                    agent_role="assistant",
-                    user_text="(engagement summary written)",
-                    assistant_text=summary,
-                )
-                last_exc = None
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                if attempt == 1 and _is_transient_connection_error(exc):
-                    logger.info(
-                        "finalize engagement %s: meta summary write hit "
-                        "transient connection error (%s), retrying once",
-                        engagement.id[:8], exc,
-                    )
-                    continue
-                break
-        if last_exc is not None:
-            logger.warning(
-                "finalize engagement %s: meta summary write failed: %s",
-                engagement.id[:8], last_exc,
-            )
+        await retain_delegated(
+            sem, origin_channel=str(engagement.origin.get("channel", "")),
+            doc_prefix=f"engagement:{engagement.id}:summary",
+            turns=[("assistant", summary)],
+        )
 
     # Plan 4a.1 §8.4: update .casa-meta.json with terminal status + retention_until.
     if engagement.driver == "claude_code":
@@ -1943,46 +1621,32 @@ async def _finalize_engagement(
                 engagement.id[:8], exc,
             )
 
-    # Plan 4a: per-executor-type Honcho archival (only for kind=executor).
-    if (memory_provider is not None
-            and engagement.kind == "executor"):
-        try:
-            channel = engagement.origin.get("channel", "telegram")
-            chat_id = str(engagement.origin.get("chat_id", ""))
-            type_session = honcho_session_id(
-                channel, chat_id, "executor", engagement.role_or_type,
-            )
-            type_summary = json.dumps({
-                "kind": "executor_engagement_summary",
-                "engagement_id": engagement.id,
-                "executor_type": engagement.role_or_type,
-                "started_at": engagement.started_at,
-                "finished_at": now,
-                "duration_s": now - engagement.started_at,
-                "terminal_state": outcome,
-                "engager": engagement.origin.get("role") or "assistant",
-                "task": engagement.task,
-                "last_text": text,
-                "artifacts": artifacts,
-            })
-            await memory_provider.ensure_session(
-                session_id=type_session,
-                agent_role=f"executor-{engagement.role_or_type}",
-            )
-            await memory_provider.add_turn(
-                session_id=type_session,
-                agent_role=f"executor-{engagement.role_or_type}",
-                user_text="(executor engagement summary)",
-                assistant_text=type_summary,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "finalize engagement %s: executor-type archival failed: %s",
-                engagement.id[:8], exc,
-            )
+    # Per-executor-type structured summary (only kind=executor), retained
+    # tier-tagged on the shared bank with a DISTINCT doc_prefix so it does not
+    # clobber the engagement_summary item above.
+    # `sem` is the active_semantic_memory resolved in step 5 above.
+    if engagement.kind == "executor" and sem is not None:
+        type_summary = json.dumps({
+            "kind": "executor_engagement_summary",
+            "engagement_id": engagement.id,
+            "executor_type": engagement.role_or_type,
+            "started_at": engagement.started_at,
+            "finished_at": now,
+            "duration_s": now - engagement.started_at,
+            "terminal_state": outcome,
+            "engager": engagement.origin.get("role") or "assistant",
+            "task": engagement.task,
+            "last_text": text,
+            "artifacts": artifacts,
+        })
+        await retain_delegated(
+            sem, origin_channel=str(engagement.origin.get("channel", "")),
+            doc_prefix=f"engagement:{engagement.id}:executor_summary",
+            turns=[("assistant", type_summary)],
+        )
 
     # H-1 (v0.34.0): honor deferred hard-reload now that all bus +
-    # Honcho writes have landed. Only on outcome=completed — per
+    # retain writes have landed. Only on outcome=completed — per
     # ``completion.md`` doctrine line 61, a cancelled engagement does
     # NOT need a reload (artifact is operator-pending). On
     # outcome=error the engagement bailed; the reload decision is the
@@ -2058,8 +1722,8 @@ async def emit_completion(args: dict) -> dict:
 
     # Bug 9 (v0.14.6): idempotency. Re-emitting completion (e.g. SDK
     # retry, hook misfire) used to re-run _finalize_engagement, which
-    # double-closes the topic, double-NOTIFYs Ellen, and double-writes
-    # the meta-scope summary into Honcho. Re-read the live registry
+    # double-closes the topic, double-NOTIFYs Ellen, and double-retains
+    # the engagement summary on the shared `casa` bank. Re-read the live registry
     # state so we catch transitions that happened on another in-flight
     # turn since this engagement_var snapshot was taken.
     if _engagement_registry is not None:
@@ -2082,17 +1746,15 @@ async def emit_completion(args: dict) -> dict:
     status_in = args.get("status", "ok") or "ok"
     outcome = "completed" if status_in == "ok" else "error"
 
-    # Driver + memory_provider are discovered via the agent singleton
-    # accessible through the agent module (plan-1 pattern).
+    # Driver is discovered via the agent singleton accessible through the
+    # agent module (plan-1 pattern).
     driver = None
-    memory_provider = None
     try:
         import agent as agent_mod  # noqa: F401
         if engagement.driver == "claude_code":
             driver = getattr(agent_mod, "active_claude_code_driver", None)
         else:
             driver = getattr(agent_mod, "active_engagement_driver", None)
-        memory_provider = getattr(agent_mod, "active_memory_provider", None)
     except Exception:
         pass
 
@@ -2144,7 +1806,6 @@ async def emit_completion(args: dict) -> dict:
         artifacts=artifacts,
         next_steps=next_steps,
         driver=driver,
-        memory_provider=memory_provider,
     )
     # Drain on terminal paths (e.g., outcome=error or
     # already-terminal short-circuit above) — the engagement is gone.
@@ -2211,35 +1872,17 @@ async def query_engager(args: dict) -> dict:
     question = args.get("question", "") or ""
     max_tokens = int(args.get("max_tokens") or 500)
 
-    # Retrieve engager-side context
-    memory_provider = None
-    try:
-        import agent as agent_mod
-        memory_provider = getattr(agent_mod, "active_memory_provider", None)
-    except Exception:
-        pass
-    engager_role = engagement.origin.get("role", "assistant")
-    channel = engagement.origin.get("channel", "telegram")
-    chat_id = str(engagement.origin.get("chat_id", ""))
-    engager_scope = engagement.origin.get("scope", "meta")
-    session_id = honcho_session_id(
-        channel, chat_id, engager_scope, engager_role,
-    )
-
+    # Retrieve engager-side context: a semantic recall against the shared `casa`
+    # bank at the engagement origin's read-clearance (design §3, plan 3).
+    import agent as agent_mod
+    sem = getattr(agent_mod, "active_semantic_memory", None)
     context = ""
-    if memory_provider is not None:
-        try:
-            context = await memory_provider.get_context(
-                session_id=session_id,
-                agent_role=engager_role,
-                tokens=2000,
-                search_query=question,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "query_engager: get_context failed (%s); returning unknown", exc,
-            )
-            context = ""
+    if sem is not None:
+        context = await delegated_recall(
+            sem, query=question,
+            origin_channel=str(engagement.origin.get("channel", "")),
+            max_tokens=2000,
+        )
 
     # Publish bus event so observer can see the query
     if _bus is not None:
@@ -2282,21 +1925,18 @@ async def cancel_engagement(args: dict) -> dict:
                         "message": f"no engagement named {engagement_id!r}"})
 
     driver = None
-    memory_provider = None
     try:
         import agent as agent_mod  # noqa: F401
         if rec.driver == "claude_code":
             driver = getattr(agent_mod, "active_claude_code_driver", None)
         else:
             driver = getattr(agent_mod, "active_engagement_driver", None)
-        memory_provider = getattr(agent_mod, "active_memory_provider", None)
     except Exception:
         pass
 
     await _finalize_engagement(
         rec, outcome="cancelled", text="Engagement cancelled.",
         artifacts=[], next_steps=[], driver=driver,
-        memory_provider=memory_provider,
     )
     return _result({"status": "ok", "engagement_id": engagement_id})
 
@@ -2449,20 +2089,18 @@ async def delete_engagement_workspace(args: dict) -> dict:
     if rec.status in _LIVE_ENGAGEMENT_STATES and force:
         # Finalize as cancelled before pulling the workspace.
         driver = None
-        memory_provider = None
         try:
             import agent as agent_mod
             driver = (getattr(agent_mod, "active_claude_code_driver", None)
                       if rec.driver == "claude_code"
                       else getattr(agent_mod, "active_engagement_driver", None))
-            memory_provider = getattr(agent_mod, "active_memory_provider", None)
         except Exception:
             pass
         await _finalize_engagement(
             rec, outcome="cancelled",
             text="Workspace deletion forced",
             artifacts=[], next_steps=[],
-            driver=driver, memory_provider=memory_provider,
+            driver=driver,
         )
 
     ws = os.path.join(_ENGAGEMENTS_ROOT, engagement_id)
@@ -2994,7 +2632,6 @@ async def get_item_fields(args: dict) -> dict:
 CASA_TOOLS: tuple = (
     send_message,
     delegate_to_agent,
-    consult_other_agent_memory,    # M6 — peer-level cross-perspective read
     recall_memory,                 # §4.3 — shared-bank semantic recall (tier-clearance filtered)
     get_schedule,
     engage_executor,
