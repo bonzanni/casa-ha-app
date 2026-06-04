@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.46.0] - 2026-06-04 — Add-on config conformance: config in Supervisor-managed `/config`
+
+Moves casa's persistent configuration to the **Supervisor-managed `addon_config` mount** at
+**`/config`**, conforming to HA add-on conventions.
+
+### Changed
+
+- **`config.yaml` `map: all_addon_configs:rw` → `addon_config:rw`.** Casa now reads its config from
+  `/config` (host `/addon_configs/{REPO}_casa-agent/`), the dir Supervisor recognizes as the add-on's
+  config. Every hardcoded `/addon_configs/casa-agent` (~60 refs across code, s6 scripts, AppArmor,
+  configurator/plugin-developer doctrine, and `DOCS.md`) now uses `/config`. AppArmor updated to
+  `/config/** rwk`.
+
+### Why
+
+The old layout mapped the **entire** `/addon_configs/` tree (every add-on's config) and hardcoded
+the *base* slug path `/addon_configs/casa-agent` — which Supervisor does **not** recognize as the
+add-on's config dir. Consequences (observed live): an uninstall with "remove configuration" did
+**not** clean casa's config, and **HA add-on backups silently missed it** (they capture the
+slug-prefixed dir, which was empty). Casa never read any other add-on's config, so the broad mount
+was unnecessary. Now config is backed up by HA, removed on remove-config uninstall, and conforming.
+
+### Migration
+
+**None — this is a path change with no auto-migration.** A fresh install seeds `/config` cleanly.
+An in-place upgrade does **not** move an existing `/addon_configs/casa-agent/` config to `/config`;
+re-create/seed config after upgrading (or restore from a backup of the old dir). The `/data` volume
+(sessions, `webhook_secret`) is unaffected.
+
 ## [0.45.1] - 2026-06-04 — Fix: tier classifier runs as root
 
 ### Fixed
