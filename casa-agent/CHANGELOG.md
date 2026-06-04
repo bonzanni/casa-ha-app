@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.46.1] - 2026-06-04 — Fix: `hindsight_api_url` actually enables long-term memory
+
+### Fixed
+
+- **Setting `hindsight_api_url` now turns long-term memory ON.** `casa_core` requires
+  `MEMORY_BACKEND=hindsight` (anything else → `noop`), but **nothing in the add-on ever set
+  `MEMORY_BACKEND`** — no option, no `environment:` block, no export in `svc-casa/run`. So
+  long-term memory was effectively **unreachable**: even with `hindsight_api_url` configured, casa
+  stayed on the NoOp backend (short-term only). `svc-casa/run` now derives
+  `export MEMORY_BACKEND="${MEMORY_BACKEND:-hindsight}"` inside the `hindsight_api_url` conditional,
+  making the URL the single toggle (set it → on; empty → off). A regression guard test asserts the
+  derivation. `DOCS.md` updated accordingly.
+
 ## [0.46.0] - 2026-06-04 — Add-on config conformance: config in Supervisor-managed `/config`
 
 Moves casa's persistent configuration to the **Supervisor-managed `addon_config` mount** at
