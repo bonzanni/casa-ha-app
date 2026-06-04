@@ -88,37 +88,33 @@ include:
       enabled: true       # default false
       token_budget: 2000
 
-When `enabled: true`, `engage_executor` reads the archive at
-`{channel}-{chat_id}-executor-{type}` (built via `honcho_session_id`) and substitutes the digest into the
-prompt template's `{executor_memory}` slot before driver dispatch. The
-archive is populated by `_finalize_engagement` (one summary per terminal
-engagement) — no separate writer code.
+When `enabled: true`, `engage_executor` reads the archive via
+semantic recall against the shared `casa` bank at the engagement's
+clearance and substitutes the digest into the prompt template's
+`{executor_memory}` slot before driver dispatch. The archive is populated
+by `_finalize_engagement` (one summary per terminal engagement) — no
+separate writer code.
 
 For Configurator (you), `memory.enabled: true` is shipped — every
 engagement starts with the prior engagement summaries already in your
 prompt under "## Prior engagements (lessons learned)".
 
-## Specialist memory (M4b, v0.17.0)
+## Specialist memory
 
-Specialists carry **per-`(role, user_peer)` Honcho memory** —
-channel-agnostic, mixed-domain. Session id is
-`f"{role}-{user_peer}"` (2-segment). It is
-built via `honcho_session_id` to satisfy Honcho's
-`^[A-Za-z0-9_-]+$` server-side regex.
+Specialists read and write the **shared `casa` Hindsight bank** via
+clearance-gated recall and sensitivity-tier-classified retain — there
+is no per-role Honcho session and no `honcho_session_id`. Memory is
+channel-agnostic and scoped by the recall query at read time.
 
-Honcho's existing `observe_others=True`-on-agent-peer setup
-(`memory.py:185-204`) populates `peer_representation` automatically
-over time, giving each specialist a domain-narrow theory-of-mind of
-the user. `search_query` retrieval at read time is scoped to the
-specialist's own corpus — denser per token than searching a
-coordinator's mixed-domain memory.
-
-Specialists do **not** participate in trust filtering at the memory
-layer — trust is one level up at the resident's `delegates` decision.
+Trust filtering happens one level up: a specialist is callable from a
+channel iff some resident on that channel lists it in `delegates`.
+Once invoked, the specialist's recall draws from the shared bank at
+the engagement's inherited clearance.
 
 Enabling memory on a specialist: set `memory.token_budget > 0` in
-`runtime.yaml`. Disabling: set `token_budget: 0` (back to stateless;
-prior session messages stay in Honcho but are no longer read).
+`runtime.yaml`. Each `delegate_to_agent` call then triggers a recall
+pass against the shared bank. Disabling: set `token_budget: 0` (back
+to stateless).
 
 ## MCP service topology (v0.14.0)
 
@@ -253,7 +249,7 @@ wiring plugin env vars via 1Password references.
 
 ### 1P universal resolver
 
-All password-typed addon options (`claude_oauth_token`, `honcho_api_key`,
+All password-typed addon options (`claude_oauth_token`,
 `telegram_bot_token`, `webhook_secret`, `github_token`) accept
 `op://vault/item/field` references. Resolved at boot by
 `secrets_resolver.resolve` (lru_cache, shells `op read`).

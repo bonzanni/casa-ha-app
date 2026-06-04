@@ -13,8 +13,6 @@ fi
 export CLAUDE_CODE_OAUTH_TOKEN="$(bashio::config 'claude_oauth_token')"
 export OP_SERVICE_ACCOUNT_TOKEN="$(bashio::config 'onepassword_service_account_token')"
 export ONEPASSWORD_DEFAULT_VAULT="$(bashio::config 'onepassword_default_vault')"
-export HONCHO_API_KEY="$(bashio::config 'honcho_api_key')"
-export HONCHO_API_URL="$(bashio::config 'honcho_api_url')"
 _hindsight_url="$(bashio::config 'hindsight_api_url')"
 if [ "$_hindsight_url" != "null" ] && [ -n "$_hindsight_url" ]; then
     export HINDSIGHT_API_URL="$_hindsight_url"

@@ -30,24 +30,20 @@ Casa runs always-on AI agents inside your Home Assistant instance. The primary a
 
 ### Optional -- Memory
 
-By default, Casa persists conversation history to a local SQLite
-database at `/data/memory.sqlite`. Set `HONCHO_API_KEY` to use the
-Honcho cloud backend instead (adds semantic retrieval + peer
-representations). Set `MEMORY_BACKEND=noop` if you want no memory at all.
+Short-term conversation continuity always works via the Claude Agent SDK
+session. **Long-term** memory (cross-session recall) is off by default and
+is enabled by pointing Casa at a self-hosted **Hindsight** add-on.
 
 | Option | Description |
 |--------|-------------|
-| `honcho_api_url` | Honcho API URL. Defaults to `https://api.honcho.dev`. |
-| `honcho_api_key` | Honcho API key. When set, enables the Honcho cloud backend (overrides SQLite default). |
-| `hindsight_api_url` | Internal base URL for the self-hosted Hindsight add-on (e.g. `http://5884eb17-hindsight:8888` or its IP), reached via the add-on's hassio network alias/IP — not the bare host `hindsight`. Set together with `MEMORY_BACKEND=hindsight` to put the resident agents' long-term semantic memory on Hindsight — both **save** (the freshness reaper retains ended conversations) and **recall** (a mental-model overlay + relevance-ranked recall on the read path, plus a `recall_memory` pull tool). Leave empty to keep long-term memory disabled (short-term conversation continuity still works via the SDK session). |
+| `hindsight_api_url` | Internal base URL for the self-hosted Hindsight add-on (e.g. `http://5884eb17-hindsight:8888` or its IP), reached via the add-on's hassio network alias/IP — not the bare host `hindsight`. Set together with `MEMORY_BACKEND=hindsight` to put the agents' long-term semantic memory on Hindsight — both **save** (the freshness reaper retains ended conversations, each item tier-classified) and **recall** (a mental-model overlay + relevance-ranked recall on the read path, plus a `recall_memory` pull tool). Leave empty to keep long-term memory disabled (short-term continuity still works via the SDK session). |
 
-The following env vars can be set via the add-on environment (not the
-options panel) for finer control:
+The following env var can be set via the add-on environment (not the
+options panel):
 
 | Env var | Purpose | Default |
 |---|---|---|
-| `MEMORY_BACKEND` | Force a specific backend (`honcho` / `hindsight` / `sqlite` / `noop`). Fails fast on typos. | unset (auto-resolves) |
-| `MEMORY_DB_PATH` | SQLite file location. | `/data/memory.sqlite` |
+| `MEMORY_BACKEND` | Long-term memory backend: `hindsight` (requires `hindsight_api_url`) or `noop` (disabled). Any other value resolves to `noop`. | unset (→ `noop`) |
 
 ### Optional -- Agents
 
@@ -155,7 +151,7 @@ When `enable_terminal` is enabled, a web terminal is available at the `/terminal
 - **Add-on won't start**: Check the log for "claude_oauth_token is required". You must set the token before starting.
 - **No Telegram messages**: Verify `telegram_bot_token` and `telegram_chat_id` are correct. The bot must have been started (`/start` in Telegram).
 - **Engagements won't open (`engagement_not_configured`)**: See the "Troubleshooting engagements" subsection under [Engagements (v0.11.0)](#engagements-v0110) — most common cause is the bot missing "Manage topics" admin permission in the engagement supergroup.
-- **Memory not working**: By default, memory persists to `/data/memory.sqlite` (SQLite backend). If `HONCHO_API_KEY` is set but memory still appears empty, check container logs for `SQLite memory init failed` or Honcho connection errors. To disable memory entirely, set `MEMORY_BACKEND=noop`.
+- **Long-term memory not working**: Long-term recall requires `MEMORY_BACKEND=hindsight` plus a reachable `hindsight_api_url`. If recall is empty, check container logs for Hindsight connection errors (and that the Hindsight add-on is running). Without it, only short-term per-session continuity works; set `MEMORY_BACKEND=noop` to disable long-term memory explicitly.
 - **502 errors on ingress**: The Python process may still be starting. Wait up to 60 seconds after add-on start.
 
 ## Engagements (v0.11.0)
@@ -307,7 +303,7 @@ as errored and tells you to start a fresh one.
 - **"Could not resume this engagement" reply after 24h+ idle.**
   The suspended SDK session rotated before you came back. The
   engagement is marked as errored after two failed resumes. Start a
-  new one; your prior conversation is still in Ellen's meta-scope
+  new one; your prior conversation is still in Ellen's long-term
   memory.
 - **Ellen doesn't narrate completion in the main chat.**
   Ellen receives the `ENGAGEMENT_COMPLETION` notification but chooses
@@ -329,7 +325,7 @@ The `configurator` is the first Tier 3 Executor - knows Casa's configuration sur
 | Per-agent prompts | yes | yes | yes | yes |
 | Triggers (cron, interval, webhook) | yes | yes | yes | yes |
 | Delegate wiring | yes | yes | yes | yes |
-| Policies (scopes corpus, disclosure) | - | yes | yes | - |
+| Policies (disclosure) | - | yes | yes | - |
 
 Not yet supported:
 
@@ -351,7 +347,7 @@ Ellen opens a topic `#[configurator] <short task>` in your engagement supergroup
 
 ### Reload behavior
 
-- hard - Supervisor addon restart (~10-15s). Agent-shape changes, runtime, scope corpus.
+- hard - Supervisor addon restart (~10-15s). Agent-shape changes, runtime, policy corpus.
 - soft - In-process casa_reload_triggers(role). Trigger-only edits; no downtime.
 - none - Prompt, response_shape, doctrine edits take effect on next turn.
 
@@ -573,7 +569,7 @@ Set `onepassword_service_account_token` (from https://developer.1password.com/do
 as a plaintext addon option — it's the single root of trust and cannot
 self-reference. Set `onepassword_default_vault` to the vault name (default
 "Casa"). Every other password-typed option (`claude_oauth_token`,
-`telegram_bot_token`, `webhook_secret`, `honcho_api_key`) accepts either
+`telegram_bot_token`, `webhook_secret`) accepts either
 plaintext OR an `op://` reference.
 
 Plugin env vars resolved via `plugin-env.conf` (`/addon_configs/casa-agent/plugin-env.conf`),

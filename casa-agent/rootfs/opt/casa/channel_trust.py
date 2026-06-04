@@ -34,7 +34,7 @@ _CHANNEL_TRUST_DISPLAY: dict[str, str] = {
 
 
 def user_peer_for_channel(channel: str) -> str:
-    """Return the Honcho peer that owns user-text from *channel*."""
+    """Return the peer name that owns user-text from *channel*."""
     return _USER_PEER_BY_CHANNEL.get(channel, "nicola")
 
 

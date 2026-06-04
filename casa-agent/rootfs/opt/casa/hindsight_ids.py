@@ -6,7 +6,7 @@ charset, because the **server does not validate**: probed live against
 Hindsight 0.7.1 (2026-06-02), ``casa.finance`` (dot), ``Casa_Butler``
 (uppercase/underscore) and a 100-char id were ALL accepted with HTTP 200.
 A permissive server is exactly why silent client-side acceptance is the bug
-class to avoid (cf. ``honcho_ids.py`` — silent sanitization blinded us for
+class to avoid (cf. the retired silent-sanitizer that blinded us for
 11 days). We therefore impose our own rule and raise rather than coerce.
 
 Allowed: ASCII letters, digits, underscore, hyphen. ``.``/``/``/space/

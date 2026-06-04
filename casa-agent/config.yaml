@@ -32,8 +32,6 @@ options:
   telegram_bot_api_base: ""
   telegram_transport: "polling"
   telegram_delivery_mode: "stream"
-  honcho_api_url: "https://api.honcho.dev"
-  honcho_api_key: ""
   hindsight_api_url: ""
   onepassword_service_account_token: ""
   onepassword_default_vault: "Casa"
@@ -67,8 +65,6 @@ schema:
   telegram_bot_api_base: "str?"
   telegram_transport: "list(polling|webhook)?"
   telegram_delivery_mode: "list(stream|block)?"
-  honcho_api_url: url?
-  honcho_api_key: password?
   hindsight_api_url: str?
   onepassword_service_account_token: password?
   onepassword_default_vault: str?
