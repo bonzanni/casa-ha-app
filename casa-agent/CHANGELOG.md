@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.44.0] - 2026-06-04 — Tiered memory access (3/4): collapse specialists/executors/engagements
+
+Folds the **specialist / executor / engagement** memory subsystem off the legacy
+`MemoryProvider` (Honcho/SQLite, per-role banks) and onto the shared tier-tagged Hindsight bank
+`casa` shipped in v0.43.0. Every delegated context now inherits the **originating context's BOTH
+axes** — read-clearance *and* write-trust (design `2026-06-03-tiered-memory-access-design` §3):
+
+- **Reads** become a single `recall("casa", text, tags=readable_tiers(clearance_for_channel(
+  origin_channel)))` at the parent/engagement origin's clearance. A finance specialist spawned
+  from a private Telegram turn recalls at `private`; one spawned from voice recalls at `friends`.
+- **Writes** are explicit, tier-classified `retain`s gated by `writes_to_bank(origin_channel)` —
+  because specialists/executors are **ephemeral** (no session registry → the freshness reaper
+  never sees them), so the reaper can't catch their turns. **Voice-originated delegation writes
+  nothing** (recall-only): no speaker auth → it cannot poison the trusted store.
+
+### Added
+
+- `delegated_memory.py` — the delegated-context bridge: `delegated_recall(...)` (read at the
+  inherited clearance, best-effort) and `retain_delegated(...)` (explicit, write-trust-gated,
+  per-item tier-classified retain with idempotent `document_id`). One place that holds the
+  inheritance rule.
+
+### Changed
+
+- **Specialist delegation** (`_run_delegated_agent`) reads via `delegated_recall` and writes one
+  tier-tagged `retain` of the exchange via `retain_delegated` — the bespoke per-turn `add_turn`
+  and Ellen meta-write are gone (under shared tier memory Ellen recalls everything at her
+  clearance, so the meta-session was redundant).
+- **Executor archive** (`_fetch_executor_archive`) becomes a semantic recall keyed on the current
+  task at the engagement's inherited clearance (was a query-less per-executor recency read).
+- **Engagement finalize** (`_finalize_engagement`) retains the structured engagement summary
+  (and the executor-type summary, distinct `document_id`) as tier-tagged `retain`s; the
+  completion **post-back NOTIFICATION is unchanged** — the resident reaper still retains it at the
+  engager's trust.
+- **`query_engager`** reads via `delegated_recall` at the engager's clearance.
+
+### Removed
+
+- **`consult_other_agent_memory`** is retired — under shared tier memory it was an access-control
+  **bypass** (it read another role's bank *unfiltered*, ignoring clearance). Removed from the
+  tool registry, the assistant `runtime.yaml` allowlist, the assistant `system.md` (replaced with
+  shared-bank "when to delegate vs. recall" guidance), and the configurator doctrine recipes.
+- **`cross_recall`** removed from the `SemanticMemory` seam (abstract + NoOp + Hindsight) — the
+  retired tool was its only consumer.
+- All residual `active_memory_provider` **reads** in the delegated/engagement paths
+  (`emit_completion` / `cancel_engagement` / workspace-delete / `query_engager` plumbing), plus
+  the now-dead Honcho meta-summary retry loop. `active_memory_provider` itself remains an inert
+  bootstrap seam (removed in 4/4).
+
 ## [0.43.0] - 2026-06-04 — Tiered memory access (2/4): tier model
 
 Long-term memory moves onto a **sensitivity-tier access model over one shared Hindsight bank**
