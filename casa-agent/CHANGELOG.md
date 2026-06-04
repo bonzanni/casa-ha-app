@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.45.0] - 2026-06-04 — Tiered memory access (4/4): full legacy retirement
+
+Completes the tiered-memory re-architecture by **deleting the entire legacy memory stack**.
+`active_semantic_memory` (Hindsight) is now the only memory; short-term continuity stays on the
+Claude Agent SDK session. `MEMORY_BACKEND ∈ {hindsight, noop}` (any other value resolves to
+`noop`, never crashes).
+
+### Removed
+
+- **`memory.py`** — `MemoryProvider` / `HonchoMemoryProvider` / `SqliteMemoryProvider` /
+  `CachedMemoryProvider` / legacy `NoOpMemory`, plus the per-(role,user_peer) render helpers.
+- **The ONNX domain classifier** — `scope_registry.py`, the **`fastembed`** dependency, the
+  per-scope read fan-out in `agent.py`, the `scopes_owned`/`scopes_readable`/`default_scope`
+  `MemoryConfig` fields + their boot validation, the `policies/scopes.yaml` corpus +
+  `policy-scopes.v2.json` schema, and the `scope_threshold` option/env plumbing. The whole
+  scope-routing block was dead since v0.43 (its outputs fed only a telemetry log + an unread
+  `origin_var["scope"]` stamp); the resident read path already uses the shared `casa` bank with
+  sensitivity-tier tags. `channel_trust` (trust tokens for the system prompt + peer mapping) is
+  **preserved** — it is independent of the scope registry.
+- **The legacy backend-selection machinery** — `_MemoryChoice`, `resolve_memory_backend_choice`,
+  `_wrap_memory_for_strategy`, the `active_memory_provider` field/seam, and `Agent`'s vestigial
+  `memory: MemoryProvider` param + `self._memory`. The dashboard memory row now reads the
+  surviving semantic-backend choice (defensively — `GET /` never raises on a memory misconfig).
+- **Honcho** — the `honcho-ai` dependency, `honcho_ids.py`, the `honcho_api_url`/`honcho_api_key`
+  add-on options + schema + translations, the `HONCHO_API_KEY`/`HONCHO_API_URL` s6 exports, and
+  `HONCHO_API_KEY` from the engagement-template unset list / `_PASSWORD_ENV_VARS`. `MEMORY_BACKEND`
+  no longer accepts `honcho` or `sqlite`.
+
+### Changed
+
+- `session_registry.build_session_key` now validates the session-key charset inline (was
+  delegated to `honcho_ids.honcho_session_id`); the produced key format is **byte-identical**.
+- Configurator doctrine + `DOCS.md` updated to the shared-`casa`-bank model (no SQLite default,
+  no Honcho options, no per-role Honcho sessions, no scope corpus).
+
+### Migration note (pre-1.0)
+
+A stale user `runtime.yaml` still carrying `scopes_owned`/`scopes_readable`/`default_scope` (or a
+saved `honcho_api_*` / `scope_threshold` add-on option) is now rejected/ignored. The store is cold
+and these are pre-1.0 removals — set `MEMORY_BACKEND=hindsight` + `hindsight_api_url` for long-term
+memory, or leave unset for short-term-only.
+
 ## [0.44.0] - 2026-06-04 — Tiered memory access (3/4): collapse specialists/executors/engagements
 
 Folds the **specialist / executor / engagement** memory subsystem off the legacy
