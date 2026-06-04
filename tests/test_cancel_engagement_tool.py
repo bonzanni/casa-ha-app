@@ -50,10 +50,13 @@ class TestCancelEngagement:
 
 
 async def test_cancel_writes_meta_scope_summary(tmp_path, monkeypatch):
-    """M2.G4 — cancel must write the engagement summary into the
-    engager's meta scope on Honcho, mirroring emit_completion's path.
-    Pre-fix passed memory_provider=None so cancellations were silent."""
-    import sys
+    """M2.G4 (rewritten for the shared-bank rearch) — cancel must not be
+    silent: it must retain a structured engagement summary on the shared
+    `casa` bank with status=='cancelled'. Pre-fix passed memory_provider=None
+    so cancellations were silent; the regression intent is preserved on the
+    new delegated-memory mechanism."""
+    import agent as agent_mod
+    import delegated_memory
     from engagement_registry import EngagementRegistry
     from tools import cancel_engagement, init_tools
 
@@ -70,17 +73,22 @@ async def test_cancel_writes_meta_scope_summary(tmp_path, monkeypatch):
         topic_id=42,
     )
 
-    # Mock memory provider; expose it on the agent module the way the
+    # Recording semantic-memory fake exposed on the agent module the way the
     # production singleton would be.
-    mp = MagicMock()
-    mp.ensure_session = AsyncMock(return_value=None)
-    mp.add_turn = AsyncMock(return_value=None)
+    class _Sem:
+        def __init__(self):
+            self.retain_calls = []
 
-    fake_agent_mod = MagicMock()
-    fake_agent_mod.active_memory_provider = mp
-    fake_agent_mod.active_engagement_driver = None
-    fake_agent_mod.active_claude_code_driver = None
-    monkeypatch.setitem(sys.modules, "agent", fake_agent_mod)
+        async def retain(self, bank, items, *, async_=True):
+            self.retain_calls.append({"bank": bank, "items": items})
+
+    sem = _Sem()
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", sem, raising=False)
+
+    async def _fake_classify(text):
+        return "private"
+
+    monkeypatch.setattr(delegated_memory, "classify_tier", _fake_classify)
 
     tch = MagicMock()
     tch.send_to_topic = AsyncMock()
@@ -99,20 +107,15 @@ async def test_cancel_writes_meta_scope_summary(tmp_path, monkeypatch):
     payload = json.loads(res["content"][0]["text"])
     assert payload["status"] == "ok"
 
-    # Meta-scope summary write fired exactly once.
-    meta_sid = "telegram-123-meta-assistant"
-    assert any(
-        c.kwargs.get("session_id") == meta_sid
-        for c in mp.ensure_session.await_args_list
-    ), f"expected ensure_session({meta_sid!r}); got {mp.ensure_session.await_args_list}"
-    assert any(
-        c.kwargs.get("session_id") == meta_sid
-        for c in mp.add_turn.await_args_list
+    # A structured engagement summary was retained on the shared `casa` bank
+    # with status=='cancelled' — cancellation is not silent.
+    assert sem.retain_calls, "expected a retain on cancel; got none"
+    summaries = [
+        json.loads(i["content"])
+        for c in sem.retain_calls for i in c["items"]
+    ]
+    eng_summary = next(
+        s for s in summaries if s["kind"] == "engagement_summary"
     )
-
-    # Per-executor-type archival also fired (kind=executor branch).
-    type_sid = "telegram-123-executor-configurator"
-    assert any(
-        c.kwargs.get("session_id") == type_sid
-        for c in mp.add_turn.await_args_list
-    )
+    assert eng_summary["status"] == "cancelled"
+    assert eng_summary["engagement_id"] == rec.id

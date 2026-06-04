@@ -27,7 +27,6 @@ from marketplace_ops import (
     remove_plugin_entry,
     update_plugin_entry,
 )
-from honcho_ids import honcho_session_id
 from plugin_env_extractor import extract_env_vars
 from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — available for future use
 from system_requirements.orchestrator import install_requirements, OrchestrationError
@@ -194,32 +193,11 @@ _ENGAGEMENTS_PENDING_RELOAD: set[str] = set()
 # (engagement_var bound), it does NOT POST to Supervisor. Instead it
 # adds engagement.id to this set and returns immediately. The actual
 # Supervisor POST is performed at the end of _finalize_engagement —
-# AFTER the bus-message write + Honcho meta-summary land — so the
+# AFTER the bus-message write + engagement-summary retain land — so the
 # user-DM "Done" relay survives the addon kill. Out-of-engagement
 # casa_reload calls (operator-triggered via /invoke) still POST
 # inline since there is no engagement to wait for.
 _ENGAGEMENTS_DEFERRED_HARD_RELOAD: set[str] = set()
-
-
-def _is_transient_connection_error(exc: BaseException) -> bool:
-    """True if ``exc`` looks like a transient connection-class failure.
-
-    F-4 (v0.32.0): Honcho's HTTPX-backed client surfaces TLS/SSL closes
-    and connection-resets as opaque exception strings (the upstream
-    typing wraps them under generic exception classes). String-sniff is
-    the only portable check — narrow set of substrings to keep retries
-    scoped to genuinely transient failures.
-    """
-    msg = str(exc).lower()
-    needles = (
-        "tls/ssl connection has been closed",
-        "connection error",
-        "connection reset",
-        "connection aborted",
-        "remoteprotocolerror",
-        "server disconnected",
-    )
-    return any(n in msg for n in needles)
 
 
 def _result(payload: dict, *, is_error: bool | None = None) -> dict:
@@ -1253,7 +1231,7 @@ async def casa_reload(args: dict) -> dict:
 
 async def _post_supervisor_restart() -> dict:
     """Internal helper used by ``_finalize_engagement`` to honor a
-    deferred hard-reload after the bus message + Honcho summary have
+    deferred hard-reload after the bus message + engagement-summary retain have
     landed. Returns a result-shaped dict for logging; never raises.
     """
     import aiohttp
@@ -1614,10 +1592,9 @@ async def _finalize_engagement(
     artifacts: list[str],
     next_steps: list[dict],
     driver: Any | None,
-    memory_provider: Any | None,
 ) -> None:
-    """End an engagement: update registry, close topic, NOTIFY Ellen, write
-    Ellen's meta-scope summary.
+    """End an engagement: update registry, close topic, NOTIFY Ellen,
+    retain a tier-classified engagement summary on the shared ``casa`` bank.
 
     Never raises on channel/memory side-effects — logs warnings and continues
     so the registry always reaches a terminal state.
@@ -1719,8 +1696,14 @@ async def _finalize_engagement(
                 engagement.id[:8], exc,
             )
 
-    # 5. Write Ellen's meta-scope summary (best-effort)
-    if memory_provider is not None:
+    # 5. Retain a structured engagement summary on the shared `casa` bank,
+    #    tier-classified and gated by the origin channel's write-trust (voice →
+    #    nothing) — design §3, plan 3. The post-back NOTIFICATION above is the
+    #    durable record for the engager; this is the structured one-shot the
+    #    maintainer chose to keep.
+    import agent as agent_mod
+    sem = getattr(agent_mod, "active_semantic_memory", None)
+    if sem is not None:
         summary = json.dumps({
             "kind": "engagement_summary",
             "engagement_id": engagement.id,
@@ -1734,50 +1717,11 @@ async def _finalize_engagement(
             "artifacts": artifacts,
             "next_steps": next_steps,
         })
-        # Use Ellen's meta session. The session_id convention is
-        # honcho_session_id(channel, chat_id, "meta", "assistant")
-        # — mirror plan-1 scope stack.
-        channel = engagement.origin.get("channel", "telegram")
-        chat_id = str(engagement.origin.get("chat_id", ""))
-        meta_sid = honcho_session_id(channel, chat_id, "meta", "assistant")
-
-        # F-4 (v0.32.0): the Honcho client's HTTPS connection is reused
-        # across calls; on long idles between turns the upstream may
-        # close the TLS session, surfacing as `Connection error: TLS/SSL
-        # connection has been closed (EOF)` on the next request. The
-        # Honcho client does not transparently reconnect, so a one-shot
-        # write at finalize time can lose the M4 meta-scope summary.
-        # Retry once on connection-class errors before giving up.
-        last_exc: Exception | None = None
-        for attempt in (1, 2):
-            try:
-                await memory_provider.ensure_session(
-                    session_id=meta_sid,
-                    agent_role="assistant",
-                )
-                await memory_provider.add_turn(
-                    session_id=meta_sid,
-                    agent_role="assistant",
-                    user_text="(engagement summary written)",
-                    assistant_text=summary,
-                )
-                last_exc = None
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                if attempt == 1 and _is_transient_connection_error(exc):
-                    logger.info(
-                        "finalize engagement %s: meta summary write hit "
-                        "transient connection error (%s), retrying once",
-                        engagement.id[:8], exc,
-                    )
-                    continue
-                break
-        if last_exc is not None:
-            logger.warning(
-                "finalize engagement %s: meta summary write failed: %s",
-                engagement.id[:8], last_exc,
-            )
+        await retain_delegated(
+            sem, origin_channel=str(engagement.origin.get("channel", "")),
+            doc_prefix=f"engagement:{engagement.id}:summary",
+            turns=[("assistant", summary)],
+        )
 
     # Plan 4a.1 §8.4: update .casa-meta.json with terminal status + retention_until.
     if engagement.driver == "claude_code":
@@ -1811,46 +1755,32 @@ async def _finalize_engagement(
                 engagement.id[:8], exc,
             )
 
-    # Plan 4a: per-executor-type Honcho archival (only for kind=executor).
-    if (memory_provider is not None
-            and engagement.kind == "executor"):
-        try:
-            channel = engagement.origin.get("channel", "telegram")
-            chat_id = str(engagement.origin.get("chat_id", ""))
-            type_session = honcho_session_id(
-                channel, chat_id, "executor", engagement.role_or_type,
-            )
-            type_summary = json.dumps({
-                "kind": "executor_engagement_summary",
-                "engagement_id": engagement.id,
-                "executor_type": engagement.role_or_type,
-                "started_at": engagement.started_at,
-                "finished_at": now,
-                "duration_s": now - engagement.started_at,
-                "terminal_state": outcome,
-                "engager": engagement.origin.get("role") or "assistant",
-                "task": engagement.task,
-                "last_text": text,
-                "artifacts": artifacts,
-            })
-            await memory_provider.ensure_session(
-                session_id=type_session,
-                agent_role=f"executor-{engagement.role_or_type}",
-            )
-            await memory_provider.add_turn(
-                session_id=type_session,
-                agent_role=f"executor-{engagement.role_or_type}",
-                user_text="(executor engagement summary)",
-                assistant_text=type_summary,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "finalize engagement %s: executor-type archival failed: %s",
-                engagement.id[:8], exc,
-            )
+    # Per-executor-type structured summary (only kind=executor), retained
+    # tier-tagged on the shared bank with a DISTINCT doc_prefix so it does not
+    # clobber the engagement_summary item above.
+    # `sem` is the active_semantic_memory resolved in step 5 above.
+    if engagement.kind == "executor" and sem is not None:
+        type_summary = json.dumps({
+            "kind": "executor_engagement_summary",
+            "engagement_id": engagement.id,
+            "executor_type": engagement.role_or_type,
+            "started_at": engagement.started_at,
+            "finished_at": now,
+            "duration_s": now - engagement.started_at,
+            "terminal_state": outcome,
+            "engager": engagement.origin.get("role") or "assistant",
+            "task": engagement.task,
+            "last_text": text,
+            "artifacts": artifacts,
+        })
+        await retain_delegated(
+            sem, origin_channel=str(engagement.origin.get("channel", "")),
+            doc_prefix=f"engagement:{engagement.id}:executor_summary",
+            turns=[("assistant", type_summary)],
+        )
 
     # H-1 (v0.34.0): honor deferred hard-reload now that all bus +
-    # Honcho writes have landed. Only on outcome=completed — per
+    # retain writes have landed. Only on outcome=completed — per
     # ``completion.md`` doctrine line 61, a cancelled engagement does
     # NOT need a reload (artifact is operator-pending). On
     # outcome=error the engagement bailed; the reload decision is the
@@ -1926,8 +1856,8 @@ async def emit_completion(args: dict) -> dict:
 
     # Bug 9 (v0.14.6): idempotency. Re-emitting completion (e.g. SDK
     # retry, hook misfire) used to re-run _finalize_engagement, which
-    # double-closes the topic, double-NOTIFYs Ellen, and double-writes
-    # the meta-scope summary into Honcho. Re-read the live registry
+    # double-closes the topic, double-NOTIFYs Ellen, and double-retains
+    # the engagement summary on the shared `casa` bank. Re-read the live registry
     # state so we catch transitions that happened on another in-flight
     # turn since this engagement_var snapshot was taken.
     if _engagement_registry is not None:
@@ -1950,17 +1880,15 @@ async def emit_completion(args: dict) -> dict:
     status_in = args.get("status", "ok") or "ok"
     outcome = "completed" if status_in == "ok" else "error"
 
-    # Driver + memory_provider are discovered via the agent singleton
-    # accessible through the agent module (plan-1 pattern).
+    # Driver is discovered via the agent singleton accessible through the
+    # agent module (plan-1 pattern).
     driver = None
-    memory_provider = None
     try:
         import agent as agent_mod  # noqa: F401
         if engagement.driver == "claude_code":
             driver = getattr(agent_mod, "active_claude_code_driver", None)
         else:
             driver = getattr(agent_mod, "active_engagement_driver", None)
-        memory_provider = getattr(agent_mod, "active_memory_provider", None)
     except Exception:
         pass
 
@@ -2012,7 +1940,6 @@ async def emit_completion(args: dict) -> dict:
         artifacts=artifacts,
         next_steps=next_steps,
         driver=driver,
-        memory_provider=memory_provider,
     )
     # Drain on terminal paths (e.g., outcome=error or
     # already-terminal short-circuit above) — the engagement is gone.
@@ -2079,35 +2006,17 @@ async def query_engager(args: dict) -> dict:
     question = args.get("question", "") or ""
     max_tokens = int(args.get("max_tokens") or 500)
 
-    # Retrieve engager-side context
-    memory_provider = None
-    try:
-        import agent as agent_mod
-        memory_provider = getattr(agent_mod, "active_memory_provider", None)
-    except Exception:
-        pass
-    engager_role = engagement.origin.get("role", "assistant")
-    channel = engagement.origin.get("channel", "telegram")
-    chat_id = str(engagement.origin.get("chat_id", ""))
-    engager_scope = engagement.origin.get("scope", "meta")
-    session_id = honcho_session_id(
-        channel, chat_id, engager_scope, engager_role,
-    )
-
+    # Retrieve engager-side context: a semantic recall against the shared `casa`
+    # bank at the engagement origin's read-clearance (design §3, plan 3).
+    import agent as agent_mod
+    sem = getattr(agent_mod, "active_semantic_memory", None)
     context = ""
-    if memory_provider is not None:
-        try:
-            context = await memory_provider.get_context(
-                session_id=session_id,
-                agent_role=engager_role,
-                tokens=2000,
-                search_query=question,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "query_engager: get_context failed (%s); returning unknown", exc,
-            )
-            context = ""
+    if sem is not None:
+        context = await delegated_recall(
+            sem, query=question,
+            origin_channel=str(engagement.origin.get("channel", "")),
+            max_tokens=2000,
+        )
 
     # Publish bus event so observer can see the query
     if _bus is not None:
@@ -2150,21 +2059,18 @@ async def cancel_engagement(args: dict) -> dict:
                         "message": f"no engagement named {engagement_id!r}"})
 
     driver = None
-    memory_provider = None
     try:
         import agent as agent_mod  # noqa: F401
         if rec.driver == "claude_code":
             driver = getattr(agent_mod, "active_claude_code_driver", None)
         else:
             driver = getattr(agent_mod, "active_engagement_driver", None)
-        memory_provider = getattr(agent_mod, "active_memory_provider", None)
     except Exception:
         pass
 
     await _finalize_engagement(
         rec, outcome="cancelled", text="Engagement cancelled.",
         artifacts=[], next_steps=[], driver=driver,
-        memory_provider=memory_provider,
     )
     return _result({"status": "ok", "engagement_id": engagement_id})
 
@@ -2317,20 +2223,18 @@ async def delete_engagement_workspace(args: dict) -> dict:
     if rec.status in _LIVE_ENGAGEMENT_STATES and force:
         # Finalize as cancelled before pulling the workspace.
         driver = None
-        memory_provider = None
         try:
             import agent as agent_mod
             driver = (getattr(agent_mod, "active_claude_code_driver", None)
                       if rec.driver == "claude_code"
                       else getattr(agent_mod, "active_engagement_driver", None))
-            memory_provider = getattr(agent_mod, "active_memory_provider", None)
         except Exception:
             pass
         await _finalize_engagement(
             rec, outcome="cancelled",
             text="Workspace deletion forced",
             artifacts=[], next_steps=[],
-            driver=driver, memory_provider=memory_provider,
+            driver=driver,
         )
 
     ws = os.path.join(_ENGAGEMENTS_ROOT, engagement_id)
