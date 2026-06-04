@@ -79,8 +79,19 @@ def _render_delegates_block(delegates, registry) -> str:
     """
     if not delegates:
         return ""
+    # A delegates.yaml entry may point at a specialist that is now disabled
+    # (enabled: false) or removed. Such an agent is NOT callable — the
+    # delegate_to_agent tool rejects it with unknown_agent — so do not advertise
+    # it. The registry holds exactly residents + ENABLED specialists; filter on
+    # that. (No registry → back-compat: render every declared delegate.)
+    visible = [
+        d for d in delegates
+        if registry is None or registry.is_known(d.agent)
+    ]
+    if not visible:
+        return ""
     lines = ["<delegates>"]
-    for d in delegates:
+    for d in visible:
         name = registry.role_to_name(d.agent) if registry is not None else d.agent
         lines.append(f"- {name} (role: {d.agent}) — {d.purpose}")
         lines.append(f"  Delegate when: {d.when}")
