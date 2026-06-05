@@ -14,15 +14,25 @@ tools:
   allowed:
     - mcp__casa-framework__query_engager
     - mcp__casa-framework__emit_completion
-    # Bash(git push*) must be allow-listed so self_containment_guard hook fires
-    - "Bash(git*)"
-    - "Bash(gh*)"
+    # v0.46.4: broad Bash — the builder must run/test what it writes across
+    # open-ended toolchains (python/pytest/uv/npm/ruff/tsc/make/...). An
+    # allowlist can't cover dev, so safety lives in the hook stack
+    # (block_dangerous_bash + path_scope to /data/engagements/ + the
+    # engagement_permission_relay), not in Bash verbs. git push still triggers
+    # self_containment_guard (PreToolUse hook, fires regardless of allow-list).
+    # Dev sandbox (isolate where this runs) is on the roadmap.
+    - Bash
     - Read
     - Write
     - Edit
     - Glob
     - Grep
     - Skill
+    # v0.46.4: current-docs / research — the builder had no doc/web access and
+    # was coding from stale memory. context7 (structured library docs) follows
+    # in v0.46.5 (needs an MCP .mcp.json driver change).
+    - WebFetch
+    - WebSearch
   permission_mode: auto
 mcp_server_names:
   - casa-framework
