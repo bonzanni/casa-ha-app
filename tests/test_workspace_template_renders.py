@@ -147,6 +147,39 @@ def test_template_path_filters_invalid_permissions(tmp_path: Path, executor_defa
     assert settings["permissions"]["defaultMode"] == "bypassPermissions"
 
 
+def test_template_keeps_broad_bash_and_web_tools(tmp_path: Path, executor_defaults: Path) -> None:
+    """v0.46.4: bare ``Bash`` (broad) + ``WebFetch``/``WebSearch`` survive the
+    permission filter (dev executors need them); bogus entries still drop."""
+    from config import ExecutorDefinition
+    from drivers.workspace import render_workspace_template
+
+    dest = tmp_path / "engagements" / "eng3"
+    defn = ExecutorDefinition(
+        type="test-fixture",
+        description="test fixture twenty-character description here",
+        model="sonnet",
+        driver="claude_code",
+        tools_allowed=["Bash", "WebFetch", "WebSearch", "Read", "casa-internal-bogus"],
+        permission_mode="auto",
+    )
+    render_workspace_template(
+        template_root=executor_defaults / "test-fixture" / "workspace-template",
+        plugins_yaml=executor_defaults / "test-fixture" / "plugins.yaml",
+        dest=dest,
+        defn=defn,
+        hooks_yaml_data={},
+        executor_type="test-fixture",
+        task="t", context="c",
+        world_state_summary="",
+    )
+    allow = json.loads((dest / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+    assert "Bash" in allow            # broad bash kept (was dropped pre-v0.46.4)
+    assert "WebFetch" in allow
+    assert "WebSearch" in allow
+    assert "Read" in allow
+    assert "casa-internal-bogus" not in allow   # bogus still filtered
+
+
 def test_template_path_writes_translated_hooks(tmp_path: Path, executor_defaults: Path) -> None:
     """L-1: template path writes hooks block from hooks_yaml_data."""
     from config import ExecutorDefinition

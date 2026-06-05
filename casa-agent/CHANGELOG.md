@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.46.4] - 2026-06-05 — plugin-developer: broad Bash + web research (it can finally run/test + read docs)
+
+### Changed
+
+- **The `plugin-developer` executor now has broad `Bash` + `WebFetch`/`WebSearch`.** Previously its
+  Bash was limited to `Bash(git*)`/`Bash(gh*)` and it had no web/doc access — so it authored code it
+  could neither run, test, nor research (coding from stale memory). It now runs open-ended toolchains
+  (python/pytest/uv/npm/ruff/tsc/…) and can read docs/examples. Safety is unchanged and lives in the
+  hook stack — `block_dangerous_bash` + `path_scope` (writes confined to `/data/engagements/`) + the
+  `engagement_permission_relay` (operator approval) — not in a Bash allowlist; `git push` still fires
+  `self_containment_guard`. A dev sandbox (isolate *where* dev executors run) is on the roadmap.
+- Widened the engagement permission filter (`drivers/workspace.py` `_VALID_CC_PERMISSION_RE`) to
+  accept bare `Bash` and `WebFetch`/`WebSearch` (it previously required `Bash(...)` and dropped the
+  web tools). Regression test added.
+
+### Notes
+
+- `context7` (structured library/SDK docs) follows in v0.46.5 — it's an MCP server and the engagement
+  `.mcp.json` is hardcoded to casa-framework, so it needs a small driver change + an HTTP-vs-`npx`
+  decision + a live check.
+
 ## [0.46.3] - 2026-06-05 — plugin-developer dev tooling: freeze at official pins + drop mis-bundled document-skills
 
 ### Changed

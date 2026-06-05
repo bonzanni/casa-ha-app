@@ -32,8 +32,11 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 # L-1 (v0.34.2): valid CC permission patterns we forward into
 # engagement-scoped .claude/settings.json::permissions.allow.
 # Anything else (e.g. Casa-internal tool names) is dropped with a WARNING.
+# v0.46.4: accept BARE ``Bash`` (broad, no parens — for dev executors that must
+# run open-ended toolchains; safety stays in the hook stack: block_dangerous_bash
+# + path_scope + the engagement_permission_relay) and ``WebFetch``/``WebSearch``.
 _VALID_CC_PERMISSION_RE = re.compile(
-    r"^(Bash\(.+\)|Read|Write|Edit|Glob|Grep|Skill|mcp__.+)$"
+    r"^(Bash(\(.+\))?|Read|Write|Edit|Glob|Grep|Skill|WebFetch|WebSearch|mcp__.+)$"
 )
 
 
