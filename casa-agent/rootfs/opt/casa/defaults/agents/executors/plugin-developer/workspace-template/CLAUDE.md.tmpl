@@ -27,8 +27,9 @@ Follow the superpowers playbook:
 3. `cd casa-plugin-<slug>`.
 4. `superpowers:writing-plans` — produce a plan at `plans/YYYY-MM-DD-<slug>.md`.
 5. `superpowers:subagent-driven-development` — dispatch `plugin-dev:*`,
-   `mcp-server-dev:*`, `skill-creator:*`, `document-skills:mcp-builder` as
-   the plan requires.
+   `mcp-server-dev:*`, `skill-creator:*` as the plan requires (use
+   `mcp-server-dev` for MCP servers; MCPB packaging via
+   `mcp-server-dev:build-mcpb`).
 6. `superpowers:requesting-code-review` — independent review before push.
 7. `git push origin main` — self_containment_guard hook fires pre-push.
 8. `mcp__casa-framework__emit_completion` with `{status: "ok", text: ...,
