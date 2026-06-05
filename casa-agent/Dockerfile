@@ -123,9 +123,7 @@ RUN CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
  && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
     claude plugin install skill-creator@casa-plugins-defaults \
  && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin install mcp-server-dev@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin install document-skills@casa-plugins-defaults
+    claude plugin install mcp-server-dev@casa-plugins-defaults
 
 USER root
 

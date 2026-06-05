@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.46.3] - 2026-06-05 — plugin-developer dev tooling: freeze at official pins + drop mis-bundled document-skills
+
+### Changed
+
+- **Re-sourced + froze the dev-tooling marketplace** (`casa-plugins-defaults`) at official, pinned
+  versions — nothing floats now: `superpowers` `v5.0.7`→**`v5.1.0`** (obra/superpowers); the
+  `claude-plugins-official` subdirs (`plugin-dev`/`skill-creator`/`mcp-server-dev`) re-pinned
+  `020446a`→**`bd7cf41`**.
+
+### Fixed / Removed
+
+- **Removed `document-skills` from the plugin-developer's toolbox.** It is `xlsx/docx/pptx/pdf`
+  document *processing* — not plugin-dev tooling — and was mis-bundled: its catalog description
+  claimed "mcp-builder, doc-coauthoring, theme-factory", but those live in a *different*
+  anthropics/skills pack (`example-skills`). The builder's workspace template even referenced a
+  non-existent **`document-skills:mcp-builder`** skill — fixed to rely on `mcp-server-dev` for MCP
+  building. Updated the marketplace catalog, `plugins.yaml`, the Dockerfile/test seed installs, the
+  setup scripts, the configurator doctrine, `DOCS.md`, and the catalog test (which now guards both
+  the removal and that every entry is pinned).
+
+### Notes
+
+- A fast-follow (v0.46.4) will add the plugin-developer's **broad `Bash`** + `WebFetch`/`WebSearch`
+  + `context7` — those need executor driver-layer changes (the permission regex drops bare `Bash`/web
+  tools, and the engagement `.mcp.json` is hardcoded), so they're handled separately with verification.
+
 ## [0.46.2] - 2026-06-04 — Fix: disabled specialists no longer advertised in a resident's delegate list
 
 ### Fixed
