@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.46.5] - 2026-06-05 — plugin-developer: context7 (current library/SDK docs) — toolbox complete
+
+### Added
+
+- **The `plugin-developer` executor now has the `context7` MCP server** — current, version-accurate
+  library/SDK/CLI docs (boto3, the MCP SDK, …), so it codes against today's APIs instead of stale
+  training memory. The `claude_code` driver wires it into the engagement `.mcp.json` when an executor
+  declares `context7` in `mcp_server_names` (per-executor, not hardcoded for all). The hosted endpoint
+  `https://mcp.context7.com/mcp` works **keyless** (verified 2026-06-05); an optional
+  `CONTEXT7_API_KEY` env raises the rate limits. Server-level allow (`mcp__context7`) auto-approves its
+  tools (`resolve-library-id`, `query-docs`). Regression tests added (`.mcp.json` includes context7
+  iff declared).
+
+This **completes the plugin-developer toolbox** (v0.46.3 freeze + drop document-skills; v0.46.4 broad
+`Bash` + web; v0.46.5 context7). A live end-to-end check happens when the executor is enabled
+(currently `enabled: false`).
+
 ## [0.46.4] - 2026-06-05 — plugin-developer: broad Bash + web research (it can finally run/test + read docs)
 
 ### Changed
