@@ -82,6 +82,12 @@ Canonical order:
     casa_reload(scope="plugin_env")
     emit_completion(status="ok", text="Wired <VAR> for <plugin>; ready=<bool>; committed SHA <sha>; called casa_reload(scope='plugin_env') to refresh MCP-server env.")
 
+**`plugin-env.conf` is gitignored** (it's a mode-0600 secrets file). So
+`config_git_commit` after a secret-only change stages nothing and returns an
+**empty/absent SHA — that is expected, NOT a failure.** Still call it (it's a
+harmless no-op that keeps the flow uniform), but in `emit_completion` say
+"no SHA (secrets file is gitignored)" rather than reporting a blank `<sha>`.
+
 If you arrived here from the install flow, batch — call
 `casa_reload(scope='plugin_env')` first, then `casa_reload(scope='agent', role=<role>)`
 per target role at the end of the install.
@@ -125,7 +131,7 @@ subprocess inherits):
     )
     config_git_commit(message="context7: wire optional CONTEXT7_API_KEY via 1Password")
     casa_reload(scope="plugin_env")
-    emit_completion(status="ok", text="Wired CONTEXT7_API_KEY (optional, raises context7 rate limits); committed SHA <sha>; reloaded plugin_env.")
+    emit_completion(status="ok", text="Wired CONTEXT7_API_KEY (optional, raises context7 rate limits); no SHA (secrets file gitignored); reloaded plugin_env (set_1_vars).")
 
 **Verify differently:** because context7 declares no required env var,
 `verify_plugin_state` won't report it. Confirm instead that `plugin-env.conf`
