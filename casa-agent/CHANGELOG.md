@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.46.7] - 2026-06-07 — configurator secrets doctrine: gitignored plugin-env.conf → empty commit SHA is expected
+
+### Changed
+
+- **`recipes/plugin/secrets.md` now sets the no-SHA expectation explicitly.** A live dogfood —
+  driving Ellen → the configurator to wire context7's optional `CONTEXT7_API_KEY` from
+  `op://Casa/Context7/credential` — passed cleanly (read recipe → `set_plugin_env_reference` →
+  `config_git_commit` → `casa_reload(scope='plugin_env')` → `emit_completion`). It surfaced one
+  latent ambiguity: `plugin-env.conf` is a mode-0600 **gitignored** secrets file, so
+  `config_git_commit` after a secret-only change stages nothing and returns an empty SHA. Sonnet
+  handled it ("gitignored so no commit SHA"), but the canonical `emit_completion` template still said
+  `committed SHA <sha>`. The doctrine now states the empty SHA is expected (not a failure) and the
+  completion text should say "no SHA (secrets file gitignored)". Doctrine-only change.
+
 ## [0.46.6] - 2026-06-07 — context7 re-modeled as a proper plugin (+ configurator doctrine for its optional key)
 
 ### Changed
