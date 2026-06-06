@@ -9,3 +9,5 @@ plugins:
     marketplace: casa-plugins-defaults
   - name: mcp-server-dev
     marketplace: casa-plugins-defaults
+  - name: context7
+    marketplace: casa-plugins-defaults

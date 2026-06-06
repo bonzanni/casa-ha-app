@@ -100,3 +100,35 @@ per target role at the end of the install.
   `config_git_commit` and `emit_completion`. The file on disk is
   correct but `os.environ` (and thus next MCP-server spawn) keeps the
   prior values.
+
+## Optional keys NOT declared by the plugin (e.g. `context7`)
+
+Some plugins ship an MCP server that **works without a key** and reads an
+**optional** API key from the environment — the key is NOT declared in the
+plugin's `.mcp.json`, so `install_casa_plugin` returns no `required_env_vars`
+and `verify_plugin_state` shows nothing unresolved. The "When to use" triggers
+above won't fire, but the operator may still want the key wired (for higher rate
+limits / reliability). **`context7`** is the canonical case: its MCP server
+(`npx @upstash/context7-mcp`) reads **`CONTEXT7_API_KEY`** from env if present
+and otherwise runs keyless (rate-limited).
+
+Wire it exactly like any other secret — the var is **global** (the `plugin` arg
+to `set_plugin_env_reference` is a label only; the line is written flat into
+`plugin-env.conf` and re-sourced into `os.environ`, which the plugin's MCP
+subprocess inherits):
+
+    # operator gives the reference, e.g. op://Casa/Context7/credential
+    set_plugin_env_reference(
+      plugin="context7",
+      var_name="CONTEXT7_API_KEY",
+      op_ref_or_value="op://Casa/Context7/credential",
+    )
+    config_git_commit(message="context7: wire optional CONTEXT7_API_KEY via 1Password")
+    casa_reload(scope="plugin_env")
+    emit_completion(status="ok", text="Wired CONTEXT7_API_KEY (optional, raises context7 rate limits); committed SHA <sha>; reloaded plugin_env.")
+
+**Verify differently:** because context7 declares no required env var,
+`verify_plugin_state` won't report it. Confirm instead that `plugin-env.conf`
+contains the `CONTEXT7_API_KEY=...` line (it does after `set_plugin_env_reference`).
+The key takes effect for the next MCP-server spawn (e.g. the next plugin-developer
+engagement). A bad/empty key does NOT break context7 — it falls back to keyless.

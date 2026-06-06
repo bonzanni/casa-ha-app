@@ -168,6 +168,7 @@ if [ -d "$SEED_DIR" ] && [ ! -f "$CC_PLUGINS_DIR/installed_plugins.json" ]; then
     HOME="$CC_HOME" claude plugin enable plugin-dev@casa-plugins-defaults     >/dev/null 2>&1 || true
     HOME="$CC_HOME" claude plugin enable skill-creator@casa-plugins-defaults  >/dev/null 2>&1 || true
     HOME="$CC_HOME" claude plugin enable mcp-server-dev@casa-plugins-defaults >/dev/null 2>&1 || true
+    HOME="$CC_HOME" claude plugin enable context7@casa-plugins-defaults       >/dev/null 2>&1 || true
 fi
 # === seed-copy: end ==============================================
 

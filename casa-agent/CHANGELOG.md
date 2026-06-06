@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.46.6] - 2026-06-07 — context7 re-modeled as a proper plugin (+ configurator doctrine for its optional key)
+
+### Changed
+
+- **context7 is now a real CC plugin, not a driver special-case.** It *is* an official plugin
+  (`claude-plugins-official` `external_plugins/context7`), so v0.46.5's driver-level HTTP wiring in
+  `drivers/workspace.py` (injecting a context7 MCP server into each engagement `.mcp.json`) was the
+  wrong model and is **reverted**. context7 is added to the dev marketplace (pinned sha `bd7cf41`) +
+  the plugin-developer's `plugins.yaml` + the image seed install; `mcp__context7` stays allow-listed.
+  The plugin brings its own MCP server (`npx @upstash/context7-mcp`).
+
+### Added
+
+- **Configurator doctrine for context7's optional key** (`recipes/plugin/secrets.md`): context7's
+  `CONTEXT7_API_KEY` is **optional + not declared** in the plugin's `.mcp.json` (so `install`/`verify`
+  don't surface it), and is a **global** env var. The new section tells the configurator to wire it
+  via `set_plugin_env_reference(var_name="CONTEXT7_API_KEY", op_ref_or_value="op://…")` →
+  `casa_reload(scope='plugin_env')`. Keyless works (rate-limited); the key raises limits.
+
+### Notes
+
+- The official context7 plugin runs `npx -y @upstash/context7-mcp` — the plugin *source* is pinned,
+  but the npm package is fetched latest at runtime (needs node in the engagement). Acceptable for now;
+  can pin the npm version later if the freeze matters.
+
 ## [0.46.5] - 2026-06-05 — plugin-developer: context7 (current library/SDK docs) — toolbox complete
 
 ### Added
