@@ -553,7 +553,7 @@ Casa uses Claude Code's native plugin machinery. Two marketplaces are
 registered at boot:
 
 - **casa-plugins-defaults** — seed-managed, ships with the addon.
-  Contains superpowers, plugin-dev, skill-creator, mcp-server-dev.
+  Contains superpowers, plugin-dev, skill-creator, mcp-server-dev, context7.
   Read-only — `claude plugin uninstall` against these
   returns a "seed-managed" error.
 - **casa-plugins** — user-writable. Plugins authored by plugin-developer

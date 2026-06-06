@@ -32,15 +32,16 @@ tools:
     # was coding from stale memory.
     - WebFetch
     - WebSearch
-    # v0.46.5: context7 = current, version-accurate library/SDK/CLI docs (boto3,
-    # the MCP SDK, …) via its MCP server (wired into the engagement .mcp.json by
-    # the claude_code driver when declared in mcp_server_names below). Server-level
-    # allow covers its tools (resolve-library-id, query-docs).
+    # v0.46.6: context7 = current library/SDK/CLI docs (boto3, the MCP SDK, …).
+    # It's a PLUGIN (see plugins.yaml; claude-plugins-official external_plugins/
+    # context7) that brings an MCP server via `npx @upstash/context7-mcp`.
+    # Server-level allow covers its tools (resolve-library-id, query-docs).
+    # Keyless works; optional CONTEXT7_API_KEY (set via plugin-env.conf — see the
+    # configurator's recipes/plugin/secrets.md) raises rate limits.
     - mcp__context7
   permission_mode: auto
 mcp_server_names:
   - casa-framework
-  - context7
 idle_reminder_days: 7
 prompt_template_file: prompt.md
 hooks_file: hooks.yaml

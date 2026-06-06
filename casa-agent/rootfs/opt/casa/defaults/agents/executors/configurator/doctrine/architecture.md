@@ -148,7 +148,7 @@ Casa uses Claude Code's native plugin machinery via a two-marketplace model.
 - **`casa-plugins-defaults`** — seed-managed, read-only. Catalog at
   `/opt/casa/defaults/marketplace-defaults/.claude-plugin/marketplace.json`.
   Pre-installed cache at `/opt/claude-seed/` (built at image build, `chmod a-w`).
-  Contains: superpowers, plugin-dev, skill-creator, mcp-server-dev.
+  Contains: superpowers, plugin-dev, skill-creator, mcp-server-dev, context7.
   Configurator MUST NOT mutate this marketplace.
 - **`casa-plugins`** — user-writable. Catalog at
   `/config/marketplace/.claude-plugin/marketplace.json`.

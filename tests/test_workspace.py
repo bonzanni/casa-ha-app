@@ -291,47 +291,6 @@ class TestProvisionWorkspace:
         mode = os.stat(p / "stdin.fifo").st_mode
         assert _stat.S_ISFIFO(mode)
 
-    @pytest.mark.unit
-    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo/symlink not meaningful on Windows")
-    async def test_mcp_json_includes_context7_when_declared(self, tmp_path):
-        """v0.46.5: context7 (HTTP, hosted) lands in .mcp.json when the executor
-        declares it in mcp_server_names."""
-        import json
-        from pathlib import Path
-        from drivers.workspace import provision_workspace
-
-        defn = self._make_defn(tmp_path)
-        defn.mcp_server_names = ["casa-framework", "context7"]
-        base = tmp_path / "base"; base.mkdir(); (base / "superpowers").mkdir()
-        ws = tmp_path / "engagements"; ws.mkdir()
-        await provision_workspace(
-            engagements_root=str(ws), base_plugins_root=str(base),
-            engagement_id="eng-c7", defn=defn, task="t", context="c",
-            casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
-        )
-        mcp = json.loads((Path(ws) / "eng-c7" / ".mcp.json").read_text())
-        assert mcp["mcpServers"]["context7"]["type"] == "http"
-        assert mcp["mcpServers"]["context7"]["url"] == "https://mcp.context7.com/mcp"
-
-    @pytest.mark.unit
-    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo/symlink not meaningful on Windows")
-    async def test_mcp_json_omits_context7_when_not_declared(self, tmp_path):
-        """context7 is NOT added for executors that don't declare it (e.g. configurator)."""
-        import json
-        from pathlib import Path
-        from drivers.workspace import provision_workspace
-
-        defn = self._make_defn(tmp_path)   # mcp_server_names = ["casa-framework"]
-        base = tmp_path / "base"; base.mkdir(); (base / "superpowers").mkdir()
-        ws = tmp_path / "engagements"; ws.mkdir()
-        await provision_workspace(
-            engagements_root=str(ws), base_plugins_root=str(base),
-            engagement_id="eng-noc7", defn=defn, task="t", context="c",
-            casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
-        )
-        mcp = json.loads((Path(ws) / "eng-noc7" / ".mcp.json").read_text())
-        assert "context7" not in mcp["mcpServers"]
-        assert "casa-framework" in mcp["mcpServers"]
 
     @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo not meaningful on Windows")
     async def test_per_executor_plugins_no_symlinks(self, tmp_path):

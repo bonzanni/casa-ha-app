@@ -11,7 +11,7 @@ pytestmark = pytest.mark.unit
 CATALOG = Path("casa-agent/rootfs/opt/casa/defaults/marketplace-defaults/.claude-plugin/marketplace.json")
 
 REQUIRED_PLUGINS = {"superpowers", "plugin-dev", "skill-creator",
-                    "mcp-server-dev"}
+                    "mcp-server-dev", "context7"}
 
 # document-skills was removed in v0.46.3 (it is xlsx/docx/pptx/pdf document
 # PROCESSING, not plugin-dev tooling, and was mis-bundled). Guard the removal.

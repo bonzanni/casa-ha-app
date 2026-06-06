@@ -266,15 +266,6 @@ async def provision_workspace(
             },
         },
     }}
-    # v0.46.5: context7 (current library/SDK docs) for executors that declare it
-    # in mcp_server_names. The hosted endpoint works KEYLESS (rate-limited,
-    # verified 2026-06-05); an optional CONTEXT7_API_KEY env raises the limits.
-    if "context7" in (getattr(defn, "mcp_server_names", None) or []):
-        _c7: dict = {"type": "http", "url": "https://mcp.context7.com/mcp"}
-        _c7_key = os.environ.get("CONTEXT7_API_KEY")
-        if _c7_key:
-            _c7["headers"] = {"CONTEXT7_API_KEY": _c7_key}
-        mcp_config["mcpServers"]["context7"] = _c7
     (ws / ".mcp.json").write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
 
     # 3. Named FIFO for stdin.

@@ -26,6 +26,12 @@
       "description": "MCP server development — build-mcp-server, build-mcpb, build-mcp-app.",
       "version": "0.0.1",
       "source": {"source": "git-subdir", "url": "https://github.com/anthropics/claude-plugins-official.git", "path": "plugins/mcp-server-dev", "ref": "main", "sha": "bd7cf41fc8a468b136a9266633303ff4a011c7b4"}
+    },
+    {
+      "name": "context7",
+      "description": "Upstash Context7 MCP server (npx @upstash/context7-mcp) — current, version-accurate library/SDK docs. Keyless works (rate-limited); optional CONTEXT7_API_KEY (set via plugin-env.conf — see configurator recipes/plugin/secrets.md) raises limits.",
+      "version": "0.0.1",
+      "source": {"source": "git-subdir", "url": "https://github.com/anthropics/claude-plugins-official.git", "path": "external_plugins/context7", "ref": "main", "sha": "bd7cf41fc8a468b136a9266633303ff4a011c7b4"}
     }
   ]
 }
