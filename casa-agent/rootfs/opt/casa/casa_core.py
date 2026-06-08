@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
 import signal
@@ -832,6 +833,73 @@ def _build_role_registry(
 
 
 # ------------------------------------------------------------------
+# Config-sync operator notification
+# ------------------------------------------------------------------
+
+
+async def notify_config_sync(
+    bus: Any,
+    *,
+    report_path: str = "/data/config-sync-report.json",
+) -> None:
+    """If the boot reconciler overwrote any runtime customization, push a
+    heads-up directly to the operator over the ``telegram`` outbound bus
+    target (``_telegram_outbound`` → operator's default chat), then mark the
+    report notified to avoid duplicate alerts on an svc-only restart.
+
+    Delivered via the deterministic ``telegram`` outbound router (not an
+    LLM turn): a config-overwrite is a system event the operator must always
+    see, so we bypass the assistant's turn — which could stay silent (the
+    G-3 ``<silent/>`` doctrine-bleed history) and, with ``channel=""``, would
+    resolve to no channel and drop the text entirely (``agent.py:230,296``).
+    Non-fatal. Spec: 2026-06-08-config-sync-reconciler-design.md §3.6.
+    """
+    try:
+        with open(report_path, "r", encoding="utf-8") as fh:
+            report = json.load(fh)
+    except (OSError, ValueError):
+        return
+
+    if report.get("notified"):
+        return
+    over = bool(report.get("conflicts") or report.get("schema_forced") or report.get("casabak"))
+    if not over:
+        return
+
+    paths = (
+        [c["path"] for c in report.get("conflicts", [])]
+        + [c["path"] for c in report.get("schema_forced", [])]
+        + list(report.get("casabak", []))
+    )
+    ver = report.get("image_version", "the latest update")
+    listed = ", ".join(paths[:8]) + ("…" if len(paths) > 8 else "")
+    content = (
+        f"Heads up: applying {ver} overwrote {len(paths)} of your config "
+        f"customization(s) so casa would keep booting: {listed}. "
+        "Say 'reconcile config' and I'll show what changed (via git history) "
+        "and carry any of it back."
+    )
+
+    # Route to the "telegram" outbound target if a telegram channel exists.
+    if "telegram" in getattr(bus, "queues", {"telegram": None}):
+        await bus.notify(BusMessage(
+            type=MessageType.NOTIFICATION,
+            source="config_sync",
+            target="telegram",
+            content=content,
+            channel="telegram",
+            context={"cid": new_cid()},
+        ))
+
+    report["notified"] = True
+    try:
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(report, fh)
+    except OSError as exc:
+        logger.warning("config_sync notify: could not mark report notified: %s", exc)
+
+
+# ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
 
@@ -1628,6 +1696,10 @@ async def main() -> None:
                 "Orphan delegation %s targets unknown role %r — dropped",
                 record.id[:8], target_role,
             )
+
+    # 13c. Surface any default-sync overwrites to the operator (direct
+    # telegram outbound — see notify_config_sync).
+    await notify_config_sync(bus)
 
     # 14. Kick off timers.
     # AsyncIOScheduler's AsyncIOExecutor schedules coroutine functions on

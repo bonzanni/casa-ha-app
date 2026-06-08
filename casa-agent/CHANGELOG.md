@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.47.0] - 2026-06-08 — `/config` default-sync reconciler (no more manual `cp` after a deploy)
+
+### Added
+
+- **Automatic `/config` default sync.** Image-default-owned config under `/config/{agents,policies}`
+  now tracks the shipped `/opt/casa/defaults` on every boot (and via
+  `casa_reload(scope=config_sync)`) — **including file removals** — so a config change baked into a
+  new image takes effect without the manual `cp` that the v0.46.3→v0.46.7 toolbox arc required after
+  every deploy. New module `config_sync.py` does a three-way merge (baseline `/data/config-baseline`
+  / new defaults / live `/config`): untouched files track the image; genuine runtime edits are
+  preserved; on a true conflict the **image wins** after a commit-first snapshot to the `/config` git
+  repo (the prior edit stays recoverable), and **Ellen** proactively tells the operator with a
+  carry-over offer. A **schema-validation backstop** force-applies the default to any kept-live file
+  that is invalid against a newly tightened schema, so casa **always boots** (closes the
+  schema-tightening crash-loop class structurally). New configurator doctrine recipe
+  `recipes/config/reconcile-defaults.md` drives the operator-initiated carry-over via `git diff`.
+
+### Changed
+
+- **`setup-configs.sh`**: the dir-level `seed_agent_dir` seeder and the warn-only `drift-check` block
+  are replaced by the reconciler (which seeds, tracks, and removes per file, and *acts* instead of
+  only warning). The `c1-relay-migration` content migration is retained. New persistent state:
+  `/data/config-baseline/` (last-synced defaults) and `/data/config-sync-report.json` (per-boot
+  result, consumed by the Ellen notification).
+
 ## [0.46.7] - 2026-06-07 — configurator secrets doctrine: gitignored plugin-env.conf → empty commit SHA is expected
 
 ### Changed
