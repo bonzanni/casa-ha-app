@@ -83,6 +83,31 @@ CASA_C1_RELAY_EOF
 fi
 # === c1-relay-migration: end ====================================
 
+# === deprecated-options-prune: begin ===========================
+# HA Supervisor only WARNS (it does not crash) when stored add-on options
+# carry a key no longer in config.yaml's schema:. Per HA docs, delete the
+# stale key via the add-on options API — bashio::addon.option <key> with no
+# value deletes it (/usr/lib/bashio/addons.sh:537). Warning-level hygiene;
+# casa already ignores unknown option keys.
+#
+# ADDITIVE LIST: when you REMOVE an option from config.yaml (options:/schema:),
+# add its key to DEPRECATED_OPTION_KEYS below. Idempotent — only deletes keys
+# actually present, so it is a no-op on clean installs. Seeded from a full
+# git-history audit of every option key ever removed (2026-06-08).
+DEPRECATED_OPTION_KEYS="github_token heartbeat_enabled heartbeat_interval_minutes honcho_api_key honcho_api_url repos scope_threshold telegram_webhook_url"
+_dop_opts="$(bashio::addon.options 2>/dev/null || echo '{}')"
+for _dop_key in $DEPRECATED_OPTION_KEYS; do
+    if bashio::jq.exists "$_dop_opts" ".${_dop_key}"; then
+        if bashio::addon.option "$_dop_key"; then
+            bashio::log.info "Pruned deprecated add-on option: $_dop_key"
+        else
+            bashio::log.warning "Failed to prune deprecated add-on option: $_dop_key"
+        fi
+    fi
+done
+unset _dop_key _dop_opts
+# === deprecated-options-prune: end =============================
+
 # Seed schemas (overwrite on every boot — schemas ship with the Casa
 # image and the image is the source of truth; hand-edits under
 # /config/schema/ get clobbered by design).
