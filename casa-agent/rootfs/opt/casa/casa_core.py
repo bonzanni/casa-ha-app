@@ -839,14 +839,20 @@ def _build_role_registry(
 
 async def notify_config_sync(
     bus: Any,
-    assistant_role: str,
     *,
     report_path: str = "/data/config-sync-report.json",
 ) -> None:
-    """If the boot reconciler overwrote any runtime customization, post a
-    proactive message to the assistant (Ellen) so she tells the operator,
-    then mark the report notified to avoid duplicate alerts on an svc-only
-    restart. Non-fatal. Spec: 2026-06-08-config-sync-reconciler-design.md §3.6.
+    """If the boot reconciler overwrote any runtime customization, push a
+    heads-up directly to the operator over the ``telegram`` outbound bus
+    target (``_telegram_outbound`` → operator's default chat), then mark the
+    report notified to avoid duplicate alerts on an svc-only restart.
+
+    Delivered via the deterministic ``telegram`` outbound router (not an
+    LLM turn): a config-overwrite is a system event the operator must always
+    see, so we bypass the assistant's turn — which could stay silent (the
+    G-3 ``<silent/>`` doctrine-bleed history) and, with ``channel=""``, would
+    resolve to no channel and drop the text entirely (``agent.py:230,296``).
+    Non-fatal. Spec: 2026-06-08-config-sync-reconciler-design.md §3.6.
     """
     try:
         with open(report_path, "r", encoding="utf-8") as fh:
@@ -874,13 +880,15 @@ async def notify_config_sync(
         "and carry any of it back."
     )
 
-    if assistant_role in getattr(bus, "queues", {assistant_role: None}):
+    # Route to the "telegram" outbound target if a telegram channel exists.
+    if "telegram" in getattr(bus, "queues", {"telegram": None}):
         await bus.notify(BusMessage(
-            type=MessageType.SCHEDULED,
+            type=MessageType.NOTIFICATION,
             source="config_sync",
-            target=assistant_role,
+            target="telegram",
             content=content,
-            channel="",
+            channel="telegram",
+            context={"cid": new_cid()},
         ))
 
     report["notified"] = True
@@ -1689,8 +1697,9 @@ async def main() -> None:
                 record.id[:8], target_role,
             )
 
-    # 13c. Surface any default-sync overwrites to the operator (Ellen).
-    await notify_config_sync(bus, assistant_role)
+    # 13c. Surface any default-sync overwrites to the operator (direct
+    # telegram outbound — see notify_config_sync).
+    await notify_config_sync(bus)
 
     # 14. Kick off timers.
     # AsyncIOScheduler's AsyncIOExecutor schedules coroutine functions on
