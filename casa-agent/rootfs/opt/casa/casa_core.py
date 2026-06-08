@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
 import signal
@@ -832,6 +833,65 @@ def _build_role_registry(
 
 
 # ------------------------------------------------------------------
+# Config-sync operator notification
+# ------------------------------------------------------------------
+
+
+async def notify_config_sync(
+    bus: Any,
+    assistant_role: str,
+    *,
+    report_path: str = "/data/config-sync-report.json",
+) -> None:
+    """If the boot reconciler overwrote any runtime customization, post a
+    proactive message to the assistant (Ellen) so she tells the operator,
+    then mark the report notified to avoid duplicate alerts on an svc-only
+    restart. Non-fatal. Spec: 2026-06-08-config-sync-reconciler-design.md §3.6.
+    """
+    try:
+        with open(report_path, "r", encoding="utf-8") as fh:
+            report = json.load(fh)
+    except (OSError, ValueError):
+        return
+
+    if report.get("notified"):
+        return
+    over = bool(report.get("conflicts") or report.get("schema_forced") or report.get("casabak"))
+    if not over:
+        return
+
+    paths = (
+        [c["path"] for c in report.get("conflicts", [])]
+        + [c["path"] for c in report.get("schema_forced", [])]
+        + list(report.get("casabak", []))
+    )
+    ver = report.get("image_version", "the latest update")
+    listed = ", ".join(paths[:8]) + ("…" if len(paths) > 8 else "")
+    content = (
+        f"Heads up: applying {ver} overwrote {len(paths)} of your config "
+        f"customization(s) so casa would keep booting: {listed}. "
+        "Say 'reconcile config' and I'll show what changed (via git history) "
+        "and carry any of it back."
+    )
+
+    if assistant_role in getattr(bus, "queues", {assistant_role: None}):
+        await bus.notify(BusMessage(
+            type=MessageType.SCHEDULED,
+            source="config_sync",
+            target=assistant_role,
+            content=content,
+            channel="",
+        ))
+
+    report["notified"] = True
+    try:
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(report, fh)
+    except OSError as exc:
+        logger.warning("config_sync notify: could not mark report notified: %s", exc)
+
+
+# ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
 
@@ -1628,6 +1688,9 @@ async def main() -> None:
                 "Orphan delegation %s targets unknown role %r — dropped",
                 record.id[:8], target_role,
             )
+
+    # 13c. Surface any default-sync overwrites to the operator (Ellen).
+    await notify_config_sync(bus, assistant_role)
 
     # 14. Kick off timers.
     # AsyncIOScheduler's AsyncIOExecutor schedules coroutine functions on
