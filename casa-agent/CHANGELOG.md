@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.47.1] - 2026-06-08 — prune deprecated add-on option keys on boot
+
+### Added
+
+- **Deprecated-options prune.** On boot, `setup-configs.sh` deletes add-on option keys that
+  Casa has removed from its schema (via `bashio::addon.option '<key>'`), so HA Supervisor
+  stops logging `Option '<key>' does not exist in the schema` after a field-removing release.
+  Warning-level hygiene only — under current HA an unknown stored option is a warning, not a
+  crash, and casa already ignores unknown keys; this just silences the recurring warning and
+  follows HA's documented recommendation. Seeded from a git-history audit of every option ever
+  removed (`github_token`, `heartbeat_enabled`, `heartbeat_interval_minutes`, `honcho_api_key`,
+  `honcho_api_url`, `repos`, `scope_threshold`, `telegram_webhook_url`). Additive
+  `DEPRECATED_OPTION_KEYS` list; idempotent (no-op on clean installs). Completes the add-on-
+  options half of the schema-tightening drift (the `/config` half shipped in v0.47.0).
+
 ## [0.47.0] - 2026-06-08 — `/config` default-sync reconciler (no more manual `cp` after a deploy)
 
 ### Added
