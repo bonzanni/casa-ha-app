@@ -73,3 +73,86 @@ def _bytes_equal(a: Path, b: Path) -> bool:
         return Path(a).read_bytes() == Path(b).read_bytes()
     except OSError:
         return False
+
+
+def _copy(src_root: Path, rel: str, dst_root: Path) -> None:
+    dst = Path(dst_root) / rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(Path(src_root) / rel, dst)
+
+
+def _delete(root: Path, rel: str) -> None:
+    p = Path(root) / rel
+    try:
+        p.unlink()
+    except FileNotFoundError:
+        return
+    # Prune now-empty parent dirs up to (not including) the tree root.
+    parent = p.parent
+    root = Path(root)
+    while parent != root and parent.is_dir() and not any(parent.iterdir()):
+        parent.rmdir()
+        parent = parent.parent
+
+
+def reconcile(*, defaults_dir, config_dir, baseline_dir,
+              image_version: str, git, validate: Callable[[str], str | None]) -> SyncReport:
+    defaults_dir = Path(defaults_dir)
+    config_dir = Path(config_dir)
+    baseline_dir = Path(baseline_dir)
+    report = SyncReport(image_version=image_version)
+
+    new_files = _list_tree_files(defaults_dir)
+    base_files = _list_tree_files(baseline_dir)
+    live_files = _list_tree_files(config_dir)
+
+    # Lazy pre-sync snapshot — taken once, before the first image-wins overwrite.
+    pre_sync: list[str | None] = []  # box: empty = not captured yet
+
+    def _ensure_pre_sync() -> str | None:
+        if not pre_sync:
+            if git.available:
+                sha = git.snapshot("casa-sync: pre-sync snapshot before default reconcile")
+                pre_sync.append(sha or git.head())
+            else:
+                pre_sync.append(None)
+            report.pre_sync_sha = pre_sync[0]
+        return pre_sync[0]
+
+    for rel in sorted(new_files | base_files | live_files):
+        new_ex = rel in new_files
+        base_ex = rel in base_files
+        live_ex = rel in live_files
+
+        if not live_ex:
+            if new_ex:
+                _copy(defaults_dir, rel, config_dir)      # create / seed
+                report.updated.append(rel)
+            continue                                       # baseline-only & gone: baseline rewrite drops it
+
+        if not base_ex:
+            continue                                       # adopt: no ownership proof → keep live
+
+        live_eq_base = _bytes_equal(config_dir / rel, baseline_dir / rel)
+        if live_eq_base:                                   # untouched
+            if not new_ex:
+                _delete(config_dir, rel)
+                report.deleted.append(rel)
+            elif not _bytes_equal(defaults_dir / rel, baseline_dir / rel):
+                _copy(defaults_dir, rel, config_dir)       # image changed → track
+                report.updated.append(rel)
+            continue
+
+        # live edited
+        if not new_ex:
+            continue                                       # edited + removed-from-defaults → keep live
+        if _bytes_equal(defaults_dir / rel, baseline_dir / rel):
+            continue                                       # image unchanged → keep live
+        if _bytes_equal(config_dir / rel, defaults_dir / rel):
+            continue                                       # converged
+        # conflict → image wins
+        sha = _ensure_pre_sync()
+        _copy(defaults_dir, rel, config_dir)
+        report.conflicts.append({"path": rel, "pre_sync_sha": sha})
+
+    return report

@@ -53,3 +53,98 @@ def test_report_has_overwrites_and_json_roundtrip() -> None:
     parsed = json.loads(r.to_json())
     assert parsed["image_version"] == "v9.9.9"
     assert parsed["conflicts"][0]["path"] == "agents/x/y.yaml"
+
+
+class _FakeGit:
+    """Records snapshot() calls; returns deterministic SHAs."""
+    def __init__(self, available: bool = True) -> None:
+        self.available = available
+        self.snapshots: list[str] = []
+        self._head = "BASEHEAD"
+
+    def snapshot(self, message: str) -> str | None:
+        if not self.available:
+            return None
+        self.snapshots.append(message)
+        self._head = f"SHA{len(self.snapshots)}"
+        return self._head
+
+    def head(self) -> str | None:
+        return None if not self.available else self._head
+
+
+def _no_schema(_rel: str) -> None:
+    return None  # backstop: nothing is ever schema-invalid
+
+
+def _run(tmp_path: Path, *, version: str = "v9.9.9", git=None, validate=_no_schema):
+    return config_sync.reconcile(
+        defaults_dir=tmp_path / "defaults",
+        config_dir=tmp_path / "live",
+        baseline_dir=tmp_path / "baseline",
+        image_version=version,
+        git=git or _FakeGit(),
+        validate=validate,
+    )
+
+
+def test_create_seeds_missing_file(tmp_path: Path) -> None:
+    _write(tmp_path / "defaults", "agents/butler/voice.yaml", "NEW")
+    # no baseline, no live
+    report = _run(tmp_path)
+    assert (tmp_path / "live/agents/butler/voice.yaml").read_text() == "NEW"
+    assert "agents/butler/voice.yaml" in report.updated
+
+
+def test_untouched_tracks_image_change(tmp_path: Path) -> None:
+    _write(tmp_path / "baseline", "agents/butler/voice.yaml", "OLD")
+    _write(tmp_path / "live", "agents/butler/voice.yaml", "OLD")     # == baseline (untouched)
+    _write(tmp_path / "defaults", "agents/butler/voice.yaml", "NEW") # image changed
+    report = _run(tmp_path)
+    assert (tmp_path / "live/agents/butler/voice.yaml").read_text() == "NEW"
+    assert "agents/butler/voice.yaml" in report.updated
+
+
+def test_untouched_file_removed_from_defaults_is_deleted(tmp_path: Path) -> None:
+    _write(tmp_path / "baseline", "agents/old/runtime.yaml", "X")
+    _write(tmp_path / "live", "agents/old/runtime.yaml", "X")        # untouched
+    # defaults: file absent
+    report = _run(tmp_path)
+    assert not (tmp_path / "live/agents/old/runtime.yaml").exists()
+    assert "agents/old/runtime.yaml" in report.deleted
+
+
+def test_user_edit_kept_when_image_unchanged(tmp_path: Path) -> None:
+    _write(tmp_path / "baseline", "agents/butler/voice.yaml", "OLD")
+    _write(tmp_path / "live", "agents/butler/voice.yaml", "USER")    # != baseline (edited)
+    _write(tmp_path / "defaults", "agents/butler/voice.yaml", "OLD") # == baseline (image unchanged)
+    report = _run(tmp_path)
+    assert (tmp_path / "live/agents/butler/voice.yaml").read_text() == "USER"
+    assert report.updated == [] and report.conflicts == []
+
+
+def test_user_edit_kept_when_image_removes_file(tmp_path: Path) -> None:
+    _write(tmp_path / "baseline", "agents/butler/voice.yaml", "OLD")
+    _write(tmp_path / "live", "agents/butler/voice.yaml", "USER")    # edited
+    # defaults: absent
+    report = _run(tmp_path)
+    assert (tmp_path / "live/agents/butler/voice.yaml").read_text() == "USER"
+    assert report.deleted == []
+
+
+def test_converged_is_noop(tmp_path: Path) -> None:
+    _write(tmp_path / "baseline", "agents/butler/voice.yaml", "OLD")
+    _write(tmp_path / "live", "agents/butler/voice.yaml", "NEW")     # edited
+    _write(tmp_path / "defaults", "agents/butler/voice.yaml", "NEW") # live == new
+    report = _run(tmp_path)
+    assert report.updated == [] and report.conflicts == []
+
+
+def test_adopt_mode_no_baseline_keeps_existing_live(tmp_path: Path) -> None:
+    # First reconciler run on an existing deployment: baseline absent.
+    _write(tmp_path / "live", "agents/butler/voice.yaml", "USER")
+    _write(tmp_path / "defaults", "agents/butler/voice.yaml", "NEW") # differs from live
+    git = _FakeGit()
+    report = _run(tmp_path, git=git)
+    assert (tmp_path / "live/agents/butler/voice.yaml").read_text() == "USER"  # NOT clobbered
+    assert report.conflicts == [] and git.snapshots == []           # no overwrite, no pre-sync commit
