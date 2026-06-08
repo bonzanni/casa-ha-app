@@ -201,3 +201,117 @@ def _mirror_baseline(defaults_dir: Path, baseline_dir: Path) -> None:
             shutil.rmtree(dst)
         if src.is_dir():
             shutil.copytree(src, dst)
+
+
+class RealGit:
+    """Git shim over the /config repo. Commits all pending changes and
+    returns the resulting HEAD sha. ``available`` is False when git is
+    missing or *repo* is not a git work-tree (degraded → .casabak path)."""
+
+    def __init__(self, repo) -> None:
+        self.repo = str(repo)
+        self.available = bool(shutil.which("git")) and Path(self.repo, ".git").is_dir()
+
+    def _run(self, *args: str):
+        return __import__("subprocess").run(
+            ["git", "-C", self.repo, *args],
+            capture_output=True, text=True,
+        )
+
+    def head(self) -> str | None:
+        if not self.available:
+            return None
+        res = self._run("rev-parse", "HEAD")
+        return res.stdout.strip() if res.returncode == 0 else None
+
+    def snapshot(self, message: str) -> str | None:
+        if not self.available:
+            return None
+        self._run("add", "-A")
+        # commit only if something is staged
+        staged = self._run("diff", "--cached", "--quiet")
+        if staged.returncode != 0:
+            self._run(
+                "-c", "user.email=casa-agent@local",
+                "-c", "user.name=Casa Agent",
+                "commit", "-q", "-m", message,
+            )
+        return self.head()
+
+
+def _make_validator(config_dir) -> Callable[[str], str | None]:
+    """Validator backed by agent_loader's schema maps + _validate, checking
+    a live file at *config_dir/rel* against the NEW image schema (agent_loader
+    reads defaults/schema, which is this image's schema). Returns an error
+    string when invalid (incl. YAML parse errors), else None. Files with no
+    associated schema return None."""
+    import agent_loader as al
+
+    config_dir = Path(config_dir)
+
+    def validate(rel: str) -> str | None:
+        name = Path(rel).name
+        parts = Path(rel).parts
+        abs_path = str(config_dir / rel)
+        try:
+            if parts and parts[0] == "agents":
+                schema_name = al._SCHEMA_BY_FILENAME.get(name)
+                if schema_name is None:
+                    return None
+                al._validate(al._read_yaml(abs_path), schema_name, abs_path)
+            elif parts and parts[0] == "policies":
+                mapping = al._SCHEMA_BY_POLICY_FILE.get(name)
+                if mapping is None:
+                    return None
+                schema_name, version = mapping
+                al._validate(al._read_yaml(abs_path), schema_name, abs_path, version=version)
+            else:
+                return None
+        except al.LoadError as exc:
+            return str(exc)
+        return None
+
+    return validate
+
+
+def run(*, defaults_dir, config_dir, baseline_dir, report_path,
+        image_version: str) -> int:
+    """Boot/reload entry point. Non-fatal by contract: logs and returns 0
+    on any unexpected error so a reconciler bug never blocks boot."""
+    try:
+        git = RealGit(config_dir)
+        validate = _make_validator(config_dir)
+        report = reconcile(
+            defaults_dir=defaults_dir, config_dir=config_dir,
+            baseline_dir=baseline_dir, image_version=image_version,
+            git=git, validate=validate,
+        )
+        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(report_path).write_text(report.to_json(), encoding="utf-8")
+        logger.info(
+            "config_sync: updated=%d deleted=%d conflicts=%d schema_forced=%d casabak=%d",
+            len(report.updated), len(report.deleted), len(report.conflicts),
+            len(report.schema_forced), len(report.casabak),
+        )
+    except Exception as exc:  # noqa: BLE001 — boot-critical: never fatal
+        logger.warning("config_sync: reconcile failed (non-fatal): %s", exc)
+    return 0
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] config_sync: %(message)s")
+    config_dir = os.environ.get("CASA_CONFIG_DIR", "/config")
+    defaults_dir = os.environ.get("CASA_DEFAULTS_DIR", "/opt/casa/defaults")
+    data_dir = os.environ.get("CASA_DATA_DIR", "/data")
+    image_version = os.environ.get("CASA_IMAGE_VERSION", "unknown")
+    return run(
+        defaults_dir=defaults_dir,
+        config_dir=config_dir,
+        baseline_dir=os.path.join(data_dir, "config-baseline"),
+        report_path=os.path.join(data_dir, "config-sync-report.json"),
+        image_version=image_version,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
