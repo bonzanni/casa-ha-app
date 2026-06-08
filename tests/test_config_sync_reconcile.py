@@ -182,3 +182,37 @@ def test_conflict_no_git_writes_casabak(tmp_path: Path) -> None:
     assert "agents/butler/voice.yaml" in report.casabak
     assert report.conflicts[0]["pre_sync_sha"] is None
     assert git.snapshots == []
+
+
+def test_baseline_updated_to_new_and_second_run_is_noop(tmp_path: Path) -> None:
+    _write(tmp_path / "baseline", "agents/butler/voice.yaml", "OLD")
+    _write(tmp_path / "live", "agents/butler/voice.yaml", "OLD")     # untouched
+    _write(tmp_path / "defaults", "agents/butler/voice.yaml", "NEW") # image changed
+    # also a removed-from-defaults untouched file
+    _write(tmp_path / "baseline", "agents/butler/old.yaml", "G")
+    _write(tmp_path / "live", "agents/butler/old.yaml", "G")
+
+    git1 = _FakeGit()
+    r1 = _run(tmp_path, git=git1)
+    assert "agents/butler/voice.yaml" in r1.updated
+    assert "agents/butler/old.yaml" in r1.deleted
+    # baseline now mirrors defaults: contains voice.yaml=NEW, no old.yaml
+    assert (tmp_path / "baseline/agents/butler/voice.yaml").read_text() == "NEW"
+    assert not (tmp_path / "baseline/agents/butler/old.yaml").exists()
+    # a post-sync commit happened because files changed
+    assert any("default reconcile" in m for m in git1.snapshots)
+
+    # Second run with the SAME defaults → fully converged, no changes, no commit.
+    git2 = _FakeGit()
+    r2 = _run(tmp_path, git=git2)
+    assert r2.updated == [] and r2.deleted == [] and r2.conflicts == []
+    assert git2.snapshots == []
+
+
+def test_no_changes_means_no_commit(tmp_path: Path) -> None:
+    _write(tmp_path / "baseline", "agents/butler/voice.yaml", "SAME")
+    _write(tmp_path / "live", "agents/butler/voice.yaml", "SAME")
+    _write(tmp_path / "defaults", "agents/butler/voice.yaml", "SAME")
+    git = _FakeGit()
+    _run(tmp_path, git=git)
+    assert git.snapshots == []

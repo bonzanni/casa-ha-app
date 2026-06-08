@@ -181,4 +181,23 @@ def reconcile(*, defaults_dir, config_dir, baseline_dir,
         _copy(defaults_dir, rel, config_dir)
         report.schema_forced.append({"path": rel, "pre_sync_sha": sha})
 
+    _mirror_baseline(defaults_dir, baseline_dir)
+
+    changed = bool(
+        report.updated or report.deleted or report.conflicts or report.schema_forced
+    )
+    if changed and git.available:
+        git.snapshot(f"casa-sync: default reconcile {image_version}")
+
     return report
+
+
+def _mirror_baseline(defaults_dir: Path, baseline_dir: Path) -> None:
+    """Replace baseline SYNC_TREES with an exact copy of the new defaults."""
+    for tree in SYNC_TREES:
+        dst = Path(baseline_dir) / tree
+        src = Path(defaults_dir) / tree
+        if dst.exists():
+            shutil.rmtree(dst)
+        if src.is_dir():
+            shutil.copytree(src, dst)
