@@ -53,6 +53,10 @@ options:
   # Scheduling
   casa_tz: "Europe/Amsterdam"
 
+# NOTE: when you REMOVE an option below, also add its key to
+# DEPRECATED_OPTION_KEYS in rootfs/etc/s6-overlay/scripts/setup-configs.sh
+# (deprecated-options-prune block) so the stale stored value is deleted on
+# boot and HA stops logging "Option '<key>' does not exist in the schema".
 schema:
   public_url: str?
   claude_oauth_token: password

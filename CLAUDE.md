@@ -31,6 +31,9 @@ The `tests/conftest.py` auto-adds the code root to `sys.path`.
 1. Branch `feat/vX.Y.Z-<desc>` off `master`.
 2. Bump `version:` in `casa-agent/config.yaml` and prepend a `casa-agent/CHANGELOG.md` entry.
 3. Commit `release: vX.Y.Z (<summary>)`, push, open a PR, **squash-merge** once CI is green.
+- **Removing an add-on option?** Also append its key to `DEPRECATED_OPTION_KEYS` in
+  `casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh` (the `deprecated-options-prune`
+  block) so the stale stored value is deleted on boot and HA stops warning.
 
 ## Environment (WSL)
 - Develop on **WSL2 on the native ext4 filesystem** (not `/mnt/c`) — needed for perf and
