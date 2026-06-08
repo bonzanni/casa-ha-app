@@ -164,4 +164,21 @@ def reconcile(*, defaults_dir, config_dir, baseline_dir,
         _copy(defaults_dir, rel, config_dir)
         report.conflicts.append({"path": rel, "pre_sync_sha": sha})
 
+    # --- Schema backstop (spec §3.4): any kept-live file invalid against the
+    # new schema is force-overwritten with the default so boot can't FATAL.
+    for rel in sorted(_list_tree_files(config_dir)):
+        if rel not in new_files:
+            continue                                   # no default to fall back to
+        if _bytes_equal(config_dir / rel, defaults_dir / rel):
+            continue                                   # already the default → valid by construction
+        err = validate(rel)
+        if not err:
+            continue
+        logger.warning("config_sync backstop: %s invalid vs new schema (%s) — forcing default", rel, err)
+        sha = _ensure_pre_sync()
+        if not git.available:
+            _archive_casabak(config_dir, rel, report)
+        _copy(defaults_dir, rel, config_dir)
+        report.schema_forced.append({"path": rel, "pre_sync_sha": sha})
+
     return report
