@@ -713,6 +713,46 @@ async def reload_executors(
 register_handler("executors", reload_executors)
 
 
+async def reload_config_sync(runtime: Any, *, role: str | None = None) -> list[str]:
+    """Re-run the default-sync reconciler live (same entry as boot), then
+    cascade agents + policies reloads so synced files take effect without a
+    container restart. Spec: 2026-06-08-config-sync-reconciler-design.md §3.1.
+    """
+    import config_sync
+
+    config_dir = runtime.config_dir
+    defaults_dir = getattr(runtime, "defaults_dir", "/opt/casa/defaults")
+    data_dir = getattr(runtime, "data_dir", "/data")
+    image_version = getattr(runtime, "image_version", "unknown")
+
+    actions: list[str] = []
+    rc = await asyncio.to_thread(
+        config_sync.run,
+        defaults_dir=defaults_dir,
+        config_dir=config_dir,
+        baseline_dir=os.path.join(data_dir, "config-baseline"),
+        report_path=os.path.join(data_dir, "config-sync-report.json"),
+        image_version=image_version,
+    )
+    actions.append(f"reconcile_rc={rc}")
+
+    # Cascade so live runtime picks up any synced changes.
+    for scope in ("agents", "policies"):
+        handler = _HANDLERS.get(scope)
+        if handler is None:
+            continue
+        try:
+            sub = await handler(runtime, role=None)
+            actions.append(f"{scope}:{sub}")
+        except Exception as exc:  # noqa: BLE001 — one cascade failure shouldn't abort the rest
+            logger.warning("config_sync cascade: scope=%s failed: %s", scope, exc)
+
+    return actions
+
+
+register_handler("config_sync", reload_config_sync)
+
+
 async def reload_full(
     runtime: Any, *, role: str | None = None, include_env: bool = False,
 ) -> list[str]:
