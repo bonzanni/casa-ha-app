@@ -95,6 +95,13 @@ def _delete(root: Path, rel: str) -> None:
         parent = parent.parent
 
 
+def _archive_casabak(config_dir: Path, rel: str, report: SyncReport) -> None:
+    src = Path(config_dir) / rel
+    bak = src.with_name(src.name + ".casabak")
+    shutil.copy2(src, bak)
+    report.casabak.append(rel)
+
+
 def reconcile(*, defaults_dir, config_dir, baseline_dir,
               image_version: str, git, validate: Callable[[str], str | None]) -> SyncReport:
     defaults_dir = Path(defaults_dir)
@@ -152,6 +159,8 @@ def reconcile(*, defaults_dir, config_dir, baseline_dir,
             continue                                       # converged
         # conflict → image wins
         sha = _ensure_pre_sync()
+        if not git.available:
+            _archive_casabak(config_dir, rel, report)
         _copy(defaults_dir, rel, config_dir)
         report.conflicts.append({"path": rel, "pre_sync_sha": sha})
 

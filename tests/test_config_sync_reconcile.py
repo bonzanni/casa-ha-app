@@ -148,3 +148,37 @@ def test_adopt_mode_no_baseline_keeps_existing_live(tmp_path: Path) -> None:
     report = _run(tmp_path, git=git)
     assert (tmp_path / "live/agents/butler/voice.yaml").read_text() == "USER"  # NOT clobbered
     assert report.conflicts == [] and git.snapshots == []           # no overwrite, no pre-sync commit
+
+
+def test_conflict_image_wins_with_single_presync_commit(tmp_path: Path) -> None:
+    # Two conflicting files → exactly ONE pre-sync snapshot, shared SHA.
+    for rel in ("agents/butler/voice.yaml", "agents/butler/character.yaml"):
+        _write(tmp_path / "baseline", rel, "OLD")
+        _write(tmp_path / "live", rel, "USER")    # edited
+        _write(tmp_path / "defaults", rel, "NEW") # image also changed → conflict
+    git = _FakeGit(available=True)
+    report = _run(tmp_path, git=git)
+    # image won on both files
+    assert (tmp_path / "live/agents/butler/voice.yaml").read_text() == "NEW"
+    assert (tmp_path / "live/agents/butler/character.yaml").read_text() == "NEW"
+    # exactly one PRE-SYNC commit (a later post-sync commit may also exist);
+    # both report entries share its SHA.
+    assert sum("pre-sync snapshot" in m for m in git.snapshots) == 1
+    shas = {c["pre_sync_sha"] for c in report.conflicts}
+    assert shas == {"SHA1"}
+    assert report.pre_sync_sha == "SHA1"
+    assert {c["path"] for c in report.conflicts} == {
+        "agents/butler/voice.yaml", "agents/butler/character.yaml"}
+
+
+def test_conflict_no_git_writes_casabak(tmp_path: Path) -> None:
+    _write(tmp_path / "baseline", "agents/butler/voice.yaml", "OLD")
+    _write(tmp_path / "live", "agents/butler/voice.yaml", "USER")
+    _write(tmp_path / "defaults", "agents/butler/voice.yaml", "NEW")
+    git = _FakeGit(available=False)
+    report = _run(tmp_path, git=git)
+    assert (tmp_path / "live/agents/butler/voice.yaml").read_text() == "NEW"
+    assert (tmp_path / "live/agents/butler/voice.yaml.casabak").read_text() == "USER"
+    assert "agents/butler/voice.yaml" in report.casabak
+    assert report.conflicts[0]["pre_sync_sha"] is None
+    assert git.snapshots == []
