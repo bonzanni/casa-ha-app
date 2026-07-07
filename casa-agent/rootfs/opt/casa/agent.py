@@ -194,6 +194,17 @@ class Agent:
         # Per-instance so assistant (4000) and butler (800) budgets stay
         # isolated even when the same channel serves both roles.
         self._budget_tracker = BudgetTracker()
+        # H2/M20: per-instance cache of the SDK plugin list. build_sdk_plugins
+        # shells out to `claude plugin list --json` (a blocking Node spawn);
+        # resolving it once per Agent instead of once per turn removes that
+        # cost from the hot path. The install.md doctrine makes
+        # casa_reload(scope='agent', role=...) MANDATORY after any plugin
+        # install/uninstall, and reload_agent constructs a FRESH Agent
+        # (reload._construct_agent) — so a per-instance cache never serves a
+        # stale plugin set. The lock guards concurrent turns of the same
+        # Agent from racing the first (off-loop) resolve.
+        self._sdk_plugins: list[dict[str, str]] | None = None
+        self._sdk_plugins_lock = asyncio.Lock()
         # Resolve hooks once at construction. HooksConfig.pre_tool_use
         # empty → default policy bundle (block_dangerous_bash + path_scope
         # scoped to cfg.cwd).
@@ -497,12 +508,8 @@ class Agent:
 
             # Binding layer — SDK does NOT auto-consume enabledPlugins; we
             # build the `plugins=[...]` list from `claude plugin list --json`.
-            sdk_plugins = build_sdk_plugins(
-                home="/config/cc-home",
-                shared_cache="/config/cc-home/.claude/plugins",
-                seed="/opt/claude-seed",
-                role=self.config.role,
-            )
+            # Resolved off-loop + cached per instance (see _get_sdk_plugins).
+            sdk_plugins = await self._get_sdk_plugins()
 
             # "Skill" is a valid allowed_tools entry (spike §Key learning 4);
             # append if not already declared so plugin-shipped skills resolve.
@@ -675,6 +682,39 @@ class Agent:
             return response_text or None
         finally:
             origin_var.reset(origin_token)
+
+    async def _get_sdk_plugins(self) -> list[dict[str, str]]:
+        """Resolve this resident's SDK ``plugins=[...]`` list, off-loop + cached.
+
+        ``build_sdk_plugins`` runs ``claude plugin list --json`` — a blocking
+        Node-CLI spawn. Calling it inline on every turn froze the single shared
+        event loop (H2/M20); here it runs via ``asyncio.to_thread`` so no other
+        channel/agent stalls, and the result is cached on the instance so the
+        cost is paid once per Agent, not once per turn.
+
+        Cache invalidation is by Agent reconstruction: the install.md doctrine
+        makes ``casa_reload(scope='agent', role=...)`` mandatory after any
+        plugin install/uninstall, and ``reload._construct_agent`` builds a fresh
+        Agent — so this cache can never surface a stale plugin set. A degraded
+        empty result (build_sdk_plugins' CLI-failure fallback) is deliberately
+        NOT cached, so the next turn retries — preserving plugins_binding.py's
+        documented recovery policy.
+        """
+        if self._sdk_plugins is not None:
+            return self._sdk_plugins
+        async with self._sdk_plugins_lock:
+            if self._sdk_plugins is not None:
+                return self._sdk_plugins
+            plugins = await asyncio.to_thread(
+                build_sdk_plugins,
+                home="/config/cc-home",
+                shared_cache="/config/cc-home/.claude/plugins",
+                seed="/opt/claude-seed",
+                role=self.config.role,
+            )
+            if plugins:
+                self._sdk_plugins = plugins
+            return plugins
 
     def _spawn_cold_retain(
         self, sid: str, directory: str, user_peer: str, channel: str,

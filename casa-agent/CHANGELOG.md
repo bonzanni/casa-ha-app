@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.48.0] - 2026-07-08 — move blocking I/O off the single event loop
+
+### Fixed
+
+- **No more whole-add-on freezes from blocking calls on the shared event loop.** Casa runs one
+  asyncio loop serving every agent and channel (Telegram, voice SSE/WebSocket, scheduler, bus),
+  so any synchronous subprocess / download / heavy filesystem walk on it froze *all* conversations
+  for its full duration. Seven such call sites are now dispatched off the loop (and the network
+  fetch is bounded):
+  - **Resident plugin resolution (H2/M20).** `Agent._process` shelled out to
+    `claude plugin list --json` (a blocking Node spawn, 30s timeout) on *every* turn. It now runs
+    via `asyncio.to_thread` and is cached per Agent instance — the install doctrine already makes
+    `casa_reload(scope='agent')` mandatory after a plugin change, and that rebuilds the Agent, so
+    the cache can never surface a stale plugin set (a degraded/empty CLI result is not cached, so
+    it retries). The three delegation/executor call sites in `tools.py` are offloaded too.
+  - **Plugin tarball download (H13).** `install_tarball` used `urlretrieve` with no timeout (global
+    default `None`), so a stalled marketplace server hung the loop forever. Now `urlopen(timeout=…)`
+    bounds every socket op, and `install_casa_plugin` / `uninstall_casa_plugin` run off the loop.
+  - **Plugin / marketplace / 1Password tool handlers (H16).** `install`/`uninstall`/`marketplace_*`
+    (`claude plugin …`, up to 300s per role) and the `op` CLI vault handlers now offload via
+    `asyncio.to_thread`; a new `_PLUGIN_TOOLS_LOCK` preserves the mutual exclusion the single loop
+    used to give the mutating handlers for free.
+  - **`commit_size_guard` (M17).** The per-Write/Edit `git status --porcelain` (up to 5s) is
+    offloaded.
+  - **`self_containment_guard` (M28).** The per-`git push` tree scan now filters by filename
+    *before* reading, caps each read at 256 KiB, and runs off the loop.
+  - **`list_engagement_workspaces` (L27).** The du-style `os.walk` + `os.stat` over every retained
+    workspace is offloaded.
+
+  Deferred to a separate PR: `session_saver.transcript_to_items` sequential SDK classify queries
+  (M29) — its fix is architectural (SDK-query concurrency).
+
 ## [0.47.1] - 2026-06-08 — prune deprecated add-on option keys on boot
 
 ### Added

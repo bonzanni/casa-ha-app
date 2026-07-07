@@ -178,7 +178,13 @@ def install_tarball(
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         archive = tmp_path / "archive"
-        urllib.request.urlretrieve(url, archive)  # noqa: S310 (scheme validated above)
+        # H13: bound the download by `timeout` (per blocking socket op). The
+        # old urlretrieve() had no timeout and used the global default (None),
+        # so a stalled marketplace server hung the caller — and, since this
+        # runs on casa-main's single event loop, the entire add-on — forever.
+        with urllib.request.urlopen(url, timeout=timeout) as resp, \
+                archive.open("wb") as out:  # noqa: S310 (scheme validated above)
+            shutil.copyfileobj(resp, out)
         actual = _sha256(archive)
         if actual != expected:
             raise IntegrityError(
