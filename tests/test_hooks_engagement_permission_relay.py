@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 def _decision(result: dict) -> str:
@@ -379,6 +379,71 @@ class TestPermissionModeShortCircuit:
         )
         assert _decision(result) == "deny"
         assert "operator timeout" in _reason(result)
+
+
+class TestConcurrentWaiters:
+    """M18 (v0.53.0): two concurrent relays on one engagement must each
+    receive THEIR OWN verdict. Pre-fix, both waiters shared one queue and
+    each discarded the other's verdict, so both denied by timeout."""
+
+    async def test_out_of_order_taps_resolve_both_requests(self):
+        from hooks import make_engagement_permission_relay
+        eid = "9" * 32
+        reg = _FakeRegistry({eid: _FakeRecord()})
+        tg = _FakeTelegramChannel()
+        q = asyncio.Queue()
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg,
+            queues={eid: q}, timeout_s=2.0,
+        )
+
+        def payload(rid):
+            return {"tool_name": "WebFetch", "tool_input": {"url": "https://x"},
+                    "cwd": f"/data/engagements/{eid}", "tool_use_id": rid}
+
+        t_a = asyncio.create_task(hook(payload("rid_A"), None, {}))
+        t_b = asyncio.create_task(hook(payload("rid_B"), None, {}))
+        await asyncio.sleep(0.05)  # both waiters registered
+
+        # Operator taps the NEWEST keyboard (B) first, then A.
+        await q.put({"request_id": "rid_B", "verdict": "allow"})
+        await q.put({"request_id": "rid_A", "verdict": "allow"})
+
+        res_a, res_b = await asyncio.wait_for(
+            asyncio.gather(t_a, t_b), timeout=1.0,
+        )
+        assert res_a == {}, f"request A denied despite operator allow: {res_a}"
+        assert res_b == {}, f"request B denied despite operator allow: {res_b}"
+
+    async def test_concurrent_mixed_verdicts_reach_correct_waiter(self):
+        """Cross-delivery must be impossible: A allowed, B denied — each
+        waiter gets its own verdict regardless of tap order."""
+        from hooks import make_engagement_permission_relay
+        eid = "8" * 32
+        reg = _FakeRegistry({eid: _FakeRecord()})
+        tg = _FakeTelegramChannel()
+        q = asyncio.Queue()
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg,
+            queues={eid: q}, timeout_s=2.0,
+        )
+
+        def payload(rid):
+            return {"tool_name": "WebFetch", "tool_input": {"url": "https://x"},
+                    "cwd": f"/data/engagements/{eid}", "tool_use_id": rid}
+
+        t_a = asyncio.create_task(hook(payload("rid_A"), None, {}))
+        t_b = asyncio.create_task(hook(payload("rid_B"), None, {}))
+        await asyncio.sleep(0.05)
+
+        await q.put({"request_id": "rid_B", "verdict": "deny"})
+        await q.put({"request_id": "rid_A", "verdict": "allow"})
+
+        res_a, res_b = await asyncio.wait_for(
+            asyncio.gather(t_a, t_b), timeout=1.0,
+        )
+        assert res_a == {}, f"A should be allowed: {res_a}"
+        assert res_b["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 class TestKeyboardFailure:

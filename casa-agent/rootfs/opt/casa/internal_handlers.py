@@ -134,11 +134,24 @@ def _make_internal_tools_call_handler(
 def _make_internal_hooks_resolve_handler(
     *,
     hook_policies: dict[str, tuple[str, HookCallback]],
+    executor_hook_policies: dict | None = None,
+    engagement_registry=None,
 ):
     """Build the aiohttp POST handler for /internal/hooks/resolve.
 
     `hook_policies` is the {name -> (matcher_regex, async_callback)} dict
-    produced by `casa_core._build_cc_hook_policies(HOOK_POLICIES)`.
+    produced by `casa_core._build_cc_hook_policies(HOOK_POLICIES)` — the
+    default-configured fallback callbacks.
+
+    H3 (v0.53.0): `executor_hook_policies` (built by
+    `casa_core._build_executor_cc_hook_policies`) is
+    ``{executor_type: {policy_name: (matcher, callback)}}`` carrying the
+    per-executor ``hooks.yaml`` parameters. When both it and
+    `engagement_registry` are supplied, the handler resolves the engagement
+    from the CC payload's ``cwd`` and prefers that executor's parameterised
+    callback for the policy; it falls back to the default `hook_policies`
+    callback for unknown engagements / executors / policies. Both default to
+    None so existing call sites (and tests) keep the original behaviour.
     """
     async def handler(request: web.Request) -> web.Response:
         try:
@@ -156,7 +169,27 @@ def _make_internal_hooks_resolve_handler(
         policy_name = body.get("policy")
         payload = body.get("payload") or {}
 
-        entry = hook_policies.get(policy_name)
+        # H3 (v0.53.0): prefer the engagement's executor-specific callback
+        # (carrying its hooks.yaml params) when we can resolve the engagement
+        # from the CC payload's cwd; otherwise fall back to the default
+        # policy callback. Same cwd-trust model the C-1 permission relay uses.
+        entry = None
+        if executor_hook_policies and engagement_registry is not None:
+            from hooks import _engagement_id_from_cwd
+            eng_id = _engagement_id_from_cwd(payload.get("cwd") or "")
+            if eng_id:
+                try:
+                    rec = engagement_registry.get(eng_id)
+                except Exception:
+                    rec = None
+                if rec is not None:
+                    entry = (
+                        executor_hook_policies.get(
+                            getattr(rec, "role_or_type", "")
+                        ) or {}
+                    ).get(policy_name)
+        if entry is None:
+            entry = hook_policies.get(policy_name)
         if entry is None:
             return web.json_response(
                 {"hookSpecificOutput": {

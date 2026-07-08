@@ -1,6 +1,47 @@
 # Changelog
 
-## [0.52.0] - 2026-07-08 — Telegram channel correctness (webhook ACK, teardown, /cancel, permission relay, typing)
+## [0.53.0] - 2026-07-08 — Silent hangs & cross-module contract drift (bus REQUEST resolution, executor hook params, observer drain, permission-relay correlation)
+
+### Fixed
+
+Five defects where a request/response path never resolved, a bus queue was never drained, executor hook params never reached the enforcer, or a permission verdict reached the wrong waiter:
+
+- **A bus REQUEST now ALWAYS resolves its caller's future (M4 + M6).** A REQUEST whose handler
+  produced empty/suppressed output — `Agent.handle_message` returning `None` on a `<silent/>` or
+  no-text turn — left the pending future unresolved, so voice SSE/WebSocket and `POST /invoke`
+  (all `bus.request(timeout=300)`) hung the full ~300s and then surfaced a spurious timeout for a
+  turn that actually completed. Fixed on both sides of the contract: `bus.run_agent_loop._dispatch`
+  now resolves a REQUEST with an explicit empty `RESPONSE` when the handler returns without
+  responding (guarded by `msg.id in self.pending`, so NOTIFY / fire-and-forget stay a no-op), and
+  `Agent.handle_message` now returns a typed empty `RESPONSE` for REQUEST turns instead of `None`
+  (channel delivery of the empty text is still suppressed). `test_bus.py::test_request_timeout`
+  reworked to register a handler-less target for the genuine timeout path.
+
+- **Executor `hooks.yaml` parameters now reach the claude_code HTTP hook path (H3).**
+  `_build_cc_hook_policies` invoked every factory with no kwargs, so the `/hooks/resolve` path (the
+  only enforcement path for claude_code engagements) ran default-configured policies — an empty
+  `path_scope` that denied ALL Read/Write/Edit for a plugin-developer engagement, and
+  `commit_size_guard` at the wrong `max_files`. New `hooks.build_policy_callbacks_from_hooks_yaml`
+  + `casa_core._build_executor_cc_hook_policies` build per-executor parameterised callbacks from the
+  executor's `hooks.yaml`; the resolve handler resolves the engagement from the payload `cwd` and
+  prefers that executor's callback, falling back to the defaults for unknown engagements. Boot-time
+  snapshot (an operator edit needs a restart to affect the HTTP path).
+
+- **The observer bus queue is now drained (H4).** `observer.subscribe()` registered an `observer`
+  target queue + handler, but the boot loop spawned `run_agent_loop` consumers only for resident
+  roles + `telegram`, so every engagement event sent to `target='observer'` (subprocess_respawn,
+  idle_detected, error tool_results) enqueued forever with no consumer — operator interjections
+  never fired and the queue leaked for the process lifetime. New `_bus_loop_targets(agents)` adds
+  `observer` (deduped) to the spawn list; the tracked task is cancelled on shutdown with the others.
+
+- **Concurrent permission requests each receive THEIR OWN verdict (M18).** All pending permission
+  requests for an engagement shared one `asyncio.Queue`, and `_await_matching_verdict` discarded any
+  item whose `request_id` was not its own — so with two parallel tool calls in flight (Claude Code
+  issues parallel tools), whichever waiter won `q.get()` for the operator's verdict destroyed it on
+  an rid mismatch, denying the approved call by timeout. Verdicts are now correlated by request_id: a
+  single per-engagement drain lock lets exactly one waiter read the queue at a time and routes a
+  non-matching verdict into a per-`request_id` mailbox for its owning waiter, so cross-delivery is
+  impossible and the stale-click defence still holds.
 
 ### Fixed
 

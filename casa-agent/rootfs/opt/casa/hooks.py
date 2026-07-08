@@ -973,6 +973,39 @@ def resolve_hooks(
     return {"PreToolUse": matchers}
 
 
+def build_policy_callbacks_from_hooks_yaml(
+    hooks_yaml_data: dict,
+) -> dict[str, tuple[str, "HookCallback"]]:
+    """Build ``{policy_name: (matcher, callback)}`` from an executor hooks.yaml.
+
+    H3 (v0.53.0): the claude_code HTTP hook path (hook_proxy.sh -> the
+    /hooks/resolve endpoint) previously ran only the default-configured
+    factories, dropping every per-executor ``hooks.yaml`` parameter (e.g.
+    plugin-developer's ``path_scope`` writable/readable prefixes), so the
+    default empty-prefix ``path_scope`` denied ALL Read/Write/Edit. This turns
+    an executor's parsed ``hooks.yaml`` into the same ``(matcher, callback)``
+    shape ``_build_cc_hook_policies`` produces, but with the declared params
+    applied.
+
+    Policies with no HOOK_POLICIES factory (e.g. ``engagement_permission_relay``
+    — injected separately in casa_core with live deps) are skipped here. The
+    per-entry ``matcher``/``timeout`` keys are consumed by other paths and are
+    not factory parameters, so they are stripped before the factory call.
+    """
+    out: dict[str, tuple[str, "HookCallback"]] = {}
+    for entry in (hooks_yaml_data.get("pre_tool_use") or []):
+        name = entry.get("policy")
+        policy = HOOK_POLICIES.get(name)
+        if policy is None:
+            continue  # e.g. engagement_permission_relay — wired separately
+        params = {
+            k: v for k, v in entry.items()
+            if k not in ("policy", "matcher", "timeout")
+        }
+        out[name] = (policy["matcher"], policy["factory"](**params))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # v0.37.2 (C-1): engagement_permission_relay
 #
@@ -1005,21 +1038,54 @@ def _engagement_id_from_cwd(cwd: str) -> str | None:
     return m.group(1) if m else None
 
 
-async def _await_matching_verdict(q: asyncio.Queue, expected_rid: str) -> str:
-    """Drain stale entries from the queue; return the verdict for ``expected_rid``.
+async def _await_matching_verdict(
+    q: asyncio.Queue,
+    expected_rid: str,
+    *,
+    mailbox: dict[str, str],
+    lock: asyncio.Lock,
+) -> str:
+    """Return the verdict for ``expected_rid``, correlated by request_id.
 
-    Defence-in-depth: a late operator click for a previously-timed-out
-    permission could otherwise approve the wrong subsequent tool call.
+    Concurrency contract (M18, v0.53.0). Claude Code issues parallel tool
+    calls, so several PreToolUse relays for ONE engagement may await the same
+    per-engagement queue at once. The previous implementation had every waiter
+    call ``q.get()`` directly and discard any item whose request_id was not its
+    own — so whichever waiter won ``q.get()`` for the operator's verdict
+    destroyed it when the rid did not match, and the owning request was denied
+    by timeout despite an explicit operator approval.
+
+    Fix: exactly one waiter drains the shared queue at a time (``lock``); a
+    dequeued verdict whose request_id is not the drainer's own is stashed in
+    ``mailbox`` keyed by request_id and picked up by its owning waiter. Only
+    the lock holder ever calls ``q.get()``, so no two waiters race the queue,
+    and the mailbox is the per-request keyed map that guarantees each waiter
+    receives only its own verdict.
+
+    Matching remains keyed by request_id, so the original stale-click defence
+    holds: a late/stale verdict for a timed-out request lands in the mailbox
+    under its own (now unowned) rid and can never approve a DIFFERENT tool
+    call — request_ids are unique per tool call.
     """
     while True:
-        item = await q.get()
-        if item.get("request_id") != expected_rid:
-            _logger.info(
-                "discarding stale permission verdict rid=%s (expected %s)",
-                item.get("request_id"), expected_rid,
-            )
-            continue
-        return item.get("verdict") or "deny"
+        # A concurrent drainer may already have delivered our verdict.
+        if expected_rid in mailbox:
+            return mailbox.pop(expected_rid) or "deny"
+        async with lock:
+            # Re-check under the lock: it may have arrived while we queued
+            # for the lock.
+            if expected_rid in mailbox:
+                return mailbox.pop(expected_rid) or "deny"
+            item = await q.get()
+            rid = item.get("request_id")
+            verdict = item.get("verdict") or "deny"
+            if rid == expected_rid:
+                return verdict
+            # Not ours — hand off to the owning waiter via its mailbox. The
+            # lock release below wakes the next waiter, which collects it.
+            mailbox[rid] = verdict
+        # Lock released: loop so another waiter can drain / collect, and we
+        # re-check the mailbox for our own verdict before draining again.
 
 
 def make_engagement_permission_relay(
@@ -1041,6 +1107,14 @@ def make_engagement_permission_relay(
             "operator_id": int | None}``).
         timeout_s: how long to wait for the operator before treating as deny.
     """
+
+    # M18 (v0.53.0): per-engagement verdict demux shared across every
+    # concurrent ``_hook`` invocation. ``_drain_locks`` ensures exactly one
+    # waiter drains the shared verdict queue at a time; ``_mailboxes`` is the
+    # per-engagement, per-request-id keyed map a drainer stashes another
+    # waiter's verdict into. See ``_await_matching_verdict``.
+    _mailboxes: dict[str, dict[str, str]] = {}
+    _drain_locks: dict[str, asyncio.Lock] = {}
 
     async def _hook(
         input_data: dict[str, Any],
@@ -1104,10 +1178,14 @@ def make_engagement_permission_relay(
             # None on the first fire, instantly denying the call before the
             # operator could tap.
             q = queues[eng_id]
+            mailbox = _mailboxes.setdefault(eng_id, {})
+            lock = _drain_locks.setdefault(eng_id, asyncio.Lock())
 
             try:
                 verdict = await asyncio.wait_for(
-                    _await_matching_verdict(q, rid),
+                    _await_matching_verdict(
+                        q, rid, mailbox=mailbox, lock=lock,
+                    ),
                     timeout=timeout_s,
                 )
             except asyncio.TimeoutError:

@@ -1331,7 +1331,12 @@ class TestScheduledSilence:
 
         assert stub.send.call_count == 0
         assert stub.finalize_stream.call_count == 0
-        assert result is None
+        # M4 (v0.53.0): send suppression is still load-bearing, but a REQUEST
+        # turn must ALWAYS return a RESPONSE (empty content) so bus.request()
+        # callers (voice SSE/WS, /invoke) resolve instead of hanging 300s.
+        assert result is not None
+        assert result.type == MessageType.RESPONSE
+        assert result.content == ""
 
     async def test_whitespace_suppresses_send_on_request_turn(self, tmp_path):
         """G-3 (v0.33.0): whitespace-only accumulated text on a
@@ -1348,7 +1353,46 @@ class TestScheduledSilence:
 
         assert stub.send.call_count == 0
         assert stub.finalize_stream.call_count == 0
-        assert result is None
+        # M4 (v0.53.0): empty REQUEST turn still returns an empty RESPONSE.
+        assert result is not None
+        assert result.type == MessageType.RESPONSE
+        assert result.content == ""
+
+    async def test_empty_request_turn_resolves_pending_future(self, tmp_path):
+        """M4/M6 (v0.53.0): a REQUEST turn whose output strips to <silent/>
+        (or whose _process returns None — a tool-only turn with no TextBlocks)
+        must resolve the caller's bus future PROMPTLY with an empty RESPONSE.
+
+        Pre-fix, handle_message returned None and the bus never auto-responded
+        to the REQUEST, so bus.request() blocked until its timeout (300s in
+        prod on voice SSE/WS and /invoke). We use a short timeout and assert
+        it resolves rather than raising TimeoutError.
+        """
+        from bus import BusMessage, MessageBus, MessageType
+
+        for ret in ("<silent/>", None):
+            agent = _make_agent(tmp_path, role="assistant")
+            bus = MessageBus()
+            bus.register("voice")
+            bus.register("assistant", agent.handle_message)
+            loop_task = asyncio.create_task(bus.run_agent_loop("assistant"))
+            try:
+                with patch.object(
+                    agent, "_process", AsyncMock(return_value=ret),
+                ):
+                    req = BusMessage(
+                        type=MessageType.REQUEST, source="voice",
+                        target="assistant", content="turn off the lights",
+                        channel="voice", context={"chat_id": "scope1"},
+                    )
+                    result = await bus.request(req, timeout=2)
+                assert result.type == MessageType.RESPONSE
+                assert result.content == ""
+                assert result.reply_to == req.id
+            finally:
+                loop_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await loop_task
 
 
 # ---------------------------------------------------------------------------

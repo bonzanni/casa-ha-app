@@ -320,8 +320,18 @@ class Agent:
             except Exception:  # noqa: BLE001
                 logger.exception("channel.turn_finished failed")
 
-        if not text and error_kind is None:
+        if not text and error_kind is None and msg.type != MessageType.REQUEST:
             return None
+        # M4 (v0.53.0): REQUEST turns must ALWAYS return a RESPONSE (possibly
+        # empty-content). Voice SSE/WS (channels/voice/channel.py) and /invoke
+        # (casa_core.py) block on bus.request(timeout=300); a None return here
+        # would leave their pending future unresolved for the full window.
+        # Channel delivery of the empty text was already suppressed above
+        # (send()/finalize_stream() are skipped, turn_finished() torn down).
+        # Note: the delegation-synthesis path rebinds ``msg`` to REQUEST, so an
+        # empty delegation turn now returns an empty RESPONSE too — but
+        # bus._dispatch keys off the ORIGINAL message (a NOTIFICATION with no
+        # pending future), so that RESPONSE is simply ignored.
 
         return BusMessage(
             type=MessageType.RESPONSE,

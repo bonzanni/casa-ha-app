@@ -56,6 +56,7 @@ async def start_internal_unix_runner(
     tool_dispatch: dict,
     engagement_registry,
     hook_policies: dict,
+    executor_hook_policies: dict | None = None,
     runtime=None,
     telegram_channel=None,
 ) -> "web.AppRunner":
@@ -110,7 +111,11 @@ async def start_internal_unix_runner(
     )
     internal_app.router.add_post(
         "/internal/hooks/resolve",
-        _make_internal_hooks_resolve_handler(hook_policies=hook_policies),
+        _make_internal_hooks_resolve_handler(
+            hook_policies=hook_policies,
+            executor_hook_policies=executor_hook_policies,
+            engagement_registry=engagement_registry,
+        ),
     )
     # Task E.1 (granular-reload plan): casactl operator CLI POSTs here
     # over the unix socket. Same dispatch path as the casa_reload MCP tool.
@@ -262,15 +267,26 @@ def _make_public_mcp_fallback_handler(
     return handler
 
 
-def _make_public_hooks_fallback_handler(*, hook_policies: dict):
+def _make_public_hooks_fallback_handler(
+    *,
+    hook_policies: dict,
+    executor_hook_policies: dict | None = None,
+    engagement_registry=None,
+):
     """Public-8099 /hooks/resolve handler.
 
     Same body shape as the internal handler ({"policy": ..., "payload": ...}).
     Just re-exports the internal factory under a different name for clarity
-    at the call site — behavior is identical.
+    at the call site — behavior is identical. H3 (v0.53.0): forwards the
+    per-executor hook policies + engagement registry so parameterised
+    callbacks apply on this path too.
     """
     from internal_handlers import _make_internal_hooks_resolve_handler
-    return _make_internal_hooks_resolve_handler(hook_policies=hook_policies)
+    return _make_internal_hooks_resolve_handler(
+        hook_policies=hook_policies,
+        executor_hook_policies=executor_hook_policies,
+        engagement_registry=engagement_registry,
+    )
 
 
 def _make_public_mcp_get_405_handler():
@@ -481,12 +497,13 @@ def _build_cc_hook_policies(hook_policies: dict) -> dict:
     time; the HTTP path inherits whatever configuration the factory
     with-defaults produces.
 
-    When an executor defines non-default hook parameters (e.g.
-    casa_config_guard.forbid_write_paths), the CC driver path currently
-    uses the factory defaults. This is acceptable for v0.13.1 because the
-    only in-tree executor-hooks config is the Configurator's, and its
-    defaults match what the executor wants. Wiring per-executor params
-    into the HTTP path is a later item.
+    These are the DEFAULT-configured callbacks and serve as the fallback for
+    the HTTP path. H3 (v0.53.0): per-executor ``hooks.yaml`` parameters (e.g.
+    plugin-developer's ``path_scope`` writable/readable prefixes) are wired in
+    separately by :func:`_build_executor_cc_hook_policies` and preferred at
+    request time by the /internal/hooks/resolve handler when the engagement
+    resolves from the payload cwd; this dict is only the fallback when no
+    executor-specific callback applies.
     """
     cc_policies: dict = {}
     for name, entry in hook_policies.items():
@@ -494,6 +511,53 @@ def _build_cc_hook_policies(hook_policies: dict) -> dict:
         callback = entry["factory"]()  # default-configured HookCallback
         cc_policies[name] = (matcher, callback)
     return cc_policies
+
+
+def _build_executor_cc_hook_policies(executor_registry) -> dict:
+    """H3 (v0.53.0): ``{executor_type: {policy_name: (matcher, callback)}}``.
+
+    For every ``claude_code`` executor with a ``hooks.yaml``, parse the file
+    and build parameterised ``(matcher, callback)`` entries so the HTTP hook
+    path (hook_proxy.sh -> /hooks/resolve) enforces the executor's declared
+    ``path_scope`` prefixes / ``commit_size_guard`` limit instead of the
+    deny-all factory defaults.
+
+    Boot-time snapshot: an operator edit to an executor ``hooks.yaml`` needs an
+    add-on restart to affect the HTTP path (same freshness as the boot-built
+    default policies). A per-executor parse failure is logged and skipped so
+    that executor simply falls back to the default callbacks.
+    """
+    import yaml
+    from hooks import build_policy_callbacks_from_hooks_yaml
+
+    out: dict = {}
+    for t in executor_registry.list_types():
+        defn = executor_registry.get(t)
+        if defn is None or defn.driver != "claude_code" or not defn.hooks_path:
+            continue
+        try:
+            with open(defn.hooks_path, "r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+            out[t] = build_policy_callbacks_from_hooks_yaml(data)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "executor %r hooks.yaml param build failed: %s — using defaults",
+                t, exc,
+            )
+    return out
+
+
+def _bus_loop_targets(agents: dict) -> list[str]:
+    """H4 (v0.53.0): bus targets that need a ``run_agent_loop`` consumer.
+
+    Residents (``agents`` roles) + the ``telegram`` outbound target + the
+    ``observer`` target. ``observer`` was previously missing, so every
+    engagement event sent to target='observer' (subprocess_respawn,
+    idle_detected, error tool_results) enqueued forever with no consumer —
+    events lost, queue leaked. ``dict.fromkeys`` dedupes while preserving
+    order (guards a hypothetical user resident literally named "observer").
+    """
+    return list(dict.fromkeys(list(agents.keys()) + ["telegram", "observer"]))
 
 
 def _wire_engagement_permission_relay(
@@ -1605,9 +1669,15 @@ async def main() -> None:
         engagement_registry=engagement_registry,
         telegram_channel=telegram_channel,
     )
+    # H3 (v0.53.0): per-executor hooks.yaml params for the HTTP hook path.
+    _executor_cc_policies = _build_executor_cc_hook_policies(executor_registry)
     app.router.add_post(
         "/hooks/resolve",
-        _make_public_hooks_fallback_handler(hook_policies=_cc_hook_policies),
+        _make_public_hooks_fallback_handler(
+            hook_policies=_cc_hook_policies,
+            executor_hook_policies=_executor_cc_policies,
+            engagement_registry=engagement_registry,
+        ),
     )
 
     from tools import CASA_TOOLS
@@ -1678,6 +1748,7 @@ async def main() -> None:
         tool_dispatch=_internal_tool_dispatch,
         engagement_registry=engagement_registry,
         hook_policies=_internal_hook_policies,
+        executor_hook_policies=_executor_cc_policies,
         runtime=runtime,
         telegram_channel=telegram_channel,
     )
@@ -1697,7 +1768,10 @@ async def main() -> None:
     # 13. Agent loop tasks. H10/H11 (v0.49.0): spawn through the bus so
     # the consumer tasks are tracked — reload reuses the same seam for
     # roles added after boot and cancels tracked tasks on eviction.
-    for name in list(agents.keys()) + ["telegram"]:
+    # H4 (v0.53.0): _bus_loop_targets adds "observer" so the observer queue
+    # (subscribed above) actually gets drained; observer.subscribe() ran
+    # earlier so its queue already exists here.
+    for name in _bus_loop_targets(agents):
         if name in bus.queues:
             loop_tasks.append(bus.start_agent_loop(name))
 
