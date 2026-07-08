@@ -70,3 +70,46 @@ async def test_profile_gets_mental_models() -> None:
     assert payload is None
     assert "terse" in out
 
+
+
+async def test_request_reuses_one_client_session(monkeypatch) -> None:
+    """L32: _request must reuse one ClientSession across calls (keep-alive
+    pooling), lazily replacing it only after close()."""
+    created = []
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        async def json(self):
+            return {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class FakeSession:
+        def __init__(self, *a, **kw):
+            created.append(self)
+            self.closed = False
+
+        def request(self, *a, **kw):
+            return FakeResp()
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr("hindsight_memory.aiohttp.ClientSession", FakeSession)
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    await mem._request("GET", "/v1/default/banks/casa-assistant/mental-models")
+    await mem._request(
+        "POST", "/v1/default/banks/casa-assistant/memories/recall", {"query": "x"},
+    )
+    assert len(created) == 1, "ClientSession must be created once and reused"
+    await mem.close()
+    assert created[0].closed, "close() must close the shared session"
+    await mem._request("GET", "/v1/default/banks/casa-assistant/mental-models")
+    assert len(created) == 2, "a closed session must be lazily replaced, not reused"
+    await mem.close()

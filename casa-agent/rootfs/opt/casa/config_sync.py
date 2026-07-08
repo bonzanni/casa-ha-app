@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -36,6 +37,12 @@ class SyncReport:
     conflicts: list[dict] = field(default_factory=list)
     schema_forced: list[dict] = field(default_factory=list)
     casabak: list[str] = field(default_factory=list)
+    # Finding 2 (theme 8/9): the POST-SYNC boot-parity validation of the
+    # reconciled /config tree. ``post_sync_errors`` are boot-fatal
+    # inconsistencies the reconciler could NOT self-heal (surfaced loudly);
+    # ``post_sync_healed`` are files the reconciler removed to keep boot alive.
+    post_sync_errors: list[str] = field(default_factory=list)
+    post_sync_healed: list[str] = field(default_factory=list)
     notified: bool = False
 
     def has_overwrites(self) -> bool:
@@ -102,8 +109,82 @@ def _archive_casabak(config_dir: Path, rel: str, report: SyncReport) -> None:
     report.casabak.append(rel)
 
 
+# Matches agent_loader's delegates-without-delegate-tool boot fatal, e.g.
+#   agent 'assistant': delegates.yaml is non-empty but runtime.yaml ...
+_DELEGATE_MISMATCH_RE = re.compile(
+    r"agent '([^']+)': delegates\.yaml is non-empty but")
+
+
+def _post_sync_validate_and_heal(
+    *, config_dir: Path, defaults_dir: Path, report: SyncReport,
+    validate_repo: Callable[[], list[str]] | None,
+) -> None:
+    """Finding 2 backstop: validate the POST-SYNC /config tree with the boot
+    loader and repair-or-surface any boot-fatal inconsistency the reconciler
+    itself introduced by re-injecting an image-owned default.
+
+    The known case: the committed tree validly dropped an image-owned
+    ``agents/<role>/delegates.yaml`` (and the delegate tool from
+    runtime.yaml), which passes the pre-commit gate — but config_sync
+    re-seeds the image-owned delegates.yaml here, producing a
+    delegates-without-delegate-tool mismatch that FATALs the next boot.
+
+    Best-effort and boot-safe: any error inside this backstop is swallowed so
+    the backstop can never itself block boot.
+    """
+    if validate_repo is None:
+        return
+    try:
+        errors = validate_repo()
+    except Exception as exc:  # noqa: BLE001 — backstop must never crash boot
+        logger.warning("config_sync post-sync validation raised (ignored): %s", exc)
+        return
+    if not errors:
+        return
+
+    # Self-heal the delegates/tool case: drop the re-injected image-owned
+    # delegates.yaml so boot survives. Only when the on-disk file is byte-equal
+    # to the image default (proof it is the image-owned copy, not an operator's
+    # genuine delegates content) — never delete real user delegation config.
+    healed = False
+    for err in errors:
+        m = _DELEGATE_MISMATCH_RE.search(err)
+        if not m:
+            continue
+        role = m.group(1)
+        rel = f"agents/{role}/delegates.yaml"
+        live = config_dir / rel
+        default = defaults_dir / rel
+        if live.exists() and default.exists() and _bytes_equal(live, default):
+            _delete(config_dir, rel)
+            report.post_sync_healed.append(rel)
+            healed = True
+            logger.warning(
+                "config_sync: removed re-injected image-owned %s to keep boot "
+                "alive — %s. Reconcile runtime.yaml tools.allowed (add the "
+                "delegate tool) or the image delegates default to make this "
+                "durable.", rel, err,
+            )
+
+    # Re-validate after any heal so the report reflects the true residual state.
+    if healed:
+        try:
+            errors = validate_repo()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("config_sync post-heal validation raised (ignored): %s", exc)
+            errors = []
+
+    report.post_sync_errors = list(errors)
+    for err in errors:
+        logger.error(
+            "config_sync POST-SYNC boot-parity error (next boot will FATAL "
+            "unless fixed): %s", err,
+        )
+
+
 def reconcile(*, defaults_dir, config_dir, baseline_dir,
-              image_version: str, git, validate: Callable[[str], str | None]) -> SyncReport:
+              image_version: str, git, validate: Callable[[str], str | None],
+              validate_repo: Callable[[], list[str]] | None = None) -> SyncReport:
     defaults_dir = Path(defaults_dir)
     config_dir = Path(config_dir)
     baseline_dir = Path(baseline_dir)
@@ -194,8 +275,16 @@ def reconcile(*, defaults_dir, config_dir, baseline_dir,
 
     _mirror_baseline(defaults_dir, baseline_dir)
 
+    # Finding 2 backstop — validate the reconciled tree with the real boot
+    # loader and repair-or-surface any inconsistency the re-seed introduced.
+    _post_sync_validate_and_heal(
+        config_dir=config_dir, defaults_dir=defaults_dir, report=report,
+        validate_repo=validate_repo,
+    )
+
     changed = bool(
-        report.updated or report.deleted or report.conflicts or report.schema_forced
+        report.updated or report.deleted or report.conflicts
+        or report.schema_forced or report.post_sync_healed
     )
     if changed and git.available:
         git.snapshot(f"casa-sync: default reconcile {image_version}")
@@ -305,6 +394,20 @@ def _make_validator(config_dir) -> Callable[[str], str | None]:
     return validate
 
 
+def _make_repo_validator(config_dir) -> Callable[[], list[str]]:
+    """Post-sync whole-tree validator backed by agent_loader's boot-parity
+    ``validate_config_repo`` (hardened in v0.55.0 to faithfully catch boot
+    fatals). Returns the list of error strings for the reconciled /config
+    tree; used by the Finding 2 backstop to repair-or-surface inconsistencies
+    the re-seed introduces."""
+    import agent_loader as al
+
+    def validate_repo() -> list[str]:
+        return al.validate_config_repo(str(config_dir))
+
+    return validate_repo
+
+
 def run(*, defaults_dir, config_dir, baseline_dir, report_path,
         image_version: str) -> int:
     """Boot/reload entry point. Non-fatal by contract: logs and returns 0
@@ -312,17 +415,20 @@ def run(*, defaults_dir, config_dir, baseline_dir, report_path,
     try:
         git = RealGit(config_dir)
         validate = _make_validator(config_dir)
+        validate_repo = _make_repo_validator(config_dir)
         report = reconcile(
             defaults_dir=defaults_dir, config_dir=config_dir,
             baseline_dir=baseline_dir, image_version=image_version,
-            git=git, validate=validate,
+            git=git, validate=validate, validate_repo=validate_repo,
         )
         Path(report_path).parent.mkdir(parents=True, exist_ok=True)
         Path(report_path).write_text(report.to_json(), encoding="utf-8")
         logger.info(
-            "config_sync: updated=%d deleted=%d conflicts=%d schema_forced=%d casabak=%d",
+            "config_sync: updated=%d deleted=%d conflicts=%d schema_forced=%d "
+            "casabak=%d post_sync_healed=%d post_sync_errors=%d",
             len(report.updated), len(report.deleted), len(report.conflicts),
             len(report.schema_forced), len(report.casabak),
+            len(report.post_sync_healed), len(report.post_sync_errors),
         )
     except Exception as exc:  # noqa: BLE001 — boot-critical: never fatal
         logger.warning("config_sync: reconcile failed (non-fatal): %s", exc)

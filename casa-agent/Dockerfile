@@ -16,16 +16,6 @@ RUN apt-get update \
     && npm install -g @anthropic-ai/claude-code@2.1.150 \
     && npm cache clean --force
 
-# Plan 4a: Tier 1 baseline plugin packs for claude_code driver.
-# These are symlinked into each engagement's isolated HOME at provisioning time.
-# Updating the pin is a Casa image release concern; see CHANGELOG for cadence.
-ARG SUPERPOWERS_REF=v5.0.7
-RUN mkdir -p /opt/casa/claude-plugins/base \
-    && git clone --depth=1 --branch ${SUPERPOWERS_REF} \
-       https://github.com/obra/superpowers \
-       /opt/casa/claude-plugins/base/superpowers \
-    && rm -rf /opt/casa/claude-plugins/base/superpowers/.git
-
 # Install ttyd (not packaged in Debian).
 ARG TTYD_VERSION=1.7.7
 ARG TARGETARCH
@@ -79,27 +69,28 @@ ENV PATH="/opt/casa/venv/bin:${PATH}"
 COPY requirements.txt /tmp/
 RUN /opt/casa/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Copy application
-COPY rootfs /
-
-# Set permissions for s6-rc services and scripts
-RUN chmod +x /etc/s6-overlay/scripts/*.sh \
-    && find /etc/s6-overlay/s6-rc.d -name 'run' -o -name 'finish' \
-    | xargs chmod +x \
-    && chmod +x /opt/casa/scripts/*.sh \
-    && chmod +x /usr/local/bin/casactl
-
 # --- Seed-marketplace build (§3.2 + §10.1 + spike §Gate 3) -------------------
+# L31: this network-bound seed install runs BEFORE `COPY rootfs /` so a routine
+# code change does not invalidate its layer cache (it only re-runs when the
+# marketplace catalogs / gitconfig / credential helper below change). Its true
+# inputs are narrow-COPY'd here; the later `COPY rootfs /` re-copies them with
+# identical content (harmless).
+
+# Build-time SSH→HTTPS rewrite is handled by /etc/gitconfig; ship it (and the
+# credential helper it references) via narrow COPYs so the seed does not depend
+# on the broad `COPY rootfs /` below. System-level gitconfig applies to every
+# USER, so the `casa` build user inherits the rewrite without per-user setup.
+COPY rootfs/etc/gitconfig /etc/gitconfig
+COPY rootfs/opt/casa/scripts/git-credential-casa.sh /opt/casa/scripts/git-credential-casa.sh
 
 # Copy marketplace catalogs into the image.
 COPY rootfs/opt/casa/defaults/marketplace-defaults/ /opt/casa/defaults/marketplace-defaults/
 COPY rootfs/opt/casa/defaults/marketplace-user/ /opt/casa/defaults/marketplace-user/
 
-# Pin the default-marketplace plugin refs. Each entry also appears in
+# Plugin refs are pinned solely in
 # /opt/casa/defaults/marketplace-defaults/.claude-plugin/marketplace.json
-# with a matching `source:{source:"github",repo:"...",ref:"..."}` stanza so
-# the seed is reproducible and offline-resolvable.
-ARG SUPERPOWERS_REF=v5.0.7
+# (superpowers v5.1.0 as of v0.46.3); the seed install below resolves refs
+# from that file — there is no ARG pin to keep in sync.
 
 # Create the non-root user the build-install runs under.
 # `--allow-dangerously-skip-permissions` refuses to run as root.
@@ -107,10 +98,6 @@ RUN id -u casa >/dev/null 2>&1 || useradd -m -s /bin/bash casa; \
     mkdir -p /opt/claude-seed && chown -R casa:casa /opt/claude-seed
 
 USER casa
-
-# Build-time SSH→HTTPS rewrite is handled by /etc/gitconfig (shipped via
-# `COPY rootfs /` above). System-level config applies to every USER, so
-# the `casa` build user inherits the rewrite without any per-user setup.
 
 # Build-time seed install. CLAUDE_CODE_PLUGIN_CACHE_DIR points at the seed's
 # plugins/ root (parent of cache/) — NOT plugins/cache/. Per spike §Gate 1.
@@ -137,6 +124,17 @@ RUN mkdir -p /opt/claude-seed/marketplaces \
           /opt/claude-seed/marketplaces/casa-plugins-defaults \
  && chmod -R a-w /opt/claude-seed \
  && chmod -R a+rX /opt/claude-seed
+
+# Copy application (frequently-changing layer; kept AFTER the seed install so a
+# code edit does not bust the seed-install layer cache — L31).
+COPY rootfs /
+
+# Set permissions for s6-rc services and scripts
+RUN chmod +x /etc/s6-overlay/scripts/*.sh \
+    && find /etc/s6-overlay/s6-rc.d -name 'run' -o -name 'finish' \
+    | xargs chmod +x \
+    && chmod +x /opt/casa/scripts/*.sh \
+    && chmod +x /usr/local/bin/casactl
 
 # Make the seed visible to every consumer (casa-main + every engagement
 # subprocess). Engagement subprocesses also get CLAUDE_CODE_PLUGIN_CACHE_DIR

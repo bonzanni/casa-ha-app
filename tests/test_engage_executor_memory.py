@@ -82,7 +82,6 @@ async def test_workspace_legacy_path_substitutes_executor_memory(tmp_path):
 
     await provision_workspace(
         engagements_root=str(eng_root),
-        base_plugins_root=str(plugins_root),
         engagement_id="abc12345",
         defn=_Defn(),
         task="dotask",

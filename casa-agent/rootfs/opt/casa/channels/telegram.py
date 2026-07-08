@@ -602,14 +602,12 @@ class TelegramChannel(Channel):
         # forwarded/group-origin update could).
         _first = text.split()[0].lower() if text else ""
         if _first.split("@", 1)[0] == "/new":
-            if self._session_registry is not None and self._semantic_memory is not None:
-                from session_registry import build_session_key
-                from session_saver import reset_channel
-                channel_key = build_session_key("telegram", chat_id)
-                await reset_channel(
-                    channel_key, self._session_registry, self._semantic_memory,
-                    channel="telegram",
-                )
+            # M29: ack BEFORE the (potentially multi-second) save so the user
+            # gets instant feedback. reset_channel stays awaited (NOT
+            # backgrounded) — the registry entry must survive until the retain
+            # succeeds so the reaper can retry; in default polling mode PTB
+            # serializes updates so no follow-up can resume the old session
+            # mid-reset.
             if self._app is not None:
                 try:
                     await self._app.bot.send_message(
@@ -618,6 +616,14 @@ class TelegramChannel(Channel):
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("/new ack send to chat_id=%s failed: %s", chat_id, exc)
+            if self._session_registry is not None and self._semantic_memory is not None:
+                from session_registry import build_session_key
+                from session_saver import reset_channel
+                channel_key = build_session_key("telegram", chat_id)
+                await reset_channel(
+                    channel_key, self._session_registry, self._semantic_memory,
+                    channel="telegram",
+                )
             return  # do NOT feed /new to the agent
 
         user = update.effective_user

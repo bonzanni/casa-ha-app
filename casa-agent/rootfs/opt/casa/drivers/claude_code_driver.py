@@ -47,13 +47,11 @@ class ClaudeCodeDriver(DriverProtocol):
         self,
         *,
         engagements_root: str,
-        base_plugins_root: str,
         send_to_topic: TopicSender,
         casa_framework_mcp_url: str,
         persist_session_id: SessionIdPersister | None = None,
     ) -> None:
         self._engagements_root = engagements_root
-        self._base_plugins_root = base_plugins_root
         self._send_to_topic = send_to_topic
         self._casa_framework_mcp_url = casa_framework_mcp_url
         self._persist_session_id = persist_session_id
@@ -109,7 +107,6 @@ class ClaudeCodeDriver(DriverProtocol):
                 # 1. Provision workspace (CLAUDE.md, .mcp.json, plugins, FIFO, meta).
                 ws = await provision_workspace(
                     engagements_root=self._engagements_root,
-                    base_plugins_root=self._base_plugins_root,
                     engagement_id=engagement.id,
                     defn=defn,
                     task=engagement.task,

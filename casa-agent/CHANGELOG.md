@@ -1,5 +1,65 @@
 # Changelog
 
+## [0.56.0] - 2026-07-08 — Prompt-cache + hot-path optimizations, Dockerfile slimming, config_sync boot backstop
+
+### Changed
+
+- **Prompt caching no longer defeated by the per-turn `<current_time>` block (M27).** The
+  second-resolution timestamp was regenerated into the *system prompt* every turn, so the cached
+  prefix changed every second and Anthropic prompt caching was invalidated for the whole
+  conversation (system + replayed messages) on every resumed turn. The `<current_time>` block now
+  rides on the per-turn *query text* instead, leaving the large stable system-prompt prefix
+  byte-identical across turns (cache-eligible) while the agent still sees the current wall-clock time
+  to second precision.
+
+- **Hindsight memory reuses one pooled HTTP connection (L32).** `HindsightSemanticMemory` opened and
+  tore down a fresh `aiohttp.ClientSession` (new TCP handshake) for every memory call on the
+  per-message path. It now lazily creates and reuses a single long-lived session, closed cleanly on
+  shutdown (`SemanticMemory.close()`, wired into `casa_core` teardown — no "Unclosed client session"
+  warning).
+
+- **`_finalize_engagement` no longer blocks on tier classification (L33).** The two
+  `retain_delegated` calls (engagement + executor summaries) each run an LLM tier-classification
+  subprocess; they now run as background tasks (strong-ref'd with exception-logging done-callbacks)
+  instead of inline `await`s, so `emit_completion` / `/cancel` return promptly. The rare
+  deferred-hard-reload path drains them before the Supervisor restart so the H-1 ordering invariant
+  ("all retain writes have landed") still holds.
+
+- **`/new` transcript classification parallelized + acks first (M29).** `transcript_to_items`
+  classified every transcript item with a sequential full SDK query, so `/new` on a long
+  conversation blocked for minutes; classification now runs with bounded concurrency
+  (`asyncio.gather` + a semaphore of 4), preserving item order, tags and idempotent `document_id`s.
+  The Telegram `/new` handler also sends its "Starting fresh" ack *before* the save so the user gets
+  instant feedback (`reset_channel` stays awaited for crash-durability).
+
+### Removed
+
+- **Dead superpowers v5.0.7 baseline clone dropped from the image (L30).** The Dockerfile cloned
+  `obra/superpowers@v5.0.7` into `/opt/casa/claude-plugins/base` on every build, but
+  `provision_workspace` has ignored `base_plugins_root` since v0.14.x (plugin symlinks removed).
+  Deleted the clone layer and both stale `ARG SUPERPOWERS_REF` pins (the live pin lives solely in
+  `marketplace-defaults/.claude-plugin/marketplace.json`, superpowers v5.1.0), and dropped the dead
+  `base_plugins_root` parameter from `provision_workspace`, `ClaudeCodeDriver.__init__`, and every
+  call site. No add-on option removed.
+
+### Fixed
+
+- **Dockerfile layer order: seed install now precedes `COPY rootfs /` (L31).** The network-bound
+  plugin-seed install (marketplace add + 5 GitHub plugin installs) sat *after* the broad
+  `COPY rootfs /`, so any code change busted its layer cache and re-ran all installs on every
+  rebuild. The seed block (with its narrow gitconfig / credential-helper / marketplace-defaults
+  inputs) now runs before the broad COPY; a code edit no longer re-runs the seed install. Same
+  reorder applied to `test-local/Dockerfile.test`.
+
+- **`config_sync` post-sync boot-parity backstop (Finding 2).** Deleting an image-owned
+  `agents/<role>/delegates.yaml` passes the pre-commit gate (the committed tree is internally
+  valid), but `config_sync` re-injects the image-owned file post-commit, producing a
+  delegates-without-delegate-tool mismatch that FATALs the next boot. After reconciling, config_sync
+  now validates the POST-SYNC `/config` tree with `agent_loader.validate_config_repo` (the hardened
+  v0.55.0 boot-parity loader); it self-heals the specific re-injected-delegates case (removing the
+  image-owned copy, only when byte-equal to the default) and surfaces any residual error loudly in
+  the sync report + logs. Best-effort and boot-safe — the backstop never itself crashes boot.
+
 ## [0.55.0] - 2026-07-08 — Boot/driver robustness + concurrency mediums
 
 ### Fixed

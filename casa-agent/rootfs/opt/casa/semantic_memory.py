@@ -65,6 +65,14 @@ class SemanticMemory(ABC):
     async def profile(self, bank: str) -> str:
         """Return the bank's mental-model overlay digest (cheap GET, no LLM)."""
 
+    async def close(self) -> None:
+        """Release any backend resources (e.g. a pooled HTTP session).
+
+        Concrete (non-abstract) no-op default so backends that hold nothing
+        (NoOpSemanticMemory) need not override it; HTTP-backed backends
+        override to close their shared client session on shutdown."""
+        return None
+
 
 class NoOpSemanticMemory(SemanticMemory):
     """Degraded backend: retain is silent, reads return ''. The agent then

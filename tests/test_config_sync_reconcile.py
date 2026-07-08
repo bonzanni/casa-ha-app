@@ -291,3 +291,92 @@ def test_real_git_snapshot_fails_closed_on_stale_index_lock(tmp_path: Path) -> N
     g = config_sync.RealGit(repo)
     assert g.available is True
     assert g.snapshot("snap") is None  # must not return the stale pre-edit HEAD
+
+
+# --- Finding 2: post-sync boot-parity backstop -------------------------------
+
+def _run_with_repo(tmp_path: Path, validate_repo, *, git=None):
+    return config_sync.reconcile(
+        defaults_dir=tmp_path / "defaults",
+        config_dir=tmp_path / "live",
+        baseline_dir=tmp_path / "baseline",
+        image_version="v9.9.9",
+        git=git or _FakeGit(),
+        validate=_no_schema,
+        validate_repo=validate_repo,
+    )
+
+
+def test_post_sync_heals_reinjected_delegates(tmp_path: Path) -> None:
+    """config_sync re-injects the image-owned agents/assistant/delegates.yaml
+    the committed tree validly dropped; the backstop must delete the re-seeded
+    copy (byte-equal to default) to keep boot alive."""
+    _write(tmp_path / "defaults", "agents/assistant/delegates.yaml", "DEFAULT")
+    # live has NO delegates.yaml (operator committed its deletion) -> re-seeded.
+    live = tmp_path / "live"
+    rel = "agents/assistant/delegates.yaml"
+
+    def validate_repo() -> list[str]:
+        # boot loader fatals iff the re-injected delegates.yaml is present.
+        if (live / rel).exists():
+            return ["agent 'assistant': delegates.yaml is non-empty but "
+                    "runtime.yaml tools.allowed is missing "
+                    "'mcp__casa-framework__delegate_to_agent'"]
+        return []
+
+    report = _run_with_repo(tmp_path, validate_repo)
+    assert rel in report.post_sync_healed
+    assert report.post_sync_errors == []
+    assert not (live / rel).exists(), "re-injected delegates.yaml must be removed"
+
+
+def test_post_sync_does_not_delete_genuine_user_delegates(tmp_path: Path) -> None:
+    """A live delegates.yaml that DIFFERS from the image default is genuine
+    operator content — never delete it; surface the error instead."""
+    _write(tmp_path / "defaults", "agents/assistant/delegates.yaml", "DEFAULT")
+    _write(tmp_path / "baseline", "agents/assistant/delegates.yaml", "DEFAULT")
+    _write(tmp_path / "live", "agents/assistant/delegates.yaml", "USER-EDIT")
+    rel = "agents/assistant/delegates.yaml"
+
+    def validate_repo() -> list[str]:
+        return ["agent 'assistant': delegates.yaml is non-empty but "
+                "runtime.yaml tools.allowed is missing "
+                "'mcp__casa-framework__delegate_to_agent'"]
+
+    report = _run_with_repo(tmp_path, validate_repo)
+    assert report.post_sync_healed == []
+    assert len(report.post_sync_errors) == 1
+    assert (tmp_path / "live" / rel).read_text() == "USER-EDIT"
+
+
+def test_post_sync_surfaces_unhealable_error(tmp_path: Path) -> None:
+    """An error the backstop can't self-heal must be recorded loudly, not
+    silently dropped."""
+    _write(tmp_path / "defaults", "agents/butler/voice.yaml", "X")
+
+    def validate_repo() -> list[str]:
+        return ["agent 'butler': character.yaml role 'assistant' != dir 'butler'"]
+
+    report = _run_with_repo(tmp_path, validate_repo)
+    assert report.post_sync_healed == []
+    assert report.post_sync_errors == [
+        "agent 'butler': character.yaml role 'assistant' != dir 'butler'"]
+
+
+def test_post_sync_validator_absent_is_noop(tmp_path: Path) -> None:
+    """No validate_repo injected -> no post-sync fields (back-compat)."""
+    _write(tmp_path / "defaults", "agents/butler/voice.yaml", "X")
+    report = _run_with_repo(tmp_path, None)
+    assert report.post_sync_errors == []
+    assert report.post_sync_healed == []
+
+
+def test_post_sync_backstop_never_crashes(tmp_path: Path) -> None:
+    """A raising validate_repo must be swallowed — the backstop can't block boot."""
+    _write(tmp_path / "defaults", "agents/butler/voice.yaml", "X")
+
+    def boom() -> list[str]:
+        raise RuntimeError("validator blew up")
+
+    report = _run_with_repo(tmp_path, boom)  # must not raise
+    assert report.post_sync_errors == []

@@ -1,4 +1,11 @@
-"""Tests for the <current_time> system-prompt block injected by Agent._process."""
+"""Tests for the <current_time> block emitted by Agent._process.
+
+M27: the timestamp must NOT live in the (cached) system prompt — a per-second
+timestamp there invalidates Anthropic prompt caching for the whole conversation
+every turn. It rides on the per-turn query text instead, keeping the system
+prompt byte-stable across resumed turns while still giving the agent the
+current wall-clock time to second precision.
+"""
 
 from __future__ import annotations
 
@@ -7,75 +14,49 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+pytestmark = pytest.mark.unit
 
-def _compose_system_prompt_parts(base: str, memory_blocks: str, channel: str, channel_trust_display: str, tz):
-    """Mirror of the system_parts assembly in agent.py::_process.
 
-    This is what a future test of the live _process would assert on. For
-    now we assert directly on a local compose — Task 3's implementation
-    plants the same construction in agent.py.
-    """
+def _compose_query_prefix(user_text: str, tz):
+    """Mirror of the per-turn prompt_text prefix built in agent.py::_process."""
     from datetime import datetime
-    parts = [base]
-    if memory_blocks:
-        parts.append("\n" + memory_blocks)
-    parts.append(
-        "\n<channel_context>\n"
-        f"channel: {channel}\n"
-        f"trust: {channel_trust_display}\n"
-        "</channel_context>"
-    )
     now = datetime.now(tz)
-    parts.append(
-        f"\n<current_time>\n"
+    return (
+        f"<current_time>\n"
         f"{now.isoformat(timespec='seconds')} "
         f"({now.strftime('%A').lower()} {now.strftime('%p').lower()}, "
         f"week {now.isocalendar().week})\n"
-        f"</current_time>"
+        f"</current_time>\n\n"
+        f"{user_text}"
     )
-    return "\n".join(parts)
 
 
 class TestCurrentTimeBlock:
-    def test_current_time_block_present_and_after_channel_context(self):
+    def test_query_prefix_shape(self):
         tz = ZoneInfo("Europe/Amsterdam")
-        out = _compose_system_prompt_parts(
-            base="You are Ellen.",
-            memory_blocks="",
-            channel="telegram",
-            channel_trust_display="authenticated",
-            tz=tz,
-        )
-        assert "<current_time>" in out
-        assert "</current_time>" in out
-        assert out.index("<channel_context>") < out.index("<current_time>")
-
-    def test_current_time_block_shape(self):
-        tz = ZoneInfo("Europe/Amsterdam")
-        out = _compose_system_prompt_parts(
-            base="You are Ellen.",
-            memory_blocks="",
-            channel="telegram",
-            channel_trust_display="authenticated",
-            tz=tz,
-        )
+        out = _compose_query_prefix("hello", tz)
         m = re.search(
-            r"<current_time>\n"
+            r"^<current_time>\n"
             r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} "
             r"\((monday|tuesday|wednesday|thursday|friday|saturday|sunday) "
             r"(am|pm), week \d{1,2}\)\n"
-            r"</current_time>",
+            r"</current_time>\n\n",
             out,
         )
         assert m is not None, f"shape mismatch: {out!r}"
+        assert out.endswith("hello")
 
 
 class TestAgentProcessInjects:
     """Integration-style test: hit Agent._process via the production path."""
 
     @pytest.mark.asyncio
-    async def test_process_emits_block_via_live_path(self, tmp_path):
-        from unittest.mock import MagicMock, patch
+    async def test_system_prompt_time_free_and_timestamp_rides_on_query(self, tmp_path):
+        """Regression guard for prompt-cache stability (M27): the system prompt
+        must carry no wall-clock timestamp; the per-turn <current_time> block
+        lives on the (never-cached) query text so resumed turns present a
+        byte-stable prefix to the API."""
+        from unittest.mock import patch
 
         import agent as agent_mod
 
@@ -92,6 +73,7 @@ class TestAgentProcessInjects:
                 return False
 
             async def query(self, text):
+                captured["query_text"] = text
                 return None
 
             async def receive_response(self):
@@ -134,5 +116,11 @@ class TestAgentProcessInjects:
             await agent._process(msg, on_token=None)
 
         system_prompt = captured["options"].system_prompt
-        assert "<current_time>" in system_prompt
-        assert "</current_time>" in system_prompt
+        # 1. No time block and no ISO wall-clock timestamp in the system prompt.
+        assert "<current_time>" not in system_prompt
+        assert re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", system_prompt) is None
+        # 2. The block rides on the (never-cached) user turn, pinned shape.
+        query_text = captured["query_text"]
+        assert query_text.startswith("<current_time>")
+        assert "</current_time>" in query_text
+        assert query_text.rstrip().endswith("hello")

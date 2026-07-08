@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 _DEFAULT_VOICE_MIN = 30
 _DEFAULT_TELEGRAM_H = 12
 
+# M29: bound the concurrency of per-item tier classification (each is a full
+# claude-CLI subprocess + LLM turn). Classifying a long transcript serially
+# blocked /new for minutes; a bounded gather cuts wall time while capping the
+# number of concurrent CLI subprocesses.
+_CLASSIFY_CONCURRENCY = 4
+
 
 def freshness_window(channel: str) -> timedelta:
     """How long a session stays 'live' (resumable) before it goes cold and is
@@ -59,20 +65,36 @@ async def transcript_to_items(
     tier (default-private on uncertainty) and tagged ``[tier]`` — Hindsight tags are
     document-granular, so per-item is the finest partition available. Deterministic
     ``document_id`` = ``f"{sid}:{idx}"`` keeps a re-retain idempotent."""
-    items: list[dict[str, Any]] = []
+    # Phase 1 — collect text-bearing turns (preserving original index/order).
+    pending: list[tuple[int, str, str]] = []
     for idx, m in enumerate(messages):
         text = _message_text(getattr(m, "message", None))
         if not text:
             continue
         speaker = user_peer if getattr(m, "type", "") == "user" else "assistant"
-        tier = await classify_tier(text)
-        items.append({
+        pending.append((idx, text, speaker))
+    if not pending:
+        return []
+    # Phase 2 — classify concurrently, bounded by a semaphore. classify_tier is
+    # looked up at call time (module-global) so tests that monkeypatch
+    # session_saver.classify_tier still take effect; it never raises (catches
+    # all and returns DEFAULT_TIER), so plain gather is safe.
+    sem = asyncio.Semaphore(_CLASSIFY_CONCURRENCY)
+
+    async def _classify(text: str) -> str:
+        async with sem:
+            return await classify_tier(text)
+
+    tiers = await asyncio.gather(*(_classify(t) for _, t, _ in pending))
+    return [
+        {
             "content": text,
             "tags": [tier],
             "metadata": {"speaker": speaker},
             "document_id": f"{sdk_session_id}:{idx}",
-        })
-    return items
+        }
+        for (idx, text, speaker), tier in zip(pending, tiers)
+    ]
 
 
 async def save_session(

@@ -160,7 +160,6 @@ def render_log_run_script(*, engagement_id: str) -> str:
 async def provision_workspace(
     *,
     engagements_root: str,
-    base_plugins_root: str,
     engagement_id: str,
     defn,                                    # ExecutorDefinition
     task: str,
