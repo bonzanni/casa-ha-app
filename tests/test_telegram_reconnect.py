@@ -405,6 +405,67 @@ class TestLogOnceAtChannelLevel:
 # ---------------------------------------------------------------------------
 
 
+class TestTeardownPerStep:
+    """M8 (v0.52.0): a failing teardown step must not skip the others, and a
+    partial bring-up in _rebuild must roll back the started Application."""
+
+    @pytest.mark.unit
+    async def test_teardown_stops_and_shuts_down_app_even_when_delete_webhook_raises(
+        self,
+    ):
+        """delete_webhook failing (network down) must not skip stop()/shutdown()."""
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(
+            bot_token="t", chat_id="1", webhook_url="https://example.test",
+        )
+        app = _make_fake_application()
+        app.bot.delete_webhook = AsyncMock(
+            side_effect=_FakeNetworkError("down"),
+        )
+        ch._app = app
+
+        await ch._teardown_app()
+
+        assert app.stop.await_count == 1
+        assert app.shutdown.await_count == 1
+        assert ch._app is None
+
+    @pytest.mark.unit
+    async def test_rebuild_rolls_back_started_app_when_set_webhook_raises(
+        self, monkeypatch,
+    ):
+        """A started-but-unpublished app must be stopped/shut down before the
+        supervisor retries, not silently dropped."""
+        from channels.telegram import TelegramChannel
+        from telegram.ext import Application
+
+        app = _make_fake_application()
+        app.running = True  # after start()
+        app.bot.set_webhook = AsyncMock(
+            side_effect=_FakeNetworkError("blip"),
+        )
+
+        def fake_builder():
+            chain = MagicMock()
+            chain.token = MagicMock(return_value=chain)
+            chain.build = MagicMock(return_value=app)
+            return chain
+
+        monkeypatch.setattr(Application, "builder", fake_builder)
+
+        ch = TelegramChannel(
+            bot_token="t", chat_id="1", webhook_url="https://example.test",
+        )
+
+        with pytest.raises(_FakeNetworkError):
+            await ch._rebuild()
+
+        assert app.stop.await_count == 1
+        assert app.shutdown.await_count == 1
+        assert ch._app is None
+
+
 class TestSetupEngagementFeaturesInRebuild:
     async def test_first_set_webhook_fails_then_recovers_engagement_permission_flips_true(
         self, mock_bus,

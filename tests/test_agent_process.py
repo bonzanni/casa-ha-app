@@ -184,6 +184,47 @@ async def test_session_id_is_channel_plus_role(tmp_path):
     assert entry is not None
 
 
+class _StubTelegramChannel:
+    """Minimal channel double exercising the L7 handle_message delivery path."""
+
+    name = "telegram"
+
+    def __init__(self) -> None:
+        self.send = AsyncMock()
+        self.finalize_stream = AsyncMock()
+        self.turn_finished = AsyncMock()
+
+    def create_on_token(self, _context):
+        async def _on_token(_text: str) -> None:
+            return None
+        return _on_token
+
+
+class TestSilentTurnTeardown:
+    """L7 (v0.52.0): a turn that strips to empty / `<silent/>` never calls
+    send()/finalize_stream(), so handle_message must call the channel's
+    turn_finished() teardown hook (which stops the Telegram typing loop)."""
+
+    async def test_silent_turn_calls_turn_finished(self, tmp_path):
+        agent = _make_agent(tmp_path, role="assistant")
+        stub = _StubTelegramChannel()
+        agent._channel_manager.register(stub)
+        with patch.object(agent, "_process", AsyncMock(return_value="<silent/>")):
+            await agent.handle_message(_msg("telegram", "123", "hi"))
+        assert stub.send.call_count == 0
+        assert stub.finalize_stream.call_count == 0
+        assert stub.turn_finished.call_count == 1
+
+    async def test_delivered_turn_does_not_call_turn_finished(self, tmp_path):
+        agent = _make_agent(tmp_path, role="assistant")
+        stub = _StubTelegramChannel()
+        agent._channel_manager.register(stub)
+        with patch.object(agent, "_process", AsyncMock(return_value="real reply")):
+            await agent.handle_message(_msg("telegram", "123", "hi"))
+        assert stub.finalize_stream.call_count == 1
+        assert stub.turn_finished.call_count == 0
+
+
 async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
     # §4.3: the per-turn read no longer threads a user_peer (no ensure_session
     # / per-turn add_turn). The voice-speaker peer is carried into save_session

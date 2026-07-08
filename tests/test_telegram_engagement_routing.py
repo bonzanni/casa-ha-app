@@ -7,7 +7,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
+
+
+async def _drain_turns(ch) -> None:
+    """Await any background engagement-turn delivery tasks (M9, v0.52.0).
+
+    handle_update now spawns the SDK turn in a tracked background task so the
+    per-topic lock is not held across it; tests that assert on
+    ``_driver_send_user_turn`` must first drain those tasks.
+    """
+    tasks = list(getattr(ch, "_turn_tasks", ()) or ())
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _mk_update(*, chat_id, text, thread_id=None, user_id=77):
@@ -51,6 +63,7 @@ class TestSupergroupRouting:
 
         u = _mk_update(chat_id=-1001, text="Alex please continue", thread_id=555)
         await ch.handle_update(u)
+        await _drain_turns(ch)
         ch._driver_send_user_turn.assert_awaited_once()
         args = ch._driver_send_user_turn.await_args.args
         assert args[0].id == rec.id
@@ -116,6 +129,7 @@ class TestPTBDispatchContract:
 
         u = _mk_update(chat_id=-1001, text="continue please", thread_id=rec.topic_id)
         await ch.handle_update(u, MagicMock(name="CallbackContext"))
+        await _drain_turns(ch)
         ch._driver_send_user_turn.assert_awaited_once()
 
 
@@ -166,6 +180,52 @@ class TestSlashCommands:
         u = _mk_update(chat_id=-1001, text="/silent", thread_id=rec.topic_id)
         await ch.handle_update(u)
         observer.silence.assert_called_once_with(rec.id)
+
+    async def test_slash_cancel_with_bot_mention_suffix(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """M10 (v0.52.0): group menus send '/cancel@BotName'; the @mention
+        suffix must be stripped so the command is handled, not forwarded to
+        the driver as a user turn."""
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = engagement_fixture.registry
+        ch._finalize_cancel = AsyncMock()
+        ch._driver_send_user_turn = AsyncMock()
+        rec = engagement_fixture.active_record
+
+        u = _mk_update(chat_id=-1001, text="/cancel@CasaBot",
+                       thread_id=rec.topic_id)
+        await ch.handle_update(u)
+        await _drain_turns(ch)
+
+        ch._finalize_cancel.assert_awaited_once()
+        ch._driver_send_user_turn.assert_not_called()
+
+    async def test_slash_command_for_other_bot_falls_through(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """A command explicitly addressed to a DIFFERENT bot must fall
+        through to the user-turn path (matching PTB CommandHandler)."""
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = engagement_fixture.registry
+        ch._bot_username = "casabot"
+        ch._finalize_cancel = AsyncMock()
+        ch._driver_send_user_turn = AsyncMock()
+        rec = engagement_fixture.active_record
+
+        u = _mk_update(chat_id=-1001, text="/cancel@otherbot",
+                       thread_id=rec.topic_id)
+        await ch.handle_update(u)
+        await _drain_turns(ch)
+
+        ch._finalize_cancel.assert_not_awaited()
+        ch._driver_send_user_turn.assert_awaited_once()
 
 
 class TestSlashCommandOriginatorOnly:
@@ -317,6 +377,7 @@ class TestResumeOnTurn:
 
         u = _mk_update(chat_id=-1001, text="Hi again", thread_id=rec.topic_id)
         await ch.handle_update(u)
+        await _drain_turns(ch)
         driver.resume.assert_awaited_once_with(rec, "sess-xyz")
         ch._driver_send_user_turn.assert_awaited_once()
 
@@ -501,6 +562,7 @@ class TestHandleUpdateConcurrencyRace:
         u2 = _mk_update(chat_id=-1001, text="hello2", thread_id=rec.topic_id)
 
         await asyncio.gather(ch.handle_update(u1), ch.handle_update(u2))
+        await _drain_turns(ch)
 
         assert ch._driver_send_user_turn.await_count == 2
         texts_sent = sorted(
@@ -554,13 +616,65 @@ class TestHandleUpdateConcurrencyRace:
         u_a = _mk_update(chat_id=-1001, text="for-A", thread_id=rec_a.topic_id)
         u_b = _mk_update(chat_id=-1001, text="for-B", thread_id=rec_b.topic_id)
 
-        # If different topics serialised on a shared lock, this hangs:
-        # u_a holds the lock waiting for b_routed, but u_b can't run
-        # because it's blocked on the same lock. wait_for(2.0) catches
-        # the deadlock.
+        # M9 (v0.52.0): turn delivery now runs in background tasks, so the
+        # per-topic lock is never held across driver_send. Both turns must
+        # still be routed and complete; A's task waits on B's, and the
+        # wait_for(2.0) inside driver_send catches any regression that
+        # serialises the two topics.
         await asyncio.gather(ch.handle_update(u_a), ch.handle_update(u_b))
+        await _drain_turns(ch)
         assert b_routed.is_set()
         assert a_can_finish.is_set()
+
+    async def test_cancel_interrupts_inflight_turn(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """M9 (v0.52.0): /cancel must complete while a turn is STILL in
+        flight — not queue behind it. Pre-fix the per-topic lock was held
+        across the whole SDK turn, so /cancel blocked until it drained."""
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        registry = engagement_fixture.registry
+        ch._engagement_registry = registry
+        rec = engagement_fixture.active_record  # driver=in_casa, status=active
+
+        turn_started = asyncio.Event()
+        release_turn = asyncio.Event()
+
+        async def slow_turn(rec_arg, text):
+            turn_started.set()
+            await release_turn.wait()  # simulates a minutes-long SDK turn
+
+        ch._driver_send_user_turn = slow_turn
+
+        cancel_ran = asyncio.Event()
+
+        async def cancel_impl(rec_arg, *, reason):
+            await registry.mark_cancelled(rec_arg.id)
+            cancel_ran.set()
+
+        ch._finalize_cancel = AsyncMock(side_effect=cancel_impl)
+
+        t_turn = asyncio.create_task(ch.handle_update(
+            _mk_update(chat_id=-1001, text="work on it",
+                       thread_id=rec.topic_id, user_id=99)))
+        await asyncio.wait_for(turn_started.wait(), timeout=1.0)
+
+        # Core assertion: /cancel returns while the turn is STILL in flight.
+        await asyncio.wait_for(
+            ch.handle_update(_mk_update(
+                chat_id=-1001, text="/cancel",
+                thread_id=rec.topic_id, user_id=99)),
+            timeout=1.0,
+        )
+        assert cancel_ran.is_set()
+        assert not release_turn.is_set()  # turn had not drained when cancel ran
+
+        release_turn.set()
+        await asyncio.wait_for(t_turn, timeout=1.0)
+        await _drain_turns(ch)
 
 
 class TestMessageHandlerWiring:
@@ -580,10 +694,12 @@ class TestMessageHandlerWiring:
         from channels.telegram import TelegramChannel
 
         source = inspect.getsource(TelegramChannel._rebuild)
-        # The wiring must point at handle_update, not _handle.
-        assert "MessageHandler(filters.TEXT, self.handle_update)" in source, (
-            f"_rebuild must register MessageHandler with handle_update; "
-            f"current source excerpt:\n{source}"
+        # The wiring must point at handle_update, not _handle. H5 (v0.52.0)
+        # added block=False so a long engagement turn can't stall PTB's
+        # sequential update fetcher.
+        assert "MessageHandler(filters.TEXT, self.handle_update, block=False)" in source, (
+            f"_rebuild must register MessageHandler with handle_update "
+            f"(block=False); current source excerpt:\n{source}"
         )
         # Defensive: catch a regression where someone re-introduces the
         # engagement-unaware _handle wiring.
