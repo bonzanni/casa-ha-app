@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.52.0] - 2026-07-08 — Telegram channel correctness (webhook ACK, teardown, /cancel, permission relay, typing)
+
+### Fixed
+
+Seven Telegram-channel defects, all in `channels/telegram.py` (plus one agent hook):
+
+- **Webhook ACK no longer blocks on the SDK turn (H5).** `process_webhook_update` awaited
+  `Application.process_update`, which (default `block=True` handlers) ran the ENTIRE engagement
+  SDK turn — minutes — before the aiohttp route could return 200. Telegram timed out and
+  redelivered the update, duplicating turns. The update is now enqueued onto PTB's
+  `update_queue` (the fetcher started by `app.start()` drains it) so the route returns in
+  milliseconds, both message and callback handlers are registered `block=False` so one long
+  turn can't stall PTB's sequential fetcher (which in polling mode also froze Ellen DMs), and a
+  bounded `update_id` LRU drops any redelivery already in flight before the first ACK landed.
+
+- **`_teardown_app` runs each step independently (M8).** A failing `delete_webhook` (common
+  during the very outage that triggered the rebuild) used to skip `app.stop()`/`shutdown()`,
+  leaking the started Application's fetcher task, JobQueue, and HTTPX pools on every reload.
+  Each teardown step now has its own try/except, and `_rebuild` rolls back a half-started
+  Application if any bring-up step raises before re-raising to the supervisor.
+
+- **`/cancel` can interrupt an in-flight turn (M9).** The per-topic lock was held across the
+  whole multi-minute turn, so `/cancel` queued behind the turn it was meant to kill. The user
+  turn is now delivered in a tracked background task (strong ref + done-callback), so the lock
+  is released as soon as routing/validation completes and `/cancel` acquires it immediately.
+  The Bug-10 status re-check still runs under the lock before any task is spawned.
+
+- **`/cancel@botname` is recognized (M10).** Group command menus send `/cancel@<botusername>`;
+  the matcher now strips the bot's own `@mention` suffix (commands addressed to a different bot
+  fall through to the agent, matching PTB's `CommandHandler`). The bot username is cached at
+  engagement setup.
+
+- **Permission-relay keyboard escapes MarkdownV2 (M11).** `post_perm_keyboard` sent tool names
+  and previews as MarkdownV2 without escaping, so an MCP tool name (`mcp__x__y`) or a Bash
+  preview with a backtick/backslash triggered a Telegram 400 that the relay hook turned into a
+  silent auto-DENY. Reserved characters are now escaped (general escaping for the bold tool
+  name, pre/code escaping for the fenced preview), with a plain-text fallback on any residual
+  parse failure.
+
+- **Typing circuit breaker no longer trips on transient outages (L6).** A transient
+  `NetworkError`/`TimedOut` used to count toward the 401 breaker, which then never reset —
+  killing typing indicators for the process lifetime. Transport errors now back off without
+  counting toward the breaker (the reconnect supervisor owns transport recovery), and a
+  successful `_rebuild` heals a previously-tripped breaker.
+
+- **Typing indicator stops after an empty/silent turn (L7).** A turn that strips to empty or
+  `<silent/>` never called `send()`/`finalize_stream()`, so the typing loop ran forever
+  (permanent "typing…" plus a Bot API call every 4 s, notably in block mode). `agent.py` now
+  calls a new `turn_finished()` channel hook on the suppressed-turn path, which stops the
+  per-chat typing indicator.
+
 ## [0.51.0] - 2026-07-08 — crash-safe on-disk state writes (atomic writes + tolerant load)
 
 ### Fixed

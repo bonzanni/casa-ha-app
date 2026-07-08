@@ -15,6 +15,7 @@ Delivery:
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import os
 import time
@@ -82,6 +83,29 @@ def _resolve_chat_id(context: dict[str, Any], default: int | str) -> int | str:
             return default
     return default
 
+# M11 (v0.52.0): MarkdownV2 escaping for permission-relay text. Telegram
+# rejects a message with parse_mode="MarkdownV2" if reserved chars in the
+# dynamic text are unescaped ("can't parse entities", HTTP 400) — and the
+# engagement_permission_relay hook treats that failure as an auto-DENY. We
+# escape locally (rather than importing telegram.helpers.escape_markdown) so
+# the code is stub-independent under tests; the char sets match PTB 22.7's
+# escape_markdown(version=2). Outside a code entity every reserved char must
+# be backslash-escaped; inside a ``` / ` (pre/code) entity only backtick and
+# backslash are special.
+_MDV2_SPECIALS = frozenset("_*[]()~`>#+-=|{}.!\\")
+_MDV2_PRE_SPECIALS = frozenset("`\\")
+
+
+def _escape_mdv2(text: str) -> str:
+    """Escape MarkdownV2 reserved characters in general (non-code) text."""
+    return "".join("\\" + c if c in _MDV2_SPECIALS else c for c in text)
+
+
+def _escape_mdv2_pre(text: str) -> str:
+    """Escape MarkdownV2 reserved characters inside a pre/code entity."""
+    return "".join("\\" + c if c in _MDV2_PRE_SPECIALS else c for c in text)
+
+
 # Reconnect supervisor backoff schedule (spec 5.2 §4.2): 1s, 2s, 4s, 8s,
 # 16s, cap 60s, unbounded. Reuses retry.compute_backoff_ms via
 # ReconnectSupervisor. Module-level so tests can monkey-patch short
@@ -141,6 +165,24 @@ class TelegramChannel(Channel):
         self._bot = bot
         self.engagement_supergroup_id = engagement_supergroup_id
         self.engagement_permission_ok = False
+        # M10 (v0.52.0): the bot's own @username, cached at setup so
+        # handle_update can strip a trailing "@botname" off engagement
+        # commands (group command menus send "/cancel@casabot"). None until
+        # setup_engagement_features resolves it; while None the suffix is
+        # stripped unconditionally (safe inside Casa's own supergroup).
+        self._bot_username: str | None = None
+        # H5 (v0.52.0): bounded LRU of recently-seen webhook update_ids so a
+        # Telegram redelivery (retry after a slow ACK) is processed at most
+        # once. OrderedDict used as an insertion-ordered ring buffer.
+        self._seen_update_ids: "collections.OrderedDict[int, None]" = (
+            collections.OrderedDict()
+        )
+        # M9 (v0.52.0): strong refs to in-flight engagement-turn delivery
+        # tasks. handle_update spawns the SDK turn in the background (so the
+        # per-topic lock is not held across a multi-minute turn and /cancel
+        # can interrupt it); each task keeps a ref here + a done-callback that
+        # discards it. Cancelled in stop().
+        self._turn_tasks: set[asyncio.Task] = set()
         # Injectable collaborators (wired at startup by Task 22; tests assign AsyncMocks).
         self._engagement_registry = None
         self._observer = None
@@ -194,6 +236,11 @@ class TelegramChannel(Channel):
             task.cancel()
         self._typing_tasks.clear()
 
+        # M9: cancel any in-flight engagement-turn delivery tasks.
+        for task in list(self._turn_tasks):
+            task.cancel()
+        self._turn_tasks.clear()
+
         if self._probe_task and not self._probe_task.done():
             self._probe_task.cancel()
             try:
@@ -218,15 +265,32 @@ class TelegramChannel(Channel):
         app = self._app
         if app is None:
             return
+        # M8 (v0.52.0): each teardown step runs independently. A failing
+        # first step (e.g. delete_webhook raising during the very network
+        # outage that triggered the rebuild) must NOT skip app.stop()/
+        # shutdown() — otherwise the started Application's _update_fetcher
+        # task, JobQueue, and HTTPX pools leak on every reload. `except
+        # Exception` deliberately does NOT catch asyncio.CancelledError
+        # (BaseException), so cancellation still propagates.
         try:
             if self._webhook_url:
-                await app.bot.delete_webhook()
+                try:
+                    await app.bot.delete_webhook()
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    logger.debug("Telegram teardown: delete_webhook failed: %s", exc)
             elif app.updater is not None:
-                await app.updater.stop()
-            await app.stop()
-            await app.shutdown()
-        except Exception as exc:  # noqa: BLE001 — best-effort
-            logger.debug("Telegram teardown swallowed exception: %s", exc)
+                try:
+                    await app.updater.stop()
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    logger.debug("Telegram teardown: updater.stop failed: %s", exc)
+            try:
+                await app.stop()
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                logger.debug("Telegram teardown: app.stop failed: %s", exc)
+            try:
+                await app.shutdown()
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                logger.debug("Telegram teardown: app.shutdown failed: %s", exc)
         finally:
             self._app = None
 
@@ -250,39 +314,76 @@ class TelegramChannel(Channel):
         # that /cancel, /complete, /silent in engagement topics are
         # intercepted. handle_update internally calls _handle for
         # non-engagement chats (Ellen DM via _route_to_ellen).
+        #
+        # H5 (v0.52.0): block=False dispatches each update via
+        # Application.create_task rather than awaiting it inline, so one
+        # long engagement turn cannot stall PTB's sequential update fetcher
+        # (default max_concurrent_updates=1) — which in polling mode would
+        # otherwise freeze Ellen DMs too. Same-topic ordering stays
+        # serialized by _engagement_handler_locks; PTB routes task
+        # exceptions to the registered error handler.
         app.add_handler(
-            MessageHandler(filters.TEXT, self.handle_update)
+            MessageHandler(filters.TEXT, self.handle_update, block=False)
         )
         # E-12 (v0.37.0) Task 20: U1 permission verdicts arrive as inline-keyboard
         # callbacks. CallbackQueryHandler with no pattern matches all callback_data;
         # _on_inline_callback parses by prefix and ignores unknown shapes.
+        # block=False (H5): a permission-verdict click must never queue
+        # behind a long in-flight in_casa turn.
         app.add_handler(
-            CallbackQueryHandler(self._on_inline_callback)
+            CallbackQueryHandler(self._on_inline_callback, block=False)
         )
         app.add_error_handler(self._on_ptb_error)
-        await app.initialize()
-        await app.start()
+        # M8 (v0.52.0): roll back a half-started Application if any bring-up
+        # step raises, so a started-but-unpublished app (fetcher task,
+        # JobQueue, HTTPX pools) is not leaked. Re-raise so the supervisor
+        # still schedules a retry.
+        try:
+            await app.initialize()
+            await app.start()
 
-        if self._webhook_url:
-            full_url = self._webhook_url.rstrip("/") + self._webhook_path
-            kwargs: dict[str, Any] = {"url": full_url}
-            if self._webhook_secret:
-                kwargs["secret_token"] = self._webhook_secret
-            await app.bot.set_webhook(**kwargs)
-            logger.info(
-                "Telegram started (webhook, delivery=%s, url=%s, secret=%s)",
-                self._delivery_mode, full_url,
-                "yes" if self._webhook_secret else "no",
-            )
-        else:
-            await app.updater.start_polling()  # type: ignore[union-attr]
-            logger.info(
-                "Telegram started (polling, delivery=%s, chat_id=%s)",
-                self._delivery_mode, self.chat_id,
-            )
+            if self._webhook_url:
+                full_url = self._webhook_url.rstrip("/") + self._webhook_path
+                kwargs: dict[str, Any] = {"url": full_url}
+                if self._webhook_secret:
+                    kwargs["secret_token"] = self._webhook_secret
+                await app.bot.set_webhook(**kwargs)
+                logger.info(
+                    "Telegram started (webhook, delivery=%s, url=%s, secret=%s)",
+                    self._delivery_mode, full_url,
+                    "yes" if self._webhook_secret else "no",
+                )
+            else:
+                await app.updater.start_polling()  # type: ignore[union-attr]
+                logger.info(
+                    "Telegram started (polling, delivery=%s, chat_id=%s)",
+                    self._delivery_mode, self.chat_id,
+                )
+        except Exception:
+            # PTB 22.7 ordering: stop() raises if not running (guard with
+            # app.running); shutdown() raises while running (only after
+            # stop()).
+            try:
+                if getattr(app, "running", False):
+                    await app.stop()
+            except Exception as exc:  # noqa: BLE001 — best-effort rollback
+                logger.debug("Telegram rebuild rollback: app.stop failed: %s", exc)
+            try:
+                await app.shutdown()
+            except Exception as exc:  # noqa: BLE001 — best-effort rollback
+                logger.debug("Telegram rebuild rollback: app.shutdown failed: %s", exc)
+            raise
 
         # Publish the rebuilt app atomically.
         self._app = app
+
+        # L6 (v0.52.0): a successful rebuild proves token+transport are
+        # healthy (initialize() performs getMe and raises InvalidToken on a
+        # bad token), so heal the typing circuit breaker — a past outage (or
+        # a since-fixed token) must not suppress typing for the process
+        # lifetime.
+        self._typing_suspended = False
+        self._typing_consecutive_failures = 0
 
         # E-F (v0.30.0): engagement-feature setup MUST run after
         # `self._app = app`. Pre-fix, casa_core.py invoked this once at
@@ -359,12 +460,32 @@ class TelegramChannel(Channel):
             logger.warning("Telegram handler error (not retryable): %s", exc)
 
     async def process_webhook_update(self, payload: dict) -> None:
-        """Process a webhook update payload from aiohttp."""
+        """Enqueue a webhook update payload for PTB's fetcher (fast ACK).
+
+        H5 (v0.52.0): pre-fix this awaited ``Application.process_update``,
+        which (default block=True handlers) ran the ENTIRE engagement SDK
+        turn before the aiohttp route could return 200 — Telegram timed out
+        and redelivered the update, duplicating turns. We now push the
+        update onto ``Application.update_queue`` (drained by the internal
+        fetcher started by ``app.start()`` in both transports — exactly what
+        PTB's own webhook server does) so the route returns within
+        milliseconds. A bounded update_id LRU drops redeliveries that were
+        already in flight before the first ACK landed.
+        """
         if self._app is None:
             return
         update = Update.de_json(payload, self._app.bot)
-        if update:
-            await self._app.process_update(update)
+        if not update:
+            return
+        uid = getattr(update, "update_id", None)
+        if uid is not None:
+            if uid in self._seen_update_ids:
+                logger.info("Dropping duplicate webhook update_id=%s", uid)
+                return
+            self._seen_update_ids[uid] = None
+            while len(self._seen_update_ids) > 256:
+                self._seen_update_ids.popitem(last=False)
+        await self._app.update_queue.put(update)
 
     # ------------------------------------------------------------------
     # Typing indicator (with 401 backoff)
@@ -401,6 +522,23 @@ class TelegramChannel(Channel):
                     # Success -- reset backoff
                     self._typing_consecutive_failures = 0
                     backoff = _TYPING_BACKOFF_INIT
+                except (NetworkError, TimedOut) as exc:
+                    # L6 (v0.52.0): transient transport failure — back off but
+                    # do NOT count toward the 401 circuit breaker; the
+                    # reconnect supervisor owns transport recovery (spec 5.2
+                    # §4.2/§4.3). (Order matters: NetworkError/TimedOut
+                    # subclass TelegramError, so this clause must precede it.
+                    # Note in PTB 22.7 BadRequest subclasses NetworkError, so
+                    # a persistent BadRequest no longer trips the breaker —
+                    # bounded because _stop_typing cancels the loop at end of
+                    # turn.)
+                    logger.warning(
+                        "Typing transport error: %s — backing off %.1fs",
+                        exc, backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * _TYPING_BACKOFF_FACTOR, _TYPING_BACKOFF_MAX)
+                    continue
                 except TelegramError as exc:
                     self._typing_consecutive_failures += 1
                     if self._typing_consecutive_failures >= _TYPING_CIRCUIT_BREAK:
@@ -459,7 +597,11 @@ class TelegramChannel(Channel):
 
         # /new reset — intercept before rate-limiting or bus dispatch (spec §4.2 #2, C2).
         text = (update.message.text or "").strip()
-        if text == "/new" or text.startswith("/new "):
+        # M10 (v0.52.0): tolerate a "/new@botname" mention suffix (defensive —
+        # /new is a DM command and private clients don't append it, but a
+        # forwarded/group-origin update could).
+        _first = text.split()[0].lower() if text else ""
+        if _first.split("@", 1)[0] == "/new":
             if self._session_registry is not None and self._semantic_memory is not None:
                 from session_registry import build_session_key
                 from session_saver import reset_channel
@@ -571,7 +713,18 @@ class TelegramChannel(Channel):
                     return
 
                 if text.startswith("/"):
-                    command = text.split()[0].lower()
+                    # M10 (v0.52.0): group command menus send "/cancel@botname"
+                    # (Telegram appends @botusername to menu-selected commands
+                    # in groups). Strip the mention so the command matches. A
+                    # command explicitly addressed to a DIFFERENT bot is
+                    # blanked (falls through to the user-turn path, matching
+                    # PTB's CommandHandler semantics). When our username isn't
+                    # cached yet, strip unconditionally — safe inside Casa's
+                    # own supergroup.
+                    token = text.split()[0].lower()
+                    command, _, mention = token.partition("@")
+                    if mention and self._bot_username and mention != self._bot_username:
+                        command = ""  # addressed to another bot — not ours
                     # Bug 8 (v0.14.6): /cancel and /complete are originator-only.
                     # Pre-fix any user in the supergroup could terminate any
                     # engagement; user_id wasn't even checked. /silent stays
@@ -639,11 +792,21 @@ class TelegramChannel(Channel):
                         )
                         return
 
-                if self._driver_send_user_turn is not None:
-                    await self._driver_send_user_turn(rec, text)
+                # M9 (v0.52.0): deliver the user turn in a tracked background
+                # task so the per-topic lock (and, in polling mode, PTB's
+                # update fetcher) is NOT held across the whole multi-minute
+                # SDK turn — a subsequent /cancel can then acquire the lock
+                # and interrupt the in-flight turn. The status re-check above
+                # still ran under the lock, preserving the Bug-10 guarantee
+                # (a cancel that already finalised the driver blanks the turn
+                # here before any task is spawned).
                 if self._engagement_registry is not None:
                     import time as _time
                     await self._engagement_registry.update_user_turn(rec.id, _time.time())
+                if self._driver_send_user_turn is not None:
+                    task = asyncio.create_task(self._deliver_turn_bg(rec, text))
+                    self._turn_tasks.add(task)
+                    task.add_done_callback(self._turn_tasks.discard)
                 return
 
         # 3) Other chats. When telegram_chat_id is configured it is an
@@ -661,6 +824,38 @@ class TelegramChannel(Channel):
             )
             return
         return await self._route_to_ellen(update)
+
+    async def _deliver_turn_bg(self, rec, text: str) -> None:
+        """M9 (v0.52.0): run one engagement user-turn to completion.
+
+        Spawned by handle_update as a tracked background task so the
+        per-topic lock is released as soon as the turn is dispatched. If a
+        concurrent /cancel finalised the driver mid-turn, send_user_turn
+        raises (DriverNotAliveError / transport-closed) and we stay quiet —
+        that is the expected end of an interrupted turn, not a failure.
+        """
+        try:
+            await self._driver_send_user_turn(rec, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            latest = (
+                self._engagement_registry.get(rec.id)
+                if self._engagement_registry is not None else None
+            )
+            if latest is not None and latest.status in (
+                "completed", "cancelled", "error",
+            ):
+                logger.info(
+                    "turn delivery ended by finalize for %s: %s",
+                    rec.id[:8], exc,
+                )
+                return
+            logger.warning("turn delivery failed for %s: %s", rec.id[:8], exc)
+            try:
+                await self.send_to_topic(rec.topic_id, f"Turn failed: {exc}")
+            except Exception:  # noqa: BLE001 — best-effort user notice
+                pass
 
     async def _maybe_redirect_main_feed(self, user_id: int | None) -> None:
         if user_id is None:
@@ -772,11 +967,18 @@ class TelegramChannel(Channel):
             )
             return None
 
-        body_lines = [f"Claude wants to use: *{tool_name}*"]
+        # M11 (v0.52.0): escape the dynamic text. tool_name goes inside a
+        # *bold* span (general MarkdownV2 escaping); the preview goes inside a
+        # ``` code fence (pre/code escaping — only backtick + backslash). The
+        # static prefix has no reserved chars. Unescaped, MCP tool names
+        # (mcp__x__y — underscore runs) and Bash previews (backticks/
+        # backslashes) trigger a Telegram 400 that the relay hook turns into
+        # an auto-deny.
+        body_lines = [f"Claude wants to use: *{_escape_mdv2(tool_name)}*"]
         preview = self._build_perm_preview(tool_name, tool_input)
         if preview:
             body_lines.append("")
-            body_lines.append(f"```\n{preview}\n```")
+            body_lines.append(f"```\n{_escape_mdv2_pre(preview)}\n```")
         body = "\n".join(body_lines)
 
         kbd = InlineKeyboardMarkup([[
@@ -790,11 +992,26 @@ class TelegramChannel(Channel):
             ),
         ]])
 
-        return await self.send_to_topic(
-            rec.topic_id, body,
-            reply_markup=kbd,
-            parse_mode="MarkdownV2",
-        )
+        try:
+            return await self.send_to_topic(
+                rec.topic_id, body,
+                reply_markup=kbd,
+                parse_mode="MarkdownV2",
+            )
+        except TelegramError as exc:
+            # M11 defense-in-depth: any residual MarkdownV2 parse failure
+            # degrades to an unformatted keyboard rather than a hook-level
+            # auto-deny. The operator still sees the request and both buttons.
+            logger.warning(
+                "post_perm_keyboard MarkdownV2 send failed (engagement=%s); "
+                "retrying as plain text: %s", engagement_id[:8], exc,
+            )
+            plain = f"Claude wants to use: {tool_name}"
+            if preview:
+                plain += f"\n\n{preview}"
+            return await self.send_to_topic(
+                rec.topic_id, plain, reply_markup=kbd,
+            )
 
     @staticmethod
     def _build_perm_preview(tool_name: str, tool_input: dict) -> str:
@@ -860,6 +1077,13 @@ class TelegramChannel(Channel):
         # Bot-permissions check
         try:
             me = await self.bot.get_me()
+            # M10 (v0.52.0): cache the bot's own @username so handle_update
+            # can strip "@botname" off menu-selected group commands. The
+            # isinstance guard keeps MagicMock get_me() fakes in tests from
+            # poisoning the cache (leaves it None → strip unconditionally).
+            _u = getattr(me, "username", None)
+            if isinstance(_u, str) and _u:
+                self._bot_username = _u.lower()
             member = await self.bot.get_chat_member(
                 chat_id=self.engagement_supergroup_id,
                 user_id=me.id,
@@ -1046,6 +1270,19 @@ class TelegramChannel(Channel):
                 chat_id=target_chat,
                 text=chunk,
             )
+
+    async def turn_finished(self, context: dict[str, Any]) -> None:
+        """L7 (v0.52.0): teardown for turns that end WITHOUT delivery.
+
+        When a turn produces empty / whitespace-only / `<silent/>` output the
+        agent never calls send()/finalize_stream(), so the per-chat typing
+        loop started in _handle would keep issuing send_chat_action forever
+        (permanent 'typing…' plus one Bot API call every 4s). The agent calls
+        this hook on the suppressed-turn path to stop it. In block mode the
+        streaming first-token teardown never runs, so this is the only stop.
+        """
+        target_chat = _resolve_chat_id(context, self.chat_id)
+        self._stop_typing(str(target_chat))
 
     # ------------------------------------------------------------------
     # Outbound: streaming

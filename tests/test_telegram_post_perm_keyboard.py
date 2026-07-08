@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 class TestPostPermKeyboard:
@@ -64,6 +64,89 @@ class TestPostPermKeyboard:
         )
         assert msg_id is None
         ch.send_to_topic.assert_not_called()
+
+    async def test_mcp_tool_name_escaped_in_bold_span(self):
+        """M11 (v0.52.0): MCP tool names (mcp__x__y) contain underscore runs
+        and hyphens — MarkdownV2-reserved. Unescaped they cause a Telegram
+        400 that the relay hook turns into an auto-deny. The bold span must
+        carry the escaped name."""
+        from channels import telegram as tg_mod
+
+        ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._engagement_registry = MagicMock()
+        ch._engagement_registry.get = MagicMock(
+            return_value=MagicMock(topic_id=42)
+        )
+        ch.send_to_topic = AsyncMock(return_value=7)
+
+        await ch.post_perm_keyboard(
+            engagement_id="x" * 32,
+            request_id="rid",
+            tool_name="mcp__casa-framework__query_engager",
+            tool_input={},
+        )
+        body = ch.send_to_topic.call_args.args[1]
+        assert "*mcp\\_\\_casa\\-framework\\_\\_query\\_engager*" in body
+        # The raw, unescaped form must NOT be present.
+        assert "*mcp__casa-framework__query_engager*" not in body
+
+    async def test_bash_preview_pre_escaped(self):
+        """Backtick + backslash inside the ``` code fence must be escaped
+        (pre entities escape ONLY those two); ':' and '.' stay literal."""
+        from channels import telegram as tg_mod
+
+        ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._engagement_registry = MagicMock()
+        ch._engagement_registry.get = MagicMock(
+            return_value=MagicMock(topic_id=42)
+        )
+        ch.send_to_topic = AsyncMock(return_value=7)
+
+        await ch.post_perm_keyboard(
+            engagement_id="x" * 32,
+            request_id="rid",
+            tool_name="Bash",
+            tool_input={"command": "echo `date` c:\\tmp"},
+        )
+        body = ch.send_to_topic.call_args.args[1]
+        assert "\\`date\\`" in body        # backtick escaped
+        assert "c:\\\\tmp" in body          # backslash escaped (c:\\tmp)
+        # ':' is NOT MarkdownV2-reserved and must stay literal.
+        assert ":" in body
+
+    async def test_parse_failure_falls_back_to_plain_text(self):
+        """Defense-in-depth: a MarkdownV2 send failure retries as plain text
+        (unformatted keyboard) rather than propagating to a hook-level
+        auto-deny."""
+        from channels import telegram as tg_mod
+        from telegram.error import TelegramError
+
+        ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._engagement_registry = MagicMock()
+        ch._engagement_registry.get = MagicMock(
+            return_value=MagicMock(topic_id=42)
+        )
+        calls: list = []
+
+        async def _send(topic_id, text, **kwargs):
+            calls.append((text, kwargs))
+            if kwargs.get("parse_mode") == "MarkdownV2":
+                raise TelegramError("can't parse entities")
+            return 7
+
+        ch.send_to_topic = _send
+
+        msg_id = await ch.post_perm_keyboard(
+            engagement_id="x" * 32,
+            request_id="rid",
+            tool_name="Bash",
+            tool_input={"command": "curl https://example.com"},
+        )
+        assert msg_id == 7
+        assert len(calls) == 2
+        # Second (fallback) call carries no parse_mode and still the keyboard.
+        assert "parse_mode" not in calls[1][1]
+        assert "reply_markup" in calls[1][1]
 
     async def test_engagement_without_topic_id_returns_none(self):
         from channels import telegram as tg_mod

@@ -309,6 +309,16 @@ class Agent:
                 await channel.finalize_stream(text, msg.context, on_token)
             else:
                 await channel.send(text, msg.context)
+        elif channel is not None and hasattr(channel, "turn_finished"):
+            # L7 (v0.52.0): a turn that strips to empty / `<silent/>` never
+            # calls send()/finalize_stream(), so give the channel a chance to
+            # tear down per-turn state (e.g. the Telegram typing indicator).
+            # hasattr-guarded so channels without the hook are unaffected;
+            # teardown must never break the turn.
+            try:
+                await channel.turn_finished(msg.context)
+            except Exception:  # noqa: BLE001
+                logger.exception("channel.turn_finished failed")
 
         if not text and error_kind is None:
             return None
