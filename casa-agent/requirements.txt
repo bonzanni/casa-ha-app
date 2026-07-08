@@ -9,7 +9,7 @@
 # It is mitigated Casa-side by H-2 (v0.36.1) — every hook callback returns
 # {} / _deny(...), never None (hooks.py:187-192). So this bump neither fixes
 # nor regresses G-1; Casa is immune on both 0.1.72 and 0.2.87.
-claude-agent-sdk==0.2.87
+claude-agent-sdk==0.2.114
 python-telegram-bot==22.7
 aiohttp==3.13.5
 apscheduler==3.11.2
