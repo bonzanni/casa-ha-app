@@ -53,10 +53,27 @@ async def handle_method(request: web.Request) -> web.Response:
                                                          "first_name": "CasaBot"}})
 
     if method == "getChatMember":
-        chat_id = int(payload.get("chat_id", 0))
+        # PTB 22.x parses this strictly: ChatMemberAdministrator requires the
+        # full admin-rights field set, and User requires first_name + is_bot.
+        # A thinner payload raises TypeError inside de_json, which the channel
+        # logs as "bot-permissions check failed" and disables engagements.
         return web.json_response({"ok": True, "result": {
-            "user": {"id": STATE["bot_id"]},
             "status": "administrator",
+            "user": {"id": STATE["bot_id"], "is_bot": True,
+                     "first_name": "CasaBot", "username": "casabot"},
+            "can_be_edited": False,
+            "is_anonymous": False,
+            "can_manage_chat": True,
+            "can_delete_messages": True,
+            "can_manage_video_chats": True,
+            "can_restrict_members": True,
+            "can_promote_members": False,
+            "can_change_info": True,
+            "can_invite_users": True,
+            "can_post_stories": False,
+            "can_edit_stories": False,
+            "can_delete_stories": False,
+            "can_pin_messages": True,
             "can_manage_topics": STATE["can_manage_topics"],
         }})
 
