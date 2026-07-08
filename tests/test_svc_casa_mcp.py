@@ -17,6 +17,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 pytestmark = [
     pytest.mark.asyncio,
+    pytest.mark.unit,
     pytest.mark.skipif(
         sys.platform == "win32",
         reason="svc_casa_mcp tests use UnixConnector path (Linux only)",
@@ -299,10 +300,17 @@ async def test_svc_hooks_resolve_forwarder_error_reason_is_actionable() -> None:
         assert "ClientPayloadError" in reason
 
 
-async def test_svc_tools_call_keeps_default_short_timeout() -> None:
+async def test_svc_tools_call_uses_default_forwarder_timeout() -> None:
     """E-1 scope guard: the tools/call route must NOT inherit the hooks
-    path's timeout_s=None. Model-driven tool calls have no human in the
-    loop, so the short default is correct there."""
+    path's timeout_s=None. It relies on _forward_to_internal's own
+    default instead of an explicit override.
+
+    L72/L21: that default must be generous enough to comfortably exceed
+    the slowest legitimate tools/call handler (query_engager's Hindsight
+    recall + ClaudeSDKClient one-shot synthesis; emit_completion's
+    Telegram teardown + two classify_tier one-shots) — a sub-minute cap
+    (the old 10s) produces spurious casa_temporarily_unavailable errors
+    while the server-side call is still succeeding."""
     captured: dict = {}
 
     async def _fwd(**kwargs):
@@ -318,10 +326,20 @@ async def test_svc_tools_call_keeps_default_short_timeout() -> None:
             },
         )
     # tools/call must NOT explicitly set timeout_s (defer to the
-    # forwarder's default 10s).
+    # forwarder's default).
     assert "timeout_s" not in captured, (
         "tools/call should rely on the default forwarder timeout, "
         f"got explicit timeout_s={captured.get('timeout_s')!r}"
+    )
+
+    import inspect
+
+    from svc_casa_mcp import _forward_to_internal
+    default = inspect.signature(_forward_to_internal).parameters["timeout_s"].default
+    assert default is not None and default >= 60, (
+        "the forwarder's default timeout_s must comfortably exceed "
+        "worst-case server-side tool latency (SDK one-shot + Hindsight "
+        f"recall); got {default!r}"
     )
 
 

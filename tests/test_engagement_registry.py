@@ -163,6 +163,44 @@ class TestRegistryStateTransitions:
         assert rec.origin.get("error_kind") == "resume_failed"
         assert rec.origin.get("error_message") == "SDK rotated"
 
+    async def test_try_transition_terminal_wins_once(self, tmp_path):
+        """L75/L24: try_transition_terminal is the atomic gate — the first
+        caller wins and flips the record; every subsequent caller (even
+        with a different outcome) is refused and the status is untouched."""
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+
+        won = await reg.try_transition_terminal(rec.id, "cancelled")
+        assert won is True
+        assert rec.status == "cancelled"
+
+        # A second caller (e.g. emit_completion resuming after the race)
+        # must NOT win and must NOT overwrite the winning outcome.
+        won2 = await reg.try_transition_terminal(rec.id, "completed", completed_at=999.0)
+        assert won2 is False
+        assert rec.status == "cancelled"
+
+    async def test_try_transition_terminal_missing_record_returns_false(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        assert await reg.try_transition_terminal("ghost", "completed") is False
+
+    async def test_try_transition_terminal_error_sets_origin(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+        won = await reg.try_transition_terminal(
+            rec.id, "error", error_kind="emit_completion_error", error_message="boom",
+        )
+        assert won is True
+        assert rec.status == "error"
+        assert rec.origin.get("error_kind") == "emit_completion_error"
+        assert rec.origin.get("error_message") == "boom"
+
     async def test_update_last_idle_reminder(self, tmp_path):
         from engagement_registry import EngagementRegistry
 

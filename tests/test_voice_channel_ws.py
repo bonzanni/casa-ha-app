@@ -1,7 +1,9 @@
 """Spec §3.2, §4.3 — WebSocket transport + stt_start prewarm dedup."""
 
 import asyncio
+import gc
 import json
+import weakref
 from unittest.mock import AsyncMock
 
 import pytest
@@ -10,6 +12,8 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from bus import BusMessage, MessageBus, MessageType
 from channels.voice.channel import VoiceChannel
+
+pytestmark = pytest.mark.unit
 
 
 class _StreamingAgent:
@@ -130,6 +134,86 @@ class TestWSTurn:
             await asyncio.wait_for(started.wait(), timeout=2.0)
             await ws.send_json({"type": "cancel", "utterance_id": "u1"})
             await asyncio.wait_for(cancelled.wait(), timeout=3.0)
+
+    async def test_client_context_cannot_clobber_computed_keys(self, ws_app):
+        """L59/L8 (WS side): a client-supplied context dict must not
+        override the channel-computed chat_id/cid/utterance_id."""
+        client, bus, _, _ = ws_app
+        captured = {}
+        orig_request = bus.request
+
+        async def spy_request(msg, timeout=300):
+            captured["msg"] = msg
+            return await orig_request(msg, timeout=timeout)
+
+        bus.request = spy_request
+
+        async with client.ws_connect("/api/converse/ws") as ws:
+            await ws.send_json({
+                "type": "utterance", "utterance_id": "forged-uid",
+                "text": "hi", "agent_role": "butler", "scope_id": "s",
+                "context": {
+                    "chat_id": "living-room",
+                    "cid": "client-forged-cid",
+                    "device_id": "kitchen",
+                },
+            })
+            async for msg in ws:
+                if msg.type != WSMsgType.TEXT:
+                    break
+                frame = json.loads(msg.data)
+                if frame["type"] == "done":
+                    break
+
+        ctx = captured["msg"].context
+        assert ctx["chat_id"] == "s"
+        assert ctx["cid"] != "client-forged-cid"
+        assert ctx["device_id"] == "kitchen"
+
+    async def test_ws_utterance_task_pruned_and_exception_retrieved(
+        self, ws_app, caplog, monkeypatch,
+    ):
+        """L60/L9: finished utterance tasks must be pruned from the
+        per-connection tasks dict, and a task that finishes with an
+        exception must have that exception retrieved (never logged as
+        'never retrieved') and surfaced as a warning."""
+        client, _, _, channel = ws_app
+        task_refs: list[weakref.ref] = []
+
+        async def stub_ok(ws, frame, uid):
+            task_refs.append(weakref.ref(asyncio.current_task()))
+            await ws.send_json({"type": "done", "utterance_id": uid})
+
+        monkeypatch.setattr(channel, "_run_ws_utterance", stub_ok)
+
+        async with client.ws_connect("/api/converse/ws") as ws:
+            await ws.send_json({
+                "type": "utterance", "utterance_id": "u1", "text": "hi",
+                "agent_role": "butler", "scope_id": "s",
+            })
+            msg = await ws.receive_json(timeout=2.0)
+            assert msg["type"] == "done"
+            await asyncio.sleep(0.05)  # let the done-callback run
+            gc.collect()
+            # Pruned from the per-connection dict => nothing references the
+            # finished task anymore, so the weakref must be dead WHILE the
+            # WS is still open.
+            assert task_refs and task_refs[0]() is None
+
+            # Exception arm: a failing utterance task must be reaped +
+            # logged, never left as an unretrieved-exception task.
+            async def stub_fail(ws_, frame, uid):
+                raise ConnectionResetError("Cannot write to closing transport")
+            monkeypatch.setattr(channel, "_run_ws_utterance", stub_fail)
+            with caplog.at_level("WARNING"):
+                await ws.send_json({
+                    "type": "utterance", "utterance_id": "u2", "text": "x",
+                    "agent_role": "butler", "scope_id": "s",
+                })
+                await asyncio.sleep(0.1)
+            gc.collect()
+            assert any("utterance task failed" in r.message for r in caplog.records)
+            assert not any("never retrieved" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

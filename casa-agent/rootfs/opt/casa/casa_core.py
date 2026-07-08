@@ -1511,6 +1511,9 @@ async def main() -> None:
         model_name=os.environ.get("SECONDARY_AGENT_MODEL", "haiku"),
     )
     await observer.subscribe()
+    # L68/L17: stash so _finalize_engagement can prune per-engagement
+    # interjection-budget bookkeeping on terminal transition.
+    agent_mod.active_observer = observer
 
     if telegram_channel is not None:
         telegram_channel._engagement_registry = engagement_registry

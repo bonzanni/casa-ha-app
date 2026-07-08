@@ -111,6 +111,7 @@ class ClaudeCodeDriver(DriverProtocol):
                     defn=defn,
                     task=engagement.task,
                     context=engagement.origin.get("context", ""),
+                    world_state_summary=engagement.origin.get("world_state_summary", ""),
                     casa_framework_mcp_url=self._casa_framework_mcp_url,
                     workspace_template_root=(
                         template_root if template_root.is_dir() else None
@@ -353,34 +354,40 @@ class ClaudeCodeDriver(DriverProtocol):
         self, engagement: EngagementRecord, *,
         log_path: str, initial_window_s: float = 60.0,
     ) -> None:
-        """Persistent tail — posts topic notices on URL change only."""
+        """Persistent tail — posts topic notices on URL change only.
+
+        A detached one-shot timer posts the 'not yet available' fallback
+        at the deadline even if the log never yields a line (file missing
+        or CLI quiet) — the tail loop alone cannot be relied on to tick."""
         last_seen: str | None = None
-        initial_posted_warning = False
-        deadline = asyncio.get_event_loop().time() + initial_window_s
 
-        async for line in _tail_file(log_path):
-            m = _URL_REGEX.search(line)
-            if not m:
-                now = asyncio.get_event_loop().time()
-                if (not initial_posted_warning and last_seen is None
-                        and now > deadline):
-                    await self._send_to_topic(
-                        engagement.topic_id,
-                        "Remote control URL not yet available — Telegram-only "
-                        "for now. Will post here if it becomes available later.",
-                    )
-                    initial_posted_warning = True
-                continue
+        async def _warn_when_window_expires() -> None:
+            await asyncio.sleep(initial_window_s)
+            if last_seen is None:
+                await self._send_to_topic(
+                    engagement.topic_id,
+                    "Remote control URL not yet available — Telegram-only "
+                    "for now. Will post here if it becomes available later.",
+                )
 
-            url = m.group(1)
-            if url == last_seen:
-                continue
-            last_seen = url
-            await self._send_to_topic(
-                engagement.topic_id,
-                f"Remote control: {url} — open in iOS app or browser "
-                f"to drive from anywhere.",
-            )
+        warn_task = asyncio.create_task(_warn_when_window_expires())
+        try:
+            async for line in _tail_file(log_path):
+                m = _URL_REGEX.search(line)
+                if not m:
+                    continue
+                url = m.group(1)
+                if url == last_seen:
+                    continue
+                last_seen = url
+                warn_task.cancel()
+                await self._send_to_topic(
+                    engagement.topic_id,
+                    f"Remote control: {url} — open in iOS app or browser "
+                    f"to drive from anywhere.",
+                )
+        finally:
+            warn_task.cancel()
 
     async def _relay_log_lines(
         self, engagement: EngagementRecord, *, log_path: str,
