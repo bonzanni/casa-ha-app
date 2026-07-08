@@ -199,6 +199,34 @@ class MessageBus:
                         result.reply_to = msg.id
                         result.type = MessageType.RESPONSE
                         await self.respond(msg.id, result)
+                    elif (
+                        msg.type == MessageType.REQUEST
+                        and msg.id in self.pending
+                    ):
+                        # M6 (v0.53.0): the handler completed but produced no
+                        # response (e.g. Agent.handle_message returning None on
+                        # a silent/empty turn — G-3 sentinel suppression or a
+                        # no-text SDK turn). Resolve the pending future with an
+                        # empty RESPONSE so bus.request() callers (voice SSE/WS,
+                        # /invoke) return immediately instead of hanging until
+                        # the ~300s timeout. Belt-and-suspenders with the
+                        # agent-level fix (agent.handle_message now returns a
+                        # typed empty RESPONSE for REQUEST turns): defends any
+                        # handler that returns None on a REQUEST. The
+                        # ``msg.id in self.pending`` guard is a no-op if
+                        # something already responded, or if request() already
+                        # timed out / was cancelled and popped the future.
+                        # NOTIFICATION / fire-and-forget targets never populate
+                        # ``pending``, so their None returns stay a no-op.
+                        await self.respond(msg.id, BusMessage(
+                            type=MessageType.RESPONSE,
+                            source=msg.target,
+                            target=msg.source,
+                            content="",
+                            reply_to=msg.id,
+                            channel=msg.channel,
+                            context=msg.context,
+                        ))
             except asyncio.CancelledError:
                 # Caller of bus.request cancelled us. Drop the pending
                 # future so nobody waits forever; do not synthesise an

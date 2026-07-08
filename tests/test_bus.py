@@ -6,7 +6,7 @@ import pytest
 
 from bus import BusMessage, MessageBus, MessageType
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 # ------------------------------------------------------------------
@@ -90,20 +90,52 @@ async def test_request_response():
 
 
 async def test_request_timeout():
-    """request() raises TimeoutError when nobody responds."""
+    """request() raises TimeoutError when nobody responds.
+
+    M6 (v0.53.0): a handler that returns None now resolves the REQUEST with
+    an empty RESPONSE (see test_request_handler_returning_none_unblocks_caller),
+    so to exercise the genuine timeout path we register 'b' with NO handler —
+    nobody responds and the future is never resolved.
+    """
     bus = MessageBus()
 
-    # Handler that does NOT produce a response
-    async def black_hole(msg: BusMessage):
-        return None
-
     bus.register("a")
-    bus.register("b", black_hole)
+    bus.register("b")  # no handler: nothing ever responds
     loop_task = asyncio.create_task(bus.run_agent_loop("b"))
 
     req = _msg(source="a", target="b")
     with pytest.raises(asyncio.TimeoutError):
         await bus.request(req, timeout=0.1)
+
+    loop_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await loop_task
+
+
+async def test_request_handler_returning_none_unblocks_caller():
+    """M6 (v0.53.0): a handler that completes normally with None (silent/empty
+    turn, e.g. Agent.handle_message after G-3 sentinel suppression) must
+    resolve the pending REQUEST with an empty RESPONSE — not strand voice
+    SSE/WS and /invoke callers until the ~300s timeout."""
+    bus = MessageBus()
+
+    async def silent_handler(msg: BusMessage):
+        return None
+
+    bus.register("a")
+    bus.register("b", silent_handler)
+    loop_task = asyncio.create_task(bus.run_agent_loop("b"))
+
+    req = BusMessage(
+        type=MessageType.NOTIFICATION, source="a", target="b", content="ping",
+    )
+    # Without the fix this raises asyncio.TimeoutError after 2s.
+    result = await bus.request(req, timeout=2)
+
+    assert result.type == MessageType.RESPONSE
+    assert result.content == ""
+    assert result.reply_to == req.id
+    assert req.id not in bus.pending
 
     loop_task.cancel()
     with pytest.raises(asyncio.CancelledError):
