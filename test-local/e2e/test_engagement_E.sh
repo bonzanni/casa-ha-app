@@ -174,6 +174,10 @@ async def main():
         ),
     )
     await ch.handle_update(update)
+    # M9 (v0.52.0): handle_update spawns the driver turn as a tracked
+    # background task; drain it before asserting.
+    while ch._turn_tasks:
+        await asyncio.gather(*list(ch._turn_tasks), return_exceptions=True)
     assert len(drv.turns) == 1, f"expected 1 driver turn, got {len(drv.turns)}"
     assert drv.turns[0][1] == "hello from user", f"wrong text: {drv.turns[0]}"
     # last_user_turn_ts should advance.
@@ -528,6 +532,9 @@ async def main():
         ),
     )
     await ch.handle_update(update)
+    # M9 (v0.52.0): turn delivery is a tracked background task — drain first.
+    while ch._turn_tasks:
+        await asyncio.gather(*list(ch._turn_tasks), return_exceptions=True)
     assert drv.is_alive(rec), "driver not alive after resume"
     assert drv.turns == ["are you there?"], f"turns: {drv.turns}"
     assert reg.get(rec.id).status == "active", \
@@ -741,6 +748,9 @@ async def main():
         ),
     )
     await ch.handle_update(update)
+    # M9 (v0.52.0): turn delivery is a tracked background task — drain first.
+    while ch._turn_tasks:
+        await asyncio.gather(*list(ch._turn_tasks), return_exceptions=True)
     assert drv.turns == ["yes do it"], f"driver turns: {drv.turns}"
 
     # 8. Registry transitioned to completed.

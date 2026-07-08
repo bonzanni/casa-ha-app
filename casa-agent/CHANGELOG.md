@@ -11,7 +11,10 @@ Repository/presentation release — no runtime behavior changes.
   `ChatMemberAdministrator` requires the full admin-rights field set), so the mock's
   thin payload made the boot-time bot-permissions check fail and disabled
   engagements, breaking the tier2 Engagement E-block. The mock now returns a
-  complete `ChatMemberAdministrator` payload.
+  complete `ChatMemberAdministrator` payload. Second independent breakage from
+  the same release: M9 made `handle_update` deliver driver turns as a tracked
+  background task, so the harness's synchronous asserts raced the delivery —
+  the E-block now drains `_turn_tasks` before asserting.
 
 ### Added
 
