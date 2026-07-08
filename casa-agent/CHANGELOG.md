@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.58.0] - 2026-07-09 — prebuilt images, aarch64, release automation
+
+### Added
+
+- **Prebuilt container images** on GHCR (`ghcr.io/bonzanni/casa-agent`,
+  Cosign-signed multi-arch manifest): installing or updating the app now pulls
+  an image instead of compiling the Dockerfile on the device. Built and
+  published by the new `deploy.yml` workflow using the home-assistant/builder
+  composite actions (2026.06.0); pull requests get a validation build.
+- **aarch64 support** — Raspberry Pi / Home Assistant Green & Yellow class
+  hardware.
+- **Release automation**: every merge to master that bumps the version also
+  publishes the images and creates the `vX.Y.Z` git tag + GitHub Release with
+  this changelog section as the notes.
+- **CI**: Home Assistant app linter (`frenck/action-addon-linter`); Dependabot
+  for pip and GitHub Actions updates.
+
+### Changed
+
+- Dockerfile now bases on the multi-arch
+  `ghcr.io/home-assistant/base-debian:bookworm` manifest via a default
+  `BUILD_FROM` arg; the retired `build.yaml` is removed (Supervisor ≥2026.04 no
+  longer injects `BUILD_FROM`; local dev builds use the arg default).
+
 ## [0.57.1] - 2026-07-09 — publishing readiness: repo shell + green CI
 
 Repository/presentation release — no runtime behavior changes.

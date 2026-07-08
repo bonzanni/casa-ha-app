@@ -11,6 +11,7 @@
 [![QA](https://github.com/bonzanni/casa-ha-app/actions/workflows/qa.yml/badge.svg)](https://github.com/bonzanni/casa-ha-app/actions/workflows/qa.yml)
 [![Version](https://img.shields.io/badge/dynamic/yaml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbonzanni%2Fcasa-ha-app%2Fmaster%2Fcasa-agent%2Fconfig.yaml&query=%24.version&label=version&color=blue)](casa-agent/CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+![Supports aarch64 Architecture](https://img.shields.io/badge/aarch64-yes-green.svg)
 ![Supports amd64 Architecture](https://img.shields.io/badge/amd64-yes-green.svg)
 
 </div>
@@ -46,6 +47,7 @@ the Home Assistant APIs at their fingertips.
 
 ### [Casa Agent](./casa-agent)
 
+![Supports aarch64 Architecture](https://img.shields.io/badge/aarch64-yes-green.svg)
 ![Supports amd64 Architecture](https://img.shields.io/badge/amd64-yes-green.svg)
 
 _Personal AI agent framework powered by Claude — the main (and currently only) app._
@@ -63,15 +65,14 @@ _Personal AI agent framework powered by Claude — the main (and currently only)
    [documentation](casa-agent/DOCS.md).
 
 > [!NOTE]
-> The app currently builds locally on your machine during installation, so the
-> first install takes several minutes. Prebuilt container images are on the
-> roadmap.
+> Installs pull a prebuilt, Cosign-signed container image from GHCR — no
+> on-device build.
 
 ## Requirements
 
 - Home Assistant OS or a Supervised installation (the app needs the Supervisor),
   Home Assistant 2025.4 or newer.
-- An **amd64** (x86-64) machine — aarch64 support is planned.
+- An **amd64** (x86-64) or **aarch64** (arm64) machine.
 - A **Claude Max subscription** for the OAuth token the agents run on.
 - Optional: a Telegram bot (via [@BotFather](https://t.me/BotFather)), a Hindsight
   server for long-term memory, a 1Password service account for secret references.

@@ -18,7 +18,7 @@ AppArmor profile.
 
 Requires a **Claude Max subscription** — run `claude setup-token` on your
 workstation and paste the OAuth token into the app configuration — and an
-**amd64** machine.
+**amd64** or **aarch64** machine.
 
 Setup guides, the full configuration reference, and troubleshooting live in the
 **Documentation** tab ([DOCS.md](DOCS.md)).
