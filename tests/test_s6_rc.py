@@ -5,10 +5,11 @@ from __future__ import annotations
 import os
 import stat
 import sys
+from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 class TestWriteServiceDir:
@@ -114,6 +115,83 @@ class TestCompileAndUpdateLocked:
         update_cmd = calls[1]
         assert update_cmd == ["s6-rc-update", new_db]
 
+    async def test_reaps_previous_db_after_successful_swap(self, tmp_path, monkeypatch):
+        """L12 leak guard: the previously-live compiled db must be removed
+        after a successful swap, so /tmp doesn't accumulate one orphan per
+        compile."""
+        import subprocess
+
+        from drivers import s6_rc
+
+        old_db = tmp_path / "s6-casa-db-old"
+        old_db.mkdir()
+        live = tmp_path / "compiled"
+        live.symlink_to(old_db)
+        monkeypatch.setattr(s6_rc, "LIVE_DB_SYMLINK", str(live))
+
+        calls: list[list[str]] = []
+
+        def fake_run(argv, check=True, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0)
+
+        monkeypatch.setattr(s6_rc.subprocess, "run", fake_run)
+
+        await s6_rc._compile_and_update_locked()
+
+        assert calls[0][0] == "s6-rc-compile"
+        assert calls[1][0] == "s6-rc-update"
+        assert not old_db.exists(), "previous live db must be reaped after a successful swap"
+
+    async def test_keeps_non_casa_previous_db(self, tmp_path, monkeypatch):
+        """A foreign/boot db (no s6-casa-db- prefix) must never be reaped."""
+        import subprocess
+
+        from drivers import s6_rc
+
+        boot_db = tmp_path / "db"  # simulates the s6-overlay boot db
+        boot_db.mkdir()
+        live = tmp_path / "compiled"
+        live.symlink_to(boot_db)
+        monkeypatch.setattr(s6_rc, "LIVE_DB_SYMLINK", str(live))
+        monkeypatch.setattr(
+            s6_rc.subprocess, "run",
+            lambda argv, check=True, **kwargs: subprocess.CompletedProcess(argv, 0),
+        )
+
+        await s6_rc._compile_and_update_locked()
+
+        assert boot_db.exists(), "foreign db must never be touched"
+
+    async def test_reaps_new_db_on_failed_swap(self, tmp_path, monkeypatch):
+        """A failed compile/update must reap the just-created db (the orphan
+        in that scenario), not the previous live one."""
+        import subprocess
+
+        from drivers import s6_rc
+
+        old_db = tmp_path / "s6-casa-db-old"
+        old_db.mkdir()
+        live = tmp_path / "compiled"
+        live.symlink_to(old_db)
+        monkeypatch.setattr(s6_rc, "LIVE_DB_SYMLINK", str(live))
+
+        captured_new_db: list[str] = []
+
+        def fake_run(argv, check=True, **kwargs):
+            if argv[0] == "s6-rc-compile":
+                captured_new_db.append(argv[1])
+                Path(argv[1]).mkdir(parents=True, exist_ok=True)
+            raise subprocess.CalledProcessError(1, argv)
+
+        monkeypatch.setattr(s6_rc.subprocess, "run", fake_run)
+
+        with pytest.raises(subprocess.CalledProcessError):
+            await s6_rc._compile_and_update_locked()
+
+        assert old_db.exists(), "previous live db must survive a failed swap"
+        assert not Path(captured_new_db[0]).exists(), "failed new db must be reaped"
+
 
 class TestServiceStatus:
     async def test_service_is_up_parses_svstat(self, monkeypatch):
@@ -210,3 +288,29 @@ class TestSweepOrphans:
         )
         assert removed == []
         assert (svc_root / "random-other-thing").exists()
+
+
+class TestSweepOrphanCompiledDbs:
+    async def test_removes_stale_dbs_keeps_live_and_foreign(self, tmp_path, monkeypatch):
+        from drivers import s6_rc
+
+        keep = tmp_path / "s6-casa-db-live"
+        keep.mkdir()
+        stale = tmp_path / "s6-casa-db-stale"
+        stale.mkdir()
+        foreign = tmp_path / "not-ours"
+        foreign.mkdir()
+        live = tmp_path / "compiled"
+        live.symlink_to(keep)
+        monkeypatch.setattr(s6_rc, "LIVE_DB_SYMLINK", str(live))
+
+        removed = s6_rc.sweep_orphan_compiled_dbs(tmp_root=str(tmp_path))
+
+        assert removed == [str(stale)]
+        assert keep.exists() and foreign.exists() and not stale.exists()
+
+    async def test_missing_tmp_root_is_noop(self, tmp_path):
+        from drivers import s6_rc
+
+        missing = tmp_path / "does-not-exist"
+        assert s6_rc.sweep_orphan_compiled_dbs(tmp_root=str(missing)) == []

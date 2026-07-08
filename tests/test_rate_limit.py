@@ -11,6 +11,8 @@ from rate_limit import (
     rate_limit_response,
 )
 
+pytestmark = pytest.mark.unit
+
 
 # ---------------------------------------------------------------------------
 # TokenBucket — burst, refill, disabled, notify-once, retry-after
@@ -173,6 +175,37 @@ class TestRateLimiter:
         assert limiter.check("g").allowed is False
         clock.advance(1.0)
         assert limiter.check("g").allowed is True
+
+
+class TestBucketEviction:
+    def test_sweep_evicts_idle_buckets_keeps_active(self):
+        clock = _FakeClock()
+        limiter = RateLimiter(capacity=1, window_s=60.0, now=clock)
+        # Spam wave: 1500 one-shot senders each allocate a bucket.
+        for i in range(1500):
+            limiter.check(f"spam-{i}")
+        limiter.check("active")                      # exhaust 'active'
+        assert limiter.check("active").allowed is False
+        clock.advance(61.0)                          # all idle past one full window
+        for _ in range(1100):                        # cross the 1024-check sweep threshold
+            limiter.check("active")
+        assert "active" in limiter._buckets
+        assert not any(k.startswith("spam-") for k in limiter._buckets), (
+            "buckets idle >= window_s must be evicted"
+        )
+
+    def test_eviction_is_behaviorally_invisible(self):
+        # A key evicted after a full idle window must behave exactly like a
+        # fresh key: full burst admitted, no notify carry-over.
+        clock = _FakeClock()
+        limiter = RateLimiter(capacity=2, window_s=60.0, now=clock)
+        limiter.check("k"); limiter.check("k")
+        assert limiter.check("k").allowed is False   # in a reject streak
+        clock.advance(61.0)
+        for i in range(1100):                        # force a sweep via other keys
+            limiter.check(f"other-{i % 3}")
+        d = limiter.check("k")
+        assert d.allowed is True and d.should_notify is False
 
 
 # ---------------------------------------------------------------------------

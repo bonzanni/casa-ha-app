@@ -15,7 +15,6 @@
   "voice_agent_name": "Tina",
   "primary_agent_model": "opus",
   "voice_agent_model": "haiku",
-  "subagent_model": "sonnet",
   "enable_terminal": false,
   "repos": []
 }

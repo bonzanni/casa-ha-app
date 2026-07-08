@@ -62,8 +62,12 @@ def set_entry(var_name: str, value: str) -> None:
         lines.append(f"{var_name}={value}\n")
 
     PLUGIN_ENV_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PLUGIN_ENV_CONF_PATH.write_text("".join(lines), encoding="utf-8")
+    # Create with 0600 atomically so secret content never exists on disk
+    # with group/other read bits (contract: "File is mode 0600").
+    fd = os.open(PLUGIN_ENV_CONF_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("".join(lines))
     try:
-        os.chmod(PLUGIN_ENV_CONF_PATH, 0o600)
+        os.chmod(PLUGIN_ENV_CONF_PATH, 0o600)  # belt-and-braces: repairs a legacy 0644 file
     except PermissionError:
         pass  # non-root in tests

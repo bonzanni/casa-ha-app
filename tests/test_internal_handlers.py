@@ -9,7 +9,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 # ----- Test fixtures: minimal engagement registry + tool dispatch ----------
@@ -276,5 +276,47 @@ async def test_hooks_resolve_malformed_json_denies() -> None:
             data="not json",
             headers={"Content-Type": "application/json"},
         )
+        body = await resp.json()
+        assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+async def test_hooks_resolve_non_dict_body_denies_structurally() -> None:
+    """L14: valid JSON that isn't an object must yield the structured
+    deny (status 200), not an unhandled-exception 500."""
+    reg = _FakeRegistry()
+    app = _make_app(dispatch={}, registry=reg, hook_policies={})
+    async with TestClient(TestServer(app)) as client:
+        for raw in ("[1, 2]", '"hello"', "null", "42"):
+            resp = await client.post(
+                "/internal/hooks/resolve",
+                data=raw,
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 200, raw
+            body = await resp.json()
+            assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+async def test_hooks_resolve_non_dict_payload_and_policy_deny() -> None:
+    """L14: a truthy non-dict payload (would crash at payload.get) and an
+    unhashable policy (would crash at hook_policies.get with TypeError)
+    must both deny structurally instead of raising."""
+    reg = _FakeRegistry()
+    policies = {"bash_only": ("Bash", _deny_callback)}
+    app = _make_app(dispatch={}, registry=reg, hook_policies=policies)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/hooks/resolve",
+            json={"policy": "bash_only", "payload": "not-a-dict"},
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+        resp = await client.post(
+            "/internal/hooks/resolve",
+            json={"policy": [1], "payload": {"tool_name": "Bash"}},
+        )
+        assert resp.status == 200
         body = await resp.json()
         assert body["hookSpecificOutput"]["permissionDecision"] == "deny"

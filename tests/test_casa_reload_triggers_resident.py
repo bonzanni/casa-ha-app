@@ -34,7 +34,18 @@ from unittest.mock import MagicMock
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
+
+
+@pytest.fixture
+def configurator_origin():
+    """Set origin_var so the L26 role guard lets the call through."""
+    import agent as agent_mod
+    tok = agent_mod.origin_var.set({"role": "configurator"})
+    try:
+        yield
+    finally:
+        agent_mod.origin_var.reset(tok)
 
 
 def _w(path: Path, text: str) -> None:
@@ -124,7 +135,7 @@ class TestCasaReloadTriggersResident:
     """The H-3 regression: residents have disclosure.yaml; soft reload
     must thread a real PolicyLibrary or fail."""
 
-    async def test_resident_with_disclosure_succeeds(self, tmp_path):
+    async def test_resident_with_disclosure_succeeds(self, tmp_path, configurator_origin):
         """The fix: casa_reload_triggers must successfully reload a
         resident whose directory contains disclosure.yaml."""
         import agent as agent_mod
@@ -165,7 +176,7 @@ class TestCasaReloadTriggersResident:
         assert [t.name for t in recorded_triggers] == ["probe-p8"]
         assert recorded_channels == ["telegram"]
 
-    async def test_missing_policies_file_returns_load_error(self, tmp_path):
+    async def test_missing_policies_file_returns_load_error(self, tmp_path, configurator_origin):
         """When ``policies/disclosure.yaml`` is missing, surface a
         ``load_error`` with a useful message - don't silently fall
         back to ``policies=None`` (which is exactly the H-3 bug)."""
@@ -191,7 +202,7 @@ class TestCasaReloadTriggersResident:
         # error refers to policies/disclosure.yaml.
         assert "polic" in payload.get("message", "").lower()
 
-    async def test_specialist_path_still_works(self, tmp_path):
+    async def test_specialist_path_still_works(self, tmp_path, configurator_origin):
         """Specialists have NO disclosure.yaml. The fix must not
         regress this path (loading policies is harmless - agent_loader
         only consults the library when the agent has a disclosure)."""

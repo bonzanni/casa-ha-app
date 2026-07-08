@@ -27,12 +27,21 @@ _tg_transport="$(bashio::config 'telegram_transport')"
 export TELEGRAM_TRANSPORT="${_tg_transport:-polling}"
 export TELEGRAM_DELIVERY_MODE="$(bashio::config 'telegram_delivery_mode')"
 export TELEGRAM_ENGAGEMENT_SUPERGROUP_ID="$(bashio::config 'telegram_engagement_supergroup_id')"
-export WEBHOOK_SECRET="$(bashio::config 'webhook_secret')"
+# telegram_bot_api_base is optional (schema str?); bashio returns "null" when unset.
+_tg_api_base="$(bashio::config 'telegram_bot_api_base')"
+if [ "$_tg_api_base" != "null" ] && [ -n "$_tg_api_base" ]; then
+    export TELEGRAM_BOT_API_BASE="$_tg_api_base"
+fi
+# webhook_auth_enabled gates whether the webhook secret check is active;
+# only export WEBHOOK_SECRET when the toggle is on, so setting it to false
+# actually disables auth even if webhook_secret still holds a value.
+if bashio::config.true 'webhook_auth_enabled'; then
+    export WEBHOOK_SECRET="$(bashio::config 'webhook_secret')"
+fi
 export PRIMARY_AGENT_NAME="$(bashio::config 'primary_agent_name')"
 export VOICE_AGENT_NAME="$(bashio::config 'voice_agent_name')"
 export PRIMARY_AGENT_MODEL="$(bashio::config 'primary_agent_model')"
 export VOICE_AGENT_MODEL="$(bashio::config 'voice_agent_model')"
-export SUBAGENT_MODEL="$(bashio::config 'subagent_model')"
 export ENABLE_TERMINAL="$(bashio::config 'enable_terminal')"
 export CASA_VERSION="$(bashio::addon.version)"
 

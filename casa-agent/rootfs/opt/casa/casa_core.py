@@ -394,6 +394,10 @@ async def replay_undergoing_engagements(
             svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
             keep_engagement_ids=keep_ids,
         )
+        # Also reap stale /tmp/s6-casa-db-* dirs left by the previous
+        # container run (L12 leak guard) — /run is fresh tmpfs after a
+        # restart, so any prior compiled db still in /tmp is orphaned.
+        s6_rc.sweep_orphan_compiled_dbs()
 
         # Fast path: no UNDERGOING engagements and no orphans were swept →
         # the engagement sources dir is empty and unchanged. Running
@@ -824,6 +828,69 @@ def _make_telegram_update_handler(*, get_telegram_channel, webhook_secret: str):
         return web.Response(status=200)
 
     return telegram_update_handler
+
+
+def _make_invoke_handler(
+    *,
+    webhook_rate_limiter: Any,
+    webhook_secret: str,
+    bus: Any,
+    assistant_role: str,
+):
+    """Build the ``POST /invoke/{agent}`` direct-invocation handler.
+
+    Extracted from ``main()`` so it is unit-testable; see
+    ``tests/test_invoke_handler_body_validation.py``. L3: a body that
+    parses to a non-dict (``[1]``, ``"hi"``, ``42``, ``null``) is
+    rejected with the same 400 the handler already uses for malformed
+    JSON, and an explicit ``"context": null`` is normalized to ``{}``
+    instead of raising ``TypeError`` at item-assignment.
+    """
+
+    def _verify(request: web.Request, body: bytes) -> bool:
+        if not webhook_secret:
+            return True
+        sig = request.headers.get("X-Webhook-Signature", "")
+        expected = hmac.new(
+            webhook_secret.encode(), body, hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(sig, expected)
+
+    async def invoke_handler(request: web.Request) -> web.Response:
+        limited = rate_limit_response(webhook_rate_limiter, "global")
+        if limited is not None:
+            return limited
+
+        body = await request.read()
+        if not _verify(request, body):
+            return web.json_response({"error": "invalid signature"}, status=401)
+
+        agent_role = request.match_info.get("agent", assistant_role)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+
+        if not isinstance(payload, dict):
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+
+        prompt = payload.get("prompt", "")
+        if not prompt:
+            return web.json_response({"error": "missing 'prompt' field"}, status=400)
+
+        context = payload.get("context")
+        if not isinstance(context, dict):
+            context = {}
+        context["cid"] = request["cid"]
+        payload["context"] = context
+        msg = build_invoke_message(agent_role, prompt, payload)
+        try:
+            result = await bus.request(msg, timeout=300)
+            return web.json_response({"response": str(result.content)})
+        except asyncio.TimeoutError:
+            return web.json_response({"error": "timeout"}, status=504)
+
+    return invoke_handler
 
 
 def build_invoke_message(
@@ -1511,16 +1578,6 @@ async def main() -> None:
 
     # 11. Webhook endpoints
 
-    def _verify_webhook(request: web.Request, body: bytes) -> bool:
-        """Verify HMAC-SHA256 signature if a webhook secret is configured."""
-        if not webhook_secret:
-            return True
-        sig = request.headers.get("X-Webhook-Signature", "")
-        expected = hmac.new(
-            webhook_secret.encode(), body, hashlib.sha256
-        ).hexdigest()
-        return hmac.compare_digest(sig, expected)
-
     # N-1 + N-2 (v0.36.0): wildcard /webhook/{name} consults the trigger
     # registry's per-boot allowlist. Unknown names → 404; known names
     # dispatch to the registered role (no longer hardcoded to
@@ -1533,33 +1590,12 @@ async def main() -> None:
         bus=bus,
     )
 
-    async def invoke_handler(request: web.Request) -> web.Response:
-        """Direct agent invocation (POST /invoke/{agent})."""
-        limited = rate_limit_response(webhook_rate_limiter, "global")
-        if limited is not None:
-            return limited
-
-        body = await request.read()
-        if not _verify_webhook(request, body):
-            return web.json_response({"error": "invalid signature"}, status=401)
-
-        agent_role = request.match_info.get("agent", assistant_role)
-        try:
-            payload = await request.json()
-        except Exception:
-            return web.json_response({"error": "invalid JSON body"}, status=400)
-
-        prompt = payload.get("prompt", "")
-        if not prompt:
-            return web.json_response({"error": "missing 'prompt' field"}, status=400)
-
-        payload.setdefault("context", {})["cid"] = request["cid"]
-        msg = build_invoke_message(agent_role, prompt, payload)
-        try:
-            result = await bus.request(msg, timeout=300)
-            return web.json_response({"response": str(result.content)})
-        except asyncio.TimeoutError:
-            return web.json_response({"error": "timeout"}, status=504)
+    invoke_handler = _make_invoke_handler(
+        webhook_rate_limiter=webhook_rate_limiter,
+        webhook_secret=webhook_secret,
+        bus=bus,
+        assistant_role=assistant_role,
+    )
 
     # 11. Telegram webhook route (only used when webhook_url is set).
     # L4: constant-time secret-token comparison lives in the extracted

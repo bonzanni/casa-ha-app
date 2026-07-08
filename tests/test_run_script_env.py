@@ -28,6 +28,7 @@ def _read_run_script() -> str:
     "TELEGRAM_TRANSPORT",
     "TELEGRAM_DELIVERY_MODE",
     "TELEGRAM_ENGAGEMENT_SUPERGROUP_ID",  # v0.18.1 - was missing pre-fix
+    "TELEGRAM_BOT_API_BASE",  # was missing pre-fix; option was dead in prod
 ])
 def test_run_script_exports_telegram_env_var(var):
     """svc-casa/run must export every TELEGRAM_* env var that
@@ -48,6 +49,44 @@ def test_run_script_exports_log_level():
     handling) so install_logging() defaults to INFO when unset."""
     script = _read_run_script()
     assert "LOG_LEVEL" in script, "Missing LOG_LEVEL handling in svc-casa/run"
+
+
+def test_run_script_exports_telegram_bot_api_base_null_normalized():
+    """v0.12.0 regression: telegram_bot_api_base was declared in config.yaml
+    schema and consumed by channels/telegram.py via env, but svc-casa/run
+    never exported it, so the add-on option was silently dead in production
+    (only the test-local harness exported it). Guard: the run script must
+    read the option via bashio and export TELEGRAM_BOT_API_BASE, normalizing
+    the "null" sentinel bashio returns for unset str? options."""
+    script = _read_run_script()
+    assert "bashio::config 'telegram_bot_api_base'" in script, (
+        "svc-casa/run must read the telegram_bot_api_base add-on option"
+    )
+    start = script.index("_tg_api_base=")
+    block = script[start:script.index("\nfi", start)]
+    assert "export TELEGRAM_BOT_API_BASE=" in block, (
+        "TELEGRAM_BOT_API_BASE must be exported (telegram.py reads it from env)"
+    )
+    assert '"null"' in block, (
+        'must skip export when bashio returns the "null" sentinel for unset option'
+    )
+
+
+def test_run_script_gates_webhook_secret_on_auth_enabled():
+    """webhook_auth_enabled=false must actually disable webhook auth, even
+    when webhook_secret still holds a configured value. Prior to the fix,
+    WEBHOOK_SECRET was exported unconditionally, so the toggle had no
+    effect once a secret was set. Guard: the export must live inside a
+    `webhook_auth_enabled` conditional."""
+    script = _read_run_script()
+    assert "bashio::config.true 'webhook_auth_enabled'" in script, (
+        "svc-casa/run must gate WEBHOOK_SECRET export on webhook_auth_enabled"
+    )
+    start = script.index("bashio::config.true 'webhook_auth_enabled'")
+    block = script[start:script.index("\nfi", start)]
+    assert 'export WEBHOOK_SECRET="$(bashio::config \'webhook_secret\')"' in block, (
+        "WEBHOOK_SECRET export must be inside the webhook_auth_enabled conditional"
+    )
 
 
 def test_run_script_derives_memory_backend_from_hindsight_url():

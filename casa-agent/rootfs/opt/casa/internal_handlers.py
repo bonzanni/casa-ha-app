@@ -166,8 +166,36 @@ def _make_internal_hooks_resolve_handler(
                 }},
             )
 
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason":
+                        "internal/hooks/resolve: body must be a JSON object",
+                }},
+            )
+
         policy_name = body.get("policy")
+        if not isinstance(policy_name, str):
+            return web.json_response(
+                {"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason":
+                        f"unknown policy: {policy_name!r}",
+                }},
+            )
         payload = body.get("payload") or {}
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason":
+                        "internal/hooks/resolve: payload must be a JSON object",
+                }},
+            )
 
         # H3 (v0.53.0): prefer the engagement's executor-specific callback
         # (carrying its hooks.yaml params) when we can resolve the engagement

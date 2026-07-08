@@ -1,10 +1,10 @@
 # Reload granularity
 
-Casa supports in-process reload at seven scopes. None of them restart the
+Casa supports in-process reload at eight scopes. None of them restart the
 addon. For changes that genuinely need a process restart, use
 `casa_restart_supervised` (rare).
 
-## Seven reload scopes
+## Eight reload scopes
 
 | `scope` | Tool | Downtime | Required `role` | When to use |
 |---|---|---|---|---|
@@ -14,6 +14,7 @@ addon. For changes that genuinely need a process restart, use
 | `plugin_env` | `casa_reload(scope='plugin_env')` | <1s | no | `set_plugin_env_reference` calls / `plugin-env.conf` edits |
 | `agents` | `casa_reload(scope='agents')` | <1s | no | created or deleted ANY resident or specialist directory under `agents/` |
 | `executors` | `casa_reload(scope='executors')` | <1s | no | executor `definition.yaml` edits; create/delete an executor; flip `enabled` / `permission_mode` / `tools.allowed` on an executor |
+| `config_sync` | `casa_reload(scope='config_sync')` | <1s | no | re-run the default-sync reconciler live (adds/updates from image defaults), then cascades `agents` + `policies` reloads |
 | `full` | `casa_reload(scope='full')` | <1s | no | catch-all when unsure or multiple categories edited |
 
 `casa_restart_supervised` (~10-15s) is reserved for s6 service-tree

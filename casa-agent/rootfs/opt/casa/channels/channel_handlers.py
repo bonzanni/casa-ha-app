@@ -210,7 +210,8 @@ def _make_permission_verdict(engagement_registry: Any) -> Handler:
             return web.json_response(
                 {"ok": False, "error": "missing_verdict"},
             )
-        if engagement_registry.get(eng_id) is None:
+        rec = engagement_registry.get(eng_id)
+        if rec is None or getattr(rec, "status", None) not in ("active", "idle"):
             return web.json_response(
                 {"ok": False, "error": "unknown_engagement"},
             )

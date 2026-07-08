@@ -17,7 +17,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 # ---------------------------------------------------------------------------
@@ -48,9 +48,12 @@ class _FakeChannel:
 
 
 class _FakeRecord:
-    def __init__(self, eng_id: str, *, topic_id: int | None) -> None:
+    def __init__(
+        self, eng_id: str, *, topic_id: int | None, status: str = "active",
+    ) -> None:
         self.id = eng_id
         self.topic_id = topic_id
+        self.status = status
 
 
 class _FakeRegistry:
@@ -372,6 +375,29 @@ async def test_permission_verdict_unknown_engagement_returns_error(
         assert (await resp.json()) == {
             "ok": False, "error": "unknown_engagement",
         }
+
+
+async def test_permission_verdict_terminal_engagement_returns_error(
+    channel_full_app_factory,
+) -> None:
+    """L5 leak guard: a late verdict tap for an engagement that has already
+    finalized (status no longer active/idle) must be refused, not silently
+    re-materialize a queue entry that would then leak forever."""
+    from channels.channel_handlers import _PERMISSION_QUEUES
+
+    reg = _FakeRegistry()
+    reg.set_record("eng-1", _FakeRecord("eng-1", topic_id=42, status="completed"))
+    app, _ch, _reg = channel_full_app_factory(registry=reg)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/permission_verdict",
+            json={"engagement_id": "eng-1", "request_id": "rid-001",
+                  "verdict": "allow", "operator_id": 999},
+        )
+        assert (await resp.json()) == {
+            "ok": False, "error": "unknown_engagement",
+        }
+        assert "eng-1" not in _PERMISSION_QUEUES
 
 
 async def test_permission_verdict_bad_json_returns_error(

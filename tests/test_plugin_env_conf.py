@@ -1,6 +1,7 @@
 """POSIX-env reader/writer for /addon_configs/casa-agent/plugin-env.conf."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -51,3 +52,25 @@ def test_preserves_comments(tmp_path: Path, monkeypatch) -> None:
     assert text.startswith("# Managed by Configurator.")
     assert "A=1" in text
     assert "B=2" in text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file mode bits not meaningful on Windows")
+def test_first_creation_is_0600_even_without_chmod(tmp_path: Path, monkeypatch) -> None:
+    """The secrets file must be *born* 0600 — not created world-readable and
+    repaired afterwards. Simulate chmod being unavailable (crash/permission
+    denial between write and chmod) and assert the mode is still 0600."""
+    path = tmp_path / "plugin-env.conf"
+    monkeypatch.setattr("plugin_env_conf.PLUGIN_ENV_CONF_PATH", path)
+
+    def _chmod_denied(*args, **kwargs):
+        raise PermissionError("simulated: no chmod between write and repair")
+
+    monkeypatch.setattr("plugin_env_conf.os.chmod", _chmod_denied)
+
+    old_umask = os.umask(0o022)  # production s6 container umask
+    try:
+        set_entry("OPENWEATHER_API_KEY", "literal-secret-key")
+    finally:
+        os.umask(old_umask)
+
+    assert path.stat().st_mode & 0o777 == 0o600

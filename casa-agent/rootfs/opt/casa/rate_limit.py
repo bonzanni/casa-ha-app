@@ -28,6 +28,14 @@ from typing import Callable
 
 from aiohttp import web
 
+# How many RateLimiter.check() calls between idle-bucket sweeps. A bucket
+# idle >= window_s is guaranteed to have refilled to full capacity on its
+# next check (idle * capacity/window_s >= capacity), and a full bucket
+# behaves identically to a fresh one — so evicting it is behaviorally
+# invisible. Amortized cost is one O(n) scan per _SWEEP_INTERVAL_CHECKS
+# calls on the single asyncio loop.
+_SWEEP_INTERVAL_CHECKS = 1024
+
 
 @dataclass(frozen=True)
 class RateDecision:
@@ -100,6 +108,11 @@ class RateLimiter:
     ``capacity == 0`` disables the limit: every :meth:`check` returns
     ``allowed=True`` and — critically — no bucket is instantiated, so
     the internal dict does not grow with the number of unique keys.
+
+    Idle buckets (no check in >= ``window_s``) are periodically evicted
+    (every :data:`_SWEEP_INTERVAL_CHECKS` calls) so an unauthenticated or
+    unbounded key space (e.g. arbitrary Telegram chat_ids) doesn't grow
+    the per-key dict for the process lifetime.
     """
 
     def __init__(
@@ -116,14 +129,29 @@ class RateLimiter:
         )
         self._now = now
         self._buckets: dict[str, TokenBucket] = {}
+        self._checks_since_sweep = 0
 
     @property
     def enabled(self) -> bool:
         return self._capacity > 0
 
+    def _sweep(self, now: float) -> None:
+        if self._window_s <= 0:
+            return
+        stale = [
+            k for k, b in self._buckets.items()
+            if now - b._last >= self._window_s
+        ]
+        for k in stale:
+            del self._buckets[k]
+
     def check(self, key: str) -> RateDecision:
         if not self.enabled:
             return RateDecision(True, False, 0.0)
+        self._checks_since_sweep += 1
+        if self._checks_since_sweep >= _SWEEP_INTERVAL_CHECKS:
+            self._checks_since_sweep = 0
+            self._sweep((self._now or time.monotonic)())
         bucket = self._buckets.get(key)
         if bucket is None:
             bucket = TokenBucket(
