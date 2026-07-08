@@ -20,6 +20,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from atomic_io import atomic_write_json
 from config import AgentConfig
 
 logger = logging.getLogger(__name__)
@@ -232,8 +233,9 @@ class SpecialistRegistry:
             )
 
     def _write_tombstone(self, snapshot: list[dict[str, Any]]) -> None:
-        with open(self._tombstone_path, "w", encoding="utf-8") as fh:
-            json.dump(snapshot, fh, indent=2)
+        # Atomic (temp-file + fsync + os.replace): a crash mid-write must not
+        # corrupt the exact file that exists for delegation crash recovery (L20).
+        atomic_write_json(self._tombstone_path, snapshot, indent=2)
 
     def orphans_from_disk(self) -> list[DelegationRecord]:
         """Read the tombstone file. Returns any records left by a prior

@@ -216,3 +216,78 @@ def test_no_changes_means_no_commit(tmp_path: Path) -> None:
     git = _FakeGit()
     _run(tmp_path, git=git)
     assert git.snapshots == []
+
+
+# ---------------------------------------------------------------------------
+# M12 — git present but FAILING must degrade to .casabak, never clobber
+#       a user edit uncaptured.
+# ---------------------------------------------------------------------------
+
+
+class _BrokenGit:
+    """git binary + .git present, but every command fails at runtime (e.g.
+    dubious-ownership or a stale index.lock). The fixed RealGit.snapshot()
+    returns None on failure; head() must NOT be trusted as a capture."""
+    available = True
+
+    def snapshot(self, message: str) -> str | None:
+        return None
+
+    def head(self) -> str | None:
+        return "STALEHEAD"
+
+
+def test_conflict_with_broken_git_writes_casabak(tmp_path: Path) -> None:
+    _write(tmp_path / "baseline", "agents/butler/voice.yaml", "OLD")
+    _write(tmp_path / "live", "agents/butler/voice.yaml", "USER")
+    _write(tmp_path / "defaults", "agents/butler/voice.yaml", "NEW")
+    report = _run(tmp_path, git=_BrokenGit())
+    assert (tmp_path / "live/agents/butler/voice.yaml").read_text() == "NEW"
+    # user edit recoverable via sidecar
+    assert (tmp_path / "live/agents/butler/voice.yaml.casabak").read_text() == "USER"
+    assert "agents/butler/voice.yaml" in report.casabak
+    # no misleading recovery pointer (must not record STALEHEAD)
+    assert report.conflicts[0]["pre_sync_sha"] is None
+    assert report.pre_sync_sha is None
+
+
+def test_schema_backstop_with_broken_git_writes_casabak(tmp_path: Path) -> None:
+    # live edited to match defaults? No — make live a distinct edited value that
+    # the validator rejects, forcing the schema backstop overwrite path.
+    _write(tmp_path / "baseline", "agents/butler/voice.yaml", "OLD")
+    _write(tmp_path / "live", "agents/butler/voice.yaml", "USER-INVALID")
+    _write(tmp_path / "defaults", "agents/butler/voice.yaml", "OLD")  # image unchanged → kept live
+    report = _run(
+        tmp_path, git=_BrokenGit(),
+        validate=lambda rel: "boom" if rel.endswith("voice.yaml") else None,
+    )
+    # backstop forced the default over the invalid live file
+    assert (tmp_path / "live/agents/butler/voice.yaml").read_text() == "OLD"
+    assert (tmp_path / "live/agents/butler/voice.yaml.casabak").read_text() == "USER-INVALID"
+    assert "agents/butler/voice.yaml" in report.casabak
+    assert report.schema_forced[0]["pre_sync_sha"] is None
+
+
+def _git(repo: Path, *args: str):
+    import subprocess
+    return subprocess.run(["git", "-C", str(repo), *args],
+                          capture_output=True, text=True)
+
+
+def test_real_git_snapshot_fails_closed_on_stale_index_lock(tmp_path: Path) -> None:
+    """RealGit.snapshot() must return None (not a stale pre-edit HEAD) when a
+    crash leftover .git/index.lock makes `git add` fail."""
+    repo = tmp_path / "cfg"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "agents").mkdir()
+    (repo / "agents/x.yaml").write_text("v1", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+    (repo / "agents/x.yaml").write_text("USER-EDIT", encoding="utf-8")
+    (repo / ".git" / "index.lock").write_text("", encoding="utf-8")  # crash leftover
+    g = config_sync.RealGit(repo)
+    assert g.available is True
+    assert g.snapshot("snap") is None  # must not return the stale pre-edit HEAD

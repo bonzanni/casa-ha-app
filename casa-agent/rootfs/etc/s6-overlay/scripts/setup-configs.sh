@@ -145,9 +145,11 @@ else
     # Idempotent boot-time snapshot of any uncommitted manual edits.
     cd "$CONFIG_DIR"
     if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-        git add -A
-        git commit -qm "manual edit (boot-time snapshot)"
-        bashio::log.info "Snapshotted manual edits in config repo"
+        if git add -A && git commit -qm "manual edit (boot-time snapshot)"; then
+            bashio::log.info "Snapshotted manual edits in config repo"
+        else
+            bashio::log.warning "Boot-time config snapshot failed (git error) — reconciler will fall back to .casabak"
+        fi
     fi
 fi
 

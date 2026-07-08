@@ -119,8 +119,14 @@ def reconcile(*, defaults_dir, config_dir, baseline_dir,
     def _ensure_pre_sync() -> str | None:
         if not pre_sync:
             if git.available:
-                sha = git.snapshot("casa-sync: pre-sync snapshot before default reconcile")
-                pre_sync.append(sha or git.head())
+                # No `or git.head()` fallback: git.snapshot() now returns None
+                # ONLY when the snapshot actually failed (e.g. dubious-ownership
+                # or a stale index.lock). Falling back to a stale pre-edit HEAD
+                # would record a misleading recovery pointer for an edit the
+                # commit never captured — treat a failed snapshot as degraded
+                # (sha None) so the caller writes a .casabak instead (M12).
+                pre_sync.append(git.snapshot(
+                    "casa-sync: pre-sync snapshot before default reconcile"))
             else:
                 pre_sync.append(None)
             report.pre_sync_sha = pre_sync[0]
@@ -159,7 +165,10 @@ def reconcile(*, defaults_dir, config_dir, baseline_dir,
             continue                                       # converged
         # conflict → image wins
         sha = _ensure_pre_sync()
-        if not git.available:
+        if sha is None:
+            # No commit captured the user's edit (git unavailable OR present
+            # but failing) — snapshot it to a .casabak before clobbering so the
+            # edit is always recoverable; never silently destroy it (M12).
             _archive_casabak(config_dir, rel, report)
         _copy(defaults_dir, rel, config_dir)
         report.conflicts.append({"path": rel, "pre_sync_sha": sha})
@@ -176,7 +185,9 @@ def reconcile(*, defaults_dir, config_dir, baseline_dir,
             continue
         logger.warning("config_sync backstop: %s invalid vs new schema (%s) — forcing default", rel, err)
         sha = _ensure_pre_sync()
-        if not git.available:
+        if sha is None:
+            # See conflict-site note: snapshot to .casabak whenever no commit
+            # captured the edit (git unavailable or failing) before clobbering.
             _archive_casabak(config_dir, rel, report)
         _copy(defaults_dir, rel, config_dir)
         report.schema_forced.append({"path": rel, "pre_sync_sha": sha})
@@ -225,17 +236,37 @@ class RealGit:
         return res.stdout.strip() if res.returncode == 0 else None
 
     def snapshot(self, message: str) -> str | None:
+        """Commit all pending /config changes; return the resulting HEAD.
+
+        Fails CLOSED: returns None on ANY git error (dubious-ownership, a
+        stale index.lock left by a crash mid-commit, a corrupt repo) so the
+        reconciler treats the snapshot as not-taken and falls back to a
+        .casabak instead of clobbering a user edit uncaptured (M12).
+        """
         if not self.available:
             return None
-        self._run("add", "-A")
-        # commit only if something is staged
+        add = self._run("add", "-A")
+        if add.returncode != 0:
+            logger.warning("config_sync: git add failed: %s", add.stderr.strip())
+            return None
+        # `git diff --cached --quiet` exit codes: 0=clean, 1=staged changes,
+        # >=2 (e.g. 128)=git error. The old code conflated error with "clean"
+        # and skipped the commit, then returned a stale pre-edit HEAD.
         staged = self._run("diff", "--cached", "--quiet")
-        if staged.returncode != 0:
-            self._run(
+        if staged.returncode == 1:
+            commit = self._run(
                 "-c", "user.email=casa-agent@local",
                 "-c", "user.name=Casa Agent",
                 "commit", "-q", "-m", message,
             )
+            if commit.returncode != 0:
+                logger.warning(
+                    "config_sync: git commit failed: %s", commit.stderr.strip())
+                return None
+        elif staged.returncode != 0:
+            logger.warning(
+                "config_sync: git diff --cached failed: %s", staged.stderr.strip())
+            return None
         return self.head()
 
 

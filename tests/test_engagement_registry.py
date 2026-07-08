@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 class TestEngagementRecord:
@@ -420,3 +420,41 @@ class TestRecentForOrigin:
         assert registry.recent_for_origin(
             channel="telegram", chat_id="42", max_age_s=60.0,
         ) is not None
+
+
+# ---------------------------------------------------------------------------
+# TestTombstoneAtomicity — M15: crash mid-write must not corrupt the tombstone
+# ---------------------------------------------------------------------------
+
+
+class TestTombstoneAtomicity:
+    async def test_crash_between_tempwrite_and_replace_keeps_tombstone(
+        self, tmp_path, monkeypatch,
+    ):
+        """A crash BETWEEN the temp write and os.replace must leave the prior
+        engagements.json intact (not truncated), preserving in-flight state."""
+        import atomic_io
+        from engagement_registry import EngagementRegistry
+
+        tombstone = tmp_path / "engagements.json"
+        reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="configurator", driver="in_casa",
+            task="keep me", origin={"channel": "telegram", "chat_id": 1},
+            topic_id=7,
+        )
+        first = json.loads(tombstone.read_text(encoding="utf-8"))
+        assert first[0]["id"] == rec.id
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated crash before replace")
+
+        monkeypatch.setattr(atomic_io.os, "replace", boom)
+        # _write_tombstone_locked swallows the exception (logs a warning), so
+        # the mutation call itself must not raise — but disk must be untouched.
+        await reg.update_user_turn(rec.id, ts=time.time())
+
+        on_disk = json.loads(tombstone.read_text(encoding="utf-8"))
+        assert on_disk == first  # prior tombstone intact, not truncated
+        import os as _os
+        assert [f for f in _os.listdir(tmp_path) if f != "engagements.json"] == []

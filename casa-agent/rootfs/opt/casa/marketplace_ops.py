@@ -11,6 +11,8 @@ import json
 import logging
 from pathlib import Path
 
+from atomic_io import atomic_write_text
+
 logger = logging.getLogger(__name__)
 
 USER_MARKETPLACE_PATH: Path = Path(
@@ -33,9 +35,11 @@ def _read() -> dict:
 
 def _write(data: dict) -> None:
     USER_MARKETPLACE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    USER_MARKETPLACE_PATH.write_text(
+    # Atomic (temp-file + fsync + os.replace): a crash mid-write must not brick
+    # every marketplace op with a truncated marketplace.json (L15).
+    atomic_write_text(
+        USER_MARKETPLACE_PATH,
         json.dumps(data, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
     )
 
 

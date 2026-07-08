@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 # ---------------------------------------------------------------------------
@@ -592,3 +592,43 @@ class TestDisabledAccessors:
         out.append("intruder")
         assert "intruder" not in reg._disabled_names
         assert reg.disabled_roles() == ["alpha", "beta", "zeta"]
+
+
+# ---------------------------------------------------------------------------
+# TestDelegationTombstoneAtomicity — L20: crash-safe tombstone write
+# ---------------------------------------------------------------------------
+
+
+class TestDelegationTombstoneAtomicity:
+    async def test_crash_between_tempwrite_and_replace_keeps_tombstone(
+        self, tmp_path, monkeypatch,
+    ):
+        """A crash BETWEEN the temp write and os.replace must leave the prior
+        delegations.json intact — this is the exact file that exists for
+        delegation crash recovery."""
+        import json
+        import atomic_io
+        from specialist_registry import SpecialistRegistry, DelegationRecord
+
+        tombstone = tmp_path / "delegations.json"
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                 tombstone_path=str(tombstone))
+        await reg.register_delegation(
+            DelegationRecord(id="d1", agent="finance", started_at=1000.0,
+                             origin={"channel": "telegram"}))
+        first = json.loads(tombstone.read_text(encoding="utf-8"))
+        assert first[0]["id"] == "d1"
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated crash before replace")
+
+        monkeypatch.setattr(atomic_io.os, "replace", boom)
+        # _write_tombstone_locked swallows + logs; mutation must not raise.
+        await reg.register_delegation(
+            DelegationRecord(id="d2", agent="legal", started_at=2000.0))
+
+        on_disk = json.loads(tombstone.read_text(encoding="utf-8"))
+        assert on_disk == first  # prior tombstone intact, not truncated
+        import os as _os
+        assert [f for f in _os.listdir(tmp_path)
+                if f not in ("delegations.json", "specialists")] == []

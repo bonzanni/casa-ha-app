@@ -5,6 +5,8 @@ from pathlib import Path
 
 import yaml
 
+from atomic_io import atomic_write_text
+
 MANIFEST_PATH: Path = Path("/config/system-requirements.yaml")
 
 
@@ -19,7 +21,9 @@ def read_manifest() -> dict:
 
 def _write(data: dict) -> None:
     MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    MANIFEST_PATH.write_text(yaml.safe_dump(data, sort_keys=True), encoding="utf-8")
+    # Atomic (temp-file + fsync + os.replace): a crash mid-write must not
+    # undermine the manifest's crash-recovery purpose with a truncated file.
+    atomic_write_text(MANIFEST_PATH, yaml.safe_dump(data, sort_keys=True))
 
 
 def add_plugin_entry(entry: dict) -> None:
