@@ -5,6 +5,7 @@ unchanged."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -82,6 +83,9 @@ async def test_telegram_summary_retained_and_postback_fires(tmp_path, monkeypatc
         rec, outcome="completed", text="summary", artifacts=["sha1"],
         next_steps=[], driver=driver,
     )
+    # L33: retains now run as background tasks; drain them before asserting.
+    import tools as tools_mod
+    await asyncio.gather(*list(tools_mod._specialist_bg_tasks), return_exceptions=True)
 
     # One retain to the shared `casa` bank with the engagement_summary item.
     assert len(sem.retain_calls) == 1
@@ -169,6 +173,9 @@ async def test_executor_kind_retains_distinct_doc_prefix(tmp_path, monkeypatch):
         rec, outcome="completed", text="summary", artifacts=[],
         next_steps=[], driver=driver,
     )
+    # L33: retains now run as background tasks; drain them before asserting.
+    import tools as tools_mod
+    await asyncio.gather(*list(tools_mod._specialist_bg_tasks), return_exceptions=True)
 
     # Two retains: the engagement summary + the per-executor-type summary,
     # under DISTINCT document_ids so they do not clobber each other.

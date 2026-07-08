@@ -75,3 +75,30 @@ async def test_save_session_retains_telegram_to_shared_bank(monkeypatch):
     assert ok is True
     assert retained["bank"] == "casa"
     assert retained["tags"] == [["friends"]]
+
+
+async def test_transcript_classification_is_concurrent(monkeypatch):
+    """M29: classification must overlap (bounded gather), not run one-at-a-time,
+    while preserving order and idempotent document_ids."""
+    import asyncio
+    in_flight = 0
+    peak = 0
+
+    async def fake_classify(content: str) -> str:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.05)
+        in_flight -= 1
+        return "public"
+
+    monkeypatch.setattr(session_saver, "classify_tier", fake_classify)
+    msgs = [_Msg("user", f"fact {i}") for i in range(8)]
+    items = await session_saver.transcript_to_items(
+        msgs, sdk_session_id="s1", user_peer="nicola",
+    )
+    assert len(items) == 8
+    # Serial gives peak == 1; bounded-parallel gives peak in [2, 4].
+    assert peak >= 2, f"classification ran serially (peak in-flight = {peak})"
+    assert peak <= session_saver._CLASSIFY_CONCURRENCY, "semaphore bound exceeded"
+    assert [i["document_id"] for i in items] == [f"s1:{i}" for i in range(8)]

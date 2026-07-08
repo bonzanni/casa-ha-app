@@ -84,7 +84,6 @@ async def main():
     reg = EngagementRegistry(tombstone_path="/tmp/t.json", bus=None)
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
-        base_plugins_root="/opt/casa/claude-plugins/base",
         send_to_topic=lambda *a, **kw: _noop(),
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )
@@ -146,7 +145,6 @@ async def main():
     reg = EngagementRegistry(tombstone_path="/tmp/t2.json", bus=None)
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
-        base_plugins_root="/opt/casa/claude-plugins/base",
         send_to_topic=lambda *a, **kw: _noop(),
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )
@@ -194,7 +192,6 @@ async def main():
     reg = EngagementRegistry(tombstone_path="/tmp/t3.json", bus=None)
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
-        base_plugins_root="/opt/casa/claude-plugins/base",
         send_to_topic=lambda *a, **kw: _noop(),
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )
@@ -252,7 +249,6 @@ async def main():
     reg = EngagementRegistry(tombstone_path="/tmp/t4.json", bus=None)
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
-        base_plugins_root="/opt/casa/claude-plugins/base",
         send_to_topic=lambda *a, **kw: _noop(),
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )
@@ -308,7 +304,6 @@ async def main():
     reg = EngagementRegistry(tombstone_path="/tmp/t5.json", bus=None)
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
-        base_plugins_root="/opt/casa/claude-plugins/base",
         send_to_topic=lambda *a, **kw: _noop(),
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )
@@ -379,7 +374,6 @@ async def main():
 
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
-        base_plugins_root="/opt/casa/claude-plugins/base",
         send_to_topic=lambda *a, **kw: _noop(),
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )
@@ -476,7 +470,6 @@ async def main():
     reg = EngagementRegistry(tombstone_path="/tmp/t8.json", bus=None)
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
-        base_plugins_root="/opt/casa/claude-plugins/base",
         send_to_topic=lambda *a, **kw: _noop(),
         casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
     )

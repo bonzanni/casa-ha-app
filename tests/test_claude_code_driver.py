@@ -101,7 +101,6 @@ class TestStart:
 
         drv = ClaudeCodeDriver(
             engagements_root=str(tmp_path / "engagements"),
-            base_plugins_root=str(tmp_path / "base-plugins"),
             send_to_topic=AsyncMock(),
             casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
         )
@@ -157,7 +156,6 @@ class TestStartRollback:
 
         drv = ClaudeCodeDriver(
             engagements_root=str(tmp_path / "engagements"),
-            base_plugins_root=str(tmp_path / "base-plugins"),
             send_to_topic=AsyncMock(),
             casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
         )
@@ -219,7 +217,6 @@ class TestStartRollback:
 
         drv = ClaudeCodeDriver(
             engagements_root=str(tmp_path / "engagements"),
-            base_plugins_root=str(tmp_path / "base-plugins"),
             send_to_topic=AsyncMock(),
             casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
         )
@@ -241,7 +238,7 @@ class TestURLCapture:
 
         sender = AsyncMock()
         drv = ClaudeCodeDriver(
-            engagements_root=str(tmp_path), base_plugins_root=str(tmp_path),
+            engagements_root=str(tmp_path),
             send_to_topic=sender, casa_framework_mcp_url="x",
         )
         log = tmp_path / "log"
@@ -271,7 +268,7 @@ class TestURLCapture:
 
         sender = AsyncMock()
         drv = ClaudeCodeDriver(
-            engagements_root=str(tmp_path), base_plugins_root=str(tmp_path),
+            engagements_root=str(tmp_path),
             send_to_topic=sender, casa_framework_mcp_url="x",
         )
         log = tmp_path / "log"
@@ -348,7 +345,6 @@ class TestSessionIdCapture:
 
         drv = ClaudeCodeDriver(
             engagements_root=str(tmp_path),
-            base_plugins_root=str(tmp_path),
             send_to_topic=AsyncMock(),
             casa_framework_mcp_url="x",
             persist_session_id=fake_persist,
@@ -394,7 +390,6 @@ class TestSessionIdCapture:
 
         drv = ClaudeCodeDriver(
             engagements_root=str(tmp_path),
-            base_plugins_root=str(tmp_path),
             send_to_topic=AsyncMock(),
             casa_framework_mcp_url="x",
             persist_session_id=fake_persist,
@@ -442,7 +437,6 @@ class TestSessionIdCapture:
 
         drv = ClaudeCodeDriver(
             engagements_root=str(tmp_path),
-            base_plugins_root=str(tmp_path),
             send_to_topic=AsyncMock(),
             casa_framework_mcp_url="x",
             persist_session_id=fake_persist,
@@ -482,7 +476,6 @@ class TestSessionIdCapture:
 
         drv = ClaudeCodeDriver(
             engagements_root=str(tmp_path),
-            base_plugins_root=str(tmp_path),
             send_to_topic=AsyncMock(),
             casa_framework_mcp_url="x",
             persist_session_id=None,  # None tolerated — no registry hook in test
@@ -522,7 +515,7 @@ class TestRespawnPoller:
             bus_events.append({"args": args, "kwargs": kwargs})
 
         drv = ClaudeCodeDriver(
-            engagements_root=str(tmp_path), base_plugins_root=str(tmp_path),
+            engagements_root=str(tmp_path),
             send_to_topic=AsyncMock(), casa_framework_mcp_url="x",
         )
         drv._publish_bus_event = fake_publish     # dependency injection
@@ -562,7 +555,7 @@ class TestCancel:
         (tmp_path / "svc" / "engagement-abc12345def67890" / "type").write_text("longrun\n")
 
         drv = ClaudeCodeDriver(
-            engagements_root=str(tmp_path / "eng"), base_plugins_root=str(tmp_path),
+            engagements_root=str(tmp_path / "eng"),
             send_to_topic=AsyncMock(), casa_framework_mcp_url="x",
         )
         rec = _make_record()
@@ -599,7 +592,6 @@ class TestRelayLogLines:
 
         drv = ClaudeCodeDriver(
             engagements_root=str(tmp_path / "engagements"),
-            base_plugins_root=str(tmp_path / "base-plugins"),
             send_to_topic=AsyncMock(),
             casa_framework_mcp_url="http://x",
         )
@@ -643,7 +635,7 @@ class TestWriteToFifoBounded:
         async def send(topic_id, text):
             sent.append((topic_id, text))
         return ClaudeCodeDriver(
-            engagements_root=str(tmp_path), base_plugins_root=str(tmp_path),
+            engagements_root=str(tmp_path),
             send_to_topic=send, casa_framework_mcp_url="http://unused",
         )
 

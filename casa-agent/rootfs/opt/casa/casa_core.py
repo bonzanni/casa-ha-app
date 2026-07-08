@@ -1466,7 +1466,6 @@ async def main() -> None:
 
     claude_code_driver = ClaudeCodeDriver(
         engagements_root="/data/engagements",
-        base_plugins_root="/opt/casa/claude-plugins/base",
         send_to_topic=_send_to_topic,
         casa_framework_mcp_url=_casa_framework_mcp_url,
         # O-5 (v0.37.9): capture-and-persist SDK session_id so a Casa
@@ -1934,6 +1933,12 @@ async def main() -> None:
     await asyncio.gather(*all_loop_tasks, return_exceptions=True)
 
     await channel_manager.stop_all()
+    # Close the shared Hindsight client session (L32) so aiohttp does not
+    # warn about an unclosed session; no-op for NoOp/other backends.
+    try:
+        await semantic_memory.close()
+    except Exception:  # noqa: BLE001
+        logger.warning("semantic memory close failed", exc_info=True)
     for _r in runners:
         await _r.cleanup()
     logger.info("Casa core shutdown complete")

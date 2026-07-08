@@ -252,16 +252,12 @@ class TestProvisionWorkspace:
         from drivers.workspace import provision_workspace
 
         defn = self._make_defn(tmp_path)
-        base_plugins_dir = tmp_path / "opt-casa-claude-plugins-base"
-        base_plugins_dir.mkdir()
-        (base_plugins_dir / "superpowers").mkdir()
 
         ws = tmp_path / "engagements"
         ws.mkdir()
 
         path = await provision_workspace(
             engagements_root=str(ws),
-            base_plugins_root=str(base_plugins_dir),
             engagement_id="eng1",
             defn=defn,
             task="do a thing",
@@ -300,16 +296,12 @@ class TestProvisionWorkspace:
 
         defn = self._make_defn(tmp_path, plugins=["superpowers", "plugin-dev"])
 
-        base = tmp_path / "base-plugins"
-        base.mkdir()
-        (base / "superpowers").mkdir()
 
         ws = tmp_path / "engagements"
         ws.mkdir()
 
         path = await provision_workspace(
             engagements_root=str(ws),
-            base_plugins_root=str(base),
             engagement_id="eng2",
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="http://x",
@@ -328,16 +320,12 @@ class TestProvisionWorkspace:
         from drivers.workspace import provision_workspace
 
         defn = self._make_defn(tmp_path)
-        base_plugins_dir = tmp_path / "opt-casa-claude-plugins-base"
-        base_plugins_dir.mkdir()
-        (base_plugins_dir / "superpowers").mkdir()
 
         ws = tmp_path / "engagements"
         ws.mkdir()
 
         await provision_workspace(
             engagements_root=str(ws),
-            base_plugins_root=str(base_plugins_dir),
             engagement_id="eng-hdr-test",
             defn=defn,
             task="t", context="c",
@@ -366,7 +354,6 @@ class TestProvisionWorkspace:
         ws.mkdir()
         path = await provision_workspace(
             engagements_root=str(ws),
-            base_plugins_root=str(tmp_path),
             engagement_id="eng-perm",
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="http://x",
@@ -395,7 +382,6 @@ class TestProvisionWorkspace:
         ws.mkdir()
         path = await provision_workspace(
             engagements_root=str(ws),
-            base_plugins_root=str(tmp_path),
             engagement_id="eng-perm-mode",
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="http://x",
@@ -427,7 +413,6 @@ class TestProvisionWorkspace:
         ws.mkdir()
         path = await provision_workspace(
             engagements_root=str(ws),
-            base_plugins_root=str(tmp_path),
             engagement_id="eng-both",
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="http://x",
@@ -462,7 +447,6 @@ class TestProvisionWorkspace:
         ws.mkdir()
         path = await provision_workspace(
             engagements_root=str(ws),
-            base_plugins_root=str(tmp_path),
             engagement_id="eng-tpl-home",
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="http://x",
@@ -482,14 +466,10 @@ class TestProvisionWorkspace:
         from drivers.workspace import provision_workspace
         eng_id = "abcd1234-test-uuid-segment-padding"  # any string; treated opaque
         defn = self._make_defn(tmp_path)
-        base = tmp_path / "base-plugins"
-        base.mkdir()
-        (base / "superpowers").mkdir()
         ws = tmp_path / "engagements"
         ws.mkdir()
         path = await provision_workspace(
             engagements_root=str(ws),
-            base_plugins_root=str(base),
             engagement_id=eng_id,
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
@@ -561,7 +541,6 @@ class TestProvisionWithHooks:
         (tmp_path / "eng").mkdir()
         path = await provision_workspace(
             engagements_root=str(tmp_path / "eng"),
-            base_plugins_root=str(tmp_path),
             engagement_id="e42",
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="x",

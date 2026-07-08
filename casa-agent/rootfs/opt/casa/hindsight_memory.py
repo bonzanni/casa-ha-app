@@ -25,6 +25,11 @@ class HindsightSemanticMemory(SemanticMemory):
     def __init__(self, base_url: str, *, timeout_s: float = 20.0) -> None:
         self._base = base_url.rstrip("/")
         self._timeout = aiohttp.ClientTimeout(total=timeout_s)
+        # Lazily created inside a running event loop (tests construct this
+        # object synchronously). Reused across calls so the per-message memory
+        # round-trips share one keep-alive connection pool (L32) instead of
+        # opening + tearing down a fresh TCP connection every call.
+        self._session: aiohttp.ClientSession | None = None
 
     async def _request(
         self, method: str, path: str, payload: dict[str, Any] | None = None,
@@ -32,10 +37,18 @@ class HindsightSemanticMemory(SemanticMemory):
         """One HTTP round-trip -> parsed JSON. Raises aiohttp errors to caller
         (callers degrade to '' / log per the existing memory-call rule)."""
         url = f"{self._base}{path}"
-        async with aiohttp.ClientSession(timeout=self._timeout) as session:
-            async with session.request(method, url, json=payload) as resp:
-                resp.raise_for_status()
-                return await resp.json()
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=self._timeout)
+        async with self._session.request(method, url, json=payload) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+    async def close(self) -> None:
+        """Close the shared client session (called on shutdown so aiohttp
+        does not emit an 'Unclosed client session' warning)."""
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
 
     async def retain(
         self, bank: str, items: list[dict[str, Any]], *, async_: bool = True,

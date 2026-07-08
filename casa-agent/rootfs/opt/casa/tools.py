@@ -1618,6 +1618,12 @@ async def _finalize_engagement(
     #    nothing) — design §3, plan 3. The post-back NOTIFICATION above is the
     #    durable record for the engager; this is the structured one-shot the
     #    maintainer chose to keep.
+    # L33: retain_delegated internally runs an LLM tier-classification per item
+    # (a claude-CLI subprocess spawn + round trip) — off the turn's critical
+    # path per tier_classifier's own doctrine. Run both retains as background
+    # tasks (mirroring _run_delegated_agent) so emit_completion / cancel return
+    # promptly; the deferred-reload path below drains them first (H-1).
+    retain_tasks: list[asyncio.Task] = []
     import agent as agent_mod
     sem = getattr(agent_mod, "active_semantic_memory", None)
     if sem is not None:
@@ -1634,11 +1640,14 @@ async def _finalize_engagement(
             "artifacts": artifacts,
             "next_steps": next_steps,
         })
-        await retain_delegated(
+        bg = asyncio.create_task(retain_delegated(
             sem, origin_channel=str(engagement.origin.get("channel", "")),
             doc_prefix=f"engagement:{engagement.id}:summary",
             turns=[("assistant", summary)],
-        )
+        ))
+        _specialist_bg_tasks.add(bg)
+        bg.add_done_callback(_specialist_bg_tasks.discard)
+        retain_tasks.append(bg)
 
     # Plan 4a.1 §8.4: update .casa-meta.json with terminal status + retention_until.
     if engagement.driver == "claude_code":
@@ -1690,11 +1699,14 @@ async def _finalize_engagement(
             "last_text": text,
             "artifacts": artifacts,
         })
-        await retain_delegated(
+        bg = asyncio.create_task(retain_delegated(
             sem, origin_channel=str(engagement.origin.get("channel", "")),
             doc_prefix=f"engagement:{engagement.id}:executor_summary",
             turns=[("assistant", type_summary)],
-        )
+        ))
+        _specialist_bg_tasks.add(bg)
+        bg.add_done_callback(_specialist_bg_tasks.discard)
+        retain_tasks.append(bg)
 
     # H-1 (v0.34.0): honor deferred hard-reload now that all bus +
     # retain writes have landed. Only on outcome=completed — per
@@ -1707,6 +1719,12 @@ async def _finalize_engagement(
     deferred_pending = engagement.id in _ENGAGEMENTS_DEFERRED_HARD_RELOAD
     _ENGAGEMENTS_DEFERRED_HARD_RELOAD.discard(engagement.id)
     if outcome == "completed" and deferred_pending:
+        # H-1: the Supervisor container-kill must be sequenced AFTER the retain
+        # writes have landed. Since L33 moved the retains to background tasks,
+        # drain them here (only on this rare deferred-reload path) so the
+        # invariant "all retain writes have landed" still holds before restart.
+        if retain_tasks:
+            await asyncio.gather(*retain_tasks, return_exceptions=True)
         result = await _post_supervisor_restart()
         if result.get("status") == "error":
             logger.warning(

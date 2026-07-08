@@ -509,15 +509,10 @@ class Agent:
             executors_block = _render_executors_block(self.config.executors)
             if executors_block:
                 system_parts.append("\n" + executors_block)
-            _now = datetime.now(resolve_tz())
-            system_parts.append(
-                f"\n<current_time>\n"
-                f"{_now.isoformat(timespec='seconds')} "
-                f"({_now.strftime('%A').lower()} "
-                f"{_now.strftime('%p').lower()}, "
-                f"week {_now.isocalendar().week})\n"
-                f"</current_time>"
-            )
+            # NOTE: <current_time> is intentionally NOT part of the system
+            # prompt — a per-second timestamp in the cached prefix would
+            # invalidate Anthropic prompt caching for the whole conversation
+            # every turn (see M27). It rides on the per-turn query text below.
             system_prompt = "\n".join(system_parts)
 
             # 4. MCP servers ---------------------------------------------------
@@ -553,6 +548,21 @@ class Agent:
             )
 
             # 7. Query the SDK — retry transient faults (spec 5.2 §3). --------
+            # <current_time> rides on the per-turn query text (NOT the cached
+            # system prompt) so the agent still knows the wall-clock time to
+            # second precision without busting prompt caching (M27). user_text
+            # itself stays raw (it also feeds origin_var + the recall query).
+            _now = datetime.now(resolve_tz())
+            prompt_text = (
+                f"<current_time>\n"
+                f"{_now.isoformat(timespec='seconds')} "
+                f"({_now.strftime('%A').lower()} "
+                f"{_now.strftime('%p').lower()}, "
+                f"week {_now.isocalendar().week})\n"
+                f"</current_time>\n\n"
+                f"{user_text}"
+            )
+
             async def _attempt_sdk_turn() -> tuple[str, str | None, dict[str, int]]:
                 """Run one end-to-end SDK turn. Phase 4b: every SDK message
                 kind dispatches through sdk_logging in addition to the
@@ -571,7 +581,7 @@ class Agent:
                         options, engagement_id=None,
                     ),
                 ) as client:
-                    await client.query(user_text)
+                    await client.query(prompt_text)
                     async for sdk_msg in client.receive_response():
                         # Phase 4b dispatch — wrapped so a malformed block
                         # cannot abort the turn (logged + continued).

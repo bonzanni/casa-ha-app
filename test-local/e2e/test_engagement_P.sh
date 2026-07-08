@@ -92,7 +92,6 @@ async def main():
 
     ws = await provision_workspace(
         engagements_root="/tmp/p1-engagements",
-        base_plugins_root="/opt/casa/claude-plugins/base",
         engagement_id="p1test00000000000000000000000001",
         defn=defn,
         task="test plugin",
