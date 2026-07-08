@@ -2143,7 +2143,22 @@ async def peek_engagement_workspace(args: dict) -> dict:
         return _result({"status": "error", "kind": "bad_request",
                         "message": "engagement_id is required"})
 
+    # Security (H15): engagement_id must be a bare workspace name. Real ids
+    # are uuid4().hex; reject anything containing path separators or dots so
+    # it cannot re-root the workspace via '..' (traversal) or '/config'
+    # (absolute join). Without this the traversal guard on `path` below is
+    # useless — it anchors on the (already re-rooted) ws_root.resolve().
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", engagement_id):
+        return _result({"status": "error", "kind": "bad_request",
+                        "message": f"invalid engagement_id {engagement_id!r}"})
+
     ws_root = _Path(_ENGAGEMENTS_ROOT) / engagement_id
+    # Defense in depth: the resolved workspace must sit DIRECTLY under the
+    # engagements root — never above it or re-rooted elsewhere (also blocks
+    # symlink tricks and any future id class).
+    if ws_root.resolve().parent != _Path(_ENGAGEMENTS_ROOT).resolve():
+        return _result({"status": "error", "kind": "unknown_workspace",
+                        "message": f"no workspace for {engagement_id!r}"})
     if not ws_root.is_dir():
         return _result({"status": "error", "kind": "unknown_workspace",
                         "message": f"no workspace for {engagement_id!r}"})

@@ -597,3 +597,39 @@ class TestMessageHandlerWiring:
                 f"MessageHandler must not be wired to _handle "
                 f"(engagement-unaware). Got: {line.strip()}"
             )
+
+
+class TestForeignChatGate:
+    """H6 (v0.50.0): telegram_chat_id is an allowlist when set (DOCS.md:
+    "Telegram chat ID to restrict messages to. Leave empty to accept all
+    chats."). Pre-fix route 3 forwarded every foreign chat to the same
+    agent path, so any Telegram user who found the bot got full access."""
+
+    pytestmark = [pytest.mark.unit]
+
+    async def test_foreign_chat_dropped_when_chat_id_configured(self, fake_telegram_bot):
+        from channels.telegram import TelegramChannel
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._route_to_ellen = AsyncMock()
+        u = _mk_update(chat_id=31337, text="unlock the front door")
+        await ch.handle_update(u)
+        ch._route_to_ellen.assert_not_awaited()
+
+    async def test_all_chats_accepted_when_chat_id_empty(self, fake_telegram_bot):
+        from channels.telegram import TelegramChannel
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id="",
+                             engagement_supergroup_id=-1001)
+        ch._route_to_ellen = AsyncMock()
+        u = _mk_update(chat_id=31337, text="hello")
+        await ch.handle_update(u)
+        ch._route_to_ellen.assert_awaited_once()
+
+    async def test_configured_chat_still_routed(self, fake_telegram_bot):
+        from channels.telegram import TelegramChannel
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._route_to_ellen = AsyncMock()
+        u = _mk_update(chat_id=100, text="hi Ellen")
+        await ch.handle_update(u)
+        ch._route_to_ellen.assert_awaited_once()

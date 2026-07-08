@@ -271,6 +271,255 @@ async def test_env_var_assignment_skipped_to_argv0():
 
 
 # ------------------------------------------------------------------
+# H8 (v0.50.0): newline is a shell command separator equivalent to ';'.
+# Pre-fix _PIPELINE_SPLIT_RE never split on newlines, so the second line's
+# program landed in argv[1:] of the first and was never inspected as argv[0].
+# Per-test `unit` marker because the module-level pytestmark lacks it.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cmd", [
+    "cd /tmp\nrm -rf /config",            # LF separator
+    "cd /tmp\r\nrm -rf /config",          # CRLF separator
+    "cd /tmp\nrm -rf /config\n",          # trailing newline
+    "echo done\nssh host uptime",         # deny-listed program on line 2
+    "true\ncurl -X POST http://x",        # curl-data check on line 2
+    "cd /tmp\ndd if=/dev/zero of=/dev/sda",
+])
+async def test_newline_separated_commands_blocked(cmd):
+    data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    result = await block_dangerous_commands(data, "tid-nl", CTX)
+    assert result is not None and result != {}, f"newline bypass: {cmd!r}"
+    assert _decision(result) == "deny"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cmd", [
+    "curl \\\n -X POST http://x",   # backslash continuation: one logical command
+    "rm \\\n -rf /data",
+])
+async def test_backslash_continuation_still_blocked(cmd):
+    """Line continuations are collapsed before newline splitting, else the
+    flag tokens land in a separate piece and evade the checks."""
+    data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    result = await block_dangerous_commands(data, "tid-cont", CTX)
+    assert result is not None and result != {}, f"continuation bypass: {cmd!r}"
+
+
+@pytest.mark.unit
+async def test_multiline_safe_command_allowed():
+    data = {"tool_name": "Bash", "tool_input": {"command": "ls /tmp\necho ok"}}
+    assert await block_dangerous_commands(data, "tid-nl-safe", CTX) == {}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cmd", [
+    "ls # note\nrm -rf /data",   # '#' must not swallow the next line's rm
+    "echo ok #x\nssh root@host",
+])
+async def test_comment_does_not_hide_next_line_command(cmd):
+    """A '#' comment ends at the newline; the quote-aware tokenizer must not
+    treat '#' as a comment that swallows the (newline-collapsed) rest of the
+    command and hides a dangerous program on the following line."""
+    data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    result = await block_dangerous_commands(data, "tid-comment", CTX)
+    assert result is not None and result != {}, f"comment bypass: {cmd!r}"
+    assert _decision(result) == "deny"
+
+
+# ------------------------------------------------------------------
+# L13 (v0.50.0): the pipeline split must be quote-aware. Operators inside
+# quoted strings are data, not pipeline boundaries — pre-fix the raw-regex
+# split cut the quote in half and the dangling piece falsely denied.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cmd", [
+    'git commit -m "cleanup && rm -rf handling"',   # && inside double quotes
+    'echo "done; ssh keys rotated"',                # ; inside double quotes
+    "git commit -m 'fix: reboot | shutdown docs'",  # | inside single quotes
+    'echo "a & b" && ls',                           # quoted & plus a real separator
+])
+async def test_quoted_operators_are_not_false_positives(cmd):
+    data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    result = await block_dangerous_commands(data, "tid-quoted", CTX)
+    assert result == {}, f"benign quoted command falsely denied: {cmd!r}"
+
+
+@pytest.mark.unit
+async def test_split_pipeline_is_quote_aware():
+    from hooks import _split_pipeline
+    assert _split_pipeline('git commit -m "a && rm -rf b"') == [
+        ["git", "commit", "-m", "a && rm -rf b"]
+    ]
+    # real separators still split
+    assert _split_pipeline("true && rm -rf /data") == [["true"], ["rm", "-rf", "/data"]]
+    # redirection target must not become argv[0] of a new piece
+    assert _split_pipeline("echo hi > /tmp/ssh") == [["echo", "hi", "/tmp/ssh"]]
+
+
+# ------------------------------------------------------------------
+# v0.50.0 security-review must-fix (M16 root cause): substitution and
+# exec wrappers hand their payload to a shell without the dangerous
+# program ever appearing as argv[0] of a pipeline piece. Pre-fix,
+# `echo $(rm -rf /)`, backticks, `eval "rm -rf /"` and
+# `... | xargs rm -rf` all reached dangerous exec undetected.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cmd", [
+    "echo $(rm -rf /)",                # command substitution as an argument
+    "$(rm -rf /)",                     # bare command substitution
+    'echo "$(rm -rf /data)"',          # double-quoted substitution still executes
+    "x=`rm -rf /`",                    # backticks in an assignment
+    "`rm -rf /`",                      # bare backticks
+    'eval "rm -rf /"',                 # eval with double-quoted payload
+    "eval 'rm -rf /'",                 # eval with single-quoted payload
+    "echo / | xargs rm -rf",           # xargs execs rm with stdin-derived args
+    "find /data | xargs -n 1 rm -rf",  # xargs with a separate-argument flag
+    "true; x=$(ssh root@host id)",     # deny-listed program inside substitution
+])
+async def test_substitution_and_exec_wrappers_blocked(cmd):
+    data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    result = await block_dangerous_commands(data, "tid-subst", CTX)
+    assert result is not None and result != {}, f"substitution bypass: {cmd!r}"
+    assert _decision(result) == "deny"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cmd", [
+    "awk '{print $(NF-1)}' file.txt",      # awk field expr looks like $(...)
+    "echo `date`",                          # benign backtick substitution
+    'eval "$(ssh-agent -s)"',               # classic eval; inner prog is safe
+    "ls | xargs -n1 echo",                  # xargs wrapping a safe program
+    "find . -name '*.pyc' | xargs rm -f",   # force-only rm stays allowed
+    "echo $((1+2))",                        # arithmetic expansion, not a command
+])
+async def test_substitution_benign_allowed(cmd):
+    data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    result = await block_dangerous_commands(data, "tid-subst-ok", CTX)
+    assert result == {}, f"benign substitution falsely denied: {cmd!r}"
+
+
+# ------------------------------------------------------------------
+# v0.50.0 hardening round 2 (security-review follow-up): two in-scope
+# bypass classes in the argv scanner.
+# (1) bash's '|&' (pipe stdout+stderr) and the case-branch terminators
+#     ';&' / ';;&' are emitted by shlex's punctuation-run tokenizer as
+#     single tokens that were NOT in _PIPELINE_SEPARATORS, so the two
+#     stages merged and the RHS program never became argv[0].
+# (2) exec-wrapper prefixes (nohup, timeout, env, sudo, ...) run their
+#     tail as the real command; argv[0] was the benign wrapper and the
+#     tail was never re-scanned.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cmd", [
+    "echo x |& rm -rf /",          # pipe-both: RHS is a new simple command
+    "echo x|&rm -rf /",            # no-space spelling
+    "true ;& rm -rf /data",        # case fall-through terminator
+    "true ;;& rm -rf /data",       # case continue-matching terminator
+    "echo x |& ssh root@host",     # deny-listed program on the RHS
+])
+async def test_pipe_both_and_case_terminator_separators_blocked(cmd):
+    data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    result = await block_dangerous_commands(data, "tid-pipeboth", CTX)
+    assert result is not None and result != {}, f"separator bypass: {cmd!r}"
+    assert _decision(result) == "deny"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cmd", [
+    "nohup rm -rf /data",
+    "timeout 5 rm -rf /",
+    "timeout -k 3 5s rm -rf /data",
+    "timeout --signal=KILL 5 rm -rf /data",
+    "env rm -rf /data",
+    "env A=B rm -rf /data",
+    "env -i A=B rm -rf /data",
+    "env -u PATH rm -rf /data",
+    "stdbuf -oL rm -rf /data",
+    "setsid rm -rf /data",
+    "time rm -rf /data",
+    "nice rm -rf /data",
+    "nice -n 5 rm -rf /data",
+    "nice -n -5 rm -rf /data",
+    "ionice -c 3 rm -rf /data",
+    "chrt 50 rm -rf /data",
+    "chrt -f 50 rm -rf /data",
+    "taskset 0x1 rm -rf /data",
+    "taskset -c 0-3 rm -rf /data",
+    "unbuffer rm -rf /data",
+    "sudo rm -rf /data",
+    "sudo -u root rm -rf /data",
+    "sudo -- rm -rf /data",
+    "doas rm -rf /data",
+    "doas -u root rm -rf /data",
+    "/usr/bin/nohup rm -rf /data",      # absolute-path wrapper
+    "sudo nohup rm -rf /data",          # nested wrappers
+    "nohup timeout 5 rm -rf /",         # nested + duration positional
+    "nohup ssh root@host",              # deny-listed program behind wrapper
+    "timeout 5 curl -X POST http://x",  # curl-data check behind wrapper
+    "ls | nohup rm -rf /data",          # wrapper as a later pipeline stage
+])
+async def test_exec_wrapper_prefixes_unwrapped(cmd):
+    data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    result = await block_dangerous_commands(data, "tid-wrapper", CTX)
+    assert result is not None and result != {}, f"wrapper bypass: {cmd!r}"
+    assert _decision(result) == "deny"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cmd", [
+    "nohup python server.py",
+    "timeout 5 curl https://example.com",   # GET behind a wrapper stays allowed
+    "env FOO=bar make build",
+    "nice -n 10 tar -xf a.tar",
+    "sudo -u casa ls /data",
+    "time make test",
+    "timeout 5 rm -r /tmp/x",               # recursive-only rm stays allowed
+    "env",                                  # bare wrapper, no tail
+])
+async def test_exec_wrapper_benign_tail_allowed(cmd):
+    data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    result = await block_dangerous_commands(data, "tid-wrapper-ok", CTX)
+    assert result == {}, f"benign wrapper falsely denied: {cmd!r}"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cmd", [
+    "echo hi > /tmp/out",
+    "echo hi >> /tmp/out",
+    "sort < /tmp/in",
+    "echo hi 2>&1",
+    "ls &> /tmp/out",        # redirect-both is a REDIRECTION, not a pipe
+    "echo hi >& /tmp/out",
+])
+async def test_true_redirections_do_not_split_or_deny(cmd):
+    data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    result = await block_dangerous_commands(data, "tid-redir", CTX)
+    assert result == {}, f"redirection falsely denied: {cmd!r}"
+
+
+@pytest.mark.unit
+async def test_split_pipeline_pipe_both_and_case_terminators():
+    from hooks import _split_pipeline
+    assert _split_pipeline("echo x |& rm -rf /") == [
+        ["echo", "x"], ["rm", "-rf", "/"]
+    ]
+    assert _split_pipeline("a ;& b") == [["a"], ["b"]]
+    assert _split_pipeline("a ;;& b") == [["a"], ["b"]]
+    # True redirections stay merged: '&>' / '>&' are redirections
+    # ('|&' is pipe-both — NOT a redirection).
+    assert _split_pipeline("ls &> /tmp/o") == [["ls", "/tmp/o"]]
+    assert _split_pipeline("echo hi 2>&1") == [["echo", "hi", "2", "1"]]
+
+
+# ------------------------------------------------------------------
 # _normalize_path — L-2 (v0.34.2): single-slash absolute paths
 # ------------------------------------------------------------------
 
@@ -289,6 +538,35 @@ class TestNormalizePathSingleSlash:
     def test_handles_relative_path_unchanged(self):
         from hooks import _normalize_path
         assert _normalize_path("foo/bar") == "foo/bar"
+
+
+# ------------------------------------------------------------------
+# v0.50.0 security-review must-fix: _normalize_path must collapse
+# redundant slashes. PurePosixPath preserves a POSIX-special leading
+# '//' as a distinct root, so '//config/agents/ellen' normalized to
+# the malformed '///config/agents/ellen' and slipped past every
+# prefix check (casa_config_guard forbid_write + _deletes_resident),
+# even though the Linux kernel resolves '//' as '/'.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestNormalizePathSlashCollapse:
+    async def test_double_leading_slash_collapsed(self):
+        from hooks import _normalize_path
+        assert _normalize_path("//x") == "/x"
+
+    async def test_triple_leading_slash_collapsed(self):
+        from hooks import _normalize_path
+        assert _normalize_path("///config/agents/ellen") == "/config/agents/ellen"
+
+    async def test_leading_and_interior_double_slash_collapsed(self):
+        from hooks import _normalize_path
+        assert _normalize_path("//config/agents//ellen") == "/config/agents/ellen"
+
+    async def test_collapse_composes_with_dotdot(self):
+        from hooks import _normalize_path
+        assert _normalize_path("//config//agents/x/../ellen") == "/config/agents/ellen"
 
 
 # ------------------------------------------------------------------

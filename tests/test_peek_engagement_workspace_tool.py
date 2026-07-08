@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 def _seed(tmp_path: Path, eid: str):
@@ -99,3 +99,50 @@ async def test_peek_unknown_engagement(tmp_path, monkeypatch):
     payload = json.loads(result["content"][0]["text"])
     assert payload["status"] == "error"
     assert payload["kind"] == "unknown_workspace"
+
+
+async def test_peek_rejects_engagement_id_traversal(tmp_path, monkeypatch):
+    """H15: engagement_id must not re-root the workspace. A secret seeded
+    ABOVE the engagements root must never leak through '..', an absolute
+    re-root, or an empty-path tree of a traversed location."""
+    import tools as tools_mod
+    from tools import peek_engagement_workspace
+
+    # layout: tmp/data/engagements/eng1 (root), tmp/data/options.json (secret)
+    data = tmp_path / "data"
+    eng = data / "engagements"
+    (eng / "eng1").mkdir(parents=True)
+    (data / "options.json").write_text(
+        '{"telegram_bot_token":"SECRET"}', encoding="utf-8")
+    monkeypatch.setattr(tools_mod, "_ENGAGEMENTS_ROOT", str(eng),
+                        raising=False)
+
+    # dot-dot traversal into /data
+    r = await peek_engagement_workspace.handler(
+        {"engagement_id": "..", "path": "options.json"})
+    p = json.loads(r["content"][0]["text"])
+    assert p["status"] == "error"
+    assert "SECRET" not in json.dumps(p)
+
+    # nested dot-dot traversal
+    r = await peek_engagement_workspace.handler(
+        {"engagement_id": "../../config", "path": "plugin-env.conf"})
+    p = json.loads(r["content"][0]["text"])
+    assert p["status"] == "error"
+
+    # absolute re-root
+    r = await peek_engagement_workspace.handler(
+        {"engagement_id": str(data), "path": "options.json"})
+    p = json.loads(r["content"][0]["text"])
+    assert p["status"] == "error"
+
+    # empty-path tree of a traversed location must not leak
+    r = await peek_engagement_workspace.handler({"engagement_id": ".."})
+    p = json.loads(r["content"][0]["text"])
+    assert p["status"] == "error"
+
+    # legit id still works
+    (eng / "eng1" / "a.txt").write_text("hello", encoding="utf-8")
+    r = await peek_engagement_workspace.handler(
+        {"engagement_id": "eng1", "path": "a.txt"})
+    assert json.loads(r["content"][0]["text"])["contents"] == "hello"
