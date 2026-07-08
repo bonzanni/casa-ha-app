@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.57.0"
+version: "0.57.1"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 init: false
@@ -20,7 +20,6 @@ ports_description:
 map:
   - addon_config:rw
 options:
-  # Secrets
   # Network
   public_url: ""
 
