@@ -292,3 +292,48 @@ def test_install_cmd_argv_list_runs(tmp_path: Path, fixture_tarball) -> None:
         assert result.ok
     finally:
         server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# H13 — the download must be bounded by a socket timeout (was urlretrieve with
+# the global default timeout of None → an unresponsive server hung the whole
+# casa-main event loop forever).
+# ---------------------------------------------------------------------------
+
+def test_download_times_out_on_stalled_server(tmp_path: Path) -> None:
+    """A server that accepts the TCP connection but never sends a response
+    must not hang install_tarball. Pre-fix (urlretrieve) used the global
+    default socket timeout (None) and this test hung forever."""
+    import socket
+    import time
+    import urllib.error
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def _accept_and_stall() -> None:
+        conn, _ = srv.accept()
+        try:
+            conn.recv(65536)   # consume the HTTP request, then go silent
+            time.sleep(30)     # stall far past the 1s timeout below
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    threading.Thread(target=_accept_and_stall, daemon=True).start()
+    start = time.monotonic()
+    with pytest.raises((TimeoutError, OSError, urllib.error.URLError)):
+        install_tarball(
+            plugin_name="stall",
+            spec={"type": "tarball",
+                  "url": f"http://127.0.0.1:{port}/x.tgz",
+                  "sha256": "0" * 64, "extract": ".", "verify_bin": "x"},
+            tools_root=tmp_path / "tools",
+            timeout=1,
+        )
+    elapsed = time.monotonic() - start
+    assert elapsed < 10, f"download ignored timeout (took {elapsed:.1f}s)"
+    srv.close()

@@ -449,7 +449,9 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
 
     prompt = f"{delegation_context}\n\n{memory_block}{body_tail}"
 
-    options = _build_specialist_options(cfg)
+    # Off-loop: _build_specialist_options shells out to `claude plugin list`
+    # (build_sdk_plugins) — keep it off the shared event loop (H2/M20).
+    options = await asyncio.to_thread(_build_specialist_options, cfg)
     text = ""
     token = agent_mod.origin_var.set(child_origin)
     try:
@@ -686,8 +688,8 @@ async def delegate_to_agent(args: dict) -> dict:
         except Exception as exc:  # noqa: BLE001
             logger.warning("set_channel_state(active) failed: %s", exc)
 
-        # Build options + start driver
-        options = _build_specialist_options(cfg)
+        # Build options + start driver (off-loop: build_sdk_plugins shell-out).
+        options = await asyncio.to_thread(_build_specialist_options, cfg)
         # Augment allowed tools (additive) with query_engager + emit_completion
         injected = list(options.allowed_tools or [])
         for t in ("mcp__casa-framework__query_engager",
@@ -1403,7 +1405,9 @@ async def engage_executor(args: dict) -> dict:
                 "message": str(exc),
             })
     else:
-        options = _build_executor_options(defn)
+        # Off-loop: _build_executor_options shells out to `claude plugin list`
+        # (build_sdk_plugins) and reads hooks.yaml — keep it off the loop.
+        options = await asyncio.to_thread(_build_executor_options, defn)
         injected = list(options.allowed_tools or [])
         for t in ("mcp__casa-framework__query_engager",
                   "mcp__casa-framework__emit_completion"):
@@ -1982,21 +1986,14 @@ async def casa_reload_triggers(args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@tool(
-    "list_engagement_workspaces",
-    "List engagement workspaces under /data/engagements with status + size. "
-    "Optional status filter. Truncates at 100 entries.",
-    {"status": str},
-)
-async def list_engagement_workspaces(args: dict) -> dict:
+def _scan_engagement_workspaces(root: str, status_filter: str | None) -> list[dict]:
+    """Blocking scan of /data/engagements — must run via asyncio.to_thread.
+
+    L27: computes a du-style recursive size per workspace (os.walk + per-file
+    os.stat). claude_code workspaces can hold cloned repos / node_modules with
+    tens of thousands of files, so this runs off the shared event loop.
+    """
     from drivers.workspace import load_casa_meta
-
-    status_filter = (args.get("status") or "").strip() or None
-    root = _ENGAGEMENTS_ROOT
-
-    if not os.path.isdir(root):
-        return _result({"workspaces": [], "truncated": False, "total": 0})
-
     entries: list[dict] = []
     for ent in sorted(os.scandir(root), key=lambda e: e.name):
         if not ent.is_dir():
@@ -2020,6 +2017,23 @@ async def list_engagement_workspaces(args: dict) -> dict:
             "retention_until": meta.get("retention_until"),
             "size_bytes": size_bytes,
         })
+    return entries
+
+
+@tool(
+    "list_engagement_workspaces",
+    "List engagement workspaces under /data/engagements with status + size. "
+    "Optional status filter. Truncates at 100 entries.",
+    {"status": str},
+)
+async def list_engagement_workspaces(args: dict) -> dict:
+    status_filter = (args.get("status") or "").strip() or None
+    root = _ENGAGEMENTS_ROOT
+
+    if not os.path.isdir(root):
+        return _result({"workspaces": [], "truncated": False, "total": 0})
+
+    entries = await asyncio.to_thread(_scan_engagement_workspaces, root, status_filter)
 
     total = len(entries)
     truncated = total > 100
@@ -2259,6 +2273,13 @@ def _tool_marketplace_list_plugins() -> dict:
 _INSTALL_LOCK = "/config/cc-home/.claude/plugins/.install.lock"
 _AGENT_HOME_ROOT = Path("/config/agent-home")
 
+# H16: serialize the mutating plugin/marketplace tools once their blocking
+# bodies move off the loop via asyncio.to_thread. On the single event loop
+# these handlers were previously mutually exclusive for free (they never
+# awaited mid-body); the lock preserves that invariant for concurrent
+# marketplace-file / manifest writes. Read-only vault helpers don't take it.
+_PLUGIN_TOOLS_LOCK = asyncio.Lock()
+
 
 def _tool_install_casa_plugin(
     *,
@@ -2354,15 +2375,17 @@ def _tool_install_casa_plugin(
     },
 )
 async def marketplace_add_plugin(args: dict) -> dict:
-    return _result(_tool_marketplace_add_plugin(
-        plugin_name=args["plugin_name"],
-        repo_url=args["repo_url"],
-        ref=args["ref"],
-        description=args["description"],
-        category=args.get("category", "productivity"),
-        version=args.get("version"),
-        casa_system_requirements=args.get("casa_system_requirements"),
-    ))
+    async with _PLUGIN_TOOLS_LOCK:
+        return _result(await asyncio.to_thread(
+            _tool_marketplace_add_plugin,
+            plugin_name=args["plugin_name"],
+            repo_url=args["repo_url"],
+            ref=args["ref"],
+            description=args["description"],
+            category=args.get("category", "productivity"),
+            version=args.get("version"),
+            casa_system_requirements=args.get("casa_system_requirements"),
+        ))
 
 
 @tool(
@@ -2371,7 +2394,10 @@ async def marketplace_add_plugin(args: dict) -> dict:
     {"plugin_name": str},
 )
 async def marketplace_remove_plugin(args: dict) -> dict:
-    return _result(_tool_marketplace_remove_plugin(plugin_name=args["plugin_name"]))
+    async with _PLUGIN_TOOLS_LOCK:
+        return _result(await asyncio.to_thread(
+            _tool_marketplace_remove_plugin, plugin_name=args["plugin_name"],
+        ))
 
 
 @tool(
@@ -2380,10 +2406,12 @@ async def marketplace_remove_plugin(args: dict) -> dict:
     {"plugin_name": str, "new_ref": str},
 )
 async def marketplace_update_plugin(args: dict) -> dict:
-    return _result(_tool_marketplace_update_plugin(
-        plugin_name=args["plugin_name"],
-        new_ref=args["new_ref"],
-    ))
+    async with _PLUGIN_TOOLS_LOCK:
+        return _result(await asyncio.to_thread(
+            _tool_marketplace_update_plugin,
+            plugin_name=args["plugin_name"],
+            new_ref=args["new_ref"],
+        ))
 
 
 @tool(
@@ -2404,10 +2432,12 @@ async def marketplace_list_plugins(args: dict) -> dict:
     },
 )
 async def install_casa_plugin(args: dict) -> dict:
-    return _result(_tool_install_casa_plugin(
-        plugin_name=args["plugin_name"],
-        targets=args["targets"],
-    ))
+    async with _PLUGIN_TOOLS_LOCK:
+        return _result(await asyncio.to_thread(
+            _tool_install_casa_plugin,
+            plugin_name=args["plugin_name"],
+            targets=args["targets"],
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -2556,10 +2586,12 @@ def _tool_get_item_fields(*, item: str, vault: str = "") -> dict:
     {"plugin_name": str, "targets": list},
 )
 async def uninstall_casa_plugin(args: dict) -> dict:
-    return _result(_tool_uninstall_casa_plugin(
-        plugin_name=args["plugin_name"],
-        targets=args.get("targets") or None,
-    ))
+    async with _PLUGIN_TOOLS_LOCK:
+        return _result(await asyncio.to_thread(
+            _tool_uninstall_casa_plugin,
+            plugin_name=args["plugin_name"],
+            targets=args.get("targets") or None,
+        ))
 
 
 @tool(
@@ -2599,7 +2631,8 @@ async def set_plugin_env_reference(args: dict) -> dict:
     {"query": str, "vault": str},
 )
 async def list_vault_items(args: dict) -> dict:
-    return _result(_tool_list_vault_items(
+    return _result(await asyncio.to_thread(
+        _tool_list_vault_items,
         query=args.get("query", ""),
         vault=args.get("vault", ""),
     ))
@@ -2611,7 +2644,8 @@ async def list_vault_items(args: dict) -> dict:
     {"item": str, "vault": str},
 )
 async def get_item_fields(args: dict) -> dict:
-    return _result(_tool_get_item_fields(
+    return _result(await asyncio.to_thread(
+        _tool_get_item_fields,
         item=args["item"],
         vault=args.get("vault", ""),
     ))

@@ -383,7 +383,14 @@ class TestTimeoutDegrades:
         _FakeSpecialistClient.reset(response="late result", delay=0.1)
         monkeypatch.setattr(tools_mod, "_SYNC_WAIT_TIMEOUT_S", 0.02)
 
-        with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
+        # Keep both patches active across the NOTIFICATION poll: post-fix the
+        # builder runs via asyncio.to_thread, so the handler returns `pending`
+        # before the background _run_delegated_agent task constructs the
+        # client. If the patch reverted here the task would build the REAL
+        # ClaudeSDKClient (and shell out via build_sdk_plugins) and never post
+        # the ok-NOTIFICATION. Hold the with-block open over the poll loop.
+        with patch("tools.ClaudeSDKClient", _FakeSpecialistClient), \
+             patch("tools.build_sdk_plugins", return_value=[]):
             await _with_origin(
                 delegate_to_agent.handler({
                     "agent": "finance", "task": "x", "context": "",
@@ -392,19 +399,19 @@ class TestTimeoutDegrades:
                 _origin(),
             )
 
-        # Poll the queue briefly for the NOTIFICATION.
-        found = None
-        for _ in range(50):
-            if not bus.queues["assistant"].empty():
-                _pri, _seq, m = await bus.queues["assistant"].get()
-                if m.type == MessageType.NOTIFICATION:
-                    found = m
-                    break
-            await asyncio.sleep(0.02)
-        assert found is not None
-        assert isinstance(found.content, DelegationComplete)
-        assert found.content.status == "ok"
-        assert found.content.text == "late result"
+            # Poll the queue briefly for the NOTIFICATION.
+            found = None
+            for _ in range(50):
+                if not bus.queues["assistant"].empty():
+                    _pri, _seq, m = await bus.queues["assistant"].get()
+                    if m.type == MessageType.NOTIFICATION:
+                        found = m
+                        break
+                await asyncio.sleep(0.02)
+            assert found is not None
+            assert isinstance(found.content, DelegationComplete)
+            assert found.content.status == "ok"
+            assert found.content.text == "late result"
 
 
 # ---------------------------------------------------------------------------

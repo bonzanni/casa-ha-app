@@ -396,7 +396,11 @@ def make_commit_size_guard_hook(*, max_files: int) -> HookCallback:
         tool_name = input_data.get("tool_name", "")
         if tool_name not in ("Write", "Edit"):
             return {}
-        count = _git_porcelain_count()
+        # M17: `git status --porcelain` is a blocking subprocess (up to 5s).
+        # Offload it so a Write/Edit on any agent doesn't freeze the shared
+        # event loop. _git_porcelain_count stays a sync module-level function
+        # so existing patch("hooks._git_porcelain_count", ...) tests still work.
+        count = await asyncio.to_thread(_git_porcelain_count)
         if count > max_files:
             return _deny(
                 f"commit_size_guard: {count} files already uncommitted "
@@ -437,6 +441,44 @@ _NONBASELINE_BIN_RE = re.compile(
     r"/usr/(local/)?bin/(terraform|kubectl|aws|ffmpeg|helm|docker|packer|ansible)\b"
 )
 
+# M28: anti-patterns live in small text files; cap the per-file read so a
+# multi-hundred-MB asset (or the read of a file that matches no check) can't
+# blow up memory or the scan time.
+_MAX_SCAN_BYTES = 262_144  # 256 KiB
+
+
+def _scan_tree_for_anti_patterns(cwd: Path) -> list[str]:
+    """Synchronous §2.0 anti-pattern tree scan — run via asyncio.to_thread.
+
+    Filters by filename BEFORE opening a file, so files that can match no
+    check (e.g. binaries, images) are never read. Reads are capped at
+    ``_MAX_SCAN_BYTES``; a pattern placed beyond that offset is not flagged
+    (an accepted tradeoff — anti-patterns live near the top of small files).
+    """
+    findings: list[str] = []
+    for root, dirs, files in os.walk(cwd):
+        # Skip VCS + deps.
+        dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "__pycache__")]
+        for f in files:
+            check_readme = f.lower() == "readme.md"
+            check_apt = f.endswith((".sh", ".bash"))
+            check_bin = f.endswith((".py", ".js", ".ts", ".sh"))
+            if not (check_readme or check_apt or check_bin):
+                continue  # filename can match no check — do not read it
+            p = Path(root) / f
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                    content = fh.read(_MAX_SCAN_BYTES)
+            except OSError:
+                continue
+            if check_readme and _PLEASE_INSTALL_RE.search(content):
+                findings.append(f"{p.relative_to(cwd)}: 'please install X manually'")
+            if check_apt and _APT_CMD_RE.search(content):
+                findings.append(f"{p.relative_to(cwd)}: apt/yum install")
+            if check_bin and _NONBASELINE_BIN_RE.search(content):
+                findings.append(f"{p.relative_to(cwd)}: hardcoded non-baseline binary path")
+    return findings
+
 
 def make_self_containment_guard() -> HookCallback:
     """Pre-push grep for §2.0 self-containment anti-patterns."""
@@ -456,22 +498,8 @@ def make_self_containment_guard() -> HookCallback:
         if not cwd.is_dir():
             return {}
 
-        findings: list[str] = []
-        for root, dirs, files in os.walk(cwd):
-            # Skip VCS + deps.
-            dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "__pycache__")]
-            for f in files:
-                p = Path(root) / f
-                try:
-                    content = p.read_text(encoding="utf-8", errors="ignore")
-                except OSError:
-                    continue
-                if f.lower() == "readme.md" and _PLEASE_INSTALL_RE.search(content):
-                    findings.append(f"{p.relative_to(cwd)}: 'please install X manually'")
-                if f.endswith((".sh", ".bash")) and _APT_CMD_RE.search(content):
-                    findings.append(f"{p.relative_to(cwd)}: apt/yum install")
-                if f.endswith((".py", ".js", ".ts", ".sh")) and _NONBASELINE_BIN_RE.search(content):
-                    findings.append(f"{p.relative_to(cwd)}: hardcoded non-baseline binary path")
+        # M28: the walk+read blocks the shared event loop — run it off-loop.
+        findings = await asyncio.to_thread(_scan_tree_for_anti_patterns, cwd)
 
         if findings:
             return _deny(
