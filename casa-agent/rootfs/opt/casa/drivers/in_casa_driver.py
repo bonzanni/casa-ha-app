@@ -108,7 +108,23 @@ class InCasaDriver(DriverProtocol):
                 "Engagement %s driver=in_casa client opened",
                 engagement.id[:8],
             )
-            await self._deliver_turn(engagement, prompt)
+            try:
+                await self._deliver_turn(engagement, prompt)
+            except Exception:
+                # M14: Bug-13-style rollback (claude_code got this in v0.14.6).
+                # engage_executor marks the record error, but error records are
+                # excluded from active_and_idle() so no sweeper ever tears this
+                # client down, and the topic stops routing — the opened claude
+                # subprocess leaks until Casa restarts. Close + deregister here,
+                # then re-raise so the caller's mark_error path still runs.
+                # cancel() pops _clients/_ctx_stack/_locks and swallows close
+                # errors, so the original exception is never masked.
+                logger.warning(
+                    "Engagement %s first turn failed; rolling back client",
+                    engagement.id[:8],
+                )
+                await self.cancel(engagement)
+                raise
         finally:
             # Clear from the parent task. The SDK inner task already
             # captured its own snapshot at __aenter__ time and is

@@ -175,21 +175,47 @@ class SessionRegistry:
             await self._save_locked()
             return True
 
-    async def finish_save(self, channel_key: str) -> None:
+    async def finish_save(
+        self, channel_key: str, sdk_session_id: str | None = None,
+    ) -> None:
         """Remove the entry after a successful retain (the session is now
-        long-term). Idempotent."""
+        long-term) — but only if it still belongs to the session that was
+        saved. If register() replaced the entry with a NEW sid mid-save (a
+        user turn landed during a slow reaper save), leave the new
+        registration intact; otherwise we would silently delete a fresh
+        session's pointer (M24). Passing ``sdk_session_id=None`` preserves the
+        old unconditional behavior. Idempotent."""
         async with self._lock:
+            entry = self._data.get(channel_key)
+            if entry is None:
+                return
+            if (
+                sdk_session_id is not None
+                and entry.get("sdk_session_id") != sdk_session_id
+            ):
+                return  # re-registered by a newer session; leave it alone
             self._data.pop(channel_key, None)
             await self._save_locked()
 
-    async def clear_save_claim(self, channel_key: str) -> None:
+    async def clear_save_claim(
+        self, channel_key: str, sdk_session_id: str | None = None,
+    ) -> None:
         """Release a save claim after a FAILED retain so the next reaper cycle
-        retries. Keeps the entry."""
+        retries. Keeps the entry. Like ``finish_save``, only clears the claim
+        if the entry still belongs to the saved session — a newer
+        registration (which already wiped ``consolidated_at``) is left
+        untouched (M24)."""
         async with self._lock:
             entry = self._data.get(channel_key)
-            if entry is not None and "consolidated_at" in entry:
-                entry.pop("consolidated_at", None)
-                await self._save_locked()
+            if entry is None or "consolidated_at" not in entry:
+                return
+            if (
+                sdk_session_id is not None
+                and entry.get("sdk_session_id") != sdk_session_id
+            ):
+                return
+            entry.pop("consolidated_at", None)
+            await self._save_locked()
 
     async def save(self) -> None:
         """Public save: acquires the lock.

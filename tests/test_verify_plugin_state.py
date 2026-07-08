@@ -152,3 +152,29 @@ def test_verify_plugin_secrets_backcompat(plugin_layout, monkeypatch) -> None:
 
     assert "secrets" in result
     assert isinstance(result["secrets"], list)
+
+
+def test_verify_dangling_symlink_is_missing(plugin_layout, monkeypatch) -> None:
+    """M23: verify_plugin_state must report a dangling verify_bin symlink as
+    missing (rolled-back install), not mask it as ready via is_symlink()."""
+    from tools import _tool_verify_plugin_state
+    from system_requirements.manifest import add_plugin_entry as add_manifest_entry
+
+    add_manifest_entry({
+        "name": "face-rec",
+        "winning_strategy": "tarball",
+        "install_dir": "/t/face-rec-0.1.0",
+        "verify_bin": "fakebin",
+        "declared_at": "2026-04-24T00:00:00Z",
+    })
+    # Dangling symlink: target directory was rmtree'd by a rollback.
+    (plugin_layout["tools_bin"] / "fakebin").symlink_to(
+        plugin_layout["tmp_path"] / "gone" / "fakebin")
+
+    result = _tool_verify_plugin_state(
+        plugin_name="face-rec",
+        _tools_bin=plugin_layout["tools_bin"],
+        _cache_root=plugin_layout["cache_root"],
+    )
+    assert result["ready"] is False
+    assert any(t["status"] == "missing" for t in result["tools"])

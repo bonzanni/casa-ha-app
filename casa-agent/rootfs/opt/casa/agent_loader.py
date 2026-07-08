@@ -207,6 +207,189 @@ def validate_config_repo(config_dir: str) -> list[str]:
             except LoadError as exc:
                 errors.append(str(exc))
 
+    # --- Boot-parity pass (M5) --------------------------------------------
+    # The per-file schema walks above cannot see the CROSS-FILE invariants
+    # boot's load_all_agents enforces and FATALs on: character.yaml role ==
+    # directory name, the tier file-set rules (unknown/forbidden files),
+    # executors.yaml assistant-only, and delegates.yaml -> the delegate MCP
+    # tool in runtime tools.allowed. A commit can pass every per-file schema
+    # yet crash-loop the add-on on the next boot (e.g. a copied resident dir
+    # still declaring role: assistant). Exercise the real resident loader so
+    # the gate refuses those commits too.
+    if os.path.isdir(agents_root):
+        from policies import load_policies  # local import avoids a cycle
+
+        # Faithfully replay boot's policy load. casa_core.main (line ~1245)
+        # runs, UNGUARDED and before load_all_agents:
+        #     policy_lib = load_policies(policies/disclosure.yaml)   # RAISES
+        #     role_configs = load_all_agents(agents_dir, policies=policy_lib)
+        # A MISSING policy file makes load_policies raise PolicyError
+        # (policies.py:68-69) and crash-loops the add-on; the policies/
+        # schema walk above cannot see that because it guards on isfile.
+        # Report the absence here so the gate refuses such a commit. A
+        # MALFORMED policy file, by contrast, is already surfaced by the
+        # schema walk, so don't double-count it.
+        policy_lib = None
+        policy_path = os.path.join(config_dir, "policies", "disclosure.yaml")
+        if os.path.isfile(policy_path):
+            try:
+                policy_lib = load_policies(policy_path)
+            except Exception:
+                # A malformed policy library is already surfaced by the
+                # policies/ schema walk above; don't double-count it here.
+                policy_lib = None
+        else:
+            errors.append(
+                f"policies/disclosure.yaml not found at {policy_path} — "
+                f"boot's load_policies raises PolicyError and crash-loops "
+                f"the add-on when a config carrying agents is committed "
+                f"without a policy library"
+            )
+        resident_configs: dict[str, AgentConfig] = {}
+        resident_dir_names: set[str] = set()
+        for entry in sorted(os.listdir(agents_root)):
+            # Mirror load_all_agents' skip set exactly (specialists/executors
+            # are loaded on isolated, boot-non-fatal paths; dotdirs skipped).
+            if entry.startswith(".") or entry in ("specialists", "executors"):
+                continue
+            path = os.path.join(agents_root, entry)
+            if not os.path.isdir(path):
+                # Boot's load_all_agents RAISES on any non-directory at
+                # agents/ root (each agent is a directory); a silent skip
+                # here would let such a commit pass the gate yet crash-loop
+                # the add-on on next boot. Report it, matching boot's fatal.
+                errors.append(
+                    f"unexpected non-directory at agents/{entry} — each "
+                    f"agent is a directory; flat YAML files are no longer "
+                    f"supported"
+                )
+                continue
+            # Directory presence == boot role presence (role == dir name is
+            # enforced on load). Tracked before the load attempt so an
+            # agents/assistant/ dir that FAILS to load still counts as "an
+            # assistant dir exists" — its own load error is authoritative, and
+            # the primary-assistant check below must not pile a derivative
+            # "no assistant" onto it.
+            resident_dir_names.add(entry)
+            try:
+                cfg = load_agent_from_dir(path, policies=policy_lib)
+            except Exception as exc:
+                # Broad by design (mandate: 'a validation error must be
+                # reported, never itself crash the gate'). load_agent_from_dir
+                # raises NON-LoadError on 100%-schema-valid input the boot
+                # loader ALSO fatals on: resolve_model raises ValueError for an
+                # unknown runtime.yaml model shortname (a free string), and
+                # _compose_prompt -> policies.resolve raises PolicyError when a
+                # resident disclosure.yaml names a policy absent from
+                # policies/disclosure.yaml (also a free string). Catching only
+                # LoadError here let those escape and crash the gate; mirror the
+                # defensive except-Exception block used for the registry build
+                # below so every boot-fatal is reported instead.
+                msg = str(exc)
+                # When no policy library is present, the ROOT cause (a missing
+                # or malformed policies/disclosure.yaml) is already reported
+                # above — as the "not found" error or by the policies/ schema
+                # walk. Each resident with a disclosure.yaml then raises a
+                # derivative "no PolicyLibrary" compose cascade; suppress only
+                # that derivative so the single authoritative error stands
+                # without N duplicates.
+                if policy_lib is None and "no PolicyLibrary was passed" in msg:
+                    continue
+                if msg not in errors:
+                    errors.append(msg)
+                continue
+            resident_configs[cfg.role] = cfg
+
+        # Primary-assistant invariant (M5). casa_core.main (line ~1306) RAISES
+        # RuntimeError "No agent with role 'assistant' found ... Casa cannot
+        # start without a primary assistant" when role_configs — the resident
+        # set load_all_agents returns — holds no 'assistant'. A committed tree
+        # whose only resident is non-assistant (e.g. butler), whose agents/ dir
+        # is empty, or whose sole assistant-ish entry is a DISABLED specialist
+        # (dropped before the registry) passes every per-file schema check yet
+        # crash-loops the add-on here. Reuse the resident dir set the parity
+        # loop already walked instead of re-deriving with a different skip set.
+        # Key on directory presence, not resident_configs: an agents/assistant/
+        # dir that failed to load is reported by its own authoritative error
+        # above, and keying on the load result would pile a derivative "no
+        # assistant" onto it. Suppress when policy_lib is None — a
+        # missing/malformed policy library is the single authoritative
+        # boot-crash there (reported above) and makes every disclosure-bearing
+        # resident fail to load as a derivative of it.
+        #
+        # Scope boundary (Finding 2): validate_config_repo sees ONLY the
+        # committed tree under config_dir. It does NOT — and cannot — simulate
+        # config_sync's post-commit re-injection of image-owned defaults. E.g.
+        # a committed deletion of the image-owned agents/assistant/delegates.yaml
+        # is internally valid here (no delegates -> the delegate MCP tool is not
+        # required), and the boot mismatch surfaces only because config_sync
+        # restores that image-owned file after the commit. That reconciler
+        # backstop lives in config_sync, not in this gate.
+        if policy_lib is not None and "assistant" not in resident_dir_names:
+            errors.append(
+                "no enabled resident with role 'assistant' — Casa cannot boot "
+                "without a primary assistant (agents/assistant/ must exist and "
+                "declare role: assistant in runtime.yaml)"
+            )
+
+        # Cross-tier role-registry parity. After load_all_agents, casa_core.main
+        # (line ~1280) builds the merged role→config registry, UNGUARDED:
+        #     _build_role_registry(residents=role_configs,
+        #                          specialists=specialist_registry.all_configs())
+        # which RAISES ValueError 'duplicate role(s) across residents and
+        # specialists' when a role exists in BOTH tiers (e.g. an agents/<r>/
+        # resident plus an enabled agents/specialists/<r>/). That build runs
+        # after every try/except in main(), so the ValueError is uncaught and
+        # crash-loops the add-on; config_sync does NOT heal it (both dirs are
+        # kept). The default image ships agents/specialists/finance/, so a
+        # configurator creating a finance resident trips it. Replay the real
+        # specialist load + registry build so the gate refuses the collision.
+        specialist_configs: dict[str, AgentConfig] = {}
+        specialists_dir = os.path.join(agents_root, "specialists")
+        try:
+            spec_found, _spec_failed = load_all_specialists(specialists_dir)
+        except LoadError:
+            # A collection-level specialist error (non-directory under
+            # specialists/) is boot-non-fatal: SpecialistRegistry.load catches
+            # it and boots with zero specialists. Mirror that — do not report,
+            # and treat the enabled specialist set as empty.
+            spec_found = {}
+        for role, spec_cfg in spec_found.items():
+            # Mirror SpecialistRegistry.load's enablement + Tier-2 shape filter:
+            # disabled or tier-2-invalid specialists never reach all_configs(),
+            # so they cannot collide at boot. Over-reporting them would falsely
+            # refuse a bootable repo.
+            if not spec_cfg.enabled:
+                continue
+            if spec_cfg.channels:
+                continue
+            if spec_cfg.session.strategy != "ephemeral":
+                continue
+            specialist_configs[role] = spec_cfg
+
+        try:
+            from casa_core import _build_role_registry  # local: heavy module
+            _build_role_registry(
+                residents=resident_configs, specialists=specialist_configs,
+            )
+        except ValueError as exc:
+            # Duplicate role across the two tiers — boot's uncaught crash.
+            msg = str(exc)
+            if msg not in errors:
+                errors.append(msg)
+        except Exception:
+            # Defensive: the gate must NEVER crash. If casa_core cannot be
+            # imported in this context, fall back to the pure overlap invariant
+            # so the collision is still caught.
+            overlap = sorted(set(resident_configs) & set(specialist_configs))
+            if overlap:
+                msg = (
+                    f"duplicate role(s) across residents and specialists: "
+                    f"{overlap} — each role must be unique"
+                )
+                if msg not in errors:
+                    errors.append(msg)
+
     return errors
 
 

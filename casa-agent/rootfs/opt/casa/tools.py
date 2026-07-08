@@ -2258,7 +2258,16 @@ async def peek_engagement_workspace(args: dict) -> dict:
     if max_bytes < 1:
         max_bytes = _PEEK_MAX_DEFAULT
 
-    contents = full.read_text(errors="replace")[:max_bytes]
+    def _read_prefix() -> str:
+        # M26: read only the capped byte prefix — never load the whole file
+        # into RAM (a multi-GB workspace log would OOM the container). Cap is
+        # in BYTES; a multibyte char split at the boundary decodes to a
+        # trailing U+FFFD, which is acceptable for a peek tool.
+        with open(full, "rb") as fh:
+            data = fh.read(max_bytes)
+        return data.decode("utf-8", errors="replace")
+
+    contents = await asyncio.to_thread(_read_prefix)
     return _result({"status": "ok", "path": path_arg, "contents": contents})
 
 
@@ -2580,7 +2589,9 @@ def _tool_verify_plugin_state(
     tools_status = []
     for t in tool_entries:
         vb = t.get("verify_bin", "")
-        if (tools_bin / vb).is_symlink() or (tools_bin / vb).is_file():
+        # is_file() follows symlinks; a dangling link (target wiped by a
+        # rollback) is correctly reported missing, not masked ready (M23).
+        if (tools_bin / vb).is_file():
             tools_status.append({"requirement": t["winning_strategy"], "verify_bin": vb,
                                  "status": "ready"})
         else:

@@ -23,7 +23,7 @@ class _Reg:
         self.removed.append(key)
         self._e.pop(key, None)
 
-    async def clear_save_claim(self, key):
+    async def clear_save_claim(self, key, sid=None):
         self.cleared_claims.append(key)
         self._e.get(key, {}).pop("consolidated_at", None)
 

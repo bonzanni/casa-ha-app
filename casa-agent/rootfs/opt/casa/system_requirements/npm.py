@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -20,7 +21,14 @@ def install_npm(
     package = spec["package"]
     verify_bin = spec["verify_bin"]
 
-    npm_root = tools_root / "npm"
+    # Per-plugin prefix (M25): a shared tools_root/"npm" prefix means the
+    # two-stage-commit rollback in tools.py (shutil.rmtree(install_dir)) would
+    # wipe node_modules for EVERY npm plugin and dangle their symlinks. Namespace
+    # per plugin (mirrors venv-{plugin_name}) so rollback is isolated. Also
+    # avoids npm 7+ ideal-tree reification pruning a sibling plugin as extraneous.
+    npm_root = tools_root / "npm" / plugin_name
+    if npm_root.exists():
+        shutil.rmtree(npm_root)  # fresh install, mirrors venv semantics
     npm_root.mkdir(parents=True, exist_ok=True)
     tools_bin = tools_root / "bin"
     tools_bin.mkdir(parents=True, exist_ok=True)

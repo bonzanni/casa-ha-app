@@ -25,4 +25,8 @@ def test_install_happy(tmp_path: Path) -> None:
     # is-number doesn't expose a bin, so verify_bin_resolves may be False.
     # Just assert installation path exists.
     assert result.ok or "verify_bin" in result.message
-    assert (tmp_path / "tools" / "npm" / "node_modules" / "is-number").is_dir()
+    # M25: npm prefix is now namespaced per plugin (tools/npm/<plugin>).
+    assert (
+        tmp_path / "tools" / "npm" / "is-number-probe"
+        / "node_modules" / "is-number"
+    ).is_dir()
