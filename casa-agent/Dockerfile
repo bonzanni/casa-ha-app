@@ -1,11 +1,11 @@
-ARG BUILD_FROM
+# Multi-arch Debian base (glibc, ships s6-overlay + bashio). The default keeps
+# Supervisor local builds working now that build.yaml is retired upstream and
+# Supervisor ≥2026.04 no longer injects BUILD_FROM; under buildx the same
+# manifest resolves to the right per-platform layer. We migrated off
+# alpine-python:3.12 in v0.8.1 for glibc wheels (onnxruntime, since retired);
+# the glibc base is kept.
+ARG BUILD_FROM=ghcr.io/home-assistant/base-debian:bookworm
 FROM ${BUILD_FROM}
-
-# Base: ghcr.io/home-assistant/{arch}-base-debian:bookworm (glibc-based,
-# ships s6-overlay + bashio). We migrated from alpine-python:3.12 in
-# v0.8.1 originally because onnxruntime (a fastembed dependency) has no
-# musl wheels on PyPI. That ONNX dependency was retired with
-# scope-routing; the glibc base is kept.
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -140,3 +140,9 @@ RUN chmod +x /etc/s6-overlay/scripts/*.sh \
 # subprocess). Engagement subprocesses also get CLAUDE_CODE_PLUGIN_CACHE_DIR
 # exported at spawn time (see §B workspace-template + §5.3).
 ENV CLAUDE_CODE_PLUGIN_SEED_DIR=/opt/claude-seed
+
+# io.hass.* labels are injected by the deploy workflow (build-image action).
+LABEL org.opencontainers.image.title="Casa Agent" \
+      org.opencontainers.image.description="Personal AI agent framework powered by Claude" \
+      org.opencontainers.image.source="https://github.com/bonzanni/casa-ha-app" \
+      org.opencontainers.image.licenses="MIT"
