@@ -941,7 +941,8 @@ async def main() -> None:
     # Resolved after OP_SERVICE_ACCOUNT_TOKEN is available so that op://
     # references inside plugin-env.conf can be resolved by the same `op` CLI.
     from plugin_env_conf import read_entries as _read_plugin_env
-    for _var, _value in _read_plugin_env().items():
+    _plugin_env_entries = _read_plugin_env()
+    for _var, _value in _plugin_env_entries.items():
         try:
             os.environ[_var] = _resolve_secret(_value)
         except RuntimeError as _exc:
@@ -949,6 +950,13 @@ async def main() -> None:
                 "plugin-env: %s unresolved: %s — plugin's MCP server will fail to start",
                 _var, _exc,
             )
+    # M22 (v0.49.0): seed reload's deletion-diff snapshot so the first
+    # casa_reload(scope='plugin_env') can DROP keys applied at boot that
+    # were later removed from plugin-env.conf. Seeding keys whose op://
+    # resolution failed above is safe — reload's removal path uses
+    # os.environ.pop(var, None), a no-op for absent vars.
+    from reload import note_boot_plugin_env as _note_boot_plugin_env
+    _note_boot_plugin_env(set(_plugin_env_entries))
 
     # 2. Long-term semantic memory (spec §5/§4.2): the only memory path —
     # Hindsight or noop (resolve_semantic_memory_choice).
@@ -1088,6 +1096,7 @@ async def main() -> None:
         agents_dir=agents_dir,
         home_root="/config/agent-home",
         defaults_root="/opt/casa",
+        semantic_memory=semantic_memory,
     )
     init_tools(
         channel_manager, bus, specialist_registry, mcp_registry,
@@ -1653,10 +1662,12 @@ async def main() -> None:
     # permanently False until manual restart. The new location makes it
     # self-healing on every successful rebuild. Removed redundant call here.
 
-    # 13. Agent loop tasks
+    # 13. Agent loop tasks. H10/H11 (v0.49.0): spawn through the bus so
+    # the consumer tasks are tracked — reload reuses the same seam for
+    # roles added after boot and cancels tracked tasks on eviction.
     for name in list(agents.keys()) + ["telegram"]:
         if name in bus.queues:
-            loop_tasks.append(asyncio.create_task(bus.run_agent_loop(name)))
+            loop_tasks.append(bus.start_agent_loop(name))
 
     # 13b. Orphan delegation recovery (Phase 3.1 §7.4). The bus loops are
     # up; the orphan NOTIFICATIONs we post here queue on Ellen's queue
@@ -1758,9 +1769,13 @@ async def main() -> None:
     await session_sweeper.stop()
     await freshness_reaper.stop()
 
-    for task in loop_tasks:
+    # H10 (v0.49.0): include consumers spawned after boot by reload
+    # (bus.start_agent_loop) — the local loop_tasks list only has the
+    # boot-time ones. cancel() is idempotent for already-evicted tasks.
+    all_loop_tasks = set(loop_tasks) | set(bus.agent_loop_tasks())
+    for task in all_loop_tasks:
         task.cancel()
-    await asyncio.gather(*loop_tasks, return_exceptions=True)
+    await asyncio.gather(*all_loop_tasks, return_exceptions=True)
 
     await channel_manager.stop_all()
     for _r in runners:

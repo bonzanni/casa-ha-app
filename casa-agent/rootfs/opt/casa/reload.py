@@ -52,25 +52,36 @@ class _RWLock:
 
     def __init__(self) -> None:
         self._readers = 0
+        # M21 (v0.49.0): the writer must hold visible lock state. Pre-fix
+        # acquire_write recorded nothing, so readers arriving while a
+        # 'full' reload was mid-flight ran concurrently with its
+        # multi-step runtime mutation.
+        self._writer = False
         self._cond = asyncio.Condition()
 
     async def acquire_read(self) -> None:
         async with self._cond:
+            while self._writer:
+                await self._cond.wait()
             self._readers += 1
 
     async def release_read(self) -> None:
         async with self._cond:
             self._readers -= 1
             if self._readers == 0:
+                # notify_all (not notify): readers and a waiting writer
+                # share this one condition.
                 self._cond.notify_all()
 
     async def acquire_write(self) -> None:
         async with self._cond:
-            while self._readers > 0:
+            while self._writer or self._readers > 0:
                 await self._cond.wait()
+            self._writer = True
 
     async def release_write(self) -> None:
         async with self._cond:
+            self._writer = False
             self._cond.notify_all()
 
 
@@ -305,7 +316,60 @@ def _construct_agent(*, cfg, runtime):
         mcp_registry=runtime.mcp_registry,
         channel_manager=runtime.channel_manager,
         agent_registry=runtime.agent_registry,
+        # H9 (v0.45.0 regression, fixed v0.49.0): reuse the boot-built
+        # long-term memory. Omitting this silently downgraded every
+        # reload-constructed resident to NoOpSemanticMemory. getattr with
+        # None default keeps runtime stand-ins without the field working
+        # (Agent maps None → NoOp).
+        semantic_memory=getattr(runtime, "semantic_memory", None),
     )
+
+
+def _start_bus_loop(runtime: Any, role: str) -> None:
+    """Ensure ``role`` has a live bus consumer after a ``bus.register``.
+
+    H10 (v0.49.0): boot only spawns ``run_agent_loop`` consumers for
+    boot-time roles (casa_core step 13). A role added by reload used to
+    get a queue + handler but no consumer, so its messages sat forever.
+    ``MessageBus.start_agent_loop`` is idempotent, so calling this after
+    every register is safe for existing roles (their running consumer
+    is reused).
+    """
+    try:
+        runtime.bus.start_agent_loop(role)
+    except Exception as exc:  # noqa: BLE001 — never fail the swap on this
+        logger.warning("start_agent_loop(%s) failed: %s", role, exc)
+
+
+async def _teardown_role(runtime: Any, role: str) -> None:
+    """Best-effort full deregistration of an evicted role.
+
+    H11 (v0.49.0): the remove half of the add/remove lifecycle —
+    ``bus.unregister`` cancels the role's consumer task and drops its
+    queue + handler (the cancellation is awaited so no consumer
+    outlives the evict), then ``reregister_for(role, [], [])`` unwinds
+    the role's APScheduler jobs, webhook paths, and webhook-allowlist
+    names. Pre-fix, eviction called a bus method that did not exist
+    (the AttributeError was swallowed) and never touched triggers, so
+    'deleted' residents kept consuming and firing as ghost agents until
+    the next add-on restart.
+    """
+    try:
+        task = runtime.bus.unregister(role)
+        if isinstance(task, asyncio.Task):
+            await asyncio.gather(task, return_exceptions=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "reload_agents: bus.unregister(%s) failed: %s", role, exc,
+        )
+    try:
+        await asyncio.to_thread(
+            runtime.trigger_registry.reregister_for, role, [], [],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "reload_agents: trigger deregister(%s) failed: %s", role, exc,
+        )
 
 
 async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
@@ -374,6 +438,9 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
             raise ReloadError("specialist_reload_failed", str(exc)) from exc
     runtime.agents[role] = new_agent
     runtime.bus.register(role, new_agent.handle_message)
+    # H10: a role whose dir was created after boot has no consumer yet;
+    # idempotent no-op for roles that already have one.
+    _start_bus_loop(runtime, role)
     actions.append("reregister_bus")
 
     # Rebuild agent_registry from current state.
@@ -442,6 +509,7 @@ async def _reload_role_after_policies(runtime: Any, role: str) -> None:
         runtime.role_configs[role] = new_cfg
     runtime.agents[role] = new_agent
     runtime.bus.register(role, new_agent.handle_message)
+    _start_bus_loop(runtime, role)
 
 
 async def reload_policies(runtime: Any, *, role: str | None = None) -> list[str]:
@@ -483,6 +551,23 @@ register_handler("policies", reload_policies)
 
 # Snapshot of last-applied plugin-env keys, used to detect deletions.
 _PLUGIN_ENV_LAST_KEYS: set[str] = set()
+
+
+def note_boot_plugin_env(keys: set[str]) -> None:
+    """Seed the last-applied plugin-env key snapshot from the boot path.
+
+    M22 (v0.49.0): casa_core.main step 1b sources plugin-env.conf into
+    os.environ directly. Without this seed the snapshot starts empty, so
+    the FIRST ``casa_reload(scope='plugin_env')`` computes
+    ``dropped = {} - new_keys`` and can never remove a key that was
+    applied at boot but has since been deleted from plugin-env.conf —
+    a revoked plugin secret survived in the process env (and kept being
+    inherited by plugin MCP subprocesses) for the container's lifetime.
+    Only the boot path may call this: it alone knows which env vars came
+    from plugin-env.conf rather than the ambient environment.
+    """
+    global _PLUGIN_ENV_LAST_KEYS
+    _PLUGIN_ENV_LAST_KEYS = set(keys)
 
 
 async def reload_plugin_env(runtime: Any, *, role: str | None = None) -> list[str]:
@@ -580,16 +665,18 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         runtime.role_configs[r] = new_cfg
         runtime.agents[r] = new_agent
         runtime.bus.register(r, new_agent.handle_message)
+        # H10: without a consumer the new resident's queue is write-only
+        # until the next add-on restart.
+        _start_bus_loop(runtime, r)
         actions.append(f"added_{r}")
 
-    # Evict deleted residents
+    # Evict deleted residents — H11: full lifecycle teardown (cancel
+    # consumer, drop queue/handler, unwind triggers), mirroring the add
+    # path's register + start.
     for r in known_residents - on_disk_residents:
         runtime.role_configs.pop(r, None)
         runtime.agents.pop(r, None)
-        try:
-            runtime.bus.unregister(r)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("reload_agents: bus.unregister(%s) failed: %s", r, exc)
+        await _teardown_role(runtime, r)
         actions.append(f"evicted_{r}")
 
     # ---- Specialists ----
@@ -641,6 +728,7 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
             continue
         runtime.agents[s] = new_agent
         runtime.bus.register(s, new_agent.handle_message)
+        _start_bus_loop(runtime, s)
         actions.append(f"added_specialist_{s}")
 
     # Evict missing specialists from runtime.agents (registry already
@@ -650,10 +738,7 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         pass
     for s in set(runtime.agents.keys()) - on_disk_residents - on_disk_specialists:
         runtime.agents.pop(s, None)
-        try:
-            runtime.bus.unregister(s)
-        except Exception:  # noqa: BLE001
-            pass
+        await _teardown_role(runtime, s)
         actions.append(f"evicted_specialist_{s}")
 
     # Rebuild agent_registry with fresh state.

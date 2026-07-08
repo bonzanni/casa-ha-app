@@ -445,3 +445,94 @@ class TestRegisterIdempotent:
             loop_task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await loop_task
+
+
+@pytest.mark.unit
+class TestLoopLifecycle:
+    """H10/H11 (v0.49.0): the bus owns the consumer-task lifecycle.
+
+    ``register`` + ``start_agent_loop`` is the add half;
+    ``unregister`` (cancel task, drop queue + handler) is the remove
+    half. Pre-fix there was no ``unregister`` at all and consumer tasks
+    were spawned untracked at boot only, so roles added by reload never
+    consumed and evicted roles kept running as ghosts.
+    """
+
+    async def test_start_agent_loop_spawns_tracked_consumer(self):
+        bus = MessageBus()
+        received: list[BusMessage] = []
+
+        async def handler(msg):
+            received.append(msg)
+
+        bus.register("b", handler)
+        task = bus.start_agent_loop("b")
+        try:
+            assert isinstance(task, asyncio.Task)
+            await bus.send(_msg(content="tick"))
+            await asyncio.sleep(0.05)
+            assert [m.content for m in received] == ["tick"]
+        finally:
+            bus.unregister("b")
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_start_agent_loop_is_idempotent(self):
+        """At most one live consumer per name — reload handlers call it
+        after EVERY register, including swaps of existing roles."""
+        bus = MessageBus()
+        bus.register("b", None)
+        t1 = bus.start_agent_loop("b")
+        t2 = bus.start_agent_loop("b")
+        try:
+            assert t1 is t2
+        finally:
+            bus.unregister("b")
+            await asyncio.gather(t1, return_exceptions=True)
+
+    async def test_unregister_cancels_consumer_and_drops_registration(self):
+        bus = MessageBus()
+
+        async def handler(msg):  # pragma: no cover — must never run post-evict
+            raise AssertionError("ghost dispatch after unregister")
+
+        bus.register("b", handler)
+        task = bus.start_agent_loop("b")
+        returned = bus.unregister("b")
+        assert returned is task
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert task.cancelled()
+        assert "b" not in bus.queues
+        assert "b" not in bus.handlers
+        # Sends to the evicted name are silently dropped (unknown-target
+        # contract) — nothing queues, nothing dispatches.
+        await bus.send(_msg(target="b"))
+        assert "b" not in bus.queues
+
+    async def test_reregister_after_unregister_gets_fresh_loop(self):
+        """Evict → re-add must yield a NEW consumer on the NEW queue."""
+        bus = MessageBus()
+        received: list[str] = []
+
+        async def handler(msg):
+            received.append(msg.content)
+
+        bus.register("b", handler)
+        t1 = bus.start_agent_loop("b")
+        bus.unregister("b")
+        await asyncio.gather(t1, return_exceptions=True)
+
+        bus.register("b", handler)
+        t2 = bus.start_agent_loop("b")
+        try:
+            assert t2 is not t1
+            await bus.send(_msg(content="reborn"))
+            await asyncio.sleep(0.05)
+            assert received == ["reborn"]
+        finally:
+            bus.unregister("b")
+            await asyncio.gather(t2, return_exceptions=True)
+
+    async def test_unregister_unknown_name_is_noop(self):
+        bus = MessageBus()
+        assert bus.unregister("nope") is None

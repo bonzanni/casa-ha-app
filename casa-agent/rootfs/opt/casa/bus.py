@@ -55,6 +55,11 @@ class MessageBus:
         # caller tears down the in-flight handler task (voice `cancel`
         # frame semantics — spec §10.3).
         self._dispatch_tasks: dict[str, asyncio.Task] = {}
+        # name -> run_agent_loop consumer task. H10/H11 (v0.49.0): the
+        # bus owns the consumer lifecycle so reload can spawn loops for
+        # roles added after boot and cancel them on eviction. Populated
+        # by start_agent_loop; drained by unregister.
+        self._loop_tasks: dict[str, asyncio.Task] = {}
         self._log: collections.deque[BusMessage] = collections.deque(
             maxlen=max_log_size
         )
@@ -72,6 +77,51 @@ class MessageBus:
         if name not in self.queues:
             self.queues[name] = asyncio.PriorityQueue()
         self.handlers[name] = handler
+
+    def start_agent_loop(self, name: str) -> asyncio.Task:
+        """Spawn (or return the already-running) consumer task for *name*.
+
+        Idempotent: at most one live ``run_agent_loop`` task per name,
+        so callers may invoke it after EVERY ``register`` — an existing
+        role keeps its running consumer, while a role added after boot
+        (H10, v0.49.0: reload-created residents/specialists) gets one
+        spawned here instead of enqueueing forever. ``register`` must
+        run first so the queue exists when the loop starts.
+        """
+        existing = self._loop_tasks.get(name)
+        if existing is not None and not existing.done():
+            return existing
+        task = asyncio.create_task(self.run_agent_loop(name))
+        self._loop_tasks[name] = task
+        return task
+
+    def unregister(self, name: str) -> asyncio.Task | None:
+        """Reverse of ``register`` + ``start_agent_loop``: cancel the
+        consumer task and drop the queue + handler.
+
+        H11 (v0.49.0): reload eviction previously called a method that
+        did not exist; the swallowed AttributeError left 'deleted'
+        residents consuming their queue forever (ghost agents). After
+        this call, ``send`` to *name* silently drops (the unknown-target
+        contract in ``send``) and the consumer ends. run_agent_loop
+        caches its queue reference at entry, so popping the queue here
+        cannot crash the loop in the window before the cancel lands.
+
+        Returns the cancelled task (if one was tracked) so async
+        callers can await its completion; ``None`` otherwise.
+        """
+        task = self._loop_tasks.pop(name, None)
+        if task is not None and not task.done():
+            task.cancel()
+        self.queues.pop(name, None)
+        self.handlers.pop(name, None)
+        return task
+
+    def agent_loop_tasks(self) -> list[asyncio.Task]:
+        """Snapshot of every tracked consumer task (boot-time and
+        reload-added). Shutdown cancels these; cancel is idempotent for
+        any that were already torn down by ``unregister``."""
+        return list(self._loop_tasks.values())
 
     async def send(self, msg: BusMessage) -> None:
         """Send a message to msg.target's queue."""

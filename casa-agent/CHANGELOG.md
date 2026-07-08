@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.49.0] - 2026-07-08 — reload subsystem: memory wiring, resident lifecycle, lock + env-drop fixes
+
+### Fixed
+
+Five interconnected defects in the reload subsystem (`reload.py`). The configurator invokes
+`casa_reload` routinely after config edits (scope=`agent`|`policies`|`executors`|`full`), so all
+of these fired in normal operation, not edge cases. They were invisible to the unit gate because
+the existing reload tests stubbed exactly the seams that were broken (`_construct_agent`,
+MagicMock bus); the new regression tests drive the real factory and the real `MessageBus`.
+
+- **Reloaded residents no longer lose Hindsight memory (H9).** `reload._construct_agent` — used
+  by every reload scope — omitted `semantic_memory` when rebuilding an Agent, so from the first
+  reload until the next add-on restart every resident silently fell back to
+  `NoOpSemanticMemory`: per-turn overlay/auto-recall returned nothing and cold-session retains
+  were permanently lost (a v0.45.0 memory-retirement regression). `CasaRuntime` now carries the
+  boot-built `semantic_memory` (new defaulted field, kept last) and the factory passes it through.
+- **Residents added via reload now actually consume their queue (H10).** Bus consumer tasks
+  (`run_agent_loop`) were only spawned at boot, so a resident created at runtime +
+  `casa_reload(scope='agents'|'full')` was registered on the bus but nothing ever read its
+  queue — cron triggers, webhooks, and NOTIFICATIONs targeting it sat enqueued (and `/invoke`
+  504'd) until a container restart. The bus now owns the consumer lifecycle:
+  `MessageBus.start_agent_loop(name)` spawns an idempotent tracked consumer; boot and every
+  reload registration path go through it.
+- **Evicted residents no longer keep running as ghost agents (H11).** Eviction called
+  `bus.unregister(...)` — a method `MessageBus` never had; the `AttributeError` was swallowed, so
+  a deleted resident kept its queue, handler, live consumer, APScheduler jobs, and webhook
+  allowlist entries, and went on executing scheduled prompts until restart. `MessageBus.unregister`
+  now exists (cancels the tracked consumer task — awaited by the eviction path — and drops the
+  queue + handler, so later sends silently drop), and eviction also unwinds the role's triggers
+  via `trigger_registry.reregister_for(role, [], [])`. Add and remove are now symmetric:
+  register + start loop ⇄ cancel loop + unregister + trigger unwind.
+- **`scope='full'` is now actually exclusive (M21).** The reload `_RWLock` writer path recorded
+  no lock state, so a `full` reload was not mutually exclusive with concurrent per-scope
+  reloads — both could interleave their multi-step mutations of `runtime.agents` /
+  `role_configs` / `agent_registry` across `to_thread` awaits. The lock now tracks an active
+  writer: readers wait for it, and the writer waits for both readers and any prior writer.
+- **First `plugin_env` reload can now drop boot-applied keys (M22).** The deletion diff in
+  `reload_plugin_env` compared against a snapshot that started empty and was never seeded by the
+  boot path, so a secret removed from `plugin-env.conf` after boot survived in `os.environ` (and
+  kept reaching plugin MCP subprocesses) for the container's lifetime. Boot now seeds the
+  snapshot via `reload.note_boot_plugin_env(...)` right after sourcing `plugin-env.conf`.
+
 ## [0.48.0] - 2026-07-08 — move blocking I/O off the single event loop
 
 ### Fixed
