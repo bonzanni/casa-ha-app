@@ -9,7 +9,7 @@ Casa runs always-on AI agents inside your Home Assistant instance. The primary a
 ## Prerequisites
 
 - **Claude Max subscription** with an OAuth token (run `claude setup-token` on your local machine to obtain one)
-- **Home Assistant 2025.4+** on an amd64 system
+- **Home Assistant 2025.4+** on an amd64 or aarch64 system
 - A Telegram bot token (optional, for Telegram channel)
 
 ## Configuration
