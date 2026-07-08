@@ -646,7 +646,20 @@ class TelegramChannel(Channel):
                     await self._engagement_registry.update_user_turn(rec.id, _time.time())
                 return
 
-        # 3) Other chats — existing enforcement applies
+        # 3) Other chats. When telegram_chat_id is configured it is an
+        #    allowlist (DOCS.md: "Telegram chat ID to restrict messages
+        #    to. Leave empty to accept all chats.") — drop updates from
+        #    any other chat. Empty chat_id = accept all (documented opt-in).
+        #    Route 1 (the configured DM) and route 2 (the engagement
+        #    supergroup + its topics) already returned above, so reaching
+        #    here means this chat is neither.
+        if str(self.chat_id or "").strip():
+            logger.info(
+                "Dropping Telegram update from unauthorized chat_id=%s "
+                "(user_id=%s); telegram_chat_id restriction active",
+                chat_id, user_id,
+            )
+            return
         return await self._route_to_ellen(update)
 
     async def _maybe_redirect_main_feed(self, user_id: int | None) -> None:

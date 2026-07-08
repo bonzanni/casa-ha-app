@@ -730,6 +730,38 @@ def _make_webhook_handler(
     return webhook_handler
 
 
+def _make_telegram_update_handler(*, get_telegram_channel, webhook_secret: str):
+    """Build the ``POST /telegram/update`` webhook handler.
+
+    Extracted from ``main()`` so it is unit-testable; see
+    ``tests/test_telegram_update_handler.py``.
+
+    L4: the ``X-Telegram-Bot-Api-Secret-Token`` header is compared with
+    ``hmac.compare_digest`` (constant-time) rather than ``!=`` to avoid a
+    timing side-channel on the shared webhook secret. BOTH sides are
+    encoded to bytes: ``compare_digest`` raises ``TypeError`` on non-ASCII
+    ``str`` inputs, and the header value is attacker-controlled (and a
+    user-supplied ``webhook_secret`` may be non-ASCII), so a non-ASCII
+    header must yield 403, not a 500.
+    """
+
+    async def telegram_update_handler(request: web.Request) -> web.Response:
+        telegram_channel = get_telegram_channel()
+        if telegram_channel is None:
+            return web.json_response({"error": "telegram not configured"}, status=404)
+        if webhook_secret:
+            token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if not hmac.compare_digest(
+                token.encode("utf-8"), webhook_secret.encode("utf-8"),
+            ):
+                return web.Response(status=403)
+        payload = await request.json()
+        await telegram_channel.process_webhook_update(payload)
+        return web.Response(status=200)
+
+    return telegram_update_handler
+
+
 def build_invoke_message(
     agent_role: str,
     prompt: str,
@@ -1465,19 +1497,14 @@ async def main() -> None:
         except asyncio.TimeoutError:
             return web.json_response({"error": "timeout"}, status=504)
 
-    # 11. Telegram webhook route (only used when webhook_url is set)
-    async def telegram_update_handler(request: web.Request) -> web.Response:
-        """Receive Telegram updates pushed via webhook."""
-        if telegram_channel is None:
-            return web.json_response({"error": "telegram not configured"}, status=404)
-        # Verify Telegram's secret token header
-        if webhook_secret:
-            token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-            if token != webhook_secret:
-                return web.Response(status=403)
-        payload = await request.json()
-        await telegram_channel.process_webhook_update(payload)
-        return web.Response(status=200)
+    # 11. Telegram webhook route (only used when webhook_url is set).
+    # L4: constant-time secret-token comparison lives in the extracted
+    # factory. The lambda preserves the closure over the local
+    # ``telegram_channel`` (assigned earlier in main()).
+    telegram_update_handler = _make_telegram_update_handler(
+        get_telegram_channel=lambda: telegram_channel,
+        webhook_secret=webhook_secret,
+    )
 
     # 12. Status dashboard
     terminal_enabled = os.environ.get("ENABLE_TERMINAL", "false").lower() == "true"
@@ -1617,9 +1644,14 @@ async def main() -> None:
         access_log=logging.getLogger("casa.access"),
     )
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8099)
+    # H1 (defense-in-depth): bind the backend to loopback only. The sole
+    # remote consumer is nginx in the SAME container (proxy_pass
+    # http://127.0.0.1:8099) and in-container workspace subprocesses reach
+    # it via 127.0.0.1; nothing legitimately connects to 8099 over the
+    # hassio bridge, so 0.0.0.0 needlessly exposed it to peer containers.
+    site = web.TCPSite(runner, "127.0.0.1", 8099)
     await site.start()
-    logger.info("HTTP server listening on 0.0.0.0:8099")
+    logger.info("HTTP server listening on 127.0.0.1:8099")
 
     # Plan 4b/3.6: second AppRunner for the Unix-socket internal API
     # consumed by svc-casa-mcp. The same internal handlers are reused

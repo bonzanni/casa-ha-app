@@ -7,6 +7,12 @@ import re
 
 # Patterns that match common secret/token formats
 _REDACT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # Anthropic-format keys: sk-ant-api03-…, sk-ant-oat01-… — the key format
+    # this Claude-powered add-on actually uses. The hyphen after the 3-char
+    # "ant" prefix (and after the version segment) defeats the generic sk-
+    # pattern below, so match it explicitly. Body may contain '-' and '_'.
+    # Keep this BEFORE the generic sk- pattern.
+    (re.compile(r"(sk-ant-[a-zA-Z0-9]{2,10}-?)[A-Za-z0-9_-]{8,}"), r"\1***"),
     # Generic long hex/base64 tokens (API keys, OAuth tokens)
     (re.compile(r"(sk-[a-zA-Z0-9]{20})[a-zA-Z0-9]+"), r"\1***"),
     (re.compile(r"(ghp_[a-zA-Z0-9]{4})[a-zA-Z0-9]+"), r"\1***"),

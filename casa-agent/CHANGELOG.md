@@ -1,5 +1,75 @@
 # Changelog
 
+## [0.50.0] - 2026-07-08 — security hardening: ingress source filter, auth/parsing controls
+
+### Security
+
+Seven security fixes closing authentication, path-traversal, command-parsing, and
+secret-handling gaps. Several were controls that existed on paper but were bypassable in
+practice; each fix ships with an attack-encoding regression test (the affected test files
+also gained the `unit` marker so the tier2 gate actually runs them).
+
+- **nginx ingress now restricts to the Supervisor proxy (H1).** The generated ingress
+  `server` block was missing the HA-mandated source filter, so any peer container on the
+  hassio bridge could reach the operator dashboard, all proxied API routes, and the web
+  terminal (an unauthenticated root shell when `enable_terminal` is on) with HA's ingress
+  auth fully bypassed. Added `allow 172.30.32.2; deny all;` at server scope (per
+  developers.home-assistant.io), so it filters every route including `/terminal/`.
+  Defense-in-depth: the aiohttp backend now binds `127.0.0.1:8099` instead of `0.0.0.0:8099`
+  (its only legitimate consumer is nginx in the same container).
+- **`telegram_chat_id` is now enforced as an allowlist (H6).** The option is documented as
+  "restrict messages to this chat" but was never applied — any Telegram user who found the
+  bot got full agent access (home control + shared memory). When `telegram_chat_id` is set,
+  updates from any other chat are now dropped (logged, not answered). Empty/unset still
+  accepts all chats (documented default); the engagement supergroup and its forum topics,
+  and the configured DM, are unaffected. No option removed → no `DEPRECATED_OPTION_KEYS`
+  change; DOCS.md already described this behavior.
+- **`peek_engagement_workspace` path-traversal closed (H15).** Only the `path` argument was
+  guarded; the `engagement_id` was joined into the workspace root unchecked, so `..` or an
+  absolute id re-rooted the "workspace" anywhere on disk (leaking `/data/options.json`,
+  `plugin-env.conf`, etc.) via the unauthenticated 8099 MCP fallback. The id is now validated
+  (`[A-Za-z0-9_-]+`) and the resolved workspace must sit directly under the engagements root.
+- **`block_dangerous_bash` no longer bypassed by newlines or quotes (H8 + L13).** Newlines
+  are now first-class command separators (so `echo hi\nrm -rf /` is caught on line 2), with
+  backslash-newline continuations collapsed first. The pipeline splitter is now quote-aware
+  (shlex `punctuation_chars`), so operators inside quoted strings are data, not boundaries —
+  fixing both the newline bypass and the false-positive denials of benign commands like
+  `git commit -m "cleanup && rm -rf handling"`. Security review of this fix found the
+  substitution/exec-wrapper class still open; the detector now also recurses into command
+  substitution (`echo $(rm -rf /)`, including double-quoted), backticks, `eval "rm -rf /"`,
+  and `… | xargs rm -rf` — while `awk '{print $(NF-1)}'`, `echo $((1+2))`, and
+  `eval "$(ssh-agent -s)"` stay allowed (denies only when the *inner* content is dangerous).
+- **`casa_config_guard` resident-deletion guard hardened (M16).** The brittle regex was
+  evaded by quoted paths, long flags (`--recursive`), and `--`. Replaced with an argv-aware
+  detector (shared splitter + path normalization + wrapper-shell recursion) that catches
+  every spelling while still exempting `specialists/` and `executors/` subtrees. Security
+  review found one residual hole: a leading `//` (which the Linux kernel resolves as `/`,
+  but PurePosixPath preserves as a distinct root) slipped past every prefix check — both
+  `rm -r //config/agents/<name>` and `Write //data/…`. Path normalization now collapses
+  redundant slashes first, and the guard also recurses into `eval` (same wrapper class as
+  `bash -c`).
+- **Command-parsing guards round 2: `|&`/`;&`/`;;&` now split pipelines; exec-wrapper
+  prefixes unwrapped (H8/M16 follow-up).** shlex emits `|&` (pipe stdout+stderr) and the
+  case-branch terminators `;&`/`;;&` as single tokens that were missing from the
+  pipeline-separator set, so `echo x |& rm -rf /` merged into one argv and the right-hand
+  command was never scanned as argv[0]. True redirections (`>`, `>>`, `<`, `>&`, `&>`,
+  `2>&1`) still do not split. Exec-wrapper prefixes (`nohup`, `timeout`, `env`, `stdbuf`,
+  `setsid`, `time`, `nice`, `ionice`, `chrt`, `taskset`, `unbuffer`, `sudo`, `doas`) are now
+  unwrapped in both `block_dangerous_bash` and the resident-deletion guard, so
+  `timeout 5 rm -rf /` and `nohup rm -r /config/agents/<name>` resolve to the same decision
+  as the bare command (arg-consuming forms like `timeout 5`, `env A=B`, `nice -n 5`,
+  `sudo -u root` handled). These guards remain defense-in-depth behind the SDK permission
+  system and workspace isolation; known residuals: command/process substitution and non-rm
+  destructive verbs (e.g. `find -delete`, `truncate`, `shred`) are not decomposed.
+- **Anthropic API keys are now redacted from logs (M19).** The `sk-` redaction pattern could
+  never match `sk-ant-api03-…` / `sk-ant-oat01-…` (the hyphen after `ant` broke it), so
+  Casa's own primary credential could leak into logs. Added an explicit `sk-ant-` pattern
+  ahead of the generic one.
+- **Constant-time Telegram webhook token check (L4).** The `X-Telegram-Bot-Api-Secret-Token`
+  header was compared with `!=` (timing side-channel); it now uses `hmac.compare_digest` with
+  both sides byte-encoded (non-ASCII header → 403, not 500). The handler was extracted into a
+  unit-testable factory.
+
 ## [0.49.0] - 2026-07-08 — reload subsystem: memory wiring, resident lifecycle, lock + env-drop fixes
 
 ### Fixed

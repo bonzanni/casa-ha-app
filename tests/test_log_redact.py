@@ -1,6 +1,12 @@
 """Tests for log_redact.py -- secret redaction."""
 
+import pytest
+
 from log_redact import redact
+
+# Without this marker the tier2 unit gate (-m "unit and not docker and not
+# slow") silently skips this whole file.
+pytestmark = pytest.mark.unit
 
 
 class TestRedact:
@@ -36,3 +42,25 @@ class TestRedact:
         text = "token: abc"
         # Short values (< 8 chars after key) should not be redacted
         assert redact(text) == text
+
+
+class TestRedactAnthropicKeys:
+    """M19 (v0.50.0): Casa's own primary key format (sk-ant-...) must be
+    redacted. Pre-fix the sk- pattern required 20 contiguous alphanumerics
+    after 'sk-', which the hyphen after 'ant' broke, so the key passed
+    through logs unredacted."""
+
+    def test_redacts_anthropic_api_key(self):
+        secret_body = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-AA"
+        text = f"spawned claude with sk-ant-api03-{secret_body}"
+        result = redact(text)
+        assert secret_body not in result
+        assert "sk-ant-api03-" in result  # prefix retained for identification
+
+    def test_redacts_anthropic_oauth_token(self):
+        # mirrors sdk_logging.py's verbatim CLI-stderr echo path
+        secret_body = "AbCd_EfGh-IjKlMnOpQrStUv"
+        text = f"stderr Error: invalid credential sk-ant-oat01-{secret_body}"
+        result = redact(text)
+        assert secret_body not in result
+        assert "sk-ant-oat01-" in result

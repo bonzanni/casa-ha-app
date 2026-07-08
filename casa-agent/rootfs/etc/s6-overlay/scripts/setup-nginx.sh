@@ -23,6 +23,13 @@ http {
         listen ${INGRESS_PORT} default_server;
         server_name _;
 
+        # HA ingress hardening (developers.home-assistant.io): only the
+        # Supervisor ingress proxy may reach this port. Deny every other
+        # peer on the hassio bridge (172.30.32.0/23). Placed at server
+        # scope so it filters every route, including /terminal/.
+        allow 172.30.32.2;
+        deny all;
+
         location / {
             proxy_pass http://127.0.0.1:8099;
             proxy_http_version 1.1;

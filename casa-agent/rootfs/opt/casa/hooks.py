@@ -28,12 +28,39 @@ _logger = logging.getLogger(__name__)
 # History: pre-v0.14.6 this was a flat list of regex patterns matched against
 # the raw command string. That trivially missed equivalents like
 # `rm -r -f`, `rm --recursive --force`, `rm -rfv`, etc. The argv-aware
-# matcher below splits the command on shell separators (;, &&, ||, |, &),
-# shlex'es each piece into argv tokens, and inspects argv[0] + argv[1:].
-# It also recurses into `bash -c <str>` / `sh -c <str>` so that wrapper
-# shells don't bypass the check.
+# matcher below splits the command on shell separators (;, &&, ||, |, &,
+# and newlines), shlex'es each piece into argv tokens, and inspects
+# argv[0] + argv[1:]. It also recurses into `bash -c <str>` / `sh -c <str>`
+# so that wrapper shells don't bypass the check.
 # FORBIDDEN_PATTERNS is kept as a deprecated alias of the legacy regex list
 # so existing imports don't break; the live matcher is _command_is_dangerous.
+#
+# SCOPE & ACCEPTED RESIDUALS (v0.50.0 security review):
+# block_dangerous_commands and casa_config_guard are DEFENSE-IN-DEPTH argv
+# inspectors, not a bash sandbox — the real security boundaries are the SDK
+# permission system and workspace isolation. Known residuals, inherent to
+# argv-level inspection, accepted and documented rather than chased with
+# ever-more regex:
+#   * command substitution ``$(...)`` / backticks and process substitution
+#     ``<(...)`` / ``>(...)``: scanned best-effort by span regexes (see
+#     _SUBSTITUTION_SPAN_RE below); adversarial quoting/nesting inside a
+#     span can still evade.
+#   * destructive verbs outside the modeled set: ``find -delete`` /
+#     ``find ... -exec rm ...``, ``truncate``, ``shred``, ``tee /target``,
+#     ``> file`` clobbering, non-``rm`` deletion of residents, etc. — a
+#     deletion hidden behind a verb we do not model is not decomposed.
+#   * anything requiring evaluation of attacker-controlled data: variable
+#     indirection (``X='rm -rf /'; $X``), ``env -S 'rm ...'``, paths built
+#     from shell variables (``rm${IFS}-rf${IFS}/``), xargs arguments
+#     arriving via stdin.
+#   * exec-wrapper prefixes outside the modeled set: the shell builtins
+#     ``command``/``exec`` (builtins, not external programs, so absent from
+#     _EXEC_WRAPPER_ARG_FLAGS), and wrapper nests deeper than the recursion
+#     bound (``_depth > 3`` — e.g. four stacked wrappers like
+#     ``sudo nohup setsid timeout 5 rm -rf /``): the innermost command is
+#     not unwrapped/re-scanned.
+# Do NOT present these guards as complete command filtering; strengthen the
+# outer boundaries instead. Honesty over false assurance.
 # ---------------------------------------------------------------------------
 
 # Programs that are denied outright (no allow-listed flag set).
@@ -46,7 +73,26 @@ _WRAPPER_SHELLS = frozenset({"bash", "sh", "dash", "zsh", "ash", "ksh"})
 
 # Shell-control operators on which we split the command into pipeline pieces.
 # Order matters in the regex: longer operators first so we don't double-split.
-_PIPELINE_SPLIT_RE = re.compile(r"&&|\|\||;|\||&")
+# ``[\r\n]+`` makes newlines (LF/CRLF) first-class command separators — an
+# LLM-issued multi-line command is exactly as dangerous as its ``;``-joined
+# equivalent. Only used by the legacy quote-blind fallback below.
+_PIPELINE_SPLIT_RE = re.compile(r"&&|\|\||;|\||&|[\r\n]+")
+
+# Pipeline separators as *tokens* (for the quote-aware shlex splitter).
+# v0.50.0 round 2: bash's '|&' (pipe stdout+stderr) and the case-branch
+# terminators ';&' / ';;&' each begin a new simple command, and shlex's
+# punctuation-run tokenizer emits each as ONE token — absent from this set
+# they fell through to the _SHLEX_PUNCT skip below and the two stages
+# merged, so the RHS program was never scanned as argv[0].
+# True redirections ('>', '>>', '<', '>&', '&>', and the '>&' inside
+# '2>&1') must stay OUT of this set: they do not start a new command, and
+# splitting on them would promote a redirection target to argv[0].
+_PIPELINE_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "|&", ";&", ";;&"})
+
+# shlex ``punctuation_chars=True`` emits these as standalone operator tokens.
+# Non-pipeline operators (redirections ``>`` ``<`` ``>>``, subshell ``(`` ``)``)
+# are skipped so a redirection target isn't promoted to argv[0] of a new piece.
+_SHLEX_PUNCT = frozenset("();<>|&")
 
 # Env-var assignment prefix (FOO=bar cmd) — skipped when locating argv[0].
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -65,12 +111,15 @@ FORBIDDEN_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 
-def _split_pipeline(command: str) -> list[list[str]]:
-    """Split a shell command line into a list of argv lists.
+def _split_pipeline_fallback(command: str) -> list[list[str]]:
+    """Legacy quote-blind split; used only when the whole command has
+    mismatched quotes and the quote-aware tokenizer cannot parse it.
 
-    Splits on ;, &&, ||, |, & (ignoring quoted contents via shlex), then
-    runs shlex.split on each piece. Leading FOO=bar assignments are
-    stripped so argv[0] is the real program name.
+    Splits on the raw operator regex, then runs shlex.split on each piece
+    with a whitespace-split fallback. Leading FOO=bar assignments are
+    stripped so argv[0] is the real program name. Permissive by intent: a
+    malformed command is the user's problem; we still want to *try* to
+    detect dangerous primitives in it.
     """
     pieces = _PIPELINE_SPLIT_RE.split(command)
     out: list[list[str]] = []
@@ -81,15 +130,68 @@ def _split_pipeline(command: str) -> list[list[str]]:
         try:
             argv = shlex.split(piece, posix=True)
         except ValueError:
-            # Mismatched quotes — fall back to whitespace split. Permissive
-            # by intent: a malformed command is the user's problem; we
-            # still want to *try* to detect dangerous primitives in it.
             argv = piece.split()
         while argv and _ENV_ASSIGN_RE.match(argv[0]):
             argv = argv[1:]
         if argv:
             out.append(argv)
     return out
+
+
+def _split_pipeline(command: str) -> list[list[str]]:
+    """Split a shell command line into a list of argv lists, quote-aware.
+
+    Splits on ;, &&, ||, |, & AND newlines. Uses shlex with
+    ``punctuation_chars`` so those operators are NOT treated as pipeline
+    boundaries when they appear inside quoted strings (e.g.
+    ``git commit -m "a && b"`` stays one argv). Leading FOO=bar
+    assignments are stripped so argv[0] is the real program name.
+    Falls back to the legacy quote-blind split on mismatched quotes.
+    """
+    # Shell line-continuation: backslash-newline joins physical lines into
+    # one logical command. Collapse it BEFORE newline splitting so
+    # ``curl \<newline> -X POST ...`` stays a single argv.
+    command = command.replace("\\\r\n", " ").replace("\\\n", " ")
+    # Newlines are command separators equivalent to ';'. Rewriting them to
+    # ' ; ' is quote-safe: a newline INSIDE quotes becomes a ';' that the
+    # tokenizer keeps as literal data (the surrounding quotes are preserved),
+    # while a bare newline becomes a real separator token.
+    command = re.sub(r"[\r\n]+", " ; ", command)
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        # Disable '#' comment handling (shlex.shlex defaults commenters='#',
+        # unlike shlex.split(comments=False)). Otherwise a '#' would swallow
+        # the rest of the (newline-collapsed) command — e.g.
+        # ``ls # note\nrm -rf /`` would hide the rm and bypass the guard.
+        lex.commenters = ""
+        tokens = list(lex)
+    except ValueError:
+        # Mismatched quotes — permissive best-effort, same as before.
+        return _split_pipeline_fallback(command)
+    out: list[list[str]] = []
+    cur: list[str] = []
+    for tok in tokens:
+        if tok in _PIPELINE_SEPARATORS:
+            if cur:
+                out.append(cur)
+                cur = []
+        elif tok and all(ch in _SHLEX_PUNCT for ch in tok):
+            # Non-pipeline operator token (>, <, >>, (, ) ...): skip it so
+            # a redirection target stays inside the current argv instead of
+            # being promoted to argv[0] of a new piece.
+            continue
+        else:
+            cur.append(tok)
+    if cur:
+        out.append(cur)
+    result: list[list[str]] = []
+    for argv in out:
+        while argv and _ENV_ASSIGN_RE.match(argv[0]):
+            argv = argv[1:]
+        if argv:
+            result.append(argv)
+    return result
 
 
 def _rm_has_recursive_and_force(argv: list[str]) -> bool:
@@ -145,38 +247,205 @@ def _curl_sends_data(argv: list[str]) -> bool:
     return False
 
 
+# v0.50.0 (security-review follow-up, H8 class): command/process
+# substitution and backticks execute their contents without the inner
+# program ever appearing as argv[0] of a pipeline piece, so the argv
+# scanner alone never saw `echo $(rm -rf /)` or ``x=`rm -rf /` ``.
+# The spans are extracted from the RAW command string (quote-blind by
+# design: `"$(...)"` still executes, and after shlex de-quoting single
+# and double quotes are indistinguishable — deny both). Only fires when
+# the *inner* content is itself dangerous, so `awk '{print $(NF-1)}'`
+# and `echo $((1+2))` stay allowed.
+_SUBSTITUTION_SPAN_RE = re.compile(r"[$<>]\((.*)\)", re.DOTALL)
+_BACKTICK_SPAN_RE = re.compile(r"`([^`]+)`")
+
+# xargs flags that consume the FOLLOWING token as their argument (GNU
+# xargs flags whose argument must be separate or may be separate).
+# Attached forms (-n1, -I{}, --max-args=1) are skipped by the generic
+# leading-dash test. -e/-i/-l take only attached optional args in GNU
+# xargs, so they are deliberately NOT in this set — consuming the next
+# token for them could swallow the wrapped command (a false negative).
+_XARGS_ARG_FLAGS = frozenset({
+    "-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s",
+    "--arg-file", "--delimiter", "--eof", "--max-lines", "--max-args",
+    "--max-procs", "--max-chars",
+})
+
+
+def _xargs_wrapped_argv(argv: list[str]) -> list[str]:
+    """Return the argv of the command ``xargs`` will exec, or ``[]``.
+
+    Skips xargs' own flags (consuming separate arguments where the flag
+    requires one); the first non-flag token starts the wrapped command.
+    """
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in _XARGS_ARG_FLAGS:
+            i += 2
+            continue
+        if a.startswith("-") and a != "-":
+            i += 1
+            continue
+        return argv[i:]
+    return []
+
+
+# v0.50.0 round 2: exec-wrapper prefixes. Each of these programs runs its
+# tail as the real command (``nohup rm -rf /``, ``timeout 5 rm -rf /``,
+# ``sudo rm ...``) — pre-fix argv[0] was the benign wrapper name and the
+# tail was never inspected. Map: wrapper name -> its flags that consume the
+# FOLLOWING token as a separate argument (attached forms like ``-n5`` /
+# ``--adjustment=5`` are skipped by the generic leading-dash test — same
+# convention as _XARGS_ARG_FLAGS above).
+_EXEC_WRAPPER_ARG_FLAGS: dict[str, frozenset[str]] = {
+    "nohup": frozenset(),
+    "timeout": frozenset({"-k", "--kill-after", "-s", "--signal"}),
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+    "setsid": frozenset(),
+    "time": frozenset({"-f", "--format", "-o", "--output"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "ionice": frozenset({"-c", "--class", "-n", "--classdata",
+                         "-p", "--pid", "-P", "--pgid", "-u", "--uid"}),
+    "chrt": frozenset({"-T", "--sched-runtime", "-P", "--sched-period",
+                       "-D", "--sched-deadline", "-p", "--pid"}),
+    "taskset": frozenset(),
+    "unbuffer": frozenset(),
+    "sudo": frozenset({"-u", "--user", "-g", "--group", "-h", "--host",
+                       "-p", "--prompt", "-C", "--close-from",
+                       "-D", "--chdir", "-R", "--chroot",
+                       "-T", "--command-timeout", "-U", "--other-user",
+                       "-r", "--role", "-t", "--type"}),
+    "doas": frozenset({"-u", "-C", "-a"}),
+}
+
+# Wrappers with a MANDATORY positional before the command: ``timeout
+# DURATION cmd``, ``chrt PRIORITY cmd``, ``taskset MASK cmd``. That many
+# non-flag tokens are skipped before the tail starts.
+_EXEC_WRAPPER_POSITIONALS: dict[str, int] = {
+    "timeout": 1, "chrt": 1, "taskset": 1,
+}
+
+
+def _exec_wrapper_tail(argv: list[str]) -> list[str]:
+    """Return the argv of the command an exec-wrapper prefix will run, or ``[]``.
+
+    Same pattern as :func:`_xargs_wrapped_argv`: skip the wrapper name, its
+    option flags (consuming the following token where the flag takes a
+    separate argument), ``NAME=VALUE`` assignments (``env A=B cmd``,
+    ``sudo VAR=x cmd``), and any mandatory positional (timeout's DURATION,
+    chrt's PRIORITY, taskset's MASK). The first remaining token starts the
+    wrapped command. Conservative by design: when a flag's arity is not in
+    the table, the tail starts at the first non-flag/non-assignment token.
+    """
+    prog = os.path.basename(argv[0])
+    arg_flags = _EXEC_WRAPPER_ARG_FLAGS.get(prog)
+    if arg_flags is None:
+        return []
+    skip_positionals = _EXEC_WRAPPER_POSITIONALS.get(prog, 0)
+    i = 1
+    opts_done = False
+    while i < len(argv):
+        a = argv[i]
+        if not opts_done and a == "--":
+            opts_done = True
+            i += 1
+            continue
+        if not opts_done and a in arg_flags:
+            i += 2
+            continue
+        if not opts_done and a.startswith("-") and a != "-":
+            i += 1
+            continue
+        if _ENV_ASSIGN_RE.match(a):
+            i += 1
+            continue
+        if skip_positionals > 0:
+            skip_positionals -= 1
+            i += 1
+            continue
+        return argv[i:]
+    return []
+
+
+def _argv_is_dangerous(argv: list[str], *, _depth: int = 0) -> str | None:
+    """Inspect a single pipeline piece (argv list) for dangerous primitives."""
+    if _depth > 3 or not argv:
+        return None
+    # Strip absolute path: /usr/bin/rm -> rm.
+    prog = os.path.basename(argv[0])
+
+    # Wrapper-shell recursion: bash -c "<cmd>" / sh -c "<cmd>".
+    if prog in _WRAPPER_SHELLS:
+        for j in range(1, len(argv) - 1):
+            if argv[j] == "-c":
+                inner_reason = _command_is_dangerous(
+                    argv[j + 1], _depth=_depth + 1,
+                )
+                if inner_reason:
+                    return f"{prog} -c wrapping {inner_reason}"
+                break  # don't double-scan the same -c
+        # Fall through — the outer wrapper shell itself isn't denied.
+
+    # eval concatenates its arguments and executes them as a shell command.
+    if prog == "eval" and len(argv) > 1:
+        inner_reason = _command_is_dangerous(
+            " ".join(argv[1:]), _depth=_depth + 1,
+        )
+        if inner_reason:
+            return f"eval wrapping {inner_reason}"
+
+    # xargs execs its trailing argv (with stdin-derived arguments appended).
+    if prog == "xargs":
+        wrapped = _xargs_wrapped_argv(argv)
+        if wrapped:
+            inner_reason = _argv_is_dangerous(wrapped, _depth=_depth + 1)
+            if inner_reason:
+                return f"xargs wrapping {inner_reason}"
+
+    # v0.50.0 round 2: exec-wrapper prefixes (nohup, timeout, env, sudo, ...)
+    # run their tail as the real command — unwrap and re-scan it as its own
+    # argv, so `timeout 5 rm -rf /` resolves like `rm -rf /`.
+    if prog in _EXEC_WRAPPER_ARG_FLAGS:
+        wrapped = _exec_wrapper_tail(argv)
+        if wrapped:
+            inner_reason = _argv_is_dangerous(wrapped, _depth=_depth + 1)
+            if inner_reason:
+                return f"{prog} wrapping {inner_reason}"
+
+    if prog == "rm" and _rm_has_recursive_and_force(argv):
+        return f"rm with recursive+force flags: {shlex.join(argv)!r}"
+    if prog == "dd" and _dd_writes_block_device(argv):
+        return f"dd with if=/of= argument: {shlex.join(argv)!r}"
+    if prog == "curl" and _curl_sends_data(argv):
+        return f"curl sending data: {shlex.join(argv)!r}"
+    if prog in _DENY_PROGRAMS:
+        return f"{prog} is not allowed"
+    return None
+
+
 def _command_is_dangerous(command: str, *, _depth: int = 0) -> str | None:
     """Return a human-readable reason if the command is dangerous, else None.
 
-    Recurses up to 3 levels deep into wrapper shells (bash -c, sh -c, ...).
+    Recurses up to 3 levels deep into wrapper shells (bash -c, sh -c, ...),
+    ``eval``, ``xargs``, and command/process-substitution spans.
     """
     if _depth > 3:
         return None
     for argv in _split_pipeline(command):
-        prog_path = argv[0]
-        # Strip absolute path: /usr/bin/rm -> rm.
-        prog = os.path.basename(prog_path)
-
-        # Wrapper-shell recursion: bash -c "<cmd>" / sh -c "<cmd>".
-        if prog in _WRAPPER_SHELLS:
-            for j in range(1, len(argv) - 1):
-                if argv[j] == "-c":
-                    inner_reason = _command_is_dangerous(
-                        argv[j + 1], _depth=_depth + 1,
-                    )
-                    if inner_reason:
-                        return f"{prog} -c wrapping {inner_reason}"
-                    break  # don't double-scan the same -c
-            # Fall through — the outer wrapper shell itself isn't denied.
-
-        if prog == "rm" and _rm_has_recursive_and_force(argv):
-            return f"rm with recursive+force flags: {shlex.join(argv)!r}"
-        if prog == "dd" and _dd_writes_block_device(argv):
-            return f"dd with if=/of= argument: {shlex.join(argv)!r}"
-        if prog == "curl" and _curl_sends_data(argv):
-            return f"curl sending data: {shlex.join(argv)!r}"
-        if prog in _DENY_PROGRAMS:
-            return f"{prog} is not allowed"
+        reason = _argv_is_dangerous(argv, _depth=_depth)
+        if reason:
+            return reason
+    # Command substitution $(...), process substitution <(...)/>(...), and
+    # backticks all execute their contents; scan those spans recursively.
+    for span_re in (_SUBSTITUTION_SPAN_RE, _BACKTICK_SPAN_RE):
+        for m in span_re.finditer(command):
+            inner_reason = _command_is_dangerous(
+                m.group(1), _depth=_depth + 1,
+            )
+            if inner_reason:
+                return f"substitution wrapping {inner_reason}"
     return None
 
 
@@ -210,6 +479,13 @@ def _deny(reason: str) -> dict[str, Any]:
 
 def _normalize_path(raw: str) -> str:
     """Resolve ``..`` segments using PurePosixPath splitting (no OS calls)."""
+    # v0.50.0 (security-review must-fix): collapse redundant slashes FIRST.
+    # POSIX leaves a leading '//' implementation-defined and PurePosixPath
+    # preserves it as a distinct root ('//config' -> parts ('//', 'config')),
+    # so '//config/agents/x' normalized to the malformed
+    # '///config/agents/x' and slipped past every prefix check — while the
+    # Linux kernel resolves '//' as '/', making the command effective.
+    raw = re.sub(r"/{2,}", "/", raw)
     parts = PurePosixPath(raw).parts
     resolved: list[str] = []
     for part in parts:
@@ -315,10 +591,77 @@ def _has_prefix(norm: str, prefixes: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-_RESIDENT_RM_RE = re.compile(
-    r"\brm\s+(-[a-zA-Z]+\s+)*"
-    r"/config/agents/(?!specialists/|executors/)[^/\s]+"
-)
+_RESIDENT_ROOT = "/config/agents"
+_RESIDENT_EXEMPT_SUBTREES = ("specialists", "executors")
+
+
+def _argv_deletes_resident(argv: list[str], *, _depth: int = 0) -> bool:
+    """One pipeline piece of :func:`_deletes_resident` (argv level)."""
+    if _depth > 3 or not argv:
+        return False
+    prog = os.path.basename(argv[0])
+    if prog in _WRAPPER_SHELLS:
+        for j in range(1, len(argv) - 1):
+            if argv[j] == "-c":
+                if _deletes_resident(argv[j + 1], _depth=_depth + 1):
+                    return True
+                break
+    # v0.50.0: eval concatenates its arguments and executes them as a
+    # shell command — same wrapper class as bash -c.
+    if prog == "eval" and len(argv) > 1:
+        if _deletes_resident(" ".join(argv[1:]), _depth=_depth + 1):
+            return True
+    # v0.50.0 round 2: exec-wrapper prefixes (nohup, timeout, env, sudo,
+    # ...) run their tail as the real command — unwrap and re-scan, same
+    # as in _argv_is_dangerous.
+    if prog in _EXEC_WRAPPER_ARG_FLAGS:
+        wrapped = _exec_wrapper_tail(argv)
+        if wrapped and _argv_deletes_resident(wrapped, _depth=_depth + 1):
+            return True
+    if prog != "rm":
+        return False
+    seen_ddash = False
+    for a in argv[1:]:
+        if not seen_ddash:
+            if a == "--":
+                seen_ddash = True
+                continue
+            if a.startswith("-") and a != "-":
+                continue  # short or long flag
+        norm = _normalize_path(a)
+        if norm == _RESIDENT_ROOT:
+            return True  # rm of the whole agents dir kills every resident
+        if norm.startswith(_RESIDENT_ROOT + "/"):
+            rest = norm[len(_RESIDENT_ROOT) + 1:]
+            head, _sep, tail = rest.partition("/")
+            # Exempt only paths INSIDE specialists/ or executors/;
+            # deleting those subtree roots themselves still denies
+            # (matches the old regex's lookahead semantics).
+            if head in _RESIDENT_EXEMPT_SUBTREES and tail:
+                continue
+            return True
+    return False
+
+
+def _deletes_resident(command: str, *, _depth: int = 0) -> bool:
+    """True iff any ``rm`` in the command (or behind a ``bash``/``sh -c``
+    wrapper, ``eval``, or an exec-wrapper prefix like ``nohup``/``timeout``/
+    ``sudo``) targets ``/config/agents`` itself or a
+    non-specialist/non-executor child of it.
+
+    Argv-aware (via :func:`_split_pipeline`), so it is immune to the
+    bypasses that defeated the old regex: quoted paths
+    (``rm -r "/config/agents/ellen"``), long flags (``--recursive``), the
+    ``--`` end-of-options marker, wrapper shells, exec-wrapper prefixes,
+    and ``..`` traversal (paths are normalised with
+    :func:`_normalize_path`).
+    """
+    if _depth > 3:
+        return False
+    for argv in _split_pipeline(command):
+        if _argv_deletes_resident(argv, _depth=_depth):
+            return True
+    return False
 
 
 def make_casa_config_guard_hook(
@@ -348,7 +691,7 @@ def make_casa_config_guard_hook(
                 )
         elif tool_name == "Bash":
             command = input_data.get("tool_input", {}).get("command", "")
-            if forbid_delete_residents and _RESIDENT_RM_RE.search(command):
+            if forbid_delete_residents and _deletes_resident(command):
                 return _deny(
                     "casa_config_guard: Bash blocked - command looks like "
                     "a resident agent deletion. Residents are very "
