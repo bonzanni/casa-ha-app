@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 def _make_runtime():
@@ -447,6 +447,53 @@ class TestReloadPluginEnv:
         assert "BAR" not in os.environ
 
 
+@pytest.mark.unit
+class TestPluginEnvBootSeed:
+    """M22 (v0.49.0): the boot path must seed _PLUGIN_ENV_LAST_KEYS.
+
+    Pre-fix the snapshot started empty and only reload itself ever
+    wrote it, so the FIRST casa_reload(scope='plugin_env') computed
+    dropped = {} - new_keys = {} and could never remove a key that was
+    applied at boot and has since been deleted from plugin-env.conf —
+    a revoked plugin secret survived in os.environ (and kept being
+    inherited by plugin MCP subprocesses) for the container's life.
+    """
+
+    async def test_first_reload_drops_key_applied_at_boot(self, monkeypatch):
+        import reload as reload_mod
+        from reload import dispatch, note_boot_plugin_env
+
+        # Isolate the module-level snapshot from other tests.
+        monkeypatch.setattr(reload_mod, "_PLUGIN_ENV_LAST_KEYS", set())
+        # Simulate boot: the var was sourced into the process env and the
+        # snapshot seeded (casa_core.main step 1b).
+        monkeypatch.setenv("CASA_TEST_BOOT_SECRET", "s3cr3t")
+        note_boot_plugin_env({"CASA_TEST_BOOT_SECRET"})
+        # Operator then removed the line from plugin-env.conf.
+        monkeypatch.setattr("plugin_env_conf.read_entries", lambda: {})
+        monkeypatch.setattr("secrets_resolver.resolve", lambda v: v)
+
+        result = await dispatch("plugin_env", runtime=_make_runtime())
+
+        assert result["status"] == "ok"
+        assert "dropped_1_vars" in result["actions"], (
+            f"boot-applied key was not dropped: {result['actions']!r}"
+        )
+        assert "CASA_TEST_BOOT_SECRET" not in os.environ
+
+    async def test_note_boot_plugin_env_copies_the_set(self, monkeypatch):
+        """Mutating the caller's set afterwards must not leak into the
+        snapshot."""
+        import reload as reload_mod
+        from reload import note_boot_plugin_env
+
+        monkeypatch.setattr(reload_mod, "_PLUGIN_ENV_LAST_KEYS", set())
+        keys = {"CASA_TEST_A"}
+        note_boot_plugin_env(keys)
+        keys.add("CASA_TEST_B")
+        assert reload_mod._PLUGIN_ENV_LAST_KEYS == {"CASA_TEST_A"}
+
+
 class TestReloadAgents:
     async def test_adds_new_resident(self, tmp_path, monkeypatch):
         from reload import dispatch, register_handler, reload_agents
@@ -494,6 +541,12 @@ class TestReloadAgents:
         assert "ellen" in runtime.role_configs
 
     async def test_evicts_deleted_resident(self, tmp_path, monkeypatch):
+        """H11 (v0.49.0): eviction against the REAL MessageBus. The old
+        version of this test used a MagicMock bus whose auto-created
+        ``.unregister`` masked that MessageBus had no such method — the
+        AttributeError was swallowed in prod and 'evicted' residents
+        kept their queue + handler (ghost agents)."""
+        from bus import MessageBus
         from reload import dispatch, register_handler, reload_agents
         register_handler("agents", reload_agents)
 
@@ -510,6 +563,10 @@ class TestReloadAgents:
         runtime = _make_runtime()
         runtime.config_dir = str(tmp_path)
         runtime.agents_dir = str(agents_dir)
+        bus = MessageBus()
+        bus.register("ellen", MagicMock())
+        bus.register("tina", MagicMock())
+        runtime.bus = bus
         runtime.role_configs = {"ellen": MagicMock(), "tina": MagicMock()}
         runtime.agents = {"ellen": MagicMock(), "tina": MagicMock()}
         runtime.specialist_registry.all_configs = lambda: {}
@@ -518,7 +575,14 @@ class TestReloadAgents:
         assert result["status"] == "ok"
         assert "tina" not in runtime.role_configs
         assert "tina" not in runtime.agents
-        runtime.bus.unregister.assert_any_call("tina")
+        # Real-bus teardown: queue + handler gone, triggers unwound.
+        assert "tina" not in bus.queues
+        assert "tina" not in bus.handlers
+        runtime.trigger_registry.reregister_for.assert_any_call(
+            "tina", [], [],
+        )
+        # Survivor untouched.
+        assert "ellen" in bus.queues and "ellen" in bus.handlers
 
     async def test_surfaces_specialist_load_failures(
         self, tmp_path, monkeypatch,
@@ -576,6 +640,156 @@ class TestReloadAgents:
         )
         assert any("broken" in a for a in failed_actions)
         assert any("runtime.yaml" in a for a in failed_actions)
+
+
+@pytest.mark.unit
+class TestReloadBusLoopLifecycle:
+    """H10 + H11 (v0.49.0): the resident add/remove lifecycle against a
+    REAL MessageBus.
+
+    Add half (H10): a resident added via reload must get a
+    ``run_agent_loop`` consumer — pre-fix its queue was registered but
+    never consumed, so every trigger firing / NOTIFICATION sat in the
+    queue until the next add-on restart.
+
+    Remove half (H11): an evicted resident's consumer must be cancelled
+    and its queue/handler/triggers dropped — pre-fix the ghost kept
+    consuming and executing scheduled prompts forever.
+    """
+
+    async def _drain_bus_loops(self, bus) -> None:
+        """Cancel + await any consumers the real bus spawned (no leaks)."""
+        tasks = list(getattr(bus, "_loop_tasks", {}).values())
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_message_to_reload_added_resident_is_dispatched(
+        self, tmp_path, monkeypatch,
+    ):
+        from bus import BusMessage, MessageBus, MessageType
+        import reload as reload_mod
+        from reload import reload_agents
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "newrole").mkdir(parents=True)
+
+        received: list = []
+
+        class _InertAgent:
+            async def handle_message(self, msg):
+                received.append(msg)
+                return None
+
+        monkeypatch.setattr(
+            "policies.load_policies", lambda *a, **kw: MagicMock(),
+        )
+        monkeypatch.setattr(
+            "agent_loader.load_agent_from_dir",
+            lambda d, policies=None: MagicMock(role="newrole"),
+        )
+        monkeypatch.setattr(
+            "agent_home.provision_agent_home", lambda **kw: None,
+        )
+        monkeypatch.setattr(
+            reload_mod, "_construct_agent",
+            lambda *, cfg, runtime: _InertAgent(),
+        )
+
+        runtime = _make_runtime()
+        runtime.bus = MessageBus()  # REAL bus — the seam MagicMock hid
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.specialist_registry.all_configs = lambda: {}
+        runtime.specialist_registry.load_failures = lambda: []
+
+        try:
+            actions = await reload_agents(runtime)
+            assert "added_newrole" in actions
+
+            await runtime.bus.send(BusMessage(
+                type=MessageType.SCHEDULED, source="scheduler",
+                target="newrole", content="cron tick",
+            ))
+            for _ in range(50):  # up to ~0.5s for the consumer to drain
+                if received:
+                    break
+                await asyncio.sleep(0.01)
+
+            assert received, (
+                "SCHEDULED message to a reload-added resident was never "
+                "dispatched: reload_agents registered the queue but "
+                "spawned no run_agent_loop consumer (H10)"
+            )
+            assert received[0].content == "cron tick"
+            assert runtime.bus.queues["newrole"].empty()
+        finally:
+            await self._drain_bus_loops(runtime.bus)
+
+    async def test_evicted_resident_consumer_cancelled_no_ghost_turns(
+        self, tmp_path, monkeypatch,
+    ):
+        from bus import BusMessage, MessageBus, MessageType
+        from reload import reload_agents
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "ellen").mkdir(parents=True)
+        # tina: known to the runtime, deleted from disk → evict.
+
+        monkeypatch.setattr(
+            "policies.load_policies", lambda *a, **kw: MagicMock(),
+        )
+        monkeypatch.setattr(
+            "agent_loader.load_agent_from_dir", lambda *a, **kw: MagicMock(),
+        )
+
+        ghost_turns: list = []
+
+        async def tina_handler(msg):
+            ghost_turns.append(msg)
+            return None
+
+        runtime = _make_runtime()
+        bus = MessageBus()
+        runtime.bus = bus
+        bus.register("ellen", MagicMock())
+        bus.register("tina", tina_handler)
+        tina_task = bus.start_agent_loop("tina")  # boot-style live consumer
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {"ellen": MagicMock(), "tina": MagicMock()}
+        runtime.agents = {"ellen": MagicMock(), "tina": MagicMock()}
+        runtime.specialist_registry.all_configs = lambda: {}
+        runtime.specialist_registry.load_failures = lambda: []
+
+        try:
+            actions = await reload_agents(runtime)
+            assert "evicted_tina" in actions
+
+            # The consumer is cancelled AND awaited by the eviction path.
+            assert tina_task.done() and tina_task.cancelled()
+            assert "tina" not in bus.queues
+            assert "tina" not in bus.handlers
+
+            # A scheduler-style send after eviction is silently dropped —
+            # no queueing, no ghost dispatch.
+            await bus.send(BusMessage(
+                type=MessageType.SCHEDULED, source="scheduler",
+                target="tina", content="cron prompt",
+            ))
+            await asyncio.sleep(0.05)
+            assert not ghost_turns, (
+                "evicted resident processed a message (ghost agent)"
+            )
+            assert "tina" not in bus.queues
+
+            # Trigger jobs + webhook allowlist unwound.
+            runtime.trigger_registry.reregister_for.assert_any_call(
+                "tina", [], [],
+            )
+        finally:
+            await self._drain_bus_loops(bus)
 
 
 class TestReloadFull:
@@ -637,6 +851,168 @@ class TestReloadFull:
 
         await dispatch("full", runtime=runtime, include_env=True)
         assert "plugin_env" in called
+
+
+@pytest.mark.unit
+class TestConstructAgentMemoryWiring:
+    """H9 (v0.49.0): reload._construct_agent must pass the runtime's
+    semantic_memory into Agent(...).
+
+    The v0.45.0 memory retirement removed the old ``memory=`` wiring here
+    and never re-added the Hindsight seam, so every reload-constructed
+    resident silently fell back to NoOpSemanticMemory (long-term amnesia
+    + permanently lost retains) until the next add-on restart. The bug
+    was invisible because every other reload test monkeypatches
+    ``_construct_agent`` — this class deliberately runs the REAL factory
+    and the REAL ``agent.Agent``.
+    """
+
+    async def test_reload_constructed_agent_reuses_runtime_semantic_memory(
+        self, monkeypatch,
+    ):
+        import agent as agent_mod
+        import reload as reload_mod
+        from types import SimpleNamespace
+        from semantic_memory import NoOpSemanticMemory
+
+        # Keep the test hermetic: no home-provisioning I/O, no hook
+        # resolution. Everything else in Agent.__init__ runs for real.
+        monkeypatch.setattr(
+            "agent_home.provision_agent_home", lambda **kw: None,
+        )
+        monkeypatch.setattr(
+            agent_mod, "resolve_hooks", lambda *a, **kw: MagicMock(),
+        )
+
+        sentinel = object()  # stands in for HindsightSemanticMemory
+        runtime = _make_runtime()
+        runtime.semantic_memory = sentinel
+        cfg = SimpleNamespace(role="probe", hooks=None, cwd="")
+
+        constructed = reload_mod._construct_agent(cfg=cfg, runtime=runtime)
+
+        assert constructed._semantic_memory is sentinel, (
+            "reload._construct_agent dropped semantic_memory — reloaded "
+            "agents silently fall back to NoOpSemanticMemory (long-term "
+            "amnesia + lost retains)"
+        )
+        assert not isinstance(constructed._semantic_memory, NoOpSemanticMemory)
+
+    async def test_runtime_without_semantic_memory_falls_back_to_noop(
+        self, monkeypatch,
+    ):
+        """Contract pin: a runtime whose ``semantic_memory`` is unset
+        (the CasaRuntime default, and every MagicMock-light test
+        stand-in) still constructs — Agent maps None to NoOp."""
+        import agent as agent_mod
+        import reload as reload_mod
+        from types import SimpleNamespace
+        from semantic_memory import NoOpSemanticMemory
+
+        monkeypatch.setattr(
+            "agent_home.provision_agent_home", lambda **kw: None,
+        )
+        monkeypatch.setattr(
+            agent_mod, "resolve_hooks", lambda *a, **kw: MagicMock(),
+        )
+
+        runtime = _make_runtime()  # semantic_memory left at its default
+        cfg = SimpleNamespace(role="probe", hooks=None, cwd="")
+
+        constructed = reload_mod._construct_agent(cfg=cfg, runtime=runtime)
+
+        assert isinstance(constructed._semantic_memory, NoOpSemanticMemory)
+
+
+@pytest.mark.unit
+class TestFullScopeExclusion:
+    """M21 (v0.49.0): the _RWLock writer must actually exclude readers.
+
+    Pre-fix, acquire_write recorded no lock state at all, so a
+    scope='full' reload was NOT mutually exclusive with other scopes —
+    a concurrent scope='agent' dispatch interleaved with reload_full's
+    multi-step mutation of runtime.agents / role_configs /
+    agent_registry, directly contradicting the module docstring.
+    """
+
+    async def test_full_excludes_other_scopes(self, monkeypatch):
+        """A reader arriving while the writer is active must wait for
+        release_write. Pre-fix ordering was
+        ["full:start", "agent:start", "agent:end", "full:end"]."""
+        import reload as reload_mod
+        from reload import dispatch
+
+        ordering: list[str] = []
+
+        async def slow_full(runtime, *, role=None, include_env=False):
+            ordering.append("full:start")
+            await asyncio.sleep(0.05)  # yield so a reader could sneak in
+            ordering.append("full:end")
+            return ["full_work"]
+
+        async def fast_agent(runtime, *, role=None):
+            ordering.append("agent:start")
+            ordering.append("agent:end")
+            return ["agent_work"]
+
+        monkeypatch.setitem(reload_mod._HANDLERS, "full", slow_full)
+        monkeypatch.setitem(reload_mod._HANDLERS, "agent", fast_agent)
+        # Fresh RW lock bound to THIS test's event loop.
+        monkeypatch.setattr(reload_mod, "_GLOBAL_RW", None)
+        runtime = _make_runtime()
+
+        async def run_agent_later():
+            await asyncio.sleep(0.01)  # start after full holds the write lock
+            return await dispatch("agent", runtime=runtime, role="x")
+
+        results = await asyncio.gather(
+            dispatch("full", runtime=runtime),
+            run_agent_later(),
+        )
+        assert all(r["status"] == "ok" for r in results), results
+        assert ordering == [
+            "full:start", "full:end", "agent:start", "agent:end",
+        ], (
+            f"scope='full' did not exclude scope='agent': {ordering!r} — "
+            "the reader ran inside the writer's critical section"
+        )
+
+    async def test_reader_in_flight_blocks_writer(self, monkeypatch):
+        """The opposite direction already worked pre-fix (writer waits
+        for _readers == 0) and must not regress."""
+        import reload as reload_mod
+        from reload import dispatch
+
+        ordering: list[str] = []
+
+        async def slow_agent(runtime, *, role=None):
+            ordering.append("agent:start")
+            await asyncio.sleep(0.05)
+            ordering.append("agent:end")
+            return ["agent_work"]
+
+        async def fast_full(runtime, *, role=None, include_env=False):
+            ordering.append("full:start")
+            ordering.append("full:end")
+            return ["full_work"]
+
+        monkeypatch.setitem(reload_mod._HANDLERS, "agent", slow_agent)
+        monkeypatch.setitem(reload_mod._HANDLERS, "full", fast_full)
+        monkeypatch.setattr(reload_mod, "_GLOBAL_RW", None)
+        runtime = _make_runtime()
+
+        async def run_full_later():
+            await asyncio.sleep(0.01)  # start after agent holds a read lock
+            return await dispatch("full", runtime=runtime)
+
+        results = await asyncio.gather(
+            dispatch("agent", runtime=runtime, role="x"),
+            run_full_later(),
+        )
+        assert all(r["status"] == "ok" for r in results), results
+        assert ordering == [
+            "agent:start", "agent:end", "full:start", "full:end",
+        ]
 
 
 class TestExecutorsScope:
