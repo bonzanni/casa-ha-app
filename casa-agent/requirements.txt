@@ -20,4 +20,4 @@ opentelemetry-api>=1.20.0
 # Build-time probe (docs/superpowers/specs/2026-05-12-e12-claude_code-channels-A6-findings.md
 # §A.6.1) confirmed FastMCP `instructions=` kwarg + `Server.create_initialization_options(
 # experimental_capabilities={...})` bootstrap path on this version range.
-mcp>=1.2,<2
+mcp>=1.28.1,<2
