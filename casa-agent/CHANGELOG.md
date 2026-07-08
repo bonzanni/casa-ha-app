@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.57.1] - 2026-07-09 — publishing readiness: repo shell + green CI
+
+Repository/presentation release — no runtime behavior changes.
+
+### Fixed
+
+- **e2e mock Telegram `getChatMember` (CI red since v0.52.0).** python-telegram-bot
+  22.7 parses the response strictly (`User` requires `first_name`/`is_bot`, and
+  `ChatMemberAdministrator` requires the full admin-rights field set), so the mock's
+  thin payload made the boot-time bot-permissions check fail and disabled
+  engagements, breaking the tier2 Engagement E-block. The mock now returns a
+  complete `ChatMemberAdministrator` payload. Second independent breakage from
+  the same release: M9 made `handle_update` deliver driver turns as a tracked
+  background task, so the harness's synchronous asserts raced the delivery —
+  the E-block now drains `_turn_tasks` before asserting.
+
+### Added
+
+- **Store presentation:** root `README.md` (add-repository button, badges, app
+  list), `casa-agent/README.md` store intro, MIT `LICENSE`.
+- **Translations** for the last untranslated options: `hindsight_api_url`,
+  `casa_tz`, `log_level`.
+- **Dev tooling:** `setup-dev.sh` falls back to uv-managed CPython when the system
+  python can't build a venv, and auto-symlinks `docs/` in linked git worktrees;
+  `.worktreeinclude`; memory-accuracy eval scripts tracked under `test-local/eval/`.
+
+### Changed
+
+- `repository.yaml`: repository name now "Casa Apps" (HA renamed add-ons → apps);
+  maintainer contact switched to the public noreply address.
+- AI-attribution policy: commits now use kernel/Fedora-style `Assisted-by: Claude Code`
+  trailers instead of `Co-Authored-By`; the root README discloses AI-assisted
+  development. Historical trailers are left untouched.
+
 ## [0.57.0] - 2026-07-08 — Theme 10: final correctness lows (11 fixes)
 
 ### Fixed

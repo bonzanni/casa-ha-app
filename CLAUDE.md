@@ -63,3 +63,30 @@ current-state spec).
 - **Verify against whole files, not thin grep slices** — read around a symbol before
   asserting behaviour.
 - Don't commit or push unless asked; if on `master`, branch first.
+
+## Repo hygiene & publishing norms
+This public repo is the storefront for the Casa app (HA renamed "add-ons" → "apps"
+mid-2026). Keep it publish-ready at all times:
+- **Green master.** Ship-fast doesn't wait for CI, but after pushing check the previous
+  QA run (`gh run list --workflow qa.yml --branch master --limit 1`); a red master is
+  stop-the-line before the next release — the e2e tiers cover what the local unit gate
+  can't (see the v0.52–v0.57 red streak).
+- **Branches die on merge.** GitHub auto-deletes the remote head; delete the local
+  branch too. No stray branches on origin.
+- **Every release**: bump `casa-agent/config.yaml` version + a user-facing CHANGELOG
+  entry (keepachangelog tone; deep engineering detail belongs in the PR body) + a
+  `translations/en.yaml` entry for any new/changed option + DOCS.md accuracy.
+- **Nothing internal on any pushed ref**: no `docs/` content, no audit/diagnosis
+  ledgers, no `.claude/`. Internal artifacts live in `docs/` (the private inner repo).
+  Force-pushed-away commits stay fetchable by SHA on GitHub — prevention is the only
+  cure.
+- **Public identity**: commits AND public-facing files (repository.yaml maintainer,
+  README) use `3899230+bonzanni@users.noreply.github.com`, never a personal address.
+- **Clean tree between sessions**: commit or revert stragglers. New files have a home
+  (eval scripts → `test-local/eval/`, e2e → `test-local/e2e/`, internal specs →
+  `docs/`); nothing parked at the repo root.
+- **AI attribution**: commits end with `Assisted-by: Claude Code` (kernel/Fedora-style
+  disclosure — not `Co-Authored-By`, which implies authorship and suffers GitHub
+  email-squatting); PR bodies carry no vendor footer. Configured in
+  `.claude/settings.json` (`attribution`); the README's "AI-assisted development" note
+  is the canonical disclosure. Never strip or rewrite historical trailers.
