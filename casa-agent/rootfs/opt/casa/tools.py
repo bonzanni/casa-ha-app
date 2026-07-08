@@ -708,6 +708,11 @@ async def delegate_to_agent(args: dict) -> dict:
 
         driver = getattr(agent_mod, "active_engagement_driver", None)
         if driver is None:
+            await _engagement_registry.mark_error(
+                rec.id, kind="no_driver",
+                message="engagement driver not initialized",
+            )
+            await _abort_engagement_topic(channel, rec.id, topic_id)
             return _result({"status": "error", "kind": "no_driver",
                             "message": "engagement driver not initialized"})
         try:
@@ -715,6 +720,7 @@ async def delegate_to_agent(args: dict) -> dict:
         except Exception as exc:  # noqa: BLE001
             await _engagement_registry.mark_error(rec.id, kind="driver_start_failed",
                                                   message=str(exc))
+            await _abort_engagement_topic(channel, rec.id, topic_id)
             return _result({"status": "error", "kind": "driver_start_failed",
                             "message": str(exc)})
 
@@ -1356,6 +1362,7 @@ async def engage_executor(args: dict) -> dict:
         await _engagement_registry.mark_error(
             rec.id, kind="prompt_template_missing", message=str(exc),
         )
+        await _abort_engagement_topic(channel, rec.id, topic_id)
         return _result({
             "status": "error", "kind": "prompt_template_missing",
             "message": str(exc),
@@ -1387,6 +1394,11 @@ async def engage_executor(args: dict) -> dict:
     if defn.driver == "claude_code":
         driver = getattr(agent_mod, "active_claude_code_driver", None)
         if driver is None:
+            await _engagement_registry.mark_error(
+                rec.id, kind="no_driver",
+                message="claude_code driver not initialized",
+            )
+            await _abort_engagement_topic(channel, rec.id, topic_id)
             return _result({
                 "status": "error", "kind": "no_driver",
                 "message": "claude_code driver not initialized",
@@ -1400,6 +1412,7 @@ async def engage_executor(args: dict) -> dict:
             await _engagement_registry.mark_error(
                 rec.id, kind="driver_start_failed", message=str(exc),
             )
+            await _abort_engagement_topic(channel, rec.id, topic_id)
             return _result({
                 "status": "error", "kind": "driver_start_failed",
                 "message": str(exc),
@@ -1418,6 +1431,11 @@ async def engage_executor(args: dict) -> dict:
 
         driver = getattr(agent_mod, "active_engagement_driver", None)
         if driver is None:
+            await _engagement_registry.mark_error(
+                rec.id, kind="no_driver",
+                message="engagement driver not initialized",
+            )
+            await _abort_engagement_topic(channel, rec.id, topic_id)
             return _result({
                 "status": "error", "kind": "no_driver",
                 "message": "engagement driver not initialized",
@@ -1428,6 +1446,7 @@ async def engage_executor(args: dict) -> dict:
             await _engagement_registry.mark_error(
                 rec.id, kind="driver_start_failed", message=str(exc),
             )
+            await _abort_engagement_topic(channel, rec.id, topic_id)
             return _result({
                 "status": "error", "kind": "driver_start_failed",
                 "message": str(exc),
@@ -1439,6 +1458,34 @@ async def engage_executor(args: dict) -> dict:
         "executor_type": executor_type,
         "topic_id": topic_id,
     })
+
+
+async def _abort_engagement_topic(
+    channel: Any, engagement_id: str, topic_id: int | None,
+) -> None:
+    """Best-effort: flip a just-created topic to 'failed' and close it when
+    an engagement dies before its driver started. Never raises.
+
+    Do NOT route these failures through _finalize_engagement — it would
+    double-notify Ellen over the bus (the tool already returns the error
+    envelope synchronously), overwrite the specific error kind with
+    'emit_completion_error', and run memory-retention side effects.
+    """
+    if channel is None or topic_id is None:
+        return
+    if hasattr(channel, "update_topic_state"):
+        try:
+            await channel.update_topic_state(
+                engagement_id=engagement_id, new_state="failed",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "abort topic %s: update_topic_state failed: %s", topic_id, exc,
+            )
+    try:
+        await channel.close_topic(thread_id=topic_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("abort topic %s: close_topic failed: %s", topic_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1524,6 +1571,14 @@ async def _finalize_engagement(
                 "finalize engagement %s: driver.cancel failed: %s",
                 engagement.id[:8], exc,
             )
+
+    # Drop the permission-verdict queue for this engagement (leak guard).
+    # Lazy import matches this function's existing style and avoids cycles.
+    try:
+        from channels.channel_handlers import PERMISSION_QUEUES
+        PERMISSION_QUEUES.pop(engagement.id, None)
+    except Exception:  # noqa: BLE001
+        pass
 
     # 4. NOTIFY Ellen (via existing DelegationComplete-shaped pathway)
     if _bus is not None:
@@ -1831,13 +1886,21 @@ async def _synthesize_answer(
     """
     import os
     model = os.environ.get("SECONDARY_AGENT_MODEL", "haiku")
+    # The pinned claude-agent-sdk's ClaudeAgentOptions has no
+    # max_tokens/max_output_tokens field; cap output via the documented
+    # Claude Code CLI env knob instead (env merges over the inherited
+    # environment for this one CLI subprocess only).
     options = ClaudeAgentOptions(
         model=model,
         system_prompt=_QUERY_ENGAGER_SYSTEM,
         max_turns=1,
         mcp_servers={},
+        env={"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max(1, max_tokens))},
     )
-    prompt = f"Context:\n{context}\n\nQuestion: {question}"
+    prompt = (
+        f"Context:\n{context}\n\nQuestion: {question}\n\n"
+        f"Answer concisely, in at most about {max_tokens} tokens."
+    )
     out = ""
     eng = engagement_var.get(None)
     eng_id = eng.id[:8] if eng is not None else None
@@ -1850,7 +1913,12 @@ async def _synthesize_answer(
                 for b in getattr(msg, "content", []):
                     if isinstance(b, TextBlock):
                         out += b.text
-    return out.strip()
+    out = out.strip()
+    # Belt-and-braces hard stop in case the CLI/model still overshoots.
+    from tokens import estimate_tokens
+    if estimate_tokens(out) > max_tokens:
+        out = out[: max_tokens * 4].rstrip()
+    return out
 
 
 @tool(
@@ -1866,7 +1934,7 @@ async def query_engager(args: dict) -> dict:
         return _result({"status": "error", "kind": "not_in_engagement",
                         "message": "query_engager called outside an engagement"})
     question = args.get("question", "") or ""
-    max_tokens = int(args.get("max_tokens") or 500)
+    max_tokens = max(1, min(int(args.get("max_tokens") or 500), 4000))
 
     # Retrieve engager-side context: a semantic recall against the shared `casa`
     # bank at the engagement origin's read-clearance (design §3, plan 3).
@@ -1946,10 +2014,14 @@ async def cancel_engagement(args: dict) -> dict:
     "casa_reload_triggers",
     "Re-register triggers for one agent in-process (no addon restart). "
     "Use when ONLY <role>/triggers.yaml changed. For other config "
-    "edits, use casa_reload(scope=...).",
+    "edits, use casa_reload(scope=...). Restricted to the configurator role.",
     {"role": str},
 )
 async def casa_reload_triggers(args: dict) -> dict:
+    caller = _effective_caller_role()
+    if caller not in _PRIVILEGED_CONFIG_ROLES:
+        return _refuse_unprivileged("casa_reload_triggers", caller)
+
     role = args.get("role")
     if not role:
         return _result({

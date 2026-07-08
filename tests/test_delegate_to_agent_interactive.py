@@ -11,7 +11,7 @@ from config import (
     AgentConfig, CharacterConfig, MemoryConfig, SessionConfig, ToolsConfig,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 def _make_alex_cfg():
@@ -184,3 +184,57 @@ class TestInteractiveMode:
         # v0.37.1 D-1: post-create edit_forum_topic rename is gone —
         # the U3 title is set at open time, no follow-up rename.
         tch.bot.edit_forum_topic.assert_not_called()
+
+    async def test_driver_start_failure_flips_and_closes_topic(
+        self, tmp_path, monkeypatch,
+    ):
+        """L23 leak guard: a failed driver.start in the interactive
+        delegation path must not leave the just-created topic open
+        forever — it must be flipped to 'failed' and closed."""
+        import agent as agent_mod
+        from engagement_registry import EngagementRegistry
+        from tools import delegate_to_agent, init_tools
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        tch = MagicMock()
+        tch.engagement_permission_ok = True
+        tch.engagement_supergroup_id = -1001
+        tch.open_engagement_topic = AsyncMock(return_value=555)
+        tch.send_to_topic = AsyncMock()
+        tch.update_topic_state = AsyncMock()
+        tch.close_topic = AsyncMock()
+        cm = MagicMock(); cm.get.return_value = tch
+        specialist_reg = MagicMock()
+        specialist_reg.get.return_value = _make_alex_cfg()
+        bus = MagicMock(); bus.notify = AsyncMock()
+        init_tools(
+            channel_manager=cm, bus=bus,
+            specialist_registry=specialist_reg, mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=reg,
+        )
+        driver = MagicMock()
+        driver.start = AsyncMock(side_effect=RuntimeError("boom"))
+        agent_mod.active_engagement_driver = driver
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+            "scope": "business",
+        })
+        try:
+            res = await delegate_to_agent.handler({
+                "agent": "finance", "task": "Plan Q2", "context": "",
+                "mode": "interactive",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+        payload = json.loads(res["content"][0]["text"])
+        assert payload["status"] == "error"
+        assert payload["kind"] == "driver_start_failed"
+
+        rec = reg.by_topic_id(555)
+        assert rec is not None
+        tch.update_topic_state.assert_awaited_once_with(
+            engagement_id=rec.id, new_state="failed",
+        )
+        tch.close_topic.assert_awaited_once_with(thread_id=555)

@@ -65,10 +65,6 @@ configuration:
     name: Voice Agent Model
     description: >-
       Claude model for the voice agent. Haiku recommended for low latency.
-  subagent_model:
-    name: Subagent Model
-    description: >-
-      Claude model used by on-demand subagents (automation-builder, plugin-builder, etc.).
   enable_terminal:
     name: Enable Web Terminal
     description: >-
@@ -83,4 +79,4 @@ configuration:
       to disable engagement features; Casa still boots.
   telegram_bot_api_base:
     name: "Telegram Bot API base URL"
-    description: "Override Telegram Bot API endpoint - leave blank for api.telegram.org. Used by e2e harness."
+    description: "Override the Telegram Bot API endpoint (e.g. a self-hosted Bot API server). Leave blank for api.telegram.org."

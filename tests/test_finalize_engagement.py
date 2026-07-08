@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 class TestFinalizeEngagement:
@@ -237,3 +237,42 @@ class TestFinalizeU3Transition:
         # Close still happened despite the state-update failure.
         telegram.close_topic.assert_awaited_once()
         assert rec.status == "completed"
+
+
+async def test_finalize_engagement_pops_permission_queue(tmp_path, monkeypatch):
+    """L5 leak guard: _finalize_engagement must drop this engagement's
+    permission-verdict queue (and any undrained verdict inside it) so it
+    doesn't persist in _PERMISSION_QUEUES for the process lifetime, while
+    leaving unrelated engagements' queues untouched."""
+    import tools
+    from engagement_registry import EngagementRecord
+    from channels.channel_handlers import PERMISSION_QUEUES
+
+    rec = EngagementRecord(
+        id="a" * 32, kind="executor", role_or_type="tester",
+        driver="in_casa",
+        status="active", topic_id=None, started_at=0.0,
+        last_user_turn_ts=0.0, last_idle_reminder_ts=0.0,
+        completed_at=None, sdk_session_id=None, origin={}, task="t",
+    )
+    # Materialize exactly as the relay hook does, and leave an undrained
+    # verdict as a timed-out operator tap would.
+    PERMISSION_QUEUES[rec.id].put_nowait(
+        {"request_id": "r1", "verdict": "allow", "operator_id": None}
+    )
+    other = "b" * 32
+    PERMISSION_QUEUES[other]  # unrelated engagement must survive
+    monkeypatch.setattr(tools, "_engagement_registry", None)
+    monkeypatch.setattr(tools, "_channel_manager", None)
+    monkeypatch.setattr(tools, "_bus", None)
+
+    try:
+        await tools._finalize_engagement(
+            rec, outcome="completed", text="", artifacts=[], next_steps=[],
+            driver=None,
+        )
+
+        assert rec.id not in PERMISSION_QUEUES  # entry and stale verdict gone
+        assert other in PERMISSION_QUEUES        # no collateral clearing
+    finally:
+        PERMISSION_QUEUES.clear()

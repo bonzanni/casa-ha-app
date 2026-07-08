@@ -1,5 +1,82 @@
 # Changelog
 
+## [0.54.0] - 2026-07-08 — Hygiene sweep: dead config keys, resource leaks, and small correctness lows
+
+### Removed
+
+- **`subagent_model` add-on option removed (M1).** It was declared in `config.yaml`'s options +
+  schema, exported as `SUBAGENT_MODEL` by `svc-casa/run`, and documented in `DOCS.md` /
+  `translations/en.yaml` — but no code anywhere ever consumed it (executors and specialists
+  hardcode `model: sonnet` in their `definition.yaml`/`runtime.yaml`). Removed the option, its
+  export, and its docs; appended `subagent_model` to `DEPRECATED_OPTION_KEYS` in
+  `setup-configs.sh` so any stored value is pruned on boot.
+
+### Fixed
+
+- **`telegram_bot_api_base` add-on option is now actually wired to the casa process (M2).** The
+  option was consumed by `channels/telegram.py` via `os.environ.get("TELEGRAM_BOT_API_BASE")`, but
+  `svc-casa/run` never exported it — only the local e2e test harness did — so a self-hosted Bot API
+  server configured via the add-on UI was silently ignored since v0.12.0. `svc-casa/run` now reads
+  and exports it (null-normalized, matching the existing optional-string pattern).
+- **`webhook_auth_enabled: false` now actually disables webhook auth (L50).** `svc-casa/run`
+  exported `WEBHOOK_SECRET` unconditionally from the `webhook_secret` option, so setting the toggle
+  off had no effect once a secret value was configured — `casa_core`'s auth-enabled check is purely
+  "is the secret non-empty". The export is now gated on `webhook_auth_enabled`.
+- **`casactl reload` now accepts `--scope=config_sync` (L80/L29).** The v0.47.0 `config_sync` reload
+  scope was registered server-side and advertised by the `casa_reload` MCP tool, but the operator
+  CLI's argparse `choices` predated it, so `casactl reload --scope=config_sync` failed with "invalid
+  choice" even though the equivalent `POST /admin/reload` succeeded. Added to `casactl` and to the
+  configurator's `reload.md` doctrine table (now "eight reload scopes").
+- **`_synthesize_answer` now honors its `max_tokens` argument (L76/L25).** `query_engager`'s bounded
+  synthesis pass built `ClaudeAgentOptions` without ever applying the caller-supplied token budget,
+  so answers were effectively unbounded. Caps output via the `CLAUDE_CODE_MAX_OUTPUT_TOKENS` CLI env
+  knob, adds a budget instruction to the synthesis prompt, and hard-truncates any overshoot as a
+  belt-and-braces stop; the tool-level arg is also clamped to `[1, 4000]`.
+- **`casa_reload_triggers` now enforces the same privileged-role guard as `casa_reload(scope='triggers')` (L77/L26).**
+  The Bug 7 (v0.14.6) defense-in-depth check — refuse callers whose effective role isn't
+  `configurator` — covered `config_git_commit`, `casa_reload`, and `casa_restart_supervised`, but its
+  back-compat alias `casa_reload_triggers` had no such check, so a misconfigured agent's
+  `allowed_tools` could re-register another role's triggers with no refusal.
+- **A failed engagement start no longer leaks an open Telegram forum topic (L74/L23).**
+  `engage_executor` and `delegate_to_agent`'s interactive path create the forum topic before
+  starting the driver; when the prompt template was missing or `driver.start` raised, the topic was
+  never closed — only `_finalize_engagement` (never reached on these failure paths) does that. Added
+  a best-effort `_abort_engagement_topic` helper that flips the topic to `failed` and closes it on
+  every `no_driver` / `driver_start_failed` / `prompt_template_missing` path, without routing through
+  `_finalize_engagement` (which would double-notify Ellen and run memory-retention side effects).
+- **`POST /invoke/{agent}` now returns 400 instead of 500 for non-object JSON bodies and
+  `"context": null` (L3).** A body that parsed to a non-dict, or an explicit `"context": null` /
+  non-dict context, crashed with an unhandled `AttributeError`/`TypeError` instead of the handler's
+  own 400 contract. `invoke_handler` is now extracted into a testable `_make_invoke_handler`
+  factory (mirroring `_make_webhook_handler`) with both cases validated.
+- **`/internal/hooks/resolve` no longer crashes with HTTP 500 on valid-JSON non-object bodies
+  (L65/L14).** A body that parsed to a list/string/number, or a truthy non-dict `payload`, raised an
+  unguarded `AttributeError`/`TypeError`; `svc_casa_mcp` then surfaced a misleading "forwarder error"
+  deny instead of the intended structured deny. The handler now validates body/policy/payload shape
+  and returns the same structured fail-closed deny used for malformed JSON.
+
+### Leak fixes
+
+- **`PERMISSION_QUEUES` entries are now evicted at engagement finalization (L5).** The per-engagement
+  `asyncio.Queue` (and any undrained verdict inside it) previously persisted in memory for the
+  process lifetime. `_finalize_engagement` now pops the entry, and the verdict-POST handler refuses
+  to re-materialize a queue for an engagement that is no longer `active`/`idle`.
+- **Compiled s6-rc databases in `/tmp` are now reaped (L63/L12).** Every engagement lifecycle
+  compile (`s6-rc-compile` into `/tmp/s6-casa-db-<uuid>`) left the previously-live db orphaned.
+  `_compile_and_update_locked` now removes the prior live db after a successful swap (or the
+  just-compiled db after a failed one); a new `sweep_orphan_compiled_dbs()` also reaps stale dirs
+  from a prior container run during boot replay.
+- **`plugin-env.conf` is now created 0600 atomically (L69/L18).** The secrets file was written with
+  default umask permissions (typically 0644) and only chmod'd to 0600 afterward — a crash or denied
+  chmod between the two steps left the secrets file world-readable. It is now opened with
+  `os.O_CREAT` and mode `0o600` from the first byte; the trailing chmod remains as a belt-and-braces
+  repair for any legacy 0644 file.
+- **`RateLimiter` buckets are now evicted when idle (L70/L19).** Every distinct rate-limit key (e.g.
+  an arbitrary Telegram `chat_id` from any sender) permanently allocated a `TokenBucket`, growing the
+  per-key dict without bound for the process lifetime. A periodic sweep (every 1024 checks) now
+  drops buckets idle for a full `window_s`, which is behaviorally invisible — an idle bucket has
+  already refilled to full capacity, identical to a fresh one.
+
 ## [0.53.0] - 2026-07-08 — Silent hangs & cross-module contract drift (bus REQUEST resolution, executor hook params, observer drain, permission-relay correlation)
 
 ### Fixed

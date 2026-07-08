@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 def _mock_executor_def(**overrides):
@@ -742,3 +742,118 @@ class TestU3TopicTitle:
         # Role passes through verbatim; open_engagement_topic resolves
         # it to DEFAULT_ROLE_ID via icon_id_for_role.
         assert kwargs["role"] == "exotic-future-type"
+
+
+class TestFailedStartClosesTopic:
+    """L23 leak guard: a failed engagement start must not leave a
+    permanently-open 'active' forum topic — it must be flipped to 'failed'
+    and closed."""
+
+    async def test_driver_start_failure_flips_and_closes_topic(
+        self, tmp_path, monkeypatch,
+    ):
+        from tools import engage_executor, init_tools
+        import agent as agent_mod
+
+        defn = _mock_executor_def()  # driver="in_casa"
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["configurator"])
+
+        er = MagicMock()
+        mock_rec = MagicMock()
+        mock_rec.id = "abcd1234" + "0" * 24
+        mock_rec.topic_id = 42
+        er.create = AsyncMock(return_value=mock_rec)
+        er.mark_error = AsyncMock()
+        er.set_channel_state = AsyncMock()
+        er.recent_for_origin = MagicMock(return_value=None)
+
+        channel = await _setup(reg, tmp_path=tmp_path)
+        channel.update_topic_state = AsyncMock()
+        channel.close_topic = AsyncMock()
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=er,
+            executor_registry=reg,
+        )
+        monkeypatch.setattr(
+            agent_mod, "active_engagement_driver",
+            MagicMock(start=AsyncMock(side_effect=RuntimeError("boom"))),
+            raising=False,
+        )
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            result = await engage_executor.handler(
+                {"executor_type": "configurator", "task": "do a thing"},
+            )
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["status"] == "error"
+        assert payload["kind"] == "driver_start_failed"
+        er.mark_error.assert_awaited_once()
+        # The leak fix: the just-created topic must be flipped to failed and closed.
+        channel.update_topic_state.assert_awaited_once_with(
+            engagement_id=mock_rec.id, new_state="failed",
+        )
+        channel.close_topic.assert_awaited_once_with(thread_id=42)
+
+    async def test_prompt_template_missing_flips_and_closes_topic(
+        self, tmp_path, monkeypatch,
+    ):
+        from tools import engage_executor, init_tools
+        import agent as agent_mod
+
+        defn = _mock_executor_def()
+        defn.prompt_template_path = "/nonexistent/prompt.md"
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["configurator"])
+
+        er = MagicMock()
+        mock_rec = MagicMock()
+        mock_rec.id = "abcd1234" + "0" * 24
+        mock_rec.topic_id = 42
+        er.create = AsyncMock(return_value=mock_rec)
+        er.mark_error = AsyncMock()
+        er.set_channel_state = AsyncMock()
+        er.recent_for_origin = MagicMock(return_value=None)
+
+        channel = await _setup(reg, tmp_path=None)
+        channel.update_topic_state = AsyncMock()
+        channel.close_topic = AsyncMock()
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=er,
+            executor_registry=reg,
+        )
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            result = await engage_executor.handler(
+                {"executor_type": "configurator", "task": "do a thing"},
+            )
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["kind"] == "prompt_template_missing"
+        channel.update_topic_state.assert_awaited_once_with(
+            engagement_id=mock_rec.id, new_state="failed",
+        )
+        channel.close_topic.assert_awaited_once_with(thread_id=42)

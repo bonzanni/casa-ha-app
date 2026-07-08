@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import stat
 import subprocess
@@ -78,23 +79,35 @@ async def _compile_and_update_locked() -> None:
 
     Compiles s6-overlay base + Casa + engagement sources into a fresh
     /tmp/s6-casa-db-<uuid>/, then atomically swaps the live db via
-    s6-rc-update.
+    s6-rc-update. Reaps the previously-live compiled db after a successful
+    swap (or the just-compiled db after a failed one) so /tmp doesn't
+    accumulate one orphaned db per compile (L12 leak guard).
     """
+    old_db = os.path.realpath(LIVE_DB_SYMLINK)
     new_db = f"/tmp/s6-casa-db-{uuid.uuid4().hex}"
-    await asyncio.to_thread(
-        subprocess.run,
-        [
-            "s6-rc-compile",
-            new_db,
-            S6_OVERLAY_SOURCES,
-            CASA_SOURCES,
-            ENGAGEMENT_SOURCES_ROOT,
-        ],
-        check=True,
-    )
-    await asyncio.to_thread(
-        subprocess.run, ["s6-rc-update", new_db], check=True,
-    )
+    try:
+        await asyncio.to_thread(
+            subprocess.run,
+            [
+                "s6-rc-compile",
+                new_db,
+                S6_OVERLAY_SOURCES,
+                CASA_SOURCES,
+                ENGAGEMENT_SOURCES_ROOT,
+            ],
+            check=True,
+        )
+        await asyncio.to_thread(
+            subprocess.run, ["s6-rc-update", new_db], check=True,
+        )
+    except BaseException:
+        # Failed swap: the fresh compile is the orphan.
+        shutil.rmtree(new_db, ignore_errors=True)
+        raise
+    # Successful swap: the previous db is unused now. Only reap dirs we
+    # created (basename prefix guard keeps a foreign/boot db in /run safe).
+    if old_db != new_db and os.path.basename(old_db).startswith("s6-casa-db-"):
+        shutil.rmtree(old_db, ignore_errors=True)
     logger.debug("s6-rc live db swapped to %s", new_db)
 
 
@@ -143,6 +156,30 @@ async def stop_service(*, engagement_id: str) -> None:
         ["s6-rc", "-d", "change", f"engagement-{engagement_id}"],
         check=True,
     )
+
+
+def sweep_orphan_compiled_dbs(*, tmp_root: str = "/tmp") -> list[str]:
+    """Remove stale /tmp/s6-casa-db-* dirs left by previous container runs.
+
+    Skips the current live db (target of LIVE_DB_SYMLINK). Returns removed
+    paths. Called once at boot replay — after a container restart /run is
+    fresh tmpfs, so every leftover /tmp/s6-casa-db-* from the prior run is
+    stale and safe to reap (L12 leak guard).
+    """
+    live = os.path.realpath(LIVE_DB_SYMLINK)
+    removed: list[str] = []
+    root = Path(tmp_root)
+    if not root.is_dir():
+        return removed
+    for entry in root.iterdir():
+        if not entry.is_dir() or not entry.name.startswith("s6-casa-db-"):
+            continue
+        if os.path.realpath(entry) == live:
+            continue
+        logger.warning("s6_rc sweep: removing stale compiled db %s", entry)
+        shutil.rmtree(entry, ignore_errors=True)
+        removed.append(str(entry))
+    return removed
 
 
 def sweep_orphan_service_dirs(

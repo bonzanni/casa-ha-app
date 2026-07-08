@@ -53,7 +53,6 @@ setting by hand:
 | `voice_agent_name` | Name of the voice agent. Default: `Tina`. |
 | `primary_agent_model` | Model for the primary agent: `opus`, `sonnet`, or `haiku`. Default: `opus`. |
 | `voice_agent_model` | Model for the voice agent. Default: `haiku`. |
-| `subagent_model` | Model for on-demand subagents. Default: `sonnet`. |
 
 ### Optional -- Features
 

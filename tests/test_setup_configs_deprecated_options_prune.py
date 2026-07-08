@@ -81,7 +81,7 @@ def test_all_seeded_keys_are_recognized(tmp_path: Path) -> None:
     seeded = [
         "github_token", "heartbeat_enabled", "heartbeat_interval_minutes",
         "honcho_api_key", "honcho_api_url", "repos", "scope_threshold",
-        "telegram_webhook_url",
+        "telegram_webhook_url", "subagent_model",
     ]
     opts = "{" + ",".join(f'"{k}":1' for k in seeded) + "}"
     assert set(_run_block(tmp_path, opts)) == set(seeded)
