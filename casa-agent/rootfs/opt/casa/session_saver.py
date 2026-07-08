@@ -104,11 +104,13 @@ async def save_session(
         )
         if items:
             await semantic_memory.retain(bank_id("casa"), items, async_=True)
-        await registry.finish_save(channel_key)
+        # Pass the saved sid so a user turn that re-registered this channel
+        # mid-save (slow multi-minute reaper retain) is not clobbered (M24).
+        await registry.finish_save(channel_key, sid)
         return True
     except Exception as exc:  # noqa: BLE001 — never crash a save; reaper retries
         logger.warning("save_session failed for %s: %s — will retry", channel_key, exc)
-        await registry.clear_save_claim(channel_key)
+        await registry.clear_save_claim(channel_key, sid)
         return False
 
 

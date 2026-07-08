@@ -16,7 +16,11 @@ logger = logging.getLogger("reconcile_system_requirements")
 
 def _resolves(verify_bin: str, tools_bin: Path) -> bool:
     direct = tools_bin / verify_bin
-    if direct.is_symlink() or direct.is_file():
+    # is_file() follows symlinks and is False for a dangling link — so a
+    # rolled-back/wiped install (stale symlink, target gone) correctly falls
+    # through to the shutil.which fallback and is reported degraded instead of
+    # masked as ready (M23).
+    if direct.is_file():
         return True
     return shutil.which(verify_bin) is not None
 

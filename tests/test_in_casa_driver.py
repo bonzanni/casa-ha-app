@@ -787,3 +787,45 @@ class TestInCasaEngagementContext:
         # Sanity: rec.sdk_session_id stays None because no callback was wired
         # AND we don't write the in-place value when callback is None.
         assert rec.sdk_session_id is None
+
+
+@pytest.mark.unit
+async def test_start_rolls_back_client_when_first_turn_fails(monkeypatch):
+    """M14: Bug-13 analogue for in_casa. A first-turn SDK failure must not leak
+    the opened client — start() re-raises, but the client is closed and
+    deregistered so is_alive() flips False (error records are otherwise
+    invisible to every sweeper)."""
+    from drivers.in_casa_driver import InCasaDriver
+
+    closed = []
+
+    class _FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            closed.append("aexit")
+
+        async def query(self, prompt):
+            raise RuntimeError("CLI subprocess died")
+
+        async def receive_response(self):
+            if False:
+                yield None  # pragma: no cover
+
+        async def close(self):
+            closed.append("close")
+
+    monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+    drv = InCasaDriver(topic_stream_factory=_mk_noop_factory())
+    rec = _make_record()
+
+    with pytest.raises(RuntimeError):
+        await drv.start(rec, prompt="hi", options=ClaudeAgentOptions(model="sonnet"))
+
+    assert drv.is_alive(rec) is False, "client leaked in _clients after failed start"
+    assert rec.id not in drv._ctx_stack and rec.id not in drv._locks
+    assert closed, "client was never closed on first-turn failure"

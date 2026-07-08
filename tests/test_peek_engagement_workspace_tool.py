@@ -146,3 +146,32 @@ async def test_peek_rejects_engagement_id_traversal(tmp_path, monkeypatch):
     r = await peek_engagement_workspace.handler(
         {"engagement_id": "eng1", "path": "a.txt"})
     assert json.loads(r["content"][0]["text"])["contents"] == "hello"
+
+
+async def test_peek_reads_only_byte_prefix_not_whole_file(tmp_path, monkeypatch):
+    """M26: peek must read at most max_bytes off disk (bounded read), never
+    load the whole file via read_text, and cap in BYTES not characters."""
+    import pathlib
+    import tools as tools_mod
+    from tools import peek_engagement_workspace
+
+    ws = tmp_path / "eng1"
+    ws.mkdir()
+    # 1000 x 'é' = 2000 bytes UTF-8 but 1000 code points.
+    (ws / "multi.txt").write_text("é" * 1000, encoding="utf-8")
+    monkeypatch.setattr(tools_mod, "_ENGAGEMENTS_ROOT", str(tmp_path),
+                        raising=False)
+
+    # Guard 1: whole-file read_text must never be called.
+    def _boom(self, *a, **k):
+        raise AssertionError("peek must not read the whole file via read_text()")
+    monkeypatch.setattr(pathlib.Path, "read_text", _boom)
+
+    result = await peek_engagement_workspace.handler(
+        {"engagement_id": "eng1", "path": "multi.txt", "max_bytes": 1000},
+    )
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["status"] == "ok"
+    # Guard 2: cap is in BYTES — 1000 bytes of 2-byte chars is <= ~500 chars
+    # (499 + a possible trailing U+FFFD from a split char).
+    assert len(payload["contents"].encode("utf-8", errors="replace")) <= 1003

@@ -1,5 +1,71 @@
 # Changelog
 
+## [0.55.0] - 2026-07-08 — Boot/driver robustness + concurrency mediums
+
+### Fixed
+
+- **Boot-replay no longer plants a service for a vanished workspace (M7).** When a UNDERGOING
+  `claude_code` engagement's s6 service dir was gone but its `/data/engagements/<id>/` workspace was
+  also wiped (partial `/data` restore, operator `rm -rf`), `replay_undergoing_engagements` re-planted
+  and started the service anyway; the generated run script does `set -e; cd <workspace>`, so it
+  exited immediately and s6 respawned it forever. The heal loop now checks the workspace dir exists
+  and warn-and-skips when it doesn't (4a.1 §7.3), matching the documented contract. Added an
+  `engagements_root` kwarg (defaulted to `/data/engagements`) so the check is testable.
+
+- **`config_git_commit` pre-commit gate now enforces boot-fatal cross-file invariants (M5).**
+  `validate_config_repo` only ran per-file JSON-schema validation, so a commit could pass the gate
+  yet crash-loop the add-on on the next boot (e.g. a copied resident dir still declaring
+  `role: assistant`, a stray unknown file in a resident dir, a schema-valid `executors.yaml` on a
+  non-assistant role, a non-empty `delegates.yaml` without the delegate MCP tool whitelisted, or a
+  stray non-directory file directly under `agents/` — which `load_all_agents` fatals on).
+  The gate now runs a boot-parity pass that exercises the real resident loader (`load_agent_from_dir`)
+  and refuses those commits. The parity pass also refuses a committed tree with **no primary
+  assistant** — only a non-assistant resident (e.g. `butler`), an empty `agents/` dir, or a sole
+  disabled specialist carrying `role: assistant` — which passes every per-file check yet crash-loops
+  boot on `casa_core.main`'s "No agent with role 'assistant'" `RuntimeError`.
+  Known limitation (by design): the gate validates only the committed tree under `config_dir`; it does
+  not simulate `config_sync`'s post-commit re-injection of image-owned defaults (e.g. a committed
+  deletion of the image-owned `agents/assistant/delegates.yaml`, which is internally valid here but is
+  restored by `config_sync` at boot). That reconciler mismatch is a `config_sync` backstop, not a
+  gate-replay defect.
+
+- **`_write_to_fifo` can no longer hang a pooled executor thread forever (M13).** Opening the
+  engagement stdin FIFO for writing with a blocking `open()` inside `asyncio.to_thread` parked an
+  (uncancellable) pool thread indefinitely when the s6 service had no reader (downed/crash-looping
+  service); a handful of stuck writes starved all subprocess orchestration app-wide. It now opens and
+  writes non-blocking (`O_NONBLOCK` + `select`-free poll) under a bounded deadline, drops the turn and
+  notifies the topic if no reader appears in time.
+
+- **`InCasaDriver.start` rolls back the opened SDK client when the first turn fails (M14).** A
+  first-turn `_deliver_turn` failure propagated to `engage_executor` (which marks the record error),
+  but error-status records are excluded from `active_and_idle()`, so no sweeper ever tore the client
+  down — the opened `claude` subprocess leaked until Casa restarted. `start` now closes + deregisters
+  the client via `cancel()` on first-turn failure, then re-raises (the Bug-13 rollback the
+  `claude_code` driver already had).
+
+- **Boot reconciler no longer masks a broken install as ready (M23).** `_resolves` (and the
+  `verify_plugin_state` MCP tool) treated a **dangling** symlink in `/config/tools/bin` as a resolving
+  `verify_bin` via `is_symlink()`, so a rolled-back/wiped plugin was reported `ready` and the boot
+  exited 0. Both now use `is_file()` (which follows symlinks and is False for a dangling link), so a
+  broken install is correctly reported `degraded`/`missing`.
+
+- **`finish_save`/`clear_save_claim` no longer delete a newly-registered session (M24).** During a
+  slow multi-minute freshness-reaper save, a concurrent user turn re-registers the channel with a new
+  `sdk_session_id`; `finish_save` then unconditionally popped the entry, wiping the fresh
+  registration (mid-conversation amnesia + an orphaned, never-retained transcript). Both methods now
+  take an optional `sdk_session_id` and only mutate the entry when it still matches the saved session.
+
+- **npm install strategy namespaces its prefix per plugin (M25).** All npm-type plugins installed into
+  one shared `tools_root/npm` prefix, reported as `install_dir`; the two-stage-commit rollback
+  (`shutil.rmtree(install_dir)`) therefore wiped `node_modules` for **every** npm plugin and dangled
+  their symlinks. The prefix is now `tools_root/npm/<plugin>` (mirroring `venv-<plugin>`), isolating
+  rollback. Existing deployments re-namespace on the next install of each plugin.
+
+- **`peek_engagement_workspace` reads at most `max_bytes` off disk (M26).** It called `read_text()` on
+  the whole file before slicing, so peeking a multi-GB workspace log loaded the entire file into RAM
+  (likely OOM-killing the container) and blocked the event loop. It now reads only the capped byte
+  prefix in a thread and decodes it, honouring the documented byte cap.
+
 ## [0.54.0] - 2026-07-08 — Hygiene sweep: dead config keys, resource leaks, and small correctness lows
 
 ### Removed

@@ -6,6 +6,7 @@ See docs/superpowers/specs/2026-04-23-3.5-plan4a-claude-code-driver-design.md.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 import re
@@ -262,16 +263,73 @@ class ClaudeCodeDriver(DriverProtocol):
 
     async def _write_to_fifo(
         self, engagement: EngagementRecord, text: str,
+        *, timeout_s: float = 20.0, poll_s: float = 0.25,
     ) -> None:
+        # M13: a blocking open(fifo, "a") parks a pooled executor thread
+        # FOREVER when no reader exists (crash-looping/downed s6 service).
+        # asyncio.to_thread threads are uncancellable, so a handful of stuck
+        # writes starve all subprocess orchestration app-wide. Open + write
+        # non-blocking with a bounded deadline instead — no thread at all.
         fifo = (Path(self._engagements_root) / engagement.id / "stdin.fifo")
         if not fifo.exists():
             logger.warning("FIFO missing for engagement %s", engagement.id[:8])
             return
-        # Open in a thread — Python's open() on a FIFO blocks until reader is present.
-        def _write():
-            with open(fifo, "a", encoding="utf-8") as fh:
-                fh.write(text + "\n")
-        await asyncio.to_thread(_write)
+        data = (text + "\n").encode("utf-8")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        fd: int | None = None
+        try:
+            # O_NONBLOCK open raises ENXIO while no reader exists — retry until
+            # a reader appears or the deadline passes (covers the ~1s s6
+            # respawn pause without ever parking a thread).
+            while fd is None:
+                try:
+                    fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
+                except OSError as exc:
+                    if exc.errno != errno.ENXIO:
+                        logger.warning(
+                            "FIFO open failed for engagement %s: %s",
+                            engagement.id[:8], exc,
+                        )
+                        return
+                    if loop.time() >= deadline:
+                        logger.warning(
+                            "engagement %s: no FIFO reader after %.0fs — "
+                            "dropping turn", engagement.id[:8], timeout_s,
+                        )
+                        await self._send_to_topic(
+                            engagement.topic_id,
+                            "The engagement isn't accepting input right now — "
+                            "your message was not delivered. Try again, or "
+                            "/cancel if it stays unresponsive.",
+                        )
+                        return
+                    await asyncio.sleep(poll_s)
+            # Reader exists; write non-blocking under the same deadline. Turns
+            # are far below the 64KB pipe buffer, so the first write virtually
+            # always completes fully.
+            view = memoryview(data)
+            while view:
+                try:
+                    n = os.write(fd, view)
+                    view = view[n:]
+                except BlockingIOError:
+                    if loop.time() >= deadline:
+                        logger.warning(
+                            "engagement %s: FIFO write stalled — dropping "
+                            "remainder of turn", engagement.id[:8],
+                        )
+                        return
+                    await asyncio.sleep(poll_s)
+                except BrokenPipeError:
+                    logger.warning(
+                        "engagement %s: FIFO reader vanished mid-write",
+                        engagement.id[:8],
+                    )
+                    return
+        finally:
+            if fd is not None:
+                os.close(fd)
         self._last_turn_ts[engagement.id] = time.time()
 
     def _spawn_background_tasks(self, engagement: EngagementRecord) -> None:

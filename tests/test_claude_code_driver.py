@@ -629,3 +629,65 @@ class TestRelayLogLines:
         assert all(r.levelno == logging.DEBUG for r in recs), (
             "relay must emit DEBUG, not INFO"
         )
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(sys.platform == "win32", reason="mkfifo Linux-only")
+class TestWriteToFifoBounded:
+    """M13: _write_to_fifo must never park a pooled thread forever when no
+    FIFO reader exists — it opens/writes non-blocking with a bounded deadline."""
+
+    def _driver(self, tmp_path, sent):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        async def send(topic_id, text):
+            sent.append((topic_id, text))
+        return ClaudeCodeDriver(
+            engagements_root=str(tmp_path), base_plugins_root=str(tmp_path),
+            send_to_topic=send, casa_framework_mcp_url="http://unused",
+        )
+
+    async def test_no_reader_returns_within_deadline_and_notifies(self, tmp_path):
+        import os
+        from types import SimpleNamespace
+
+        ws = tmp_path / "eng-no-reader"
+        ws.mkdir()
+        os.mkfifo(str(ws / "stdin.fifo"))
+        sent = []
+        driver = self._driver(tmp_path, sent)
+        rec = SimpleNamespace(id="eng-no-reader", topic_id=42)
+        # Pre-fix: parks a pool thread forever in open() -> wait_for raises
+        # TimeoutError and this FAILS. Fixed: returns within ~1s + notifies.
+        await asyncio.wait_for(
+            driver._write_to_fifo(rec, "hello", timeout_s=1.0, poll_s=0.05),
+            timeout=5.0,
+        )
+        assert sent and sent[0][0] == 42
+        assert rec.id not in driver._last_turn_ts
+
+    async def test_with_reader_delivers_text(self, tmp_path):
+        import os
+        import threading
+        from types import SimpleNamespace
+
+        ws = tmp_path / "eng-reader"
+        ws.mkdir()
+        fifo = str(ws / "stdin.fifo")
+        os.mkfifo(fifo)
+        got = []
+        t = threading.Thread(
+            target=lambda: got.append(
+                open(fifo, "r", encoding="utf-8").readline()),
+        )
+        t.start()
+        sent = []
+        driver = self._driver(tmp_path, sent)
+        rec = SimpleNamespace(id="eng-reader", topic_id=7)
+        await asyncio.wait_for(
+            driver._write_to_fifo(rec, "hi there", timeout_s=5.0), timeout=5.0,
+        )
+        t.join(timeout=5.0)
+        assert got == ["hi there\n"]
+        assert sent == []
+        assert rec.id in driver._last_turn_ts

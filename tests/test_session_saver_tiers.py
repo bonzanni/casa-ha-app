@@ -36,8 +36,8 @@ async def test_save_session_skips_voice():
     class _Reg:
         async def try_begin_save(self, k): return True
         def get(self, k): return {"sdk_session_id": "s1"}
-        async def clear_save_claim(self, k): pass
-        async def finish_save(self, k): pass
+        async def clear_save_claim(self, k, sid=None): pass
+        async def finish_save(self, k, sid=None): pass
 
     ok = await session_saver.save_session(
         "voice-abc", _Reg(), _Sem(), role="butler",
@@ -65,8 +65,8 @@ async def test_save_session_retains_telegram_to_shared_bank(monkeypatch):
     class _Reg:
         async def try_begin_save(self, k): return True
         def get(self, k): return {"sdk_session_id": "s1"}
-        async def finish_save(self, k): pass
-        async def clear_save_claim(self, k): pass
+        async def finish_save(self, k, sid=None): pass
+        async def clear_save_claim(self, k, sid=None): pass
 
     ok = await session_saver.save_session(
         "telegram-1", _Reg(), _Sem(), role="assistant",

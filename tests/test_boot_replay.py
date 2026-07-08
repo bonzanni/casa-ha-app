@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 async def _make_registry(records):
@@ -118,13 +118,20 @@ async def test_replay_heals_missing_service_dir_with_known_executor(
     driver = AsyncMock()
     driver._spawn_background_tasks = lambda rec: None
 
+    # M7: heal only happens when the workspace dir still exists.
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
     await replay_undergoing_engagements(
         registry=reg, driver=driver, executor_registry=exec_reg,
+        engagements_root=str(ws_root),
     )
 
     # Service dir re-planted via write_service_dir.
     assert len(write_calls) == 1
     assert write_calls[0]["engagement_id"] == "keep1"
+    # FIFO created in the workspace alongside the planted service.
+    assert (ws_root / "keep1" / "stdin.fifo").exists()
 
 
 async def test_replay_leaves_alone_unknown_executor(monkeypatch, tmp_path):
@@ -153,9 +160,67 @@ async def test_replay_leaves_alone_unknown_executor(monkeypatch, tmp_path):
     driver = AsyncMock()
     driver._spawn_background_tasks = lambda rec: None
 
+    # Workspace present so we exercise the unknown-executor branch (not the
+    # M7 missing-workspace warn-and-skip that precedes it).
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
     await replay_undergoing_engagements(
         registry=reg, driver=driver, executor_registry=EmptyReg(),
+        engagements_root=str(ws_root),
     )
 
     # No re-plant.
+    assert write_calls == []
+
+
+async def test_replay_warn_and_skips_heal_when_workspace_missing(
+    monkeypatch, tmp_path,
+):
+    """UNDERGOING + missing svc dir + known executor BUT missing workspace →
+    warn-and-skip (M7, 4a.1 §7.3). Planting a service whose run script does
+    `cd <workspace>` under set -e would crash-loop s6."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+    from config import ExecutorDefinition
+
+    svc_root = tmp_path / "svc"
+    svc_root.mkdir()
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+    write_calls: list[dict] = []
+    monkeypatch.setattr(
+        s6_rc, "write_service_dir", lambda **kw: write_calls.append(kw),
+    )
+    async def fake_cau(): return None
+    async def fake_start(*, engagement_id): return None
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+
+    class FakeExecReg:
+        def get(self, t):
+            return ExecutorDefinition(
+                type="hello-driver", description="test", model="haiku",
+                driver="claude_code", enabled=True,
+                tools_allowed=[], tools_disallowed=[],
+                permission_mode="bypassPermissions",
+                mcp_server_names=[], idle_reminder_days=1,
+                prompt_template_path="/nope/prompt.md", hooks_path=None,
+                observer_policy_path=None, doctrine_dir="/nope/doctrine",
+                extra_dirs=[], mirror_chat_to_topic=False, plugins_dir="",
+            )
+
+    reg = await _make_registry([_rec("keep1")])
+    driver = AsyncMock()
+    driver._spawn_background_tasks = lambda rec: None
+
+    ws_root = tmp_path / "eng"   # exists, but keep1/ subdir deliberately absent
+    ws_root.mkdir()
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, executor_registry=FakeExecReg(),
+        engagements_root=str(ws_root),
+    )
+
+    # Missing workspace → NO service planted.
     assert write_calls == []

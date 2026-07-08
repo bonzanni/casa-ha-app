@@ -71,3 +71,36 @@ def test_exits_nonzero_on_degraded(tmp_path: Path) -> None:
     assert r.returncode != 0
     data = yaml.safe_load(status.read_text())
     assert data["results"][0]["status"] == "degraded"
+
+
+def test_dangling_symlink_reports_degraded(tmp_path: Path) -> None:
+    """M23: a rolled-back install leaves a dangling verify_bin symlink (target
+    rmtree'd). is_symlink() is still True for it, so the old check masked the
+    breakage as ready. is_file() follows the link and is False, so it is now
+    correctly reported degraded."""
+    tools_root = tmp_path / "tools"
+    tools_bin = tools_root / "bin"
+    tools_bin.mkdir(parents=True)
+    # bin symlink survives, install_dir rmtree'd — target never created.
+    (tools_bin / "fakebin").symlink_to(tools_root / "face-rec-1.0.0" / "fakebin")
+
+    manifest = tmp_path / "m.yaml"
+    _write_manifest(manifest, [{
+        "name": "face-rec",
+        "winning_strategy": "tarball",
+        "install_dir": str(tools_root / "face-rec-1.0.0"),
+        "verify_bin": "fakebin",
+        "declared_at": "2026-04-24T00:00:00Z",
+    }])
+    status = tmp_path / "status.yaml"
+
+    r = subprocess.run([sys.executable, str(RECONCILER),
+                        "--manifest", str(manifest),
+                        "--tools-root", str(tools_root),
+                        "--status-file", str(status),
+                        "--log-level", "warning"],
+                       capture_output=True, text=True)
+    # "fakebin" is on no PATH, so the shutil.which fallback cannot mask this.
+    assert r.returncode != 0
+    data = yaml.safe_load(status.read_text())
+    assert data["results"][0]["status"] == "degraded"

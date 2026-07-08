@@ -368,6 +368,7 @@ async def healthz(_request: web.Request) -> web.Response:
 
 async def replay_undergoing_engagements(
     *, registry, driver, executor_registry=None,
+    engagements_root: str = "/data/engagements",
 ) -> None:
     """On Casa boot: reconstruct s6 services for UNDERGOING claude_code engagements.
 
@@ -415,6 +416,19 @@ async def replay_undergoing_engagements(
             if os.path.isdir(svc_dir):
                 continue
 
+            # M7: never plant a service for an engagement whose workspace is
+            # gone. The generated run script does `set -e; cd <workspace>`, so
+            # a missing workspace makes the longrun exit immediately and s6
+            # respawns it forever. Warn-and-skip (4a.1 §7.3) instead.
+            ws_dir = os.path.join(engagements_root, rec.id)
+            if not os.path.isdir(ws_dir):
+                logger.warning(
+                    "boot replay: workspace dir %s missing for engagement %s "
+                    "— leaving UNDERGOING (warn-and-skip, 4a.1 §7.3)",
+                    ws_dir, rec.id[:8],
+                )
+                continue
+
             if executor_registry is None:
                 logger.warning(
                     "boot replay: service dir missing for engagement %s "
@@ -447,7 +461,7 @@ async def replay_undergoing_engagements(
                 log_run_script=log_script,
             )
             # Ensure FIFO exists — it might have been wiped alongside the svc dir.
-            fifo = os.path.join("/data/engagements", rec.id, "stdin.fifo")
+            fifo = os.path.join(engagements_root, rec.id, "stdin.fifo")
             try:
                 if os.path.isdir(os.path.dirname(fifo)) and not os.path.exists(fifo):
                     os.mkfifo(fifo, 0o600)

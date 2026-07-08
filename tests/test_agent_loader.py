@@ -547,6 +547,9 @@ class TestValidateConfigRepo:
         repo = tmp_path / "addon_configs" / "casa-agent"
         _seed_resident(repo / "agents", "assistant")
         _seed_specialist(repo / "agents", "finance")
+        # A genuinely-bootable repo has a policy library (boot's load_policies
+        # is unguarded); without it the add-on crash-loops (M5).
+        _policies_file(repo / "policies")
 
         errors = validate_config_repo(str(repo))
         assert errors == []
@@ -628,6 +631,7 @@ class TestValidateConfigRepo:
 
         repo = tmp_path / "addon_configs" / "casa-agent"
         agent_dir = _seed_resident(repo / "agents", "assistant")
+        _policies_file(repo / "policies")  # isolate the character.yaml error
 
         # Append the offending top-level key, mirroring the configurator's
         # actual diff (commit 5cd731ac on 2026-04-30).
@@ -656,6 +660,7 @@ class TestValidateConfigRepo:
 
         repo = tmp_path / "addon_configs" / "casa-agent"
         _seed_resident(repo / "agents", "assistant")
+        _policies_file(repo / "policies")
         _w(repo / "agents" / "assistant" / "prompts" / "system.md",
            "Some prompt body — not schema-validated.\n")
         _w(repo / "doctrine.md", "free-form notes\n")
@@ -673,6 +678,7 @@ class TestValidateConfigRepo:
 
         repo = tmp_path / "addon_configs" / "casa-agent"
         _seed_resident(repo / "agents", "assistant")
+        _policies_file(repo / "policies")
         # Write a file inside agents/.git that would FAIL validation if visited.
         _w(repo / "agents" / ".git" / "objects" / "character.yaml",
            "TRAIT: garbage\n")
@@ -686,6 +692,7 @@ class TestValidateConfigRepo:
 
         repo = tmp_path / "addon_configs" / "casa-agent"
         agent_dir = _seed_resident(repo / "agents", "assistant")
+        _policies_file(repo / "policies")  # isolate the two character.yaml errors
         _w(agent_dir / "character.yaml", """\
             schema_version: 1
             name: Ellen
@@ -711,3 +718,341 @@ class TestValidateConfigRepo:
         joined = "\n".join(errors)
         assert "BOGUS_A" in joined
         assert "BOGUS_B" in joined
+
+
+@pytest.mark.unit
+class TestValidateConfigRepoBootParity:
+    """M5: the gate must refuse anything load_all_agents would FATAL on at
+    boot — cross-file invariants that pass per-file schema validation yet
+    crash-loop the add-on on the next boot."""
+
+    def _policies(self, repo: Path) -> None:
+        _w(repo / "policies" / "disclosure.yaml", """\
+            schema_version: 1
+            policies:
+              standard:
+                categories:
+                  financial:
+                    required_trust: authenticated
+                    examples: [balances]
+                safe_on_any_channel: [device_state]
+                deflection_patterns:
+                  household_shared: "private."
+        """)
+
+    def test_copied_resident_with_stale_role_refused(self, tmp_path):
+        import shutil
+        from agent_loader import validate_config_repo, load_agent_from_dir, LoadError
+
+        repo = tmp_path / "cfg"
+        src = _seed_resident(repo / "agents", "assistant")
+        self._policies(repo)
+        # Copy the whole dir but leave character.yaml role: assistant.
+        shutil.copytree(src, repo / "agents" / "helper")
+
+        with pytest.raises(LoadError):  # boot fatals on this dir
+            load_agent_from_dir(str(repo / "agents" / "helper"), policies=None)
+
+        errors = validate_config_repo(str(repo))
+        assert any("must match directory name" in e for e in errors), errors
+
+    def test_stray_unknown_file_in_resident_refused(self, tmp_path):
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "cfg"
+        d = _seed_resident(repo / "agents", "assistant")
+        self._policies(repo)
+        _w(d / "notes.yaml", "anything: true\n")  # unmapped basename: schema walk skips it
+
+        errors = validate_config_repo(str(repo))
+        assert any("unknown file" in e for e in errors), errors
+
+    def test_schema_valid_executors_yaml_on_non_assistant_refused(self, tmp_path):
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "cfg"
+        d = _seed_resident(repo / "agents", "butler")
+        self._policies(repo)
+        _w(d / "executors.yaml", """\
+            schema_version: 1
+            executors:
+              - executor_type: configurator
+                purpose: config edits
+                when: on request
+        """)
+
+        errors = validate_config_repo(str(repo))
+        assert any("only allowed on the assistant role" in e for e in errors), errors
+
+    def test_delegates_without_delegate_tool_refused(self, tmp_path):
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "cfg"
+        d = _seed_resident(repo / "agents", "assistant")  # tools.allowed = [Read, Write]
+        self._policies(repo)
+        _w(d / "delegates.yaml", """\
+            schema_version: 1
+            delegates:
+              - {agent: finance, purpose: money, when: asked}
+        """)
+
+        errors = validate_config_repo(str(repo))
+        assert any("delegate_to_agent" in e for e in errors), errors
+
+    def test_stray_non_directory_at_agents_root_refused(self, tmp_path):
+        """M5 gate-bypass: a schema-valid (or non-schema) stray FILE directly
+        under agents/ passes the per-file schema walk but crash-loops boot —
+        load_all_agents RAISES LoadError on any non-directory at agents/ root.
+        The parity loop must report it, not silently skip it."""
+        from agent_loader import validate_config_repo, load_all_agents, LoadError
+
+        repo = tmp_path / "cfg"
+        _seed_resident(repo / "agents", "assistant")
+        self._policies(repo)
+        # Stray non-schema file at agents/ root: schema walk ignores it,
+        # but boot fatals on it.
+        _w(repo / "agents" / "scratch.md", "stray note, not an agent\n")
+
+        with pytest.raises(LoadError):  # boot fatals on this entry
+            load_all_agents(str(repo / "agents"), policies=None)
+
+        errors = validate_config_repo(str(repo))
+        assert any("non-directory" in e and "scratch.md" in e for e in errors), errors
+
+    def test_missing_policies_file_with_resident_refused(self, tmp_path):
+        """M5 gate-bypass: a resident with a disclosure.yaml but NO
+        policies/disclosure.yaml passes every per-file schema check, yet
+        boot's ``load_policies`` (casa_core.main line 1245, unguarded)
+        RAISES ``PolicyError`` and crash-loops the add-on. The gate must
+        report the missing policy library, not suppress the resulting
+        'no PolicyLibrary' compose cascade."""
+        from agent_loader import validate_config_repo
+        from policies import PolicyError, load_policies
+
+        repo = tmp_path / "cfg"
+        _seed_resident(repo / "agents", "assistant")  # has disclosure.yaml
+        # Deliberately NO policies/disclosure.yaml — the bypass under test.
+
+        # Prove boot fatals exactly as casa_core.main would at line 1245.
+        with pytest.raises(PolicyError):
+            load_policies(str(repo / "policies" / "disclosure.yaml"))
+
+        errors = validate_config_repo(str(repo))
+        assert any("disclosure.yaml" in e and "not found" in e for e in errors), errors
+        # The single missing-policies error is authoritative; the per-resident
+        # 'no PolicyLibrary' cascade rooted in that same absence must NOT
+        # double-report.
+        assert not any("no PolicyLibrary" in e for e in errors), errors
+
+    def test_missing_policies_file_no_agents_dir_passes(self, tmp_path):
+        """A fresh repo with no agents/ subtree (pre-seed) does not trip the
+        missing-policies check — boot never reaches load_all_agents there,
+        matching the existing no-agents-dir contract."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "cfg"
+        repo.mkdir(parents=True)
+        errors = validate_config_repo(str(repo))
+        assert errors == [], errors
+
+    def test_clean_repo_with_policies_passes(self, tmp_path):
+        """A schema- and boot-valid repo still returns no errors."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "cfg"
+        _seed_resident(repo / "agents", "assistant")
+        self._policies(repo)
+
+        errors = validate_config_repo(str(repo))
+        assert errors == [], errors
+
+    def _enable_specialist(self, spec_dir: Path, role: str) -> None:
+        """Rewrite a seeded specialist's runtime.yaml to enabled: true so it
+        reaches SpecialistRegistry.all_configs() at boot (the seed default is
+        enabled: false, which would be dropped and never collide)."""
+        _w(spec_dir / "runtime.yaml", f"""\
+            schema_version: 1
+            model: sonnet
+            enabled: true
+            memory:
+              token_budget: 0
+            session:
+              strategy: ephemeral
+        """)
+
+    def test_resident_specialist_role_collision_refused(self, tmp_path):
+        """M5 gate-bypass: a repo with agents/<r>/ (valid resident) AND an
+        ENABLED agents/specialists/<r>/ (valid specialist) passes every
+        per-file schema check and the per-agent load, yet crash-loops boot.
+
+        casa_core.main (line ~1280) calls, UNGUARDED,
+            _build_role_registry(residents=role_configs,
+                                  specialists=specialist_registry.all_configs())
+        which RAISES ValueError 'duplicate role(s) across residents and
+        specialists' when a role exists in both tiers. config_sync does not
+        heal it. The default image ships agents/specialists/finance/, so a
+        configurator that creates a finance resident trips this. The gate
+        must refuse the collision by replaying that registry build."""
+        from agent_loader import (
+            validate_config_repo,
+            load_all_agents,
+            load_all_specialists,
+        )
+        from policies import load_policies
+        from casa_core import _build_role_registry
+
+        repo = tmp_path / "cfg"
+        _seed_resident(repo / "agents", "finance")            # resident finance
+        spec = _seed_specialist(repo / "agents" / "specialists", "finance")
+        self._enable_specialist(spec, "finance")              # enabled specialist finance
+        self._policies(repo)
+
+        # Prove boot fatals exactly as casa_core.main would at line ~1280:
+        # residents + enabled specialists both carry role 'finance'.
+        policy_lib = load_policies(str(repo / "policies" / "disclosure.yaml"))
+        residents = load_all_agents(str(repo / "agents"), policies=policy_lib)
+        spec_found, _ = load_all_specialists(str(repo / "agents" / "specialists"))
+        with pytest.raises(ValueError):
+            _build_role_registry(residents=residents, specialists=spec_found)
+
+        errors = validate_config_repo(str(repo))
+        assert any(
+            "duplicate role" in e and "finance" in e for e in errors
+        ), errors
+
+    def test_disabled_specialist_role_collision_passes(self, tmp_path):
+        """Boot parity, negative direction: a DISABLED specialist sharing a
+        resident's role does NOT collide at boot — SpecialistRegistry.load
+        drops disabled specialists before all_configs(), so
+        _build_role_registry never sees the overlap. The gate must mirror
+        that enablement filter and NOT over-refuse the (bootable) repo.
+
+        The repo carries a primary assistant resident too, so the
+        no-primary-assistant invariant (below) does not fire — this test
+        isolates the collision path, not the missing-assistant path."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "cfg"
+        _seed_resident(repo / "agents", "assistant")          # primary assistant
+        _seed_resident(repo / "agents", "finance")            # resident finance
+        # Seeded specialist defaults to enabled: false — dropped at boot.
+        _seed_specialist(repo / "agents" / "specialists", "finance")
+        self._policies(repo)
+
+        errors = validate_config_repo(str(repo))
+        assert errors == [], errors
+
+    def test_no_primary_assistant_butler_only_refused(self, tmp_path):
+        """M5 gate-bypass: a committed tree whose only resident is a valid
+        NON-assistant (e.g. butler) passes every per-file schema check and the
+        per-agent load, yet crash-loops boot. casa_core.main (line ~1306)
+        RAISES RuntimeError 'No agent with role \\'assistant\\' found ... Casa
+        cannot start without a primary assistant' because role_configs holds no
+        'assistant'. The gate must refuse it."""
+        from agent_loader import validate_config_repo, load_all_agents
+        from policies import load_policies
+
+        repo = tmp_path / "cfg"
+        _seed_resident(repo / "agents", "butler")   # enabled, non-assistant
+        self._policies(repo)
+
+        # Prove boot reaches an assistant-less role_configs: load_all_agents
+        # succeeds (butler is valid) but yields no 'assistant' key, which
+        # casa_core.main then FATALs on.
+        policy_lib = load_policies(str(repo / "policies" / "disclosure.yaml"))
+        residents = load_all_agents(str(repo / "agents"), policies=policy_lib)
+        assert "assistant" not in residents
+
+        errors = validate_config_repo(str(repo))
+        assert any("primary assistant" in e for e in errors), errors
+
+    def test_no_primary_assistant_empty_agents_dir_refused(self, tmp_path):
+        """M5 gate-bypass: an existing but EMPTY agents/ dir (no resident
+        subdirs) passes the per-file walk trivially, yet boot's load_all_agents
+        returns {} and casa_core.main FATALs on the missing primary assistant.
+        The gate must refuse it."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "cfg"
+        (repo / "agents").mkdir(parents=True)   # exists, but empty
+        self._policies(repo)
+
+        errors = validate_config_repo(str(repo))
+        assert any("primary assistant" in e for e in errors), errors
+
+    def test_no_primary_assistant_only_disabled_specialist_refused(self, tmp_path):
+        """M5 gate-bypass: the only 'assistant-ish' entry is a DISABLED
+        specialist (agents/specialists/assistant/, enabled: false). It is
+        dropped before the role registry, so boot has no resident 'assistant'
+        and FATALs. The gate must refuse it."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "cfg"
+        # No residents at all; only a disabled specialist carrying role assistant.
+        _seed_specialist(repo / "agents" / "specialists", "assistant")
+        self._policies(repo)
+
+        errors = validate_config_repo(str(repo))
+        assert any("primary assistant" in e for e in errors), errors
+
+    def test_resident_unknown_model_reported_not_crashed(self, tmp_path):
+        """M5 defensive contract: a resident runtime.yaml naming an unknown
+        model shortname is 100% schema-valid (``model`` is a free string), but
+        boot's ``resolve_model`` RAISES ValueError inside load_agent_from_dir
+        — a NON-LoadError. The per-resident replay must REPORT it as a
+        validation error, never let it escape and crash the gate itself (the
+        mandate: 'a validation error must be reported, never itself crash the
+        gate')."""
+        from agent_loader import validate_config_repo, load_all_agents
+        from policies import load_policies
+
+        repo = tmp_path / "cfg"
+        d = _seed_resident(repo / "agents", "assistant")
+        self._policies(repo)
+        _w(d / "runtime.yaml", """\
+            schema_version: 1
+            model: bogusmodel
+            tools:
+              allowed: [Read, Write]
+            channels: [telegram]
+        """)
+
+        # Prove boot fatals with a NON-LoadError exactly as casa_core.main
+        # would: load_all_agents raises ValueError, not LoadError.
+        policy_lib = load_policies(str(repo / "policies" / "disclosure.yaml"))
+        with pytest.raises(ValueError):
+            load_all_agents(str(repo / "agents"), policies=policy_lib)
+
+        # The gate must RETURN an error, not raise.
+        errors = validate_config_repo(str(repo))
+        assert any(
+            "bogusmodel" in e or "model shortname" in e for e in errors
+        ), errors
+
+    def test_resident_unknown_policy_reported_not_crashed(self, tmp_path):
+        """M5 defensive contract: a resident disclosure.yaml naming a policy
+        absent from policies/disclosure.yaml is 100% schema-valid (``policy``
+        is a free string), but boot's _compose_prompt -> policies.resolve
+        RAISES PolicyError inside load_agent_from_dir — a NON-LoadError. The
+        per-resident replay must REPORT it, never crash the gate."""
+        from agent_loader import validate_config_repo, load_all_agents
+        from policies import PolicyError, load_policies
+
+        repo = tmp_path / "cfg"
+        d = _seed_resident(repo / "agents", "assistant")
+        self._policies(repo)  # defines only policy 'standard'
+        _w(d / "disclosure.yaml", """\
+            schema_version: 1
+            policy: nonexistent
+        """)
+
+        # Prove boot fatals with a NON-LoadError: load_all_agents (which
+        # composes the prompt) raises PolicyError, not LoadError.
+        policy_lib = load_policies(str(repo / "policies" / "disclosure.yaml"))
+        with pytest.raises(PolicyError):
+            load_all_agents(str(repo / "agents"), policies=policy_lib)
+
+        errors = validate_config_repo(str(repo))
+        assert any(
+            "nonexistent" in e or "unknown policy" in e for e in errors
+        ), errors
