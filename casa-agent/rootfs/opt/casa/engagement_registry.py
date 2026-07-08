@@ -21,6 +21,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from atomic_io import atomic_write_json
+
 logger = logging.getLogger(__name__)
 
 
@@ -246,8 +248,9 @@ class EngagementRegistry:
             logger.warning("Failed to persist engagement tombstone: %s", exc)
 
     def _write_tombstone(self, snapshot: list[dict[str, Any]]) -> None:
-        with open(self._tombstone_path, "w", encoding="utf-8") as fh:
-            json.dump(snapshot, fh, indent=2)
+        # Atomic (temp-file + fsync + os.replace): a crash mid-write must not
+        # lose all in-flight engagement state to a truncated tombstone (M15).
+        atomic_write_json(self._tombstone_path, snapshot, indent=2)
 
     # -- Mutators ---------------------------------------------------------
 

@@ -1,13 +1,15 @@
 """Tests for session_registry.py."""
 
 import asyncio
+import json
+import os
 import time
 
 import pytest
 
 from session_registry import SessionRegistry
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 class TestSessionRegistry:
@@ -181,3 +183,61 @@ class TestClearSdkSession:
         assert "voice:scope-a" in data
         assert "sdk_session_id" not in data["voice:scope-a"]
         assert data["voice:scope-a"]["agent"] == "butler"
+
+
+# ---------------------------------------------------------------------------
+# TestCrashSafety — H12: atomic write + tolerant load
+# ---------------------------------------------------------------------------
+
+
+class TestCrashSafety:
+    """sessions.json must survive a crash mid-write and a corrupt file on boot."""
+
+    async def test_corrupt_file_starts_empty_and_quarantines(self, tmp_path):
+        """A truncated sessions.json (power loss / OOM-kill mid-write) must not
+        raise on load — it is quarantined to .corrupt and the registry starts
+        empty instead of crash-looping the add-on."""
+        p = tmp_path / "sessions.json"
+        p.write_text('{"telegram-123": {"agent": "casa", "sdk_ses', encoding="utf-8")
+
+        reg = SessionRegistry(str(p))  # must NOT raise
+
+        assert reg.all_entries() == {}
+        assert (tmp_path / "sessions.json.corrupt").exists()
+
+    async def test_non_dict_json_is_quarantined(self, tmp_path):
+        """A syntactically valid but wrong-shape file (e.g. a JSON list) is
+        also treated as corrupt rather than loaded blindly."""
+        p = tmp_path / "sessions.json"
+        p.write_text("[1, 2, 3]", encoding="utf-8")
+
+        reg = SessionRegistry(str(p))
+
+        assert reg.all_entries() == {}
+        assert (tmp_path / "sessions.json.corrupt").exists()
+
+    async def test_crash_between_tempwrite_and_replace_keeps_original(
+        self, tmp_path, monkeypatch,
+    ):
+        """Simulate a crash BETWEEN the temp-file write and os.replace: the
+        live sessions.json must keep its previous valid contents (the old
+        truncate-in-place open('w') left it empty)."""
+        import atomic_io
+
+        p = tmp_path / "sessions.json"
+        reg = SessionRegistry(str(p))
+        await reg.register("tg:1", "assistant", "sdk-OLD")
+        assert json.loads(p.read_text(encoding="utf-8"))["tg:1"]["sdk_session_id"] == "sdk-OLD"
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated crash before replace")
+
+        monkeypatch.setattr(atomic_io.os, "replace", boom)
+        with pytest.raises(RuntimeError):
+            reg._write({"tg:1": {"agent": "assistant", "sdk_session_id": "sdk-NEW"}})
+
+        # Original intact, not truncated.
+        on_disk = json.loads(p.read_text(encoding="utf-8"))
+        assert on_disk["tg:1"]["sdk_session_id"] == "sdk-OLD"
+        # No orphaned temp sidecar.
+        assert [f for f in os.listdir(tmp_path) if f != "sessions.json"] == []

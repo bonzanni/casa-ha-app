@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 from datetime import datetime, timezone
 from typing import Any
+
+from atomic_io import atomic_write_json
+
+logger = logging.getLogger(__name__)
 
 _SESSION_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _SESSION_KEY_MAX = 100  # mirrors the server-side max_length from the former upstream dependency
@@ -75,8 +80,26 @@ class SessionRegistry:
         self._data: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as fh:
-                self._data = json.load(fh)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                if not isinstance(loaded, dict):
+                    raise ValueError(f"expected dict, got {type(loaded).__name__}")
+                self._data = loaded
+            except (json.JSONDecodeError, OSError, ValueError):
+                # Corrupt/unreadable registry (e.g. truncated by power loss or
+                # OOM-kill mid-write). Losing session pointers is recoverable —
+                # the fleet just starts fresh sessions; a boot crash-stop is
+                # not. Quarantine the bad file for diagnosis and start empty.
+                logger.error(
+                    "sessions.json is corrupt or unreadable; moving it to "
+                    "%s.corrupt and starting with an empty registry", path,
+                )
+                try:
+                    os.replace(path, f"{path}.corrupt")
+                except OSError:
+                    pass
+                self._data = {}
 
     async def register(
         self,
@@ -190,9 +213,13 @@ class SessionRegistry:
         await asyncio.to_thread(self._write, data)
 
     def _write(self, data: dict[str, dict[str, Any]]) -> None:
-        """Synchronous write helper, runs in thread pool."""
-        with open(self._path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2)
+        """Synchronous write helper, runs in thread pool.
+
+        Atomic (temp-file + fsync + ``os.replace`` via :mod:`atomic_io`) so a
+        crash mid-write can never leave a truncated sessions.json — a corrupt
+        file used to crash-stop the add-on on boot (H12).
+        """
+        atomic_write_json(self._path, data, indent=2)
 
     def all_entries(self) -> dict[str, dict[str, Any]]:
         """Return a shallow copy of all entries."""

@@ -82,3 +82,30 @@ def test_load_rejects_malformed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr("marketplace_ops.USER_MARKETPLACE_PATH", target)
     with pytest.raises(MarketplaceError):
         load_user_marketplace()
+
+
+def test_write_is_atomic_crash_keeps_original(user_mkt: Path, monkeypatch) -> None:
+    """L15: a crash BETWEEN the temp write and os.replace must leave the prior
+    marketplace.json intact — a truncated file bricks every marketplace op."""
+    import atomic_io
+
+    add_plugin_entry({"name": "a", "source": {"source": "github", "repo": "u/a"},
+                      "description": "x", "version": "0.1.0"})
+    before = user_mkt.read_text(encoding="utf-8")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash before replace")
+
+    monkeypatch.setattr(atomic_io.os, "replace", boom)
+    with pytest.raises(RuntimeError):
+        add_plugin_entry({"name": "b", "source": {"source": "github", "repo": "u/b"},
+                          "description": "y", "version": "0.2.0"})
+
+    # Original intact, not truncated; still loads and has only 'a'.
+    assert user_mkt.read_text(encoding="utf-8") == before
+    data = json.loads(user_mkt.read_text(encoding="utf-8"))
+    assert [p["name"] for p in data["plugins"]] == ["a"]
+    # No orphaned temp sidecar in the marketplace dir.
+    import os as _os
+    leftovers = [f for f in _os.listdir(user_mkt.parent) if f != "marketplace.json"]
+    assert leftovers == []

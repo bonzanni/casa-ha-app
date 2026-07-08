@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.51.0] - 2026-07-08 — crash-safe on-disk state writes (atomic writes + tolerant load)
+
+### Fixed
+
+On-disk state files were written with a plain truncate-in-place `open("w")` + `json.dump`
+(or `write_text`) directly over the live file, so a crash or power-loss mid-write could
+leave a truncated/corrupt file. In the worst case a corrupt `sessions.json` was then loaded
+intolerantly and crash-looped the add-on on every boot. All such writes now route through a
+new shared atomic-write helper (`atomic_io.py`): write to a same-directory temp file, fsync,
+then `os.replace` — so a crash can never expose a half-written file. The helper preserves the
+prior `open("w")` permission semantics — an existing file keeps its current mode and a fresh
+file lands at `0o644` — so it never leaks the `tempfile.mkstemp()` `0o600` onto the replaced
+inode.
+
+- **`sessions.json` crash-loop eliminated (H12).** `SessionRegistry._write` is now atomic,
+  and `__init__` loads tolerantly: a corrupt/unreadable (or wrong-shape) registry is logged,
+  quarantined to `sessions.json.corrupt`, and the fleet starts from an empty registry instead
+  of raising and dying on boot. Losing session pointers is recoverable; a boot crash-stop was
+  not.
+- **Engagement tombstone atomic (M15).** `engagement_registry._write_tombstone` no longer
+  risks losing all in-flight engagement state to a truncated `engagements.json`.
+- **Delegation tombstone atomic (L20).** `specialist_registry._write_tombstone` — the exact
+  file that exists for delegation crash recovery — is now crash-safe.
+- **Marketplace + system-requirements manifests atomic (L15, L).** `marketplace_ops._write`
+  and `system_requirements/manifest._write` no longer risk bricking marketplace ops / the
+  crash-recovery manifest with a truncated file.
+- **Config-sync no longer silently destroys user edits when git is failing (M12).** The
+  image-wins conflict/backstop paths only wrote a `.casabak` backup when git was entirely
+  unavailable. `RealGit.snapshot()` now fails closed (returns `None` on any git error —
+  dubious-ownership, a stale `index.lock`, a corrupt repo — instead of returning a stale
+  pre-edit HEAD), and both overwrite sites now write a `.casabak` whenever no commit actually
+  captured the edit, so an operator's config edit is always recoverable. The boot-time
+  snapshot in `setup-configs.sh` also stops logging false success when its commit failed.
+
+### Tests
+
+New crash-simulation unit tests (`test_atomic_io.py` plus additions to the registry,
+marketplace, manifest, and config-sync suites) assert the original file stays intact when a
+crash is injected between temp-write and `os.replace`, that a corrupt `sessions.json` loads
+empty and is quarantined, and that a broken-git conflict falls back to `.casabak`. The
+`test_session_registry.py`, `test_engagement_registry.py`, and `test_specialist_registry.py`
+suites gained the `unit` marker so the tier2 gate actually runs them.
+
 ## [0.50.0] - 2026-07-08 — security hardening: ingress source filter, auth/parsing controls
 
 ### Security
