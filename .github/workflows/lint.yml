@@ -1,0 +1,20 @@
+name: Lint
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * *" # daily, an hour before the QA nightly
+
+jobs:
+  addon-linter:
+    name: App lint (casa-agent)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Home Assistant app lint
+        uses: frenck/action-addon-linter@v2.21
+        with:
+          path: "./casa-agent"
