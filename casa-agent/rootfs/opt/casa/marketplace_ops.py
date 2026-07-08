@@ -45,8 +45,15 @@ def _write(data: dict) -> None:
 
 def load_user_marketplace() -> dict:
     data = _read()
-    if not isinstance(data.get("plugins"), list):
+    plugins = data.get("plugins")
+    if not isinstance(plugins, list):
         raise MarketplaceError("user marketplace: 'plugins' must be array")
+    for i, p in enumerate(plugins):
+        if not isinstance(p, dict) or not isinstance(p.get("name"), str) or not p["name"]:
+            raise MarketplaceError(
+                f"user marketplace: plugins[{i}] must be an object with a "
+                f"non-empty string 'name' (got: {p!r:.120})"
+            )
     return data
 
 
@@ -90,7 +97,15 @@ def update_plugin_entry(name: str, *, new_ref: str | None = None,
     for entry in data["plugins"]:
         if entry["name"] == name:
             if new_ref is not None:
-                entry.setdefault("source", {})["sha"] = new_ref
+                src = entry.setdefault("source", {})
+                if not isinstance(src, dict):
+                    raise MarketplaceError(
+                        f"plugin {name!r}: 'source' is a "
+                        f"{type(src).__name__}, not an object — cannot set "
+                        "'sha'. Convert the entry to the object source form "
+                        f"in {USER_MARKETPLACE_PATH} first."
+                    )
+                src["sha"] = new_ref
             if new_version is not None:
                 entry["version"] = new_version
             _write(data)

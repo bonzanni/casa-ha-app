@@ -109,3 +109,32 @@ def test_write_is_atomic_crash_keeps_original(user_mkt: Path, monkeypatch) -> No
     import os as _os
     leftovers = [f for f in _os.listdir(user_mkt.parent) if f != "marketplace.json"]
     assert leftovers == []
+
+
+def _write_mkt(path: Path, plugins: list) -> None:
+    path.write_text(json.dumps({
+        "name": "casa-plugins", "owner": {"name": "t"}, "plugins": plugins,
+    }), encoding="utf-8")
+
+
+def test_update_string_source_raises_marketplace_error(user_mkt: Path) -> None:
+    """L66/L16: a hand-edited entry using CC's legal string-source form
+    must raise MarketplaceError, not TypeError, and must not partially
+    write the file."""
+    _write_mkt(user_mkt, [{"name": "x", "source": "./plugins/x"}])
+    with pytest.raises(MarketplaceError, match="source"):
+        update_plugin_entry("x", new_ref="abc123")
+    # file unchanged — no partial write
+    assert json.loads(user_mkt.read_text())["plugins"][0]["source"] == "./plugins/x"
+
+
+def test_entry_missing_name_raises_marketplace_error(user_mkt: Path) -> None:
+    """L66/L16: an entry lacking 'name' must raise MarketplaceError (not
+    KeyError) from add/remove/update alike."""
+    _write_mkt(user_mkt, [{"description": "hand-added, no name"}])
+    with pytest.raises(MarketplaceError, match="name"):
+        add_plugin_entry({"name": "y", "source": {"source": "github", "repo": "u/y"}, "description": "d"})
+    with pytest.raises(MarketplaceError, match="name"):
+        remove_plugin_entry("y")
+    with pytest.raises(MarketplaceError, match="name"):
+        update_plugin_entry("y", new_ref="abc")

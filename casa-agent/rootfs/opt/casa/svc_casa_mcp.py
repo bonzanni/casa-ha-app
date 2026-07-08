@@ -66,7 +66,7 @@ async def _forward_to_internal(
     path: str,                  # "/internal/tools/call" or "/internal/hooks/resolve"
     body: dict[str, Any],
     socket_path: str = INTERNAL_SOCKET_PATH,
-    timeout_s: float | None = 10.0,
+    timeout_s: float | None = 180.0,
 ) -> tuple[int, dict[str, Any]]:
     """POST `body` to the casa-main internal handler over Unix socket.
 
@@ -74,6 +74,14 @@ async def _forward_to_internal(
     if the socket is missing or the connection is refused — the caller maps
     that to the appropriate user-facing error (casa_temporarily_unavailable
     for tools/call, fail-closed deny for hooks/resolve).
+
+    The 180s default bounds model-driven tools/call forwarding — long
+    enough for server-side LLM work (query_engager = Hindsight recall +
+    ClaudeSDKClient one-shot synthesis; emit_completion = Telegram topic
+    teardown + s6 stop + two classify_tier one-shots) yet finite. casa-main
+    downness is detected instantly via ClientConnectorError on the
+    missing/refused socket, not by this timeout, so restart-resilience is
+    unchanged.
 
     Pass ``timeout_s=None`` to disable the client-side total timeout — the
     /hooks/resolve route does this so casa-main's policy-driven timeout

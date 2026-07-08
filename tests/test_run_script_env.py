@@ -111,3 +111,26 @@ def test_run_script_derives_memory_backend_from_hindsight_url():
         "MEMORY_BACKEND=hindsight must be derived inside the hindsight_api_url "
         "conditional so the URL is the single toggle"
     )
+
+
+def test_run_script_execs_venv_python():
+    """svc-casa/run must exec the venv interpreter by ABSOLUTE path.
+    setup-configs.sh (P-9) prepends the user-writable /config/tools/bin
+    ahead of /opt/casa/venv/bin in the s6 container PATH, so a bare
+    `python3` exec is hijackable by any plugin whose systemRequirements
+    declare verify_bin=python3 (install_venv symlinks it into tools/bin).
+    Regression guard for the Dockerfile venv invariant."""
+    script = _read_run_script()
+    assert "exec /opt/casa/venv/bin/python3 /opt/casa/casa_core.py" in script
+    assert "exec python3 " not in script
+
+
+def test_svc_casa_mcp_run_script_execs_venv_python():
+    """Symmetric guard for the other long-run Python service."""
+    p = (
+        Path(__file__).resolve().parent.parent
+        / "casa-agent" / "rootfs" / "etc" / "s6-overlay"
+        / "s6-rc.d" / "svc-casa-mcp" / "run"
+    )
+    script = p.read_text(encoding="utf-8")
+    assert "exec /opt/casa/venv/bin/python3 /opt/casa/svc_casa_mcp.py" in script

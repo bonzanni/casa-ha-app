@@ -62,4 +62,4 @@ fi
 
 # SUPERVISOR_TOKEN is injected automatically by the HA Supervisor.
 
-exec python3 /opt/casa/casa_core.py
+exec /opt/casa/venv/bin/python3 /opt/casa/casa_core.py

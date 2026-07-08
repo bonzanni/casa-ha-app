@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 class TestClassifier:
@@ -112,3 +112,53 @@ class TestInterject:
                             AsyncMock(return_value={"interject": False, "text": ""}))
         await obs._interject("e1", "warn", {})
         bus.notify.assert_not_called()
+
+
+class TestBudgetCountsOnlyPostedInterjections:
+    """L68/L17: declined-trigger evaluations must not consume the
+    per-engagement interjection budget — otherwise 3 declined evaluations
+    silence every later genuine alert."""
+
+    async def test_declined_triggers_do_not_consume_budget(self, monkeypatch):
+        from observer import Observer
+
+        bus = MagicMock(); bus.notify = AsyncMock()
+        registry = MagicMock()
+        registry.get.return_value = MagicMock(
+            id="e1", task="t",
+            origin={"role": "assistant", "channel": "telegram", "chat_id": "c1"},
+            role_or_type="finance",
+        )
+        obs = Observer(bus=bus, engagement_registry=registry, model_name="haiku")
+
+        # Three trigger events the LLM declines must not consume the budget.
+        monkeypatch.setattr(obs, "_decide_interjection",
+                            AsyncMock(return_value={"interject": False, "text": ""}))
+        err = MagicMock()
+        err.content = {"event": "tool_result", "status": "error", "engagement_id": "e1"}
+        for _ in range(3):
+            await obs._handle_event(err)
+        assert obs._rate_limit_ok("e1") is True   # FAILS on current code (count==3)
+
+        # A later genuine idle event must still produce a notification.
+        monkeypatch.setattr(obs, "_decide_interjection",
+                            AsyncMock(return_value={"interject": True, "text": "Engagement stuck."}))
+        idle = MagicMock()
+        idle.content = {"event": "idle_detected", "engagement_id": "e1"}
+        await obs._handle_event(idle)
+        bus.notify.assert_awaited_once()          # FAILS on current code (dropped at rate limit)
+        assert obs._interjection_counts.get("e1", 0) == 1  # only the posted one counted
+
+    async def test_forget_clears_counts_and_silence(self):
+        from observer import Observer
+
+        obs = Observer(bus=MagicMock(), engagement_registry=MagicMock(),
+                       model_name="haiku")
+        obs._count_interjection("e1")
+        obs.silence("e1")
+        assert obs._interjection_counts.get("e1") == 1
+        assert obs.is_silenced("e1") is True
+
+        obs.forget("e1")
+        assert "e1" not in obs._interjection_counts
+        assert obs.is_silenced("e1") is False

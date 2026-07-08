@@ -94,6 +94,12 @@ class TriggerRegistry:
                         f"agent {role!r} trigger {trig.name!r}: webhook "
                         f"path {trig.path!r} already registered"
                     )
+                owner = self._webhook_targets.get(trig.name)
+                if owner is not None and owner != role:
+                    raise TriggerError(
+                        f"agent {role!r} trigger {trig.name!r}: webhook "
+                        f"trigger name already registered by role {owner!r}"
+                    )
                 self._register_webhook(role, trig)
                 self._seen_webhook_paths.add(trig.path)
             else:
@@ -240,9 +246,9 @@ class TriggerRegistry:
         # allowlist so a removed webhook trigger naturally 404s on the
         # wildcard handler post-reload.
         for name in self._webhook_names_by_role.get(role, []):
-            # Only evict if THIS role still owns the name (defensive
-            # against name collisions across roles, which register_agent
-            # itself doesn't currently prevent for webhooks).
+            # Only evict if THIS role still owns the name (register_agent
+            # now rejects cross-role webhook name collisions, so this is
+            # belt-and-braces).
             if self._webhook_targets.get(name) == role:
                 self._webhook_targets.pop(name, None)
         self._webhook_names_by_role[role] = []

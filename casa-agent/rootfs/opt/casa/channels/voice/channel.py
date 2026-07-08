@@ -218,10 +218,10 @@ class VoiceChannel(Channel):
             content=prompt,
             channel="voice",
             context={
+                **(payload.get("context") or {}),
                 "chat_id": scope_id,
                 "utterance_id": utterance_id,
                 "cid": request["cid"],
-                **(payload.get("context") or {}),
                 "_on_token": on_token,
                 "_error_sink": _error_sink,
             },
@@ -334,13 +334,37 @@ class VoiceChannel(Channel):
 
             if t == "utterance":
                 uid = frame.get("utterance_id") or str(uuid.uuid4())
-                tasks[uid] = asyncio.create_task(
+                task = asyncio.create_task(
                     self._run_ws_utterance(ws, frame, uid),
                 )
+                tasks[uid] = task
+
+                def _reap(done_task: asyncio.Task, uid: str = uid) -> None:
+                    # Prune only if this entry wasn't overwritten by a
+                    # duplicate uid. `done_task` (the callback's own arg)
+                    # IS the finished task, so this closure never holds a
+                    # separate strong reference to it beyond the callback's
+                    # own (transient) invocation.
+                    if tasks.get(uid) is done_task:
+                        tasks.pop(uid, None)
+                    if done_task.cancelled():
+                        return
+                    exc = done_task.exception()  # retrieve so GC never logs 'never retrieved'
+                    if exc is not None:
+                        logger.warning(
+                            "Voice WS utterance task failed (utterance_id=%s): %s",
+                            uid, exc,
+                        )
+
+                task.add_done_callback(_reap)
+                # Drop the frame-local reference so a finished task is not
+                # kept alive by this coroutine's own suspended stack frame
+                # while it awaits the next WS frame.
+                del task
                 continue
 
         # Clean up dangling tasks on WS close.
-        for task in tasks.values():
+        for task in list(tasks.values()):
             if not task.done():
                 task.cancel()
         return ws
@@ -409,9 +433,9 @@ class VoiceChannel(Channel):
             content=frame.get("text", ""),
             channel="voice",
             context={
+                **(frame.get("context") or {}),
                 "chat_id": scope_id, "utterance_id": uid,
                 "cid": new_cid(),
-                **(frame.get("context") or {}),
                 "_on_token": on_token,
                 "_error_sink": _error_sink,
             },

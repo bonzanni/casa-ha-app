@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -742,6 +743,139 @@ class TestU3TopicTitle:
         # Role passes through verbatim; open_engagement_topic resolves
         # it to DEFAULT_ROLE_ID via icon_id_for_role.
         assert kwargs["role"] == "exotic-future-type"
+
+
+class TestOriginContextPropagation:
+    """L61/L10: engage_executor's context= argument (and the world-state
+    summary) must be threaded onto the EngagementRecord's origin so the
+    claude_code driver can later render them into the workspace CLAUDE.md.
+    Before the fix, origin=dict(origin_var) never carried a 'context' key,
+    so the driver's engagement.origin.get('context', '') was always empty."""
+
+    async def test_context_and_world_state_land_in_created_origin(
+        self, tmp_path, monkeypatch,
+    ):
+        from tools import engage_executor, init_tools
+        import agent as agent_mod
+
+        defn = _mock_executor_def()
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["configurator"])
+
+        er = MagicMock()
+        mock_rec = MagicMock()
+        mock_rec.id = "abcd1234" + "0" * 24
+        mock_rec.topic_id = 42
+        er.create = AsyncMock(return_value=mock_rec)
+        er.mark_error = AsyncMock()
+        er.recent_for_origin = MagicMock(return_value=None)
+
+        channel = await _setup(reg, tmp_path=tmp_path)
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=er,
+            executor_registry=reg,
+        )
+        monkeypatch.setattr(agent_mod, "active_engagement_driver",
+                             MagicMock(start=AsyncMock()), raising=False)
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "configurator", "task": "do it",
+                "context": "repo is x/y, branch dev",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(r["content"][0]["text"])
+        assert payload["status"] == "pending"
+
+        created_origin = er.create.await_args.kwargs["origin"]
+        assert created_origin["context"] == "repo is x/y, branch dev"
+        assert "world_state_summary" in created_origin
+        # Original origin_var fields must still be present.
+        assert created_origin["role"] == "assistant"
+        assert created_origin["channel"] == "telegram"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="workspace provisioning uses mkfifo/symlink (Linux-only)",
+    )
+    async def test_claude_code_driver_receives_context_and_world_state(
+        self, monkeypatch, tmp_path,
+    ):
+        """Driver-side regression: ClaudeCodeDriver.start must read the
+        origin's 'context'/'world_state_summary' back out and pass them
+        into provision_workspace. Follows the mocking pattern of
+        tests/test_claude_code_driver.py::TestStart."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers import s6_rc
+        from engagement_registry import EngagementRecord
+
+        async def fake_cau():
+            pass
+
+        async def fake_start_kw(*, engagement_id):
+            pass
+
+        monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+        monkeypatch.setattr(s6_rc, "start_service", fake_start_kw)
+        monkeypatch.setattr(
+            s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(tmp_path / "svc-root"),
+        )
+        (tmp_path / "svc-root").mkdir()
+        monkeypatch.setattr(
+            ClaudeCodeDriver, "_spawn_background_tasks",
+            lambda self, engagement: None,
+        )
+
+        async def _noop_write(self, engagement, text):
+            return None
+        monkeypatch.setattr(ClaudeCodeDriver, "_write_to_fifo", _noop_write)
+
+        defn = _mock_executor_def(driver="claude_code")
+        exec_dir = tmp_path / "defaults-executors" / "hello-driver"
+        exec_dir.mkdir(parents=True)
+        prompt_path = exec_dir / "prompt.md"
+        prompt_path.write_text(
+            "T:{task} C:{context} W:{world_state_summary}",
+        )
+        defn.prompt_template_path = str(prompt_path)
+
+        rec = EngagementRecord(
+            id="abc12345def67890", kind="executor", role_or_type="hello-driver",
+            driver="claude_code", status="active", topic_id=999,
+            started_at=0.0, last_user_turn_ts=0.0, last_idle_reminder_ts=0.0,
+            completed_at=None, sdk_session_id=None,
+            origin={
+                "channel": "telegram", "chat_id": "42",
+                "context": "repo is x/y, branch dev",
+                "world_state_summary": "ws-summary",
+            },
+            task="do it",
+        )
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        )
+        (tmp_path / "engagements").mkdir()
+
+        await drv.start(rec, prompt="system prompt body", options=defn)
+
+        claude_md = (
+            tmp_path / "engagements" / rec.id / "CLAUDE.md"
+        ).read_text(encoding="utf-8")
+        assert "C:repo is x/y, branch dev" in claude_md
 
 
 class TestFailedStartClosesTopic:

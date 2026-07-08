@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 def _make_defn(tmp_path, plugins=None):
@@ -290,6 +290,58 @@ class TestURLCapture:
 
         # Only one post, not two
         assert sender.await_count == 1
+
+
+class TestURLCaptureFallbackWarning:
+    """L62/L11: the 'not yet available' fallback must fire at the
+    initial_window_s deadline even when _tail_file never yields a line
+    (missing log file — the prod reality per O-5), and must NOT fire if
+    a URL was already found within the window."""
+
+    async def test_warning_posts_when_log_file_never_appears(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        sender = AsyncMock()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+        missing = tmp_path / "log-that-is-never-created"  # do NOT write it
+        task = asyncio.create_task(
+            drv._capture_url(rec, log_path=str(missing), initial_window_s=0.2)
+        )
+        await asyncio.sleep(0.6)  # well past the 0.2s window
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        sender.assert_awaited_once()
+        args, _ = sender.call_args
+        assert args[0] == rec.topic_id
+        assert "not yet available" in args[1]
+
+    async def test_no_warning_when_url_arrives_inside_window(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        sender = AsyncMock()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+        )
+        log = tmp_path / "log"
+        log.write_text("Remote Control URL: https://r.test/abc\n")
+        rec = _make_record()
+        task = asyncio.create_task(
+            drv._capture_url(rec, log_path=str(log), initial_window_s=0.2)
+        )
+        await asyncio.sleep(0.6)  # past the window — timer must have been cancelled
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert sender.await_count == 1  # only the URL post, no fallback warning
+        assert "https://r.test/abc" in sender.call_args[0][1]
 
 
 class TestSessionIdCapture:

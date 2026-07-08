@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 class TestEmitCompletionHandler:
@@ -157,3 +158,54 @@ class TestEmitCompletionIdempotency:
         # Topic close / bus.notify NEVER fired.
         assert tch.close_topic.await_count == 0
         assert bus.notify.await_count == 0
+
+
+class TestConcurrentCancelVsEmit:
+    """L75/L24: /cancel landing while emit_completion is suspended in a
+    real await (the G-2 forced-reload window) must not double-finalize
+    or let emit_completion clobber the winning 'cancelled' outcome."""
+
+    async def test_cancel_during_g2_reload_window_finalizes_once(
+        self, tmp_path, monkeypatch,
+    ):
+        import tools
+        from engagement_registry import EngagementRegistry
+        from tools import emit_completion, engagement_var, init_tools, _finalize_engagement
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="configurator", driver="in_casa",
+            task="t", origin={"role": "assistant", "channel": "telegram"}, topic_id=42,
+        )
+        tch = MagicMock(); tch.send_to_topic = AsyncMock(); tch.close_topic = AsyncMock()
+        cm = MagicMock(); cm.get.return_value = tch
+        bus = MagicMock(); bus.notify = AsyncMock()
+        init_tools(channel_manager=cm, bus=bus, specialist_registry=MagicMock(),
+                   mcp_registry=MagicMock(), trigger_registry=MagicMock(),
+                   engagement_registry=reg)
+
+        gate = asyncio.Event()
+
+        async def fake_reload(args):
+            await gate.wait()
+            return {"content": [{"type": "text", "text": json.dumps({"status": "ok"})}]}
+        monkeypatch.setattr(tools.casa_reload, "handler", fake_reload)
+        tools._ENGAGEMENTS_PENDING_RELOAD.add(rec.id)
+
+        token = engagement_var.set(rec)
+        try:
+            emit_task = asyncio.create_task(
+                emit_completion.handler({"text": "done", "status": "ok"}))
+            await asyncio.sleep(0)   # emit passes its terminal check, parks in fake_reload
+            # user /cancel wins the race (same call casa_core._finalize_cancel makes)
+            await _finalize_engagement(rec, outcome="cancelled",
+                                       text="Cancelled by user.",
+                                       artifacts=[], next_steps=[], driver=None)
+            gate.set()
+            await emit_task
+        finally:
+            engagement_var.reset(token)
+
+        assert rec.status == "cancelled"          # emit must NOT overwrite the cancel
+        assert bus.notify.await_count == 1        # exactly one DelegationComplete
+        assert tch.close_topic.await_count == 1   # topic closed exactly once

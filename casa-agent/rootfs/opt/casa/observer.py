@@ -51,6 +51,13 @@ class Observer:
     def is_silenced(self, engagement_id: str) -> bool:
         return engagement_id in self._silenced
 
+    def forget(self, engagement_id: str) -> None:
+        """Drop per-engagement bookkeeping on terminal transition — keeps
+        ``_interjection_counts``/``_silenced`` from growing unbounded over
+        the process lifetime (L68/L17)."""
+        self._interjection_counts.pop(engagement_id, None)
+        self._silenced.discard(engagement_id)
+
     # -- bus integration --------------------------------------------------
 
     async def subscribe(self) -> None:
@@ -82,8 +89,9 @@ class Observer:
             return
         if not self._rate_limit_ok(engagement_id):
             return
-        await self._interject(engagement_id, event_type, content)
-        self._count_interjection(engagement_id)
+        posted = await self._interject(engagement_id, event_type, content)
+        if posted:
+            self._count_interjection(engagement_id)
 
     # -- classifier -------------------------------------------------------
 
@@ -116,13 +124,18 @@ class Observer:
 
     async def _interject(
         self, engagement_id: str, event_type: str, payload: dict,
-    ) -> None:
+    ) -> bool:
+        """Return True only when a NOTIFICATION was actually posted —
+        the caller uses this to decide whether to consume the
+        per-engagement interjection budget (L68/L17: declined/skipped
+        evaluations must not burn budget that a later genuine alert
+        needs)."""
         rec = self._registry.get(engagement_id)
         if rec is None:
-            return
+            return False
         decision = await self._decide_interjection(event_type, payload, rec)
         if not decision.get("interject"):
-            return
+            return False
         text = decision.get("text", "")
         logger.info(
             "observer.interjection engagement=%s event=%s",
@@ -147,8 +160,10 @@ class Observer:
                     "engagement_id": engagement_id,
                 },
             ))
+            return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("observer notify failed: %s", exc)
+            return False
 
     async def _decide_interjection(
         self, event_type: str, payload: dict, rec: Any,

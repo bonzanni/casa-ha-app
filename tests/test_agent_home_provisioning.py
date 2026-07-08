@@ -85,6 +85,34 @@ def test_provision_preserves_user_enabledplugins(tmp_path: Path) -> None:
     }
 
 
+@pytest.mark.parametrize("payload", ["null", "[]", '"x"', "42"])
+def test_provision_recreates_non_object_settings(tmp_path: Path, payload: str, caplog) -> None:
+    """Valid-but-non-object JSON in settings.json must self-heal exactly
+    like invalid JSON does — not raise AttributeError and permanently
+    skip the role's seeding on every boot."""
+    import logging
+
+    from agent_home import provision_agent_home
+
+    home_root = tmp_path / "agent-home"
+    defaults_root = tmp_path
+    _write_plugins_yaml(defaults_root, "ellen", [
+        {"name": "superpowers", "marketplace": "casa-plugins-defaults"},
+    ])
+    settings_path = home_root / "ellen" / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(payload, encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="agent_home"):
+        provision_agent_home(role="ellen", home_root=home_root, defaults_root=defaults_root)
+
+    # File healed to a proper object with defaults seeded.
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert settings == {"enabledPlugins": {"superpowers@casa-plugins-defaults": True}}
+    # And the recreation was surfaced at WARNING.
+    assert any("not a JSON object" in r.message for r in caplog.records)
+
+
 def test_provision_all_homes_includes_residents_and_specialists(tmp_path: Path) -> None:
     """E-4 regression: residents AND specialists must each get an
     agent-home dir at boot. Pre-Phase-2 the inline loop in

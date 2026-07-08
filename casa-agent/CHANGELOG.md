@@ -1,5 +1,69 @@
 # Changelog
 
+## [0.57.0] - 2026-07-08 — Theme 10: final correctness lows (11 fixes)
+
+### Fixed
+
+- **`svc-casa/run` no longer execs a PATH-resolved `python3` (L1).** The user-writable
+  `/config/tools/bin` is prepended ahead of `/opt/casa/venv/bin` in the s6 container PATH (intentional,
+  for engagement tool overrides); `svc-casa/run` now execs `/opt/casa/venv/bin/python3` by absolute
+  path, matching `svc-casa-mcp/run` and the Dockerfile's stated venv invariant, so a planted/plugin-installed
+  `python3` shim can no longer hijack the main process.
+- **A non-object `settings.json` no longer permanently disables agent-home provisioning (L2).**
+  `provision_agent_home` only self-healed on `JSONDecodeError`; valid-but-non-object JSON (`null`,
+  `[]`, a bare string/number) raised `AttributeError` and was swallowed by the per-role try/except,
+  silently skipping default-plugin seeding on every boot thereafter. Non-dict JSON is now treated the
+  same as invalid JSON — logged and recreated.
+- **Voice client context can no longer clobber channel-computed routing identity (L8/L59).** The SSE
+  and WS handlers spread the client-supplied `context` dict *after* the channel-computed
+  `chat_id`/`utterance_id`/`cid`, letting a client override them and fork SDK session/rate-limiter
+  keying from the transport scope and forge log-correlation `cid`s. The client context now spreads
+  first so channel-computed keys always win; benign passthrough keys (e.g. `device_id`) still survive.
+- **WS per-connection utterance tasks are now pruned and their exceptions retrieved (L9/L60).** The
+  `tasks` dict in `_ws_handler` grew one entry per utterance for the life of the connection and never
+  retrieved exceptions from failed tasks (logged as "Task exception was never retrieved"). Each task
+  now carries a done-callback that prunes its dict entry and logs any exception; the frame-local
+  strong reference to the task is also dropped so a finished task is collectable while the connection
+  stays open.
+- **`engage_executor`'s `context=` argument now reaches the workspace `CLAUDE.md` (L10/L61).** It was
+  stored only in the FIFO first-turn prompt — `engagement.origin` never carried a `context` key, so
+  `ClaudeCodeDriver.start`'s read of `engagement.origin.get("context", "")` was always empty and the
+  persistent `## Context` section rendered blank. `context` (and the world-state summary) are now
+  threaded onto the record's `origin` at creation time and read back out by the driver.
+- **The "remote control URL not yet available" fallback notice now actually fires (L11/L62).** It lived
+  inside the tail loop's per-line branch, so it never ran when the engagement log file never appeared
+  (the production reality) or stayed quiet past the window. A detached one-shot timer now posts the
+  fallback at the deadline regardless of whether the log ever yields a line, and is cancelled the
+  moment a URL is found.
+- **Marketplace mutations on legally hand-edited entries no longer crash (L16/L66).** A string-form
+  `source` (legal in Claude Code) raised `TypeError` on `update_plugin_entry`, and an entry missing
+  `name` raised `KeyError` from add/remove/update — both escaped the module's `MarketplaceError`
+  contract. `load_user_marketplace` now validates entry shape up front, and `update_plugin_entry`
+  guards the `source` shape before mutating, both raising a clean `MarketplaceError`.
+- **The observer's 3-interjection budget is now consumed only on an actual post (L17/L68).** Declined
+  or skipped evaluations (no registry record, LLM says no, notify failure) previously still counted
+  against the per-engagement cap, so three declined evaluations could silence a later genuine alert.
+  `_interject` now reports whether it actually posted, and only those posts increment the counter;
+  per-engagement bookkeeping is also pruned on terminal transition to bound memory growth.
+- **The MCP `tools/call` forwarding timeout no longer trips on legitimate slow tool calls (L21/L72).**
+  The 10s default was shorter than `emit_completion`/`query_engager` routinely take (Telegram
+  round-trips, `classify_tier` SDK one-shots, Hindsight recall + synthesis), producing spurious
+  `casa_temporarily_unavailable` errors while the call was actually succeeding server-side. Raised to
+  180s; the `/hooks/resolve` route is unaffected (keeps its own explicit `timeout_s=None`).
+- **`emit_completion` can no longer double-finalize against a racing `/cancel` (L24/L75).** The
+  check-then-act between the terminal-status read and the registry write could interleave with a
+  concurrent `/cancel` across a real suspension point (e.g. the G-2 forced-reload await), letting both
+  paths run finalize side effects (duplicate topic close, duplicate `DelegationComplete`
+  notification). `EngagementRegistry.try_transition_terminal` is now the single atomic gate — only the
+  first caller to flip the record terminal runs finalize; `cancel_engagement` also now replies
+  `already_terminal` instead of silently no-opping against an already-finalized engagement.
+- **A cross-agent webhook trigger name collision is now rejected instead of silently rerouting traffic
+  (L28/L79).** `register_agent` only rejected duplicate webhook *paths* and duplicate *names within
+  the same agent*; two different agents declaring a webhook trigger with the same name (different
+  paths) silently overwrote the wildcard `/webhook/{name}` dispatch target, misrouting the first
+  agent's webhook traffic to the second. Cross-role name collisions now raise `TriggerError` at
+  registration time.
+
 ## [0.56.0] - 2026-07-08 — Prompt-cache + hot-path optimizations, Dockerfile slimming, config_sync boot backstop
 
 ### Changed

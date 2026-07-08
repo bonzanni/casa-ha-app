@@ -36,6 +36,12 @@ def provision_agent_home(
         except json.JSONDecodeError:
             logger.warning("settings.json at %s is not valid JSON — recreating", settings_path)
             existing = {}
+    if not isinstance(existing, dict):
+        logger.warning(
+            "settings.json at %s is not a JSON object — recreating",
+            settings_path,
+        )
+        existing = {}
     if not isinstance(existing.get("enabledPlugins"), dict):
         existing["enabledPlugins"] = {}
 

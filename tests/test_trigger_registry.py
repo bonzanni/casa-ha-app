@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +183,51 @@ class TestWebhook:
         with pytest.raises(TriggerError, match="/webhook/gh"):
             reg.register_agent("butler", [_trigger_webhook()],
                                channels=["webhook"])
+
+
+class TestCrossRoleWebhookNameCollision:
+    """L79/L28: two agents each declaring a webhook trigger with the same
+    NAME but different PATHs must be rejected — otherwise the wildcard
+    /webhook/{name} dispatch silently reroutes all traffic to whichever
+    role registered last."""
+
+    async def test_cross_role_webhook_name_collision_rejected(self):
+        from trigger_registry import TriggerError, TriggerRegistry
+
+        reg = TriggerRegistry(
+            scheduler=_make_scheduler(), app=web.Application(), bus=_make_bus(),
+        )
+        reg.register_agent(
+            role="assistant",
+            triggers=[_trigger_webhook(name="doorbell", path="/hooks/assist-doorbell")],
+            channels=["telegram", "webhook"],
+        )
+        with pytest.raises(TriggerError, match="doorbell"):
+            reg.register_agent(
+                role="security",
+                triggers=[_trigger_webhook(name="doorbell", path="/hooks/sec-doorbell")],
+                channels=["telegram", "webhook"],
+            )
+        # first owner keeps the wildcard dispatch target
+        assert reg.get_webhook_target("doorbell") == "assistant"
+
+    async def test_same_role_reregister_same_webhook_name_allowed(self):
+        from trigger_registry import TriggerRegistry
+
+        reg = TriggerRegistry(
+            scheduler=_make_scheduler(), app=web.Application(), bus=_make_bus(),
+        )
+        reg.register_agent(
+            "assistant",
+            [_trigger_webhook(name="doorbell", path="/hooks/a1")],
+            ["telegram", "webhook"],
+        )
+        reg.reregister_for(
+            "assistant",
+            [_trigger_webhook(name="doorbell", path="/hooks/a2")],
+            ["telegram", "webhook"],
+        )
+        assert reg.get_webhook_target("doorbell") == "assistant"
 
 
 class TestWebhookAllowlist:

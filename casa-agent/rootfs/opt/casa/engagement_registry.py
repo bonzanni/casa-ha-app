@@ -324,6 +324,38 @@ class EngagementRegistry:
             rec.origin["error_message"] = message
             await self._write_tombstone_locked()
 
+    async def try_transition_terminal(
+        self,
+        engagement_id: str,
+        outcome: str,  # "completed" | "cancelled" | "error"
+        *,
+        completed_at: float | None = None,
+        error_kind: str = "",
+        error_message: str = "",
+    ) -> bool:
+        """Atomically move a record to a terminal status. Returns True only
+        for the first caller; False if missing or already terminal.
+
+        L75/L24: emit_completion's fast-path terminal check and
+        _finalize_engagement's registry write are separated by real
+        suspension points (e.g. a forced-reload await), so a concurrent
+        /cancel can race between them. This method is the single
+        authoritative gate — only the first caller to flip the record
+        terminal may run finalize side effects (topic close, DelegationComplete
+        NOTIFICATION, summary retain).
+        """
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None or rec.status in ("completed", "cancelled", "error"):
+                return False
+            rec.status = outcome if outcome in ("completed", "cancelled") else "error"
+            rec.completed_at = completed_at if completed_at is not None else time.time()
+            if rec.status == "error":
+                rec.origin["error_kind"] = error_kind or "emit_completion_error"
+                rec.origin["error_message"] = error_message
+            await self._write_tombstone_locked()
+            return True
+
     async def mark_idle(self, engagement_id: str) -> None:
         async with self._lock:
             rec = self._records.get(engagement_id)

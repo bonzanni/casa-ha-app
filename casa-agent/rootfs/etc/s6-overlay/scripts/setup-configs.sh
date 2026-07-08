@@ -411,7 +411,10 @@ TOOLS_ROOT=/config/tools
 TOOLS_BIN="$TOOLS_ROOT/bin"
 mkdir -p "$TOOLS_BIN"
 
-# Merge TOOLS_BIN into s6 container env PATH (takes precedence over /usr/local/bin).
+# Merge TOOLS_BIN into s6 container env PATH. NOTE: it is prepended ahead of
+# the ENTIRE image PATH including /opt/casa/venv/bin — intentional for
+# engagement tool overrides; core services must therefore exec the venv
+# interpreter by absolute path (/opt/casa/venv/bin/python3), never bare python3.
 CURRENT_PATH="${PATH}"
 if ! printf "%s" "$CURRENT_PATH" | grep -q "^\(.*:\)\?${TOOLS_BIN}\(:\|$\)"; then
     NEW_PATH="$TOOLS_BIN:$CURRENT_PATH"

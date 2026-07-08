@@ -16,6 +16,7 @@ from bus import BusMessage, MessageBus, MessageType
 from casa_core_middleware import cid_middleware
 from channels.voice.channel import VoiceChannel
 
+pytestmark = pytest.mark.unit
 
 
 class StubAgent:
@@ -250,6 +251,45 @@ class TestSSE:
         assert "Natural-path Tina voice failure" in body
         # Crucially: done MUST NOT be emitted after error.
         assert "event: done" not in body
+
+    async def test_client_context_cannot_clobber_computed_keys(self, voice_app):
+        """L59/L8: a client-supplied context dict must not override the
+        channel-computed chat_id/cid/utterance_id — those key the SDK
+        session, rate limiter, and log correlation. Benign passthrough
+        keys (e.g. device_id) must still survive."""
+        client, bus = voice_app
+        captured = {}
+        orig_request = bus.request
+
+        async def spy_request(msg, timeout=300):
+            captured["msg"] = msg
+            return await orig_request(msg, timeout=timeout)
+
+        bus.request = spy_request
+
+        resp = await client.post(
+            "/api/converse",
+            json={
+                "prompt": "hi",
+                "agent_role": "butler",
+                "scope_id": "kitchen-satellite",
+                "context": {
+                    "chat_id": "living-room",       # must NOT win
+                    "cid": "client-forged-cid",     # must NOT win
+                    "utterance_id": "forged-uid",   # must NOT win
+                    "device_id": "kitchen",          # passthrough key, must survive
+                },
+            },
+        )
+        assert resp.status == 200
+        await resp.read()  # drain the SSE stream
+
+        ctx = captured["msg"].context
+        assert ctx["chat_id"] == "kitchen-satellite"      # channel-computed scope wins
+        assert ctx["cid"] != "client-forged-cid"          # middleware cid wins
+        assert ctx["utterance_id"] != "forged-uid"        # server-generated uuid wins
+        assert ctx["device_id"] == "kitchen"              # benign client keys pass through
+        assert callable(ctx["_on_token"]) and callable(ctx["_error_sink"])
 
 
 # ---------------------------------------------------------------------------

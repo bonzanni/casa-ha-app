@@ -1336,9 +1336,16 @@ async def engage_executor(args: dict) -> dict:
             "message": str(exc),
         })
 
+    # Computed BEFORE create() so it can be persisted onto the record's
+    # origin — the claude_code driver reads it (and context_text) back out
+    # of engagement.origin when provisioning the workspace CLAUDE.md.
+    world_state = _build_world_state_summary()
+
     rec = await _engagement_registry.create(
         kind="executor", role_or_type=executor_type, driver=defn.driver,
-        task=task_text, origin=dict(origin), topic_id=topic_id,
+        task=task_text,
+        origin={**origin, "context": context_text, "world_state_summary": world_state},
+        topic_id=topic_id,
         tools_allowed=tuple(defn.tools_allowed or ()),
         permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
     )
@@ -1367,8 +1374,6 @@ async def engage_executor(args: dict) -> dict:
             "status": "error", "kind": "prompt_template_missing",
             "message": str(exc),
         })
-
-    world_state = _build_world_state_summary()
 
     # Semantic-recall memory injection (design §3, plan 3): when the executor
     # opts in (defn.memory.enabled=True, off by default), fetch prior-engagement
@@ -1510,16 +1515,34 @@ async def _finalize_engagement(
     """
     now = time.time()
 
-    # 1. Registry transition
+    # 1. Registry transition — atomic and authoritative. Only the first
+    #    caller to flip the record terminal runs the finalize side effects
+    #    below (L75/L24: guards against a concurrent /cancel racing this
+    #    call across a real suspension point, e.g. the G-2 forced-reload
+    #    await, which the naive check-then-act in emit_completion cannot).
     if _engagement_registry is not None:
-        if outcome == "completed":
-            await _engagement_registry.mark_completed(engagement.id, completed_at=now)
-        elif outcome == "cancelled":
-            await _engagement_registry.mark_cancelled(engagement.id)
-        else:  # "error"
-            await _engagement_registry.mark_error(
-                engagement.id, kind="emit_completion_error", message=text,
+        won = await _engagement_registry.try_transition_terminal(
+            engagement.id, outcome,
+            completed_at=now if outcome == "completed" else None,
+            error_kind="emit_completion_error", error_message=text,
+        )
+        if not won:
+            logger.info(
+                "Engagement %s already terminal — skipping duplicate finalize (outcome=%s)",
+                engagement.id[:8], outcome,
             )
+            return
+
+    # L68/L17: drop per-engagement observer bookkeeping now that the
+    # engagement is terminal — keeps _interjection_counts/_silenced from
+    # growing unbounded over the process lifetime.
+    try:
+        import agent as agent_mod
+        _obs = getattr(agent_mod, "active_observer", None)
+        if _obs is not None:
+            _obs.forget(engagement.id)
+    except Exception:  # noqa: BLE001
+        pass
 
     # 2. Post completion message into the topic (if any), flip U3 state, close.
     if engagement.topic_id is not None and _channel_manager is not None:
@@ -2005,6 +2028,12 @@ async def cancel_engagement(args: dict) -> dict:
     if rec is None:
         return _result({"status": "error", "kind": "unknown_engagement",
                         "message": f"no engagement named {engagement_id!r}"})
+    if rec.status in ("completed", "cancelled", "error"):
+        # L75/L24: a late cancel against an engagement that already
+        # finalized (e.g. it raced emit_completion and lost) gets a
+        # truthful reply instead of a silent no-op / duplicate finalize.
+        return _result({"status": "acknowledged", "kind": "already_terminal",
+                        "message": f"engagement is already {rec.status!r}"})
 
     driver = None
     try:
@@ -2572,6 +2601,8 @@ def _tool_uninstall_casa_plugin(
                 if not settings.is_file():
                     continue
                 data = json.loads(settings.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    continue
                 if any(k.startswith(f"{plugin_name}@") for k in data.get("enabledPlugins", {})):
                     targets.append(d.name)
 
