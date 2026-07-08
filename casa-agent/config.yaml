@@ -5,7 +5,6 @@ slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 image: "ghcr.io/bonzanni/casa-agent"
 init: false
-startup: application
 timeout: 120
 arch:
   - aarch64
@@ -14,7 +13,6 @@ homeassistant_api: true
 hassio_api: true
 ingress: true
 ingress_port: 8080
-apparmor: true
 ports:
   "18065/tcp": null
 ports_description:

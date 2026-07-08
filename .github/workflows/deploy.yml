@@ -31,10 +31,10 @@ jobs:
       build_matrix: ${{ steps.matrix.outputs.matrix }}
       image_name: ${{ steps.normalize.outputs.image_name }}
       registry_prefix: ${{ steps.normalize.outputs.registry_prefix }}
-      name: ${{ steps.info.outputs.name }}
-      description: ${{ steps.info.outputs.description }}
-      url: ${{ steps.info.outputs.url }}
-      version: ${{ steps.info.outputs.version }}
+      name: ${{ steps.normalize.outputs.name }}
+      description: ${{ steps.normalize.outputs.description }}
+      url: ${{ steps.normalize.outputs.url }}
+      version: ${{ steps.normalize.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -44,12 +44,26 @@ jobs:
         with:
           path: "./casa-agent"
 
-      - name: Normalize image reference
+      - name: Normalize app information
         id: normalize
+        # The info helper returns scalars with their YAML quotes intact
+        # (version "0.58.0" would become an invalid image tag). Unquoted
+        # shell assignment strips them — same laundering the official
+        # apps-example build-app.yaml does.
         run: |
-          image="${{ steps.info.outputs.image }}"
+          image=${{ steps.info.outputs.image }}
           echo "image_name=${image##*/}" >> "$GITHUB_OUTPUT"
           echo "registry_prefix=${image%/*}" >> "$GITHUB_OUTPUT"
+          version=${{ steps.info.outputs.version }}
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          name=${{ steps.info.outputs.name }}
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          description=${{ steps.info.outputs.description }}
+          echo "description=${description}" >> "$GITHUB_OUTPUT"
+          url=${{ steps.info.outputs.url }}
+          if [[ -n "$url" && "$url" != "null" ]]; then
+            echo "url=${url}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Prepare build matrix
         id: matrix
