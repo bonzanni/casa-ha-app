@@ -8,10 +8,16 @@
 # guard (_internal/query.py:_convert_hook_output_for_cli, call site ~:452).
 # It is mitigated Casa-side by H-2 (v0.36.1) — every hook callback returns
 # {} / _deny(...), never None (hooks.py:187-192). So this bump neither fixes
-# nor regresses G-1; Casa is immune on both 0.1.72 and 0.2.87.
-claude-agent-sdk==0.2.87
+# nor regresses G-1; Casa is immune across this range.
+# Bumped 0.2.87 -> 0.2.114 (v0.59.1, Dependabot #104): no breaking changes
+# across the range (release-notes reviewed); additive TaskUpdatedMessage typing
+# (0.2.101) and a defensive mcp<2.0.0 pin (0.2.96, matches ours below).
+claude-agent-sdk==0.2.114
 python-telegram-bot==22.7
-aiohttp==3.13.5
+# Bumped 3.13.5 -> 3.14.1 (v0.59.1): clears 11 security advisories (deserialization,
+# HTTP request-smuggling/pipelining, websocket memory-limit bypass, etc.), all
+# fixed by <=3.14.1. Dependabot #97 (branch deleted before recreate).
+aiohttp==3.14.1
 apscheduler==3.11.2
 pyyaml==6.0.3
 jsonschema==4.23.0

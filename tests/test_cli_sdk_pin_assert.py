@@ -16,7 +16,7 @@ REPO = Path(__file__).resolve().parents[1]
 DOCKERFILE = REPO / "casa-agent" / "Dockerfile"
 REQUIREMENTS = REPO / "casa-agent" / "requirements.txt"
 
-SDK_VERSION = "0.2.87"
+SDK_VERSION = "0.2.114"
 CLI_VERSION = "2.1.150"
 
 

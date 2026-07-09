@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.59.1] - 2026-07-09 — dependency updates (security)
+
+Dependency-only release — no code changes; re-anchors the published image.
+
+### Changed
+
+- **`aiohttp` 3.13.5 → 3.14.1** — clears 11 security advisories (untrusted-data
+  deserialization, HTTP/1 pipelined-request queue exhaustion, websocket
+  memory-limit bypass, `client_max_size` bypass, cross-origin redirect
+  credential/cookie leaks, CRLF injection in multipart headers, and more), all
+  fixed by ≤3.14.1 (Dependabot #97).
+- **`claude-agent-sdk` 0.2.87 → 0.2.114** (Dependabot #104) — no breaking
+  changes across the range (release notes reviewed); additive typed
+  `TaskUpdatedMessage` (0.2.101) and a defensive `mcp<2.0.0` pin (0.2.96,
+  consistent with our existing `mcp>=1.28.1,<2`).
+
 ## [0.59.0] - 2026-07-09 — memory dedup + observability (live-exploration findings)
 
 Fixes from the 2026-07-09 live exploration session
