@@ -6,6 +6,7 @@ tools:
     - Read
     - Skill
     - mcp__casa-framework__get_schedule
+    - mcp__casa-framework__recall_memory
     - mcp__homeassistant
   disallowed: [Bash, Write, Edit]
   permission_mode: acceptEdits
