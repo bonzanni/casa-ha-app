@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.60.0] - 2026-07-09 — per-agent capability boot log
+
+### Added
+
+- **Capability boot log.** Every agent construction (boot AND reload) emits one
+  INFO `agent_capabilities` line — `role`, `model`, `enabled`, tool count + the
+  sorted allowed-tool list, and the declared MCP servers. Capability drift (a
+  tool grant vanishing after a `config_sync` reconcile, an MCP server going
+  undeclared — the shape behind the v0.59.2 `recall_memory` incident) is now
+  visible in `docker logs` and diffable across deploys. Best-effort: the line
+  can never break agent construction. A runtime backstop complementing the
+  v0.59.3 static guards and the mode-matrix contract tests.
+
 ## [0.59.3] - 2026-07-09 — seam guards (capability parity + mock drift)
 
 Test-only release — no runtime changes. Hardens against the *class* of bug

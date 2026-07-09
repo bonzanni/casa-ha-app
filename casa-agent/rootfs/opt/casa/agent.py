@@ -212,6 +212,28 @@ class Agent:
             config.hooks, default_cwd=config.cwd,
         )
 
+        # Layer-5 capability boot log: one INFO line per Agent construction
+        # (boot AND reload — reload._construct_agent builds a fresh Agent), so
+        # a capability regression (a tool grant vanishing after a config_sync
+        # reconcile, an MCP server going undeclared) is visible in `docker
+        # logs` and diffable across deploys. Logs the CONFIGURED surface
+        # (config.tools.allowed) — the thing that drifts vs runtime.yaml; the
+        # per-turn auto-appended "Skill" is not a config grant and is omitted.
+        # Best-effort: an observability line must never break construction.
+        try:
+            allowed = list(getattr(config.tools, "allowed", []) or [])
+            logger.info(
+                "agent_capabilities role=%s model=%s enabled=%s tool_count=%d "
+                "tools=%s mcp_servers=%s",
+                config.role, getattr(config, "model", "?"),
+                getattr(config, "enabled", "?"),
+                len(allowed), sorted(allowed),
+                sorted(getattr(config, "mcp_server_names", []) or []),
+            )
+        except Exception:  # noqa: BLE001 — never let the boot log break boot
+            logger.warning("agent_capabilities log failed for role=%s",
+                           getattr(config, "role", "?"), exc_info=True)
+
     # ------------------------------------------------------------------
     # Public entry point (used as bus handler)
     # ------------------------------------------------------------------
