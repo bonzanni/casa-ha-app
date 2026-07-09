@@ -3,6 +3,7 @@
 render logic is tested without live HTTP (verified shapes in spec §8 findings)."""
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -56,6 +57,39 @@ async def test_recall_posts_verified_shape_and_renders() -> None:
     assert payload["budget"] == "low"
     assert "world" in payload["types"]        # spec §8.9 — must not drop world
     assert "thermostat at 20C" in out         # rendered digest
+
+
+async def test_retain_logs_success(caplog) -> None:
+    """E1: a successful retain emits an INFO trace (was previously silent)."""
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._request = AsyncMock(return_value={"success": True})
+    items = [{"content": "a", "tags": ["public"], "document_id": "m-x"},
+             {"content": "b", "tags": ["public"], "document_id": "m-y"}]
+    with caplog.at_level(logging.INFO, logger="hindsight_memory"):
+        await mem.retain("casa", items, async_=True)
+    line = "".join(r.getMessage() for r in caplog.records)
+    assert "memory_retain" in line
+    assert "bank=casa" in line
+    assert "items=2" in line
+
+
+async def test_recall_logs_hit_count_not_query(caplog) -> None:
+    """E1: recall logs the hit count + clearance tags, never the query text."""
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._request = AsyncMock(return_value={"results": [
+        {"text": "one", "type": "world", "tags": ["private"]},
+        {"text": "two", "type": "experience", "tags": ["private"]},
+    ]})
+    with caplog.at_level(logging.INFO, logger="hindsight_memory"):
+        await mem.recall(
+            "casa", "what is my secret salary", tags=["private"],
+            max_tokens=512, budget="low",
+        )
+    line = "".join(r.getMessage() for r in caplog.records)
+    assert "memory_recall" in line
+    assert "bank=casa" in line
+    assert "hits=2" in line
+    assert "salary" not in line  # query text must NOT be logged
 
 
 async def test_profile_gets_mental_models() -> None:

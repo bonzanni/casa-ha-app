@@ -135,17 +135,27 @@ def log_tool_result(
 
 
 def log_turn_done(sdk_msg: ResultMessage, *, started_ms: float) -> None:
-    """INFO ``turn_done turns=N cost_usd=N.NNNN in_tok=N out_tok=N ms=N``."""
+    """INFO ``turn_done turns=N cost_usd=N.NNNN in_tok=N out_tok=N
+    cache_read=N cache_write=N ms=N``.
+
+    E2 (observability): the cache token fields were omitted, which made the
+    cost line unexplainable — a cached prompt shows ``in_tok=3`` yet costs
+    real money, and the v0.56 prompt-cache win was invisible to monitoring.
+    ``cache_read_input_tokens`` / ``cache_creation_input_tokens`` are the
+    Anthropic usage keys the SDK forwards."""
     turns = getattr(sdk_msg, "num_turns", 0) or 0
     cost = float(getattr(sdk_msg, "total_cost_usd", 0.0) or 0.0)
     usage = getattr(sdk_msg, "usage", {}) or {}
     in_tok = int(usage.get("input_tokens", 0) or 0)
     out_tok = int(usage.get("output_tokens", 0) or 0)
+    cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
+    cache_write = int(usage.get("cache_creation_input_tokens", 0) or 0)
     now_ms = time.monotonic() * 1000
     elapsed = int(now_ms - started_ms)
     logger.info(
-        "turn_done turns=%d cost_usd=%.4f in_tok=%d out_tok=%d ms=%d",
-        turns, cost, in_tok, out_tok, elapsed,
+        "turn_done turns=%d cost_usd=%.4f in_tok=%d out_tok=%d "
+        "cache_read=%d cache_write=%d ms=%d",
+        turns, cost, in_tok, out_tok, cache_read, cache_write, elapsed,
     )
 
 

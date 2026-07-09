@@ -154,6 +154,32 @@ class TestLogTurnDone:
         assert "cost_usd=0.0042" in msg
         assert "in_tok=1234" in msg
         assert "out_tok=567" in msg
+        # E2: cache fields default to 0 when the usage dict omits them.
+        assert "cache_read=0" in msg
+        assert "cache_write=0" in msg
+
+    def test_emits_cache_token_fields(self, caplog):
+        """E2: cache_read/cache_write come from the Anthropic usage keys so a
+        cached prompt's low in_tok with real cost is explainable."""
+        import time
+        from sdk_logging import log_turn_done
+        sdk_msg = MagicMock()
+        sdk_msg.num_turns = 1
+        sdk_msg.total_cost_usd = 0.0755
+        sdk_msg.usage = {
+            "input_tokens": 3, "output_tokens": 12,
+            "cache_read_input_tokens": 18500,
+            "cache_creation_input_tokens": 1200,
+        }
+        started_ms = (time.monotonic() * 1000) - 100
+
+        with caplog.at_level(logging.INFO, logger="sdk"):
+            log_turn_done(sdk_msg, started_ms=started_ms)
+
+        msg = [r for r in caplog.records if r.name == "sdk"][0].getMessage()
+        assert "in_tok=3" in msg
+        assert "cache_read=18500" in msg
+        assert "cache_write=1200" in msg
 
 
 class TestLogSystemInit:
