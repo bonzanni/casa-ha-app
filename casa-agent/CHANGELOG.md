@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.58.2] - 2026-07-09 — dependency updates
+
+Dependency-only release — re-anchors the published image tag after the pin
+bumps below; no code changes.
+
+### Changed
+
+- `mcp` pinned `>=1.28.1,<2` and `opentelemetry-api` `>=1.43.0`
+  (Dependabot #102 / #103).
+- CI: `actions/checkout` 4 → 7 (#100); `actions/setup-python` 5 → 6
+  (supersedes #101, which conflicted after the checkout bump).
+
 ## [0.58.1] - 2026-07-09 — presentation polish (P2)
 
 Repository/presentation release — no runtime behavior changes.
