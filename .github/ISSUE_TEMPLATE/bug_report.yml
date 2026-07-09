@@ -1,0 +1,55 @@
+name: Bug report
+description: Something in the Casa Agent app is broken
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Version info and logs make
+        most bugs quickly fixable.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: Casa Agent version
+      description: Shown on the app's page in the store.
+      placeholder: "0.58.1"
+    validations:
+      required: true
+  - type: input
+    id: ha-version
+    attributes:
+      label: Home Assistant version
+      description: "Settings → About (Core / Supervisor / OS)."
+      placeholder: "Core 2026.7.1 / Supervisor 2026.07.0 / OS 16.2"
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      options:
+        - amd64
+        - aarch64
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: |
+        Settings → Apps (Add-ons) → Casa Agent → Log. Casa redacts most
+        secrets from its logs, but please double-check before pasting.
+      render: text
+  - type: textarea
+    id: config
+    attributes:
+      label: App configuration (secrets removed)
+      description: Your app configuration with every token and secret removed.
+      render: yaml
