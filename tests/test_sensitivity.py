@@ -6,6 +6,7 @@ import pytest
 
 from sensitivity import (
     TIERS, DEFAULT_TIER, readable_tiers, apply_ceiling, clearance_for_channel,
+    CLEARANCE_BY_CHANNEL,
 )
 
 pytestmark = [pytest.mark.unit]
@@ -36,6 +37,23 @@ def test_voice_channel_clearance_is_friends():
 def test_unknown_channel_defaults_to_private_clearance():
     assert clearance_for_channel("telegram") == "private"
     assert clearance_for_channel("something-else") == "private"
+
+
+def test_real_ingress_channels_explicitly_mapped():
+    """X2 (2026-07-09): every real ingress channel is an EXPLICIT clearance
+    decision, not an accident of the fallback."""
+    for ch in ("telegram", "voice", "webhook"):
+        assert ch in CLEARANCE_BY_CHANNEL, f"{ch} clearance must be explicit"
+
+
+def test_webhook_reads_at_private_per_hmac_trust_decision():
+    """/invoke + /webhook are HMAC-gated; operator decision (2026-07-09): the
+    secret is the trust boundary, so a holder reads at full (private) clearance
+    like the DM."""
+    assert clearance_for_channel("webhook") == "private"
+    assert set(readable_tiers(clearance_for_channel("webhook"))) == {
+        "public", "friends", "family", "private",
+    }
 
 
 # ---------------------------------------------------------------------------

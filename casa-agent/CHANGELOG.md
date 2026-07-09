@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.61.0] - 2026-07-10 — cross-surface fixes (voice recall + clearance intent)
+
+Fixes from the 2026-07-09 cross-surface consistency sweep
+(`bug-review-2026-07-09-cross-surface.md`).
+
+### Fixed
+
+- **Voice was memory-blind (X1).** The voice agent (butler) holds the
+  `recall_memory` tool (since v0.59.2) but its prompt never told it to use it,
+  so on voice it answered "each conversation starts fresh for me" and never
+  recalled — not even facts it is cleared to read. Added a "Using your
+  long-term memory" section to butler's system prompt directing it to
+  `recall_memory` before saying it doesn't know, and correcting the "start
+  fresh" misconception.
+
+### Changed
+
+- **Read-clearance is now explicit per channel (X2).** `CLEARANCE_BY_CHANNEL`
+  maps `telegram`→private, `voice`→friends, `webhook`→private explicitly, so
+  each grant is an intentional, tested decision rather than an accident of the
+  fallback. Per operator decision, the HMAC secret is the trust boundary for
+  `/invoke` + `/webhook`, so those read at full (private) clearance like the DM.
+  (The fail-open default for genuinely-unmapped channels is unchanged pending a
+  separate review.)
+
 ## [0.60.0] - 2026-07-09 — per-agent capability boot log
 
 ### Added
