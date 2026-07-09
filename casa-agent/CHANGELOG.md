@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.59.0] - 2026-07-09 — memory dedup + observability (live-exploration findings)
+
+Fixes from the 2026-07-09 live exploration session
+(`bug-review-2026-07-09-exploration.md`).
+
+### Fixed
+
+- **Memory duplication (F1).** A repetitive conversation used to bloat the
+  memory bank with near-duplicate items — one live session produced ~50 copies
+  of a single trivial exchange. `transcript_to_items` now (a) collapses
+  identical `(speaker, text)` turns within a transcript and (b) derives each
+  Hindsight `document_id` from the content instead of `session_id:index`, so the
+  same utterance retained from a later (rotated) session upserts to one document
+  rather than duplicating. Saying the same thing across ten sessions is now one
+  memory, not ten.
+- **config_sync false-positive (D1).** The post-sync boot-parity validator ran
+  in an s6 oneshot that never exported `PRIMARY_AGENT_MODEL` /
+  `VOICE_AGENT_MODEL`, so it saw literal `${…}` placeholders in `runtime.yaml`
+  and wrote a bogus `Unknown model shortname` into
+  `config-sync-report.json`. `setup-configs.sh` now exports both (env-parity
+  with `svc-casa/run`) before running the reconciler; a genuinely bad model
+  still fails.
+
+### Changed
+
+- **Memory observability (E1).** Successful retains and recalls now log at INFO
+  (`memory_retain bank=… items=…`, `memory_recall bank=… tags=… hits=…`) —
+  previously only failures logged, leaving working memory operations invisible.
+  Recall never logs the query text (may be sensitive).
+- **Turn cost observability (E2).** `turn_done` now includes `cache_read` and
+  `cache_write` token counts, so a cached prompt's low `in_tok` with real
+  `cost_usd` is explainable and the prompt-cache win is visible in logs.
+
 ## [0.58.2] - 2026-07-09 — dependency updates
 
 Dependency-only release — re-anchors the published image tag after the pin
