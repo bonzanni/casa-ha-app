@@ -14,6 +14,7 @@ non-ASCII are rejected (``/`` and space also break the URL path segment).
 """
 from __future__ import annotations
 
+import hashlib
 import re
 
 _BANK_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -44,3 +45,24 @@ def bank_id(*parts: str) -> str:
             f"bank id {joined!r} is {len(joined)} chars; max {_BANK_NAME_MAX}"
         )
     return joined
+
+
+def content_document_id(speaker: str, text: str) -> str:
+    """Content-stable Hindsight ``document_id`` for a retained turn.
+
+    Hindsight upserts by ``document_id``, so the id chosen decides idempotency
+    scope. The retired scheme ``f"{sdk_session_id}:{idx}"`` was idempotent only
+    *within one SDK session*: the same utterance retained from a later, rotated
+    session (a resumed/gap/`/new` conversation gets a fresh sid) landed under a
+    new id and duplicated. Live evidence (2026-07-09 bug review, finding F1): one
+    repetitive conversation produced ~50 near-identical memories across four sids.
+
+    Keying on ``sha256(speaker \\x00 text)`` instead makes an identical
+    ``(speaker, text)`` collapse to ONE document no matter how many sessions
+    retain it — the desired behaviour for a personal memory (saying the same
+    thing ten times is one fact, not ten). The ``m-`` prefix keeps ids readable
+    and namespaced away from any accidental raw-hash collision with other id
+    spaces; 24 hex chars (96 bits) is collision-safe for a single bank.
+    """
+    digest = hashlib.sha256(f"{speaker}\x00{text}".encode("utf-8")).hexdigest()
+    return f"m-{digest[:24]}"

@@ -36,3 +36,17 @@ def test_old_dir_level_seed_block_removed() -> None:
 def test_c1_relay_migration_retained() -> None:
     src = SETUP.read_text(encoding="utf-8")
     assert "c1-relay-migration: begin" in src, "c1-relay migration must be retained"
+
+
+def test_model_env_exported_before_config_sync() -> None:
+    """D1: config_sync's boot-parity validation resolves ${PRIMARY_AGENT_MODEL}
+    / ${VOICE_AGENT_MODEL}, so both must be exported (env-parity with
+    svc-casa/run) BEFORE the reconciler runs, else the report shows a bogus
+    'Unknown model shortname'."""
+    src = SETUP.read_text(encoding="utf-8")
+    invoke = src.find("config_sync.py")
+    assert invoke >= 0
+    for var in ("PRIMARY_AGENT_MODEL", "VOICE_AGENT_MODEL"):
+        exp = src.find(f"export {var}=")
+        assert exp >= 0, f"{var} not exported in setup-configs.sh"
+        assert exp < invoke, f"{var} must be exported BEFORE config_sync.py runs"

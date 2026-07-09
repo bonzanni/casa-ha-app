@@ -61,6 +61,11 @@ class HindsightSemanticMemory(SemanticMemory):
             "POST", f"/v1/default/banks/{bank}/memories",
             {"async": async_, "items": items},
         )
+        # E1 (observability): retains were previously silent on success, so a
+        # working memory write left no trace in the logs — only failures logged.
+        logger.info(
+            "memory_retain bank=%s items=%d async=%s", bank, len(items), async_,
+        )
 
     async def recall(
         self, bank: str, query: str, *, tags: list[str], max_tokens: int,
@@ -74,6 +79,14 @@ class HindsightSemanticMemory(SemanticMemory):
                 "query": query, "tags": tags, "tags_match": tags_match,
                 "max_tokens": max_tokens, "types": list(types), "budget": budget,
             },
+        )
+        # E1 (observability): recalls were silent, so an empty recall was
+        # indistinguishable from a recall never happening. Log the hit count
+        # and the clearance tags used (never the query text — may be sensitive).
+        hits = resp.get("results") or resp.get("memories") or []
+        logger.info(
+            "memory_recall bank=%s tags=%s hits=%d",
+            bank, tags, len(hits) if isinstance(hits, list) else 0,
         )
         return render_recall(resp)
 

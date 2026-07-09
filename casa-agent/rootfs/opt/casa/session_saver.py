@@ -13,7 +13,7 @@ from typing import Any
 from channel_policy import writes_to_bank
 from channel_trust import user_peer_for_channel
 from claude_agent_sdk import get_session_messages
-from hindsight_ids import bank_id
+from hindsight_ids import bank_id, content_document_id
 from tier_classifier import classify_tier
 
 logger = logging.getLogger(__name__)
@@ -61,18 +61,39 @@ async def transcript_to_items(
     messages: list, *, sdk_session_id: str, user_peer: str,
 ) -> list[dict[str, Any]]:
     """Turn an SDK transcript into Hindsight retain items (design §4.2; tier model
-    §2.4). One item per text-bearing turn, each classified at its TRUE sensitivity
-    tier (default-private on uncertainty) and tagged ``[tier]`` — Hindsight tags are
-    document-granular, so per-item is the finest partition available. Deterministic
-    ``document_id`` = ``f"{sid}:{idx}"`` keeps a re-retain idempotent."""
-    # Phase 1 — collect text-bearing turns (preserving original index/order).
-    pending: list[tuple[int, str, str]] = []
-    for idx, m in enumerate(messages):
+    §2.4). One item per DISTINCT text-bearing turn, each classified at its TRUE
+    sensitivity tier (default-private on uncertainty) and tagged ``[tier]`` —
+    Hindsight tags are document-granular, so per-item is the finest partition
+    available.
+
+    F1 (2026-07-09 bug review): a repetitive conversation used to emit one item
+    per occurrence of a repeated line AND re-retain the same content under a new
+    ``document_id`` every time the SDK session rotated — one session produced ~40
+    near-duplicate memories, ~50 across four sids. Two dedup layers fix that:
+
+    * **Within-batch:** collapse identical ``(speaker, text)`` turns so a line
+      repeated N times in one transcript yields ONE item (first occurrence wins,
+      order preserved). ``sdk_session_id`` is now unused for the id but kept in
+      the signature for caller stability and future provenance needs.
+    * **Cross-session:** ``document_id`` is content-derived
+      (:func:`content_document_id`), so the same ``(speaker, text)`` retained
+      from any later session upserts to the SAME Hindsight document instead of
+      duplicating."""
+    # Phase 1 — collect DISTINCT text-bearing turns (first occurrence wins,
+    # original order preserved). Dedup key is (speaker, text): the same words
+    # from user vs assistant stay distinct.
+    seen: set[tuple[str, str]] = set()
+    pending: list[tuple[str, str]] = []  # (text, speaker)
+    for m in messages:
         text = _message_text(getattr(m, "message", None))
         if not text:
             continue
         speaker = user_peer if getattr(m, "type", "") == "user" else "assistant"
-        pending.append((idx, text, speaker))
+        key = (speaker, text)
+        if key in seen:
+            continue
+        seen.add(key)
+        pending.append((text, speaker))
     if not pending:
         return []
     # Phase 2 — classify concurrently, bounded by a semaphore. classify_tier is
@@ -85,15 +106,15 @@ async def transcript_to_items(
         async with sem:
             return await classify_tier(text)
 
-    tiers = await asyncio.gather(*(_classify(t) for _, t, _ in pending))
+    tiers = await asyncio.gather(*(_classify(t) for t, _ in pending))
     return [
         {
             "content": text,
             "tags": [tier],
             "metadata": {"speaker": speaker},
-            "document_id": f"{sdk_session_id}:{idx}",
+            "document_id": content_document_id(speaker, text),
         }
-        for (idx, text, speaker), tier in zip(pending, tiers)
+        for (text, speaker), tier in zip(pending, tiers)
     ]
 
 

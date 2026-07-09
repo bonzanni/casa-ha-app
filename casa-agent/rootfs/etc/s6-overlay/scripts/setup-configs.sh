@@ -164,6 +164,15 @@ export CASA_CONFIG_DIR="$CONFIG_DIR"
 export CASA_DEFAULTS_DIR="$DEFAULTS_DIR"
 export CASA_DATA_DIR="$DATA_DIR"
 export CASA_IMAGE_VERSION="$(bashio::addon.version 2>/dev/null || echo unknown)"
+# D1 (2026-07-09 bug review): config_sync's post-sync boot-parity pass runs the
+# real agent loader, which resolves ${PRIMARY_AGENT_MODEL}/${VOICE_AGENT_MODEL}
+# in runtime.yaml via resolve_model(). svc-casa/run exports these for the actual
+# boot, but this oneshot runs in a separate s6 process that did NOT — so the
+# validator saw the literal "${...}" and reported a bogus "Unknown model
+# shortname" in config-sync-report.json. Export them here for env-parity with
+# boot so the validation is faithful (a genuinely bad model still fails).
+export PRIMARY_AGENT_MODEL="$(bashio::config 'primary_agent_model')"
+export VOICE_AGENT_MODEL="$(bashio::config 'voice_agent_model')"
 python3 /opt/casa/config_sync.py || bashio::log.warning "config_sync exited non-zero (non-fatal)"
 
 # Initialize session registry if missing
