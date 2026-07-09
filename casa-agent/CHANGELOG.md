@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.59.2] - 2026-07-09 — fix: residents can recall memory on-demand
+
+### Fixed
+
+- **Residents could not use `recall_memory` (memory-read regression).** The
+  `mcp__casa-framework__recall_memory` pull tool was missing from the assistant's
+  and butler's `tools.allowed`. Auto-injected recall fires only on a *fresh*
+  session, so on **resumed or scheduled turns** (heartbeat, morning-briefing) the
+  primary agent had no memory-read path and reported "memory recall isn't
+  permitted this session" — even though its prompts direct it to check memory.
+  The **voice channel** (routes to butler, never auto-recalls, no overlay at
+  `friends` clearance) had no long-term-memory path at all. Added the tool to
+  both residents' allowed lists. A new invariant test asserts any agent whose
+  prompt references `recall_memory` actually allows it. (Regression from the
+  v0.42–v0.45 tiered-memory rework.)
+
 ## [0.59.1] - 2026-07-09 — dependency updates (security)
 
 Dependency-only release — no code changes; re-anchors the published image.
