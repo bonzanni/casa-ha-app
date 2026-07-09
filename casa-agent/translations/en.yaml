@@ -2,10 +2,10 @@ configuration:
   public_url:
     name: Public URL
     description: >-
-      The public-facing base URL for this add-on (e.g. https://your-ha.duckdns.org:18065).
+      The public-facing base URL for this app (e.g. https://your-ha.duckdns.org:18065).
       Required for Telegram webhook mode and future callback integrations.
       Enable the external port (18065) and set up port forwarding first.
-      Leave empty if the add-on is only accessed via the HA UI.
+      Leave empty if the app is only accessed via the HA UI.
   claude_oauth_token:
     name: Claude OAuth Token
     description: >-

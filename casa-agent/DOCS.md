@@ -1,6 +1,6 @@
 # Casa Agent
 
-A personal AI agent framework running as a Home Assistant add-on, powered by the Claude Agent SDK.
+A personal AI agent framework running as a Home Assistant app (formerly add-on), powered by the Claude Agent SDK.
 
 ## What it does
 
@@ -32,18 +32,18 @@ Casa runs always-on AI agents inside your Home Assistant instance. The primary a
 
 Short-term conversation continuity always works via the Claude Agent SDK
 session. **Long-term** memory (cross-session recall) is off by default and
-is enabled by pointing Casa at a self-hosted **Hindsight** add-on.
+is enabled by pointing Casa at a self-hosted **Hindsight** app.
 
 | Option | Description |
 |--------|-------------|
-| `hindsight_api_url` | Internal base URL for the self-hosted Hindsight add-on (e.g. `http://5884eb17-hindsight:8888` or its IP), reached via the add-on's hassio network alias/IP — not the bare host `hindsight`. **This is the single toggle for long-term memory: set it to turn long-term semantic memory ON** (the add-on auto-derives `MEMORY_BACKEND=hindsight`) — both **save** (the freshness reaper retains ended conversations, each item tier-classified) and **recall** (a mental-model overlay + relevance-ranked recall on the read path, plus a `recall_memory` pull tool). **Leave empty to keep long-term memory disabled** (short-term continuity still works via the SDK session). |
+| `hindsight_api_url` | Internal base URL for the self-hosted Hindsight app (e.g. `http://5884eb17-hindsight:8888` or its IP), reached via the app's hassio network alias/IP — not the bare host `hindsight`. **This is the single toggle for long-term memory: set it to turn long-term semantic memory ON** (the app auto-derives `MEMORY_BACKEND=hindsight`) — both **save** (the freshness reaper retains ended conversations, each item tier-classified) and **recall** (a mental-model overlay + relevance-ranked recall on the read path, plus a `recall_memory` pull tool). **Leave empty to keep long-term memory disabled** (short-term continuity still works via the SDK session). |
 
 The following env var is **auto-derived** from `hindsight_api_url` and rarely needs
 setting by hand:
 
 | Env var | Purpose | Default |
 |---|---|---|
-| `MEMORY_BACKEND` | Long-term memory backend: `hindsight` or `noop` (disabled). **Auto-set to `hindsight` by the add-on whenever `hindsight_api_url` is non-empty**; otherwise unset → `noop`. Any unrecognized value → `noop`. You normally just set `hindsight_api_url`. | derived from `hindsight_api_url` |
+| `MEMORY_BACKEND` | Long-term memory backend: `hindsight` or `noop` (disabled). **Auto-set to `hindsight` by the app whenever `hindsight_api_url` is non-empty**; otherwise unset → `noop`. Any unrecognized value → `noop`. You normally just set `hindsight_api_url`. | derived from `hindsight_api_url` |
 
 ### Optional -- Agents
 
@@ -64,7 +64,7 @@ setting by hand:
 
 ## How it works
 
-1. **Startup**: The add-on validates your OAuth token, copies default agent configs (if first boot), and starts nginx + the Casa core process.
+1. **Startup**: The app validates your OAuth token, copies default agent configs (if first boot), and starts nginx + the Casa core process.
 2. **Message flow**: Incoming messages (Telegram, webhook, voice) are routed through an async message bus to the appropriate agent based on the originating channel.
 3. **Agent processing**: Each agent builds a system prompt (personality + memory context), queries the Claude Agent SDK, stores the conversation in memory, and sends the response back through the originating channel.
 4. **Home Assistant integration**: Agents interact with HA via the official HA MCP server, allowing them to control devices, read states, and create automations.
@@ -109,7 +109,7 @@ Casa exposes two transports for Home Assistant voice / generic voice clients. Th
   `done`, `error`. On `stt_start`, Casa prewarms the voice session's
   memory cache so first-utterance latency is bounded.
 
-Toggle the transports via environment variables on the add-on:
+Toggle the transports via environment variables on the app:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -143,15 +143,15 @@ override it.
 
 ## Web terminal
 
-When `enable_terminal` is enabled, a web terminal is available at the `/terminal/` path in the ingress panel. This gives you shell access to the add-on container for debugging and manual operations.
+When `enable_terminal` is enabled, a web terminal is available at the `/terminal/` path in the ingress panel. This gives you shell access to the app container for debugging and manual operations.
 
 ## Troubleshooting
 
-- **Add-on won't start**: Check the log for "claude_oauth_token is required". You must set the token before starting.
+- **App won't start**: Check the log for "claude_oauth_token is required". You must set the token before starting.
 - **No Telegram messages**: Verify `telegram_bot_token` and `telegram_chat_id` are correct. The bot must have been started (`/start` in Telegram).
 - **Engagements won't open (`engagement_not_configured`)**: See the "Troubleshooting engagements" subsection under [Engagements (v0.11.0)](#engagements-v0110) — most common cause is the bot missing "Manage topics" admin permission in the engagement supergroup.
-- **Long-term memory not working**: Long-term recall requires the `hindsight_api_url` option to be set to a reachable Hindsight add-on (which auto-enables `MEMORY_BACKEND=hindsight`). If recall is empty, check that `hindsight_api_url` is set and the Hindsight add-on is running, and check container logs for Hindsight connection errors. With `hindsight_api_url` empty, only short-term per-session continuity works.
-- **502 errors on ingress**: The Python process may still be starting. Wait up to 60 seconds after add-on start.
+- **Long-term memory not working**: Long-term recall requires the `hindsight_api_url` option to be set to a reachable Hindsight app (which auto-enables `MEMORY_BACKEND=hindsight`). If recall is empty, check that `hindsight_api_url` is set and the Hindsight app is running, and check container logs for Hindsight connection errors. With `hindsight_api_url` empty, only short-term per-session continuity works.
+- **502 errors on ingress**: The Python process may still be starting. Wait up to 60 seconds after app start.
 
 ## Engagements (v0.11.0)
 
@@ -210,21 +210,21 @@ Casa needs the **negative integer** Telegram assigns to the supergroup.
 Alternatives:
 - Add a helper bot like `@getidsbot` or `@RawDataBot` to the supergroup
   temporarily; it will reply with the chat ID.
-- If you already run Casa on the 1:1 chat, the addon log also echoes
+- If you already run Casa on the 1:1 chat, the app log also echoes
   the ID under the `CHANNEL_IN` traces when the bot sees any message
   in the supergroup.
 
 #### 4. Configure Casa
 
-1. Home Assistant → **Settings** → **Add-ons** → **Casa Agent** → **Configuration**.
+1. Home Assistant → **Settings** → **Apps** (formerly Add-ons) → **Casa Agent** → **Configuration**.
 2. Set `telegram_engagement_supergroup_id` to the negative integer from step 3.
    Leave it at `0` to disable engagements (Casa still boots; interactive
    mode returns `engagement_not_configured`).
-3. **Save** → **Restart** the addon.
+3. **Save** → **Restart** the app.
 
 #### 5. Verify
 
-Once the addon has restarted, check the log for:
+Once the app has restarted, check the log for:
 
 ```
 Engagement supergroup -100…: commands registered (['cancel', 'complete', 'silent'])
@@ -289,12 +289,12 @@ as errored and tells you to start a fresh one.
 - **"Engagements disabled" / `engagement_not_configured` on delegate call.**
   Most common: the bot wasn't promoted to admin with **Manage topics**.
   Re-check step 2 of Setup. Also check `telegram_engagement_supergroup_id`
-  is not `0` and the addon was restarted after the option was set.
+  is not `0` and the app was restarted after the option was set.
 - **`/cancel` / `/complete` / `/silent` don't appear in autocomplete.**
   They're scoped to the supergroup only. Make sure you're typing `/` in
   a topic inside the engagement supergroup, not your 1:1 DM with Ellen.
   Also: Telegram caches `setMyCommands` client-side — restart the
-  Telegram client if they don't show up within 30 seconds of addon boot.
+  Telegram client if they don't show up within 30 seconds of app boot.
 - **"No active engagement in this topic" reply in a topic.**
   The engagement for that topic has already completed, cancelled, or
   errored (registry status transition). Start a fresh engagement from
@@ -346,7 +346,7 @@ Ellen opens a topic `#[configurator] <short task>` in your engagement supergroup
 
 ### Reload behavior
 
-- hard - Supervisor addon restart (~10-15s). Agent-shape changes, runtime, policy corpus.
+- hard - Supervisor app restart (~10-15s). Agent-shape changes, runtime, policy corpus.
 - soft - In-process casa_reload_triggers(role). Trigger-only edits; no downtime.
 - none - Prompt, response_shape, doctrine edits take effect on next turn.
 
@@ -359,7 +359,7 @@ Configurator reads short markdown recipes from its own doctrine tree at `/config
 ### Troubleshooting
 
 - **"engagement_not_configured"** - you haven't set telegram_engagement_supergroup_id, or the bot doesn't have can_manage_topics.
-- **Configurator stalls after first message** - check engagement's driver log. If you see prompt_template_missing, restart the addon.
+- **Configurator stalls after first message** - check engagement's driver log. If you see prompt_template_missing, restart the app.
 - **Hook denied, configurator cancelled** - expected for resident deletion. To override: edit configurator's hooks.yaml, commit, reload, retry.
 - **Soft reload didn't take effect** - casa_reload_triggers requires the role to exist before the edit.
 - **Doctrine references stale fields** - file an issue; maintainer forgot to sync doctrine with Casa-core change.
@@ -373,19 +373,19 @@ dispatch until you opt in.
 
 To enable one:
 
-1. Open the Casa addon config folder at `/config/agents/specialists/`
+1. Open the Casa app config folder at `/config/agents/specialists/`
    (host path: `/addon_configs/{REPO}_casa-agent/agents/specialists/`).
 2. Edit the specialist's YAML file (for example `finance.yaml`).
 3. Change `enabled: false` to `enabled: true`.
-4. Restart the Casa addon.
+4. Restart the Casa app.
 
-After restart, check the addon log for the
+After restart, check the app log for the
 `Specialists: enabled=[...] disabled=[...]` summary line to confirm
 your specialist moved into the enabled set. Residents can now invoke
 it via `delegate_to_agent(agent="<role>", ...)`.
 
 To disable it again, set `enabled: false` and restart. Your edits to
-the YAML file persist across addon updates — Casa only seeds from
+the YAML file persist across app updates — Casa only seeds from
 bundled defaults when the file is absent.
 
 ## Claude Code driver (v0.13.1)
@@ -398,7 +398,7 @@ claude.ai/code via remote control.
 ### Architecture
 
 Each `driver: claude_code` engagement becomes its own s6-rc-supervised
-service inside the addon container. s6 owns supervision; Casa orchestrates
+service inside the app container. s6 owns supervision; Casa orchestrates
 lifecycle via `s6-rc-compile` + `s6-rc-update`. Engagement subprocesses
 outlive Casa-main restarts (service dependencies are ordering-only, not
 lifetime-coupled).
@@ -510,11 +510,11 @@ left off.
 
 Casa runs the `casa-framework` MCP server as a separate s6-supervised
 service called `svc-casa-mcp`, listening on `127.0.0.1:8100` inside the
-addon container. Engagement subprocesses connect to it via the URL
+app container. Engagement subprocesses connect to it via the URL
 written into their `.mcp.json` at provisioning time.
 
 **Why it exists.** Engagement subprocesses survive casa-main restarts
-(addon updates, container respawns, HA reboots) because they run under
+(app updates, container respawns, HA reboots) because they run under
 their own s6 services. Before v0.14.0, the MCP server lived inside
 casa-main, so a casa-main restart dropped every live MCP connection
 and any mid-turn tool call would fail with a connection error. With
@@ -551,7 +551,7 @@ sweep). The fallback is removed in v0.14.2 or later.
 Casa uses Claude Code's native plugin machinery. Two marketplaces are
 registered at boot:
 
-- **casa-plugins-defaults** — seed-managed, ships with the addon.
+- **casa-plugins-defaults** — seed-managed, ships with the app.
   Contains superpowers, plugin-dev, skill-creator, mcp-server-dev, context7.
   Read-only — `claude plugin uninstall` against these
   returns a "seed-managed" error.
@@ -565,7 +565,7 @@ Each in_casa agent gets a project-scope settings dir at
 ## 1Password integration (v0.14.1)
 
 Set `onepassword_service_account_token` (from https://developer.1password.com/docs/service-accounts/)
-as a plaintext addon option — it's the single root of trust and cannot
+as a plaintext app option — it's the single root of trust and cannot
 self-reference. Set `onepassword_default_vault` to the vault name (default
 "Casa"). Every other password-typed option (`claude_oauth_token`,
 `telegram_bot_token`, `webhook_secret`) accepts either
@@ -589,4 +589,4 @@ Prerequisites:
   `onepassword_default_vault` (default `Casa`), with a field labeled
   `credential` holding a GitHub PAT with `repo` scope. Plugin-developer
   resolves `op://${onepassword_default_vault}/GitHub/credential` at
-  engagement spawn — no separate addon option.
+  engagement spawn — no separate app option.

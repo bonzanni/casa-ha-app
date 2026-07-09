@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 Documentation
+    url: https://github.com/bonzanni/casa-ha-app/blob/master/casa-agent/DOCS.md
+    about: Setup, configuration reference, and troubleshooting.
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/bonzanni/casa-ha-app/security/advisories/new
+    about: Please report security problems privately — not as public issues.

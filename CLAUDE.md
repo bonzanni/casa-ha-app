@@ -1,15 +1,15 @@
 # Casa Agent — contributor & AI-assistant guide
 
-Casa is a **Home Assistant add-on**: a fleet of Claude-powered agents reachable over
-Telegram and a voice (SSE/WebSocket) channel, packaged as an HA add-on. Python +
-`aiohttp`, built on the **Claude Agent SDK**, Honcho memory, the **MCP** protocol, and
-**APScheduler**, all **s6-overlay**–supervised inside the container.
+Casa is a **Home Assistant app** (formerly "add-on"): a fleet of Claude-powered agents
+reachable over Telegram and a voice (SSE/WebSocket) channel, packaged as an HA app.
+Python + `aiohttp`, built on the **Claude Agent SDK**, Hindsight memory, the **MCP**
+protocol, and **APScheduler**, all **s6-overlay**–supervised inside the container.
 
 ## Where things are
 - **Application code:** `casa-agent/rootfs/opt/casa/` (~45 modules — this is the deep
   HA-rootfs path; the add-on copies `rootfs/` into the image root).
-- **Add-on manifest:** `casa-agent/config.yaml` (version lives here). User-facing add-on
-  docs: `casa-agent/DOCS.md`. Add-on changelog: `casa-agent/CHANGELOG.md`.
+- **App manifest:** `casa-agent/config.yaml` (version lives here). User-facing app
+  docs: `casa-agent/DOCS.md`. App changelog: `casa-agent/CHANGELOG.md`.
 - **Tests:** `tests/` (173 files). Container/e2e harness: `test-local/`. CI: `.github/workflows/qa.yml`.
 - **Internal engineering docs:** `docs/` — see the boundary note below.
 
@@ -31,7 +31,9 @@ The `tests/conftest.py` auto-adds the code root to `sys.path`.
 1. Branch `feat/vX.Y.Z-<desc>` off `master`.
 2. Bump `version:` in `casa-agent/config.yaml` and prepend a `casa-agent/CHANGELOG.md` entry.
 3. Commit `release: vX.Y.Z (<summary>)`, push, open a PR, **squash-merge** once CI is green.
-- **Removing an add-on option?** Also append its key to `DEPRECATED_OPTION_KEYS` in
+4. Merging to master auto-publishes the GHCR images and creates the `vX.Y.Z` tag +
+   GitHub Release from the changelog entry (`deploy.yml`) — no manual tagging.
+- **Removing an app option?** Also append its key to `DEPRECATED_OPTION_KEYS` in
   `casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh` (the `deprecated-options-prune`
   block) so the stale stored value is deleted on boot and HA stops warning.
 

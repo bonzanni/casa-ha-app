@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.58.1] - 2026-07-09 — presentation polish (P2)
+
+Repository/presentation release — no runtime behavior changes.
+
+### Added
+
+- Community health files: issue forms (bug report / feature request), PR
+  template, `SECURITY.md` (GitHub private vulnerability reporting is enabled),
+  `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1), and a
+  social-preview banner asset.
+
+### Changed
+
+- Logo regenerated from the icon's palette — no more tagline clipped at the
+  right edge.
+- Docs wording follows HA's rename: "add-on" → "app" across DOCS.md and the
+  option translations (technical identifiers like `addon_config` and
+  `/addon_configs/...` paths are unchanged).
+- The stale repo-level `CHANGELOG.md` at the repository root is retired; app
+  history lives here and in GitHub Releases.
+
 ## [0.58.0] - 2026-07-09 — prebuilt images, aarch64, release automation
 
 ### Added
