@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 import session_saver
+from hindsight_ids import content_document_id
 from session_saver import freshness_window, reset_channel, save_session, transcript_to_items
 
 pytestmark = [pytest.mark.unit]
@@ -49,7 +50,9 @@ async def test_transcript_to_items_builds_verified_shape(monkeypatch):
     ]
     items = await transcript_to_items(msgs, sdk_session_id="sid-9", user_peer="nicola")
     assert [i["content"] for i in items] == ["What temp do I like?", "20C."]
-    assert items[0]["document_id"] == "sid-9:0" and items[1]["document_id"] == "sid-9:1"
+    # F1: content-derived document_id (cross-session idempotent), not sid:idx.
+    assert items[0]["document_id"] == content_document_id("nicola", "What temp do I like?")
+    assert items[1]["document_id"] == content_document_id("assistant", "20C.")
     assert all(i["tags"] == ["public"] for i in items)
     assert items[0]["metadata"]["speaker"] == "nicola"
     assert items[1]["metadata"]["speaker"] == "assistant"

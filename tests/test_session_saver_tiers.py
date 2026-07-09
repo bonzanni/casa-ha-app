@@ -3,6 +3,7 @@
 import pytest
 
 import session_saver
+from hindsight_ids import content_document_id
 
 pytestmark = [pytest.mark.unit]
 
@@ -23,7 +24,58 @@ async def test_transcript_items_tagged_per_item(monkeypatch):
         msgs, sdk_session_id="s1", user_peer="nicola",
     )
     assert [i["tags"] for i in items] == [["private"], ["public"]]
-    assert [i["document_id"] for i in items] == ["s1:0", "s1:1"]
+    # F1: document_id is content-derived (cross-session idempotent), not sid:idx.
+    assert [i["document_id"] for i in items] == [
+        content_document_id("nicola", "my salary is 5000"),
+        content_document_id("assistant", "bin day is Tuesday"),
+    ]
+
+
+async def test_transcript_dedupes_repeated_line_within_batch(monkeypatch):
+    """F1: a line repeated N times in one transcript yields ONE item (first
+    occurrence wins, order preserved)."""
+    calls = []
+
+    async def fake_classify(content: str) -> str:
+        calls.append(content)
+        return "public"
+    monkeypatch.setattr(session_saver, "classify_tier", fake_classify)
+
+    msgs = [
+        _Msg("user", "harden probe TG-DISPATCH-001 reply ok"),
+        _Msg("assistant", "ok"),
+        _Msg("user", "harden probe TG-DISPATCH-001 reply ok"),  # dup
+        _Msg("user", "harden probe TG-DISPATCH-001 reply ok"),  # dup
+        _Msg("assistant", "ok"),                                # dup
+    ]
+    items = await session_saver.transcript_to_items(
+        msgs, sdk_session_id="s1", user_peer="nicola",
+    )
+    assert [i["content"] for i in items] == [
+        "harden probe TG-DISPATCH-001 reply ok", "ok",
+    ]
+    # classify runs once per distinct item, not once per occurrence.
+    assert len(calls) == 2
+
+
+async def test_transcript_same_content_stable_id_across_sessions(monkeypatch):
+    """F1: identical (speaker, text) retained from a rotated sid maps to the
+    SAME document_id, so Hindsight upserts instead of duplicating."""
+    async def fake_classify(content: str) -> str:
+        return "public"
+    monkeypatch.setattr(session_saver, "classify_tier", fake_classify)
+
+    msg = [_Msg("user", "the bins go out on Tuesday")]
+    a = await session_saver.transcript_to_items(msg, sdk_session_id="sid-A", user_peer="nicola")
+    b = await session_saver.transcript_to_items(msg, sdk_session_id="sid-B", user_peer="nicola")
+    assert a[0]["document_id"] == b[0]["document_id"]
+
+    # A different speaker with the same words is a distinct document.
+    other = await session_saver.transcript_to_items(
+        [_Msg("assistant", "the bins go out on Tuesday")],
+        sdk_session_id="sid-A", user_peer="nicola",
+    )
+    assert other[0]["document_id"] != a[0]["document_id"]
 
 
 async def test_save_session_skips_voice():
@@ -101,4 +153,7 @@ async def test_transcript_classification_is_concurrent(monkeypatch):
     # Serial gives peak == 1; bounded-parallel gives peak in [2, 4].
     assert peak >= 2, f"classification ran serially (peak in-flight = {peak})"
     assert peak <= session_saver._CLASSIFY_CONCURRENCY, "semaphore bound exceeded"
-    assert [i["document_id"] for i in items] == [f"s1:{i}" for i in range(8)]
+    # F1: content-derived ids, one per distinct fact, order preserved.
+    assert [i["document_id"] for i in items] == [
+        content_document_id("nicola", f"fact {i}") for i in range(8)
+    ]
