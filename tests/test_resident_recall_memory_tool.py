@@ -39,6 +39,18 @@ def test_butler_allows_recall_memory() -> None:
     assert RECALL_TOOL in _allowed("butler")
 
 
+def test_butler_prompt_guides_recall_usage() -> None:
+    """X1 (2026-07-09): butler holds recall_memory (v0.59.2) but was memory-blind
+    on voice because its prompt never told it to use the tool. Its system prompt
+    must now guide recall (or voice stays memory-blind despite the grant)."""
+    sys_md = (AGENTS / "butler" / "prompts" / "system.md").read_text(encoding="utf-8")
+    assert "recall_memory" in sys_md, "butler prompt must reference recall_memory"
+    low = sys_md.lower()
+    assert "long-term memory" in low or "household" in low, (
+        "butler prompt must tell it it can read long-term/household memory"
+    )
+
+
 def test_prompt_referenced_recall_memory_is_allowed() -> None:
     """Invariant: any agent whose prompt text names `recall_memory` must have
     the tool in its allowed list, or the instruction is unfulfillable."""

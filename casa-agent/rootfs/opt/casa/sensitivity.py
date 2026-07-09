@@ -18,10 +18,22 @@ TIERS: tuple[str, ...] = ("public", "friends", "family", "private")
 # Leak-safe default when a turn is unlabeled on a classified channel (design §2.4).
 DEFAULT_TIER = "private"
 
-# Default channel -> clearance. Voice = friends (people in the home, not the open public);
-# a private DM is fully trusted. Future speaker-recognition can lift voice above friends.
+# Channel -> read clearance. Explicit for every real ingress so the grant is a
+# DECISION, not an accident of the fallback (X2, 2026-07-09):
+#   telegram = private — the operator's authenticated DM, fully trusted.
+#   voice    = friends  — people in the home, not the open public; a future
+#                         speaker-ID upgrade can lift a recognised speaker higher.
+#   webhook  = private — /invoke + /webhook are gated by the HMAC secret;
+#                        per operator decision (2026-07-09) the secret IS the
+#                        trust boundary, so a holder reads at full clearance
+#                        like the DM.
+# NOTE: _DEFAULT_CLEARANCE is still "private" (fail-OPEN) for any UNMAPPED
+# channel. Flipping it to fail-closed is a stored decision (touches the
+# channel="" boot-replay edge) — see overnight-2026-07-09-worklog.
 CLEARANCE_BY_CHANNEL: dict[str, str] = {
+    "telegram": "private",
     "voice": "friends",
+    "webhook": "private",
 }
 _DEFAULT_CLEARANCE = "private"
 
