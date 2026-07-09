@@ -35,6 +35,64 @@ STATE: dict = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Pure Bot-API result builders. Extracted so tests/test_mock_telegram_ptb_contract.py
+# can feed each payload through the REAL python-telegram-bot de_json parsers —
+# a mock that drifts from PTB's strict parsing (as getChatMember did before
+# v0.57.1) then fails in the 90s unit gate, not after six red tier2 releases.
+# Keep these BEHAVIOUR-IDENTICAL to what the handlers return.
+# ---------------------------------------------------------------------------
+
+
+def build_getme_result(bot_id: int) -> dict:
+    return {"id": bot_id, "is_bot": True, "first_name": "CasaBot"}
+
+
+def build_getchatmember_result(bot_id: int, can_manage_topics: bool) -> dict:
+    # PTB parses this strictly: ChatMemberAdministrator requires the full
+    # admin-rights field set, and User requires first_name + is_bot. A thinner
+    # payload raises inside de_json → the channel logs "bot-permissions check
+    # failed" and disables engagements.
+    return {
+        "status": "administrator",
+        "user": {"id": bot_id, "is_bot": True,
+                 "first_name": "CasaBot", "username": "casabot"},
+        "can_be_edited": False,
+        "is_anonymous": False,
+        "can_manage_chat": True,
+        "can_delete_messages": True,
+        "can_manage_video_chats": True,
+        "can_restrict_members": True,
+        "can_promote_members": False,
+        "can_change_info": True,
+        "can_invite_users": True,
+        "can_post_stories": False,
+        "can_edit_stories": False,
+        "can_delete_stories": False,
+        "can_pin_messages": True,
+        "can_manage_topics": can_manage_topics,
+    }
+
+
+def build_createforumtopic_result(thread_id: int, name: str) -> dict:
+    return {"message_thread_id": thread_id, "name": name, "icon_color": 0}
+
+
+def build_sendmessage_result(message_id: int, chat_id: int, text: str,
+                             thread_id: int | None = None) -> dict:
+    # PTB's Message.de_json requires message_id + date + chat. Return a
+    # minimally-well-formed Message so callers can deserialize the reply.
+    result = {
+        "message_id": message_id,
+        "date": 0,
+        "chat": {"id": chat_id, "type": "supergroup" if thread_id else "private"},
+        "text": text,
+    }
+    if thread_id:
+        result["message_thread_id"] = int(thread_id)
+    return result
+
+
 async def handle_method(request: web.Request) -> web.Response:
     method = request.match_info["method"]
     payload = {}
@@ -48,34 +106,11 @@ async def handle_method(request: web.Request) -> web.Response:
             payload = {}
 
     if method == "getMe":
-        return web.json_response({"ok": True, "result": {"id": STATE["bot_id"],
-                                                         "is_bot": True,
-                                                         "first_name": "CasaBot"}})
+        return web.json_response({"ok": True, "result": build_getme_result(STATE["bot_id"])})
 
     if method == "getChatMember":
-        # PTB 22.x parses this strictly: ChatMemberAdministrator requires the
-        # full admin-rights field set, and User requires first_name + is_bot.
-        # A thinner payload raises TypeError inside de_json, which the channel
-        # logs as "bot-permissions check failed" and disables engagements.
-        return web.json_response({"ok": True, "result": {
-            "status": "administrator",
-            "user": {"id": STATE["bot_id"], "is_bot": True,
-                     "first_name": "CasaBot", "username": "casabot"},
-            "can_be_edited": False,
-            "is_anonymous": False,
-            "can_manage_chat": True,
-            "can_delete_messages": True,
-            "can_manage_video_chats": True,
-            "can_restrict_members": True,
-            "can_promote_members": False,
-            "can_change_info": True,
-            "can_invite_users": True,
-            "can_post_stories": False,
-            "can_edit_stories": False,
-            "can_delete_stories": False,
-            "can_pin_messages": True,
-            "can_manage_topics": STATE["can_manage_topics"],
-        }})
+        return web.json_response({"ok": True, "result": build_getchatmember_result(
+            STATE["bot_id"], STATE["can_manage_topics"])})
 
     if method == "createForumTopic":
         tid = STATE["next_thread_id"]
@@ -85,9 +120,8 @@ async def handle_method(request: web.Request) -> web.Response:
             "icon_custom_emoji_id": payload.get("icon_custom_emoji_id"),
             "closed": False,
         }
-        return web.json_response({"ok": True, "result": {"message_thread_id": tid,
-                                                         "name": payload.get("name", ""),
-                                                         "icon_color": 0}})
+        return web.json_response({"ok": True, "result": build_createforumtopic_result(
+            tid, payload.get("name", ""))})
 
     if method == "editForumTopic":
         tid = int(payload.get("message_thread_id", 0))
@@ -115,17 +149,11 @@ async def handle_method(request: web.Request) -> web.Response:
             STATE["messages_by_thread"].setdefault(int(tid), []).append(text)
         else:
             STATE["main_feed_messages"].append(text)
-        # PTB's Message.de_json requires message_id + date + chat. Return a
-        # minimally-well-formed Message so callers can deserialize the reply.
         STATE["next_message_id"] = STATE.get("next_message_id", 1) + 1
-        result = {
-            "message_id": STATE["next_message_id"],
-            "date": 0,
-            "chat": {"id": chat_id, "type": "supergroup" if tid else "private"},
-            "text": text,
-        }
-        if tid:
-            result["message_thread_id"] = int(tid)
+        result = build_sendmessage_result(
+            STATE["next_message_id"], chat_id, text,
+            thread_id=int(tid) if tid else None,
+        )
         return web.json_response({"ok": True, "result": result})
 
     if method == "setMyCommands":
