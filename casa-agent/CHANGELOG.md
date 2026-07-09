@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.59.3] - 2026-07-09 — seam guards (capability parity + mock drift)
+
+Test-only release — no runtime changes. Hardens against the *class* of bug
+behind v0.59.2 and the E-block red streak: seam bugs invisible to any single
+module's tests.
+
+### Added
+
+- **Capability-parity suite** (`tests/test_capability_parity.py`): every
+  granted tool resolves to a real framework tool / known built-in / wired-or-
+  plugin MCP server (catches typos, stale grants for removed tools, MCP grants
+  with no server); a curated required-self-use manifest asserts agents that
+  depend on a framework tool actually allow it (catches the `recall_memory`
+  missing-grant class); every trigger `prompt_file`/`channel` resolves; every
+  add-on option has a translation.
+- **Mock-drift guard** (`tests/test_mock_telegram_ptb_contract.py`): the mock
+  Telegram server's payloads are parsed through the REAL python-telegram-bot
+  `de_json` in a subprocess, so a PTB bump or mock edit that would only fail in
+  tier2 (as the `getChatMember` payload did across six releases) now fails in
+  the fast unit gate. The mock's payloads were refactored into pure builders to
+  make them testable (behaviour-identical).
+
 ## [0.59.2] - 2026-07-09 — fix: residents can recall memory on-demand
 
 ### Fixed
