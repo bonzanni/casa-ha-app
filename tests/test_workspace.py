@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 class TestRenderRunScript:
@@ -537,8 +537,10 @@ class TestProvisionWithHooks:
         exec_dir = tmp_path / "defaults-executors" / "cfg"
         exec_dir.mkdir(parents=True)
         (exec_dir / "prompt.md").write_text("p")
+        # Casa hooks.yaml INPUT schema is snake_case (hooks.v1.json /
+        # translate_hooks_to_settings); PascalCase is the CC OUTPUT shape.
         (exec_dir / "hooks.yaml").write_text(
-            "PreToolUse:\n"
+            "pre_tool_use:\n"
             "  - policy: casa_config_guard\n"
             "    matcher: Write|Edit\n"
         )
