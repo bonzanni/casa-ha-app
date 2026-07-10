@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.64.1] - 2026-07-10 — test hygiene: two stale tests fixed and brought into the CI gate
+
+No runtime changes. Two long-broken tests that CI never ran (their files
+lacked the `unit` marker, so the gate silently deselected them) are fixed
+and now gate-protected:
+
+### Fixed
+
+- The force-delete workspace test drains the background memory-retention
+  tasks before asserting (retention moved off the critical path in the L33
+  fix; the test predates that). The hooks-translation test feeds the
+  snake_case `pre_tool_use` input schema instead of the Claude Code
+  *output* shape. Live engagement workspaces were verified unaffected —
+  hook guards were always written correctly in production.
+- Both test files now carry the `unit` marker, growing the CI unit gate
+  from 1048 to 1089 tests.
+
 ## [0.64.0] - 2026-07-10 — engagement topics: honest messaging; engagement logs: actually captured
 
 Every Claude Code engagement topic used to receive "Remote control URL not yet

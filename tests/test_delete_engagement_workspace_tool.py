@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 def _make_ws(tmp_path: Path, eid: str, status: str = "COMPLETED"):
@@ -251,6 +252,15 @@ async def test_force_delete_writes_meta_scope_summary(tmp_path, monkeypatch):
     })
     payload = json.loads(res["content"][0]["text"])
     assert payload["status"] == "ok"
+
+    # L33 moved the retains off the turn's critical path into background
+    # tasks (_finalize_engagement schedules retain_delegated via
+    # asyncio.create_task) — drain them before asserting, else the fake
+    # deterministically records nothing.
+    import tools as tools_mod
+    pending = list(tools_mod._specialist_bg_tasks)
+    if pending:
+        await asyncio.gather(*pending)
 
     # A structured engagement summary was retained on the shared `casa` bank
     # with status=='cancelled' — force-delete finalises as cancelled,
