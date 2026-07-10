@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.63.2] - 2026-07-10 — plugin lifecycle polish (uninstall cache sweep, author-object doctrine)
+
+Two minor fixes found during the block-R plugin-lifecycle validation.
+
+### Fixed
+
+- **`uninstall_casa_plugin` now sweeps the shared plugin cache dir** once no
+  agent-home still enables the plugin. `claude plugin uninstall` clears the
+  agent-home's `enabledPlugins` but leaves the cached plugin under
+  `…/plugins/cache/casa-plugins/<name>/` orphaned; the tool now removes it
+  (guarded so a plugin still enabled in another agent-home keeps its cache).
+
+### Changed
+
+- **plugin-developer doctrine (`casa-conventions.md`):** now specifies that
+  `.claude-plugin/plugin.json` `author` must be an **object** (`{"name": "…"}`),
+  not a bare string — Claude Code rejects a string `author` at install time
+  (`author: expected object, received string`), which fails the whole install.
+
 ## [0.63.1] - 2026-07-10 — plugin install fix (github sources pin via `ref`)
 
 Fixes a plugin-install bug found during the block-R live lifecycle run: no

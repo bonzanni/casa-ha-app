@@ -2415,6 +2415,7 @@ def _tool_marketplace_list_plugins() -> dict:
 
 _INSTALL_LOCK = "/config/cc-home/.claude/plugins/.install.lock"
 _AGENT_HOME_ROOT = Path("/config/agent-home")
+_CASA_PLUGIN_CACHE_ROOT = Path("/config/cc-home/.claude/plugins/cache/casa-plugins")
 
 # H16: serialize the mutating plugin/marketplace tools once their blocking
 # bodies move off the loop via asyncio.to_thread. On the single event loop
@@ -2487,9 +2488,7 @@ def _tool_install_casa_plugin(
         }
 
     # 5. Extract required env vars from cached plugin's .mcp.json.
-    cache_root = Path(
-        "/config/cc-home/.claude/plugins/cache/casa-plugins"
-    )
+    cache_root = _CASA_PLUGIN_CACHE_ROOT
     mcp_json = next(
         iter(cache_root.glob(f"{plugin_name}/*/.mcp.json")),
         None,
@@ -2614,7 +2613,37 @@ def _tool_uninstall_casa_plugin(
         r = subprocess.run(cmd, cwd=agent_home, capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
             uninstalled.append(role)
-    return {"uninstalled_from": uninstalled}
+
+    # R-9: `claude plugin uninstall` clears the agent-home's enabledPlugins but
+    # leaves the shared marketplace cache dir orphaned. Sweep it once NO
+    # agent-home still enables the plugin (the cache is shared across targets,
+    # so keep it while any remaining target uses it).
+    cache_swept = False
+    if uninstalled and not _any_agent_enables_plugin(plugin_name):
+        cache_dir = _CASA_PLUGIN_CACHE_ROOT / plugin_name
+        if cache_dir.is_dir():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            cache_swept = True
+    return {"uninstalled_from": uninstalled, "cache_swept": cache_swept}
+
+
+def _any_agent_enables_plugin(plugin_name: str) -> bool:
+    """True if any agent-home still lists ``<plugin_name>@…`` in enabledPlugins."""
+    if not _AGENT_HOME_ROOT.is_dir():
+        return False
+    for d in _AGENT_HOME_ROOT.iterdir():
+        settings = d / ".claude" / "settings.json"
+        if not settings.is_file():
+            continue
+        try:
+            data = json.loads(settings.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if isinstance(data, dict) and any(
+            k.startswith(f"{plugin_name}@") for k in data.get("enabledPlugins", {})
+        ):
+            return True
+    return False
 
 
 def _tool_verify_plugin_state(
@@ -2648,9 +2677,7 @@ def _tool_verify_plugin_state(
                                  "status": "missing",
                                  "reason": f"{vb} not in tools/bin"})
 
-    cache_root = _cache_root if _cache_root is not None else Path(
-        "/config/cc-home/.claude/plugins/cache/casa-plugins"
-    )
+    cache_root = _cache_root if _cache_root is not None else _CASA_PLUGIN_CACHE_ROOT
     mcp_json = next(iter(cache_root.glob(f"{plugin_name}/*/.mcp.json")), None)
     required = extract_env_vars(mcp_json) if mcp_json else set()
     env_conf = read_entries()
