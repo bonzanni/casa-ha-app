@@ -27,15 +27,19 @@ DEFAULT_TIER = "private"
 #                        per operator decision (2026-07-09) the secret IS the
 #                        trust boundary, so a holder reads at full clearance
 #                        like the DM.
-# NOTE: _DEFAULT_CLEARANCE is still "private" (fail-OPEN) for any UNMAPPED
-# channel. Flipping it to fail-closed is a stored decision (touches the
-# channel="" boot-replay edge) — see overnight-2026-07-09-worklog.
 CLEARANCE_BY_CHANNEL: dict[str, str] = {
     "telegram": "private",
     "voice": "friends",
     "webhook": "private",
 }
-_DEFAULT_CLEARANCE = "private"
+# Fail-CLOSED default (2026-07-10): a genuinely UNMAPPED channel reads at the
+# LEAST-sensitive tier only. Every real ingress is explicitly mapped above, so
+# this affects only unknown/future channels and the rare orphan-recovery
+# NOTIFICATION replayed with channel="" (origin.get("channel","")) — which then
+# reads at public clearance (fail-safe; if orphan recovery ever needs more,
+# make engagement origins always carry their channel rather than reopening the
+# fail-open default). Was "private" (fail-OPEN) — see X2, cross-surface sweep.
+_DEFAULT_CLEARANCE = "public"
 
 
 def _rank(tier: str) -> int:

@@ -10,9 +10,13 @@ class TestChannelTrust:
         from channel_trust import channel_trust
         assert channel_trust("voice") == "household-shared"
 
-    def test_webhook_returns_external_authenticated(self):
+    def test_webhook_returns_authenticated(self):
+        # X2 (2026-07-10): /invoke + /webhook are HMAC-gated; operator decision
+        # "the secret is the trust boundary" → trusted like the authenticated DM
+        # so the agent may disclose private categories (meets disclosure.yaml's
+        # required_trust: authenticated).
         from channel_trust import channel_trust
-        assert channel_trust("webhook") == "external-authenticated"
+        assert channel_trust("webhook") == "authenticated"
 
     def test_scheduler_returns_internal(self):
         from channel_trust import channel_trust
@@ -29,7 +33,7 @@ class TestChannelTrustDisplay:
         assert channel_trust_display("telegram") == "authenticated (Nicola)"
         assert channel_trust_display("voice") == "household-shared (speaker unauthenticated)"
         assert channel_trust_display("scheduler") == "internal (system-initiated)"
-        assert channel_trust_display("webhook") == "external (authenticated by shared secret)"
+        assert channel_trust_display("webhook") == "authenticated (shared secret)"
 
     def test_display_unknown_channel_falls_back(self):
         from channel_trust import channel_trust_display

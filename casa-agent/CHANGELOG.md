@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.62.0] - 2026-07-10 — trust-model consistency + validator robustness
+
+Resolves the three items left open by the cross-surface sweep, per the operator
+decision that the HMAC secret is the trust boundary.
+
+### Changed
+
+- **`/invoke` + `/webhook` are now full-trust disclosure surfaces.** Their
+  channel trust is raised to `authenticated` (from `external-authenticated`), so
+  the agent may disclose private-category facts (financial, medical, contacts,
+  schedule, credentials — `policies/disclosure.yaml`) to an HMAC-secret holder,
+  the same as the authenticated Telegram DM. Previously the agent withheld
+  ("can't share on this channel") even though the read-clearance already loaded
+  the facts. **Operational note:** any holder of the webhook secret can now
+  elicit private facts via `/invoke` — the secret is the trust boundary.
+- **Read-clearance now fails CLOSED for unmapped channels.** `_DEFAULT_CLEARANCE`
+  is `public` (was `private`); every real ingress (telegram/voice/webhook) is
+  explicitly mapped, so an unknown/future channel — or the rare orphan-recovery
+  notification replayed with an empty channel — reads at the least-sensitive
+  tier instead of silently getting full private access.
+
+### Fixed
+
+- **`validate_config_repo` is env-independent.** `resolve_model` treats an
+  unresolved `${VAR}` model placeholder as a deferred value rather than raising,
+  so any caller that validates `runtime.yaml` without the model env exported
+  (config_sync, the live invariant auditor, the configurator's pre-commit gate,
+  future tooling) no longer false-positives on `Unknown model shortname
+  '${PRIMARY_AGENT_MODEL}'`. Boot is unaffected (the value is substituted before
+  it reaches the resolver) and still rejects genuine typos. Generalises the
+  point-local v0.59.3 (D1) fix.
+
 ## [0.61.0] - 2026-07-10 — cross-surface fixes (voice recall + clearance intent)
 
 Fixes from the 2026-07-09 cross-surface consistency sweep
