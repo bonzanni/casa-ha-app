@@ -22,14 +22,20 @@ _CHANNEL_TRUST_TOKEN: dict[str, str] = {
     "telegram":  "authenticated",
     "voice":     "household-shared",
     "scheduler": "internal",
-    "webhook":   "external-authenticated",
+    # webhook = /invoke + /webhook, gated by the HMAC secret. Operator decision
+    # (2026-07-10): the secret IS the trust boundary, so a holder is trusted
+    # like the authenticated DM — meets disclosure.yaml's required_trust:
+    # authenticated, so the agent may disclose private categories. (Was
+    # "external-authenticated", which sat below the bar and made the agent
+    # withhold — X2, cross-surface sweep 2026-07-09.)
+    "webhook":   "authenticated",
 }
 
 _CHANNEL_TRUST_DISPLAY: dict[str, str] = {
     "telegram":  "authenticated (Nicola)",
     "voice":     "household-shared (speaker unauthenticated)",
     "scheduler": "internal (system-initiated)",
-    "webhook":   "external (authenticated by shared secret)",
+    "webhook":   "authenticated (shared secret)",
 }
 
 

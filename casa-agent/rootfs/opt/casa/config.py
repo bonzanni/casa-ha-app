@@ -28,10 +28,21 @@ def resolve_model(shortname: str) -> str:
     If *shortname* is already a full model ID (contains a hyphen and digits),
     it is returned unchanged. Otherwise it must be a key in MODEL_MAP.
 
+    An unresolved ``${VAR}`` env placeholder is returned unchanged (a DEFERRED
+    value, resolved at boot when ``_substitute_env`` runs with the var set). This
+    makes ``validate_config_repo`` env-INDEPENDENT: any caller (config_sync, the
+    live invariant auditor, the configurator pre-commit gate, future tools) that
+    validates ``runtime.yaml`` without the model env exported no longer
+    false-positives on the placeholder. Boot is unaffected — the value is
+    already substituted before it reaches here, so boot never sees a placeholder
+    and keeps rejecting genuine typos. (Generalises the point-local D1 fix.)
+
     Raises ValueError for unknown shortnames.
     """
     if shortname in MODEL_MAP:
         return MODEL_MAP[shortname]
+    if _ENV_RE.fullmatch(shortname.strip()):
+        return shortname  # deferred env placeholder — resolved at boot
     if "-" in shortname:
         return shortname
     raise ValueError(

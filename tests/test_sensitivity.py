@@ -34,9 +34,12 @@ def test_voice_channel_clearance_is_friends():
     assert clearance_for_channel("voice") == "friends"
 
 
-def test_unknown_channel_defaults_to_private_clearance():
-    assert clearance_for_channel("telegram") == "private"
-    assert clearance_for_channel("something-else") == "private"
+def test_unknown_channel_fails_closed_to_public():
+    # 2026-07-10: unmapped channels now fail CLOSED (least-sensitive). Real
+    # channels are explicitly mapped; only unknown/future channels hit this.
+    assert clearance_for_channel("telegram") == "private"   # explicit
+    assert clearance_for_channel("something-else") == "public"
+    assert clearance_for_channel("") == "public"            # boot-replay edge
 
 
 def test_real_ingress_channels_explicitly_mapped():

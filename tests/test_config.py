@@ -30,6 +30,16 @@ class TestResolveModel:
         with pytest.raises(ValueError, match="Unknown model shortname"):
             resolve_model("gpt4")
 
+    def test_unresolved_env_placeholder_is_deferred_not_error(self):
+        # 2026-07-10: a ${VAR} placeholder is a DEFERRED value (resolved at boot
+        # when the env var is set), so validation without the env must not raise
+        # — makes validate_config_repo env-independent for all callers.
+        assert resolve_model("${PRIMARY_AGENT_MODEL}") == "${PRIMARY_AGENT_MODEL}"
+        assert resolve_model("${VOICE_AGENT_MODEL}") == "${VOICE_AGENT_MODEL}"
+        # A genuine non-placeholder typo still raises (boot strictness intact).
+        with pytest.raises(ValueError):
+            resolve_model("opuss")
+
 
 # ------------------------------------------------------------------
 # Dataclasses (Phase 4.x agent-definition refactor)

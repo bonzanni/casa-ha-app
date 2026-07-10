@@ -147,6 +147,19 @@ def test_trigger_prompt_files_and_channels_resolve() -> None:
     assert not violations, "trigger reference errors:\n  " + "\n  ".join(violations)
 
 
+def test_validate_config_repo_is_env_independent(monkeypatch) -> None:
+    """D3 (2026-07-10): validating the shipped defaults tree must NOT require the
+    model env vars — a ${VAR} model placeholder is deferred, not an error. Pre-fix
+    this returned two 'Unknown model shortname ${…}' errors when the env was
+    unset (the D1 fragility for non-boot callers)."""
+    monkeypatch.delenv("PRIMARY_AGENT_MODEL", raising=False)
+    monkeypatch.delenv("VOICE_AGENT_MODEL", raising=False)
+    from agent_loader import validate_config_repo
+    errs = validate_config_repo(str(CASA / "defaults"))
+    model_errs = [e for e in errs if "Unknown model shortname" in e]
+    assert not model_errs, f"env-unset validation still trips on model placeholders: {model_errs}"
+
+
 def test_every_option_has_a_translation() -> None:
     """Invariant D (options): each add-on schema key has an en.yaml translation,
     so the HA UI never renders a raw key."""
