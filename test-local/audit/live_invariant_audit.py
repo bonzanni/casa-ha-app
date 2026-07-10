@@ -1,0 +1,209 @@
+"""Live invariant auditor (sweep type #6) — READ-ONLY.
+
+Runs INSIDE the casa container (docker exec … python3 live_invariant_audit.py)
+and checks ground-truth invariants on live state, rather than driving turns.
+Catches soak-emergent drift (F1 memory duplication), config/capability
+regressions, and malformed on-disk state — the class no single-turn probe sees.
+Never mutates. Prints a JSON report + a PASS/WARN/FAIL summary; exit code is the
+number of FAIL-level invariants (0 = clean) so it can gate a cron.
+
+Invariants:
+  A config_sync   — /data/config-sync-report.json has empty post_sync_errors.
+  B delegates↔tool — every agent with a non-empty delegates.yaml grants the
+                     delegate MCP tool in runtime.yaml (boot-fatal if not).
+  C schema-valid   — validate_config_repo(/config) returns no errors
+                     (env-substituted, so model placeholders resolve).
+  D sessions.json  — parses; no 'active' entry missing sdk_session_id.
+  E engagements    — engagements.json parses; no active/idle entry missing topic_id.
+  F memory dup     — Hindsight bank document dup-rate (1 - distinct_content_hash
+                     / total) below THRESHOLD (F1 guard). WARN, not FAIL.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.request
+
+CONFIG_DIR = os.environ.get("CASA_CONFIG_DIR", "/config")
+DATA_DIR = os.environ.get("CASA_DATA_DIR", "/data")
+HINDSIGHT_URL = os.environ.get("HINDSIGHT_API_URL", "").rstrip("/")
+DUP_RATE_WARN = 0.35  # tune as the bank grows; F1 was ~0.6 on the probe cluster
+
+report: dict = {"pass": [], "warn": [], "fail": []}
+
+
+def _ok(inv, msg): report["pass"].append(f"{inv}: {msg}")
+def _warn(inv, msg): report["warn"].append(f"{inv}: {msg}")
+def _fail(inv, msg): report["fail"].append(f"{inv}: {msg}")
+
+
+def _read_json(path):
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def check_config_sync():
+    p = os.path.join(DATA_DIR, "config-sync-report.json")
+    if not os.path.exists(p):
+        _warn("A/config_sync", f"{p} absent (no reconcile yet?)")
+        return
+    try:
+        r = _read_json(p)
+    except Exception as e:
+        _fail("A/config_sync", f"unreadable: {e}")
+        return
+    errs = r.get("post_sync_errors") or []
+    conflicts = r.get("conflicts") or []
+    if errs:
+        _fail("A/config_sync", f"post_sync_errors={errs}")
+    elif conflicts:
+        _warn("A/config_sync", f"conflicts={conflicts}")
+    else:
+        _ok("A/config_sync", f"clean (image {r.get('image_version')})")
+
+
+def check_delegates_tool():
+    agents_root = os.path.join(CONFIG_DIR, "agents")
+    bad = []
+    for root, _dirs, files in os.walk(agents_root):
+        if "delegates.yaml" not in files or "runtime.yaml" not in files:
+            continue
+        import yaml
+        deleg = yaml.safe_load(open(os.path.join(root, "delegates.yaml"))) or {}
+        entries = deleg.get("delegates") or deleg if isinstance(deleg, list) else deleg.get("delegates", [])
+        if not entries:
+            continue
+        rt = yaml.safe_load(open(os.path.join(root, "runtime.yaml"))) or {}
+        allowed = (rt.get("tools") or {}).get("allowed") or []
+        if "mcp__casa-framework__delegate_to_agent" not in allowed:
+            bad.append(os.path.basename(root))
+    if bad:
+        _fail("B/delegates", f"non-empty delegates but no delegate tool: {bad}")
+    else:
+        _ok("B/delegates", "all delegates.yaml backed by the delegate tool")
+
+
+def _ensure_model_env():
+    """validate_config_repo resolves ${PRIMARY_AGENT_MODEL}/${VOICE_AGENT_MODEL}
+    in runtime.yaml and rejects unresolved placeholders (the D1 fragility). Boot
+    exports these via bashio; a docker-exec caller does not — so mirror boot by
+    reading the (non-secret) model keys from options.json. Without this the
+    auditor's C check false-positives exactly as config_sync did pre-v0.59.3."""
+    for env_key, opt_key in (("PRIMARY_AGENT_MODEL", "primary_agent_model"),
+                             ("VOICE_AGENT_MODEL", "voice_agent_model")):
+        if os.environ.get(env_key):
+            continue
+        try:
+            with open(os.path.join(DATA_DIR, "options.json")) as fh:
+                opts = json.load(fh)
+            val = opts.get(opt_key)
+            if val:
+                os.environ[env_key] = str(val)
+        except Exception:
+            pass  # leave unset; C will report honestly if truly unresolved
+
+
+def check_schema_valid():
+    _ensure_model_env()
+    sys.path.insert(0, "/opt/casa")
+    try:
+        from agent_loader import validate_config_repo
+    except ImportError as e:
+        # Not in the casa container (or code moved) — an environment issue, not
+        # a prod invariant failure. WARN so a misuse-run can't look like a FAIL.
+        _warn("C/schema", f"validator unavailable in this environment: {e}")
+        return
+    try:
+        errs = validate_config_repo(CONFIG_DIR)
+    except Exception as e:
+        _fail("C/schema", f"validator raised: {e}")
+        return
+    if errs:
+        _fail("C/schema", f"{len(errs)} error(s): {errs[:3]}")
+    else:
+        _ok("C/schema", "/config validates")
+
+
+def check_sessions():
+    p = os.path.join(DATA_DIR, "sessions.json")
+    if not os.path.exists(p):
+        _ok("D/sessions", "no sessions.json (empty)")
+        return
+    try:
+        data = _read_json(p)
+    except Exception as e:
+        _fail("D/sessions", f"unparseable: {e}")
+        return
+    orphan = [k for k, v in (data or {}).items()
+              if isinstance(v, dict) and v.get("status") == "active"
+              and not v.get("sdk_session_id")]
+    if orphan:
+        _warn("D/sessions", f"active entries missing sdk_session_id: {orphan}")
+    else:
+        _ok("D/sessions", f"{len(data or {})} entries, well-formed")
+
+
+def check_engagements():
+    p = os.path.join(DATA_DIR, "engagements.json")
+    if not os.path.exists(p):
+        _ok("E/engagements", "no engagements.json (empty)")
+        return
+    try:
+        data = _read_json(p)
+    except Exception as e:
+        _fail("E/engagements", f"unparseable: {e}")
+        return
+    recs = data if isinstance(data, list) else data.get("engagements", [])
+    bad = [r.get("id", "?")[:8] for r in recs
+           if r.get("status") in ("active", "idle") and not r.get("topic_id")]
+    if bad:
+        _fail("E/engagements", f"active/idle without topic_id: {bad}")
+    else:
+        _ok("E/engagements", f"{len(recs)} records, well-formed")
+
+
+def check_memory_dup():
+    if not HINDSIGHT_URL:
+        _warn("F/memory_dup", "HINDSIGHT_API_URL unset — skipped")
+        return
+    try:
+        total = 0
+        hashes = set()
+        offset = 0
+        while True:
+            url = f"{HINDSIGHT_URL}/v1/default/banks/casa/documents?limit=200&offset={offset}"
+            d = json.loads(urllib.request.urlopen(url, timeout=30).read())
+            items = d.get("items", [])
+            for it in items:
+                total += 1
+                hashes.add(it.get("content_hash") or it.get("id"))
+            offset += len(items)
+            if offset >= d.get("total", 0) or not items:
+                break
+    except Exception as e:
+        _warn("F/memory_dup", f"could not sample bank: {e}")
+        return
+    if total == 0:
+        _ok("F/memory_dup", "bank empty")
+        return
+    dup_rate = 1 - len(hashes) / total
+    msg = f"{total} docs, {len(hashes)} distinct content → dup_rate={dup_rate:.2f}"
+    (_warn if dup_rate > DUP_RATE_WARN else _ok)("F/memory_dup", msg)
+
+
+def main():
+    for fn in (check_config_sync, check_delegates_tool, check_schema_valid,
+               check_sessions, check_engagements, check_memory_dup):
+        try:
+            fn()
+        except Exception as e:  # an auditor bug must not look like a prod fail
+            _warn(fn.__name__, f"auditor error: {e}")
+    print(json.dumps(report, indent=2))
+    print(f"\nSUMMARY: {len(report['pass'])} pass, "
+          f"{len(report['warn'])} warn, {len(report['fail'])} fail")
+    sys.exit(len(report["fail"]))
+
+
+if __name__ == "__main__":
+    main()
