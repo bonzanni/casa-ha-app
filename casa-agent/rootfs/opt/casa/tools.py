@@ -2667,10 +2667,17 @@ def _tool_verify_plugin_state(
     mcp_started = mcp_json is not None
     mcp_errors: list[dict] = []
 
+    # Readiness gates on satisfied tools + secrets, plus the absence of MCP
+    # startup errors. It does NOT require an .mcp.json to exist: a skill-only
+    # plugin (a recommended pattern) legitimately ships no MCP server, and after
+    # a successful install the presence of an .mcp.json only signals that a
+    # server is declared — whether it actually works is already covered by the
+    # tool and secret checks. Gating on mcp_started here would make every
+    # skill-only plugin report ready=False (R-1).
     ready = (
         all(t["status"] == "ready" for t in tools_status)
         and all(s["status"] == "resolved" for s in secrets_status)
-        and mcp_started
+        and not mcp_errors
     )
     return {
         "tools": tools_status,

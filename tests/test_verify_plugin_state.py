@@ -66,6 +66,25 @@ def test_verify_all_ready(plugin_layout, monkeypatch) -> None:
     assert result["mcp_errors"] == []
 
 
+def test_verify_skill_only_plugin_ready(plugin_layout, monkeypatch) -> None:
+    """R-1: a skill-only plugin ships no MCP server (so no .mcp.json) and may
+    declare no system-requirement tools. It is READY once its (empty) tool and
+    secret sets are satisfied — the mere absence of an .mcp.json must not force
+    ready=False, or the recommended skill-only pattern can never verify."""
+    from tools import _tool_verify_plugin_state
+
+    # No manifest entry (no system requirements) and no .mcp.json in the cache.
+    result = _tool_verify_plugin_state(
+        plugin_name="greet-skill",
+        _tools_bin=plugin_layout["tools_bin"],
+        _cache_root=plugin_layout["cache_root"],
+    )
+    assert result["tools"] == []
+    assert result["secrets"] == []
+    assert result["mcp_started"] is False
+    assert result["ready"] is True
+
+
 def test_verify_missing_tools(plugin_layout, monkeypatch) -> None:
     from tools import _tool_verify_plugin_state
     from system_requirements.manifest import add_plugin_entry as add_manifest_entry
