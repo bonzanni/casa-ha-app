@@ -2237,6 +2237,19 @@ async def delete_engagement_workspace(args: dict) -> dict:
                 "status": "error", "kind": "rmtree_failed",
                 "message": f"rmtree {ws}: {exc}",
             })
+    # v0.64.0: the per-engagement s6-log dir follows the workspace on this
+    # caller-managed path too — once the workspace is gone, the retention
+    # sweep can never map to the log dir again.
+    from drivers.workspace import engagement_log_dir
+    log_dir = engagement_log_dir(engagement_id)
+    try:
+        if os.path.isdir(log_dir):
+            shutil.rmtree(log_dir)
+    except OSError as exc:
+        logger.warning(
+            "delete_engagement_workspace: log dir rmtree %s failed: %s",
+            log_dir, exc,
+        )
     return _result({
         "status": "ok", "engagement_id": engagement_id,
         "workspace_removed": os.path.isdir(ws) is False,

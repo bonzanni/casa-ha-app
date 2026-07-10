@@ -28,7 +28,6 @@ class TestRenderRunScript:
         assert "{EXTRA_UNSET}" not in out
 
         assert 'HOME="/data/engagements/abc12345def67890/.home"' in out
-        assert "engagement-abc12345" in out             # 8-char slug in CLI name
         assert "--permission-mode acceptEdits" in out
         assert "--add-dir /data/engagements/abc12345def67890/" in out
         assert "--add-dir /data/casa-plugins-repo" in out
@@ -68,6 +67,17 @@ class TestRenderRunScript:
         assert "mkdir -p /var/log/casa-engagement-xxxxxxxxxxxxxxxx" in script
         assert "exec s6-log n20 s1000000 /var/log/casa-engagement-xxxxxxxxxxxxxxxx" in script
 
+    def test_engagement_log_dir_helper(self):
+        """v0.64.0: one owner for the per-engagement log location — the
+        render script, the log relay, the retention sweep, and the delete
+        tool all derive from it."""
+        from drivers.workspace import ENGAGEMENT_LOG_ROOT, engagement_log_dir
+
+        assert engagement_log_dir("abc") == (
+            f"{ENGAGEMENT_LOG_ROOT}/casa-engagement-abc"
+        )
+        assert engagement_log_dir("abc", root="/x") == "/x/casa-engagement-abc"
+
     def test_render_run_script_contains_channels_flag(self):
         """E-12 (v0.37.0): --channels server:casa-engagement-channel."""
         from drivers.workspace import render_run_script
@@ -77,8 +87,10 @@ class TestRenderRunScript:
             extra_dirs=[],
         )
         assert "--channels server:casa-engagement-channel" in script
-        # Sanity: --remote-control still present (--channels composes with it).
-        assert "--remote-control" in script
+        # v0.64.0: --remote-control dropped — inert headless (non-TTY stdout
+        # degrades the CLI to one-shot --print; no interactive/remote session
+        # ever starts), and passing it advertised a surface that doesn't exist.
+        assert "--remote-control" not in script
 
     def test_render_run_script_consumes_persisted_session_id(self):
         """O-5 (v0.37.9): the run script must read ``.session_id`` from

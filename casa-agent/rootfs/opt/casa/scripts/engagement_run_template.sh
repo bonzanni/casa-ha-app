@@ -2,7 +2,6 @@
 # Casa claude_code engagement run script.
 # Substitutions performed by drivers.workspace.render_run_script():
 #   {ID}             — engagement id (hex uuid)
-#   {ID_SHORT}       — first 8 chars of engagement id (remote-control slug)
 #   {PERMISSION_MODE}— permission-mode flag value
 #   {ADD_DIR_FLAGS}  — space-joined --add-dir <path> flags
 #   {EXTRA_UNSET}    — additional space-separated env var names to unset
@@ -35,9 +34,10 @@ fi
 
 # E-12 (v0.37.0): --channels server:casa-engagement-channel binds the
 # per-engagement Channels MCP server defined in workspace .mcp.json.
-# Composes with --remote-control (verified §A.3 of the spec).
-exec claude --remote-control "engagement-{ID_SHORT}" \
-            --channels server:casa-engagement-channel \
+# v0.64.0: the remote-control flag was dropped — with non-TTY stdio the CLI
+# degrades to one-shot print mode and never starts an interactive/remote
+# session (live-verified; see the 2026-07-10 remote-control-honesty design).
+exec claude --channels server:casa-engagement-channel \
             $RESUME_FLAG \
             --permission-mode {PERMISSION_MODE} \
             {ADD_DIR_FLAGS}

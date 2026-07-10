@@ -22,6 +22,20 @@ _TEMPLATE_PATH = os.path.join(
     os.path.dirname(__file__), "..", "scripts", "engagement_run_template.sh",
 )
 
+# v0.64.0: single owner of the per-engagement log location. The s6-log run
+# script (render_log_run_script), the driver's DEBUG relay, the retention
+# sweep, and the delete_engagement_workspace tool all derive from this —
+# moving the location means changing exactly one place.
+ENGAGEMENT_LOG_ROOT = "/var/log"
+
+
+def engagement_log_dir(engagement_id: str, *, root: str | None = None) -> str:
+    """Absolute path of the engagement's s6-log directory."""
+    return os.path.join(
+        root if root is not None else ENGAGEMENT_LOG_ROOT,
+        f"casa-engagement-{engagement_id}",
+    )
+
 # Bug 5 (v0.14.6): env-var names must match shell-identifier syntax.
 # Pre-fix the key was interpolated unsanitised into `export {}='{}'`,
 # so a key containing "\n" or other shell-special chars escaped the
@@ -145,15 +159,16 @@ def render_log_run_script(*, engagement_id: str) -> str:
     """Render an s6-log run script for an engagement's stdout capture.
 
     The resulting script routes the engagement service's stdout to
-    /var/log/casa-engagement-<id>/current, rotating at 1MB with up to 20
-    archive files. This is consumed by drivers.claude_code_driver._capture_url
-    via readline tailing.
+    <ENGAGEMENT_LOG_ROOT>/casa-engagement-<id>/current, rotating at 1MB with
+    up to 20 archive files. This is consumed by
+    drivers.claude_code_driver._relay_log_lines via readline tailing.
     """
+    log_dir = engagement_log_dir(engagement_id)
     return (
         "#!/command/with-contenv sh\n"
         "set -e\n"
-        f"mkdir -p /var/log/casa-engagement-{engagement_id}\n"
-        f"exec s6-log n20 s1000000 /var/log/casa-engagement-{engagement_id}\n"
+        f"mkdir -p {log_dir}\n"
+        f"exec s6-log n20 s1000000 {log_dir}\n"
     )
 
 
@@ -321,7 +336,9 @@ def load_casa_meta(workspace_path: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-async def _sweep_workspaces(*, engagements_root: str) -> None:
+async def _sweep_workspaces(
+    *, engagements_root: str, log_root: str | None = None,
+) -> None:
     """Periodic sweep: delete terminal engagement workspaces past retention.
 
     Status semantics from .casa-meta.json:
@@ -331,11 +348,14 @@ async def _sweep_workspaces(*, engagements_root: str) -> None:
       - No .casa-meta.json at all: skip (caller-managed via
         delete_engagement_workspace MCP tool).
 
+    v0.64.0: the per-engagement s6-log dir (<log_root>/casa-engagement-<id>)
+    follows the same retention — removed together with the workspace, so
+    post-mortem logs stay available exactly as long as the workspace does
+    (bounded ~21 MB/engagement by ``s6-log n20 s1000000``).
+
     Disk-pressure mode (§6.5 aggressive tier) is out of scope — see spec
     §8.3. The N150 has >30 GB free.
     """
-    import shutil
-
     if not os.path.isdir(engagements_root):
         return
 
@@ -362,15 +382,27 @@ async def _sweep_workspaces(*, engagements_root: str) -> None:
             continue
         try:
             shutil.rmtree(entry.path)
-            logger.info(
-                "workspace sweep: removed %s (status=%s, past retention)",
-                entry.name, status,
-            )
         except OSError as exc:
             logger.warning(
                 "workspace sweep: rmtree %s failed: %s",
                 entry.path, exc,
             )
+        else:
+            logger.info(
+                "workspace sweep: removed %s (status=%s, past retention)",
+                entry.name, status,
+            )
+            log_dir = engagement_log_dir(entry.name, root=log_root)
+            try:
+                if os.path.isdir(log_dir):
+                    shutil.rmtree(log_dir)
+            except OSError as exc:
+                # The workspace is already gone, so no future sweep can map
+                # to this log dir again — warn, it's the only signal left.
+                logger.warning(
+                    "workspace sweep: log dir rmtree %s failed: %s",
+                    log_dir, exc,
+                )
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import sys
 from pathlib import Path
@@ -10,6 +11,17 @@ from pathlib import Path
 import pytest
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
+
+
+def _pair(svc_root: Path, eid: str) -> None:
+    """Write a healthy producer/consumer engagement pair."""
+    from drivers.s6_rc import write_service_dir
+
+    write_service_dir(
+        svc_root=str(svc_root), engagement_id=eid,
+        run_script="#!/bin/sh\nexec true\n", depends_on=[],
+        log_run_script="#!/bin/sh\nexec s6-log /tmp/x\n",
+    )
 
 
 class TestWriteServiceDir:
@@ -37,27 +49,51 @@ class TestWriteServiceDir:
 
 
     @pytest.mark.skipif(sys.platform == "win32", reason="chmod exec-bits not meaningful on Windows")
-    async def test_writes_log_subservice_when_log_script_provided(self, tmp_path):
+    async def test_writes_sibling_logger_service_when_log_script_provided(self, tmp_path):
+        """v0.64.0: s6-rc-compile ignores nested log/ subdirs (skarnet docs) —
+        a logged service must be TWO sibling top-level services wired
+        producer-for/consumer-for. s6-rc auto-adds the producer→consumer
+        dependency (verified empirically on s6-rc 0.6.0.0)."""
         from drivers.s6_rc import write_service_dir
 
         svc_root = tmp_path / "casa-s6-services"
         svc_root.mkdir()
+        log_script = (
+            "#!/command/with-contenv sh\n"
+            "exec s6-log n20 s1000000 /var/log/casa-engagement-abc12345\n"
+        )
 
         write_service_dir(
             svc_root=str(svc_root),
             engagement_id="abc12345",
             run_script="#!/command/with-contenv sh\nexec true\n",
-            depends_on=[],
-            log_run_script="#!/command/with-contenv sh\nexec s6-log /var/log/casa-engagement-abc12345/\n",
+            depends_on=["init-setup-configs"],
+            log_run_script=log_script,
         )
 
-        log_dir = svc_root / "engagement-abc12345" / "log"
-        assert log_dir.is_dir()
+        main_dir = svc_root / "engagement-abc12345"
+        log_dir = svc_root / "engagement-abc12345-log"
+        assert not (main_dir / "log").exists(), \
+            "nested log/ is ignored by s6-rc-compile — must not be written"
+        assert (main_dir / "producer-for").read_text() == "engagement-abc12345-log\n"
         assert (log_dir / "type").read_text() == "longrun\n"
-        assert (log_dir / "run").is_file()
+        assert (log_dir / "run").read_text() == log_script
         mode = os.stat(log_dir / "run").st_mode
         assert mode & stat.S_IXUSR
-        assert (log_dir / "dependencies.d" / "engagement-abc12345").exists()
+        assert (log_dir / "consumer-for").read_text() == "engagement-abc12345\n"
+        assert (log_dir / "dependencies.d" / "init-setup-configs").exists()
+
+    async def test_no_logger_artifacts_without_log_script(self, tmp_path):
+        from drivers.s6_rc import write_service_dir
+
+        svc_root = tmp_path / "casa-s6-services"
+        svc_root.mkdir()
+        write_service_dir(
+            svc_root=str(svc_root), engagement_id="abc12345",
+            run_script="#!/bin/sh\nexec true\n", depends_on=[],
+        )
+        assert not (svc_root / "engagement-abc12345" / "producer-for").exists()
+        assert not (svc_root / "engagement-abc12345-log").exists()
 
 
 class TestRemoveServiceDir:
@@ -82,6 +118,172 @@ class TestRemoveServiceDir:
         svc_root.mkdir()
         # Does not raise.
         remove_service_dir(svc_root=str(svc_root), engagement_id="nosuch")
+
+    async def test_removes_sibling_logger_dir(self, tmp_path):
+        from drivers.s6_rc import remove_service_dir, write_service_dir
+
+        svc_root = tmp_path / "casa-s6-services"
+        svc_root.mkdir()
+        write_service_dir(
+            svc_root=str(svc_root), engagement_id="x1",
+            run_script="#!/bin/sh\nexec true\n", depends_on=[],
+            log_run_script="#!/bin/sh\nexec s6-log /var/log/casa-engagement-x1\n",
+        )
+        assert (svc_root / "engagement-x1-log").exists()
+
+        remove_service_dir(svc_root=str(svc_root), engagement_id="x1")
+        assert not (svc_root / "engagement-x1").exists()
+        assert not (svc_root / "engagement-x1-log").exists()
+
+    async def test_remove_continues_past_rmtree_failure(
+        self, tmp_path, monkeypatch,
+    ):
+        """One rmtree failing must not abort the other half's removal —
+        a torn pair would otherwise persist (the compile-path prune is the
+        backstop, but removal should make progress on its own)."""
+        from drivers import s6_rc
+
+        svc_root = tmp_path / "casa-s6-services"
+        svc_root.mkdir()
+        _pair(svc_root, "x1")
+
+        real_rmtree = s6_rc.shutil.rmtree
+
+        def flaky(path, *args, **kwargs):
+            if str(path).endswith("engagement-x1"):
+                raise OSError("EBUSY")
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(s6_rc.shutil, "rmtree", flaky)
+        # Does not raise; the -log half is removed despite the main failing.
+        s6_rc.remove_service_dir(svc_root=str(svc_root), engagement_id="x1")
+        assert not (svc_root / "engagement-x1-log").exists()
+        assert (svc_root / "engagement-x1").exists()
+
+
+class TestPruneBrokenPairs:
+    """v0.64.0: the pair dirs cross-reference each other, so NO write/remove
+    ordering is crash-atomic — a torn half (producer-for naming a missing
+    service, or a consumer-for whose producer is gone) fails EVERY
+    s6-rc-compile, bricking all engagement orchestration. The compile path
+    therefore prunes broken halves into a compilable state first."""
+
+    async def test_dangling_producer_for_is_unlinked(self, tmp_path):
+        from drivers.s6_rc import _prune_broken_pairs
+
+        svc_root = tmp_path / "svc"
+        svc_root.mkdir()
+        _pair(svc_root, "torn1")
+        shutil.rmtree(svc_root / "engagement-torn1-log")
+
+        _prune_broken_pairs(svc_root=str(svc_root))
+
+        # The engagement service survives (unlogged); the dangling
+        # cross-reference is gone so the sources compile again.
+        assert (svc_root / "engagement-torn1").is_dir()
+        assert not (svc_root / "engagement-torn1" / "producer-for").exists()
+
+    async def test_orphan_log_sibling_is_removed(self, tmp_path):
+        from drivers.s6_rc import _prune_broken_pairs
+
+        svc_root = tmp_path / "svc"
+        svc_root.mkdir()
+        _pair(svc_root, "torn2")
+        shutil.rmtree(svc_root / "engagement-torn2")
+
+        _prune_broken_pairs(svc_root=str(svc_root))
+
+        assert not (svc_root / "engagement-torn2-log").exists()
+
+    async def test_log_sibling_without_producer_for_is_removed(self, tmp_path):
+        from drivers.s6_rc import _prune_broken_pairs
+
+        svc_root = tmp_path / "svc"
+        svc_root.mkdir()
+        _pair(svc_root, "torn3")
+        (svc_root / "engagement-torn3" / "producer-for").unlink()
+
+        _prune_broken_pairs(svc_root=str(svc_root))
+
+        assert (svc_root / "engagement-torn3").is_dir()
+        assert not (svc_root / "engagement-torn3-log").exists()
+
+    async def test_healthy_pair_untouched(self, tmp_path):
+        from drivers.s6_rc import _prune_broken_pairs
+
+        svc_root = tmp_path / "svc"
+        svc_root.mkdir()
+        _pair(svc_root, "ok1")
+
+        _prune_broken_pairs(svc_root=str(svc_root))
+
+        assert (svc_root / "engagement-ok1" / "producer-for").exists()
+        assert (svc_root / "engagement-ok1-log" / "consumer-for").exists()
+
+    async def test_compile_prunes_before_compiling(self, tmp_path, monkeypatch):
+        from drivers import s6_rc
+
+        svc_root = tmp_path / "svc"
+        svc_root.mkdir()
+        _pair(svc_root, "torn4")
+        shutil.rmtree(svc_root / "engagement-torn4-log")
+        monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+        calls: list[list[str]] = []
+
+        def fake_run(argv, check=True, **kwargs):
+            calls.append(list(argv))
+            class _R: returncode = 0
+            return _R()
+
+        monkeypatch.setattr(s6_rc.subprocess, "run", fake_run)
+
+        await s6_rc._compile_and_update_locked()
+
+        assert not (svc_root / "engagement-torn4" / "producer-for").exists()
+        assert calls and calls[0][0] == "s6-rc-compile"
+
+
+class TestStopLogService:
+    async def test_stops_when_log_source_dir_exists(self, tmp_path, monkeypatch):
+        from drivers import s6_rc
+
+        svc_root = tmp_path / "svc"
+        svc_root.mkdir()
+        (svc_root / "engagement-abc-log").mkdir()
+        monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+        calls: list[list[str]] = []
+
+        def fake_run(argv, check=True, **kwargs):
+            calls.append(list(argv))
+            class _R: returncode = 0
+            return _R()
+
+        monkeypatch.setattr(s6_rc.subprocess, "run", fake_run)
+
+        await s6_rc.stop_log_service(engagement_id="abc")
+
+        assert calls == [["s6-rc", "-d", "change", "engagement-abc-log"]]
+
+    async def test_noop_when_log_source_dir_absent(self, tmp_path, monkeypatch):
+        """Legacy engagements (pre-v0.64.0 layout) have no logger service —
+        stopping one would exec a doomed s6-rc and log a spurious warning."""
+        from drivers import s6_rc
+
+        svc_root = tmp_path / "svc"
+        svc_root.mkdir()
+        monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+        calls: list[list[str]] = []
+        monkeypatch.setattr(
+            s6_rc.subprocess, "run",
+            lambda argv, check=True, **kw: calls.append(list(argv)),
+        )
+
+        await s6_rc.stop_log_service(engagement_id="abc")
+
+        assert calls == []
 
 
 class TestCompileAndUpdateLocked:
@@ -288,6 +490,31 @@ class TestSweepOrphans:
         )
         assert removed == []
         assert (svc_root / "random-other-thing").exists()
+
+    async def test_logger_dirs_follow_their_engagement(self, tmp_path):
+        """v0.64.0: engagement-<id>-log is kept iff <id> is kept. The
+        pre-fix parser read the whole suffix as engagement id '<id>-log'
+        (never in the keep set) and swept live loggers at boot."""
+        from drivers.s6_rc import sweep_orphan_service_dirs, write_service_dir
+
+        svc_root = tmp_path / "casa-s6-services"
+        svc_root.mkdir()
+        for eid in ("keep1", "orphan1"):
+            write_service_dir(
+                svc_root=str(svc_root), engagement_id=eid,
+                run_script="#!/bin/sh\nexec true\n", depends_on=[],
+                log_run_script="#!/bin/sh\nexec s6-log /tmp/x\n",
+            )
+
+        removed = sweep_orphan_service_dirs(
+            svc_root=str(svc_root), keep_engagement_ids={"keep1"},
+        )
+
+        assert set(removed) == {"orphan1"}, "orphan pair counts once"
+        assert (svc_root / "engagement-keep1").exists()
+        assert (svc_root / "engagement-keep1-log").exists()
+        assert not (svc_root / "engagement-orphan1").exists()
+        assert not (svc_root / "engagement-orphan1-log").exists()
 
 
 class TestSweepOrphanCompiledDbs:

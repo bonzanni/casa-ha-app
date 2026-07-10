@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.64.0] - 2026-07-10 — engagement topics: honest messaging; engagement logs: actually captured
+
+Every Claude Code engagement topic used to receive "Remote control URL not yet
+available — Telegram-only for now. Will post here if it becomes available
+later." — a promise that could never be kept: the headless CLI runs in
+non-interactive mode and never emits a remote-control URL, and the log pipe
+the watcher tailed was never wired. Both halves fixed.
+
+### Fixed
+
+- **Engagement subprocess output is now actually captured** to
+  `/var/log/casa-engagement-<id>/` inside the app container. The s6-rc service
+  layout used a nested `log/` directory, which `s6-rc-compile` ignores — the
+  CLI's stdout had gone to a pipe with no reader since v0.13.0. Each engagement
+  now gets a proper producer/consumer logger pair (pipe held by
+  `s6rc-fdholder`, so log lines survive per-turn respawns), the diagnostic log
+  relay (`LOG_LEVEL=DEBUG`) works for the first time, and log dirs are cleaned
+  up with the workspace when retention expires.
+- **Removed the misleading remote-control notice** (and the never-firing
+  "Remote control: <url>" companion) from engagement topics, along with the
+  URL watcher behind them and the inert `--remote-control` CLI flag.
+  Engagements are driven through their Telegram topic; DOCS.md no longer
+  advertises iOS/claude.ai remote control (it was never functional — a real
+  mechanism is a separate design).
+
+### Changed
+
+- Engagement service teardown, boot replay, and the compile path are now
+  robust to crash-torn service pairs (a half-written pair could previously
+  wedge every engagement start until manual cleanup). Engagements running
+  across the upgrade are migrated to the new logging layout at the first
+  restart. Per-engagement log directories are cleaned up by the retention
+  sweep and the `delete_engagement_workspace` tool alike; the diagnostic
+  log relay runs only when debug logging is enabled.
+
 ## [0.63.3] - 2026-07-10 — plugin-developer: private-first repos
 
 Sets the plugin-developer repo-creation policy to **private-first**, per the

@@ -24,19 +24,23 @@ CASA_SOURCES = "/etc/s6-overlay/s6-rc.d"
 ENGAGEMENT_SOURCES_ROOT = "/data/casa-s6-services"
 LIVE_DB_SYMLINK = "/run/s6-rc/compiled"
 
+# v0.64.0: every engagement service has a sibling logger service. The
+# suffix/name convention is owned HERE — no caller formats these names.
+LOG_SERVICE_SUFFIX = "-log"
 
-def write_service_dir(
-    *, svc_root: str, engagement_id: str, run_script: str,
-    depends_on: list[str], log_run_script: str | None = None,
-) -> str:
-    """Create /<svc_root>/engagement-<id>/ with type/run/dependencies.d/.
 
-    When log_run_script is provided, also create a log/ child service dir
-    (type=longrun) so s6-log routes stdout to /var/log/casa-engagement-<id>/.
+def _main_service_name(engagement_id: str) -> str:
+    return f"engagement-{engagement_id}"
 
-    Returns the full path to the service dir.
-    """
-    svc_dir = Path(svc_root) / f"engagement-{engagement_id}"
+
+def _log_service_name(engagement_id: str) -> str:
+    return f"engagement-{engagement_id}{LOG_SERVICE_SUFFIX}"
+
+
+def _emit_longrun(
+    svc_dir: Path, *, run_script: str, depends_on: list[str],
+) -> None:
+    """Write one longrun source-definition dir (type/run/dependencies.d)."""
     svc_dir.mkdir(parents=True, exist_ok=False)
     (svc_dir / "type").write_text("longrun\n")
     run_path = svc_dir / "run"
@@ -47,25 +51,123 @@ def write_service_dir(
     for dep in depends_on:
         (deps_dir / dep).touch()
 
+
+def write_service_dir(
+    *, svc_root: str, engagement_id: str, run_script: str,
+    depends_on: list[str], log_run_script: str | None = None,
+) -> str:
+    """Create /<svc_root>/engagement-<id>/ with type/run/dependencies.d/.
+
+    When log_run_script is provided, also create a SIBLING top-level
+    service dir ``engagement-<id>-log`` wired to the main service via
+    ``producer-for``/``consumer-for``, so s6-rc-compile builds a
+    producer-consumer pipeline and s6-log routes the CLI's stdout to
+    the engagement's log dir. A nested ``log/`` subdir is s6-scandir
+    convention that s6-rc-compile explicitly ignores — using it left the
+    subprocess stdout on a reader-less pipe from v0.13.0 through v0.63.x
+    (P31's deeper cause). s6-rc auto-adds the producer→consumer dependency
+    and holds the pipe in s6rc-fdholder, so log lines survive producer
+    respawns (verified on s6-rc 0.6.0.0, 2026-07-10 design doc).
+
+    The cross-reference (``producer-for``) is written LAST: until then both
+    dirs compile standalone, so a crash mid-write cannot leave the sources
+    un-compilable (and ``_prune_broken_pairs`` clears any residue anyway).
+
+    Returns the full path to the main service dir.
+    """
+    svc_dir = Path(svc_root) / _main_service_name(engagement_id)
+    _emit_longrun(svc_dir, run_script=run_script, depends_on=depends_on)
+
     if log_run_script is not None:
-        log_dir = svc_dir / "log"
-        log_dir.mkdir()
-        (log_dir / "type").write_text("longrun\n")
-        log_run_path = log_dir / "run"
-        log_run_path.write_text(log_run_script)
-        log_run_path.chmod(log_run_path.stat().st_mode | stat.S_IXUSR)
-        (log_dir / "dependencies.d").mkdir()
-        # Ordering — log dep on the main engagement service so it starts first.
-        (log_dir / "dependencies.d" / f"engagement-{engagement_id}").touch()
+        log_name = _log_service_name(engagement_id)
+        log_dir = Path(svc_root) / log_name
+        _emit_longrun(log_dir, run_script=log_run_script, depends_on=depends_on)
+        (log_dir / "consumer-for").write_text(
+            _main_service_name(engagement_id) + "\n")
+        (svc_dir / "producer-for").write_text(log_name + "\n")
 
     return str(svc_dir)
 
 
 def remove_service_dir(*, svc_root: str, engagement_id: str) -> None:
-    """Idempotent rm -rf of /<svc_root>/engagement-<id>/."""
-    svc_dir = Path(svc_root) / f"engagement-{engagement_id}"
-    if svc_dir.exists():
-        shutil.rmtree(svc_dir)
+    """Best-effort idempotent removal of the engagement's service pair.
+
+    Logger first: if the main rmtree then fails, the survivor's dangling
+    ``producer-for`` is cleared by ``_prune_broken_pairs`` on the next
+    compile, so a partial removal can never wedge the sources. Failures are
+    warned, not raised — callers treat removal as best-effort teardown, and
+    the recompile that follows drops removed services from the live db,
+    which stops them (s6-rc-update semantics).
+    """
+    for name in (_log_service_name(engagement_id),
+                 _main_service_name(engagement_id)):
+        svc_dir = Path(svc_root) / name
+        if svc_dir.exists():
+            try:
+                shutil.rmtree(svc_dir)
+            except OSError as exc:
+                logger.warning(
+                    "remove_service_dir: rmtree %s failed: %s", svc_dir, exc,
+                )
+
+
+def service_pair_complete(*, svc_root: str, engagement_id: str) -> bool:
+    """True iff the v0.64.0 service pair is fully present: main dir +
+    ``producer-for`` + ``-log`` sibling. Legacy (≤v0.63.x) dirs and torn
+    halves return False so boot replay re-plants (and thereby migrates)
+    them."""
+    root = Path(svc_root)
+    main = root / _main_service_name(engagement_id)
+    return (
+        main.is_dir()
+        and (main / "producer-for").is_file()
+        and (root / _log_service_name(engagement_id)).is_dir()
+    )
+
+
+def _prune_broken_pairs(*, svc_root: str) -> list[str]:
+    """Make the engagement sources compilable again after a crash.
+
+    The pair dirs cross-reference each other, so no write/remove ordering
+    is crash-atomic — and a torn half (``producer-for`` naming a missing
+    service, or a logger whose producer no longer declares it) fails the
+    WHOLE s6-rc-compile, bricking every engagement start/stop. Rules:
+
+      - main dir whose ``producer-for`` names a missing sibling → unlink
+        ``producer-for`` (the service survives, unlogged);
+      - ``-log`` dir whose main lacks a ``producer-for`` (or is gone) →
+        remove the ``-log`` dir (a logger alone cannot compile).
+
+    Engagement ids are hex UUIDs, so the suffix is unambiguous. Returns the
+    pruned paths. Called under ``_compile_lock`` before every compile.
+    """
+    pruned: list[str] = []
+    root = Path(svc_root)
+    if not root.is_dir():
+        return pruned
+    for entry in root.iterdir():
+        if not entry.is_dir() or not entry.name.startswith("engagement-"):
+            continue
+        if entry.name.endswith(LOG_SERVICE_SUFFIX):
+            main = root / entry.name[:-len(LOG_SERVICE_SUFFIX)]
+            if not (main / "producer-for").is_file():
+                logger.warning(
+                    "s6_rc prune: removing torn logger dir %s", entry,
+                )
+                shutil.rmtree(entry, ignore_errors=True)
+                pruned.append(str(entry))
+        else:
+            producer_for = entry / "producer-for"
+            if producer_for.is_file():
+                target = producer_for.read_text().strip()
+                if target and not (root / target).is_dir():
+                    logger.warning(
+                        "s6_rc prune: unlinking dangling producer-for in %s",
+                        entry,
+                    )
+                    producer_for.unlink(missing_ok=True)
+                    pruned.append(str(producer_for))
+    return pruned
 
 
 # Module-level lock — guards the full [write-dir → compile → update → change]
@@ -83,6 +185,10 @@ async def _compile_and_update_locked() -> None:
     swap (or the just-compiled db after a failed one) so /tmp doesn't
     accumulate one orphaned db per compile (L12 leak guard).
     """
+    # v0.64.0: clear any crash-torn producer/consumer halves first — a
+    # single dangling cross-reference fails the whole compile.
+    _prune_broken_pairs(svc_root=ENGAGEMENT_SOURCES_ROOT)
+
     old_db = os.path.realpath(LIVE_DB_SYMLINK)
     new_db = f"/tmp/s6-casa-db-{uuid.uuid4().hex}"
     try:
@@ -158,6 +264,19 @@ async def stop_service(*, engagement_id: str) -> None:
     )
 
 
+async def stop_log_service(*, engagement_id: str) -> None:
+    """Down the engagement's sibling logger service, if it has one.
+
+    No-op when the ``-log`` source dir is absent (legacy pre-v0.64.0
+    engagements) so callers never exec a doomed s6-rc or log spurious
+    warnings. Keeps the suffix convention inside this module.
+    """
+    log_dir = Path(ENGAGEMENT_SOURCES_ROOT) / _log_service_name(engagement_id)
+    if not log_dir.is_dir():
+        return
+    await stop_service(engagement_id=f"{engagement_id}{LOG_SERVICE_SUFFIX}")
+
+
 def sweep_orphan_compiled_dbs(*, tmp_root: str = "/tmp") -> list[str]:
     """Remove stale /tmp/s6-casa-db-* dirs left by previous container runs.
 
@@ -185,10 +304,13 @@ def sweep_orphan_compiled_dbs(*, tmp_root: str = "/tmp") -> list[str]:
 def sweep_orphan_service_dirs(
     *, svc_root: str, keep_engagement_ids: set[str],
 ) -> list[str]:
-    """Remove /<svc_root>/engagement-<id>/ where <id> not in keep set.
+    """Remove /<svc_root>/engagement-<id>[-log]/ where <id> not in keep set.
 
-    Returns the list of removed engagement_ids. Only dirs prefixed with
-    'engagement-' are considered — foreign dirs are untouched.
+    Returns the list of removed engagement_ids (an orphan main+logger pair
+    counts once). Only dirs prefixed with 'engagement-' are considered —
+    foreign dirs are untouched. Logger siblings (``engagement-<id>-log``)
+    live and die with their engagement; engagement ids are hex UUIDs, so
+    the ``-log`` suffix is unambiguous.
     """
     removed: list[str] = []
     root = Path(svc_root)
@@ -197,10 +319,11 @@ def sweep_orphan_service_dirs(
     for entry in root.iterdir():
         if not entry.is_dir() or not entry.name.startswith("engagement-"):
             continue
-        eid = entry.name[len("engagement-"):]
+        eid = entry.name[len("engagement-"):].removesuffix(LOG_SERVICE_SUFFIX)
         if eid in keep_engagement_ids:
             continue
         logger.warning("s6_rc sweep: removing orphan service dir %s", entry)
         shutil.rmtree(entry)
-        removed.append(eid)
+        if eid not in removed:
+            removed.append(eid)
     return removed

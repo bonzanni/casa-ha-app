@@ -118,8 +118,7 @@ def _make_post_inline_keyboard(
     """Build the aiohttp POST handler for /internal/channel/post_inline_keyboard.
 
     Phase 2 (Task 19): renders an inline-keyboard prompt in the engagement
-    topic. The channel server uses this for U1 permission relay (Task 18) and
-    Phase 4 U6 pinned-block Remote Control button.
+    topic. The channel server uses this for U1 permission relay (Task 18).
 
     Body shape: ``{engagement_id, text, buttons: [[{text, callback_data?,
     url?}, ...], ...], parse_mode?, request_id?}``. ``request_id`` is logged

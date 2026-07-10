@@ -174,6 +174,181 @@ async def test_replay_leaves_alone_unknown_executor(monkeypatch, tmp_path):
     assert write_calls == []
 
 
+async def test_replay_replants_incomplete_pair(monkeypatch, tmp_path):
+    """v0.64.0: 'service dir present' no longer means 'unit present' — the
+    heal predicate is pair-completeness (main + producer-for + -log sibling).
+    A legacy v0.63.x dir (no producer-for, nested log/) or a torn pair is
+    re-planted, which also migrates engagements surviving the upgrade."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+    from config import ExecutorDefinition
+
+    svc_root = tmp_path / "svc"
+    svc_root.mkdir()
+    # Legacy layout: main dir exists, no producer-for, no -log sibling.
+    legacy = svc_root / "engagement-keep1"
+    legacy.mkdir()
+    (legacy / "type").write_text("longrun\n")
+    (legacy / "log").mkdir()  # ignored-by-compile nested dir, pre-v0.64.0
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+    write_calls: list[dict] = []
+
+    def fake_write(**kw):
+        write_calls.append(kw)
+        # Mirrors the real exist_ok=False semantics: collides if the old
+        # dir was not removed first.
+        (svc_root / f"engagement-{kw['engagement_id']}").mkdir()
+        return str(svc_root / f"engagement-{kw['engagement_id']}")
+
+    monkeypatch.setattr(s6_rc, "write_service_dir", fake_write)
+
+    async def fake_cau(): return None
+    async def fake_start(*, engagement_id): return None
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+
+    class FakeExecReg:
+        def get(self, t):
+            return ExecutorDefinition(
+                type="hello-driver", description="test", model="haiku",
+                driver="claude_code", enabled=True,
+                tools_allowed=[], tools_disallowed=[],
+                permission_mode="bypassPermissions",
+                mcp_server_names=[], idle_reminder_days=1,
+                prompt_template_path="/nope/prompt.md", hooks_path=None,
+                observer_policy_path=None, doctrine_dir="/nope/doctrine",
+                extra_dirs=[], mirror_chat_to_topic=False, plugins_dir="",
+            )
+
+    reg = await _make_registry([_rec("keep1")])
+    driver = AsyncMock()
+    driver._spawn_background_tasks = lambda rec: None
+
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, executor_registry=FakeExecReg(),
+        engagements_root=str(ws_root),
+    )
+
+    assert len(write_calls) == 1, "incomplete pair must be re-planted"
+    assert write_calls[0]["engagement_id"] == "keep1"
+
+
+async def test_replay_heals_when_only_log_sibling_survives(
+    monkeypatch, tmp_path,
+):
+    """Torn state: -log sibling present, main dir gone (crash between the
+    two rmtrees). The sweep keeps the sibling (its engagement is live);
+    heal must re-plant without tripping over it — pre-fix the REAL
+    write_service_dir raised FileExistsError on the sibling mkdir."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+    from config import ExecutorDefinition
+
+    svc_root = tmp_path / "svc"
+    svc_root.mkdir()
+    (svc_root / "engagement-keep1-log").mkdir()
+    (svc_root / "engagement-keep1-log" / "type").write_text("longrun\n")
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+    async def fake_cau(): return None
+    async def fake_start(*, engagement_id): return None
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+    # NOTE: write_service_dir is REAL here — the collision is the point.
+
+    class FakeExecReg:
+        def get(self, t):
+            return ExecutorDefinition(
+                type="hello-driver", description="test", model="haiku",
+                driver="claude_code", enabled=True,
+                tools_allowed=[], tools_disallowed=[],
+                permission_mode="bypassPermissions",
+                mcp_server_names=[], idle_reminder_days=1,
+                prompt_template_path="/nope/prompt.md", hooks_path=None,
+                observer_policy_path=None, doctrine_dir="/nope/doctrine",
+                extra_dirs=[], mirror_chat_to_topic=False, plugins_dir="",
+            )
+
+    reg = await _make_registry([_rec("keep1")])
+    driver = AsyncMock()
+    driver._spawn_background_tasks = lambda rec: None
+
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, executor_registry=FakeExecReg(),
+        engagements_root=str(ws_root),
+    )
+
+    # Healed to a complete pair; no FileExistsError escaped.
+    assert (svc_root / "engagement-keep1").is_dir()
+    assert (svc_root / "engagement-keep1" / "producer-for").exists()
+    assert (svc_root / "engagement-keep1-log" / "consumer-for").exists()
+
+
+async def test_replay_one_bad_heal_does_not_abort_others(
+    monkeypatch, tmp_path,
+):
+    """A single record's heal failure must not skip the compile/start of
+    every other undergoing engagement."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+    from config import ExecutorDefinition
+
+    svc_root = tmp_path / "svc"
+    svc_root.mkdir()
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+    def fake_write(**kw):
+        if kw["engagement_id"] == "bad1":
+            raise OSError("disk full")
+        (svc_root / f"engagement-{kw['engagement_id']}").mkdir()
+        return str(svc_root / f"engagement-{kw['engagement_id']}")
+
+    monkeypatch.setattr(s6_rc, "write_service_dir", fake_write)
+
+    cau_calls: list[int] = []
+    start_calls: list[str] = []
+    async def fake_cau(): cau_calls.append(1)
+    async def fake_start(*, engagement_id): start_calls.append(engagement_id)
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+
+    class FakeExecReg:
+        def get(self, t):
+            return ExecutorDefinition(
+                type="hello-driver", description="test", model="haiku",
+                driver="claude_code", enabled=True,
+                tools_allowed=[], tools_disallowed=[],
+                permission_mode="bypassPermissions",
+                mcp_server_names=[], idle_reminder_days=1,
+                prompt_template_path="/nope/prompt.md", hooks_path=None,
+                observer_policy_path=None, doctrine_dir="/nope/doctrine",
+                extra_dirs=[], mirror_chat_to_topic=False, plugins_dir="",
+            )
+
+    reg = await _make_registry([_rec("bad1"), _rec("good1")])
+    driver = AsyncMock()
+    driver._spawn_background_tasks = lambda rec: None
+
+    ws_root = tmp_path / "eng"
+    (ws_root / "bad1").mkdir(parents=True)
+    (ws_root / "good1").mkdir(parents=True)
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, executor_registry=FakeExecReg(),
+        engagements_root=str(ws_root),
+    )
+
+    assert len(cau_calls) == 1, "compile must still run"
+    assert "good1" in start_calls, "healthy engagement must still start"
+
+
 async def test_replay_warn_and_skips_heal_when_workspace_missing(
     monkeypatch, tmp_path,
 ):
