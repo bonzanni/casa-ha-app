@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -106,6 +107,14 @@ async def test_cancel_writes_meta_scope_summary(tmp_path, monkeypatch):
     res = await cancel_engagement.handler({"engagement_id": rec.id})
     payload = json.loads(res["content"][0]["text"])
     assert payload["status"] == "ok"
+
+    # L33 moved the retains off the turn's critical path into background
+    # tasks (_finalize_engagement schedules retain_delegated via
+    # asyncio.create_task) — drain them before asserting.
+    import tools as tools_mod
+    pending = list(tools_mod._specialist_bg_tasks)
+    if pending:
+        await asyncio.gather(*pending)
 
     # A structured engagement summary was retained on the shared `casa` bank
     # with status=='cancelled' — cancellation is not silent.

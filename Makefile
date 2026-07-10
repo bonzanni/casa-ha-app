@@ -9,11 +9,11 @@ help: ## Show this help
 setup: ## One-time WSL dev setup (Linux venv + git hooks)
 	./scripts/setup-dev.sh
 
-test-unit: ## Fast unit tests (no docker, no slow)
-	$(PY) -m pytest tests/ -m "unit and not docker and not slow" --tb=short
+test-unit: ## Fast unit tests (everything except docker/slow — opt-out gate)
+	$(PY) -m pytest tests/ -m "not docker and not slow" --tb=short
 
 test-docker: ## Docker-backed unit tests
-	$(PY) -m pytest tests/ -m "unit and docker" --tb=short
+	$(PY) -m pytest tests/ -m "docker and not slow" --tb=short
 
 test-image: ## Build the e2e test image (mirrors CI tier1/baseline)
 	docker build -f test-local/Dockerfile.test -t casa-test .

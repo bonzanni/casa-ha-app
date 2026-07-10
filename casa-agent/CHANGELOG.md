@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.64.2] - 2026-07-10 — CI gate flipped to opt-out: 776 more tests protected
+
+No runtime changes. Closes the systemic gap behind v0.64.1's stale tests.
+
+### Changed
+
+- The unit gate (`make test-unit` / CI tier2) now runs **every** test except
+  those marked `docker` or `slow`. Previously only `unit`-marked files ran,
+  leaving ~20 unmarked files — 776 tests — silently invisible to CI, which
+  is exactly how the v0.64.1 stale tests rotted. New test files are now
+  gate-protected by default; the `unit` marker is legacy/optional. Gate
+  grows 1089 → 1865 tests (~+25 s runtime).
+
+### Fixed
+
+- The one failure the wider gate surfaced: the engagement-cancel test now
+  drains the background memory-retention tasks before asserting (same L33
+  drift as v0.64.1's force-delete test; cancel retention itself worked all
+  along).
+
 ## [0.64.1] - 2026-07-10 — test hygiene: two stale tests fixed and brought into the CI gate
 
 No runtime changes. Two long-broken tests that CI never ran (their files
