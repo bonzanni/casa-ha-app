@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.63.0] - 2026-07-10 — skill-only plugins report ready
+
+Fixes a plugin-management bug found while building the plugin-lifecycle e2e
+coverage (block R): `verify_plugin_state` could never report a skill-only
+plugin as ready.
+
+### Fixed
+
+- **`verify_plugin_state` no longer requires an MCP server for readiness.**
+  Readiness previously ANDed in `mcp_started` (i.e. an `.mcp.json` exists in the
+  plugin cache), so a **skill-only** plugin — a recommended pattern that ships
+  no MCP server — always reported `ready: false` even when correctly installed
+  and functional. Readiness now gates on satisfied system-requirement tools +
+  resolved secrets + the absence of MCP startup errors; `mcp_started` is still
+  reported for information but is no longer a gate. After a successful install
+  the presence of an `.mcp.json` only signals that a server is *declared* —
+  whether it works is already covered by the tool and secret checks. Unblocks
+  the fast skill-only plugin path for the configurator's install-time readiness
+  check.
+
 ## [0.62.0] - 2026-07-10 — trust-model consistency + validator robustness
 
 Resolves the three items left open by the cross-surface sweep, per the operator
