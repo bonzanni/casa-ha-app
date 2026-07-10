@@ -2,15 +2,20 @@
 """Mock `claude` CLI for CI. See §9.1 of the plan-4a design spec.
 
 Usage (exactly mimics real claude):
-    claude --remote-control <name> [--resume <sid>] --permission-mode <mode> --add-dir <dir>...
+    claude [--resume <sid>] --permission-mode <mode> --add-dir <dir>...
 
 Reads user turns line-by-line from stdin. For each turn, appends JSONL
 entries for `user` and `assistant` messages to
-$HOME/.claude/projects/<slug>/sessions/<sid>.jsonl. Prints the
-`Remote Control URL:` line on boot. On `/mock emit_completion`, prints
-a synthetic MCP tool-call JSON line and exits 0. On `/mock cancel`, exits 0.
-On `--resume <sid>`, reads the prior transcript and prints "Resumed
-session <sid> with N prior turns" before entering the main loop.
+$HOME/.claude/projects/<slug>/sessions/<sid>.jsonl. On
+`/mock emit_completion`, prints a synthetic MCP tool-call JSON line and
+exits 0. On `/mock cancel`, exits 0. On `--resume <sid>`, reads the prior
+transcript and prints "Resumed session <sid> with N prior turns" before
+entering the main loop.
+
+v0.64.0: no `Remote Control URL:` boot banner — the real headless CLI
+never prints one (non-TTY stdout degrades it to --print mode; the
+`--remote-control` flag was dropped from the run template). The parser
+still tolerates the flag for old harnesses.
 """
 
 from __future__ import annotations
@@ -22,8 +27,6 @@ import pathlib
 import sys
 import time
 import uuid
-
-URL_FORMAT = "Remote Control URL: https://mock-relay.test/{sid}"
 
 
 def _parse_args(argv: list[str]) -> dict:
@@ -111,8 +114,6 @@ def main() -> int:
         path = _session_path(home, cwd, sid)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
-
-    print(URL_FORMAT.format(sid=sid), flush=True)
 
     # Main loop: read stdin line by line.
     for line in sys.stdin:

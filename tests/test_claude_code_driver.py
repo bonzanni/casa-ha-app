@@ -78,10 +78,10 @@ class TestStart:
                             str(tmp_path / "svc-root"))
         (tmp_path / "svc-root").mkdir()
 
-        # Don't actually spawn _capture_url / _poll_respawns background tasks
-        # in the unit test — they're covered by TestURLCapture and TestRespawnPoller
-        # directly. Without this patch, _capture_url polls a non-existent log
-        # path forever and hangs CI.
+        # Don't actually spawn the background tasks (log relay, respawn
+        # poller, session-id capture) in the unit test — they're covered by
+        # their dedicated test classes. Without this patch they poll
+        # non-existent paths forever and hang CI.
         monkeypatch.setattr(
             ClaudeCodeDriver, "_spawn_background_tasks",
             lambda self, engagement: None,
@@ -232,8 +232,15 @@ class TestStartRollback:
         assert not (tmp_path / "engagements" / rec.id).exists()
 
 
-class TestURLCapture:
-    async def test_first_url_line_posts_to_topic(self, tmp_path):
+class TestNoRemoteControlNotices:
+    """v0.64.0: URL capture removed — headless claude auto-degrades to
+    one-shot --print mode on non-TTY stdout and never prints a
+    'Remote Control URL:' line (live-verified 2026-07-10), so the driver
+    must neither watch for one nor post any remote-control topic notice.
+    See docs/superpowers/specs/2026-07-10-v0.64.0-remote-control-honesty-design.md."""
+
+    async def test_background_tasks_never_post_to_topic(self, tmp_path, caplog):
+        import logging
         from drivers.claude_code_driver import ClaudeCodeDriver
 
         sender = AsyncMock()
@@ -241,107 +248,78 @@ class TestURLCapture:
             engagements_root=str(tmp_path),
             send_to_topic=sender, casa_framework_mcp_url="x",
         )
-        log = tmp_path / "log"
-        log.write_text("boot...\nRemote Control URL: https://r.test/abc\nmore\n")
-
         rec = _make_record()
-        # capture_url reads new lines as they appear — for a test, we pre-write
-        # then run the coroutine with a short time budget.
-        task = asyncio.create_task(
-            drv._capture_url(rec, log_path=str(log), initial_window_s=1.0)
+        # DEBUG-enable subprocess_cli so the full roster (incl. relay) runs.
+        with caplog.at_level(logging.DEBUG, logger="subprocess_cli"):
+            drv._spawn_background_tasks(rec)
+            tasks = drv._tasks[rec.id]
+            # log relay + respawn poller + session-id capture; no URL capture.
+            assert len(tasks) == 3
+            await asyncio.sleep(0.3)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        sender.assert_not_awaited()
+
+
+class TestRelaySpawnGate:
+    """v0.64.0 efficiency: the relay tails a now-real file at 10 Hz only to
+    discard every line unless subprocess_cli is DEBUG-enabled — so the task
+    is only spawned when it is. (A LOG_LEVEL flip requires an add-on
+    restart, which respawns these tasks anyway.)"""
+
+    async def test_relay_skipped_when_debug_disabled(self, tmp_path):
+        import logging
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="x",
         )
-        await asyncio.sleep(0.3)
-        task.cancel()
+        rec = _make_record()
+        lg = logging.getLogger("subprocess_cli")
+        old_level = lg.level
+        lg.setLevel(logging.WARNING)
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-        # send_to_topic was called with the topic_id + a remote-control message.
-        sender.assert_awaited()
-        args, _ = sender.call_args
-        assert args[0] == rec.topic_id
-        assert "https://r.test/abc" in args[1]
-
-    async def test_duplicate_url_not_reposted(self, tmp_path):
-        from drivers.claude_code_driver import ClaudeCodeDriver
-
-        sender = AsyncMock()
-        drv = ClaudeCodeDriver(
-            engagements_root=str(tmp_path),
-            send_to_topic=sender, casa_framework_mcp_url="x",
-        )
-        log = tmp_path / "log"
-        # Same URL twice
-        log.write_text(
-            "Remote Control URL: https://r.test/same\n"
-            "filler\n"
-            "Remote Control URL: https://r.test/same\n"
-        )
-
-        rec = _make_record()
-        task = asyncio.create_task(
-            drv._capture_url(rec, log_path=str(log), initial_window_s=1.0)
-        )
-        await asyncio.sleep(0.3)
-        task.cancel()
-        try: await task
-        except asyncio.CancelledError: pass
-
-        # Only one post, not two
-        assert sender.await_count == 1
+            drv._spawn_background_tasks(rec)
+            tasks = drv._tasks[rec.id]
+            # respawn poller + session-id capture only.
+            assert len(tasks) == 2
+        finally:
+            lg.setLevel(old_level)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
-class TestURLCaptureFallbackWarning:
-    """L62/L11: the 'not yet available' fallback must fire at the
-    initial_window_s deadline even when _tail_file never yields a line
-    (missing log file — the prod reality per O-5), and must NOT fire if
-    a URL was already found within the window."""
+class TestTailFileResilience:
+    """s6-log rotates `current` by rename; if that lands between the
+    tailer's exists() and open(), the open raises FileNotFoundError. The
+    relay task is unobserved — the tailer must retry, not die."""
 
-    async def test_warning_posts_when_log_file_never_appears(self, tmp_path):
-        from drivers.claude_code_driver import ClaudeCodeDriver
-        sender = AsyncMock()
-        drv = ClaudeCodeDriver(
-            engagements_root=str(tmp_path),
-            send_to_topic=sender, casa_framework_mcp_url="x",
-        )
-        rec = _make_record()
-        missing = tmp_path / "log-that-is-never-created"  # do NOT write it
-        task = asyncio.create_task(
-            drv._capture_url(rec, log_path=str(missing), initial_window_s=0.2)
-        )
-        await asyncio.sleep(0.6)  # well past the 0.2s window
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        sender.assert_awaited_once()
-        args, _ = sender.call_args
-        assert args[0] == rec.topic_id
-        assert "not yet available" in args[1]
+    async def test_survives_transient_open_failure(self, tmp_path, monkeypatch):
+        import pathlib
+        from drivers.claude_code_driver import _tail_file
 
-    async def test_no_warning_when_url_arrives_inside_window(self, tmp_path):
-        from drivers.claude_code_driver import ClaudeCodeDriver
-        sender = AsyncMock()
-        drv = ClaudeCodeDriver(
-            engagements_root=str(tmp_path),
-            send_to_topic=sender, casa_framework_mcp_url="x",
-        )
-        log = tmp_path / "log"
-        log.write_text("Remote Control URL: https://r.test/abc\n")
-        rec = _make_record()
-        task = asyncio.create_task(
-            drv._capture_url(rec, log_path=str(log), initial_window_s=0.2)
-        )
-        await asyncio.sleep(0.6)  # past the window — timer must have been cancelled
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        assert sender.await_count == 1  # only the URL post, no fallback warning
-        assert "https://r.test/abc" in sender.call_args[0][1]
+        f = tmp_path / "current"
+        f.write_text("hello\n", encoding="utf-8")
+
+        real_open = pathlib.Path.open
+        state = {"raised": False}
+
+        def flaky(self, *args, **kwargs):
+            if self == f and not state["raised"]:
+                state["raised"] = True
+                raise FileNotFoundError("rotated away")
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "open", flaky)
+
+        gen = _tail_file(str(f))
+        line = await asyncio.wait_for(gen.__anext__(), timeout=2.0)
+        assert line == "hello\n"
+        assert state["raised"], "the transient failure was never exercised"
+        await gen.aclose()
 
 
 class TestSessionIdCapture:
@@ -605,6 +583,41 @@ class TestCancel:
         (tmp_path / "svc").mkdir()
         (tmp_path / "svc" / "engagement-abc12345def67890").mkdir()
         (tmp_path / "svc" / "engagement-abc12345def67890" / "type").write_text("longrun\n")
+        (tmp_path / "svc" / "engagement-abc12345def67890-log").mkdir()
+        (tmp_path / "svc" / "engagement-abc12345def67890-log" / "type").write_text("longrun\n")
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "eng"),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+        await drv.cancel(rec)
+
+        # v0.64.0: the sibling logger service is stopped explicitly too, so
+        # the follow-up recompile never has to down a still-live service.
+        assert stopped == [rec.id, f"{rec.id}-log"]
+        assert not (tmp_path / "svc" / f"engagement-{rec.id}").exists()
+        assert not (tmp_path / "svc" / f"engagement-{rec.id}-log").exists()
+
+    async def test_cancel_skips_logger_stop_for_legacy_engagement(
+        self, monkeypatch, tmp_path,
+    ):
+        """Engagements created pre-v0.64.0 have no logger service — cancel
+        must not exec a doomed `s6-rc -d change engagement-<id>-log`."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers import s6_rc
+
+        stopped: list[str] = []
+        async def fake_stop(*, engagement_id):
+            stopped.append(engagement_id)
+        async def fake_cau(): pass
+
+        monkeypatch.setattr(s6_rc, "stop_service", fake_stop)
+        monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+        monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(tmp_path / "svc"))
+        (tmp_path / "svc").mkdir()
+        (tmp_path / "svc" / "engagement-abc12345def67890").mkdir()
+        # No engagement-<id>-log sibling (legacy layout).
 
         drv = ClaudeCodeDriver(
             engagements_root=str(tmp_path / "eng"),
@@ -614,7 +627,6 @@ class TestCancel:
         await drv.cancel(rec)
 
         assert stopped == [rec.id]
-        assert not (tmp_path / "svc" / f"engagement-{rec.id}").exists()
 
 
 class TestRelayLogLines:
@@ -635,12 +647,6 @@ class TestRelayLogLines:
 
         rec = _make_record()  # id="abc12345def67890"
         log_file = tmp_path / "log-current"
-        log_file.write_text(
-            "first line\n"
-            "second line\n"
-            "Remote Control URL: https://example/123\n",
-            encoding="utf-8",
-        )
 
         drv = ClaudeCodeDriver(
             engagements_root=str(tmp_path / "engagements"),
@@ -652,7 +658,15 @@ class TestRelayLogLines:
             task = asyncio.create_task(
                 drv._relay_log_lines(rec, log_path=str(log_file)),
             )
-            # Give the tailer a beat to read all 3 lines + start polling.
+            # Lines are written AFTER the relay starts (the real flow: s6-log
+            # creates the file once the fresh engagement's CLI first writes).
+            await asyncio.sleep(0.2)
+            log_file.write_text(
+                "first line\n"
+                "second line\n"
+                "third line https://example/123\n",
+                encoding="utf-8",
+            )
             await asyncio.sleep(0.3)
             task.cancel()
             try:
@@ -664,7 +678,7 @@ class TestRelayLogLines:
         msgs = [r.getMessage() for r in recs]
         assert any("first line" in m for m in msgs), msgs
         assert any("second line" in m for m in msgs), msgs
-        assert any("Remote Control URL" in m for m in msgs), msgs
+        assert any("third line" in m for m in msgs), msgs
         # Every relayed record carries engagement_id (first 8 chars of rec.id)
         for r in recs:
             assert getattr(r, "engagement_id", None) == "abc12345", (
@@ -673,6 +687,51 @@ class TestRelayLogLines:
         assert all(r.levelno == logging.DEBUG for r in recs), (
             "relay must emit DEBUG, not INFO"
         )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="_tail_file uses path semantics that don't work cleanly on Windows",
+    )
+    async def test_relay_starts_at_end_of_preexisting_file(
+        self, tmp_path, caplog,
+    ):
+        """Boot replay re-spawns the relay against a file that may already
+        hold up to 1 MB of history — re-relaying it would bury fresh lines
+        at DEBUG. A pre-existing file is tailed from its end."""
+        import asyncio
+        import logging
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        rec = _make_record()
+        log_file = tmp_path / "log-current"
+        log_file.write_text("old historical line\n", encoding="utf-8")
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="http://x",
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="subprocess_cli"):
+            task = asyncio.create_task(
+                drv._relay_log_lines(rec, log_path=str(log_file)),
+            )
+            await asyncio.sleep(0.3)
+            with log_file.open("a", encoding="utf-8") as fh:
+                fh.write("fresh line\n")
+            await asyncio.sleep(0.3)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        msgs = [
+            r.getMessage() for r in caplog.records
+            if r.name == "subprocess_cli"
+        ]
+        assert any("fresh line" in m for m in msgs), msgs
+        assert not any("old historical line" in m for m in msgs), msgs
 
 
 @pytest.mark.unit

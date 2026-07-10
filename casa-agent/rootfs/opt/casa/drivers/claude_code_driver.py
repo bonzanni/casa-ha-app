@@ -17,12 +17,12 @@ from typing import Any, Awaitable, Callable
 from drivers import s6_rc
 from drivers.driver_protocol import DriverProtocol
 from drivers.workspace import (
-    provision_workspace, render_log_run_script, render_run_script, write_casa_meta,
+    engagement_log_dir, provision_workspace, render_log_run_script,
+    render_run_script, write_casa_meta,
 )
 from engagement_registry import EngagementRecord
 
 logger = logging.getLogger(__name__)
-_URL_REGEX = re.compile(r"Remote Control URL:\s+(https?://\S+)")
 # P31 (v0.37.10): match a UUID as a complete filename stem — the
 # claude CLI names its session-storage files ``<uuid>.jsonl``. Replaces
 # v0.37.9's free-text session_id regex (which tailed a log file that
@@ -55,7 +55,8 @@ class ClaudeCodeDriver(DriverProtocol):
         self._send_to_topic = send_to_topic
         self._casa_framework_mcp_url = casa_framework_mcp_url
         self._persist_session_id = persist_session_id
-        # Per-engagement background tasks (URL capture, respawn poller).
+        # Per-engagement background tasks (respawn poller, session-id
+        # capture, DEBUG log relay).
         self._tasks: dict[str, list[asyncio.Task]] = {}
         self._last_turn_ts: dict[str, float] = {}
 
@@ -130,7 +131,8 @@ class ClaudeCodeDriver(DriverProtocol):
                     finished_at=None, retention_until=None,
                 )
 
-                # 2. Write the s6 service dir (with log sub-service for stdout capture).
+                # 2. Write the s6 service pair (sibling logger service
+                #    captures the CLI's stdout — see s6_rc.write_service_dir).
                 # v0.14.9: GITHUB_TOKEN is set at addon boot via
                 # setup-configs.sh → /run/s6/container_environment/GITHUB_TOKEN, and
                 # s6-overlay merges it into every supervised service's env. Engagement
@@ -162,16 +164,20 @@ class ClaudeCodeDriver(DriverProtocol):
                 )
                 # Best-effort rollback. Each step swallows its own errors so
                 # one rollback failure doesn't mask the original cause.
+                # v0.64.0: ALWAYS attempt dir removal — write_service_dir can
+                # raise midway (pair half-written), and remove_service_dir is
+                # idempotent. Recompile only when the dirs were fully written
+                # (before that, the live db never saw them).
+                try:
+                    s6_rc.remove_service_dir(
+                        svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                        engagement_id=engagement.id,
+                    )
+                except Exception as rb_exc:  # noqa: BLE001
+                    logger.warning(
+                        "rollback remove_service_dir failed: %s", rb_exc,
+                    )
                 if service_dir_written:
-                    try:
-                        s6_rc.remove_service_dir(
-                            svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
-                            engagement_id=engagement.id,
-                        )
-                    except Exception as rb_exc:  # noqa: BLE001
-                        logger.warning(
-                            "rollback remove_service_dir failed: %s", rb_exc,
-                        )
                     try:
                         await s6_rc._compile_and_update_locked()
                     except Exception as rb_exc:  # noqa: BLE001
@@ -189,7 +195,8 @@ class ClaudeCodeDriver(DriverProtocol):
                     )
                 raise
 
-        # 4. Kick off URL capture + respawn poller tasks (outside lock).
+        # 4. Kick off the background tasks (outside lock): respawn poller,
+        #    session-id capture, and (at DEBUG) the log relay.
         self._spawn_background_tasks(engagement)
 
         # 5. Write initial prompt to FIFO — background, non-blocking.
@@ -220,6 +227,14 @@ class ClaudeCodeDriver(DriverProtocol):
                 await s6_rc.stop_service(engagement_id=engagement.id)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("stop_service(%s) failed: %s",
+                               engagement.id[:8], exc)
+            # v0.64.0: also stop the sibling logger service explicitly so the
+            # recompile below never has to down a still-live service. No-op
+            # for legacy engagements without one.
+            try:
+                await s6_rc.stop_log_service(engagement_id=engagement.id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("stop_log_service(%s) failed: %s",
                                engagement.id[:8], exc)
             try:
                 s6_rc.remove_service_dir(
@@ -331,63 +346,27 @@ class ClaudeCodeDriver(DriverProtocol):
         self._last_turn_ts[engagement.id] = time.time()
 
     def _spawn_background_tasks(self, engagement: EngagementRecord) -> None:
-        log_path = f"/var/log/casa-engagement-{engagement.id}/current"
-        self._tasks[engagement.id] = [
-            asyncio.create_task(self._capture_url(engagement, log_path=log_path)),
+        tasks = [
             asyncio.create_task(self._poll_respawns(engagement)),
-            # Phase 4b G5: relay every s6-log line into Casa's logger at
-            # DEBUG so operators have one greppable namespace for both
-            # drivers' CLI subprocess output. Independent tailer — the
-            # _capture_url task drops non-URL lines.
-            asyncio.create_task(self._relay_log_lines(engagement, log_path=log_path)),
             # P31 (v0.37.10): capture the SDK session_id by watching the
-            # claude CLI's own session-storage directory (NOT log_path —
-            # that file is never created in production; see
-            # bug-review-2026-05-14-exploration6.md::O-5). Persists the
+            # claude CLI's own session-storage directory. Persists the
             # UUID to ``<workspace>/.session_id`` so the run script's
             # ``--resume $(cat .session_id)`` plumbing picks up after a
             # Casa restart.
             asyncio.create_task(self._capture_session_id(engagement)),
         ]
-
-    async def _capture_url(
-        self, engagement: EngagementRecord, *,
-        log_path: str, initial_window_s: float = 60.0,
-    ) -> None:
-        """Persistent tail — posts topic notices on URL change only.
-
-        A detached one-shot timer posts the 'not yet available' fallback
-        at the deadline even if the log never yields a line (file missing
-        or CLI quiet) — the tail loop alone cannot be relied on to tick."""
-        last_seen: str | None = None
-
-        async def _warn_when_window_expires() -> None:
-            await asyncio.sleep(initial_window_s)
-            if last_seen is None:
-                await self._send_to_topic(
-                    engagement.topic_id,
-                    "Remote control URL not yet available — Telegram-only "
-                    "for now. Will post here if it becomes available later.",
-                )
-
-        warn_task = asyncio.create_task(_warn_when_window_expires())
-        try:
-            async for line in _tail_file(log_path):
-                m = _URL_REGEX.search(line)
-                if not m:
-                    continue
-                url = m.group(1)
-                if url == last_seen:
-                    continue
-                last_seen = url
-                warn_task.cancel()
-                await self._send_to_topic(
-                    engagement.topic_id,
-                    f"Remote control: {url} — open in iOS app or browser "
-                    f"to drive from anywhere.",
-                )
-        finally:
-            warn_task.cancel()
+        # Phase 4b G5: relay every s6-log line into Casa's logger at DEBUG
+        # so operators have one greppable namespace for both drivers' CLI
+        # subprocess output. Spawned only when DEBUG-enabled: the tailer
+        # re-opens and reads the (v0.64.0: now real) file at 10 Hz, and at
+        # INFO every line would be discarded. A LOG_LEVEL flip requires an
+        # add-on restart, which respawns these tasks anyway.
+        if logging.getLogger("subprocess_cli").isEnabledFor(logging.DEBUG):
+            log_path = os.path.join(
+                engagement_log_dir(engagement.id), "current")
+            tasks.append(asyncio.create_task(
+                self._relay_log_lines(engagement, log_path=log_path)))
+        self._tasks[engagement.id] = tasks
 
     async def _relay_log_lines(
         self, engagement: EngagementRecord, *, log_path: str,
@@ -403,14 +382,14 @@ class ClaudeCodeDriver(DriverProtocol):
         DEBUG so prod operators see nothing and debugging operators see
         everything (single LOG_LEVEL=DEBUG flip).
 
-        Distinct from ``_capture_url`` — that task seeks the URL regex and
-        drops every other line. This task is the catch-all diagnostic
-        relay; both tasks share the same log_path but tail it
-        independently.
+        v0.64.0 removed the sibling ``_capture_url`` task: headless claude
+        auto-degrades to one-shot --print mode on non-TTY stdout and never
+        prints a remote-control URL line, so there is nothing to capture
+        (live-verified; see the 2026-07-10 remote-control-honesty design).
         """
         short = engagement.id[:8]
         relay_logger = logging.getLogger("subprocess_cli")
-        async for line in _tail_file(log_path):
+        async for line in _tail_file(log_path, from_end=True):
             relay_logger.debug(
                 "stdout %s", line.rstrip("\n"),
                 extra={"engagement_id": short},
@@ -427,11 +406,13 @@ class ClaudeCodeDriver(DriverProtocol):
         ``--resume $(cat .session_id)`` flag carries the conversation
         forward.
 
-        Replaces v0.37.9's s6-log tailing approach: that path tailed
-        ``/var/log/casa-engagement-<id>/current`` which is never
-        created in production (the s6-rc service dir's log/ subdir
-        lacks producer-for / consumer-for wiring, so s6-rc-compile
-        doesn't wire the producer-consumer pipe). Bug-review:
+        Replaces v0.37.9's s6-log tailing approach, which was
+        non-functional at the time: until v0.64.0 the s6-rc log pipeline
+        was never compiled (nested log/ subdir — see
+        ``s6_rc.write_service_dir``), so the log file did not exist.
+        Watching the CLI's own session storage is retained even now that
+        the log pipeline works: it observes the authoritative artifact
+        directly. Bug-review:
         ``docs/bug-review-2026-05-14-exploration6.md::O-5``.
 
         Claude CLI session storage layout (HOME=<ws>/.home, CWD=<ws>):
@@ -558,7 +539,7 @@ def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-async def _tail_file(log_path: str):
+async def _tail_file(log_path: str, *, from_end: bool = False):
     """Yield new lines from a file as they appear. Terminates on task cancel.
 
     Bug 11 (v0.14.6): tracks the file's inode so rotation is handled.
@@ -568,13 +549,31 @@ async def _tail_file(log_path: str):
     cutoff were silently dropped. Now: when ``st_ino`` changes, reset
     ``pos`` to 0 so the new file is read from its start. We also reset
     if the file shrinks below ``pos`` (truncate-in-place pattern).
+
+    v0.64.0 (file is now real in production):
+      - ``from_end=True`` starts at the file's current end when it already
+        exists at first sight — boot replay re-attaches without re-yielding
+        up to 1 MB of history. A file that appears later (fresh engagement)
+        is still read from its start.
+      - A transient OSError mid-cycle (rotation renames ``current`` between
+        ``exists()`` and ``open()``) retries next tick instead of killing
+        the (unobserved) consumer task.
     """
     path = Path(log_path)
     pos = 0
     last_inode: int | None = None
+    first_sight = True
     while True:
         try:
-            if path.exists():
+            exists = path.exists()
+            if first_sight:
+                first_sight = False
+                if exists and from_end:
+                    try:
+                        pos = path.stat().st_size
+                    except OSError:
+                        pos = 0
+            if exists:
                 try:
                     current_inode = path.stat().st_ino
                 except OSError:
@@ -595,6 +594,6 @@ async def _tail_file(log_path: str):
                             pos = fh.tell()
                             break
                         yield line
-        except (OSError, asyncio.CancelledError):
-            raise
+        except OSError:
+            pass                             # transient — retry next tick
         await asyncio.sleep(0.1)

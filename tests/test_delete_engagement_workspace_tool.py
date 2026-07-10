@@ -46,6 +46,41 @@ async def test_delete_terminal_workspace(tmp_path, monkeypatch):
     assert not (tmp_path / "eng-done").exists()
 
 
+async def test_delete_also_removes_log_dir(tmp_path, monkeypatch):
+    """v0.64.0: /var/log/casa-engagement-<id> follows the workspace on the
+    caller-managed deletion path too — the sweep can never find it once the
+    workspace is gone."""
+    import tools as tools_mod
+    from drivers import workspace as ws_mod
+    from tools import delete_engagement_workspace
+    from engagement_registry import EngagementRegistry, EngagementRecord
+
+    _make_ws(tmp_path, "eng-done")
+    log_root = tmp_path / "var-log"
+    log_root.mkdir()
+    (log_root / "casa-engagement-eng-done").mkdir()
+    monkeypatch.setattr(ws_mod, "ENGAGEMENT_LOG_ROOT", str(log_root))
+
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "t.json"), bus=None)
+    reg._records["eng-done"] = EngagementRecord(
+        id="eng-done", kind="executor", role_or_type="hello-driver",
+        driver="claude_code", status="completed", topic_id=None,
+        started_at=0.0, last_user_turn_ts=0.0, last_idle_reminder_ts=0.0,
+        completed_at=0.0, sdk_session_id=None, origin={}, task="t",
+    )
+    monkeypatch.setattr(tools_mod, "_engagement_registry", reg)
+    monkeypatch.setattr(tools_mod, "_ENGAGEMENTS_ROOT", str(tmp_path),
+                        raising=False)
+
+    result = await delete_engagement_workspace.handler(
+        {"engagement_id": "eng-done"},
+    )
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["status"] == "ok"
+    assert not (tmp_path / "eng-done").exists()
+    assert not (log_root / "casa-engagement-eng-done").exists()
+
+
 async def test_refuses_undergoing_without_force(tmp_path, monkeypatch):
     import tools as tools_mod
     from tools import delete_engagement_workspace

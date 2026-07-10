@@ -391,9 +391,9 @@ bundled defaults when the file is absent.
 ## Claude Code driver (v0.13.1)
 
 Plan 4a infrastructure — does not change user-facing behavior by itself.
-Enables future Tier 3 executors (plugin-developer, ha-developer) to run
-inside real Claude Code CLI sessions, reachable from the iOS app or
-claude.ai/code via remote control.
+Enables Tier 3 executors (plugin-developer, ha-developer) to run inside
+real Claude Code CLI sessions, driven through their Telegram engagement
+topics.
 
 ### Architecture
 
@@ -406,8 +406,14 @@ lifetime-coupled).
 - **Workspace:** `/data/engagements/<id>/` — CLAUDE.md, `.mcp.json`,
   isolated `$HOME`, Tier 1 baseline + Tier 2 per-executor plugin symlinks,
   named FIFO for Casa → CLI turn delivery.
-- **Service dir:** `/data/casa-s6-services/engagement-<id>/` — `run` script
-  + `type: longrun` + ordering dependency on `init-setup-configs`.
+- **Service dirs:** `/data/casa-s6-services/engagement-<id>/` — `run` script
+  + `type: longrun` + ordering dependency on `init-setup-configs` — plus a
+  sibling logger service `engagement-<id>-log/` wired to it via
+  `producer-for`/`consumer-for` (an s6-rc pipeline). Both are created and
+  removed together; don't delete one without the other.
+- **Logs:** the CLI's stdout+stderr land in `/var/log/casa-engagement-<id>/`
+  (`s6-log`, 1 MB × 20 rotation), survive per-turn respawns, and are removed
+  with the workspace when retention expires.
 - **Auth:** `CLAUDE_CODE_OAUTH_TOKEN` flows via s6-overlay's `/command/with-contenv`.
   No `ANTHROPIC_API_KEY` path.
 

@@ -408,72 +408,96 @@ async def replay_undergoing_engagements(
         if not undergoing and not removed_orphans:
             return
 
-        # 2. Heal missing service dirs for UNDERGOING engagements.
+        # 2. Heal missing/incomplete service pairs for UNDERGOING
+        # engagements. v0.64.0: 'main dir present' no longer means 'unit
+        # present' — the predicate is pair-completeness, so torn halves AND
+        # legacy (≤v0.63.x, nested-log/) dirs are re-planted, migrating
+        # in-flight engagements to the working log pipeline. Each record
+        # heals independently: one failure must not abort the others'
+        # compile/start below.
         for rec in undergoing:
-            svc_dir = os.path.join(
-                s6_rc.ENGAGEMENT_SOURCES_ROOT, f"engagement-{rec.id}",
-            )
-            if os.path.isdir(svc_dir):
-                continue
+            try:
+                if s6_rc.service_pair_complete(
+                    svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                    engagement_id=rec.id,
+                ):
+                    continue
 
-            # M7: never plant a service for an engagement whose workspace is
-            # gone. The generated run script does `set -e; cd <workspace>`, so
-            # a missing workspace makes the longrun exit immediately and s6
-            # respawns it forever. Warn-and-skip (4a.1 §7.3) instead.
-            ws_dir = os.path.join(engagements_root, rec.id)
-            if not os.path.isdir(ws_dir):
-                logger.warning(
-                    "boot replay: workspace dir %s missing for engagement %s "
-                    "— leaving UNDERGOING (warn-and-skip, 4a.1 §7.3)",
-                    ws_dir, rec.id[:8],
+                # M7: never plant a service for an engagement whose workspace
+                # is gone. The generated run script does `set -e;
+                # cd <workspace>`, so a missing workspace makes the longrun
+                # exit immediately and s6 respawns it forever. Warn-and-skip
+                # (4a.1 §7.3) instead.
+                ws_dir = os.path.join(engagements_root, rec.id)
+                if not os.path.isdir(ws_dir):
+                    logger.warning(
+                        "boot replay: workspace dir %s missing for engagement "
+                        "%s — leaving UNDERGOING (warn-and-skip, 4a.1 §7.3)",
+                        ws_dir, rec.id[:8],
+                    )
+                    continue
+
+                if executor_registry is None:
+                    logger.warning(
+                        "boot replay: service pair missing for engagement %s "
+                        "— no executor_registry passed; leaving UNDERGOING",
+                        rec.id[:8],
+                    )
+                    continue
+
+                defn = executor_registry.get(rec.role_or_type)
+                if defn is None:
+                    logger.warning(
+                        "boot replay: cannot heal engagement %s — executor "
+                        "type %r not registered; leaving UNDERGOING",
+                        rec.id[:8], rec.role_or_type,
+                    )
+                    continue
+
+                # Clear stale/legacy/torn dirs first — write_service_dir
+                # mkdirs with exist_ok=False (a surviving -log sibling would
+                # otherwise collide).
+                s6_rc.remove_service_dir(
+                    svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                    engagement_id=rec.id,
                 )
-                continue
 
-            if executor_registry is None:
-                logger.warning(
-                    "boot replay: service dir missing for engagement %s "
-                    "— no executor_registry passed; leaving UNDERGOING",
-                    rec.id[:8],
+                # Re-render run + log scripts.
+                run_script = render_run_script(
+                    engagement_id=rec.id,
+                    permission_mode=defn.permission_mode or "acceptEdits",
+                    extra_dirs=list(defn.extra_dirs or []),
                 )
-                continue
-
-            defn = executor_registry.get(rec.role_or_type)
-            if defn is None:
-                logger.warning(
-                    "boot replay: cannot heal engagement %s — executor type "
-                    "%r not registered; leaving UNDERGOING",
+                log_script = render_log_run_script(engagement_id=rec.id)
+                s6_rc.write_service_dir(
+                    svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                    engagement_id=rec.id,
+                    run_script=run_script,
+                    depends_on=["init-setup-configs"],
+                    log_run_script=log_script,
+                )
+                # Ensure FIFO exists — it might have been wiped alongside the
+                # svc dir.
+                fifo = os.path.join(engagements_root, rec.id, "stdin.fifo")
+                try:
+                    if (os.path.isdir(os.path.dirname(fifo))
+                            and not os.path.exists(fifo)):
+                        os.mkfifo(fifo, 0o600)
+                except OSError as exc:
+                    logger.warning(
+                        "boot replay: mkfifo %s failed: %s — continuing",
+                        fifo, exc,
+                    )
+                logger.info(
+                    "boot replay: healed engagement %s (%s)",
                     rec.id[:8], rec.role_or_type,
                 )
-                continue
-
-            # Re-render run + log scripts.
-            run_script = render_run_script(
-                engagement_id=rec.id,
-                permission_mode=defn.permission_mode or "acceptEdits",
-                extra_dirs=list(defn.extra_dirs or []),
-            )
-            log_script = render_log_run_script(engagement_id=rec.id)
-            s6_rc.write_service_dir(
-                svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
-                engagement_id=rec.id,
-                run_script=run_script,
-                depends_on=["init-setup-configs"],
-                log_run_script=log_script,
-            )
-            # Ensure FIFO exists — it might have been wiped alongside the svc dir.
-            fifo = os.path.join(engagements_root, rec.id, "stdin.fifo")
-            try:
-                if os.path.isdir(os.path.dirname(fifo)) and not os.path.exists(fifo):
-                    os.mkfifo(fifo, 0o600)
-            except OSError as exc:
+            except Exception as exc:  # noqa: BLE001 — per-record isolation
                 logger.warning(
-                    "boot replay: mkfifo %s failed: %s — continuing",
-                    fifo, exc,
+                    "boot replay: heal failed for engagement %s: %s — "
+                    "continuing (compile-path prune keeps sources sane)",
+                    rec.id[:8], exc,
                 )
-            logger.info(
-                "boot replay: healed engagement %s (%s)",
-                rec.id[:8], rec.role_or_type,
-            )
 
         # 3. Single compile + update pass.
         await s6_rc._compile_and_update_locked()
