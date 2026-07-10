@@ -102,10 +102,13 @@ def update_plugin_entry(name: str, *, new_ref: str | None = None,
                     raise MarketplaceError(
                         f"plugin {name!r}: 'source' is a "
                         f"{type(src).__name__}, not an object — cannot set "
-                        "'sha'. Convert the entry to the object source form "
+                        "'ref'. Convert the entry to the object source form "
                         f"in {USER_MARKETPLACE_PATH} first."
                     )
-                src["sha"] = new_ref
+                # github sources pin via `ref` — CC 2.1.150 rejects a `sha`
+                # key on a github source ("source type not supported"). The
+                # user marketplace only holds github-source entries.
+                src["ref"] = new_ref
             if new_version is not None:
                 entry["version"] = new_version
             _write(data)

@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.63.1] - 2026-07-10 — plugin install fix (github sources pin via `ref`)
+
+Fixes a plugin-install bug found during the block-R live lifecycle run: no
+github-source plugin added via the marketplace tools could be installed.
+
+### Fixed
+
+- **`marketplace_add_plugin` / `marketplace_update_plugin` now pin github
+  sources via `ref`, not `sha`.** The bundled Claude Code (2.1.150) rejects a
+  `sha` key on a `github` source ("This plugin uses a source type your Claude
+  Code version does not support"), so `install_casa_plugin`'s per-agent
+  `claude plugin install <name>@casa-plugins` failed for every plugin added via
+  the marketplace tools. The marketplace-defaults catalog already used `ref` for
+  its github source; the user-marketplace writers now match. (`git-subdir` seed
+  entries legitimately keep `sha` alongside `ref` and are unaffected.) Confirmed
+  live on CC 2.1.150: a `github`+`ref` entry clears the source-type gate that a
+  `github`+`sha` entry fails.
+
 ## [0.63.0] - 2026-07-10 — skill-only plugins report ready
 
 Fixes a plugin-management bug found while building the plugin-lifecycle e2e

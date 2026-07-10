@@ -61,11 +61,11 @@ def test_remove_nonexistent_raises(user_mkt: Path) -> None:
 
 
 def test_update_happy(user_mkt: Path) -> None:
-    add_plugin_entry({"name": "a", "source": {"source": "github", "repo": "u/a", "sha": "old"},
+    add_plugin_entry({"name": "a", "source": {"source": "github", "repo": "u/a", "ref": "old"},
                       "description": "x", "version": "0.1.0"})
     update_plugin_entry("a", new_ref="new")
     data = json.loads(user_mkt.read_text())
-    assert data["plugins"][0]["source"]["sha"] == "new"
+    assert data["plugins"][0]["source"]["ref"] == "new"
 
 
 def test_list_returns_entries(user_mkt: Path) -> None:
