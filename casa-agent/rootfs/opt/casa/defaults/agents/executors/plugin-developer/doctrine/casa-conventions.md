@@ -6,7 +6,12 @@
 - Default repo name: `casa-plugin-<slug>`. `<slug>` is the plugin's `name`
   field in `.claude-plugin/plugin.json` (kebab-case, no `casa-plugin-`
   prefix inside `plugin.json`).
-- Visibility (public/private) is a user decision per engagement.
+- **Repos are created PRIVATE** (`gh repo create … --private`). Casa installs
+  plugins from private repos (the in-container `GITHUB_TOKEN` authenticates the
+  clone), so private is sufficient for the user's own agents. Making a plugin
+  public — to *share* it beyond this Casa — is a deliberate later step the user
+  runs themselves (`gh repo edit <repo> --visibility public`); Claude Code
+  hard-blocks creating a public repo from within an engagement.
 - Ship `origin` = just-created user-owned repo; `gh repo create --clone`
   sets this for you.
 
