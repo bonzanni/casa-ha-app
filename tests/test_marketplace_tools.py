@@ -35,6 +35,11 @@ def test_marketplace_add_plugin_happy(mock_run, user_mkt) -> None:
     assert result["added"] is True
     data = json.loads(user_mkt.read_text())
     assert data["plugins"][0]["name"] == "face-rec"
+    # R-6: a github source must pin via `ref` — bundled CC 2.1.150 rejects a
+    # `sha` key on a github source as "source type not supported", which broke
+    # every install_casa_plugin (Stage 2 `claude plugin install`).
+    assert data["plugins"][0]["source"]["ref"] == "abc123"
+    assert "sha" not in data["plugins"][0]["source"]
 
 
 def test_marketplace_add_plugin_rejects_apt(user_mkt) -> None:

@@ -2362,7 +2362,7 @@ def _tool_marketplace_add_plugin(
         "name": plugin_name,
         "description": description,
         "version": version or ref,
-        "source": {"source": "github", "repo": repo, "sha": ref},
+        "source": {"source": "github", "repo": repo, "ref": ref},
         "category": category,
     }
     if casa_system_requirements:
