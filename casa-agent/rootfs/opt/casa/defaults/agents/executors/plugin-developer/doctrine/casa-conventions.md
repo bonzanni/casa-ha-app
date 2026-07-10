@@ -24,7 +24,11 @@ Examples:
 Casa installs your plugin via `claude plugin install <name>@casa-plugins --scope project`
 in the target agent-home. That means:
 
-- `.claude-plugin/plugin.json` — required. name, description, version, author.
+- `.claude-plugin/plugin.json` — required. `name`, `description`, `version`, and
+  `author` **as an object** — `{"name": "..."}` (optionally `email`/`url`), NOT a
+  bare string. Claude Code rejects a string `author` at install time
+  (`author: Invalid input: expected object, received string`), which fails the
+  whole install.
 - `skills/<name>/SKILL.md` — skills pack. Single-line description triggers
   right. Keep it specific.
 - `agents/<name>.md` — optional subagents.
