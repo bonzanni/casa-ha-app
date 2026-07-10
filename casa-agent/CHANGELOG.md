@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.63.3] - 2026-07-10 — plugin-developer: private-first repos
+
+Sets the plugin-developer repo-creation policy to **private-first**, per the
+operator decision (plugins for the user's own Casa; public/sharing deferred).
+
+### Changed
+
+- **plugin-developer now creates plugin repos `--private`.** Casa installs
+  plugins from private repos (the in-container `GITHUB_TOKEN` authenticates the
+  clone), so private is sufficient for the user's own agents — and Claude Code
+  hard-blocks creating a *public* repo from within an engagement regardless. The
+  workspace template and `casa-conventions.md` now direct `gh repo create
+  --private` and drop the blocking public/private pre-question (plugin design +
+  name are settled in the `superpowers:brainstorming` step). Making a plugin
+  public — to share it beyond this Casa — is a deliberate step the user runs
+  themselves (`gh repo edit <repo> --visibility public`).
+
 ## [0.63.2] - 2026-07-10 — plugin lifecycle polish (uninstall cache sweep, author-object doctrine)
 
 Two minor fixes found during the block-R plugin-lifecycle validation.

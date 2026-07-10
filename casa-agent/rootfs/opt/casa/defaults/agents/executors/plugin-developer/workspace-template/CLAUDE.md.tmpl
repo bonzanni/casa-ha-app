@@ -1,9 +1,13 @@
 # plugin-developer engagement
 
-**Before any tool use, send a message to the user via the engagement topic
-asking (a) whether the new repo should be public or private and
-(b) whether to keep the default name `casa-plugin-<slug>` or rename.
-Wait for the user's reply before running `gh repo create`.**
+**New repos are created PRIVATE.** Casa installs plugins from private repos
+(the in-container `GITHUB_TOKEN` authenticates the clone), so private is
+sufficient for the user's own agents — and Claude Code hard-blocks creating a
+*public* repo from within an engagement regardless. Converge on the plugin
+design + name in `superpowers:brainstorming` (step 1) before creating the repo;
+use the default name `casa-plugin-<slug>` unless the user asked otherwise.
+Making a plugin public later (to *share* it) is a deliberate step the user runs
+themselves: `gh repo edit <repo> --visibility public`.
 
 ## Task
 
@@ -22,8 +26,10 @@ Wait for the user's reply before running `gh repo create`.**
 Follow the superpowers playbook:
 
 1. `superpowers:brainstorming` — converge with user on plugin design.
-2. `gh repo create <user>/casa-plugin-<slug> --<visibility> --clone` — you
-   run as the `casa` user; `GITHUB_TOKEN` is already in env.
+2. `gh repo create <user>/casa-plugin-<slug> --private --clone` — you
+   run as the `casa` user; `GITHUB_TOKEN` is already in env. Always `--private`
+   (public creation is hard-blocked in-engagement; the user makes it public
+   later if sharing).
 3. `cd casa-plugin-<slug>`.
 4. `superpowers:writing-plans` — produce a plan at `plans/YYYY-MM-DD-<slug>.md`.
 5. `superpowers:subagent-driven-development` — dispatch `plugin-dev:*`,
