@@ -40,8 +40,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r casa-agent/requirements.txt pytest pytest-asyncio anyio
-      - name: Unit pytest (today's filter)
-        run: python -m pytest tests/ -v -m "unit and not docker and not slow" --tb=short
+      - name: Unit pytest (opt-out gate — everything except docker/slow)
+        run: python -m pytest tests/ -v -m "not docker and not slow" --tb=short
       - name: Build image
         run: docker build -f test-local/Dockerfile.test -t casa-test .
       - name: Invoke sessions
@@ -83,7 +83,7 @@ jobs:
           python-version: "3.11"
       - run: pip install -r casa-agent/requirements.txt pytest pytest-asyncio anyio
       - name: Baseline runtime CI assertion
-        run: python -m pytest tests/test_baseline_runtime_assert.py -v -m "unit and docker" --tb=short
+        run: python -m pytest tests/test_baseline_runtime_assert.py -v -m "docker and not slow" --tb=short
 
   tier3-hardening:
     runs-on: ubuntu-latest

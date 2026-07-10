@@ -20,11 +20,13 @@ make setup        # builds a WSL/Linux venv at venv_test/ + installs the git hoo
 ```
 Then:
 ```bash
-make test-unit    # fast unit tests:  pytest -m "unit and not docker and not slow"
+make test-unit    # fast unit tests:  pytest -m "not docker and not slow" (opt-out gate)
 make test-docker  # docker-backed unit tests
 ```
 CI runs four tiers (tier1-smoke, tier2-functional, baseline-runtime, tier3-hardening);
-tier2 is the unit gate. Test markers: `unit`, `docker`, `slow` (`pytest.ini`).
+tier2 is the unit gate. The gate is **opt-out** (v0.64.2): unmarked tests run by
+default; mark `docker` or `slow` to exclude (`unit` is legacy/optional). Markers
+in `pytest.ini`.
 The `tests/conftest.py` auto-adds the code root to `sys.path`.
 
 ## Release flow
