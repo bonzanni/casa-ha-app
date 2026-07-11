@@ -26,10 +26,34 @@ class HindsightSemanticMemory(SemanticMemory):
         self._base = base_url.rstrip("/")
         self._timeout = aiohttp.ClientTimeout(total=timeout_s)
         # Lazily created inside a running event loop (tests construct this
-        # object synchronously). Reused across calls so the per-message memory
-        # round-trips share one keep-alive connection pool (L32) instead of
-        # opening + tearing down a fresh TCP connection every call.
+        # object synchronously). One ClientSession is reused across calls, but
+        # its connector uses ``force_close`` (see _new_session) so no TCP
+        # connection is pooled between calls.
         self._session: aiohttp.ClientSession | None = None
+
+    def _new_session(self) -> aiohttp.ClientSession:
+        # D-3 (2026-07-11): the client previously pooled keep-alive
+        # connections. Memory round-trips are sparse and bursty (1-2 per turn,
+        # turns minutes+ apart), so a pooled connection was almost always idle
+        # past Hindsight's keep-alive window; the FIRST round-trip of a turn
+        # (the recall) then reused a half-closed socket and raised
+        # ServerDisconnectedError on ``await protocol.read()``, silently
+        # degrading memory for hours while the same-turn retain (fresh
+        # connection) still succeeded. ``force_close`` opens one fresh
+        # connection per call — correct for this traffic shape, and the
+        # keep-alive it dropped was never actually reused between turns anyway.
+        return aiohttp.ClientSession(
+            timeout=self._timeout,
+            connector=aiohttp.TCPConnector(force_close=True),
+        )
+
+    async def _roundtrip(
+        self, method: str, url: str, payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        assert self._session is not None  # set by _request before calling
+        async with self._session.request(method, url, json=payload) as resp:
+            resp.raise_for_status()
+            return await resp.json()
 
     async def _request(
         self, method: str, path: str, payload: dict[str, Any] | None = None,
@@ -38,10 +62,18 @@ class HindsightSemanticMemory(SemanticMemory):
         (callers degrade to '' / log per the existing memory-call rule)."""
         url = f"{self._base}{path}"
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=self._timeout)
-        async with self._session.request(method, url, json=payload) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+            self._session = self._new_session()
+        try:
+            return await self._roundtrip(method, url, payload)
+        except aiohttp.ClientConnectionError:
+            # Belt to force_close's root-cause fix: a genuine mid-call drop
+            # (ServerDisconnectedError / ClientOSError, both subclasses) means
+            # no response was received, so aiohttp has discarded the dead
+            # transport and a single retry gets a fresh connection. Scoped to
+            # connection errors ONLY: an HTTP 4xx/5xx (ClientResponseError, not
+            # a ClientConnectionError) means the request WAS received, so a
+            # retained write may have landed — retrying it could double-write.
+            return await self._roundtrip(method, url, payload)
 
     async def close(self) -> None:
         """Close the shared client session (called on shutdown so aiohttp

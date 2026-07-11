@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.67.2] - 2026-07-11 — long-term memory recall stops dropping connections
+
+### Fixed
+
+- Memory recall no longer fails after an idle gap. The Hindsight client pooled
+  keep-alive connections, but memory traffic is sparse (roughly one or two
+  calls per turn, turns minutes apart), so a pooled connection was almost
+  always idle past the server's keep-alive window; the first recall of a turn
+  reused a half-closed socket and failed, silently degrading recall while the
+  same-turn memory write still succeeded. The client now opens a fresh
+  connection per call and retries once on a dropped connection. No
+  user-facing behavior change beyond memory recall actually working.
+
 ## [0.67.1] - 2026-07-11 — reload now reaches delegations
 
 ### Fixed

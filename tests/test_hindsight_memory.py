@@ -147,3 +147,101 @@ async def test_request_reuses_one_client_session(monkeypatch) -> None:
     await mem._request("GET", "/v1/default/banks/casa-assistant/mental-models")
     assert len(created) == 2, "a closed session must be lazily replaced, not reused"
     await mem.close()
+
+# --- D-3 (2026-07-11): stale keep-alive connection resilience --------------
+# Recall is the FIRST memory round-trip of a turn, after a long idle gap
+# (hourly heartbeats, sparse messages). The reused pooled connection was
+# reliably idle past Hindsight's keep-alive window, so recall reused a
+# half-closed socket and raised ServerDisconnectedError on `await
+# protocol.read()` — silently degrading memory for hours while the later
+# same-turn retain (fresh connection) succeeded.
+
+
+class _SeqResp:
+    """One request outcome: raise ``exc`` on enter, else return status/body."""
+
+    def __init__(self, *, exc=None, raise_for_status_exc=None, body=None):
+        self._exc = exc
+        self._rfs_exc = raise_for_status_exc
+        self._body = body if body is not None else {}
+
+    def raise_for_status(self):
+        if self._rfs_exc is not None:
+            raise self._rfs_exc
+
+    async def json(self):
+        return self._body
+
+    async def __aenter__(self):
+        if self._exc is not None:
+            raise self._exc
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _SeqSession:
+    """ClientSession stub replaying a fixed sequence of request outcomes."""
+
+    def __init__(self, outcomes):
+        self._outcomes = list(outcomes)
+        self.calls = 0
+        self.closed = False
+
+    def request(self, *a, **kw):
+        out = self._outcomes[self.calls]
+        self.calls += 1
+        return out
+
+    async def close(self):
+        self.closed = True
+
+
+async def test_request_retries_once_on_server_disconnect() -> None:
+    import aiohttp
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._session = _SeqSession([
+        _SeqResp(exc=aiohttp.ServerDisconnectedError()),
+        _SeqResp(body={"ok": 1}),
+    ])
+    out = await mem._request("POST", "/p", {"q": "x"})
+    assert out == {"ok": 1}
+    assert mem._session.calls == 2, "must retry a dropped connection once"
+
+
+async def test_request_gives_up_after_one_retry() -> None:
+    import aiohttp
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._session = _SeqSession([
+        _SeqResp(exc=aiohttp.ServerDisconnectedError()),
+        _SeqResp(exc=aiohttp.ServerDisconnectedError()),
+    ])
+    with pytest.raises(aiohttp.ServerDisconnectedError):
+        await mem._request("POST", "/p", {"q": "x"})
+    assert mem._session.calls == 2, "exactly one retry, not an unbounded loop"
+
+
+async def test_request_does_not_retry_http_error() -> None:
+    """A 5xx means the request WAS received (a retained write may have
+    landed) — retrying could double-write. Only connection-level drops retry."""
+    import aiohttp
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    http_err = aiohttp.ClientResponseError(
+        request_info=None, history=(), status=500,
+    )
+    mem._session = _SeqSession([_SeqResp(raise_for_status_exc=http_err)])
+    with pytest.raises(aiohttp.ClientResponseError):
+        await mem._request("POST", "/p", {"q": "x"})
+    assert mem._session.calls == 1, "HTTP errors must not be retried"
+
+
+async def test_session_uses_force_close_connector() -> None:
+    """Root cause: never reuse a keep-alive connection for this sparse,
+    bursty traffic — a pooled connection is almost always idle-expired."""
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    session = mem._new_session()
+    try:
+        assert session.connector.force_close is True
+    finally:
+        await session.close()
