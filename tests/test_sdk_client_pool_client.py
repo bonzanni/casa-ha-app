@@ -63,11 +63,13 @@ def _mk_assistant(text: str) -> _SDKAssistantMessage:
         return m
 
 
-def _mk_result(sid: str, usage: dict[str, int] | None = None) -> _SDKResultMessage:
+def _mk_result(sid, usage=None, *, is_error=False, result=""):
     m = _SDKResultMessage.__new__(_SDKResultMessage)
-    m.session_id = sid  # type: ignore[attr-defined]
+    m.session_id = sid
+    m.is_error = is_error
+    m.result = result
     if usage is not None:
-        m.usage = usage  # type: ignore[attr-defined]
+        m.usage = usage
     return m
 
 
@@ -198,3 +200,128 @@ async def test_aclose_idempotent_and_disconnects():
     await c.aclose()
     assert inner.disconnected
     assert c.state == "closed"
+
+
+async def test_turn_exception_invalidates():
+    c = _client()
+    await c.open()
+
+    class Boom(Exception): pass
+
+    async def bad_query(prompt, session_id="default"):
+        raise Boom("subprocess died")
+    c._client.query = bad_query
+    async def on_message(m): pass
+    with pytest.raises(Boom):
+        async with c.lock:
+            await c.run_turn_locked("t", origin={}, cid="c", on_message=on_message)
+    assert c.state == "invalid"
+    assert c._client is None
+
+
+async def test_error_result_retryable_raises_sdkturnerror_and_invalidates():
+    c = _client()
+    await c.open()
+    c._client.script = [[_mk_result("sid-e", is_error=True,
+                                    result="API Error: 529 overloaded_error")]]
+    async def on_message(m): pass
+    from sdk_client_pool import SdkTurnError
+    with pytest.raises(SdkTurnError):
+        async with c.lock:
+            await c.run_turn_locked("t", origin={}, cid="c", on_message=on_message)
+    assert c.state in ("invalid", "closed")
+
+
+async def test_error_result_nonretryable_returns_but_invalidates():
+    c = _client()
+    await c.open()
+    c._client.script = [[_mk_assistant("partial"),
+                         _mk_result("sid-e", is_error=True,
+                                    result="invalid_request: bad tool schema")]]
+    async def on_message(m): pass
+    async with c.lock:
+        sid = await c.run_turn_locked("t", origin={}, cid="c",
+                                      on_message=on_message)
+    assert sid == "sid-e"
+    assert c.state == "invalid"        # never warm after is_error (AR-5)
+
+
+async def test_cancel_interrupts_drains_and_stays_warm():
+    """AR-1: the aborted turn's buffered tail (incl. its ResultMessage) is
+    consumed during cleanup, so the NEXT turn cannot go off-by-one."""
+    c = _client()
+    await c.open()
+    hang = asyncio.Event()
+
+    async def hanging_query(prompt, session_id="default"):
+        c._client._buffer.extend([_mk_assistant("partial")])
+        hang.set()
+
+    real_receive = c._client.receive_response
+
+    async def slow_receive():
+        async for m in real_receive():
+            yield m
+        await asyncio.sleep(30)         # never yields Result: simulates mid-turn
+
+    c._client.query = hanging_query
+    c._client.receive_response = slow_receive
+
+    async def interrupt():
+        c._client.interrupts += 1
+        # CLI aborts: the stale result lands in the buffer
+        c._client._buffer.append(_mk_result("sid-x"))
+        c._client.receive_response = real_receive   # drain reads the real buffer
+
+    c._client.interrupt = interrupt
+    async def on_message(m): pass
+
+    async def turn():
+        async with c.lock:
+            await c.run_turn_locked("long", origin={}, cid="c",
+                                    on_message=on_message)
+
+    t = asyncio.create_task(turn())
+    await hang.wait()
+    await asyncio.sleep(0.05)
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    assert c._client.interrupts == 1
+    assert c.state == "warm"
+    assert c._client._buffer == []      # drained through the stale Result
+    assert c.sid == "sid-x"
+
+
+async def test_cancel_with_failing_interrupt_invalidates():
+    c = _client()
+    await c.open()
+    started = asyncio.Event()
+
+    async def hanging_query(prompt, session_id="default"):
+        started.set()
+
+    async def slow_receive():
+        await asyncio.sleep(30)
+        yield  # pragma: no cover
+
+    async def bad_interrupt():
+        raise RuntimeError("transport gone")
+
+    c._client.query = hanging_query
+    c._client.receive_response = slow_receive
+    c._client.interrupt = bad_interrupt
+    async def on_message(m): pass
+
+    async def turn():
+        async with c.lock:
+            await c.run_turn_locked("long", origin={}, cid="c",
+                                    on_message=on_message)
+
+    t = asyncio.create_task(turn())
+    await started.wait()
+    await asyncio.sleep(0.05)
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    assert c.state == "invalid"
