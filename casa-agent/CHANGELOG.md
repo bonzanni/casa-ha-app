@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.68.0] - 2026-07-12 — installed plugins are usable by construction
+
+### Fixed
+
+- Installing a plugin now actually makes it usable: each agent's allowed
+  tools include a server-level grant for every plugin enabled on that agent,
+  derived at session build from installed state. Previously the first tool
+  call of a freshly installed plugin hit an unanswerable permission prompt.
+  Uninstalling a plugin revokes its grant automatically.
+
+### Changed
+
+- Agents without an interactive permission channel (residents and
+  specialists) now fail closed: a tool call that is not allowed is denied
+  immediately with a clear log message instead of hanging on a permission
+  prompt nothing can answer. Executor engagements keep their Telegram
+  approval flow.
+
 ## [0.67.2] - 2026-07-11 — long-term memory recall stops dropping connections
 
 ### Fixed

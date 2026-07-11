@@ -197,3 +197,23 @@ def test_verify_dangling_symlink_is_missing(plugin_layout, monkeypatch) -> None:
     )
     assert result["ready"] is False
     assert any(t["status"] == "missing" for t in result["tools"])
+
+
+def test_verify_reports_granted_tools_from_cache_override(plugin_layout) -> None:
+    """P-5a follow-up: the _cache_root test override must thread into the
+    granted_tools derivation. A cached plugin with one MCP server reports its
+    server-level grant — not [] (which the plugin_grants default root would
+    silently yield in a sandbox without /config)."""
+    from tools import _tool_verify_plugin_state
+
+    plugin_layout["mcp_json"].write_text(json.dumps({
+        "mcpServers": {"s": {"command": "x"}}
+    }))
+
+    result = _tool_verify_plugin_state(
+        plugin_name="face-rec",
+        _tools_bin=plugin_layout["tools_bin"],
+        _cache_root=plugin_layout["cache_root"],
+    )
+    assert result["mcp_started"] is True
+    assert result["granted_tools"] == ["mcp__plugin_face-rec_s"]

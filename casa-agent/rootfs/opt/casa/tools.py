@@ -32,6 +32,9 @@ from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — availa
 from system_requirements.orchestrator import install_requirements, OrchestrationError
 from system_requirements.manifest import add_plugin_entry as add_manifest
 from plugins_binding import build_sdk_plugins
+from plugin_grants import (
+    derived_plugin_grants, grants_for_plugin, make_fail_closed_can_use_tool,
+)
 from delegated_memory import delegated_recall, retain_delegated
 
 from claude_agent_sdk import (
@@ -305,9 +308,18 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
         seed="/opt/claude-seed",
     )
 
+    agent_home = (cfg.cwd
+                  or f"/config/agent-home/{getattr(cfg, 'role', 'unknown')}")
+
     allowed_tools = list(cfg.tools.allowed)
     if "Skill" not in allowed_tools:
         allowed_tools.append("Skill")
+    # P-5a: installed ⇒ granted, by construction. Server-level grants derived
+    # from the agent-home's enabledPlugins; disallowed_tools still wins at the
+    # CC layer (explicit-deny escape hatch).
+    for grant in derived_plugin_grants(agent_home):
+        if grant not in allowed_tools:
+            allowed_tools.append(grant)
 
     return ClaudeAgentOptions(
         model=cfg.model,
@@ -318,11 +330,14 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
         max_turns=cfg.tools.max_turns,
         mcp_servers=mcp_servers if mcp_servers else {},
         hooks=resolved_hooks,
-        cwd=(cfg.cwd
-             or f"/config/agent-home/{getattr(cfg, 'role', 'unknown')}"),
+        cwd=agent_home,
         resume=None,
         setting_sources=["project"],
         plugins=sdk_plugins,
+        # P-5b: no relay exists on this path — deny ungranted tools fast
+        # instead of hanging on an unanswerable CC prompt.
+        can_use_tool=make_fail_closed_can_use_tool(
+            getattr(cfg, "role", "unknown")),
     )
 
 
@@ -2683,6 +2698,9 @@ def _tool_install_casa_plugin(
         "installed_on": installed,
         "required_env_vars": sorted(env_vars),
         "system_requirements_installed": len(outcomes),
+        # P-5a observability: grants now derive from installed state at every
+        # options build; report them so configurator/verify can confirm.
+        "granted_tools": grants_for_plugin(plugin_name, "casa-plugins"),
     }
 
 
@@ -2893,6 +2911,14 @@ def _tool_verify_plugin_state(
         "tools": tools_status,
         "secrets": secrets_status,
         "mcp_started": mcp_started,
+        # cache_root is the marketplace-level dir (<cache root>/casa-plugins);
+        # decompose it so the grant derivation reads the exact tree globbed
+        # above — threading the _cache_root test override. Production is
+        # unchanged: parent=/config/cc-home/.claude/plugins/cache (the
+        # plugin_grants default), name=casa-plugins.
+        "granted_tools": grants_for_plugin(
+            plugin_name, cache_root.name, cache_root=cache_root.parent,
+        ),
         "mcp_errors": mcp_errors,
         "ready": ready,
     }
