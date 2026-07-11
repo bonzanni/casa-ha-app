@@ -178,8 +178,13 @@ class PermissionResultDeny:
     this at module scope and uses it in the fail_closed can_use_tool callback
     to deny tools not in allowed_tools (residents/specialists have no way to
     answer an interactive prompt). The mock accepts and ignores the return
-    value; permission decisions in the offline mock are pre-made by ClaudeAgentOptions."""
+    value; permission decisions in the offline mock are pre-made by
+    ClaudeAgentOptions. Field order and defaults mirror the real SDK:
+    PermissionResultDeny(behavior: Literal['deny']='deny', message: str='',
+    interrupt: bool=False) — behavior is the discriminant (plain str here;
+    the mock avoids importing Literal)."""
 
+    behavior: str = "deny"
     message: str = ""
     interrupt: bool = False
 
