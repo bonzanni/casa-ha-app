@@ -29,6 +29,18 @@ default; mark `docker` or `slow` to exclude (`unit` is legacy/optional). Markers
 in `pytest.ini`.
 The `tests/conftest.py` auto-adds the code root to `sys.path`.
 
+> **⚠️ Memory cage for pytest (2026-07-11, leak FIXED in v0.66.0 — cap stays):**
+> a ~23 GB pytest blow-up OOM-killed the entire WSL VM twice. Root cause:
+> `patch("retry.asyncio.sleep", …)` patches the **global** `asyncio.sleep`, which
+> made the SDK-pool sweeper's `while True: await asyncio.sleep(...)` spin at CPU
+> speed under an AsyncMock (unbounded `call_args_list`). Fixed by scoping those
+> patches to retry's module-local `asyncio` (see `patch_retry_sleep` in
+> `tests/test_agent_process.py`). Two standing rules: (1) **never patch
+> `<module>.asyncio.sleep`** — it is the shared module attribute, not a local;
+> (2) keep running pytest under the hard cap as belt-and-suspenders, since a cap
+> kills only the runaway pytest, not the VM:
+> `systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=2G venv_test/bin/pytest …`
+
 ## Release flow
 1. Branch `feat/vX.Y.Z-<desc>` off `master`.
 2. Bump `version:` in `casa-agent/config.yaml` and prepend a `casa-agent/CHANGELOG.md` entry.
