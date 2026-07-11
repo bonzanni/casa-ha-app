@@ -193,6 +193,10 @@ async def reset_channel(
     directory are derived from the registry entry (the caller — e.g. the Telegram
     channel — does not need to know them). If there is no entry there is nothing
     to save; just return (the caller still acks)."""
+    # AR-4 (pooling spec): close any warm SDK client for this key FIRST —
+    # disconnect sends stdin EOF, which is what makes the CLI flush the
+    # transcript .jsonl this save is about to read (SDK #625).
+    await registry.notify_reset(channel_key)
     entry = registry.get(channel_key)
     if entry is None:
         return
