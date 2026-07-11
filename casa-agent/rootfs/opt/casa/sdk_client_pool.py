@@ -104,7 +104,10 @@ class ManagedSdkClient:
         try:
             await task
         except BaseException:
-            self.state = "invalid"
+            # Finding 3 (final-review): don't leave self._client set with no
+            # disconnect on a failed connect — best-effort disconnect + null
+            # it via the same path a mid-turn failure uses.
+            await self._invalidate()
             raise
         self.state = "warm"
 
@@ -275,7 +278,9 @@ class SdkClientPool:
 
     async def turn(self, *, channel_key: str, channel: str, prompt: str,
                    origin: dict, cid: str, build_options, on_stale_old,
-                   on_message) -> PoolTurnResult:
+                   on_message,
+                   on_decision: Callable[[str | None, bool], None] | None = None,
+                   ) -> PoolTurnResult:
         self._ensure_sweeper()
         for _attempt in (1, 2):                      # AR-7: one silent retry
             if self._closing:
@@ -300,6 +305,14 @@ class SdkClientPool:
                     if decision == "resume" and reg_entry else None
                 )
                 is_fresh = resume_sid is None
+                # Finding 2 (final-review): record the decision even when the
+                # turn is a warm reuse (which skips build_options / _build
+                # below) — otherwise a caller-side "last resume sid" tracker
+                # fed only from build_options misses warm-reuse turns, and a
+                # non-retryable failure on one can't tell the stale-resume
+                # fallback which sid was in play.
+                if on_decision is not None:
+                    on_decision(resume_sid, is_fresh)
                 reusable = (
                     entry.state == "warm"
                     and not is_fresh
@@ -314,6 +327,12 @@ class SdkClientPool:
                         if stale:
                             on_stale_old(stale)
                     options = await build_options(is_fresh, resume_sid)
+                    # Finding 4 (final-review): one INFO per cold connect;
+                    # warm reuse stays silent (hot path).
+                    logger.info(
+                        "pool cold connect key=%s resume=%s",
+                        channel_key, bool(resume_sid),
+                    )
                     fresh_client = ManagedSdkClient(
                         options,
                         origin_ctxvar=self._origin_ctxvar,
@@ -473,6 +492,10 @@ class SdkClientPool:
         for key, e in doomed:
             logger.info("pool sweep: closing %s (idle/max-age)", key)
             await self._evict(key, e)
+        if doomed:
+            # Finding 4 (final-review): post-sweep depth, so an operator can
+            # see the pool actually shrank without instrumenting further.
+            logger.info("pool depth=%d", len(self._entries))
 
     async def _run_sweeper(self, interval: float = 60.0) -> None:
         try:

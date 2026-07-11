@@ -222,6 +222,78 @@ async def test_options_fresh_vs_resumed_memory_blocks(agent_fixture,
     assert scripted_factory.constructed == 1  # no second options build
 
 
+async def test_warm_reuse_process_error_clears_sid_and_retries_fresh(
+    agent_fixture, monkeypatch,
+):
+    """Finding 2 (final-review): a warm-reuse turn that dies with a
+    non-retryable ProcessError must still hit the stale-resume fallback
+    (clear sid + retry fresh) instead of surfacing raw to the user — even
+    though the pool's ``_build`` callback (agent.py's only pre-fix source
+    of ``last_resume["sid"]``) is skipped on warm reuse.
+
+    ``FlakyClient`` raises on its SECOND ``query()`` call — i.e. turn 1 on a
+    freshly-connected client succeeds and warms the entry; turn 2, a warm
+    REUSE of that same client instance, is the one that blows up.
+    """
+    from claude_agent_sdk import ProcessError
+
+    class FlakyClient(ScriptedClient):
+        def __init__(self, options, sid: str) -> None:
+            super().__init__(options, sid=sid)
+            self.query_count = 0
+
+        async def query(self, prompt, session_id="default"):
+            self.query_count += 1
+            if self.query_count == 2:
+                # Non-retryable: exit code 1, message matches no retryable
+                # pattern (not rate/timeout/overloaded; type name carries
+                # none of CLI/SDK/Connection) -> classified UNKNOWN.
+                raise ProcessError("boom", exit_code=1)
+            await super().query(prompt, session_id=session_id)
+
+    class FlakyFactory:
+        def __init__(self) -> None:
+            self.constructed = 0
+            self.clients: list[FlakyClient] = []
+
+        def __call__(self, options) -> FlakyClient:
+            self.constructed += 1
+            c = FlakyClient(options, sid=f"sid-attempt-{self.constructed}")
+            self.clients.append(c)
+            return c
+
+    factory = FlakyFactory()
+    monkeypatch.setattr("sdk_client_pool._default_make_client", factory)
+
+    agent, send_turn = agent_fixture
+
+    reply1 = await send_turn("hello")
+    assert reply1 is not None and reply1.content.endswith("hello")
+    channel_key = "telegram-42"
+    assert agent._session_registry.get(channel_key)["sdk_session_id"] == (
+        "sid-attempt-1"
+    )
+    assert factory.constructed == 1
+
+    # Turn 2: warm reuse of the SAME client -> its 2nd query() raises the
+    # non-retryable ProcessError. Pre-fix, last_resume["sid"] was None here
+    # (only _build, which warm reuse skips, ever set it) so the fallback's
+    # `if last_resume["sid"] is None: raise` re-raised straight to the
+    # caller. Post-fix, on_decision recorded "sid-attempt-1" under the entry
+    # lock regardless of reuse, so the fallback clears it and retries fresh.
+    reply2 = await send_turn("again")
+    # did NOT surface the ProcessError to the caller:
+    assert reply2 is not None and reply2.content.endswith("again")
+
+    # The retry-fresh reconnect constructed a brand-new client and the
+    # registry now holds ITS sid — proof the stale one was actually cleared
+    # and replaced, not just silently kept.
+    assert factory.constructed == 2
+    assert agent._session_registry.get(channel_key)["sdk_session_id"] == (
+        "sid-attempt-2"
+    )
+
+
 async def test_aclose_closes_pool_and_unsubscribes(agent_fixture,
                                                    scripted_factory):
     agent, send_turn = agent_fixture

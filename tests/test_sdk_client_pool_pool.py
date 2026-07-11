@@ -160,6 +160,42 @@ async def test_warm_reuse_skips_connect_and_build_options():
     assert builds == [(False, "sid-0")]     # only the cold connect built options
 
 
+async def test_on_decision_fires_on_cold_connect_and_warm_reuse():
+    """Finding 2 (final-review): on_decision(resume_sid, is_fresh) must fire
+    for EVERY turn, under the entry lock, right after the decision is
+    derived — including a warm-reuse turn that skips build_options
+    entirely. Without this, a caller tracking "last resume sid" only from
+    build_options loses visibility into warm-reuse turns."""
+    reg = FakeRegistry()
+    reg.data["voice-s1"] = {"sdk_session_id": "sid-0", "last_active": "x"}
+    pool = _mk_pool(reg)
+    made = []
+    pool._make_client = lambda opts: made.append(ScriptedClient(opts)) or made[-1]
+    async def build_options(is_fresh, resume_sid): return {}
+    async def on_message(m): pass
+    decisions = []
+    def on_decision(resume_sid, is_fresh):
+        decisions.append((resume_sid, is_fresh))
+    async def go():
+        return await pool.turn(channel_key="voice-s1", channel="voice",
+                               prompt="hi", origin={}, cid="c",
+                               build_options=build_options,
+                               on_stale_old=lambda s: None,
+                               on_message=on_message,
+                               on_decision=on_decision)
+    # Turn 1 — cold connect (resume sid-0 from the registry).
+    t = asyncio.create_task(go()); await asyncio.sleep(0.01)
+    made[0].script = [[_mk_result("sid-0")]]
+    await t
+    assert decisions == [("sid-0", False)]
+    # Turn 2 — warm reuse: same client, no new construction, but on_decision
+    # must still fire with the same resume sid.
+    made[0].script = [[_mk_result("sid-0")]]
+    await go()
+    assert len(made) == 1                       # confirms this WAS a warm reuse
+    assert decisions == [("sid-0", False), ("sid-0", False)]
+
+
 async def test_decision_new_closes_old_awaits_disconnect_then_stale_cb():
     """AR-3 + AR-4 ordering: old entry fully disconnected BEFORE
     on_stale_old fires (cold-retain reads the flushed transcript)."""

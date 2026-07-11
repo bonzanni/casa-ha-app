@@ -72,6 +72,21 @@ def test_run_script_exports_telegram_bot_api_base_null_normalized():
     )
 
 
+def test_run_script_exports_sdk_client_pool():
+    """Finding 1 (v0.66.0 final-review): sdk_client_pool must be an
+    operator-reachable add-on option, not just an env var — the deploy
+    plan's rollback step depends on flipping it via add-on options. Guard:
+    svc-casa/run must read the option and export SDK_CLIENT_POOL so
+    sdk_client_pool.pool_enabled() sees it."""
+    script = _read_run_script()
+    assert "bashio::config 'sdk_client_pool'" in script, (
+        "svc-casa/run must read the sdk_client_pool add-on option"
+    )
+    assert 'export SDK_CLIENT_POOL="$(bashio::config \'sdk_client_pool\')"' in script, (
+        "Missing `export SDK_CLIENT_POOL=...` in svc-casa/run"
+    )
+
+
 def test_run_script_gates_webhook_secret_on_auth_enabled():
     """webhook_auth_enabled=false must actually disable webhook auth, even
     when webhook_secret still holds a configured value. Prior to the fix,

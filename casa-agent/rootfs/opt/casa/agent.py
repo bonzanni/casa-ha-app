@@ -516,12 +516,12 @@ class Agent:
                 on_message, state = self._make_on_message(on_token)
 
                 async def _build(is_fresh, resume_sid):
-                    # Recorded HERE (not just on success) so a ProcessError
-                    # raised at connect — the resume-failure class — still
-                    # tells the fallback below which sid was in play. A warm
-                    # reuse skips _build; if a warm turn dies, the retry's
-                    # reconnect calls _build and the fallback fires one attempt
-                    # later — same net behaviour as today.
+                    # Recorded HERE too (not just via on_decision below) so a
+                    # ProcessError raised at connect — the resume-failure
+                    # class — still tells the fallback below which sid was in
+                    # play. Harmless double-set: on_decision already recorded
+                    # the same resume_sid a moment earlier, under the entry
+                    # lock, before this cold-connect branch even runs.
                     last_resume["sid"] = resume_sid
                     return await self._build_options(
                         channel=msg.channel, channel_key=channel_key,
@@ -537,6 +537,14 @@ class Agent:
                         old_sid, agent_home, user_peer, msg.channel,
                     ),
                     on_message=on_message,
+                    # Finding 2 (final-review): fires for EVERY turn (warm
+                    # reuse included), unlike _build above which the pool
+                    # skips on warm reuse — so a non-retryable failure on a
+                    # warm-reuse turn still leaves last_resume["sid"]
+                    # populated for the ProcessError fallback below.
+                    on_decision=lambda resume_sid, is_fresh: (
+                        last_resume.__setitem__("sid", resume_sid)
+                    ),
                 )
                 last_resume["sid"] = result.resume_sid
                 return (

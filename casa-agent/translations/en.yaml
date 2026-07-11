@@ -69,6 +69,12 @@ configuration:
     name: Enable Web Terminal
     description: >-
       Expose a web terminal in the ingress panel for shell access to the container.
+  sdk_client_pool:
+    name: Reuse Warm SDK Clients
+    description: >-
+      Reuse a warm Claude SDK client across resident turns instead of
+      reconnecting every turn (faster replies). Disable only to fall back to
+      per-turn sessions when diagnosing issues.
   telegram_engagement_supergroup_id:
     name: "Telegram engagement supergroup chat ID"
     description: |

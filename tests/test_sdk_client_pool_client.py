@@ -127,6 +127,33 @@ async def test_open_binds_holder_and_connects():
     assert str(c.cid_box) == "-"
 
 
+async def test_open_connect_failure_invalidates_and_disconnects():
+    """Finding 3 (final-review): a failed connect() must not leave
+    self._client set with no disconnect — open() should best-effort
+    disconnect + null the client via the same _invalidate() path a
+    mid-turn failure uses, keeping state == 'invalid'."""
+    made: list[ScriptedClient] = []
+
+    class FailingConnectClient(ScriptedClient):
+        def __init__(self, options):
+            super().__init__(options)
+            made.append(self)
+
+        async def connect(self):
+            raise RuntimeError("connect failed")
+
+    from sdk_client_pool import ManagedSdkClient
+    c = ManagedSdkClient(
+        object(), origin_ctxvar=test_origin, cid_ctxvar=test_cid,
+        engagement_ctxvar=test_engagement, make_client=FailingConnectClient,
+    )
+    with pytest.raises(RuntimeError):
+        await c.open()
+    assert c.state == "invalid"
+    assert c._client is None
+    assert made[0].disconnected
+
+
 async def test_open_refuses_inside_engagement():
     tok = test_engagement.set(object())
     try:
