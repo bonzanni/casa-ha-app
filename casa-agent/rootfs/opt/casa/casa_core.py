@@ -2037,6 +2037,17 @@ async def main() -> None:
     await session_sweeper.stop()
     await freshness_reaper.stop()
 
+    # AR-9: close every resident/specialist Agent's SDK client pool so no
+    # warm subprocess outlives container shutdown. Bounded per-agent so one
+    # hung drain can't block the rest of the shutdown sequence.
+    for _role, _agent in list(getattr(runtime, "agents", {}).items()):
+        aclose = getattr(_agent, "aclose", None)
+        if aclose is not None:
+            try:
+                await asyncio.wait_for(aclose(), timeout=15)
+            except Exception:  # noqa: BLE001 — shutdown must complete
+                logger.warning("agent %s aclose failed/timed out", _role)
+
     # H10 (v0.49.0): include consumers spawned after boot by reload
     # (bus.start_agent_loop) — the local loop_tasks list only has the
     # boot-time ones. cancel() is idempotent for already-evicted tasks.

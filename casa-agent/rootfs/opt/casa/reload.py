@@ -17,6 +17,7 @@ other scopes via the ``_GLOBAL_LOCK`` mechanism.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from typing import Any, Awaitable, Callable
@@ -280,6 +281,42 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
 register_handler("triggers", reload_triggers)
 
 
+# Background agent-pool-close tasks (F12). Held here so they aren't
+# garbage-collected mid-flight (a bare fire-and-forget create_task with no
+# other reference can be swept by the GC before it completes).
+_AGENT_CLOSE_TASKS: set[asyncio.Task] = set()
+
+
+def _schedule_agent_close(old_agent) -> None:
+    """Background-drain a replaced/evicted Agent's SDK client pool (F12).
+
+    Background is load-bearing: casa_reload runs as a casa-framework tool
+    INSIDE a warm client's turn — a synchronous drain would deadlock on
+    that turn's own entry lock. The drain task waits for in-flight turns
+    (bounded by the pool's drain timeout) then disconnects.
+
+    Tolerates non-Agent stand-ins used throughout the reload test suite:
+    objects with no ``aclose`` at all (``getattr`` default), and bare
+    ``MagicMock()`` placeholders whose auto-generated ``aclose()`` returns
+    a Mock rather than a coroutine (``inspect.isawaitable`` guard) — a real
+    ``Agent.aclose`` is always awaitable, so this only ever short-circuits
+    test doubles, never production instances.
+    """
+    aclose = getattr(old_agent, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        coro = aclose()
+    except Exception:  # noqa: BLE001 — best-effort teardown, never block reload
+        logger.warning("agent aclose() raised while scheduling close", exc_info=True)
+        return
+    if not inspect.isawaitable(coro):
+        return
+    task = asyncio.create_task(coro, name="agent-pool-close")
+    _AGENT_CLOSE_TASKS.add(task)
+    task.add_done_callback(_AGENT_CLOSE_TASKS.discard)
+
+
 def _construct_agent(*, cfg, runtime):
     """Factory wrapper so tests can monkeypatch construction.
 
@@ -426,6 +463,7 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     actions.append("construct_agent")
 
     # --- ATOMIC SWAP WINDOW ---
+    old_agent = runtime.agents.get(role)  # AR-7: capture before overwrite
     if tier == "resident":
         runtime.role_configs[role] = new_cfg
     else:
@@ -442,6 +480,10 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     # idempotent no-op for roles that already have one.
     _start_bus_loop(runtime, role)
     actions.append("reregister_bus")
+
+    # F12: drain/close the replaced Agent's SDK client pool in the
+    # background so no warm subprocess outlives this swap.
+    _schedule_agent_close(old_agent)
 
     # Rebuild agent_registry from current state.
     from agent_registry import AgentRegistry
@@ -505,11 +547,15 @@ async def _reload_role_after_policies(runtime: Any, role: str) -> None:
     new_agent = await asyncio.to_thread(
         _construct_agent, cfg=new_cfg, runtime=runtime,
     )
+    old_agent = runtime.agents.get(role)  # AR-7: capture before overwrite
     if tier == "resident":
         runtime.role_configs[role] = new_cfg
     runtime.agents[role] = new_agent
     runtime.bus.register(role, new_agent.handle_message)
     _start_bus_loop(runtime, role)
+    # F12: drain/close the replaced Agent's SDK client pool in the
+    # background so no warm subprocess outlives this swap.
+    _schedule_agent_close(old_agent)
 
 
 async def reload_policies(runtime: Any, *, role: str | None = None) -> list[str]:
@@ -675,7 +721,8 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
     # path's register + start.
     for r in known_residents - on_disk_residents:
         runtime.role_configs.pop(r, None)
-        runtime.agents.pop(r, None)
+        old_agent = runtime.agents.pop(r, None)  # AR-7: capture before drop
+        _schedule_agent_close(old_agent)  # F12
         await _teardown_role(runtime, r)
         actions.append(f"evicted_{r}")
 
@@ -737,7 +784,8 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         # No-op — handled in resident block above.
         pass
     for s in set(runtime.agents.keys()) - on_disk_residents - on_disk_specialists:
-        runtime.agents.pop(s, None)
+        old_agent = runtime.agents.pop(s, None)  # AR-7: capture before drop
+        _schedule_agent_close(old_agent)  # F12
         await _teardown_role(runtime, s)
         actions.append(f"evicted_specialist_{s}")
 
