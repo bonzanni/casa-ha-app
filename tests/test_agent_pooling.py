@@ -311,12 +311,15 @@ def test_claude_agent_options_fields_all_classified():
         "model", "system_prompt", "allowed_tools", "disallowed_tools",
         "permission_mode", "max_turns", "mcp_servers", "hooks", "cwd",
         "resume", "setting_sources", "plugins", "stderr",
+        # voice partial-message streaming (2026-07-11 design §2 point 1):
+        # connect-time, derived from `channel` — True only for voice.
+        "include_partial_messages",
         # defaults Casa does not set — audited 2026-07-11 against SDK
         # 0.2.114 (spec §Q6): none is turn-variable in Casa's usage.
         "add_dirs", "agents", "betas", "can_use_tool", "cli_path",
         "continue_conversation", "debug_stderr", "effort",
         "enable_file_checkpointing", "env", "extra_args", "fallback_model",
-        "fork_session", "include_hook_events", "include_partial_messages",
+        "fork_session", "include_hook_events",
         "load_timeout_ms", "max_budget_usd", "max_buffer_size",
         "max_thinking_tokens", "output_format", "permission_prompt_tool_name",
         "sandbox", "session_id", "session_store", "session_store_flush",
