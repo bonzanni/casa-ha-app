@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.65.0] - 2026-07-11 — engagement-topic retention & cleanup
+
+Finished engagements used to park their Telegram forum topics in the
+engagement supergroup forever — closed, but cluttering the sidebar for
+good. Topics now expire the way engagement workspaces always have.
+
+### Added
+
+- **Automatic topic deletion after retention.** When an engagement ends,
+  its topic is recorded in a persistent ledger and deleted automatically
+  **7 days later** — the same retention window as the engagement's
+  workspace. The durable record of the engagement remains the memory
+  summary plus Ellen's completion notification. Both engagement drivers
+  are covered, including the resume-failure paths after a restart, whose
+  topics previously stayed open (and unrecorded) forever.
+- **`cleanup_engagement_topics` — on-demand purge, configurator-only.**
+  Deletes known finished topics immediately without waiting out
+  retention: `scope="due"` (exactly what the next sweep would delete) or
+  `scope="all_terminal"`, with a `dry_run` preview. It only ever deletes
+  topics recorded in the ledger — active and idle engagements are never
+  touched. Ask Ellen to "clean up the engagement group" and she delegates
+  to the configurator; the tool is deliberately not granted to Ellen
+  herself, because deletion is irreversible.
+
+### Changed
+
+- **One-time setup: grant the bot "Delete messages".** Deleting a forum
+  topic requires the `can_delete_messages` admin right in the engagement
+  supergroup (DOCS.md Setup now has the step). Until granted, Casa
+  degrades gracefully: finished topics are still closed and marked as
+  before, deletions are retried at the next sweep, and Casa asks you once
+  per boot to grant the right. Note that **deletion is irreversible**: it
+  removes the topic and all its messages for every member.
+- **Topics from before this release need one manual sweep.** The Telegram
+  Bot API cannot enumerate a group's topics, so engagements that finished
+  before v0.65.0 are unknown to Casa. Clear the old pile once by hand in
+  the Telegram UI; the ledger keeps the sidebar clean from then on.
+
 ## [0.64.2] - 2026-07-10 — CI gate flipped to opt-out: 776 more tests protected
 
 No runtime changes. Closes the systemic gap behind v0.64.1's stale tests.

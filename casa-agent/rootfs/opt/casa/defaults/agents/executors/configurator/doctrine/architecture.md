@@ -255,3 +255,20 @@ All password-typed addon options (`claude_oauth_token`,
 `secrets_resolver.resolve` (lru_cache, shells `op read`).
 `onepassword_service_account_token` is the single root of trust —
 plaintext only.
+
+## Engagement-topic cleanup (v0.65.0)
+
+You own engagement-topic cleanup. Finished engagements' Telegram topics
+are recorded in a framework-owned ledger (`/data/topic-ledger.json`) and
+deleted automatically 7 days after the engagement ends. On demand,
+`cleanup_engagement_topics(scope="due"|"all_terminal", dry_run=...)`
+purges them immediately: `due` deletes exactly what the next sweep
+would; `all_terminal` purges every ledger entry regardless of retention.
+The tool deletes **only ledger-known terminal topics** — never active or
+idle engagements (they are not in the ledger), never guessed topic ids.
+Deletion is **irreversible** (topic + all messages, for every member),
+so when the user asks for a big purge, run `dry_run: true` first and
+confirm the list — the `targets` field of the dry-run result names each
+topic that would go — before deleting for real. If deletion fails because the
+bot lacks the *Delete messages* admin right in the supergroup, entries
+are kept for retry — ask the user to grant the right.

@@ -70,7 +70,10 @@ REQUIRED_FRAMEWORK_TOOLS: dict[str, set[str]] = {
         "send_message", "get_schedule",
     },
     "butler": {"recall_memory"},          # serves the voice channel; no auto-recall path
-    "configurator": {"emit_completion", "config_git_commit"},
+    "configurator": {
+        "emit_completion", "config_git_commit",
+        "cleanup_engagement_topics",       # v0.65.0 topic retention: doctrine tells it to
+    },
     "plugin-developer": {"emit_completion"},
 }
 
@@ -128,6 +131,27 @@ def test_required_self_use_tools_present() -> None:
             if tool not in fw:
                 missing.append(f"{role}: MUST allow '{tool}' (required self-use) but does not")
     assert not missing, "missing required tools:\n  " + "\n  ".join(missing)
+
+
+def test_cleanup_engagement_topics_is_configurator_exclusive() -> None:
+    """Exclusivity pin (v0.65.0): cleanup_engagement_topics irreversibly
+    deletes Telegram topics and all their messages. The grant must never
+    spread beyond the configurator — in particular not to the assistant,
+    which is reachable through the webhook path whose read-clearance
+    currently fails open. A grant showing up anywhere else is a security
+    regression, not a convenience."""
+    granted = [
+        role
+        for role, _path, data in _agent_configs()
+        if any(
+            "cleanup_engagement_topics" in str(entry)
+            for entry in (data.get("tools") or {}).get("allowed") or []
+        )
+    ]
+    assert granted == ["configurator"], (
+        f"cleanup_engagement_topics must be granted to the configurator and "
+        f"NOBODY else; currently granted to: {granted}"
+    )
 
 
 def test_trigger_prompt_files_and_channels_resolve() -> None:

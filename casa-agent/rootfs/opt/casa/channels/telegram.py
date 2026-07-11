@@ -38,6 +38,8 @@ from channels.telegram_supervisor import ReconnectSupervisor
 from log_cid import cid_var, new_cid
 from rate_limit import RateLimiter
 
+import topic_ledger
+
 logger = logging.getLogger(__name__)
 
 # Telegram typing indicator lasts ~5 s; resend every 4 s to keep it alive.
@@ -786,6 +788,16 @@ class TelegramChannel(Channel):
                                 f"Could not resume this engagement: {exc}. "
                                 f"Start a fresh one if needed.",
                             )
+                            if fail_count >= 2:
+                                # [AR-1] (v0.65.0): this terminal path
+                                # bypasses finalize — title-mark, close +
+                                # ledger the topic here (best-effort,
+                                # never raises). After the notice: posting
+                                # into a just-closed topic works only
+                                # while the bot keeps can_manage_topics —
+                                # mirror the funnel's send-then-close
+                                # order.
+                                await self._cleanup_error_topic(rec)
                             return
                     elif not drv.is_alive(rec):
                         # No session to resume — orphan
@@ -796,6 +808,11 @@ class TelegramChannel(Channel):
                         await self.send_to_topic(
                             thread_id, "This engagement can't be resumed.",
                         )
+                        # [AR-1] (v0.65.0): this terminal path bypasses
+                        # finalize — title-mark, close + ledger the topic
+                        # here (best-effort, never raises). After the
+                        # notice — the funnel's send-then-close order.
+                        await self._cleanup_error_topic(rec)
                         return
 
                 # M9 (v0.52.0): deliver the user turn in a tracked background
@@ -1248,6 +1265,86 @@ class TelegramChannel(Channel):
             logger.warning(
                 "close_forum_topic failed for thread=%s: %s",
                 thread_id, exc,
+            )
+
+    async def delete_topic(self, thread_id: int) -> None:
+        """Delete a forum topic and all its messages (v0.65.0 topic
+        retention, [AR-3]/[AR-9]).
+
+        Deliberately UNLIKE :meth:`close_topic`, this PROPAGATES every
+        Telegram exception to the caller — it mirrors close_topic ONLY in
+        the RuntimeError-when-unconfigured guard, NOT in its
+        swallow-everything except. The topic-ledger sweep classifies the
+        real error (not_found / permission / transient / unknown) to
+        decide whether an entry is resolved or retained; a swallow here
+        would make every failure look like success and silently drop
+        ledger entries even under permission denial [AR-3].
+
+        Refuses ``thread_id in (None, 0, 1)`` with a ValueError — 1 is
+        the supergroup's General topic and None/0 mean "no topic"; an
+        accidental call must never touch General [AR-9]. Requires the
+        ``can_delete_messages`` admin right; without it Telegram raises
+        BadRequest, which the sweep records as a permission failure and
+        keeps the entry for retry.
+        """
+        if not self.engagement_supergroup_id:
+            raise RuntimeError("engagement supergroup not configured")
+        if thread_id in (None, 0, 1):
+            raise ValueError(
+                f"refusing to delete General/invalid topic "
+                f"(thread_id={thread_id})"
+            )
+        await self.bot.delete_forum_topic(
+            chat_id=self.engagement_supergroup_id,
+            message_thread_id=thread_id,
+        )
+
+    async def _cleanup_error_topic(self, rec) -> None:
+        """[AR-1] (v0.65.0) Best-effort topic cleanup for the two direct-
+        ``mark_error`` terminal paths in ``handle_update``
+        (``resume_failed``, ``orphan_no_session``).
+
+        Those paths bypass the finalize funnel entirely, so pre-v0.65.0
+        their topics stayed open — and unrecorded — forever after every
+        restart-with-in-flight-engagement. ``rec.topic_id`` is guaranteed
+        non-None here: the record was resolved *by* topic id. Title-mark
+        (❌ failed, like every funnel-terminal topic), close and ledger
+        append each run in their own try/except (warn-and-continue) — a
+        Telegram or disk failure must never break the resume-failure
+        handling itself, and the append happens even when the close fails
+        (the sweep's not_found handling makes deleting an already-gone
+        topic safe).
+        """
+        try:
+            await self.update_topic_state(
+                engagement_id=rec.id, new_state="failed",
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort title mark
+            logger.warning(
+                "error-path topic cleanup: update_topic_state failed for "
+                "engagement %s (topic %s): %s",
+                rec.id[:8], rec.topic_id, exc,
+            )
+        try:
+            await self.close_topic(rec.topic_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort close
+            logger.warning(
+                "error-path topic cleanup: close_topic failed for "
+                "engagement %s (topic %s): %s",
+                rec.id[:8], rec.topic_id, exc,
+            )
+        try:
+            await topic_ledger.append(
+                engagement_id=rec.id,
+                chat_id=self.engagement_supergroup_id,
+                topic_id=rec.topic_id,
+                outcome="error",
+            )
+        except Exception as exc:  # noqa: BLE001 — ledger raises on I/O failure
+            logger.warning(
+                "error-path topic cleanup: topic_ledger.append failed for "
+                "engagement %s (topic %s): %s",
+                rec.id[:8], rec.topic_id, exc,
             )
 
     # ------------------------------------------------------------------

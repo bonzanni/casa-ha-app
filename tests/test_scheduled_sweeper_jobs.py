@@ -43,23 +43,78 @@ def test_workspace_sweep_target_is_coroutine_function():
     )
 
 
+_CASA_CORE_SRC = (
+    Path(__file__).resolve().parent.parent
+    / "casa-agent"
+    / "rootfs"
+    / "opt"
+    / "casa"
+    / "casa_core.py"
+)
+
+
 def test_casa_core_does_not_register_sync_lambda_sweepers():
     """Static guard: casa_core.py must not register sweeper jobs as
     ``lambda: asyncio.create_task(...)``. That pattern caused
     ``RuntimeError: no running event loop`` on every fire from v0.13.0
     through v0.15.1."""
-    casa_core_src = (
-        Path(__file__).resolve().parent.parent
-        / "casa-agent"
-        / "rootfs"
-        / "opt"
-        / "casa"
-        / "casa_core.py"
-    )
-    text = casa_core_src.read_text(encoding="utf-8")
+    text = _CASA_CORE_SRC.read_text(encoding="utf-8")
     assert not re.search(r"lambda:\s*asyncio\.create_task\b", text), (
         "Found `lambda: asyncio.create_task(...)` in casa_core.py — this "
         "re-introduces the v0.13.0 sweeper bug. Pass the coroutine "
         "function directly to scheduler.add_job(...) with kwargs={...} "
         "instead."
+    )
+
+
+def test_engagement_topics_sweep_target_is_coroutine_function():
+    import casa_core
+
+    assert asyncio.iscoroutinefunction(casa_core._sweep_engagement_topics), (
+        "_sweep_engagement_topics must be a coroutine function so the "
+        "workspace_sweep closure can await it on the running loop. If "
+        "this fails after a refactor, do NOT re-wrap with a sync lambda "
+        "— find another fix."
+    )
+
+
+def test_workspace_sweep_job_runs_both_workspace_and_topics_passes():
+    """Static wiring guard (v0.65.0): the ``workspace_sweep`` job must be
+    registered with a closure that awaits BOTH ``_sweep_workspaces`` (as
+    ``_sweep_ws``) and ``_sweep_engagement_topics(channel_manager, bus)``.
+    Silently dropping either half would disable that sweeper with no test
+    noticing — topics and workspaces expire together."""
+    text = _CASA_CORE_SRC.read_text(encoding="utf-8")
+
+    closure = re.search(
+        r"async def _sweep_workspaces_and_topics\(\)[^\n]*\n"
+        r"(?P<body>.*?)\n\s*scheduler\.add_job\(",
+        text,
+        re.S,
+    )
+    assert closure, (
+        "casa_core.py no longer defines the _sweep_workspaces_and_topics "
+        "closure right before its scheduler.add_job registration — if it "
+        "was renamed/refactored, update this pin so the both-passes "
+        "contract stays guarded."
+    )
+    body = closure.group("body")
+    assert re.search(r"await _sweep_ws\(|await _sweep_workspaces\(", body), (
+        "the workspace_sweep closure must await the workspace sweep"
+    )
+    assert re.search(
+        r"await _sweep_engagement_topics\(channel_manager, bus\)", body
+    ), (
+        "the workspace_sweep closure must await "
+        "_sweep_engagement_topics(channel_manager, bus)"
+    )
+
+    assert re.search(
+        r"scheduler\.add_job\(\s*_sweep_workspaces_and_topics,"
+        r".*?id=\"workspace_sweep\"",
+        text,
+        re.S,
+    ), (
+        "the _sweep_workspaces_and_topics closure must be registered as "
+        'the id="workspace_sweep" scheduler job'
     )
