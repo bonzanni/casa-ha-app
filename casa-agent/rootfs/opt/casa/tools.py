@@ -122,6 +122,34 @@ def init_tools(
     _runtime = runtime
 
 
+def sync_agent_role_map(runtime: Any) -> None:
+    """Rebuild the delegation role map from live runtime state.
+
+    Called by the reload handlers after an agent/agents swap. Without
+    this, the map stays a boot-time snapshot and ``delegate_to_agent``
+    keeps resolving PRE-reload AgentConfigs — a specialist
+    ``tools.allowed`` grant stays inert for every fresh delegation until
+    a full add-on restart, even though ``casa_reload`` reports ok (P-6,
+    live run 2026-07-11). Overlapping roles keep the resident entry and
+    warn instead of raising: a reload must not brick on a collision
+    boot would have rejected.
+    """
+    global _agent_role_map  # noqa: PLW0603
+    residents = dict(getattr(runtime, "role_configs", {}) or {})
+    registry = getattr(runtime, "specialist_registry", None)
+    specialists = dict(registry.all_configs()) if registry is not None else {}
+    merged = dict(residents)
+    for name, cfg in specialists.items():
+        if name in merged:
+            logger.warning(
+                "sync_agent_role_map: role %r exists in both tiers — "
+                "resident entry wins", name,
+            )
+            continue
+        merged[name] = cfg
+    _agent_role_map = merged
+
+
 @tool(
     "send_message",
     "Send a message to a user through a communication channel.",
