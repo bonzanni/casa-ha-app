@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -273,6 +273,7 @@ class TestReloadAgent:
             character=SimpleNamespace(name="Ellen", card=""),
         )
         old_agent = MagicMock()
+        old_agent.aclose = AsyncMock()
         runtime.agents["ellen"] = old_agent
 
         result = await dispatch("agent", runtime=runtime, role="ellen")
@@ -568,7 +569,11 @@ class TestReloadAgents:
         bus.register("tina", MagicMock())
         runtime.bus = bus
         runtime.role_configs = {"ellen": MagicMock(), "tina": MagicMock()}
-        runtime.agents = {"ellen": MagicMock(), "tina": MagicMock()}
+        ellen_agent = MagicMock()
+        ellen_agent.aclose = AsyncMock()
+        tina_agent = MagicMock()
+        tina_agent.aclose = AsyncMock()
+        runtime.agents = {"ellen": ellen_agent, "tina": tina_agent}
         runtime.specialist_registry.all_configs = lambda: {}
 
         result = await dispatch("agents", runtime=runtime)
@@ -759,7 +764,11 @@ class TestReloadBusLoopLifecycle:
         runtime.config_dir = str(tmp_path)
         runtime.agents_dir = str(agents_dir)
         runtime.role_configs = {"ellen": MagicMock(), "tina": MagicMock()}
-        runtime.agents = {"ellen": MagicMock(), "tina": MagicMock()}
+        ellen_agent = MagicMock()
+        ellen_agent.aclose = AsyncMock()
+        tina_agent = MagicMock()
+        tina_agent.aclose = AsyncMock()
+        runtime.agents = {"ellen": ellen_agent, "tina": tina_agent}
         runtime.specialist_registry.all_configs = lambda: {}
         runtime.specialist_registry.load_failures = lambda: []
 

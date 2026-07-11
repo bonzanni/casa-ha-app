@@ -17,7 +17,6 @@ other scopes via the ``_GLOBAL_LOCK`` mechanism.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import time
 from typing import Any, Awaitable, Callable
@@ -296,11 +295,8 @@ def _schedule_agent_close(old_agent) -> None:
     (bounded by the pool's drain timeout) then disconnects.
 
     Tolerates non-Agent stand-ins used throughout the reload test suite:
-    objects with no ``aclose`` at all (``getattr`` default), and bare
-    ``MagicMock()`` placeholders whose auto-generated ``aclose()`` returns
-    a Mock rather than a coroutine (``inspect.isawaitable`` guard) — a real
-    ``Agent.aclose`` is always awaitable, so this only ever short-circuits
-    test doubles, never production instances.
+    objects with no ``aclose`` at all (``getattr`` default). A real
+    ``Agent.aclose`` is always awaitable.
     """
     aclose = getattr(old_agent, "aclose", None)
     if aclose is None:
@@ -309,8 +305,6 @@ def _schedule_agent_close(old_agent) -> None:
         coro = aclose()
     except Exception:  # noqa: BLE001 — best-effort teardown, never block reload
         logger.warning("agent aclose() raised while scheduling close", exc_info=True)
-        return
-    if not inspect.isawaitable(coro):
         return
     task = asyncio.create_task(coro, name="agent-pool-close")
     _AGENT_CLOSE_TASKS.add(task)
