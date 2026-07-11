@@ -230,3 +230,37 @@ def test_resident_options_merge_grants_and_fail_closed(tmp_path, monkeypatch):
         assert opts.can_use_tool is not None
 
     asyncio.run(run())
+
+
+def test_install_result_reports_granted_tools(tmp_path, monkeypatch):
+    """Self-contained: stub the marketplace entry + the two subprocess calls
+    (marketplace update, per-target `claude plugin install`) so stage 2
+    succeeds, then assert the new `granted_tools` key rides the ok-result."""
+    from types import SimpleNamespace
+    import tools as tools_mod
+
+    monkeypatch.setattr(
+        tools_mod, "load_user_marketplace",
+        lambda: {"plugins": [{"name": "lesina-invoice",
+                              "source": {"source": "github"}}]},
+    )
+    monkeypatch.setattr(
+        tools_mod.subprocess, "run",
+        lambda *a, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(tools_mod, "_AGENT_HOME_ROOT", tmp_path / "agent-home")
+    monkeypatch.setattr(
+        tools_mod, "_CASA_PLUGIN_CACHE_ROOT", tmp_path / "cache" / "casa-plugins",
+    )
+    monkeypatch.setattr(
+        tools_mod, "grants_for_plugin",
+        lambda name, marketplace, **kw: [f"mcp__plugin_{name}_{name}"],
+    )
+
+    result = tools_mod._tool_install_casa_plugin(
+        plugin_name="lesina-invoice", targets=["finance"],
+    )
+    assert result["ok"] is True
+    assert result["granted_tools"] == [
+        "mcp__plugin_lesina-invoice_lesina-invoice",
+    ]

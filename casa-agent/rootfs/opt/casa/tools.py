@@ -32,7 +32,9 @@ from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — availa
 from system_requirements.orchestrator import install_requirements, OrchestrationError
 from system_requirements.manifest import add_plugin_entry as add_manifest
 from plugins_binding import build_sdk_plugins
-from plugin_grants import derived_plugin_grants, make_fail_closed_can_use_tool
+from plugin_grants import (
+    derived_plugin_grants, grants_for_plugin, make_fail_closed_can_use_tool,
+)
 from delegated_memory import delegated_recall, retain_delegated
 
 from claude_agent_sdk import (
@@ -2696,6 +2698,9 @@ def _tool_install_casa_plugin(
         "installed_on": installed,
         "required_env_vars": sorted(env_vars),
         "system_requirements_installed": len(outcomes),
+        # P-5a observability: grants now derive from installed state at every
+        # options build; report them so configurator/verify can confirm.
+        "granted_tools": grants_for_plugin(plugin_name, "casa-plugins"),
     }
 
 
@@ -2906,6 +2911,7 @@ def _tool_verify_plugin_state(
         "tools": tools_status,
         "secrets": secrets_status,
         "mcp_started": mcp_started,
+        "granted_tools": grants_for_plugin(plugin_name, "casa-plugins"),
         "mcp_errors": mcp_errors,
         "ready": ready,
     }
