@@ -487,6 +487,16 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     )
     actions.append("rebuild_agent_registry")
 
+    # P-6: refresh tools' delegation role map. It is a boot-time snapshot;
+    # without this, delegate_to_agent keeps resolving the PRE-reload
+    # AgentConfig (stale tools.allowed etc.) for every fresh delegation.
+    try:
+        from tools import sync_agent_role_map
+        sync_agent_role_map(runtime)
+        actions.append("refresh_role_map")
+    except Exception as exc:  # noqa: BLE001 — log but don't fail the swap
+        logger.warning("role-map refresh failed for role=%s: %s", role, exc)
+
     # Re-register triggers for that role only.
     try:
         await asyncio.to_thread(
@@ -790,6 +800,15 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         specialists=runtime.specialist_registry.all_configs(),
     )
     actions.append("rebuild_agent_registry")
+
+    # P-6: refresh tools' delegation role map (adds + evictions included) —
+    # same rationale as the reload_agent hook.
+    try:
+        from tools import sync_agent_role_map
+        sync_agent_role_map(runtime)
+        actions.append("refresh_role_map")
+    except Exception as exc:  # noqa: BLE001 — log but don't fail the sweep
+        logger.warning("role-map refresh failed in agents sweep: %s", exc)
 
     return actions
 

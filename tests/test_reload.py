@@ -1143,3 +1143,99 @@ class TestExecutorsScope:
             a == "executors:rebuild_executor_registry"
             for a in result["actions"]
         )
+
+
+class TestReloadRefreshesDelegationRoleMap:
+    """P-6 (live run 2026-07-11): ``tools._agent_role_map`` is populated once
+    at boot and no reload handler refreshed it, so ``delegate_to_agent``
+    resolved BOOT-TIME AgentConfigs forever — a specialist ``tools.allowed``
+    grant (lesina-invoice) stayed inert for fresh delegations until a full
+    add-on restart, while ``casa_reload`` reported ok=True."""
+
+    async def test_agent_scope_specialist_reload_refreshes_role_map(
+        self, tmp_path, monkeypatch,
+    ):
+        from types import SimpleNamespace
+        import tools as tools_mod
+        from reload import dispatch, register_handler, reload_agent
+        register_handler("agent", reload_agent)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "specialists" / "finance").mkdir(parents=True)
+
+        new_cfg = SimpleNamespace(
+            role="finance",
+            character=SimpleNamespace(name="Alex", card=""),
+            triggers=[], channels=[],
+        )
+        new_agent = MagicMock()
+        monkeypatch.setattr(
+            "agent_loader.load_agent_from_dir", lambda *a, **kw: new_cfg,
+        )
+        monkeypatch.setattr(
+            "policies.load_policies", lambda *a, **kw: MagicMock(),
+        )
+        import reload as reload_mod
+        monkeypatch.setattr(
+            reload_mod, "_construct_agent", lambda *a, **kw: new_agent,
+        )
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.specialist_registry.load = MagicMock()
+        runtime.specialist_registry.all_configs = MagicMock(
+            return_value={"finance": new_cfg},
+        )
+
+        # Boot-time wiring left the OLD config in the delegation map.
+        old_cfg = SimpleNamespace(role="finance")
+        monkeypatch.setattr(tools_mod, "_agent_role_map", {"finance": old_cfg})
+
+        result = await dispatch("agent", runtime=runtime, role="finance")
+        assert result["status"] == "ok"
+        # The delegation-resolution map must now hold the POST-reload config.
+        assert tools_mod._agent_role_map["finance"] is new_cfg
+        assert "refresh_role_map" in result["actions"]
+
+    async def test_agents_scope_sweep_refreshes_role_map(
+        self, tmp_path, monkeypatch,
+    ):
+        from types import SimpleNamespace
+        import tools as tools_mod
+        from reload import dispatch, register_handler, reload_agents
+        register_handler("agents", reload_agents)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "ellen").mkdir(parents=True)
+        monkeypatch.setattr(
+            "policies.load_policies", lambda *a, **kw: MagicMock(),
+        )
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        resident_cfg = SimpleNamespace(
+            role="ellen",
+            character=SimpleNamespace(name="Ellen", card=""),
+            triggers=[], channels=["telegram"],
+        )
+        runtime.role_configs["ellen"] = resident_cfg
+        spec_cfg = SimpleNamespace(
+            role="finance",
+            character=SimpleNamespace(name="Alex", card=""),
+            triggers=[], channels=[],
+        )
+        runtime.specialist_registry.load = MagicMock()
+        runtime.specialist_registry.load_failures = MagicMock(return_value=[])
+        runtime.specialist_registry.all_configs = MagicMock(
+            return_value={"finance": spec_cfg},
+        )
+
+        monkeypatch.setattr(tools_mod, "_agent_role_map", {})
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        assert tools_mod._agent_role_map == {
+            "ellen": resident_cfg, "finance": spec_cfg,
+        }

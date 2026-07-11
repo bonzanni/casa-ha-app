@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.67.1] - 2026-07-11 — reload now reaches delegations
+
+### Fixed
+
+- Configuration changes now take effect for specialist delegations after a
+  `casa_reload`: the internal role map that `delegate_to_agent` resolves
+  against was built once at boot and never refreshed, so edits such as
+  granting a newly installed plugin's tools to a specialist silently
+  required a full add-on restart. Reload reports a new
+  `refresh_role_map` action when the map is rebuilt.
+
 ## [0.67.0] - 2026-07-11 — voice partial-message streaming
 
 ### Changed
