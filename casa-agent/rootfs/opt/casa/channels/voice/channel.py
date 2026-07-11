@@ -193,7 +193,23 @@ class VoiceChannel(Channel):
         last_text = ""
 
         async def on_token(accumulated: str) -> None:
-            nonlocal last_text
+            nonlocal last_text, splitter
+            if not accumulated.startswith(last_text):
+                # AR-B (2026-07-11 design §2 point 3): a mid-turn SDK retry
+                # or a divergent canonical correction breaks the
+                # "accumulated always extends last_text" assumption the
+                # delta slice below depends on. Reset to a fresh splitter
+                # so the new cumulative re-renders cleanly from its own
+                # start instead of computing a bogus delta (mid-word
+                # garbage, or a silently swallowed restart).
+                logger.debug(
+                    "voice sse on_token non-prefix cumulative "
+                    "(len=%d vs last_text len=%d); resetting splitter "
+                    "scope_id=%s",
+                    len(accumulated), len(last_text), scope_id,
+                )
+                last_text = ""
+                splitter = ProsodicSplitter()
             delta = accumulated[len(last_text):]
             last_text = accumulated
             for block in splitter.feed(delta):
@@ -411,7 +427,17 @@ class VoiceChannel(Channel):
         error_emitted = False
 
         async def on_token(accumulated: str) -> None:
-            nonlocal last_text
+            nonlocal last_text, splitter
+            if not accumulated.startswith(last_text):
+                # AR-B — see the SSE handler's on_token for rationale.
+                logger.debug(
+                    "voice ws on_token non-prefix cumulative "
+                    "(len=%d vs last_text len=%d); resetting splitter "
+                    "utterance_id=%s scope_id=%s",
+                    len(accumulated), len(last_text), uid, scope_id,
+                )
+                last_text = ""
+                splitter = ProsodicSplitter()
             delta = accumulated[len(last_text):]
             last_text = accumulated
             for block in splitter.feed(delta):

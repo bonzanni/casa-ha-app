@@ -421,3 +421,247 @@ class TestRateLimit:
             if f["event"] == "error"
         ]
         assert "rate_limit" in kinds
+
+
+# ---------------------------------------------------------------------------
+# AR-B prefix-divergence guard + AR-C time-cap (2026-07-11 voice partial-
+# streaming design §2 point 3, §6) — SSE side.
+# ---------------------------------------------------------------------------
+
+
+class _NonPrefixAgent:
+    """Simulates a divergent/retried turn: the two on_token calls do NOT
+    form a growing prefix sequence — e.g. a mid-turn SDK retry restarting
+    against unrelated content, or a canonical correction that diverges
+    from the accumulated partials (AR-B covers both uniformly)."""
+
+    def __init__(self, bus: MessageBus, role: str) -> None:
+        self._role = role
+
+    async def handle_message(self, msg: BusMessage) -> BusMessage | None:
+        on_token = msg.context.get("_on_token")
+        if on_token:
+            await on_token("Attempt one talking ")       # no sentence mark yet
+            await on_token("Attempt two is unrelated.")   # does NOT extend the above
+        return BusMessage(
+            type=MessageType.RESPONSE,
+            source=self._role,
+            target=msg.source,
+            content="Attempt two is unrelated.",
+            reply_to=msg.id,
+            channel=msg.channel,
+            context=msg.context,
+        )
+
+
+class _ShrinkingAgent:
+    """The second cumulative is SHORTER than the first (a canonical
+    correction that retracts already-flushed text)."""
+
+    def __init__(self, bus: MessageBus, role: str) -> None:
+        self._role = role
+
+    async def handle_message(self, msg: BusMessage) -> BusMessage | None:
+        on_token = msg.context.get("_on_token")
+        if on_token:
+            await on_token("Hello there my friend.")   # flushes immediately (sentence mark)
+            await on_token("Hi.")                        # SDK correction: much shorter
+        return BusMessage(
+            type=MessageType.RESPONSE,
+            source=self._role,
+            target=msg.source,
+            content="Hi.",
+            reply_to=msg.id,
+            channel=msg.channel,
+            context=msg.context,
+        )
+
+
+class _StallingAgent:
+    """AR-C: emits two deltas with a >1.5s monkeypatched clock gap between
+    them, mid-sentence (no natural cut) — exercises the splitter's time-cap
+    path via real per-delta channel feeding (previously dormant: a whole
+    message arrived in one feed() call, per the design doc §3)."""
+
+    def __init__(self, bus: MessageBus, role: str, clock: list[float]) -> None:
+        self._role = role
+        self._clock = clock
+
+    async def handle_message(self, msg: BusMessage) -> BusMessage | None:
+        on_token = msg.context.get("_on_token")
+        if on_token:
+            await on_token("word, ")
+            self._clock[0] += 2.0  # advance past the 1.5s cap
+            await on_token("word, more text")
+        return BusMessage(
+            type=MessageType.RESPONSE,
+            source=self._role,
+            target=msg.source,
+            content="word, more text",
+            reply_to=msg.id,
+            channel=msg.channel,
+            context=msg.context,
+        )
+
+
+async def _run_and_parse(client, scope_id: str) -> tuple[int, str, list[dict]]:
+    resp = await client.post(
+        "/api/converse",
+        json={"prompt": "hi", "agent_role": "butler", "scope_id": scope_id},
+    )
+    frames: list[dict] = []
+    async for line in resp.content:
+        s = line.decode("utf-8").rstrip("\r\n")
+        if s.startswith("event:"):
+            frames.append({"event": s.split(":", 1)[1].strip()})
+        elif s.startswith("data:"):
+            frames[-1]["data"] = json.loads(s.split(":", 1)[1].strip())
+    return resp.status, "", frames
+
+
+@pytest.fixture
+async def voice_app_nonprefix():
+    bus = MessageBus()
+    agent = _NonPrefixAgent(bus, "butler")
+    bus.register("butler", agent.handle_message)
+    loop_task = asyncio.create_task(bus.run_agent_loop("butler"))
+
+    channel = VoiceChannel(
+        bus=bus,
+        default_agent="butler",
+        webhook_secret="",
+        sse_path="/api/converse",
+        ws_path="/api/converse/ws",
+        agent_configs={"butler": _FakeAgentConfig()},
+        memory=_DummyMemory(),
+        idle_timeout=300,
+    )
+    app = web.Application(middlewares=[cid_middleware])
+    channel.register_routes(app)
+    async with TestClient(TestServer(app)) as client:
+        yield client
+    loop_task.cancel()
+
+
+@pytest.fixture
+async def voice_app_shrinking():
+    bus = MessageBus()
+    agent = _ShrinkingAgent(bus, "butler")
+    bus.register("butler", agent.handle_message)
+    loop_task = asyncio.create_task(bus.run_agent_loop("butler"))
+
+    channel = VoiceChannel(
+        bus=bus,
+        default_agent="butler",
+        webhook_secret="",
+        sse_path="/api/converse",
+        ws_path="/api/converse/ws",
+        agent_configs={"butler": _FakeAgentConfig()},
+        memory=_DummyMemory(),
+        idle_timeout=300,
+    )
+    app = web.Application(middlewares=[cid_middleware])
+    channel.register_routes(app)
+    async with TestClient(TestServer(app)) as client:
+        yield client
+    loop_task.cancel()
+
+
+@pytest.fixture
+async def voice_app_stalling(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(
+        "channels.voice.prosodic.time.monotonic", lambda: clock[0],
+    )
+    bus = MessageBus()
+    agent = _StallingAgent(bus, "butler", clock)
+    bus.register("butler", agent.handle_message)
+    loop_task = asyncio.create_task(bus.run_agent_loop("butler"))
+
+    channel = VoiceChannel(
+        bus=bus,
+        default_agent="butler",
+        webhook_secret="",
+        sse_path="/api/converse",
+        ws_path="/api/converse/ws",
+        agent_configs={"butler": _FakeAgentConfig()},
+        memory=_DummyMemory(),
+        idle_timeout=300,
+    )
+    app = web.Application(middlewares=[cid_middleware])
+    channel.register_routes(app)
+    async with TestClient(TestServer(app)) as client:
+        yield client
+    loop_task.cancel()
+
+
+@pytest.mark.asyncio
+class TestARBGuardSSE:
+    async def test_nonprefix_cumulative_resets_splitter_and_logs_debug(
+        self, voice_app_nonprefix, caplog,
+    ):
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="channels.voice.channel"):
+            status, _, frames = await _run_and_parse(
+                voice_app_nonprefix, "s-ar-b-sse",
+            )
+
+        assert status == 200
+        events = [f["event"] for f in frames]
+        assert "done" in events
+
+        block_texts = [
+            f["data"]["text"] for f in frames if f["event"] == "block"
+        ]
+        # The pre-reset buffered text ("Attempt one talking ", no sentence
+        # mark, never flushed) is discarded on reset; the fresh splitter
+        # renders attempt two's text cleanly — no garbled concatenation.
+        assert block_texts == ["Attempt two is unrelated."], block_texts
+
+        assert any(
+            "non-prefix cumulative" in r.getMessage()
+            for r in caplog.records
+            if r.name == "channels.voice.channel"
+        ), [r.getMessage() for r in caplog.records]
+
+    async def test_shrinking_cumulative_does_not_throw(
+        self, voice_app_shrinking,
+    ):
+        status, _, frames = await _run_and_parse(
+            voice_app_shrinking, "s-ar-b-shrink-sse",
+        )
+
+        assert status == 200
+        events = [f["event"] for f in frames]
+        assert "done" in events
+        assert "error" not in events
+
+        block_texts = [
+            f["data"]["text"] for f in frames if f["event"] == "block"
+        ]
+        # The first (already-flushed) block survives; the shrink is
+        # rendered as a fresh, clean block of its own — no crash, no
+        # garbage/empty-string block.
+        assert block_texts == ["Hello there my friend.", "Hi."], block_texts
+
+
+@pytest.mark.asyncio
+class TestARCTimeCapSSE:
+    async def test_stall_mid_sentence_forces_clause_preferring_block(
+        self, voice_app_stalling,
+    ):
+        status, _, frames = await _run_and_parse(
+            voice_app_stalling, "s-ar-c-sse",
+        )
+
+        assert status == 200
+        block_texts = [
+            f["data"]["text"] for f in frames if f["event"] == "block"
+        ]
+        # The >1.5s stall forces a cap block on the rightmost clause mark
+        # (the comma) rather than waiting for a sentence mark or hard-
+        # cutting mid-word; the remainder is flushed at turn end.
+        assert block_texts, "expected the time-cap to force a block mid-turn"
+        assert block_texts[0].rstrip() == "word,", block_texts
+        assert "more text" in "".join(block_texts)
