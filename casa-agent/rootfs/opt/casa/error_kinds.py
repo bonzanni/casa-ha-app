@@ -39,6 +39,15 @@ def _classify_error(exc: Exception) -> ErrorKind:
         return ErrorKind.RATE_LIMIT
     if "429" in msg:
         return ErrorKind.RATE_LIMIT
+    # Anthropic API overload (HTTP 529 / ``overloaded_error``) — the single
+    # most common transient failure. The SDK surfaces it as a ``ProcessError``
+    # (type name lacks the CLI/SDK/Connection markers below) whose message
+    # carries none of the rate-limit/timeout tokens, so without this rule it
+    # fell through to UNKNOWN and was never retried. Treat as RATE_LIMIT: it
+    # is retryable, and 529s carry no Retry-After, so the loop uses jittered
+    # exponential backoff — exactly right for an overload.
+    if "overloaded" in msg or "529" in msg:
+        return ErrorKind.RATE_LIMIT
     if "timeout" in msg or "timed out" in msg:
         return ErrorKind.TIMEOUT
 

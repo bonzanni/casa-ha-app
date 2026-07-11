@@ -1,29 +1,12 @@
 """Tests for agent error classification.
 
-We stub out claude_agent_sdk to avoid importing the SDK (not installed
-locally). The error classification logic is pure Python.
+The classification logic is pure Python; ``claude_agent_sdk`` is installed
+in the test venv, so we import ``agent`` directly rather than stubbing a
+stale SDK surface (the old hand-maintained stub drifted from agent.py's
+imports and only survived on full-gate import ordering).
 """
 
 import asyncio
-import sys
-import types
-from unittest.mock import MagicMock
-
-# Stub out claude_agent_sdk before importing agent
-_sdk_stub = types.ModuleType("claude_agent_sdk")
-for _name in [
-    "AssistantMessage",
-    "ClaudeAgentOptions",
-    "ClaudeSDKClient",
-    "HookMatcher",
-    "ResultMessage",
-    "SystemMessage",
-    "TextBlock",
-    "create_sdk_mcp_server",
-    "tool",
-]:
-    setattr(_sdk_stub, _name, MagicMock())
-sys.modules.setdefault("claude_agent_sdk", _sdk_stub)
 
 from agent import ErrorKind, _classify_error, _USER_MESSAGES
 
@@ -58,6 +41,36 @@ class TestClassifyError:
 
     def test_unknown_fallback(self):
         assert _classify_error(ValueError("something odd")) == ErrorKind.UNKNOWN
+
+    def test_overloaded_error_is_retryable(self):
+        """An Anthropic 529 overload surfaces from the SDK as a ``ProcessError``
+        (type name lacks CLI/SDK/Connection) whose message carries neither
+        'rate limit', '429', nor 'timeout' — pre-fix it fell through to
+        UNKNOWN and was never retried, the single most common transient
+        failure. Classify as RATE_LIMIT so the backoff loop handles it."""
+        class ProcessError(Exception):
+            pass
+
+        exc = ProcessError(
+            "Command failed with exit code 1: "
+            '{"type":"error","error":{"type":"overloaded_error",'
+            '"message":"Overloaded"}}'
+        )
+        assert _classify_error(exc) == ErrorKind.RATE_LIMIT
+
+    def test_http_529_is_retryable(self):
+        exc = Exception("API error: HTTP 529 Overloaded")
+        assert _classify_error(exc) == ErrorKind.RATE_LIMIT
+
+    def test_overloaded_is_in_retry_kinds(self):
+        """End-to-end: the classification must land in the retry set."""
+        from retry import RETRY_KINDS
+
+        class ProcessError(Exception):
+            pass
+
+        exc = ProcessError("stderr: overloaded_error — Overloaded")
+        assert _classify_error(exc) in RETRY_KINDS
 
     def test_all_kinds_have_user_messages(self):
         for kind in ErrorKind:
