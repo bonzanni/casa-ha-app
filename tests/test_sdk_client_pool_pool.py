@@ -302,3 +302,105 @@ async def test_turn_on_closing_pool_raises_poolunavailable():
         await pool.turn(channel_key="v-1", channel="voice", prompt="p",
                         origin={}, cid="c", build_options=build_options,
                         on_stale_old=lambda s: None, on_message=on_message)
+
+
+async def test_per_agent_cap_lru_evicts(monkeypatch):
+    monkeypatch.setenv("SDK_POOL_MAX_PER_AGENT", "2")
+    reg = FakeRegistry()
+    for i in range(3):
+        reg.data[f"v-{i}"] = {"sdk_session_id": f"sid-{i}", "last_active": "x"}
+    pool = _mk_pool(reg)
+    made = []
+    pool._make_client = lambda opts: made.append(ScriptedClient(opts)) or made[-1]
+    async def build_options(is_fresh, resume_sid): return {}
+    async def on_message(m): pass
+    async def go(i):
+        return await pool.turn(channel_key=f"v-{i}", channel="voice",
+                               prompt="p", origin={}, cid="c",
+                               build_options=build_options,
+                               on_stale_old=lambda s: None,
+                               on_message=on_message)
+    for i in range(3):
+        t = asyncio.create_task(go(i)); await asyncio.sleep(0.01)
+        made[-1].script = [[_mk_result(f"sid-{i}")]]
+        await t
+    assert pool.stats()["entries"] == 2
+    assert made[0].disconnected          # v-0 was least-recently-used
+
+
+async def test_sweeper_closes_idle_and_overage(monkeypatch):
+    now = [1000.0]
+    reg = FakeRegistry()
+    reg.data["v-1"] = {"sdk_session_id": "sid-1", "last_active": "x"}
+    pool = _mk_pool(reg, monotonic=lambda: now[0])
+    pool.idle_seconds = 100.0
+    made = []
+    pool._make_client = lambda opts: made.append(ScriptedClient(opts)) or made[-1]
+    async def build_options(is_fresh, resume_sid): return {}
+    async def on_message(m): pass
+    async def go():
+        return await pool.turn(channel_key="v-1", channel="voice", prompt="p",
+                               origin={}, cid="c", build_options=build_options,
+                               on_stale_old=lambda s: None, on_message=on_message)
+    t = asyncio.create_task(go()); await asyncio.sleep(0.01)
+    made[0].script = [[_mk_result("sid-1")]]
+    await t
+    now[0] += 50
+    await pool._sweep_once()
+    assert pool.stats()["entries"] == 1
+    now[0] += 100                          # beyond idle bound
+    await pool._sweep_once()
+    assert pool.stats()["entries"] == 0
+    assert made[0].disconnected
+
+
+async def test_idle_bound_clamped_to_freshness(monkeypatch):
+    """AR-4: idle can never exceed the channel freshness window."""
+    from datetime import timedelta
+    now = [0.0]
+    reg = FakeRegistry()
+    reg.data["voice-1"] = {"sdk_session_id": "s", "last_active": "x"}
+    pool = _mk_pool(reg, monotonic=lambda: now[0])
+    pool.idle_seconds = 10_000_000.0       # operator misconfig
+    pool._freshness = lambda ch: timedelta(minutes=30)
+    made = []
+    pool._make_client = lambda opts: made.append(ScriptedClient(opts)) or made[-1]
+    async def build_options(is_fresh, resume_sid): return {}
+    async def on_message(m): pass
+    async def go():
+        return await pool.turn(channel_key="voice-1", channel="voice",
+                               prompt="p", origin={}, cid="c",
+                               build_options=build_options,
+                               on_stale_old=lambda s: None,
+                               on_message=on_message)
+    t = asyncio.create_task(go()); await asyncio.sleep(0.01)
+    made[0].script = [[_mk_result("s")]]
+    await t
+    now[0] += 31 * 60                      # 31 min > freshness 30 min
+    await pool._sweep_once()
+    assert pool.stats()["entries"] == 0
+
+
+async def test_fleet_cap_across_pools(monkeypatch):
+    monkeypatch.setenv("SDK_POOL_FLEET_CAP", "1")
+    reg = FakeRegistry()
+    reg.data["a-1"] = {"sdk_session_id": "s1", "last_active": "x"}
+    reg.data["b-1"] = {"sdk_session_id": "s2", "last_active": "x"}
+    p1, p2 = _mk_pool(reg), _mk_pool(reg)
+    made = []
+    for p in (p1, p2):
+        p._make_client = lambda opts: made.append(ScriptedClient(opts)) or made[-1]
+    async def build_options(is_fresh, resume_sid): return {}
+    async def on_message(m): pass
+    async def go(pool, key):
+        return await pool.turn(channel_key=key, channel="voice", prompt="p",
+                               origin={}, cid="c", build_options=build_options,
+                               on_stale_old=lambda s: None, on_message=on_message)
+    t = asyncio.create_task(go(p1, "a-1")); await asyncio.sleep(0.01)
+    made[-1].script = [[_mk_result("s1")]]
+    await t
+    t = asyncio.create_task(go(p2, "b-1")); await asyncio.sleep(0.01)
+    made[-1].script = [[_mk_result("s2")]]
+    await t
+    assert p1.stats()["entries"] + p2.stats()["entries"] == 1
+    await p1.aclose(); await p2.aclose()

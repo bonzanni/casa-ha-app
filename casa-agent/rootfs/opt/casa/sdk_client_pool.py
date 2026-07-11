@@ -276,10 +276,12 @@ class SdkClientPool:
     async def turn(self, *, channel_key: str, channel: str, prompt: str,
                    origin: dict, cid: str, build_options, on_stale_old,
                    on_message) -> PoolTurnResult:
+        self._ensure_sweeper()
         for _attempt in (1, 2):                      # AR-7: one silent retry
             if self._closing:
                 raise PoolUnavailable("pool closing")
             entry = await self._entry_stub(channel_key)
+            result: PoolTurnResult | None = None
             async with entry.lock:
                 if self._entries.get(channel_key) is not entry:
                     continue                          # replaced/evicted; retry
@@ -341,8 +343,11 @@ class SdkClientPool:
                     raise
                 if entry.state != "warm":             # AR-5 non-retryable path
                     await self._drop(channel_key, entry)
-                return PoolTurnResult(sid=sid, resume_sid=resume_sid,
-                                      is_fresh=is_fresh)
+                result = PoolTurnResult(sid=sid, resume_sid=resume_sid,
+                                        is_fresh=is_fresh)
+            if result is not None:
+                await self._enforce_caps(channel_key)  # outside entry.lock
+                return result
         raise PoolUnavailable("entry unstable after retry")
 
     async def _entry_stub(self, channel_key: str) -> ManagedSdkClient:
@@ -395,3 +400,71 @@ class SdkClientPool:
                 await entry.aclose()
         if self in SdkClientPool._instances:
             SdkClientPool._instances.remove(self)
+
+    def _channel_of(self, channel_key: str) -> str:
+        return channel_key.partition("-")[0]
+
+    async def _enforce_caps(self, protect: str) -> None:
+        """Caller holds no locks. LRU-close overage; never the protected key."""
+        fleet_cap = _env_int("SDK_POOL_FLEET_CAP", 8)
+
+        def _lru(pools):
+            candidates = [
+                (e.last_used, p, k, e)
+                for p in pools
+                for k, e in p._entries.items()
+                if e.state == "warm" and not (p is self and k == protect)
+            ]
+            return min(candidates, default=None)
+
+        while len(self._entries) > self.max_per_agent:
+            victim = _lru([self])
+            if victim is None:
+                break
+            _, p, k, e = victim
+            logger.info("pool cap: LRU-closing %s", k)
+            await p._drop(k, e)
+        while sum(len(p._entries) for p in SdkClientPool._instances) > fleet_cap:
+            victim = _lru(SdkClientPool._instances)
+            if victim is None:
+                break
+            _, p, k, e = victim
+            logger.info("fleet cap: LRU-closing %s", k)
+            await p._drop(k, e)
+
+    async def _sweep_once(self) -> None:
+        now = self._monotonic()
+        doomed: list[tuple[str, ManagedSdkClient]] = []
+        async with self._pool_lock:
+            for key, e in list(self._entries.items()):
+                if e.state != "warm":
+                    continue
+                bound = min(
+                    self._freshness(self._channel_of(key)).total_seconds(),
+                    self.idle_seconds,
+                )
+                if (now - e.last_used) > bound or \
+                        (now - e.created_at) > self.max_age_seconds:
+                    doomed.append((key, e))
+        for key, e in doomed:
+            logger.info("pool sweep: closing %s (idle/max-age)", key)
+            await self._drop(key, e)
+
+    async def _run_sweeper(self, interval: float = 60.0) -> None:
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self._sweep_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    logger.exception("pool sweep failed; retrying next tick")
+        except asyncio.CancelledError:
+            return
+
+    def _ensure_sweeper(self) -> None:
+        if self._sweeper is None or self._sweeper.done():
+            self._sweeper = asyncio.create_task(
+                self._run_sweeper(), name="sdk-pool-sweeper",
+            )
