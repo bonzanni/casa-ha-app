@@ -409,12 +409,24 @@ async def test_fleet_cap_across_pools(monkeypatch):
 
 
 async def test_fleet_cap_lru_tie_across_pools(monkeypatch):
-    """Identical last_used in two pools must not TypeError the fleet LRU."""
-    monkeypatch.setenv("SDK_POOL_FLEET_CAP", "1")
+    """Identical last_used in two DISTINCT pools must not TypeError the fleet LRU.
+
+    FLEET_CAP=2, frozen identical monotonic on both pools. Turn 3 (p2's second
+    key) pushes the fleet to 3 and calls `_enforce_caps(protect="b-2")` on p2.
+    Candidates at that min() call are p1's "a-1" AND p2's "b-1" — two warm
+    entries, tied last_used, from two DISTINCT pool objects — so the
+    pre-fix `min(candidates, default=None)` falls through the tie to
+    comparing (p1, ...) < (p2, ...) tuples, i.e. comparing SdkClientPool
+    objects directly -> TypeError. (With only one candidate, as the prior
+    single-entry-per-pool version of this test had, min() never compares
+    anything and the bug is unreachable.)
+    """
+    monkeypatch.setenv("SDK_POOL_FLEET_CAP", "2")
     frozen = 1000.0
     reg = FakeRegistry()
     reg.data["a-1"] = {"sdk_session_id": "s1", "last_active": "x"}
     reg.data["b-1"] = {"sdk_session_id": "s2", "last_active": "x"}
+    reg.data["b-2"] = {"sdk_session_id": "s3", "last_active": "x"}
     p1 = _mk_pool(reg, monotonic=lambda: frozen)
     p2 = _mk_pool(reg, monotonic=lambda: frozen)
     made = []
@@ -426,17 +438,26 @@ async def test_fleet_cap_lru_tie_across_pools(monkeypatch):
         return await pool.turn(channel_key=key, channel="voice", prompt="p",
                                origin={}, cid="c", build_options=build_options,
                                on_stale_old=lambda s: None, on_message=on_message)
+    # Turn 1: p1 gets "a-1" — fleet=1, no eviction.
     t = asyncio.create_task(go(p1, "a-1")); await asyncio.sleep(0.01)
     made[-1].script = [[_mk_result("s1")]]
     await t
+    # Turn 2: p2 gets "b-1" — fleet=2, no eviction.
     t = asyncio.create_task(go(p2, "b-1")); await asyncio.sleep(0.01)
     made[-1].script = [[_mk_result("s2")]]
     await t
-    # Both entries have identical last_used (frozen clock); fleet cap forces LRU eviction.
-    # Before the fix, comparing tuples with identical first element would TypeError
-    # when trying to compare SdkClientPool objects. After the fix, min() uses only
-    # the last_used timestamp (first element of the tuple).
-    assert p1.stats()["entries"] + p2.stats()["entries"] == 1
+    # Turn 3: p2 gets "b-2" — fleet=3 > cap=2, forces _enforce_caps(protect="b-2")
+    # on p2. Candidates: p1's warm "a-1" and p2's warm "b-1", tied last_used,
+    # from two distinct pool objects.
+    t = asyncio.create_task(go(p2, "b-2")); await asyncio.sleep(0.01)
+    made[-1].script = [[_mk_result("s3")]]
+    await t
+    assert p1.stats()["entries"] + p2.stats()["entries"] == 2
+    # Exactly one of the tied "a-1"/"b-1" clients was the LRU victim; "b-2"
+    # (the just-used, protected key) must survive.
+    a1_client, b1_client, b2_client = made[0], made[1], made[2]
+    assert a1_client.disconnected != b1_client.disconnected  # exactly one evicted
+    assert not b2_client.disconnected
     await p1.aclose(); await p2.aclose()
 
 
