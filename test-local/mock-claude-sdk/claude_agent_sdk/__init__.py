@@ -173,6 +173,18 @@ class StreamEvent:
 
 
 @dataclass
+class PermissionResultDeny:
+    """v0.68.0 fail-closed in-casa permissions — plugin_grants.py imports
+    this at module scope and uses it in the fail_closed can_use_tool callback
+    to deny tools not in allowed_tools (residents/specialists have no way to
+    answer an interactive prompt). The mock accepts and ignores the return
+    value; permission decisions in the offline mock are pre-made by ClaudeAgentOptions."""
+
+    message: str = ""
+    interrupt: bool = False
+
+
+@dataclass
 class HookMatcher:
     matcher: str
     hooks: list[Any] = field(default_factory=list)
@@ -206,6 +218,10 @@ class ClaudeAgentOptions:
     # its client never emits StreamEvents, which the agent handles fine
     # (partials are an optimization, not a contract).
     include_partial_messages: bool = False
+    # v0.68.0 fail-closed in-casa permissions: agent._build_options passes
+    # a can_use_tool callback for residents/specialists. The mock accepts
+    # and ignores it; offline permission decisions are pre-made by options.
+    can_use_tool: Any = None
 
 
 class ClaudeSDKClient:
@@ -378,6 +394,7 @@ __all__ = [
     "ClaudeAgentOptions",
     "ClaudeSDKClient",
     "HookMatcher",
+    "PermissionResultDeny",
     "ProcessError",
     "ResultMessage",
     "SdkMcpTool",

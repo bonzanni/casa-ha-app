@@ -100,3 +100,13 @@ operator has rejected that specific call. Acknowledge in your next
 turn, then either retry with a different tool, describe what you
 would have done so the operator can decide whether to approve, or
 ask the operator directly via `mcp__casa-engagement-channel__reply`.
+
+## MCP server naming = the grant namespace
+
+Your `.mcp.json` `mcpServers` key becomes part of every tool's callable name:
+`mcp__plugin_<plugin-name>_<server-key>__<tool>`. Casa grants installed
+plugins server-level (`mcp__plugin_<plugin-name>_<server-key>`), derived from
+that key. Name the server after the plugin (one server per plugin unless you
+truly need more), and never rename it in a version bump — a rename orphans
+nothing functionally (grants re-derive) but changes the tool names agents and
+skills reference.
