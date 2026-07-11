@@ -2911,7 +2911,14 @@ def _tool_verify_plugin_state(
         "tools": tools_status,
         "secrets": secrets_status,
         "mcp_started": mcp_started,
-        "granted_tools": grants_for_plugin(plugin_name, "casa-plugins"),
+        # cache_root is the marketplace-level dir (<cache root>/casa-plugins);
+        # decompose it so the grant derivation reads the exact tree globbed
+        # above — threading the _cache_root test override. Production is
+        # unchanged: parent=/config/cc-home/.claude/plugins/cache (the
+        # plugin_grants default), name=casa-plugins.
+        "granted_tools": grants_for_plugin(
+            plugin_name, cache_root.name, cache_root=cache_root.parent,
+        ),
         "mcp_errors": mcp_errors,
         "ready": ready,
     }
