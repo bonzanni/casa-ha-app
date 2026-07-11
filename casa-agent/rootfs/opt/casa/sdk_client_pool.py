@@ -439,7 +439,7 @@ class SdkClientPool:
                 for k, e in p._entries.items()
                 if e.state == "warm" and not (p is self and k == protect)
             ]
-            return min(candidates, default=None)
+            return min(candidates, key=lambda c: c[0], default=None)
 
         while len(self._entries) > self.max_per_agent:
             victim = _lru([self])
@@ -488,6 +488,8 @@ class SdkClientPool:
             return
 
     def _ensure_sweeper(self) -> None:
+        if self._closing:
+            return
         if self._sweeper is None or self._sweeper.done():
             self._sweeper = asyncio.create_task(
                 self._run_sweeper(), name="sdk-pool-sweeper",

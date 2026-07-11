@@ -302,6 +302,8 @@ async def test_turn_on_closing_pool_raises_poolunavailable():
         await pool.turn(channel_key="v-1", channel="voice", prompt="p",
                         origin={}, cid="c", build_options=build_options,
                         on_stale_old=lambda s: None, on_message=on_message)
+    # Finding 2: sweeper should not be created on turn() after aclose()
+    assert pool._sweeper is None
 
 
 async def test_per_agent_cap_lru_evicts(monkeypatch):
@@ -402,6 +404,38 @@ async def test_fleet_cap_across_pools(monkeypatch):
     t = asyncio.create_task(go(p2, "b-1")); await asyncio.sleep(0.01)
     made[-1].script = [[_mk_result("s2")]]
     await t
+    assert p1.stats()["entries"] + p2.stats()["entries"] == 1
+    await p1.aclose(); await p2.aclose()
+
+
+async def test_fleet_cap_lru_tie_across_pools(monkeypatch):
+    """Identical last_used in two pools must not TypeError the fleet LRU."""
+    monkeypatch.setenv("SDK_POOL_FLEET_CAP", "1")
+    frozen = 1000.0
+    reg = FakeRegistry()
+    reg.data["a-1"] = {"sdk_session_id": "s1", "last_active": "x"}
+    reg.data["b-1"] = {"sdk_session_id": "s2", "last_active": "x"}
+    p1 = _mk_pool(reg, monotonic=lambda: frozen)
+    p2 = _mk_pool(reg, monotonic=lambda: frozen)
+    made = []
+    for p in (p1, p2):
+        p._make_client = lambda opts: made.append(ScriptedClient(opts)) or made[-1]
+    async def build_options(is_fresh, resume_sid): return {}
+    async def on_message(m): pass
+    async def go(pool, key):
+        return await pool.turn(channel_key=key, channel="voice", prompt="p",
+                               origin={}, cid="c", build_options=build_options,
+                               on_stale_old=lambda s: None, on_message=on_message)
+    t = asyncio.create_task(go(p1, "a-1")); await asyncio.sleep(0.01)
+    made[-1].script = [[_mk_result("s1")]]
+    await t
+    t = asyncio.create_task(go(p2, "b-1")); await asyncio.sleep(0.01)
+    made[-1].script = [[_mk_result("s2")]]
+    await t
+    # Both entries have identical last_used (frozen clock); fleet cap forces LRU eviction.
+    # Before the fix, comparing tuples with identical first element would TypeError
+    # when trying to compare SdkClientPool objects. After the fix, min() uses only
+    # the last_used timestamp (first element of the tuple).
     assert p1.stats()["entries"] + p2.stats()["entries"] == 1
     await p1.aclose(); await p2.aclose()
 
