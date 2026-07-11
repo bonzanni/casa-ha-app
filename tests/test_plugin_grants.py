@@ -190,3 +190,43 @@ def test_executor_options_keep_no_callback_and_no_grants(monkeypatch):
     opts = tools_mod._build_executor_options(defn)
     assert opts.can_use_tool is None
     assert "mcp__plugin_should_not_appear" not in opts.allowed_tools
+
+
+def test_resident_options_merge_grants_and_fail_closed(tmp_path, monkeypatch):
+    import asyncio
+    import agent as agent_mod
+    from agent import Agent
+    from channels import ChannelManager
+    from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
+    from mcp_registry import McpServerRegistry
+    from session_registry import SessionRegistry
+
+    monkeypatch.setattr(agent_mod, "build_sdk_plugins", lambda **kw: [])
+    monkeypatch.setattr(
+        agent_mod, "derived_plugin_grants",
+        lambda home, **kw: ["mcp__plugin_x_y"],
+    )
+    cfg = AgentConfig(
+        role="assistant",
+        model="claude-sonnet-4-6",
+        system_prompt="You are helpful.",
+        character=CharacterConfig(name="Test"),
+        tools=ToolsConfig(allowed=["Read"], permission_mode="acceptEdits"),
+        memory=MemoryConfig(token_budget=1000, read_strategy="per_turn"),
+    )
+    a = Agent(
+        config=cfg,
+        session_registry=SessionRegistry(str(tmp_path / "sessions.json")),
+        mcp_registry=McpServerRegistry(),
+        channel_manager=ChannelManager(),
+    )
+
+    async def run():
+        opts = await a._build_options(
+            channel="telegram", channel_key="k", is_fresh=False,
+            resume_sid=None, user_text="hi",
+        )
+        assert "mcp__plugin_x_y" in opts.allowed_tools
+        assert opts.can_use_tool is not None
+
+    asyncio.run(run())

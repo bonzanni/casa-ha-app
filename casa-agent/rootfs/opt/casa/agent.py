@@ -24,6 +24,7 @@ from claude_agent_sdk import (
 )
 
 from plugins_binding import build_sdk_plugins
+from plugin_grants import derived_plugin_grants, make_fail_closed_can_use_tool
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
@@ -765,6 +766,13 @@ class Agent:
         if "Skill" not in allowed_tools:
             allowed_tools.append("Skill")
 
+        # P-5a: installed ⇒ granted, by construction — server-level grants
+        # derived from this agent-home's enabledPlugins. Off-loop (H2/M20):
+        # two small disk reads, but the loop is shared.
+        for grant in await asyncio.to_thread(derived_plugin_grants, agent_home):
+            if grant not in allowed_tools:
+                allowed_tools.append(grant)
+
         options = ClaudeAgentOptions(
             model=self.config.model,
             system_prompt=system_prompt,
@@ -778,6 +786,10 @@ class Agent:
             resume=resume_sid,
             setting_sources=["project"],
             plugins=sdk_plugins,
+            # P-5b: in-casa agents have no permission relay — fail closed on
+            # ungranted tools instead of hanging on CC's prompt. New closure
+            # per build is fine: the pool reuses clients, not options objects.
+            can_use_tool=make_fail_closed_can_use_tool(self.config.role),
             # Voice partial-message streaming (2026-07-11 design §2 point 1):
             # SDK partial StreamEvents are opt-in and constant per channel,
             # so this stays pool-key compatible (spec §Q6). Non-voice
