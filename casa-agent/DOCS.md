@@ -190,8 +190,10 @@ Engagement topics live here, not in your personal chat.
 3. Turn ON **"Manage topics"**. This permission is **required** —
    Casa refuses to enable engagements without it and logs
    `bot lacks can_manage_topics; engagements disabled`.
-4. Other permissions (delete messages, pin, etc.) are optional. Casa does
-   not require them. Leave unused ones off to minimise the bot's surface.
+4. Recommended: also turn ON **"Delete messages"** — Casa uses it to
+   delete finished engagements' topics after retention (see step 6).
+   Other permissions (pin, etc.) are optional. Casa does not require
+   them. Leave unused ones off to minimise the bot's surface.
 5. Confirm. The bot is now a topic-managing admin.
 
 #### 3. Find the supergroup's chat ID
@@ -244,6 +246,37 @@ In Telegram, inside the engagement supergroup, type `/` in any topic.
 The autocomplete should list `/cancel`, `/complete`, and `/silent`.
 These commands are registered via Telegram's `setMyCommands` scoped to
 the supergroup only — they do NOT appear in your 1:1 DM with Ellen.
+
+#### 6. Grant "Delete messages" (recommended — enables topic cleanup)
+
+Since v0.65.0 Casa deletes a finished engagement's topic automatically
+**7 days after the engagement ends** — the same retention window as its
+workspace — so the sidebar doesn't fill up with dead topics. Deleting
+topics requires one more admin right:
+
+1. Open the group → tap the bot in the members list → edit its admin
+   rights.
+2. Turn ON **"Delete messages"**.
+
+Without this right, Casa degrades gracefully: finished topics are still
+closed and title-marked (✅/❌/⏹) as before, deletion is retried at the
+next sweep, and Ellen asks you once per boot to grant the right.
+
+Notes:
+
+- **Deletion is irreversible.** Deleting a topic removes the topic and
+  **all its messages for every member**. Casa's durable record of each
+  engagement is its memory summary plus Ellen's completion message in
+  your 1:1 chat (and the workspace artifacts during the 7-day window).
+- **On-demand cleanup:** ask Ellen to *"clean up the engagement group"* —
+  she delegates to the configurator, whose `cleanup_engagement_topics`
+  tool purges known finished topics immediately (optionally as a dry
+  run) without waiting out the retention window. Only topics Casa has
+  on record are deleted; active engagements are never touched.
+- **Topics from before v0.65.0** are unknown to Casa (the Telegram Bot
+  API cannot enumerate a group's topics), so the existing pile needs
+  **one manual cleanup** in the Telegram UI. From this release on, Casa
+  keeps the sidebar clean automatically.
 
 ### Starting an engagement
 

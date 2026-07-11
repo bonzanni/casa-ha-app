@@ -1465,6 +1465,26 @@ async def engage_executor(args: dict) -> dict:
     })
 
 
+def _engagement_supergroup_chat_id(channel: Any | None) -> int | None:
+    """Best-effort chat-id resolution for topic-ledger appends [AR-2].
+
+    Prefer the live telegram channel's configured supergroup id; fall back
+    to the boot env the channel would have been built from (casa_core), so
+    an append still records a chat_id when telegram is momentarily
+    unwired. None when neither is available — the ledger keeps such
+    entries but never auto-deletes them.
+    """
+    chat_id = getattr(channel, "engagement_supergroup_id", None)
+    if chat_id:
+        return chat_id
+    try:
+        return int(
+            os.environ.get("TELEGRAM_ENGAGEMENT_SUPERGROUP_ID", "0") or 0,
+        ) or None
+    except (TypeError, ValueError):
+        return None
+
+
 async def _abort_engagement_topic(
     channel: Any, engagement_id: str, topic_id: int | None,
 ) -> None:
@@ -1476,7 +1496,25 @@ async def _abort_engagement_topic(
     envelope synchronously), overwrite the specific error kind with
     'emit_completion_error', and run memory-retention side effects.
     """
-    if channel is None or topic_id is None:
+    if topic_id is None:
+        return
+    # Topic-retention ledger (2026-07-10 design): an aborted engagement's
+    # topic is today's most orphan-prone — record it for the retention
+    # sweep even when the channel is gone (gate only on topic_id, like the
+    # finalize funnel). Own try/except: this function never raises.
+    try:
+        import topic_ledger
+        await topic_ledger.append(
+            engagement_id=engagement_id,
+            chat_id=_engagement_supergroup_chat_id(channel),
+            topic_id=topic_id,
+            outcome="error",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "abort topic %s: topic ledger append failed: %s", topic_id, exc,
+        )
+    if channel is None:
         return
     if hasattr(channel, "update_topic_state"):
         try:
@@ -1532,6 +1570,30 @@ async def _finalize_engagement(
                 engagement.id[:8], outcome,
             )
             return
+
+    # [AR-4] Topic-retention ledger (2026-07-10 design): record the topic
+    # for the retention sweep the moment the record flips terminal — both
+    # drivers, all outcomes, regardless of whether close_topic below
+    # succeeds. Gated ONLY on topic_id, NOT on channel-manager presence:
+    # telegram may be momentarily unwired and the append must still land.
+    # Own try/except: a ledger failure must never abort this funnel — the
+    # idempotency guard above makes a partial finalize unretryable.
+    if engagement.topic_id is not None:
+        try:
+            import topic_ledger
+            ledger_ch = (_channel_manager.get("telegram")
+                         if _channel_manager is not None else None)
+            await topic_ledger.append(
+                engagement_id=engagement.id,
+                chat_id=_engagement_supergroup_chat_id(ledger_ch),
+                topic_id=engagement.topic_id,
+                outcome=outcome,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "finalize engagement %s: topic ledger append failed: %s",
+                engagement.id[:8], exc,
+            )
 
     # L68/L17: drop per-engagement observer bookkeeping now that the
     # engagement is terminal — keeps _interjection_counts/_silenced from
@@ -2351,6 +2413,66 @@ def _walk_workspace_tree(root, *, max_depth: int) -> list[dict]:
     return out
 
 
+_TOPIC_CLEANUP_SCOPES = ("due", "all_terminal")
+
+
+@tool(
+    "cleanup_engagement_topics",
+    "Delete finished engagements' Telegram forum topics recorded in the "
+    "topic ledger. scope='due' (default) deletes only entries past the "
+    "7-day retention window; 'all_terminal' purges every ledger entry "
+    "immediately. Deletion is irreversible — pass dry_run=true first to "
+    "preview what would be deleted.",
+    {"scope": str, "dry_run": bool},
+)
+async def cleanup_engagement_topics(args: dict) -> dict:
+    """Configurator-owned on-demand topic cleanup [AR-7] — ledger-only.
+
+    Deletes ONLY topics recorded in the terminal-engagement ledger
+    (``/data/topic-ledger.json``): never guesses topic ids, never touches
+    active/idle engagements (they are not in the ledger). Deletion is
+    IRREVERSIBLE — it removes the topic and all its messages for every
+    member — so prefer a ``dry_run=true`` pass first and confirm the
+    counts before purging for real (configurator doctrine:
+    architecture.md "Engagement-topic cleanup"). The result echoes
+    ``dry_run`` and lists the affected topics in ``targets``
+    (``{engagement_id, topic_id}`` pairs — would-be deletions under
+    dry_run, resolved deletions otherwise) alongside the counts.
+    Per-entry telegram failures are classified inside the sweep ([AR-5])
+    and reported in ``failures``; entries are retained for retry, never
+    dropped on an unrecognized error.
+    """
+    import topic_ledger
+
+    scope = (args.get("scope") or "due").strip()
+    if scope not in _TOPIC_CLEANUP_SCOPES:
+        return _result({
+            "status": "error", "kind": "bad_scope",
+            "message": (
+                f"scope must be one of {_TOPIC_CLEANUP_SCOPES}, "
+                f"got {scope!r}"
+            ),
+        })
+    dry_run = bool(args.get("dry_run", False))
+
+    channel = (_channel_manager.get("telegram")
+               if _channel_manager is not None else None)
+    if channel is None or not getattr(channel, "engagement_supergroup_id", None):
+        return _result({
+            "status": "error", "kind": "telegram_not_configured",
+            "message": ("telegram engagement supergroup is not configured "
+                        "— there are no topics to clean up"),
+        })
+
+    result = await topic_ledger.sweep_topics(
+        channel,
+        chat_id=channel.engagement_supergroup_id,
+        scope=scope,
+        dry_run=dry_run,
+    )
+    return _result({"status": "ok", **result})
+
+
 # ---------------------------------------------------------------------------
 # Plan 4b §7.1: marketplace_* Configurator MCP tools
 # ---------------------------------------------------------------------------
@@ -2865,6 +2987,7 @@ CASA_TOOLS: tuple = (
     list_engagement_workspaces,
     delete_engagement_workspace,
     peek_engagement_workspace,
+    cleanup_engagement_topics,     # v0.65.0 [AR-7] — configurator-only grant
     marketplace_add_plugin,
     marketplace_remove_plugin,
     marketplace_update_plugin,

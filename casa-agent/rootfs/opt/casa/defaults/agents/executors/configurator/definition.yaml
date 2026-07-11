@@ -22,6 +22,8 @@ tools:
     - mcp__casa-framework__casa_restart_supervised
     - mcp__casa-framework__query_engager
     - mcp__casa-framework__emit_completion
+    # Engagement-topic cleanup (v0.65.0) — configurator-only; see doctrine/architecture.md.
+    - mcp__casa-framework__cleanup_engagement_topics
     # Plugin lifecycle (Plan 4b §7) — see doctrine/recipes/plugin/.
     - mcp__casa-framework__marketplace_add_plugin
     - mcp__casa-framework__marketplace_remove_plugin
