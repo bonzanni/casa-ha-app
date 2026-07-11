@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.66.0] - 2026-07-11 — resident SDK client pooling (warm-turn latency floor removed)
+
+### Changed
+
+- Resident turns now reuse a warm Claude Agent SDK client per conversation
+  instead of spawning a new subprocess + MCP handshake every turn — the
+  fixed ~2.3–3.7 s per-turn latency floor is gone; warm voice/text replies
+  start streaming in well under 1.5 s. Sessions, `/new`, memory injection,
+  and retry behavior are unchanged; warm clients are recycled on idle,
+  age, reloads, and shutdown. Set `SDK_CLIENT_POOL=off` (env) to restore
+  the previous per-turn behavior.
+- New option `sdk_client_pool` (default on) — disable to fall back to
+  per-turn sessions.
+
+### Fixed
+
+- Voice barge-in now interrupts the in-flight reply without killing the
+  session's warm client, so the next utterance responds immediately.
+
 ## [0.65.2] - 2026-07-11 — retry Anthropic API overloads (resilience fix)
 
 ### Fixed
