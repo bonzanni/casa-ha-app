@@ -129,3 +129,64 @@ async def test_fail_closed_callback_denies_with_log(caplog):
     assert "finance" in result.message
     assert result.interrupt is False
     assert any("fail-closed" in r.message for r in caplog.records)
+
+
+def _specialist_cfg(tmp_home: str):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        role="finance",
+        model="claude-sonnet-4-6",
+        system_prompt="You are Alex.",
+        tools=SimpleNamespace(
+            allowed=["Read", "Skill"], disallowed=["Bash"],
+            permission_mode="acceptEdits", max_turns=10,
+        ),
+        mcp_server_names=[],
+        hooks=SimpleNamespace(pre_tool_use=[]),
+        cwd=tmp_home,
+        memory=SimpleNamespace(token_budget=0),
+    )
+
+
+def test_specialist_options_merge_grants_and_fail_closed(tmp_path, monkeypatch):
+    import tools as tools_mod
+    monkeypatch.setattr(
+        tools_mod, "build_sdk_plugins", lambda **kw: [],
+    )
+    monkeypatch.setattr(
+        "hooks.resolve_hooks", lambda *a, **kw: {},
+    )
+    monkeypatch.setattr(
+        tools_mod, "derived_plugin_grants",
+        lambda home, **kw: ["mcp__plugin_lesina-invoice_lesina-invoice"],
+    )
+    cfg = _specialist_cfg(str(tmp_path))
+    opts = tools_mod._build_specialist_options(cfg)
+    assert "mcp__plugin_lesina-invoice_lesina-invoice" in opts.allowed_tools
+    # No duplicate if already present in cfg.tools.allowed:
+    cfg2 = _specialist_cfg(str(tmp_path))
+    cfg2.tools.allowed.append("mcp__plugin_lesina-invoice_lesina-invoice")
+    opts2 = tools_mod._build_specialist_options(cfg2)
+    assert opts2.allowed_tools.count(
+        "mcp__plugin_lesina-invoice_lesina-invoice") == 1
+    assert opts.can_use_tool is not None
+
+
+def test_executor_options_keep_no_callback_and_no_grants(monkeypatch):
+    """Spec B: executors are untouched — they have a real permission relay."""
+    from types import SimpleNamespace
+    import tools as tools_mod
+    monkeypatch.setattr(tools_mod, "build_sdk_plugins", lambda **kw: [])
+    monkeypatch.setattr("hooks.resolve_hooks", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        tools_mod, "derived_plugin_grants",
+        lambda home, **kw: ["mcp__plugin_should_not_appear"],
+    )
+    defn = SimpleNamespace(
+        hooks_path=None, mcp_server_names=[], tools_allowed=["Read"],
+        model="claude-sonnet-4-6", permission_mode="auto", max_turns=None,
+        tools_disallowed=[],
+    )
+    opts = tools_mod._build_executor_options(defn)
+    assert opts.can_use_tool is None
+    assert "mcp__plugin_should_not_appear" not in opts.allowed_tools
