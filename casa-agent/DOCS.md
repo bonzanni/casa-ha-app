@@ -190,10 +190,10 @@ Engagement topics live here, not in your personal chat.
 3. Turn ON **"Manage topics"**. This permission is **required** —
    Casa refuses to enable engagements without it and logs
    `bot lacks can_manage_topics; engagements disabled`.
-4. Recommended: also turn ON **"Delete messages"** — Casa uses it to
-   delete finished engagements' topics after retention (see step 6).
-   Other permissions (pin, etc.) are optional. Casa does not require
-   them. Leave unused ones off to minimise the bot's surface.
+4. Other permissions ("Delete messages", pin, etc.) are optional —
+   Casa does not require them; topic cleanup works with "Manage
+   topics" alone (see step 6). Leave unused ones off to minimise the
+   bot's surface.
 5. Confirm. The bot is now a topic-managing admin.
 
 #### 3. Find the supergroup's chat ID
@@ -247,20 +247,19 @@ The autocomplete should list `/cancel`, `/complete`, and `/silent`.
 These commands are registered via Telegram's `setMyCommands` scoped to
 the supergroup only — they do NOT appear in your 1:1 DM with Ellen.
 
-#### 6. Grant "Delete messages" (recommended — enables topic cleanup)
+#### 6. Automatic topic cleanup (works out of the box)
 
 Since v0.65.0 Casa deletes a finished engagement's topic automatically
 **7 days after the engagement ends** — the same retention window as its
-workspace — so the sidebar doesn't fill up with dead topics. Deleting
-topics requires one more admin right:
+workspace — so the sidebar doesn't fill up with dead topics.
 
-1. Open the group → tap the bot in the members list → edit its admin
-   rights.
-2. Turn ON **"Delete messages"**.
-
-Without this right, Casa degrades gracefully: finished topics are still
-closed and title-marked (✅/❌/⏹) as before, deletion is retried at the
-next sweep, and Ellen asks you once per boot to grant the right.
+**No extra admin right is needed** (v0.65.1 correction): Telegram lets a
+topic's *creator* delete it with the "Manage topics" right the bot
+already has from step 2, and every engagement topic is created by the
+bot. The **"Delete messages"** admin right is optional insurance — if a
+deletion is ever refused for rights reasons, Casa keeps the topic
+scheduled, retries at the next sweep, and Ellen asks you once per boot
+to grant it.
 
 Notes:
 

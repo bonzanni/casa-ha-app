@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.65.1] - 2026-07-11 — topic cleanup works out of the box (docs correction)
+
+No code changes. The v0.65.0 live verification found that the
+**"Delete messages" grant is not needed** for Casa's topic cleanup:
+Telegram lets a topic's *creator* delete it with the "Manage topics"
+right the bot already has, and every engagement topic is bot-created —
+verified end-to-end on a live supergroup (real topic deleted through the
+shipped ledger sweep with `can_delete_messages: False`).
+
+### Changed
+
+- DOCS.md no longer asks for the "Delete messages" grant; it documents
+  cleanup as working out of the box, with the grant as optional
+  insurance. The graceful-degradation path (retry + once-per-boot ask)
+  remains in place should Telegram semantics ever change. Your only
+  remaining action for an existing install: the **one-time manual sweep**
+  of topics from before v0.65.0.
+
 ## [0.65.0] - 2026-07-11 — engagement-topic retention & cleanup
 
 Finished engagements used to park their Telegram forum topics in the
