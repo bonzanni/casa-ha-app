@@ -200,6 +200,19 @@ _ENGAGEMENTS_PENDING_RELOAD: set[str] = set()
 _ENGAGEMENTS_DEFERRED_HARD_RELOAD: set[str] = set()
 
 
+def _snapshot_origin() -> dict:
+    """Copy the current origin at handler entry (AR-2, pooling spec §Q7).
+
+    With a pooled SDK client, ``origin_var`` in the read-task context is
+    bound to a MUTABLE holder rewritten at each turn start. Any handler
+    that keeps the reference across an await that can outlive its turn
+    (delegations most of all) would read the NEXT turn's origin — for
+    the delegation retain gate that is a clearance violation, not just
+    misattribution. Snapshot once, at entry, before any await."""
+    import agent as agent_mod
+    return dict(agent_mod.origin_var.get(None) or {})
+
+
 def _result(payload: dict, *, is_error: bool | None = None) -> dict:
     """Wrap a JSON-serializable payload as the tool's MCP content.
 
@@ -397,7 +410,10 @@ _specialist_bg_tasks: set[asyncio.Task[Any]] = set()
 async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
     """Run one ephemeral delegated turn and return the concatenated text."""
     import agent as agent_mod
-    parent = agent_mod.origin_var.get(None) or {}
+    # AR-2: snapshot BEFORE any await — this coroutine outlives the parent
+    # turn (async delegations especially), and a pooled client's origin_var
+    # holder can be rewritten by the NEXT turn while this one is in flight.
+    parent = _snapshot_origin()
     child_origin = {
         **parent,
         "delegation_depth": int(parent.get("delegation_depth", 0)) + 1,
@@ -579,8 +595,11 @@ async def delegate_to_agent(args: dict) -> dict:
     # without an origin, even if the name is also invalid. Lets
     # callers test the no-origin branch without first seeding a
     # valid specialist.
-    origin = agent_mod.origin_var.get(None)
-    if origin is None:
+    # AR-2: snapshot at entry — this handler awaits (channel setup,
+    # engagement/delegation dispatch) and must not read a holder that a
+    # later turn has since rewritten in place.
+    origin = _snapshot_origin()
+    if not origin:
         return _result({
             "status": "error",
             "kind": "no_origin",
@@ -840,7 +859,7 @@ async def recall_memory(args: dict) -> dict:
     if sem is None:
         return _result({"status": "ok", "memory": ""})  # not wired / cold
 
-    origin = agent_mod.origin_var.get(None) or {}
+    origin = _snapshot_origin()
     role = origin.get("role", "assistant")
     channel = origin.get("channel", "telegram")
     caller_cfg = _agent_role_map.get(role)
@@ -879,14 +898,12 @@ async def recall_memory(args: dict) -> dict:
     {"within_hours": int},
 )
 async def get_schedule(args: dict) -> dict:
-    import agent as agent_mod
-
     if _trigger_registry is None:
         return {"content": [{"type": "text",
                              "text": "Error: trigger registry not initialized"}]}
 
-    origin = agent_mod.origin_var.get(None)
-    if origin is None:
+    origin = _snapshot_origin()
+    if not origin:
         return {"content": [{"type": "text",
                              "text": "Error: get_schedule called outside a turn context"}]}
 
@@ -955,9 +972,8 @@ def _effective_caller_role() -> str | None:
         if r:
             return r
     try:
-        import agent as agent_mod
-        origin = agent_mod.origin_var.get(None)
-        if origin is not None:
+        origin = _snapshot_origin()
+        if origin:
             r = origin.get("role")
             if r:
                 return r
@@ -1212,8 +1228,12 @@ async def _fetch_executor_archive(
 )
 async def engage_executor(args: dict) -> dict:
     import agent as agent_mod
-    origin = agent_mod.origin_var.get(None)
-    if origin is None:
+    # AR-2: snapshot at entry — this handler awaits extensively (topic
+    # creation, engagement-registry create, driver dispatch) and reads
+    # `origin` well after those awaits; a pooled client's holder rewrite
+    # by a later turn must not leak into this in-flight engagement.
+    origin = _snapshot_origin()
+    if not origin:
         return _result({
             "status": "error", "kind": "no_origin",
             "message": "engage_executor called outside a turn",
