@@ -404,3 +404,31 @@ async def test_fleet_cap_across_pools(monkeypatch):
     await t
     assert p1.stats()["entries"] + p2.stats()["entries"] == 1
     await p1.aclose(); await p2.aclose()
+
+
+async def test_evict_waits_for_entry_lock():
+    """AR-7: sweep/LRU eviction must not disconnect a client whose entry
+    lock is held (warm-window race: lock acquired, state still 'warm')."""
+    reg = FakeRegistry()
+    reg.data["v-1"] = {"sdk_session_id": "s", "last_active": "x"}
+    pool = _mk_pool(reg)
+    made = []
+    pool._make_client = lambda opts: made.append(ScriptedClient(opts)) or made[-1]
+    async def build_options(is_fresh, resume_sid): return {}
+    async def on_message(m): pass
+    async def go():
+        return await pool.turn(channel_key="v-1", channel="voice", prompt="p",
+                               origin={}, cid="c", build_options=build_options,
+                               on_stale_old=lambda s: None, on_message=on_message)
+    t = asyncio.create_task(go()); await asyncio.sleep(0.01)
+    made[0].script = [[_mk_result("s")]]
+    await t
+    entry = pool._entries["v-1"]
+    async with entry.lock:                      # simulate the warm window
+        evict = asyncio.create_task(pool._evict("v-1", entry))
+        await asyncio.sleep(0.05)
+        assert not evict.done()                 # eviction is waiting, not closing
+        assert not made[0].disconnected
+    await evict
+    assert made[0].disconnected
+    assert pool.stats()["entries"] == 0

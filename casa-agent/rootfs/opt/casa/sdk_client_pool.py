@@ -366,11 +366,35 @@ class SdkClientPool:
             return entry
 
     async def _drop(self, channel_key: str, entry: ManagedSdkClient) -> None:
-        """Generation-checked invalidate: only removes THIS entry object."""
+        """Generation-checked invalidate: only removes THIS entry object.
+
+        Locking contract: caller already holds ``entry.lock`` (the only
+        callers are the in-turn failure/non-retryable paths inside
+        ``turn()``) — this must NOT try to acquire it again, that would
+        deadlock against itself."""
         async with self._pool_lock:
             if self._entries.get(channel_key) is entry:
                 del self._entries[channel_key]
         await entry.aclose()
+
+    async def _evict(self, channel_key: str, entry: ManagedSdkClient) -> None:
+        """Generation-checked pop + lock-guarded close (AR-7).
+
+        Locking contract: caller must NOT hold ``entry.lock`` — this is
+        the eviction path for callers outside the entry's own turn (LRU
+        cap enforcement, idle/max-age sweep). It removes the entry from
+        the dict under the pool lock first (so no new turn can pick it
+        up), then acquires the entry's own lock before closing — this
+        blocks until any in-flight turn holding the lock (e.g. the
+        warm-window between resume-touch and run_turn_locked flipping
+        the state to "in_turn") has released it, so a close can never
+        race a turn already using this entry."""
+        async with self._pool_lock:
+            if self._entries.get(channel_key) is not entry:
+                return
+            del self._entries[channel_key]
+        async with entry.lock:
+            await entry.aclose()
 
     async def close_key(self, channel_key: str) -> None:
         """AR-4 reset-hook target: close (flush) the key's warm client."""
@@ -423,14 +447,14 @@ class SdkClientPool:
                 break
             _, p, k, e = victim
             logger.info("pool cap: LRU-closing %s", k)
-            await p._drop(k, e)
+            await p._evict(k, e)
         while sum(len(p._entries) for p in SdkClientPool._instances) > fleet_cap:
             victim = _lru(SdkClientPool._instances)
             if victim is None:
                 break
             _, p, k, e = victim
             logger.info("fleet cap: LRU-closing %s", k)
-            await p._drop(k, e)
+            await p._evict(k, e)
 
     async def _sweep_once(self) -> None:
         now = self._monotonic()
@@ -448,7 +472,7 @@ class SdkClientPool:
                     doomed.append((key, e))
         for key, e in doomed:
             logger.info("pool sweep: closing %s (idle/max-age)", key)
-            await self._drop(key, e)
+            await self._evict(key, e)
 
     async def _run_sweeper(self, interval: float = 60.0) -> None:
         try:
