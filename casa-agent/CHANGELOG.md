@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.65.2] - 2026-07-11 — retry Anthropic API overloads (resilience fix)
+
+### Fixed
+
+- **API overloads (HTTP 529 / `overloaded_error`) are now retried.** They are
+  the most common transient Anthropic failure, but the error classifier had no
+  rule for them: a 529 carries none of the "rate limit" / "429" / "timeout"
+  markers, and the SDK surfaces it as a `ProcessError` whose type name lacks
+  the CLI/SDK/Connection markers — so it fell through to `UNKNOWN` and was
+  **never retried**, surfacing to the user as "something went wrong" on a
+  blip a single backoff would have ridden out. Overloads now classify as
+  retryable and use jittered exponential backoff. (Found during a live-test
+  coverage survey; connection-class failures were already retried.)
+
 ## [0.65.1] - 2026-07-11 — topic cleanup works out of the box (docs correction)
 
 No code changes. The v0.65.0 live verification found that the
