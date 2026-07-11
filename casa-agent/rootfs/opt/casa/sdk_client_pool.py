@@ -12,8 +12,10 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+import os
 import time
-from typing import Any, Awaitable, Callable
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -209,3 +211,187 @@ class ManagedSdkClient:
                 await client.disconnect()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("pool client close failed: %s", exc)
+
+
+def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %d", name, raw, default)
+        return default
+    return max(value, min_value)
+
+
+def pool_enabled() -> bool:
+    return os.environ.get("SDK_CLIENT_POOL", "on").strip().lower() not in (
+        "off", "0", "false",
+    )
+
+
+class PoolTurnResult(NamedTuple):
+    sid: str | None
+    resume_sid: str | None
+    is_fresh: bool
+
+
+class SdkClientPool:
+    """Per-Agent cache of warm conversation clients, keyed by channel_key.
+
+    The SessionRegistry stays authoritative: the resume decision is derived
+    INSIDE turn(), under the entry's serialization (AR-3), from a fresh
+    registry read — so /new, freshness expiry, sid drift, and interleaved
+    turns can never fork a conversation or reuse a stale client."""
+
+    _instances: "list[SdkClientPool]" = []   # fleet accounting (Task 6)
+
+    def __init__(self, session_registry, *, decide, origin_ctxvar, cid_ctxvar,
+                 engagement_ctxvar, freshness=None, make_client=None,
+                 monotonic=time.monotonic, wall_now=None) -> None:
+        if freshness is None:
+            from session_saver import freshness_window as freshness
+        self._registry = session_registry
+        self._decide = decide
+        self._origin_ctxvar = origin_ctxvar
+        self._cid_ctxvar = cid_ctxvar
+        self._engagement_ctxvar = engagement_ctxvar
+        self._freshness = freshness
+        self._make_client = make_client
+        self._monotonic = monotonic
+        self._wall_now = wall_now or (lambda: datetime.now(timezone.utc))
+        self._entries: dict[str, ManagedSdkClient] = {}
+        self._pool_lock = asyncio.Lock()
+        self._closing = False
+        self._sweeper: asyncio.Task | None = None
+        self.max_per_agent = _env_int("SDK_POOL_MAX_PER_AGENT", 4)
+        self.idle_seconds = float(_env_int("SDK_POOL_IDLE_SECONDS", 1800))
+        self.max_age_seconds = float(_env_int("SDK_POOL_MAX_AGE_SECONDS", 43200))
+        SdkClientPool._instances.append(self)
+
+    def stats(self) -> dict:
+        return {"entries": len(self._entries), "closing": self._closing}
+
+    async def turn(self, *, channel_key: str, channel: str, prompt: str,
+                   origin: dict, cid: str, build_options, on_stale_old,
+                   on_message) -> PoolTurnResult:
+        for _attempt in (1, 2):                      # AR-7: one silent retry
+            if self._closing:
+                raise PoolUnavailable("pool closing")
+            entry = await self._entry_stub(channel_key)
+            async with entry.lock:
+                if self._entries.get(channel_key) is not entry:
+                    continue                          # replaced/evicted; retry
+                if entry.state not in ("new", "warm"):
+                    async with self._pool_lock:
+                        if self._entries.get(channel_key) is entry:
+                            del self._entries[channel_key]
+                    continue
+                # --- decision UNDER the entry lock (AR-3) ---
+                reg_entry = self._registry.get(channel_key)
+                decision, save_old = self._decide(
+                    channel, reg_entry, self._wall_now(),
+                )
+                resume_sid = (
+                    reg_entry.get("sdk_session_id")
+                    if decision == "resume" and reg_entry else None
+                )
+                is_fresh = resume_sid is None
+                reusable = (
+                    entry.state == "warm"
+                    and not is_fresh
+                    and entry.sid == resume_sid
+                )
+                if not reusable:
+                    old_sid = entry.sid
+                    if entry.state == "warm":
+                        await entry.aclose()          # flush BEFORE retain (AR-4)
+                    if save_old:
+                        stale = (reg_entry or {}).get("sdk_session_id") or old_sid
+                        if stale:
+                            on_stale_old(stale)
+                    options = await build_options(is_fresh, resume_sid)
+                    fresh_client = ManagedSdkClient(
+                        options,
+                        origin_ctxvar=self._origin_ctxvar,
+                        cid_ctxvar=self._cid_ctxvar,
+                        engagement_ctxvar=self._engagement_ctxvar,
+                        make_client=self._make_client or _default_make_client,
+                        monotonic=self._monotonic,
+                    )
+                    fresh_client.lock = entry.lock    # keep the held lock
+                    fresh_client.sid = resume_sid
+                    await fresh_client.open()
+                    async with self._pool_lock:
+                        self._entries[channel_key] = fresh_client
+                    entry = fresh_client
+                if decision == "resume":
+                    await self._registry.touch(channel_key)
+                try:
+                    sid = await entry.run_turn_locked(
+                        prompt, origin=origin, cid=cid, on_message=on_message,
+                    )
+                except asyncio.CancelledError:
+                    if entry.state != "warm":
+                        await self._drop(channel_key, entry)
+                    raise
+                except BaseException:
+                    await self._drop(channel_key, entry)
+                    raise
+                if entry.state != "warm":             # AR-5 non-retryable path
+                    await self._drop(channel_key, entry)
+                return PoolTurnResult(sid=sid, resume_sid=resume_sid,
+                                      is_fresh=is_fresh)
+        raise PoolUnavailable("entry unstable after retry")
+
+    async def _entry_stub(self, channel_key: str) -> ManagedSdkClient:
+        async with self._pool_lock:
+            entry = self._entries.get(channel_key)
+            if entry is None:
+                entry = ManagedSdkClient(
+                    None,
+                    origin_ctxvar=self._origin_ctxvar,
+                    cid_ctxvar=self._cid_ctxvar,
+                    engagement_ctxvar=self._engagement_ctxvar,
+                    make_client=self._make_client or _default_make_client,
+                    monotonic=self._monotonic,
+                )
+                self._entries[channel_key] = entry
+            return entry
+
+    async def _drop(self, channel_key: str, entry: ManagedSdkClient) -> None:
+        """Generation-checked invalidate: only removes THIS entry object."""
+        async with self._pool_lock:
+            if self._entries.get(channel_key) is entry:
+                del self._entries[channel_key]
+        await entry.aclose()
+
+    async def close_key(self, channel_key: str) -> None:
+        """AR-4 reset-hook target: close (flush) the key's warm client."""
+        async with self._pool_lock:
+            entry = self._entries.pop(channel_key, None)
+        if entry is not None:
+            async with entry.lock:
+                await entry.aclose()
+
+    async def aclose(self, *, drain_timeout: float = 120.0) -> None:
+        self._closing = True
+        if self._sweeper is not None:
+            self._sweeper.cancel()
+            self._sweeper = None
+        async with self._pool_lock:
+            entries = dict(self._entries)
+            self._entries.clear()
+        for key, entry in entries.items():
+            try:
+                await asyncio.wait_for(entry.lock.acquire(), timeout=drain_timeout)
+                try:
+                    await entry.aclose()
+                finally:
+                    entry.lock.release()
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.warning("pool aclose: drain timeout on %s; force close", key)
+                await entry.aclose()
+        if self in SdkClientPool._instances:
+            SdkClientPool._instances.remove(self)
