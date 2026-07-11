@@ -110,7 +110,7 @@ class TestNotificationBranch:
         )
 
         _FakeClient.reset()
-        with patch("agent.ClaudeSDKClient", _FakeClient):
+        with patch("sdk_client_pool._default_make_client", _FakeClient):
             await agent.handle_message(msg)
 
         # SDK was queried — fresh turn was synthesized.
@@ -140,7 +140,7 @@ class TestNotificationBranch:
         )
 
         _FakeClient.reset()
-        with patch("agent.ClaudeSDKClient", _FakeClient):
+        with patch("sdk_client_pool._default_make_client", _FakeClient):
             await agent.handle_message(msg)
 
         prompt = _FakeClient.captured_prompts[0]
@@ -167,7 +167,7 @@ class TestNotificationBranch:
         )
 
         _FakeClient.reset()
-        with patch("agent.ClaudeSDKClient", _FakeClient):
+        with patch("sdk_client_pool._default_make_client", _FakeClient):
             await agent.handle_message(msg)
 
         prompt = _FakeClient.captured_prompts[0]
@@ -194,7 +194,7 @@ class TestNonDelegationNotificationPassthrough:
         )
 
         _FakeClient.reset()
-        with patch("agent.ClaudeSDKClient", _FakeClient):
+        with patch("sdk_client_pool._default_make_client", _FakeClient):
             await agent.handle_message(msg)
 
         # SDK still ran (default flow), but the prompt is the original

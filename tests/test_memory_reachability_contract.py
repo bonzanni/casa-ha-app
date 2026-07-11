@@ -148,7 +148,7 @@ async def test_memory_reachable_in_every_cell(tmp_path, role, channel, is_fresh)
     chat_id = f"{channel}-{is_fresh}"
     key = None if is_fresh else f"{channel}-{chat_id}"
     agent, sem = _agent(tmp_path, role, seed_resumed=key)
-    with patch("agent.ClaudeSDKClient", _CaptureClient):
+    with patch("sdk_client_pool._default_make_client", _CaptureClient):
         await agent._process(_msg(channel, chat_id))
 
     opts = _CaptureClient.captured_options
@@ -169,7 +169,7 @@ async def test_options_allowed_tools_superset_of_config(tmp_path, role, channel,
     chat_id = f"sup-{channel}-{is_fresh}"
     key = None if is_fresh else f"{channel}-{chat_id}"
     agent, _ = _agent(tmp_path, role, seed_resumed=key)
-    with patch("agent.ClaudeSDKClient", _CaptureClient):
+    with patch("sdk_client_pool._default_make_client", _CaptureClient):
         await agent._process(_msg(channel, chat_id))
     opts = _CaptureClient.captured_options
     assert set(_real_allowed(role)) <= set(opts.allowed_tools)
@@ -179,7 +179,7 @@ async def test_fresh_telegram_recall_uses_full_private_clearance(tmp_path):
     """Clearance-tag correctness on the captured recall: a fresh telegram turn
     (private clearance) recalls across all four tiers."""
     agent, sem = _agent(tmp_path, "assistant")
-    with patch("agent.ClaudeSDKClient", _CaptureClient):
+    with patch("sdk_client_pool._default_make_client", _CaptureClient):
         await agent._process(_msg("telegram", "clr"))
     assert len(sem.recall_calls) == 1
     assert set(sem.recall_calls[0]["tags"]) == {"private", "family", "friends", "public"}

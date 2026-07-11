@@ -107,7 +107,7 @@ class TestAgentProcessInjects:
             channel_manager=ChannelManager(),
         )
 
-        with patch("agent.ClaudeSDKClient", _FakeClient):
+        with patch("sdk_client_pool._default_make_client", _FakeClient):
             msg = BusMessage(
                 type=MessageType.REQUEST, source="telegram",
                 target="assistant", content="hello",

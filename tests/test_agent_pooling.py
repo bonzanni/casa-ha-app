@@ -1,0 +1,259 @@
+"""Agent ↔ SdkClientPool integration (spec §4/§5, AR-1..AR-10).
+
+Drives ``Agent.handle_message`` end-to-end with a scripted client factory
+patched at ``sdk_client_pool._default_make_client`` (the seam BOTH the pooled
+path and the per-turn bypass path construct their client through). Covers the
+eligibility gate, warm reuse, the SCHEDULED / webhook-uuid / kill-switch
+bypasses, the reset-listener flush, options fresh-vs-resumed, and ``aclose``.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+
+import pytest
+from claude_agent_sdk import (
+    AssistantMessage as _SDKAssistantMessage,
+    ClaudeAgentOptions,
+    ResultMessage as _SDKResultMessage,
+    TextBlock as _SDKTextBlock,
+)
+
+from agent import Agent
+from bus import BusMessage, MessageType
+from channels import ChannelManager
+from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
+from mcp_registry import McpServerRegistry
+from semantic_memory import SemanticMemory
+from session_registry import SessionRegistry
+
+
+# --------------------------------------------------------------------------
+# SDK-message helpers (SDK-shape-tolerant, mirror test_sdk_client_pool_*)
+# --------------------------------------------------------------------------
+
+
+def _mk_text_block(text: str) -> _SDKTextBlock:
+    try:
+        return _SDKTextBlock(text=text)
+    except TypeError:
+        return _SDKTextBlock(text)  # type: ignore[call-arg]
+
+
+def _mk_assistant(text: str) -> _SDKAssistantMessage:
+    block = _mk_text_block(text)
+    try:
+        return _SDKAssistantMessage(content=[block])
+    except TypeError:
+        m = _SDKAssistantMessage.__new__(_SDKAssistantMessage)
+        m.content = [block]  # type: ignore[attr-defined]
+        return m
+
+
+def _mk_result(sid, usage=None, *, is_error=False, result=""):
+    m = _SDKResultMessage.__new__(_SDKResultMessage)
+    m.session_id = sid
+    m.is_error = is_error
+    m.result = result
+    if usage is not None:
+        m.usage = usage
+    return m
+
+
+class ScriptedClient:
+    """Warm-transport double: a stable session_id so a resumed turn reuses it.
+
+    Auto-responds to every ``query`` with one AssistantMessage + a
+    ResultMessage carrying the stable sid, so a turn always succeeds.
+    """
+
+    def __init__(self, options, sid: str = "sid-scripted") -> None:
+        self.options = options
+        self.connected = False
+        self.disconnected = False
+        self.queries: list[str] = []
+        self._sid = sid
+
+    async def connect(self):
+        self.connected = True
+
+    async def disconnect(self):
+        self.disconnected = True
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+
+    async def receive_response(self):
+        text = self.queries[-1] if self.queries else ""
+        yield _mk_assistant("ok: " + text)
+        yield _mk_result(self._sid)
+
+
+class ScriptedFactory:
+    """``make_client(options)`` factory counting constructions."""
+
+    def __init__(self) -> None:
+        self.constructed = 0
+        self.clients: list[ScriptedClient] = []
+
+    def __call__(self, options) -> ScriptedClient:
+        self.constructed += 1
+        c = ScriptedClient(options)
+        self.clients.append(c)
+        return c
+
+
+class FakeSemanticMemory(SemanticMemory):
+    """Overlay/recall double — overlay rendered as <peer_overlay>."""
+
+    def __init__(self, overlay: str = "OV", facts: str = "") -> None:
+        self._overlay = overlay
+        self._facts = facts
+
+    async def retain(self, bank, items, *, async_=True):
+        return None
+
+    async def recall(self, bank, query, *, tags, max_tokens,
+                     types=("world", "experience", "observation"),
+                     tags_match="any", budget="mid"):
+        return self._facts
+
+    async def profile(self, bank):
+        return self._overlay
+
+
+@pytest.fixture
+def scripted_factory(monkeypatch):
+    factory = ScriptedFactory()
+    monkeypatch.setattr("sdk_client_pool._default_make_client", factory)
+    return factory
+
+
+@pytest.fixture
+async def agent_fixture(tmp_path, scripted_factory):
+    cfg = AgentConfig(
+        role="assistant",
+        model="claude-sonnet-4-6",
+        system_prompt="You are helpful.",
+        character=CharacterConfig(name="Test"),
+        tools=ToolsConfig(allowed=["Read"], permission_mode="acceptEdits"),
+        memory=MemoryConfig(token_budget=1000, read_strategy="per_turn"),
+    )
+    agent = Agent(
+        config=cfg,
+        session_registry=SessionRegistry(str(tmp_path / "sessions.json")),
+        mcp_registry=McpServerRegistry(),
+        channel_manager=ChannelManager(),
+        semantic_memory=FakeSemanticMemory(overlay="OV"),
+    )
+
+    async def send_turn(text, *, msg_type=MessageType.REQUEST,
+                        channel="telegram", chat_id="42"):
+        msg = BusMessage(
+            type=msg_type, source="user", target="assistant",
+            content=text, channel=channel, context={"chat_id": chat_id},
+        )
+        return await agent.handle_message(msg)
+
+    yield agent, send_turn
+    # Teardown: close the pool so the per-test sdk-pool-sweeper task and any
+    # warm ScriptedClients die with the test (isolation — no sweeper leaks
+    # into a later test). aclose is idempotent, so tests that already call it
+    # (e.g. test_aclose_closes_pool_and_unsubscribes) are unaffected.
+    await agent.aclose()
+
+
+# --------------------------------------------------------------------------
+# Tests
+# --------------------------------------------------------------------------
+
+
+async def test_second_turn_reuses_warm_client(agent_fixture, scripted_factory):
+    """Two REQUEST turns on one telegram chat → exactly ONE construction."""
+    agent, send_turn = agent_fixture
+    await send_turn("hello")
+    await send_turn("again")
+    assert scripted_factory.constructed == 1
+    assert scripted_factory.clients[0].queries[-1].endswith("again")
+
+
+async def test_scheduled_turn_bypasses_pool(agent_fixture, scripted_factory):
+    agent, send_turn = agent_fixture
+    await send_turn("cron tick", msg_type=MessageType.SCHEDULED)
+    await send_turn("cron tick", msg_type=MessageType.SCHEDULED)
+    assert scripted_factory.constructed == 2          # per-turn clients
+    assert agent._pool.stats()["entries"] == 0
+
+
+async def test_webhook_uuid_turn_bypasses_pool(agent_fixture, scripted_factory):
+    agent, send_turn = agent_fixture
+    await send_turn("one-shot", channel="webhook",
+                    chat_id="0b6f5df2-30cc-4f7e-9b4e-1d1c8f0a1b2c")
+    assert agent._pool.stats()["entries"] == 0
+
+
+async def test_kill_switch_disables_pool(agent_fixture, scripted_factory,
+                                         monkeypatch):
+    monkeypatch.setenv("SDK_CLIENT_POOL", "off")
+    agent, send_turn = agent_fixture
+    await send_turn("a")
+    await send_turn("b")
+    assert scripted_factory.constructed == 2
+
+
+async def test_new_reset_listener_closes_warm_entry(agent_fixture,
+                                                    scripted_factory):
+    agent, send_turn = agent_fixture
+    await send_turn("hello")
+    assert agent._pool.stats()["entries"] == 1
+    await agent._session_registry.notify_reset("telegram-42")
+    assert agent._pool.stats()["entries"] == 0
+    assert scripted_factory.clients[0].disconnected
+
+
+async def test_options_fresh_vs_resumed_memory_blocks(agent_fixture,
+                                                     scripted_factory):
+    """Fresh connect carries <peer_overlay>; warm turns never rebuild options."""
+    agent, send_turn = agent_fixture          # FakeSemanticMemory(overlay="OV")
+    await send_turn("hello")
+    opts0 = scripted_factory.clients[0].options
+    assert "OV" in opts0.system_prompt
+    await send_turn("again")
+    assert scripted_factory.constructed == 1  # no second options build
+
+
+async def test_aclose_closes_pool_and_unsubscribes(agent_fixture,
+                                                   scripted_factory):
+    agent, send_turn = agent_fixture
+    await send_turn("hello")
+    await agent.aclose()
+    assert scripted_factory.clients[0].disconnected
+    await agent._session_registry.notify_reset("telegram-42")  # no boom
+
+
+def test_claude_agent_options_fields_all_classified():
+    """Fails when the SDK adds an options field nobody classified as
+    static / connect-time / query-borne (spec §Q6)."""
+    KNOWN = {
+        # connect-time (pool-owned): every field agent._build_options sets
+        "model", "system_prompt", "allowed_tools", "disallowed_tools",
+        "permission_mode", "max_turns", "mcp_servers", "hooks", "cwd",
+        "resume", "setting_sources", "plugins", "stderr",
+        # defaults Casa does not set — audited 2026-07-11 against SDK
+        # 0.2.114 (spec §Q6): none is turn-variable in Casa's usage.
+        "add_dirs", "agents", "betas", "can_use_tool", "cli_path",
+        "continue_conversation", "debug_stderr", "effort",
+        "enable_file_checkpointing", "env", "extra_args", "fallback_model",
+        "fork_session", "include_hook_events", "include_partial_messages",
+        "load_timeout_ms", "max_budget_usd", "max_buffer_size",
+        "max_thinking_tokens", "output_format", "permission_prompt_tool_name",
+        "sandbox", "session_id", "session_store", "session_store_flush",
+        "settings", "skills", "strict_mcp_config", "task_budget", "thinking",
+        "tools", "user",
+    }
+    actual = {f.name for f in dataclasses.fields(ClaudeAgentOptions)}
+    assert actual <= KNOWN, (
+        f"unclassified ClaudeAgentOptions fields {actual - KNOWN}: a new SDK "
+        "field appeared — classify it static/connect-time/query-borne in the "
+        "pooling spec §Q6 before extending this set"
+    )

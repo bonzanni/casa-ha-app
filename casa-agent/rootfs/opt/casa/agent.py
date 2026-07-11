@@ -6,14 +6,13 @@ import asyncio
 import logging
 import time
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
-    ClaudeSDKClient,
     ProcessError,
     ResultMessage,
     SystemMessage,
@@ -40,6 +39,13 @@ from sensitivity import clearance_for_channel, readable_tiers
 from session_saver import freshness_window, retain_cold_session, save_session
 from semantic_memory import NoOpSemanticMemory, SemanticMemory
 from session_registry import SessionRegistry, build_session_key
+from session_sweeper import _is_uuid_scope
+from sdk_client_pool import (
+    ManagedSdkClient,
+    PoolUnavailable,
+    SdkClientPool,
+    pool_enabled,
+)
 from retry import retry_sdk_call
 from tokens import (
     BudgetTracker,
@@ -210,6 +216,26 @@ class Agent:
         # scoped to cfg.cwd).
         self._resolved_hooks = resolve_hooks(
             config.hooks, default_cwd=config.cwd,
+        )
+
+        # Warm SDK-client pool (spec 2026-07-11, AR-1..AR-10). One warm
+        # conversation per channel_key, reconciled against the SessionRegistry
+        # (the registry stays authoritative — the pool derives the resume
+        # decision from a fresh read INSIDE turn() via ``_resume_decision``).
+        # ``engagement_var`` is imported LAZILY here to avoid the tools↔agent
+        # circular import (tools imports agent only inside functions); resident
+        # turns never run inside an engagement binding, so open() asserts it is
+        # None. The reset listener gives the pool a chance to close (flush) a
+        # key's warm subprocess when the registry is explicitly reset (AR-4).
+        from tools import engagement_var as _engagement_var
+        self._engagement_var = _engagement_var
+        self._pool = SdkClientPool(
+            session_registry, decide=_resume_decision,
+            origin_ctxvar=origin_var, cid_ctxvar=cid_var,
+            engagement_ctxvar=_engagement_var,
+        )
+        self._unsub_reset = session_registry.add_reset_listener(
+            self._pool.close_key,
         )
 
         # Layer-5 capability boot log: one INFO line per Agent construction
@@ -425,7 +451,12 @@ class Agent:
         user_peer = user_peer_for_channel(msg.channel)
         user_text = str(msg.content)
 
-        origin_token = origin_var.set({
+        # The origin snapshot is set into ``origin_var`` for this task (so the
+        # delegate_to_agent tool handler can read the outer turn) AND handed to
+        # the pool / bypass client as ``origin=`` (the warm client rewrites its
+        # read-task-visible holder from it per turn — spec Q7). Same content on
+        # both seams.
+        origin_snapshot = {
             "role": self.config.role,
             "channel": msg.channel,
             "chat_id": msg.context.get("chat_id", ""),
@@ -435,7 +466,8 @@ class Agent:
             "user_id": msg.context.get("user_id"),
             "cid": cid_var.get(),
             "user_text": user_text,
-        })
+        }
+        origin_token = origin_var.set(origin_snapshot)
         try:
             # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at
             # /config/agent-home/<role>/; configured cwd on
@@ -445,131 +477,6 @@ class Agent:
                 or f"/config/agent-home/{self.config.role}"
             )
 
-            # SDK resume / save-before-overwrite (spec §3.3/§4.2) — runs BEFORE
-            # the memory-context build so the load plan can key on whether this
-            # is a fresh session (resume_session_id is None).
-            existing = self._session_registry.get(channel_key)
-            decision, save_old = _resume_decision(
-                msg.channel, existing, datetime.now(timezone.utc),
-            )
-            resume_session_id: str | None = None
-            if decision == "resume":
-                resume_session_id = existing.get("sdk_session_id")
-                await self._session_registry.touch(channel_key)
-            elif save_old:
-                # next-turn-after-gap: register() below will overwrite this channel's
-                # pointer with the new SDK session, so capture the OLD sid now and
-                # retain it in the BACKGROUND (per-item classification runs off the
-                # hot path — tier model §2.4). This is claim-free / registry-decoupled
-                # so it cannot race the register() rewrite. (save_session — which
-                # claims the registry — is intentionally NOT used here.)
-                old_sid = (existing or {}).get("sdk_session_id")
-                if old_sid:
-                    self._spawn_cold_retain(
-                        old_sid, agent_home, user_peer, msg.channel,
-                    )
-            # else ("new", False): no prior entry → nothing to save
-
-            # 2b. Memory context (spec §4.3) — channel-aware load on the
-            # SemanticMemory seam: a cheap mental-model overlay at fresh-session
-            # start, plus (text only) one recall filtered by channel clearance tier.
-            is_fresh = resume_session_id is None
-            load_plan = _plan_load(msg.channel, is_fresh_session=is_fresh)
-            bank = _memory_bank()
-            overlay_digest = ""
-            facts = ""
-            if load_plan.push_overlay and _overlay_allowed(msg.channel):
-                try:
-                    overlay_digest = await self._semantic_memory.profile(bank)
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "profile overlay failed for role=%s", self.config.role,
-                        exc_info=True,
-                    )
-            if load_plan.auto_recall:
-                try:
-                    facts = await self._semantic_memory.recall(
-                        bank, user_text, tags=_recall_tier_tags(msg.channel),
-                        max_tokens=self.config.memory.token_budget,
-                        budget="mid",  # auto_recall is always non-voice (see _plan_load); voice uses the recall_memory pull tool at budget=low
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "recall failed for role=%s", self.config.role, exc_info=True,
-                    )
-            parts: list[str] = []
-            if overlay_digest:
-                parts.append(f"<peer_overlay>\n{overlay_digest}\n</peer_overlay>")
-            if facts:
-                parts.append(f"<memory_context>\n{facts}\n</memory_context>")
-            memory_blocks = "\n".join(parts)
-
-            if memory_blocks:
-                self._budget_tracker.record(
-                    f"{channel_key}-{self.config.role}",
-                    estimate_tokens(memory_blocks),
-                    self.config.memory.token_budget,
-                )
-
-            # 3. System prompt = composed-prompt + runtime-injected blocks.
-            system_parts = [self.config.system_prompt]
-            if memory_blocks:
-                system_parts.append("\n" + memory_blocks)
-            system_parts.append(
-                "\n<channel_context>\n"
-                f"channel: {msg.channel}\n"
-                f"trust: {channel_trust_display(msg.channel)}\n"
-                "</channel_context>"
-            )
-            # <delegates> block — renders cfg.delegates with display names.
-            delegates_block = _render_delegates_block(
-                self.config.delegates, self._agent_registry,
-            )
-            if delegates_block:
-                system_parts.append("\n" + delegates_block)
-            # <executors> block — assistant role only (loader enforces this).
-            executors_block = _render_executors_block(self.config.executors)
-            if executors_block:
-                system_parts.append("\n" + executors_block)
-            # NOTE: <current_time> is intentionally NOT part of the system
-            # prompt — a per-second timestamp in the cached prefix would
-            # invalidate Anthropic prompt caching for the whole conversation
-            # every turn (see M27). It rides on the per-turn query text below.
-            system_prompt = "\n".join(system_parts)
-
-            # 4. MCP servers ---------------------------------------------------
-            mcp_servers = self._mcp_registry.resolve(self.config.mcp_server_names)
-
-            # 5. Hooks — resolved from hooks.yaml at load time by agent_loader.
-            hooks = self._resolved_hooks
-
-            # Binding layer — SDK does NOT auto-consume enabledPlugins; we
-            # build the `plugins=[...]` list from `claude plugin list --json`.
-            # Resolved off-loop + cached per instance (see _get_sdk_plugins).
-            sdk_plugins = await self._get_sdk_plugins()
-
-            # "Skill" is a valid allowed_tools entry (spike §Key learning 4);
-            # append if not already declared so plugin-shipped skills resolve.
-            allowed_tools = list(self.config.tools.allowed)
-            if "Skill" not in allowed_tools:
-                allowed_tools.append("Skill")
-
-            options = ClaudeAgentOptions(
-                model=self.config.model,
-                system_prompt=system_prompt,
-                allowed_tools=allowed_tools,
-                disallowed_tools=self.config.tools.disallowed,
-                permission_mode=self.config.tools.permission_mode or "acceptEdits",
-                max_turns=self.config.tools.max_turns,
-                mcp_servers=mcp_servers if mcp_servers else {},
-                hooks=hooks,
-                cwd=agent_home,
-                resume=resume_session_id,
-                setting_sources=["project"],
-                plugins=sdk_plugins,
-            )
-
-            # 7. Query the SDK — retry transient faults (spec 5.2 §3). --------
             # <current_time> rides on the per-turn query text (NOT the cached
             # system prompt) so the agent still knows the wall-clock time to
             # second precision without busting prompt caching (M27). user_text
@@ -585,120 +492,136 @@ class Agent:
                 f"{user_text}"
             )
 
-            async def _attempt_sdk_turn() -> tuple[str, str | None, dict[str, int]]:
-                """Run one end-to-end SDK turn. Phase 4b: every SDK message
-                kind dispatches through sdk_logging in addition to the
-                E-2 streaming concat below. Each attempt resets the
-                streaming accumulator so ``on_token`` delivers cumulative
-                text from scratch if an earlier attempt failed mid-turn.
-                """
-                attempt_text = ""
-                attempt_sid: str | None = resume_session_id
-                attempt_usage: dict[str, int] = {}
-                idx = 0
-                started_ms = time.monotonic() * 1000
-                tool_names_by_id: dict[str, str] = {}
-                async with ClaudeSDKClient(
-                    sdk_logging.with_stderr_callback(
-                        options, engagement_id=None,
-                    ),
-                ) as client:
-                    await client.query(prompt_text)
-                    async for sdk_msg in client.receive_response():
-                        # Phase 4b dispatch — wrapped so a malformed block
-                        # cannot abort the turn (logged + continued).
-                        try:
-                            if isinstance(sdk_msg, SystemMessage):
-                                sdk_logging.log_system_init(sdk_msg)
-                            elif isinstance(sdk_msg, AssistantMessage):
-                                idx += 1
-                                sdk_logging.log_assistant_message(sdk_msg, idx=idx)
-                                for block in getattr(sdk_msg, "content", []) or []:
-                                    if isinstance(block, ToolUseBlock):
-                                        tool_names_by_id[
-                                            getattr(block, "id", "")
-                                        ] = getattr(block, "name", "?")
-                                        sdk_logging.log_tool_use(block, idx=idx)
-                            elif isinstance(sdk_msg, UserMessage):
-                                for block in getattr(sdk_msg, "content", []) or []:
-                                    if isinstance(block, ToolResultBlock):
-                                        name = tool_names_by_id.get(
-                                            getattr(block, "tool_use_id", ""),
-                                            "",
-                                        )
-                                        sdk_logging.log_tool_result(
-                                            block, idx=idx, started_ms=started_ms,
-                                            name=name,
-                                        )
-                            elif isinstance(sdk_msg, ResultMessage):
-                                sdk_logging.log_turn_done(
-                                    sdk_msg, started_ms=started_ms,
-                                )
-                        except Exception as dispatch_exc:  # noqa: BLE001
-                            logger.warning(
-                                "phase4b dispatch failed: %s", dispatch_exc,
-                                exc_info=True,
-                            )
-                        # Existing branches — session_id capture, usage,
-                        # E-2 streaming concat — unchanged.
-                        if isinstance(sdk_msg, SystemMessage):
-                            if getattr(sdk_msg, "subtype", None) == "init":
-                                data = getattr(sdk_msg, "data", {}) or {}
-                                if "session_id" in data:
-                                    attempt_sid = data["session_id"]
-                        elif isinstance(sdk_msg, ResultMessage):
-                            sid = getattr(sdk_msg, "session_id", None)
-                            if sid:
-                                attempt_sid = sid
-                            attempt_usage = extract_usage(sdk_msg)
-                        elif isinstance(sdk_msg, AssistantMessage):
-                            # E-2: collect TextBlocks of THIS AssistantMessage.
-                            msg_text = "".join(
-                                b.text for b in getattr(sdk_msg, "content", [])
-                                if isinstance(b, TextBlock)
-                            )
-                            if msg_text:
-                                if attempt_text:
-                                    attempt_text += "\n\n"
-                                attempt_text += msg_text
-                                if on_token is not None:
-                                    await on_token(attempt_text)
-                return attempt_text, attempt_sid, attempt_usage
-
-            try:
-                response_text, sdk_session_id, usage = await retry_sdk_call(
-                    _attempt_sdk_turn, on_retry=self._log_retry,
+            # Eligibility gate (spec §4, AR-6/AR-7): a pooled warm turn iff the
+            # pool is enabled, the turn is not a SCHEDULED heartbeat, and it is
+            # not a webhook one-shot (random-uuid chat_id). Ineligible turns —
+            # and any PoolUnavailable — fall to the per-turn bypass path, which
+            # reproduces today's semantics exactly (decision here → one-shot
+            # ManagedSdkClient → aclose in finally).
+            use_pool = (
+                pool_enabled()
+                and msg.type != MessageType.SCHEDULED          # AR-6
+                and not (
+                    msg.channel == "webhook"
+                    and _is_uuid_scope(str(msg.context.get("chat_id", "")))
                 )
+            )
+
+            # The pool decides the resume sid internally (AR-3), but the
+            # ProcessError fallback below needs to know whether the failed
+            # attempt was resuming. Both attempt closures record it here.
+            last_resume: dict[str, str | None] = {"sid": None}
+
+            async def _attempt_pooled_turn():
+                on_message, state = self._make_on_message(on_token)
+
+                async def _build(is_fresh, resume_sid):
+                    # Recorded HERE (not just on success) so a ProcessError
+                    # raised at connect — the resume-failure class — still
+                    # tells the fallback below which sid was in play. A warm
+                    # reuse skips _build; if a warm turn dies, the retry's
+                    # reconnect calls _build and the fallback fires one attempt
+                    # later — same net behaviour as today.
+                    last_resume["sid"] = resume_sid
+                    return await self._build_options(
+                        channel=msg.channel, channel_key=channel_key,
+                        is_fresh=is_fresh, resume_sid=resume_sid,
+                        user_text=user_text,
+                    )
+
+                result = await self._pool.turn(
+                    channel_key=channel_key, channel=msg.channel,
+                    prompt=prompt_text, origin=origin_snapshot,
+                    cid=cid_var.get(), build_options=_build,
+                    on_stale_old=lambda old_sid: self._spawn_cold_retain(
+                        old_sid, agent_home, user_peer, msg.channel,
+                    ),
+                    on_message=on_message,
+                )
+                last_resume["sid"] = result.resume_sid
+                return (
+                    state["text"], result.sid, state["usage"],
+                    result.resume_sid,
+                )
+
+            async def _attempt_bypass_turn():
+                # Per-turn path (today's semantics): decision here, one-shot
+                # ManagedSdkClient reusing the same turn body.
+                existing = self._session_registry.get(channel_key)
+                decision, save_old = _resume_decision(
+                    msg.channel, existing, datetime.now(timezone.utc),
+                )
+                resume_sid = (
+                    existing.get("sdk_session_id")
+                    if decision == "resume" and existing else None
+                )
+                last_resume["sid"] = resume_sid
+                if decision == "resume":
+                    await self._session_registry.touch(channel_key)
+                elif save_old and (existing or {}).get("sdk_session_id"):
+                    # next-turn-after-gap: register() below overwrites this
+                    # channel's pointer, so retain the OLD sid in the BACKGROUND
+                    # (claim-free / registry-decoupled — cannot race register();
+                    # per-item classification runs off the hot path, tier §2.4).
+                    self._spawn_cold_retain(
+                        existing["sdk_session_id"], agent_home, user_peer,
+                        msg.channel,
+                    )
+                # else ("new", False): no prior entry → nothing to save
+                options = await self._build_options(
+                    channel=msg.channel, channel_key=channel_key,
+                    is_fresh=resume_sid is None, resume_sid=resume_sid,
+                    user_text=user_text,
+                )
+                client = ManagedSdkClient(
+                    options, origin_ctxvar=origin_var,
+                    cid_ctxvar=cid_var, engagement_ctxvar=self._engagement_var,
+                )
+                on_message, state = self._make_on_message(on_token)
+                try:
+                    await client.open()
+                    async with client.lock:
+                        sid = await client.run_turn_locked(
+                            prompt_text, origin=origin_snapshot,
+                            cid=cid_var.get(), on_message=on_message,
+                        )
+                finally:
+                    await client.aclose()
+                return state["text"], sid, state["usage"], resume_sid
+
+            # Retry transient faults (spec 5.2 §3). The pooled path may raise
+            # PoolUnavailable (pool closing / entry unstable) — fall to the
+            # per-turn bypass. ProcessError on a resuming attempt = the stale
+            # resume class (spec 5.8): clear + retry fresh (the pool re-derives
+            # a FRESH decision from the cleared registry).
+            attempt = _attempt_pooled_turn if use_pool else _attempt_bypass_turn
+            try:
+                response_text, sdk_session_id, usage, used_resume = \
+                    await retry_sdk_call(attempt, on_retry=self._log_retry)
+            except PoolUnavailable:
+                response_text, sdk_session_id, usage, used_resume = \
+                    await retry_sdk_call(
+                        _attempt_bypass_turn, on_retry=self._log_retry,
+                    )
             except ProcessError as exc:
-                # claude CLI exited non-zero. If we were resuming a prior
-                # session, the most common cause (spec 5.8) is a stale
-                # sdk_session_id — the local conversation file under
-                # ``cc-home/.claude/projects/`` (was ``/root/.claude/``
-                # pre-v0.37.8 H-1) was wiped (rebuild) while
-                # ``/data/sessions.json`` persisted. Clear and retry fresh.
-                if resume_session_id is None:
+                if last_resume["sid"] is None:
                     raise
-                # Phase 4b Bug 5: structured retry telemetry.
-                # exc.stderr is populated by Bug 4's stderr callback
-                # (subprocess_cli.py:472 + ProcessError._errors.py:25-37);
-                # truncate to a 200-char tail with newlines escaped so
-                # one log line stays scannable.
+                # Phase 4b Bug 5: structured retry telemetry. exc.stderr is
+                # populated by Bug 4's stderr callback; truncate to a 200-char
+                # tail with newlines escaped so one log line stays scannable.
                 stderr_tail = (exc.stderr or "")[-200:].replace("\n", "\\n")
                 logger.info(
                     "sdk_retry_fresh channel_key=%s exit_code=%s prior_sid=%s "
                     "stderr_tail=%s",
-                    channel_key, exc.exit_code, resume_session_id, stderr_tail,
+                    channel_key, exc.exit_code, last_resume["sid"], stderr_tail,
                 )
                 logger.warning(
-                    "SDK resume failed (key=%s sid=%s); clearing and retrying fresh",
-                    channel_key, resume_session_id,
+                    "SDK resume failed (key=%s sid=%s); clearing and retrying "
+                    "fresh", channel_key, last_resume["sid"],
                 )
                 await self._session_registry.clear_sdk_session(channel_key)
-                resume_session_id = None
-                options = replace(options, resume=None)
-                response_text, sdk_session_id, usage = await retry_sdk_call(
-                    _attempt_sdk_turn, on_retry=self._log_retry,
-                )
+                response_text, sdk_session_id, usage, used_resume = \
+                    await retry_sdk_call(attempt, on_retry=self._log_retry)
 
             # Per-turn telemetry (spec 5.2 §5.2). Microsecond cost — string
             # format + one logger.info — and runs after streaming has
@@ -712,7 +635,7 @@ class Agent:
                 ),
             )
 
-            if sdk_session_id and sdk_session_id != resume_session_id:
+            if sdk_session_id and sdk_session_id != used_resume:
                 logger.info(
                     "SDK session for '%s': %s",
                     self.config.role,
@@ -734,6 +657,197 @@ class Agent:
             return response_text or None
         finally:
             origin_var.reset(origin_token)
+
+    async def _build_options(
+        self, *, channel: str, channel_key: str, is_fresh: bool,
+        resume_sid: str | None, user_text: str,
+    ) -> ClaudeAgentOptions:
+        """Assemble the connect-time ClaudeAgentOptions for one conversation
+        (spec §4.3 steps 2b–6). Extracted verbatim from _process so BOTH the
+        pooled path (via the pool's build_options callback) and the bypass path
+        build identical options. Keys the channel-aware memory load on the
+        ``is_fresh`` PARAMETER (the pool decides it under the entry lock — AR-3),
+        not a locally-recomputed value. Returns the stderr-wrapped options."""
+        agent_home = (
+            self.config.cwd
+            or f"/config/agent-home/{self.config.role}"
+        )
+
+        # 2b. Memory context (spec §4.3) — channel-aware load on the
+        # SemanticMemory seam: a cheap mental-model overlay at fresh-session
+        # start, plus (text only) one recall filtered by channel clearance tier.
+        load_plan = _plan_load(channel, is_fresh_session=is_fresh)
+        bank = _memory_bank()
+        overlay_digest = ""
+        facts = ""
+        if load_plan.push_overlay and _overlay_allowed(channel):
+            try:
+                overlay_digest = await self._semantic_memory.profile(bank)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "profile overlay failed for role=%s", self.config.role,
+                    exc_info=True,
+                )
+        if load_plan.auto_recall:
+            try:
+                facts = await self._semantic_memory.recall(
+                    bank, user_text, tags=_recall_tier_tags(channel),
+                    max_tokens=self.config.memory.token_budget,
+                    budget="mid",  # auto_recall is always non-voice (see _plan_load); voice uses the recall_memory pull tool at budget=low
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "recall failed for role=%s", self.config.role, exc_info=True,
+                )
+        parts: list[str] = []
+        if overlay_digest:
+            parts.append(f"<peer_overlay>\n{overlay_digest}\n</peer_overlay>")
+        if facts:
+            parts.append(f"<memory_context>\n{facts}\n</memory_context>")
+        memory_blocks = "\n".join(parts)
+
+        if memory_blocks:
+            self._budget_tracker.record(
+                f"{channel_key}-{self.config.role}",
+                estimate_tokens(memory_blocks),
+                self.config.memory.token_budget,
+            )
+
+        # 3. System prompt = composed-prompt + runtime-injected blocks.
+        system_parts = [self.config.system_prompt]
+        if memory_blocks:
+            system_parts.append("\n" + memory_blocks)
+        system_parts.append(
+            "\n<channel_context>\n"
+            f"channel: {channel}\n"
+            f"trust: {channel_trust_display(channel)}\n"
+            "</channel_context>"
+        )
+        # <delegates> block — renders cfg.delegates with display names.
+        delegates_block = _render_delegates_block(
+            self.config.delegates, self._agent_registry,
+        )
+        if delegates_block:
+            system_parts.append("\n" + delegates_block)
+        # <executors> block — assistant role only (loader enforces this).
+        executors_block = _render_executors_block(self.config.executors)
+        if executors_block:
+            system_parts.append("\n" + executors_block)
+        # NOTE: <current_time> is intentionally NOT part of the system prompt —
+        # a per-second timestamp in the cached prefix would invalidate Anthropic
+        # prompt caching for the whole conversation every turn (see M27). It
+        # rides on the per-turn query text (built in _process).
+        system_prompt = "\n".join(system_parts)
+
+        # 4. MCP servers.
+        mcp_servers = self._mcp_registry.resolve(self.config.mcp_server_names)
+
+        # 5. Hooks — resolved from hooks.yaml at load time by agent_loader.
+        hooks = self._resolved_hooks
+
+        # Binding layer — SDK does NOT auto-consume enabledPlugins; we build the
+        # `plugins=[...]` list from `claude plugin list --json`. Resolved
+        # off-loop + cached per instance (see _get_sdk_plugins).
+        sdk_plugins = await self._get_sdk_plugins()
+
+        # "Skill" is a valid allowed_tools entry (spike §Key learning 4);
+        # append if not already declared so plugin-shipped skills resolve.
+        allowed_tools = list(self.config.tools.allowed)
+        if "Skill" not in allowed_tools:
+            allowed_tools.append("Skill")
+
+        options = ClaudeAgentOptions(
+            model=self.config.model,
+            system_prompt=system_prompt,
+            allowed_tools=allowed_tools,
+            disallowed_tools=self.config.tools.disallowed,
+            permission_mode=self.config.tools.permission_mode or "acceptEdits",
+            max_turns=self.config.tools.max_turns,
+            mcp_servers=mcp_servers if mcp_servers else {},
+            hooks=hooks,
+            cwd=agent_home,
+            resume=resume_sid,
+            setting_sources=["project"],
+            plugins=sdk_plugins,
+        )
+        return sdk_logging.with_stderr_callback(options, engagement_id=None)
+
+    def _make_on_message(self, on_token: OnTokenCallback | None):
+        """Build the per-turn ``on_message(sdk_msg)`` handler + its ``state``.
+
+        Reproduces today's per-message body VERBATIM (Phase 4b sdk_logging
+        dispatch wrapped in try/except, tool_names_by_id, idx counter,
+        started_ms, E-2 streaming concat into state["text"] with cumulative
+        on_token, usage extraction into state["usage"]) — MINUS session-id
+        capture, which the warm client / pool now owns (spec Q7). A fresh state
+        per call resets the streaming accumulator per attempt (spec §3.2)."""
+        state: dict[str, Any] = {
+            "text": "",
+            "usage": {},
+            "idx": 0,
+            "started_ms": time.monotonic() * 1000,
+            "tool_names_by_id": {},
+        }
+
+        async def on_message(sdk_msg: Any) -> None:
+            # Phase 4b dispatch — wrapped so a malformed block cannot abort the
+            # turn (logged + continued).
+            try:
+                if isinstance(sdk_msg, SystemMessage):
+                    sdk_logging.log_system_init(sdk_msg)
+                elif isinstance(sdk_msg, AssistantMessage):
+                    state["idx"] += 1
+                    sdk_logging.log_assistant_message(sdk_msg, idx=state["idx"])
+                    for block in getattr(sdk_msg, "content", []) or []:
+                        if isinstance(block, ToolUseBlock):
+                            state["tool_names_by_id"][
+                                getattr(block, "id", "")
+                            ] = getattr(block, "name", "?")
+                            sdk_logging.log_tool_use(block, idx=state["idx"])
+                elif isinstance(sdk_msg, UserMessage):
+                    for block in getattr(sdk_msg, "content", []) or []:
+                        if isinstance(block, ToolResultBlock):
+                            name = state["tool_names_by_id"].get(
+                                getattr(block, "tool_use_id", ""), "",
+                            )
+                            sdk_logging.log_tool_result(
+                                block, idx=state["idx"],
+                                started_ms=state["started_ms"], name=name,
+                            )
+                elif isinstance(sdk_msg, ResultMessage):
+                    sdk_logging.log_turn_done(
+                        sdk_msg, started_ms=state["started_ms"],
+                    )
+            except Exception as dispatch_exc:  # noqa: BLE001
+                logger.warning(
+                    "phase4b dispatch failed: %s", dispatch_exc, exc_info=True,
+                )
+            # Usage + E-2 streaming concat (session-id capture is the client's).
+            if isinstance(sdk_msg, ResultMessage):
+                state["usage"] = extract_usage(sdk_msg)
+            elif isinstance(sdk_msg, AssistantMessage):
+                # E-2: collect TextBlocks of THIS AssistantMessage.
+                msg_text = "".join(
+                    b.text for b in getattr(sdk_msg, "content", [])
+                    if isinstance(b, TextBlock)
+                )
+                if msg_text:
+                    if state["text"]:
+                        state["text"] += "\n\n"
+                    state["text"] += msg_text
+                    if on_token is not None:
+                        await on_token(state["text"])
+
+        return on_message, state
+
+    async def aclose(self) -> None:
+        """Release pooled SDK clients + reset hook. Safe to call twice; called
+        by reload (old instance) and casa_core shutdown."""
+        try:
+            self._unsub_reset()
+        except Exception:  # noqa: BLE001
+            pass
+        await self._pool.aclose()
 
     async def _get_sdk_plugins(self) -> list[dict[str, str]]:
         """Resolve this resident's SDK ``plugins=[...]`` list, off-loop + cached.

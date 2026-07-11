@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import retry as retry_mod
 from retry import (
     RETRY_KINDS,
     compute_backoff_ms,
@@ -18,6 +21,25 @@ from agent import ErrorKind
 
 
 pytestmark = pytest.mark.asyncio
+
+
+@contextmanager
+def patch_retry_sleep():
+    """Make retry's backoff instant WITHOUT touching the global asyncio.
+
+    Patching ``retry.asyncio.sleep`` mutates the shared ``asyncio`` module
+    object process-wide; with the SDK-client-pool sweeper looping
+    ``while True: await asyncio.sleep(interval)`` in a background task, an
+    instant-return sleep turns that loop into a tight CPU spin whose
+    AsyncMock records every call → unbounded RSS (~23 GB) + OOM. Instead we
+    replace retry's *module-local* ``asyncio`` reference with a namespace
+    carrying just the two attributes retry.py touches, so no other module's
+    ``asyncio.sleep`` is affected. Yields the sleep AsyncMock for assertions.
+    """
+    sleep = AsyncMock()
+    ns = SimpleNamespace(sleep=sleep, CancelledError=asyncio.CancelledError)
+    with patch.object(retry_mod, "asyncio", ns):
+        yield sleep
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +155,7 @@ class TestRetrySdkCall:
         async def fn():
             return "ok"
 
-        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+        with patch_retry_sleep() as sleep:
             result = await retry_sdk_call(fn)
 
         assert result == "ok"
@@ -148,7 +170,7 @@ class TestRetrySdkCall:
                 raise nxt
             return nxt
 
-        with patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch_retry_sleep():
             result = await retry_sdk_call(fn)
         assert result == "ok"
 
@@ -157,7 +179,7 @@ class TestRetrySdkCall:
         async def fn():
             raise _sdk_error()
 
-        with patch("retry.asyncio.sleep", new=AsyncMock()), \
+        with patch_retry_sleep(), \
              patch("retry.MAX_ATTEMPTS", 3):
             with pytest.raises(Exception) as excinfo:
                 await retry_sdk_call(fn)
@@ -167,7 +189,7 @@ class TestRetrySdkCall:
         async def fn():
             raise _unknown()
 
-        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+        with patch_retry_sleep() as sleep:
             with pytest.raises(ValueError):
                 await retry_sdk_call(fn)
         sleep.assert_not_awaited()
@@ -181,7 +203,7 @@ class TestRetrySdkCall:
                 raise _rate_limit("7")
             return "ok"
 
-        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+        with patch_retry_sleep() as sleep:
             result = await retry_sdk_call(fn)
 
         assert result == "ok"
@@ -198,7 +220,7 @@ class TestRetrySdkCall:
                 raise _rate_limit(None)
             return "ok"
 
-        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+        with patch_retry_sleep() as sleep:
             result = await retry_sdk_call(fn)
         assert result == "ok"
         # Delay is a jittered backoff (0.25–0.5s for attempt 0 with
@@ -221,7 +243,7 @@ class TestRetrySdkCall:
         def on_retry(attempt: int, exc: Exception, delay_ms: int) -> None:
             seen.append((attempt, type(exc).__name__, delay_ms))
 
-        with patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch_retry_sleep():
             await retry_sdk_call(fn, on_retry=on_retry)
 
         assert len(seen) == 1
@@ -237,7 +259,7 @@ class TestRetrySdkCall:
             attempts["n"] += 1
             raise asyncio.CancelledError()
 
-        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+        with patch_retry_sleep() as sleep:
             with pytest.raises(asyncio.CancelledError):
                 await retry_sdk_call(fn)
         # CancelledError is not retryable; no sleep should have run.
@@ -262,7 +284,7 @@ class TestRetryAfterCap:
                 raise RuntimeError("429 rate limit. Retry-After: 3600")
             return "ok"
 
-        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+        with patch_retry_sleep() as sleep:
             result = await retry_sdk_call(fn)
         assert result == "ok"
         # 10 * 8000 ms = 80 s — the hint was clamped.
@@ -278,7 +300,7 @@ class TestRetryAfterCap:
                 raise RuntimeError("429 rate limit. Retry-After: 5")
             return "ok"
 
-        with patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+        with patch_retry_sleep() as sleep:
             await retry_sdk_call(fn)
         sleep.assert_awaited_once_with(5.0)
 
