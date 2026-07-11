@@ -79,6 +79,7 @@ class SessionRegistry:
         self._path = path
         self._data: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
+        self._reset_listeners: list = []
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as fh:
@@ -250,3 +251,25 @@ class SessionRegistry:
     def all_entries(self) -> dict[str, dict[str, Any]]:
         """Return a shallow copy of all entries."""
         return dict(self._data)
+
+    def add_reset_listener(self, cb):
+        """Register an async callback(channel_key) fired by notify_reset
+        BEFORE an explicit reset saves the transcript (AR-4: gives the SDK
+        client pool a chance to close — and thereby flush — the warm
+        subprocess for that key). Returns an unsubscribe callable."""
+        self._reset_listeners.append(cb)
+
+        def _unsub() -> None:
+            try:
+                self._reset_listeners.remove(cb)
+            except ValueError:
+                pass
+        return _unsub
+
+    async def notify_reset(self, channel_key: str) -> None:
+        """Best-effort fan-out; a listener failure must never block a reset."""
+        for cb in list(self._reset_listeners):
+            try:
+                await cb(channel_key)
+            except Exception:  # noqa: BLE001
+                logger.exception("reset listener failed for %s", channel_key)

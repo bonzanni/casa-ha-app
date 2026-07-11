@@ -76,7 +76,7 @@ class CidFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.cid = cid_var.get()
+        record.cid = str(cid_var.get())
         return True
 
 
@@ -180,7 +180,7 @@ def install_logging(
 
         def _casa_record_factory(*args, **kwargs):
             record = orig_factory(*args, **kwargs)
-            record.cid = cid_var.get()
+            record.cid = str(cid_var.get())
             return record
 
         _casa_record_factory._casa_owned = True  # type: ignore[attr-defined]

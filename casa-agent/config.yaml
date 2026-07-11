@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.65.2"
+version: "0.66.0"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 image: "ghcr.io/bonzanni/casa-agent"
@@ -48,6 +48,9 @@ options:
   # Web terminal
   enable_terminal: false
 
+  # Performance
+  sdk_client_pool: true
+
   # Scheduling
   casa_tz: "Europe/Amsterdam"
 
@@ -74,5 +77,6 @@ schema:
   primary_agent_model: "list(opus|sonnet|haiku)?"
   voice_agent_model: "list(opus|sonnet|haiku)?"
   enable_terminal: bool?
+  sdk_client_pool: bool?
   casa_tz: str?
   log_level: "list(debug|info|warning|error)?"

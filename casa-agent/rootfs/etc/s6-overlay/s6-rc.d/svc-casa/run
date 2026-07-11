@@ -43,6 +43,11 @@ export VOICE_AGENT_NAME="$(bashio::config 'voice_agent_name')"
 export PRIMARY_AGENT_MODEL="$(bashio::config 'primary_agent_model')"
 export VOICE_AGENT_MODEL="$(bashio::config 'voice_agent_model')"
 export ENABLE_TERMINAL="$(bashio::config 'enable_terminal')"
+# sdk_client_pool: operator-reachable kill-switch for the warm SDK client
+# pool (rollback path). pool_enabled() in sdk_client_pool.py treats
+# off/0/false as disabled and anything else as enabled, so exporting
+# bashio's raw "true"/"false" string works the same way as ENABLE_TERMINAL.
+export SDK_CLIENT_POOL="$(bashio::config 'sdk_client_pool')"
 export CASA_VERSION="$(bashio::addon.version)"
 
 # 3.3: scheduler timezone — optional; timekeeping.resolve_tz() falls back

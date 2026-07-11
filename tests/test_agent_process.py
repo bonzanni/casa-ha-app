@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import retry as retry_mod
 from agent import Agent
 from bus import BusMessage, MessageType
 from channels import ChannelManager
@@ -23,6 +26,25 @@ from claude_agent_sdk import (
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
+
+
+@contextmanager
+def patch_retry_sleep():
+    """Make retry's backoff instant WITHOUT touching the global asyncio.
+
+    Patching ``retry.asyncio.sleep`` mutates the shared ``asyncio`` module
+    object process-wide. Because every pooled turn starts the
+    SdkClientPool sweeper (``while True: await asyncio.sleep(interval)`` in a
+    background task), an instant-return global sleep turns that loop into a
+    tight CPU spin whose AsyncMock records every call → unbounded RSS
+    (~23 GB) + OOM. Replacing retry's *module-local* ``asyncio`` reference
+    with a namespace carrying only the two attributes retry.py uses leaves
+    the sweeper's ``asyncio.sleep`` real. Yields the sleep AsyncMock.
+    """
+    sleep = AsyncMock()
+    ns = SimpleNamespace(sleep=sleep, CancelledError=asyncio.CancelledError)
+    with patch.object(retry_mod, "asyncio", ns):
+        yield sleep
 
 
 def _mk_text_block(text: str) -> _SDKTextBlock:
@@ -174,7 +196,7 @@ async def test_session_id_is_channel_plus_role(tmp_path):
     # recalls once against the role's bank.
     sem = FakeSemanticMemory(facts="recall digest")
     agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
-    with patch("agent.ClaudeSDKClient", FakeClient):
+    with patch("sdk_client_pool._default_make_client", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
     # Fresh telegram session → one bank recall keyed to the shared casa bank.
@@ -234,7 +256,7 @@ async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
     # first-utterance critical path).
     sem = FakeSemanticMemory(overlay="OVERLAY")
     agent = _make_agent(tmp_path, role="butler", semantic_memory=sem)
-    with patch("agent.ClaudeSDKClient", FakeClient):
+    with patch("sdk_client_pool._default_make_client", FakeClient):
         await agent._process(_msg("voice", "lr", "lights on"))
 
     assert len(sem.profile_calls) == 0   # voice clearance < private → overlay blocked
@@ -250,7 +272,7 @@ async def test_telegram_channel_autorecalls_on_fresh_session(tmp_path):
     # auto-recall the opening utterance against the role's bank.
     sem = FakeSemanticMemory(overlay="O", facts="F")
     agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
-    with patch("agent.ClaudeSDKClient", FakeClient):
+    with patch("sdk_client_pool._default_make_client", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
     assert len(sem.profile_calls) == 1          # overlay pushed
@@ -270,7 +292,7 @@ async def test_fresh_text_turn_pushes_overlay_and_recalls(tmp_path):
     the per-scope fan-out is gone; recall is a single tagged call."""
     sem = FakeSemanticMemory(overlay="overlay-content", facts="recall-content")
     agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
-    with patch("agent.ClaudeSDKClient", FakeClient):
+    with patch("sdk_client_pool._default_make_client", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
     # One overlay (profile) call per fresh turn, keyed to the shared casa bank.
@@ -298,7 +320,7 @@ async def test_overlay_block_present_when_overlay_non_empty(tmp_path):
             super().__init__(options)
             captured["system"] = options.system_prompt
 
-    with patch("agent.ClaudeSDKClient", _CapturingClient):
+    with patch("sdk_client_pool._default_make_client", _CapturingClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
     assert "<peer_overlay>" in captured["system"]
@@ -326,7 +348,7 @@ async def test_overlay_failure_does_not_poison_recall(tmp_path, caplog):
             captured["system"] = options.system_prompt
 
     with caplog.at_level(logging.WARNING, logger="agent"):
-        with patch("agent.ClaudeSDKClient", _CapturingClient):
+        with patch("sdk_client_pool._default_make_client", _CapturingClient):
             await agent._process(_msg("telegram", "123", "hi"))
 
     assert "<peer_overlay>" not in captured["system"]   # overlay omitted
@@ -347,7 +369,7 @@ async def test_overlay_failure_does_not_poison_recall(tmp_path, caplog):
 
 async def test_system_prompt_contains_channel_context(tmp_path):
     agent = _make_agent(tmp_path, role="assistant")
-    with patch("agent.ClaudeSDKClient", FakeClient):
+    with patch("sdk_client_pool._default_make_client", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
 
     prompt = FakeClient.captured_options.system_prompt
@@ -362,7 +384,7 @@ async def test_system_prompt_memory_context_only_when_nonempty(tmp_path):
     # scope= attribute). Empty recall → no block; non-empty → block + content.
     sem = FakeSemanticMemory(facts="")
     agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
-    with patch("agent.ClaudeSDKClient", FakeClient):
+    with patch("sdk_client_pool._default_make_client", FakeClient):
         await agent._process(_msg("telegram", "123", "hi"))
     assert "<memory_context>" not in FakeClient.captured_options.system_prompt
 
@@ -371,8 +393,13 @@ async def test_system_prompt_memory_context_only_when_nonempty(tmp_path):
     # resume and skip the recall under §4.3).
     sem2 = FakeSemanticMemory(facts="## Recent\n[nicola] hi")
     agent2 = _make_agent(tmp_path, role="assistant", semantic_memory=sem2)
-    with patch("agent.ClaudeSDKClient", FakeClient), \
-         patch("agent._resume_decision", return_value=("new", False)):
+    # The pool captures ``decide=_resume_decision`` by reference at
+    # construction (Agent.__init__), so patching the module-level
+    # ``agent._resume_decision`` no longer reaches the pooled turn — patch the
+    # live pool decision hook instead to force a fresh session (assertions
+    # unchanged; §4.3 recall fires only on is_fresh).
+    with patch("sdk_client_pool._default_make_client", FakeClient), \
+         patch.object(agent2._pool, "_decide", return_value=("new", False)):
         await agent2._process(_msg("telegram", "123", "hi"))
     prompt2 = FakeClient.captured_options.system_prompt
     assert "<memory_context>" in prompt2
@@ -389,7 +416,7 @@ async def test_memory_failure_does_not_break_response(tmp_path, caplog):
 
     sem = BrokenSemanticMemory()
     agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
-    with patch("agent.ClaudeSDKClient", FakeClient):
+    with patch("sdk_client_pool._default_make_client", FakeClient):
         with caplog.at_level(logging.WARNING):
             out = await agent._process(_msg("telegram", "123", "hi"))
     assert out == "pong"
@@ -424,8 +451,8 @@ class TestRetryIntegration:
         FakeClient.failure_schedule = [exc, None]
 
         agent = _make_agent(tmp_path, role="assistant")
-        with patch("agent.ClaudeSDKClient", FakeClient), \
-             patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch("sdk_client_pool._default_make_client", FakeClient), \
+             patch_retry_sleep():
             text = await agent._process(_msg("telegram", "123", "hi"))
 
         assert text == "pong"
@@ -438,8 +465,8 @@ class TestRetryIntegration:
             None,
         ]
         agent = _make_agent(tmp_path, role="assistant")
-        with patch("agent.ClaudeSDKClient", FakeClient), \
-             patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch("sdk_client_pool._default_make_client", FakeClient), \
+             patch_retry_sleep():
             text = await agent._process(_msg("telegram", "123", "hi"))
         assert text == "pong"
         assert FakeClient.attempts == 2
@@ -448,8 +475,8 @@ class TestRetryIntegration:
         FakeClient.reset()
         FakeClient.failure_schedule = [ValueError("bad input")]
         agent = _make_agent(tmp_path, role="assistant")
-        with patch("agent.ClaudeSDKClient", FakeClient), \
-             patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch("sdk_client_pool._default_make_client", FakeClient), \
+             patch_retry_sleep():
             with pytest.raises(ValueError):
                 await agent._process(_msg("telegram", "123", "hi"))
         assert FakeClient.attempts == 1
@@ -458,8 +485,8 @@ class TestRetryIntegration:
         FakeClient.reset()
         FakeClient.failure_schedule = [asyncio.CancelledError()]
         agent = _make_agent(tmp_path, role="assistant")
-        with patch("agent.ClaudeSDKClient", FakeClient), \
-             patch("retry.asyncio.sleep", new=AsyncMock()) as sleep:
+        with patch("sdk_client_pool._default_make_client", FakeClient), \
+             patch_retry_sleep() as sleep:
             with pytest.raises(asyncio.CancelledError):
                 await agent._process(_msg("telegram", "123", "hi"))
         assert FakeClient.attempts == 1
@@ -479,8 +506,8 @@ class TestRetryIntegration:
         async def on_token(txt: str) -> None:
             seen_tokens.append(txt)
 
-        with patch("agent.ClaudeSDKClient", FakeClient), \
-             patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch("sdk_client_pool._default_make_client", FakeClient), \
+             patch_retry_sleep():
             msg = _msg("voice", "lr", "status?")
             await agent._process(msg, on_token=on_token)
 
@@ -520,7 +547,7 @@ class TestAssistantMessageSeparator:
         async def on_token(txt: str) -> None:
             seen.append(txt)
 
-        with patch("agent.ClaudeSDKClient", _TwoMsgClient):
+        with patch("sdk_client_pool._default_make_client", _TwoMsgClient):
             msg = _msg("telegram", "123", "are the lights on?")
             await agent._process(msg, on_token=on_token)
 
@@ -580,7 +607,7 @@ class TestPhase4bDispatch:
         agent = _make_agent(tmp_path, role="assistant")
 
         with caplog.at_level(logging.DEBUG, logger="sdk"):
-            with patch("agent.ClaudeSDKClient", _RichFakeClient):
+            with patch("sdk_client_pool._default_make_client", _RichFakeClient):
                 await agent._process(_msg("telegram", "200", "hi"))
 
         msgs = [r.getMessage() for r in caplog.records if r.name == "sdk"]
@@ -597,7 +624,7 @@ class TestPhase4bDispatch:
         FakeClient.reset()
         agent = _make_agent(tmp_path, role="assistant")
 
-        with patch("agent.ClaudeSDKClient", FakeClient):
+        with patch("sdk_client_pool._default_make_client", FakeClient):
             await agent._process(_msg("telegram", "201", "hi"))
 
         opts = FakeClient.captured_options
@@ -664,8 +691,8 @@ class TestCorrelationId:
             context={"chat_id": "42", "cid": "abcd1234"},
         )
 
-        with patch("agent.ClaudeSDKClient", FakeClient), \
-             patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch("sdk_client_pool._default_make_client", FakeClient), \
+             patch_retry_sleep():
             loop = asyncio.create_task(bus.run_agent_loop("assistant"))
             try:
                 result = await bus.request(msg, timeout=5)
@@ -717,8 +744,8 @@ class TestCorrelationId:
                 context={"chat_id": chat_id, "cid": cid},
             )
 
-        with patch("agent.ClaudeSDKClient", FakeClient), \
-             patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch("sdk_client_pool._default_make_client", FakeClient), \
+             patch_retry_sleep():
             loop = asyncio.create_task(bus.run_agent_loop("assistant"))
             try:
                 # Fire both concurrently.
@@ -783,7 +810,7 @@ class TestTokenBudgetMonitoring:
             original_record(session_id, used_tokens, budget)
         agent._budget_tracker.record = _spy  # type: ignore[method-assign]
 
-        with patch("agent.ClaudeSDKClient", FakeClient):
+        with patch("sdk_client_pool._default_make_client", FakeClient):
             await agent._process(_msg("telegram", "123", "hi"))
 
         expected = estimate_tokens(
@@ -810,8 +837,11 @@ class TestTokenBudgetMonitoring:
         agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
 
         caplog.set_level(_logging.WARNING, logger="tokens")
-        with patch("agent.ClaudeSDKClient", FakeClient), \
-             patch("agent._resume_decision", return_value=("new", False)):
+        # Force every turn fresh via the live pool decision hook: the pool
+        # captured ``decide`` by reference at construction, so patching the
+        # module-level ``agent._resume_decision`` would not reach it.
+        with patch("sdk_client_pool._default_make_client", FakeClient), \
+             patch.object(agent._pool, "_decide", return_value=("new", False)):
             for _ in range(5):
                 await agent._process(_msg("telegram", "123", "hi"))
 
@@ -839,7 +869,7 @@ class TestTokenBudgetMonitoring:
         agent = _make_agent(tmp_path, role="butler")
 
         caplog.set_level(_logging.INFO, logger="agent")
-        with patch("agent.ClaudeSDKClient", FakeClient):
+        with patch("sdk_client_pool._default_make_client", FakeClient):
             await agent._process(_msg("voice", "lr", "lights on"))
 
         # Phase 4b added an `sdk` logger turn_done line; this test asserts
@@ -881,8 +911,8 @@ class TestTokenBudgetMonitoring:
         agent = _make_agent(tmp_path, role="assistant")
 
         caplog.set_level(_logging.INFO, logger="agent")
-        with patch("agent.ClaudeSDKClient", FakeClient), \
-             patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch("sdk_client_pool._default_make_client", FakeClient), \
+             patch_retry_sleep():
             await agent._process(_msg("telegram", "123", "hi"))
 
         assert FakeClient.attempts == 2
@@ -950,8 +980,8 @@ class TestResumeResilience:
 
         agent = _make_agent_with_registry(reg, role="butler")
 
-        with patch("agent.ClaudeSDKClient", FakeClient), \
-             patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch("sdk_client_pool._default_make_client", FakeClient), \
+             patch_retry_sleep():
             text = await agent._process(_msg("voice", "probe-scope", "hi"))
 
         assert text == "pong"
@@ -981,8 +1011,8 @@ class TestResumeResilience:
         agent = _make_agent_with_registry(reg, role="butler")
 
         with caplog.at_level(logging.INFO, logger="agent"):
-            with patch("agent.ClaudeSDKClient", FakeClient), \
-                 patch("retry.asyncio.sleep", new=AsyncMock()):
+            with patch("sdk_client_pool._default_make_client", FakeClient), \
+                 patch_retry_sleep():
                 await agent._process(_msg("telegram", "202", "hi"))
 
         msgs = [r.getMessage() for r in caplog.records if r.name == "agent"]
@@ -1021,8 +1051,8 @@ class TestResumeResilience:
 
         agent = _make_agent_with_registry(reg, role="butler")
 
-        with patch("agent.ClaudeSDKClient", _CapturingFakeClient), \
-             patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch("sdk_client_pool._default_make_client", _CapturingFakeClient), \
+             patch_retry_sleep():
             await agent._process(_msg("voice", "probe-scope", "hi"))
 
         assert len(captured_resumes) == 2
@@ -1041,8 +1071,8 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         agent = _make_agent_with_registry(reg, role="butler")
 
-        with patch("agent.ClaudeSDKClient", FakeClient), \
-             patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch("sdk_client_pool._default_make_client", FakeClient), \
+             patch_retry_sleep():
             with pytest.raises(ProcessError):
                 await agent._process(_msg("voice", "fresh-scope", "hi"))
 
@@ -1064,8 +1094,8 @@ class TestResumeResilience:
 
         agent = _make_agent_with_registry(reg, role="butler")
 
-        with patch("agent.ClaudeSDKClient", FakeClient), \
-             patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch("sdk_client_pool._default_make_client", FakeClient), \
+             patch_retry_sleep():
             with pytest.raises(ProcessError):
                 await agent._process(_msg("voice", "probe-scope", "hi"))
 
@@ -1091,8 +1121,8 @@ class TestResumeResilience:
         agent = _make_agent_with_registry(reg, role="butler")
 
         caplog.set_level(_logging.WARNING, logger="agent")
-        with patch("agent.ClaudeSDKClient", FakeClient), \
-             patch("retry.asyncio.sleep", new=AsyncMock()):
+        with patch("sdk_client_pool._default_make_client", FakeClient), \
+             patch_retry_sleep():
             await agent._process(_msg("voice", "probe-scope", "hi"))
 
         warning_records = [
@@ -1132,7 +1162,7 @@ class TestOriginVar:
 
         a = _make_agent(tmp_path, role="assistant")
         msg = _msg("telegram", "777", "hello")
-        with patch("agent.ClaudeSDKClient", CapturingClient):
+        with patch("sdk_client_pool._default_make_client", CapturingClient):
             await a._process(msg)
 
         assert captured["inside_turn"] is not None
@@ -1164,7 +1194,7 @@ class TestOriginVar:
 
         a = _make_agent(tmp_path, role="butler")
         msg = _msg("voice", "living-room", "lights on")
-        with patch("agent.ClaudeSDKClient", SpawningClient):
+        with patch("sdk_client_pool._default_make_client", SpawningClient):
             await a._process(msg)
 
         assert child_saw["origin"] is not None
@@ -1462,7 +1492,7 @@ class TestSaveBeforeOverwrite:
 
         agent = _make_agent_with_registry(reg, role="assistant")
 
-        with patch("agent.ClaudeSDKClient", FakeClient):
+        with patch("sdk_client_pool._default_make_client", FakeClient):
             await agent._process(_msg("telegram", "123", "hi"))
 
         # Drain any background tasks so retain_cold_session can complete.
@@ -1513,7 +1543,7 @@ class TestSaveBeforeOverwrite:
 
         agent = _make_agent_with_registry(reg, role="assistant")
 
-        with patch("agent.ClaudeSDKClient", FakeClient):
+        with patch("sdk_client_pool._default_make_client", FakeClient):
             await agent._process(_msg("telegram", "456", "hi"))
 
         assert save_calls == [], (
@@ -1552,7 +1582,7 @@ class TestSaveBeforeOverwrite:
         # Replace the NoOp semantic memory with our tracking fake.
         agent._semantic_memory = fake
 
-        with patch("agent.ClaudeSDKClient", FakeClient):
+        with patch("sdk_client_pool._default_make_client", FakeClient):
             await agent._process(_msg("telegram", "789", "hi"))
 
         assert fake.profile_calls == [], (

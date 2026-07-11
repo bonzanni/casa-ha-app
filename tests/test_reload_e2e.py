@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -104,8 +104,10 @@ class TestReloadE2E:
         )
         v1_agent = MagicMock(name="agent_v1")
         v1_agent.handle_message = MagicMock()
+        v1_agent.aclose = AsyncMock()
         v2_agent = MagicMock(name="agent_v2")
         v2_agent.handle_message = MagicMock()
+        v2_agent.aclose = AsyncMock()
 
         load_calls = {"n": 0}
 
