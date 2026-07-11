@@ -159,6 +159,20 @@ class SystemMessage:
 
 
 @dataclass
+class StreamEvent:
+    """v0.67.0 voice partial streaming — agent.py imports this at module
+    scope, so the mock must export it even though the mock client never
+    emits partials (include_partial_messages is accepted and ignored).
+    Field shape mirrors the real SDK's message_parser (uuid, session_id,
+    event payload dict, parent_tool_use_id)."""
+
+    uuid: str = ""
+    session_id: str = ""
+    event: dict[str, Any] = field(default_factory=dict)
+    parent_tool_use_id: str | None = None
+
+
+@dataclass
 class HookMatcher:
     matcher: str
     hooks: list[Any] = field(default_factory=list)
@@ -187,6 +201,11 @@ class ClaudeAgentOptions:
     # wraps the options struct via dataclasses.replace(options, stderr=cb);
     # the mock's frozen=False default still requires the field to exist.
     stderr: Any = None
+    # v0.67.0 voice partial streaming: agent._build_options passes this for
+    # every channel (True only for voice). The mock accepts and ignores it —
+    # its client never emits StreamEvents, which the agent handles fine
+    # (partials are an optimization, not a contract).
+    include_partial_messages: bool = False
 
 
 class ClaudeSDKClient:
@@ -363,6 +382,7 @@ __all__ = [
     "ResultMessage",
     "SdkMcpTool",
     "SessionMessage",
+    "StreamEvent",
     "SystemMessage",
     "TextBlock",
     "ToolResultBlock",
