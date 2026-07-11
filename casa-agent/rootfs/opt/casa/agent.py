@@ -15,6 +15,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ProcessError,
     ResultMessage,
+    StreamEvent,
     SystemMessage,
     TextBlock,
     ToolResultBlock,
@@ -777,6 +778,12 @@ class Agent:
             resume=resume_sid,
             setting_sources=["project"],
             plugins=sdk_plugins,
+            # Voice partial-message streaming (2026-07-11 design §2 point 1):
+            # SDK partial StreamEvents are opt-in and constant per channel,
+            # so this stays pool-key compatible (spec §Q6). Non-voice
+            # channels are byte-for-byte unaffected — StreamEvents simply
+            # never arrive when this is False.
+            include_partial_messages=(channel == "voice"),
         )
         return sdk_logging.with_stderr_callback(options, engagement_id=None)
 
@@ -788,16 +795,65 @@ class Agent:
         started_ms, E-2 streaming concat into state["text"] with cumulative
         on_token, usage extraction into state["usage"]) — MINUS session-id
         capture, which the warm client / pool now owns (spec Q7). A fresh state
-        per call resets the streaming accumulator per attempt (spec §3.2)."""
+        per call resets the streaming accumulator per attempt (spec §3.2).
+
+        Voice partial-message streaming (2026-07-11 design, AR-A/AR-B/AR-E):
+        ``state["partial"]`` accumulates the in-flight message's text deltas
+        from ``StreamEvent`` messages (only ever produced when
+        ``include_partial_messages=True``, i.e. voice turns — see
+        ``_build_options``). ``_cum()`` is the single pinned formula (AR-A)
+        joining the folded ``state["text"]`` to the in-flight partial with
+        the same "\\n\\n" separator the canonical fold uses, so a partial
+        emission and the eventual fold never disagree — this is what makes
+        message N+1's FIRST partial emission already carry the joiner.
+        ``state["last_emitted"]`` dedupes: on_token only fires when the
+        computed cumulative actually changed (AR-A/AR-B)."""
         state: dict[str, Any] = {
             "text": "",
             "usage": {},
             "idx": 0,
             "started_ms": time.monotonic() * 1000,
             "tool_names_by_id": {},
+            "partial": "",
+            "last_emitted": "",
         }
 
+        def _cum() -> str:
+            return (
+                state["text"]
+                + ("\n\n" if state["text"] and state["partial"] else "")
+                + state["partial"]
+            )
+
         async def on_message(sdk_msg: Any) -> None:
+            # Voice partial streaming — handled EARLY so a StreamEvent never
+            # falls through to the phase4b dispatch below (no per-token log
+            # lines, no idx/tool bookkeeping). AR-E: defensive parsing — the
+            # CLI can forward raw `error` events with no `delta` key, or any
+            # other shape; a malformed event must never abort the turn.
+            if isinstance(sdk_msg, StreamEvent):
+                try:
+                    ev = getattr(sdk_msg, "event", None) or {}
+                    if ev.get("type") == "content_block_delta":
+                        d = ev.get("delta") or {}
+                        if d.get("type") == "text_delta":
+                            t = d.get("text") or ""
+                            if t:
+                                state["partial"] += t
+                                cum = _cum()
+                                if (
+                                    on_token is not None
+                                    and cum != state["last_emitted"]
+                                ):
+                                    await on_token(cum)
+                                    state["last_emitted"] = cum
+                except Exception as stream_exc:  # noqa: BLE001
+                    logger.warning(
+                        "stream_event dispatch failed: %s", stream_exc,
+                        exc_info=True,
+                    )
+                return
+
             # Phase 4b dispatch — wrapped so a malformed block cannot abort the
             # turn (logged + continued).
             try:
@@ -843,8 +899,19 @@ class Agent:
                     if state["text"]:
                         state["text"] += "\n\n"
                     state["text"] += msg_text
-                    if on_token is not None:
-                        await on_token(state["text"])
+                # The canonical fold supersedes any in-flight partial for
+                # this message (AR-A/AR-B): reset before computing the
+                # cumulative so a stale partial never bleeds into message
+                # N+1's first delta. Runs unconditionally (even when this
+                # message carried no text, e.g. tool-use-only) so a
+                # tool-only fold never leaves a stale partial dangling —
+                # cum() then equals state["text"] unchanged, which already
+                # matches last_emitted, so no spurious emit follows.
+                state["partial"] = ""
+                cum = _cum()
+                if on_token is not None and cum != state["last_emitted"]:
+                    await on_token(cum)
+                    state["last_emitted"] = cum
 
         return on_message, state
 

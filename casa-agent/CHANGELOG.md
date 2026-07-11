@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.67.0] - 2026-07-11 — voice partial-message streaming
+
+### Changed
+
+- Voice replies now start streaming as the model generates them: the first
+  spoken chunk arrives after the first sentence or clause instead of after
+  the whole reply, and long answers begin speaking almost immediately.
+  Text/Telegram behavior is unchanged.
+
+### Fixed
+
+- A voice reply could be silently truncated or garbled if the underlying
+  model call was retried mid-stream; the stream now recovers cleanly.
+
 ## [0.66.0] - 2026-07-11 — resident SDK client pooling (warm-turn latency floor removed)
 
 ### Changed
