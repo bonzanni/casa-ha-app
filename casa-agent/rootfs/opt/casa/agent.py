@@ -768,7 +768,8 @@ class Agent:
 
         # P-5a: installed ⇒ granted, by construction — server-level grants
         # derived from this agent-home's enabledPlugins. Off-loop (H2/M20):
-        # two small disk reads, but the loop is shared.
+        # settings.json + one .mcp.json per enabled plugin — small reads,
+        # but the loop is shared.
         for grant in await asyncio.to_thread(derived_plugin_grants, agent_home):
             if grant not in allowed_tools:
                 allowed_tools.append(grant)

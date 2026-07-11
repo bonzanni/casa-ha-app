@@ -40,7 +40,10 @@ def _version_key(p: Path) -> tuple:
     parts compare as strings after all numeric ones."""
     parts: list[tuple[int, int | str]] = []
     for part in p.name.split("."):
-        parts.append((0, int(part)) if part.isdigit() else (1, part))
+        # isdecimal(), not isdigit(): int() accepts exactly what isdecimal
+        # admits (incl. non-ASCII decimal digits). isdigit() is broader —
+        # e.g. "²".isdigit() is True but int("²") raises ValueError.
+        parts.append((0, int(part)) if part.isdecimal() else (1, part))
     return tuple(parts)
 
 
@@ -54,27 +57,41 @@ def grants_for_plugin(
     resolves after an update)."""
     plugin_dir = Path(cache_root) / marketplace / name
     try:
-        versions = [d for d in plugin_dir.iterdir() if d.is_dir()]
-    except OSError:
+        try:
+            versions = [d for d in plugin_dir.iterdir() if d.is_dir()]
+        except OSError:
+            logger.debug(
+                "plugin_grants: no cache dir for %s@%s", name, marketplace,
+            )
+            return []
+        if not versions:
+            return []
+        mcp_json = max(versions, key=_version_key) / ".mcp.json"
+        if not mcp_json.is_file():
+            return []
+        try:
+            data: dict[str, Any] = json.loads(mcp_json.read_text(encoding="utf-8"))
+            servers = data.get("mcpServers") or {}
+        except (OSError, json.JSONDecodeError, AttributeError) as exc:
+            logger.debug("plugin_grants: unreadable %s: %s", mcp_json, exc)
+            return []
+        if not isinstance(servers, dict):
+            return []
+        plugin_seg = sanitize_segment(name)
+        return sorted(
+            f"mcp__plugin_{plugin_seg}_{sanitize_segment(server)}"
+            for server in servers
+        )
+    except Exception as exc:
+        # Never-raise guarantee (I-1 belt): any unexpected failure here
+        # degrades to no grants rather than propagating into an options
+        # build. BaseException (KeyboardInterrupt/SystemExit) is deliberately
+        # NOT caught.
+        logger.debug(
+            "plugin_grants: derivation failed for %s@%s: %s",
+            name, marketplace, exc,
+        )
         return []
-    if not versions:
-        return []
-    mcp_json = max(versions, key=_version_key) / ".mcp.json"
-    if not mcp_json.is_file():
-        return []
-    try:
-        data: dict[str, Any] = json.loads(mcp_json.read_text(encoding="utf-8"))
-        servers = data.get("mcpServers") or {}
-    except (OSError, json.JSONDecodeError, AttributeError) as exc:
-        logger.debug("plugin_grants: unreadable %s: %s", mcp_json, exc)
-        return []
-    if not isinstance(servers, dict):
-        return []
-    plugin_seg = sanitize_segment(name)
-    return sorted(
-        f"mcp__plugin_{plugin_seg}_{sanitize_segment(server)}"
-        for server in servers
-    )
 
 
 def derived_plugin_grants(

@@ -264,3 +264,28 @@ def test_install_result_reports_granted_tools(tmp_path, monkeypatch):
     assert result["granted_tools"] == [
         "mcp__plugin_lesina-invoice_lesina-invoice",
     ]
+
+
+def test_grants_for_plugin_survives_superscript_version_dir(tmp_path):
+    """I-1: '²'.isdigit() is True but int('²') raises — a malformed version
+    dir must never propagate an exception into an options build."""
+    cache = tmp_path / "cache"
+    _mk_plugin(cache, "casa-plugins", "weird", "1.²", {"s": {}})
+    assert grants_for_plugin("weird", "casa-plugins", cache_root=cache) == [
+        "mcp__plugin_weird_s",
+    ]
+
+
+def test_grants_for_plugin_never_raises(tmp_path, monkeypatch, caplog):
+    """Belt: any unexpected exception inside derivation degrades to []."""
+    import plugin_grants as pg
+    cache = tmp_path / "cache"
+    _mk_plugin(cache, "casa-plugins", "boom", "1.0.0", {"s": {}})
+
+    def _explode(p):
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(pg, "_version_key", _explode)
+    with caplog.at_level(logging.DEBUG, logger="plugin_grants"):
+        assert grants_for_plugin("boom", "casa-plugins", cache_root=cache) == []
+    assert any("boom" in r.message for r in caplog.records)
