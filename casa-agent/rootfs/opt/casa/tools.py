@@ -358,9 +358,9 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
     agent_home = (cfg.cwd
                   or f"/config/agent-home/{getattr(cfg, 'role', 'unknown')}")
 
-    allowed_tools = list(cfg.tools.allowed)
-    if "Skill" not in allowed_tools:
-        allowed_tools.append("Skill")
+    # Skills via skills="all" below; strip any config-supplied "Skill"
+    # (deprecated) — (f) v0.69.9.
+    allowed_tools = [t for t in cfg.tools.allowed if t != "Skill"]
     # P-5a: installed ⇒ granted, by construction. Server-level grants derived
     # from the agent-home's enabledPlugins; disallowed_tools still wins at the
     # CC layer (explicit-deny escape hatch).
@@ -380,6 +380,7 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
         cwd=agent_home,
         resume=None,
         setting_sources=["project"],
+        skills="all",  # (f) v0.69.9
         plugins=sdk_plugins,
         # P-5b: no relay exists on this path — deny ungranted tools fast
         # instead of hanging on an unanswerable CC prompt.
@@ -418,9 +419,9 @@ def _build_executor_options(defn) -> ClaudeAgentOptions:
         seed="/opt/claude-seed",
     )
 
-    allowed_tools = list(defn.tools_allowed)
-    if "Skill" not in allowed_tools:
-        allowed_tools.append("Skill")
+    # Skills via skills="all" below; strip any config-supplied "Skill"
+    # (deprecated) — (f) v0.69.9.
+    allowed_tools = [t for t in defn.tools_allowed if t != "Skill"]
 
     # Executors (in_casa driver — Configurator, future Tier-3) operate on
     # the addon-config root rather than an agent-home, because their
@@ -438,6 +439,7 @@ def _build_executor_options(defn) -> ClaudeAgentOptions:
         cwd="/config",
         resume=None,
         setting_sources=["project"],
+        skills="all",  # (f) v0.69.9
         plugins=sdk_plugins,
     )
 

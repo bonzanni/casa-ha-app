@@ -233,6 +233,39 @@ def test_executor_options_keep_no_callback_and_no_grants(monkeypatch):
     assert "mcp__plugin_should_not_appear" not in opts.allowed_tools
 
 
+def _skills_specialist_cfg(tmp_home):
+    return _specialist_cfg(tmp_home)
+
+
+def test_specialist_options_use_skills_all_not_bare_skill(tmp_path, monkeypatch):
+    """(f) v0.69.9: 'Skill' in allowed_tools is deprecated by the SDK; enable
+    skills via the `skills="all"` option instead (SDK auto-allows the Skill
+    tool). Casa must NOT hand-append 'Skill'."""
+    import tools as tools_mod
+    monkeypatch.setattr(tools_mod, "build_sdk_plugins", lambda **kw: [])
+    monkeypatch.setattr("hooks.resolve_hooks", lambda *a, **kw: {})
+    monkeypatch.setattr(tools_mod, "derived_plugin_grants", lambda home, **kw: [])
+    opts = tools_mod._build_specialist_options(_specialist_cfg(str(tmp_path)))
+    assert opts.skills == "all"
+    assert "Skill" not in opts.allowed_tools
+
+
+def test_executor_options_use_skills_all_not_bare_skill(monkeypatch):
+    from types import SimpleNamespace
+    import tools as tools_mod
+    monkeypatch.setattr(tools_mod, "build_sdk_plugins", lambda **kw: [])
+    monkeypatch.setattr("hooks.resolve_hooks", lambda *a, **kw: {})
+    monkeypatch.setattr(tools_mod, "derived_plugin_grants", lambda home, **kw: [])
+    defn = SimpleNamespace(
+        hooks_path=None, mcp_server_names=[], tools_allowed=["Read"],
+        model="claude-sonnet-4-6", permission_mode="auto", max_turns=None,
+        tools_disallowed=[],
+    )
+    opts = tools_mod._build_executor_options(defn)
+    assert opts.skills == "all"
+    assert "Skill" not in opts.allowed_tools
+
+
 def test_resident_options_merge_grants_and_fail_closed(tmp_path, monkeypatch):
     import asyncio
     import agent as agent_mod

@@ -245,8 +245,9 @@ class Agent:
         # a capability regression (a tool grant vanishing after a config_sync
         # reconcile, an MCP server going undeclared) is visible in `docker
         # logs` and diffable across deploys. Logs the CONFIGURED surface
-        # (config.tools.allowed) — the thing that drifts vs runtime.yaml; the
-        # per-turn auto-appended "Skill" is not a config grant and is omitted.
+        # (config.tools.allowed) — the thing that drifts vs runtime.yaml.
+        # Skills are enabled via skills="all", not an allowed_tools entry
+        # ((f) v0.69.9), so they don't appear here.
         # Best-effort: an observability line must never break construction.
         try:
             allowed = list(getattr(config.tools, "allowed", []) or [])
@@ -769,11 +770,13 @@ class Agent:
         # off-loop + cached per instance (see _get_sdk_plugins).
         sdk_plugins = await self._get_sdk_plugins()
 
-        # "Skill" is a valid allowed_tools entry (spike §Key learning 4);
-        # append if not already declared so plugin-shipped skills resolve.
-        allowed_tools = list(self.config.tools.allowed)
-        if "Skill" not in allowed_tools:
-            allowed_tools.append("Skill")
+        # Skills are enabled via the `skills="all"` option below, NOT by
+        # putting "Skill" in allowed_tools ((f) v0.69.9: bare "Skill" is
+        # deprecated by the SDK; skills="all" auto-allows the Skill tool +
+        # keeps our explicit setting_sources=["project"]). Strip any
+        # config-supplied "Skill" so a runtime.yaml still listing it (deployed
+        # configs, pre-reconcile) never re-introduces the deprecated form.
+        allowed_tools = [t for t in self.config.tools.allowed if t != "Skill"]
 
         # P-5a: installed ⇒ granted, by construction — server-level grants
         # derived from this agent-home's enabledPlugins. Off-loop (H2/M20):
@@ -795,6 +798,7 @@ class Agent:
             cwd=agent_home,
             resume=resume_sid,
             setting_sources=["project"],
+            skills="all",  # (f) v0.69.9: replaces the deprecated bare "Skill"
             plugins=sdk_plugins,
             # P-5b: in-casa agents have no permission relay — fail closed on
             # ungranted tools instead of hanging on CC's prompt. New closure
