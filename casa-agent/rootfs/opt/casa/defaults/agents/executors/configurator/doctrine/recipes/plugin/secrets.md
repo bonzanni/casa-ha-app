@@ -83,10 +83,12 @@ Canonical order:
     emit_completion(status="ok", text="Wired <VAR> for <plugin>; ready=<bool>; committed SHA <sha>; called casa_reload(scope='plugin_env') to refresh MCP-server env.")
 
 **`plugin-env.conf` is gitignored** (it's a mode-0600 secrets file). So
-`config_git_commit` after a secret-only change stages nothing and returns an
-**empty/absent SHA — that is expected, NOT a failure.** Still call it (it's a
-harmless no-op that keeps the flow uniform), but in `emit_completion` say
-"no SHA (secrets file is gitignored)" rather than reporting a blank `<sha>`.
+`config_git_commit` after a secret-only change stages nothing and returns
+`sha=""` **plus a `warning` explaining that only whitelisted paths are
+tracked — that is expected, NOT a failure. Do not retry the commit.** Still
+call it (it's a harmless no-op that keeps the flow uniform), but in
+`emit_completion` say "no SHA (secrets file is gitignored)" rather than
+reporting a blank `<sha>`.
 
 If you arrived here from the install flow, batch — call
 `casa_reload(scope='plugin_env')` first, then `casa_reload(scope='agent', role=<role>)`

@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.69.1] - 2026-07-12 — plugin marketplace changes are now git-versioned
+
+### Fixed
+
+- The plugin marketplace manifest is now tracked by the config git repo, so
+  committing after a marketplace change produces a real commit. Previously
+  the file was gitignored while the configurator's own recipes required
+  committing it — agents wasted minutes looping between "committed ok" and
+  "file still untracked" on every marketplace operation. Existing
+  installations pick up the new whitelist automatically on next start.
+- When a commit finds no tracked changes, the result now explains which
+  paths are tracked and that secret files (like the plugin environment
+  file) are intentionally excluded, instead of returning a silent empty
+  answer that reads like a failure.
+- Configurator guidance no longer claims plugins can only be installed on
+  primary agents — specialist installs have been supported (and in
+  production) since v0.68.0.
+
 ## [0.69.0] - 2026-07-12 — engagements stop leaking state across restarts and time
 
 ### Added

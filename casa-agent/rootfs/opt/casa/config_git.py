@@ -28,6 +28,14 @@ _GITIGNORE_CONTENT = """\
 !policies/**
 !schema/
 !schema/**
+# P-3 (v0.69.1): the user-marketplace manifest is config, not a secret —
+# configurator recipes commit it after every marketplace op, and versioning
+# it gives an audit trail. ONLY the manifest: everything else under
+# marketplace/ (and plugin-env.conf, a mode-0600 secrets file) stays
+# untracked via the leading `*`.
+!marketplace/
+!marketplace/.claude-plugin/
+!marketplace/.claude-plugin/marketplace.json
 !.gitignore
 """
 
@@ -44,11 +52,31 @@ def _run(cwd: str, args: Sequence[str], *, check: bool = True) -> str:
 def init_repo(config_dir: str) -> None:
     """Initialize *config_dir* as a local git repo if not already one.
 
-    Idempotent: the second call is a no-op (``.git`` already exists).
-    Writes ``.gitignore`` to restrict tracking to ``agents/``, ``policies/``,
-    and ``schema/``. Makes one initial commit so ``HEAD`` resolves.
+    Idempotent: on an already-initialized repo the only action is the
+    ``.gitignore`` reconcile below. Writes ``.gitignore`` to restrict
+    tracking to ``agents/``, ``policies/``, ``schema/``, and the user
+    marketplace manifest. Makes one initial commit so ``HEAD`` resolves.
     """
+    gitignore = os.path.join(config_dir, ".gitignore")
+
     if os.path.isdir(os.path.join(config_dir, ".git")):
+        # P-3 (v0.69.1): existing deployments carry the whitelist their repo
+        # was initialized with — reconcile .gitignore on every boot so
+        # whitelist changes (e.g. marketplace.json) reach them without a
+        # fresh install. snapshot_manual_edits runs right after and commits
+        # any newly-tracked files as the boot snapshot.
+        try:
+            with open(gitignore, "r", encoding="utf-8") as fh:
+                current = fh.read()
+        except OSError:
+            current = ""
+        if current != _GITIGNORE_CONTENT:
+            logger.info("Refreshing config-repo .gitignore whitelist")
+            with open(gitignore, "w", encoding="utf-8") as fh:
+                fh.write(_GITIGNORE_CONTENT)
+            _run(config_dir, ["add", ".gitignore"], check=False)
+            _run(config_dir, ["commit", "-qm",
+                              "update .gitignore whitelist"], check=False)
         return
 
     logger.info("Initializing config git repo at %s", config_dir)
@@ -56,12 +84,14 @@ def init_repo(config_dir: str) -> None:
     _run(config_dir, ["config", "user.email", "casa-agent@local"])
     _run(config_dir, ["config", "user.name",  "Casa Agent"])
 
-    gitignore = os.path.join(config_dir, ".gitignore")
     with open(gitignore, "w", encoding="utf-8") as fh:
         fh.write(_GITIGNORE_CONTENT)
 
-    _run(config_dir, ["add", ".gitignore", "agents", "policies", "schema"],
-         check=False)  # dirs may be empty on fresh install
+    # add -A honors the .gitignore whitelist and — unlike explicit pathspecs —
+    # cannot abort the whole add when a whitelisted dir doesn't exist yet
+    # (git rejects unmatched pathspecs wholesale; marketplace/ is absent on a
+    # fresh install).
+    _run(config_dir, ["add", "-A"], check=False)
     _run(config_dir, ["commit", "-qm", "initial config snapshot"],
          check=False)
 
