@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.69.11] - 2026-07-12 — interactive engagements can be resumed again
+
+### Fixed
+
+- The session id of an interactive (in-process) engagement is now captured
+  correctly, so an engagement that goes idle or survives an add-on restart can
+  actually be resumed. Previously the id was read from a client attribute that
+  no longer exists in the pinned SDK, so it was never saved — the resume path
+  was silently dead and a suspended engagement could not be reopened. The id is
+  now read from the message stream (the same source the resident session pool
+  already uses).
+
 ## [0.69.10] - 2026-07-12 — resumed engagements keep their restrictions
 
 ### Security

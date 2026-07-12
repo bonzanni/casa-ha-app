@@ -31,6 +31,20 @@ def _mk_assistant(text: str) -> AssistantMessage:
         return m
 
 
+def _mk_system_init(session_id: str):
+    """A SystemMessage(subtype='init', data={'session_id': ...}) — the REAL
+    source of the CLI session id (ClaudeSDKClient has no session_id attr on the
+    pinned SDK). Faithful to production, unlike a fake `client.session_id`."""
+    from claude_agent_sdk import SystemMessage
+    try:
+        return SystemMessage(subtype="init", data={"session_id": session_id})
+    except TypeError:
+        m = SystemMessage.__new__(SystemMessage)
+        m.subtype = "init"          # type: ignore[attr-defined]
+        m.data = {"session_id": session_id}  # type: ignore[attr-defined]
+        return m
+
+
 def _mk_factory_with_fake_handle():
     """Return (factory, handle) where factory(topic_id) → handle.
 
@@ -567,18 +581,18 @@ class TestInCasaResume:
         assert "Agent" in seen_options[0].disallowed_tools
         assert "Task" in seen_options[0].disallowed_tools
 
-    async def test_get_session_id_returns_clients_session_id(self, monkeypatch):
+    async def test_get_session_id_returns_stream_sourced_session_id(self, monkeypatch):
+        """v0.69.11: get_session_id returns the id captured from the message
+        stream (SystemMessage init), NOT a nonexistent client.session_id attr."""
         from drivers.in_casa_driver import InCasaDriver
 
         class _FakeClient:
-            def __init__(self, options):
-                self.session_id = "sess-xyz"
+            def __init__(self, options): pass
             async def __aenter__(self): return self
             async def __aexit__(self, *a): pass
             async def query(self, prompt): pass
             async def receive_response(self):
-                if False:
-                    yield None  # pragma: no cover
+                yield _mk_system_init("sess-xyz")
             async def close(self): pass
 
         monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
@@ -587,6 +601,9 @@ class TestInCasaResume:
         rec = _make_record()
         await drv.start(rec, "p", ClaudeAgentOptions(model="sonnet"))
         assert drv.get_session_id(rec) == "sess-xyz"
+        # cleared after cancel (no leak)
+        await drv.cancel(rec)
+        assert drv.get_session_id(rec) is None
 
 
 class TestInCasaEngagementContext:
@@ -724,16 +741,17 @@ class TestInCasaEngagementContext:
         assert captured == [rec]
 
     async def test_deliver_turn_persists_session_id_on_first_message(self, monkeypatch):
-        """First non-null client.session_id triggers persist_session_id once."""
+        """session_id from the SystemMessage init stream triggers persist once
+        (v0.69.11 — was read from a nonexistent client.session_id attr)."""
         from drivers.in_casa_driver import InCasaDriver
 
         class _FakeClient:
-            def __init__(self, options):
-                self.session_id = "sess-abc"
+            def __init__(self, options): pass
             async def __aenter__(self): return self
             async def __aexit__(self, *a): pass
             async def query(self, prompt): pass
             async def receive_response(self):
+                yield _mk_system_init("sess-abc")
                 yield _mk_assistant("hi")
             async def close(self): pass
 
@@ -747,18 +765,19 @@ class TestInCasaEngagementContext:
 
         persist.assert_awaited_once_with(rec.id, "sess-abc")
         assert rec.sdk_session_id == "sess-abc"
+        assert drv.get_session_id(rec) == "sess-abc"   # stream-sourced accessor
 
     async def test_deliver_turn_persist_idempotent_on_second_turn(self, monkeypatch):
         """Subsequent _deliver_turn calls skip the callback when sid unchanged."""
         from drivers.in_casa_driver import InCasaDriver
 
         class _FakeClient:
-            def __init__(self, options):
-                self.session_id = "sess-abc"
+            def __init__(self, options): pass
             async def __aenter__(self): return self
             async def __aexit__(self, *a): pass
             async def query(self, prompt): pass
             async def receive_response(self):
+                yield _mk_system_init("sess-abc")
                 yield _mk_assistant("hi")
             async def close(self): pass
 
@@ -771,7 +790,7 @@ class TestInCasaEngagementContext:
         await drv.start(rec, "hi", ClaudeAgentOptions(model="sonnet"))
         await drv.send_user_turn(rec, "another turn")
 
-        # Persist must fire exactly once across both turns.
+        # Persist must fire exactly once across both turns (sid unchanged).
         assert persist.await_count == 1
         assert rec.sdk_session_id == "sess-abc"
 
