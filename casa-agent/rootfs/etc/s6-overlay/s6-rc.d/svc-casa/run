@@ -26,6 +26,7 @@ export TELEGRAM_CHAT_ID="$(bashio::config 'telegram_chat_id')"
 _tg_transport="$(bashio::config 'telegram_transport')"
 export TELEGRAM_TRANSPORT="${_tg_transport:-polling}"
 export TELEGRAM_DELIVERY_MODE="$(bashio::config 'telegram_delivery_mode')"
+export TELEGRAM_RICH_TEXT="$(bashio::config 'telegram_rich_text')"
 export TELEGRAM_ENGAGEMENT_SUPERGROUP_ID="$(bashio::config 'telegram_engagement_supergroup_id')"
 # telegram_bot_api_base is optional (schema str?); bashio returns "null" when unset.
 _tg_api_base="$(bashio::config 'telegram_bot_api_base')"

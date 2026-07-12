@@ -1180,6 +1180,16 @@ async def _sweep_engagement_topics(channel_manager: Any, bus: Any) -> None:
 # ------------------------------------------------------------------
 
 
+def _rich_text_enabled_from_env(env: dict) -> bool:
+    """Whether Telegram rich-text rendering is on (kill-switch default: on).
+
+    Mirrors the ``telegram_rich_text`` app option exported as ``TELEGRAM_RICH_TEXT``.
+    """
+    return env.get("TELEGRAM_RICH_TEXT", "true").strip().lower() not in (
+        "false", "0", "off", "no",
+    )
+
+
 async def main() -> None:
     """Async entry point for the Casa add-on."""
 
@@ -1478,6 +1488,7 @@ async def main() -> None:
 
         telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
         telegram_delivery = os.environ.get("TELEGRAM_DELIVERY_MODE", "stream")
+        telegram_rich_text = _rich_text_enabled_from_env(os.environ)
         telegram_engagement_supergroup_id = int(os.environ.get(
             "TELEGRAM_ENGAGEMENT_SUPERGROUP_ID", "0",
         ) or "0")
@@ -1503,6 +1514,7 @@ async def main() -> None:
             webhook_secret=webhook_secret,
             rate_limiter=telegram_rate_limiter,
             engagement_supergroup_id=telegram_engagement_supergroup_id or None,
+            rich_text_enabled=telegram_rich_text,
         )
         channel_manager.register(telegram_channel)
         # NOTE: setup_engagement_features() needs the bot, which is only

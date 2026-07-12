@@ -32,16 +32,60 @@ if _casa_root not in sys.path:
 # ---------------------------------------------------------------------------
 
 
-class _FakeNetworkError(Exception):
-    pass
-
-
-class _FakeTimedOut(Exception):
-    pass
-
-
 class _FakeTelegramError(Exception):
     pass
+
+
+class _FakeNetworkError(_FakeTelegramError):
+    pass
+
+
+class _FakeTimedOut(_FakeNetworkError):
+    pass
+
+
+class _FakeBadRequest(_FakeNetworkError):
+    # Mirrors real PTB 22.7: BadRequest -> NetworkError -> TelegramError
+    # (verified empirically 2026-07-12).
+    pass
+
+
+class _FakeMessageEntity:
+    """Value-shape stand-in for telegram.MessageEntity.
+
+    Carries the type constants the parser uses and a codepoint→UTF-16 offset
+    adjustment matching PTB's ``adjust_message_entities_to_utf_16`` for BMP and
+    astral characters. Equality is (type, offset, length) so tests can compare.
+    """
+
+    BOLD = "bold"
+    ITALIC = "italic"
+    CODE = "code"
+    PRE = "pre"
+
+    def __init__(self, type, offset, length, **kwargs):
+        self.type = type
+        self.offset = offset
+        self.length = length
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, _FakeMessageEntity)
+            and (self.type, self.offset, self.length)
+            == (other.type, other.offset, other.length)
+        )
+
+    def __repr__(self):
+        return f"_FakeMessageEntity({self.type!r}, {self.offset}, {self.length})"
+
+    @staticmethod
+    def adjust_message_entities_to_utf_16(text, entities):
+        out = []
+        for e in entities:
+            off16 = len(text[:e.offset].encode("utf-16-le")) // 2
+            len16 = len(text[e.offset:e.offset + e.length].encode("utf-16-le")) // 2
+            out.append(_FakeMessageEntity(e.type, off16, len16))
+        return out
 
 
 def _install_telegram_stubs() -> None:
@@ -62,7 +106,10 @@ def _install_telegram_stubs() -> None:
     tg_err.TelegramError = _FakeTelegramError
     tg_err.NetworkError = _FakeNetworkError
     tg_err.TimedOut = _FakeTimedOut
+    tg_err.BadRequest = _FakeBadRequest
     tg.error = tg_err
+
+    tg.MessageEntity = _FakeMessageEntity
 
     tg_ext = types.ModuleType("telegram.ext")
     tg_ext.Application = MagicMock()

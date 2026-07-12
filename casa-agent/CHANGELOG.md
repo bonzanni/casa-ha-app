@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.70.0] - 2026-07-12 — rich text in Telegram replies
+
+### Added
+
+- Agent replies now render Markdown in Telegram: **bold**, *italic*, `inline
+  code`, and fenced code blocks shown as an aligned monospace box — so tables
+  and structured output finally line up on your phone instead of showing raw
+  `**` and backticks. On by default; a new **Rich Text in Telegram**
+  (`telegram_rich_text`) option turns it off to send everything as plain text.
+
+### Notes
+
+- Rendering is applied only to genuine agent responses; system notices,
+  permission prompts, and error messages are unchanged. If a message can't be
+  formatted safely it is delivered as plain text (never dropped). Very long
+  messages (over one Telegram message) are sent unformatted for now.
+
 ## [0.69.12] - 2026-07-12 — Ellen can tidy finished engagement topics
 
 ### Added

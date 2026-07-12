@@ -27,6 +27,7 @@ Casa runs always-on AI agents inside your Home Assistant instance. The primary a
 | `telegram_bot_token` | Telegram bot token from @BotFather. Enables the Telegram channel. |
 | `telegram_chat_id` | Telegram chat ID to restrict messages to. Leave empty to accept all chats. |
 | `telegram_engagement_supergroup_id` | Chat ID of the dedicated Telegram forum supergroup used for interactive engagements (Tier 2 Specialist interactive mode; Tier 3 Executor types, Plan 3+). Must be a negative integer. Leave at 0 to disable engagements. |
+| `telegram_rich_text` | Render Markdown (bold, italic, inline code, and monospace code blocks) in agent replies. Default: `true`. Set to `false` to send all replies as plain text. |
 
 ### Optional -- Memory
 

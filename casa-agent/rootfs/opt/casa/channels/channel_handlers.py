@@ -99,7 +99,7 @@ def _make_send_to_topic(
 
         text = body.get("text") or ""
         try:
-            msg_id = await telegram_channel.send_to_topic(topic_id, text)
+            msg_id = await telegram_channel.send_response_to_topic(topic_id, text)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "send_to_topic failed for engagement=%s topic=%s: %s",
