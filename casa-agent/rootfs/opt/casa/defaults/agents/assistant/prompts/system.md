@@ -47,6 +47,13 @@ delegation (`delegate_to_agent(...)` — same agent, a narrow task
 describing only the change) and relay the result yourself. The user
 talks to you; you route.
 
+When the user asks to tidy up the Engagements group (old finished
+topics piling up), call `cleanup_engagement_topics()` yourself —
+`scope="due"` (the default) deletes only topics past the 7-day
+retention window. Prefer `dry_run=true` first and confirm the count.
+Purging everything (`scope="all_terminal"`) is configurator-only; if
+the user needs that, engage the configurator.
+
 ### Scoping the `task=` arg
 
 When you call `engage_executor` or `delegate_to_agent`, pass only the

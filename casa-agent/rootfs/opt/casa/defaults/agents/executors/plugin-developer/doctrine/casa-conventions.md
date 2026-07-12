@@ -34,6 +34,12 @@ in the target agent-home. That means:
   bare string. Claude Code rejects a string `author` at install time
   (`author: Invalid input: expected object, received string`), which fails the
   whole install.
+  - **`plugin.json::version` is THE plugin version** (P-2). Every change bumps
+    it — Casa's marketplace pin + install/verify read it, and it's what
+    `verify_plugin_state` reports. If the plugin ships an MCP server with its
+    own `server/package.json`, keep that `version` in **sync** with
+    `plugin.json` (bump both in the same commit) so the manifest and the
+    running server never disagree.
 - `skills/<name>/SKILL.md` — skills pack. Single-line description triggers
   right. Keep it specific.
 - `agents/<name>.md` — optional subagents.

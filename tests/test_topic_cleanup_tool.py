@@ -345,14 +345,60 @@ async def test_tool_all_terminal_scope(monkeypatch):
     calls = _sweep_recorder(monkeypatch)
     _wire_tool(_telegram_channel())
 
-    res = await tools_mod.cleanup_engagement_topics.handler(
-        {"scope": "all_terminal"},
-    )
+    # v0.69.12: all_terminal is configurator-only.
+    import agent as agent_mod
+    tok = agent_mod.origin_var.set({"role": "configurator"})
+    try:
+        res = await tools_mod.cleanup_engagement_topics.handler(
+            {"scope": "all_terminal"},
+        )
+    finally:
+        agent_mod.origin_var.reset(tok)
     payload = json.loads(res["content"][0]["text"])
 
     assert payload["status"] == "ok"
     assert calls[0]["scope"] == "all_terminal"
     assert calls[0]["dry_run"] is False
+
+
+async def test_tool_due_scope_allowed_for_assistant(monkeypatch):
+    """v0.69.12: Ellen (assistant) can run the safe due-scope cleanup directly
+    (no delegation) — X2 resolved cleared the AR-7 deferral."""
+    calls = _sweep_recorder(monkeypatch)
+    _wire_tool(_telegram_channel())
+
+    import agent as agent_mod
+    tok = agent_mod.origin_var.set({"role": "assistant"})
+    try:
+        res = await tools_mod.cleanup_engagement_topics.handler({"scope": "due"})
+    finally:
+        agent_mod.origin_var.reset(tok)
+    payload = json.loads(res["content"][0]["text"])
+
+    assert payload["status"] == "ok"
+    assert calls[0]["scope"] == "due"
+
+
+async def test_tool_all_terminal_refused_for_assistant(monkeypatch):
+    """v0.69.12: the irreversible all_terminal purge stays configurator-only —
+    a non-privileged caller (Ellen) is refused and nudged to due."""
+    calls = _sweep_recorder(monkeypatch)
+    _wire_tool(_telegram_channel())
+
+    import agent as agent_mod
+    tok = agent_mod.origin_var.set({"role": "assistant"})
+    try:
+        res = await tools_mod.cleanup_engagement_topics.handler(
+            {"scope": "all_terminal"},
+        )
+    finally:
+        agent_mod.origin_var.reset(tok)
+    payload = json.loads(res["content"][0]["text"])
+
+    assert payload["status"] == "error"
+    assert payload["kind"] == "not_authorized"
+    assert "due" in payload["message"]
+    assert calls == []          # never reached the sweep
 
 
 async def test_tool_dry_run_passthrough(monkeypatch):
@@ -430,9 +476,14 @@ async def test_tool_all_terminal_purges_real_ledger_end_to_end():
     tch.delete_topic = AsyncMock()
     _wire_tool(tch)
 
-    res = await tools_mod.cleanup_engagement_topics.handler(
-        {"scope": "all_terminal"},
-    )
+    import agent as agent_mod
+    tok = agent_mod.origin_var.set({"role": "configurator"})  # all_terminal (v0.69.12)
+    try:
+        res = await tools_mod.cleanup_engagement_topics.handler(
+            {"scope": "all_terminal"},
+        )
+    finally:
+        agent_mod.origin_var.reset(tok)
     payload = json.loads(res["content"][0]["text"])
 
     assert not res.get("is_error")
@@ -595,3 +646,13 @@ async def test_sweep_pass_logs_info_counts_when_deleted(monkeypatch, caplog):
         "deleted=3" in r.getMessage() and "kept=1" in r.getMessage()
         for r in caplog.records
     )
+
+
+async def test_assistant_config_grants_cleanup_tool():
+    """v0.69.12: Ellen's runtime.yaml grants the (due-only) cleanup tool so she
+    can tidy the engagement group without delegation."""
+    import yaml
+    root = Path(__file__).resolve().parent.parent
+    rt = root / "casa-agent/rootfs/opt/casa/defaults/agents/assistant/runtime.yaml"
+    allowed = yaml.safe_load(rt.read_text(encoding="utf-8"))["tools"]["allowed"]
+    assert "mcp__casa-framework__cleanup_engagement_topics" in allowed

@@ -133,25 +133,29 @@ def test_required_self_use_tools_present() -> None:
     assert not missing, "missing required tools:\n  " + "\n  ".join(missing)
 
 
-def test_cleanup_engagement_topics_is_configurator_exclusive() -> None:
-    """Exclusivity pin (v0.65.0): cleanup_engagement_topics irreversibly
-    deletes Telegram topics and all their messages. The grant must never
-    spread beyond the configurator — in particular not to the assistant,
-    which is reachable through the webhook path whose read-clearance
-    currently fails open. A grant showing up anywhere else is a security
+def test_cleanup_engagement_topics_grant_limited_to_configurator_and_assistant() -> None:
+    """Grant pin (updated v0.69.12): cleanup_engagement_topics irreversibly
+    deletes Telegram topics. Since X2 resolved (v0.62.0 — webhook trust =
+    authenticated), the assistant (Ellen) holds a DUE-ONLY variant: the tool's
+    own role guard refuses the irreversible `all_terminal` purge for any
+    non-configurator caller (see test_topic_cleanup_tool
+    test_tool_all_terminal_refused_for_assistant). The grant must never spread
+    beyond {configurator, assistant} — any other role is a security
     regression, not a convenience."""
-    granted = [
+    granted = {
         role
         for role, _path, data in _agent_configs()
         if any(
             "cleanup_engagement_topics" in str(entry)
             for entry in (data.get("tools") or {}).get("allowed") or []
         )
-    ]
-    assert granted == ["configurator"], (
-        f"cleanup_engagement_topics must be granted to the configurator and "
-        f"NOBODY else; currently granted to: {granted}"
+    }
+    assert granted <= {"configurator", "assistant"}, (
+        f"cleanup_engagement_topics must be granted ONLY to the configurator "
+        f"(full) + assistant (due-only, guarded); currently granted to: "
+        f"{sorted(granted)}"
     )
+    assert "configurator" in granted
 
 
 def test_trigger_prompt_files_and_channels_resolve() -> None:
