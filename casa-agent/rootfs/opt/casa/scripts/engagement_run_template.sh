@@ -1,10 +1,11 @@
 #!/command/with-contenv sh
 # Casa claude_code engagement run script.
 # Substitutions performed by drivers.workspace.render_run_script():
-#   {ID}             — engagement id (hex uuid)
-#   {PERMISSION_MODE}— permission-mode flag value
-#   {ADD_DIR_FLAGS}  — space-joined --add-dir <path> flags
-#   {EXTRA_UNSET}    — additional space-separated env var names to unset
+#   {ID}              — engagement id (hex uuid)
+#   {PERMISSION_MODE} — permission-mode flag value
+#   {ADD_DIR_FLAGS}   — space-joined --add-dir <path> flags
+#   {PLUGIN_DIR_FLAGS}— space-joined --plugin-dir <path> flags (pinned artifacts)
+#   {EXTRA_UNSET}     — additional space-separated env var names to unset
 
 set -e
 
@@ -19,9 +20,8 @@ unset TELEGRAM_BOT_TOKEN WEBHOOK_SECRET \
 
 export HOME="/data/engagements/{ID}/.home"
 export CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1
-# Plan 4b §B.9: plugin seed + shared cache dirs for CC plugin resolution.
-export CLAUDE_CODE_PLUGIN_SEED_DIR="/opt/claude-seed"
-export CLAUDE_CODE_PLUGIN_CACHE_DIR="/config/cc-home/.claude/plugins"
+# Unified plugin architecture (§3.8): plugins load ONLY via the pinned
+# --plugin-dir flags below — no seed/cache env (the marketplace is gone).
 {EXTRA_EXPORT}
 cd "/data/engagements/{ID}"
 
@@ -40,4 +40,5 @@ fi
 exec claude --channels server:casa-engagement-channel \
             $RESUME_FLAG \
             --permission-mode {PERMISSION_MODE} \
-            {ADD_DIR_FLAGS}
+            {ADD_DIR_FLAGS} \
+            {PLUGIN_DIR_FLAGS}
