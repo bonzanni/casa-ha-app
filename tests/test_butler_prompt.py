@@ -60,3 +60,18 @@ def test_butler_prompt_covers_toggle(butler_md_text):
     guidance — its absence from the action table was part of why the model
     fell back to surveying instead of acting."""
     assert "toggle" in butler_md_text.lower()
+
+
+def test_butler_runtime_disallows_subagent_spawn():
+    """Q-1 (v0.69.8): butler must not spawn sub-agents — Agent/Task in the
+    bundled runtime.yaml disallowed list (config-enforced; butler also can't
+    Write to change it)."""
+    import yaml
+
+    root = Path(__file__).resolve().parent.parent
+    rt = root / "casa-agent/rootfs/opt/casa/defaults/agents/butler/runtime.yaml"
+    data = yaml.safe_load(rt.read_text(encoding="utf-8"))
+    disallowed = data["tools"]["disallowed"]
+    assert "Agent" in disallowed and "Task" in disallowed
+    # existing restrictions preserved
+    assert {"Bash", "Write", "Edit"} <= set(disallowed)

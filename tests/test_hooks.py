@@ -610,3 +610,62 @@ class TestEngagementPermissionRelayWired:
         )
 
         assert PERMISSION_QUEUES is _PERMISSION_QUEUES
+
+
+# ------------------------------------------------------------------
+# I-2 (v0.69.8): agent-home settings.json self-grant guard
+# ------------------------------------------------------------------
+
+
+async def test_settings_guard_blocks_write_to_agent_settings():
+    from hooks import make_agent_home_settings_guard
+    hook = make_agent_home_settings_guard()
+    data = {"tool_name": "Write", "tool_input": {
+        "file_path": "/config/agent-home/assistant/.claude/settings.json"}}
+    result = await hook(data, "t", CTX)
+    assert _decision(result) == "deny"
+
+
+async def test_settings_guard_blocks_edit_and_multiedit():
+    from hooks import make_agent_home_settings_guard
+    hook = make_agent_home_settings_guard()
+    for tool in ("Edit", "MultiEdit"):
+        data = {"tool_name": tool, "tool_input": {
+            "file_path": "/config/agent-home/butler/.claude/settings.json"}}
+        assert _decision(await hook(data, "t", CTX)) == "deny"
+
+
+async def test_settings_guard_blocks_traversal_to_settings():
+    from hooks import make_agent_home_settings_guard
+    hook = make_agent_home_settings_guard()
+    data = {"tool_name": "Write", "tool_input": {
+        "file_path": "/config/agent-home/assistant/skills/../.claude/settings.json"}}
+    assert _decision(await hook(data, "t", CTX)) == "deny"
+
+
+async def test_settings_guard_allows_other_writes():
+    from hooks import make_agent_home_settings_guard
+    hook = make_agent_home_settings_guard()
+    data = {"tool_name": "Write", "tool_input": {
+        "file_path": "/config/agent-home/assistant/notes.md"}}
+    assert await hook(data, "t", CTX) == {}
+
+
+async def test_settings_guard_ignores_non_write_tools():
+    from hooks import make_agent_home_settings_guard
+    hook = make_agent_home_settings_guard()
+    data = {"tool_name": "Read", "tool_input": {
+        "file_path": "/config/agent-home/assistant/.claude/settings.json"}}
+    assert await hook(data, "t", CTX) == {}
+
+
+async def test_settings_guard_matcher_shape_and_denies():
+    """I-2 wiring: the injected matcher targets the write tools and its
+    callback denies a settings.json edit."""
+    from hooks import agent_home_settings_guard_matcher
+    m = agent_home_settings_guard_matcher()
+    assert m.matcher == "Write|Edit|MultiEdit"
+    assert len(m.hooks) == 1
+    data = {"tool_name": "Edit", "tool_input": {
+        "file_path": "/config/agent-home/assistant/.claude/settings.json"}}
+    assert _decision(await m.hooks[0](data, "t", CTX)) == "deny"

@@ -308,6 +308,27 @@ def _engagement_unavailable_result(origin: dict) -> dict:
     })
 
 
+# Q-1 (v0.69.8, operator decision 2026-07-12): the SDK meta-tools that spawn a
+# sub-agent. They bypass `allowed_tools` AND the v0.68.0 fail-closed
+# can_use_tool callback (empirically: the CLI does not consult the callback for
+# them), so a restricted agent could spawn a sub-agent that reaches a broad
+# default toolset its own allowlist excludes. `disallowed_tools` IS enforced by
+# the CLI (removes them from the surface), so specialists — and butler, via its
+# runtime.yaml — are denied these. NOT `ToolSearch` (operator kept it: it is
+# the deferred-tool-load mechanism and cannot spawn a sub-agent on its own).
+_SUBAGENT_SPAWN_TOOLS = ("Agent", "Task")
+
+
+def _with_subagent_spawn_disallowed(disallowed) -> list[str]:
+    """Return ``disallowed`` (any iterable) plus the sub-agent-spawn tools,
+    de-duplicated, order-stable."""
+    out = list(disallowed)
+    for t in _SUBAGENT_SPAWN_TOOLS:
+        if t not in out:
+            out.append(t)
+    return out
+
+
 def _build_specialist_options(cfg) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for a Tier 2 specialist invocation.
 
@@ -351,7 +372,7 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
         model=cfg.model,
         system_prompt=cfg.system_prompt,
         allowed_tools=allowed_tools,
-        disallowed_tools=list(cfg.tools.disallowed),
+        disallowed_tools=_with_subagent_spawn_disallowed(cfg.tools.disallowed),
         permission_mode=cfg.tools.permission_mode or "acceptEdits",
         max_turns=cfg.tools.max_turns,
         mcp_servers=mcp_servers if mcp_servers else {},

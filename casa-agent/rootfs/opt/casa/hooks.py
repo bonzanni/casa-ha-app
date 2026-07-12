@@ -704,6 +704,56 @@ def make_casa_config_guard_hook(
 
 
 # ---------------------------------------------------------------------------
+# I-2 (v0.69.8): agent-home settings.json self-grant guard
+# ---------------------------------------------------------------------------
+
+
+_SETTINGS_JSON_SUFFIX = "/.claude/settings.json"
+
+
+def make_agent_home_settings_guard() -> HookCallback:
+    """Deny Write/Edit/MultiEdit to any ``.claude/settings.json`` (I-2).
+
+    Plugin grants derive from an agent-home's ``.claude/settings.json``
+    (``enabledPlugins``). Residents hold Write/Edit under ``acceptEdits``, so a
+    prompt-injected resident could self-enable a cached plugin by editing its
+    own settings.json — bounded (``mcp__plugin_*`` namespace, ``disallowed``
+    wins, the cache is configurator-populated), but a self-grant vector.
+    settings.json is configurator-managed; no agent should hand-edit it. The
+    match is by normalized-path suffix, so ``..`` traversal can't slip a write
+    through (see `_normalize_path`)."""
+    async def _hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        if input_data.get("tool_name", "") not in ("Write", "Edit", "MultiEdit"):
+            return {}
+        raw = input_data.get("tool_input", {}).get("file_path", "")
+        if _normalize_path(raw).endswith(_SETTINGS_JSON_SUFFIX):
+            return _deny(
+                "settings_guard: editing .claude/settings.json is not "
+                "permitted — plugin grants are configurator-managed. Ask the "
+                "configurator to install/enable a plugin instead of editing "
+                "settings.json directly."
+            )
+        return {}
+
+    return _hook
+
+
+def agent_home_settings_guard_matcher():
+    """A ``HookMatcher`` wrapping :func:`make_agent_home_settings_guard`,
+    injected code-side into every resident's PreToolUse hooks (I-2, v0.69.8)
+    so the self-grant guard is an always-on invariant, not config-removable."""
+    from claude_agent_sdk import HookMatcher
+    return HookMatcher(
+        matcher="Write|Edit|MultiEdit",
+        hooks=[make_agent_home_settings_guard()],
+    )
+
+
+# ---------------------------------------------------------------------------
 # commit_size_guard - Plan 3 (asks user before batch commits > N files)
 # ---------------------------------------------------------------------------
 
