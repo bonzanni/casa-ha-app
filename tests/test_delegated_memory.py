@@ -35,20 +35,22 @@ async def test_delegated_recall_uses_inherited_clearance():
 async def test_delegated_recall_voice_is_friends():
     sem = _Sem()
     await delegated_memory.delegated_recall(
-        sem, query="q", origin_channel="voice", max_tokens=500, budget="mid",
+        sem, query="q", origin_channel="voice", max_tokens=500, budget="low",
     )
     assert sem.recall_calls[0]["tags"] == ["friends", "public"]
-    assert sem.recall_calls[0]["budget"] == "mid"   # explicit override still wins
+    assert sem.recall_calls[0]["budget"] == "low"   # explicit override still wins
 
 
-async def test_delegated_recall_defaults_to_low_budget():
-    # D-3 complement: mid → 300 rerank candidates ≈ 12s server-side on the
-    # N150 vs the 20s client budget — delegated turns must default to low.
+async def test_delegated_recall_defaults_to_mid_budget():
+    # The D-3 low-budget default (v0.68.1) was reverted in v0.69.4 once the
+    # hindsight-side rerank latency was fixed: mid → 300 candidates gives
+    # materially better recall quality and no longer risks the 20s client
+    # timeout. Explicit budget= (e.g. voice) still overrides.
     sem = _Sem()
     await delegated_memory.delegated_recall(
         sem, query="q", origin_channel="telegram", max_tokens=2000,
     )
-    assert sem.recall_calls[0]["budget"] == "low"
+    assert sem.recall_calls[0]["budget"] == "mid"
 
 
 async def test_delegated_recall_swallows_errors():

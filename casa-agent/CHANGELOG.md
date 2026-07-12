@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.69.4] - 2026-07-12 — delegated memory recall quality restored
+
+### Changed
+
+- Memory recalls made on behalf of specialists, executor engagements, and
+  engagement queries return to the balanced recall depth (`mid`), restoring
+  recall quality. The reduced depth (`low`) shipped in 0.68.1 was a stop-gap
+  for a memory-backend latency issue that has since been fixed on the backend
+  side, so the deeper, higher-quality recall no longer risks a timeout. Voice
+  recalls are unaffected (they keep their own `low` setting for latency).
+
 ## [0.69.3] - 2026-07-12 — completing an engagement is harder to get wrong
 
 ### Fixed
