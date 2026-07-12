@@ -2738,8 +2738,8 @@ _TOPIC_CLEANUP_SCOPES = ("due", "all_terminal")
     "Delete finished engagements' Telegram forum topics recorded in the "
     "topic ledger. scope='due' (default) deletes only entries past the "
     "7-day retention window; 'all_terminal' purges every ledger entry "
-    "immediately. Deletion is irreversible — pass dry_run=true first to "
-    "preview what would be deleted.",
+    "immediately and is configurator-only. Deletion is irreversible — pass "
+    "dry_run=true first to preview what would be deleted.",
     {"scope": str, "dry_run": bool},
 )
 async def cleanup_engagement_topics(args: dict) -> dict:
@@ -2768,6 +2768,20 @@ async def cleanup_engagement_topics(args: dict) -> dict:
             "message": (
                 f"scope must be one of {_TOPIC_CLEANUP_SCOPES}, "
                 f"got {scope!r}"
+            ),
+        })
+    # v0.69.12: Ellen (assistant) holds a due-ONLY variant (X2 resolved →
+    # webhook trust = authenticated, so the AR-7 deferral is cleared). The
+    # irreversible `all_terminal` purge (deletes EVERY ledger topic + all its
+    # messages immediately, for all members) stays configurator-only; a
+    # non-privileged caller requesting it is refused with a nudge to `due`.
+    if scope == "all_terminal" and _effective_caller_role() not in _PRIVILEGED_CONFIG_ROLES:
+        return _result({
+            "status": "error", "kind": "not_authorized",
+            "message": (
+                "scope='all_terminal' (immediate purge of every engagement "
+                "topic) is restricted to the configurator; use scope='due' to "
+                "delete only topics past the retention window."
             ),
         })
     dry_run = bool(args.get("dry_run", False))

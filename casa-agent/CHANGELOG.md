@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.69.12] - 2026-07-12 — Ellen can tidy finished engagement topics
+
+### Added
+
+- The primary agent can now clean up finished engagements' Telegram topics on
+  request ("clean up the engagement group") without delegating to the
+  configurator. It's limited to the safe cleanup that only removes topics past
+  their retention window; purging everything immediately remains
+  configurator-only.
+
 ## [0.69.11] - 2026-07-12 — interactive engagements can be resumed again
 
 ### Fixed
