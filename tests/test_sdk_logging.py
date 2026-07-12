@@ -262,3 +262,104 @@ class TestWithStderrCallback:
         out = with_stderr_callback(opts, engagement_id="x12345678")
         # We do NOT clobber a caller-provided callback.
         assert out.stderr is sentinel
+
+
+class TestSdkTaskNoiseFilter:
+    """P-4: the SDK spawns control-request handlers as DETACHED tasks; at
+    engagement teardown their transport.write raises CLIConnectionError and
+    nothing retrieves it -> asyncio GC logs "Task exception was never
+    retrieved" at ERROR on every successful engagement close."""
+
+    @staticmethod
+    def _ctx(exc):
+        return {
+            "message": "Task exception was never retrieved",
+            "exception": exc,
+            "task": object(),
+        }
+
+    def test_suppresses_unretrieved_cli_connection_error(self, caplog):
+        import asyncio
+        from claude_agent_sdk import CLIConnectionError
+        from sdk_logging import install_sdk_task_noise_filter
+
+        loop = asyncio.new_event_loop()
+        try:
+            install_sdk_task_noise_filter(loop)
+            handler = loop.get_exception_handler()
+            assert handler is not None
+            with caplog.at_level(logging.DEBUG):
+                handler(loop, self._ctx(
+                    CLIConnectionError("ProcessTransport is not ready for writing")))
+        finally:
+            loop.close()
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+        sdk_records = [r for r in caplog.records if r.name == "sdk"]
+        assert sdk_records and sdk_records[-1].levelno == logging.DEBUG
+        assert "ProcessTransport is not ready for writing" in sdk_records[-1].getMessage()
+
+    def test_delegates_other_exceptions_to_default(self, caplog):
+        import asyncio
+        from sdk_logging import install_sdk_task_noise_filter
+
+        loop = asyncio.new_event_loop()
+        try:
+            install_sdk_task_noise_filter(loop)
+            with caplog.at_level(logging.DEBUG):
+                loop.get_exception_handler()(loop, self._ctx(ValueError("real bug")))
+        finally:
+            loop.close()
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "non-SDK task exceptions must still reach the default handler"
+
+    def test_cli_not_found_subclass_stays_loud(self, caplog):
+        import asyncio
+        from claude_agent_sdk import CLINotFoundError
+        from sdk_logging import install_sdk_task_noise_filter
+
+        loop = asyncio.new_event_loop()
+        try:
+            install_sdk_task_noise_filter(loop)
+            with caplog.at_level(logging.DEBUG):
+                loop.get_exception_handler()(
+                    loop, self._ctx(CLINotFoundError("claude binary missing")))
+        finally:
+            loop.close()
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "CLINotFoundError (subclass) is a real fault, never noise"
+
+    def test_context_without_exception_delegates(self, caplog):
+        import asyncio
+        from sdk_logging import install_sdk_task_noise_filter
+
+        loop = asyncio.new_event_loop()
+        try:
+            install_sdk_task_noise_filter(loop)
+            with caplog.at_level(logging.DEBUG):
+                loop.get_exception_handler()(
+                    loop, {"message": "Unclosed resource", "source": object()})
+        finally:
+            loop.close()
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "exception-less contexts must still reach the default handler"
+
+    def test_detached_task_death_is_suppressed_end_to_end(self, caplog):
+        import asyncio
+        import gc
+        from claude_agent_sdk import CLIConnectionError
+        from sdk_logging import install_sdk_task_noise_filter
+
+        async def scenario():
+            install_sdk_task_noise_filter(asyncio.get_running_loop())
+
+            async def boom():
+                raise CLIConnectionError("ProcessTransport is not ready for writing")
+
+            task = asyncio.get_running_loop().create_task(boom())
+            await asyncio.sleep(0)  # task completes; exception stored, never retrieved
+            del task
+            gc.collect()  # Task.__del__ -> loop.call_exception_handler
+
+        with caplog.at_level(logging.DEBUG):
+            asyncio.run(scenario())
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []

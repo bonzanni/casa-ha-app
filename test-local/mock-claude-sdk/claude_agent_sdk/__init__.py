@@ -336,6 +336,12 @@ def create_sdk_mcp_server(name: str = "", tools: list[Any] | None = None) -> dic
     }
 
 
+class CLIConnectionError(Exception):
+    """Mock of claude_agent_sdk.CLIConnectionError (transport not writable /
+    not connected). sdk_logging's loop noise filter matches this EXACT type;
+    the mock client never raises it, so the filter is inert offline."""
+
+
 class ProcessError(Exception):
     """Mock of claude_agent_sdk.ProcessError. Raised when the CLI process fails.
 
@@ -396,6 +402,7 @@ def delete_session(session_id: str, directory: str | None = None) -> None:
 
 __all__ = [
     "AssistantMessage",
+    "CLIConnectionError",
     "ClaudeAgentOptions",
     "ClaudeSDKClient",
     "HookMatcher",

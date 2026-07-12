@@ -29,6 +29,7 @@ from typing import Callable
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    CLIConnectionError,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -215,8 +216,43 @@ def with_stderr_callback(
     )
 
 
+def install_sdk_task_noise_filter(loop) -> None:
+    """Install a loop exception handler that downgrades unretrieved
+    ``CLIConnectionError`` from detached SDK tasks to DEBUG (P-4, v0.68.2).
+
+    The SDK's ``Query`` spawns control-request handlers as DETACHED tasks
+    (``_spawn_control_request_handler`` → ``spawn_detached``). At engagement
+    teardown the handler's response ``transport.write`` races subprocess
+    shutdown and raises ``CLIConnectionError`` ("ProcessTransport is not
+    ready for writing"); the handler's own error path writes again and
+    re-raises, so the task dies unretrieved and asyncio GC logs "Task
+    exception was never retrieved" at ERROR on EVERY successful engagement
+    close — noise that masks real errors. Nothing casa-side can await those
+    SDK-internal tasks, so the loop exception handler is the only
+    interception point.
+
+    Scope is deliberately the EXACT type: awaited ``CLIConnectionError``
+    paths are handled by turn/engagement error handling (only detached
+    SDK-internal tasks reach the loop handler), while the
+    ``CLINotFoundError`` subclass (claude binary missing) and every other
+    exception stay on the default handler at ERROR.
+    """
+    def _handler(loop_, context: dict) -> None:
+        exc = context.get("exception")
+        if type(exc) is CLIConnectionError:
+            logger.debug(
+                "suppressed detached SDK-task teardown noise: %s: %s",
+                type(exc).__name__, exc,
+            )
+            return
+        loop_.default_exception_handler(context)
+
+    loop.set_exception_handler(_handler)
+
+
 __all__ = [
     "extract_tool_target",
+    "install_sdk_task_noise_filter",
     "log_system_init",
     "log_assistant_message",
     "log_tool_use",

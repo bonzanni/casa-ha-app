@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.68.2] - 2026-07-12 — engagement teardown stops logging a false error
+
+### Fixed
+
+- Closing an agent engagement no longer logs an ERROR ("Task exception was
+  never retrieved: CLIConnectionError") on every successful close. The Claude
+  Agent SDK answers control requests on background tasks; when one raced the
+  agent subprocess shutting down, its failed write was logged by the runtime
+  as an unhandled error even though nothing was wrong. That specific teardown
+  race is now logged at debug level instead; genuine failures (including a
+  missing claude binary) still log at ERROR.
+
 ## [0.68.1] - 2026-07-12 — delegated memory recalls stop timing out under load
 
 ### Fixed
