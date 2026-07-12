@@ -41,6 +41,27 @@ SessionIdPersister = Callable[[str, str], Awaitable[None]]
 Matches engagement_registry.persist_session_id's bound-method signature."""
 
 
+def _session_id_from_message(sdk_msg: Any) -> str | None:
+    """Extract the CLI session id from an SDK message (v0.69.11).
+
+    The pinned Agent SDK's ``ClaudeSDKClient`` exposes no ``session_id``
+    attribute; the id arrives in the stream — on the ``SystemMessage`` whose
+    ``subtype == "init"`` (``data["session_id"]``) and on every
+    ``ResultMessage`` (``.session_id``). Same source ``sdk_client_pool`` uses.
+    """
+    if isinstance(sdk_msg, SystemMessage):
+        if getattr(sdk_msg, "subtype", None) == "init":
+            data = getattr(sdk_msg, "data", None) or {}
+            sid = data.get("session_id") if isinstance(data, dict) else None
+            if isinstance(sid, str) and sid:
+                return sid
+    elif isinstance(sdk_msg, ResultMessage):
+        sid = getattr(sdk_msg, "session_id", None)
+        if isinstance(sid, str) and sid:
+            return sid
+    return None
+
+
 class DriverNotAliveError(RuntimeError):
     """Raised when a turn is fed to a driver that has no open client."""
 
@@ -68,6 +89,12 @@ class InCasaDriver(DriverProtocol):
         # Per-engagement asyncio.Lock guards query/receive_response sequencing:
         # ClaudeSDKClient is single-threaded per connection.
         self._locks: dict[str, asyncio.Lock] = {}
+        # v0.69.11: the CLI's session id, captured from the MESSAGE STREAM
+        # (SystemMessage init `data["session_id"]` / ResultMessage.session_id) —
+        # ClaudeSDKClient has NO `session_id` attribute on the pinned Agent SDK
+        # (0.2.114), so the old getattr(client, "session_id") was always None
+        # and persistence silently never fired. Same source the warm pool uses.
+        self._session_ids: dict[str, str] = {}
 
     # -- lifecycle --------------------------------------------------------
 
@@ -144,6 +171,7 @@ class InCasaDriver(DriverProtocol):
         client = self._clients.pop(engagement.id, None)
         ctx = self._ctx_stack.pop(engagement.id, None)
         self._locks.pop(engagement.id, None)
+        self._session_ids.pop(engagement.id, None)
         if client is None and ctx is None:
             return
         try:
@@ -205,9 +233,14 @@ class InCasaDriver(DriverProtocol):
             engagement_var.reset(token)
 
     def get_session_id(self, engagement: EngagementRecord) -> str | None:
-        """Return the live client's session_id for persistence before cancel."""
-        client = self._clients.get(engagement.id)
-        return getattr(client, "session_id", None) if client else None
+        """Return the session id captured from this engagement's message stream
+        (v0.69.11), falling back to the record's persisted value. The live
+        ``ClaudeSDKClient`` has no ``session_id`` attribute (pinned SDK), so the
+        stream-sourced value is authoritative."""
+        return (
+            self._session_ids.get(engagement.id)
+            or getattr(engagement, "sdk_session_id", None)
+        )
 
     def is_alive(self, engagement: EngagementRecord) -> bool:
         return engagement.id in self._clients
@@ -237,7 +270,9 @@ class InCasaDriver(DriverProtocol):
             async with lock:
                 await client.query(prompt)
                 async for sdk_msg in client.receive_response():
-                    sid = getattr(client, "session_id", None)
+                    sid = _session_id_from_message(sdk_msg)
+                    if sid:
+                        self._session_ids[engagement.id] = sid
                     if (
                         sid
                         and self._persist_session_id is not None
