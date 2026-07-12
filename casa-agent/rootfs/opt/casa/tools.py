@@ -1918,6 +1918,70 @@ async def _finalize_engagement(
 
 
 # ---------------------------------------------------------------------------
+# Stale-engagement reap (D-4, v0.69.0)
+# ---------------------------------------------------------------------------
+
+
+_ENGAGEMENT_REAP_DAYS_DEFAULT = 7.0
+
+
+def _engagement_reap_days() -> float:
+    """Reap TTL in days from the ``engagement_reap_days`` add-on option
+    (env ``ENGAGEMENT_REAP_DAYS``); 0 disables the reap."""
+    raw = os.environ.get("ENGAGEMENT_REAP_DAYS", "")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return _ENGAGEMENT_REAP_DAYS_DEFAULT
+
+
+async def reap_stale_engagements(
+    *, driver: Any, ttl_days: float | None = None,
+) -> int:
+    """Cancel engagements with no user turn for ``ttl_days`` (D-4, v0.69.0).
+
+    Interrupted/abandoned engagements used to linger active/idle forever
+    (25-day-stale engagement, 2026-07-10; restart orphan reaped manually,
+    2026-07-11). Runs in the daily engagement sweep BEFORE the idle-reminder
+    pass so a to-be-reaped record doesn't get a pointless reminder in the
+    same run. Goes through ``_finalize_engagement`` — the same funnel as a
+    manual cancel — so the topic is closed + ledger-recorded, Ellen is
+    notified, and the summary retain lands. Returns the number reaped.
+    """
+    if _engagement_registry is None:
+        return 0
+    if ttl_days is None:
+        ttl_days = _engagement_reap_days()
+    if ttl_days <= 0:
+        return 0
+    now = time.time()
+    cutoff = now - ttl_days * 86400
+    reaped = 0
+    for rec in list(_engagement_registry.active_and_idle()):
+        if rec.last_user_turn_ts >= cutoff:
+            continue
+        idle_days = int((now - rec.last_user_turn_ts) // 86400)
+        logger.info(
+            "reaping stale engagement %s (%s/%s, idle %dd > ttl %gd)",
+            rec.id[:8], rec.kind, rec.role_or_type, idle_days, ttl_days,
+        )
+        try:
+            await _finalize_engagement(
+                rec, outcome="cancelled",
+                text=(
+                    f"Auto-closed after {idle_days} days with no activity "
+                    f"(reap TTL {ttl_days:g}d). Start a new engagement to "
+                    "continue this work."
+                ),
+                artifacts=[], next_steps=[], driver=driver,
+            )
+            reaped += 1
+        except Exception:  # noqa: BLE001 — one bad record must not stop the sweep
+            logger.warning("reap of engagement %s failed", rec.id[:8], exc_info=True)
+    return reaped
+
+
+# ---------------------------------------------------------------------------
 # emit_completion — called by the engaged agent
 # ---------------------------------------------------------------------------
 

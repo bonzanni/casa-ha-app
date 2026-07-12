@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.69.0] - 2026-07-12 — engagements stop leaking state across restarts and time
+
+### Added
+
+- Abandoned engagements are now cleaned up automatically: a daily sweep
+  cancels any engagement with no activity for `engagement_reap_days` days
+  (new option, default 7; 0 disables), closing its Telegram topic and
+  notifying the engaging agent — previously an interrupted engagement could
+  sit "active" forever (a 25-day-old one was found this week).
+- Finished engagements now leave a tombstone in the engagement registry
+  file (kept 30 days) instead of vanishing on the next write, so the
+  duplicate-task guard and post-mortem inspection keep working across
+  add-on restarts.
+
+### Fixed
+
+- After a restart, engagements that were running when the container stopped
+  are reconciled to "idle" (dormant, resumable) instead of claiming to be
+  active with no process behind them.
+
 ## [0.68.2] - 2026-07-12 — engagement teardown stops logging a false error
 
 ### Fixed

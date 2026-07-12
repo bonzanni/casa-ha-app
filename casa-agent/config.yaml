@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.68.2"
+version: "0.69.0"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 image: "ghcr.io/bonzanni/casa-agent"
@@ -53,6 +53,7 @@ options:
 
   # Scheduling
   casa_tz: "Europe/Amsterdam"
+  engagement_reap_days: 7
 
 # NOTE: when you REMOVE an option below, also add its key to
 # DEPRECATED_OPTION_KEYS in rootfs/etc/s6-overlay/scripts/setup-configs.sh
@@ -79,4 +80,5 @@ schema:
   enable_terminal: bool?
   sdk_client_pool: bool?
   casa_tz: str?
+  engagement_reap_days: int?
   log_level: "list(debug|info|warning|error)?"

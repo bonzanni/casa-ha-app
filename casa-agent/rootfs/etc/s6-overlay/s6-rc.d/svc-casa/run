@@ -65,6 +65,13 @@ if [ "$_log_level" != "null" ] && [ -n "$_log_level" ]; then
     export LOG_LEVEL="$_log_level"
 fi
 
+# D-4 (v0.69.0): stale-engagement reap TTL in days; 0 disables the reap.
+# tools._engagement_reap_days() falls back to 7 when unset/invalid.
+_reap_days="$(bashio::config 'engagement_reap_days')"
+if [ "$_reap_days" != "null" ] && [ -n "$_reap_days" ]; then
+    export ENGAGEMENT_REAP_DAYS="$_reap_days"
+fi
+
 # SUPERVISOR_TOKEN is injected automatically by the HA Supervisor.
 
 exec /opt/casa/venv/bin/python3 /opt/casa/casa_core.py

@@ -97,6 +97,12 @@ configuration:
     description: >-
       IANA timezone for schedules and agent clocks (e.g. Europe/Amsterdam).
       Unknown values fall back to Europe/Amsterdam with a warning.
+  engagement_reap_days:
+    name: Engagement Auto-Close Days
+    description: >-
+      Engagements with no activity for this many days are automatically
+      cancelled and their Telegram topic closed (daily sweep). Set 0 to
+      disable. Defaults to 7.
   log_level:
     name: Log Level
     description: >-
