@@ -1,6 +1,25 @@
 # Changelog
 
-## [0.69.6] - 2026-07-12 — engagement auto-reap and restart reconcile hardening
+## [0.69.7] - 2026-07-12 — plugin/engagement polish
+
+### Fixed
+
+- When a plugin has more than one version cached, install and verification now
+  read environment-variable requirements from the same (highest) version the
+  tool grants are derived from, instead of whichever the filesystem listed
+  first.
+- Trying to start an engagement from a non-Telegram surface (voice, webhook)
+  now returns an accurate message — engagements can only be started from
+  Telegram — instead of wrongly telling the operator to set a Telegram
+  supergroup option.
+
+### Changed
+
+- Specialist agents now log their capability summary at boot (like the primary
+  agents already did), giving post-install verification a log to check.
+- The offline test SDK is now guarded against field-shape drift from the real
+  SDK for the permission result type, closing a gap a past review had to catch
+  by hand.
 
 ### Fixed
 

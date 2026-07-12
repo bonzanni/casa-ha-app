@@ -33,7 +33,8 @@ from system_requirements.orchestrator import install_requirements, Orchestration
 from system_requirements.manifest import add_plugin_entry as add_manifest
 from plugins_binding import build_sdk_plugins
 from plugin_grants import (
-    derived_plugin_grants, grants_for_plugin, make_fail_closed_can_use_tool,
+    derived_plugin_grants, grants_for_plugin, highest_version_mcp_json,
+    make_fail_closed_can_use_tool,
 )
 from delegated_memory import delegated_recall, retain_delegated
 
@@ -280,6 +281,31 @@ def _result(payload: dict, *, is_error: bool | None = None) -> dict:
     if is_error:
         envelope["is_error"] = True
     return envelope
+
+
+def _engagement_unavailable_result(origin: dict) -> dict:
+    """R-2 (v0.69.7): the engagement supergroup/topic check failed — return an
+    accurate error keyed on origin. A non-Telegram origin can't start an
+    engagement at all (only the telegram channel carries the supergroup/topic
+    machinery; full non-Telegram origination is backlogged), which is a
+    different problem from a genuine telegram-side misconfiguration. The old
+    single message ("set telegram_engagement_supergroup_id …") misdiagnosed the
+    non-Telegram case as an add-on config gap."""
+    origin_channel = origin.get("channel", "telegram")
+    if origin_channel != "telegram":
+        return _result({
+            "status": "error", "kind": "engagement_wrong_origin",
+            "message": (
+                "engagements can only be initiated from Telegram; this request "
+                f"originated from {origin_channel!r}. Non-Telegram origination "
+                "is not supported yet."
+            ),
+        })
+    return _result({
+        "status": "error", "kind": "engagement_not_configured",
+        "message": ("set telegram_engagement_supergroup_id in addon options "
+                    "and verify the bot has can_manage_topics"),
+    })
 
 
 def _build_specialist_options(cfg) -> ClaudeAgentOptions:
@@ -712,11 +738,7 @@ async def delegate_to_agent(args: dict) -> dict:
         if (channel is None
                 or not getattr(channel, "engagement_supergroup_id", 0)
                 or not getattr(channel, "engagement_permission_ok", False)):
-            return _result({
-                "status": "error", "kind": "engagement_not_configured",
-                "message": ("set telegram_engagement_supergroup_id in addon "
-                            "options and verify the bot has can_manage_topics"),
-            })
+            return _engagement_unavailable_result(origin)  # R-2 (v0.69.7)
         # v0.37.1 D-1: U3 title format for specialist engagements too
         # (was legacy `#[<role>] <task> · <id8>`). Bubble carries the
         # role icon via icon_id_for_role; title is `<state> <task>`.
@@ -1350,11 +1372,7 @@ async def engage_executor(args: dict) -> dict:
     if (channel is None
             or not getattr(channel, "engagement_supergroup_id", 0)
             or not getattr(channel, "engagement_permission_ok", False)):
-        return _result({
-            "status": "error", "kind": "engagement_not_configured",
-            "message": ("set telegram_engagement_supergroup_id in addon "
-                        "options and verify the bot has can_manage_topics"),
-        })
+        return _engagement_unavailable_result(origin)  # R-2 (v0.69.7)
 
     # P32 (v0.37.10): refuse duplicate-task spawns. Compare against the
     # most-recent engagement for the same channel/chat_id within the
@@ -2861,12 +2879,9 @@ def _tool_install_casa_plugin(
             "installed": installed,
         }
 
-    # 5. Extract required env vars from cached plugin's .mcp.json.
-    cache_root = _CASA_PLUGIN_CACHE_ROOT
-    mcp_json = next(
-        iter(cache_root.glob(f"{plugin_name}/*/.mcp.json")),
-        None,
-    )
+    # 5. Extract required env vars from cached plugin's .mcp.json — from the
+    # SAME (highest) version dir the grant derivation reads (e, v0.69.7).
+    mcp_json = highest_version_mcp_json(_CASA_PLUGIN_CACHE_ROOT / plugin_name)
     env_vars = extract_env_vars(mcp_json) if mcp_json else set()
 
     return {
@@ -3055,7 +3070,7 @@ def _tool_verify_plugin_state(
                                  "reason": f"{vb} not in tools/bin"})
 
     cache_root = _cache_root if _cache_root is not None else _CASA_PLUGIN_CACHE_ROOT
-    mcp_json = next(iter(cache_root.glob(f"{plugin_name}/*/.mcp.json")), None)
+    mcp_json = highest_version_mcp_json(cache_root / plugin_name)  # (e, v0.69.7)
     required = extract_env_vars(mcp_json) if mcp_json else set()
     env_conf = read_entries()
     secrets_status = []

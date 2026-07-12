@@ -94,3 +94,34 @@ def test_mock_exports_streamevent_with_event_payload():
                                  "delta": {"type": "text_delta", "text": "x"}})
     assert ev.event["delta"]["text"] == "x"
     assert "StreamEvent" in mock.__all__
+
+
+# (g) v0.69.7: SDK dataclasses the app CONSTRUCTS and returns to the SDK must
+# mirror the real SDK's field shape EXACTLY — a missing field (the
+# PermissionResultDeny.behavior gap, caught by review not the guard) makes the
+# offline permission path silently wrong. Distinct from the two guards above,
+# which check import-name presence and ClaudeAgentOptions kwargs (name/kwarg
+# level), not field shape.
+_RESULT_TYPES_MIRRORING_REAL = ["PermissionResultDeny"]
+
+
+def test_mock_result_dataclasses_mirror_real_sdk_field_shape():
+    import claude_agent_sdk as real  # the REAL installed SDK under the unit gate
+
+    mock = _load_mock()
+    for name in _RESULT_TYPES_MIRRORING_REAL:
+        real_obj = getattr(real, name, None)
+        mock_obj = getattr(mock, name, None)
+        assert real_obj is not None, (
+            f"real SDK no longer exposes {name} — update the guard list"
+        )
+        assert mock_obj is not None, f"mock SDK lacks {name}"
+        assert dataclasses.is_dataclass(real_obj), f"real {name} is not a dataclass"
+        assert dataclasses.is_dataclass(mock_obj), f"mock {name} is not a dataclass"
+        real_fields = {f.name for f in dataclasses.fields(real_obj)}
+        mock_fields = {f.name for f in dataclasses.fields(mock_obj)}
+        assert mock_fields == real_fields, (
+            f"mock {name} field shape drifted from the real SDK — "
+            f"missing={real_fields - mock_fields}, extra={mock_fields - real_fields}; "
+            "the e2e container returns this to the SDK, so the shapes must match"
+        )

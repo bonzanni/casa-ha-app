@@ -180,6 +180,36 @@ class TestEngageExecutorReal:
         payload = json.loads(r["content"][0]["text"])
         assert payload["kind"] == "engagement_not_configured"
 
+    async def test_non_telegram_origin_gets_accurate_error(self):
+        """R-2 (v0.69.7): when the engagement machinery is unavailable for a
+        non-Telegram origin, the error must accurately say engagements
+        originate from Telegram — NOT the misleading 'set
+        telegram_engagement_supergroup_id' message (which telegram-origin
+        callers still get, see test_engagement_not_configured)."""
+        from tools import engage_executor
+        import agent as agent_mod
+
+        defn = _mock_executor_def()
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["configurator"])
+        await _setup(reg, channel_ok=False)  # supergroup unavailable on this origin
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "voice",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "configurator", "task": "t", "context": "",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+        payload = json.loads(r["content"][0]["text"])
+        assert payload["kind"] == "engagement_wrong_origin"
+        assert "Telegram" in payload["message"]
+        assert "supergroup" not in payload["message"].lower()
+
     async def test_ef_inline_retry_recovers_from_first_boot_race(
         self, tmp_path, monkeypatch,
     ):
