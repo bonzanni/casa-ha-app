@@ -664,8 +664,40 @@ async def test_settings_guard_matcher_shape_and_denies():
     callback denies a settings.json edit."""
     from hooks import agent_home_settings_guard_matcher
     m = agent_home_settings_guard_matcher()
-    assert m.matcher == "Write|Edit|MultiEdit"
+    assert m.matcher == "Write|Edit|MultiEdit|Bash"
     assert len(m.hooks) == 1
     data = {"tool_name": "Edit", "tool_input": {
         "file_path": "/config/agent-home/assistant/.claude/settings.json"}}
     assert _decision(await m.hooks[0](data, "t", CTX)) == "deny"
+
+
+# I-2 Bash coverage (codex review v0.69.10, Finding 1): Ellen has Bash, so the
+# Write/Edit-only guard was bypassable via `echo > settings.json`.
+
+
+async def test_settings_guard_blocks_bash_redirect_to_settings():
+    from hooks import make_agent_home_settings_guard
+    hook = make_agent_home_settings_guard()
+    for cmd in (
+        "echo '{}' > /config/agent-home/assistant/.claude/settings.json",
+        "cat x >> /config/agent-home/butler/.claude/settings.json",
+        "tee /config/agent-home/assistant/.claude/settings.json < x",
+        "sed -i 's/a/b/' /config/agent-home/assistant/.claude/settings.json",
+    ):
+        data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+        assert _decision(await hook(data, "t", CTX)) == "deny", cmd
+
+
+async def test_settings_guard_allows_bash_read_of_settings():
+    from hooks import make_agent_home_settings_guard
+    hook = make_agent_home_settings_guard()
+    data = {"tool_name": "Bash", "tool_input": {
+        "command": "cat /config/agent-home/assistant/.claude/settings.json"}}
+    assert await hook(data, "t", CTX) == {}
+
+
+async def test_settings_guard_allows_unrelated_bash():
+    from hooks import make_agent_home_settings_guard
+    hook = make_agent_home_settings_guard()
+    data = {"tool_name": "Bash", "tool_input": {"command": "ls -la /tmp > out.txt"}}
+    assert await hook(data, "t", CTX) == {}

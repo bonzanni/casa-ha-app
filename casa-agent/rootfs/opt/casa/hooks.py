@@ -710,6 +710,23 @@ def make_casa_config_guard_hook(
 
 _SETTINGS_JSON_SUFFIX = "/.claude/settings.json"
 
+_SETTINGS_DENY_MSG = (
+    "settings_guard: editing .claude/settings.json is not permitted — plugin "
+    "grants are configurator-managed. Ask the configurator to install/enable a "
+    "plugin instead of editing settings.json directly."
+)
+
+# A Bash command with a write operator (redirect / tee / dd / cp / mv /
+# install / sed -i / truncate) appearing BEFORE a .claude/settings.json path —
+# i.e. writing INTO settings.json. A bare `cat …/settings.json` (read) has no
+# preceding write op and is allowed. Best-effort — see the Bash branch of
+# make_agent_home_settings_guard.
+_SETTINGS_JSON_WRITE_RE = re.compile(
+    r"(?:>>?|\btee\b|\bdd\b|\bcp\b|\bmv\b|\binstall\b|sed\s+-i|\btruncate\b)"
+    r".*?\.claude/settings\.json",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def make_agent_home_settings_guard() -> HookCallback:
     """Deny Write/Edit/MultiEdit to any ``.claude/settings.json`` (I-2).
@@ -727,16 +744,23 @@ def make_agent_home_settings_guard() -> HookCallback:
         tool_use_id: str | None,
         context: dict[str, Any],
     ) -> dict[str, Any]:
-        if input_data.get("tool_name", "") not in ("Write", "Edit", "MultiEdit"):
-            return {}
-        raw = input_data.get("tool_input", {}).get("file_path", "")
-        if _normalize_path(raw).endswith(_SETTINGS_JSON_SUFFIX):
-            return _deny(
-                "settings_guard: editing .claude/settings.json is not "
-                "permitted — plugin grants are configurator-managed. Ask the "
-                "configurator to install/enable a plugin instead of editing "
-                "settings.json directly."
-            )
+        tool_name = input_data.get("tool_name", "")
+        if tool_name in ("Write", "Edit", "MultiEdit"):
+            raw = input_data.get("tool_input", {}).get("file_path", "")
+            if _normalize_path(raw).endswith(_SETTINGS_JSON_SUFFIX):
+                return _deny(_SETTINGS_DENY_MSG)
+        elif tool_name == "Bash":
+            # Finding 1 (codex review v0.69.10): residents with Bash (Ellen)
+            # could bypass the file-tool guard with `echo … >
+            # .claude/settings.json`. Deny a Bash command that names a
+            # settings.json path AND looks like a write. This is best-effort
+            # (a determined obfuscated command can still slip through — the
+            # complete boundary is filesystem/sandbox enforcement or removing
+            # residents' broad Bash; tracked in ROADMAP-backlog), but it
+            # catches the realistic prompt-injection form (a plain redirect).
+            command = input_data.get("tool_input", {}).get("command", "")
+            if _SETTINGS_JSON_WRITE_RE.search(command):
+                return _deny(_SETTINGS_DENY_MSG)
         return {}
 
     return _hook
@@ -748,7 +772,7 @@ def agent_home_settings_guard_matcher():
     so the self-grant guard is an always-on invariant, not config-removable."""
     from claude_agent_sdk import HookMatcher
     return HookMatcher(
-        matcher="Write|Edit|MultiEdit",
+        matcher="Write|Edit|MultiEdit|Bash",
         hooks=[make_agent_home_settings_guard()],
     )
 
