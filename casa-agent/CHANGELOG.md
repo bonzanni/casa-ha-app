@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.68.1] - 2026-07-12 — delegated memory recalls stop timing out under load
+
+### Fixed
+
+- Memory recalls made on behalf of specialists, executor engagements, and
+  engagement queries now use the fast recall budget. The previous default
+  asked the memory backend to rerank 300 candidates (~12s on the appliance
+  CPU), which under concurrent load crossed the 20s client timeout and made
+  every delegated recall fail during busy periods. Direct (non-delegated)
+  recalls are unchanged.
+
 ## [0.68.0] - 2026-07-12 — installed plugins are usable by construction
 
 ### Fixed

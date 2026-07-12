@@ -35,9 +35,19 @@ async def test_delegated_recall_uses_inherited_clearance():
 async def test_delegated_recall_voice_is_friends():
     sem = _Sem()
     await delegated_memory.delegated_recall(
-        sem, query="q", origin_channel="voice", max_tokens=500, budget="low",
+        sem, query="q", origin_channel="voice", max_tokens=500, budget="mid",
     )
     assert sem.recall_calls[0]["tags"] == ["friends", "public"]
+    assert sem.recall_calls[0]["budget"] == "mid"   # explicit override still wins
+
+
+async def test_delegated_recall_defaults_to_low_budget():
+    # D-3 complement: mid → 300 rerank candidates ≈ 12s server-side on the
+    # N150 vs the 20s client budget — delegated turns must default to low.
+    sem = _Sem()
+    await delegated_memory.delegated_recall(
+        sem, query="q", origin_channel="telegram", max_tokens=2000,
+    )
     assert sem.recall_calls[0]["budget"] == "low"
 
 
