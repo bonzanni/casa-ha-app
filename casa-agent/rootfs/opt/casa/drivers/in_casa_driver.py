@@ -177,7 +177,15 @@ class InCasaDriver(DriverProtocol):
                 engagement.id[:8],
             )
             return
-        options = ClaudeAgentOptions(resume=session_id)
+        # Finding 2 (codex review v0.69.10): rebuild the FULL option set (a
+        # bare ClaudeAgentOptions(resume=) drops disallowed_tools/Agent+Task,
+        # the fail-closed callback, hooks, skills, MCP restrictions — running
+        # the resumed engagement unrestricted). Off-loop: the builder shells
+        # out to `claude plugin list`. Fails closed if the config is gone.
+        from tools import build_engagement_resume_options
+        options = await asyncio.to_thread(
+            build_engagement_resume_options, engagement, session_id,
+        )
         client = ClaudeSDKClient(
             sdk_logging.with_stderr_callback(
                 options, engagement_id=engagement.id[:8],

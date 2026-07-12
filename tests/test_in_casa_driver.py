@@ -533,11 +533,11 @@ class TestInCasaResume:
     async def test_resume_reopens_client_with_session_id(self, monkeypatch):
         from drivers.in_casa_driver import InCasaDriver
 
-        seen_resume = []
+        seen_options = []
 
         class _FakeClient:
             def __init__(self, options):
-                seen_resume.append(getattr(options, "resume", None))
+                seen_options.append(options)
                 self.session_id = "sess-new"
             async def __aenter__(self): return self
             async def __aexit__(self, *a): pass
@@ -548,12 +548,24 @@ class TestInCasaResume:
             async def close(self): pass
 
         monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+        # Finding 2 (v0.69.10): resume rebuilds the FULL option set (Agent/Task
+        # denies + fail-closed callback), not a bare ClaudeAgentOptions(resume=).
+        import tools as tools_mod
+
+        def _fake_rebuild(engagement, session_id):
+            return ClaudeAgentOptions(
+                resume=session_id, disallowed_tools=["Bash", "Agent", "Task"],
+            )
+        monkeypatch.setattr(tools_mod, "build_engagement_resume_options", _fake_rebuild)
 
         drv = InCasaDriver(topic_stream_factory=_mk_noop_factory())
         rec = _make_record(sdk_session_id="sess-old")
         await drv.resume(rec, session_id="sess-old")
         assert drv.is_alive(rec) is True
-        assert seen_resume == ["sess-old"]
+        assert seen_options[0].resume == "sess-old"
+        # the restrictions must ride along on resume, not be dropped
+        assert "Agent" in seen_options[0].disallowed_tools
+        assert "Task" in seen_options[0].disallowed_tools
 
     async def test_get_session_id_returns_clients_session_id(self, monkeypatch):
         from drivers.in_casa_driver import InCasaDriver

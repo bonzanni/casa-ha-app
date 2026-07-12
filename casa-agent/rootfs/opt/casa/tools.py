@@ -444,6 +444,43 @@ def _build_executor_options(defn) -> ClaudeAgentOptions:
     )
 
 
+def build_engagement_resume_options(engagement, session_id: str) -> ClaudeAgentOptions:
+    """Rebuild the FULL option set for a resumed engagement, then attach
+    ``resume=session_id`` (Finding 2, codex review v0.69.10).
+
+    ``InCasaDriver.resume()`` used to open a BARE ``ClaudeAgentOptions(resume=)``,
+    so a resumed interactive specialist/executor lost ``disallowed_tools``
+    (Agent/Task — Q-1), the fail-closed ``can_use_tool`` callback, ``hooks``
+    (the I-2 settings guard), ``skills``, ``mcp_servers``, and ``cwd`` — running
+    on the CLI's broad default surface. Rebuilt from the engagement's CURRENT
+    config via the same builder the initial start used.
+
+    Fails CLOSED: if the specialist/executor config is gone (removed while the
+    engagement was suspended), raise rather than resume with dropped
+    restrictions. May shell out (build_sdk_plugins) — call off the event loop.
+    """
+    import dataclasses
+
+    kind = getattr(engagement, "kind", "")
+    role = getattr(engagement, "role_or_type", "")
+    opts: ClaudeAgentOptions | None = None
+    if kind == "executor":
+        defn = _executor_registry.get(role) if _executor_registry is not None else None
+        if defn is not None:
+            opts = _build_executor_options(defn)
+    else:
+        cfg = _specialist_registry.get(role) if _specialist_registry is not None else None
+        if cfg is not None:
+            opts = _build_specialist_options(cfg)
+    if opts is None:
+        raise RuntimeError(
+            f"cannot rebuild options to resume {kind or 'specialist'} engagement "
+            f"role={role!r}: config not found (fail-closed — refusing a bare "
+            "resume that would drop Agent/Task denies + the fail-closed callback)"
+        )
+    return dataclasses.replace(opts, resume=session_id)
+
+
 def _build_world_state_summary() -> str:
     """Return a short (<=500 tokens) snapshot of Casa's config surface.
 

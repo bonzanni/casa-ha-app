@@ -1,6 +1,21 @@
 # Changelog
 
-## [0.69.9] - 2026-07-12 — skills use the current SDK option
+## [0.69.10] - 2026-07-12 — resumed engagements keep their restrictions
+
+### Security
+
+- Resuming a paused engagement (after an idle period or an add-on restart)
+  now re-applies the agent's full set of restrictions. Previously a resumed
+  specialist or executor came back with none of its configured limits — no
+  tool denials, no permission guard, no restricted working directory — running
+  with the default broad toolset. It now rebuilds the original configuration,
+  and refuses to resume if that configuration is missing rather than falling
+  back to an unrestricted session.
+- The self-grant guard for `.claude/settings.json` now also covers shell
+  commands that write to it (e.g. a redirect), not just the file-editing
+  tools, closing an obvious bypass for agents that have shell access. (Fully
+  preventing shell writes to protected files is a larger change tracked
+  separately.)
 
 ### Changed
 
