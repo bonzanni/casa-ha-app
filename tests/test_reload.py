@@ -1239,3 +1239,29 @@ class TestReloadRefreshesDelegationRoleMap:
         assert tools_mod._agent_role_map == {
             "ellen": resident_cfg, "finance": spec_cfg,
         }
+
+
+class TestReloadFullSnapshotOrdering:
+    async def test_snapshot_refreshed_before_reconstruction(self, monkeypatch):
+        """§3.9 manual-edit seam: reload_full must reload the plugin resolver
+        snapshot BEFORE any agent-reconstructing handler runs (a stale snapshot
+        would let desired==active verification false-pass)."""
+        import reload as reload_mod
+        import plugin_registry
+        order: list[str] = []
+        monkeypatch.setattr(plugin_registry, "reload_snapshot",
+                            lambda: order.append("snapshot"))
+
+        def _rec(name):
+            async def h(runtime, role=None, **kw):
+                order.append(name)
+                return []
+            return h
+
+        for name in ("policies", "agents", "executors", "agent", "plugin_env"):
+            monkeypatch.setitem(reload_mod._HANDLERS, name, _rec(name))
+
+        await reload_mod.reload_full(_make_runtime())
+        assert order[0] == "snapshot"
+        assert order.index("snapshot") < order.index("agents")
+        assert order.index("snapshot") < order.index("executors")

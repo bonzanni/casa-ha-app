@@ -356,6 +356,13 @@ class Agent:
             if not stripped or stripped == "<silent/>":
                 text = ""
 
+        # §3.10 first-contact notice: while plugin-health holds a blocking
+        # issue affecting this agent's role, prepend a one-line notice to the
+        # FIRST user-visible reply after boot (§3.10). The flag is consumed
+        # ONLY when a notice is actually delivered (Sol F6).
+        if text and channel is not None and self._health_notice_pending:
+            text = await self._maybe_prepend_health_notice(text)
+
         if text and channel is not None:
             # Rich-text (v0.70.0) renders only genuine agent responses
             # (error_kind is None). Error/system text stays plain via the
@@ -961,6 +968,21 @@ class Agent:
         except Exception:  # noqa: BLE001
             pass
         await self._pool.aclose()
+
+    async def _maybe_prepend_health_notice(self, text: str) -> str:
+        """§3.10 first-contact: prepend a one-line plugin-health notice (if the
+        report holds a blocking issue for this role) and consume the pending
+        flag ONLY on actual delivery (Sol F6) — a healthy first turn leaves the
+        flag set so a later-appearing issue still surfaces next turn."""
+        if not (text and self._health_notice_pending):
+            return text
+        import plugin_health
+        notice = await asyncio.to_thread(
+            plugin_health.first_contact_notice, self.config.role)
+        if notice:
+            self._health_notice_pending = False
+            return f"{notice}\n\n{text}"
+        return text
 
     async def _get_plugin_resolution(self):
         """Resolve this agent's tier:role plugin assignment to immutable

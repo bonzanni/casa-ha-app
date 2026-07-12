@@ -918,6 +918,14 @@ async def reload_full(
     """
     actions: list[str] = []
 
+    # §3.9 mutation sequencing / manual-edit seam: refresh the plugin resolver
+    # snapshot from disk FIRST — BEFORE any agent is reconstructed below — so
+    # reconstructed agents pick up the new registry and desired==active
+    # verification compares fresh state (a stale snapshot would false-pass).
+    import plugin_registry
+    await asyncio.to_thread(plugin_registry.reload_snapshot)
+    actions.append("plugins:snapshot_reloaded")
+
     # Policies — full cascade includes per-role re-load.
     sub = await _HANDLERS["policies"](runtime, role=None)
     actions += [f"policies:{a}" for a in sub]

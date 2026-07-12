@@ -229,3 +229,43 @@ def test_executor_resume_uses_recorded_paths_never_resolves(tmp_path,
                            "path": str(tmp_path / "gone")}])
     with pytest.raises(Exception):
         tools_mod.build_engagement_resume_options(eng_missing, "sess-2")
+
+
+# --- §3.10 first-contact notice --------------------------------------------
+
+def test_first_contact_prepends_once_then_consumed(tmp_path, monkeypatch):
+    import plugin_health
+    monkeypatch.setattr(plugin_health, "first_contact_notice",
+                        lambda role: "PLUGIN-DEGRADED x (corrupt_artifact)")
+    a = _make_agent(tmp_path)
+
+    async def run():
+        out = await a._maybe_prepend_health_notice("hello")
+        assert out.startswith("PLUGIN-DEGRADED")
+        assert out.endswith("hello")
+        assert a._health_notice_pending is False
+        out2 = await a._maybe_prepend_health_notice("again")
+        assert out2 == "again"          # flag consumed → unprefixed
+
+    asyncio.run(run())
+
+
+def test_first_contact_healthy_turn_leaves_flag_pending(tmp_path, monkeypatch):
+    """Sol F6: a healthy first turn must NOT burn the flag — a later-appearing
+    issue still gets first-contact delivery."""
+    import plugin_health
+    state = {"notice": None}
+    monkeypatch.setattr(plugin_health, "first_contact_notice",
+                        lambda role: state["notice"])
+    a = _make_agent(tmp_path)
+
+    async def run():
+        out = await a._maybe_prepend_health_notice("healthy")
+        assert out == "healthy"
+        assert a._health_notice_pending is True          # NOT consumed
+        state["notice"] = "PLUGIN-DEGRADED y (reload_required)"
+        out2 = await a._maybe_prepend_health_notice("now")
+        assert out2.startswith("PLUGIN-DEGRADED")
+        assert a._health_notice_pending is False
+
+    asyncio.run(run())

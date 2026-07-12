@@ -388,6 +388,10 @@ async def replay_undergoing_engagements(
         if r.driver == "claude_code"
     ]
     keep_ids = {r.id for r in undergoing}
+    # §3.8/Sol F5: engagements whose recorded plugin artifacts are gone are
+    # refused resume — and MUST be excluded from the start_service and
+    # background-task loops below, not merely skipped during rendering.
+    refused_ids: set[str] = set()
 
     async with s6_rc._compile_lock:
         # 1. Orphan sweep — dirs for non-UNDERGOING engagements, remove them.
@@ -454,6 +458,29 @@ async def replay_undergoing_engagements(
                     )
                     continue
 
+                # §3.8: replay renders --plugin-dir flags from the engagement's
+                # RECORDED artifacts, never a re-resolution of current
+                # assignments. A missing recorded artifact refuses resume
+                # (fail-closed) — start/background loops skip it via refused_ids.
+                missing = [pa for pa in rec.plugin_artifacts
+                           if not os.path.isdir(pa.get("path", ""))]
+                if missing:
+                    names = ", ".join(pa.get("name", "?") for pa in missing)
+                    logger.warning(
+                        "boot replay: engagement %s refuses resume — plugin "
+                        "artifact(s) missing: %s", rec.id[:8], names)
+                    if rec.topic_id is not None:
+                        try:
+                            await driver._send_to_topic(
+                                rec.topic_id,
+                                "⚠️ This engagement can't resume: its pinned "
+                                f"plugin artifact(s) are missing ({names}). "
+                                "Start a new engagement.")
+                        except Exception:  # noqa: BLE001 — best-effort notice
+                            pass
+                    refused_ids.add(rec.id)
+                    continue
+
                 # Clear stale/legacy/torn dirs first — write_service_dir
                 # mkdirs with exist_ok=False (a surviving -log sibling would
                 # otherwise collide).
@@ -467,6 +494,7 @@ async def replay_undergoing_engagements(
                     engagement_id=rec.id,
                     permission_mode=defn.permission_mode or "acceptEdits",
                     extra_dirs=list(defn.extra_dirs or []),
+                    plugin_dirs=[pa["path"] for pa in rec.plugin_artifacts],
                 )
                 log_script = render_log_run_script(engagement_id=rec.id)
                 s6_rc.write_service_dir(
@@ -504,6 +532,8 @@ async def replay_undergoing_engagements(
 
         # 4. Start each (idempotent under s6-rc change).
         for rec in undergoing:
+            if rec.id in refused_ids:        # Sol F5: no service was written
+                continue
             try:
                 await s6_rc.start_service(engagement_id=rec.id)
             except Exception as exc:  # noqa: BLE001
@@ -514,6 +544,8 @@ async def replay_undergoing_engagements(
 
     # 5. Background tasks OUTSIDE the lock (long-lived).
     for rec in undergoing:
+        if rec.id in refused_ids:            # Sol F5: refused resume
+            continue
         try:
             driver._spawn_background_tasks(rec)
         except Exception as exc:  # noqa: BLE001
@@ -1100,6 +1132,50 @@ async def notify_config_sync(
         logger.warning("config_sync notify: could not mark report notified: %s", exc)
 
 
+async def notify_plugin_health(
+    bus: Any,
+    *,
+    path: str = "/data/plugin-health.json",
+) -> None:
+    """Push an operator DM for NEW plugin-health issues (§3.10), via the
+    deterministic ``telegram`` outbound router. Deduped by STRUCTURED
+    fingerprints (not free text). Marks notified ONLY after a successful
+    enqueue, so a Telegram-down boot/mutation retries next time. Non-fatal.
+    """
+    import plugin_health
+    report = plugin_health.load_report(path)
+    if not report:
+        return
+    fps = plugin_health.new_fingerprints(report)
+    if not fps:
+        return
+    fp_set = set(fps)
+    issues = [i for i in report.get("issues", [])
+              if i.get("fingerprint") in fp_set]
+    parts = [f"{i.get('name')} ({i.get('reason_code')})" for i in issues[:5]]
+    listed = ", ".join(parts) + (f" +{len(issues) - 5} more"
+                                 if len(issues) > 5 else "")
+    content = (
+        f"⚠️ Plugin health: {len(issues)} plugin issue(s) need attention: "
+        f"{listed}. See /data/plugin-health.json."
+    )
+    if "telegram" not in getattr(bus, "queues", {"telegram": None}):
+        return  # retry next boot/mutation once telegram is up
+    try:
+        await bus.notify(BusMessage(
+            type=MessageType.NOTIFICATION,
+            source="plugin_health",
+            target="telegram",
+            content=content,
+            channel="telegram",
+            context={"cid": new_cid()},
+        ))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("plugin_health notify: enqueue failed: %s", exc)
+        return  # not marked → retried next boot/mutation
+    plugin_health.mark_notified(fps, path)
+
+
 # ------------------------------------------------------------------
 # Engagement-topic retention sweep (v0.65.0 [AR-8])
 # ------------------------------------------------------------------
@@ -1424,6 +1500,13 @@ async def main() -> None:
             "agents/assistant/ exists and runtime.yaml declares "
             "`role: assistant`."
         )
+
+    # Unified plugin architecture (§3.9): load the process-local resolver
+    # snapshot from disk ONCE before constructing agents (init-plugin-store
+    # already imported bundled artifacts + seeded/migrated the registry). Each
+    # Agent's _get_plugin_resolution then reads this snapshot.
+    import plugin_registry
+    await asyncio.to_thread(plugin_registry.reload_snapshot)
 
     agents: dict[str, Agent] = {}
     loop_tasks: list[asyncio.Task] = []
@@ -1985,6 +2068,7 @@ async def main() -> None:
     # 13c. Surface any default-sync overwrites to the operator (direct
     # telegram outbound — see notify_config_sync).
     await notify_config_sync(bus)
+    await notify_plugin_health(bus)
 
     # 14. Kick off timers.
     # AsyncIOScheduler's AsyncIOExecutor schedules coroutine functions on
