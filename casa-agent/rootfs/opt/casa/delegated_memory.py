@@ -30,10 +30,14 @@ logger = logging.getLogger(__name__)
 
 async def delegated_recall(
     semantic_memory: Any, *, query: str, origin_channel: str, max_tokens: int,
-    budget: str = "mid",
+    budget: str = "low",
 ) -> str:
     """Recall the shared bank at the ORIGINATING context's read-clearance.
-    Best-effort: any error → '' (the delegated turn proceeds with no memory)."""
+    Best-effort: any error → '' (the delegated turn proceeds with no memory).
+
+    ``budget`` defaults to ``low``: on the N150, ``mid`` reranks 300 candidates
+    (~12s server-side) and under concurrent load crosses the 20s client budget,
+    failing every delegated recall (D-3, 2026-07-12)."""
     if not (query or "").strip():
         return ""
     tags = readable_tiers(clearance_for_channel(origin_channel))
