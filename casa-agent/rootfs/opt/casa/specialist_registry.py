@@ -119,6 +119,23 @@ class SpecialistRegistry:
                 continue
             self._configs[role] = cfg
             logger.info("Specialist %r loaded (model=%s)", role, cfg.model)
+            # D-2 (v0.69.7): emit the same Layer-5 capability line residents
+            # log in Agent.__init__ — specialists never build an Agent (they
+            # run via _build_specialist_options), so without this they had no
+            # boot-time capability oracle for post-install verification.
+            try:
+                allowed = list(getattr(cfg.tools, "allowed", []) or [])
+                logger.info(
+                    "agent_capabilities role=%s model=%s enabled=%s tool_count=%d "
+                    "tools=%s mcp_servers=%s",
+                    cfg.role, getattr(cfg, "model", "?"),
+                    getattr(cfg, "enabled", "?"),
+                    len(allowed), sorted(allowed),
+                    sorted(getattr(cfg, "mcp_server_names", []) or []),
+                )
+            except Exception:  # noqa: BLE001 — an observability line must never break load
+                logger.warning("agent_capabilities log failed for specialist role=%s",
+                               getattr(cfg, "role", "?"), exc_info=True)
 
         logger.info(
             "Specialists: enabled=%s disabled=%s failed=%s",

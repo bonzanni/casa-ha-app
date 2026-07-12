@@ -47,6 +47,28 @@ def _version_key(p: Path) -> tuple:
     return tuple(parts)
 
 
+def highest_version_mcp_json(plugin_dir: str | Path) -> Path | None:
+    """Return the ``.mcp.json`` in the HIGHEST version subdir of ``plugin_dir``
+    (or ``None`` if the dir is missing, has no version subdirs, or the winning
+    version ships no ``.mcp.json``).
+
+    The single source of truth for "which cached version's manifest wins" —
+    the same ``_version_key`` pick ``grants_for_plugin`` uses (matches what a
+    fresh CC load resolves after an update). Install/verify env-var
+    extraction MUST read this same tree; globbing the first match (e) could
+    otherwise extract a different version's env vars than the grants derive
+    from (v0.69.7)."""
+    pd = Path(plugin_dir)
+    try:
+        versions = [d for d in pd.iterdir() if d.is_dir()]
+    except OSError:
+        return None
+    if not versions:
+        return None
+    mcp = max(versions, key=_version_key) / ".mcp.json"
+    return mcp if mcp.is_file() else None
+
+
 def grants_for_plugin(
     name: str, marketplace: str, *, cache_root: Path = _CACHE_ROOT,
 ) -> list[str]:
@@ -57,17 +79,11 @@ def grants_for_plugin(
     resolves after an update)."""
     plugin_dir = Path(cache_root) / marketplace / name
     try:
-        try:
-            versions = [d for d in plugin_dir.iterdir() if d.is_dir()]
-        except OSError:
+        mcp_json = highest_version_mcp_json(plugin_dir)
+        if mcp_json is None:
             logger.debug(
-                "plugin_grants: no cache dir for %s@%s", name, marketplace,
+                "plugin_grants: no cached .mcp.json for %s@%s", name, marketplace,
             )
-            return []
-        if not versions:
-            return []
-        mcp_json = max(versions, key=_version_key) / ".mcp.json"
-        if not mcp_json.is_file():
             return []
         try:
             data: dict[str, Any] = json.loads(mcp_json.read_text(encoding="utf-8"))

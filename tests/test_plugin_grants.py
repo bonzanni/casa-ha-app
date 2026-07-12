@@ -12,11 +12,34 @@ import pytest
 from plugin_grants import (
     derived_plugin_grants,
     grants_for_plugin,
+    highest_version_mcp_json,
     make_fail_closed_can_use_tool,
     sanitize_segment,
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_highest_version_mcp_json_picks_highest(tmp_path):
+    """(e) v0.69.7: install/verify env extraction must read the SAME version
+    dir the grant derivation picks (the highest), not glob's first match —
+    otherwise a plugin with two cached versions extracts the wrong env vars."""
+    cache = tmp_path / "cache"
+    _mk_plugin(cache, "casa-plugins", "p", "1.9.0", {"old": {}})
+    _mk_plugin(cache, "casa-plugins", "p", "1.10.0", {"new": {}})
+    mcp = highest_version_mcp_json(cache / "casa-plugins" / "p")
+    assert mcp is not None
+    assert mcp.parent.name == "1.10.0", "must pick 1.10.0 > 1.9.0 (numeric-aware)"
+
+
+def test_highest_version_mcp_json_skill_only_is_none(tmp_path):
+    cache = tmp_path / "cache"
+    _mk_plugin(cache, "casa-plugins", "sk", "0.1.0", None)  # no .mcp.json
+    assert highest_version_mcp_json(cache / "casa-plugins" / "sk") is None
+
+
+def test_highest_version_mcp_json_missing_dir_is_none(tmp_path):
+    assert highest_version_mcp_json(tmp_path / "nope") is None
 
 
 def _mk_plugin(cache_root, marketplace, name, version, mcp_servers):

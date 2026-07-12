@@ -632,3 +632,36 @@ class TestDelegationTombstoneAtomicity:
         import os as _os
         assert [f for f in _os.listdir(tmp_path)
                 if f not in ("delegations.json", "specialists")] == []
+
+
+class TestSpecialistBootCapabilities:
+    """D-2 (v0.69.7): specialists must emit the L5 `agent_capabilities` line
+    at boot (load), not only on reload/construct — so post-install
+    verification has a log oracle for specialist targets too."""
+
+    async def test_load_logs_agent_capabilities_for_enabled_specialist(
+        self, tmp_path, caplog
+    ):
+        import logging
+
+        from specialist_registry import SpecialistRegistry
+
+        _seed_specialist_dir(tmp_path, "finance", enabled=True)
+        reg = SpecialistRegistry(str(tmp_path), tombstone_path=str(tmp_path / "d.json"))
+        with caplog.at_level(logging.INFO):
+            reg.load()
+        cap = [r.getMessage() for r in caplog.records
+               if "agent_capabilities" in r.getMessage() and "role=finance" in r.getMessage()]
+        assert cap, "no agent_capabilities line logged for the enabled specialist at load"
+        assert "model=" in cap[0] and "tool_count=" in cap[0]
+
+    async def test_disabled_specialist_gets_no_capabilities_line(self, tmp_path, caplog):
+        import logging
+
+        from specialist_registry import SpecialistRegistry
+
+        _seed_specialist_dir(tmp_path, "finance", enabled=False)
+        reg = SpecialistRegistry(str(tmp_path), tombstone_path=str(tmp_path / "d.json"))
+        with caplog.at_level(logging.INFO):
+            reg.load()
+        assert not any("agent_capabilities" in r.getMessage() for r in caplog.records)
