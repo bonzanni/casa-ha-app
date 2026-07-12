@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.69.2] - 2026-07-12 — memory sensitivity classification rides out transient failures
+
+### Fixed
+
+- Classifying a memory's sensitivity tier now retries once (2s backoff)
+  before falling back to the most restrictive tier. A transient failure used
+  to mis-tier the memory permanently, making it invisible to household
+  members it should have been shared with. The classification runs off the
+  conversational hot path, so the retry costs nothing user-visible.
+- Classification failures now log the exception type and message in the
+  warning line itself (previously only in a traceback that log tooling
+  truncated), and an unparseable model reply — previously indistinguishable
+  from a genuine "private" verdict — now leaves a log trace.
+
 ## [0.69.1] - 2026-07-12 — plugin marketplace changes are now git-versioned
 
 ### Fixed

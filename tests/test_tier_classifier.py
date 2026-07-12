@@ -64,6 +64,7 @@ async def test_classify_defaults_private_on_unparseable(monkeypatch):
 
 
 async def test_classify_defaults_private_on_error(monkeypatch):
+    monkeypatch.setattr(tier_classifier, "_RETRY_BACKOFF_S", 0)  # D-5 retry path
     _install_fake_sdk(monkeypatch, raise_exc=RuntimeError("sdk boom"))
     assert await tier_classifier.classify_tier("anything") == DEFAULT_TIER
 
@@ -84,3 +85,68 @@ async def test_classify_uses_root_safe_permission_mode(monkeypatch):
     await tier_classifier.classify_tier("the family dinner is at 7")
     assert captured.get("permission_mode") != "bypassPermissions"
     assert captured.get("permission_mode") == "acceptEdits"
+
+
+def _install_flaky_sdk(monkeypatch, *, fail_times: int, reply: str,
+                       exc: Exception | None = None):
+    """Fake SDK whose query() raises on the first ``fail_times`` calls, then
+    yields ``reply``. Records the call count on the returned dict."""
+    fake = types.ModuleType("claude_agent_sdk")
+    state = {"calls": 0}
+
+    class ClaudeAgentOptions:  # noqa: N801
+        def __init__(self, **kw):
+            self.kw = kw
+
+    fake.ClaudeAgentOptions = ClaudeAgentOptions
+    fake.AssistantMessage = _FakeAssistant
+
+    async def query(*, prompt, options):  # noqa: ANN001
+        state["calls"] += 1
+        if state["calls"] <= fail_times:
+            raise (exc or RuntimeError("transient sdk boom"))
+        yield _FakeAssistant(reply)
+
+    fake.query = query
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
+    return state
+
+
+async def test_transient_failure_retries_once_then_classifies(monkeypatch):
+    """D-5 (v0.69.2): two transient SDK failures during the 2026-07-12 probes
+    permanently mis-tiered items to `private` (over-restriction). The
+    classifier is off the hot path — one bounded retry is safe and cuts the
+    mis-tier rate for transient spawn/API failures."""
+    monkeypatch.setattr(tier_classifier, "_RETRY_BACKOFF_S", 0)
+    state = _install_flaky_sdk(monkeypatch, fail_times=1, reply="family")
+    assert await tier_classifier.classify_tier("dinner at seven") == "family"
+    assert state["calls"] == 2
+
+
+async def test_both_attempts_fail_defaults_with_typed_warning(monkeypatch, caplog):
+    """The original D-5 tracebacks were truncated by log tooling — the WARNING
+    line itself must carry the exception type + message (greppable one-liner)."""
+    import logging as _logging
+
+    monkeypatch.setattr(tier_classifier, "_RETRY_BACKOFF_S", 0)
+    state = _install_flaky_sdk(
+        monkeypatch, fail_times=99, reply="never",
+        exc=ConnectionError("ProcessTransport is not ready"),
+    )
+    with caplog.at_level(_logging.WARNING):
+        assert await tier_classifier.classify_tier("anything") == DEFAULT_TIER
+    assert state["calls"] == 2  # exactly one retry — never unbounded
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "ConnectionError" in msg
+    assert "ProcessTransport is not ready" in msg
+
+
+async def test_unparseable_reply_logs_the_reply_shape(monkeypatch, caplog):
+    """A garbled/unparseable reply used to default to private with ZERO log
+    trace — indistinguishable from a correct `private` classification."""
+    import logging as _logging
+
+    _install_fake_sdk(monkeypatch, reply="I am not sure")
+    with caplog.at_level(_logging.WARNING):
+        assert await tier_classifier.classify_tier("ambiguous") == DEFAULT_TIER
+    assert any("unparseable" in r.getMessage().lower() for r in caplog.records)
