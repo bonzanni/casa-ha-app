@@ -31,6 +31,7 @@ options:
   telegram_bot_api_base: ""
   telegram_transport: "polling"
   telegram_delivery_mode: "stream"
+  telegram_rich_text: true
   hindsight_api_url: ""
   onepassword_service_account_token: ""
   onepassword_default_vault: "Casa"
@@ -68,6 +69,7 @@ schema:
   telegram_bot_api_base: "str?"
   telegram_transport: "list(polling|webhook)?"
   telegram_delivery_mode: "list(stream|block)?"
+  telegram_rich_text: "bool?"
   hindsight_api_url: str?
   onepassword_service_account_token: password?
   onepassword_default_vault: str?

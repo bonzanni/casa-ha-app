@@ -31,6 +31,11 @@ configuration:
       How responses are displayed in Telegram.
       "stream" shows the response building in real-time (edit-in-place).
       "block" waits for the full response before sending.
+  telegram_rich_text:
+    name: Rich Text in Telegram
+    description: >-
+      Render Markdown (bold, italic, inline code, and monospace code blocks) in
+      agent replies. Disable to send all replies as plain text.
   onepassword_service_account_token:
     name: "1Password service account token"
     description: "Token from https://developer.1password.com/docs/service-accounts/ — plaintext only, cannot be a op:// reference (root of trust). Read access to the vault named in 'onepassword_default_vault'."

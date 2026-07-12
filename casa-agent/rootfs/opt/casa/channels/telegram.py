@@ -143,8 +143,10 @@ class TelegramChannel(Channel):
         rate_limiter: RateLimiter | None = None,
         bot: Any = None,
         engagement_supergroup_id: int | None = None,
+        rich_text_enabled: bool = True,
     ) -> None:
         self.bot_token = bot_token
+        self._rich_text_enabled = rich_text_enabled
         self.chat_id = chat_id
         self.default_agent = default_agent
         self._bus = bus
