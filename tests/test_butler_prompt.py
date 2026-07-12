@@ -1,0 +1,62 @@
+"""Regression guards on butler/prompts/system.md content (B-2, v0.69.5).
+
+Plain string-match assertions on the bundled butler (voice) system prompt,
+mirroring test_assistant_prompts.py. The wording is load-bearing for
+HA-tool-routing behaviour: a delegated "toggle office light" once looped on
+GetLiveContext without acting (2026-07-11 ~23:50Z) because the prompt framed
+GetLiveContext as a prerequisite for action and gave no anti-loop guard.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+
+def _butler_md_path() -> Path:
+    root = Path(__file__).resolve().parent.parent
+    return root / (
+        "casa-agent/rootfs/opt/casa/defaults/agents/butler/prompts/system.md"
+    )
+
+
+@pytest.fixture(scope="module")
+def butler_md_text() -> str:
+    # Collapse whitespace so anchor phrases match regardless of markdown
+    # line-wrapping (prose guards must not be brittle to re-flowing).
+    import re
+    raw = _butler_md_path().read_text(encoding="utf-8")
+    return re.sub(r"\s+", " ", raw)
+
+
+def test_butler_prompt_has_getlivecontext_anti_loop_rule(butler_md_text):
+    """B-2: an explicit 'at most once per turn' bound on GetLiveContext is
+    the load-bearing anti-loop guard. This is the regression this test
+    catches if the wording is reverted."""
+    text = butler_md_text.lower()
+    assert "at most once per turn" in text or "at most one" in text, (
+        "butler prompt must bound GetLiveContext to one call per turn"
+    )
+    # It must forbid re-querying rather than acting.
+    assert "never call `getlivecontext` a second time" in text or (
+        "do not re-query" in text
+    ), "butler prompt must forbid a second GetLiveContext in the same turn"
+
+
+def test_butler_prompt_says_act_directly_for_actions(butler_md_text):
+    """B-2: actions call the action tool directly; GetLiveContext is not a
+    prerequisite. Assist resolves entities by name."""
+    text = butler_md_text.lower()
+    assert "act directly" in text, (
+        "butler prompt must tell the model to act directly on action intents"
+    )
+    # GetLiveContext explicitly framed as a READ tool, not an action precursor.
+    assert "read" in text and "getlivecontext" in text
+
+
+def test_butler_prompt_covers_toggle(butler_md_text):
+    """B-2: 'toggle' (the exact verb Ellen delegated) must be in the intent
+    guidance — its absence from the action table was part of why the model
+    fell back to surveying instead of acting."""
+    assert "toggle" in butler_md_text.lower()
