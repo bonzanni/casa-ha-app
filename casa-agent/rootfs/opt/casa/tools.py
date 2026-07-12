@@ -2005,10 +2005,24 @@ async def reap_stale_engagements(
 # ---------------------------------------------------------------------------
 
 
+# B-3 (v0.69.3): the doctrine's status vocabulary (completion.md:31), each
+# mapped to its TRUE registry outcome. "error" kept as a legacy alias — the
+# tool historically treated any non-ok status as error, so agents may pass it.
+_COMPLETION_STATUS_TO_OUTCOME = {
+    "ok": "completed",
+    "partial": "completed",   # objectives partly met — text carries the marker
+    "failed": "error",
+    "error": "error",
+    "cancelled": "cancelled",
+}
+_COMPLETION_TEXT_MAX = 8000
+
+
 @tool(
     "emit_completion",
     "Mark this engagement complete. Ellen receives the summary. Must be called "
-    "from inside an active engagement.",
+    "from inside an active engagement. status: 'ok' | 'partial' | 'failed' | "
+    "'cancelled'.",
     {"text": str, "artifacts": list, "next_steps": list, "status": str},
 )
 async def emit_completion(args: dict) -> dict:
@@ -2040,11 +2054,58 @@ async def emit_completion(args: dict) -> dict:
                 ),
             })
 
-    text = args.get("text", "") or ""
-    artifacts = list(args.get("artifacts") or [])
-    next_steps = list(args.get("next_steps") or [])
+    # B-3 (v0.69.3): validate BEFORE any side effect. The old mapping sent
+    # EVERY status other than exactly "ok" — including the doctrine's own
+    # "partial"/"cancelled", or a model writing "success" — into a terminal
+    # outcome=error kind=emit_completion_error, failing fully-successful
+    # engagements (2026-07-12 00:14Z incident). A malformed call now comes
+    # back as a TOOL error the agent can correct; the engagement stays live.
     status_in = args.get("status", "ok") or "ok"
-    outcome = "completed" if status_in == "ok" else "error"
+    if not isinstance(status_in, str) or status_in not in _COMPLETION_STATUS_TO_OUTCOME:
+        return _result({
+            "status": "error", "kind": "invalid_status",
+            "message": (
+                f"status={status_in!r} is not a valid completion status; use "
+                "'ok' | 'partial' | 'failed' | 'cancelled' (completion.md). "
+                "The engagement is still active — call emit_completion again "
+                "with a valid status."
+            ),
+        })
+    text = args.get("text", "") or ""
+    if not isinstance(text, str):
+        return _result({
+            "status": "error", "kind": "invalid_args",
+            "message": ("text must be a string (got "
+                        f"{type(text).__name__}). The engagement is still "
+                        "active — call emit_completion again."),
+        })
+    artifacts = args.get("artifacts") or []
+    if isinstance(artifacts, str):
+        artifacts = [artifacts]  # a bare SHA is obviously one artifact
+    if not isinstance(artifacts, list):
+        return _result({
+            "status": "error", "kind": "invalid_args",
+            "message": ("artifacts must be a list of strings (got "
+                        f"{type(artifacts).__name__}). The engagement is "
+                        "still active — call emit_completion again."),
+        })
+    next_steps = args.get("next_steps") or []
+    if not isinstance(next_steps, list):
+        return _result({
+            "status": "error", "kind": "invalid_args",
+            "message": ("next_steps must be a list (got "
+                        f"{type(next_steps).__name__}). The engagement is "
+                        "still active — call emit_completion again."),
+        })
+    if len(text) > _COMPLETION_TEXT_MAX:
+        logger.warning(
+            "emit_completion text truncated (%d > %d chars) for engagement %s",
+            len(text), _COMPLETION_TEXT_MAX, engagement.id[:8],
+        )
+        text = text[:_COMPLETION_TEXT_MAX] + " … [truncated]"
+    if status_in == "partial":
+        text = f"[partial] {text}" if text else "[partial]"
+    outcome = _COMPLETION_STATUS_TO_OUTCOME[status_in]
 
     # Driver is discovered via the agent singleton accessible through the
     # agent module (plan-1 pattern).

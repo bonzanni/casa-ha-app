@@ -209,3 +209,118 @@ class TestConcurrentCancelVsEmit:
         assert rec.status == "cancelled"          # emit must NOT overwrite the cancel
         assert bus.notify.await_count == 1        # exactly one DelegationComplete
         assert tch.close_topic.await_count == 1   # topic closed exactly once
+
+
+def _wire_engagement(tmp_path):
+    """Registry + mocks + init_tools; returns (rec, registry, telegram, bus)."""
+    import asyncio as _a  # noqa: F401
+    from engagement_registry import EngagementRegistry
+    from tools import init_tools
+
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+    rec = _a.get_event_loop() if False else None  # placeholder never used
+    tch = MagicMock(); tch.send_to_topic = AsyncMock(); tch.close_topic = AsyncMock()
+    cm = MagicMock(); cm.get.return_value = tch
+    bus = MagicMock(); bus.notify = AsyncMock()
+    init_tools(
+        channel_manager=cm, bus=bus,
+        specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+        trigger_registry=MagicMock(), engagement_registry=reg,
+    )
+    return reg, tch, bus
+
+
+class TestEmitCompletionValidation:
+    """B-3 (v0.69.3): a fully-successful configurator engagement finalized
+    outcome=error kind=emit_completion_error (2026-07-12 00:14Z) — the tool
+    mapped EVERY status other than exactly "ok" (including the doctrine's
+    own "partial"/"cancelled", or a model writing "success") to a terminal
+    error, and malformed arg shapes rode straight into finalize. Malformed
+    calls must get a TOOL error back (agent retries); doctrine statuses map
+    to their true outcomes."""
+
+    async def _emit(self, reg, rec, args):
+        from tools import emit_completion, engagement_var
+        token = engagement_var.set(rec)
+        try:
+            res = await emit_completion.handler(args)
+        finally:
+            engagement_var.reset(token)
+        return json.loads(res["content"][0]["text"])
+
+    async def _rec(self, reg, tmp_path):
+        return await reg.create(
+            kind="executor", role_or_type="configurator", driver="in_casa",
+            task="t", origin={"role": "assistant", "channel": "telegram"},
+            topic_id=42,
+        )
+
+    async def test_unknown_status_is_tool_error_not_engagement_failure(self, tmp_path):
+        reg, tch, bus = _wire_engagement(tmp_path)
+        rec = await self._rec(reg, tmp_path)
+        payload = await self._emit(reg, rec, {"text": "all good", "status": "success"})
+        assert payload["status"] == "error"
+        assert payload["kind"] == "invalid_status"
+        assert "ok" in payload["message"] and "partial" in payload["message"]
+        assert rec.status == "active"          # engagement NOT finalized
+        tch.close_topic.assert_not_awaited()   # agent gets to retry
+
+    async def test_cancelled_status_finalizes_cancelled_not_error(self, tmp_path):
+        reg, tch, bus = _wire_engagement(tmp_path)
+        rec = await self._rec(reg, tmp_path)
+        payload = await self._emit(reg, rec, {"text": "user aborted", "status": "cancelled"})
+        assert payload["status"] == "acknowledged"
+        assert rec.status == "cancelled"       # doctrine status, true outcome
+        assert rec.origin.get("error_kind") is None
+
+    async def test_partial_status_completes_with_partial_marker(self, tmp_path):
+        reg, tch, bus = _wire_engagement(tmp_path)
+        rec = await self._rec(reg, tmp_path)
+        payload = await self._emit(reg, rec, {"text": "did 2 of 3", "status": "partial"})
+        assert payload["status"] == "acknowledged"
+        assert rec.status == "completed"
+        sent = " ".join(str(c.args) for c in tch.send_to_topic.await_args_list)
+        assert "partial" in sent.lower()
+
+    async def test_failed_status_finalizes_error(self, tmp_path):
+        reg, tch, bus = _wire_engagement(tmp_path)
+        rec = await self._rec(reg, tmp_path)
+        payload = await self._emit(reg, rec, {"text": "could not", "status": "failed"})
+        assert payload["status"] == "acknowledged"
+        assert rec.status == "error"
+
+    async def test_string_artifacts_wrapped_not_exploded(self, tmp_path):
+        """list("sha123") == ['s','h','a','1','2','3'] — the old coercion."""
+        reg, tch, bus = _wire_engagement(tmp_path)
+        rec = await self._rec(reg, tmp_path)
+        payload = await self._emit(
+            reg, rec, {"text": "done", "status": "ok", "artifacts": "sha123"})
+        assert payload["status"] == "acknowledged"
+        complete = bus.notify.await_args_list[0].args[0].content
+        assert complete.origin is not None  # sanity: DelegationComplete shape
+
+    async def test_non_list_next_steps_is_tool_error(self, tmp_path):
+        reg, tch, bus = _wire_engagement(tmp_path)
+        rec = await self._rec(reg, tmp_path)
+        payload = await self._emit(
+            reg, rec, {"text": "done", "status": "ok", "next_steps": {"step": 1}})
+        assert payload["kind"] == "invalid_args"
+        assert rec.status == "active"
+
+    async def test_non_string_text_is_tool_error(self, tmp_path):
+        reg, tch, bus = _wire_engagement(tmp_path)
+        rec = await self._rec(reg, tmp_path)
+        payload = await self._emit(
+            reg, rec, {"text": {"summary": "done"}, "status": "ok"})
+        assert payload["kind"] == "invalid_args"
+        assert rec.status == "active"
+
+    async def test_oversized_text_truncated_not_fatal(self, tmp_path):
+        reg, tch, bus = _wire_engagement(tmp_path)
+        rec = await self._rec(reg, tmp_path)
+        payload = await self._emit(
+            reg, rec, {"text": "x" * 50000, "status": "ok"})
+        assert payload["status"] == "acknowledged"
+        assert rec.status == "completed"
+        complete = bus.notify.await_args_list[0].args[0].content
+        assert len(complete.text) <= 8100  # 8000 cap + truncation marker

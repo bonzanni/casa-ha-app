@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.69.3] - 2026-07-12 — completing an engagement is harder to get wrong
+
+### Fixed
+
+- A successful engagement no longer ends up marked as failed because the
+  agent phrased its completion call differently than expected. The
+  completion tool now accepts the documented status vocabulary (`ok`,
+  `partial`, `failed`, `cancelled`) and maps each to its true outcome —
+  previously anything other than exactly `ok` (including the documented
+  `partial` and `cancelled`) failed the engagement. An unrecognized status
+  or malformed arguments now return a clear tool error the agent can
+  correct, with the engagement still running.
+- Oversized completion summaries are truncated instead of being pushed
+  through notifications and topic messages at full size.
+
+### Changed
+
+- The primary agent's guidance now says explicitly: when an engagement
+  completes, its topic is closed — follow-ups and edits go through a fresh
+  delegation, never "continue in the old topic" (which users couldn't post
+  to anyway).
+
 ## [0.69.2] - 2026-07-12 — memory sensitivity classification rides out transient failures
 
 ### Fixed
