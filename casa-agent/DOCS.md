@@ -61,6 +61,7 @@ setting by hand:
 | `enable_terminal` | Enable a web terminal accessible via the ingress panel. Default: `false`. |
 | `sdk_client_pool` | Reuse a warm Claude SDK client across resident turns for faster replies. Default: `true`. Disable to fall back to a fresh per-turn session (e.g. while diagnosing an issue). |
 | `webhook_secret` | HMAC-SHA256 secret for authenticating webhook requests. Leave empty to skip verification. |
+| `engagement_reap_days` | Auto-close engagements after this many days without activity (daily sweep cancels them and closes their Telegram topic; the engaging agent is notified). Set `0` to disable. Default: `7`. |
 | `log_level` | Log verbosity: `debug`, `info`, `warning`, or `error`. Default: `info`. Flip to `debug` for verbose troubleshooting without rebuilding the image. |
 
 ## How it works

@@ -121,18 +121,80 @@ class TestRegistryCreate:
 
 
 class TestRegistryStateTransitions:
-    async def test_mark_completed_drops_from_disk(self, tmp_path):
+    async def test_mark_completed_persists_terminal_tombstone(self, tmp_path):
+        """D-4: terminal records STAY on disk as tombstones (they used to be
+        dropped, so the duplicate-task guard forgot them across restarts and
+        the file never matched the 'tombstone' name)."""
         from engagement_registry import EngagementRegistry
 
         reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
         rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
-        await reg.mark_completed(rec.id, completed_at=2000.0)
+        await reg.mark_completed(rec.id, completed_at=time.time())
         assert rec.status == "completed"
-        assert rec.completed_at == 2000.0
-        # Tombstone now empty on disk
-        assert json.loads((tmp_path / "e.json").read_text()) == []
-        # But still in memory for short-term lookups (by_topic_id after /cancel)
+        rows = json.loads((tmp_path / "e.json").read_text())
+        assert [r["id"] for r in rows] == [rec.id]
+        assert rows[0]["status"] == "completed"
+        # Still in memory for short-term lookups (by_topic_id after /cancel)
         assert reg.get(rec.id) is rec
+
+    async def test_terminal_tombstones_pruned_after_retention(self, tmp_path):
+        """D-4: terminal tombstones age out of the file (30d) so it can't
+        grow unboundedly; in-flight records are never pruned."""
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        old = await reg.create("executor", "configurator", "claude_code", "t1", {}, 1)
+        await reg.mark_completed(old.id, completed_at=time.time() - 31 * 86400)
+        fresh = await reg.create("specialist", "finance", "in_casa", "t2", {}, 2)
+        rows = json.loads((tmp_path / "e.json").read_text())
+        ids = [r["id"] for r in rows]
+        assert fresh.id in ids
+        assert old.id not in ids, "31d-old terminal tombstone must be pruned"
+
+    async def test_load_reconciles_active_to_idle(self, tmp_path):
+        """D-4 boot reconcile: a record loaded as 'active' cannot have a live
+        driver (the process that ran it died with the old container) — load()
+        must flip it to idle so it stops claiming to run forever."""
+        from engagement_registry import EngagementRegistry
+
+        base = {
+            "kind": "executor", "role_or_type": "configurator",
+            "driver": "claude_code", "started_at": 1000.0,
+            "last_user_turn_ts": 1000.0, "origin": {}, "task": "t",
+        }
+        tombstone = tmp_path / "engagements.json"
+        tombstone.write_text(json.dumps([
+            {**base, "id": "e-active", "status": "active", "topic_id": 1},
+            {**base, "id": "e-idle", "status": "idle", "topic_id": 2},
+            {**base, "id": "e-done", "status": "completed", "topic_id": 3,
+             "completed_at": 2000.0},
+        ]))
+        reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        await reg.load()
+        assert reg.get("e-active").status == "idle"
+        assert reg.get("e-idle").status == "idle"
+        assert reg.get("e-done").status == "completed"
+        assert {r.id for r in reg.active_and_idle()} == {"e-active", "e-idle"}
+
+    async def test_recent_for_origin_survives_restart_via_tombstone(self, tmp_path):
+        """D-4: the P32 duplicate-task guard reads recent engagements from
+        memory; persisting terminal tombstones makes it hold across restarts."""
+        from engagement_registry import EngagementRegistry
+
+        path = str(tmp_path / "e.json")
+        reg1 = EngagementRegistry(tombstone_path=path, bus=None)
+        rec = await reg1.create(
+            "executor", "configurator", "claude_code", "install plugin X",
+            {"channel": "telegram", "chat_id": "123"}, 1,
+        )
+        await reg1.mark_completed(rec.id, completed_at=time.time())
+
+        reg2 = EngagementRegistry(tombstone_path=path, bus=None)
+        await reg2.load()
+        found = reg2.recent_for_origin(
+            channel="telegram", chat_id="123", max_age_s=3600,
+        )
+        assert found is not None and found.id == rec.id
 
     async def test_mark_idle_and_back_to_active(self, tmp_path):
         from engagement_registry import EngagementRegistry

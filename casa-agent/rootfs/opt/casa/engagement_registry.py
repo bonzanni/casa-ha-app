@@ -2,10 +2,14 @@
 
 Symmetric with :mod:`specialist_registry`. Owns:
 - EngagementRecord (one in-flight engagement)
-- EngagementRegistry (in-memory dict + ``/data/engagements.json`` tombstone)
+- EngagementRegistry (in-memory dict + ``/data/engagements.json``: in-flight
+  records for crash recovery PLUS terminal tombstones, which age out after
+  ``_TERMINAL_RETENTION_DAYS`` — D-4, v0.69.0)
 - Idle sweep (fires ``idle_detected`` bus events + session-suspends live clients)
-- Orphan recovery (startup: load tombstone; records remain dormant until
-  next user turn in their topic)
+- Orphan recovery (startup: load the file; "active" rows are reconciled to
+  idle — no driver survives a restart — and remain dormant until the next
+  user turn in their topic; ``tools.reap_stale_engagements`` retires them
+  after the reap TTL)
 
 See docs/superpowers/specs/2026-04-22-3.5-plan2-engagement-primitive-design.md.
 """
@@ -35,6 +39,10 @@ _IDLE_REMINDER_DAYS_EXECUTOR = 7          # default; per-type override lands Pla
 _IDLE_REMINDER_REFIRE_DAYS = 7
 _SESSION_SUSPEND_IDLE_S = 86400
 _IDLE_SWEEP_CRON = "0 8 * * *"            # daily 08:00 user TZ
+# D-4 (v0.69.0): terminal tombstones stay on disk this long, then age out of
+# the snapshot on the next write — bounds the file while keeping the P32
+# duplicate-task guard and post-mortems working across restarts.
+_TERMINAL_RETENTION_DAYS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -52,9 +60,11 @@ class EngagementRecord:
 
     ``status`` transitions:
       active ──first idle sweep past 24h──▶ idle
+      active ──registry load after restart──▶ idle   (D-4 boot reconcile)
       idle    ──next user turn──▶ active
       active  ──emit_completion / /complete──▶ completed
       active  ──/cancel / cancel_engagement──▶ cancelled
+      active/idle ──reap sweep past ENGAGEMENT_REAP_DAYS──▶ cancelled  (D-4)
       active  ──resume twice failed / sweep orphan──▶ error
     """
 
@@ -159,6 +169,17 @@ class EngagementRegistry:
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed engagement row: %s", exc)
                 continue
+            # D-4 boot reconcile (v0.69.0): a record loaded as "active" claims
+            # a live driver, but no driver survives a restart — the process
+            # that ran it died with the old container. Idle is the truthful
+            # state: dormant, resumable on the next user turn in its topic
+            # (update_user_turn flips it back), and visible to the reap sweep.
+            if rec.status == "active":
+                rec.status = "idle"
+                logger.info(
+                    "boot reconcile: engagement %s active→idle "
+                    "(no driver survives a restart)", rec.id[:8],
+                )
             self._records[rec.id] = rec
             if rec.topic_id is not None:
                 self._topic_index[rec.topic_id] = rec.id
@@ -185,12 +206,13 @@ class EngagementRegistry:
         ``started_at``) for this ``(channel, chat_id)`` started within
         the last ``max_age_s`` seconds, regardless of status.
 
-        Includes completed / cancelled / errored engagements that are
-        still resident in memory — the tombstone drops them on
-        terminal-state transitions but ``_records`` retains until the
-        process exits. The duplicate-task guard at the
-        ``engage_executor`` call site uses this to refuse spawns that
-        overlap with whichever task was spawned last.
+        Includes completed / cancelled / errored engagements: they stay
+        in ``_records`` for the process lifetime and (since D-4,
+        v0.69.0) persist on disk as tombstones for
+        ``_TERMINAL_RETENTION_DAYS``, so the guard also holds across
+        restarts. The duplicate-task guard at the ``engage_executor``
+        call site uses this to refuse spawns that overlap with whichever
+        task was spawned last.
 
         ``chat_id`` is coerced via ``str()`` for the compare; channel
         adapters may store the value as int (telegram) or str.
@@ -215,12 +237,20 @@ class EngagementRegistry:
     # -- Persist helper ---------------------------------------------------
 
     async def _write_tombstone_locked(self) -> None:
-        """Caller MUST hold self._lock."""
+        """Caller MUST hold self._lock.
+
+        Terminal records are persisted as real tombstones (D-4, v0.69.0) —
+        they used to be silently dropped, so the P32 duplicate-task guard
+        forgot recent spawns across restarts and the file never matched its
+        name. Tombstones age out after ``_TERMINAL_RETENTION_DAYS`` to bound
+        the file.
+        """
+        cutoff = time.time() - _TERMINAL_RETENTION_DAYS * 86400
         snapshot = []
         for rec in self._records.values():
-            if rec.status in ("completed", "cancelled", "error"):
-                # Finished records are dropped from disk — Ellen's meta-scope
-                # memory carries the durable record (spec §4.6).
+            if (rec.status in ("completed", "cancelled", "error")
+                    and rec.completed_at is not None
+                    and rec.completed_at < cutoff):
                 continue
             snapshot.append({
                 "id": rec.id,

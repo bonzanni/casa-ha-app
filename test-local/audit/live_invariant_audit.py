@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.request
 
 CONFIG_DIR = os.environ.get("CASA_CONFIG_DIR", "/config")
@@ -157,8 +158,24 @@ def check_engagements():
     recs = data if isinstance(data, list) else data.get("engagements", [])
     bad = [r.get("id", "?")[:8] for r in recs
            if r.get("status") in ("active", "idle") and not r.get("topic_id")]
+    # D-4 (v0.69.0): the daily sweep auto-reaps active/idle records past
+    # ENGAGEMENT_REAP_DAYS (default 7). Anything older than TTL + 2d grace
+    # means the reap is not running — the block-M stale-engagement gap.
+    try:
+        ttl_days = float(os.environ.get("ENGAGEMENT_REAP_DAYS", "") or 7)
+    except ValueError:
+        ttl_days = 7.0
+    stale = []
+    if ttl_days > 0:
+        cutoff = time.time() - (ttl_days + 2) * 86400
+        stale = [r.get("id", "?")[:8] for r in recs
+                 if r.get("status") in ("active", "idle")
+                 and float(r.get("last_user_turn_ts") or 0) < cutoff]
     if bad:
         _fail("E/engagements", f"active/idle without topic_id: {bad}")
+    elif stale:
+        _fail("E/engagements",
+              f"active/idle older than reap TTL+2d — reap not running? {stale}")
     else:
         _ok("E/engagements", f"{len(recs)} records, well-formed")
 

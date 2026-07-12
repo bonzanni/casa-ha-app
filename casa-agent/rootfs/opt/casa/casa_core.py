@@ -1982,9 +1982,21 @@ async def main() -> None:
     # Pass the coroutine functions directly with kwargs.
     session_sweeper.start()
     freshness_reaper.start()
+    # D-4 (v0.69.0): reap stale engagements FIRST, then run the idle pass —
+    # a record past the reap TTL is cancelled outright and must not receive
+    # a pointless idle reminder in the same daily run.
+    async def _engagement_daily_sweep() -> None:
+        from tools import reap_stale_engagements
+        try:
+            reaped = await reap_stale_engagements(driver=engagement_driver)
+            if reaped:
+                logger.info("engagement sweep: reaped %d stale engagement(s)", reaped)
+        except Exception:  # noqa: BLE001 — reap failure must not starve the idle pass
+            logger.warning("engagement reap failed", exc_info=True)
+        await engagement_registry.sweep_idle_and_suspend(driver=engagement_driver)
+
     scheduler.add_job(
-        engagement_registry.sweep_idle_and_suspend,
-        kwargs={"driver": engagement_driver},
+        _engagement_daily_sweep,
         trigger="cron",
         id="engagement_idle_sweep",
         hour=8, minute=0,
