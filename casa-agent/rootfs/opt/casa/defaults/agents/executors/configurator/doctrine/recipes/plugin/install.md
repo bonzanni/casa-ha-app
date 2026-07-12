@@ -132,9 +132,12 @@ not appear until the next reload.
 - Skipping Stage 4 when `required_env_vars` is non-empty. The MCP
   server fails silently at next agent boot; `verify_plugin_state`
   reports `mcp_started: false`.
-- Targeting a specialist or executor role. Plugin install only makes
-  sense for residents (Tier 1) — they're the agents Claude Code SDK
-  consumes plugins through.
+- Targeting an executor role. Plugin install targets residents (Tier 1)
+  AND specialists (Tier 2) — both consume plugins through the Claude Code
+  SDK with auto-derived tool grants (since v0.68.0; the finance
+  specialist runs lesina-invoice this way). Executors get tools via
+  their per-engagement workspace `.mcp.json` instead, never via
+  install_casa_plugin.
 - Skipping `casa_reload(scope='agent', role=<role>)` between
   `config_git_commit` and `emit_completion`. The git tree on disk is
   correct but the running Casa keeps the prior agent option builders.

@@ -1039,8 +1039,11 @@ def _refuse_unprivileged(tool_name: str, caller: str | None) -> dict:
 
 @tool(
     "config_git_commit",
-    "Stage and commit all tracked changes under /config/. "
-    "Returns the commit SHA (empty if nothing changed). "
+    "Stage and commit all tracked changes under /config/ (tracked: agents/, "
+    "policies/, schema/, marketplace/.claude-plugin/marketplace.json; "
+    "everything else incl. plugin-env.conf is gitignored by design). "
+    "Returns the commit SHA — empty plus a warning when nothing tracked "
+    "changed, which is the expected outcome for gitignored-only writes. "
     "Restricted to the configurator executor role.",
     {"message": str},
 )
@@ -1091,7 +1094,23 @@ async def config_git_commit(args: dict) -> dict:
             eng = engagement_var.get(None)
             if eng is not None:
                 _ENGAGEMENTS_PENDING_RELOAD.add(eng.id)
-        return _result({"sha": sha, "message": message})
+            return _result({"sha": sha, "message": message})
+        # P-3 (v0.69.1): a bare {"sha": ""} left agents looping to reconcile
+        # "committed ok" against "file still untracked" when their writes
+        # landed on gitignored paths. Say it loudly instead.
+        return _result({
+            "sha": "", "message": message,
+            "warning": (
+                "No tracked changes to commit. The config repo tracks ONLY "
+                "agents/, policies/, schema/ and "
+                "marketplace/.claude-plugin/marketplace.json; every other "
+                "path is gitignored by design — plugin-env.conf in "
+                "particular is a secrets file and must never enter git "
+                "history. If you only wrote gitignored paths, an empty SHA "
+                "is the expected, correct outcome: report it as such and "
+                "do NOT retry the commit."
+            ),
+        })
     except Exception as exc:  # noqa: BLE001
         return _result({
             "status": "error",

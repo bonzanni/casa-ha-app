@@ -37,6 +37,27 @@ class TestConfigGitCommitTool:
         payload = json.loads(result["content"][0]["text"])
         assert payload["sha"] == ""
 
+    async def test_noop_carries_loud_gitignore_warning(self, configurator_origin):
+        """P-3 (v0.69.1): a silent {"sha": ""} left agents looping to
+        reconcile "committed ok" vs "untracked" when their writes landed on
+        gitignored paths. The no-op result must SAY that only whitelisted
+        paths are tracked."""
+        from tools import config_git_commit
+        with patch("config_git.commit_config", return_value=""):
+            result = await config_git_commit.handler({"message": "noop"})
+        payload = json.loads(result["content"][0]["text"])
+        warning = payload.get("warning", "")
+        assert "gitignored" in warning
+        assert "plugin-env.conf" in warning   # the intentionally-secret case
+        assert "marketplace.json" in warning  # the tracked exception
+
+    async def test_real_commit_has_no_warning(self, configurator_origin):
+        from tools import config_git_commit
+        with patch("config_git.commit_config", return_value="abc123def"):
+            result = await config_git_commit.handler({"message": "test"})
+        payload = json.loads(result["content"][0]["text"])
+        assert "warning" not in payload
+
     async def test_raises_bubbles_as_error_kind(self, configurator_origin):
         from tools import config_git_commit
         with patch("config_git.commit_config", side_effect=RuntimeError("git broke")):

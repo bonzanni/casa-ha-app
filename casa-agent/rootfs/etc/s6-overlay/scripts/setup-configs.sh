@@ -127,8 +127,10 @@ elif [ ! -d "$CONFIG_DIR/.git" ]; then
     git init -q
     git config user.email "casa-agent@local"
     git config user.name  "Casa Agent"
+    # Whitelist mirrors config_git._GITIGNORE_CONTENT — keep in sync; the
+    # python side reconciles drift on every boot (P-3, v0.69.1).
     cat > .gitignore <<'EOF'
-# Track configs only.
+# Casa config repo — track configs only.
 *
 !agents/
 !agents/**
@@ -136,9 +138,17 @@ elif [ ! -d "$CONFIG_DIR/.git" ]; then
 !policies/**
 !schema/
 !schema/**
+# P-3 (v0.69.1): the user-marketplace manifest is config, not a secret —
+# configurator recipes commit it after every marketplace op, and versioning
+# it gives an audit trail. ONLY the manifest: everything else under
+# marketplace/ (and plugin-env.conf, a mode-0600 secrets file) stays
+# untracked via the leading `*`.
+!marketplace/
+!marketplace/.claude-plugin/
+!marketplace/.claude-plugin/marketplace.json
 !.gitignore
 EOF
-    git add .gitignore agents/ policies/ schema/ 2>/dev/null || true
+    git add -A 2>/dev/null || true
     git commit -qm "initial config snapshot" 2>/dev/null || true
     bashio::log.info "Initialized config git repo at $CONFIG_DIR"
 else

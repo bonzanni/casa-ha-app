@@ -119,3 +119,92 @@ class TestRestoreFile:
         # The file should again contain "x", and the restore itself is
         # committed.
         assert (tmp_path / "agents" / "marker.txt").read_text() == "x"
+
+
+class TestMarketplaceWhitelist:
+    """P-3 (v0.69.1): configurator recipes mandate config_git_commit for
+    marketplace changes, but marketplace.json was gitignored — every such
+    commit was a silent no-op and agents looped reconciling 'committed ok'
+    vs 'untracked' (~2-min live loop observed 2026-07-11)."""
+
+    def test_marketplace_json_is_tracked(self, tmp_path):
+        from config_git import commit_config, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        mp = tmp_path / "marketplace" / ".claude-plugin"
+        mp.mkdir(parents=True)
+        (mp / "marketplace.json").write_text('{"plugins": []}', encoding="utf-8")
+        sha = commit_config(str(tmp_path), "marketplace: add test")
+        assert sha, "marketplace.json write must produce a real commit"
+        tracked = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "ls-files"],
+        ).decode().splitlines()
+        assert "marketplace/.claude-plugin/marketplace.json" in tracked
+
+    def test_plugin_env_conf_stays_untracked(self, tmp_path):
+        from config_git import commit_config, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        (tmp_path / "plugin-env.conf").write_text(
+            "SECRET=op://x/y/z\n", encoding="utf-8",
+        )
+        sha = commit_config(str(tmp_path), "should be a no-op")
+        assert sha == ""  # mode-0600 secrets file must never enter history
+        tracked = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "ls-files"],
+        ).decode().splitlines()
+        assert "plugin-env.conf" not in tracked
+
+    def test_other_marketplace_files_stay_untracked(self, tmp_path):
+        from config_git import commit_config, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        mp = tmp_path / "marketplace" / ".claude-plugin"
+        mp.mkdir(parents=True)
+        (mp / "marketplace.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "marketplace" / "scratch.txt").write_text("x", encoding="utf-8")
+        commit_config(str(tmp_path), "marketplace: add")
+        tracked = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "ls-files"],
+        ).decode().splitlines()
+        assert "marketplace/.claude-plugin/marketplace.json" in tracked
+        assert "marketplace/scratch.txt" not in tracked
+
+    def test_init_repo_refreshes_stale_gitignore(self, tmp_path):
+        """Existing deployments initialized the repo with the OLD whitelist;
+        init_repo must reconcile .gitignore on boot, not only on fresh init."""
+        from config_git import _GITIGNORE_CONTENT, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        old = "# old whitelist\n*\n!agents/\n!agents/**\n!.gitignore\n"
+        (tmp_path / ".gitignore").write_text(old, encoding="utf-8")
+        subprocess.check_call(
+            ["git", "-C", str(tmp_path), "commit", "-aqm", "simulate old deploy"],
+        )
+
+        init_repo(str(tmp_path))  # boot on an existing repo
+        assert (tmp_path / ".gitignore").read_text(
+            encoding="utf-8") == _GITIGNORE_CONTENT
+        status = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "status", "--porcelain"],
+        ).decode().strip()
+        assert status == "", "refreshed .gitignore must be committed, not left dirty"
+
+    def test_setup_configs_heredoc_matches_python_whitelist(self):
+        """Two writers own the whitelist (setup-configs.sh fresh-install
+        heredoc, config_git fresh-init + boot reconcile) — they drifted once
+        (P-3); this pins them together."""
+        import re
+
+        from config_git import _GITIGNORE_CONTENT
+
+        sh = (Path(__file__).resolve().parent.parent
+              / "casa-agent" / "rootfs" / "etc" / "s6-overlay" / "scripts"
+              / "setup-configs.sh").read_text(encoding="utf-8")
+        m = re.search(r"cat > \.gitignore <<'EOF'\n(.*?)EOF\n", sh, re.S)
+        assert m, "setup-configs.sh .gitignore heredoc not found"
+        assert m.group(1) == _GITIGNORE_CONTENT
