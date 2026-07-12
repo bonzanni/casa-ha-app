@@ -208,6 +208,9 @@ class ClaudeAgentOptions:
     cwd: str | None = None
     resume: str | None = None
     setting_sources: list[str] = field(default_factory=list)
+    # (f) v0.69.9: all three option builders set skills="all" (replaces the
+    # deprecated bare "Skill" in allowed_tools). Mock accepts + ignores it.
+    skills: Any = None
     # Plan 4b (commit 28b8748): casa_core wires plugins=build_sdk_plugins(...)
     # into resident SDK construction. Without this field the dataclass init
     # raised TypeError, every turn failed, and /data/sessions.json stayed

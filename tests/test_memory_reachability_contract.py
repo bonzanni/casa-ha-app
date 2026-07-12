@@ -172,7 +172,12 @@ async def test_options_allowed_tools_superset_of_config(tmp_path, role, channel,
     with patch("sdk_client_pool._default_make_client", _CaptureClient):
         await agent._process(_msg(channel, chat_id))
     opts = _CaptureClient.captured_options
-    assert set(_real_allowed(role)) <= set(opts.allowed_tools)
+    # (f) v0.69.9: skills are enabled via skills="all", not a bare "Skill" in
+    # allowed_tools (deprecated) — exclude it from the superset contract and
+    # assert the new positive contract instead.
+    assert (set(_real_allowed(role)) - {"Skill"}) <= set(opts.allowed_tools)
+    assert "Skill" not in opts.allowed_tools
+    assert opts.skills == "all"
 
 
 async def test_fresh_telegram_recall_uses_full_private_clearance(tmp_path):

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.69.9] - 2026-07-12 — skills use the current SDK option
+
+### Changed
+
+- Agent skills are now enabled through the Claude Agent SDK's dedicated
+  `skills` option instead of the deprecated practice of listing `"Skill"` as
+  an allowed tool. Behavior is unchanged (all skills remain available); this
+  moves off an interface the SDK has deprecated, across the primary, voice,
+  specialist, and executor agents.
+
 ## [0.69.8] - 2026-07-12 — permission hardening
 
 ### Security
