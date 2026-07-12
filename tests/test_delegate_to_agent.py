@@ -14,6 +14,7 @@ import pytest
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig, CharacterConfig, MemoryConfig, SessionConfig, ToolsConfig
+from plugin_registry import ResolutionResult
 from specialist_registry import (
     DelegationComplete,
     DelegationRecord,
@@ -387,10 +388,11 @@ class TestTimeoutDegrades:
         # builder runs via asyncio.to_thread, so the handler returns `pending`
         # before the background _run_delegated_agent task constructs the
         # client. If the patch reverted here the task would build the REAL
-        # ClaudeSDKClient (and shell out via build_sdk_plugins) and never post
+        # ClaudeSDKClient (and resolve the registry) and never post
         # the ok-NOTIFICATION. Hold the with-block open over the poll loop.
         with patch("tools.ClaudeSDKClient", _FakeSpecialistClient), \
-             patch("tools.build_sdk_plugins", return_value=[]):
+             patch("plugin_registry.resolve_for",
+                   return_value=ResolutionResult(registry_valid=True)):
             await _with_origin(
                 delegate_to_agent.handler({
                     "agent": "finance", "task": "x", "context": "",
@@ -436,7 +438,8 @@ class TestAsyncMode:
 
         _FakeSpecialistClient.reset(response="async reply", delay=0.05)
         with patch("tools.ClaudeSDKClient", _FakeSpecialistClient), \
-             patch("tools.build_sdk_plugins", return_value=[]):
+             patch("plugin_registry.resolve_for",
+                   return_value=ResolutionResult(registry_valid=True)):
             t0 = asyncio.get_event_loop().time()
             result = await _with_origin(
                 delegate_to_agent.handler({

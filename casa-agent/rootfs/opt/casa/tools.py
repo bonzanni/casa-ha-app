@@ -31,10 +31,10 @@ from plugin_env_extractor import extract_env_vars
 from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — available for future use
 from system_requirements.orchestrator import install_requirements, OrchestrationError
 from system_requirements.manifest import add_plugin_entry as add_manifest
-from plugins_binding import build_sdk_plugins
+import plugin_registry
 from plugin_grants import (
-    derived_plugin_grants, grants_for_plugin, highest_version_mcp_json,
-    make_fail_closed_can_use_tool,
+    grants_for_resolution, grants_for_resolved, make_fail_closed_can_use_tool,
+    required_env_vars_for_resolved,
 )
 from delegated_memory import delegated_recall, retain_delegated
 
@@ -349,11 +349,13 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
 
     resolved_hooks = resolve_hooks(cfg.hooks, default_cwd=cfg.cwd)
 
-    sdk_plugins = build_sdk_plugins(
-        home="/config/cc-home",
-        shared_cache="/config/cc-home/.claude/plugins",
-        seed="/opt/claude-seed",
-    )
+    # Unified plugin architecture (§3.3): resolve with the specialist's
+    # CONCRETE role (fixes the old role-less build_sdk_plugins that dropped
+    # project-scope plugins for specialists).
+    resolution = plugin_registry.resolve_for(
+        f"specialist:{getattr(cfg, 'role', 'unknown')}")
+    sdk_plugins = [{"type": "local", "path": rp.path}
+                   for rp in resolution.plugins]
 
     agent_home = (cfg.cwd
                   or f"/config/agent-home/{getattr(cfg, 'role', 'unknown')}")
@@ -361,10 +363,9 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
     # Skills via skills="all" below; strip any config-supplied "Skill"
     # (deprecated) — (f) v0.69.9.
     allowed_tools = [t for t in cfg.tools.allowed if t != "Skill"]
-    # P-5a: installed ⇒ granted, by construction. Server-level grants derived
-    # from the agent-home's enabledPlugins; disallowed_tools still wins at the
-    # CC layer (explicit-deny escape hatch).
-    for grant in derived_plugin_grants(agent_home):
+    # P-5a: installed ⇒ granted, by construction. Server-level grants from the
+    # SAME resolved artifacts; disallowed_tools still wins at the CC layer.
+    for grant in grants_for_resolution(resolution):
         if grant not in allowed_tools:
             allowed_tools.append(grant)
 
@@ -389,12 +390,21 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
     )
 
 
-def _build_executor_options(defn) -> ClaudeAgentOptions:
+def _build_executor_options(defn, *, executor_type: str,
+                            resolution=None,
+                            plugin_paths: "list[str] | None" = None,
+                            ) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for a Tier 3 Executor invocation.
 
     Unlike specialists, executors DO have MCP servers and structured hooks
     driven by their definition.yaml + hooks.yaml. Prompt is injected at
     engage_executor time - this helper does not set system_prompt.
+
+    Plugins (§3.8/§3.9), in priority order: explicit ``plugin_paths`` (resume
+    from recorded artifacts — never re-resolved), else a passed ``resolution``
+    (engage_executor feeds the SAME result it gated + recorded — one resolve,
+    one binding), else a fresh resolve for ``executor:<executor_type>``.
+    Executors get NO grant merge + NO can_use_tool (they keep the relay).
     """
     from config import HooksConfig
     from hooks import resolve_hooks
@@ -413,11 +423,14 @@ def _build_executor_options(defn) -> ClaudeAgentOptions:
     else:
         mcp_servers = {}
 
-    sdk_plugins = build_sdk_plugins(
-        home="/config/cc-home",
-        shared_cache="/config/cc-home/.claude/plugins",
-        seed="/opt/claude-seed",
-    )
+    if plugin_paths is not None:
+        sdk_plugins = [{"type": "local", "path": p} for p in plugin_paths]
+    else:
+        if resolution is None:
+            resolution = plugin_registry.resolve_for(
+                f"executor:{executor_type}")
+        sdk_plugins = [{"type": "local", "path": rp.path}
+                       for rp in resolution.plugins]
 
     # Skills via skills="all" below; strip any config-supplied "Skill"
     # (deprecated) — (f) v0.69.9.
@@ -457,7 +470,10 @@ def build_engagement_resume_options(engagement, session_id: str) -> ClaudeAgentO
 
     Fails CLOSED: if the specialist/executor config is gone (removed while the
     engagement was suspended), raise rather than resume with dropped
-    restrictions. May shell out (build_sdk_plugins) — call off the event loop.
+    restrictions. §3.8: an executor resumes from its RECORDED plugin artifacts
+    (never re-resolving current assignments); a missing recorded artifact
+    fails the resume closed (plugin_artifact_missing). Reads registry snapshot
+    files — call off the event loop.
     """
     import dataclasses
 
@@ -467,7 +483,18 @@ def build_engagement_resume_options(engagement, session_id: str) -> ClaudeAgentO
     if kind == "executor":
         defn = _executor_registry.get(role) if _executor_registry is not None else None
         if defn is not None:
-            opts = _build_executor_options(defn)
+            recorded = getattr(engagement, "plugin_artifacts", None) or ()
+            plugin_paths: list[str] = []
+            for pa in recorded:
+                path = pa.get("path") if isinstance(pa, dict) else None
+                if not path or not os.path.isdir(path):
+                    raise RuntimeError(
+                        f"cannot resume executor engagement role={role!r}: "
+                        f"recorded plugin artifact missing "
+                        f"(plugin_artifact_missing): {pa!r}")
+                plugin_paths.append(path)
+            opts = _build_executor_options(defn, executor_type=role,
+                                           plugin_paths=plugin_paths)
     else:
         cfg = _specialist_registry.get(role) if _specialist_registry is not None else None
         if cfg is not None:
@@ -594,7 +621,7 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
 
     prompt = f"{delegation_context}\n\n{memory_block}{body_tail}"
 
-    # Off-loop: _build_specialist_options shells out to `claude plugin list`
+    # Off-loop: _build_specialist_options resolves the registry (file IO)
     # (build_sdk_plugins) — keep it off the shared event loop (H2/M20).
     options = await asyncio.to_thread(_build_specialist_options, cfg)
     text = ""
@@ -1583,9 +1610,10 @@ async def engage_executor(args: dict) -> dict:
                 "message": str(exc),
             })
     else:
-        # Off-loop: _build_executor_options shells out to `claude plugin list`
-        # (build_sdk_plugins) and reads hooks.yaml — keep it off the loop.
-        options = await asyncio.to_thread(_build_executor_options, defn)
+        # Off-loop: _build_executor_options resolves the registry (file IO)
+        # and reads hooks.yaml — keep it off the loop.
+        options = await asyncio.to_thread(
+            _build_executor_options, defn, executor_type=executor_type)
         injected = list(options.allowed_tools or [])
         for t in ("mcp__casa-framework__query_engager",
                   "mcp__casa-framework__emit_completion"):
@@ -2882,6 +2910,55 @@ def _tool_marketplace_list_plugins() -> dict:
 _INSTALL_LOCK = "/config/cc-home/.claude/plugins/.install.lock"
 _AGENT_HOME_ROOT = Path("/config/agent-home")
 _CASA_PLUGIN_CACHE_ROOT = Path("/config/cc-home/.claude/plugins/cache/casa-plugins")
+
+# --- legacy plugin-grant helpers (deleted with the legacy tools in Task 14) --
+# The marketplace/install/verify tools below still resolve grants + env vars
+# from the version-keyed cache. Moved inline off plugin_grants.py (which now
+# owns only the resolver-based API); nothing new should call these.
+_LEGACY_CACHE_ROOT = Path("/config/cc-home/.claude/plugins/cache")
+
+
+def _legacy_version_key(p: Path) -> tuple:
+    parts: list[tuple[int, int | str]] = []
+    for part in p.name.split("."):
+        parts.append((0, int(part)) if part.isdecimal() else (1, part))
+    return tuple(parts)
+
+
+def highest_version_mcp_json(plugin_dir: "str | Path") -> "Path | None":
+    pd = Path(plugin_dir)
+    try:
+        versions = [d for d in pd.iterdir() if d.is_dir()]
+    except OSError:
+        return None
+    if not versions:
+        return None
+    mcp = max(versions, key=_legacy_version_key) / ".mcp.json"
+    return mcp if mcp.is_file() else None
+
+
+def grants_for_plugin(name: str, marketplace: str, *,
+                      cache_root: Path = _LEGACY_CACHE_ROOT) -> list[str]:
+    plugin_dir = Path(cache_root) / marketplace / name
+    try:
+        mcp_json = highest_version_mcp_json(plugin_dir)
+        if mcp_json is None:
+            return []
+        try:
+            data = json.loads(mcp_json.read_text(encoding="utf-8"))
+            servers = data.get("mcpServers") or {}
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return []
+        if not isinstance(servers, dict):
+            return []
+        from plugin_grants import sanitize_segment
+        plugin_seg = sanitize_segment(name)
+        return sorted(
+            f"mcp__plugin_{plugin_seg}_{sanitize_segment(server)}"
+            for server in servers
+        )
+    except Exception:  # noqa: BLE001 — never-raise (I-1 belt)
+        return []
 
 # H16: serialize the mutating plugin/marketplace tools once their blocking
 # bodies move off the loop via asyncio.to_thread. On the single event loop

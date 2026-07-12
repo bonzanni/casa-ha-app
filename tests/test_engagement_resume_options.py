@@ -18,9 +18,11 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 def _wire(monkeypatch, *, specialist_cfg=None, executor_defn=None):
     import tools as tools_mod
-    monkeypatch.setattr(tools_mod, "build_sdk_plugins", lambda **kw: [])
+    import plugin_registry
+    monkeypatch.setattr(
+        tools_mod.plugin_registry, "resolve_for",
+        lambda t: plugin_registry.ResolutionResult(registry_valid=True))
     monkeypatch.setattr("hooks.resolve_hooks", lambda *a, **kw: {})
-    monkeypatch.setattr(tools_mod, "derived_plugin_grants", lambda home, **kw: [])
     spec_reg = MagicMock()
     spec_reg.get = MagicMock(return_value=specialist_cfg)
     exec_reg = MagicMock()

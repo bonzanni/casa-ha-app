@@ -8,48 +8,14 @@ from pathlib import Path
 import pytest
 
 import plugin_registry
-from plugin_registry import compute_artifact_id, reload_snapshot, resolve_for
-from plugin_store import content_checksum, write_metadata
-# NOTE: _mk_artifact MUST write metadata via write_metadata + a real checksum
-# (deep validation at snapshot load now checksums every artifact).
+from plugin_registry import reload_snapshot, resolve_for
+from plugin_fixtures import (
+    entry as _entry,
+    mk_artifact as _mk_artifact,
+    mk_registry as _mk_registry,
+)
 
 pytestmark = pytest.mark.unit
-
-
-def _mk_artifact(store: Path, name: str, artifact_id: str,
-                 version="1.0.0", manifest_name=None,
-                 revision="git:" + "a" * 40, subdir="") -> Path:
-    # Metadata identity MUST match the registry entry's (name/repo/revision/
-    # subdir/artifact_id), else artifact_verdict → artifact_invalid.
-    root = store / name / artifact_id
-    (root / ".claude-plugin").mkdir(parents=True)
-    (root / ".claude-plugin" / "plugin.json").write_text(json.dumps(
-        {"name": manifest_name or name, "version": version}),
-        encoding="utf-8")
-    write_metadata(root, name=name, repo="o/r", ref="v1",
-                   revision=revision, subdir=subdir,
-                   artifact_id=artifact_id, version=version,
-                   checksum=content_checksum(root))
-    return root
-
-
-def _mk_registry(tmp_path, entries) -> Path:
-    p = tmp_path / "registry.json"
-    p.write_text(json.dumps({"schema_version": 1, "plugins": entries}),
-                 encoding="utf-8")
-    return p
-
-
-def _entry(name, targets, revision="git:" + "a" * 40, subdir=""):
-    return {
-        "name": name,
-        "source": {"type": "github", "repo": "o/r", "ref": "v1",
-                   "revision": revision, "subdir": subdir},
-        "artifact_id": compute_artifact_id(repo="o/r", revision=revision,
-                                           subdir=subdir, name=name),
-        "version": "1.0.0",
-        "targets": targets,
-    }
 
 
 def test_resolve_happy(tmp_path):

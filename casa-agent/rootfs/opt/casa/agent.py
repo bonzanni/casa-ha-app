@@ -23,8 +23,8 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
-from plugins_binding import build_sdk_plugins
-from plugin_grants import derived_plugin_grants, make_fail_closed_can_use_tool
+import plugin_registry
+from plugin_grants import grants_for_resolution, make_fail_closed_can_use_tool
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
@@ -202,17 +202,18 @@ class Agent:
         # Per-instance so assistant (4000) and butler (800) budgets stay
         # isolated even when the same channel serves both roles.
         self._budget_tracker = BudgetTracker()
-        # H2/M20: per-instance cache of the SDK plugin list. build_sdk_plugins
-        # shells out to `claude plugin list --json` (a blocking Node spawn);
-        # resolving it once per Agent instead of once per turn removes that
-        # cost from the hot path. The install.md doctrine makes
-        # casa_reload(scope='agent', role=...) MANDATORY after any plugin
-        # install/uninstall, and reload_agent constructs a FRESH Agent
-        # (reload._construct_agent) — so a per-instance cache never serves a
-        # stale plugin set. The lock guards concurrent turns of the same
-        # Agent from racing the first (off-loop) resolve.
-        self._sdk_plugins: list[dict[str, str]] | None = None
-        self._sdk_plugins_lock = asyncio.Lock()
+        # Unified plugin architecture (§3.3/§3.9): per-instance cache of the
+        # registry ResolutionResult for this agent's tier:role. resolve_for
+        # reads the process snapshot (refreshed by casa_reload BEFORE agent
+        # reconstruction), so a fresh Agent (reload._construct_agent) always
+        # rebuilds this — the cache can never surface a stale plugin set. The
+        # lock guards concurrent turns from racing the first (off-loop)
+        # resolve. `active_plugin_binding` is this agent's desired==active
+        # binding for §3.9 verification.
+        self._plugin_resolution: "plugin_registry.ResolutionResult | None" = None
+        self._plugin_resolution_lock = asyncio.Lock()
+        self.active_plugin_binding: dict[str, str] = {}
+        self._health_notice_pending = True   # Task 10: first-contact notice
         # Resolve hooks once at construction. HooksConfig.pre_tool_use
         # empty → default policy bundle (block_dangerous_bash + path_scope
         # scoped to cfg.cwd).
@@ -777,10 +778,10 @@ class Agent:
             agent_home_settings_guard_matcher(),
         ]
 
-        # Binding layer — SDK does NOT auto-consume enabledPlugins; we build the
-        # `plugins=[...]` list from `claude plugin list --json`. Resolved
-        # off-loop + cached per instance (see _get_sdk_plugins).
-        sdk_plugins = await self._get_sdk_plugins()
+        # Unified plugin architecture: the resolver turns this agent's
+        # tier:role assignment into immutable artifact paths. Resolved
+        # off-loop + cached per instance (see _get_plugin_resolution).
+        resolution = await self._get_plugin_resolution()
 
         # Skills are enabled via the `skills="all"` option below, NOT by
         # putting "Skill" in allowed_tools ((f) v0.69.9: bare "Skill" is
@@ -791,10 +792,8 @@ class Agent:
         allowed_tools = [t for t in self.config.tools.allowed if t != "Skill"]
 
         # P-5a: installed ⇒ granted, by construction — server-level grants
-        # derived from this agent-home's enabledPlugins. Off-loop (H2/M20):
-        # settings.json + one .mcp.json per enabled plugin — small reads,
-        # but the loop is shared.
-        for grant in await asyncio.to_thread(derived_plugin_grants, agent_home):
+        # derived from the SAME resolved artifacts the loader consumes.
+        for grant in grants_for_resolution(resolution):
             if grant not in allowed_tools:
                 allowed_tools.append(grant)
 
@@ -811,7 +810,8 @@ class Agent:
             resume=resume_sid,
             setting_sources=["project"],
             skills="all",  # (f) v0.69.9: replaces the deprecated bare "Skill"
-            plugins=sdk_plugins,
+            plugins=[{"type": "local", "path": rp.path}
+                     for rp in resolution.plugins],
             # P-5b: in-casa agents have no permission relay — fail closed on
             # ungranted tools instead of hanging on CC's prompt. New closure
             # per build is fine: the pool reuses clients, not options objects.
@@ -962,38 +962,38 @@ class Agent:
             pass
         await self._pool.aclose()
 
-    async def _get_sdk_plugins(self) -> list[dict[str, str]]:
-        """Resolve this resident's SDK ``plugins=[...]`` list, off-loop + cached.
+    async def _get_plugin_resolution(self):
+        """Resolve this agent's tier:role plugin assignment to immutable
+        artifacts, off-loop + cached per instance (§3.3/§3.9).
 
-        ``build_sdk_plugins`` runs ``claude plugin list --json`` — a blocking
-        Node-CLI spawn. Calling it inline on every turn froze the single shared
-        event loop (H2/M20); here it runs via ``asyncio.to_thread`` so no other
-        channel/agent stalls, and the result is cached on the instance so the
-        cost is paid once per Agent, not once per turn.
-
-        Cache invalidation is by Agent reconstruction: the install.md doctrine
-        makes ``casa_reload(scope='agent', role=...)`` mandatory after any
-        plugin install/uninstall, and ``reload._construct_agent`` builds a fresh
-        Agent — so this cache can never surface a stale plugin set. A degraded
-        empty result (build_sdk_plugins' CLI-failure fallback) is deliberately
-        NOT cached, so the next turn retries — preserving plugins_binding.py's
-        documented recovery policy.
+        resolve_for reads the process snapshot (refreshed from disk by
+        casa_reload BEFORE agent reconstruction), so a fresh Agent always
+        rebuilds this — no stale plugin set. Cached even when empty: under the
+        registry the result is deterministic, and reconstruction is the
+        invalidation seam. The active binding {name: artifact_id} is captured
+        here for §3.9 desired==active verification.
         """
-        if self._sdk_plugins is not None:
-            return self._sdk_plugins
-        async with self._sdk_plugins_lock:
-            if self._sdk_plugins is not None:
-                return self._sdk_plugins
-            plugins = await asyncio.to_thread(
-                build_sdk_plugins,
-                home="/config/cc-home",
-                shared_cache="/config/cc-home/.claude/plugins",
-                seed="/opt/claude-seed",
-                role=self.config.role,
+        if self._plugin_resolution is not None:
+            return self._plugin_resolution
+        async with self._plugin_resolution_lock:
+            if self._plugin_resolution is not None:
+                return self._plugin_resolution
+            tier = None
+            if self._agent_registry is not None:      # agent.py:199 attr name
+                tier = self._agent_registry.tier_for_role(self.config.role)
+            target = f"{tier or 'resident'}:{self.config.role}"
+            resolution = await asyncio.to_thread(
+                plugin_registry.resolve_for, target,
             )
-            if plugins:
-                self._sdk_plugins = plugins
-            return plugins
+            self._plugin_resolution = resolution
+            self.active_plugin_binding = {
+                rp.name: rp.artifact_id for rp in resolution.plugins
+            }
+            if resolution.issues:
+                logger.warning(
+                    "plugin resolution degraded for %s: %s", target,
+                    [(i.name, i.reason_code) for i in resolution.issues])
+            return resolution
 
     def _spawn_cold_retain(
         self, sid: str, directory: str, user_peer: str, channel: str,
