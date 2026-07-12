@@ -11,16 +11,27 @@ Leak-safe: any uncertainty, empty content, or backend error → DEFAULT_TIER
 leaked. Voice never reaches here (voice is recall-only — see channel_policy)."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from sensitivity import DEFAULT_TIER, SENSITIVITY_PROMPT, parse_tier
 
 logger = logging.getLogger(__name__)
 
+# D-5 (v0.69.2): backoff before the single retry. A transient SDK/CLI failure
+# permanently mis-tiers the item to ``private`` (over-restriction — the fact
+# becomes invisible below private clearance forever), and this path is off the
+# turn's critical path, so one bounded retry is cheap insurance. Module-level
+# so tests zero it instead of patching any sleep (see the CLAUDE.md memory
+# cage note: never patch ``<module>.asyncio.sleep``).
+_RETRY_BACKOFF_S = 2.0
+_ATTEMPTS = 2
+
 
 async def classify_tier(content: str) -> str:
     """Classify one fact/item into a sensitivity tier. Returns a member of TIERS;
-    DEFAULT_TIER on blank input, an unparseable reply, or any backend error."""
+    DEFAULT_TIER on blank input, an unparseable reply, or any backend error
+    (after one retry — D-5)."""
     text = (content or "").strip()
     if not text:
         return DEFAULT_TIER
@@ -36,15 +47,40 @@ async def classify_tier(content: str) -> str:
         # mode the rest of casa runs as root) never prompts and works.
         permission_mode="acceptEdits",
     )
-    reply = ""
-    try:
-        async for msg in sdk.query(prompt=text, options=opts):
-            if isinstance(msg, sdk.AssistantMessage):
-                for block in getattr(msg, "content", []) or []:
-                    t = getattr(block, "text", None)
-                    if isinstance(t, str):
-                        reply += t
-    except Exception:  # noqa: BLE001 — classifier must never crash a save
-        logger.warning("tier classification failed; defaulting to %s", DEFAULT_TIER, exc_info=True)
+    for attempt in range(1, _ATTEMPTS + 1):
+        reply = ""
+        try:
+            async for msg in sdk.query(prompt=text, options=opts):
+                if isinstance(msg, sdk.AssistantMessage):
+                    for block in getattr(msg, "content", []) or []:
+                        t = getattr(block, "text", None)
+                        if isinstance(t, str):
+                            reply += t
+        except Exception as exc:  # noqa: BLE001 — classifier must never crash a save
+            # The exception type+message live IN the log line: the D-5
+            # occurrences' tracebacks were truncated by log tooling and the
+            # container logs were gone before anyone could read them.
+            if attempt < _ATTEMPTS:
+                logger.warning(
+                    "tier classification attempt %d/%d failed (%s: %s); retrying",
+                    attempt, _ATTEMPTS, type(exc).__name__, exc,
+                )
+                await asyncio.sleep(_RETRY_BACKOFF_S)
+                continue
+            logger.warning(
+                "tier classification failed after %d attempts (%s: %s); "
+                "defaulting to %s",
+                _ATTEMPTS, type(exc).__name__, exc, DEFAULT_TIER, exc_info=True,
+            )
+            return DEFAULT_TIER
+        tier = parse_tier(reply)
+        if tier:
+            return tier
+        # A garbled reply used to default SILENTLY — indistinguishable from a
+        # correct ``private`` classification when auditing tiering accuracy.
+        logger.warning(
+            "tier classification reply unparseable (%d chars); defaulting to %s",
+            len(reply), DEFAULT_TIER,
+        )
         return DEFAULT_TIER
-    return parse_tier(reply) or DEFAULT_TIER
+    return DEFAULT_TIER  # pragma: no cover — loop always returns
