@@ -32,6 +32,7 @@ from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — availa
 from system_requirements.orchestrator import install_requirements, OrchestrationError
 from system_requirements.manifest import add_plugin_entry as add_manifest
 import plugin_registry
+import plugin_store
 from plugin_grants import (
     grants_for_resolution, grants_for_resolved, make_fail_closed_can_use_tool,
     required_env_vars_for_resolved,
@@ -2994,6 +2995,259 @@ def grants_for_plugin(name: str, marketplace: str, *,
 # marketplace-file / manifest writes. Read-only vault helpers don't take it.
 _PLUGIN_TOOLS_LOCK = asyncio.Lock()
 
+# ---------------------------------------------------------------------------
+# Unified plugin architecture (§3.9/§3.13): registry-mutating tools.
+# ---------------------------------------------------------------------------
+
+_PLUGIN_HEALTH_PATH = "/data/plugin-health.json"
+
+
+def _regenerate_plugin_health(extra_issues: list) -> None:
+    """§3.10/R2-4: rewrite the health report from the CURRENT resolver state
+    PLUS this mutation's runtime failures (a failed mutation must never leave a
+    green health file). resolve_all().issues already carries registry-stage
+    issues — do not add them twice (Sol R3)."""
+    import plugin_health
+    res = plugin_registry.resolve_all()
+    plugin_health.write_report(
+        issues=list(res.issues) + list(extra_issues),
+        warnings=list(res.warnings),
+        path=_PLUGIN_HEALTH_PATH,
+    )
+
+
+async def _notify_plugin_health_if_possible() -> None:
+    if _bus is None:
+        return
+    try:
+        import casa_core
+        await casa_core.notify_plugin_health(_bus, path=_PLUGIN_HEALTH_PATH)
+    except Exception:  # noqa: BLE001 — never fail a mutation on notify
+        logger.debug("plugin health notify skipped", exc_info=True)
+
+
+def _postcondition_holds(verify: dict, targets: list, *, expect: str) -> bool:
+    """§3.9 mutation postcondition. 'present' (add/update/assign): every in-casa
+    target row must be ready. 'absent' (unassign/remove): the plugin is gone
+    (not_registered) or no listed target still binds it. Legacy verify (no
+    'targets' key, Task 11 interim) is not blocking — Task 14's rewrite adds
+    the real per-target rows."""
+    rows = verify.get("targets")
+    if rows is None:
+        return True
+    if expect == "present":
+        return all(r.get("ready") for r in rows)
+    return (verify.get("reasons") == ["not_registered"]
+            or all(r.get("ready") for r in rows))
+
+
+def _issues_from_mutation(name: str, *, reload_errors: list, verify: dict,
+                          expect: str, postcondition_ok: bool) -> list:
+    """R2-4: translate reload/verify/postcondition failures into structured
+    PluginIssues so they persist in the health report."""
+    from plugin_registry import PluginIssue
+    issues: list = []
+    for err in reload_errors:
+        issues.append(PluginIssue(
+            name=name, target=err.get("target"), stage="reload",
+            reason_code="reload_failed"))
+    for row in (verify.get("targets") or []):
+        if not row.get("ready"):
+            reasons = row.get("reasons") or ["not_ready"]
+            issues.append(PluginIssue(
+                name=name, target=row.get("target"), stage="verify",
+                reason_code=reasons[0]))
+    if not postcondition_ok and not reload_errors:
+        issues.append(PluginIssue(
+            name=name, target=None, stage="verify",
+            reason_code="postcondition_failed"))
+    return issues
+
+
+async def _reload_and_verify_targets(name: str, targets: list,
+                                     *, expect: str) -> dict:
+    """§3.9 mutation sequencing — THE ordering that kills the incident. The
+    atomic registry write already happened; now: reload the resolver snapshot
+    FIRST, reconstruct affected in-casa agents, desired==active verify, then
+    regenerate + notify health. Order is load-bearing (stale-snapshot hazard)."""
+    await asyncio.to_thread(plugin_registry.reload_snapshot)   # 1. FIRST
+    import agent as agent_mod
+    import reload as reload_mod
+    runtime = getattr(agent_mod, "active_runtime", None)
+    reloaded: list = []
+    reload_errors: list = []
+    for target in targets:
+        tier, _, role = target.partition(":")
+        if tier in ("resident", "specialist") and runtime is not None:
+            res = await reload_mod.dispatch("agent", runtime=runtime, role=role)
+            if res.get("status") == "ok":
+                reloaded.append(target)
+            else:
+                reload_errors.append({"target": target, **res})
+        # executors: nothing to reconstruct (per-launch resolution).
+    verify = await asyncio.to_thread(_tool_verify_plugin_state, plugin_name=name)
+    ok = (not reload_errors
+          and _postcondition_holds(verify, targets, expect=expect))
+    mutation_issues = _issues_from_mutation(
+        name, reload_errors=reload_errors, verify=verify,
+        expect=expect, postcondition_ok=ok)
+    await asyncio.to_thread(_regenerate_plugin_health, mutation_issues)
+    await _notify_plugin_health_if_possible()
+    result = {"ok": ok, "reloaded": reloaded, "reload_errors": reload_errors,
+              "verify": verify}
+    if not ok:
+        result["kind"] = ("reload_failed" if reload_errors
+                          else "postcondition_failed")
+    return result
+
+
+def _install_plugin_sysreqs(name: str, manifest: dict) -> dict | None:
+    """§3.3: install a plugin's system requirements BEFORE registry activation.
+    Returns an error envelope on failure (registry left unchanged), else None."""
+    reqs = plugin_store.manifest_sysreqs(manifest)
+    if not reqs:
+        return None
+    try:
+        outcomes = install_requirements(
+            plugin_name=name, requirements=reqs,
+            tools_root=Path("/config/tools"))
+    except OrchestrationError as exc:
+        return {"ok": False, "kind": "system_requirements_failed",
+                "detail": str(exc)}
+    for outcome in outcomes:
+        add_manifest(outcome.manifest_entry(name))
+    return None
+
+
+def _plugin_add_sync(*, name: str, repo: str, ref: str, subdir: str = "",
+                     targets: list) -> dict:
+    """Blocking core of plugin_add: publish → sysreqs → activate. Pure-sync;
+    returns the exact envelope contract (ok True|False). Registry stays
+    byte-identical on any pre-activation failure (FR2)."""
+    if not plugin_registry.NAME_RE.match(name or ""):
+        return {"ok": False, "kind": "invalid_name", "name": name}
+    targets = list(targets or [])
+    bad = [t for t in targets if not plugin_registry.TARGET_RE.match(t)]
+    if bad or not targets:
+        return {"ok": False, "kind": "invalid_target", "invalid": bad}
+    data = plugin_registry.load_registry()                     # from DISK
+    if not data.valid:
+        return {"ok": False, "kind": "registry_invalid"}
+    if any(isinstance(e, dict) and e.get("name") == name
+           for e in data.raw.get("plugins", [])):
+        return {"ok": False, "kind": "plugin_exists", "name": name}
+    try:
+        result = plugin_store.publish(name=name, repo=repo, ref=ref,
+                                      subdir=subdir)
+    except plugin_store.RefNotFound:
+        return {"ok": False, "kind": "ref_not_found"}
+    except plugin_store.ResolveUnavailable:
+        return {"ok": False, "kind": "resolve_unavailable"}
+    except plugin_store.StoreError as exc:
+        return {"ok": False, "kind": getattr(exc, "reason_code", "store_error")}
+    err = _install_plugin_sysreqs(name, result.manifest)       # BEFORE activate
+    if err is not None:
+        return err
+    data.raw.setdefault("plugins", []).append({
+        "name": name,
+        "source": {"type": "github", "repo": repo, "ref": ref,
+                   "revision": result.revision, "subdir": subdir},
+        "artifact_id": result.artifact_id, "version": result.version,
+        "targets": targets,
+    })
+    plugin_registry.save_registry(data)
+    return {"ok": True, "name": name, "targets": targets,
+            "artifact_id": result.artifact_id, "version": result.version,
+            "revision": result.revision, "path": result.path}
+
+
+def _plugin_update_sync(*, name: str, new_ref: str) -> dict:
+    """Blocking core of plugin_update: re-publish from new_ref (version DERIVED
+    from the fetched manifest, FR5), install new sysreqs BEFORE moving the
+    registry pointer, then repoint the entry. Old artifact retained."""
+    data = plugin_registry.load_registry()
+    if not data.valid:
+        return {"ok": False, "kind": "registry_invalid"}
+    entry = next((e for e in data.raw.get("plugins", [])
+                  if isinstance(e, dict) and e.get("name") == name), None)
+    if entry is None:
+        return {"ok": False, "kind": "not_registered", "name": name}
+    src = entry.get("source") or {}
+    repo, subdir = src.get("repo", ""), src.get("subdir", "")
+    try:
+        result = plugin_store.publish(name=name, repo=repo, ref=new_ref,
+                                      subdir=subdir)
+    except plugin_store.RefNotFound:
+        return {"ok": False, "kind": "ref_not_found"}
+    except plugin_store.ResolveUnavailable:
+        return {"ok": False, "kind": "resolve_unavailable"}
+    except plugin_store.StoreError as exc:
+        return {"ok": False, "kind": getattr(exc, "reason_code", "store_error")}
+    err = _install_plugin_sysreqs(name, result.manifest)       # BEFORE repoint
+    if err is not None:
+        return err
+    entry["source"]["ref"] = new_ref
+    entry["source"]["revision"] = result.revision
+    entry["artifact_id"] = result.artifact_id
+    entry["version"] = result.version
+    plugin_registry.save_registry(data)
+    return {"ok": True, "name": name, "targets": list(entry.get("targets") or []),
+            "artifact_id": result.artifact_id, "version": result.version,
+            "revision": result.revision, "path": result.path}
+
+
+def _resolved_observability(name: str) -> dict:
+    """granted_tools + required_env_vars for the freshly-activated plugin (best
+    effort — reads the just-reloaded snapshot; resolve_all finds it regardless
+    of target)."""
+    for rp in plugin_registry.resolve_all().plugins:
+        if rp.name == name:
+            return {"granted_tools": grants_for_resolved(rp),
+                    "required_env_vars": required_env_vars_for_resolved(rp)}
+    return {"granted_tools": [], "required_env_vars": []}
+
+
+@tool(
+    "plugin_add",
+    "Add a plugin to the registry: publish its pinned artifact, install any "
+    "system requirements, assign it to targets, then reload + verify. Version "
+    "is derived from the plugin manifest (never supplied).",
+    {"name": str, "repo": str, "ref": str, "subdir": str, "targets": list},
+)
+async def plugin_add(args: dict) -> dict:
+    async with _PLUGIN_TOOLS_LOCK:
+        core = await asyncio.to_thread(
+            _plugin_add_sync, name=args["name"], repo=args["repo"],
+            ref=args["ref"], subdir=args.get("subdir", ""),
+            targets=args.get("targets") or [])
+        if core.get("ok") is not True:
+            return _result(core)
+        seq = await _reload_and_verify_targets(
+            core["name"], core["targets"], expect="present")
+        core.update(seq)
+        core.update(_resolved_observability(core["name"]))
+        return _result(core)
+
+
+@tool(
+    "plugin_update",
+    "Update a registered plugin to a new ref: re-publish, install new system "
+    "requirements, repoint the registry, reload + verify. Version derives from "
+    "the fetched manifest.",
+    {"name": str, "new_ref": str},
+)
+async def plugin_update(args: dict) -> dict:
+    async with _PLUGIN_TOOLS_LOCK:
+        core = await asyncio.to_thread(
+            _plugin_update_sync, name=args["name"], new_ref=args["new_ref"])
+        if core.get("ok") is not True:
+            return _result(core)
+        seq = await _reload_and_verify_targets(
+            core["name"], core["targets"], expect="present")
+        core.update(seq)
+        core.update(_resolved_observability(core["name"]))
+        return _result(core)
+
 
 def _tool_install_casa_plugin(
     *,
@@ -3431,7 +3685,10 @@ CASA_TOOLS: tuple = (
     delete_engagement_workspace,
     peek_engagement_workspace,
     cleanup_engagement_topics,     # v0.65.0 [AR-7] — configurator-only grant
-    marketplace_add_plugin,
+    # Unified plugin architecture (§3.13) — registry-mutating tools.
+    plugin_add,
+    plugin_update,
+    marketplace_add_plugin,        # legacy — deleted in Task 14
     marketplace_remove_plugin,
     marketplace_update_plugin,
     marketplace_list_plugins,
