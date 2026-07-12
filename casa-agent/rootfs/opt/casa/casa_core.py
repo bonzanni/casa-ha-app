@@ -1187,6 +1187,11 @@ async def main() -> None:
     _log_level_name = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
     _log_level = getattr(logging, _log_level_name, logging.INFO)
     install_logging(level=_log_level)
+    # P-4 (v0.68.2): detached SDK control-request tasks racing subprocess
+    # teardown die with an unretrieved CLIConnectionError that asyncio GC
+    # would log at ERROR on every engagement close.
+    from sdk_logging import install_sdk_task_noise_filter
+    install_sdk_task_noise_filter(asyncio.get_running_loop())
     logger.info("Casa core starting up")
 
     # 1a. §8: universal op:// resolution for password-typed addon options.
