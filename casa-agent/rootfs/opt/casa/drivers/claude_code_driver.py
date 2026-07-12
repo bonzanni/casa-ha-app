@@ -124,6 +124,9 @@ class ClaudeCodeDriver(DriverProtocol):
                     status="UNDERGOING",
                     created_at=_iso_now(),
                     finished_at=None, retention_until=None,
+                    # §3.8: record the pinned artifacts with the workspace meta.
+                    plugin_artifacts=list(
+                        getattr(engagement, "plugin_artifacts", ()) or ()),
                 )
 
                 # 2. Write the s6 service pair (sibling logger service
@@ -138,6 +141,9 @@ class ClaudeCodeDriver(DriverProtocol):
                     permission_mode=defn.permission_mode or "acceptEdits",
                     extra_dirs=list(defn.extra_dirs),
                     extra_env=extra_env or None,
+                    # §3.8: load the pinned artifacts via --plugin-dir flags.
+                    plugin_dirs=[pa["path"] for pa in
+                                 getattr(engagement, "plugin_artifacts", ()) or ()],
                 )
                 log_script = render_log_run_script(engagement_id=engagement.id)
                 s6_rc.write_service_dir(

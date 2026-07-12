@@ -1021,3 +1021,49 @@ class TestFailedStartClosesTopic:
             engagement_id=mock_rec.id, new_state="failed",
         )
         channel.close_topic.assert_awaited_once_with(thread_id=42)
+
+
+class TestEngageExecutorPluginGate:
+    """§3.5/§3.8: executor launches gate on the plugin resolution (before any
+    topic is created), and record the resolved binding."""
+
+    async def _run(self, monkeypatch, resolution):
+        from tools import engage_executor
+        import agent as agent_mod
+        import plugin_registry
+
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=_mock_executor_def(driver="claude_code"))
+        reg.list_types = MagicMock(return_value=["configurator"])
+        channel = await _setup(reg)
+        monkeypatch.setattr(plugin_registry, "resolve_for", lambda t: resolution)
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "configurator", "task": "t", "context": "",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+        return json.loads(r["content"][0]["text"]), channel
+
+    async def test_engage_executor_blocks_on_registry_invalid(self, monkeypatch):
+        from plugin_registry import ResolutionResult
+        payload, channel = await self._run(
+            monkeypatch, ResolutionResult(registry_valid=False))
+        assert payload["kind"] == "plugin_registry_invalid"
+        channel.open_engagement_topic.assert_not_called()   # gate is pre-topic
+
+    async def test_engage_executor_blocks_on_plugin_issue(self, monkeypatch):
+        from plugin_registry import PluginIssue, ResolutionResult
+        issue = PluginIssue(name="lesina-invoice",
+                            target="executor:configurator", stage="resolve",
+                            reason_code="artifact_missing")
+        payload, channel = await self._run(
+            monkeypatch,
+            ResolutionResult(registry_valid=True, issues=[issue]))
+        assert payload["kind"] == "plugin_unavailable"
+        assert "lesina-invoice" in payload["message"]
+        channel.open_engagement_topic.assert_not_called()

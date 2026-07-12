@@ -1433,6 +1433,29 @@ async def engage_executor(args: dict) -> dict:
             ),
         })
 
+    # §3.5/§3.8/§3.9: resolve this executor's plugin assignment ONCE — the
+    # result feeds the launch gate, the recorded binding, AND the in-casa
+    # options (one resolve, one binding). Gate BEFORE topic creation so a
+    # blocked launch never leaves a dangling topic.
+    plugin_resolution = plugin_registry.resolve_for(f"executor:{executor_type}")
+    if not plugin_resolution.registry_valid:
+        return _result({
+            "status": "error", "kind": "plugin_registry_invalid",
+            "message": ("plugin registry is invalid — executor launches are "
+                        "blocked until it is repaired "
+                        "(see /data/plugin-health.json)"),
+        })
+    if plugin_resolution.issues:
+        detail = [(i.name, i.reason_code) for i in plugin_resolution.issues]
+        return _result({
+            "status": "error", "kind": "plugin_unavailable",
+            "message": (f"required plugin(s) unavailable for "
+                        f"{executor_type!r}: {detail}"),
+        })
+    plugin_artifacts = tuple(
+        {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
+        for rp in plugin_resolution.plugins)
+
     if _channel_manager is None:
         return _result({
             "status": "error", "kind": "no_channel_manager",
@@ -1535,6 +1558,7 @@ async def engage_executor(args: dict) -> dict:
         topic_id=topic_id,
         tools_allowed=tuple(defn.tools_allowed or ()),
         permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
+        plugin_artifacts=plugin_artifacts,          # §3.8 recorded binding
     )
 
     # Persist the initial state emoji so Task 23 ``update_topic_state`` knows
@@ -1610,10 +1634,11 @@ async def engage_executor(args: dict) -> dict:
                 "message": str(exc),
             })
     else:
-        # Off-loop: _build_executor_options resolves the registry (file IO)
-        # and reads hooks.yaml — keep it off the loop.
+        # Off-loop: _build_executor_options reads hooks.yaml. §3.9: feed the
+        # SAME resolution gated + recorded above (one resolve, one binding).
         options = await asyncio.to_thread(
-            _build_executor_options, defn, executor_type=executor_type)
+            _build_executor_options, defn, executor_type=executor_type,
+            resolution=plugin_resolution)
         injected = list(options.allowed_tools or [])
         for t in ("mcp__casa-framework__query_engager",
                   "mcp__casa-framework__emit_completion"):
@@ -1958,6 +1983,8 @@ async def _finalize_engagement(
                     created_at=meta.get("created_at") or finished_iso,
                     finished_at=finished_iso,
                     retention_until=retention_iso,
+                    # §3.8: the immutable binding survives the terminal rewrite.
+                    plugin_artifacts=meta.get("plugin_artifacts"),
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning(

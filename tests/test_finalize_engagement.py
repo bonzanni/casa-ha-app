@@ -276,3 +276,51 @@ async def test_finalize_engagement_pops_permission_queue(tmp_path, monkeypatch):
         assert other in PERMISSION_QUEUES        # no collateral clearing
     finally:
         PERMISSION_QUEUES.clear()
+
+    async def test_finalize_preserves_plugin_artifacts_in_casa_meta(
+            self, tmp_path, monkeypatch):
+        """§3.8: the terminal .casa-meta.json rewrite must NOT drop the
+        immutable plugin_artifacts recorded at engagement start."""
+        import os
+        import tools as tools_mod
+        from drivers.workspace import load_casa_meta, write_casa_meta
+        from engagement_registry import EngagementRegistry
+        from tools import _finalize_engagement, init_tools
+
+        eng_root = tmp_path / "engagements"
+        monkeypatch.setattr(tools_mod, "_ENGAGEMENTS_ROOT", str(eng_root))
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="plugin-developer",
+            driver="claude_code", task="t",
+            origin={"role": "assistant", "channel": "telegram", "chat_id": "1"},
+            topic_id=42)
+
+        ws = eng_root / rec.id
+        ws.mkdir(parents=True)
+        artifacts = [{"name": "superpowers", "artifact_id": "a" * 64,
+                      "path": "/config/plugins/store/superpowers/" + "a" * 64}]
+        write_casa_meta(
+            workspace_path=str(ws), engagement_id=rec.id,
+            executor_type="plugin-developer", status="UNDERGOING",
+            created_at="2026-07-13T00:00:00Z", finished_at=None,
+            retention_until=None, plugin_artifacts=artifacts)
+
+        telegram = MagicMock()
+        telegram.send_to_topic = AsyncMock()
+        telegram.close_topic = AsyncMock()
+        cm = MagicMock()
+        cm.get.return_value = telegram
+        init_tools(channel_manager=cm, bus=MagicMock(),
+                   specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+                   trigger_registry=MagicMock(), engagement_registry=reg)
+        driver = MagicMock()
+        driver.cancel = AsyncMock()
+
+        await _finalize_engagement(rec, outcome="completed", text="s",
+                                   artifacts=[], next_steps=[], driver=driver)
+
+        meta = load_casa_meta(str(ws))
+        assert meta["status"] == "COMPLETED"
+        assert meta["plugin_artifacts"] == artifacts       # NOT dropped
