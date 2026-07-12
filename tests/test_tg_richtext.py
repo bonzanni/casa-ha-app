@@ -149,3 +149,10 @@ def test_render_over_entity_limit_none():
 
 def test_render_over_length_none():
     assert render("**" + "a" * 5000 + "**")[1] is None
+
+
+def test_render_unpaired_surrogate_degrades_to_none():
+    # Sol code-review: a lone surrogate breaks UTF-16 conversion; render() must
+    # degrade to plain (never raise).
+    display, ents = render("\ud800 **x**")
+    assert ents is None

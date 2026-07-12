@@ -182,6 +182,10 @@ async def test_unix_runner_serves_channel_send_to_topic() -> None:
                     assert resp.status == 200
                     body = await resp.json()
                     assert body == {"ok": True, "message_id": 9001}
+            # v0.70.0: CC reply must route through send_response_to_topic, not
+            # the plain send_to_topic.
+            _Channel.send_response_to_topic.assert_awaited_once()
+            _Channel.send_to_topic.assert_not_awaited()
         finally:
             await runner.cleanup()
 

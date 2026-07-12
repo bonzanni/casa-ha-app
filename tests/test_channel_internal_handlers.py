@@ -34,6 +34,7 @@ class _FakeChannel:
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.response_route_calls = 0
         self._next_msg_id = 7000
 
     async def send_to_topic(
@@ -50,7 +51,8 @@ class _FakeChannel:
         self, thread_id: int, text: str, **kwargs: Any,
     ) -> int:
         # v0.70.0: CC reply handler routes here; rich rendering lives in the real
-        # TelegramChannel — the fake just records via the plain path.
+        # TelegramChannel. Record separately so tests can prove the route.
+        self.response_route_calls += 1
         return await self.send_to_topic(thread_id, text, **kwargs)
 
 
@@ -130,6 +132,8 @@ async def test_send_to_topic_routes_by_engagement_id(app_factory) -> None:
     assert len(ch.calls) == 1
     assert ch.calls[0]["topic_id"] == 42
     assert ch.calls[0]["text"] == "hello operator"
+    # v0.70.0: the CC reply handler must use the response-provenant method.
+    assert ch.response_route_calls == 1
 
 
 async def test_send_to_topic_unknown_engagement_returns_error(

@@ -244,4 +244,8 @@ def render(text: str) -> tuple[str, "list[MessageEntity] | None"]:
         if end <= start or start < 0 or end > len(display):
             return display, None
         ents.append(MessageEntity(type=_KIND[kind], offset=start, length=end - start))
-    return display, MessageEntity.adjust_message_entities_to_utf_16(display, ents)
+    try:
+        return display, MessageEntity.adjust_message_entities_to_utf_16(display, ents)
+    except Exception:  # noqa: BLE001 — e.g. an unpaired surrogate breaks UTF-16
+        # "never raises": any offset-conversion failure degrades to plain text.
+        return display, None

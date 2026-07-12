@@ -213,7 +213,9 @@ class _StubTelegramChannel:
 
     def __init__(self) -> None:
         self.send = AsyncMock()
+        self.send_response = AsyncMock()
         self.finalize_stream = AsyncMock()
+        self.finalize_response_stream = AsyncMock()
         self.turn_finished = AsyncMock()
 
     def create_on_token(self, _context):
@@ -243,8 +245,37 @@ class TestSilentTurnTeardown:
         agent._channel_manager.register(stub)
         with patch.object(agent, "_process", AsyncMock(return_value="real reply")):
             await agent.handle_message(_msg("telegram", "123", "hi"))
-        assert stub.finalize_stream.call_count == 1
+        # v0.70.0: a successful streamed turn (error_kind is None) routes through
+        # the response-provenant finalizer, NOT the plain one.
+        assert stub.finalize_response_stream.call_count == 1
+        assert stub.finalize_stream.call_count == 0
         assert stub.turn_finished.call_count == 0
+
+
+class TestResponseProvenanceRouting:
+    """v0.70.0: rich-text renders only genuine agent responses; error/system
+    text stays on the plain finalizer."""
+
+    async def test_success_streamed_turn_uses_response_finalizer(self, tmp_path):
+        agent = _make_agent(tmp_path, role="assistant")
+        stub = _StubTelegramChannel()
+        agent._channel_manager.register(stub)
+        with patch.object(agent, "_process", AsyncMock(return_value="ok reply")):
+            await agent.handle_message(_msg("telegram", "123", "hi"))
+        assert stub.finalize_response_stream.call_count == 1
+        assert stub.finalize_stream.call_count == 0
+
+    async def test_error_turn_uses_plain_finalizer(self, tmp_path):
+        agent = _make_agent(tmp_path, role="assistant")
+        stub = _StubTelegramChannel()
+        agent._channel_manager.register(stub)
+        with patch.object(
+            agent, "_process", AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            await agent.handle_message(_msg("telegram", "123", "hi"))
+        # error text (error_kind set) must NOT be rich-rendered
+        assert stub.finalize_stream.call_count == 1
+        assert stub.finalize_response_stream.call_count == 0
 
 
 async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
@@ -1224,7 +1255,9 @@ class _StubChannel:
         # create_on_token is a sync factory returning an async callback.
         self.create_on_token = MagicMock(return_value=AsyncMock())
         self.send = AsyncMock()
+        self.send_response = AsyncMock()
         self.finalize_stream = AsyncMock()
+        self.finalize_response_stream = AsyncMock()
 
     async def start(self) -> None:
         pass
@@ -1330,11 +1363,13 @@ class TestScheduledSilence:
         ):
             result = await agent.handle_message(_scheduled_msg())
 
-        # No on_token (Fix B.1 disables streaming for SCHEDULED) →
-        # falls through to channel.send, NOT finalize_stream.
-        assert stub.send.call_count == 1
-        sent_text = stub.send.call_args.args[0]
+        # No on_token (Fix B.1 disables streaming for SCHEDULED). A successful
+        # scheduled turn (error_kind is None) routes through send_response
+        # (v0.70.0 rich-text), NOT plain send/finalize_stream.
+        assert stub.send_response.call_count == 1
+        sent_text = stub.send_response.call_args.args[0]
         assert sent_text == text
+        assert stub.send.call_count == 0
         assert stub.finalize_stream.call_count == 0
         assert result is not None
         assert result.content == text
