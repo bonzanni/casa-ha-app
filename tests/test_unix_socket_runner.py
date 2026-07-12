@@ -153,6 +153,8 @@ async def test_unix_runner_serves_channel_send_to_topic() -> None:
 
     class _Channel:
         engagement_supergroup_id = -100
+        # v0.70.0: the CC reply handler routes through send_response_to_topic.
+        send_response_to_topic = AsyncMock(return_value=9001)
         send_to_topic = AsyncMock(return_value=9001)
 
     class _Reg:
