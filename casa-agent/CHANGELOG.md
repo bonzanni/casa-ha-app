@@ -1,6 +1,19 @@
 # Changelog
 
-## [0.69.7] - 2026-07-12 — plugin/engagement polish
+## [0.69.8] - 2026-07-12 — permission hardening
+
+### Security
+
+- The voice butler and specialist agents can no longer spawn sub-agents. The
+  underlying SDK exposes sub-agent-spawning tools regardless of an agent's
+  configured tool list, and a spawned sub-agent runs with a broad default
+  toolset rather than the restricted parent's — so a prompt-injected butler or
+  specialist could reach read/enumeration tools its own configuration excludes.
+  These tools are now explicitly denied for those agents. (Destructive actions
+  were already blocked; the primary assistant and executors are unaffected.)
+- Agents can no longer edit their own `.claude/settings.json`. Plugin
+  enablement is managed by the configurator; blocking direct edits closes a
+  path by which a prompt-injected agent could self-enable a cached plugin.
 
 ### Fixed
 

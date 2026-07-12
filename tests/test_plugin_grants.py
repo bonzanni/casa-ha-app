@@ -192,6 +192,24 @@ def test_specialist_options_merge_grants_and_fail_closed(tmp_path, monkeypatch):
     opts2 = tools_mod._build_specialist_options(cfg2)
     assert opts2.allowed_tools.count(
         "mcp__plugin_lesina-invoice_lesina-invoice") == 1
+
+
+def test_specialist_options_disallow_subagent_spawn(tmp_path, monkeypatch):
+    """Q-1 (v0.69.8, operator decision): specialists must not spawn
+    sub-agents. Agent/Task bypass allowed_tools + the fail-closed callback
+    (empirically verified), so they're forced into disallowed_tools, which the
+    CLI enforces (removes them from the surface)."""
+    import tools as tools_mod
+    monkeypatch.setattr(tools_mod, "build_sdk_plugins", lambda **kw: [])
+    monkeypatch.setattr("hooks.resolve_hooks", lambda *a, **kw: {})
+    monkeypatch.setattr(tools_mod, "derived_plugin_grants", lambda home, **kw: [])
+    cfg = _specialist_cfg(str(tmp_path))
+    opts = tools_mod._build_specialist_options(cfg)
+    assert "Agent" in opts.disallowed_tools
+    assert "Task" in opts.disallowed_tools
+    # existing disallowed entries preserved, no dupes
+    assert "Bash" in opts.disallowed_tools
+    assert opts.disallowed_tools.count("Agent") == 1
     assert opts.can_use_tool is not None
 
 

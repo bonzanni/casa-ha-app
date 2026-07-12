@@ -753,7 +753,16 @@ class Agent:
         mcp_servers = self._mcp_registry.resolve(self.config.mcp_server_names)
 
         # 5. Hooks — resolved from hooks.yaml at load time by agent_loader.
-        hooks = self._resolved_hooks
+        #    I-2 (v0.69.8): always inject the agent-home settings.json
+        #    self-grant guard — a code-side security invariant that config
+        #    cannot remove. Build a fresh dict so the shared _resolved_hooks
+        #    isn't mutated across turns.
+        from hooks import agent_home_settings_guard_matcher
+        hooks = dict(self._resolved_hooks)
+        hooks["PreToolUse"] = [
+            *hooks.get("PreToolUse", []),
+            agent_home_settings_guard_matcher(),
+        ]
 
         # Binding layer — SDK does NOT auto-consume enabledPlugins; we build the
         # `plugins=[...]` list from `claude plugin list --json`. Resolved
