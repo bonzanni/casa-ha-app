@@ -1,0 +1,237 @@
+"""§3.3 resolver: one ResolutionResult feeds everything. plugins XOR issues;
+warnings accompany loaded plugins; registry-wide invalid vs per-entry."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+import plugin_registry
+from plugin_registry import compute_artifact_id, reload_snapshot, resolve_for
+from plugin_store import content_checksum, write_metadata
+# NOTE: _mk_artifact MUST write metadata via write_metadata + a real checksum
+# (deep validation at snapshot load now checksums every artifact).
+
+pytestmark = pytest.mark.unit
+
+
+def _mk_artifact(store: Path, name: str, artifact_id: str,
+                 version="1.0.0", manifest_name=None,
+                 revision="git:" + "a" * 40, subdir="") -> Path:
+    # Metadata identity MUST match the registry entry's (name/repo/revision/
+    # subdir/artifact_id), else artifact_verdict → artifact_invalid.
+    root = store / name / artifact_id
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(json.dumps(
+        {"name": manifest_name or name, "version": version}),
+        encoding="utf-8")
+    write_metadata(root, name=name, repo="o/r", ref="v1",
+                   revision=revision, subdir=subdir,
+                   artifact_id=artifact_id, version=version,
+                   checksum=content_checksum(root))
+    return root
+
+
+def _mk_registry(tmp_path, entries) -> Path:
+    p = tmp_path / "registry.json"
+    p.write_text(json.dumps({"schema_version": 1, "plugins": entries}),
+                 encoding="utf-8")
+    return p
+
+
+def _entry(name, targets, revision="git:" + "a" * 40, subdir=""):
+    return {
+        "name": name,
+        "source": {"type": "github", "repo": "o/r", "ref": "v1",
+                   "revision": revision, "subdir": subdir},
+        "artifact_id": compute_artifact_id(repo="o/r", revision=revision,
+                                           subdir=subdir, name=name),
+        "version": "1.0.0",
+        "targets": targets,
+    }
+
+
+def test_resolve_happy(tmp_path):
+    store = tmp_path / "store"
+    e = _entry("probe", ["specialist:finance"])
+    _mk_artifact(store, "probe", e["artifact_id"])
+    reload_snapshot(registry_path=_mk_registry(tmp_path, [e]),
+                    store_root=store)
+    res = resolve_for("specialist:finance")
+    assert res.registry_valid is True
+    assert [rp.name for rp in res.plugins] == ["probe"]
+    assert res.plugins[0].artifact_id == e["artifact_id"]
+    assert res.plugins[0].manifest["version"] == "1.0.0"
+    assert res.issues == [] and res.warnings == []
+    # Target not assigned → empty, no issue.
+    other = resolve_for("resident:assistant")
+    assert other.plugins == [] and other.issues == []
+
+
+def test_missing_artifact_is_issue_not_plugin(tmp_path):
+    e = _entry("probe", ["specialist:finance"])
+    reload_snapshot(registry_path=_mk_registry(tmp_path, [e]),
+                    store_root=tmp_path / "store")
+    res = resolve_for("specialist:finance")
+    assert res.plugins == []
+    assert [i.reason_code for i in res.issues] == ["artifact_missing"]
+    assert res.issues[0].target == "specialist:finance"
+
+
+def test_manifest_name_mismatch_is_artifact_invalid(tmp_path):
+    store = tmp_path / "store"
+    e = _entry("probe", ["specialist:finance"])
+    _mk_artifact(store, "probe", e["artifact_id"], manifest_name="other")
+    reload_snapshot(registry_path=_mk_registry(tmp_path, [e]),
+                    store_root=store)
+    res = resolve_for("specialist:finance")
+    assert res.plugins == []
+    assert [i.reason_code for i in res.issues] == ["artifact_invalid"]
+
+
+def test_legacy_content_loads_with_warning(tmp_path):
+    store = tmp_path / "store"
+    rev = "legacy-content:" + "c" * 64
+    e = _entry("probe", ["specialist:finance"], revision=rev)
+    _mk_artifact(store, "probe", e["artifact_id"], revision=rev)
+    reload_snapshot(registry_path=_mk_registry(tmp_path, [e]),
+                    store_root=store)
+    res = resolve_for("specialist:finance")
+    assert [rp.name for rp in res.plugins] == ["probe"]
+    assert [w.reason_code for w in res.warnings] == ["legacy_provenance"]
+
+
+def test_tampered_user_artifact_detected_at_snapshot_reload(tmp_path):
+    """Sol F1: deep validation at snapshot load — a tampered NON-bundled
+    artifact must yield corrupt_artifact, never a loaded plugin."""
+    store = tmp_path / "store"
+    e = _entry("probe", ["specialist:finance"])
+    root = _mk_artifact(store, "probe", e["artifact_id"])
+    (root / "evil.md").write_text("tampered", encoding="utf-8")  # post-publish tamper
+    reload_snapshot(registry_path=_mk_registry(tmp_path, [e]),
+                    store_root=store)
+    res = resolve_for("specialist:finance")
+    assert res.plugins == []
+    assert [i.reason_code for i in res.issues] == ["corrupt_artifact"]
+
+
+def test_wrong_identity_metadata_is_artifact_invalid_at_resolve(tmp_path):
+    """Sol R2-1: checksum-valid artifact whose metadata names a different
+    revision/repo/subdir must be artifact_invalid at ORDINARY resolution."""
+    import plugin_store
+    store = tmp_path / "store"
+    e = _entry("probe", ["specialist:finance"])
+    root = _mk_artifact(store, "probe", e["artifact_id"])
+    meta_path = root / ".casa-artifact.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["revision"] = "git:" + "b" * 40          # altered identity
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    meta["content_checksum"] = plugin_store.content_checksum(root)
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")  # checksum OK
+    reload_snapshot(registry_path=_mk_registry(tmp_path, [e]),
+                    store_root=store)
+    res = resolve_for("specialist:finance")
+    assert res.plugins == []
+    assert [i.reason_code for i in res.issues] == ["artifact_invalid"]
+
+
+def test_unrelated_invalid_entry_does_not_pollute_other_targets(tmp_path):
+    """Sol F2: a malformed RESIDENT entry must not appear in an EXECUTOR
+    resolve (per-entry isolation, spec 3.1/3.5) — but health sees it."""
+    store = tmp_path / "store"
+    good = _entry("good", ["executor:plugin-developer"])
+    _mk_artifact(store, "good", good["artifact_id"])
+    bad = dict(_entry("bad", ["resident:assistant"]), artifact_id="0" * 64)
+    reload_snapshot(registry_path=_mk_registry(tmp_path, [bad, good]),
+                    store_root=store)
+    res = resolve_for("executor:plugin-developer")
+    assert [rp.name for rp in res.plugins] == ["good"]
+    assert res.issues == []                       # executor launch NOT blocked
+    health = plugin_registry.resolve_all()
+    assert "bad" in {i.name for i in health.issues}
+
+
+def test_same_name_collision_does_not_lend_targets(tmp_path):
+    """Sol R2-2: an invalid, UNSCOPABLE entry named x must not inherit the
+    targets of a valid entry also named x. (Both are name-colliding raw
+    entries; the valid one's duplicate issue scopes to its own targets,
+    the invalid one's stays health-only.)"""
+    store = tmp_path / "store"
+    valid_x = _entry("x", ["executor:plugin-developer"])
+    _mk_artifact(store, "x", valid_x["artifact_id"])
+    invalid_x = dict(_entry("x", ["resident:assistant"]), targets="oops")
+    reload_snapshot(registry_path=_mk_registry(tmp_path, [invalid_x, valid_x]),
+                    store_root=store)
+    res = resolve_for("executor:plugin-developer")
+    # invalid_x is entry_invalid (bad targets) -> health only. valid_x has no
+    # valid-entry duplicate (the invalid one never reached the PK check), so
+    # it resolves normally.
+    assert [rp.name for rp in res.plugins] == ["x"]
+    assert res.issues == []
+    assert any(i.name == "x" and i.reason_code == "entry_invalid"
+               for i in plugin_registry.resolve_all().issues)
+
+
+def test_unscopable_invalid_entry_only_in_resolve_all(tmp_path):
+    store = tmp_path / "store"
+    good = _entry("good", ["executor:plugin-developer"])
+    _mk_artifact(store, "good", good["artifact_id"])
+    bad = dict(_entry("bad", ["resident:assistant"]), targets="oops")
+    reload_snapshot(registry_path=_mk_registry(tmp_path, [bad, good]),
+                    store_root=store)
+    assert resolve_for("executor:plugin-developer").issues == []
+    assert resolve_for("resident:assistant").issues == []      # unscopable
+    assert "bad" in {i.name for i in plugin_registry.resolve_all().issues}
+
+
+def test_one_bad_entry_never_defeats_the_rest(tmp_path):
+    store = tmp_path / "store"
+    good = _entry("good", ["executor:plugin-developer"])
+    _mk_artifact(store, "good", good["artifact_id"])
+    bad = dict(_entry("bad", ["executor:plugin-developer"]),
+               artifact_id="0" * 64)          # per-entry invalid, SAME target
+    missing = _entry("missing", ["executor:plugin-developer"])
+    reload_snapshot(
+        registry_path=_mk_registry(tmp_path, [bad, good, missing]),
+        store_root=store)
+    res = resolve_for("executor:plugin-developer")
+    assert [rp.name for rp in res.plugins] == ["good"]
+    codes = {i.name: i.reason_code for i in res.issues}
+    # bad names THIS target in its parseable targets list -> scoped in (F2).
+    assert codes == {"bad": "entry_invalid", "missing": "artifact_missing"}
+
+
+def test_registry_wide_invalid(tmp_path):
+    p = tmp_path / "registry.json"
+    p.write_text("{broken", encoding="utf-8")
+    reload_snapshot(registry_path=p, store_root=tmp_path / "store")
+    res = resolve_for("resident:assistant")
+    assert res.registry_valid is False and res.plugins == []
+
+
+def test_snapshot_is_stale_until_reloaded(tmp_path):
+    """§3.9: resolve_for reads the SNAPSHOT, not the disk."""
+    store = tmp_path / "store"
+    e = _entry("probe", ["specialist:finance"])
+    _mk_artifact(store, "probe", e["artifact_id"])
+    reg = _mk_registry(tmp_path, [e])
+    reload_snapshot(registry_path=reg, store_root=store)
+    assert len(resolve_for("specialist:finance").plugins) == 1
+    reg.write_text(json.dumps({"schema_version": 1, "plugins": []}),
+                   encoding="utf-8")
+    assert len(resolve_for("specialist:finance").plugins) == 1   # stale by design
+    reload_snapshot(registry_path=reg, store_root=store)
+    assert resolve_for("specialist:finance").plugins == []
+
+
+def test_tier_for_role():
+    from agent_registry import AgentRegistry
+    from config import AgentConfig
+    reg = AgentRegistry.build(
+        residents={"assistant": AgentConfig(role="assistant")},
+        specialists={"finance": AgentConfig(role="finance")},
+    )
+    assert reg.tier_for_role("assistant") == "resident"
+    assert reg.tier_for_role("finance") == "specialist"
+    assert reg.tier_for_role("ghost") is None

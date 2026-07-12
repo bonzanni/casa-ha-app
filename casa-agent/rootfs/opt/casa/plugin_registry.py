@@ -243,3 +243,147 @@ def seed_defaults(data: RegistryData,
     if mutated:
         _revalidate(data)
     return mutated
+
+
+@dataclass(frozen=True)
+class ResolvedPlugin:
+    name: str
+    artifact_id: str
+    path: str
+    version: str
+    manifest: dict
+
+
+@dataclass
+class ResolutionResult:
+    registry_valid: bool
+    plugins: list[ResolvedPlugin] = field(default_factory=list)
+    issues: list[PluginIssue] = field(default_factory=list)
+    warnings: list[PluginIssue] = field(default_factory=list)
+
+
+@dataclass
+class _Snapshot:
+    registry: RegistryData
+    registry_path: Path
+    store_root: Path
+    # (name, artifact_id) -> reason_code | None (None == deep-valid).
+    validation: dict[tuple[str, str], str | None] = field(default_factory=dict)
+
+
+_snapshot: _Snapshot | None = None
+
+
+def reload_snapshot(*, registry_path: Path = REGISTRY_PATH,
+                    store_root: Path = STORE_ROOT) -> None:
+    """§3.9 mutation-sequencing seam: refresh the in-memory snapshot from
+    disk BEFORE agents are reconstructed. reload_full and every registry-
+    mutating tool call this; nothing else re-reads the registry file.
+
+    Sol F1: deep validation (full checksum, plugin_store.artifact_verdict)
+    runs HERE, once per referenced artifact per snapshot, cached — resolve_for
+    never checksums."""
+    import plugin_store  # local import: plugin_store imports this module
+    reg = load_registry(registry_path)
+    validation: dict[tuple[str, str], str | None] = {}
+    if reg.valid:
+        for entry in reg.entries:
+            key = (entry["name"], entry["artifact_id"])
+            path = Path(store_root) / entry["name"] / entry["artifact_id"]
+            if not path.is_dir():
+                validation[key] = "artifact_missing"
+            else:
+                # Sol R2-1: the ONE deep validator — identity vs the ENTRY
+                # (name/repo/revision/subdir/artifact_id) + checksum.
+                validation[key] = plugin_store.artifact_verdict(
+                    path,
+                    name=entry["name"],
+                    repo=entry["source"]["repo"],
+                    revision=entry["source"]["revision"],
+                    subdir=entry["source"].get("subdir", ""),
+                    artifact_id=entry["artifact_id"],
+                )
+    global _snapshot
+    _snapshot = _Snapshot(registry=reg, registry_path=Path(registry_path),
+                          store_root=Path(store_root), validation=validation)
+
+
+def _current() -> _Snapshot:
+    if _snapshot is None:
+        reload_snapshot()
+    return _snapshot
+
+
+def snapshot_registry() -> RegistryData:
+    return _current().registry
+
+
+def _resolve_entry(entry: dict, snap: "_Snapshot", target: str | None,
+                   ) -> tuple[ResolvedPlugin | None, PluginIssue | None,
+                              PluginIssue | None]:
+    """Returns (plugin, issue, warning) — plugin XOR issue."""
+    name = entry["name"]
+    artifact_id = entry["artifact_id"]
+    store_root = snap.store_root
+    deep = snap.validation.get((name, artifact_id), "artifact_missing")
+    if deep is not None:   # cached artifact_verdict result (Sol F1/R2-1):
+        return None, PluginIssue(name=name, target=target, stage="resolve",
+                                 reason_code=deep,
+                                 artifact_id=artifact_id), None
+    path = Path(store_root) / name / artifact_id
+    try:
+        manifest = json.loads(
+            (path / ".claude-plugin" / "plugin.json")
+            .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # Raced-away since snapshot load — treat as invalid, never partial.
+        return None, PluginIssue(name=name, target=target, stage="resolve",
+                                 reason_code="artifact_invalid",
+                                 artifact_id=artifact_id), None
+    warning = None
+    if entry["source"]["revision"].startswith("legacy-content:"):
+        warning = PluginIssue(name=name, target=target, stage="resolve",
+                              reason_code="legacy_provenance",
+                              artifact_id=artifact_id)
+    return ResolvedPlugin(
+        name=name, artifact_id=artifact_id, path=str(path),
+        version=str(manifest.get("version", entry.get("version", ""))),
+        manifest=manifest,
+    ), None, warning
+
+
+def _resolve(target: str | None) -> ResolutionResult:
+    snap = _current()
+    reg = snap.registry
+    if not reg.valid:
+        return ResolutionResult(registry_valid=False)
+    result = ResolutionResult(registry_valid=True)
+    for issue in reg.entry_issues:   # stage="registry"; Sol F2 + R2-2:
+        # attribution rides on the issue's OWN scoped_targets, captured at
+        # validation time from its own raw entry — never name-matched.
+        if target is None:
+            result.issues.append(issue)
+        elif target in issue.scoped_targets:
+            result.issues.append(PluginIssue(
+                name=issue.name, target=target, stage=issue.stage,
+                reason_code=issue.reason_code, artifact_id=issue.artifact_id,
+                scoped_targets=issue.scoped_targets))
+    for entry in reg.entries:
+        if target is not None and target not in entry.get("targets", []):
+            continue
+        plugin, issue, warning = _resolve_entry(entry, snap, target)
+        if plugin is not None:
+            result.plugins.append(plugin)
+        if issue is not None:
+            result.issues.append(issue)
+        if warning is not None:
+            result.warnings.append(warning)
+    return result
+
+
+def resolve_for(target: str) -> ResolutionResult:
+    return _resolve(target)
+
+
+def resolve_all() -> ResolutionResult:
+    return _resolve(None)
