@@ -1626,12 +1626,21 @@ async def _finalize_engagement(
     artifacts: list[str],
     next_steps: list[dict],
     driver: Any | None,
-) -> None:
+    stale_before: float | None = None,
+) -> bool:
     """End an engagement: update registry, close topic, NOTIFY Ellen,
     retain a tier-classified engagement summary on the shared ``casa`` bank.
 
     Never raises on channel/memory side-effects — logs warnings and continues
     so the registry always reaches a terminal state.
+
+    ``stale_before`` (reap only): the terminal transition wins ONLY if the
+    record's ``last_user_turn_ts`` is still older than this cutoff — a record
+    revived by a user turn since the reap snapshot is left live.
+
+    Returns ``True`` iff this call won the terminal transition and ran the
+    finalize side-effects; ``False`` if the record was already terminal or
+    the ``stale_before`` guard lost (so the reap doesn't count it).
     """
     now = time.time()
 
@@ -1645,13 +1654,15 @@ async def _finalize_engagement(
             engagement.id, outcome,
             completed_at=now if outcome == "completed" else None,
             error_kind="emit_completion_error", error_message=text,
+            stale_before=stale_before,
         )
         if not won:
             logger.info(
-                "Engagement %s already terminal — skipping duplicate finalize (outcome=%s)",
+                "Engagement %s not finalized — already terminal or revived "
+                "since snapshot (outcome=%s)",
                 engagement.id[:8], outcome,
             )
-            return
+            return False
 
     # [AR-4] Topic-retention ledger (2026-07-10 design): record the topic
     # for the retention sweep the moment the record flips terminal — both
@@ -1934,6 +1945,7 @@ async def _finalize_engagement(
             "Engagement %s finalized outcome=%s",
             engagement.id[:8], outcome,
         )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1954,9 +1966,22 @@ def _engagement_reap_days() -> float:
         return _ENGAGEMENT_REAP_DAYS_DEFAULT
 
 
-async def reap_stale_engagements(
-    *, driver: Any, ttl_days: float | None = None,
-) -> int:
+def _resolve_engagement_driver(rec: Any) -> Any | None:
+    """Resolve the driver that owns ``rec``'s engagement lifecycle.
+
+    ``claude_code`` executors run as s6-managed subprocesses that only the
+    claude_code driver stops/removes; everything else runs in-casa. Shared by
+    ``emit_completion``, ``cancel_engagement`` and ``reap_stale_engagements``
+    so all three tear down the RIGHT process. (D-4 fix v0.69.6: the reap used
+    the in-casa driver for every record, so reaping a claude_code executor
+    closed the topic but leaked its subprocess + workspace.)"""
+    import agent as agent_mod
+    attr = ("active_claude_code_driver" if rec.driver == "claude_code"
+            else "active_engagement_driver")
+    return getattr(agent_mod, attr, None)
+
+
+async def reap_stale_engagements(*, ttl_days: float | None = None) -> int:
     """Cancel engagements with no user turn for ``ttl_days`` (D-4, v0.69.0).
 
     Interrupted/abandoned engagements used to linger active/idle forever
@@ -1964,8 +1989,12 @@ async def reap_stale_engagements(
     2026-07-11). Runs in the daily engagement sweep BEFORE the idle-reminder
     pass so a to-be-reaped record doesn't get a pointless reminder in the
     same run. Goes through ``_finalize_engagement`` — the same funnel as a
-    manual cancel — so the topic is closed + ledger-recorded, Ellen is
-    notified, and the summary retain lands. Returns the number reaped.
+    manual cancel — so the topic is closed + ledger-recorded, the RIGHT
+    driver stops the process, Ellen is notified, and the summary retain
+    lands. ``stale_before=cutoff`` makes the staleness check part of the
+    locked terminal transition, so a record revived by a user turn between
+    the snapshot below and the transition is NOT cancelled. Returns the
+    number actually reaped.
     """
     if _engagement_registry is None:
         return 0
@@ -1985,16 +2014,19 @@ async def reap_stale_engagements(
             rec.id[:8], rec.kind, rec.role_or_type, idle_days, ttl_days,
         )
         try:
-            await _finalize_engagement(
+            won = await _finalize_engagement(
                 rec, outcome="cancelled",
                 text=(
                     f"Auto-closed after {idle_days} days with no activity "
                     f"(reap TTL {ttl_days:g}d). Start a new engagement to "
                     "continue this work."
                 ),
-                artifacts=[], next_steps=[], driver=driver,
+                artifacts=[], next_steps=[],
+                driver=_resolve_engagement_driver(rec),
+                stale_before=cutoff,
             )
-            reaped += 1
+            if won:
+                reaped += 1
         except Exception:  # noqa: BLE001 — one bad record must not stop the sweep
             logger.warning("reap of engagement %s failed", rec.id[:8], exc_info=True)
     return reaped

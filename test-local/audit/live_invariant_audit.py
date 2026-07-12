@@ -155,8 +155,20 @@ def check_engagements():
     except Exception as e:
         _fail("E/engagements", f"unparseable: {e}")
         return
-    recs = data if isinstance(data, list) else data.get("engagements", [])
-    bad = [r.get("id", "?")[:8] for r in recs
+    # Malformed-but-parseable JSON must record a FAIL, not crash the auditor
+    # (codex review, v0.69.6): a non-list/dict top level, non-dict rows, or a
+    # non-numeric last_user_turn_ts would otherwise raise past this function.
+    if isinstance(data, list):
+        recs = data
+    elif isinstance(data, dict):
+        recs = data.get("engagements", [])
+    else:
+        _fail("E/engagements", f"top-level is {type(data).__name__}, not list/object")
+        return
+    if not isinstance(recs, list) or any(not isinstance(r, dict) for r in recs):
+        _fail("E/engagements", "records is not a list of objects")
+        return
+    bad = [str(r.get("id", "?"))[:8] for r in recs
            if r.get("status") in ("active", "idle") and not r.get("topic_id")]
     # D-4 (v0.69.0): the daily sweep auto-reaps active/idle records past
     # ENGAGEMENT_REAP_DAYS (default 7). Anything older than TTL + 2d grace
@@ -165,12 +177,19 @@ def check_engagements():
         ttl_days = float(os.environ.get("ENGAGEMENT_REAP_DAYS", "") or 7)
     except ValueError:
         ttl_days = 7.0
+
+    def _last_turn(r):
+        try:
+            return float(r.get("last_user_turn_ts") or 0)
+        except (TypeError, ValueError):
+            return 0.0  # unparseable ts → treat as epoch (won't hide a stale one)
+
     stale = []
     if ttl_days > 0:
         cutoff = time.time() - (ttl_days + 2) * 86400
-        stale = [r.get("id", "?")[:8] for r in recs
+        stale = [str(r.get("id", "?"))[:8] for r in recs
                  if r.get("status") in ("active", "idle")
-                 and float(r.get("last_user_turn_ts") or 0) < cutoff]
+                 and _last_turn(r) < cutoff]
     if bad:
         _fail("E/engagements", f"active/idle without topic_id: {bad}")
     elif stale:

@@ -144,6 +144,7 @@ class EngagementRegistry:
             except OSError:
                 pass
             return
+        reconciled_any = False
         for row in raw:
             try:
                 rec = EngagementRecord(
@@ -176,6 +177,7 @@ class EngagementRegistry:
             # (update_user_turn flips it back), and visible to the reap sweep.
             if rec.status == "active":
                 rec.status = "idle"
+                reconciled_any = True
                 logger.info(
                     "boot reconcile: engagement %s active→idle "
                     "(no driver survives a restart)", rec.id[:8],
@@ -183,6 +185,17 @@ class EngagementRegistry:
             self._records[rec.id] = rec
             if rec.topic_id is not None:
                 self._topic_index[rec.topic_id] = rec.id
+
+        # v0.69.6: persist the reconcile so the on-disk tombstone matches the
+        # in-memory state immediately after boot. Without this the file kept
+        # showing "active" until the next mutation, and the disk-reading
+        # auditor (invariant E) saw the stale status. Only write when
+        # something actually changed (no needless boot churn). load() runs
+        # single-threaded during init, but take the lock for consistency with
+        # every other tombstone write.
+        if reconciled_any:
+            async with self._lock:
+                await self._write_tombstone_locked()
 
     def active_and_idle(self) -> list[EngagementRecord]:
         return [r for r in self._records.values() if r.status in ("active", "idle")]
@@ -362,6 +375,7 @@ class EngagementRegistry:
         completed_at: float | None = None,
         error_kind: str = "",
         error_message: str = "",
+        stale_before: float | None = None,
     ) -> bool:
         """Atomically move a record to a terminal status. Returns True only
         for the first caller; False if missing or already terminal.
@@ -373,10 +387,18 @@ class EngagementRegistry:
         authoritative gate — only the first caller to flip the record
         terminal may run finalize side effects (topic close, DelegationComplete
         NOTIFICATION, summary retain).
+
+        ``stale_before`` (reap, v0.69.6): win ONLY if ``last_user_turn_ts`` is
+        still older than the cutoff. The reap checks staleness before this
+        call at a suspension point away; without this guard a user turn that
+        revives the record in that window would still be reaped.
         """
         async with self._lock:
             rec = self._records.get(engagement_id)
             if rec is None or rec.status in ("completed", "cancelled", "error"):
+                return False
+            if stale_before is not None and rec.last_user_turn_ts >= stale_before:
+                # Revived since the reap snapshot — never cancel a live engagement.
                 return False
             rec.status = outcome if outcome in ("completed", "cancelled") else "error"
             rec.completed_at = completed_at if completed_at is not None else time.time()

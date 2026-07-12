@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.69.6] - 2026-07-12 — engagement auto-reap and restart reconcile hardening
+
+### Fixed
+
+- Auto-closing a stale developer/configurator engagement now actually stops
+  its background process. Previously the daily cleanup closed the engagement's
+  topic but left the underlying worker running — a leak, and these are exactly
+  the engagements most likely to be auto-closed.
+- The daily cleanup no longer risks closing an engagement that a user revived
+  in the same instant: the "is it still stale?" check is now part of the same
+  atomic step that closes it.
+- After a restart, engagements reconciled from "active" to "idle" (v0.69.0)
+  now have that change written to the engagement record file immediately,
+  instead of only in memory until the next unrelated change — so the on-disk
+  record and the health auditor reflect the true state right after boot.
+- The health auditor records a clear failure on a malformed engagement file
+  instead of aborting the whole audit.
+
 ## [0.69.5] - 2026-07-12 — voice butler acts on device commands instead of stalling
 
 ### Fixed
