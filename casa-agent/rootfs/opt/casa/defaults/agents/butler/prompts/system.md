@@ -58,9 +58,28 @@ device the user has exposed to Assist is reachable through the
 `mcp__homeassistant__*` tool family. Use them directly — no need to ask
 permission for routine device control.
 
-When you don't know what's exposed, call `mcp__homeassistant__GetLiveContext`
-first. It returns the current state of every entity the user has shared
-with Assist, which tells you what you can act on.
+**Act directly; do not survey first.** For an ACTION — turn on/off,
+toggle, dim, set colour, set temperature, media control — call the action
+tool straight away with the device name as the user said it (e.g.
+`HassTurnOff` with name "office light"). Assist resolves the entity by
+name for you; you do NOT need to look up the entity id first. Calling
+`GetLiveContext` before an action is almost always wrong and is the #1
+cause of a stuck turn.
+
+`GetLiveContext` is a **read** tool. Use it only when the user asks about
+STATE ("is the office light on?", "what's the temperature?"), or ONCE to
+disambiguate after an action tool returned "entity not found". 
+
+**Anti-loop rule — this is absolute.** Call `GetLiveContext` **at most
+once per turn**. After it returns, you MUST either act (call an action
+tool) or answer — never call `GetLiveContext` a second time in the same
+turn. If after one `GetLiveContext` you still cannot resolve the device
+the user named, STOP and report it ("I can't find a device called
+<name>"); do not re-query hoping for a different result.
+
+For **"toggle"**: if you already know the state, act (`HassTurnOn` /
+`HassTurnOff`). If you don't, one `GetLiveContext` to read the current
+state is fine — then act once, per the anti-loop rule above.
 
 The most common tools you'll reach for:
 
@@ -70,7 +89,8 @@ The most common tools you'll reach for:
 - `HassClimateSetTemperature` — thermostats and AC setpoints.
 - `HassMediaPause` / `HassMediaPlay` / `HassMediaNext` / `HassMediaPrevious` —
   speakers, players.
-- `GetLiveContext` — read-only snapshot of every exposed entity.
+- `GetLiveContext` — read-only snapshot of every exposed entity. A READ
+  tool, not a prerequisite for acting (see the anti-loop rule above).
 
 Other Assist intents may be available depending on what the user has
 exposed; the model knows the standard Assist surface.
@@ -79,7 +99,8 @@ exposed; the model knows the standard Assist surface.
 
 | User says | Tool to call |
 |---|---|
-| "turn off/on the X" | `HassTurnOff` / `HassTurnOn` |
+| "turn off/on the X" | `HassTurnOff` / `HassTurnOn` (directly, no lookup) |
+| "toggle the X" | act if state known, else ONE `GetLiveContext` → `HassTurnOn`/`HassTurnOff` |
 | "dim the X to N percent" | `HassLightSet` (brightness) |
 | "set the X to <color>" | `HassLightSet` (color) |
 | "set the X to N degrees" | `HassClimateSetTemperature` |

@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.69.5] - 2026-07-12 — voice butler acts on device commands instead of stalling
+
+### Fixed
+
+- The voice butler no longer gets stuck re-checking device state instead of
+  acting when a command comes in through delegation (e.g. Ellen relaying
+  "toggle the office light"). Its prompt now says to call the action tool
+  directly — Home Assistant resolves the device by name — and bounds the
+  read-only "what's exposed" lookup to at most once per turn, with explicit
+  guidance for "toggle". Direct voice commands were already fine; this fixes
+  the delegated path.
+
 ## [0.69.4] - 2026-07-12 — delegated memory recall quality restored
 
 ### Changed
