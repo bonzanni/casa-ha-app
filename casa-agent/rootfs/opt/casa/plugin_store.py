@@ -16,6 +16,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from plugin_registry import STORE_ROOT, compute_artifact_id, normalize_subdir
@@ -171,3 +172,265 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
     except (OSError, StoreError):
         return "corrupt_artifact"
     return None
+
+
+_REJECTED_REQ_TYPES = {"apt", "dpkg", "yum", "dnf", "pacman"}
+
+
+@dataclass(frozen=True)
+class PublishResult:
+    name: str
+    artifact_id: str
+    revision: str
+    version: str
+    path: str
+    manifest: dict
+
+
+def resolve_ref(repo: str, ref: str, *, timeout: float = 20.0) -> str:
+    """Resolve a ref to a 40-hex commit via the GitHub commits API (gh CLI).
+    HTTP 404 => RefNotFound (hard, pre-mutation). Anything else network/auth/
+    timeout/tooling => ResolveUnavailable (retryable). NEVER conflated."""
+    argv = ["gh", "api", f"repos/{repo}/commits/{ref}", "--jq", ".sha"]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise ResolveUnavailable(f"gh api timeout for {repo}@{ref}") from exc
+    except (FileNotFoundError, OSError) as exc:
+        raise ResolveUnavailable(f"gh unavailable: {exc}") from exc
+    if proc.returncode != 0:
+        err = (proc.stderr or "") + (proc.stdout or "")
+        if "HTTP 404" in err:
+            raise RefNotFound(f"{repo}@{ref} not found (HTTP 404)")
+        raise ResolveUnavailable(f"gh api failed for {repo}@{ref}: "
+                                 f"{err.strip()[:200]}")
+    out = proc.stdout.strip()
+    # `--jq .sha` prints the bare sha; tolerate full-JSON output too.
+    if out.startswith("{"):
+        try:
+            out = json.loads(out).get("sha", "")
+        except ValueError:
+            out = ""
+    sha = out.strip().strip('"')
+    if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha.lower()):
+        raise ResolveUnavailable(f"unparseable sha for {repo}@{ref}: {out!r}")
+    return sha.lower()
+
+
+def fetch_commit_tree(repo: str, commit: str, subdir: str, dest: Path,
+                      *, timeout: float = 300.0) -> None:
+    """Bare authenticated fetch of the exact commit -> `git archive` -> safe
+    extraction. Never a mutable .git working clone. Auth flows through
+    /etc/gitconfig + git-credential-casa.sh (GITHUB_TOKEN), anonymous for
+    public repos."""
+    url = f"https://github.com/{repo}.git"
+    subdir = normalize_subdir(subdir)
+    with tempfile.TemporaryDirectory(dir=str(Path(dest).parent)) as td:
+        bare = Path(td) / "bare.git"
+        tar_path = Path(td) / "tree.tar"
+        try:
+            subprocess.run(["git", "init", "--bare", "-q", str(bare)],
+                           check=True, capture_output=True, timeout=60)
+            subprocess.run(
+                ["git", "-C", str(bare), "fetch", "--depth", "1", "-q",
+                 url, commit],
+                check=True, capture_output=True, timeout=timeout)
+            argv = ["git", "-C", str(bare), "archive",
+                    "-o", str(tar_path), commit]
+            if subdir:
+                argv.append(subdir)
+            subprocess.run(argv, check=True, capture_output=True, timeout=120)
+        except subprocess.TimeoutExpired as exc:
+            raise ResolveUnavailable(f"git fetch/archive timeout: {repo}"
+                                     ) from exc
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or b"").decode("utf-8", "replace")[:200]
+            raise ResolveUnavailable(
+                f"git fetch/archive failed for {repo}@{commit}: {detail}",
+            ) from exc
+        extract_root = Path(td) / "x"
+        safe_extract_tar(tar_path, extract_root)
+        src = extract_root / subdir if subdir else extract_root
+        if not src.is_dir():
+            raise StoreError(f"subdir {subdir!r} absent at {repo}@{commit}",
+                             reason_code="manifest_invalid")
+        shutil.copytree(src, dest, dirs_exist_ok=True, symlinks=True)
+
+
+def manifest_sysreqs(manifest: dict) -> list:
+    """Guarded casa.systemRequirements extraction (Sol R2-3): tolerates a
+    non-object `casa` and non-list requirements. THE shared helper — used by
+    validate_manifest, plugin_add, and plugin_update; never re-derive inline."""
+    casa = manifest.get("casa") if isinstance(manifest, dict) else None
+    reqs = casa.get("systemRequirements") if isinstance(casa, dict) else None
+    return [r for r in reqs if isinstance(r, dict)] if isinstance(reqs, list) else []
+
+
+def validate_manifest(root: Path, expected_name: str) -> dict:
+    mf = Path(root) / ".claude-plugin" / "plugin.json"
+    try:
+        manifest = json.loads(mf.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise StoreError(f"plugin.json missing/unparseable: {exc}",
+                         reason_code="manifest_invalid") from exc
+    if not isinstance(manifest, dict):
+        raise StoreError("plugin.json not an object",
+                         reason_code="manifest_invalid")
+    if manifest.get("name") != expected_name:
+        raise StoreError(
+            f"manifest name {manifest.get('name')!r} != {expected_name!r}",
+            reason_code="name_mismatch")
+    if not isinstance(manifest.get("version"), str) or not manifest["version"]:
+        raise StoreError("manifest version missing",
+                         reason_code="manifest_invalid")
+    for req in manifest_sysreqs(manifest):
+        if req.get("type") in _REJECTED_REQ_TYPES:
+            raise StoreError(
+                f"package-manager requirement rejected: {req.get('type')}",
+                reason_code="apt_requirements_rejected")
+    return manifest
+
+
+def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
+                    store_root: Path) -> PublishResult:
+    """Shared tail: validate -> checksum -> metadata-in-staging -> rename."""
+    manifest = validate_manifest(staged, name)
+    artifact_id = compute_artifact_id(repo=repo, revision=revision,
+                                      subdir=subdir, name=name)
+    dest = Path(store_root) / name / artifact_id
+    if dest.exists():
+        # Idempotent re-publish: the existing copy must BE this artifact.
+        # artifact_verdict is the ONE deep validator (Sol R2-1) — identity
+        # mismatch or checksum failure both fail closed (spec 3.2).
+        verdict = artifact_verdict(dest, name=name, repo=repo,
+                                   revision=revision, subdir=subdir,
+                                   artifact_id=artifact_id)
+        if verdict is None:
+            shutil.rmtree(staged, ignore_errors=True)
+            return PublishResult(name, artifact_id, revision,
+                                 manifest["version"], str(dest), manifest)
+        raise StoreError(
+            f"existing destination fails validation ({verdict}): {dest}",
+            reason_code="corrupt_artifact")
+    checksum = content_checksum(staged)
+    write_metadata(staged, name=name, repo=repo, ref=ref, revision=revision,
+                   subdir=subdir, artifact_id=artifact_id,
+                   version=manifest["version"], checksum=checksum)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.rename(staged, dest)
+    return PublishResult(name, artifact_id, revision, manifest["version"],
+                         str(dest), manifest)
+
+
+def publish(*, name: str, repo: str, ref: str, subdir: str = "",
+            store_root: Path = STORE_ROOT,
+            staging_root: Path = STAGING_ROOT) -> PublishResult:
+    commit = resolve_ref(repo, ref)               # pre-mutation, may raise
+    revision = f"git:{commit}"
+    subdir = normalize_subdir(subdir)
+    artifact_id = compute_artifact_id(repo=repo, revision=revision,
+                                      subdir=subdir, name=name)
+    staged = Path(staging_root) / artifact_id
+    if staged.exists():
+        shutil.rmtree(staged)
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fetch_commit_tree(repo, commit, subdir, staged)
+        return _stage_and_swap(name=name, repo=repo, ref=ref,
+                               revision=revision, subdir=subdir,
+                               staged=staged, store_root=store_root)
+    except BaseException:
+        shutil.rmtree(staged, ignore_errors=True)
+        raise
+
+
+def publish_from_tree(*, name: str, repo: str, ref: str, revision: str,
+                      subdir: str, src_root: Path,
+                      store_root: Path = STORE_ROOT,
+                      staging_root: Path = STAGING_ROOT,
+                      exclude_git: bool = True) -> PublishResult:
+    subdir = normalize_subdir(subdir)
+    artifact_id = compute_artifact_id(repo=repo, revision=revision,
+                                      subdir=subdir, name=name)
+    staged = Path(staging_root) / artifact_id
+    if staged.exists():
+        shutil.rmtree(staged)
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        ignore = shutil.ignore_patterns(".git") if exclude_git else None
+        shutil.copytree(src_root, staged, symlinks=True, ignore=ignore)
+        # Drop a stale metadata file if the source was itself an artifact.
+        meta = staged / METADATA_FILENAME
+        if meta.exists():
+            meta.unlink()
+        return _stage_and_swap(name=name, repo=repo, ref=ref,
+                               revision=revision, subdir=subdir,
+                               staged=staged, store_root=store_root)
+    except BaseException:
+        shutil.rmtree(staged, ignore_errors=True)
+        raise
+
+
+def import_bundle(bundle_root: Path, store_root: Path = STORE_ROOT) -> list:
+    """Boot import of image-baked artifacts (§3.6). Idempotent, checksum-
+    verified, fail-closed on an existing-but-corrupt store copy."""
+    from plugin_registry import PluginIssue
+    issues: list[PluginIssue] = []
+    bundle_root = Path(bundle_root)
+    if not bundle_root.is_dir():
+        return issues
+    for name_dir in sorted(p for p in bundle_root.iterdir() if p.is_dir()):
+        for art_dir in sorted(p for p in name_dir.iterdir() if p.is_dir()):
+            dest = Path(store_root) / name_dir.name / art_dir.name
+            if dest.exists():
+                if not validate_artifact(dest):
+                    issues.append(PluginIssue(
+                        name=name_dir.name, target=None, stage="import",
+                        reason_code="corrupt_artifact",
+                        artifact_id=art_dir.name))
+                continue
+            tmp = dest.parent / f".import-{art_dir.name}"
+            try:
+                if tmp.exists():
+                    shutil.rmtree(tmp)
+                tmp.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(art_dir, tmp, symlinks=True)
+                if not validate_artifact(tmp):
+                    raise StoreError("bundle copy failed checksum",
+                                     reason_code="corrupt_artifact")
+                os.rename(tmp, dest)
+            except (OSError, StoreError) as exc:
+                shutil.rmtree(tmp, ignore_errors=True)
+                code = getattr(exc, "reason_code", "import_failed")
+                issues.append(PluginIssue(
+                    name=name_dir.name, target=None, stage="import",
+                    reason_code=code, artifact_id=art_dir.name))
+    return issues
+
+
+def gc_sweep(*, store_root: Path = STORE_ROOT, referenced: set[str],
+             min_age_days: int = 7, enabled: bool = False) -> list[str]:
+    """§3.12 conservative GC. SHIPS DISABLED: no production caller passes
+    enabled=True this release; with enabled=False only reports candidates."""
+    import time
+    cutoff = time.time() - min_age_days * 86400
+    candidates: list[str] = []
+    root = Path(store_root)
+    if not root.is_dir():
+        return candidates
+    for name_dir in root.iterdir():
+        if not name_dir.is_dir():
+            continue
+        for art_dir in name_dir.iterdir():
+            if not art_dir.is_dir() or art_dir.name in referenced:
+                continue
+            try:
+                if art_dir.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+            candidates.append(art_dir.name)
+            if enabled:
+                shutil.rmtree(art_dir, ignore_errors=True)
+    return sorted(candidates)
