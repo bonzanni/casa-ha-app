@@ -356,8 +356,20 @@ class Agent:
                 text = ""
 
         if text and channel is not None:
+            # Rich-text (v0.70.0) renders only genuine agent responses
+            # (error_kind is None). Error/system text stays plain via the
+            # original finalize_stream/send paths.
             if on_token is not None and hasattr(channel, "finalize_stream"):
-                await channel.finalize_stream(text, msg.context, on_token)
+                if error_kind is None and hasattr(
+                    channel, "finalize_response_stream",
+                ):
+                    await channel.finalize_response_stream(
+                        text, msg.context, on_token,
+                    )
+                else:
+                    await channel.finalize_stream(text, msg.context, on_token)
+            elif error_kind is None and hasattr(channel, "send_response"):
+                await channel.send_response(text, msg.context)
             else:
                 await channel.send(text, msg.context)
         elif channel is not None and hasattr(channel, "turn_finished"):

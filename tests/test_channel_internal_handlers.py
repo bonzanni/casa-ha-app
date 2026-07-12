@@ -46,6 +46,13 @@ class _FakeChannel:
         )
         return msg_id
 
+    async def send_response_to_topic(
+        self, thread_id: int, text: str, **kwargs: Any,
+    ) -> int:
+        # v0.70.0: CC reply handler routes here; rich rendering lives in the real
+        # TelegramChannel — the fake just records via the plain path.
+        return await self.send_to_topic(thread_id, text, **kwargs)
+
 
 class _FakeRecord:
     def __init__(

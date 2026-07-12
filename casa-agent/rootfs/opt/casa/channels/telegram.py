@@ -23,7 +23,9 @@ from typing import Any, Awaitable, Callable
 
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.error import NetworkError, TelegramError, TimedOut
+from telegram.error import BadRequest, NetworkError, TelegramError, TimedOut
+
+from channels.tg_richtext import render
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -84,6 +86,23 @@ def _resolve_chat_id(context: dict[str, Any], default: int | str) -> int | str:
         except ValueError:
             return default
     return default
+
+
+def _peek_stream_message_id(on_token: "OnTokenCallback") -> int | None:
+    """Recover the streamed message_id from the on_token closure state.
+
+    Mirrors the closure-peek in ``finalize_stream``; ``None`` means streaming
+    never sent a message (block mode, or an empty/suppressed stream).
+    """
+    if hasattr(on_token, "__closure__") and on_token.__closure__:
+        for cell in on_token.__closure__:
+            try:
+                val = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(val, dict) and "message_id" in val:
+                return val["message_id"]
+    return None
 
 # M11 (v0.52.0): MarkdownV2 escaping for permission-relay text. Telegram
 # rejects a message with parse_mode="MarkdownV2" if reserved chars in the
@@ -1376,6 +1395,111 @@ class TelegramChannel(Channel):
                 text=chunk,
             )
 
+    # ------------------------------------------------------------------
+    # Rich-text response delivery (v0.70.0). ONLY reached via the
+    # response-provenant methods below (agent.py gates on error_kind is None);
+    # send()/send_to_topic()/finalize_stream() stay plain for tools, bus
+    # routing, notices, permission prompts, and error text.
+    # ------------------------------------------------------------------
+
+    async def _send_one(self, chat_id, original, display, entities, **kw):
+        """Send one ≤4096 message with entities; on entity BadRequest resend the
+        ORIGINAL text plain (exactly one retry — a TimedOut etc. propagates so we
+        never duplicate a message Telegram may already have accepted)."""
+        try:
+            return await self._app.bot.send_message(
+                chat_id=chat_id, text=display, entities=entities, **kw,
+            )
+        except BadRequest as exc:
+            logger.warning("rich-text send fell back to plain: %s", exc)
+            return await self._app.bot.send_message(
+                chat_id=chat_id, text=original, **kw,
+            )
+
+    async def send_response(self, message: str, context: dict[str, Any]) -> None:
+        """Block-mode agent response with rich-text rendering (plain fallback)."""
+        if self._app is None:
+            logger.warning("Telegram channel not started; cannot send message")
+            return
+        if not self._rich_text_enabled:
+            await self.send(message, context)
+            return
+        display, entities = render(message)
+        if entities is None:
+            await self.send(message, context)
+            return
+        target_chat = _resolve_chat_id(context, self.chat_id)
+        self._stop_typing(str(target_chat))
+        await self._send_one(target_chat, message, display, entities)
+
+    async def finalize_response_stream(
+        self, full_text: str, context: dict[str, Any], on_token: OnTokenCallback,
+    ) -> None:
+        """Streamed agent response: apply entities on the final edit only.
+
+        Block mode / no streamed message → send_response(). Plain (no markup) or
+        oversize → the existing plain finalize_stream(). Entity edit falls back to
+        the ORIGINAL text edited into the SAME message on BadRequest."""
+        if self._app is None:
+            return
+        if not self._rich_text_enabled:
+            await self.finalize_stream(full_text, context, on_token)
+            return
+        if self._delivery_mode != "stream":
+            await self.send_response(full_text, context)
+            return
+        message_id = _peek_stream_message_id(on_token)
+        if message_id is None:
+            await self.send_response(full_text, context)
+            return
+        display, entities = render(full_text)
+        if entities is None:
+            await self.finalize_stream(full_text, context, on_token)
+            return
+        target_chat = _resolve_chat_id(context, self.chat_id)
+        self._stop_typing(str(target_chat))
+        try:
+            try:
+                await self._app.bot.edit_message_text(
+                    chat_id=target_chat, message_id=message_id,
+                    text=display, entities=entities,
+                )
+            except BadRequest:
+                await self._app.bot.edit_message_text(
+                    chat_id=target_chat, message_id=message_id, text=full_text,
+                )
+        except TelegramError as exc:
+            if "not modified" not in str(exc).lower():
+                logger.warning("Final stream edit failed: %s", exc)
+
+    async def send_response_to_topic(
+        self, thread_id: int, text: str, **kwargs,
+    ) -> int:
+        """Post an agent response into an engagement topic with rich text.
+
+        Used by the Claude-Code reply handler and by TopicStreamHandle's
+        single-message finalize. Plain (no markup) → send_to_topic verbatim; on
+        entity BadRequest resend the ORIGINAL text plain."""
+        if not self._rich_text_enabled:
+            return await self.send_to_topic(thread_id, text, **kwargs)
+        display, entities = render(text)
+        if entities is None:
+            return await self.send_to_topic(thread_id, text, **kwargs)
+        if not self.engagement_supergroup_id:
+            raise RuntimeError("engagement supergroup not configured")
+        try:
+            msg = await self.bot.send_message(
+                chat_id=self.engagement_supergroup_id, text=display,
+                message_thread_id=thread_id, entities=entities, **kwargs,
+            )
+        except BadRequest as exc:
+            logger.warning("topic rich-text fell back to plain: %s", exc)
+            msg = await self.bot.send_message(
+                chat_id=self.engagement_supergroup_id, text=text,
+                message_thread_id=thread_id, **kwargs,
+            )
+        return msg.message_id
+
     async def turn_finished(self, context: dict[str, Any]) -> None:
         """L7 (v0.52.0): teardown for turns that end WITHOUT delivery.
 
@@ -1590,6 +1714,20 @@ class TopicStreamHandle:
             return
 
         if self._message_id is None:
+            # No prior emit: one fresh message. Rich-render when it fits a single
+            # Telegram message; otherwise fall back to the plain split-send.
+            if (
+                self._channel._rich_text_enabled
+                and len(full_text) <= _TG_MAX_LENGTH
+            ):
+                try:
+                    await self._channel.send_response_to_topic(
+                        self._topic_id, full_text,
+                    )
+                    return
+                except TelegramError as exc:
+                    logger.warning("Stream finalize rich send failed: %s", exc)
+                    return
             for chunk in _split_message(full_text):
                 try:
                     await bot.send_message(
@@ -1602,12 +1740,29 @@ class TopicStreamHandle:
             return
 
         if len(full_text) <= _TG_MAX_LENGTH:
+            display, entities = (full_text, None)
+            if self._channel._rich_text_enabled:
+                display, entities = render(full_text)
             try:
-                await bot.edit_message_text(
-                    chat_id=self._channel.engagement_supergroup_id,
-                    message_id=self._message_id,
-                    text=full_text,
-                )
+                if entities is not None:
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=self._channel.engagement_supergroup_id,
+                            message_id=self._message_id,
+                            text=display, entities=entities,
+                        )
+                    except BadRequest:
+                        await bot.edit_message_text(
+                            chat_id=self._channel.engagement_supergroup_id,
+                            message_id=self._message_id,
+                            text=full_text,
+                        )
+                else:
+                    await bot.edit_message_text(
+                        chat_id=self._channel.engagement_supergroup_id,
+                        message_id=self._message_id,
+                        text=full_text,
+                    )
             except TelegramError as exc:
                 if "not modified" not in str(exc).lower():
                     logger.warning("Stream finalize edit failed: %s", exc)
