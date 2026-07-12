@@ -166,8 +166,9 @@ class TestRegistryStateTransitions:
         tombstone.write_text(json.dumps([
             {**base, "id": "e-active", "status": "active", "topic_id": 1},
             {**base, "id": "e-idle", "status": "idle", "topic_id": 2},
+            # recent completed_at so the 30d tombstone-prune keeps it.
             {**base, "id": "e-done", "status": "completed", "topic_id": 3,
-             "completed_at": 2000.0},
+             "completed_at": time.time()},
         ]))
         reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
         await reg.load()
@@ -175,6 +176,30 @@ class TestRegistryStateTransitions:
         assert reg.get("e-idle").status == "idle"
         assert reg.get("e-done").status == "completed"
         assert {r.id for r in reg.active_and_idle()} == {"e-active", "e-idle"}
+        # v0.69.6: the reconcile must be PERSISTED — the disk-reading auditor
+        # (invariant E) must not keep seeing the stale "active" until some
+        # later mutation happens to rewrite the file.
+        on_disk = {r["id"]: r["status"] for r in json.loads(tombstone.read_text())}
+        assert on_disk["e-active"] == "idle", "boot reconcile must persist to disk"
+        assert on_disk["e-idle"] == "idle"
+        assert on_disk["e-done"] == "completed"
+
+    async def test_load_without_reconcile_does_not_rewrite(self, tmp_path):
+        """No active records → nothing to reconcile → load() must not rewrite
+        the file (avoid needless boot churn / mtime bump)."""
+        from engagement_registry import EngagementRegistry
+
+        tombstone = tmp_path / "engagements.json"
+        tombstone.write_text(json.dumps([{
+            "id": "e-idle", "kind": "specialist", "role_or_type": "finance",
+            "driver": "in_casa", "status": "idle", "topic_id": 2,
+            "started_at": 1000.0, "last_user_turn_ts": 1000.0,
+            "origin": {}, "task": "t",
+        }]))
+        before = tombstone.read_text()
+        reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        await reg.load()
+        assert tombstone.read_text() == before, "load() rewrote with nothing to reconcile"
 
     async def test_recent_for_origin_survives_restart_via_tombstone(self, tmp_path):
         """D-4: the P32 duplicate-task guard reads recent engagements from

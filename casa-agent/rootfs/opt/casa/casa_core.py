@@ -1986,9 +1986,11 @@ async def main() -> None:
     # a record past the reap TTL is cancelled outright and must not receive
     # a pointless idle reminder in the same daily run.
     async def _engagement_daily_sweep() -> None:
+        # reap resolves the per-record driver itself (claude_code executors
+        # need the claude_code driver — v0.69.6); no driver arg here.
         from tools import reap_stale_engagements
         try:
-            reaped = await reap_stale_engagements(driver=engagement_driver)
+            reaped = await reap_stale_engagements()
             if reaped:
                 logger.info("engagement sweep: reaped %d stale engagement(s)", reaped)
         except Exception:  # noqa: BLE001 — reap failure must not starve the idle pass
