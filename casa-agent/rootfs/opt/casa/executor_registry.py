@@ -21,12 +21,18 @@ class ExecutorRegistry:
         self._dir = executors_dir
         self._defs: dict[str, ExecutorDefinition] = {}
         self._disabled: set[str] = set()
+        # Disabled executors' definitions, kept so verify/health can validate a
+        # plugin assigned to a currently-disabled executor (the executor being
+        # off by config is not a plugin-health failure). NEVER exposed via get()
+        # — engagement launch relies on get()==None to refuse a disabled type.
+        self._disabled_defs: dict[str, ExecutorDefinition] = {}
 
     def load(self) -> None:
         from agent_loader import LoadError, load_all_executors
 
         self._defs.clear()
         self._disabled.clear()
+        self._disabled_defs.clear()
 
         base = os.path.dirname(self._dir)
         try:
@@ -47,6 +53,7 @@ class ExecutorRegistry:
             if not defn.enabled:
                 logger.info("Executor %r bundled but disabled", type_name)
                 self._disabled.add(type_name)
+                self._disabled_defs[type_name] = defn
                 continue
             self._defs[type_name] = defn
             logger.info(
@@ -63,6 +70,17 @@ class ExecutorRegistry:
 
     def get(self, type_name: str) -> ExecutorDefinition | None:
         return self._defs.get(type_name)
+
+    def is_disabled(self, type_name: str) -> bool:
+        """True iff ``type_name`` loaded but is config-disabled (enabled: false)."""
+        return type_name in self._disabled
+
+    def definition_any(self, type_name: str) -> ExecutorDefinition | None:
+        """The definition whether the executor is ENABLED or DISABLED — for
+        verify/health only, so a plugin assigned to a disabled executor can still
+        have its tools.allowed inspected. Engagement launch must keep using
+        ``get()`` (None for disabled) to refuse a disabled type."""
+        return self._defs.get(type_name) or self._disabled_defs.get(type_name)
 
     def list_types(self) -> list[str]:
         return sorted(self._defs.keys())

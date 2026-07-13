@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.71.1] - 2026-07-13
+
+### Fixed
+
+- **Plugin health no longer false-alarms on a disabled executor.** A plugin
+  assigned to an executor that is disabled by config (`enabled: false`, e.g.
+  the plugin-developer toolbox before it is turned on) was reported
+  `authorization_missing` — because a disabled executor is absent from the
+  registry lookup, its `tools.allowed` read as empty and every derived MCP grant
+  looked unauthorized, sending a spurious plugin-health notice on every boot.
+  `verify_plugin_state` now recognises a disabled-executor target as
+  dormant-by-config (`state: "disabled"`, never not-ready) and validates its
+  authorization against the disabled definition, so the check is real again the
+  moment the executor is enabled.
+- **Enabling an executor refreshes plugin health.** `casa_reload(scope="executors")`
+  (which picks up an `enabled:` flip) now regenerates the plugin-health report and
+  re-notifies, so turning an executor on immediately surfaces any real
+  `authorization_missing` for its assigned plugins instead of leaving the report
+  stale-green until an unrelated trigger.
+
 ## [0.71.0] - 2026-07-13 — unified plugin architecture
 
 ### Changed
