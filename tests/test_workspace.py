@@ -442,17 +442,14 @@ class TestProvisionWorkspace:
         from pathlib import Path
         from drivers.workspace import provision_workspace
 
-        # Build a minimal workspace-template/ + plugins.yaml so template path fires.
+        # Build a minimal workspace-template/ so the template path fires
+        # (§3.3: selection is independent of any plugins.yaml).
         defn = self._make_defn(tmp_path, executor_type="tpl-fixture")
         exec_dir = tmp_path / "defaults-executors" / "tpl-fixture"
         tpl_root = exec_dir / "workspace-template"
         tpl_root.mkdir()
         (tpl_root / "CLAUDE.md.tmpl").write_text(
             "Tpl: type={executor_type} task={task}"
-        )
-        plugins_yaml = exec_dir / "plugins.yaml"
-        plugins_yaml.write_text(
-            "schema_version: 1\nplugins: []\n"
         )
 
         ws = tmp_path / "engagements"
@@ -463,7 +460,6 @@ class TestProvisionWorkspace:
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="http://x",
             workspace_template_root=tpl_root,
-            plugins_yaml=plugins_yaml,
         )
         # Regression: HOME dir must exist even when template path fired.
         assert (Path(path) / ".home" / ".claude" / "plugins").is_dir()

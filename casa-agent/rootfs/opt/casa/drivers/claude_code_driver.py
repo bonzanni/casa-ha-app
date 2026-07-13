@@ -98,14 +98,12 @@ class ClaudeCodeDriver(DriverProtocol):
                         token_budget=defn.memory.token_budget,
                     )
 
-                # L-1 (v0.34.2): pass workspace_template_root + plugins_yaml so
-                # claude_code executors with a workspace-template/ (e.g.
-                # plugin-developer) flow through the template path.
+                # §3.3: a workspace-template/ (e.g. plugin-developer) selects
+                # the template render path — independent of plugin assignment.
                 exec_dir = Path(defn.prompt_template_path).parent
                 template_root = exec_dir / "workspace-template"
-                plugins_yaml_path = exec_dir / "plugins.yaml"
 
-                # 1. Provision workspace (CLAUDE.md, .mcp.json, plugins, FIFO, meta).
+                # 1. Provision workspace (CLAUDE.md, .mcp.json, FIFO, meta).
                 ws = await provision_workspace(
                     engagements_root=self._engagements_root,
                     engagement_id=engagement.id,
@@ -117,9 +115,6 @@ class ClaudeCodeDriver(DriverProtocol):
                     workspace_template_root=(
                         template_root if template_root.is_dir() else None
                     ),
-                    plugins_yaml=(
-                        plugins_yaml_path if plugins_yaml_path.is_file() else None
-                    ),
                     executor_memory=executor_memory_block,
                 )
                 write_casa_meta(
@@ -129,6 +124,9 @@ class ClaudeCodeDriver(DriverProtocol):
                     status="UNDERGOING",
                     created_at=_iso_now(),
                     finished_at=None, retention_until=None,
+                    # §3.8: record the pinned artifacts with the workspace meta.
+                    plugin_artifacts=list(
+                        getattr(engagement, "plugin_artifacts", ()) or ()),
                 )
 
                 # 2. Write the s6 service pair (sibling logger service
@@ -143,6 +141,9 @@ class ClaudeCodeDriver(DriverProtocol):
                     permission_mode=defn.permission_mode or "acceptEdits",
                     extra_dirs=list(defn.extra_dirs),
                     extra_env=extra_env or None,
+                    # §3.8: load the pinned artifacts via --plugin-dir flags.
+                    plugin_dirs=[pa["path"] for pa in
+                                 getattr(engagement, "plugin_artifacts", ()) or ()],
                 )
                 log_script = render_log_run_script(engagement_id=engagement.id)
                 s6_rc.write_service_dir(

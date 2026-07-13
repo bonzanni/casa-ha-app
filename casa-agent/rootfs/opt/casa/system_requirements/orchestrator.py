@@ -69,7 +69,8 @@ def install_requirements(
     """
     reqs = list(requirements)
 
-    # Pre-check for rejected types (defense-in-depth vs marketplace_ops).
+    # Pre-check for rejected types (defense-in-depth vs
+    # plugin_store.validate_manifest's P-10 apt rejection).
     for req in reqs:
         rtype = req.get("type")
         if rtype in _REJECTED:

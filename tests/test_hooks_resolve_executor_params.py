@@ -33,7 +33,7 @@ def _handler():
     hooks_yaml = {"pre_tool_use": [
         {"policy": "path_scope",
          "writable": ["/data/engagements/"],
-         "readable": ["/data/engagements/", "/opt/claude-seed"]},
+         "readable": ["/data/engagements/", "/config/plugins/store"]},
         {"policy": "commit_size_guard", "max_files": 50},
     ]}
     return _make_internal_hooks_resolve_handler(
@@ -68,7 +68,7 @@ async def test_read_inside_declared_readable_prefix_is_allowed():
             "policy": "path_scope",
             "payload": {"tool_name": "Read",
                         "cwd": f"/data/engagements/{ENG_ID}",
-                        "tool_input": {"file_path": "/opt/claude-seed/x.md"}}})
+                        "tool_input": {"file_path": "/config/plugins/store/x.md"}}})
         assert await resp.json() == {}
 
 

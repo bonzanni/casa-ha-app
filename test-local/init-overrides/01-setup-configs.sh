@@ -138,38 +138,8 @@ else
     rm -f "$SECRET_FILE"
 fi
 
-# === seed-copy: begin (test override) ===========================
-# Mirror of the production setup-configs.sh seed-copy block. The test
-# image's `claude` is the real CLI (Dockerfile.test installs it), and
-# /opt/claude-seed/ is populated at image build time by Dockerfile's
-# `claude plugin install` lines. This block populates cc-home from the
-# seed so e2e/test_invoke_sessions.sh::C-4 sees the 5 default plugins.
-SEED_DIR="${SEED_DIR:-/opt/claude-seed}"
-CC_HOME="${CC_HOME:-/config/cc-home}"
-CC_PLUGINS_DIR="$CC_HOME/.claude/plugins"
-
-if [ -d "$SEED_DIR" ] && [ ! -f "$CC_PLUGINS_DIR/installed_plugins.json" ]; then
-    echo "[INFO] Seeding cc-home plugin state from $SEED_DIR (test mode)"
-    mkdir -p "$CC_PLUGINS_DIR/cache"
-    if [ ! -e "$CC_PLUGINS_DIR/cache/casa-plugins-defaults" ]; then
-        ln -s "$SEED_DIR/cache/casa-plugins-defaults" \
-              "$CC_PLUGINS_DIR/cache/casa-plugins-defaults"
-    fi
-    cp "$SEED_DIR/installed_plugins.json" "$CC_PLUGINS_DIR/installed_plugins.json"
-    if [ ! -f "$CC_PLUGINS_DIR/known_marketplaces.json" ]; then
-        cp "$SEED_DIR/known_marketplaces.json" "$CC_PLUGINS_DIR/known_marketplaces.json"
-    fi
-    if [ ! -d "$CC_PLUGINS_DIR/marketplaces" ]; then
-        cp -r "$SEED_DIR/marketplaces" "$CC_PLUGINS_DIR/marketplaces"
-    fi
-    # CACHE_DIR-mode install at build leaves enabled=false; flip via
-    # runtime enable so the binding layer's enabled-filter passes them.
-    HOME="$CC_HOME" claude plugin enable superpowers@casa-plugins-defaults    >/dev/null 2>&1 || true
-    HOME="$CC_HOME" claude plugin enable plugin-dev@casa-plugins-defaults     >/dev/null 2>&1 || true
-    HOME="$CC_HOME" claude plugin enable skill-creator@casa-plugins-defaults  >/dev/null 2>&1 || true
-    HOME="$CC_HOME" claude plugin enable mcp-server-dev@casa-plugins-defaults >/dev/null 2>&1 || true
-    HOME="$CC_HOME" claude plugin enable context7@casa-plugins-defaults       >/dev/null 2>&1 || true
-fi
-# === seed-copy: end ==============================================
+# v0.71.0: no seed-copy in the test override. Plugin materialization is the
+# init-plugin-store s6 oneshot (plugin_boot.py), which runs unmodified in the
+# test image (bundled artifacts baked at Dockerfile.test build time).
 
 echo "[INFO] Configuration setup complete (local test mode)."

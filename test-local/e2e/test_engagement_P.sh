@@ -76,50 +76,41 @@ MSYS_NO_PATHCONV=1 docker run -d --rm --name "$NAME" \
 wait_healthy "$NAME"
 pass "P-block container healthy"
 
-log "P-1: plugin-developer workspace provisioning"
+log "P-1: plugin-developer executor plugins load via --plugin-dir (§3.8)"
 run_harness "P-1" "$(cat <<'PY'
-import asyncio, pathlib, json, sys
+import sys
 sys.path.insert(0, "/opt/casa")
 
-async def main():
-    from drivers.workspace import provision_workspace
-    from executor_registry import ExecutorRegistry
+# §3.3/§3.8: executor plugins are NOT provisioned into settings.json anymore.
+# They resolve from the registry (resolve_for(executor:<type>) — the exact
+# call tools.py makes at engagement launch) to immutable store paths, which
+# the driver renders as repeated --plugin-dir flags on the run script.
+import plugin_registry
+from drivers.workspace import render_run_script
 
-    exec_reg = ExecutorRegistry("/opt/casa/defaults/agents/executors")
-    exec_reg.load()
-    defn = exec_reg.get("plugin-developer")
-    assert defn is not None, "plugin-developer executor not found in registry"
+res = plugin_registry.resolve_for("executor:plugin-developer")
+assert res.registry_valid, (
+    f"registry invalid: {[i.reason_code for i in res.issues]}")
+names = {p.name for p in res.plugins}
+assert "superpowers" in names, (
+    f"superpowers not resolved for plugin-developer: {sorted(names)}")
 
-    ws = await provision_workspace(
-        engagements_root="/tmp/p1-engagements",
-        engagement_id="p1test00000000000000000000000001",
-        defn=defn,
-        task="test plugin",
-        context="t=1",
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
-        workspace_template_root=pathlib.Path(
-            "/opt/casa/defaults/agents/executors/plugin-developer/workspace-template"
-        ),
-        plugins_yaml=pathlib.Path(
-            "/opt/casa/defaults/agents/executors/plugin-developer/plugins.yaml"
-        ),
-    )
+sp = next(p for p in res.plugins if p.name == "superpowers")
+assert sp.path.startswith("/config/plugins/store/superpowers/"), (
+    f"superpowers store path unexpected: {sp.path}")
 
-    ws_path = pathlib.Path(ws)
-    assert (ws_path / "CLAUDE.md").exists(), "CLAUDE.md missing"
-    assert (ws_path / ".claude" / "settings.json").exists(), ".claude/settings.json missing"
-
-    settings = json.loads((ws_path / ".claude" / "settings.json").read_text())
-    enabled = settings.get("enabledPlugins", {})
-    assert "superpowers@casa-plugins-defaults" in enabled, (
-        f"superpowers@casa-plugins-defaults not in enabledPlugins: {list(enabled)}"
-    )
-    print("P-1 OK")
-
-asyncio.run(main())
+script = render_run_script(
+    engagement_id="p1test00000000000000000000000001",
+    permission_mode="default",
+    extra_dirs=[],
+    plugin_dirs=[p.path for p in res.plugins],
+)
+assert "--plugin-dir /config/plugins/store/superpowers/" in script, (
+    f"--plugin-dir superpowers flag missing from run script:\n{script}")
+print("P-1 OK")
 PY
 )"
-pass "P-1: plugin-developer workspace provisioned with correct enabledPlugins"
+pass "P-1: plugin-developer run script pins plugins via --plugin-dir"
 
 # ---------------------------------------------------------------------------
 # P-2 — mock gh CLI present
@@ -146,57 +137,57 @@ PY
 pass "P-3: emit_completion present in CASA_TOOLS"
 
 # ---------------------------------------------------------------------------
-# P-4 — install_casa_plugin tool registered
+# P-4 — plugin_add tool registered (§3.13; replaces install_casa_plugin)
 # ---------------------------------------------------------------------------
-log "P-4: Configurator install_casa_plugin tool registered"
+log "P-4: Configurator plugin_add tool registered"
 run_harness "P-4" "$(cat <<'PY'
 import sys
 sys.path.insert(0, "/opt/casa")
 import tools
-assert hasattr(tools, "_tool_install_casa_plugin"), (
-    "install tool missing: _tool_install_casa_plugin not in tools module"
-)
+names = {getattr(t, "name", None) for t in tools.CASA_TOOLS}
+assert "plugin_add" in names, f"plugin_add not in CASA_TOOLS: {sorted(n for n in names if n)}"
+assert hasattr(tools, "plugin_add"), "plugin_add tool object missing from module"
+assert hasattr(tools, "_plugin_add_sync"), "_plugin_add_sync core missing"
 print("P-4 OK")
 PY
 )"
-pass "P-4: _tool_install_casa_plugin present in tools module"
+pass "P-4: plugin_add registered in CASA_TOOLS"
 
 # ---------------------------------------------------------------------------
-# P-5 — uninstall_casa_plugin tool registered
+# P-5 — plugin_remove tool registered (§3.13; replaces uninstall_casa_plugin)
 # ---------------------------------------------------------------------------
-log "P-5: uninstall_casa_plugin tool registered"
+log "P-5: Configurator plugin_remove tool registered"
 run_harness "P-5" "$(cat <<'PY'
 import sys
 sys.path.insert(0, "/opt/casa")
 import tools
-assert hasattr(tools, "_tool_uninstall_casa_plugin"), (
-    "uninstall tool missing: _tool_uninstall_casa_plugin not in tools module"
-)
+names = {getattr(t, "name", None) for t in tools.CASA_TOOLS}
+assert "plugin_remove" in names, f"plugin_remove not in CASA_TOOLS: {sorted(n for n in names if n)}"
+assert hasattr(tools, "plugin_remove"), "plugin_remove tool object missing from module"
+assert hasattr(tools, "_plugin_remove_sync"), "_plugin_remove_sync core missing"
 print("P-5 OK")
 PY
 )"
-pass "P-5: _tool_uninstall_casa_plugin present in tools module"
+pass "P-5: plugin_remove registered in CASA_TOOLS"
 
 # ---------------------------------------------------------------------------
-# P-6 — marketplace_read_only guard: removing a plugin that is not in the
-#        user marketplace returns an error containing "not found"
+# P-6 — plugin_remove refuses an unregistered plugin (registry guard; the
+#        marketplace read-only guard's successor). Uses the sync core on a
+#        name NOT in the registry so the live registry is never mutated.
 # ---------------------------------------------------------------------------
-log "P-6: marketplace_read_only guard on casa-plugins-defaults"
+log "P-6: plugin_remove refuses an unregistered plugin"
 run_harness "P-6" "$(cat <<'PY'
-import sys, json
+import sys
 sys.path.insert(0, "/opt/casa")
-from tools import _tool_marketplace_remove_plugin
+from tools import _plugin_remove_sync
 
-r = _tool_marketplace_remove_plugin(plugin_name="superpowers")
-assert r.get("removed") is False, f"expected removed=False, got {r}"
-err = r.get("error", "")
-assert "not found" in err.lower(), (
-    f"expected 'not found' in error, got: {err!r}"
-)
-print("P-6 OK (seed plugin not in user mkt)")
+r = _plugin_remove_sync(name="p6-definitely-not-registered")
+assert r.get("ok") is False, f"expected ok=False, got {r}"
+assert r.get("kind") == "not_registered", f"expected not_registered, got {r}"
+print("P-6 OK (unregistered plugin refused)")
 PY
 )"
-pass "P-6: marketplace_read_only guard — seed plugin not removable from user mkt"
+pass "P-6: plugin_remove refuses an unregistered plugin (not_registered)"
 
 # ---------------------------------------------------------------------------
 # P-7 — tarball systemRequirements infrastructure importable
@@ -266,6 +257,49 @@ asyncio.run(main())
 PY
 )"
 pass "P-9: self_containment_guard denies push with anti-pattern README"
+
+# ---------------------------------------------------------------------------
+# P-10 — real-artifact authorization proof (Sol R2-5): verify_plugin_state on
+#         the REAL materialized context7 bundle × the REAL plugin-developer
+#         definition reports no missing authorization for its namespace.
+#         Sol R3: plugin-developer ships enabled:false, so the running
+#         registry's get() returns None — load the definition directly
+#         (load_all_executors returns ALL defns pre-enabled-filter) and wire
+#         it into active_runtime, exactly the definition the addon uses.
+# ---------------------------------------------------------------------------
+log "P-10: verify_plugin_state(context7) authorizes plugin-developer namespace"
+run_harness "P-10" "$(cat <<'PY'
+import sys, types
+sys.path.insert(0, "/opt/casa")
+import agent as agent_mod
+from agent_loader import load_all_executors
+from tools import _tool_verify_plugin_state
+
+found, failed = load_all_executors("/config/agents")
+defn = found.get("plugin-developer")
+assert defn is not None, f"plugin-developer defn not loaded; failed={failed}"
+
+class _Reg:
+    def get(self, name):
+        return defn if name == "plugin-developer" else None
+
+agent_mod.active_runtime = types.SimpleNamespace(agents={}, executor_registry=_Reg())
+
+state = _tool_verify_plugin_state(plugin_name="context7")
+# The grant must actually derive from the materialized artifact's .mcp.json —
+# guards against a vacuous empty-grants pass.
+assert "mcp__plugin_context7_context7" in state["granted_tools"], (
+    f"context7 grant not derived from artifact: {state.get('granted_tools')} "
+    f"reasons={state.get('reasons')}")
+rows = [r for r in state["targets"] if r["target"] == "executor:plugin-developer"]
+assert rows, f"no executor:plugin-developer target row: {state['targets']}"
+missing = rows[0].get("authorization", {}).get("missing")
+assert missing == [], (
+    f"context7 authorization_missing for plugin-developer: {rows[0]}")
+print("P-10 OK")
+PY
+)"
+pass "P-10: context7 namespace authorized by real plugin-developer definition"
 
 stop_container "$NAME"
 

@@ -208,8 +208,9 @@ class InCasaDriver(DriverProtocol):
         # Finding 2 (codex review v0.69.10): rebuild the FULL option set (a
         # bare ClaudeAgentOptions(resume=) drops disallowed_tools/Agent+Task,
         # the fail-closed callback, hooks, skills, MCP restrictions — running
-        # the resumed engagement unrestricted). Off-loop: the builder shells
-        # out to `claude plugin list`. Fails closed if the config is gone.
+        # the resumed engagement unrestricted). Off-loop: the builder reads the
+        # registry + hooks.yaml. Fails closed if the config is gone (§3.8: an
+        # executor resumes from its recorded plugin artifacts, never re-resolved).
         from tools import build_engagement_resume_options
         options = await asyncio.to_thread(
             build_engagement_resume_options, engagement, session_id,

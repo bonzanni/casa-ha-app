@@ -286,13 +286,50 @@ register_handler("triggers", reload_triggers)
 _AGENT_CLOSE_TASKS: set[asyncio.Task] = set()
 
 
-def _schedule_agent_close(old_agent) -> None:
+def _track_draining(runtime, role, old_agent):
+    """Sol #4: record a swapped-out agent's plugin binding on runtime.draining
+    so verify can DISCLOSE it as a consumer still on the PREVIOUS artifact while
+    its in-flight turn drains (aclose waits on the turn's lock, ≤ drain timeout).
+    Returns the entry (to drop on close) or None."""
+    if runtime is None or role is None:
+        return None
+    binding = dict(getattr(old_agent, "active_plugin_binding", {}) or {})
+    if not binding:
+        return None
+    draining = getattr(runtime, "draining", None)
+    if not isinstance(draining, list):
+        draining = []
+        try:
+            runtime.draining = draining
+        except Exception:  # noqa: BLE001 — SimpleNamespace/Mock stand-ins
+            return None
+    entry = {"role": role, "binding": binding}
+    draining.append(entry)
+    return entry
+
+
+def _drop_draining(runtime, entry) -> None:
+    if entry is None or runtime is None:
+        return
+    draining = getattr(runtime, "draining", None)
+    if isinstance(draining, list):
+        try:
+            draining.remove(entry)
+        except ValueError:
+            pass
+
+
+def _schedule_agent_close(old_agent, *, runtime=None, role=None) -> None:
     """Background-drain a replaced/evicted Agent's SDK client pool (F12).
 
     Background is load-bearing: casa_reload runs as a casa-framework tool
     INSIDE a warm client's turn — a synchronous drain would deadlock on
     that turn's own entry lock. The drain task waits for in-flight turns
     (bounded by the pool's drain timeout) then disconnects.
+
+    Sol #4: when ``runtime``+``role`` are supplied, the draining agent's plugin
+    binding is tracked on ``runtime.draining`` for the duration of the drain so
+    verify can disclose the still-running old turn (cleared on close).
 
     Tolerates non-Agent stand-ins used throughout the reload test suite:
     objects with no ``aclose`` at all (``getattr`` default). A real
@@ -301,14 +338,21 @@ def _schedule_agent_close(old_agent) -> None:
     aclose = getattr(old_agent, "aclose", None)
     if aclose is None:
         return
+    entry = _track_draining(runtime, role, old_agent)
     try:
         coro = aclose()
     except Exception:  # noqa: BLE001 — best-effort teardown, never block reload
         logger.warning("agent aclose() raised while scheduling close", exc_info=True)
+        _drop_draining(runtime, entry)
         return
     task = asyncio.create_task(coro, name="agent-pool-close")
     _AGENT_CLOSE_TASKS.add(task)
-    task.add_done_callback(_AGENT_CLOSE_TASKS.discard)
+
+    def _done(t):
+        _AGENT_CLOSE_TASKS.discard(t)
+        _drop_draining(runtime, entry)
+
+    task.add_done_callback(_done)
 
 
 def _construct_agent(*, cfg, runtime):
@@ -476,8 +520,9 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     actions.append("reregister_bus")
 
     # F12: drain/close the replaced Agent's SDK client pool in the
-    # background so no warm subprocess outlives this swap.
-    _schedule_agent_close(old_agent)
+    # background so no warm subprocess outlives this swap. Sol #4: track its
+    # binding on runtime.draining so verify discloses the still-draining turn.
+    _schedule_agent_close(old_agent, runtime=runtime, role=role)
 
     # Rebuild agent_registry from current state.
     from agent_registry import AgentRegistry
@@ -917,6 +962,14 @@ async def reload_full(
     fresh state.
     """
     actions: list[str] = []
+
+    # §3.9 mutation sequencing / manual-edit seam: refresh the plugin resolver
+    # snapshot from disk FIRST — BEFORE any agent is reconstructed below — so
+    # reconstructed agents pick up the new registry and desired==active
+    # verification compares fresh state (a stale snapshot would false-pass).
+    import plugin_registry
+    await asyncio.to_thread(plugin_registry.reload_snapshot)
+    actions.append("plugins:snapshot_reloaded")
 
     # Policies — full cascade includes per-role re-load.
     sub = await _HANDLERS["policies"](runtime, role=None)

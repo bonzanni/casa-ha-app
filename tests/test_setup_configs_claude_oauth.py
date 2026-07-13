@@ -198,14 +198,13 @@ def test_run_template_does_not_unset_claude_oauth_token() -> None:
 
 
 def test_setup_configs_has_oauth_block() -> None:
-    """Sanity: the markers are present and bracket the block in the right
-    spot (after github-token, before seed-copy)."""
+    """Sanity: the markers are present and bracket the block in the right spot
+    (after github-token). The seed-copy block that followed it was removed in
+    v0.71.0 (plugin materialization → init-plugin-store oneshot)."""
     src = SETUP_CONFIGS.read_text(encoding="utf-8")
     gh_end = src.find("# === github-token: end")
     oauth_begin = src.find("# === claude-oauth-token: begin")
     oauth_end = src.find("# === claude-oauth-token: end")
-    seed_begin = src.find("# === seed-copy: begin")
-    assert gh_end < oauth_begin < oauth_end < seed_begin, (
-        "claude-oauth-token block must sit between github-token end and "
-        "seed-copy begin"
+    assert gh_end < oauth_begin < oauth_end, (
+        "claude-oauth-token block must sit after github-token end"
     )

@@ -3,7 +3,6 @@ not in CC's built-in allowlist. Plan 4b §4.2 + §7.3 step 6.
 """
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
@@ -25,17 +24,13 @@ _VAR_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
 
 def extract_env_vars(mcp_json_path: Path | str) -> set[str]:
-    path = Path(mcp_json_path)
-    if not path.is_file():
-        return set()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"{path}: invalid JSON: {exc}") from exc
-
-    servers = data.get("mcpServers") or {}
+    # Sol CI-review: resolve servers via the ONE shared parser so secrets are
+    # extracted for BOTH the mcpServers wrapper AND the top-level shape (context7
+    # ships the latter) — otherwise a top-level plugin's required secrets would be
+    # silently missed and verification could report ready without them.
+    from plugin_store import mcp_servers_map
     vars_found: set[str] = set()
-    for server in servers.values():
+    for server in mcp_servers_map(mcp_json_path).values():
         env = (server or {}).get("env") or {}
         for val in env.values():
             if not isinstance(val, str):

@@ -138,14 +138,14 @@ elif [ ! -d "$CONFIG_DIR/.git" ]; then
 !policies/**
 !schema/
 !schema/**
-# P-3 (v0.69.1): the user-marketplace manifest is config, not a secret —
-# configurator recipes commit it after every marketplace op, and versioning
-# it gives an audit trail. ONLY the manifest: everything else under
-# marketplace/ (and plugin-env.conf, a mode-0600 secrets file) stays
-# untracked via the leading `*`.
-!marketplace/
-!marketplace/.claude-plugin/
-!marketplace/.claude-plugin/marketplace.json
+# Unified plugin architecture (v0.71.0): the registry is config — the single
+# plugin-assignment authority — and versioning it gives an audit trail.
+# ONLY registry.json: the artifact store and staging under plugins/ are
+# content-addressed binaries, never tracked.
+!plugins/
+!plugins/registry.json
+plugins/store/
+plugins/.staging/
 !.gitignore
 EOF
     git add -A 2>/dev/null || true
@@ -224,45 +224,15 @@ else
     rm -f "$SECRET_FILE"
 fi
 
-# --- Plan 4b: plugin consumer infrastructure bootstrap ----------------------
-
-# Seed the user-writable marketplace overlay (idempotent — only if absent).
-if [ ! -f /config/marketplace/.claude-plugin/marketplace.json ]; then
-    mkdir -p /config/marketplace/.claude-plugin
-    cp /opt/casa/defaults/marketplace-user/.claude-plugin/marketplace.json \
-       /config/marketplace/.claude-plugin/marketplace.json
-    bashio::log.info "Seeded user marketplace at /config/marketplace/"
-fi
-
-# Ensure casa-main's HOME is cc-home (required by binding layer + CC CLI).
+# --- cc-home HOME setup -----------------------------------------------------
+# casa-main + the CC CLI both require HOME=cc-home. Plugin materialization
+# (bundled-artifact import + registry seed/migration) now lives in the
+# init-plugin-store s6 oneshot (plugin_boot.py), which runs AFTER this script
+# and BEFORE svc-casa (unified plugin architecture §3.6). The marketplace seed,
+# the load-bearing `claude -p noop`, and the marketplace registration/install
+# loop are all removed with the marketplace itself.
 export HOME=/config/cc-home
 mkdir -p "$HOME/.claude"
-
-# Trigger seed-marketplace auto-register into cc-home's in-memory view.
-# The API call fails with the bogus key; the startup path runs first.
-# Exit 0 expected. Spike §Key learning 7 — plain `claude plugin ...` calls
-# do NOT run full startup, so this `claude -p` is load-bearing.
-ANTHROPIC_API_KEY=sk-ant-bootstrap-noop \
-  claude -p "noop" --allow-dangerously-skip-permissions >/dev/null 2>&1 || true
-
-# Register both marketplaces in casa-main's HOME. Idempotent.
-# - casa-plugins-defaults: read-only seed at /opt/casa/defaults/marketplace-defaults/.
-#   Required so `<name>@casa-plugins-defaults` install refs in defaults/agents/**/plugins.yaml
-#   resolve. Without this, the install loop below silently fails for every default plugin
-#   (CC CLI: 'Plugin "<name>" not found in marketplace "casa-plugins-defaults"').
-# - casa-plugins: user-writable overlay at /config/marketplace/.
-claude plugin marketplace add /opt/casa/defaults/marketplace-defaults/ \
-  --scope user 2>/dev/null || true
-claude plugin marketplace add /config/marketplace/ \
-  --scope user 2>/dev/null || true
-
-# For every plugin referenced by defaults/agents/**/plugins.yaml,
-# ensure it's installed into cc-home so `claude plugin list --json`
-# (used by the binding layer in /opt/casa/plugins_binding.py) sees it.
-# An advisory flock serializes against any concurrent Configurator
-# install_casa_plugin calls (spike §Key learning 5).
-INSTALL_LOCK=/config/cc-home/.claude/plugins/.install.lock
-mkdir -p "$(dirname "$INSTALL_LOCK")"
 
 # === github-token: begin ========================================
 # v0.14.9: resolve op://VAULT/GitHub/credential at boot, export to s6
@@ -340,86 +310,22 @@ unset CC_OAUTH
 # === claude-oauth-token: end ====================================
 
 # === claude-home-propagation: begin =============================
-# H-1 (v0.37.8): propagate HOME=cc-home to every s6-supervised
-# service + child subprocess. K-1 (v0.34.1) lesson — a shell-level
-# `export HOME=...` (line 322) only governs setup-configs.sh's own
-# `claude plugin marketplace add` / `claude plugin enable` calls.
-# casa-main and svc-casa-mcp boot with HOME=/root unless we write
-# to /run/s6/container_environment/. Without this, any claude
-# binary subprocess spawned from casa-main (install_casa_plugin
-# and the three marketplace_* MCP tools in tools.py) reads
-# /root/.claude/plugins/known_marketplaces.json (empty) instead
-# of cc-home's, breaking plugin install. Configurator papered
-# over it by improvising a `claude plugin marketplace add` Bash
-# call mid-engagement — see bug-review-2026-05-13-exploration4.md::H-1.
+# H-1 (v0.37.8): propagate HOME=cc-home to every s6-supervised service +
+# child subprocess. A shell-level `export HOME=...` only governs this
+# script's own process; casa-main and svc-casa-mcp boot with HOME=/root
+# unless we write to /run/s6/container_environment/. cc-home is still the
+# CC CLI's home for residents/specialists (SDK plugin loading via
+# --plugin-dir, agent-home settings) and engagement subprocesses.
 printf '%s' "/config/cc-home" \
     > /run/s6/container_environment/HOME
 bashio::log.info "HOME propagated to s6 services: /config/cc-home"
 # === claude-home-propagation: end ===============================
 
-# === seed-copy: begin ===========================================
-# v0.14.9: replace the boot install loop with a no-network seed copy.
-# /opt/claude-seed/ is image-baked at Dockerfile build time and contains
-# the full CC CLI install state for the 5 default plugins. We populate
-# cc-home from it on first boot only (idempotent — sentinel is the
-# presence of installed_plugins.json in cc-home's plugin dir).
-#
-# Spike result (Task D.1, 2026-04-25): option (a) symlink works.
-# CC CLI tolerates installPath via symlink — `claude plugin list --json`
-# resolves all 5 plugins via the seed cache. If you find this is broken
-# in a future image, fall back to full copy + installPath rewrite per
-# spec §4 option (b).
-SEED_DIR="${SEED_DIR:-/opt/claude-seed}"
-CC_HOME="${CC_HOME:-/config/cc-home}"
-CC_PLUGINS_DIR="$CC_HOME/.claude/plugins"
-
-# _sc_log: portable wrapper — uses bashio in production, printf in test envs.
-# (bashio::log.info uses '::' which is a bash function-name extension not
-#  valid in POSIX sh; defining a helper keeps the block sh-compatible.)
-_sc_log() { if command -v bashio >/dev/null 2>&1; then bashio::log.info "$*"; else printf '[INFO] %s\n' "$*"; fi; }
-
-if [ -d "$SEED_DIR" ] && [ ! -f "$CC_PLUGINS_DIR/installed_plugins.json" ]; then
-    _sc_log "Seeding cc-home plugin state from $SEED_DIR"
-    mkdir -p "$CC_PLUGINS_DIR/cache"
-    # Symlink the seed cache dir; CC CLI tolerates installPath via symlink
-    # (verified by Task D.1 spike). Pre-1.0.0 wipe-on-update means both
-    # endpoints survive together.
-    if [ ! -e "$CC_PLUGINS_DIR/cache/casa-plugins-defaults" ]; then
-        ln -s "$SEED_DIR/cache/casa-plugins-defaults" \
-              "$CC_PLUGINS_DIR/cache/casa-plugins-defaults"
-    fi
-    # Copy install state. installed_plugins.json contains absolute paths
-    # under $SEED_DIR/cache/...; the symlink above makes them resolvable.
-    cp "$SEED_DIR/installed_plugins.json" "$CC_PLUGINS_DIR/installed_plugins.json"
-    # known_marketplaces.json + marketplaces/ are merged with what
-    # `claude plugin marketplace add` already wrote — only copy if absent.
-    if [ ! -f "$CC_PLUGINS_DIR/known_marketplaces.json" ]; then
-        cp "$SEED_DIR/known_marketplaces.json" "$CC_PLUGINS_DIR/known_marketplaces.json"
-    fi
-    if [ ! -d "$CC_PLUGINS_DIR/marketplaces" ]; then
-        cp -r "$SEED_DIR/marketplaces" "$CC_PLUGINS_DIR/marketplaces"
-    fi
-    _sc_log "Seeded cc-home with $(ls "$CC_PLUGINS_DIR/cache/casa-plugins-defaults/" 2>/dev/null | wc -l) default plugins"
-
-    # Build-time `claude plugin install` against $CLAUDE_CODE_PLUGIN_CACHE_DIR
-    # leaves enabled=false in the seed's installed_plugins.json. The binding
-    # layer (plugins_binding.py::build_sdk_plugins) filters out enabled=false
-    # entries, so without this enable loop, engagements get plugins=[] even
-    # though all 5 are present. At runtime against cc-home (--scope user),
-    # `claude plugin enable` flips the flag persistently and is idempotent.
-    HOME="$CC_HOME" claude plugin enable superpowers@casa-plugins-defaults    >/dev/null 2>&1 || true
-    HOME="$CC_HOME" claude plugin enable plugin-dev@casa-plugins-defaults     >/dev/null 2>&1 || true
-    HOME="$CC_HOME" claude plugin enable skill-creator@casa-plugins-defaults  >/dev/null 2>&1 || true
-    HOME="$CC_HOME" claude plugin enable mcp-server-dev@casa-plugins-defaults >/dev/null 2>&1 || true
-    HOME="$CC_HOME" claude plugin enable context7@casa-plugins-defaults       >/dev/null 2>&1 || true
-    _sc_log "Enabled $(HOME="$CC_HOME" claude plugin list --json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for p in d if p.get('enabled')))") of $(HOME="$CC_HOME" claude plugin list --json 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)))") seeded plugins"
-fi
-# === seed-copy: end =============================================
-
-# v0.14.9: replaced by the seed-copy block above. Default plugins are
-# baked at image build time; user-marketplace plugins are installed on
-# demand by Configurator's `install_casa_plugin` MCP tool, which goes
-# through /etc/gitconfig + git-credential-casa.sh.
+# Plugin materialization (bundled-artifact import → content-addressed store,
+# registry seed + one-time migration) moved to the init-plugin-store s6
+# oneshot (plugin_boot.py) under the unified plugin architecture (§3.6). The
+# old /opt/claude-seed → cc-home seed-copy + `claude plugin enable` loop is
+# deleted with the marketplace.
 
 # --- Plan 4b: plugin-runtime tool dir + PATH propagation (P-9) -------------
 # Ensure the persistent tools bin dir exists, and add it to PATH for every

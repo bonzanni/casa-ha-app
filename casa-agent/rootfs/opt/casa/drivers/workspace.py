@@ -14,7 +14,6 @@ from pathlib import Path
 import yaml
 
 from drivers.hook_bridge import translate_hooks_to_settings
-from plugins_config import load_plugins_yaml
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +103,7 @@ def render_run_script(
     *, engagement_id: str, permission_mode: str,
     extra_dirs: list[str], extra_unset: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
+    plugin_dirs: list[str] | None = None,
 ) -> str:
     """Read the run-script template and substitute per-engagement values.
 
@@ -128,6 +128,14 @@ def render_run_script(
     all_dirs = [f"/data/engagements/{engagement_id}/", *extra_dirs]
     add_dir_flags = " ".join(f"--add-dir {shlex.quote(d)}" for d in all_dirs)
 
+    # §3.8: immutable plugin-artifact paths → repeated --plugin-dir flags.
+    # Each is an absolute store path (same validation as extra_dirs, minus
+    # the engagement-relative prefixing).
+    for d in (plugin_dirs or []):
+        _validate_extra_dir(d)
+    plugin_dir_flags = " ".join(
+        f"--plugin-dir {shlex.quote(d)}" for d in (plugin_dirs or []))
+
     extra_unset_str = " ".join(extra_unset or [])
 
     if extra_env:
@@ -150,6 +158,7 @@ def render_run_script(
         .replace("{ID}", engagement_id)
         .replace("{PERMISSION_MODE}", permission_mode)
         .replace("{ADD_DIR_FLAGS}", add_dir_flags)
+        .replace("{PLUGIN_DIR_FLAGS}", plugin_dir_flags)
         .replace("{EXTRA_UNSET}", extra_unset_str)
         .replace("{EXTRA_EXPORT}", export_lines)
     )
@@ -181,7 +190,6 @@ async def provision_workspace(
     context: str,
     casa_framework_mcp_url: str,
     workspace_template_root: Path | None = None,
-    plugins_yaml: Path | None = None,
     world_state_summary: str = "",
     executor_memory: str = "",
 ) -> str:
@@ -190,10 +198,11 @@ async def provision_workspace(
     Returns the absolute workspace path. Caller must NOT create the
     directory first — this function does.
 
-    If ``workspace_template_root`` and ``plugins_yaml`` are both provided
-    and the template directory exists, ``render_workspace_template`` is
-    called to populate CLAUDE.md and .claude/settings.json (Plan 4b §16.3).
-    Otherwise the legacy prompt-interpolation path is used.
+    If ``workspace_template_root`` is provided and the template directory
+    exists, ``render_workspace_template`` populates CLAUDE.md and
+    .claude/settings.json — independent of plugin assignment (§3.3; plugins
+    now load via --plugin-dir, not settings.json). Otherwise the legacy
+    prompt-interpolation path is used.
 
     Note: filesystem I/O (mkdir, write_text, os.symlink, os.mkfifo) is
     currently synchronous despite the ``async def`` surface. The cost
@@ -215,14 +224,13 @@ async def provision_workspace(
 
     # Plan 4b §16.3: if a workspace-template exists for this executor, render it
     # into the workspace root. This subsumes the old symlink-loop behavior.
+    # §3.3: selection is independent of plugin assignment now.
     if (
         workspace_template_root is not None
-        and plugins_yaml is not None
         and workspace_template_root.is_dir()
     ):
         render_workspace_template(
             template_root=workspace_template_root,
-            plugins_yaml=plugins_yaml,
             dest=ws,
             defn=defn,
             hooks_yaml_data=hooks_yaml_data,
@@ -300,7 +308,11 @@ def write_casa_meta(
     *, workspace_path: str, engagement_id: str, executor_type: str,
     status: str, created_at: str,
     finished_at: str | None, retention_until: str | None,
+    plugin_artifacts: list[dict] | None = None,
 ) -> None:
+    # This dict is reconstructed from scratch on every rewrite — the immutable
+    # plugin_artifacts (§3.8) must be re-passed by every caller (initial write
+    # + terminal finalize) or it is silently dropped.
     meta = {
         "engagement_id": engagement_id,
         "executor_type": executor_type,
@@ -308,6 +320,7 @@ def write_casa_meta(
         "created_at": created_at,
         "finished_at": finished_at,
         "retention_until": retention_until,
+        "plugin_artifacts": list(plugin_artifacts or []),
     }
     path = Path(workspace_path) / ".casa-meta.json"
     path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -413,7 +426,6 @@ async def _sweep_workspaces(
 def render_workspace_template(
     *,
     template_root: Path,
-    plugins_yaml: Path,
     dest: Path,
     defn,                                    # ExecutorDefinition (Plan 4b §16.3 + L-1)
     hooks_yaml_data: dict,                   # L-1 (v0.34.2)
@@ -424,9 +436,11 @@ def render_workspace_template(
     executor_memory: str = "",
 ) -> None:
     """Copy the executor's workspace-template/ subtree into `dest`, interpolate
-    CLAUDE.md.tmpl → CLAUDE.md, and generate .claude/settings.json with
-    enabledPlugins + hooks + permissions from plugins.yaml and executor definition.
-    Plan 4b §16.3.
+    CLAUDE.md.tmpl → CLAUDE.md, and generate .claude/settings.json with hooks +
+    permissions from the executor definition. Plan 4b §16.3.
+
+    §3.3 (unified plugin arch): settings.json NO LONGER carries enabledPlugins —
+    executor plugins load via the pinned --plugin-dir flags on the run script.
 
     L-1 (v0.34.2): ``defn`` and ``hooks_yaml_data`` are REQUIRED. The generated
     settings.json always includes a ``hooks`` block (from
@@ -462,17 +476,15 @@ def render_workspace_template(
         )
         (dest / "CLAUDE.md").write_text(text, encoding="utf-8")
 
-    # Generate .claude/settings.json from plugins.yaml.
-    # L-1 (v0.34.2): merge enabledPlugins + hooks + permissions into settings.json.
+    # Generate .claude/settings.json (hooks + permissions only).
+    # §3.3: no enabledPlugins — executor plugins load via --plugin-dir.
     claude_dir = dest / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
     settings_path = claude_dir / "settings.json"
-    cfg = load_plugins_yaml(plugins_yaml)
     hooks_block = translate_hooks_to_settings(
         hooks_yaml_data, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
     )
     settings = {
-        "enabledPlugins": {ref: True for ref in cfg.iter_refs()},
         "hooks": hooks_block.get("hooks", {}),
         "permissions": _build_cc_permissions(defn),
     }

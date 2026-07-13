@@ -81,6 +81,12 @@ class AgentRegistry:
     def name_to_role(self, name: str) -> str | None:
         return self._name_lower_to_role.get((name or "").strip().lower())
 
+    def tier_for_role(self, role: str) -> str | None:
+        """'resident' | 'specialist' for a known role, else None (unified
+        plugin architecture — the resolver targets a tier:role)."""
+        known = self._role_to_known.get(role)
+        return known.tier if known is not None else None
+
     def is_known(self, role: str) -> bool:
         """True if ``role`` is a currently-known agent — a resident or an
         ENABLED specialist. A bundled-but-disabled (``enabled: false``) or

@@ -56,7 +56,9 @@ def main() -> int:
                             "verify_bin": verify_bin})
             continue
         logger.warning(
-            "plugin %s: verify_bin %r missing — cannot self-heal (requires marketplace entry; v0.14.2 enhancement)",
+            "plugin %s: verify_bin %r missing — re-run the plugin's install via "
+            "the configurator (plugin_update / plugin_add) to reinstall its "
+            "system requirements",
             name, verify_bin,
         )
         results.append({"name": name, "status": "degraded",

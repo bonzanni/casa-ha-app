@@ -19,22 +19,16 @@ if TYPE_CHECKING:
     from trigger_registry import TriggerRegistry
 
 from executor_registry import ExecutorRegistry
-from marketplace_ops import (
-    MarketplaceError,
-    add_plugin_entry,
-    list_plugin_entries,
-    load_user_marketplace,
-    remove_plugin_entry,
-    update_plugin_entry,
-)
-from plugin_env_extractor import extract_env_vars
 from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — available for future use
 from system_requirements.orchestrator import install_requirements, OrchestrationError
-from system_requirements.manifest import add_plugin_entry as add_manifest
-from plugins_binding import build_sdk_plugins
+from system_requirements.manifest import (
+    add_plugin_entry as add_manifest, remove_plugin_entry as remove_manifest,
+)
+import plugin_registry
+import plugin_store
 from plugin_grants import (
-    derived_plugin_grants, grants_for_plugin, highest_version_mcp_json,
-    make_fail_closed_can_use_tool,
+    grants_for_resolution, grants_for_resolved, make_fail_closed_can_use_tool,
+    mcp_json_malformed, required_env_vars_for_resolved,
 )
 from delegated_memory import delegated_recall, retain_delegated
 
@@ -329,7 +323,42 @@ def _with_subagent_spawn_disallowed(disallowed) -> list[str]:
     return out
 
 
-def _build_specialist_options(cfg) -> ClaudeAgentOptions:
+def _resolution_from_recorded(plugin_artifacts) -> "plugin_registry.ResolutionResult":
+    """Sol round-3 H7b: rebuild a ResolutionResult from an engagement's RECORDED
+    plugin_artifacts (§3.8) so a resumed specialist loads exactly what it started
+    with (paths AND derived grants), never re-resolving current assignments.
+    Fails closed (raises) if a recorded artifact path is gone."""
+    from plugin_registry import ResolutionResult, ResolvedPlugin
+    plugins = []
+    for pa in plugin_artifacts or ():
+        path = pa.get("path") if isinstance(pa, dict) else None
+        if not path or not os.path.isdir(path):
+            raise RuntimeError(
+                f"cannot resume: recorded plugin artifact missing "
+                f"(plugin_artifact_missing): {pa!r}")
+        # Sol round-4: DEEP-validate before resume — a tampered/corrupt pinned
+        # artifact, or one whose metadata identity no longer matches the recorded
+        # artifact_id, must fail the resume closed (not silently load).
+        if not plugin_store.validate_artifact(Path(path)):
+            raise RuntimeError(
+                f"cannot resume: recorded artifact corrupt: {pa!r}")
+        _meta = plugin_store.read_metadata(Path(path)) or {}
+        if pa.get("artifact_id") and _meta.get("artifact_id") != pa.get("artifact_id"):
+            raise RuntimeError(
+                f"cannot resume: recorded artifact identity mismatch: {pa!r}")
+        manifest = {}
+        try:
+            manifest = json.loads((Path(path) / ".claude-plugin" / "plugin.json")
+                                  .read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        plugins.append(ResolvedPlugin(
+            name=pa.get("name", ""), artifact_id=pa.get("artifact_id", ""),
+            path=path, version=str(manifest.get("version", "")), manifest=manifest))
+    return ResolutionResult(registry_valid=True, plugins=plugins)
+
+
+def _build_specialist_options(cfg, *, resolution=None) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for a Tier 2 specialist invocation.
 
     Specialist memory is injected via prompt in :func:`_run_delegated_agent`
@@ -348,12 +377,32 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
         mcp_servers = {}
 
     resolved_hooks = resolve_hooks(cfg.hooks, default_cwd=cfg.cwd)
+    # Sol #5: inject the /config/plugins + settings.json guard code-side (like
+    # residents — agent.py step 5). A delegated specialist with Bash could
+    # otherwise `echo > /config/plugins/registry.json`, bypassing validation and
+    # §3.9 sequencing. Fresh dict so the shared resolved hooks aren't mutated.
+    from hooks import agent_home_settings_guard_matcher
+    resolved_hooks = dict(resolved_hooks)
+    resolved_hooks["PreToolUse"] = [
+        *resolved_hooks.get("PreToolUse", []),
+        agent_home_settings_guard_matcher(),
+    ]
 
-    sdk_plugins = build_sdk_plugins(
-        home="/config/cc-home",
-        shared_cache="/config/cc-home/.claude/plugins",
-        seed="/opt/claude-seed",
-    )
+    # Unified plugin architecture (§3.3): resolve with the CONCRETE tier + role.
+    # Sol #12: delegate_to_agent also routes RESIDENTS through this builder
+    # (sync/async delegation of e.g. butler), so a hardcoded "specialist:"
+    # dropped a delegated resident's resident:<role> plugins. Use the
+    # authoritative AgentRegistry tier; fall back to specialist for unknown roles.
+    # Sol round-3 H7b: a caller-supplied ``resolution`` is used verbatim so the
+    # engagement record + the options share ONE resolve (no create-vs-builder
+    # drift), and a resumed engagement rebuilds from its RECORDED artifacts.
+    _role = getattr(cfg, "role", "unknown")
+    if resolution is None:
+        _tier = (_agent_registry.tier_for_role(_role)
+                 if _agent_registry is not None else None) or "specialist"
+        resolution = plugin_registry.resolve_for(f"{_tier}:{_role}")
+    sdk_plugins = [{"type": "local", "path": rp.path}
+                   for rp in resolution.plugins]
 
     agent_home = (cfg.cwd
                   or f"/config/agent-home/{getattr(cfg, 'role', 'unknown')}")
@@ -361,10 +410,9 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
     # Skills via skills="all" below; strip any config-supplied "Skill"
     # (deprecated) — (f) v0.69.9.
     allowed_tools = [t for t in cfg.tools.allowed if t != "Skill"]
-    # P-5a: installed ⇒ granted, by construction. Server-level grants derived
-    # from the agent-home's enabledPlugins; disallowed_tools still wins at the
-    # CC layer (explicit-deny escape hatch).
-    for grant in derived_plugin_grants(agent_home):
+    # P-5a: installed ⇒ granted, by construction. Server-level grants from the
+    # SAME resolved artifacts; disallowed_tools still wins at the CC layer.
+    for grant in grants_for_resolution(resolution):
         if grant not in allowed_tools:
             allowed_tools.append(grant)
 
@@ -389,12 +437,21 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
     )
 
 
-def _build_executor_options(defn) -> ClaudeAgentOptions:
+def _build_executor_options(defn, *, executor_type: str,
+                            resolution=None,
+                            plugin_paths: "list[str] | None" = None,
+                            ) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for a Tier 3 Executor invocation.
 
     Unlike specialists, executors DO have MCP servers and structured hooks
     driven by their definition.yaml + hooks.yaml. Prompt is injected at
     engage_executor time - this helper does not set system_prompt.
+
+    Plugins (§3.8/§3.9), in priority order: explicit ``plugin_paths`` (resume
+    from recorded artifacts — never re-resolved), else a passed ``resolution``
+    (engage_executor feeds the SAME result it gated + recorded — one resolve,
+    one binding), else a fresh resolve for ``executor:<executor_type>``.
+    Executors get NO grant merge + NO can_use_tool (they keep the relay).
     """
     from config import HooksConfig
     from hooks import resolve_hooks
@@ -407,17 +464,29 @@ def _build_executor_options(defn) -> ClaudeAgentOptions:
         hooks_cfg = HooksConfig(pre_tool_use=list(raw.get("pre_tool_use") or []))
 
     resolved_hooks = resolve_hooks(hooks_cfg, default_cwd="/config")
+    # Sol #5: in_casa executors (e.g. configurator, cwd=/config, Bash allowed)
+    # could `echo > /config/plugins/registry.json` — inject the same code-side
+    # guard so a Bash write to /config/plugins or settings.json is denied.
+    from hooks import agent_home_settings_guard_matcher
+    resolved_hooks = dict(resolved_hooks)
+    resolved_hooks["PreToolUse"] = [
+        *resolved_hooks.get("PreToolUse", []),
+        agent_home_settings_guard_matcher(),
+    ]
 
     if _mcp_registry is not None:
         mcp_servers = _mcp_registry.resolve(defn.mcp_server_names)
     else:
         mcp_servers = {}
 
-    sdk_plugins = build_sdk_plugins(
-        home="/config/cc-home",
-        shared_cache="/config/cc-home/.claude/plugins",
-        seed="/opt/claude-seed",
-    )
+    if plugin_paths is not None:
+        sdk_plugins = [{"type": "local", "path": p} for p in plugin_paths]
+    else:
+        if resolution is None:
+            resolution = plugin_registry.resolve_for(
+                f"executor:{executor_type}")
+        sdk_plugins = [{"type": "local", "path": rp.path}
+                       for rp in resolution.plugins]
 
     # Skills via skills="all" below; strip any config-supplied "Skill"
     # (deprecated) — (f) v0.69.9.
@@ -457,7 +526,10 @@ def build_engagement_resume_options(engagement, session_id: str) -> ClaudeAgentO
 
     Fails CLOSED: if the specialist/executor config is gone (removed while the
     engagement was suspended), raise rather than resume with dropped
-    restrictions. May shell out (build_sdk_plugins) — call off the event loop.
+    restrictions. §3.8: an executor resumes from its RECORDED plugin artifacts
+    (never re-resolving current assignments); a missing recorded artifact
+    fails the resume closed (plugin_artifact_missing). Reads registry snapshot
+    files — call off the event loop.
     """
     import dataclasses
 
@@ -467,11 +539,32 @@ def build_engagement_resume_options(engagement, session_id: str) -> ClaudeAgentO
     if kind == "executor":
         defn = _executor_registry.get(role) if _executor_registry is not None else None
         if defn is not None:
-            opts = _build_executor_options(defn)
+            recorded = getattr(engagement, "plugin_artifacts", None) or ()
+            plugin_paths: list[str] = []
+            for pa in recorded:
+                path = pa.get("path") if isinstance(pa, dict) else None
+                if not path or not os.path.isdir(path):
+                    raise RuntimeError(
+                        f"cannot resume executor engagement role={role!r}: "
+                        f"recorded plugin artifact missing "
+                        f"(plugin_artifact_missing): {pa!r}")
+                plugin_paths.append(path)
+            opts = _build_executor_options(defn, executor_type=role,
+                                           plugin_paths=plugin_paths)
     else:
         cfg = _specialist_registry.get(role) if _specialist_registry is not None else None
         if cfg is not None:
-            opts = _build_specialist_options(cfg)
+            # Sol round-3 H7b / round-4: a resumed specialist rebuilds from its
+            # RECORDED artifacts (§3.8) — like executors — never re-resolving
+            # current assignments. An EMPTY record ([]) is AUTHORITATIVE (started
+            # with no plugins → resume with none); only a pre-v0.71.0 record
+            # (field absent → None) falls back to a fresh resolve.
+            recorded = getattr(engagement, "plugin_artifacts", None)
+            if recorded is not None:
+                opts = _build_specialist_options(
+                    cfg, resolution=_resolution_from_recorded(recorded))
+            else:
+                opts = _build_specialist_options(cfg)
     if opts is None:
         raise RuntimeError(
             f"cannot rebuild options to resume {kind or 'specialist'} engagement "
@@ -594,8 +687,15 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
 
     prompt = f"{delegation_context}\n\n{memory_block}{body_tail}"
 
-    # Off-loop: _build_specialist_options shells out to `claude plugin list`
-    # (build_sdk_plugins) — keep it off the shared event loop (H2/M20).
+    # Off-loop: _build_specialist_options resolves the registry (file IO) —
+    # keep it off the shared event loop (H2/M20).
+    # Sol #4 residual (documented): this ephemeral delegation client pins the
+    # artifacts it resolves here for its (short) lifetime; it is NOT recorded in
+    # runtime.agents or the engagement registry, so a plugin_update landing
+    # mid-delegation is not disclosed by verify until the delegation ends. This
+    # window is transient and self-healing (the next delegation resolves the new
+    # artifact); the PERSISTENT stale-binding incident is fully closed. Tracked
+    # for a future live-binding registry (docs/ROADMAP-backlog.md).
     options = await asyncio.to_thread(_build_specialist_options, cfg)
     text = ""
     token = agent_mod.origin_var.set(child_origin)
@@ -818,10 +918,25 @@ async def delegate_to_agent(args: dict) -> dict:
         except Exception as exc:  # noqa: BLE001
             return _result({"status": "error", "kind": "topic_create_failed",
                             "message": str(exc)})
+        # §3.8 (Sol #4): record the specialist's plugin binding so verify can
+        # disclose this engagement if a later plugin_update supersedes its
+        # artifact (informational — mirrors the executor-engagement case). The
+        # specialist runs on the same tier:role resolution _build_specialist_
+        # options uses below.
+        # Sol round-3 H7b: resolve ONCE and feed the SAME result to both the
+        # engagement record and the options builder, so a concurrent update can't
+        # make the recorded binding disagree with what actually launches.
+        _spec_tier = (_agent_registry.tier_for_role(agent_name)
+                      if _agent_registry is not None else None) or "specialist"
+        _spec_res = plugin_registry.resolve_for(f"{_spec_tier}:{agent_name}")
+        _spec_arts = tuple(
+            {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
+            for rp in _spec_res.plugins)
         # Create record
         rec = await _engagement_registry.create(
             kind="specialist", role_or_type=agent_name, driver="in_casa",
             task=task_text, origin=dict(origin), topic_id=topic_id,
+            plugin_artifacts=_spec_arts,
         )
         # Persist initial state emoji so update_topic_state knows
         # whether it needs to edit the title (no-op when state didn't change).
@@ -832,8 +947,9 @@ async def delegate_to_agent(args: dict) -> dict:
         except Exception as exc:  # noqa: BLE001
             logger.warning("set_channel_state(active) failed: %s", exc)
 
-        # Build options + start driver (off-loop: build_sdk_plugins shell-out).
-        options = await asyncio.to_thread(_build_specialist_options, cfg)
+        # Build options + start driver (off-loop: registry resolve is file IO).
+        options = await asyncio.to_thread(
+            _build_specialist_options, cfg, resolution=_spec_res)
         # Augment allowed tools (additive) with query_engager + emit_completion
         injected = list(options.allowed_tools or [])
         for t in ("mcp__casa-framework__query_engager",
@@ -1122,8 +1238,8 @@ def _refuse_unprivileged(tool_name: str, caller: str | None) -> dict:
 @tool(
     "config_git_commit",
     "Stage and commit all tracked changes under /config/ (tracked: agents/, "
-    "policies/, schema/, marketplace/.claude-plugin/marketplace.json; "
-    "everything else incl. plugin-env.conf is gitignored by design). "
+    "policies/, schema/, plugins/registry.json; everything else incl. "
+    "plugins/store/, plugins/.staging/, and plugin-env.conf is gitignored). "
     "Returns the commit SHA — empty plus a warning when nothing tracked "
     "changed, which is the expected outcome for gitignored-only writes. "
     "Restricted to the configurator executor role.",
@@ -1184,13 +1300,12 @@ async def config_git_commit(args: dict) -> dict:
             "sha": "", "message": message,
             "warning": (
                 "No tracked changes to commit. The config repo tracks ONLY "
-                "agents/, policies/, schema/ and "
-                "marketplace/.claude-plugin/marketplace.json; every other "
-                "path is gitignored by design — plugin-env.conf in "
-                "particular is a secrets file and must never enter git "
-                "history. If you only wrote gitignored paths, an empty SHA "
-                "is the expected, correct outcome: report it as such and "
-                "do NOT retry the commit."
+                "agents/, policies/, schema/ and plugins/registry.json; every "
+                "other path is gitignored by design — plugins/store/, "
+                "plugins/.staging/, and plugin-env.conf (a secrets file) must "
+                "never enter git history. If you only wrote gitignored paths, "
+                "an empty SHA is the expected, correct outcome: report it as "
+                "such and do NOT retry the commit."
             ),
         })
     except Exception as exc:  # noqa: BLE001
@@ -1406,6 +1521,71 @@ async def engage_executor(args: dict) -> dict:
             ),
         })
 
+    # §3.5/§3.8/§3.9: resolve this executor's plugin assignment ONCE — the
+    # result feeds the launch gate, the recorded binding, AND the in-casa
+    # options (one resolve, one binding). Gate BEFORE topic creation so a
+    # blocked launch never leaves a dangling topic.
+    def _resolve_and_gate():
+        """Returns (plugin_resolution, plugin_artifacts, error_result|None)."""
+        res = plugin_registry.resolve_for(f"executor:{executor_type}")
+        if not res.registry_valid:
+            return res, (), _result({
+                "status": "error", "kind": "plugin_registry_invalid",
+                "message": ("plugin registry is invalid — executor launches are "
+                            "blocked until it is repaired "
+                            "(see /data/plugin-health.json)"),
+            })
+        if res.issues:
+            detail = [(i.name, i.reason_code) for i in res.issues]
+            return res, (), _result({
+                "status": "error", "kind": "plugin_unavailable",
+                "message": (f"required plugin(s) unavailable for "
+                            f"{executor_type!r}: {detail}"),
+            })
+        # Sol round-3 B4: also gate on CONFIGURED readiness — a resolvable plugin
+        # that is not ready (authorization_missing / unresolved secret / missing
+        # system requirement / malformed .mcp.json) must NOT launch with
+        # --plugin-dir. Check each assigned plugin's executor-target row through
+        # the same verification path.
+        target = f"executor:{executor_type}"
+        not_ready = []
+        for rp in res.plugins:
+            try:
+                v = _tool_verify_plugin_state(plugin_name=rp.name)
+            except Exception as exc:  # noqa: BLE001 — Sol round-4 M: fail CLOSED
+                logger.warning("launch readiness verify raised for %s: %s",
+                               rp.name, exc)
+                not_ready.append((rp.name, "verify_error"))
+                continue
+            row = next((r for r in v.get("targets", [])
+                        if r.get("target") == target), None)
+            if row is not None and not row.get("ready"):
+                not_ready.append((rp.name, (row.get("reasons") or ["not_ready"])[0]))
+            elif row is None and v.get("ready") is not True:
+                not_ready.append((rp.name, (v.get("reasons") or ["not_ready"])[0]))
+        if not_ready:
+            return res, (), _result({
+                "status": "error", "kind": "plugin_not_ready",
+                "message": (f"plugin(s) not ready for {executor_type!r}: "
+                            f"{not_ready} (see /data/plugin-health.json)"),
+            })
+        arts = tuple(
+            {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
+            for rp in res.plugins)
+        return res, arts, None
+
+    # Sol #6: capture the snapshot generation at resolve so a concurrent
+    # plugin_update during the topic-creation await can be detected before the
+    # engagement record pins its artifacts (below, just before create()).
+    # Sol round-4 M: run the resolve + readiness verification OFF the event loop
+    # (it does per-plugin artifact checks + YAML/file reads). This is the
+    # PRE-TOPIC gate (fail fast before creating a topic on a known-unavailable
+    # plugin); the authoritative record binding is (re)resolved under the lock
+    # below, bound to a stable snapshot generation.
+    _, _, _gate_err = await asyncio.to_thread(_resolve_and_gate)
+    if _gate_err is not None:
+        return _gate_err
+
     if _channel_manager is None:
         return _result({
             "status": "error", "kind": "no_channel_manager",
@@ -1496,19 +1676,56 @@ async def engage_executor(args: dict) -> dict:
             "message": str(exc),
         })
 
-    # Computed BEFORE create() so it can be persisted onto the record's
-    # origin — the claude_code driver reads it (and context_text) back out
-    # of engagement.origin when provisioning the workspace CLAUDE.md.
-    world_state = _build_world_state_summary()
+    # Sol #6 / round-3 H6 / round-4 TOCTOU fence: hold the plugin-tools lock
+    # across the re-resolve + durable record write so a concurrent plugin_update
+    # (which bumps the snapshot generation UNDER THE SAME LOCK during its reload)
+    # cannot interleave. plugin_update holds this lock; the manual-edit seam
+    # reload_full() does NOT, so we BIND the recorded artifacts to a stable
+    # generation: sample → resolve → verify unchanged, retrying if reload_full
+    # moved the snapshot mid-resolve. `_gen_at_create` is then the generation the
+    # recorded artifacts actually came from, making the post-create recheck sound.
+    # The lock covers only this brief section — NOT the topic-creation RT above.
+    async with _PLUGIN_TOOLS_LOCK:
+        _gate_err = None
+        for _attempt in range(5):
+            _gen_at_create = plugin_registry.snapshot_generation()
+            plugin_resolution, plugin_artifacts, _gate_err = \
+                await asyncio.to_thread(_resolve_and_gate)
+            if plugin_registry.snapshot_generation() == _gen_at_create:
+                break   # artifacts + generation agree
+        if _gate_err is not None:
+            await _abort_engagement_topic(channel, "engage-abort", topic_id)
+            return _gate_err
 
-    rec = await _engagement_registry.create(
-        kind="executor", role_or_type=executor_type, driver=defn.driver,
-        task=task_text,
-        origin={**origin, "context": context_text, "world_state_summary": world_state},
-        topic_id=topic_id,
-        tools_allowed=tuple(defn.tools_allowed or ()),
-        permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
-    )
+        # Computed BEFORE create() so it can be persisted onto the record's
+        # origin — the claude_code driver reads it (and context_text) back out
+        # of engagement.origin when provisioning the workspace CLAUDE.md.
+        world_state = _build_world_state_summary()
+
+        rec = await _engagement_registry.create(
+            kind="executor", role_or_type=executor_type, driver=defn.driver,
+            task=task_text,
+            origin={**origin, "context": context_text,
+                    "world_state_summary": world_state},
+            topic_id=topic_id,
+            tools_allowed=tuple(defn.tools_allowed or ()),
+            permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
+            plugin_artifacts=plugin_artifacts,      # §3.8 recorded binding
+        )
+
+    # Sol round-4: the manual-edit seam `casa_reload(scope="full")` bumps the
+    # snapshot generation WITHOUT the plugin-tools lock, so it can move the
+    # snapshot while create() awaits. Recheck against the pre-create generation
+    # and abort before the driver starts — the record must not launch stale.
+    if plugin_registry.snapshot_generation() != _gen_at_create:
+        await _engagement_registry.mark_error(
+            rec.id, kind="plugin_superseded",
+            message="plugin snapshot changed during launch")
+        await _abort_engagement_topic(channel, rec.id, topic_id)
+        return _result({
+            "status": "error", "kind": "plugin_superseded",
+            "message": ("plugin registry changed during launch — engagement "
+                        "aborted before start; retry")})
 
     # Persist the initial state emoji so Task 23 ``update_topic_state`` knows
     # whether it needs to edit the title (no-op when state didn't change).
@@ -1583,9 +1800,11 @@ async def engage_executor(args: dict) -> dict:
                 "message": str(exc),
             })
     else:
-        # Off-loop: _build_executor_options shells out to `claude plugin list`
-        # (build_sdk_plugins) and reads hooks.yaml — keep it off the loop.
-        options = await asyncio.to_thread(_build_executor_options, defn)
+        # Off-loop: _build_executor_options reads hooks.yaml. §3.9: feed the
+        # SAME resolution gated + recorded above (one resolve, one binding).
+        options = await asyncio.to_thread(
+            _build_executor_options, defn, executor_type=executor_type,
+            resolution=plugin_resolution)
         injected = list(options.allowed_tools or [])
         for t in ("mcp__casa-framework__query_engager",
                   "mcp__casa-framework__emit_completion"):
@@ -1930,6 +2149,8 @@ async def _finalize_engagement(
                     created_at=meta.get("created_at") or finished_iso,
                     finished_at=finished_iso,
                     retention_until=retention_iso,
+                    # §3.8: the immutable binding survives the terminal rewrite.
+                    plugin_artifacts=meta.get("plugin_artifacts"),
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -2809,80 +3030,6 @@ async def cleanup_engagement_topics(args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _tool_marketplace_add_plugin(
-    *,
-    plugin_name: str,
-    repo_url: str,
-    ref: str,
-    description: str,
-    category: str = "productivity",
-    version: str | None = None,
-    casa_system_requirements: list[dict] | None = None,
-) -> dict:
-    # Normalize repo_url → github source shape.
-    repo = repo_url.replace("https://github.com/", "").rstrip("/")
-    if repo.endswith(".git"):
-        repo = repo[:-4]
-
-    entry = {
-        "name": plugin_name,
-        "description": description,
-        "version": version or ref,
-        "source": {"source": "github", "repo": repo, "ref": ref},
-        "category": category,
-    }
-    if casa_system_requirements:
-        entry["casa"] = {"systemRequirements": casa_system_requirements}
-
-    try:
-        add_plugin_entry(entry)
-    except MarketplaceError as exc:
-        return {"added": False, "error": str(exc)}
-
-    # Refresh CC's view of the user marketplace.
-    subprocess.run(
-        ["claude", "plugin", "marketplace", "update", "casa-plugins"],
-        capture_output=True, text=True, timeout=30,
-    )
-    return {"added": True, "entry": entry}
-
-
-def _tool_marketplace_remove_plugin(*, plugin_name: str) -> dict:
-    try:
-        remove_plugin_entry(plugin_name)
-    except MarketplaceError as exc:
-        return {"removed": False, "error": str(exc)}
-    subprocess.run(
-        ["claude", "plugin", "marketplace", "update", "casa-plugins"],
-        capture_output=True, text=True, timeout=30,
-    )
-    return {"removed": True}
-
-
-def _tool_marketplace_update_plugin(*, plugin_name: str, new_ref: str) -> dict:
-    try:
-        update_plugin_entry(plugin_name, new_ref=new_ref)
-    except MarketplaceError as exc:
-        return {"updated": False, "error": str(exc)}
-    subprocess.run(
-        ["claude", "plugin", "marketplace", "update", "casa-plugins"],
-        capture_output=True, text=True, timeout=30,
-    )
-    return {"updated": True, "new_ref": new_ref}
-
-
-def _tool_marketplace_list_plugins() -> dict:
-    return {"plugins": list_plugin_entries()}
-
-
-# ---------------------------------------------------------------------------
-# Plan 4b §7.3 / §4.3.3: install_casa_plugin two-stage commit
-# ---------------------------------------------------------------------------
-
-_INSTALL_LOCK = "/config/cc-home/.claude/plugins/.install.lock"
-_AGENT_HOME_ROOT = Path("/config/agent-home")
-_CASA_PLUGIN_CACHE_ROOT = Path("/config/cc-home/.claude/plugins/cache/casa-plugins")
-
 # H16: serialize the mutating plugin/marketplace tools once their blocking
 # bodies move off the loop via asyncio.to_thread. On the single event loop
 # these handlers were previously mutually exclusive for free (they never
@@ -2890,162 +3037,521 @@ _CASA_PLUGIN_CACHE_ROOT = Path("/config/cc-home/.claude/plugins/cache/casa-plugi
 # marketplace-file / manifest writes. Read-only vault helpers don't take it.
 _PLUGIN_TOOLS_LOCK = asyncio.Lock()
 
+# ---------------------------------------------------------------------------
+# Unified plugin architecture (§3.9/§3.13): registry-mutating tools.
+# ---------------------------------------------------------------------------
 
-def _tool_install_casa_plugin(
-    *,
-    plugin_name: str,
-    targets: list[str],
-) -> dict:
-    # 1. Validate marketplace entry exists.
-    data = load_user_marketplace()
-    entry = next((p for p in data["plugins"] if p["name"] == plugin_name), None)
-    if entry is None:
-        return {"ok": False, "error": "plugin_not_in_marketplace"}
+_PLUGIN_HEALTH_PATH = "/data/plugin-health.json"
 
-    # 2. Refresh CC's view.
-    subprocess.run(
-        ["claude", "plugin", "marketplace", "update", "casa-plugins"],
-        capture_output=True, text=True, timeout=30,
+
+def _regenerate_plugin_health(extra_issues: list) -> None:
+    """§3.10/R2-4 + Sol #13: rewrite the health report from the CURRENT resolver
+    state PLUS the RUNTIME verify state of EVERY registered plugin — not just the
+    plugin this mutation touched. Otherwise a successful mutation of plugin B
+    would rewrite health from resolver issues + B's (empty) extras and ERASE
+    plugin A's still-active runtime failure (reload_required / authorization_
+    missing / unresolved secret). extra_issues carries this mutation's own
+    freshly-computed rows; they are de-duplicated against the recompute."""
+    import plugin_health
+    from plugin_registry import PluginIssue, load_registry
+    res = plugin_registry.resolve_all()
+    seen = {(getattr(e, "name", None), getattr(e, "target", None),
+             getattr(e, "reason_code", None)) for e in extra_issues}
+    runtime_issues: list = []
+    def _add(name, target, reason):
+        key = (name, target, reason)
+        if key not in seen:
+            seen.add(key)
+            runtime_issues.append(PluginIssue(
+                name=name, target=target, stage="verify", reason_code=reason))
+
+    reg = load_registry()
+    if reg.valid:
+        for entry in reg.entries:
+            name = entry.get("name")
+            try:
+                verify = _tool_verify_plugin_state(plugin_name=name)
+            except Exception:  # noqa: BLE001
+                # Sol round-3 H13: a verifier crash is ITSELF a health problem —
+                # surface it, never silently drop the plugin from the report.
+                _add(name, None, "verify_exception")
+                continue
+            rows = verify.get("targets") or []
+            for row in rows:
+                if not row.get("ready"):
+                    _add(name, row.get("target"),
+                         (row.get("reasons") or ["not_ready"])[0])
+            # Sol round-3 H13: a top-level not-ready with NO target rows (e.g. an
+            # unassigned plugin with a missing secret / mcp_invalid) would else be
+            # erased — surface it against the plugin itself.
+            if verify.get("ready") is not True and not rows:
+                for reason in (verify.get("reasons") or ["not_ready"]):
+                    _add(name, None, reason)
+    # Sol round-4 HIGH: preserve replayed UNRESOLVED migration issues on EVERY
+    # health rewrite — a refused/absent plugin is neither in resolve_all() nor
+    # reg.entries, so without this a later unrelated mutation would erase its
+    # issue and the report would go green until the next boot.
+    migration_issues = []
+    try:
+        import plugin_boot
+        migration_issues = plugin_boot._unresolved_migration_issues(reg)
+    except Exception:  # noqa: BLE001 — never fail health regen on the replay
+        pass
+    plugin_health.write_report(
+        issues=(list(res.issues) + list(extra_issues) + runtime_issues
+                + migration_issues),
+        warnings=list(res.warnings),
+        path=_PLUGIN_HEALTH_PATH,
     )
 
-    # 3. Stage 1 — install system requirements (if any).
-    reqs = (entry.get("casa") or {}).get("systemRequirements") or []
-    outcomes: list = []
-    if reqs:
-        try:
-            outcomes = install_requirements(
-                plugin_name=plugin_name,
-                requirements=reqs,
-                tools_root=Path("/config/tools"),
-            )
-        except OrchestrationError as exc:
-            return {"ok": False, "error": "system_requirements_failed", "detail": str(exc)}
 
-        # Record manifest BEFORE stage 2 so reconciler can recover on crash.
-        for outcome in outcomes:
-            add_manifest(outcome.manifest_entry(plugin_name))
+async def _notify_plugin_health_if_possible() -> None:
+    if _bus is None:
+        return
+    try:
+        import casa_core
+        await casa_core.notify_plugin_health(_bus, path=_PLUGIN_HEALTH_PATH)
+    except Exception:  # noqa: BLE001 — never fail a mutation on notify
+        logger.debug("plugin health notify skipped", exc_info=True)
 
-    # 4. Stage 2 — claude plugin install in each agent-home.
-    installed: list[str] = []
-    failed: list[str] = []
-    for role in targets:
-        agent_home = _AGENT_HOME_ROOT / role
-        agent_home.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            "flock", _INSTALL_LOCK,
-            "claude", "plugin", "install",
-            f"{plugin_name}@casa-plugins", "--scope", "project",
-        ]
-        r = subprocess.run(cmd, cwd=agent_home, capture_output=True, text=True, timeout=300)
-        if r.returncode == 0:
-            installed.append(role)
-        else:
-            failed.append(role)
 
-    if failed:
-        # Best-effort rollback of stage 1.
-        for outcome in outcomes:
-            shutil.rmtree(outcome.install_dir, ignore_errors=True)
-        return {
-            "ok": False,
-            "error": "agent_install_failed",
-            "failed": failed,
-            "installed": installed,
-        }
+def _postcondition_holds(verify: dict, targets: list, *, expect: str,
+                         name: str | None = None, runtime=None) -> bool:
+    """§3.9 mutation postcondition. 'present' (add/update/assign): every in-casa
+    target row must be ready (legacy verify with no 'targets' key is not
+    blocking — Task 14's rewrite adds the real rows). 'absent' (unassign/
+    remove): no RECONSTRUCTED in-casa agent still binds `name` — read the live
+    agent's active_plugin_binding directly, independent of verify shape."""
+    if expect == "present":
+        # Sol #9: a plugin with zero target rows (e.g. fully unassigned, or an
+        # update whose new artifact has unresolved secrets) made all([]) == True
+        # → false-green. Require the TOP-LEVEL readiness, which folds in the
+        # artifact/tools/secrets checks AND every target row's readiness — so an
+        # empty-rows verify no longer passes vacuously.
+        return verify.get("ready") is True
+    # absent
+    if runtime is None or name is None:
+        return True
+    agents = getattr(runtime, "agents", {}) or {}
+    for target in targets:
+        tier, _, role = target.partition(":")
+        if tier in ("resident", "specialist"):
+            agent = agents.get(role)
+            if agent is not None and name in getattr(
+                    agent, "active_plugin_binding", {}):
+                return False
+    return True
 
-    # 5. Extract required env vars from cached plugin's .mcp.json — from the
-    # SAME (highest) version dir the grant derivation reads (e, v0.69.7).
-    mcp_json = highest_version_mcp_json(_CASA_PLUGIN_CACHE_ROOT / plugin_name)
-    env_vars = extract_env_vars(mcp_json) if mcp_json else set()
 
+def _issues_from_mutation(name: str, *, reload_errors: list, verify: dict,
+                          expect: str, postcondition_ok: bool) -> list:
+    """R2-4: translate reload/verify/postcondition failures into structured
+    PluginIssues so they persist in the health report."""
+    from plugin_registry import PluginIssue
+    issues: list = []
+    for err in reload_errors:
+        issues.append(PluginIssue(
+            name=name, target=err.get("target"), stage="reload",
+            reason_code="reload_failed"))
+    for row in (verify.get("targets") or []):
+        if not row.get("ready"):
+            reasons = row.get("reasons") or ["not_ready"]
+            issues.append(PluginIssue(
+                name=name, target=row.get("target"), stage="verify",
+                reason_code=reasons[0]))
+    if not postcondition_ok and not reload_errors:
+        issues.append(PluginIssue(
+            name=name, target=None, stage="verify",
+            reason_code="postcondition_failed"))
+    return issues
+
+
+async def _reload_and_verify_targets(name: str, targets: list,
+                                     *, expect: str) -> dict:
+    """§3.9 mutation sequencing — THE ordering that kills the incident. The
+    atomic registry write already happened; now: reload the resolver snapshot
+    FIRST, reconstruct affected in-casa agents, desired==active verify, then
+    regenerate + notify health. Order is load-bearing (stale-snapshot hazard)."""
+    await asyncio.to_thread(plugin_registry.reload_snapshot)   # 1. FIRST
+    import agent as agent_mod
+    import reload as reload_mod
+    runtime = getattr(agent_mod, "active_runtime", None)
+    reloaded: list = []
+    reload_errors: list = []
+    for target in targets:
+        tier, _, role = target.partition(":")
+        if tier in ("resident", "specialist") and runtime is not None:
+            res = await reload_mod.dispatch("agent", runtime=runtime, role=role)
+            if res.get("status") == "ok":
+                reloaded.append(target)
+            else:
+                reload_errors.append({"target": target, **res})
+        # executors: nothing to reconstruct (per-launch resolution).
+    # Sol round-3 B2a: reconstruction leaves the new Agent's _plugin_resolution
+    # lazy (None until its first turn) — verify would then classify a live,
+    # registered agent as "dormant" and green it BEFORE its binding is captured.
+    # Force resolution now so verify sees "active" and confirms binding==desired.
+    agents = getattr(runtime, "agents", {}) or {}
+    for target in reloaded:
+        _, _, role = target.partition(":")
+        agent = agents.get(role)
+        if agent is not None and getattr(agent, "_plugin_resolution", None) is None:
+            try:
+                await agent._get_plugin_resolution()
+            except Exception as exc:  # noqa: BLE001
+                # Sol round-4 M: a fail-OPEN resolve would leave _plugin_resolution
+                # None → verify classifies the live agent as dormant → green. Record
+                # a reload error so the mutation reports not-ok instead.
+                logger.warning("post-reconstruct resolve failed for %s: %s",
+                               role, exc)
+                reload_errors.append({"target": target, "status": "error",
+                                      "kind": "resolve_failed"})
+    verify = await asyncio.to_thread(_tool_verify_plugin_state, plugin_name=name)
+    ok = (not reload_errors
+          and _postcondition_holds(verify, targets, expect=expect,
+                                   name=name, runtime=runtime))
+    mutation_issues = _issues_from_mutation(
+        name, reload_errors=reload_errors, verify=verify,
+        expect=expect, postcondition_ok=ok)
+    await asyncio.to_thread(_regenerate_plugin_health, mutation_issues)
+    await _notify_plugin_health_if_possible()
+    result = {"ok": ok, "reloaded": reloaded, "reload_errors": reload_errors,
+              "verify": verify}
+    if not ok:
+        result["kind"] = ("reload_failed" if reload_errors
+                          else "postcondition_failed")
+    return result
+
+
+def _safe_remove_manifest(name: str) -> None:
+    """Sol round-4: remove the plugin's sysreq manifest row, tolerating failure
+    (unwritable/malformed manifest) so a cleanup error never bypasses the
+    mandatory reload/verify sequencing that follows a registry mutation."""
+    try:
+        remove_manifest(name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("plugin sysreq manifest cleanup for %s failed "
+                       "(non-fatal): %s", name, exc)
+
+
+def _install_plugin_sysreqs(name: str, manifest: dict) -> dict | None:
+    """§3.3: install a plugin's system requirements BEFORE registry activation.
+    Returns an error envelope on failure (registry left unchanged), else None."""
+    reqs = plugin_store.manifest_sysreqs(manifest)
+    if not reqs:
+        # Sol round-3 M: an update to a manifest with NO requirements must clear
+        # any stale row (add_plugin_entry replaces by name on the has-reqs path,
+        # so only this branch leaks). No-op for a brand-new plugin. Sol round-4:
+        # cleanup failure is non-fatal — never break the mutation sequence.
+        _safe_remove_manifest(name)
+        return None
+    try:
+        outcomes = install_requirements(
+            plugin_name=name, requirements=reqs,
+            tools_root=Path("/config/tools"))
+    except OrchestrationError as exc:
+        return {"ok": False, "kind": "system_requirements_failed",
+                "detail": str(exc)}
+    for outcome in outcomes:
+        add_manifest(outcome.manifest_entry(name))
+    return None
+
+
+def _plugin_add_sync(*, name: str, repo: str, ref: str, subdir: str = "",
+                     targets: list) -> dict:
+    """Blocking core of plugin_add: publish → sysreqs → activate. Pure-sync;
+    returns the exact envelope contract (ok True|False). Registry stays
+    byte-identical on any pre-activation failure (FR2)."""
+    if not plugin_registry.NAME_RE.match(name or ""):
+        return {"ok": False, "kind": "invalid_name", "name": name}
+    targets = list(targets or [])
+    # Sol round-3 M: a non-string target must not raise TypeError out of the
+    # envelope (TARGET_RE.match(1) throws) — reject it as an invalid target.
+    bad = [t for t in targets
+           if not isinstance(t, str) or not plugin_registry.TARGET_RE.match(t)]
+    if bad or not targets:
+        return {"ok": False, "kind": "invalid_target", "invalid": bad}
+    # Sol round-3 M: validate subdir here so `../x` returns an envelope instead
+    # of an uncaught ValueError from normalize_subdir inside publish.
+    try:
+        plugin_registry.normalize_subdir(subdir or "")
+    except ValueError:
+        return {"ok": False, "kind": "invalid_subdir", "subdir": subdir}
+    data = plugin_registry.load_registry()                     # from DISK
+    if not data.valid:
+        return {"ok": False, "kind": "registry_invalid"}
+    if any(isinstance(e, dict) and e.get("name") == name
+           for e in data.raw.get("plugins", [])):
+        return {"ok": False, "kind": "plugin_exists", "name": name}
+    try:
+        result = plugin_store.publish(name=name, repo=repo, ref=ref,
+                                      subdir=subdir)
+    except plugin_store.RefNotFound:
+        return {"ok": False, "kind": "ref_not_found"}
+    except plugin_store.ResolveUnavailable:
+        return {"ok": False, "kind": "resolve_unavailable"}
+    except plugin_store.StoreError as exc:
+        return {"ok": False, "kind": getattr(exc, "reason_code", "store_error")}
+    err = _install_plugin_sysreqs(name, result.manifest)       # BEFORE activate
+    if err is not None:
+        return err
+    data.raw.setdefault("plugins", []).append({
+        "name": name,
+        "source": {"type": "github", "repo": repo, "ref": ref,
+                   "revision": result.revision, "subdir": subdir},
+        "artifact_id": result.artifact_id, "version": result.version,
+        "targets": targets,
+    })
+    plugin_registry.save_registry(data)
+    return {"ok": True, "name": name, "targets": targets,
+            "artifact_id": result.artifact_id, "version": result.version,
+            "revision": result.revision, "path": result.path}
+
+
+def _plugin_update_sync(*, name: str, new_ref: str) -> dict:
+    """Blocking core of plugin_update: re-publish from new_ref (version DERIVED
+    from the fetched manifest, FR5), install new sysreqs BEFORE moving the
+    registry pointer, then repoint the entry. Old artifact retained."""
+    data = plugin_registry.load_registry()
+    if not data.valid:
+        return {"ok": False, "kind": "registry_invalid"}
+    entry = next((e for e in data.raw.get("plugins", [])
+                  if isinstance(e, dict) and e.get("name") == name), None)
+    if entry is None:
+        return {"ok": False, "kind": "not_registered", "name": name}
+    src = entry.get("source") or {}
+    repo, subdir = src.get("repo", ""), src.get("subdir", "")
+    try:
+        result = plugin_store.publish(name=name, repo=repo, ref=new_ref,
+                                      subdir=subdir)
+    except plugin_store.RefNotFound:
+        return {"ok": False, "kind": "ref_not_found"}
+    except plugin_store.ResolveUnavailable:
+        return {"ok": False, "kind": "resolve_unavailable"}
+    except plugin_store.StoreError as exc:
+        return {"ok": False, "kind": getattr(exc, "reason_code", "store_error")}
+    err = _install_plugin_sysreqs(name, result.manifest)       # BEFORE repoint
+    if err is not None:
+        return err
+    entry["source"]["ref"] = new_ref
+    entry["source"]["revision"] = result.revision
+    entry["artifact_id"] = result.artifact_id
+    entry["version"] = result.version
+    plugin_registry.save_registry(data)
+    return {"ok": True, "name": name, "targets": list(entry.get("targets") or []),
+            "artifact_id": result.artifact_id, "version": result.version,
+            "revision": result.revision, "path": result.path}
+
+
+def _resolved_observability(name: str) -> dict:
+    """granted_tools + required_env_vars for the freshly-activated plugin (best
+    effort — reads the just-reloaded snapshot; resolve_all finds it regardless
+    of target)."""
+    for rp in plugin_registry.resolve_all().plugins:
+        if rp.name == name:
+            return {"granted_tools": grants_for_resolved(rp),
+                    "required_env_vars": required_env_vars_for_resolved(rp)}
+    return {"granted_tools": [], "required_env_vars": []}
+
+
+@tool(
+    "plugin_add",
+    "Add a plugin to the registry: publish its pinned artifact, install any "
+    "system requirements, assign it to targets, then reload + verify. Version "
+    "is derived from the plugin manifest (never supplied).",
+    # Sol #15: an explicit JSON Schema — the shorthand {key: type} form marks
+    # EVERY key required, so a root-plugin call omitting `subdir` (defaulted by
+    # the handler) is rejected by the MCP input validator before the handler
+    # runs. `subdir` is the only optional field.
+    {"type": "object",
+     "properties": {
+         "name": {"type": "string"},
+         "repo": {"type": "string"},
+         "ref": {"type": "string"},
+         "subdir": {"type": "string"},
+         # Sol round-3 M: constrain items so a non-string target (`[1]`) is
+         # rejected by the MCP validator, not by an uncaught TARGET_RE.match.
+         "targets": {"type": "array", "items": {"type": "string"}}},
+     "required": ["name", "repo", "ref", "targets"]},
+)
+async def plugin_add(args: dict) -> dict:
+    async with _PLUGIN_TOOLS_LOCK:
+        core = await asyncio.to_thread(
+            _plugin_add_sync, name=args["name"], repo=args["repo"],
+            ref=args["ref"], subdir=args.get("subdir", ""),
+            targets=args.get("targets") or [])
+        if core.get("ok") is not True:
+            return _result(core)
+        seq = await _reload_and_verify_targets(
+            core["name"], core["targets"], expect="present")
+        core.update(seq)
+        core.update(_resolved_observability(core["name"]))
+        return _result(core)
+
+
+@tool(
+    "plugin_update",
+    "Update a registered plugin to a new ref: re-publish, install new system "
+    "requirements, repoint the registry, reload + verify. Version derives from "
+    "the fetched manifest.",
+    {"name": str, "new_ref": str},
+)
+async def plugin_update(args: dict) -> dict:
+    async with _PLUGIN_TOOLS_LOCK:
+        core = await asyncio.to_thread(
+            _plugin_update_sync, name=args["name"], new_ref=args["new_ref"])
+        if core.get("ok") is not True:
+            return _result(core)
+        seq = await _reload_and_verify_targets(
+            core["name"], core["targets"], expect="present")
+        core.update(seq)
+        core.update(_resolved_observability(core["name"]))
+        return _result(core)
+
+
+def _find_entry(data, name: str) -> dict | None:
+    return next((e for e in data.raw.get("plugins", [])
+                 if isinstance(e, dict) and e.get("name") == name), None)
+
+
+def _plugin_assign_sync(*, name: str, target: str) -> dict:
+    if not plugin_registry.TARGET_RE.match(target or ""):
+        return {"ok": False, "kind": "invalid_target", "target": target}
+    data = plugin_registry.load_registry()
+    if not data.valid:
+        return {"ok": False, "kind": "registry_invalid"}
+    entry = _find_entry(data, name)
+    if entry is None:
+        return {"ok": False, "kind": "not_registered", "name": name}
+    targets = entry.setdefault("targets", [])
+    was_assigned = target in targets
+    if not was_assigned:
+        targets.append(target)
+        plugin_registry.save_registry(data)
+    return {"ok": True, "name": name, "target": target,
+            "targets": list(targets), "was_assigned": was_assigned}
+
+
+def _plugin_unassign_sync(*, name: str, target: str) -> dict:
+    data = plugin_registry.load_registry()
+    if not data.valid:
+        return {"ok": False, "kind": "registry_invalid"}
+    entry = _find_entry(data, name)
+    if entry is None:
+        return {"ok": False, "kind": "not_registered", "name": name}
+    targets = entry.get("targets") or []
+    was_assigned = target in targets
+    if was_assigned:
+        entry["targets"] = [t for t in targets if t != target]
+        plugin_registry.save_registry(data)
+    return {"ok": True, "name": name, "target": target,
+            "was_assigned": was_assigned, "targets": entry.get("targets") or []}
+
+
+def _plugin_remove_sync(*, name: str) -> dict:
+    data = plugin_registry.load_registry()
+    if not data.valid:
+        return {"ok": False, "kind": "registry_invalid"}
+    entry = _find_entry(data, name)
+    if entry is None:
+        return {"ok": False, "kind": "not_registered", "name": name}
+    targets = list(entry.get("targets") or [])
+    data.raw["plugins"] = [
+        e for e in data.raw.get("plugins", [])
+        if not (isinstance(e, dict) and e.get("name") == name)]
+    # §3.1 no-resurrection: seeded_defaults is INTENTIONALLY left untouched, so
+    # a removed default stays removed across upgrades. Artifact left for GC.
+    plugin_registry.save_registry(data)
+    # Sol round-3 M: drop the plugin's system-requirement manifest row too, so a
+    # removed plugin leaves no stale reconciliation burden. Sol round-4: this is
+    # NON-FATAL — a raise here (unwritable manifest) must not bypass the mandatory
+    # reload/verify tail that runs after the sync core returns ok.
+    _safe_remove_manifest(name)
+    return {"ok": True, "name": name, "targets": targets,
+            "artifact_retained": True}
+
+
+def _tool_plugin_list() -> dict:
+    data = plugin_registry.load_registry()
+    seeded = set(data.raw.get("seeded_defaults") or [])
+    plugins = []
+    for e in data.raw.get("plugins", []):
+        if not isinstance(e, dict):
+            continue
+        name, aid = e.get("name"), e.get("artifact_id")
+        store_dir = plugin_registry.STORE_ROOT / str(name) / str(aid)
+        plugins.append({
+            "name": name, "version": e.get("version"),
+            "revision": (e.get("source") or {}).get("revision"),
+            "targets": e.get("targets") or [], "artifact_id": aid,
+            "artifact_present": store_dir.is_dir(),
+            "seeded_default": name in seeded,
+        })
     return {
-        "ok": True,
-        "installed_on": installed,
-        "required_env_vars": sorted(env_vars),
-        "system_requirements_installed": len(outcomes),
-        # P-5a observability: grants now derive from installed state at every
-        # options build; report them so configurator/verify can confirm.
-        "granted_tools": grants_for_plugin(plugin_name, "casa-plugins"),
+        "registry_valid": data.valid, "plugins": plugins,
+        "issues": [{"name": i.name, "reason_code": i.reason_code}
+                   for i in data.entry_issues],
     }
 
 
 @tool(
-    "marketplace_add_plugin",
-    "Add a plugin entry to the user marketplace.",
-    {
-        "plugin_name": str,
-        "repo_url": str,
-        "ref": str,
-        "description": str,
-        "category": str,
-        "version": str,
-        "casa_system_requirements": list,
-    },
+    "plugin_assign",
+    "Assign a registered plugin to a target (resident:/specialist:/executor:).",
+    {"name": str, "target": str},
 )
-async def marketplace_add_plugin(args: dict) -> dict:
+async def plugin_assign(args: dict) -> dict:
     async with _PLUGIN_TOOLS_LOCK:
-        return _result(await asyncio.to_thread(
-            _tool_marketplace_add_plugin,
-            plugin_name=args["plugin_name"],
-            repo_url=args["repo_url"],
-            ref=args["ref"],
-            description=args["description"],
-            category=args.get("category", "productivity"),
-            version=args.get("version"),
-            casa_system_requirements=args.get("casa_system_requirements"),
-        ))
+        core = await asyncio.to_thread(
+            _plugin_assign_sync, name=args["name"], target=args["target"])
+        if core.get("ok") is not True:
+            return _result(core)
+        seq = await _reload_and_verify_targets(
+            core["name"], [core["target"]], expect="present")
+        core.update(seq)
+        return _result(core)
 
 
 @tool(
-    "marketplace_remove_plugin",
-    "Remove a plugin entry from the user marketplace.",
-    {"plugin_name": str},
+    "plugin_unassign",
+    "Remove a plugin's assignment to one target (the plugin stays registered).",
+    {"name": str, "target": str},
 )
-async def marketplace_remove_plugin(args: dict) -> dict:
+async def plugin_unassign(args: dict) -> dict:
     async with _PLUGIN_TOOLS_LOCK:
-        return _result(await asyncio.to_thread(
-            _tool_marketplace_remove_plugin, plugin_name=args["plugin_name"],
-        ))
+        core = await asyncio.to_thread(
+            _plugin_unassign_sync, name=args["name"], target=args["target"])
+        if core.get("ok") is not True:
+            return _result(core)
+        seq = await _reload_and_verify_targets(
+            core["name"], [core["target"]], expect="absent")
+        core.update(seq)
+        return _result(core)
 
 
 @tool(
-    "marketplace_update_plugin",
-    "Update a plugin's sha/ref in the user marketplace.",
-    {"plugin_name": str, "new_ref": str},
+    "plugin_remove",
+    "Remove a plugin from the registry entirely (artifact retained for GC).",
+    {"name": str},
 )
-async def marketplace_update_plugin(args: dict) -> dict:
+async def plugin_remove(args: dict) -> dict:
     async with _PLUGIN_TOOLS_LOCK:
-        return _result(await asyncio.to_thread(
-            _tool_marketplace_update_plugin,
-            plugin_name=args["plugin_name"],
-            new_ref=args["new_ref"],
-        ))
+        core = await asyncio.to_thread(_plugin_remove_sync, name=args["name"])
+        if core.get("ok") is not True:
+            return _result(core)
+        seq = await _reload_and_verify_targets(
+            core["name"], core["targets"], expect="absent")
+        core.update(seq)
+        return _result(core)
 
 
 @tool(
-    "marketplace_list_plugins",
-    "List all plugins in the user marketplace.",
+    "plugin_list",
+    "List every registered plugin with its version, revision, targets, "
+    "artifact presence, and seeded-default status.",
     {},
 )
-async def marketplace_list_plugins(args: dict) -> dict:
-    return _result(_tool_marketplace_list_plugins())
-
-
-@tool(
-    "install_casa_plugin",
-    "Install a plugin into target agents (two-stage commit: system requirements then per-agent-home plugin install).",
-    {
-        "plugin_name": str,
-        "targets": list,
-    },
-)
-async def install_casa_plugin(args: dict) -> dict:
-    async with _PLUGIN_TOOLS_LOCK:
-        return _result(await asyncio.to_thread(
-            _tool_install_casa_plugin,
-            plugin_name=args["plugin_name"],
-            targets=args["targets"],
-        ))
+async def plugin_list(args: dict) -> dict:
+    return _result(await asyncio.to_thread(_tool_plugin_list))
 
 
 # ---------------------------------------------------------------------------
@@ -3053,139 +3559,220 @@ async def install_casa_plugin(args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _tool_uninstall_casa_plugin(
-    *,
-    plugin_name: str,
-    targets: list[str] | None = None,
-) -> dict:
-    if targets is None:
-        targets = []
-        if _AGENT_HOME_ROOT.is_dir():
-            for d in _AGENT_HOME_ROOT.iterdir():
-                settings = d / ".claude" / "settings.json"
-                if not settings.is_file():
-                    continue
-                data = json.loads(settings.read_text(encoding="utf-8"))
-                if not isinstance(data, dict):
-                    continue
-                if any(k.startswith(f"{plugin_name}@") for k in data.get("enabledPlugins", {})):
-                    targets.append(d.name)
-
-    uninstalled: list[str] = []
-    for role in targets:
-        agent_home = _AGENT_HOME_ROOT / role
-        cmd = ["claude", "plugin", "uninstall",
-               f"{plugin_name}@casa-plugins", "--scope", "project"]
-        r = subprocess.run(cmd, cwd=agent_home, capture_output=True, text=True, timeout=60)
-        if r.returncode == 0:
-            uninstalled.append(role)
-
-    # R-9: `claude plugin uninstall` clears the agent-home's enabledPlugins but
-    # leaves the shared marketplace cache dir orphaned. Sweep it once NO
-    # agent-home still enables the plugin (the cache is shared across targets,
-    # so keep it while any remaining target uses it).
-    cache_swept = False
-    if uninstalled and not _any_agent_enables_plugin(plugin_name):
-        cache_dir = _CASA_PLUGIN_CACHE_ROOT / plugin_name
-        if cache_dir.is_dir():
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            cache_swept = True
-    return {"uninstalled_from": uninstalled, "cache_swept": cache_swept}
-
-
-def _any_agent_enables_plugin(plugin_name: str) -> bool:
-    """True if any agent-home still lists ``<plugin_name>@…`` in enabledPlugins."""
-    if not _AGENT_HOME_ROOT.is_dir():
-        return False
-    for d in _AGENT_HOME_ROOT.iterdir():
-        settings = d / ".claude" / "settings.json"
-        if not settings.is_file():
-            continue
-        try:
-            data = json.loads(settings.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            continue
-        if isinstance(data, dict) and any(
-            k.startswith(f"{plugin_name}@") for k in data.get("enabledPlugins", {})
-        ):
-            return True
-    return False
-
-
 def _tool_verify_plugin_state(
     *,
     plugin_name: str,
     _tools_bin: Path | None = None,
-    _cache_root: Path | None = None,
+    _registry_path=None,
+    _store_root=None,
 ) -> dict:
-    """Check tool readiness, secret resolution, and MCP cache for a plugin.
-
-    The optional ``_tools_bin`` and ``_cache_root`` parameters override the
-    production paths for testing.
+    """Tier-aware verification (§3.9): does the RUNNING state agree with the
+    registry's DESIRED state? Constructed residents/specialists must have the
+    desired artifact bound (else reload_required); dormant targets report
+    configured readiness only; executors also need their plugin MCP namespaces
+    authorized; running engagements on a previous artifact are informational.
+    Verification can never report active agreement while a running consumer
+    executes different code (FR3).
     """
-    from system_requirements.manifest import read_manifest
+    import agent as agent_mod
+    import cc_tool_pattern
     from plugin_env_conf import read_entries
+    from plugin_registry import ResolvedPlugin, STORE_ROOT, load_registry
+    from system_requirements.manifest import read_manifest
 
+    reg = (load_registry(_registry_path) if _registry_path is not None
+           else load_registry())
+    if not reg.valid:
+        return {"ready": False, "reasons": ["registry_invalid"],
+                "targets": []}
+    # Sol #8: verify MUST agree with the resolver. An entry that resolve_for()
+    # drops (duplicate_name) or skips (entry_invalid) is unavailable to every
+    # agent/executor — verify must not green it off the raw list. Select from
+    # the VALIDATED entries and surface the resolver's own rejection reason.
+    # Sol round-3 M-shadow: PREFER a validated resolved entry. A rejection issue
+    # (entry_invalid / duplicate_name) only blocks when NO validated entry of
+    # this name survived — otherwise an unrelated same-name invalid entry would
+    # shadow the valid one the resolver actually serves.
+    entry = next((e for e in reg.entries
+                  if isinstance(e, dict) and e.get("name") == plugin_name), None)
+    if entry is None:
+        bad = next((i for i in reg.entry_issues if i.name == plugin_name), None)
+        if bad is not None:
+            return {"ready": False, "reasons": [bad.reason_code], "targets": []}
+        return {"ready": False, "reasons": ["not_registered"], "targets": []}
+
+    store_root = _store_root if _store_root is not None else STORE_ROOT
+    artifact_id = entry.get("artifact_id")
+    src = entry.get("source") or {}
+    revision = src.get("revision", "")
+    path = Path(store_root) / plugin_name / str(artifact_id)
+    reasons: list[str] = []
+    provenance_warning = revision.startswith("legacy-content:")
+    present = path.is_dir()
+    checksum_valid = False
+    if not present:
+        reasons.append("artifact_missing")
+    else:
+        verdict = plugin_store.artifact_verdict(
+            path, name=plugin_name, repo=src.get("repo", ""),
+            revision=revision, subdir=src.get("subdir", ""),
+            artifact_id=str(artifact_id))
+        if verdict is None:
+            checksum_valid = True
+        else:
+            reasons.append(verdict)          # artifact_invalid | corrupt_artifact
+
+    manifest: dict = {}
+    try:
+        manifest = json.loads((path / ".claude-plugin" / "plugin.json")
+                              .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    rp = ResolvedPlugin(name=plugin_name, artifact_id=str(artifact_id),
+                        path=str(path), version=str(entry.get("version", "")),
+                        manifest=manifest)
+    # Sol #16: a PRESENT-but-malformed .mcp.json silently degrades grants/secrets
+    # to [] (indistinguishable from skill-only), so a broken MCP server would
+    # otherwise verify ready. Treat it as a blocking reason.
+    if checksum_valid and mcp_json_malformed(rp):
+        reasons.append("mcp_invalid")
+    granted = grants_for_resolved(rp) if checksum_valid else []
+
+    # Tools (system-requirements — verify_bin presence). Sol #11: check BOTH the
+    # INSTALLED manifest rows AND every requirement the ARTIFACT declares, so a
+    # plugin declaring a sysreq with no installed row can't pass on all([]).
     data = read_manifest()
     tool_entries = [p for p in data["plugins"] if p["name"] == plugin_name]
-
     tools_bin = _tools_bin if _tools_bin is not None else Path("/config/tools/bin")
     tools_status = []
     for t in tool_entries:
         vb = t.get("verify_bin", "")
-        # is_file() follows symlinks; a dangling link (target wiped by a
-        # rollback) is correctly reported missing, not masked ready (M23).
-        if (tools_bin / vb).is_file():
-            tools_status.append({"requirement": t["winning_strategy"], "verify_bin": vb,
-                                 "status": "ready"})
-        else:
-            tools_status.append({"requirement": t["winning_strategy"], "verify_bin": vb,
-                                 "status": "missing",
-                                 "reason": f"{vb} not in tools/bin"})
+        ready_bin = (tools_bin / vb).is_file()   # follows symlinks (M23)
+        tools_status.append({
+            # Sol CI-review: a hand-corrupted manifest row may lack winning_strategy
+            # (read_manifest keeps any dict with a name) — access defensively.
+            "requirement": t.get("winning_strategy", "unknown"), "verify_bin": vb,
+            "status": "ready" if ready_bin else "missing",
+            **({} if ready_bin else {"reason": f"{vb} not in tools/bin"})})
+    # Declared-but-not-installed requirements (Sol #11): every requirement the
+    # artifact's manifest declares must have a corresponding installed entry.
+    installed_bins = {t.get("verify_bin", "") for t in tool_entries}
+    for req in (plugin_store.manifest_sysreqs(manifest) if checksum_valid else []):
+        vb = req.get("verify_bin", "")
+        if vb and vb not in installed_bins:
+            tools_status.append({
+                "requirement": req.get("type", "declared"), "verify_bin": vb,
+                "status": "missing",
+                "reason": f"declared requirement {vb!r} has no installed entry"})
 
-    cache_root = _cache_root if _cache_root is not None else _CASA_PLUGIN_CACHE_ROOT
-    mcp_json = highest_version_mcp_json(cache_root / plugin_name)  # (e, v0.69.7)
-    required = extract_env_vars(mcp_json) if mcp_json else set()
+    # Secrets from the ARTIFACT's .mcp.json (no version-dir guessing).
+    required = set(required_env_vars_for_resolved(rp)) if checksum_valid else set()
     env_conf = read_entries()
     secrets_status = []
     for var in sorted(required):
-        if var in env_conf:
-            source = "op" if env_conf[var].startswith("op://") else "plain"
-            secrets_status.append({"var": var, "source": source, "status": "resolved"})
+        conf_val = env_conf.get(var)
+        # Sol round-4: a secret counts as resolved only if it is present in the
+        # EFFECTIVE environment (boot sourced plugin-env.conf into os.environ,
+        # resolving op:// refs). A config entry whose op:// resolution FAILED at
+        # boot leaves os.environ unset — configuration presence alone must not
+        # mark it resolved, or a broken MCP plugin passes the launch gate.
+        effective = os.environ.get(var)
+        if effective and not effective.startswith("op://"):
+            source = "op" if (conf_val or "").startswith("op://") else "plain"
+            secrets_status.append({"var": var, "source": source,
+                                   "status": "resolved"})
+        elif conf_val is not None:
+            secrets_status.append({
+                "var": var,
+                "source": "op" if conf_val.startswith("op://") else "plain",
+                "status": "unresolved",
+                "reason": "configured but not resolved in the effective environment"})
         else:
             secrets_status.append({"var": var, "source": "missing",
                                    "status": "unresolved",
                                    "reason": "not in plugin-env.conf"})
 
-    mcp_started = mcp_json is not None
-    mcp_errors: list[dict] = []
+    tools_ready = all(t["status"] == "ready" for t in tools_status)
+    secrets_ready = all(s["status"] == "resolved" for s in secrets_status)
+    configured_ready = (not reasons) and tools_ready and secrets_ready
 
-    # Readiness gates on satisfied tools + secrets, plus the absence of MCP
-    # startup errors. It does NOT require an .mcp.json to exist: a skill-only
-    # plugin (a recommended pattern) legitimately ships no MCP server, and after
-    # a successful install the presence of an .mcp.json only signals that a
-    # server is declared — whether it actually works is already covered by the
-    # tool and secret checks. Gating on mcp_started here would make every
-    # skill-only plugin report ready=False (R-1).
-    ready = (
-        all(t["status"] == "ready" for t in tools_status)
-        and all(s["status"] == "resolved" for s in secrets_status)
-        and not mcp_errors
-    )
+    runtime = getattr(agent_mod, "active_runtime", None)
+    agents = getattr(runtime, "agents", {}) or {}
+    exec_reg = getattr(runtime, "executor_registry", None)
+
+    target_rows = []
+    stale_targets = []
+    for target in entry.get("targets", []):
+        tier, _, role = target.partition(":")
+        row = {"target": target, "ready": configured_ready, "reasons": []}
+        if not configured_ready:
+            row["reasons"] = list(reasons) or ["not_ready"]
+        if tier in ("resident", "specialist"):
+            agent = agents.get(role)
+            constructed = (agent is not None
+                           and getattr(agent, "_plugin_resolution", None) is not None)
+            if constructed:
+                row["state"] = "active"
+                active_aid = getattr(agent, "active_plugin_binding", {}).get(plugin_name)
+                row["active_artifact_id"] = active_aid
+                if active_aid != artifact_id:
+                    row["ready"] = False
+                    row["reasons"] = ["reload_required"]
+                    stale_targets.append(target)
+            else:
+                row["state"] = "dormant"
+        elif tier == "executor":
+            row["state"] = "dormant"
+            defn = exec_reg.get(role) if exec_reg is not None else None
+            allowed = list(getattr(defn, "tools_allowed", []) or []) if defn else []
+            missing = [g for g in granted
+                       if not cc_tool_pattern.matches_any(allowed, g, {})]
+            row["authorization"] = {"required": granted, "missing": missing}
+            if missing:
+                row["ready"] = False
+                row["reasons"] = ["authorization_missing"]
+        target_rows.append(row)
+
+    # Running executor engagements on a PREVIOUS artifact — informational.
+    sessions = []
+    if _engagement_registry is not None:
+        try:
+            running = _engagement_registry.active_and_idle()
+        except Exception:  # noqa: BLE001
+            running = []
+        for rec in running:
+            for pa in getattr(rec, "plugin_artifacts", ()) or ():
+                if (pa.get("name") == plugin_name
+                        and pa.get("artifact_id") != artifact_id):
+                    sessions.append({"engagement_id": rec.id,
+                                     "artifact_id": pa.get("artifact_id")})
+
+    # Draining resident/specialist turns still on the PREVIOUS artifact —
+    # informational (Sol #4): after a reload swaps an agent, its in-flight turn
+    # keeps executing the old artifact until aclose drains it (≤ pool drain
+    # timeout). verify discloses it rather than silently implying it's gone.
+    for d in getattr(runtime, "draining", None) or []:
+        aid = (d.get("binding") or {}).get(plugin_name)
+        if aid is not None and aid != artifact_id:
+            sessions.append({"draining_role": d.get("role"),
+                             "artifact_id": aid})
+
+    top_ready = (configured_ready
+                 and all(r["ready"] for r in target_rows))
     return {
+        "ready": top_ready,
+        "reasons": reasons,
+        "desired": {"artifact_id": artifact_id,
+                    "version": entry.get("version"),
+                    "revision": revision, "targets": entry.get("targets", [])},
+        "artifact": {"present": present, "checksum_valid": checksum_valid,
+                     "provenance_warning": provenance_warning},
         "tools": tools_status,
         "secrets": secrets_status,
-        "mcp_started": mcp_started,
-        # cache_root is the marketplace-level dir (<cache root>/casa-plugins);
-        # decompose it so the grant derivation reads the exact tree globbed
-        # above — threading the _cache_root test override. Production is
-        # unchanged: parent=/config/cc-home/.claude/plugins/cache (the
-        # plugin_grants default), name=casa-plugins.
-        "granted_tools": grants_for_plugin(
-            plugin_name, cache_root.name, cache_root=cache_root.parent,
-        ),
-        "mcp_errors": mcp_errors,
-        "ready": ready,
+        "granted_tools": granted,
+        "targets": target_rows,
+        "stale_targets": stale_targets,
+        "sessions_on_previous_artifact": sessions,
     }
 
 
@@ -3233,20 +3820,6 @@ def _tool_get_item_fields(*, item: str, vault: str = "") -> dict:
                         "section": (f.get("section") or {}).get("label", ""),
                         "type": f.get("type")}
                        for f in data.get("fields", [])]}
-
-
-@tool(
-    "uninstall_casa_plugin",
-    "Uninstall a plugin from target agent-homes (or all homes that have it enabled if targets omitted).",
-    {"plugin_name": str, "targets": list},
-)
-async def uninstall_casa_plugin(args: dict) -> dict:
-    async with _PLUGIN_TOOLS_LOCK:
-        return _result(await asyncio.to_thread(
-            _tool_uninstall_casa_plugin,
-            plugin_name=args["plugin_name"],
-            targets=args.get("targets") or None,
-        ))
 
 
 @tool(
@@ -3327,12 +3900,13 @@ CASA_TOOLS: tuple = (
     delete_engagement_workspace,
     peek_engagement_workspace,
     cleanup_engagement_topics,     # v0.65.0 [AR-7] — configurator-only grant
-    marketplace_add_plugin,
-    marketplace_remove_plugin,
-    marketplace_update_plugin,
-    marketplace_list_plugins,
-    install_casa_plugin,
-    uninstall_casa_plugin,
+    # Unified plugin architecture (§3.13) — registry tools.
+    plugin_add,
+    plugin_update,
+    plugin_assign,
+    plugin_unassign,
+    plugin_remove,
+    plugin_list,
     verify_plugin_state,
     verify_plugin_secrets,
     set_plugin_env_reference,

@@ -6,8 +6,10 @@ pre_tool_use:
       - /data/engagements/
     readable:
       - /data/engagements/
-      - /opt/claude-seed
-      - /config/cc-home/.claude/plugins/cache
+      # v0.71.0: read-only access to the content-addressed plugin store, so
+      # the plugin-developer can inspect its --plugin-dir'd plugins. The old
+      # /opt/claude-seed + cc-home plugin cache are gone (marketplace removed).
+      - /config/plugins/store
   - policy: commit_size_guard
     max_files: 50
   - policy: self_containment_guard

@@ -139,54 +139,39 @@ You (Configurator) do NOT need to touch any of this — workspace
 provisioning + hook proxying are framework concerns. If a user asks why
 their engagement survived a Casa restart cleanly, this is the reason.
 
-## Plugin consumer infrastructure (v0.14.1)
+## Plugin infrastructure — unified plugin architecture (v0.71.0)
 
-Casa uses Claude Code's native plugin machinery via a two-marketplace model.
+ONE mechanism for ALL agent tiers. The marketplace, the version-keyed cache,
+and the `claude plugin install` machinery are gone.
 
-### Two marketplaces
+### Registry — the single assignment authority
 
-- **`casa-plugins-defaults`** — seed-managed, read-only. Catalog at
-  `/opt/casa/defaults/marketplace-defaults/.claude-plugin/marketplace.json`.
-  Pre-installed cache at `/opt/claude-seed/` (built at image build, `chmod a-w`).
-  Contains: superpowers, plugin-dev, skill-creator, mcp-server-dev, context7.
-  Configurator MUST NOT mutate this marketplace.
-- **`casa-plugins`** — user-writable. Catalog at
-  `/config/marketplace/.claude-plugin/marketplace.json`.
-  Configurator mutates via `marketplace_ops` helpers (add/remove/update).
+`/config/plugins/registry.json` (config, git-tracked) pins each plugin to an
+immutable content-addressed artifact and lists its targets
+(`resident:`/`specialist:`/`executor:`). It is the ONLY place plugin
+assignments live — there is no `enabledPlugins`, no per-agent `plugins.yaml`.
 
-### Plugin cache
+### Store + resolver
 
-- Seed cache: `/opt/claude-seed/cache/casa-plugins-defaults/<plugin>/<version>/`
-  (read-only, baked into image).
-- User cache: `/config/cc-home/.claude/plugins/cache/casa-plugins/<plugin>/<version>/`
-  (managed by `claude plugin install --scope user`).
+- Store: `/config/plugins/store/<name>/<artifact-id>/` — immutable artifacts,
+  content-addressed by `SHA-256(repo\nrevision\nsubdir\nname)`. An update is a
+  NEW artifact + a registry pointer change; old artifacts are retained.
+- Resolver: `plugin_registry.resolve_for(target)` turns the registry into one
+  `ResolutionResult` that feeds EVERYTHING — the SDK `plugins=[…]` list
+  (residents/specialists), the executor `--plugin-dir` flags, tool grants,
+  secrets, system requirements, and verification. No split brain.
+- Bundled defaults (superpowers, plugin-dev, skill-creator, mcp-server-dev,
+  context7) are materialized into the store at image build and imported by the
+  `init-plugin-store` boot oneshot.
 
-### Binding layer
+### How each tier loads
 
-`/opt/casa/plugins_binding.py::build_sdk_plugins` — shells
-`claude plugin list --json`, translates `installPath` entries into SDK
-`plugins=[{"type":"local","path":...}]` shape. Called from every
-`ClaudeAgentOptions` construction in `agent.py` and `tools.py`.
-
-### Per-agent enablement
-
-Each in_casa agent has a project-scope settings.json at
-`/config/agent-home/<role>/.claude/settings.json` with:
-
-```json
-{"enabledPlugins": {"<plugin>@<marketplace>": true}}
-```
-
-Provisioned at boot by `casa_core.provision_agent_home()` — idempotent,
-preserves user-added entries.
-
-### Workspace-template (claude_code executors)
-
-For Tier 3 executors, `defaults/agents/executors/<type>/workspace-template/`
-is rendered per engagement via `drivers.workspace.render_workspace_template`.
-`CLAUDE.md.tmpl` is interpolated with `{task}/{context}/{world_state_summary}/{executor_type}`.
-`.claude/settings.json::enabledPlugins` is generated from the executor's
-`plugins.yaml`.
+- Residents/specialists: `agent.py` passes `plugins=[{"type":"local","path":
+  rp.path}]` from the resolver; server-level grants
+  (`mcp__plugin_<name>_<server>`) are auto-derived (P-5).
+- Executors: launched with repeated `--plugin-dir <path>` flags rendered from
+  the engagement's RECORDED artifacts (pinned at launch, never re-resolved);
+  they keep their explicit `tools.allowed` allow-list + permission relay.
 
 ### Plugin environment variables
 
@@ -198,12 +183,12 @@ SDK clients spawn.
 
 ### System requirements (plugin-runtime tools)
 
-Plugins may declare `casa.systemRequirements` in their marketplace entry:
+Plugins may declare `casa.systemRequirements` in their `plugin.json` manifest:
 
 - `{type: tarball, url, sha256, verify_bin}` — HTTPS download + sha256 check.
 - `{type: venv, package, verify_bin}` — `python -m venv` + pip install.
 - `{type: npm, package, verify_bin}` — `npm install --prefix` + .bin symlink.
-- `{type: apt}` — **REJECTED at marketplace-add time** (§4.3.2 / P-10).
+- `{type: apt}` — **REJECTED at publish time** by `plugin_store.validate_manifest` (P-10).
 
 Install into `/config/tools/` with symlinks in `tools/bin/`
 (on `PATH` via `/run/s6/container_environment/PATH`).
@@ -218,34 +203,32 @@ for every installed requirement. `setup-configs.sh` invokes
 non-zero on any `degraded`. Non-blocking (degrades affected plugins,
 never crashes boot).
 
-### Configurator MCP tools (v0.14.1)
+### Configurator MCP tools (v0.71.0)
 
-These tools are wired into your `definition.yaml::tools.allowed` and
-exercised through the recipes under `recipes/plugin/` (install,
-remove, marketplace, secrets).
+Wired into your `definition.yaml::tools.allowed` and exercised through the
+recipes under `recipes/plugin/`. Every mutating tool publishes/updates the
+registry, then reloads + verifies internally — NO separate `casa_reload`.
 
-Core:
-- `marketplace_add_plugin` — append entry to user marketplace + refresh CC.
-- `marketplace_remove_plugin` — remove from user marketplace.
-- `marketplace_update_plugin` — bump ref on existing entry.
-- `marketplace_list_plugins` — enumerate user marketplace entries.
-- `install_casa_plugin` — two-stage commit: stage 1 = systemRequirements,
-  stage 2 = `claude plugin install --scope project` per target agent-home.
-  Stage 2 failure rolls back stage 1 via `rmtree`.
-- `uninstall_casa_plugin` — `claude plugin uninstall --scope project`
-  per target.
-- `verify_plugin_state` — per-plugin readiness report: tools +
-  secrets (from plugin-env.conf) + mcp_started + overall `ready` bool.
+Registry:
+- `plugin_add(name, repo, ref, subdir?, targets)` — publish artifact → install
+  system requirements → activate → reload → verify. Version DERIVED from the
+  manifest (never supplied).
+- `plugin_update(name, new_ref)` — re-publish from a new ref, repoint, reload,
+  verify. New commit ⇒ new artifact_id (stale-code bug impossible).
+- `plugin_assign(name, target)` / `plugin_unassign(name, target)` — add/drop
+  one target's assignment.
+- `plugin_remove(name)` — remove the entry (artifact retained for GC).
+- `plugin_list()` — enumerate registered plugins + presence + seeded-default.
+- `verify_plugin_state(name)` — tier-aware readiness: desired-vs-active binding,
+  artifact validity, tools, secrets, executor authorization.
 
 Helpers:
 - `set_plugin_env_reference` — upsert `VAR=value` in plugin-env.conf.
-- `list_vault_items` — `op item list --format json` filtered.
-- `get_item_fields` — `op item get --format json` field metadata.
+- `list_vault_items` / `get_item_fields` — 1Password discovery.
 
-See `recipes/plugin/install.md` for the canonical install flow,
-`recipes/plugin/remove.md` for uninstall, `recipes/plugin/marketplace.md`
-for marketplace-only operations, and `recipes/plugin/secrets.md` for
-wiring plugin env vars via 1Password references.
+See `recipes/plugin/add.md` (add), `recipes/plugin/update.md` (update),
+`recipes/plugin/remove.md` (unassign/remove), and `recipes/plugin/secrets.md`
+(wiring plugin env vars via 1Password references).
 
 ### 1P universal resolver
 

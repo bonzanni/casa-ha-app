@@ -92,6 +92,11 @@ class EngagementRecord:
     # creation. When "auto" or "bypassPermissions" the relay hook
     # short-circuits without surfacing a permission keyboard.
     permission_mode: str = "acceptEdits"
+    # §3.8: immutable snapshot of the resolved plugin artifacts this
+    # engagement launched with — each {"name","artifact_id","path"}. Boot
+    # replay renders --plugin-dir flags from THESE recorded paths, never a
+    # re-resolution of current assignments. Preserved by every rewrite.
+    plugin_artifacts: tuple[dict, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +171,7 @@ class EngagementRegistry:
                     current_state_emoji=row.get("current_state_emoji"),
                     tools_allowed=tuple(row.get("tools_allowed") or ()),
                     permission_mode=row.get("permission_mode") or "acceptEdits",
+                    plugin_artifacts=tuple(row.get("plugin_artifacts") or ()),
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed engagement row: %s", exc)
@@ -284,6 +290,7 @@ class EngagementRegistry:
                 "current_state_emoji": rec.current_state_emoji,
                 "tools_allowed": list(rec.tools_allowed),
                 "permission_mode": rec.permission_mode,
+                "plugin_artifacts": [dict(pa) for pa in rec.plugin_artifacts],
             })
         try:
             await asyncio.to_thread(self._write_tombstone, snapshot)
@@ -307,6 +314,7 @@ class EngagementRegistry:
         topic_id: int | None,
         tools_allowed: tuple[str, ...] | list[str] = (),
         permission_mode: str = "acceptEdits",
+        plugin_artifacts: tuple[dict, ...] | list[dict] = (),
     ) -> EngagementRecord:
         engagement_id = uuid.uuid4().hex
         now = time.time()
@@ -326,6 +334,7 @@ class EngagementRegistry:
             task=task,
             tools_allowed=tuple(tools_allowed),
             permission_mode=permission_mode or "acceptEdits",
+            plugin_artifacts=tuple(dict(pa) for pa in plugin_artifacts),
         )
         async with self._lock:
             self._records[engagement_id] = rec

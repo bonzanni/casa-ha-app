@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.71.0] - 2026-07-13 — unified plugin architecture
+
+### Changed
+
+- **Unified plugin architecture.** One registry (`/config/plugins/registry.json`)
+  is now the single plugin-assignment authority for every agent tier, resolved to
+  immutable content-addressed artifacts under `/config/plugins/store/`. Residents
+  and specialists load plugins directly through the Agent SDK; executor
+  engagements pin their exact artifacts at launch and load them via `--plugin-dir`.
+  The plugin marketplace, version-keyed cache, and `claude plugin` install
+  machinery are removed end-to-end. A one-time migration converts existing
+  installs automatically on first boot (report: `/data/plugin-migration-report.json`).
+- Configurator plugin tools are now `plugin_add`, `plugin_update`,
+  `plugin_assign`, `plugin_unassign`, `plugin_remove`, `plugin_list`, and a
+  tier-aware `verify_plugin_state`; plugin versions always derive from the
+  plugin's own manifest.
+
+### Fixed
+
+- A plugin update can no longer silently keep executing stale code
+  (the v1.1.0→v1.2.0 lesina-invoice incident): artifacts are content-addressed,
+  verification compares the registry's desired state against each running
+  agent's actual loaded artifact, and reports `reload_required` on any mismatch.
+
+### Added
+
+- Plugin health report (`/data/plugin-health.json`) with an operator DM on new
+  issues and a one-line first-contact notice from affected agents.
+
+### Removed
+
+- Marketplace catalogs, `enabledPlugins` provisioning, the build-time plugin
+  seed, and the boot-time `claude plugin` bootstrap. Legacy state under
+  `/config/marketplace` and `/config/cc-home/.claude/plugins` is left inert for
+  one release (rollback-safe) and will be cleaned up in a later release.
+
 ## [0.70.0] - 2026-07-12 — rich text in Telegram replies
 
 ### Added

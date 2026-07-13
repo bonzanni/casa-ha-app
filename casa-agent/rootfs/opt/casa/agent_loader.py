@@ -38,6 +38,11 @@ SCHEMA_DIR = os.path.join(os.path.dirname(__file__), "defaults", "schema")
 
 # --- Tier file-set rules ---------------------------------------------------
 
+# NOTE: `plugins.yaml` is legacy, ignored since v0.71.0 (unified plugin
+# architecture — assignment lives in the registry). It stays whitelisted here
+# so an operator-MODIFIED file (which config_sync preserves) does not crash
+# agent loading on upgrade; nothing reads it anymore. Prune with the
+# inert-state cleanup release.
 TIER_FILES: dict[str, dict[str, set[str]]] = {
     "resident": {
         "required":  {"character.yaml", "voice.yaml", "response_shape.yaml",

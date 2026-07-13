@@ -1021,3 +1021,220 @@ class TestFailedStartClosesTopic:
             engagement_id=mock_rec.id, new_state="failed",
         )
         channel.close_topic.assert_awaited_once_with(thread_id=42)
+
+
+class TestEngageExecutorPluginGate:
+    """§3.5/§3.8: executor launches gate on the plugin resolution (before any
+    topic is created), and record the resolved binding."""
+
+    async def _run(self, monkeypatch, resolution):
+        from tools import engage_executor
+        import agent as agent_mod
+        import plugin_registry
+
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=_mock_executor_def(driver="claude_code"))
+        reg.list_types = MagicMock(return_value=["configurator"])
+        channel = await _setup(reg)
+        monkeypatch.setattr(plugin_registry, "resolve_for", lambda t: resolution)
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "configurator", "task": "t", "context": "",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+        return json.loads(r["content"][0]["text"]), channel
+
+    async def test_engage_executor_blocks_on_registry_invalid(self, monkeypatch):
+        from plugin_registry import ResolutionResult
+        payload, channel = await self._run(
+            monkeypatch, ResolutionResult(registry_valid=False))
+        assert payload["kind"] == "plugin_registry_invalid"
+        channel.open_engagement_topic.assert_not_called()   # gate is pre-topic
+
+    async def test_engage_executor_blocks_on_plugin_issue(self, monkeypatch):
+        from plugin_registry import PluginIssue, ResolutionResult
+        issue = PluginIssue(name="lesina-invoice",
+                            target="executor:configurator", stage="resolve",
+                            reason_code="artifact_missing")
+        payload, channel = await self._run(
+            monkeypatch,
+            ResolutionResult(registry_valid=True, issues=[issue]))
+        assert payload["kind"] == "plugin_unavailable"
+        assert "lesina-invoice" in payload["message"]
+        channel.open_engagement_topic.assert_not_called()
+
+    async def test_blocks_on_not_ready_plugin(self, monkeypatch):
+        """Sol round-3 B4: a resolvable-but-not-ready plugin (unresolved secret /
+        authorization_missing / missing sysreq / mcp_invalid) must NOT launch."""
+        from tools import engage_executor
+        import agent as agent_mod
+        import plugin_registry
+        import tools as tools_mod
+        from plugin_registry import ResolutionResult, ResolvedPlugin
+
+        rp = ResolvedPlugin(name="p", artifact_id="a" * 64, path="/store/p",
+                            version="1", manifest={})
+        reg = MagicMock()
+        reg.get = MagicMock(
+            return_value=_mock_executor_def(driver="claude_code"))
+        reg.list_types = MagicMock(return_value=["configurator"])
+        channel = await _setup(reg)
+        monkeypatch.setattr(plugin_registry, "resolve_for",
+                            lambda t: ResolutionResult(registry_valid=True,
+                                                       plugins=[rp]))
+        monkeypatch.setattr(tools_mod, "_tool_verify_plugin_state",
+                            lambda *, plugin_name: {"ready": False, "targets": [
+                                {"target": "executor:configurator",
+                                 "ready": False,
+                                 "reasons": ["authorization_missing"]}]})
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "configurator", "task": "t", "context": "",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+        payload = json.loads(r["content"][0]["text"])
+        assert payload["kind"] == "plugin_not_ready"
+        channel.open_engagement_topic.assert_not_called()   # gate is pre-topic
+
+    async def test_aborts_when_snapshot_changes_during_create(
+        self, monkeypatch, tmp_path,
+    ):
+        """Sol round-4: a lock-less reload_full() bumping the generation DURING
+        create()'s await is caught by the post-create recheck → the engagement is
+        aborted (plugin_superseded) before the driver starts."""
+        from tools import engage_executor, init_tools
+        import agent as agent_mod
+        import plugin_registry
+        import tools as tools_mod
+        from plugin_registry import ResolutionResult, ResolvedPlugin
+
+        rp = ResolvedPlugin(name="p", artifact_id="a" * 64, path="/store/p",
+                            version="1", manifest={})
+        reg = MagicMock()
+        reg.get = MagicMock(
+            return_value=_mock_executor_def(driver="claude_code"))
+        reg.list_types = MagicMock(return_value=["configurator"])
+        er = MagicMock()
+        mock_rec = MagicMock()
+        mock_rec.id = "abcd1234" + "0" * 24
+        mock_rec.topic_id = 42
+        er.mark_error = AsyncMock()
+        er.recent_for_origin = MagicMock(return_value=None)
+
+        async def _create(**kw):
+            plugin_registry._generation += 1   # reload_full during create's await
+            return mock_rec
+        er.create = AsyncMock(side_effect=_create)
+
+        channel = await _setup(reg)
+        channel.update_topic_state = AsyncMock()
+        channel.close_topic = AsyncMock()
+        monkeypatch.setattr(plugin_registry, "resolve_for",
+                            lambda t: ResolutionResult(registry_valid=True,
+                                                       plugins=[rp]))
+        monkeypatch.setattr(tools_mod, "_tool_verify_plugin_state",
+                            lambda *, plugin_name: {"ready": True, "targets": [
+                                {"target": "executor:configurator",
+                                 "ready": True}]})
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        init_tools(channel_manager=cm, bus=MagicMock(),
+                   specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+                   trigger_registry=MagicMock(), engagement_registry=er,
+                   executor_registry=reg)
+        monkeypatch.setattr(agent_mod, "active_engagement_driver",
+                            MagicMock(start=AsyncMock()), raising=False)
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi"})
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "configurator", "task": "t", "context": ""})
+        finally:
+            agent_mod.origin_var.reset(token)
+        payload = json.loads(r["content"][0]["text"])
+        assert payload["kind"] == "plugin_superseded"
+        er.mark_error.assert_awaited()
+
+    async def test_reresolves_on_concurrent_update_during_launch(
+        self, monkeypatch, tmp_path,
+    ):
+        """Sol #6 TOCTOU: a plugin_update during the topic-creation await bumps
+        the snapshot generation → engage_executor re-resolves so the record pins
+        the CURRENT artifact, not the one resolved before the await."""
+        from tools import engage_executor, init_tools
+        import agent as agent_mod
+        import plugin_registry
+        from plugin_registry import ResolutionResult, ResolvedPlugin
+
+        reg = MagicMock()
+        reg.get = MagicMock(
+            return_value=_mock_executor_def(driver="claude_code"))
+        reg.list_types = MagicMock(return_value=["configurator"])
+        er = MagicMock()
+        mock_rec = MagicMock()
+        mock_rec.id = "abcd1234" + "0" * 24
+        mock_rec.topic_id = 42
+        er.create = AsyncMock(return_value=mock_rec)
+        er.mark_error = AsyncMock()
+        er.set_channel_state = AsyncMock()
+        er.recent_for_origin = MagicMock(return_value=None)
+
+        old = ResolvedPlugin(name="p", artifact_id="a" * 64,
+                             path="/store/p/old", version="1", manifest={})
+        new = ResolvedPlugin(name="p", artifact_id="b" * 64,
+                             path="/store/p/new", version="2", manifest={})
+        state = {"res": ResolutionResult(registry_valid=True, plugins=[old])}
+        monkeypatch.setattr(plugin_registry, "resolve_for",
+                            lambda t: state["res"])
+        # B4 gate runs verify before the topic — stub it ready so the re-resolve
+        # path (not readiness) is what this test exercises.
+        import tools as tools_mod
+        monkeypatch.setattr(tools_mod, "_tool_verify_plugin_state",
+                            lambda *, plugin_name: {"ready": True, "targets": [
+                                {"target": "executor:configurator",
+                                 "ready": True}]})
+
+        channel = await _setup(reg, tmp_path=tmp_path)
+
+        async def _open(**kw):
+            # Simulate a concurrent plugin_update landing during topic creation.
+            plugin_registry._generation += 1
+            state["res"] = ResolutionResult(registry_valid=True, plugins=[new])
+            return 42
+        channel.open_engagement_topic = AsyncMock(side_effect=_open)
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=er,
+            executor_registry=reg,
+        )
+        monkeypatch.setattr(agent_mod, "active_engagement_driver",
+                            MagicMock(start=AsyncMock()), raising=False)
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            await engage_executor.handler({
+                "executor_type": "configurator", "task": "t", "context": "",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        arts = er.create.await_args.kwargs["plugin_artifacts"]
+        assert [a["artifact_id"] for a in arts] == ["b" * 64], (
+            f"record must pin the FRESH artifact after a mid-launch update: {arts}")

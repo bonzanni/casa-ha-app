@@ -13,7 +13,7 @@ asked to rotate a secret on an already-installed plugin.
 
 ## When to use
 
-- `install_casa_plugin` returned a non-empty `required_env_vars` list.
+- `plugin_add` (or `plugin_update`) returned a non-empty `required_env_vars` list.
 - `verify_plugin_state` reports `mcp_started: false` with one or more
   `secrets[*].status: unresolved`.
 - The operator asks to update an existing secret (1P field changed,
@@ -113,7 +113,7 @@ per target role at the end of the install.
 
 Some plugins ship an MCP server that **works without a key** and reads an
 **optional** API key from the environment — the key is NOT declared in the
-plugin's `.mcp.json`, so `install_casa_plugin` returns no `required_env_vars`
+plugin's `.mcp.json`, so `plugin_add` returns no `required_env_vars`
 and `verify_plugin_state` shows nothing unresolved. The "When to use" triggers
 above won't fire, but the operator may still want the key wired (for higher rate
 limits / reliability). **`context7`** is the canonical case: its MCP server

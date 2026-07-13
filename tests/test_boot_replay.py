@@ -399,3 +399,118 @@ async def test_replay_warn_and_skips_heal_when_workspace_missing(
 
     # Missing workspace → NO service planted.
     assert write_calls == []
+
+
+def _rec_pa(eid, artifacts, topic_id=1):
+    from engagement_registry import EngagementRecord
+    return EngagementRecord(
+        id=eid, kind="executor", role_or_type="hello-driver",
+        driver="claude_code", status="active", topic_id=topic_id,
+        started_at=0.0, last_user_turn_ts=0.0, last_idle_reminder_ts=0.0,
+        completed_at=None, sdk_session_id=None, origin={}, task="t",
+        plugin_artifacts=tuple(artifacts),
+    )
+
+
+def _exec_reg():
+    from config import ExecutorDefinition
+    class FakeExecReg:
+        def get(self, t):
+            return ExecutorDefinition(
+                type="hello-driver", description="test", model="haiku",
+                driver="claude_code", enabled=True, tools_allowed=[],
+                tools_disallowed=[], permission_mode="bypassPermissions",
+                mcp_server_names=[], idle_reminder_days=1,
+                prompt_template_path="/nope/prompt.md", hooks_path=None,
+                observer_policy_path=None, doctrine_dir="/nope/doctrine",
+                extra_dirs=[], mirror_chat_to_topic=False, plugins_dir="",
+            )
+    return FakeExecReg()
+
+
+async def test_replay_renders_plugin_dir_flags_from_record(monkeypatch, tmp_path):
+    """§3.8: the run script renders --plugin-dir flags from the RECORDED
+    artifacts; replay never re-resolves current assignments."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+    import plugin_registry
+
+    svc_root = tmp_path / "svc"; svc_root.mkdir()
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+    write_calls: list[dict] = []
+    def fake_write(**kw):
+        write_calls.append(kw)
+        (svc_root / f"engagement-{kw['engagement_id']}").mkdir()
+    monkeypatch.setattr(s6_rc, "write_service_dir", fake_write)
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", AsyncMock())
+    monkeypatch.setattr(s6_rc, "start_service", AsyncMock())
+    # Replay must NEVER call resolve_for.
+    monkeypatch.setattr(plugin_registry, "resolve_for",
+                        lambda t: (_ for _ in ()).throw(
+                            AssertionError("replay re-resolved!")))
+
+    art_dir = tmp_path / "store" / "sp" / ("a" * 64)
+    art_dir.mkdir(parents=True)
+    rec = _rec_pa("keep1", [{"name": "superpowers", "artifact_id": "a" * 64,
+                             "path": str(art_dir)}])
+    reg = await _make_registry([rec])
+    driver = AsyncMock(); driver._spawn_background_tasks = lambda r: None
+    ws_root = tmp_path / "eng"; (ws_root / "keep1").mkdir(parents=True)
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, executor_registry=_exec_reg(),
+        engagements_root=str(ws_root))
+
+    assert len(write_calls) == 1
+    assert f"--plugin-dir {art_dir}" in write_calls[0]["run_script"]
+
+
+async def test_replay_refuses_when_recorded_artifact_missing(monkeypatch, tmp_path):
+    """Sol F5: a missing recorded artifact refuses resume — no service written,
+    no start_service, no background tasks; a topic notice fires; others heal."""
+    from unittest.mock import MagicMock
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+
+    svc_root = tmp_path / "svc"; svc_root.mkdir()
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+    write_ids: list[str] = []
+    def fake_write(**kw):
+        write_ids.append(kw["engagement_id"])
+        (svc_root / f"engagement-{kw['engagement_id']}").mkdir()
+    monkeypatch.setattr(s6_rc, "write_service_dir", fake_write)
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", AsyncMock())
+    start_ids: list[str] = []
+    async def fake_start(*, engagement_id): start_ids.append(engagement_id)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+
+    good_dir = tmp_path / "store" / "ok" / ("b" * 64)
+    good_dir.mkdir(parents=True)
+    refused = _rec_pa("refused1",
+                      [{"name": "gone", "artifact_id": "a" * 64,
+                        "path": str(tmp_path / "does-not-exist")}], topic_id=5)
+    healthy = _rec_pa("healthy1",
+                      [{"name": "ok", "artifact_id": "b" * 64,
+                        "path": str(good_dir)}], topic_id=6)
+    reg = await _make_registry([refused, healthy])
+
+    driver = AsyncMock()
+    bg = MagicMock()
+    driver._spawn_background_tasks = bg
+    ws_root = tmp_path / "eng"
+    (ws_root / "refused1").mkdir(parents=True)
+    (ws_root / "healthy1").mkdir(parents=True)
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, executor_registry=_exec_reg(),
+        engagements_root=str(ws_root))
+
+    # Refused: no service, no start, no background tasks; topic notice fired.
+    assert "refused1" not in write_ids and "refused1" not in start_ids
+    driver._send_to_topic.assert_awaited_once()
+    assert driver._send_to_topic.await_args.args[0] == 5    # topic_id
+    bg_ids = {c.args[0].id for c in bg.call_args_list}
+    assert "refused1" not in bg_ids
+    # Healthy engagement still healed + started + background-tasked.
+    assert "healthy1" in write_ids and "healthy1" in start_ids
+    assert "healthy1" in bg_ids

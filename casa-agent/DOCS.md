@@ -360,11 +360,15 @@ The `configurator` is the first Tier 3 Executor - knows Casa's configuration sur
 | Triggers (cron, interval, webhook) | yes | yes | yes | yes |
 | Delegate wiring | yes | yes | yes | yes |
 | Policies (disclosure) | - | yes | yes | - |
+| Plugins (registry + store) | yes | yes | yes | yes |
+
+Plugin management uses the registry tools (`plugin_add`, `plugin_update`,
+`plugin_assign`, `plugin_unassign`, `plugin_remove`, `plugin_list`,
+`verify_plugin_state`) — see [Plugins](#plugins-v0710).
 
 Not yet supported:
 
 - Eval running (configurator can shell to casa_eval, but no first-class recipe).
-- Plugin/skill installation - waiting on Plan 5 plugin-developer.
 - Creating new executor types - waiting on Plans 4/5.
 
 ### Invocation
@@ -398,6 +402,103 @@ Configurator reads short markdown recipes from its own doctrine tree at `/config
 - **Hook denied, configurator cancelled** - expected for resident deletion. To override: edit configurator's hooks.yaml, commit, reload, retry.
 - **Soft reload didn't take effect** - casa_reload_triggers requires the role to exist before the edit.
 - **Doctrine references stale fields** - file an issue; maintainer forgot to sync doctrine with Casa-core change.
+
+## Plugins (v0.71.0)
+
+Casa loads Claude Code plugins for every agent tier from **one registry**. There
+is no marketplace to browse and no per-agent install step — you pin a plugin
+once, assign it to the agents that should have it, and Casa materializes an
+immutable copy that every tier loads the same way.
+
+### Layout
+
+- `/config/plugins/registry.json` — the single source of truth: which plugins
+  exist, the exact commit each is pinned to, and which agents each is assigned
+  to. Tracked in the config git repo, so every change is snapshotted.
+- `/config/plugins/store/<name>/<artifact-id>/` — the materialized plugin
+  content. Each `<artifact-id>` is a content hash of the plugin's source
+  (repo + commit + subdirectory), so a given artifact directory is immutable:
+  a new commit produces a new artifact, never an in-place overwrite.
+
+Residents and specialists load their assigned plugins directly through the
+Claude Agent SDK. Executor engagements (e.g. plugin-developer) pin their exact
+artifacts at launch and load them via `--plugin-dir`, so a plugin update never
+changes the code a running engagement is already executing.
+
+### Managing plugins (via the Configurator)
+
+Ask Ellen for a plugin change; she opens a configurator engagement that uses
+these tools:
+
+- `plugin_add(name, repo, ref, subdir, targets)` — publish a plugin's pinned
+  artifact, install any system requirements it declares, assign it to targets,
+  then reload and verify.
+- `plugin_update(name, new_ref)` — re-pin to a new commit/tag and re-verify.
+  The version is always read from the plugin's own manifest — you never supply
+  it, so the stale-version class of bug is gone.
+- `plugin_assign(name, target)` / `plugin_unassign(name, target)` — change which
+  agents load a plugin. Targets look like `resident:ellen`, `specialist:finance`,
+  or `executor:plugin-developer`.
+- `plugin_remove(name)` — drop a plugin from the registry (its artifact is left
+  on disk for now; see disk usage).
+- `plugin_list()` / `verify_plugin_state(name)` — inspect the registry and check
+  that the running agents actually agree with it.
+
+### Secrets
+
+Unchanged from prior releases: a plugin declares required environment variables
+via `${VAR}` references in its `.mcp.json`. When you add a plugin, the
+configurator reports the required variables and asks for a 1Password reference
+(`op://…`) for each, stored in `plugin-env.conf`. Secret values never appear in
+transcripts.
+
+### Disk usage
+
+The store lives on `/config` (the `addon_config` volume), so artifacts persist
+across app updates. Because artifacts are content-addressed, updating a plugin
+adds a new artifact directory rather than replacing the old one, and removing a
+plugin leaves its artifact in place. Automatic garbage collection is written but
+**ships disabled in this release**; unreferenced artifacts can be pruned in a
+later version. Typical plugins are small (skills + a small MCP server), so this
+is not a concern for normal use.
+
+### Integrity model
+
+Artifact integrity rests on **content-addressing + checksum detection**: each
+artifact directory is named by a hash of its source, and its bytes are checksum-
+verified whenever the plugin snapshot is (re)loaded — a mismatch is reported
+(`corrupt_artifact`) so a tampered or damaged artifact is never silently loaded. The write guards on
+`/config/plugins` and the read-only freeze of published files are **best-effort
+defense-in-depth** — the real trust boundary is each agent's minimal tool scope,
+not a hard filesystem barrier. They are not designed to stop a deliberately
+evasive process running as root; a true filesystem/privilege boundary is a
+separate, later hardening item.
+
+### Migration & rollback
+
+On first boot after upgrading, a one-time migration converts any existing plugin
+installs into registry entries automatically and writes a report to
+`/data/plugin-migration-report.json`. The migration is offline (it reads only
+on-disk state) and runs once. Rollback is safe: the previous release's legacy
+plugin state under `/config/marketplace` and `/config/cc-home/.claude/plugins`
+is left untouched for one release, so downgrading the app image reads it as
+before.
+
+### Troubleshooting
+
+- **A plugin isn't loading / an agent complains it's missing** — run
+  `verify_plugin_state(<name>)` (ask Ellen). It compares the registry's desired
+  state against what each running agent has actually loaded and reports the
+  reason (`artifact_missing`, `corrupt_artifact`, `reload_required`,
+  `authorization_missing`, unresolved secret, …).
+- **`reload_required`** — the registry was updated but the agent hasn't been
+  reconstructed yet; a reload (or the configurator's own post-update reload)
+  clears it.
+- **Health at a glance** — `/data/plugin-health.json` summarizes current plugin
+  issues; Casa also DMs the operator when a *new* issue appears and affected
+  agents prepend a one-line first-contact notice.
+- **Migration questions** — see `/data/plugin-migration-report.json` for what
+  the one-time migration did.
 
 ## Enabling a bundled-disabled specialist
 
@@ -439,8 +540,9 @@ outlive Casa-main restarts (service dependencies are ordering-only, not
 lifetime-coupled).
 
 - **Workspace:** `/data/engagements/<id>/` — CLAUDE.md, `.mcp.json`,
-  isolated `$HOME`, Tier 1 baseline + Tier 2 per-executor plugin symlinks,
-  named FIFO for Casa → CLI turn delivery.
+  isolated `$HOME`, named FIFO for Casa → CLI turn delivery. Assigned plugins
+  are pinned at launch and loaded from the immutable store via repeated
+  `--plugin-dir` flags (see [Plugins](#plugins-v0710)), not symlinks.
 - **Service dirs:** `/data/casa-s6-services/engagement-<id>/` — `run` script
   + `type: longrun` + ordering dependency on `init-setup-configs` — plus a
   sibling logger service `engagement-<id>-log/` wired to it via
@@ -587,21 +689,15 @@ sweep). The fallback is removed in v0.14.2 or later.
 - `CASA_HOOK_RESOLVE_URL` — overrides where `hook_proxy.sh` POSTs hook
   decisions.
 
-## Plugin consumer infrastructure (v0.14.1)
+## Plugin consumer infrastructure (v0.71.0)
 
-Casa uses Claude Code's native plugin machinery. Two marketplaces are
-registered at boot:
-
-- **casa-plugins-defaults** — seed-managed, ships with the app.
-  Contains superpowers, plugin-dev, skill-creator, mcp-server-dev, context7.
-  Read-only — `claude plugin uninstall` against these
-  returns a "seed-managed" error.
-- **casa-plugins** — user-writable. Plugins authored by plugin-developer
-  land here, Configurator mutates.
-
-Each in_casa agent gets a project-scope settings dir at
-`/config/agent-home/<role>/.claude/settings.json` with
-`enabledPlugins` keyed as `<plugin>@<marketplace>`.
+Plugins are managed through the unified registry + immutable store — see
+[Plugins](#plugins-v0710) for the full model. There is no marketplace and no
+`enabledPlugins`: the registry (`/config/plugins/registry.json`) is the single
+assignment authority, and each pinned plugin resolves to an immutable artifact
+under `/config/plugins/store/<name>/<artifact-id>/`. The five defaults
+(superpowers, plugin-dev, skill-creator, mcp-server-dev, context7) are seeded
+from the app image and assigned to the plugin-developer executor.
 
 ## 1Password integration (v0.14.1)
 
@@ -620,8 +716,8 @@ managed by Configurator.
 Ask the primary assistant to build a plugin. It engages plugin-developer in
 a dedicated Telegram topic. Plugin-developer asks public/private, authors
 the plugin in its own GitHub repo, pushes, and emits completion. Assistant
-relays; on your confirm, Configurator installs to the target agents +
-asks for secrets via 1P Q&A.
+relays; on your confirm, Configurator adds it to the registry (`plugin_add`)
+and assigns it to the target agents + asks for secrets via 1P Q&A.
 
 Prerequisites:
 

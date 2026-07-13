@@ -97,17 +97,18 @@ class TestClaudeHomePropagationBlock:
 
 
 def test_setup_configs_has_home_block() -> None:
-    """Sanity: the markers are present and bracket the block in the right
-    spot (after claude-oauth-token end, before seed-copy begin).
+    """Sanity: the markers are present and bracket the block in the right spot
+    (after claude-oauth-token end). The seed-copy block that used to follow it
+    was removed in v0.71.0 — plugin materialization is now the init-plugin-store
+    oneshot (plugin_boot.py).
     """
     src = SETUP_CONFIGS.read_text(encoding="utf-8")
     oauth_end = src.find("# === claude-oauth-token: end")
     home_begin = src.find("# === claude-home-propagation: begin")
     home_end = src.find("# === claude-home-propagation: end")
-    seed_begin = src.find("# === seed-copy: begin")
-    assert oauth_end < home_begin < home_end < seed_begin, (
-        "claude-home-propagation block must sit between claude-oauth-token "
-        "end and seed-copy begin"
+    assert "seed-copy: begin" not in src, "the seed-copy block must be gone (§3.6)"
+    assert oauth_end < home_begin < home_end, (
+        "claude-home-propagation block must sit after claude-oauth-token end"
     )
 
 

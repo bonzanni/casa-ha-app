@@ -27,7 +27,6 @@ changes, addon options.json mutations, or kernel concerns.
 | Edit prompts/system.md or prompts/<trigger>.md | none (lazy-read per turn) |
 | Edit response_shape.yaml | none |
 | Edit executor's doctrine/*.md | none |
-| Edit user marketplace.json (`marketplace_*` tools) | none — read on demand |
 | Edit existing agent's triggers.yaml (no other change) | `triggers` |
 | Edit character.yaml | `agent` for that role |
 | Edit runtime.yaml | `agent` for that role |
@@ -41,8 +40,7 @@ changes, addon options.json mutations, or kernel concerns.
 | Edit an executor's `prompt.md` / `hooks.yaml` / `observer.yaml` / `doctrine/*` | none (lazy-read per turn) |
 | Create a NEW resident or specialist | `agents` |
 | Delete a resident or specialist | `agents` |
-| `install_casa_plugin` for a role | `agent` for that role |
-| `uninstall_casa_plugin` for a role | `agent` for that role |
+| `plugin_add`/`plugin_update`/`plugin_assign`/`plugin_unassign`/`plugin_remove` | none — the tool self-sequences its own reload + verify (§3.9) |
 | `set_plugin_env_reference` | `plugin_env` |
 | Multiple categories edited in one engagement | `full` |
 | Unsure | `full` |

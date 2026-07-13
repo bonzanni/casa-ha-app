@@ -121,26 +121,25 @@ class TestRestoreFile:
         assert (tmp_path / "agents" / "marker.txt").read_text() == "x"
 
 
-class TestMarketplaceWhitelist:
-    """P-3 (v0.69.1): configurator recipes mandate config_git_commit for
-    marketplace changes, but marketplace.json was gitignored — every such
-    commit was a silent no-op and agents looped reconciling 'committed ok'
-    vs 'untracked' (~2-min live loop observed 2026-07-11)."""
+class TestPluginsWhitelist:
+    """Unified plugin architecture (v0.71.0): the plugin registry is config
+    (tracked + versioned for an audit trail); the content-addressed store +
+    staging are binaries, never tracked."""
 
-    def test_marketplace_json_is_tracked(self, tmp_path):
+    def test_registry_json_is_tracked(self, tmp_path):
         from config_git import commit_config, init_repo
 
         _seed(tmp_path)
         init_repo(str(tmp_path))
-        mp = tmp_path / "marketplace" / ".claude-plugin"
-        mp.mkdir(parents=True)
-        (mp / "marketplace.json").write_text('{"plugins": []}', encoding="utf-8")
-        sha = commit_config(str(tmp_path), "marketplace: add test")
-        assert sha, "marketplace.json write must produce a real commit"
+        pl = tmp_path / "plugins"
+        pl.mkdir(parents=True)
+        (pl / "registry.json").write_text('{"plugins": []}', encoding="utf-8")
+        sha = commit_config(str(tmp_path), "plugins: registry init")
+        assert sha, "registry.json write must produce a real commit"
         tracked = subprocess.check_output(
             ["git", "-C", str(tmp_path), "ls-files"],
         ).decode().splitlines()
-        assert "marketplace/.claude-plugin/marketplace.json" in tracked
+        assert "plugins/registry.json" in tracked
 
     def test_plugin_env_conf_stays_untracked(self, tmp_path):
         from config_git import commit_config, init_repo
@@ -157,21 +156,23 @@ class TestMarketplaceWhitelist:
         ).decode().splitlines()
         assert "plugin-env.conf" not in tracked
 
-    def test_other_marketplace_files_stay_untracked(self, tmp_path):
+    def test_store_and_staging_stay_untracked(self, tmp_path):
         from config_git import commit_config, init_repo
 
         _seed(tmp_path)
         init_repo(str(tmp_path))
-        mp = tmp_path / "marketplace" / ".claude-plugin"
-        mp.mkdir(parents=True)
-        (mp / "marketplace.json").write_text("{}", encoding="utf-8")
-        (tmp_path / "marketplace" / "scratch.txt").write_text("x", encoding="utf-8")
-        commit_config(str(tmp_path), "marketplace: add")
+        pl = tmp_path / "plugins"
+        (pl / "store" / "superpowers" / "abc").mkdir(parents=True)
+        (pl / "store" / "superpowers" / "abc" / "skill.md").write_text("x")
+        (pl / ".staging" / "xyz").mkdir(parents=True)
+        (pl / "registry.json").write_text("{}", encoding="utf-8")
+        commit_config(str(tmp_path), "plugins: registry init")
         tracked = subprocess.check_output(
             ["git", "-C", str(tmp_path), "ls-files"],
         ).decode().splitlines()
-        assert "marketplace/.claude-plugin/marketplace.json" in tracked
-        assert "marketplace/scratch.txt" not in tracked
+        assert "plugins/registry.json" in tracked
+        assert not any(t.startswith("plugins/store/") for t in tracked)
+        assert not any(t.startswith("plugins/.staging/") for t in tracked)
 
     def test_init_repo_refreshes_stale_gitignore(self, tmp_path):
         """Existing deployments initialized the repo with the OLD whitelist;
