@@ -379,3 +379,36 @@ def test_regenerate_health_preserves_other_plugins_runtime_issue(monkeypatch):
     tools._regenerate_plugin_health([])           # mutating B, no extras
     reasons = [i.reason_code for i in captured["issues"]]
     assert "reload_required" in reasons
+
+
+def test_verify_discloses_draining_agent_on_previous_artifact(tmp_path,
+                                                              monkeypatch):
+    """Sol #4: a resident/specialist whose in-flight turn is still draining the
+    PREVIOUS artifact after a reload is disclosed (informational) — ready stays
+    true (the active binding is the new artifact; the old turn is transient)."""
+    import agent as agent_mod
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"])
+    mk_registry(tmp_path, [e])
+    runtime = _runtime(agents={})
+    runtime.draining = [{"role": "finance", "binding": {"probe": "b" * 64}}]
+    monkeypatch.setattr(agent_mod, "active_runtime", runtime, raising=False)
+    r = _verify(tmp_path)
+    assert any(s.get("draining_role") == "finance"
+               for s in r["sessions_on_previous_artifact"])
+    assert r["ready"] is True
+
+
+def test_reload_track_and_drop_draining():
+    """Sol #4: the draining tracker records a swapped-out agent's binding and
+    removes it on close; a binding-less agent is not tracked."""
+    from reload import _track_draining, _drop_draining
+    runtime = SimpleNamespace()
+    agent = SimpleNamespace(active_plugin_binding={"p": "aid1"})
+    ent = _track_draining(runtime, "finance", agent)
+    assert runtime.draining == [{"role": "finance", "binding": {"p": "aid1"}}]
+    _drop_draining(runtime, ent)
+    assert runtime.draining == []
+    assert _track_draining(
+        runtime, "x", SimpleNamespace(active_plugin_binding={})) is None

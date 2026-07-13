@@ -638,6 +638,13 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
 
     # Off-loop: _build_specialist_options resolves the registry (file IO) —
     # keep it off the shared event loop (H2/M20).
+    # Sol #4 residual (documented): this ephemeral delegation client pins the
+    # artifacts it resolves here for its (short) lifetime; it is NOT recorded in
+    # runtime.agents or the engagement registry, so a plugin_update landing
+    # mid-delegation is not disclosed by verify until the delegation ends. This
+    # window is transient and self-healing (the next delegation resolves the new
+    # artifact); the PERSISTENT stale-binding incident is fully closed. Tracked
+    # for a future live-binding registry (docs/ROADMAP-backlog.md).
     options = await asyncio.to_thread(_build_specialist_options, cfg)
     text = ""
     token = agent_mod.origin_var.set(child_origin)
@@ -860,10 +867,22 @@ async def delegate_to_agent(args: dict) -> dict:
         except Exception as exc:  # noqa: BLE001
             return _result({"status": "error", "kind": "topic_create_failed",
                             "message": str(exc)})
+        # §3.8 (Sol #4): record the specialist's plugin binding so verify can
+        # disclose this engagement if a later plugin_update supersedes its
+        # artifact (informational — mirrors the executor-engagement case). The
+        # specialist runs on the same tier:role resolution _build_specialist_
+        # options uses below.
+        _spec_tier = (_agent_registry.tier_for_role(agent_name)
+                      if _agent_registry is not None else None) or "specialist"
+        _spec_arts = tuple(
+            {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
+            for rp in plugin_registry.resolve_for(
+                f"{_spec_tier}:{agent_name}").plugins)
         # Create record
         rec = await _engagement_registry.create(
             kind="specialist", role_or_type=agent_name, driver="in_casa",
             task=task_text, origin=dict(origin), topic_id=topic_id,
+            plugin_artifacts=_spec_arts,
         )
         # Persist initial state emoji so update_topic_state knows
         # whether it needs to edit the title (no-op when state didn't change).
@@ -3525,6 +3544,16 @@ def _tool_verify_plugin_state(
                         and pa.get("artifact_id") != artifact_id):
                     sessions.append({"engagement_id": rec.id,
                                      "artifact_id": pa.get("artifact_id")})
+
+    # Draining resident/specialist turns still on the PREVIOUS artifact —
+    # informational (Sol #4): after a reload swaps an agent, its in-flight turn
+    # keeps executing the old artifact until aclose drains it (≤ pool drain
+    # timeout). verify discloses it rather than silently implying it's gone.
+    for d in getattr(runtime, "draining", None) or []:
+        aid = (d.get("binding") or {}).get(plugin_name)
+        if aid is not None and aid != artifact_id:
+            sessions.append({"draining_role": d.get("role"),
+                             "artifact_id": aid})
 
     top_ready = (configured_ready
                  and all(r["ready"] for r in target_rows))

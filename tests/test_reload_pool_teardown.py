@@ -90,7 +90,7 @@ async def test_reload_agent_closes_replaced_instance(monkeypatch, tmp_path):
                         lambda *a, **kw: new_agent)
     closed = []
     monkeypatch.setattr(reload_mod, "_schedule_agent_close",
-                        lambda a: closed.append(a))
+                        lambda a, **kw: closed.append(a))
 
     await reload_mod.reload_agent(runtime, role="assistant")
 
