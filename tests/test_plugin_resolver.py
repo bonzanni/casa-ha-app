@@ -201,3 +201,91 @@ def test_tier_for_role():
     assert reg.tier_for_role("assistant") == "resident"
     assert reg.tier_for_role("finance") == "specialist"
     assert reg.tier_for_role("ghost") is None
+
+
+# --- D2 (v0.74.0): generation lives inside the frozen snapshot ---------------
+
+
+def test_resolution_carries_snapshot_generation(tmp_path):
+    """D2: resolve_for returns the generation it was computed against."""
+    from plugin_registry import snapshot_generation
+    store = tmp_path / "store"
+    e = _entry("probe", ["specialist:finance"])
+    _mk_artifact(store, "probe", e["artifact_id"])
+    reg = _mk_registry(tmp_path, [e])
+    reload_snapshot(registry_path=reg, store_root=store)
+    g1 = snapshot_generation()
+    assert resolve_for("specialist:finance").generation == g1
+    reload_snapshot(registry_path=reg, store_root=store)
+    assert snapshot_generation() == g1 + 1
+    assert resolve_for("specialist:finance").generation == g1 + 1
+
+
+def test_generation_lives_inside_the_frozen_snapshot(tmp_path):
+    """D2: generation is a field OF the (frozen) snapshot object — one
+    assignment publishes both; the torn module-global pair is gone."""
+    import dataclasses
+    reload_snapshot(registry_path=tmp_path / "absent.json",
+                    store_root=tmp_path / "store")
+    snap = plugin_registry._current()
+    assert snap.generation == plugin_registry.snapshot_generation()
+    assert not hasattr(plugin_registry, "_generation")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        snap.generation = 999
+
+
+def test_registry_invalid_resolution_still_carries_generation(tmp_path):
+    p = tmp_path / "registry.json"
+    p.write_text("{broken", encoding="utf-8")
+    reload_snapshot(registry_path=p, store_root=tmp_path / "store")
+    res = resolve_for("resident:assistant")
+    assert res.registry_valid is False
+    assert res.generation == plugin_registry.snapshot_generation()
+
+
+def test_concurrent_reload_snapshot_is_serialized_and_monotonic(
+        tmp_path, monkeypatch):
+    """r2-B2 (r3-B2 hardened): reload_snapshot's whole load/validate/publish
+    must be MUTUALLY EXCLUSIVE across worker threads (mutation + manual
+    reload_full). The instrumented load_registry counts concurrently-active
+    calls — max_active == 1 is the lock's direct signature (Sol verified the
+    bare final-generation assertion alone passes 30/30 against UNLOCKED
+    code, so mutual exclusion is the load-bearing assert); the final
+    generation being EXACTLY start+N additionally pins monotonicity."""
+    import threading
+    import time as _time
+    from plugin_registry import load_registry as real_load
+    reload_snapshot(registry_path=tmp_path / "absent.json",
+                    store_root=tmp_path / "store")
+    start = plugin_registry.snapshot_generation()
+
+    counter_lock = threading.Lock()
+    state = {"active": 0, "max_active": 0}
+
+    def instrumented_load(path=None):
+        with counter_lock:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+        _time.sleep(0.005)          # hold the section open so overlap SHOWS
+        try:
+            return real_load(tmp_path / "absent.json")
+        finally:
+            with counter_lock:
+                state["active"] -= 1
+
+    monkeypatch.setattr(plugin_registry, "load_registry", instrumented_load)
+    n = 16
+    barrier = threading.Barrier(n)
+
+    def worker():
+        barrier.wait()
+        reload_snapshot(registry_path=tmp_path / "absent.json",
+                        store_root=tmp_path / "store")
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert state["max_active"] == 1                  # mutual exclusion held
+    assert plugin_registry.snapshot_generation() == start + n
