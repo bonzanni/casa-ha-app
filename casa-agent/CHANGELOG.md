@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.74.0] - 2026-07-13
+
+### Added
+
+- **Plugin release-flow hardening.** Plugin releases are now identified by an
+  annotated `vX.Y.Z` tag. A plugin-developer's completion is mechanically
+  validated (tag exists, is annotated, matches the built commit and the remote
+  manifest version) and rejected otherwise — the engagement stays live so the
+  producer can fix the release and re-emit.
+- `plugin_add` / `plugin_update` accept `expected_revision` and abort before
+  any change if the tag moved after the build (`revision_mismatch`) or does
+  not match the plugin's own version (`tag_version_mismatch`).
+- Plugin mutations report phase-aware outcomes (`activation_committed`,
+  `runtime_ready`) so a "pin landed, reload pending" state is actionable
+  instead of ambiguous.
+
+### Fixed
+
+- A missing release tag is now reported as `ref_not_found` instead of "GitHub
+  temporarily unavailable" (GitHub returns 422 for missing refs; the resolver
+  classifies status codes structurally, with new `resolve_auth_failed` and
+  `source_empty` verdicts and bounded rate-limit retries that honor
+  Retry-After).
+- Removed a race that could mark a freshly-updated plugin as `reload_required`
+  and warn every agent with "Plugin degraded" after a successful update;
+  health reports now derive from a fresh verification pass, and duplicate
+  registry-wide rows are suppressed.
+- First-contact plugin notices now say precisely what is wrong ("Plugin update
+  incomplete: … remains bound to the previous artifact") instead of a generic
+  degraded warning.
+
 ## [0.73.0] - 2026-07-13
 
 ### Added

@@ -41,10 +41,37 @@ from your pinned commit. That means:
     own `server/package.json`, keep that `version` in **sync** with
     `plugin.json` (bump both in the same commit) so the manifest and the
     running server never disagree.
-  - **Handoff (v0.71.0):** after you push a plugin release, hand the new tag to
-    the operator/configurator. Casa pins by RESOLVED commit via
-    `plugin_update(name, new_ref)` — pushing a tag alone changes nothing in
-    Casa until the configurator points the registry at it (§3.13).
+  - **Release ritual (v0.74.0 — REQUIRED, mechanically enforced):** every
+    release ships as an **annotated tag** named exactly
+    `"v" + plugin.json.version` (version `1.3.0` → tag `v1.3.0`):
+    1. `VERSION=$(jq -r .version .claude-plugin/plugin.json)`
+    2. `git tag -a "v${VERSION}" -m "release v${VERSION}"`
+    3. Push branch **and** tag **atomically** — a half-push can leave a
+       branch the configurator would mis-pin:
+       `git push --atomic origin main "refs/tags/v${VERSION}"`
+    4. **Existing conflicting tag → fail closed.** If the remote already has
+       `v${VERSION}` at a different commit, **stop** — never `--force`/move a
+       published release tag. Bump `plugin.json::version` and retry.
+    5. **Remote peel-verify before completing** (executable — the tag is
+       annotated, so compare the *peeled* commit, not the tag-object sha):
+       ```bash
+       [ "$(git ls-remote origin "refs/tags/v${VERSION}^{}" | cut -f1)" \
+         = "$(git rev-parse HEAD)" ] && echo PEEL-OK || echo PEEL-FAILED
+       ```
+       (equivalently `gh api repos/<owner>/<repo>/commits/v${VERSION} --jq
+       .sha` — the same call Casa's resolver makes, so your verify and the
+       configurator's pin agree by construction). On PEEL-FAILED, stop and
+       fix the push before emitting completion.
+  - **Handoff:** hand the operator/configurator all **three** identity
+    fields — `ref` (the `vX.Y.Z` tag), `revision` (the 40-hex commit sha,
+    lowercase, that the tag peels to), `version` (`X.Y.Z`). Casa pins via
+    `plugin_update(name, new_ref=<tag>, expected_revision=<sha>)`; pushing a
+    tag alone changes nothing in Casa until the configurator points the
+    registry at it (§3.13). **`emit_completion` mechanically validates every
+    `casa_plugin_repo` artifact** (annotated tag exists, peels to
+    `revision`, tag == `"v" + <remote plugin.json.version>`, `version`
+    matches) and rejects the completion otherwise — the engagement stays
+    live so you can fix the release and re-emit.
 - `skills/<name>/SKILL.md` — skills pack. Single-line description triggers
   right. Keep it specific.
 - `agents/<name>.md` — optional subagents.
@@ -82,21 +109,29 @@ When you finish, emit:
     "kind": "casa_plugin_repo",
     "repo_url": "https://github.com/<user>/casa-plugin-<slug>.git",
     "plugin_name": "<slug>",
-    "ref": "<sha>",
-    "version": "<semver>",
+    "ref": "vX.Y.Z",
+    "revision": "<40-hex commit sha the tag peels to, lowercase>",
+    "version": "X.Y.Z",
     "visibility": "public|private"
   }],
   "next_steps": [{
     "action": "add_to_registry_and_assign_with_confirmation",
     "plugin_name": "<slug>",
     "repo_url": "...",
-    "ref": "<sha>",
+    "ref": "vX.Y.Z",
+    "revision": "<same 40-hex sha>",
     "description": "<short>",
     "category": "productivity|data|security|...",
     "targets": ["<role>", ...]
   }]
 }
 ```
+
+`ref` is always the release tag (`vX.Y.Z` — never a bare sha, never a
+branch); `revision` is the exact commit it peels to; `version` matches
+`plugin.json`. All three are validated against the live remote when you call
+`emit_completion` — a lightweight tag, a moved tag, or a version mismatch
+rejects the completion.
 
 ## Operator approval for non-allow-listed tools
 

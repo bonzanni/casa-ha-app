@@ -11,6 +11,17 @@ import pytest
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
+def _bump_generation():
+    """Simulate a concurrent reload_snapshot: republish the current frozen
+    snapshot with generation+1 (the module-global _generation is gone —
+    v0.74.0 D2 publishes generation inside the one frozen snapshot)."""
+    import dataclasses
+    import plugin_registry
+    snap = plugin_registry._current()
+    plugin_registry._snapshot = dataclasses.replace(
+        snap, generation=snap.generation + 1)
+
+
 def _mock_executor_def(**overrides):
     from config import ExecutorDefinition
     defaults = {
@@ -1132,7 +1143,7 @@ class TestEngageExecutorPluginGate:
         er.recent_for_origin = MagicMock(return_value=None)
 
         async def _create(**kw):
-            plugin_registry._generation += 1   # reload_full during create's await
+            _bump_generation()   # reload_full during create's await
             return mock_rec
         er.create = AsyncMock(side_effect=_create)
 
@@ -1209,7 +1220,7 @@ class TestEngageExecutorPluginGate:
 
         async def _open(**kw):
             # Simulate a concurrent plugin_update landing during topic creation.
-            plugin_registry._generation += 1
+            _bump_generation()
             state["res"] = ResolutionResult(registry_valid=True, plugins=[new])
             return 42
         channel.open_engagement_topic = AsyncMock(side_effect=_open)

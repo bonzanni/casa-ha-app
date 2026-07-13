@@ -124,8 +124,21 @@ def first_contact_notice(role: str, path: Path = HEALTH_PATH) -> str | None:
                if d.get("target") in ok_targets]
     if not matched:
         return None
-    parts = [f"{d.get('name')} ({d.get('reason_code')})" for d in matched[:2]]
+    def _line(d) -> str:
+        # D4 (v0.74.0): a stale binding is an INCOMPLETE UPDATE — the old
+        # artifact stays live until reload. Never say "updating" or "will
+        # refresh next use" (false for a cached persistent Agent).
+        if d.get("reason_code") == "reload_required":
+            where = d.get("target") or "a target"
+            return (f"{d.get('name')}: {where} remains bound to the previous "
+                    f"artifact (reload_required)")
+        return f"{d.get('name')} ({d.get('reason_code')})"
+
+    parts = [_line(d) for d in matched[:2]]
     body = ", ".join(parts)
     if len(matched) > 2:
         body += f" +{len(matched) - 2} more"
+    if all(d.get("reason_code") == "reload_required" for d in matched):
+        return (f"⚠️ Plugin update incomplete: {body} — an operator has "
+                f"been notified.")
     return f"⚠️ Plugin degraded: {body} — an operator has been notified."

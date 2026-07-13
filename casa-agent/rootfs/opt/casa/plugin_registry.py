@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -260,27 +261,45 @@ class ResolutionResult:
     plugins: list[ResolvedPlugin] = field(default_factory=list)
     issues: list[PluginIssue] = field(default_factory=list)
     warnings: list[PluginIssue] = field(default_factory=list)
+    # D2 (v0.74.0): the snapshot generation this resolution was computed
+    # against — consumers (Agent binding snapshots, the mutation's post-reload
+    # check) detect an intervening reload instead of grading stale state.
+    generation: int = 0
 
 
-@dataclass
+@dataclass(frozen=True)
 class _Snapshot:
     registry: RegistryData
     registry_path: Path
     store_root: Path
+    # D2 (v0.74.0): the monotonic generation is a FIELD of the frozen
+    # snapshot — published in the same single `_snapshot = …` assignment, so
+    # no reader can observe a new snapshot with an old generation (the old
+    # separate `_generation` global was itself a torn pair).
+    generation: int = 0
     # (name, artifact_id) -> reason_code | None (None == deep-valid).
     validation: dict[tuple[str, str], str | None] = field(default_factory=dict)
 
 
 _snapshot: _Snapshot | None = None
-# Monotonic snapshot generation — bumped on every reload_snapshot so a launch
-# that resolved against one snapshot can detect a concurrent registry mutation
-# before it commits (Sol #6 TOCTOU fence).
-_generation: int = 0
+# r2-B2 (v0.74.0): reload_snapshot runs on worker threads (the mutation tools
+# hold the asyncio _PLUGIN_TOOLS_LOCK, but the manual-edit seam reload_full
+# does NOT serialize with them at this layer) — the generation
+# read-modify-write must be a critical section or two concurrent reloads can
+# publish the same generation, defeating the intervening-reload fence.
+# threading.Lock (not asyncio) because every caller is in a to_thread context.
+_RELOAD_LOCK = threading.Lock()
 
 
 def snapshot_generation() -> int:
-    """The current snapshot generation (see `_generation`)."""
-    return _generation
+    """The current snapshot's monotonic generation (bumped by every
+    reload_snapshot). Reads the one published snapshot object. Fail-closed
+    by design: _current() lazily publishes via the real reload_snapshot, so
+    None is only reachable through a NON-publishing test stub — which must
+    publish a snapshot itself (or stub this function) rather than get a
+    silent 0 (Sol diff-review: a 0 fallback made the mutation generation
+    fence order-dependently false-green in tests)."""
+    return _current().generation
 
 
 def reload_snapshot(*, registry_path: Path = REGISTRY_PATH,
@@ -291,31 +310,40 @@ def reload_snapshot(*, registry_path: Path = REGISTRY_PATH,
 
     Sol F1: deep validation (full checksum, plugin_store.artifact_verdict)
     runs HERE, once per referenced artifact per snapshot, cached — resolve_for
-    never checksums."""
+    never checksums.
+
+    r2-B2 (v0.74.0): the ENTIRE load/deep-validate/publish sequence is
+    serialized under _RELOAD_LOCK so concurrent reloads can never publish
+    duplicate generations; the snapshot itself is published by one
+    assignment of a frozen object."""
     import plugin_store  # local import: plugin_store imports this module
-    reg = load_registry(registry_path)
-    validation: dict[tuple[str, str], str | None] = {}
-    if reg.valid:
-        for entry in reg.entries:
-            key = (entry["name"], entry["artifact_id"])
-            path = Path(store_root) / entry["name"] / entry["artifact_id"]
-            if not path.is_dir():
-                validation[key] = "artifact_missing"
-            else:
-                # Sol R2-1: the ONE deep validator — identity vs the ENTRY
-                # (name/repo/revision/subdir/artifact_id) + checksum.
-                validation[key] = plugin_store.artifact_verdict(
-                    path,
-                    name=entry["name"],
-                    repo=entry["source"]["repo"],
-                    revision=entry["source"]["revision"],
-                    subdir=entry["source"].get("subdir", ""),
-                    artifact_id=entry["artifact_id"],
-                )
-    global _snapshot, _generation
-    _snapshot = _Snapshot(registry=reg, registry_path=Path(registry_path),
-                          store_root=Path(store_root), validation=validation)
-    _generation += 1
+    global _snapshot
+    with _RELOAD_LOCK:
+        reg = load_registry(registry_path)
+        validation: dict[tuple[str, str], str | None] = {}
+        if reg.valid:
+            for entry in reg.entries:
+                key = (entry["name"], entry["artifact_id"])
+                path = Path(store_root) / entry["name"] / entry["artifact_id"]
+                if not path.is_dir():
+                    validation[key] = "artifact_missing"
+                else:
+                    # Sol R2-1: the ONE deep validator — identity vs the ENTRY
+                    # (name/repo/revision/subdir/artifact_id) + checksum.
+                    validation[key] = plugin_store.artifact_verdict(
+                        path,
+                        name=entry["name"],
+                        repo=entry["source"]["repo"],
+                        revision=entry["source"]["revision"],
+                        subdir=entry["source"].get("subdir", ""),
+                        artifact_id=entry["artifact_id"],
+                    )
+        _snapshot = _Snapshot(
+            registry=reg, registry_path=Path(registry_path),
+            store_root=Path(store_root),
+            generation=(_snapshot.generation + 1
+                        if _snapshot is not None else 1),
+            validation=validation)
 
 
 def _current() -> _Snapshot:
@@ -366,8 +394,9 @@ def _resolve(target: str | None) -> ResolutionResult:
     snap = _current()
     reg = snap.registry
     if not reg.valid:
-        return ResolutionResult(registry_valid=False)
-    result = ResolutionResult(registry_valid=True)
+        return ResolutionResult(registry_valid=False,
+                                generation=snap.generation)
+    result = ResolutionResult(registry_valid=True, generation=snap.generation)
     for issue in reg.entry_issues:   # stage="registry"; Sol F2 + R2-2:
         # attribution rides on the issue's OWN scoped_targets, captured at
         # validation time from its own raw entry — never name-matched.

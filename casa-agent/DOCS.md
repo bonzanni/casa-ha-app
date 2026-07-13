@@ -430,12 +430,17 @@ changes the code a running engagement is already executing.
 Ask Ellen for a plugin change; she opens a configurator engagement that uses
 these tools:
 
-- `plugin_add(name, repo, ref, subdir, targets)` — publish a plugin's pinned
-  artifact, install any system requirements it declares, assign it to targets,
-  then reload and verify.
-- `plugin_update(name, new_ref)` — re-pin to a new commit/tag and re-verify.
-  The version is always read from the plugin's own manifest — you never supply
-  it, so the stale-version class of bug is gone.
+- `plugin_add(name, repo, ref, subdir, targets, expected_revision?)` — publish
+  a plugin's pinned artifact, install any system requirements it declares,
+  assign it to targets, then reload and verify.
+- `plugin_update(name, new_ref, expected_revision?)` — re-pin to a new release
+  and re-verify. Plugin releases are identified by an annotated `vX.Y.Z` tag
+  (v0.74.0); passing `expected_revision` (the commit the release was built at)
+  makes a tag that moved afterwards abort before anything changes. The version
+  is always read from the plugin's own manifest — you never supply it, so the
+  stale-version class of bug is gone. Both tools report phase-aware outcomes
+  (`activation_committed` / `runtime_ready`) so a "pin landed, reload pending"
+  state is actionable.
 - `plugin_assign(name, target)` / `plugin_unassign(name, target)` — change which
   agents load a plugin. Targets look like `resident:ellen`, `specialist:finance`,
   or `executor:plugin-developer`.
