@@ -358,3 +358,60 @@ def test_resolution_from_recorded_empty_and_identity_mismatch(tmp_path):
     with pytest.raises(RuntimeError):
         tools_mod._resolution_from_recorded(
             [{"name": "p", "artifact_id": "d" * 64, "path": str(art)}])
+
+
+# --- D2 (v0.74.0): one-assignment PluginBindingSnapshot ----------------------
+
+
+def test_resolution_and_binding_publish_as_one_snapshot(tmp_path):
+    """D2 torn-read fix: no state exists where _plugin_resolution is set
+    while active_plugin_binding is stale — both derive from ONE frozen
+    snapshot published by a single assignment."""
+    store = tmp_path / "store"
+    e = entry("probe", ["resident:assistant"])
+    mk_artifact(store, "probe", e["artifact_id"])
+    reload_snapshot(registry_path=mk_registry(tmp_path, [e]), store_root=store)
+    a = _make_agent(tmp_path, role="assistant")
+
+    async def run():
+        assert a.plugin_binding_snapshot is None
+        assert a._plugin_resolution is None
+        assert a.active_plugin_binding == {}
+        res = await a._get_plugin_resolution()
+        snap = a.plugin_binding_snapshot
+        assert snap is not None
+        assert snap.resolution is res
+        assert a._plugin_resolution is res
+        assert a.active_plugin_binding == {"probe": e["artifact_id"]}
+        assert dict(snap.binding) == {"probe": e["artifact_id"]}
+        assert snap.generation == res.generation
+
+    asyncio.run(run())
+
+
+def test_binding_attrs_are_read_only(tmp_path):
+    """The torn two-assignment publish is structurally impossible: the
+    legacy attribute names are read-only properties."""
+    a = _make_agent(tmp_path)
+    with pytest.raises(AttributeError):
+        a._plugin_resolution = object()
+    with pytest.raises(AttributeError):
+        a.active_plugin_binding = {"x": "y"}
+
+
+def test_snapshot_and_binding_are_immutable(tmp_path):
+    """S1: frozen dataclass + MappingProxyType binding."""
+    import dataclasses
+    reload_snapshot(registry_path=tmp_path / "absent.json",
+                    store_root=tmp_path / "store")
+    a = _make_agent(tmp_path)
+
+    async def run():
+        await a._get_plugin_resolution()
+        snap = a.plugin_binding_snapshot
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            snap.generation = 999
+        with pytest.raises(TypeError):
+            snap.binding["x"] = "y"          # MappingProxyType
+
+    asyncio.run(run())

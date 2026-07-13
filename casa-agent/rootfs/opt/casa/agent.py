@@ -8,7 +8,8 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable
+from types import MappingProxyType
+from typing import Any, Awaitable, Callable, Mapping
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -140,6 +141,20 @@ def _resume_decision(
 
 
 @dataclass(frozen=True)
+class PluginBindingSnapshot:
+    """§3.9/D2 (v0.74.0): ONE immutable publish of this agent's resolved
+    plugin state — replaces the two-assignment (resolution, binding) pair
+    that verify_plugin_state could tear between (spec D2, agent.py:1010-1011
+    pre-fix). ``binding`` is a read-only MappingProxyType; ``generation`` is
+    the resolver-snapshot generation the resolution was computed against
+    (returned by resolve_for), so verify and the mutation's post-reload
+    check can detect an intervening reload instead of grading stale state."""
+    resolution: "plugin_registry.ResolutionResult"
+    binding: "Mapping[str, str]"
+    generation: int
+
+
+@dataclass(frozen=True)
 class _LoadPlan:
     push_overlay: bool   # GET mental-model overlay precedes the turn
     auto_recall: bool    # auto-run a query-specific recall on the opening utterance
@@ -202,17 +217,18 @@ class Agent:
         # Per-instance so assistant (4000) and butler (800) budgets stay
         # isolated even when the same channel serves both roles.
         self._budget_tracker = BudgetTracker()
-        # Unified plugin architecture (§3.3/§3.9): per-instance cache of the
-        # registry ResolutionResult for this agent's tier:role. resolve_for
-        # reads the process snapshot (refreshed by casa_reload BEFORE agent
-        # reconstruction), so a fresh Agent (reload._construct_agent) always
-        # rebuilds this — the cache can never surface a stale plugin set. The
-        # lock guards concurrent turns from racing the first (off-loop)
-        # resolve. `active_plugin_binding` is this agent's desired==active
-        # binding for §3.9 verification.
-        self._plugin_resolution: "plugin_registry.ResolutionResult | None" = None
+        # Unified plugin architecture (§3.3/§3.9): per-instance ONE-shot
+        # snapshot of the registry resolution for this agent's tier:role
+        # (resolution + {name: artifact_id} binding + resolver generation),
+        # published by a SINGLE assignment in _get_plugin_resolution so a
+        # concurrent verify can never observe a resolved agent with a
+        # stale/empty binding (D2, v0.74.0). resolve_for reads the process
+        # snapshot (refreshed by casa_reload BEFORE agent reconstruction),
+        # so a fresh Agent (reload._construct_agent) always rebuilds this —
+        # the cache can never surface a stale plugin set. The lock guards
+        # concurrent turns from racing the first (off-loop) resolve.
+        self._plugin_snapshot: PluginBindingSnapshot | None = None
         self._plugin_resolution_lock = asyncio.Lock()
-        self.active_plugin_binding: dict[str, str] = {}
         self._health_notice_pending = True   # Task 10: first-contact notice
         # Resolve hooks once at construction. HooksConfig.pre_tool_use
         # empty → default policy bundle (block_dangerous_bash + path_scope
@@ -984,6 +1000,24 @@ class Agent:
             return f"{notice}\n\n{text}"
         return text
 
+    @property
+    def plugin_binding_snapshot(self) -> "PluginBindingSnapshot | None":
+        """§3.9 verify's ONE coherent read (D2). None until first resolve."""
+        return self._plugin_snapshot
+
+    @property
+    def _plugin_resolution(self):
+        """Read-only view for legacy readers; publishing happens ONLY via
+        the snapshot (single assignment — the torn pair is impossible)."""
+        snap = self._plugin_snapshot
+        return snap.resolution if snap is not None else None
+
+    @property
+    def active_plugin_binding(self) -> dict[str, str]:
+        """Read-only {name: artifact_id} view of the snapshot."""
+        snap = self._plugin_snapshot
+        return dict(snap.binding) if snap is not None else {}
+
     async def _get_plugin_resolution(self):
         """Resolve this agent's tier:role plugin assignment to immutable
         artifacts, off-loop + cached per instance (§3.3/§3.9).
@@ -992,14 +1026,15 @@ class Agent:
         casa_reload BEFORE agent reconstruction), so a fresh Agent always
         rebuilds this — no stale plugin set. Cached even when empty: under the
         registry the result is deterministic, and reconstruction is the
-        invalidation seam. The active binding {name: artifact_id} is captured
-        here for §3.9 desired==active verification.
+        invalidation seam. D2 (v0.74.0): resolution + binding + generation
+        publish together as ONE frozen PluginBindingSnapshot — a concurrent
+        §3.9 verify can never observe a torn (resolved, stale-binding) state.
         """
-        if self._plugin_resolution is not None:
-            return self._plugin_resolution
+        if self._plugin_snapshot is not None:
+            return self._plugin_snapshot.resolution
         async with self._plugin_resolution_lock:
-            if self._plugin_resolution is not None:
-                return self._plugin_resolution
+            if self._plugin_snapshot is not None:
+                return self._plugin_snapshot.resolution
             tier = None
             if self._agent_registry is not None:      # agent.py:199 attr name
                 tier = self._agent_registry.tier_for_role(self.config.role)
@@ -1007,10 +1042,14 @@ class Agent:
             resolution = await asyncio.to_thread(
                 plugin_registry.resolve_for, target,
             )
-            self._plugin_resolution = resolution
-            self.active_plugin_binding = {
-                rp.name: rp.artifact_id for rp in resolution.plugins
-            }
+            # D2: ONE assignment publishes resolution + binding + generation
+            # together — no torn-read window, ever.
+            self._plugin_snapshot = PluginBindingSnapshot(
+                resolution=resolution,
+                binding=MappingProxyType({
+                    rp.name: rp.artifact_id for rp in resolution.plugins}),
+                generation=resolution.generation,
+            )
             if resolution.issues:
                 logger.warning(
                     "plugin resolution degraded for %s: %s", target,
