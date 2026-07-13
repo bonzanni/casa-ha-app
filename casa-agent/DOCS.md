@@ -474,15 +474,13 @@ not a hard filesystem barrier. They are not designed to stop a deliberately
 evasive process running as root; a true filesystem/privilege boundary is a
 separate, later hardening item.
 
-### Migration & rollback
+### Fresh install & rollback
 
-On first boot after upgrading, a one-time migration converts any existing plugin
-installs into registry entries automatically and writes a report to
-`/data/plugin-migration-report.json`. The migration is offline (it reads only
-on-disk state) and runs once. Rollback is safe: the previous release's legacy
-plugin state under `/config/marketplace` and `/config/cc-home/.claude/plugins`
-is left untouched for one release, so downgrading the app image reads it as
-before.
+The registry (`/config/plugins/registry.json`) is the single source of truth. On
+a fresh install Casa seeds it with the bundled default plugins; a newer release
+adds any newly-introduced defaults on the next boot, and a default you remove is
+never re-added. Rollback is safe: the registry format is stable across releases,
+so downgrading the app image reads the same registry as before.
 
 ### Troubleshooting
 
@@ -497,8 +495,6 @@ before.
 - **Health at a glance** — `/data/plugin-health.json` summarizes current plugin
   issues; Casa also DMs the operator when a *new* issue appears and affected
   agents prepend a one-line first-contact notice.
-- **Migration questions** — see `/data/plugin-migration-report.json` for what
-  the one-time migration did.
 
 ## Enabling a bundled-disabled specialist
 

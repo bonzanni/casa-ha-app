@@ -3087,19 +3087,8 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
             if verify.get("ready") is not True and not rows:
                 for reason in (verify.get("reasons") or ["not_ready"]):
                     _add(name, None, reason)
-    # Sol round-4 HIGH: preserve replayed UNRESOLVED migration issues on EVERY
-    # health rewrite — a refused/absent plugin is neither in resolve_all() nor
-    # reg.entries, so without this a later unrelated mutation would erase its
-    # issue and the report would go green until the next boot.
-    migration_issues = []
-    try:
-        import plugin_boot
-        migration_issues = plugin_boot._unresolved_migration_issues(reg)
-    except Exception:  # noqa: BLE001 — never fail health regen on the replay
-        pass
     plugin_health.write_report(
-        issues=(list(res.issues) + list(extra_issues) + runtime_issues
-                + migration_issues),
+        issues=(list(res.issues) + list(extra_issues) + runtime_issues),
         warnings=list(res.warnings),
         path=_PLUGIN_HEALTH_PATH,
     )
