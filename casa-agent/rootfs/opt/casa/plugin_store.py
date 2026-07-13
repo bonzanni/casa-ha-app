@@ -291,8 +291,13 @@ def validate_manifest(root: Path, expected_name: str) -> dict:
             f"manifest name {manifest.get('name')!r} != {expected_name!r}",
             reason_code="name_mismatch")
     if not isinstance(manifest.get("version"), str) or not manifest["version"]:
-        raise StoreError("manifest version missing",
-                         reason_code="manifest_invalid")
+        # Real-world plugins (e.g. every anthropics/claude-plugins-official
+        # plugin) ship NO top-level version. Version is no longer identity-load-
+        # bearing — artifact identity is content-addressed and the version-keyed
+        # cache that caused the incident is gone — so DEFAULT a missing version
+        # rather than reject (the authoring doctrine still recommends one). The
+        # unit gate uses versioned fixtures, so only the image build surfaced this.
+        manifest["version"] = "0.0.0"
     for req in manifest_sysreqs(manifest):
         if req.get("type") in _REJECTED_REQ_TYPES:
             raise StoreError(

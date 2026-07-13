@@ -104,6 +104,18 @@ def test_validate_manifest_paths(tmp_path):
     assert ei.value.reason_code == "manifest_invalid"
 
 
+def test_validate_manifest_defaults_missing_version(tmp_path):
+    """CI/real-world: plugins like anthropics/claude-plugins-official ship NO
+    top-level version. validate_manifest must default it (0.0.0), not reject —
+    version is no longer identity-load-bearing. The unit gate's versioned
+    fixtures masked this; only the image build caught it."""
+    root = tmp_path / "src"
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "probe"}), encoding="utf-8")   # no version
+    assert validate_manifest(root, "probe")["version"] == "0.0.0"
+
+
 def test_validate_manifest_tolerates_non_object_casa(tmp_path):
     root = _plugin_tree(tmp_path)
     (root / ".claude-plugin" / "plugin.json").write_text(json.dumps(
