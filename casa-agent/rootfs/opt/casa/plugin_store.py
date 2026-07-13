@@ -11,11 +11,13 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -41,7 +43,41 @@ class RefNotFound(StoreError):
 
 
 class ResolveUnavailable(StoreError):
+    """Transient/retryable resolve verdict. C.3 (v0.74.0): carries structured
+    retry metadata — ``retry_after_s`` is the server's latest Retry-After (or
+    the wait the resolver refused to truncate) so callers can surface it."""
     reason_code = "resolve_unavailable"
+
+    def __init__(self, message: str, *, retry_after_s: float | None = None):
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+
+
+class ResolveAuthFailed(StoreError):
+    """C.1 (v0.74.0): 401 / non-rate-limited 403 — hard, non-retryable."""
+    reason_code = "resolve_auth_failed"
+
+
+class SourceEmpty(StoreError):
+    """C.1 (v0.74.0): 409 'repository is empty' — hard, non-retryable."""
+    reason_code = "source_empty"
+
+
+# C.2/A.2 (v0.74.0): a release ref is exactly "v" + semver.
+RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
+
+_HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def normalize_revision(rev) -> str | None:
+    """Canonical revision form (spec §E): lowercase 40-hex sha. Accepts the
+    registry's ``git:<sha>`` form and a bare sha; anything else -> None."""
+    if not isinstance(rev, str):
+        return None
+    r = rev.strip().lower()
+    if r.startswith("git:"):
+        r = r[4:]
+    return r if _HEX40_RE.match(r) else None
 
 
 def _entry_line(rel: str, etype: str, exec_bit: int, payload: str) -> bytes:
@@ -258,35 +294,178 @@ class PublishResult:
     manifest: dict
 
 
-def resolve_ref(repo: str, ref: str, *, timeout: float = 20.0) -> str:
-    """Resolve a ref to a 40-hex commit via the GitHub commits API (gh CLI).
-    HTTP 404 => RefNotFound (hard, pre-mutation). Anything else network/auth/
-    timeout/tooling => ResolveUnavailable (retryable). NEVER conflated."""
-    argv = ["gh", "api", f"repos/{repo}/commits/{ref}", "--jq", ".sha"]
+def _parse_gh_http_response(stdout: str) -> tuple[int | None, dict, str]:
+    """Parse `gh api -i` stdout into (status, headers, body). `-i` prepends
+    the status line + headers to the body on stdout for BOTH success and
+    error responses (live-verified 2026-07-13: 422 → status line + headers +
+    JSON body, exit 1). Tolerates stacked header blocks (1xx/redirects): the
+    LAST status line wins. Header keys are lowercased. (None, {}, stdout)
+    when no HTTP status line is present — a tooling failure, classified
+    retryable by the caller."""
+    status: int | None = None
+    headers: dict[str, str] = {}
+    lines = stdout.split("\n")
+    i = 0
+    while i < len(lines) and lines[i].startswith("HTTP/"):
+        parts = lines[i].split()
+        try:
+            status = int(parts[1])
+        except (IndexError, ValueError):
+            return None, {}, stdout
+        headers = {}
+        i += 1
+        while i < len(lines) and lines[i].strip():
+            k, _, v = lines[i].partition(":")
+            headers[k.strip().lower()] = v.strip()
+            i += 1
+        i += 1  # consume the blank separator
+    if status is None:
+        return None, {}, stdout
+    return status, headers, "\n".join(lines[i:])
+
+
+def gh_api_probe(path: str, *, timeout: float = 20.0, accept: str | None = None,
+                 jq: str | None = None) -> tuple[int, dict, str]:
+    """One structured GitHub-API round trip via `gh api -i` (C.1: status +
+    headers + body — never stderr-grep). ``jq`` applies only to the 2xx body
+    (gh leaves error bodies as raw JSON). Raises ResolveUnavailable on
+    transport/tooling failure. Shared by resolve_ref and the A.2 completion
+    guard so producer-verify and configurator-pin agree by construction."""
+    argv = ["gh", "api", "-i", path]
+    if accept:
+        argv += ["-H", f"Accept: {accept}"]
+    if jq:
+        argv += ["--jq", jq]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True,
                               timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
-        raise ResolveUnavailable(f"gh api timeout for {repo}@{ref}") from exc
+        raise ResolveUnavailable(f"gh api timeout for {path}") from exc
     except (FileNotFoundError, OSError) as exc:
         raise ResolveUnavailable(f"gh unavailable: {exc}") from exc
-    if proc.returncode != 0:
-        err = (proc.stderr or "") + (proc.stdout or "")
-        if "HTTP 404" in err:
-            raise RefNotFound(f"{repo}@{ref} not found (HTTP 404)")
-        raise ResolveUnavailable(f"gh api failed for {repo}@{ref}: "
-                                 f"{err.strip()[:200]}")
-    out = proc.stdout.strip()
-    # `--jq .sha` prints the bare sha; tolerate full-JSON output too.
+    status, headers, body = _parse_gh_http_response(proc.stdout or "")
+    if status is None:
+        err = ((proc.stderr or "") + (proc.stdout or "")).strip()[:200]
+        raise ResolveUnavailable(f"gh api failed for {path}: {err}")
+    return status, headers, body
+
+
+_GH_NO_COMMIT_RE = re.compile(r"no commit found for sha", re.IGNORECASE)
+_GH_EMPTY_REPO_RE = re.compile(r"repository is empty", re.IGNORECASE)
+_GH_RATE_LIMIT_BODY_RE = re.compile(
+    r"(secondary rate limit|exceeded a secondary rate limit|"
+    r"rate limit exceeded|api rate limit)", re.IGNORECASE)
+
+_RESOLVE_MAX_ATTEMPTS = 3
+_RESOLVE_WAIT_BUDGET_S = 60.0
+_RESOLVE_DEFAULT_BACKOFF_S = (2.0, 8.0)   # pre-attempt-2, pre-attempt-3
+
+
+def _rate_limited(status: int, headers: dict, body: str) -> bool:
+    """Rate-limit detection needs HEADERS (why C.1 mandates structured
+    capture); body text is the fallback for secondary limits (C.3)."""
+    if status == 429:
+        return True
+    if status != 403:
+        return False
+    if headers.get("x-ratelimit-remaining") == "0":
+        return True
+    if "retry-after" in headers:
+        return True
+    return bool(_GH_RATE_LIMIT_BODY_RE.search(body or ""))
+
+
+def _retry_after_seconds(headers: dict) -> float | None:
+    raw = headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _classify_resolve_failure(repo: str, ref: str, status: int,
+                              headers: dict, body: str) -> StoreError:
+    """C.1 verdict table for repos/<repo>/commits/<ref>. Returns the exception
+    INSTANCE (the caller decides raise-vs-retry for ResolveUnavailable)."""
+    if status == 422 and _GH_NO_COMMIT_RE.search(body or ""):
+        return RefNotFound(f"{repo}@{ref} not found (HTTP 422: no such ref)")
+    if status == 404:
+        return RefNotFound(
+            f"{repo}@{ref}: repository or ref not visible (HTTP 404)")
+    if status == 401 or (status == 403
+                         and not _rate_limited(status, headers, body)):
+        return ResolveAuthFailed(
+            f"GitHub auth failed for {repo}@{ref} (HTTP {status})")
+    if status == 409 and _GH_EMPTY_REPO_RE.search(body or ""):
+        return SourceEmpty(f"{repo} is an empty repository (HTTP 409)")
+    return ResolveUnavailable(
+        f"gh api failed for {repo}@{ref}: HTTP {status}: "
+        f"{(body or '').strip()[:200]}",
+        retry_after_s=_retry_after_seconds(headers))
+
+
+def _sha_from_body(body: str) -> str | None:
+    """Commit sha from a 200 body: `--jq .sha` yields a bare sha; a full-JSON
+    body (jq unapplied) is tolerated."""
+    out = (body or "").strip()
     if out.startswith("{"):
         try:
-            out = json.loads(out).get("sha", "")
+            out = str(json.loads(out).get("sha", ""))
         except ValueError:
-            out = ""
-    sha = out.strip().strip('"')
-    if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha.lower()):
-        raise ResolveUnavailable(f"unparseable sha for {repo}@{ref}: {out!r}")
-    return sha.lower()
+            return None
+    sha = out.strip().strip('"').lower()
+    return sha if _HEX40_RE.match(sha) else None
+
+
+def resolve_ref(repo: str, ref: str, *, timeout: float = 20.0,
+                _sleep=time.sleep) -> str:
+    """Resolve a ref to a 40-hex commit via the GitHub commits API (annotated
+    tags auto-peel to the commit). C.1 classification: 422-no-commit / 404 =>
+    RefNotFound; 401 / non-rate-limited 403 => ResolveAuthFailed; 409-empty =>
+    SourceEmpty (all hard, pre-mutation); rate-limited 403/429 => bounded
+    retry (C.3: <=3 attempts, <=60s TOTAL wait, Retry-After honored fully or
+    not at all — never truncated); everything else transient =>
+    ResolveUnavailable carrying retry_after_s metadata. NEVER conflated."""
+    waited = 0.0
+    last_retry_after: float | None = None
+    for attempt in range(1, _RESOLVE_MAX_ATTEMPTS + 1):
+        status, headers, body = gh_api_probe(
+            f"repos/{repo}/commits/{ref}", timeout=timeout, jq=".sha")
+        if status == 200:
+            sha = _sha_from_body(body)
+            if sha is None:
+                raise ResolveUnavailable(
+                    f"unparseable sha for {repo}@{ref}: {body[:80]!r}")
+            return sha
+        exc = _classify_resolve_failure(repo, ref, status, headers, body)
+        if not isinstance(exc, ResolveUnavailable):
+            raise exc                       # hard verdicts never retry
+        if not _rate_limited(status, headers, body):
+            raise exc                       # transient-but-not-rate-limited:
+                                            # surface; the CALLER owns retry
+        wait = _retry_after_seconds(headers)
+        if wait is not None:
+            last_retry_after = wait
+        if attempt >= _RESOLVE_MAX_ATTEMPTS:
+            raise ResolveUnavailable(
+                f"rate-limit retries exhausted for {repo}@{ref}",
+                retry_after_s=last_retry_after)
+        if wait is None:
+            wait = _RESOLVE_DEFAULT_BACKOFF_S[attempt - 1]
+        if waited + wait > _RESOLVE_WAIT_BUDGET_S:
+            # Honor Retry-After FULLY or not at all — never truncate a
+            # server-requested delay and retry early (C.3).
+            raise ResolveUnavailable(
+                f"gh rate-limited for {repo}@{ref}; server asks "
+                f"retry-after: {int(wait)}s which exceeds the remaining "
+                f"budget — try again later",
+                retry_after_s=wait)
+        _sleep(wait)
+        waited += wait
+    raise ResolveUnavailable(f"resolve retries exhausted for {repo}@{ref}",
+                             retry_after_s=last_retry_after)
 
 
 def fetch_commit_tree(repo: str, commit: str, subdir: str, dest: Path,
@@ -455,8 +634,13 @@ def _reject_escaping_symlinks(root: Path) -> None:
 
 def publish(*, name: str, repo: str, ref: str, subdir: str = "",
             store_root: Path = STORE_ROOT,
-            staging_root: Path = STAGING_ROOT) -> PublishResult:
-    commit = resolve_ref(repo, ref)               # pre-mutation, may raise
+            staging_root: Path = STAGING_ROOT,
+            commit: str | None = None) -> PublishResult:
+    """Publish an artifact from ``repo@ref``. C.2 (v0.74.0): a caller that
+    already resolved the ref (the identity guards) passes ``commit`` so the
+    fetch pins exactly that sha — no re-resolve window for a moving tag."""
+    if commit is None:
+        commit = resolve_ref(repo, ref)           # pre-mutation, may raise
     revision = f"git:{commit}"
     subdir = normalize_subdir(subdir)
     artifact_id = compute_artifact_id(repo=repo, revision=revision,

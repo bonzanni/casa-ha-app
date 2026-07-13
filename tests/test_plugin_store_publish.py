@@ -56,22 +56,105 @@ class _Proc:
         self.returncode, self.stdout, self.stderr = rc, out, err
 
 
-def test_resolve_ref_happy():
+def _gh_response(status: int, body: str, headers: dict | None = None) -> str:
+    """Render `gh api -i` stdout: status line + headers + blank + body."""
+    hdrs = {"content-type": "application/json; charset=utf-8", **(headers or {})}
+    head = "\n".join([f"HTTP/2.0 {status} X"] + [f"{k}: {v}" for k, v in hdrs.items()])
+    return f"{head}\n\n{body}"
+
+
+def _proc_for(status: int, body: str, headers: dict | None = None) -> "_Proc":
+    return _Proc(0 if 200 <= status < 300 else 1,
+                 _gh_response(status, body, headers), "")
+
+
+def test_resolve_ref_happy_bare_sha_with_headers():
+    """200 via `gh api -i … --jq .sha`: headers block + bare sha body."""
     with patch("plugin_store.subprocess.run",
-               return_value=_Proc(0, json.dumps({"sha": SHA}))) as run:
+               return_value=_proc_for(200, SHA + "\n")) as run:
         assert resolve_ref("o/r", "v1.0.0") == SHA
     argv = run.call_args[0][0]
-    assert argv[:2] == ["gh", "api"]
+    assert argv[:3] == ["gh", "api", "-i"]
+    assert argv[3] == "repos/o/r/commits/v1.0.0"
+    assert argv[-2:] == ["--jq", ".sha"]
+
+
+def test_resolve_ref_happy_tolerates_json_body():
+    """Belt-and-braces: a full-JSON 200 body still parses (jq not applied)."""
+    with patch("plugin_store.subprocess.run",
+               return_value=_proc_for(200, json.dumps({"sha": SHA}))):
+        assert resolve_ref("o/r", "v1.0.0") == SHA
+
+
+def test_resolve_ref_422_no_commit_is_ref_not_found():
+    """THE primary fix: missing tag/sha/branch → 422 'No commit found for
+    SHA' → hard ref_not_found, never retryable-unavailable."""
+    body = json.dumps({"message": "No commit found for SHA: v9999.9.9",
+                       "documentation_url": "https://docs.github.com/rest",
+                       "status": "422"})
+    with patch("plugin_store.subprocess.run", return_value=_proc_for(422, body)):
+        with pytest.raises(RefNotFound):
+            resolve_ref("o/r", "v9999.9.9")
+
+
+def test_resolve_ref_422_other_is_resolve_unavailable():
+    body = json.dumps({"message": "Validation Failed", "status": "422"})
+    with patch("plugin_store.subprocess.run", return_value=_proc_for(422, body)):
+        with pytest.raises(ResolveUnavailable):
+            resolve_ref("o/r", "weird")
 
 
 def test_resolve_ref_404_is_ref_not_found():
-    with patch("plugin_store.subprocess.run",
-               return_value=_Proc(1, "", "gh: Not Found (HTTP 404)")):
-        with pytest.raises(RefNotFound):
+    body = json.dumps({"message": "Not Found", "status": "404"})
+    with patch("plugin_store.subprocess.run", return_value=_proc_for(404, body)):
+        with pytest.raises(RefNotFound) as ei:
             resolve_ref("o/r", "phantom-tag")
+    assert "not visible" in str(ei.value)          # spec wording
 
 
-def test_resolve_ref_network_is_resolve_unavailable():
+def test_resolve_ref_401_is_resolve_auth_failed():
+    from plugin_store import ResolveAuthFailed
+    body = json.dumps({"message": "Bad credentials", "status": "401"})
+    with patch("plugin_store.subprocess.run", return_value=_proc_for(401, body)):
+        with pytest.raises(ResolveAuthFailed):
+            resolve_ref("o/r", "v1.0.0")
+
+
+def test_resolve_ref_403_not_ratelimited_is_resolve_auth_failed():
+    from plugin_store import ResolveAuthFailed
+    body = json.dumps({"message": "Resource not accessible by integration",
+                       "status": "403"})
+    with patch("plugin_store.subprocess.run",
+               return_value=_proc_for(403, body,
+                                      {"x-ratelimit-remaining": "42"})):
+        with pytest.raises(ResolveAuthFailed):
+            resolve_ref("o/r", "v1.0.0")
+
+
+def test_resolve_ref_409_empty_repo_is_source_empty():
+    from plugin_store import SourceEmpty
+    body = json.dumps({"message": "Git Repository is empty.", "status": "409"})
+    with patch("plugin_store.subprocess.run", return_value=_proc_for(409, body)):
+        with pytest.raises(SourceEmpty):
+            resolve_ref("o/r", "main")
+
+
+def test_resolve_ref_409_other_is_resolve_unavailable():
+    body = json.dumps({"message": "Conflict", "status": "409"})
+    with patch("plugin_store.subprocess.run", return_value=_proc_for(409, body)):
+        with pytest.raises(ResolveUnavailable):
+            resolve_ref("o/r", "main")
+
+
+def test_resolve_ref_5xx_is_resolve_unavailable():
+    with patch("plugin_store.subprocess.run",
+               return_value=_proc_for(503, '{"message": "Service Unavailable"}')):
+        with pytest.raises(ResolveUnavailable):
+            resolve_ref("o/r", "v1")
+
+
+def test_resolve_ref_no_status_line_is_resolve_unavailable():
+    """Tooling failure (no HTTP response on stdout) stays retryable."""
     with patch("plugin_store.subprocess.run",
                return_value=_Proc(1, "", "error connecting to api.github.com")):
         with pytest.raises(ResolveUnavailable):
@@ -89,6 +172,129 @@ def test_resolve_ref_missing_gh_is_resolve_unavailable():
     with patch("plugin_store.subprocess.run", side_effect=FileNotFoundError()):
         with pytest.raises(ResolveUnavailable):
             resolve_ref("o/r", "v1")
+
+
+def test_normalize_revision():
+    from plugin_store import normalize_revision
+    assert normalize_revision("git:" + "A" * 40) == "a" * 40
+    assert normalize_revision("a" * 40) == "a" * 40
+    assert normalize_revision(" git:" + "b" * 40 + " ") == "b" * 40
+    assert normalize_revision("g" * 40) is None          # not hex
+    assert normalize_revision("abc") is None
+    assert normalize_revision(None) is None
+    assert normalize_revision(1234) is None
+
+
+def test_resolve_ref_ratelimit_403_retries_then_succeeds():
+    body = json.dumps({"message": "API rate limit exceeded", "status": "403"})
+    responses = [
+        _proc_for(403, body, {"x-ratelimit-remaining": "0", "retry-after": "1"}),
+        _proc_for(200, SHA + "\n"),
+    ]
+    sleeps: list[float] = []
+    with patch("plugin_store.subprocess.run", side_effect=responses):
+        assert resolve_ref("o/r", "v1", _sleep=sleeps.append) == SHA
+    assert sleeps == [1.0]           # Retry-After honored exactly
+
+
+def test_resolve_ref_429_retries():
+    responses = [
+        _proc_for(429, '{"message": "too many requests"}', {"retry-after": "2"}),
+        _proc_for(200, SHA + "\n"),
+    ]
+    sleeps: list[float] = []
+    with patch("plugin_store.subprocess.run", side_effect=responses):
+        assert resolve_ref("o/r", "v1", _sleep=sleeps.append) == SHA
+    assert sleeps == [2.0]
+
+
+def test_resolve_ref_ratelimit_exhaustion_bounded_and_carries_metadata():
+    body = json.dumps({"message": "API rate limit exceeded", "status": "403"})
+    proc = _proc_for(403, body, {"x-ratelimit-remaining": "0", "retry-after": "1"})
+    sleeps: list[float] = []
+    with patch("plugin_store.subprocess.run", return_value=proc) as run:
+        with pytest.raises(ResolveUnavailable) as ei:
+            resolve_ref("o/r", "v1", _sleep=sleeps.append)
+    assert run.call_count == 3               # <=3 attempts (C.3)
+    assert len(sleeps) == 2                  # waits only BETWEEN attempts
+    assert ei.value.retry_after_s == 1.0     # latest Retry-After surfaced
+
+
+def test_resolve_ref_retry_after_exceeding_budget_returns_immediately():
+    """A Retry-After above the 60s budget is NEVER waited or truncated:
+    immediate ResolveUnavailable carrying the server's requested delay."""
+    body = json.dumps({"message": "API rate limit exceeded", "status": "403"})
+    proc = _proc_for(403, body, {"x-ratelimit-remaining": "0",
+                                 "retry-after": "3600"})
+    sleeps: list[float] = []
+    with patch("plugin_store.subprocess.run", return_value=proc) as run:
+        with pytest.raises(ResolveUnavailable) as ei:
+            resolve_ref("o/r", "v1", _sleep=sleeps.append)
+    assert run.call_count == 1 and sleeps == []
+    assert ei.value.retry_after_s == 3600.0
+
+
+def test_resolve_ref_cumulative_budget_never_exceeded():
+    """r2-B5: each delay individually < 60s but the SUM would exceed the 60s
+    TOTAL budget — sleep only the first (40s), stop before the second, and
+    surface the un-waited delay as retry metadata."""
+    body = json.dumps({"message": "API rate limit exceeded", "status": "403"})
+    responses = [
+        _proc_for(403, body, {"x-ratelimit-remaining": "0", "retry-after": "40"}),
+        _proc_for(403, body, {"x-ratelimit-remaining": "0", "retry-after": "30"}),
+    ]
+    sleeps: list[float] = []
+    with patch("plugin_store.subprocess.run", side_effect=responses) as run:
+        with pytest.raises(ResolveUnavailable) as ei:
+            resolve_ref("o/r", "v1", _sleep=sleeps.append)
+    assert run.call_count == 2               # 2nd response seen, 3rd never tried
+    assert sleeps == [40.0]                  # 40+30 > 60 → second wait refused
+    assert ei.value.retry_after_s == 30.0    # the refused delay is surfaced
+
+
+def test_resolve_ref_secondary_ratelimit_recognized_by_body_only():
+    """C.3: headers inconclusive -> body text recognizes a secondary limit."""
+    body = json.dumps({"message":
+                       "You have exceeded a secondary rate limit. "
+                       "Please wait a few minutes before you try again."})
+    responses = [
+        _proc_for(403, body),        # NO rate-limit headers at all
+        _proc_for(200, SHA + "\n"),
+    ]
+    sleeps: list[float] = []
+    with patch("plugin_store.subprocess.run", side_effect=responses):
+        assert resolve_ref("o/r", "v1", _sleep=sleeps.append) == SHA
+    assert sleeps == [2.0]           # default backoff (no Retry-After)
+
+
+def test_resolve_ref_non_ratelimit_transient_does_not_retry_in_function():
+    """5xx is a retryable VERDICT for the caller, not an in-function loop."""
+    with patch("plugin_store.subprocess.run",
+               return_value=_proc_for(502, '{"message": "Bad gateway"}')) as run:
+        with pytest.raises(ResolveUnavailable):
+            resolve_ref("o/r", "v1", _sleep=lambda s: (_ for _ in ()).throw(
+                AssertionError("must not sleep")))
+    assert run.call_count == 1
+
+
+def test_publish_with_precommitted_sha_skips_resolve(tmp_path):
+    """C.2: the identity guards resolve ONCE; publish(commit=) must not
+    re-resolve (a tag moving between resolve and fetch would be a TOCTOU)."""
+    import shutil
+    src = _plugin_tree(tmp_path)
+
+    def _no_resolve(*a, **k):
+        raise AssertionError("resolve_ref must not be called")
+
+    with patch("plugin_store.resolve_ref", side_effect=_no_resolve), \
+         patch("plugin_store.fetch_commit_tree",
+               side_effect=lambda repo, commit, subdir, dest, **k:
+               shutil.copytree(src, dest, dirs_exist_ok=True)) as fct:
+        res = publish(name="probe", repo="o/r", ref="v1.0.0",
+                      store_root=tmp_path / "store",
+                      staging_root=tmp_path / "staging", commit=SHA)
+    assert res.revision == f"git:{SHA}"
+    assert fct.call_args[0][1] == SHA
 
 
 def test_validate_manifest_paths(tmp_path):
