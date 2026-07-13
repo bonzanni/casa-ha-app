@@ -1484,6 +1484,14 @@ async def main() -> None:
     mcp_registry.register_sdk("casa-framework", casa_tools_config)
     logger.info("Registered casa-framework MCP tools")
 
+    # Plugin media outbox (v0.73.0 §3.4): init FDs + boot-reap + register the
+    # hourly sweep — all BEFORE channels/HTTP go live (steps 12–13) so send_media
+    # is ready the moment a turn can fire. One call, unit-tested with a fake
+    # scheduler (plugin_outbox.wire); never blocks boot.
+    import plugin_outbox
+    await plugin_outbox.wire(
+        scheduler, os.environ.get("CASA_PLUGIN_OUTBOX_DIR", "/data/plugin-outbox"))
+
     # Plan 4b §5.1 — ensure every loaded in_casa resident or specialist
     # agent has an agent-home with default plugins seeded from
     # plugins.yaml. Idempotent — runs every boot. Executors deliberately
@@ -2165,6 +2173,9 @@ async def main() -> None:
     scheduler.shutdown(wait=False)
     await session_sweeper.stop()
     await freshness_reaper.stop()
+    _ob = plugin_outbox.get_outbox()
+    if _ob is not None:
+        _ob.close()
 
     # AR-9: close every resident/specialist Agent's SDK client pool so no
     # warm subprocess outlives container shutdown. Bounded per-agent so one
