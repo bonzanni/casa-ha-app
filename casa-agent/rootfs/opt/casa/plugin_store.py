@@ -132,32 +132,53 @@ def write_metadata(root: Path, *, name: str, repo: str, ref: str,
         os.fsync(fh.fileno())
 
 
-def mcp_servers_map(mcp_json_path: Path) -> dict:
-    """Return the {server-name: config} map from a plugin ``.mcp.json``.
+def parse_mcp_servers(mcp_json_path: Path) -> tuple[dict, bool]:
+    """THE single shared ``.mcp.json`` parser (Sol) — used by grant derivation,
+    secret extraction, verification's malformed check, AND the build-time
+    verifier, so all four agree on both shapes.
 
-    Lives here (a stdlib-only module already present in the image's bundle-build
-    stage) so both grant derivation and the build-time verifier share ONE
-    implementation. Handles BOTH shapes: the project-style ``{"mcpServers":
-    {...}}`` wrapper AND the top-level form real plugins use (e.g. context7's
-    ``{"context7": {"command": "npx", ...}}`` — no wrapper). A top-level entry
-    counts as a server only if its value is a config object (command/url/type/
-    args), so a plain config key isn't mistaken for a server."""
+    Returns ``(valid_servers, malformed)``. Handles BOTH the project-style
+    ``{"mcpServers": {...}}`` wrapper AND the top-level form real plugins use
+    (e.g. context7's ``{"context7": {"command": "npx", ...}}`` — no wrapper). A
+    server is VALID only if its config declares ``command`` OR ``url`` (the
+    load-bearing launch fields); ``args``/``env``/``type`` alone do NOT make a
+    runnable server. ``malformed`` is True when the file is PRESENT but
+    unparseable / not an object / declares a non-dict ``mcpServers`` / declares
+    server-like objects NONE of which are valid. An ABSENT file (skill-only
+    plugin) and an empty/no-server config are NOT malformed."""
+    path = Path(mcp_json_path)
+    if not path.is_file():
+        return {}, False
     try:
-        data = json.loads(Path(mcp_json_path).read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        logger.debug("plugin .mcp.json unreadable (%s): %s", mcp_json_path, exc)
-        return {}
+        logger.debug("plugin .mcp.json unreadable (%s): %s", path, exc)
+        return {}, True
     if not isinstance(data, dict):
-        logger.debug("plugin .mcp.json not an object (%s)", mcp_json_path)
-        return {}
+        logger.debug("plugin .mcp.json not an object (%s)", path)
+        return {}, True
     servers = data.get("mcpServers")
-    if isinstance(servers, dict):
-        return servers
-    if "mcpServers" not in data:
-        return {k: v for k, v in data.items()
-                if isinstance(v, dict)
-                and any(f in v for f in ("command", "url", "type", "args"))}
-    return {}
+    if servers is not None:
+        # WRAPPER form: the `mcpServers` key IS the explicit intent signal, so
+        # every dict entry is a declared server (grant derived) — no command/url
+        # heuristic needed. A non-dict `mcpServers` is malformed.
+        if not isinstance(servers, dict):
+            logger.debug("plugin .mcp.json mcpServers not a mapping (%s)", path)
+            return {}, True
+        return {k: v for k, v in servers.items() if isinstance(v, dict)}, False
+    # TOP-LEVEL form (no wrapper): with no intent signal, a server is
+    # distinguished from ordinary config by declaring command|url (the launch
+    # fields). A server-like object lacking BOTH is malformed (Sol).
+    candidates = {k: v for k, v in data.items() if isinstance(v, dict)}
+    valid = {k: v for k, v in candidates.items()
+             if "command" in v or "url" in v}
+    malformed = bool(candidates) and not valid
+    return valid, malformed
+
+
+def mcp_servers_map(mcp_json_path: Path) -> dict:
+    """The valid {server-name: config} map — see :func:`parse_mcp_servers`."""
+    return parse_mcp_servers(mcp_json_path)[0]
 
 
 def read_metadata(root: Path) -> dict | None:

@@ -498,3 +498,19 @@ def test_regenerate_health_preserves_migration_issues(monkeypatch, tmp_path):
     tools._regenerate_plugin_health([])
     assert any(i.reason_code == "install_path_divergence"
                for i in captured["issues"])
+
+
+def test_verify_tolerates_manifest_row_without_winning_strategy(tmp_path, monkeypatch):
+    """Sol CI-review: a hand-corrupted sysreq manifest row (name but no
+    winning_strategy) must not crash verify (defensive access)."""
+    import system_requirements.manifest as mani
+    import yaml
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"])
+    mk_registry(tmp_path, [e])
+    (tmp_path / "sysreq.yaml").write_text(yaml.safe_dump({"plugins": [
+        {"name": "probe", "verify_bin": "ffmpeg"}]}))   # no winning_strategy
+    monkeypatch.setattr(mani, "MANIFEST_PATH", tmp_path / "sysreq.yaml")
+    r = _verify(tmp_path, tools_bin=tmp_path / "empty")   # must not raise
+    assert r["tools"][0]["requirement"] == "unknown"

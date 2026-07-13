@@ -56,17 +56,30 @@ def test_missing_mcp_json_returns_empty(tmp_path: Path) -> None:
     assert extract_env_vars(tmp_path / "none.json") == set()
 
 
-def test_malformed_json_raises(tmp_path: Path) -> None:
+def test_malformed_json_degrades_to_empty(tmp_path: Path) -> None:
+    """Sol CI-review: env extraction now shares one parser with grants; a
+    malformed .mcp.json degrades to no vars (the malformed status is surfaced
+    separately by parse_mcp_servers → verify's mcp_invalid), never raises."""
+    from plugin_store import parse_mcp_servers
     mcp = tmp_path / ".mcp.json"
     mcp.write_text("{{}", encoding="utf-8")
-    with pytest.raises(ValueError):
-        extract_env_vars(mcp)
+    assert extract_env_vars(mcp) == set()
+    assert parse_mcp_servers(mcp)[1] is True          # flagged malformed
 
 
 def test_no_env_block(tmp_path: Path) -> None:
     mcp = tmp_path / ".mcp.json"
     _write(mcp, {"mcpServers": {"s": {"command": "x"}}})
     assert extract_env_vars(mcp) == set()
+
+
+def test_top_level_mcp_json_env_vars_extracted(tmp_path: Path) -> None:
+    """Sol CI-review HIGH: a top-level (no-mcpServers-wrapper) plugin .mcp.json —
+    the shape context7 ships — must still yield its required secrets, or verify
+    could report ready without them."""
+    mcp = tmp_path / ".mcp.json"
+    _write(mcp, {"svc": {"command": "node", "env": {"TOKEN": "${MY_TOKEN}"}}})
+    assert extract_env_vars(mcp) == {"MY_TOKEN"}
 
 
 def test_cc_builtin_list_is_stable() -> None:

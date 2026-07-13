@@ -137,3 +137,17 @@ def test_grants_from_top_level_mcp_json(tmp_path):
     rp2 = ResolvedPlugin(name="p", artifact_id="a" * 64, path=str(art),
                          version="0.0.0", manifest={})
     assert grants_for_resolved(rp2) == ["mcp__plugin_p_foo"]
+
+
+def test_top_level_args_only_is_malformed_no_grant(tmp_path):
+    """Sol CI-review HIGH: a top-level entry with `args` but NO command/url is not
+    a runnable server → no grant AND flagged malformed (must not verify green)."""
+    from plugin_grants import mcp_json_malformed
+    art = tmp_path / "art"
+    art.mkdir()
+    (art / ".mcp.json").write_text(json.dumps({"svc": {"args": []}}),
+                                   encoding="utf-8")
+    rp = ResolvedPlugin(name="p", artifact_id="a" * 64, path=str(art),
+                        version="0.0.0", manifest={})
+    assert grants_for_resolved(rp) == []
+    assert mcp_json_malformed(rp) is True

@@ -3649,7 +3649,9 @@ def _tool_verify_plugin_state(
         vb = t.get("verify_bin", "")
         ready_bin = (tools_bin / vb).is_file()   # follows symlinks (M23)
         tools_status.append({
-            "requirement": t["winning_strategy"], "verify_bin": vb,
+            # Sol CI-review: a hand-corrupted manifest row may lack winning_strategy
+            # (read_manifest keeps any dict with a name) — access defensively.
+            "requirement": t.get("winning_strategy", "unknown"), "verify_bin": vb,
             "status": "ready" if ready_bin else "missing",
             **({} if ready_bin else {"reason": f"{vb} not in tools/bin"})})
     # Declared-but-not-installed requirements (Sol #11): every requirement the
