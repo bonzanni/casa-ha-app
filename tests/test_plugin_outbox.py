@@ -194,6 +194,54 @@ def test_closed_outbox_fails_closed_not_cwd(tmp_path, monkeypatch):
     assert ob.sweep_once(10_000_000_000_000) == 0              # sweep no-op when closed
 
 
+def test_close_serializes_with_inflight_op_no_cwd_grab(tmp_path, monkeypatch):
+    # Regression (Sol diff review r2): the _closed flag is a CHECK, not
+    # synchronization — without the lock, close() could null the FDs between an
+    # op's guard and its syscall (dir_fd=None -> CWD grab). The lock serializes
+    # close() against the FD syscalls: an in-flight claim runs on VALID fds while
+    # close() waits, so it targets the outbox, never a same-named CWD file.
+    import threading
+    ob = PluginOutbox(str(tmp_path / "ob"))
+    src = _write_outbox_file(ob._root_realpath, "invoice.pdf", PDF)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / "invoice.pdf").write_bytes(b"CWD-FILE")
+    monkeypatch.chdir(cwd)
+
+    in_rename = threading.Event()
+    release = threading.Event()
+    real_rename = os.rename
+
+    def slow_rename(*a, **k):
+        in_rename.set()
+        release.wait(5)                 # hold the lock mid-rename (runs INSIDE it)
+        return real_rename(*a, **k)
+
+    monkeypatch.setattr(plugin_outbox.os, "rename", slow_rename)
+    result: dict = {}
+
+    def worker():
+        try:
+            result["claim"] = ob.claim(src)
+        except OutboxError as e:            # pragma: no cover - defensive
+            result["err"] = e.kind
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert in_rename.wait(5)             # worker is inside the lock, mid-rename
+    closed = threading.Event()
+    ct = threading.Thread(target=lambda: (ob.close(), closed.set()))
+    ct.start()                            # close() blocks on the lock the worker holds
+    release.set()                         # let the rename finish on VALID fds
+    t.join(5)
+    ct.join(5)
+
+    assert "claim" in result                                   # ran on valid fds
+    assert (cwd / "invoice.pdf").read_bytes() == b"CWD-FILE"   # CWD untouched
+    assert not os.path.exists(src)                             # outbox file claimed
+    assert closed.is_set()                                     # close() completed
+
+
 # ---------------------------------------------------------------------------
 # capture
 # ---------------------------------------------------------------------------

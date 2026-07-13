@@ -26,6 +26,7 @@ import logging
 import os
 import shutil
 import stat
+import threading
 import uuid
 
 from media_policies import MEDIA_POLICIES
@@ -96,6 +97,12 @@ def _claim_epoch_ms(name: str):
 
 class PluginOutbox:
     def __init__(self, root: str) -> None:
+        # `_lock` serializes the dir-FD syscalls against close() so a concurrent
+        # close (which nulls the FDs) can never interleave between the closed-
+        # check and a syscall — otherwise a dir_fd=None op would resolve against
+        # the process CWD (a fail-open). Held only for the FAST syscalls; the
+        # slow capture read uses the returned file FD and runs outside the lock.
+        self._lock = threading.Lock()
         self._closed = False
         self._root_realpath = os.path.realpath(root)
         self._claims_realpath = os.path.join(self._root_realpath, CLAIMS_SUBDIR)
@@ -124,7 +131,6 @@ class PluginOutbox:
         """Atomically claim *requested_path* into ``.claims/`` and return the
         claim name. Raises
         ``OutboxError(bad_name|outside_outbox|missing|guard_error)``."""
-        self._ensure_open()
         basename = os.path.basename(requested_path)
         if not _safe_basename(basename):
             raise OutboxError("bad_name", f"unsafe basename {basename!r}")
@@ -135,15 +141,17 @@ class PluginOutbox:
         if not parent or os.path.realpath(parent) != self._root_realpath:
             raise OutboxError("outside_outbox", "path is not directly under the outbox")
         claim_name = f"{_now_ms()}-{uuid.uuid4().hex}"
-        try:
-            os.rename(basename, claim_name,
-                      src_dir_fd=self._outbox_dirfd, dst_dir_fd=self._claims_dirfd)
-        except FileNotFoundError as exc:
-            raise OutboxError("missing", "source vanished before claim") from exc
-        except OSError as exc:
-            # EXDEV/EACCES/EISDIR/etc. — a guard/FS failure, NOT a clean "missing".
-            raise OutboxError("guard_error",
-                              f"claim rename failed: errno {exc.errno}") from exc
+        with self._lock:                       # atomic: closed-check + the FD rename
+            self._ensure_open()
+            try:
+                os.rename(basename, claim_name,
+                          src_dir_fd=self._outbox_dirfd, dst_dir_fd=self._claims_dirfd)
+            except FileNotFoundError as exc:
+                raise OutboxError("missing", "source vanished before claim") from exc
+            except OSError as exc:
+                # EXDEV/EACCES/EISDIR/etc. — a guard/FS failure, NOT clean "missing".
+                raise OutboxError("guard_error",
+                                  f"claim rename failed: errno {exc.errno}") from exc
         return claim_name
 
     # -- cleanup --------------------------------------------------------------
@@ -155,15 +163,16 @@ class PluginOutbox:
         the container base is 3.11). A directory-typed claim (a misbehaving
         producer) is rmtree'd — ``os.rmdir`` would fail on a non-empty dir.
         Unconditional (but fail-closed once the outbox is closed)."""
-        self._ensure_open()
-        try:
-            st = os.lstat(claim_name, dir_fd=self._claims_dirfd)
-        except FileNotFoundError:
-            return  # already gone — nothing to do
-        if stat.S_ISDIR(st.st_mode):
-            shutil.rmtree(claim_name, dir_fd=self._claims_dirfd)
-        else:
-            os.unlink(claim_name, dir_fd=self._claims_dirfd)
+        with self._lock:
+            self._ensure_open()
+            try:
+                st = os.lstat(claim_name, dir_fd=self._claims_dirfd)
+            except FileNotFoundError:
+                return  # already gone — nothing to do
+            if stat.S_ISDIR(st.st_mode):
+                shutil.rmtree(claim_name, dir_fd=self._claims_dirfd)
+            else:
+                os.unlink(claim_name, dir_fd=self._claims_dirfd)
 
     # -- capture --------------------------------------------------------------
 
@@ -172,33 +181,39 @@ class PluginOutbox:
         bytes. Never re-opens by the original path. Raises
         ``OutboxError(not_regular|multi_link|too_large|magic_mismatch|guard_error)``.
         Synchronous — the tool runs it via ``asyncio.to_thread``."""
-        self._ensure_open()
         cap = MEDIA_POLICIES[kind].size_cap
         # Type-gate via lstat FIRST: only a regular file is deliverable. This
         # rejects symlink/socket/fifo/dir/device UNIFORMLY as not_regular — a
         # socket open() returns ENXIO (NOT ELOOP), so errno-matching on the open
         # alone is insufficient. O_NOFOLLOW + the post-open fstat re-check then
         # defend the lstat->open TOCTOU (a symlink swapped in after lstat -> ELOOP).
-        try:
-            st0 = os.lstat(claim_name, dir_fd=self._claims_dirfd)
-        except OSError as exc:
-            raise OutboxError("guard_error", f"lstat failed: errno {exc.errno}") from exc
-        if not stat.S_ISREG(st0.st_mode):
-            raise OutboxError("not_regular", "claimed inode is not a regular file")
-        try:
-            fd = os.open(
-                claim_name,
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                dir_fd=self._claims_dirfd,
-            )
-        except OSError as exc:
-            # A symlink swapped in AFTER the lstat (TOCTOU) -> O_NOFOLLOW ELOOP.
-            # Any other open failure is an unexpected guard fault, not a type verdict.
-            if exc.errno == errno.ELOOP:
-                raise OutboxError("not_regular",
-                                  "symlink swapped in; refused by O_NOFOLLOW") from exc
-            raise OutboxError("guard_error",
-                              f"open failed: errno {exc.errno}") from exc
+        # The dir-FD syscalls (lstat + open) run under the lock so a concurrent
+        # close() cannot null the FDs between the closed-check and the open; the
+        # returned file FD is independent of the dir-FD, so the slow read below
+        # runs OUTSIDE the lock (captures stay concurrent).
+        with self._lock:
+            self._ensure_open()
+            try:
+                st0 = os.lstat(claim_name, dir_fd=self._claims_dirfd)
+            except OSError as exc:
+                raise OutboxError("guard_error",
+                                  f"lstat failed: errno {exc.errno}") from exc
+            if not stat.S_ISREG(st0.st_mode):
+                raise OutboxError("not_regular", "claimed inode is not a regular file")
+            try:
+                fd = os.open(
+                    claim_name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                    dir_fd=self._claims_dirfd,
+                )
+            except OSError as exc:
+                # A symlink swapped in AFTER lstat (TOCTOU) -> O_NOFOLLOW ELOOP.
+                # Any other open failure is an unexpected guard fault, not a type.
+                if exc.errno == errno.ELOOP:
+                    raise OutboxError("not_regular",
+                                      "symlink swapped in; refused by O_NOFOLLOW") from exc
+                raise OutboxError("guard_error",
+                                  f"open failed: errno {exc.errno}") from exc
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
@@ -230,9 +245,16 @@ class PluginOutbox:
     def sweep_once(self, now_ms: int) -> int:
         """Reap orphans: outbox-root entries by lstat mtime, ``.claims/`` entries
         by embedded epoch; both older than ``MAX_AGE_S``. Never follows symlinks.
-        Returns the count reaped. Synchronous (run via ``asyncio.to_thread``)."""
-        if self._closed:
-            return 0
+        Returns the count reaped. Synchronous (run via ``asyncio.to_thread``).
+        The whole scan runs under the lock so a concurrent close() cannot null the
+        dir-FDs mid-scan (``os.listdir(None)`` would enumerate the CWD). The outbox
+        is normally near-empty, so this is cheap."""
+        with self._lock:
+            if self._closed:
+                return 0
+            return self._sweep_locked(now_ms)
+
+    def _sweep_locked(self, now_ms: int) -> int:
         cutoff_ms = MAX_AGE_S * 1000
         reaped = 0
         # Outbox root — skip the .claims dir; reap producer leftovers by mtime.
@@ -274,17 +296,21 @@ class PluginOutbox:
         return self.sweep_once(_now_ms())
 
     def close(self) -> None:
-        # Fail-closed FIRST: flip the flag before nulling FDs so a concurrent
-        # op sees `_closed` (raises) rather than a `dir_fd=None` CWD fall-through.
-        self._closed = True
-        for fd_attr in ("_outbox_dirfd", "_claims_dirfd"):
-            fd = getattr(self, fd_attr, None)
-            if isinstance(fd, int):
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                setattr(self, fd_attr, None)
+        # Serialized against every FD-using op via the lock: an in-flight op has
+        # either already completed its syscall (lock released) or has not yet
+        # passed its closed-check — so nulling the FDs here can never make a live
+        # op perform a dir_fd=None (CWD-relative) syscall. If another thread holds
+        # the lock mid-syscall, close() just waits for it.
+        with self._lock:
+            self._closed = True
+            for fd_attr in ("_outbox_dirfd", "_claims_dirfd"):
+                fd = getattr(self, fd_attr, None)
+                if isinstance(fd, int):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    setattr(self, fd_attr, None)
 
 
 # ---------------------------------------------------------------------------
