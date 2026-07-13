@@ -21,7 +21,9 @@ if TYPE_CHECKING:
 from executor_registry import ExecutorRegistry
 from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — available for future use
 from system_requirements.orchestrator import install_requirements, OrchestrationError
-from system_requirements.manifest import add_plugin_entry as add_manifest
+from system_requirements.manifest import (
+    add_plugin_entry as add_manifest, remove_plugin_entry as remove_manifest,
+)
 import plugin_registry
 import plugin_store
 from plugin_grants import (
@@ -321,7 +323,32 @@ def _with_subagent_spawn_disallowed(disallowed) -> list[str]:
     return out
 
 
-def _build_specialist_options(cfg) -> ClaudeAgentOptions:
+def _resolution_from_recorded(plugin_artifacts) -> "plugin_registry.ResolutionResult":
+    """Sol round-3 H7b: rebuild a ResolutionResult from an engagement's RECORDED
+    plugin_artifacts (§3.8) so a resumed specialist loads exactly what it started
+    with (paths AND derived grants), never re-resolving current assignments.
+    Fails closed (raises) if a recorded artifact path is gone."""
+    from plugin_registry import ResolutionResult, ResolvedPlugin
+    plugins = []
+    for pa in plugin_artifacts or ():
+        path = pa.get("path") if isinstance(pa, dict) else None
+        if not path or not os.path.isdir(path):
+            raise RuntimeError(
+                f"cannot resume: recorded plugin artifact missing "
+                f"(plugin_artifact_missing): {pa!r}")
+        manifest = {}
+        try:
+            manifest = json.loads((Path(path) / ".claude-plugin" / "plugin.json")
+                                  .read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        plugins.append(ResolvedPlugin(
+            name=pa.get("name", ""), artifact_id=pa.get("artifact_id", ""),
+            path=path, version=str(manifest.get("version", "")), manifest=manifest))
+    return ResolutionResult(registry_valid=True, plugins=plugins)
+
+
+def _build_specialist_options(cfg, *, resolution=None) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for a Tier 2 specialist invocation.
 
     Specialist memory is injected via prompt in :func:`_run_delegated_agent`
@@ -356,10 +383,14 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
     # (sync/async delegation of e.g. butler), so a hardcoded "specialist:"
     # dropped a delegated resident's resident:<role> plugins. Use the
     # authoritative AgentRegistry tier; fall back to specialist for unknown roles.
+    # Sol round-3 H7b: a caller-supplied ``resolution`` is used verbatim so the
+    # engagement record + the options share ONE resolve (no create-vs-builder
+    # drift), and a resumed engagement rebuilds from its RECORDED artifacts.
     _role = getattr(cfg, "role", "unknown")
-    _tier = (_agent_registry.tier_for_role(_role)
-             if _agent_registry is not None else None) or "specialist"
-    resolution = plugin_registry.resolve_for(f"{_tier}:{_role}")
+    if resolution is None:
+        _tier = (_agent_registry.tier_for_role(_role)
+                 if _agent_registry is not None else None) or "specialist"
+        resolution = plugin_registry.resolve_for(f"{_tier}:{_role}")
     sdk_plugins = [{"type": "local", "path": rp.path}
                    for rp in resolution.plugins]
 
@@ -513,7 +544,16 @@ def build_engagement_resume_options(engagement, session_id: str) -> ClaudeAgentO
     else:
         cfg = _specialist_registry.get(role) if _specialist_registry is not None else None
         if cfg is not None:
-            opts = _build_specialist_options(cfg)
+            # Sol round-3 H7b: a resumed specialist rebuilds from its RECORDED
+            # artifacts (§3.8) — like executors — never re-resolving current
+            # assignments; a missing recorded artifact fails the resume closed.
+            # Old records (pre-v0.71.0) have no plugin_artifacts → fresh resolve.
+            recorded = getattr(engagement, "plugin_artifacts", None)
+            if recorded:
+                opts = _build_specialist_options(
+                    cfg, resolution=_resolution_from_recorded(recorded))
+            else:
+                opts = _build_specialist_options(cfg)
     if opts is None:
         raise RuntimeError(
             f"cannot rebuild options to resume {kind or 'specialist'} engagement "
@@ -872,12 +912,15 @@ async def delegate_to_agent(args: dict) -> dict:
         # artifact (informational — mirrors the executor-engagement case). The
         # specialist runs on the same tier:role resolution _build_specialist_
         # options uses below.
+        # Sol round-3 H7b: resolve ONCE and feed the SAME result to both the
+        # engagement record and the options builder, so a concurrent update can't
+        # make the recorded binding disagree with what actually launches.
         _spec_tier = (_agent_registry.tier_for_role(agent_name)
                       if _agent_registry is not None else None) or "specialist"
+        _spec_res = plugin_registry.resolve_for(f"{_spec_tier}:{agent_name}")
         _spec_arts = tuple(
             {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
-            for rp in plugin_registry.resolve_for(
-                f"{_spec_tier}:{agent_name}").plugins)
+            for rp in _spec_res.plugins)
         # Create record
         rec = await _engagement_registry.create(
             kind="specialist", role_or_type=agent_name, driver="in_casa",
@@ -894,7 +937,8 @@ async def delegate_to_agent(args: dict) -> dict:
             logger.warning("set_channel_state(active) failed: %s", exc)
 
         # Build options + start driver (off-loop: registry resolve is file IO).
-        options = await asyncio.to_thread(_build_specialist_options, cfg)
+        options = await asyncio.to_thread(
+            _build_specialist_options, cfg, resolution=_spec_res)
         # Augment allowed tools (additive) with query_engager + emit_completion
         injected = list(options.allowed_tools or [])
         for t in ("mcp__casa-framework__query_engager",
@@ -1611,31 +1655,35 @@ async def engage_executor(args: dict) -> dict:
             "message": str(exc),
         })
 
-    # Sol #6 TOCTOU fence: if a concurrent plugin_update/remove changed the
-    # snapshot during the topic-creation await, re-resolve so the engagement
-    # record pins the CURRENT artifacts (not ones superseded mid-launch). An
-    # update AFTER create() is the by-design informational "previous artifact"
-    # case; this only closes the resolve→create window.
-    if plugin_registry.snapshot_generation() != _resolve_generation:
-        plugin_resolution, plugin_artifacts, _gate_err = _resolve_and_gate()
-        if _gate_err is not None:
-            await _abort_engagement_topic(channel, "engage-abort", topic_id)
-            return _gate_err
+    # Sol #6 / round-3 H6 TOCTOU fence: hold the plugin-tools lock across the
+    # re-resolve + durable record write so a concurrent plugin_update (which
+    # bumps the snapshot generation UNDER THE SAME LOCK during its reload) cannot
+    # interleave between the generation check and create(). The lock is held only
+    # for this brief section (re-resolve is sync, create is a quick registry
+    # write) — NOT across the topic-creation network round-trip above. An update
+    # AFTER create() is the by-design informational "previous artifact" case.
+    async with _PLUGIN_TOOLS_LOCK:
+        if plugin_registry.snapshot_generation() != _resolve_generation:
+            plugin_resolution, plugin_artifacts, _gate_err = _resolve_and_gate()
+            if _gate_err is not None:
+                await _abort_engagement_topic(channel, "engage-abort", topic_id)
+                return _gate_err
 
-    # Computed BEFORE create() so it can be persisted onto the record's
-    # origin — the claude_code driver reads it (and context_text) back out
-    # of engagement.origin when provisioning the workspace CLAUDE.md.
-    world_state = _build_world_state_summary()
+        # Computed BEFORE create() so it can be persisted onto the record's
+        # origin — the claude_code driver reads it (and context_text) back out
+        # of engagement.origin when provisioning the workspace CLAUDE.md.
+        world_state = _build_world_state_summary()
 
-    rec = await _engagement_registry.create(
-        kind="executor", role_or_type=executor_type, driver=defn.driver,
-        task=task_text,
-        origin={**origin, "context": context_text, "world_state_summary": world_state},
-        topic_id=topic_id,
-        tools_allowed=tuple(defn.tools_allowed or ()),
-        permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
-        plugin_artifacts=plugin_artifacts,          # §3.8 recorded binding
-    )
+        rec = await _engagement_registry.create(
+            kind="executor", role_or_type=executor_type, driver=defn.driver,
+            task=task_text,
+            origin={**origin, "context": context_text,
+                    "world_state_summary": world_state},
+            topic_id=topic_id,
+            tools_allowed=tuple(defn.tools_allowed or ()),
+            permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
+            plugin_artifacts=plugin_artifacts,      # §3.8 recorded binding
+        )
 
     # Persist the initial state emoji so Task 23 ``update_topic_state`` knows
     # whether it needs to edit the title (no-op when state didn't change).
@@ -3122,6 +3170,10 @@ def _install_plugin_sysreqs(name: str, manifest: dict) -> dict | None:
     Returns an error envelope on failure (registry left unchanged), else None."""
     reqs = plugin_store.manifest_sysreqs(manifest)
     if not reqs:
+        # Sol round-3 M: an update to a manifest with NO requirements must clear
+        # any stale row (add_plugin_entry replaces by name on the has-reqs path,
+        # so only this branch leaks). No-op for a brand-new plugin.
+        remove_manifest(name)
         return None
     try:
         outcomes = install_requirements(
@@ -3143,9 +3195,18 @@ def _plugin_add_sync(*, name: str, repo: str, ref: str, subdir: str = "",
     if not plugin_registry.NAME_RE.match(name or ""):
         return {"ok": False, "kind": "invalid_name", "name": name}
     targets = list(targets or [])
-    bad = [t for t in targets if not plugin_registry.TARGET_RE.match(t)]
+    # Sol round-3 M: a non-string target must not raise TypeError out of the
+    # envelope (TARGET_RE.match(1) throws) — reject it as an invalid target.
+    bad = [t for t in targets
+           if not isinstance(t, str) or not plugin_registry.TARGET_RE.match(t)]
     if bad or not targets:
         return {"ok": False, "kind": "invalid_target", "invalid": bad}
+    # Sol round-3 M: validate subdir here so `../x` returns an envelope instead
+    # of an uncaught ValueError from normalize_subdir inside publish.
+    try:
+        plugin_registry.normalize_subdir(subdir or "")
+    except ValueError:
+        return {"ok": False, "kind": "invalid_subdir", "subdir": subdir}
     data = plugin_registry.load_registry()                     # from DISK
     if not data.valid:
         return {"ok": False, "kind": "registry_invalid"}
@@ -3238,7 +3299,9 @@ def _resolved_observability(name: str) -> dict:
          "repo": {"type": "string"},
          "ref": {"type": "string"},
          "subdir": {"type": "string"},
-         "targets": {"type": "array"}},
+         # Sol round-3 M: constrain items so a non-string target (`[1]`) is
+         # rejected by the MCP validator, not by an uncaught TARGET_RE.match.
+         "targets": {"type": "array", "items": {"type": "string"}}},
      "required": ["name", "repo", "ref", "targets"]},
 )
 async def plugin_add(args: dict) -> dict:
@@ -3329,6 +3392,9 @@ def _plugin_remove_sync(*, name: str) -> dict:
     # §3.1 no-resurrection: seeded_defaults is INTENTIONALLY left untouched, so
     # a removed default stays removed across upgrades. Artifact left for GC.
     plugin_registry.save_registry(data)
+    # Sol round-3 M: drop the plugin's system-requirement manifest row too, so a
+    # removed plugin leaves no stale reconciliation burden.
+    remove_manifest(name)
     return {"ok": True, "name": name, "targets": targets,
             "artifact_retained": True}
 

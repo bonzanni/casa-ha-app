@@ -303,9 +303,44 @@ def test_specialist_and_executor_options_inject_plugins_guard(tmp_path,
 
     def _has_guard(opts):
         pre = (opts.hooks or {}).get("PreToolUse", [])
-        return any(getattr(m, "matcher", None) == "Write|Edit|MultiEdit|Bash"
-                   for m in pre)
+        return any(getattr(m, "matcher", None)
+                   == "Write|Edit|MultiEdit|NotebookEdit|Bash" for m in pre)
 
     assert _has_guard(tools_mod._build_specialist_options(_spec_cfg("finance")))
     assert _has_guard(tools_mod._build_executor_options(
         _exec_defn(), executor_type="probe-exec"))
+
+
+def test_resolution_from_recorded_builds_and_fails_closed(tmp_path):
+    """Sol round-3 H7b: a resumed specialist rebuilds a resolution from its
+    RECORDED artifacts (paths + derived grants), failing closed if a recorded
+    path is gone."""
+    import pytest
+    import tools as tools_mod
+    store = tmp_path / "store"
+    e = entry("p", ["specialist:finance"])
+    art = mk_artifact(store, "p", e["artifact_id"], mcp_servers={"p": {}})
+    recorded = [{"name": "p", "artifact_id": e["artifact_id"], "path": str(art)}]
+    res = tools_mod._resolution_from_recorded(recorded)
+    assert [rp.path for rp in res.plugins] == [str(art)]
+    assert res.plugins[0].version == "1.0.0"          # manifest read back
+    with pytest.raises(RuntimeError):
+        tools_mod._resolution_from_recorded(
+            [{"name": "x", "artifact_id": "a", "path": "/nonexistent"}])
+
+
+def test_build_specialist_options_uses_passed_resolution(tmp_path, monkeypatch):
+    """Sol round-3 H7b: a caller-supplied resolution is used verbatim (no second
+    resolve) so record + options can share one resolve."""
+    import tools as tools_mod
+    from plugin_registry import ResolutionResult, ResolvedPlugin
+    monkeypatch.setattr(tools_mod, "_mcp_registry", None, raising=False)
+    monkeypatch.setattr(
+        plugin_registry, "resolve_for",
+        lambda t: (_ for _ in ()).throw(AssertionError("must not re-resolve")))
+    rp = ResolvedPlugin(name="p", artifact_id="a" * 64, path="/store/p/a",
+                        version="1", manifest={})
+    opts = tools_mod._build_specialist_options(
+        _spec_cfg("finance"),
+        resolution=ResolutionResult(registry_valid=True, plugins=[rp]))
+    assert opts.plugins == [{"type": "local", "path": "/store/p/a"}]

@@ -59,6 +59,8 @@ def _wire(monkeypatch, tmp_path, st, *, publish=None, publish_exc=None,
         st.log.append(f"dispatch:{role}")
         return {"status": dispatch_status}
 
+    import system_requirements.manifest as _mani
+    monkeypatch.setattr(_mani, "MANIFEST_PATH", tmp_path / "sysreq-manifest.yaml")
     monkeypatch.setattr(preg, "load_registry", fake_load)
     monkeypatch.setattr(preg, "save_registry", fake_save)
     monkeypatch.setattr(preg, "reload_snapshot",
@@ -413,3 +415,40 @@ def test_plugin_add_schema_subdir_optional():
     assert schema.get("type") == "object"
     assert "subdir" not in schema["required"]
     assert set(schema["required"]) == {"name", "repo", "ref", "targets"}
+
+
+def test_plugin_add_sync_rejects_bad_subdir_and_nonstring_target():
+    """Sol round-3 M: a bad subdir / non-string target returns an envelope, not
+    an uncaught crash outside it."""
+    from tools import _plugin_add_sync
+    r = _plugin_add_sync(name="p", repo="o/r", ref="v1", subdir="../x",
+                         targets=["specialist:finance"])
+    assert r == {"ok": False, "kind": "invalid_subdir", "subdir": "../x"}
+    r2 = _plugin_add_sync(name="p", repo="o/r", ref="v1", targets=[1])
+    assert r2["kind"] == "invalid_target"
+
+
+def test_install_sysreqs_no_reqs_clears_stale_row(monkeypatch):
+    """Sol round-3 M: an update to a manifest with NO requirements clears a stale
+    manifest row (add_plugin_entry replaces by name on the has-reqs path)."""
+    import tools as tools_mod
+    removed = []
+    monkeypatch.setattr(tools_mod, "remove_manifest", lambda n: removed.append(n))
+    r = tools_mod._install_plugin_sysreqs("p", {"name": "p", "version": "2"})
+    assert r is None
+    assert removed == ["p"]
+
+
+def test_plugin_remove_clears_manifest_row(monkeypatch, tmp_path):
+    """Sol round-3 M: removing a plugin drops its system-requirement manifest row."""
+    import tools as tools_mod
+    st = _State()
+    st.raw["plugins"].append({
+        "name": "gone", "source": {"type": "github", "repo": "o/r", "ref": "v1",
+        "revision": "git:" + "a" * 40, "subdir": ""}, "artifact_id": "c" * 64,
+        "version": "1.0.0", "targets": ["specialist:finance"]})
+    _wire(monkeypatch, tmp_path, st)
+    removed = []
+    monkeypatch.setattr(tools_mod, "remove_manifest", lambda n: removed.append(n))
+    r = tools_mod._plugin_remove_sync(name="gone")
+    assert r["ok"] is True and removed == ["gone"]
