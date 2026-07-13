@@ -172,6 +172,28 @@ def test_init_outbox_singleton(tmp_path):
         plugin_outbox._OUTBOX = None
 
 
+def test_closed_outbox_fails_closed_not_cwd(tmp_path, monkeypatch):
+    # Regression (Sol diff review): after close(), the dir-FDs are None; a
+    # dir_fd=None op resolves relative to the process CWD (fail-OPEN). Operations
+    # on a closed outbox MUST fail CLOSED and touch NOTHING — never grab a
+    # same-named CWD file.
+    ob = PluginOutbox(str(tmp_path / "ob"))
+    src = _write_outbox_file(ob._root_realpath, "invoice.pdf", PDF)
+    ob.close()
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / "invoice.pdf").write_bytes(b"CWD-FILE")
+    monkeypatch.chdir(cwd)
+    with pytest.raises(OutboxError) as ei:
+        ob.claim(src)
+    assert ei.value.kind == "guard_error"
+    assert (cwd / "invoice.pdf").read_bytes() == b"CWD-FILE"   # CWD file untouched
+    assert os.path.exists(src)                                  # outbox file untouched
+    with pytest.raises(OutboxError):
+        ob.capture("anything", "document")                     # capture fail-closed too
+    assert ob.sweep_once(10_000_000_000_000) == 0              # sweep no-op when closed
+
+
 # ---------------------------------------------------------------------------
 # capture
 # ---------------------------------------------------------------------------

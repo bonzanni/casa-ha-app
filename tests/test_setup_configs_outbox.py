@@ -20,10 +20,10 @@ def test_script_creates_and_exports_outbox():
     assert "/run/s6/container_environment/CASA_PLUGIN_OUTBOX_DIR" in text
 
 
-def test_casa_core_wires_and_closes_outbox():
+def test_casa_core_wires_outbox():
     # Guards against an omitted boot call — the wire() BEHAVIOUR is unit-tested
     # separately (test_wire_inits_and_registers_hourly_job); this asserts casa_core
-    # actually invokes it + closes on shutdown.
+    # actually invokes it. (It deliberately does NOT close the live singleton on
+    # shutdown — see the fail-closed note in plugin_outbox.close.)
     text = CASA_CORE.read_text()
     assert "plugin_outbox.wire(" in text
-    assert "plugin_outbox.get_outbox()" in text

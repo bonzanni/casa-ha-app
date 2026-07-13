@@ -96,6 +96,7 @@ def _claim_epoch_ms(name: str):
 
 class PluginOutbox:
     def __init__(self, root: str) -> None:
+        self._closed = False
         self._root_realpath = os.path.realpath(root)
         self._claims_realpath = os.path.join(self._root_realpath, CLAIMS_SUBDIR)
         # Belt-and-suspenders: setup-configs.sh creates these at boot, but make
@@ -110,12 +111,20 @@ class PluginOutbox:
         self._outbox_dirfd = os.open(self._root_realpath, _DIR_OPEN_FLAGS)
         self._claims_dirfd = os.open(self._claims_realpath, _DIR_OPEN_FLAGS)
 
+    def _ensure_open(self) -> None:
+        # A closed instance must FAIL CLOSED — never fall through to a
+        # ``dir_fd=None`` op, which resolves relative to the process CWD (an
+        # exfiltration fail-open, e.g. grabbing a same-named CWD file).
+        if self._closed:
+            raise OutboxError("guard_error", "outbox is closed")
+
     # -- claim ----------------------------------------------------------------
 
     def claim(self, requested_path: str) -> str:
         """Atomically claim *requested_path* into ``.claims/`` and return the
         claim name. Raises
         ``OutboxError(bad_name|outside_outbox|missing|guard_error)``."""
+        self._ensure_open()
         basename = os.path.basename(requested_path)
         if not _safe_basename(basename):
             raise OutboxError("bad_name", f"unsafe basename {basename!r}")
@@ -145,7 +154,8 @@ class PluginOutbox:
         ``dir_fd`` kwarg is **Python 3.11+** (verified against the 3.11 docs;
         the container base is 3.11). A directory-typed claim (a misbehaving
         producer) is rmtree'd — ``os.rmdir`` would fail on a non-empty dir.
-        Unconditional."""
+        Unconditional (but fail-closed once the outbox is closed)."""
+        self._ensure_open()
         try:
             st = os.lstat(claim_name, dir_fd=self._claims_dirfd)
         except FileNotFoundError:
@@ -162,6 +172,7 @@ class PluginOutbox:
         bytes. Never re-opens by the original path. Raises
         ``OutboxError(not_regular|multi_link|too_large|magic_mismatch|guard_error)``.
         Synchronous — the tool runs it via ``asyncio.to_thread``."""
+        self._ensure_open()
         cap = MEDIA_POLICIES[kind].size_cap
         # Type-gate via lstat FIRST: only a regular file is deliverable. This
         # rejects symlink/socket/fifo/dir/device UNIFORMLY as not_regular — a
@@ -220,6 +231,8 @@ class PluginOutbox:
         """Reap orphans: outbox-root entries by lstat mtime, ``.claims/`` entries
         by embedded epoch; both older than ``MAX_AGE_S``. Never follows symlinks.
         Returns the count reaped. Synchronous (run via ``asyncio.to_thread``)."""
+        if self._closed:
+            return 0
         cutoff_ms = MAX_AGE_S * 1000
         reaped = 0
         # Outbox root — skip the .claims dir; reap producer leftovers by mtime.
@@ -261,6 +274,9 @@ class PluginOutbox:
         return self.sweep_once(_now_ms())
 
     def close(self) -> None:
+        # Fail-closed FIRST: flip the flag before nulling FDs so a concurrent
+        # op sees `_closed` (raises) rather than a `dir_fd=None` CWD fall-through.
+        self._closed = True
         for fd_attr in ("_outbox_dirfd", "_claims_dirfd"):
             fd = getattr(self, fd_attr, None)
             if isinstance(fd, int):

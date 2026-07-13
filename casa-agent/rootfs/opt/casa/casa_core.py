@@ -2173,9 +2173,11 @@ async def main() -> None:
     scheduler.shutdown(wait=False)
     await session_sweeper.stop()
     await freshness_reaper.stop()
-    _ob = plugin_outbox.get_outbox()
-    if _ob is not None:
-        _ob.close()
+    # NOTE: deliberately do NOT close the plugin outbox here. Its dir-FDs are
+    # O_CLOEXEC and process-lived (the OS reclaims them on exit); closing the
+    # live singleton during shutdown — before HTTP ingress + agent turns are
+    # drained below — would let an in-flight send_media fall through to a
+    # dir_fd=None (CWD-relative) op. close() is for test teardown only.
 
     # AR-9: close every resident/specialist Agent's SDK client pool so no
     # warm subprocess outlives container shutdown. Bounded per-agent so one
