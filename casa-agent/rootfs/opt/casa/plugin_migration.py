@@ -326,10 +326,13 @@ def _migrate(data, cc_home, config_dir, defaults_dir, agents_dir,
         src = entry["source"]
         active_paths = sorted(active.get(name, {}).get("installPaths", set()))
         if len(active_paths) > 1:
-            # Sol #10: ambiguous — several installs of one bundled default. Keep
-            # the known-good bundled pin (never an arbitrary adopt) and flag it.
+            # Sol round-3 H10b: ambiguous — several installs of one bundled
+            # default. REFUSE (leave unassigned) rather than silently fall back
+            # to the bundled pin: the migration issue is not replayed after the
+            # sentinel, so a bundled-pin fallback would verify green next boot
+            # with the operator's divergence forgotten. Absence is the persistent
+            # signal; the operator re-adds via plugin_add once resolved.
             add_issue(name, "install_path_divergence")
-            new_entries[name] = copy.deepcopy(entry)
             continue
         if not (active_paths and Path(active_paths[0]).is_dir()):
             new_entries[name] = copy.deepcopy(entry)  # bundled pin verbatim

@@ -335,6 +335,25 @@ def test_divergent_installpaths_refused(tmp_path, monkeypatch):
     assert not any(e["name"] == "dup" for e in reg["plugins"])   # NOT adopted
 
 
+def test_bundled_default_installpath_divergence_refused(tmp_path, monkeypatch):
+    """Sol round-3 H10b: a bundled default with >1 install paths is REFUSED (not
+    silently pinned to the bundled artifact — which would verify green after the
+    sentinel forgets the divergence). Absence + the seeded_defaults mark (no
+    resurrection) is the persistent signal."""
+    d = _dirs(tmp_path)
+    _default_registry(d["defaults"], ["superpowers"])
+    (Path(d["agents"]) / "executors" / "plugin-developer").mkdir(parents=True)
+    monkeypatch.setattr(pm, "_installed_state", lambda cc: {
+        "superpowers": {"installPaths": {"/a", "/b"}, "scopes": {"user", "project"},
+                        "enabled": True}})
+    report, issues, warnings = _run(tmp_path, monkeypatch, d)
+    assert any(i["reason_code"] == "install_path_divergence"
+               and i["name"] == "superpowers" for i in report["issues"])
+    reg = json.loads((d["plugins"] / "registry.json").read_text())
+    assert not any(e["name"] == "superpowers" for e in reg["plugins"])   # refused
+    assert "superpowers" in reg["seeded_defaults"]        # no-resurrection mark
+
+
 def test_append_idempotent_no_duplicate_names(tmp_path, monkeypatch):
     """Sol #1 defense-in-depth: even against a pre-populated registry (the old
     seed-before-migrate order), migration never appends a duplicate name."""

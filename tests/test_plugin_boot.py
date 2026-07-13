@@ -106,6 +106,7 @@ def test_boot_runs_migration_before_seed(monkeypatch, tmp_path):
 
     def _mig(**kw):
         order.append("migrate")
+        (tmp_path / ".migration-done").touch()    # migration COMPLETED → sentinel
         return ({"migrated": [], "issues": []}, [], [])
 
     _wire(monkeypatch, tmp_path, migration=_mig)
@@ -113,3 +114,24 @@ def test_boot_runs_migration_before_seed(monkeypatch, tmp_path):
                         lambda *a, **k: (order.append("seed"), False)[1])
     assert plugin_boot.main() == 0
     assert order == ["migrate", "seed"]           # migration precedes seeding
+
+
+def test_boot_skips_seed_when_migration_did_not_complete(monkeypatch, tmp_path):
+    """Sol round-3 B1: a migration that FAILED without writing the sentinel must
+    NOT seed defaults — seeding poisons the next retry (existing_names would then
+    skip active-install precedence + executor overrides)."""
+    seeded = {"called": False}
+
+    def _mig(**kw):
+        # Ran, recorded a failure issue, but did NOT write the sentinel.
+        return ({"migrated": [], "issues": [{"name": "*"}]},
+                [PluginIssue(name="*", target=None, stage="migration",
+                             reason_code="migration_exception")], [])
+
+    _wire(monkeypatch, tmp_path, migration=_mig)
+    monkeypatch.setattr(
+        plugin_registry, "seed_defaults",
+        lambda *a, **k: (seeded.__setitem__("called", True), False)[1])
+    # Sentinel absent (migration did not complete).
+    assert plugin_boot.main() == 0
+    assert seeded["called"] is False              # seeding skipped

@@ -44,16 +44,19 @@ def main() -> int:
                      len(report.get("migrated", [])),
                      len(mig_issues))
 
-        # Seed AFTER migration: a no-op on the first boot (migration already
-        # considered every bundled default and marked seeded_defaults), active
-        # only for defaults introduced by a LATER release — no-resurrection
-        # honored so a removed default stays removed across upgrades.
+        # Seed AFTER migration, and ONLY once migration has COMPLETED (sentinel
+        # present). Sol round-3 B1: a FAILED migration (sentinel withheld) must
+        # NOT seed — seeding the bundled defaults would make the next retry see
+        # those names as existing and skip active-install precedence + executor
+        # assignment overrides. On the first success the sentinel is present and
+        # seeding is a no-op (migration already created the defaults); on later
+        # boots it fills defaults introduced by a newer release (no-resurrection).
         data = plugin_registry.load_registry()
         if not data.valid:
             issues.append(plugin_registry.PluginIssue(
                 name="*", target=None, stage="registry",
                 reason_code="registry_invalid"))
-        elif plugin_registry.seed_defaults(data):
+        elif SENTINEL.exists() and plugin_registry.seed_defaults(data):
             plugin_registry.save_registry(data)
 
         plugin_registry.reload_snapshot()
