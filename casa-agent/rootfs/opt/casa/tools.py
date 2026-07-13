@@ -3227,16 +3227,39 @@ _PLUGIN_HEALTH_PATH = "/data/plugin-health.json"
 
 
 def _regenerate_plugin_health(extra_issues: list) -> None:
-    """§3.10/R2-4 + Sol #13: rewrite the health report from the CURRENT resolver
-    state PLUS the RUNTIME verify state of EVERY registered plugin — not just the
-    plugin this mutation touched. Otherwise a successful mutation of plugin B
-    would rewrite health from resolver issues + B's (empty) extras and ERASE
-    plugin A's still-active runtime failure (reload_required / authorization_
-    missing / unresolved secret). extra_issues carries this mutation's own
-    freshly-computed rows; they are de-duplicated against the recompute."""
+    """§3.10/R2-4 + Sol #13 + D2/B3 (v0.74.0): rewrite the health report from
+    the CURRENT resolver state PLUS the RUNTIME verify state of EVERY
+    registered plugin — not just the plugin this mutation touched. Otherwise
+    a successful mutation of plugin B would rewrite health from resolver
+    issues + B's (empty) extras and ERASE plugin A's still-active runtime
+    failure. D2: readiness derives from THIS regeneration's OWN fresh pass —
+    a caller-supplied stage="verify" extra row is DROPPED when the fresh
+    pass can REDISCOVER it (its plugin is registered AND its target is None
+    or still among that entry's targets): a still-true failure re-lands
+    fresh, a transient one (e.g. a pre-v0.74.0 torn-read reload_required)
+    must not linger. Carried forward verbatim: stage="reload" rows (a failed
+    reconstruction is not rediscoverable by verify), rows for unregistered
+    plugins, and rows whose target was since UNASSIGNED (the fresh pass no
+    longer grades that target — B3)."""
     import plugin_health
     from plugin_registry import PluginIssue, load_registry
     res = plugin_registry.resolve_all()
+    reg = load_registry()
+    entry_targets: dict = {}
+    if reg.valid:
+        for e in reg.entries:
+            entry_targets[e.get("name")] = list(e.get("targets") or [])
+
+    def _rediscoverable(issue) -> bool:
+        if getattr(issue, "stage", None) != "verify":
+            return False
+        nm = getattr(issue, "name", None)
+        if nm not in entry_targets:
+            return False
+        tgt = getattr(issue, "target", None)
+        return tgt is None or tgt in entry_targets[nm]
+
+    extra_issues = [e for e in extra_issues if not _rediscoverable(e)]
     seen = {(getattr(e, "name", None), getattr(e, "target", None),
              getattr(e, "reason_code", None)) for e in extra_issues}
     runtime_issues: list = []
@@ -3247,7 +3270,6 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
             runtime_issues.append(PluginIssue(
                 name=name, target=target, stage="verify", reason_code=reason))
 
-    reg = load_registry()
     if reg.valid:
         for entry in reg.entries:
             name = entry.get("name")
@@ -3286,13 +3308,31 @@ async def _notify_plugin_health_if_possible() -> None:
         logger.debug("plugin health notify skipped", exc_info=True)
 
 
+def _stale_absent_targets(targets: list, name: str, runtime) -> list[str]:
+    """The concrete resident/specialist targets that STILL bind `name` after
+    an absent-expectation mutation (unassign/remove) — read from the live
+    agents' coherent binding property (D3, v0.74.0: concrete targets, never
+    a registry-wide null)."""
+    if runtime is None:
+        return []
+    agents = getattr(runtime, "agents", {}) or {}
+    stale: list[str] = []
+    for target in targets:
+        tier, _, role = target.partition(":")
+        if tier in ("resident", "specialist"):
+            agent = agents.get(role)
+            if agent is not None and name in getattr(
+                    agent, "active_plugin_binding", {}):
+                stale.append(target)
+    return stale
+
+
 def _postcondition_holds(verify: dict, targets: list, *, expect: str,
                          name: str | None = None, runtime=None) -> bool:
     """§3.9 mutation postcondition. 'present' (add/update/assign): every in-casa
-    target row must be ready (legacy verify with no 'targets' key is not
-    blocking — Task 14's rewrite adds the real rows). 'absent' (unassign/
-    remove): no RECONSTRUCTED in-casa agent still binds `name` — read the live
-    agent's active_plugin_binding directly, independent of verify shape."""
+    target row must be ready. 'absent' (unassign/remove): no RECONSTRUCTED
+    in-casa agent still binds `name` — delegates to _stale_absent_targets so
+    failures carry concrete targets (D3, v0.74.0)."""
     if expect == "present":
         # Sol #9: a plugin with zero target rows (e.g. fully unassigned, or an
         # update whose new artifact has unresolved secrets) made all([]) == True
@@ -3300,37 +3340,48 @@ def _postcondition_holds(verify: dict, targets: list, *, expect: str,
         # artifact/tools/secrets checks AND every target row's readiness — so an
         # empty-rows verify no longer passes vacuously.
         return verify.get("ready") is True
-    # absent
     if runtime is None or name is None:
         return True
-    agents = getattr(runtime, "agents", {}) or {}
-    for target in targets:
-        tier, _, role = target.partition(":")
-        if tier in ("resident", "specialist"):
-            agent = agents.get(role)
-            if agent is not None and name in getattr(
-                    agent, "active_plugin_binding", {}):
-                return False
-    return True
+    return not _stale_absent_targets(targets, name, runtime)
 
 
 def _issues_from_mutation(name: str, *, reload_errors: list, verify: dict,
-                          expect: str, postcondition_ok: bool) -> list:
-    """R2-4: translate reload/verify/postcondition failures into structured
-    PluginIssues so they persist in the health report."""
+                          expect: str, postcondition_ok: bool,
+                          stale_absent_targets: "tuple | list" = (),
+                          snapshot_raced: bool = False) -> list:
+    """R2-4 + D3 (v0.74.0): translate reload/verify/postcondition failures
+    into structured PluginIssues. postcondition_failed(target=None) is
+    emitted ONLY when nothing concrete (reload error / not-ready target row /
+    top-level verify reason / snapshot race) already explains the failure —
+    pre-v0.74.0 it duplicated reload_required registry-wide, warning EVERY
+    resident (the operator's original symptom). Absent-case failures name
+    their concrete stale targets; a snapshot race is its own reason."""
     from plugin_registry import PluginIssue
     issues: list = []
     for err in reload_errors:
         issues.append(PluginIssue(
             name=name, target=err.get("target"), stage="reload",
             reason_code="reload_failed"))
-    for row in (verify.get("targets") or []):
-        if not row.get("ready"):
-            reasons = row.get("reasons") or ["not_ready"]
+    row_failures = [row for row in (verify.get("targets") or [])
+                    if not row.get("ready")]
+    for row in row_failures:
+        reasons = row.get("reasons") or ["not_ready"]
+        issues.append(PluginIssue(
+            name=name, target=row.get("target"), stage="verify",
+            reason_code=reasons[0]))
+    if snapshot_raced:
+        issues.append(PluginIssue(
+            name=name, target=None, stage="verify",
+            reason_code="snapshot_raced"))
+        return issues
+    if postcondition_ok or reload_errors:
+        return issues
+    if expect == "absent" and stale_absent_targets:
+        for t in stale_absent_targets:
             issues.append(PluginIssue(
-                name=name, target=row.get("target"), stage="verify",
-                reason_code=reasons[0]))
-    if not postcondition_ok and not reload_errors:
+                name=name, target=t, stage="verify",
+                reason_code="postcondition_failed"))
+    elif not row_failures and not (verify.get("reasons") or []):
         issues.append(PluginIssue(
             name=name, target=None, stage="verify",
             reason_code="postcondition_failed"))
@@ -3358,32 +3409,73 @@ async def _reload_and_verify_targets(name: str, targets: list,
             else:
                 reload_errors.append({"target": target, **res})
         # executors: nothing to reconstruct (per-launch resolution).
-    # Sol round-3 B2a: reconstruction leaves the new Agent's _plugin_resolution
-    # lazy (None until its first turn) — verify would then classify a live,
-    # registered agent as "dormant" and green it BEFORE its binding is captured.
-    # Force resolution now so verify sees "active" and confirms binding==desired.
+    # Sol round-3 B2a + D2 (v0.74.0): reconstruction leaves the new Agent's
+    # binding snapshot lazy (None until its first turn) — verify would then
+    # classify a live, registered agent as "dormant" and green it BEFORE its
+    # binding is captured. Force resolution, then enforce the D2 generation
+    # fence: every reloaded target's snapshot must carry the CURRENT
+    # post-reload generation, and the global generation must not move across
+    # the verify. A mismatch means an intervening reload — retry ONCE with a
+    # real re-dispatch (a cached snapshot would short-circuit a bare
+    # re-resolve), then fail EXPLICITLY (kind=snapshot_raced), never grading
+    # against a stale generation.
     agents = getattr(runtime, "agents", {}) or {}
-    for target in reloaded:
-        _, _, role = target.partition(":")
-        agent = agents.get(role)
-        if agent is not None and getattr(agent, "_plugin_resolution", None) is None:
-            try:
-                await agent._get_plugin_resolution()
-            except Exception as exc:  # noqa: BLE001
-                # Sol round-4 M: a fail-OPEN resolve would leave _plugin_resolution
-                # None → verify classifies the live agent as dormant → green. Record
-                # a reload error so the mutation reports not-ok instead.
-                logger.warning("post-reconstruct resolve failed for %s: %s",
-                               role, exc)
-                reload_errors.append({"target": target, "status": "error",
-                                      "kind": "resolve_failed"})
-    verify = await asyncio.to_thread(_tool_verify_plugin_state, plugin_name=name)
-    ok = (not reload_errors
+    verify: dict = {}
+    snapshot_raced = False
+    resolve_failed: set = set()
+    for _verify_attempt in range(2):
+        gen_now = plugin_registry.snapshot_generation()
+        for target in reloaded:
+            _, _, role = target.partition(":")
+            agent = agents.get(role)
+            if agent is not None and getattr(
+                    agent, "plugin_binding_snapshot", None) is None:
+                try:
+                    await agent._get_plugin_resolution()
+                except Exception as exc:  # noqa: BLE001
+                    # Sol round-4 M: a fail-OPEN resolve would leave the
+                    # snapshot None → verify classifies the live agent as
+                    # dormant → green. Record a reload error instead.
+                    logger.warning(
+                        "post-reconstruct resolve failed for %s: %s",
+                        role, exc)
+                    if target not in resolve_failed:
+                        resolve_failed.add(target)
+                        reload_errors.append(
+                            {"target": target, "status": "error",
+                             "kind": "resolve_failed"})
+        stale_gen = []
+        for t in reloaded:
+            _, _, _role = t.partition(":")
+            _snap = getattr(agents.get(_role), "plugin_binding_snapshot", None)
+            if _snap is not None and _snap.generation != gen_now:
+                stale_gen.append(t)
+        verify = await asyncio.to_thread(
+            _tool_verify_plugin_state, plugin_name=name)
+        raced = (bool(stale_gen)
+                 or plugin_registry.snapshot_generation() != gen_now)
+        if not raced:
+            snapshot_raced = False
+            break
+        snapshot_raced = True
+        if _verify_attempt == 0:
+            for t in (stale_gen or reloaded):
+                _, _, role = t.partition(":")
+                try:
+                    await reload_mod.dispatch("agent", runtime=runtime,
+                                              role=role)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("generation-race re-reload failed for "
+                                   "%s: %s", role, exc)
+    stale_absent = (_stale_absent_targets(targets, name, runtime)
+                    if expect == "absent" else [])
+    ok = (not snapshot_raced and not reload_errors
           and _postcondition_holds(verify, targets, expect=expect,
                                    name=name, runtime=runtime))
     mutation_issues = _issues_from_mutation(
         name, reload_errors=reload_errors, verify=verify,
-        expect=expect, postcondition_ok=ok)
+        expect=expect, postcondition_ok=ok,
+        stale_absent_targets=stale_absent, snapshot_raced=snapshot_raced)
     await asyncio.to_thread(_regenerate_plugin_health, mutation_issues)
     await _notify_plugin_health_if_possible()
     result = {
@@ -3400,7 +3492,8 @@ async def _reload_and_verify_targets(name: str, targets: list,
         "verify": verify,
     }
     if not ok:
-        result["kind"] = ("reload_failed" if reload_errors
+        result["kind"] = ("snapshot_raced" if snapshot_raced
+                          else "reload_failed" if reload_errors
                           else "postcondition_failed")
     return result
 
@@ -3859,6 +3952,18 @@ def _tool_verify_plugin_state(
     authorized; running engagements on a previous artifact are informational.
     Verification can never report active agreement while a running consumer
     executes different code (FR3).
+
+    FR3 readiness rule (spec 2026-07-13 §D1 — verbatim):
+
+    Readiness describes the artifact a target can execute on its next new
+    turn, not whether it is busy at verification time. A current dispatchable
+    resident or specialist Agent is ready only when it is unresolved and will
+    resolve the current registry snapshot before use, or its coherently
+    recorded binding equals the desired artifact. A stale binding remains
+    `reload_required` while idle because that Agent can reuse it on its next
+    bus or trigger turn. Artifacts retained only by already-started, pinned,
+    or draining engagements are informational, provided no new turn can enter
+    them.
     """
     import agent as agent_mod
     import cc_tool_pattern
@@ -3994,14 +4099,42 @@ def _tool_verify_plugin_state(
         if not configured_ready:
             row["reasons"] = list(reasons) or ["not_ready"]
         if tier in ("resident", "specialist"):
-            agent = agents.get(role)
-            constructed = (agent is not None
-                           and getattr(agent, "_plugin_resolution", None) is not None)
-            if constructed:
+            # D2 (v0.74.0): read the ONE frozen snapshot — never the legacy
+            # attribute pair — and guard against racing a reload swap: the
+            # object we grade must still BE runtime.agents[role] after the
+            # snapshot read (verify runs on a worker thread). Bounded
+            # re-read; if the mapping won't stabilize, fail EXPLICITLY
+            # rather than grade a replaced object.
+            agent = None
+            snap = None
+            stable = False
+            for _ in range(5):
+                agent = agents.get(role)
+                snap = (getattr(agent, "plugin_binding_snapshot", None)
+                        if agent is not None else None)
+                if agent is agents.get(role):
+                    stable = True
+                    break
+            if not stable:
+                row["ready"] = False
+                row["reasons"] = ["verify_unstable"]
+                row["state"] = "unstable"
+            elif agent is not None and snap is not None:
                 row["state"] = "active"
-                active_aid = getattr(agent, "active_plugin_binding", {}).get(plugin_name)
+                active_aid = snap.binding.get(plugin_name)
                 row["active_artifact_id"] = active_aid
+                # D2 disclosure: which resolver generation this binding was
+                # computed against. Grading stays FR3 — binding equality is
+                # authoritative (an unrelated mutation bumps the generation
+                # for agents it never reconstructs; the MUTATION path is
+                # where a generation mismatch hard-fails, spec D2 —
+                # provisional pending the B1 spec decision, Sol r3/r4).
+                row["resolution_generation"] = snap.generation
+                row["generation_stale"] = (
+                    snap.generation != plugin_registry.snapshot_generation())
                 if active_aid != artifact_id:
+                    # FR3: a stale binding is BLOCKING even while idle — the
+                    # persistent Agent reuses it on its next bus/trigger turn.
                     row["ready"] = False
                     row["reasons"] = ["reload_required"]
                     stale_targets.append(target)

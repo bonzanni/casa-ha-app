@@ -702,3 +702,34 @@ def test_plugin_remove_clears_manifest_row(monkeypatch, tmp_path):
     monkeypatch.setattr(tools_mod, "remove_manifest", lambda n: removed.append(n))
     r = tools_mod._plugin_remove_sync(name="gone")
     assert r["ok"] is True and removed == ["gone"]
+
+
+async def test_mutation_generation_race_retries_reload_then_fails_explicit(
+        monkeypatch, tmp_path):
+    """D2: a reloaded target whose snapshot generation disagrees with the
+    post-reload snapshot triggers ONE re-dispatch retry (a real
+    re-resolution), then explicit snapshot_raced — never graded stale."""
+    st = _State()
+    st.raw["plugins"].append(_entry())
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    import plugin_registry as preg
+    import agent as agent_mod
+    from types import SimpleNamespace
+
+    class _StaleSnapAgent:
+        # generation pinned at 1; snapshot_generation() below returns 99 —
+        # permanently mismatched, so both attempts fail.
+        plugin_binding_snapshot = SimpleNamespace(binding={}, generation=1)
+
+    runtime = SimpleNamespace(agents={"assistant": _StaleSnapAgent()})
+    monkeypatch.setattr(agent_mod, "active_runtime", runtime, raising=False)
+    monkeypatch.setattr(preg, "snapshot_generation", lambda: 99)
+    res = await tools_mod.plugin_update.handler(
+        {"name": "probe", "new_ref": "v1.2.0"})
+    payload = json.loads(res["content"][0]["text"])
+    assert payload["activation_committed"] is True
+    assert payload["runtime_ready"] is False
+    assert payload["ok"] is False
+    assert payload["kind"] == "snapshot_raced"
+    # ONE retry: the agent reload was dispatched twice for the target.
+    assert st.log.count("dispatch:assistant") == 2

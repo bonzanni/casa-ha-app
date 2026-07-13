@@ -33,8 +33,18 @@ def _verify(tmp_path, name="probe", tools_bin=None):
         _tools_bin=tools_bin)
 
 
+class _Snap:
+    def __init__(self, binding, generation=1):
+        self.binding = dict(binding)
+        self.generation = generation
+
+
 class _Agent:
-    def __init__(self, binding, resolved=True):
+    def __init__(self, binding, resolved=True, generation=1):
+        # D2 (v0.74.0): verify reads the ONE snapshot; the legacy attrs stay
+        # as plain attributes here for the absent-postcondition reader.
+        self.plugin_binding_snapshot = (
+            _Snap(binding, generation) if resolved else None)
         self.active_plugin_binding = dict(binding)
         self._plugin_resolution = object() if resolved else None
 
@@ -546,3 +556,270 @@ def test_verify_tolerates_manifest_row_without_winning_strategy(tmp_path, monkey
     monkeypatch.setattr(mani, "MANIFEST_PATH", tmp_path / "sysreq.yaml")
     r = _verify(tmp_path, tools_bin=tmp_path / "empty")   # must not raise
     assert r["tools"][0]["requirement"] == "unknown"
+
+
+# --- D2 (v0.74.0): snapshot read, swap-race, generation disclosure -----------
+
+
+def test_verify_reads_the_snapshot_not_legacy_attrs(tmp_path, monkeypatch):
+    """D2: grading reads plugin_binding_snapshot alone; a disagreeing legacy
+    attribute (impossible on a real Agent, possible on a stand-in) is
+    ignored."""
+    import agent as agent_mod
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"])
+    mk_registry(tmp_path, [e])
+    a = _Agent({"probe": e["artifact_id"]})
+    a.active_plugin_binding = {}                 # stale legacy view — ignored
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        _runtime(agents={"finance": a}), raising=False)
+    r = _verify(tmp_path)
+    row = r["targets"][0]
+    assert row["ready"] is True
+    assert row["active_artifact_id"] == e["artifact_id"]
+    assert row["resolution_generation"] == 1
+
+
+def test_verify_swap_race_grades_the_replacement(tmp_path, monkeypatch):
+    """D2: when runtime.agents[role] is swapped between the read and the
+    grade, verify re-reads and grades the REPLACEMENT, never the replaced
+    object."""
+    import agent as agent_mod
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"])
+    mk_registry(tmp_path, [e])
+    stale = _Agent({"probe": "old" * 21 + "o"})
+    fresh = _Agent({"probe": e["artifact_id"]})
+
+    class _SwappingAgents(dict):
+        """First .get() returns the pre-swap agent; later reads the fresh
+        one — deterministic simulation of a reload swap racing verify."""
+        def __init__(self):
+            super().__init__({"finance": fresh})
+            self._first = True
+
+        def get(self, key, default=None):
+            if self._first:
+                self._first = False
+                return stale
+            return super().get(key, default)
+
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        _runtime(agents=_SwappingAgents()), raising=False)
+    r = _verify(tmp_path)
+    row = r["targets"][0]
+    assert row["ready"] is True                          # graded the fresh agent
+    assert row["active_artifact_id"] == e["artifact_id"]
+
+
+def test_verify_stale_generation_with_equal_binding_stays_ready(
+        tmp_path, monkeypatch):
+    """FR3: binding==desired => ready — an unrelated mutation's generation
+    bump must not degrade an untouched agent. Disclosed, not failed.
+    (PROVISIONAL pending Nicola's B1 spec decision — Sol r3/r4.)"""
+    import agent as agent_mod
+    import plugin_registry as preg
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"])
+    mk_registry(tmp_path, [e])
+    a = _Agent({"probe": e["artifact_id"]}, generation=1)
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        _runtime(agents={"finance": a}), raising=False)
+    monkeypatch.setattr(preg, "snapshot_generation", lambda: 7)
+    r = _verify(tmp_path)
+    row = r["targets"][0]
+    assert row["ready"] is True                  # FR3 grading unchanged
+    assert row["generation_stale"] is True       # ...but disclosed
+
+
+def test_verify_idle_stale_binding_stays_blocking(tmp_path, monkeypatch):
+    """D1/FR3: a persistent Agent's stale binding remains reload_required
+    while idle — it can reuse it on its next bus/trigger turn."""
+    import agent as agent_mod
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"])
+    mk_registry(tmp_path, [e])
+    a = _Agent({"probe": "old" * 21 + "o"})
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        _runtime(agents={"finance": a}), raising=False)
+    r = _verify(tmp_path)
+    row = r["targets"][0]
+    assert row["ready"] is False and row["reasons"] == ["reload_required"]
+    assert r["stale_targets"] == ["specialist:finance"]
+
+
+def test_fr3_rule_verbatim_in_docstring():
+    from tools import _tool_verify_plugin_state
+    doc = " ".join(_tool_verify_plugin_state.__doc__.split())   # unwrap lines
+    assert ("Readiness describes the artifact a target can execute on its "
+            "next new turn") in doc
+    assert "remains `reload_required` while idle" in doc
+
+
+# --- D2/B3 (v0.74.0): health regen derives from its own fresh pass -----------
+
+
+def _regen_harness(monkeypatch, *, entries, verify_stub, extras):
+    import tools
+    import plugin_health
+    import plugin_registry
+    captured = {}
+    monkeypatch.setattr(plugin_registry, "resolve_all",
+                        lambda: SimpleNamespace(issues=[], warnings=[]))
+    monkeypatch.setattr(plugin_registry, "load_registry",
+                        lambda *a, **k: SimpleNamespace(valid=True,
+                                                        entries=entries))
+    monkeypatch.setattr(tools, "_tool_verify_plugin_state", verify_stub)
+    monkeypatch.setattr(plugin_health, "write_report",
+                        lambda **k: captured.update(k))
+    tools._regenerate_plugin_health(extras)
+    return captured
+
+
+def test_regen_drops_transient_verify_extra_when_fresh_pass_clean(monkeypatch):
+    """D2: a torn-read reload_required from the mutation's verify must not
+    linger once the regen's OWN fresh pass of that (plugin, target) is
+    clean."""
+    from plugin_registry import PluginIssue
+    stale = PluginIssue(name="probe", target="specialist:finance",
+                        stage="verify", reason_code="reload_required")
+    captured = _regen_harness(
+        monkeypatch,
+        entries=[{"name": "probe", "targets": ["specialist:finance"]}],
+        verify_stub=lambda *, plugin_name: {
+            "ready": True,
+            "targets": [{"target": "specialist:finance", "ready": True}]},
+        extras=[stale])
+    assert all(i.reason_code != "reload_required" for i in captured["issues"])
+
+
+def test_regen_keeps_still_true_reload_required(monkeypatch):
+    """A GENUINELY stale binding stays flagged: the extra is dropped but the
+    fresh pass rediscovers the same row."""
+    captured = _regen_harness(
+        monkeypatch,
+        entries=[{"name": "probe", "targets": ["specialist:finance"]}],
+        verify_stub=lambda *, plugin_name: {
+            "ready": False,
+            "targets": [{"target": "specialist:finance", "ready": False,
+                         "reasons": ["reload_required"]}]},
+        extras=[])
+    assert any(i.reason_code == "reload_required"
+               and i.target == "specialist:finance"
+               for i in captured["issues"])
+
+
+def test_regen_carries_forward_reload_stage_rows(monkeypatch):
+    """stage='reload' failures are NOT rediscoverable by verify — kept."""
+    from plugin_registry import PluginIssue
+    err = PluginIssue(name="probe", target="specialist:finance",
+                      stage="reload", reason_code="reload_failed")
+    captured = _regen_harness(
+        monkeypatch,
+        entries=[{"name": "probe", "targets": ["specialist:finance"]}],
+        verify_stub=lambda *, plugin_name: {"ready": True, "targets": []},
+        extras=[err])
+    assert any(i.reason_code == "reload_failed" for i in captured["issues"])
+
+
+def test_regen_keeps_unassigned_target_postcondition_row(monkeypatch):
+    """r2-B3: after plugin_unassign, the stale target is no longer in the
+    entry's targets — the fresh pass cannot rediscover it; keep the row."""
+    from plugin_registry import PluginIssue
+    row = PluginIssue(name="probe", target="specialist:finance",
+                      stage="verify", reason_code="postcondition_failed")
+    captured = _regen_harness(
+        monkeypatch,
+        entries=[{"name": "probe", "targets": []}],       # target unassigned
+        verify_stub=lambda *, plugin_name: {"ready": True, "targets": []},
+        extras=[row])
+    assert any(i.reason_code == "postcondition_failed"
+               for i in captured["issues"])
+
+
+def test_regen_keeps_rows_for_unregistered_plugins(monkeypatch):
+    """A plugin_remove postcondition row targets a plugin the fresh pass no
+    longer covers — kept."""
+    from plugin_registry import PluginIssue
+    row = PluginIssue(name="ghost", target="specialist:finance",
+                      stage="verify", reason_code="postcondition_failed")
+    captured = _regen_harness(
+        monkeypatch, entries=[], verify_stub=lambda *, plugin_name: {},
+        extras=[row])
+    assert any(i.name == "ghost" for i in captured["issues"])
+
+
+# --- D3 (v0.74.0): postcondition de-dup --------------------------------------
+
+
+def test_postcondition_row_suppressed_when_reload_required_explains():
+    """D3: postcondition_failed(target=None) must not duplicate a concrete
+    reload_required row — that duplication warned EVERY resident."""
+    from tools import _issues_from_mutation
+    verify = {"ready": False, "reasons": [],
+              "targets": [{"target": "specialist:finance", "ready": False,
+                           "reasons": ["reload_required"]}]}
+    issues = _issues_from_mutation(
+        "probe", reload_errors=[], verify=verify, expect="present",
+        postcondition_ok=False)
+    codes = [(i.reason_code, i.target) for i in issues]
+    assert ("reload_required", "specialist:finance") in codes
+    assert not any(c == "postcondition_failed" for c, _ in codes)
+
+
+def test_postcondition_row_suppressed_when_top_level_reason_explains():
+    from tools import _issues_from_mutation
+    verify = {"ready": False, "reasons": ["mcp_invalid"], "targets": []}
+    issues = _issues_from_mutation(
+        "probe", reload_errors=[], verify=verify, expect="present",
+        postcondition_ok=False)
+    assert not any(i.reason_code == "postcondition_failed" for i in issues)
+
+
+def test_postcondition_row_emitted_when_nothing_explains():
+    from tools import _issues_from_mutation
+    verify = {"ready": False, "reasons": [], "targets": []}
+    issues = _issues_from_mutation(
+        "probe", reload_errors=[], verify=verify, expect="present",
+        postcondition_ok=False)
+    assert [(i.reason_code, i.target) for i in issues] == \
+        [("postcondition_failed", None)]
+
+
+def test_absent_postcondition_targets_the_stale_role():
+    """D3: absent-case failures name the CONCRETE stale target — no more
+    registry-wide target=None amplification."""
+    from tools import _issues_from_mutation
+    issues = _issues_from_mutation(
+        "probe", reload_errors=[],
+        verify={"ready": False, "reasons": ["not_registered"], "targets": []},
+        expect="absent", postcondition_ok=False,
+        stale_absent_targets=["specialist:finance"])
+    assert [(i.reason_code, i.target) for i in issues] == \
+        [("postcondition_failed", "specialist:finance")]
+
+
+def test_snapshot_raced_issue_replaces_postcondition_row():
+    """r2-B3: snapshot_raced must not fall through to a registry-wide
+    postcondition_failed(target=None)."""
+    from tools import _issues_from_mutation
+    issues = _issues_from_mutation(
+        "probe", reload_errors=[],
+        verify={"ready": False, "reasons": [], "targets": []},
+        expect="present", postcondition_ok=False, snapshot_raced=True)
+    assert [(i.reason_code, i.target) for i in issues] == \
+        [("snapshot_raced", None)]
+
+
+def test_stale_absent_targets_reads_live_bindings():
+    from tools import _stale_absent_targets
+    runtime = SimpleNamespace(agents={
+        "finance": SimpleNamespace(active_plugin_binding={"probe": "aid"}),
+        "butler": SimpleNamespace(active_plugin_binding={})})
+    assert _stale_absent_targets(
+        ["specialist:finance", "resident:butler", "executor:x"],
+        "probe", runtime) == ["specialist:finance"]

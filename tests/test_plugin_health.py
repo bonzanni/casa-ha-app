@@ -90,3 +90,37 @@ def test_first_contact_notice_caps_at_two_plus_more(tmp_path):
     notice = plugin_health.first_contact_notice("finance", p)
     assert "a (corrupt_artifact)" in notice and "b (artifact_missing)" in notice
     assert "+1 more" in notice and "c (" not in notice
+
+
+def test_first_contact_reload_required_uses_incomplete_update_wording(tmp_path):
+    """D4 (v0.74.0): never 'updating / will refresh next use' (false for a
+    cached persistent Agent) — say the update is incomplete."""
+    p = tmp_path / "h.json"
+    plugin_health.write_report(
+        issues=[_issue(name="lesina-invoice", target="specialist:finance",
+                       stage="verify", reason_code="reload_required")],
+        warnings=[], path=p)
+    notice = plugin_health.first_contact_notice("finance", p)
+    assert "Plugin update incomplete" in notice
+    assert "remains bound to the previous artifact" in notice
+    assert "reload_required" in notice
+    assert "will refresh" not in notice and "updating" not in notice
+
+
+def test_first_contact_targeted_issue_does_not_warn_other_roles(tmp_path):
+    p = tmp_path / "h.json"
+    plugin_health.write_report(
+        issues=[_issue(name="lesina-invoice", target="specialist:finance",
+                       stage="verify", reason_code="reload_required")],
+        warnings=[], path=p)
+    assert plugin_health.first_contact_notice("assistant", p) is None
+
+
+def test_first_contact_mixed_issues_keep_degraded_header(tmp_path):
+    p = tmp_path / "h.json"
+    plugin_health.write_report(
+        issues=[_issue(reason_code="reload_required"),
+                _issue(name="q", reason_code="corrupt_artifact")],
+        warnings=[], path=p)
+    notice = plugin_health.first_contact_notice("finance", p)
+    assert notice.startswith("⚠️ Plugin degraded:")
