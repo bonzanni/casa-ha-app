@@ -56,9 +56,11 @@ class _FakeForbidden(_FakeTelegramError):
 
 
 class _FakeRetryAfter(_FakeTelegramError):
-    # Real PTB 22.7: RetryAfter -> TelegramError.
-    def __init__(self, *a, **k):
-        super().__init__(*a)
+    # Real PTB 22.7: RetryAfter -> TelegramError, carrying a .retry_after attr
+    # (topic_ledger's sweep reads exc.retry_after to size its backoff).
+    def __init__(self, retry_after=0, *a, **k):
+        super().__init__(f"Flood control exceeded. Retry in {retry_after} seconds")
+        self.retry_after = retry_after
 
 
 class _FakeInputFile:
