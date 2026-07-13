@@ -48,11 +48,12 @@ def main() -> int:
             f"{entry['version']!r}")
         # Sol R2-5: pin the REAL fetched .mcp.json server keys so the executor
         # allow-list (mcp__plugin_context7_context7) provably matches the
-        # materialized artifact — not a fixture's claim.
-        mcp = Path(res.path) / ".mcp.json"
+        # materialized artifact — not a fixture's claim. Use the SAME server
+        # detection grants use, so it also understands context7's top-level
+        # (no-mcpServers-wrapper) .mcp.json shape.
         if name == "context7":
-            servers = json.loads(mcp.read_text(encoding="utf-8"))
-            keys = sorted((servers.get("mcpServers") or {}).keys())
+            from plugin_grants import _mcp_servers
+            keys = sorted(_mcp_servers(Path(res.path) / ".mcp.json").keys())
             assert keys == ["context7"], (
                 f"context7 server keys drifted: {keys} — update "
                 f"plugin-developer definition.yaml grants to match")

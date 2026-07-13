@@ -114,3 +114,24 @@ async def test_fail_closed_callback_denies_with_log(caplog):
     assert "mcp__something__tool" in result.message
     assert "finance" in result.message
     assert result.interrupt is False
+
+
+def test_grants_from_top_level_mcp_json(tmp_path):
+    """CI/real-world: a plugin .mcp.json may declare its server at the TOP LEVEL
+    with no `mcpServers` wrapper (context7:
+    {"context7": {"command": "npx", ...}}). The grant must still derive. Only
+    the image build (which fetches the real context7) surfaced this."""
+    art = tmp_path / "art"
+    art.mkdir()
+    (art / ".mcp.json").write_text(json.dumps(
+        {"context7": {"command": "npx", "args": ["-y", "@upstash/context7-mcp"]}}),
+        encoding="utf-8")
+    rp = ResolvedPlugin(name="context7", artifact_id="a" * 64, path=str(art),
+                        version="0.0.0", manifest={})
+    assert grants_for_resolved(rp) == ["mcp__plugin_context7_context7"]
+    # The `mcpServers` wrapper shape still works.
+    (art / ".mcp.json").write_text(json.dumps(
+        {"mcpServers": {"foo": {"command": "x"}}}), encoding="utf-8")
+    rp2 = ResolvedPlugin(name="p", artifact_id="a" * 64, path=str(art),
+                         version="0.0.0", manifest={})
+    assert grants_for_resolved(rp2) == ["mcp__plugin_p_foo"]
