@@ -37,12 +37,24 @@ Follow the superpowers playbook:
    `mcp-server-dev` for MCP servers; MCPB packaging via
    `mcp-server-dev:build-mcpb`).
 6. `superpowers:requesting-code-review` — independent review before push.
-7. `git push origin main` — self_containment_guard hook fires pre-push.
+7. Release ritual (REQUIRED — `emit_completion` mechanically verifies it):
+   `VERSION=$(jq -r .version .claude-plugin/plugin.json)` →
+   `git tag -a "v${VERSION}" -m "release v${VERSION}"` →
+   `git push --atomic origin main "refs/tags/v${VERSION}"` (atomic branch +
+   annotated tag; self_containment_guard hook fires pre-push). If the remote
+   already has `v${VERSION}` at a different commit: STOP, bump the version,
+   retry — never force-move a published tag. Then peel-verify (must print
+   PEEL-OK):
+   `[ "$(git ls-remote origin "refs/tags/v${VERSION}^{}" | cut -f1)" = "$(git rev-parse HEAD)" ] && echo PEEL-OK || echo PEEL-FAILED`
 8. `mcp__casa-framework__emit_completion` with `{status: "ok", text: ...,
-   artifacts: [{kind: "casa_plugin_repo", repo_url, plugin_name, ref,
-   version, visibility}], next_steps: [{action:
+   artifacts: [{kind: "casa_plugin_repo", repo_url, plugin_name,
+   ref: "v${VERSION}", revision: "<40-hex sha the tag peels to>",
+   version: "${VERSION}", visibility}], next_steps: [{action:
    "add_to_registry_and_assign_with_confirmation", plugin_name, repo_url,
-   ref, description, category, targets}]}` (see doctrine/casa-conventions.md).
+   ref: "v${VERSION}", revision, description, category, targets}]}` (see
+   doctrine/casa-conventions.md). The completion is REJECTED if the tag is
+   missing/lightweight/moved or doesn't match the remote plugin.json version
+   — fix the release and emit again.
 
 ## Casa doctrine
 
