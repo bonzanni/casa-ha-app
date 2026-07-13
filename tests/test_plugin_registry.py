@@ -196,6 +196,29 @@ def test_seed_defaults_no_resurrection(tmp_path):
     assert data2.entries == []
 
 
+def test_seed_defaults_adds_new_default_without_resurrecting_removed(tmp_path):
+    """v0.72.0 (migration removed): on an EXISTING install a newly-introduced
+    default is added while an operator-removed default (recorded in
+    seeded_defaults) is NOT resurrected. The seeded_defaults ledger — not any
+    migration sentinel — is the sole guard, so unconditional boot seeding is safe."""
+    # A newer release's catalog ships BOTH the previously-removed default and a
+    # brand-new one.
+    default = _write(tmp_path, {"schema_version": 1,
+                                "plugins": [_entry(name="old-removed"),
+                                            _entry(name="brand-new")]})
+    reg = tmp_path / "r.json"
+    # Existing registry: old-removed was seeded then removed (ledger retains it);
+    # an operator-installed plugin is present.
+    reg.write_text(json.dumps({"schema_version": 1,
+                               "seeded_defaults": ["old-removed"],
+                               "plugins": [_entry(name="mine")]}), encoding="utf-8")
+    data = load_registry(reg)
+    assert seed_defaults(data, default) is True
+    names = sorted(e["name"] for e in data.entries)
+    assert names == ["brand-new", "mine"]        # new added; removed NOT resurrected
+    assert sorted(data.raw["seeded_defaults"]) == ["brand-new", "old-removed"]
+
+
 def test_seed_defaults_skips_present_plugin_without_bookkeeping_dup(tmp_path):
     default = _write(tmp_path, {"schema_version": 1, "plugins": [_entry(name="superpowers")]})
     reg = tmp_path / "r.json"

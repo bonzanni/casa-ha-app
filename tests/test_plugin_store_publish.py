@@ -289,27 +289,6 @@ def test_gc_disabled_returns_candidates_without_deleting(tmp_path):
     assert cands == [res.artifact_id] and Path(res.path).exists()
 
 
-def test_publish_legacy_tree_checksums_staged_not_raw(tmp_path):
-    """Sol F9: legacy-content revision hashes the STAGED tree (excluding .git),
-    so a .git dir in the source does not change the artifact_id."""
-    from plugin_store import publish_legacy_tree
-    src = _plugin_tree(tmp_path)
-    store, staging = tmp_path / "store", tmp_path / "staging"
-    r1 = publish_legacy_tree(name="probe", repo="o/r", ref="master", subdir="",
-                             src_root=src, store_root=store, staging_root=staging)
-    assert r1.revision.startswith("legacy-content:")
-    assert not (Path(r1.path) / ".git").exists()
-
-    # Same content + a .git dir → identical artifact_id (git excluded).
-    src2 = _plugin_tree(tmp_path / "b")
-    (src2 / ".git").mkdir()
-    (src2 / ".git" / "HEAD").write_text("ref: x", encoding="utf-8")
-    r2 = publish_legacy_tree(name="probe", repo="o/r", ref="master", subdir="",
-                             src_root=src2, store_root=tmp_path / "store2",
-                             staging_root=tmp_path / "stg2")
-    assert r2.artifact_id == r1.artifact_id
-
-
 def test_publish_from_tree_rejects_escaping_symlink(tmp_path):
     """Sol round-3 H7: an offline-adopt tree with a symlink escaping the artifact
     root is rejected (unsafe_archive) — freezing/loading it must never touch or

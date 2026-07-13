@@ -2072,18 +2072,14 @@ async def main() -> None:
     # 13c. Surface any default-sync overwrites to the operator (direct
     # telegram outbound — see notify_config_sync).
     await notify_config_sync(bus)
-    # Sol round-4: init-plugin-store's health report is resolver-only (it ran
-    # before agents/executor-registry existed). Now that they are constructed,
+    # init-plugin-store's health report is resolver-only (it ran before
+    # agents/executor-registry existed). Now that they are constructed,
     # regenerate with RUNTIME verification (authorization, effective secrets,
-    # system requirements, active bindings) — preserving the replayed unresolved
-    # migration issues — so a migrated plugin with missing auth/secret is not
-    # green until a mutation. Never block boot on it.
+    # system requirements, active bindings) so a plugin with missing auth/secret
+    # is not green until a mutation. Never block boot on it.
     try:
-        import plugin_boot
         from tools import _regenerate_plugin_health
-        _extra = plugin_boot._unresolved_migration_issues(
-            plugin_registry.load_registry())
-        await asyncio.to_thread(_regenerate_plugin_health, _extra)
+        await asyncio.to_thread(_regenerate_plugin_health, [])
     except Exception:  # noqa: BLE001
         logger.warning("boot plugin-health runtime regen failed", exc_info=True)
     await notify_plugin_health(bus)

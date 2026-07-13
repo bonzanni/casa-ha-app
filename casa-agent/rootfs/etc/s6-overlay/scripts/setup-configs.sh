@@ -226,7 +226,7 @@ fi
 
 # --- cc-home HOME setup -----------------------------------------------------
 # casa-main + the CC CLI both require HOME=cc-home. Plugin materialization
-# (bundled-artifact import + registry seed/migration) now lives in the
+# (bundled-artifact import + registry seed) now lives in the
 # init-plugin-store s6 oneshot (plugin_boot.py), which runs AFTER this script
 # and BEFORE svc-casa (unified plugin architecture §3.6). The marketplace seed,
 # the load-bearing `claude -p noop`, and the marketplace registration/install
@@ -322,7 +322,7 @@ bashio::log.info "HOME propagated to s6 services: /config/cc-home"
 # === claude-home-propagation: end ===============================
 
 # Plugin materialization (bundled-artifact import → content-addressed store,
-# registry seed + one-time migration) moved to the init-plugin-store s6
+# registry seed) moved to the init-plugin-store s6
 # oneshot (plugin_boot.py) under the unified plugin architecture (§3.6). The
 # old /opt/claude-seed → cc-home seed-copy + `claude plugin enable` loop is
 # deleted with the marketplace.

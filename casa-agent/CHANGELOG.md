@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.72.0] - 2026-07-13
+
+### Removed
+
+- **The one-time pre-v0.71.0 plugin migration is gone.** With the marketplace
+  architecture retired and no pre-v0.71.0 install reachable any longer, the
+  legacy-state migration (`plugin_migration.py`, the boot migrate-before-seed
+  branch and its `.migration-done` sentinel, `/data/plugin-migration-report.json`,
+  the migration-issue replay across boots and mutations, and the legacy-tree
+  offline-adopt publish path) was removed — it was pure dead weight and added
+  boot/health failure surface. Fresh-install seeding no longer depends on the
+  migration sentinel: `seed_defaults` runs on every boot, is idempotent, and the
+  registry's permanent `seeded_defaults` ledger (not any boot flag) is what
+  prevents re-adding an operator-removed default. A corrupt registry is still
+  left untouched rather than overwritten as if fresh. Existing v0.71.x installs
+  are unaffected — their registry stays authoritative and the stale sentinel/
+  report files are simply ignored. The `legacy-content:` artifact-resolution
+  grammar is retained so any already-adopted legacy artifact keeps loading.
+
 ## [0.71.1] - 2026-07-13
 
 ### Fixed
