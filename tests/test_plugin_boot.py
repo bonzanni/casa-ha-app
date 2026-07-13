@@ -156,17 +156,22 @@ def test_unresolved_migration_issues_replayed(tmp_path, monkeypatch):
 
 
 def test_unresolved_migration_issues_reason_filter(tmp_path, monkeypatch):
-    """Sol round-4 polish: only plugin-presence-clearable reasons are replayed —
-    a role-keyed enabled_plugins_malformed (never clears by plugin presence) is not."""
+    """Sol round-4/5: EVERY plugin-scoped failure replays (denylist), including
+    StoreError reasons like manifest_invalid/unsafe_archive; only role/global-
+    scoped reasons (enabled_plugins_malformed) are excluded."""
     import json
     from plugin_registry import RegistryData
     monkeypatch.setattr(plugin_boot, "MIGRATION_REPORT", tmp_path / "r.json")
     (tmp_path / "r.json").write_text(json.dumps({"issues": [
         {"name": "sp", "reason_code": "install_path_divergence", "target": None},
+        {"name": "badplug", "reason_code": "manifest_invalid", "target": None},
+        {"name": "evilplug", "reason_code": "unsafe_archive", "target": None},
         {"name": "assistant", "reason_code": "enabled_plugins_malformed",
          "target": "resident:assistant"}]}), encoding="utf-8")
     data = RegistryData(raw={"schema_version": 1, "plugins": []}, valid=True)
     codes = [i.reason_code
              for i in plugin_boot._unresolved_migration_issues(data)]
     assert "install_path_divergence" in codes
-    assert "enabled_plugins_malformed" not in codes
+    assert "manifest_invalid" in codes            # plugin-scoped StoreError → replayed
+    assert "unsafe_archive" in codes
+    assert "enabled_plugins_malformed" not in codes   # role-keyed → excluded

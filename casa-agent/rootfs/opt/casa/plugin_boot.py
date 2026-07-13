@@ -15,13 +15,18 @@ BUNDLE_ROOT = Path("/opt/casa/plugin-bundle")
 SENTINEL = Path("/config/plugins/.migration-done")
 MIGRATION_REPORT = Path("/data/plugin-migration-report.json")
 
-# Sol round-4 polish: only replay migration reasons that CLEAR by adding the
-# named plugin to the registry (plugin presence == resolved). Reasons keyed on a
-# ROLE (e.g. enabled_plugins_malformed) or on "*" would never clear that way.
-_REPLAYABLE_MIGRATION_REASONS = frozenset({
-    "install_path_divergence", "adoption_failed", "ref_not_found",
-    "resolve_unavailable", "artifact_unavailable", "store_error",
-    "artifact_missing", "corrupt_artifact",
+# Sol round-4/5: a migration issue is replayed while its plugin is still absent
+# from the registry. Use a DENYLIST (not an allowlist) so EVERY plugin-scoped
+# failure replays — manifest_invalid, name_mismatch, apt_requirements_rejected,
+# unsafe_archive, ref_not_found, adoption_failed, install_path_divergence, … —
+# and only reasons keyed on a ROLE or the "*" global scope (which could never
+# clear by adding the named plugin) are excluded. Future plugin-scoped reasons
+# are covered automatically.
+_NON_REPLAYABLE_MIGRATION_REASONS = frozenset({
+    "enabled_plugins_malformed",            # keyed on a ROLE, not a plugin
+    "migration_exception",                  # global (name "*", already excluded)
+    "registry_invalid_migration_skipped",   # global
+    "config_git_untrack_failed",            # global
 })
 
 
@@ -45,7 +50,7 @@ def _unresolved_migration_issues(data) -> list:
     for i in report.get("issues", []):
         name = i.get("name")
         if (name and name != "*" and name not in present
-                and i.get("reason_code") in _REPLAYABLE_MIGRATION_REASONS):
+                and i.get("reason_code") not in _NON_REPLAYABLE_MIGRATION_REASONS):
             out.append(PluginIssue(name=name, target=i.get("target"),
                                    stage="migration",
                                    reason_code=i.get("reason_code")))

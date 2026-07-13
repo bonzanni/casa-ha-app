@@ -70,3 +70,15 @@ def test_write_is_atomic_crash_keeps_original(tmp_path: Path, monkeypatch) -> No
     import os as _os
     leftovers = [f for f in _os.listdir(tmp_path) if f != "system-requirements.yaml"]
     assert leftovers == []
+
+
+def test_read_manifest_tolerates_malformed_yaml(tmp_path, monkeypatch):
+    """Sol round-5: a corrupt manifest returns an empty view, never raises — so
+    plugin verification that reads it can't crash before health regeneration."""
+    path = tmp_path / "system-requirements.yaml"
+    monkeypatch.setattr("system_requirements.manifest.MANIFEST_PATH", path)
+    path.write_text("{ this: is: not: valid: yaml", encoding="utf-8")
+    assert read_manifest() == {"plugins": []}
+    # A top-level non-mapping (list) also degrades to empty.
+    path.write_text("- a\n- b\n", encoding="utf-8")
+    assert read_manifest() == {"plugins": []}

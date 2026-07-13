@@ -13,7 +13,15 @@ MANIFEST_PATH: Path = Path("/config/system-requirements.yaml")
 def read_manifest() -> dict:
     if not MANIFEST_PATH.is_file():
         return {"plugins": []}
-    data = yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8")) or {}
+    # Sol round-5: tolerate a malformed/unreadable manifest — return an empty
+    # view rather than raising, so a corrupt system-requirements.yaml can't make
+    # plugin verification (which reads this) raise before health regeneration.
+    try:
+        data = yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return {"plugins": []}
+    if not isinstance(data, dict):
+        return {"plugins": []}
     if not isinstance(data.get("plugins"), list):
         data["plugins"] = []
     return data
