@@ -27,7 +27,7 @@ better.
 ## Apt / dpkg
 
 **Not supported pre-1.0.0.** Any plugin declaring `{type: "apt", …}` is
-rejected at marketplace_add_plugin time (§4.3.2). If your plugin needs a
+rejected at `plugin_add` time (§4.3.2). If your plugin needs a
 system library (e.g. `ffmpeg`), either:
 
 - Use a tarball install strategy with a statically-linked build, or

@@ -178,12 +178,13 @@ door"; "read my Todoist"). If the capability requires a plugin:
 
 1. Engage **plugin-developer** to author the plugin.
 2. When plugin-developer returns a completion with `next_steps.action =
-   add_to_marketplace_and_install_with_confirmation`, relay to user:
-   *"<plugin> is built (public|private repo). Add to marketplace and
-   install on <targets>?"*
-3. On user confirm, engage **configurator** with `install_args` from
-   `next_steps` — configurator mutates the marketplace + installs.
-4. Relay install outcome to user.
+   add_to_registry_and_assign_with_confirmation`, relay to user:
+   *"<plugin> is built (public|private repo). Add it to the plugin registry
+   and assign it to <targets>?"*
+3. On user confirm, engage **configurator** with the `next_steps` payload —
+   the configurator runs `plugin_add` (pins the repo/ref, publishes the
+   immutable artifact, assigns the targets, reloads + verifies).
+4. Relay the outcome to user.
 
 Never cross-dispatch (plugin-developer does not call configurator
 directly).

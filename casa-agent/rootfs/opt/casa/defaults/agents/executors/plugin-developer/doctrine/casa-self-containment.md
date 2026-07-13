@@ -1,12 +1,13 @@
 # Self-containment axiom (§2.0)
 
-**A plugin must be fully operational on a fresh Casa install solely by
-marketplace-add + `install_casa_plugin`.**
+**A plugin must be fully operational on a fresh Casa install solely by the
+configurator adding it to the registry (`plugin_add`) and assigning it.**
 
 No Dockerfile forks. No "please install X manually." No out-of-band
 configuration. Everything a plugin needs — system tools, env vars,
-persistent state — is declared in the plugin's marketplace entry or its
-own `.mcp.json::env`.
+persistent state — is declared in the plugin's own manifest
+(`.claude-plugin/plugin.json`, incl. `casa.systemRequirements`) or its
+`.mcp.json::env`.
 
 ## What this forbids
 

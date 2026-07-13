@@ -677,21 +677,15 @@ sweep). The fallback is removed in v0.14.2 or later.
 - `CASA_HOOK_RESOLVE_URL` — overrides where `hook_proxy.sh` POSTs hook
   decisions.
 
-## Plugin consumer infrastructure (v0.14.1)
+## Plugin consumer infrastructure (v0.71.0)
 
-Casa uses Claude Code's native plugin machinery. Two marketplaces are
-registered at boot:
-
-- **casa-plugins-defaults** — seed-managed, ships with the app.
-  Contains superpowers, plugin-dev, skill-creator, mcp-server-dev, context7.
-  Read-only — `claude plugin uninstall` against these
-  returns a "seed-managed" error.
-- **casa-plugins** — user-writable. Plugins authored by plugin-developer
-  land here, Configurator mutates.
-
-Each in_casa agent gets a project-scope settings dir at
-`/config/agent-home/<role>/.claude/settings.json` with
-`enabledPlugins` keyed as `<plugin>@<marketplace>`.
+Plugins are managed through the unified registry + immutable store — see
+[Plugins](#plugins-v0710) for the full model. There is no marketplace and no
+`enabledPlugins`: the registry (`/config/plugins/registry.json`) is the single
+assignment authority, and each pinned plugin resolves to an immutable artifact
+under `/config/plugins/store/<name>/<artifact-id>/`. The five defaults
+(superpowers, plugin-dev, skill-creator, mcp-server-dev, context7) are seeded
+from the app image and assigned to the plugin-developer executor.
 
 ## 1Password integration (v0.14.1)
 
@@ -710,8 +704,8 @@ managed by Configurator.
 Ask the primary assistant to build a plugin. It engages plugin-developer in
 a dedicated Telegram topic. Plugin-developer asks public/private, authors
 the plugin in its own GitHub repo, pushes, and emits completion. Assistant
-relays; on your confirm, Configurator installs to the target agents +
-asks for secrets via 1P Q&A.
+relays; on your confirm, Configurator adds it to the registry (`plugin_add`)
+and assigns it to the target agents + asks for secrets via 1P Q&A.
 
 Prerequisites:
 
