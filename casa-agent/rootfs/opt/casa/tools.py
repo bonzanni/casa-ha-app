@@ -43,6 +43,8 @@ from claude_agent_sdk import (
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
+from media_policies import MEDIA_POLICIES
+import plugin_outbox
 from error_kinds import _classify_error
 from mcp_registry import McpServerRegistry
 import sdk_logging
@@ -167,6 +169,186 @@ async def send_message(args: dict) -> dict:
 
     await ch.send(message, {})
     return {"content": [{"type": "text", "text": f"Message sent via {channel}."}]}
+
+
+# ---------------------------------------------------------------------------
+# send_media — reusable agent->channel media delivery (v0.73.0, spec §3).
+# ---------------------------------------------------------------------------
+
+_CAPTION_MAX = 1024
+_FILENAME_MAX_BYTES = 255
+
+
+def _validate_delivery_filename(name: str, kind: str) -> str | None:
+    """Return *name* if it is a safe delivered filename for *kind*, else None.
+    basename-only, control-free, <=255 bytes, extension (case-insensitive) in the
+    kind's allowlist."""
+    if not name or name in (".", "..") or "/" in name or "\0" in name:
+        return None
+    if any(ord(c) < 0x20 for c in name):
+        return None
+    if len(name.encode("utf-8")) > _FILENAME_MAX_BYTES:
+        return None
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in MEDIA_POLICIES[kind].extensions:
+        return None
+    return name
+
+
+async def _classify_send(ch, content, kind, filename, origin, caption) -> dict:
+    """Attempt the channel send and classify the outcome into a payload dict.
+    Never raises a send/channel exception (the caller's finally still cleans up
+    the claim)."""
+    from telegram.error import (
+        BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut,
+    )
+    try:
+        await ch.send_media(content, kind, filename, context=origin, caption=caption)
+        return {"status": "ok", "kind_error": None, "kind": kind,
+                "filename": filename,
+                "summary": f"delivered {kind} {filename!r}"}
+    except NotImplementedError:
+        return {"status": "error", "kind_error": "unsupported_channel", "kind": kind,
+                "message": "channel cannot deliver media"}
+    except (BadRequest, Forbidden) as exc:
+        return {"status": "error", "kind_error": "rejected", "kind": kind,
+                "message": f"telegram refused: {type(exc).__name__}"}
+    except (TimedOut, NetworkError, RetryAfter) as exc:
+        return {"status": "error", "kind_error": "delivery_uncertain", "kind": kind,
+                "message": f"delivery uncertain: {type(exc).__name__}; not retried"}
+    except TelegramError as exc:
+        return {"status": "error", "kind_error": "delivery_uncertain", "kind": kind,
+                "message": f"delivery uncertain: {type(exc).__name__}; not retried"}
+    except RuntimeError:
+        return {"status": "error", "kind_error": "channel_unavailable", "kind": kind,
+                "message": "channel not started"}
+
+
+@tool(
+    "send_media",
+    "Deliver a media file (document/photo/audio/voice) from the plugin outbox "
+    "to the user over the originating channel. Pass the outbox path returned by "
+    "a producer tool; the bytes never enter the model context.",
+    {"type": "object",
+     "properties": {
+         "path": {"type": "string"},
+         "kind": {"type": "string", "enum": list(MEDIA_POLICIES)},
+         "caption": {"type": "string"},
+         "filename": {"type": "string"}},
+     "required": ["path", "kind"]},
+)
+async def send_media(args: dict) -> dict:
+    try:
+        # 0. Validate arguments up front (the Casa MCP forwarding path does NOT
+        #    enforce the JSON schema). `kind` MUST be a str before the dict
+        #    membership test — `[] in MEDIA_POLICIES` raises TypeError.
+        path = args.get("path")
+        kind = args.get("kind")
+        caption = args.get("caption")
+        filename_arg = args.get("filename")
+        if not isinstance(path, str) or not path:
+            return _result({"status": "error", "kind_error": "invalid_arguments",
+                            "message": "path must be a non-empty string"})
+        if not isinstance(kind, str) or kind not in MEDIA_POLICIES:
+            return _result({"status": "error", "kind_error": "invalid_arguments",
+                            "message": f"unknown kind {kind!r}"})
+        if caption is not None and not isinstance(caption, str):
+            return _result({"status": "error", "kind_error": "invalid_arguments",
+                            "message": "caption must be a string"})
+        if filename_arg is not None and not isinstance(filename_arg, str):
+            return _result({"status": "error", "kind_error": "invalid_arguments",
+                            "message": "filename must be a string"})
+
+        # 1. Resolve target chat — NO default fallback. Active engagement first
+        #    (HTTP engagement handlers bind engagement_var, not origin_var); a
+        #    delegated specialist turn carries the origin via origin_var.
+        eng = engagement_var.get(None)
+        origin = dict(eng.origin) if eng is not None else _snapshot_origin()
+        if not origin:
+            return _result({"status": "error", "kind_error": "no_origin",
+                            "message": "no turn origin"})
+        if origin.get("channel") != "telegram":
+            return _result({"status": "error", "kind_error": "invalid_origin",
+                            "message": f"origin channel {origin.get('channel')!r} "
+                                       "cannot receive media"})
+        raw_chat = origin.get("chat_id")
+        if isinstance(raw_chat, bool):
+            chat_id = None
+        elif isinstance(raw_chat, int):
+            chat_id = raw_chat
+        elif isinstance(raw_chat, str):
+            try:
+                chat_id = int(raw_chat)
+            except ValueError:
+                chat_id = None
+        else:
+            chat_id = None
+        if not chat_id:
+            return _result({"status": "error", "kind_error": "invalid_origin",
+                            "message": "no numeric, nonzero chat_id in origin"})
+        origin["chat_id"] = chat_id  # normalise to the validated int for dispatch
+
+        # 2. Resolve channel (fail fast, before claiming).
+        if _channel_manager is None:
+            return _result({"status": "error", "kind_error": "channel_unavailable",
+                            "message": "tools not initialised"})
+        ch = _channel_manager.get(origin.get("channel", "telegram"))
+        if ch is None:
+            return _result({"status": "error", "kind_error": "channel_unavailable",
+                            "message": "channel not registered"})
+        if caption is not None and len(caption) > _CAPTION_MAX:
+            caption = caption[:_CAPTION_MAX]
+
+        outbox = plugin_outbox.get_outbox()
+        if outbox is None:
+            return _result({"status": "error", "kind_error": "internal_error",
+                            "message": "outbox not initialised"})
+
+        # 3. Claim FIRST — the path guard (outside_outbox / missing / bad
+        #    basename) runs BEFORE filename validation, so an out-of-outbox path
+        #    reports `outside_outbox`, not `bad_name`. Pre-claim errors own
+        #    nothing and return directly.
+        try:
+            claim = await asyncio.to_thread(outbox.claim, path)
+        except plugin_outbox.OutboxError as exc:
+            return _result({"status": "error", "kind_error": exc.kind,
+                            "message": str(exc)})
+
+        # 4. Claim is OWNED — remove it on EVERY outcome (including bad_name and
+        #    every guard/capture/send error).
+        cleanup_warning = None
+        try:
+            try:
+                # Delivered filename: an explicit arg (incl. "" -> bad_name) else
+                # the path basename; validated against the kind's extensions.
+                candidate = (filename_arg if filename_arg is not None
+                             else os.path.basename(path))
+                filename = _validate_delivery_filename(candidate, kind)
+                if filename is None:
+                    payload = {"status": "error", "kind_error": "bad_name",
+                               "kind": kind,
+                               "message": "filename not valid for the media kind"}
+                else:
+                    content = await asyncio.to_thread(outbox.capture, claim, kind)
+                    payload = await _classify_send(
+                        ch, content, kind, filename, origin, caption)
+            except plugin_outbox.OutboxError as exc:
+                payload = {"status": "error", "kind_error": exc.kind,
+                           "kind": kind, "message": str(exc)}
+        finally:
+            try:
+                await asyncio.to_thread(outbox.remove_claim, claim)
+            except Exception as ce:  # noqa: BLE001 — cleanup best-effort
+                cleanup_warning = f"claim cleanup failed: {type(ce).__name__}"
+                logger.warning("send_media claim cleanup failed for %s: %s",
+                               claim, ce)
+        if cleanup_warning and payload.get("status") == "ok":
+            payload["cleanup_warning"] = cleanup_warning
+        return _result(payload)
+    except Exception:  # noqa: BLE001 — nothing escapes; worst case is a result
+        logger.exception("send_media: unexpected failure")
+        return _result({"status": "error", "kind_error": "internal_error",
+                        "message": "unexpected failure"})
 
 
 # ---------------------------------------------------------------------------
@@ -3884,6 +4066,7 @@ async def get_item_fields(args: dict) -> dict:
 # transports automatically.
 CASA_TOOLS: tuple = (
     send_message,
+    send_media,
     delegate_to_agent,
     recall_memory,                 # §4.3 — shared-bank semantic recall (tier-clearance filtered)
     get_schedule,
