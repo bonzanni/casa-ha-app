@@ -727,9 +727,31 @@ _SETTINGS_JSON_WRITE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Unified plugin architecture (§3.11/§3.13): /config/plugins/ (registry.json +
+# the content-addressed store + staging) is the single plugin-assignment
+# authority. An engagement with Write/Edit/Bash could self-assign plugins by
+# editing the registry directly, bypassing plugin_add's validation + §3.9
+# sequencing. Deny direct writes under it (same residual as I-2: an obfuscated
+# `permission_mode: auto` Bash command can still slip through — the complete
+# boundary is sandbox enforcement).
+_PLUGINS_DIR_PREFIX = "/config/plugins/"
+_PLUGINS_DENY_MSG = (
+    "Direct writes under /config/plugins/ are refused. The plugin registry and "
+    "store are the single assignment authority — mutate them via the "
+    "configurator's plugin_add / plugin_update / plugin_assign / "
+    "plugin_unassign / plugin_remove tools, never by hand."
+)
+_PLUGINS_WRITE_RE = re.compile(
+    r"(?:>>?|\btee\b|\bdd\b|\bcp\b|\bmv\b|\binstall\b|sed\s+-i|\btruncate\b|"
+    r"\brm\b|\bmkdir\b)"
+    r".*?/config/plugins/",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def make_agent_home_settings_guard() -> HookCallback:
-    """Deny Write/Edit/MultiEdit to any ``.claude/settings.json`` (I-2).
+    """Deny hand-edits to any ``.claude/settings.json`` (I-2) OR anything under
+    ``/config/plugins/`` (unified plugin architecture §3.11/§3.13).
 
     Plugin grants derive from an agent-home's ``.claude/settings.json``
     (``enabledPlugins``). Residents hold Write/Edit under ``acceptEdits``, so a
@@ -745,10 +767,14 @@ def make_agent_home_settings_guard() -> HookCallback:
         context: dict[str, Any],
     ) -> dict[str, Any]:
         tool_name = input_data.get("tool_name", "")
-        if tool_name in ("Write", "Edit", "MultiEdit"):
-            raw = input_data.get("tool_input", {}).get("file_path", "")
-            if _normalize_path(raw).endswith(_SETTINGS_JSON_SUFFIX):
+        if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+            ti = input_data.get("tool_input", {})
+            raw = ti.get("file_path") or ti.get("notebook_path") or ""
+            norm = _normalize_path(raw)
+            if norm.endswith(_SETTINGS_JSON_SUFFIX):
                 return _deny(_SETTINGS_DENY_MSG)
+            if norm.startswith(_PLUGINS_DIR_PREFIX):
+                return _deny(_PLUGINS_DENY_MSG)
         elif tool_name == "Bash":
             # Finding 1 (codex review v0.69.10): residents with Bash (Ellen)
             # could bypass the file-tool guard with `echo … >
@@ -761,6 +787,8 @@ def make_agent_home_settings_guard() -> HookCallback:
             command = input_data.get("tool_input", {}).get("command", "")
             if _SETTINGS_JSON_WRITE_RE.search(command):
                 return _deny(_SETTINGS_DENY_MSG)
+            if _PLUGINS_WRITE_RE.search(command):
+                return _deny(_PLUGINS_DENY_MSG)
         return {}
 
     return _hook

@@ -651,6 +651,36 @@ async def test_settings_guard_allows_other_writes():
     assert await hook(data, "t", CTX) == {}
 
 
+async def test_plugin_guard_blocks_write_to_registry():
+    """§3.11/§3.13: direct writes to the plugin registry are denied."""
+    from hooks import make_agent_home_settings_guard
+    hook = make_agent_home_settings_guard()
+    for path in ("/config/plugins/registry.json",
+                 "/config/plugins/store/superpowers/abc/skill.md"):
+        data = {"tool_name": "Write", "tool_input": {"file_path": path}}
+        assert _decision(await hook(data, "t", CTX)) == "deny"
+
+
+async def test_plugin_guard_allows_sibling_path():
+    """A sibling like /config/plugins-notes.md is NOT under the guarded dir."""
+    from hooks import make_agent_home_settings_guard
+    hook = make_agent_home_settings_guard()
+    data = {"tool_name": "Write", "tool_input": {
+        "file_path": "/config/plugins-notes.md"}}
+    assert await hook(data, "t", CTX) == {}
+
+
+async def test_plugin_guard_blocks_traversal_and_bash():
+    from hooks import make_agent_home_settings_guard
+    hook = make_agent_home_settings_guard()
+    trav = {"tool_name": "Edit", "tool_input": {
+        "file_path": "/config/agents/../plugins/registry.json"}}
+    assert _decision(await hook(trav, "t", CTX)) == "deny"
+    bash = {"tool_name": "Bash", "tool_input": {
+        "command": "echo '{}' > /config/plugins/registry.json"}}
+    assert _decision(await hook(bash, "t", CTX)) == "deny"
+
+
 async def test_settings_guard_ignores_non_write_tools():
     from hooks import make_agent_home_settings_guard
     hook = make_agent_home_settings_guard()
