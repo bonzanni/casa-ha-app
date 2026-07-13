@@ -272,6 +272,15 @@ class _Snapshot:
 
 
 _snapshot: _Snapshot | None = None
+# Monotonic snapshot generation — bumped on every reload_snapshot so a launch
+# that resolved against one snapshot can detect a concurrent registry mutation
+# before it commits (Sol #6 TOCTOU fence).
+_generation: int = 0
+
+
+def snapshot_generation() -> int:
+    """The current snapshot generation (see `_generation`)."""
+    return _generation
 
 
 def reload_snapshot(*, registry_path: Path = REGISTRY_PATH,
@@ -303,9 +312,10 @@ def reload_snapshot(*, registry_path: Path = REGISTRY_PATH,
                     subdir=entry["source"].get("subdir", ""),
                     artifact_id=entry["artifact_id"],
                 )
-    global _snapshot
+    global _snapshot, _generation
     _snapshot = _Snapshot(registry=reg, registry_path=Path(registry_path),
                           store_root=Path(store_root), validation=validation)
+    _generation += 1
 
 
 def _current() -> _Snapshot:

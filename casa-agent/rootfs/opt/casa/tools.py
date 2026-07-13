@@ -1451,24 +1451,35 @@ async def engage_executor(args: dict) -> dict:
     # result feeds the launch gate, the recorded binding, AND the in-casa
     # options (one resolve, one binding). Gate BEFORE topic creation so a
     # blocked launch never leaves a dangling topic.
-    plugin_resolution = plugin_registry.resolve_for(f"executor:{executor_type}")
-    if not plugin_resolution.registry_valid:
-        return _result({
-            "status": "error", "kind": "plugin_registry_invalid",
-            "message": ("plugin registry is invalid — executor launches are "
-                        "blocked until it is repaired "
-                        "(see /data/plugin-health.json)"),
-        })
-    if plugin_resolution.issues:
-        detail = [(i.name, i.reason_code) for i in plugin_resolution.issues]
-        return _result({
-            "status": "error", "kind": "plugin_unavailable",
-            "message": (f"required plugin(s) unavailable for "
-                        f"{executor_type!r}: {detail}"),
-        })
-    plugin_artifacts = tuple(
-        {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
-        for rp in plugin_resolution.plugins)
+    def _resolve_and_gate():
+        """Returns (plugin_resolution, plugin_artifacts, error_result|None)."""
+        res = plugin_registry.resolve_for(f"executor:{executor_type}")
+        if not res.registry_valid:
+            return res, (), _result({
+                "status": "error", "kind": "plugin_registry_invalid",
+                "message": ("plugin registry is invalid — executor launches are "
+                            "blocked until it is repaired "
+                            "(see /data/plugin-health.json)"),
+            })
+        if res.issues:
+            detail = [(i.name, i.reason_code) for i in res.issues]
+            return res, (), _result({
+                "status": "error", "kind": "plugin_unavailable",
+                "message": (f"required plugin(s) unavailable for "
+                            f"{executor_type!r}: {detail}"),
+            })
+        arts = tuple(
+            {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
+            for rp in res.plugins)
+        return res, arts, None
+
+    # Sol #6: capture the snapshot generation at resolve so a concurrent
+    # plugin_update during the topic-creation await can be detected before the
+    # engagement record pins its artifacts (below, just before create()).
+    _resolve_generation = plugin_registry.snapshot_generation()
+    plugin_resolution, plugin_artifacts, _gate_err = _resolve_and_gate()
+    if _gate_err is not None:
+        return _gate_err
 
     if _channel_manager is None:
         return _result({
@@ -1559,6 +1570,17 @@ async def engage_executor(args: dict) -> dict:
             "status": "error", "kind": "topic_create_failed",
             "message": str(exc),
         })
+
+    # Sol #6 TOCTOU fence: if a concurrent plugin_update/remove changed the
+    # snapshot during the topic-creation await, re-resolve so the engagement
+    # record pins the CURRENT artifacts (not ones superseded mid-launch). An
+    # update AFTER create() is the by-design informational "previous artifact"
+    # case; this only closes the resolve→create window.
+    if plugin_registry.snapshot_generation() != _resolve_generation:
+        plugin_resolution, plugin_artifacts, _gate_err = _resolve_and_gate()
+        if _gate_err is not None:
+            await _abort_engagement_topic(channel, "engage-abort", topic_id)
+            return _gate_err
 
     # Computed BEFORE create() so it can be persisted onto the record's
     # origin — the claude_code driver reads it (and context_text) back out
