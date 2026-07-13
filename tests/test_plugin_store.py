@@ -122,6 +122,30 @@ def test_safe_extract_happy(tmp_path):
     assert (dest / "dir" / "file.txt").read_bytes() == b"ok"
 
 
+def test_safe_extract_falls_back_without_filter_kwarg(tmp_path, monkeypatch):
+    """The add-on's base image ships a Python where TarFile.extractall lacks the
+    `filter=` kwarg (PEP 706 is 3.12+/3.11.4+). safe_extract_tar must fall back to
+    a plain extract — the per-member validation loop is the safety net. (The unit
+    gate runs a 3.12 venv, so only the image build exercises this path in CI.)"""
+    import tarfile as _tf
+    real = _tf.TarFile.extractall
+
+    def _no_filter(self, *args, **kwargs):
+        if "filter" in kwargs:
+            raise TypeError("extractall() got an unexpected keyword argument 'filter'")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(_tf.TarFile, "extractall", _no_filter)
+    tar = _write_tar(tmp_path, [("dir/file.txt", b"ok", {})])
+    dest = tmp_path / "out"
+    safe_extract_tar(tar, dest)                      # must NOT raise
+    assert (dest / "dir" / "file.txt").read_bytes() == b"ok"
+    # Unsafe members are still rejected by the validation loop on the fallback path.
+    bad = _write_tar(tmp_path, [("../evil", b"x", {})])
+    with pytest.raises(StoreError):
+        safe_extract_tar(bad, tmp_path / "out2")
+
+
 @pytest.mark.parametrize("member", [
     ("../evil", b"x", {}),
     ("/abs", b"x", {}),

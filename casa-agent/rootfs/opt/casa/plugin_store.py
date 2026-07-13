@@ -103,7 +103,16 @@ def safe_extract_tar(tar_path: Path, dest: Path) -> None:
                         parts.pop()
                     elif part != ".":
                         parts.append(part)
-        tf.extractall(dest, filter="data")
+        # `filter="data"` (PEP 706) is defense-in-depth ON TOP of the per-member
+        # validation above. It exists on Python 3.12+ and the 3.9-3.11 security
+        # backports (3.11.4+), but NOT on older 3.11 — which is what the add-on's
+        # base image ships (the unit gate runs a 3.12 venv, so only the image
+        # build catches this). Fall back to a plain extract where the kwarg is
+        # unavailable; the validation loop is the actual safety net.
+        try:
+            tf.extractall(dest, filter="data")
+        except TypeError:
+            tf.extractall(dest)
 
 
 def write_metadata(root: Path, *, name: str, repo: str, ref: str,
