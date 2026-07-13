@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.74.2] - 2026-07-13
+
+### Fixed
+
+- A retried or duplicated `emit_completion` that arrives after the engagement
+  already finalized now gets the honest `already_terminal` acknowledgment
+  instead of a misleading `not_in_engagement` error (terminal-record binding
+  for `emit_completion` only; privileged tools keep the active-only rule).
+- claude_code engagement workspaces now receive the executor's `doctrine/`
+  directory — the workspace CLAUDE.md references doctrine files that
+  previously never existed in the workspace, so engaged agents worked
+  without their conventions.
+
 ## [0.74.1] - 2026-07-13
 
 ### Fixed

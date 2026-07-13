@@ -43,6 +43,15 @@ logger = logging.getLogger(__name__)
 ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 HookCallback = Callable[[dict[str, Any], Any, dict], Awaitable[dict | None]]
 
+# v0.74.2 (live finding 2026-07-13): tools that bind the engagement record
+# even when it is TERMINAL. A duplicate/racing emit_completion delivery that
+# lands after the record flips completed must reach the tool's own
+# idempotency check (`already_terminal`) instead of getting a lying
+# `not_in_engagement` from the active-only gate. Everything else keeps the
+# defense-in-depth active-only rule — a finished engagement's leftover CLI
+# must not retain authority over privileged tools.
+_TERMINAL_BINDING_TOOLS = frozenset({"emit_completion"})
+
 
 # ---------------------------------------------------------------------------
 # tools/call handler factory
@@ -62,7 +71,10 @@ def _make_internal_tools_call_handler(
 
     `engagement_registry` is used to look up records by id when the body
     carries `engagement_id`. Bound records with status == "active" populate
-    `tools.engagement_var`; other states (or missing record) bind None.
+    `tools.engagement_var`; other states (or missing record) bind None —
+    EXCEPT the _TERMINAL_BINDING_TOOLS allowlist (emit_completion), whose
+    terminal records still bind so retries reach the idempotency check
+    (v0.74.2).
     """
     async def handler(request: web.Request) -> web.Response:
         try:
@@ -93,14 +105,19 @@ def _make_internal_tools_call_handler(
             )
 
         # Resolve engagement record. Defense-in-depth: only bind when status
-        # is still active. Mirrors v0.13.1 mcp_bridge._dispatch_tool_call.
+        # is still active (mirrors v0.13.1 mcp_bridge._dispatch_tool_call) —
+        # EXCEPT the _TERMINAL_BINDING_TOOLS allowlist (v0.74.2), so a
+        # duplicate/racing emit_completion delivery gets the honest
+        # `already_terminal` from the tool's idempotency check.
         engagement = None
         if eng_id:
             try:
                 rec = engagement_registry.get(eng_id)
             except Exception:  # noqa: BLE001
                 rec = None
-            if rec is not None and getattr(rec, "status", None) == "active":
+            if rec is not None and (
+                    getattr(rec, "status", None) == "active"
+                    or name in _TERMINAL_BINDING_TOOLS):
                 engagement = rec
 
         # Lazy import so monkeypatching `tools.engagement_var` in tests works.

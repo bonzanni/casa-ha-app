@@ -367,3 +367,37 @@ class TestLoadAllExecutorsBroadIsolation:
         assert list(loaded.keys()) == ["configurator"]
         assert len(failed) == 1
         assert failed[0][0] == "plugin-developer"
+
+
+class TestDoctrineDirOptOut:
+    def test_empty_doctrine_dir_yaml_produces_empty_defn_field(self, tmp_path):
+        """v0.74.2 (Sol S1): an explicitly empty `doctrine_dir: ""` in
+        definition.yaml is the doctrine-less opt-out — the loader must NOT
+        join it into `<exec_dir>` (which would make provisioning copy the
+        whole executor dir) but yield defn.doctrine_dir == ''."""
+        import os
+        from agent_loader import load_all_executors
+        _write_minimal_executor(str(tmp_path), "noduct", body_override=textwrap.dedent("""\
+            schema_version: 1
+            type: noduct
+            description: A reasonably long description that meets minLength 20.
+            model: sonnet
+            driver: in_casa
+            enabled: true
+            doctrine_dir: ""
+            tools:
+              allowed: [Read]
+              permission_mode: acceptEdits
+        """))
+        os.rmdir(os.path.join(tmp_path, "executors", "noduct", "doctrine"))
+        loaded, failed = load_all_executors(str(tmp_path))
+        assert failed == []
+        assert loaded["noduct"].doctrine_dir == ""
+
+    def test_default_doctrine_dir_resolves_to_abs_path(self, tmp_path):
+        import os
+        from agent_loader import load_all_executors
+        _write_minimal_executor(str(tmp_path), "withduct")
+        loaded, _failed = load_all_executors(str(tmp_path))
+        assert loaded["withduct"].doctrine_dir == os.path.join(
+            str(tmp_path), "executors", "withduct", "doctrine")

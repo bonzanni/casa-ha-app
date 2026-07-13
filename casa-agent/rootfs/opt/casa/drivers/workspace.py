@@ -263,6 +263,25 @@ async def provision_workspace(
             json.dumps(settings, indent=2), encoding="utf-8",
         )
 
+    # v0.74.2 (live finding 2026-07-13): provision the executor's doctrine/
+    # into the workspace — the rendered CLAUDE.md references doctrine/*.md,
+    # which never existed in claude_code workspaces (the plugin-developer
+    # read missing files and proceeded without its conventions). Copy, not
+    # symlink: the workspace must stay self-contained + immutable-ish even
+    # if the live /config doctrine changes mid-engagement. FAIL CLOSED on a
+    # declared-but-missing source (Sol design review: silently proceeding
+    # recreates the original degradation); a doctrine-less executor opts out
+    # with an explicitly empty `doctrine_dir:` in its definition.yaml.
+    doctrine_src = getattr(defn, "doctrine_dir", "") or ""
+    if doctrine_src:
+        if not os.path.isdir(doctrine_src):
+            raise FileNotFoundError(
+                f"executor {defn.type!r} declares doctrine at "
+                f"{doctrine_src!r} but the directory is missing — refusing "
+                "to provision a workspace whose CLAUDE.md references absent "
+                "doctrine (set doctrine_dir: '' to opt out)")
+        shutil.copytree(doctrine_src, ws / "doctrine")
+
     # Per-engagement HOME dir (plugins symlinks removed in v0.14.x).
     # L-1 (v0.34.2): hoisted outside the if/else so template path also gets it.
     (ws / ".home" / ".claude" / "plugins").mkdir(parents=True)

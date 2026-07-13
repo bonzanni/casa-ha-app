@@ -38,7 +38,7 @@ def _mock_executor_def(**overrides):
         "prompt_template_path": "/tmp/nonexistent.md",
         "hooks_path": None,
         "observer_policy_path": None,
-        "doctrine_dir": "/tmp/doctrine",
+        "doctrine_dir": "",   # v0.74.2: non-empty + missing now fails closed
     }
     defaults.update(overrides)
     return ExecutorDefinition(**defaults)
