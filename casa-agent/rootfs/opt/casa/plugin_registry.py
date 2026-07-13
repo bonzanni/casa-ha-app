@@ -293,11 +293,13 @@ _RELOAD_LOCK = threading.Lock()
 
 def snapshot_generation() -> int:
     """The current snapshot's monotonic generation (bumped by every
-    reload_snapshot). Reads the one published snapshot object; 0 when no
-    snapshot has ever been published (a stubbed reload_snapshot in tests —
-    the lazy load in _current normally guarantees one)."""
-    snap = _current()
-    return snap.generation if snap is not None else 0
+    reload_snapshot). Reads the one published snapshot object. Fail-closed
+    by design: _current() lazily publishes via the real reload_snapshot, so
+    None is only reachable through a NON-publishing test stub — which must
+    publish a snapshot itself (or stub this function) rather than get a
+    silent 0 (Sol diff-review: a 0 fallback made the mutation generation
+    fence order-dependently false-green in tests)."""
+    return _current().generation
 
 
 def reload_snapshot(*, registry_path: Path = REGISTRY_PATH,

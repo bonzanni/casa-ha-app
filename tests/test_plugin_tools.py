@@ -75,12 +75,24 @@ def _wire(monkeypatch, tmp_path, st, *, publish=None, publish_exc=None,
         st.log.append(f"dispatch:{role}")
         return {"status": dispatch_status}
 
+    def fake_reload_snapshot():
+        # Sol diff-review B1: the stub must PUBLISH a real frozen snapshot —
+        # a non-publishing stub made snapshot_generation() lazily re-invoke
+        # this stub (extra log entries, order-dependent false green) or, with
+        # a 0-fallback, turned the generation fence into a no-op in tests.
+        st.log.append("reload_snapshot")
+        prev = preg._snapshot
+        preg._snapshot = preg._Snapshot(
+            registry=fake_load(), registry_path=tmp_path / "registry.json",
+            store_root=tmp_path / "store",
+            generation=(prev.generation + 1 if prev is not None else 1))
+
     import system_requirements.manifest as _mani
     monkeypatch.setattr(_mani, "MANIFEST_PATH", tmp_path / "sysreq-manifest.yaml")
+    monkeypatch.setattr(preg, "_snapshot", None)   # per-test isolation
     monkeypatch.setattr(preg, "load_registry", fake_load)
     monkeypatch.setattr(preg, "save_registry", fake_save)
-    monkeypatch.setattr(preg, "reload_snapshot",
-                        lambda: st.log.append("reload_snapshot"))
+    monkeypatch.setattr(preg, "reload_snapshot", fake_reload_snapshot)
     monkeypatch.setattr(preg, "resolve_all",
                         lambda: ResolutionResult(registry_valid=True))
     monkeypatch.setattr(tools_mod.plugin_store, "resolve_ref", fake_resolve)
