@@ -372,6 +372,33 @@ def publish_from_tree(*, name: str, repo: str, ref: str, revision: str,
         raise
 
 
+def publish_legacy_tree(*, name: str, repo: str, ref: str, subdir: str,
+                        src_root: Path, store_root: Path = STORE_ROOT,
+                        staging_root: Path = STAGING_ROOT) -> PublishResult:
+    """Offline-adopt a legacy checkout with a content-DERIVED revision
+    (``legacy-content:<checksum>``). The checksum is taken over the CANONICAL
+    STAGED tree (post ``.git`` / stale-metadata exclusion), so the recorded
+    identity matches exactly what lands in the store (Sol F9). Used only by the
+    one-time migration's offline-adopt path (§3.7)."""
+    subdir = normalize_subdir(subdir)
+    Path(staging_root).mkdir(parents=True, exist_ok=True)
+    holder = Path(tempfile.mkdtemp(dir=str(staging_root), prefix=".legacy-"))
+    staged = holder / "artifact"
+    try:
+        shutil.copytree(src_root, staged, symlinks=True,
+                        ignore=shutil.ignore_patterns(".git"))
+        meta = staged / METADATA_FILENAME
+        if meta.exists():
+            meta.unlink()
+        checksum = content_checksum(staged)
+        revision = f"legacy-content:{checksum}"
+        return _stage_and_swap(name=name, repo=repo, ref=ref,
+                               revision=revision, subdir=subdir,
+                               staged=staged, store_root=store_root)
+    finally:
+        shutil.rmtree(holder, ignore_errors=True)
+
+
 def import_bundle(bundle_root: Path, store_root: Path = STORE_ROOT) -> list:
     """Boot import of image-baked artifacts (§3.6). Idempotent, checksum-
     verified, fail-closed on an existing-but-corrupt store copy."""
