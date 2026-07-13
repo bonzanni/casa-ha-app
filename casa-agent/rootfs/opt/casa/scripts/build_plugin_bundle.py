@@ -52,8 +52,8 @@ def main() -> int:
         # detection grants use, so it also understands context7's top-level
         # (no-mcpServers-wrapper) .mcp.json shape.
         if name == "context7":
-            from plugin_grants import _mcp_servers
-            keys = sorted(_mcp_servers(Path(res.path) / ".mcp.json").keys())
+            from plugin_store import mcp_servers_map
+            keys = sorted(mcp_servers_map(Path(res.path) / ".mcp.json").keys())
             assert keys == ["context7"], (
                 f"context7 server keys drifted: {keys} — update "
                 f"plugin-developer definition.yaml grants to match")

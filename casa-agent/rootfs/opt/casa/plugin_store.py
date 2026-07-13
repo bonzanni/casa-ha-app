@@ -132,6 +132,34 @@ def write_metadata(root: Path, *, name: str, repo: str, ref: str,
         os.fsync(fh.fileno())
 
 
+def mcp_servers_map(mcp_json_path: Path) -> dict:
+    """Return the {server-name: config} map from a plugin ``.mcp.json``.
+
+    Lives here (a stdlib-only module already present in the image's bundle-build
+    stage) so both grant derivation and the build-time verifier share ONE
+    implementation. Handles BOTH shapes: the project-style ``{"mcpServers":
+    {...}}`` wrapper AND the top-level form real plugins use (e.g. context7's
+    ``{"context7": {"command": "npx", ...}}`` — no wrapper). A top-level entry
+    counts as a server only if its value is a config object (command/url/type/
+    args), so a plain config key isn't mistaken for a server."""
+    try:
+        data = json.loads(Path(mcp_json_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.debug("plugin .mcp.json unreadable (%s): %s", mcp_json_path, exc)
+        return {}
+    if not isinstance(data, dict):
+        logger.debug("plugin .mcp.json not an object (%s)", mcp_json_path)
+        return {}
+    servers = data.get("mcpServers")
+    if isinstance(servers, dict):
+        return servers
+    if "mcpServers" not in data:
+        return {k: v for k, v in data.items()
+                if isinstance(v, dict)
+                and any(f in v for f in ("command", "url", "type", "args"))}
+    return {}
+
+
 def read_metadata(root: Path) -> dict | None:
     try:
         return json.loads((Path(root) / METADATA_FILENAME)

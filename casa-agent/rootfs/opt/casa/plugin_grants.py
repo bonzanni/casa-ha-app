@@ -34,30 +34,11 @@ def sanitize_segment(s: str) -> str:
 
 
 def _mcp_servers(mcp_json_path: Path) -> dict:
-    """Return the {server-name: config} map from a plugin ``.mcp.json``.
-
-    Handles BOTH shapes: the project-style ``{"mcpServers": {...}}`` wrapper AND
-    the top-level form real plugins use (e.g. context7's
-    ``{"context7": {"command": "npx", "args": [...]}}`` — no wrapper). For the
-    latter, a top-level entry counts as a server only if its value is a config
-    object (has command/url/type/args), so a plain config key isn't mistaken for
-    a server.
-    """
-    try:
-        data = json.loads(mcp_json_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        logger.debug("plugin .mcp.json unreadable (%s): %s", mcp_json_path, exc)
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    servers = data.get("mcpServers")
-    if isinstance(servers, dict):
-        return servers
-    if "mcpServers" not in data:
-        return {k: v for k, v in data.items()
-                if isinstance(v, dict)
-                and any(f in v for f in ("command", "url", "type", "args"))}
-    return {}
+    """The {server-name: config} map from a plugin ``.mcp.json`` — delegates to
+    the shared, stdlib-only ``plugin_store.mcp_servers_map`` (also used by the
+    build-time verifier) so both understand the wrapper AND top-level shapes."""
+    from plugin_store import mcp_servers_map
+    return mcp_servers_map(mcp_json_path)
 
 
 def mcp_json_malformed(rp) -> bool:

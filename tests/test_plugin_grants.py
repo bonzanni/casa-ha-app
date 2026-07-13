@@ -72,7 +72,9 @@ def test_grants_for_resolved_sanitizes_segments(tmp_path):
 def test_grants_for_resolved_corrupt_mcp_json_degrades(tmp_path, caplog):
     rp = _artifact(tmp_path, "bad", servers={"srv": {}})
     (tmp_path / "bad" / ".mcp.json").write_text("{not json", encoding="utf-8")
-    with caplog.at_level(logging.DEBUG, logger="plugin_grants"):
+    # The .mcp.json parsing now lives in plugin_store.mcp_servers_map (shared with
+    # the build-time verifier); its DEBUG log records the unreadable path.
+    with caplog.at_level(logging.DEBUG, logger="plugin_store"):
         assert grants_for_resolved(rp) == []
     assert any("bad" in r.message for r in caplog.records)
 
