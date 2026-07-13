@@ -633,3 +633,93 @@ class TestBuildCcPermissions:
         defn = self._make_minimal_defn(["Read"], permission_mode="")
         out = _build_cc_permissions(defn)
         assert out["defaultMode"] == "acceptEdits"
+
+
+class TestDoctrineProvisioning:
+    """v0.74.2 (live finding 2026-07-13): the rendered CLAUDE.md references
+    doctrine/*.md, but claude_code workspaces never received the executor's
+    doctrine/ — the plugin-developer read missing files and proceeded
+    without its conventions."""
+
+    @pytest.mark.asyncio
+    async def test_doctrine_dir_copied_into_workspace(self, tmp_path):
+        from pathlib import Path
+        from config import ExecutorDefinition
+        from drivers.workspace import provision_workspace
+
+        exec_dir = tmp_path / "executors" / "probe"
+        exec_dir.mkdir(parents=True)
+        (exec_dir / "prompt.md").write_text("Task: {task}")
+        doctrine = exec_dir / "doctrine"
+        doctrine.mkdir()
+        (doctrine / "casa-conventions.md").write_text("# conventions")
+        (doctrine / "recipes").mkdir()
+        (doctrine / "recipes" / "r.md").write_text("# recipe")
+
+        defn = ExecutorDefinition(
+            type="probe", description="d", model="m", driver="claude_code",
+            enabled=True, tools_allowed=["Read"], tools_disallowed=[],
+            permission_mode="acceptEdits",
+            prompt_template_path=str(exec_dir / "prompt.md"),
+            doctrine_dir=str(doctrine),
+            mcp_server_names=[],
+        )
+        ws = tmp_path / "engagements"
+        ws.mkdir()
+        path = await provision_workspace(
+            engagements_root=str(ws), engagement_id="engd", defn=defn,
+            task="t", context="c",
+            casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework")
+        p = Path(path)
+        assert (p / "doctrine" / "casa-conventions.md").read_text() == "# conventions"
+        assert (p / "doctrine" / "recipes" / "r.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_declared_but_missing_doctrine_fails_closed(self, tmp_path):
+        """Sol design review: a declared-but-absent doctrine dir must abort
+        provisioning, never silently recreate the degradation."""
+        from config import ExecutorDefinition
+        from drivers.workspace import provision_workspace
+
+        exec_dir = tmp_path / "executors" / "probe"
+        exec_dir.mkdir(parents=True)
+        (exec_dir / "prompt.md").write_text("Task: {task}")
+        defn = ExecutorDefinition(
+            type="probe", description="d", model="m", driver="claude_code",
+            enabled=True, tools_allowed=["Read"], tools_disallowed=[],
+            permission_mode="acceptEdits",
+            prompt_template_path=str(exec_dir / "prompt.md"),
+            doctrine_dir=str(exec_dir / "nope"),
+            mcp_server_names=[],
+        )
+        ws = tmp_path / "engagements"
+        ws.mkdir()
+        with pytest.raises(FileNotFoundError):
+            await provision_workspace(
+                engagements_root=str(ws), engagement_id="engm", defn=defn,
+                task="t", context="c",
+                casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework")
+
+    @pytest.mark.asyncio
+    async def test_empty_doctrine_dir_is_the_opt_out(self, tmp_path):
+        from config import ExecutorDefinition
+        from drivers.workspace import provision_workspace
+
+        exec_dir = tmp_path / "executors" / "probe"
+        exec_dir.mkdir(parents=True)
+        (exec_dir / "prompt.md").write_text("Task: {task}")
+        defn = ExecutorDefinition(
+            type="probe", description="d", model="m", driver="claude_code",
+            enabled=True, tools_allowed=["Read"], tools_disallowed=[],
+            permission_mode="acceptEdits",
+            prompt_template_path=str(exec_dir / "prompt.md"),
+            doctrine_dir="",
+            mcp_server_names=[],
+        )
+        ws = tmp_path / "engagements"
+        ws.mkdir()
+        path = await provision_workspace(
+            engagements_root=str(ws), engagement_id="engo", defn=defn,
+            task="t", context="c",
+            casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework")
+        assert not (__import__("pathlib").Path(path) / "doctrine").exists()

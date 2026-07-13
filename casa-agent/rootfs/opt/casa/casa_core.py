@@ -325,13 +325,18 @@ async def _dispatch_internal_tools_call(
         return {"error": {"code": -32602,
                           "message": f"Unknown tool: {name}"}}
 
+    # v0.74.2: terminal binding for the emit_completion idempotency path —
+    # mirrors internal_handlers (see _TERMINAL_BINDING_TOOLS there).
+    from internal_handlers import _TERMINAL_BINDING_TOOLS
     engagement = None
     if eng_id:
         try:
             rec = engagement_registry.get(eng_id)
         except Exception:  # noqa: BLE001
             rec = None
-        if rec is not None and getattr(rec, "status", None) == "active":
+        if rec is not None and (
+                getattr(rec, "status", None) == "active"
+                or name in _TERMINAL_BINDING_TOOLS):
             engagement = rec
 
     from tools import engagement_var

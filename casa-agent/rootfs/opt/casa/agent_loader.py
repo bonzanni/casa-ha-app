@@ -971,7 +971,11 @@ def load_all_executors(
 
             tools = defn.get("tools") or {}
             doctrine_name = defn.get("doctrine_dir", "doctrine")
-            doctrine_abs = os.path.join(exec_dir, doctrine_name)
+            # v0.74.2: an EXPLICITLY empty doctrine_dir is the opt-out for a
+            # doctrine-less executor (provisioning fails closed on a missing
+            # dir otherwise — Sol: never recreate the silent degradation).
+            doctrine_abs = (os.path.join(exec_dir, doctrine_name)
+                            if doctrine_name else "")
 
             hooks_name = defn.get("hooks_file", "hooks.yaml")
             hooks_abs = (os.path.join(exec_dir, hooks_name)

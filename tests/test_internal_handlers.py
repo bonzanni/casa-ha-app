@@ -320,3 +320,49 @@ async def test_hooks_resolve_non_dict_payload_and_policy_deny() -> None:
         assert resp.status == 200
         body = await resp.json()
         assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+async def test_tools_call_terminal_engagement_binds_for_emit_completion() -> None:
+    """v0.74.2 (live finding 2026-07-13): a duplicate/racing emit_completion
+    delivery landing AFTER the record flips terminal must still bind, so the
+    tool's own idempotency check answers already_terminal — the active-only
+    gate returned a lying not_in_engagement to the agent. ONLY
+    emit_completion gets terminal binding (privileged tools keep the
+    defense-in-depth active-only rule)."""
+    reg = _FakeRegistry()
+    rec = _FakeRecord(eng_id="fin-2", status="completed")
+    reg.add(rec)
+    app = _make_app(dispatch={"emit_completion": _engagement_aware_tool},
+                    registry=reg)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/tools/call",
+            json={"name": "emit_completion", "arguments": {},
+                  "engagement_id": "fin-2"},
+        )
+        body = await resp.json()
+        text = json.loads(body["content"][0]["text"])
+        assert text == {"eng": "fin-2"}
+
+
+async def test_public_fallback_terminal_binding_matches_internal() -> None:
+    """casa_core._dispatch_internal_tools_call mirrors the internal handler:
+    terminal binding for emit_completion only."""
+    from casa_core import _dispatch_internal_tools_call
+    reg = _FakeRegistry()
+    reg.add(_FakeRecord(eng_id="fin-3", status="completed"))
+    out = await _dispatch_internal_tools_call(
+        body={"name": "emit_completion", "arguments": {},
+              "engagement_id": "fin-3"},
+        tool_dispatch={"emit_completion": _engagement_aware_tool,
+                       "eng": _engagement_aware_tool},
+        engagement_registry=reg,
+    )
+    assert json.loads(out["content"][0]["text"]) == {"eng": "fin-3"}
+    out2 = await _dispatch_internal_tools_call(
+        body={"name": "eng", "arguments": {}, "engagement_id": "fin-3"},
+        tool_dispatch={"emit_completion": _engagement_aware_tool,
+                       "eng": _engagement_aware_tool},
+        engagement_registry=reg,
+    )
+    assert json.loads(out2["content"][0]["text"]) == {"eng": None}
