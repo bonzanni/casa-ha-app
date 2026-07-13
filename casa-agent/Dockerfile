@@ -69,63 +69,27 @@ ENV PATH="/opt/casa/venv/bin:${PATH}"
 COPY requirements.txt /tmp/
 RUN /opt/casa/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
 
-# --- Seed-marketplace build (§3.2 + §10.1 + spike §Gate 3) -------------------
-# L31: this network-bound seed install runs BEFORE `COPY rootfs /` so a routine
-# code change does not invalidate its layer cache (it only re-runs when the
-# marketplace catalogs / gitconfig / credential helper below change). Its true
-# inputs are narrow-COPY'd here; the later `COPY rootfs /` re-copies them with
-# identical content (harmless).
-
-# Build-time SSH→HTTPS rewrite is handled by /etc/gitconfig; ship it (and the
-# credential helper it references) via narrow COPYs so the seed does not depend
-# on the broad `COPY rootfs /` below. System-level gitconfig applies to every
-# USER, so the `casa` build user inherits the rewrite without per-user setup.
+# --- Bundled plugin artifacts (unified plugin architecture, spec 3.6) --------
+# Network-bound layer kept BEFORE `COPY rootfs /` so routine code changes do
+# not re-fetch. Inputs are narrow-COPY'd; pins are exact commits checked into
+# defaults/plugin-registry.json — the build NEVER resolves a tag/branch.
+#
+# Build-time SSH→HTTPS rewrite + auth flow through /etc/gitconfig + the
+# credential helper; ship them via narrow COPYs so the fetch does not depend
+# on the broad `COPY rootfs /` below (re-copied identically later, harmless).
 COPY rootfs/etc/gitconfig /etc/gitconfig
 COPY rootfs/opt/casa/scripts/git-credential-casa.sh /opt/casa/scripts/git-credential-casa.sh
+COPY rootfs/opt/casa/plugin_registry.py rootfs/opt/casa/plugin_store.py /opt/casa/
+COPY rootfs/opt/casa/scripts/build_plugin_bundle.py /opt/casa/scripts/build_plugin_bundle.py
+COPY rootfs/opt/casa/defaults/plugin-registry.json /opt/casa/defaults/plugin-registry.json
+RUN python3 /opt/casa/scripts/build_plugin_bundle.py \
+      --registry /opt/casa/defaults/plugin-registry.json \
+      --out /opt/casa/plugin-bundle \
+ && rm -rf /opt/casa/.bundle-staging \
+ && chmod -R a-w /opt/casa/plugin-bundle \
+ && chmod -R a+rX /opt/casa/plugin-bundle
 
-# Copy marketplace catalogs into the image.
-COPY rootfs/opt/casa/defaults/marketplace-defaults/ /opt/casa/defaults/marketplace-defaults/
-COPY rootfs/opt/casa/defaults/marketplace-user/ /opt/casa/defaults/marketplace-user/
-
-# Plugin refs are pinned solely in
-# /opt/casa/defaults/marketplace-defaults/.claude-plugin/marketplace.json
-# (superpowers v5.1.0 as of v0.46.3); the seed install below resolves refs
-# from that file — there is no ARG pin to keep in sync.
-
-# Create the non-root user the build-install runs under.
-# `--allow-dangerously-skip-permissions` refuses to run as root.
-RUN id -u casa >/dev/null 2>&1 || useradd -m -s /bin/bash casa; \
-    mkdir -p /opt/claude-seed && chown -R casa:casa /opt/claude-seed
-
-USER casa
-
-# Build-time seed install. CLAUDE_CODE_PLUGIN_CACHE_DIR points at the seed's
-# plugins/ root (parent of cache/) — NOT plugins/cache/. Per spike §Gate 1.
-RUN CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin marketplace add /opt/casa/defaults/marketplace-defaults/ \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin install superpowers@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin install plugin-dev@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin install skill-creator@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin install mcp-server-dev@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin install context7@casa-plugins-defaults
-
-USER root
-
-# Spike §Gate 3 addendum: the build-time install populates
-# known_marketplaces.json + cache/ but does NOT populate marketplaces/<name>/.
-# Manually copy so runtime plugin resolution works.
-RUN mkdir -p /opt/claude-seed/marketplaces \
- && cp -r /opt/casa/defaults/marketplace-defaults \
-          /opt/claude-seed/marketplaces/casa-plugins-defaults \
- && chmod -R a-w /opt/claude-seed \
- && chmod -R a+rX /opt/claude-seed
-
-# Copy application (frequently-changing layer; kept AFTER the seed install so a
+# Copy application (frequently-changing layer; kept AFTER the bundle build so a
 # code edit does not bust the seed-install layer cache — L31).
 COPY rootfs /
 
@@ -136,10 +100,6 @@ RUN chmod +x /etc/s6-overlay/scripts/*.sh \
     && chmod +x /opt/casa/scripts/*.sh \
     && chmod +x /usr/local/bin/casactl
 
-# Make the seed visible to every consumer (casa-main + every engagement
-# subprocess). Engagement subprocesses also get CLAUDE_CODE_PLUGIN_CACHE_DIR
-# exported at spawn time (see §B workspace-template + §5.3).
-ENV CLAUDE_CODE_PLUGIN_SEED_DIR=/opt/claude-seed
 
 # io.hass.* labels are injected by the deploy workflow (build-image action).
 LABEL org.opencontainers.image.title="Casa Agent" \
