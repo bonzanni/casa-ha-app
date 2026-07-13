@@ -157,22 +157,31 @@ def parse_mcp_servers(mcp_json_path: Path) -> tuple[dict, bool]:
     if not isinstance(data, dict):
         logger.debug("plugin .mcp.json not an object (%s)", path)
         return {}, True
-    servers = data.get("mcpServers")
-    if servers is not None:
-        # WRAPPER form: the `mcpServers` key IS the explicit intent signal, so
-        # every dict entry is a declared server (grant derived) — no command/url
-        # heuristic needed. A non-dict `mcpServers` is malformed.
+    def _runnable(cfg) -> bool:
+        # A runnable server declares a non-empty command (stdio) OR url (http/sse).
+        return isinstance(cfg, dict) and (
+            bool(cfg.get("command")) and isinstance(cfg.get("command"), str)
+            or bool(cfg.get("url")) and isinstance(cfg.get("url"), str))
+
+    if "mcpServers" in data:
+        # WRAPPER form: `mcpServers` is the explicit intent signal (KEY presence
+        # — so `{"mcpServers": null}` is caught here, not mistaken for top-level).
+        # Grants derive from every dict entry's KEY; but malformed is set when ANY
+        # declared entry is non-dict or not runnable, so a broken server still
+        # blocks readiness (Sol).
+        servers = data["mcpServers"]
         if not isinstance(servers, dict):
             logger.debug("plugin .mcp.json mcpServers not a mapping (%s)", path)
             return {}, True
-        return {k: v for k, v in servers.items() if isinstance(v, dict)}, False
-    # TOP-LEVEL form (no wrapper): with no intent signal, a server is
-    # distinguished from ordinary config by declaring command|url (the launch
-    # fields). A server-like object lacking BOTH is malformed (Sol).
+        grant_servers = {k: v for k, v in servers.items() if isinstance(v, dict)}
+        malformed = any(not _runnable(v) for v in servers.values())
+        return grant_servers, malformed
+    # TOP-LEVEL form (no wrapper): with no intent signal, only entries declaring
+    # command|url are servers; a server-like object (any dict candidate) lacking
+    # BOTH means the file is malformed — even if a sibling entry is valid (Sol).
     candidates = {k: v for k, v in data.items() if isinstance(v, dict)}
-    valid = {k: v for k, v in candidates.items()
-             if "command" in v or "url" in v}
-    malformed = bool(candidates) and not valid
+    valid = {k: v for k, v in candidates.items() if _runnable(v)}
+    malformed = any(not _runnable(v) for v in candidates.values())
     return valid, malformed
 
 

@@ -151,3 +151,52 @@ def test_top_level_args_only_is_malformed_no_grant(tmp_path):
                         version="0.0.0", manifest={})
     assert grants_for_resolved(rp) == []
     assert mcp_json_malformed(rp) is True
+
+
+def _parse(tmp_path, data):
+    from plugin_store import parse_mcp_servers
+    p = tmp_path / ".mcp.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    return parse_mcp_servers(p)
+
+
+def test_parse_null_mcpservers_is_malformed(tmp_path):
+    """Sol CI-review-2 HIGH #2a: `{"mcpServers": null}` must be caught by the
+    wrapper branch on KEY presence (not fall through to top-level → false-green)."""
+    servers, malformed = _parse(tmp_path, {"mcpServers": None})
+    assert servers == {} and malformed is True
+
+
+def test_parse_mixed_top_level_one_invalid_is_malformed(tmp_path):
+    """Sol CI-review-2 HIGH #2b: a valid sibling must NOT suppress an invalid
+    top-level server — malformed if ANY candidate lacks command/url."""
+    servers, malformed = _parse(
+        tmp_path, {"good": {"command": "x"}, "bad": {"args": []}})
+    assert list(servers) == ["good"] and malformed is True
+
+
+def test_parse_wrapper_nondict_entry_is_malformed(tmp_path):
+    """Sol CI-review-2 HIGH #2c: a non-dict wrapper entry is dropped from grants
+    but must set malformed (not silently removed → false-green)."""
+    servers, malformed = _parse(tmp_path, {"mcpServers": {"svc": "notadict"}})
+    assert servers == {} and malformed is True
+
+
+def test_parse_wrapper_empty_config_grants_but_malformed(tmp_path):
+    """Sol CI-review-2: a wrapper server with no command/url still yields its
+    grant (from the key) but is malformed (can't run) → blocks readiness."""
+    servers, malformed = _parse(tmp_path, {"mcpServers": {"probe": {}}})
+    assert list(servers) == ["probe"] and malformed is True
+
+
+def test_parse_empty_string_command_is_malformed(tmp_path):
+    """Sol CI-review-2: command/url must be NON-empty strings."""
+    servers, malformed = _parse(tmp_path, {"mcpServers": {"s": {"command": ""}}})
+    assert list(servers) == ["s"] and malformed is True
+
+
+def test_parse_url_only_server_is_valid(tmp_path):
+    """A url-declaring (http/sse) server is runnable — not malformed."""
+    servers, malformed = _parse(
+        tmp_path, {"mcpServers": {"s": {"url": "http://x"}}})
+    assert list(servers) == ["s"] and malformed is False

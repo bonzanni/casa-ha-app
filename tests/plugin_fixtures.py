@@ -23,8 +23,16 @@ def mk_artifact(store: Path, name: str, artifact_id: str,
         {"name": manifest_name or name, "version": version}),
         encoding="utf-8")
     if mcp_servers is not None:
+        # Fixtures declare servers by NAME (for grant/secret derivation); ensure
+        # each has a runnable command so the strict malformed check (Sol) treats
+        # them as valid servers. Grants come from keys + secrets from env, so this
+        # injection changes no assertion.
+        servers = {
+            k: (v if isinstance(v, dict) and (v.get("command") or v.get("url"))
+                else {"command": "x", **(v if isinstance(v, dict) else {})})
+            for k, v in mcp_servers.items()}
         (root / ".mcp.json").write_text(
-            json.dumps({"mcpServers": mcp_servers}), encoding="utf-8")
+            json.dumps({"mcpServers": servers}), encoding="utf-8")
     write_metadata(root, name=name, repo="o/r", ref="v1",
                    revision=revision, subdir=subdir,
                    artifact_id=artifact_id, version=version,
