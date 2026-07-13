@@ -3026,19 +3026,30 @@ async def _notify_plugin_health_if_possible() -> None:
         logger.debug("plugin health notify skipped", exc_info=True)
 
 
-def _postcondition_holds(verify: dict, targets: list, *, expect: str) -> bool:
+def _postcondition_holds(verify: dict, targets: list, *, expect: str,
+                         name: str | None = None, runtime=None) -> bool:
     """§3.9 mutation postcondition. 'present' (add/update/assign): every in-casa
-    target row must be ready. 'absent' (unassign/remove): the plugin is gone
-    (not_registered) or no listed target still binds it. Legacy verify (no
-    'targets' key, Task 11 interim) is not blocking — Task 14's rewrite adds
-    the real per-target rows."""
-    rows = verify.get("targets")
-    if rows is None:
-        return True
+    target row must be ready (legacy verify with no 'targets' key is not
+    blocking — Task 14's rewrite adds the real rows). 'absent' (unassign/
+    remove): no RECONSTRUCTED in-casa agent still binds `name` — read the live
+    agent's active_plugin_binding directly, independent of verify shape."""
     if expect == "present":
+        rows = verify.get("targets")
+        if rows is None:
+            return True
         return all(r.get("ready") for r in rows)
-    return (verify.get("reasons") == ["not_registered"]
-            or all(r.get("ready") for r in rows))
+    # absent
+    if runtime is None or name is None:
+        return True
+    agents = getattr(runtime, "agents", {}) or {}
+    for target in targets:
+        tier, _, role = target.partition(":")
+        if tier in ("resident", "specialist"):
+            agent = agents.get(role)
+            if agent is not None and name in getattr(
+                    agent, "active_plugin_binding", {}):
+                return False
+    return True
 
 
 def _issues_from_mutation(name: str, *, reload_errors: list, verify: dict,
@@ -3087,7 +3098,8 @@ async def _reload_and_verify_targets(name: str, targets: list,
         # executors: nothing to reconstruct (per-launch resolution).
     verify = await asyncio.to_thread(_tool_verify_plugin_state, plugin_name=name)
     ok = (not reload_errors
-          and _postcondition_holds(verify, targets, expect=expect))
+          and _postcondition_holds(verify, targets, expect=expect,
+                                   name=name, runtime=runtime))
     mutation_issues = _issues_from_mutation(
         name, reload_errors=reload_errors, verify=verify,
         expect=expect, postcondition_ok=ok)
@@ -3247,6 +3259,146 @@ async def plugin_update(args: dict) -> dict:
         core.update(seq)
         core.update(_resolved_observability(core["name"]))
         return _result(core)
+
+
+def _find_entry(data, name: str) -> dict | None:
+    return next((e for e in data.raw.get("plugins", [])
+                 if isinstance(e, dict) and e.get("name") == name), None)
+
+
+def _plugin_assign_sync(*, name: str, target: str) -> dict:
+    if not plugin_registry.TARGET_RE.match(target or ""):
+        return {"ok": False, "kind": "invalid_target", "target": target}
+    data = plugin_registry.load_registry()
+    if not data.valid:
+        return {"ok": False, "kind": "registry_invalid"}
+    entry = _find_entry(data, name)
+    if entry is None:
+        return {"ok": False, "kind": "not_registered", "name": name}
+    targets = entry.setdefault("targets", [])
+    was_assigned = target in targets
+    if not was_assigned:
+        targets.append(target)
+        plugin_registry.save_registry(data)
+    return {"ok": True, "name": name, "target": target,
+            "targets": list(targets), "was_assigned": was_assigned}
+
+
+def _plugin_unassign_sync(*, name: str, target: str) -> dict:
+    data = plugin_registry.load_registry()
+    if not data.valid:
+        return {"ok": False, "kind": "registry_invalid"}
+    entry = _find_entry(data, name)
+    if entry is None:
+        return {"ok": False, "kind": "not_registered", "name": name}
+    targets = entry.get("targets") or []
+    was_assigned = target in targets
+    if was_assigned:
+        entry["targets"] = [t for t in targets if t != target]
+        plugin_registry.save_registry(data)
+    return {"ok": True, "name": name, "target": target,
+            "was_assigned": was_assigned, "targets": entry.get("targets") or []}
+
+
+def _plugin_remove_sync(*, name: str) -> dict:
+    data = plugin_registry.load_registry()
+    if not data.valid:
+        return {"ok": False, "kind": "registry_invalid"}
+    entry = _find_entry(data, name)
+    if entry is None:
+        return {"ok": False, "kind": "not_registered", "name": name}
+    targets = list(entry.get("targets") or [])
+    data.raw["plugins"] = [
+        e for e in data.raw.get("plugins", [])
+        if not (isinstance(e, dict) and e.get("name") == name)]
+    # §3.1 no-resurrection: seeded_defaults is INTENTIONALLY left untouched, so
+    # a removed default stays removed across upgrades. Artifact left for GC.
+    plugin_registry.save_registry(data)
+    return {"ok": True, "name": name, "targets": targets,
+            "artifact_retained": True}
+
+
+def _tool_plugin_list() -> dict:
+    data = plugin_registry.load_registry()
+    seeded = set(data.raw.get("seeded_defaults") or [])
+    plugins = []
+    for e in data.raw.get("plugins", []):
+        if not isinstance(e, dict):
+            continue
+        name, aid = e.get("name"), e.get("artifact_id")
+        store_dir = plugin_registry.STORE_ROOT / str(name) / str(aid)
+        plugins.append({
+            "name": name, "version": e.get("version"),
+            "revision": (e.get("source") or {}).get("revision"),
+            "targets": e.get("targets") or [], "artifact_id": aid,
+            "artifact_present": store_dir.is_dir(),
+            "seeded_default": name in seeded,
+        })
+    return {
+        "registry_valid": data.valid, "plugins": plugins,
+        "issues": [{"name": i.name, "reason_code": i.reason_code}
+                   for i in data.entry_issues],
+    }
+
+
+@tool(
+    "plugin_assign",
+    "Assign a registered plugin to a target (resident:/specialist:/executor:).",
+    {"name": str, "target": str},
+)
+async def plugin_assign(args: dict) -> dict:
+    async with _PLUGIN_TOOLS_LOCK:
+        core = await asyncio.to_thread(
+            _plugin_assign_sync, name=args["name"], target=args["target"])
+        if core.get("ok") is not True:
+            return _result(core)
+        seq = await _reload_and_verify_targets(
+            core["name"], [core["target"]], expect="present")
+        core.update(seq)
+        return _result(core)
+
+
+@tool(
+    "plugin_unassign",
+    "Remove a plugin's assignment to one target (the plugin stays registered).",
+    {"name": str, "target": str},
+)
+async def plugin_unassign(args: dict) -> dict:
+    async with _PLUGIN_TOOLS_LOCK:
+        core = await asyncio.to_thread(
+            _plugin_unassign_sync, name=args["name"], target=args["target"])
+        if core.get("ok") is not True:
+            return _result(core)
+        seq = await _reload_and_verify_targets(
+            core["name"], [core["target"]], expect="absent")
+        core.update(seq)
+        return _result(core)
+
+
+@tool(
+    "plugin_remove",
+    "Remove a plugin from the registry entirely (artifact retained for GC).",
+    {"name": str},
+)
+async def plugin_remove(args: dict) -> dict:
+    async with _PLUGIN_TOOLS_LOCK:
+        core = await asyncio.to_thread(_plugin_remove_sync, name=args["name"])
+        if core.get("ok") is not True:
+            return _result(core)
+        seq = await _reload_and_verify_targets(
+            core["name"], core["targets"], expect="absent")
+        core.update(seq)
+        return _result(core)
+
+
+@tool(
+    "plugin_list",
+    "List every registered plugin with its version, revision, targets, "
+    "artifact presence, and seeded-default status.",
+    {},
+)
+async def plugin_list(args: dict) -> dict:
+    return _result(await asyncio.to_thread(_tool_plugin_list))
 
 
 def _tool_install_casa_plugin(
@@ -3685,9 +3837,13 @@ CASA_TOOLS: tuple = (
     delete_engagement_workspace,
     peek_engagement_workspace,
     cleanup_engagement_topics,     # v0.65.0 [AR-7] — configurator-only grant
-    # Unified plugin architecture (§3.13) — registry-mutating tools.
+    # Unified plugin architecture (§3.13) — registry tools.
     plugin_add,
     plugin_update,
+    plugin_assign,
+    plugin_unassign,
+    plugin_remove,
+    plugin_list,
     marketplace_add_plugin,        # legacy — deleted in Task 14
     marketplace_remove_plugin,
     marketplace_update_plugin,

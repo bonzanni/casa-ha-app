@@ -282,3 +282,122 @@ async def test_mutating_tools_do_not_stall_event_loop(monkeypatch, tmp_path):
         "targets": ["resident:assistant"]})
     t.cancel()
     assert ticks >= 1
+
+
+# --- Task 12: assign / unassign / remove / list -----------------------------
+
+class _FakeAgent:
+    def __init__(self, binding):
+        self.active_plugin_binding = dict(binding)
+
+
+class _FakeRuntime:
+    def __init__(self, agents):
+        self.agents = agents
+
+
+def _registered(st, name="probe", targets=None):
+    st.raw["plugins"].append({
+        "name": name,
+        "source": {"type": "github", "repo": "o/r", "ref": "v1",
+                   "revision": "git:" + "c" * 40, "subdir": ""},
+        "artifact_id": "c" * 64, "version": "1.0.0",
+        "targets": list(targets or [])})
+
+
+async def test_plugin_assign_roundtrip(monkeypatch, tmp_path):
+    st = _State()
+    _registered(st, targets=[])
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    r = await tools_mod.plugin_assign.handler({
+        "name": "probe", "target": "specialist:finance"})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True and payload["was_assigned"] is False
+    assert st.raw["plugins"][0]["targets"] == ["specialist:finance"]
+    assert "reload_snapshot" in st.log and "dispatch:finance" in st.log
+
+
+async def test_plugin_assign_idempotent(monkeypatch, tmp_path):
+    st = _State()
+    _registered(st, targets=["specialist:finance"])
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    r = await tools_mod.plugin_assign.handler({
+        "name": "probe", "target": "specialist:finance"})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["was_assigned"] is True
+    assert "save" not in st.log            # no-op: not re-saved
+
+
+async def test_plugin_unassign_removes_target(monkeypatch, tmp_path):
+    st = _State()
+    _registered(st, targets=["specialist:finance", "resident:assistant"])
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    monkeypatch.setattr(__import__("agent"), "active_runtime",
+                        _FakeRuntime({"finance": _FakeAgent({})}), raising=False)
+    r = await tools_mod.plugin_unassign.handler({
+        "name": "probe", "target": "specialist:finance"})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True and payload["was_assigned"] is True
+    assert st.raw["plugins"][0]["targets"] == ["resident:assistant"]
+
+
+async def test_unassign_postcondition_is_absence(monkeypatch, tmp_path):
+    """Sol F7: a reconstructed agent that STILL binds the plugin flips the tool
+    to postcondition_failed; a clean one returns ok."""
+    st = _State()
+    _registered(st, targets=["specialist:finance"])
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    import agent as agent_mod
+    # Stub agent that WRONGLY keeps the binding → postcondition_failed.
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        _FakeRuntime({"finance": _FakeAgent({"probe": "x"})}),
+                        raising=False)
+    r = await tools_mod.plugin_unassign.handler({
+        "name": "probe", "target": "specialist:finance"})
+    assert json.loads(r["content"][0]["text"])["ok"] is False
+
+    # Reconstructed cleanly (binding gone) → ok.
+    st2 = _State(); _registered(st2, targets=["specialist:finance"])
+    tools_mod = _wire(monkeypatch, tmp_path, st2, publish=_pr())
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        _FakeRuntime({"finance": _FakeAgent({})}), raising=False)
+    r = await tools_mod.plugin_unassign.handler({
+        "name": "probe", "target": "specialist:finance"})
+    assert json.loads(r["content"][0]["text"])["ok"] is True
+
+
+async def test_plugin_remove_keeps_seeded_defaults(monkeypatch, tmp_path):
+    """§3.1 no-resurrection: removing a seeded default keeps its name in
+    seeded_defaults so a later seed_defaults does NOT re-add it."""
+    import plugin_registry
+    st = _State()
+    st.raw["seeded_defaults"] = ["probe"]
+    _registered(st, name="probe", targets=["executor:plugin-developer"])
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    r = await tools_mod.plugin_remove.handler({"name": "probe"})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True and payload["artifact_retained"] is True
+    assert st.raw["plugins"] == []
+    assert st.raw["seeded_defaults"] == ["probe"]     # untouched
+
+
+async def test_plugin_remove_unknown_refused(monkeypatch, tmp_path):
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    r = await tools_mod.plugin_remove.handler({"name": "ghost"})
+    assert json.loads(r["content"][0]["text"])["kind"] == "not_registered"
+
+
+async def test_plugin_list_reports_presence_and_seeded(monkeypatch, tmp_path):
+    st = _State()
+    st.raw["seeded_defaults"] = ["probe"]
+    _registered(st, name="probe", targets=["executor:plugin-developer"])
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    r = await tools_mod.plugin_list.handler({})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["registry_valid"] is True
+    row = payload["plugins"][0]
+    assert row["name"] == "probe"
+    assert row["seeded_default"] is True
+    assert row["artifact_present"] is False           # store dir absent in test
+    assert row["targets"] == ["executor:plugin-developer"]
