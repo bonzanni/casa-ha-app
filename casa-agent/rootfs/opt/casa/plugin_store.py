@@ -140,12 +140,16 @@ def parse_mcp_servers(mcp_json_path: Path) -> tuple[dict, bool]:
     Returns ``(valid_servers, malformed)``. Handles BOTH the project-style
     ``{"mcpServers": {...}}`` wrapper AND the top-level form real plugins use
     (e.g. context7's ``{"context7": {"command": "npx", ...}}`` — no wrapper). A
-    server is VALID only if its config declares ``command`` OR ``url`` (the
-    load-bearing launch fields); ``args``/``env``/``type`` alone do NOT make a
-    runnable server. ``malformed`` is True when the file is PRESENT but
-    unparseable / not an object / declares a non-dict ``mcpServers`` / declares
-    server-like objects NONE of which are valid. An ABSENT file (skill-only
-    plugin) and an empty/no-server config are NOT malformed."""
+    server is VALID only if its config declares a non-empty-string ``command``
+    OR ``url`` (the load-bearing launch fields); ``args``/``env``/``type`` alone
+    do NOT make a runnable server. ``malformed`` is True when the file is PRESENT
+    but unparseable / not an object / declares a non-dict ``mcpServers`` / OR
+    declares ANY server-like object that is not valid (a broken server blocks
+    readiness even beside a valid sibling — Sol). An ABSENT file (skill-only
+    plugin) and a config declaring ZERO servers (``{"mcpServers": {}}``) are NOT
+    malformed; a DECLARED server that is non-dict or lacks a runnable
+    command/url IS. Wrapper keys still derive grants while malformed gates
+    readiness."""
     path = Path(mcp_json_path)
     if not path.is_file():
         return {}, False
