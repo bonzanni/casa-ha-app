@@ -472,3 +472,29 @@ def test_verify_secret_configured_but_not_in_effective_env_unresolved(
     monkeypatch.setenv("MY_API_KEY", "sk-real-value")
     r2 = _verify(tmp_path)
     assert r2["secrets"][0]["status"] == "resolved"
+
+
+def test_regenerate_health_preserves_migration_issues(monkeypatch, tmp_path):
+    """Sol round-4 HIGH: a mutation's health rewrite must PRESERVE replayed
+    unresolved migration issues (an absent refused plugin is in neither
+    resolve_all nor reg.entries)."""
+    import json
+    import tools
+    import plugin_health
+    import plugin_registry
+    import plugin_boot
+    captured = {}
+    monkeypatch.setattr(plugin_registry, "resolve_all",
+                        lambda: SimpleNamespace(issues=[], warnings=[]))
+    monkeypatch.setattr(plugin_registry, "load_registry",
+                        lambda *a, **k: SimpleNamespace(
+                            valid=True, entries=[], raw={"plugins": []}))
+    monkeypatch.setattr(plugin_boot, "MIGRATION_REPORT", tmp_path / "r.json")
+    (tmp_path / "r.json").write_text(json.dumps({"issues": [
+        {"name": "sp", "reason_code": "install_path_divergence",
+         "target": None}]}), encoding="utf-8")
+    monkeypatch.setattr(plugin_health, "write_report",
+                        lambda **k: captured.update(k))
+    tools._regenerate_plugin_health([])
+    assert any(i.reason_code == "install_path_divergence"
+               for i in captured["issues"])

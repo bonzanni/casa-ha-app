@@ -153,3 +153,20 @@ def test_unresolved_migration_issues_replayed(tmp_path, monkeypatch):
     codes = [(i.name, i.reason_code) for i in out]
     assert ("superpowers", "install_path_divergence") in codes   # absent → replayed
     assert not any(i.name == "present-plugin" for i in out)      # present → dropped
+
+
+def test_unresolved_migration_issues_reason_filter(tmp_path, monkeypatch):
+    """Sol round-4 polish: only plugin-presence-clearable reasons are replayed —
+    a role-keyed enabled_plugins_malformed (never clears by plugin presence) is not."""
+    import json
+    from plugin_registry import RegistryData
+    monkeypatch.setattr(plugin_boot, "MIGRATION_REPORT", tmp_path / "r.json")
+    (tmp_path / "r.json").write_text(json.dumps({"issues": [
+        {"name": "sp", "reason_code": "install_path_divergence", "target": None},
+        {"name": "assistant", "reason_code": "enabled_plugins_malformed",
+         "target": "resident:assistant"}]}), encoding="utf-8")
+    data = RegistryData(raw={"schema_version": 1, "plugins": []}, valid=True)
+    codes = [i.reason_code
+             for i in plugin_boot._unresolved_migration_issues(data)]
+    assert "install_path_divergence" in codes
+    assert "enabled_plugins_malformed" not in codes

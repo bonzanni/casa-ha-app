@@ -1578,10 +1578,11 @@ async def engage_executor(args: dict) -> dict:
     # plugin_update during the topic-creation await can be detected before the
     # engagement record pins its artifacts (below, just before create()).
     # Sol round-4 M: run the resolve + readiness verification OFF the event loop
-    # (it does per-plugin artifact checks + YAML/file reads).
-    _resolve_generation = plugin_registry.snapshot_generation()
-    plugin_resolution, plugin_artifacts, _gate_err = await asyncio.to_thread(
-        _resolve_and_gate)
+    # (it does per-plugin artifact checks + YAML/file reads). This is the
+    # PRE-TOPIC gate (fail fast before creating a topic on a known-unavailable
+    # plugin); the authoritative record binding is (re)resolved under the lock
+    # below, bound to a stable snapshot generation.
+    _, _, _gate_err = await asyncio.to_thread(_resolve_and_gate)
     if _gate_err is not None:
         return _gate_err
 
@@ -1675,21 +1676,26 @@ async def engage_executor(args: dict) -> dict:
             "message": str(exc),
         })
 
-    # Sol #6 / round-3 H6 TOCTOU fence: hold the plugin-tools lock across the
-    # re-resolve + durable record write so a concurrent plugin_update (which
-    # bumps the snapshot generation UNDER THE SAME LOCK during its reload) cannot
-    # interleave between the generation check and create(). The lock is held only
-    # for this brief section (re-resolve is sync, create is a quick registry
-    # write) — NOT across the topic-creation network round-trip above. An update
-    # AFTER create() is the by-design informational "previous artifact" case.
+    # Sol #6 / round-3 H6 / round-4 TOCTOU fence: hold the plugin-tools lock
+    # across the re-resolve + durable record write so a concurrent plugin_update
+    # (which bumps the snapshot generation UNDER THE SAME LOCK during its reload)
+    # cannot interleave. plugin_update holds this lock; the manual-edit seam
+    # reload_full() does NOT, so we BIND the recorded artifacts to a stable
+    # generation: sample → resolve → verify unchanged, retrying if reload_full
+    # moved the snapshot mid-resolve. `_gen_at_create` is then the generation the
+    # recorded artifacts actually came from, making the post-create recheck sound.
+    # The lock covers only this brief section — NOT the topic-creation RT above.
     async with _PLUGIN_TOOLS_LOCK:
-        if plugin_registry.snapshot_generation() != _resolve_generation:
+        _gate_err = None
+        for _attempt in range(5):
+            _gen_at_create = plugin_registry.snapshot_generation()
             plugin_resolution, plugin_artifacts, _gate_err = \
                 await asyncio.to_thread(_resolve_and_gate)
-            if _gate_err is not None:
-                await _abort_engagement_topic(channel, "engage-abort", topic_id)
-                return _gate_err
-        _gen_at_create = plugin_registry.snapshot_generation()
+            if plugin_registry.snapshot_generation() == _gen_at_create:
+                break   # artifacts + generation agree
+        if _gate_err is not None:
+            await _abort_engagement_topic(channel, "engage-abort", topic_id)
+            return _gate_err
 
         # Computed BEFORE create() so it can be persisted onto the record's
         # origin — the claude_code driver reads it (and context_text) back out
@@ -3081,8 +3087,19 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
             if verify.get("ready") is not True and not rows:
                 for reason in (verify.get("reasons") or ["not_ready"]):
                     _add(name, None, reason)
+    # Sol round-4 HIGH: preserve replayed UNRESOLVED migration issues on EVERY
+    # health rewrite — a refused/absent plugin is neither in resolve_all() nor
+    # reg.entries, so without this a later unrelated mutation would erase its
+    # issue and the report would go green until the next boot.
+    migration_issues = []
+    try:
+        import plugin_boot
+        migration_issues = plugin_boot._unresolved_migration_issues(reg)
+    except Exception:  # noqa: BLE001 — never fail health regen on the replay
+        pass
     plugin_health.write_report(
-        issues=list(res.issues) + list(extra_issues) + runtime_issues,
+        issues=(list(res.issues) + list(extra_issues) + runtime_issues
+                + migration_issues),
         warnings=list(res.warnings),
         path=_PLUGIN_HEALTH_PATH,
     )

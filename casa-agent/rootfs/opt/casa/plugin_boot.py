@@ -15,13 +15,23 @@ BUNDLE_ROOT = Path("/opt/casa/plugin-bundle")
 SENTINEL = Path("/config/plugins/.migration-done")
 MIGRATION_REPORT = Path("/data/plugin-migration-report.json")
 
+# Sol round-4 polish: only replay migration reasons that CLEAR by adding the
+# named plugin to the registry (plugin presence == resolved). Reasons keyed on a
+# ROLE (e.g. enabled_plugins_malformed) or on "*" would never clear that way.
+_REPLAYABLE_MIGRATION_REASONS = frozenset({
+    "install_path_divergence", "adoption_failed", "ref_not_found",
+    "resolve_unavailable", "artifact_unavailable", "store_error",
+    "artifact_missing", "corrupt_artifact",
+})
+
 
 def _unresolved_migration_issues(data) -> list:
     """Sol round-4: migration issues (install_path_divergence, adoption_failed,
     …) for plugins STILL absent from the registry — replayed into the health
-    report every boot so a refused/divergent default doesn't silently go green
-    after the one-time migration's sentinel. Once the operator re-adds the plugin
-    (plugin_add) it is present and the issue naturally drops."""
+    report every boot AND on every mutation so a refused/divergent default doesn't
+    silently go green after the one-time migration's sentinel. Once the operator
+    re-adds the plugin (plugin_add) it is present and the issue naturally drops.
+    Restricted to plugin-presence-clearable reasons."""
     import json
     from plugin_registry import PluginIssue
     try:
@@ -34,7 +44,8 @@ def _unresolved_migration_issues(data) -> list:
     out = []
     for i in report.get("issues", []):
         name = i.get("name")
-        if name and name != "*" and name not in present:
+        if (name and name != "*" and name not in present
+                and i.get("reason_code") in _REPLAYABLE_MIGRATION_REASONS):
             out.append(PluginIssue(name=name, target=i.get("target"),
                                    stage="migration",
                                    reason_code=i.get("reason_code")))

@@ -1106,6 +1106,66 @@ class TestEngageExecutorPluginGate:
         assert payload["kind"] == "plugin_not_ready"
         channel.open_engagement_topic.assert_not_called()   # gate is pre-topic
 
+    async def test_aborts_when_snapshot_changes_during_create(
+        self, monkeypatch, tmp_path,
+    ):
+        """Sol round-4: a lock-less reload_full() bumping the generation DURING
+        create()'s await is caught by the post-create recheck → the engagement is
+        aborted (plugin_superseded) before the driver starts."""
+        from tools import engage_executor, init_tools
+        import agent as agent_mod
+        import plugin_registry
+        import tools as tools_mod
+        from plugin_registry import ResolutionResult, ResolvedPlugin
+
+        rp = ResolvedPlugin(name="p", artifact_id="a" * 64, path="/store/p",
+                            version="1", manifest={})
+        reg = MagicMock()
+        reg.get = MagicMock(
+            return_value=_mock_executor_def(driver="claude_code"))
+        reg.list_types = MagicMock(return_value=["configurator"])
+        er = MagicMock()
+        mock_rec = MagicMock()
+        mock_rec.id = "abcd1234" + "0" * 24
+        mock_rec.topic_id = 42
+        er.mark_error = AsyncMock()
+        er.recent_for_origin = MagicMock(return_value=None)
+
+        async def _create(**kw):
+            plugin_registry._generation += 1   # reload_full during create's await
+            return mock_rec
+        er.create = AsyncMock(side_effect=_create)
+
+        channel = await _setup(reg)
+        channel.update_topic_state = AsyncMock()
+        channel.close_topic = AsyncMock()
+        monkeypatch.setattr(plugin_registry, "resolve_for",
+                            lambda t: ResolutionResult(registry_valid=True,
+                                                       plugins=[rp]))
+        monkeypatch.setattr(tools_mod, "_tool_verify_plugin_state",
+                            lambda *, plugin_name: {"ready": True, "targets": [
+                                {"target": "executor:configurator",
+                                 "ready": True}]})
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        init_tools(channel_manager=cm, bus=MagicMock(),
+                   specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+                   trigger_registry=MagicMock(), engagement_registry=er,
+                   executor_registry=reg)
+        monkeypatch.setattr(agent_mod, "active_engagement_driver",
+                            MagicMock(start=AsyncMock()), raising=False)
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi"})
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "configurator", "task": "t", "context": ""})
+        finally:
+            agent_mod.origin_var.reset(token)
+        payload = json.loads(r["content"][0]["text"])
+        assert payload["kind"] == "plugin_superseded"
+        er.mark_error.assert_awaited()
+
     async def test_reresolves_on_concurrent_update_during_launch(
         self, monkeypatch, tmp_path,
     ):
