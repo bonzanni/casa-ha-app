@@ -369,9 +369,11 @@ def _reject_escaping_symlinks(root: Path) -> None:
             try:
                 resolved = (Path(dirpath) / os.readlink(p)).resolve()
                 resolved.relative_to(root)                # ValueError ⇒ escapes
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, RuntimeError) as exc:
+                # Sol round-4: Path.resolve() raises RuntimeError on a symlink
+                # LOOP — translate it into the same unsafe_archive contract.
                 raise StoreError(
-                    f"escaping symlink in artifact: {p}",
+                    f"escaping or cyclic symlink in artifact: {p}",
                     reason_code="unsafe_archive") from exc
 
 

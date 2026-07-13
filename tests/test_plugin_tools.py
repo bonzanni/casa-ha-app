@@ -291,6 +291,14 @@ async def test_mutating_tools_do_not_stall_event_loop(monkeypatch, tmp_path):
 class _FakeAgent:
     def __init__(self, binding):
         self.active_plugin_binding = dict(binding)
+        # A real Agent always exposes these; the mutation's post-reconstruct
+        # force-resolve (Sol round-4) calls _get_plugin_resolution when the
+        # binding hasn't been captured yet.
+        self._plugin_resolution = object()
+
+    async def _get_plugin_resolution(self):
+        self._plugin_resolution = object()
+        return self._plugin_resolution
 
 
 class _FakeRuntime:

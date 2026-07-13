@@ -448,3 +448,27 @@ def test_regenerate_health_surfaces_verify_exception(monkeypatch):
                         lambda **k: captured.update(k))
     tools._regenerate_plugin_health([])
     assert any(i.reason_code == "verify_exception" for i in captured["issues"])
+
+
+def test_verify_secret_configured_but_not_in_effective_env_unresolved(
+        tmp_path, monkeypatch):
+    """Sol round-4: a secret whose op:// ref failed at boot (config present but
+    os.environ unset) must verify UNRESOLVED, not falsely green off config presence."""
+    import plugin_env_conf as pec
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"],
+                mcp_servers={"s": {"env": {"K": "${MY_API_KEY}"}}})
+    mk_registry(tmp_path, [e])
+    (tmp_path / "plugin-env.conf").write_text(
+        "MY_API_KEY=op://vault/item/field\n", encoding="utf-8")
+    monkeypatch.setattr(pec, "PLUGIN_ENV_CONF_PATH", tmp_path / "plugin-env.conf")
+    monkeypatch.delenv("MY_API_KEY", raising=False)          # not resolved at boot
+    r = _verify(tmp_path)
+    assert r["ready"] is False
+    assert r["secrets"][0]["status"] == "unresolved"
+
+    # Now present in the effective env → resolved.
+    monkeypatch.setenv("MY_API_KEY", "sk-real-value")
+    r2 = _verify(tmp_path)
+    assert r2["secrets"][0]["status"] == "resolved"

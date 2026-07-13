@@ -340,3 +340,18 @@ def test_import_bundle_freezes_files(tmp_path):
     import_bundle(bundle, store_root=store)
     skill = store / "probe" / res.artifact_id / "skills" / "s.md"
     assert stat.S_IMODE(os.lstat(skill).st_mode) & 0o222 == 0
+
+
+def test_publish_rejects_cyclic_symlink(tmp_path):
+    """Sol round-4: a symlink LOOP raises unsafe_archive (RuntimeError from
+    resolve() translated), not an uncaught error."""
+    import os
+    src = _plugin_tree(tmp_path)
+    os.symlink("b", src / "a")           # a -> b
+    os.symlink("a", src / "b")           # b -> a  (cycle)
+    store, staging = tmp_path / "store", tmp_path / "staging"
+    with pytest.raises(StoreError) as ei:
+        publish_from_tree(name="probe", repo="o/r", ref="master",
+                          revision="legacy-content:" + "c" * 64, subdir="",
+                          src_root=src, store_root=store, staging_root=staging)
+    assert ei.value.reason_code == "unsafe_archive"

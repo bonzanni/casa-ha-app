@@ -336,6 +336,16 @@ def _resolution_from_recorded(plugin_artifacts) -> "plugin_registry.ResolutionRe
             raise RuntimeError(
                 f"cannot resume: recorded plugin artifact missing "
                 f"(plugin_artifact_missing): {pa!r}")
+        # Sol round-4: DEEP-validate before resume — a tampered/corrupt pinned
+        # artifact, or one whose metadata identity no longer matches the recorded
+        # artifact_id, must fail the resume closed (not silently load).
+        if not plugin_store.validate_artifact(Path(path)):
+            raise RuntimeError(
+                f"cannot resume: recorded artifact corrupt: {pa!r}")
+        _meta = plugin_store.read_metadata(Path(path)) or {}
+        if pa.get("artifact_id") and _meta.get("artifact_id") != pa.get("artifact_id"):
+            raise RuntimeError(
+                f"cannot resume: recorded artifact identity mismatch: {pa!r}")
         manifest = {}
         try:
             manifest = json.loads((Path(path) / ".claude-plugin" / "plugin.json")
@@ -544,12 +554,13 @@ def build_engagement_resume_options(engagement, session_id: str) -> ClaudeAgentO
     else:
         cfg = _specialist_registry.get(role) if _specialist_registry is not None else None
         if cfg is not None:
-            # Sol round-3 H7b: a resumed specialist rebuilds from its RECORDED
-            # artifacts (§3.8) — like executors — never re-resolving current
-            # assignments; a missing recorded artifact fails the resume closed.
-            # Old records (pre-v0.71.0) have no plugin_artifacts → fresh resolve.
+            # Sol round-3 H7b / round-4: a resumed specialist rebuilds from its
+            # RECORDED artifacts (§3.8) — like executors — never re-resolving
+            # current assignments. An EMPTY record ([]) is AUTHORITATIVE (started
+            # with no plugins → resume with none); only a pre-v0.71.0 record
+            # (field absent → None) falls back to a fresh resolve.
             recorded = getattr(engagement, "plugin_artifacts", None)
-            if recorded:
+            if recorded is not None:
                 opts = _build_specialist_options(
                     cfg, resolution=_resolution_from_recorded(recorded))
             else:
@@ -1539,7 +1550,13 @@ async def engage_executor(args: dict) -> dict:
         target = f"executor:{executor_type}"
         not_ready = []
         for rp in res.plugins:
-            v = _tool_verify_plugin_state(plugin_name=rp.name)
+            try:
+                v = _tool_verify_plugin_state(plugin_name=rp.name)
+            except Exception as exc:  # noqa: BLE001 — Sol round-4 M: fail CLOSED
+                logger.warning("launch readiness verify raised for %s: %s",
+                               rp.name, exc)
+                not_ready.append((rp.name, "verify_error"))
+                continue
             row = next((r for r in v.get("targets", [])
                         if r.get("target") == target), None)
             if row is not None and not row.get("ready"):
@@ -1560,8 +1577,11 @@ async def engage_executor(args: dict) -> dict:
     # Sol #6: capture the snapshot generation at resolve so a concurrent
     # plugin_update during the topic-creation await can be detected before the
     # engagement record pins its artifacts (below, just before create()).
+    # Sol round-4 M: run the resolve + readiness verification OFF the event loop
+    # (it does per-plugin artifact checks + YAML/file reads).
     _resolve_generation = plugin_registry.snapshot_generation()
-    plugin_resolution, plugin_artifacts, _gate_err = _resolve_and_gate()
+    plugin_resolution, plugin_artifacts, _gate_err = await asyncio.to_thread(
+        _resolve_and_gate)
     if _gate_err is not None:
         return _gate_err
 
@@ -1664,10 +1684,12 @@ async def engage_executor(args: dict) -> dict:
     # AFTER create() is the by-design informational "previous artifact" case.
     async with _PLUGIN_TOOLS_LOCK:
         if plugin_registry.snapshot_generation() != _resolve_generation:
-            plugin_resolution, plugin_artifacts, _gate_err = _resolve_and_gate()
+            plugin_resolution, plugin_artifacts, _gate_err = \
+                await asyncio.to_thread(_resolve_and_gate)
             if _gate_err is not None:
                 await _abort_engagement_topic(channel, "engage-abort", topic_id)
                 return _gate_err
+        _gen_at_create = plugin_registry.snapshot_generation()
 
         # Computed BEFORE create() so it can be persisted onto the record's
         # origin — the claude_code driver reads it (and context_text) back out
@@ -1684,6 +1706,20 @@ async def engage_executor(args: dict) -> dict:
             permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
             plugin_artifacts=plugin_artifacts,      # §3.8 recorded binding
         )
+
+    # Sol round-4: the manual-edit seam `casa_reload(scope="full")` bumps the
+    # snapshot generation WITHOUT the plugin-tools lock, so it can move the
+    # snapshot while create() awaits. Recheck against the pre-create generation
+    # and abort before the driver starts — the record must not launch stale.
+    if plugin_registry.snapshot_generation() != _gen_at_create:
+        await _engagement_registry.mark_error(
+            rec.id, kind="plugin_superseded",
+            message="plugin snapshot changed during launch")
+        await _abort_engagement_topic(channel, rec.id, topic_id)
+        return _result({
+            "status": "error", "kind": "plugin_superseded",
+            "message": ("plugin registry changed during launch — engagement "
+                        "aborted before start; retry")})
 
     # Persist the initial state emoji so Task 23 ``update_topic_state`` knows
     # whether it needs to edit the title (no-op when state didn't change).
@@ -3145,9 +3181,14 @@ async def _reload_and_verify_targets(name: str, targets: list,
         if agent is not None and getattr(agent, "_plugin_resolution", None) is None:
             try:
                 await agent._get_plugin_resolution()
-            except Exception:  # noqa: BLE001 — never fail the mutation on resolve
-                logger.debug("post-reconstruct resolve failed for %s",
-                             role, exc_info=True)
+            except Exception as exc:  # noqa: BLE001
+                # Sol round-4 M: a fail-OPEN resolve would leave _plugin_resolution
+                # None → verify classifies the live agent as dormant → green. Record
+                # a reload error so the mutation reports not-ok instead.
+                logger.warning("post-reconstruct resolve failed for %s: %s",
+                               role, exc)
+                reload_errors.append({"target": target, "status": "error",
+                                      "kind": "resolve_failed"})
     verify = await asyncio.to_thread(_tool_verify_plugin_state, plugin_name=name)
     ok = (not reload_errors
           and _postcondition_holds(verify, targets, expect=expect,
@@ -3165,6 +3206,17 @@ async def _reload_and_verify_targets(name: str, targets: list,
     return result
 
 
+def _safe_remove_manifest(name: str) -> None:
+    """Sol round-4: remove the plugin's sysreq manifest row, tolerating failure
+    (unwritable/malformed manifest) so a cleanup error never bypasses the
+    mandatory reload/verify sequencing that follows a registry mutation."""
+    try:
+        remove_manifest(name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("plugin sysreq manifest cleanup for %s failed "
+                       "(non-fatal): %s", name, exc)
+
+
 def _install_plugin_sysreqs(name: str, manifest: dict) -> dict | None:
     """§3.3: install a plugin's system requirements BEFORE registry activation.
     Returns an error envelope on failure (registry left unchanged), else None."""
@@ -3172,8 +3224,9 @@ def _install_plugin_sysreqs(name: str, manifest: dict) -> dict | None:
     if not reqs:
         # Sol round-3 M: an update to a manifest with NO requirements must clear
         # any stale row (add_plugin_entry replaces by name on the has-reqs path,
-        # so only this branch leaks). No-op for a brand-new plugin.
-        remove_manifest(name)
+        # so only this branch leaks). No-op for a brand-new plugin. Sol round-4:
+        # cleanup failure is non-fatal — never break the mutation sequence.
+        _safe_remove_manifest(name)
         return None
     try:
         outcomes = install_requirements(
@@ -3393,8 +3446,10 @@ def _plugin_remove_sync(*, name: str) -> dict:
     # a removed default stays removed across upgrades. Artifact left for GC.
     plugin_registry.save_registry(data)
     # Sol round-3 M: drop the plugin's system-requirement manifest row too, so a
-    # removed plugin leaves no stale reconciliation burden.
-    remove_manifest(name)
+    # removed plugin leaves no stale reconciliation burden. Sol round-4: this is
+    # NON-FATAL — a raise here (unwritable manifest) must not bypass the mandatory
+    # reload/verify tail that runs after the sync core returns ok.
+    _safe_remove_manifest(name)
     return {"ok": True, "name": name, "targets": targets,
             "artifact_retained": True}
 
@@ -3596,10 +3651,23 @@ def _tool_verify_plugin_state(
     env_conf = read_entries()
     secrets_status = []
     for var in sorted(required):
-        if var in env_conf:
-            source = "op" if env_conf[var].startswith("op://") else "plain"
+        conf_val = env_conf.get(var)
+        # Sol round-4: a secret counts as resolved only if it is present in the
+        # EFFECTIVE environment (boot sourced plugin-env.conf into os.environ,
+        # resolving op:// refs). A config entry whose op:// resolution FAILED at
+        # boot leaves os.environ unset — configuration presence alone must not
+        # mark it resolved, or a broken MCP plugin passes the launch gate.
+        effective = os.environ.get(var)
+        if effective and not effective.startswith("op://"):
+            source = "op" if (conf_val or "").startswith("op://") else "plain"
             secrets_status.append({"var": var, "source": source,
                                    "status": "resolved"})
+        elif conf_val is not None:
+            secrets_status.append({
+                "var": var,
+                "source": "op" if conf_val.startswith("op://") else "plain",
+                "status": "unresolved",
+                "reason": "configured but not resolved in the effective environment"})
         else:
             secrets_status.append({"var": var, "source": "missing",
                                    "status": "unresolved",

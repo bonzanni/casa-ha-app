@@ -344,3 +344,17 @@ def test_build_specialist_options_uses_passed_resolution(tmp_path, monkeypatch):
         _spec_cfg("finance"),
         resolution=ResolutionResult(registry_valid=True, plugins=[rp]))
     assert opts.plugins == [{"type": "local", "path": "/store/p/a"}]
+
+
+def test_resolution_from_recorded_empty_and_identity_mismatch(tmp_path):
+    """Sol round-4: empty recorded → zero plugins (authoritative); a recorded
+    artifact_id that disagrees with the on-disk metadata fails closed."""
+    import pytest
+    import tools as tools_mod
+    assert tools_mod._resolution_from_recorded([]).plugins == []
+    store = tmp_path / "store"
+    e = entry("p", ["specialist:finance"])
+    art = mk_artifact(store, "p", e["artifact_id"])
+    with pytest.raises(RuntimeError):
+        tools_mod._resolution_from_recorded(
+            [{"name": "p", "artifact_id": "d" * 64, "path": str(art)}])

@@ -462,6 +462,18 @@ plugin leaves its artifact in place. Automatic garbage collection is written but
 later version. Typical plugins are small (skills + a small MCP server), so this
 is not a concern for normal use.
 
+### Integrity model
+
+Artifact integrity rests on **content-addressing + checksum detection**: each
+artifact directory is named by a hash of its source, its bytes are checksum-
+verified on every resolve, and a mismatch is reported (`corrupt_artifact`) so a
+tampered or damaged artifact is never silently loaded. The write guards on
+`/config/plugins` and the read-only freeze of published files are **best-effort
+defense-in-depth** — the real trust boundary is each agent's minimal tool scope,
+not a hard filesystem barrier. They are not designed to stop a deliberately
+evasive process running as root; a true filesystem/privilege boundary is a
+separate, later hardening item.
+
 ### Migration & rollback
 
 On first boot after upgrading, a one-time migration converts any existing plugin
