@@ -85,11 +85,14 @@ def write_report(*, issues: list, warnings: list,
 
 
 def new_fingerprints(report: dict) -> list[str]:
-    """Issue fingerprints not yet notified (order-preserving, deduped)."""
+    """Issue AND warning fingerprints not yet notified (order-preserving,
+    deduped). Sol #17: warnings (e.g. ``legacy_provenance`` from an offline
+    adopt — a real trust downgrade) are operator-relevant and must also fire the
+    one-time DM, not merely land in the report."""
     notified = set(report.get("notified_fingerprints") or [])
     seen: set[str] = set()
     out: list[str] = []
-    for d in report.get("issues", []):
+    for d in list(report.get("issues", [])) + list(report.get("warnings", [])):
         fp = d.get("fingerprint")
         if fp and fp not in notified and fp not in seen:
             seen.add(fp)

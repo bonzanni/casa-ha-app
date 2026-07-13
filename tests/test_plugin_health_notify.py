@@ -76,3 +76,23 @@ async def test_empty_report_is_noop(tmp_path):
     bus = _FakeBus()
     await casa_core.notify_plugin_health(bus, path=str(p))
     assert bus.sent == []
+
+
+async def test_warning_only_change_fires_dm(tmp_path):
+    """Sol #17: a warning-only report (e.g. legacy_provenance from offline-adopt)
+    must fire the operator DM — new_fingerprints now spans warnings, and the DM
+    body lists them (not a vacuous '0 items')."""
+    path = tmp_path / "health.json"
+    w = PluginIssue(name="lesina", target=None, stage="migration",
+                    reason_code="legacy_provenance")
+    plugin_health.write_report(issues=[], warnings=[w], path=path)
+    report = plugin_health.load_report(path)
+    assert len(plugin_health.new_fingerprints(report)) == 1
+
+    bus = _FakeBus()
+    await casa_core.notify_plugin_health(bus, path=str(path))
+    assert len(bus.sent) == 1
+    assert "legacy_provenance" in bus.sent[0].content
+    # marked notified → second call is a no-op (deduped).
+    await casa_core.notify_plugin_health(bus, path=str(path))
+    assert len(bus.sent) == 1

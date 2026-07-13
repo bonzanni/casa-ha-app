@@ -526,6 +526,14 @@ async def block_dangerous_commands(
     reason = _command_is_dangerous(command)
     if reason is not None:
         return _deny(f"Blocked by safety hook: {reason}")
+    # Sol #5: also deny a Bash write into /config/plugins (registry/store).
+    # path_scope ignores Bash, so a claude_code executor (plugin-developer,
+    # configurator) could otherwise `echo > /config/plugins/registry.json`,
+    # bypassing plugin_add validation + §3.9 sequencing. Both executors carry
+    # block_dangerous_bash, so this closes the HTTP-hook path too — the same
+    # regex the resident/specialist settings guard uses.
+    if _PLUGINS_WRITE_RE.search(command):
+        return _deny(_PLUGINS_DENY_MSG)
     return {}
 
 

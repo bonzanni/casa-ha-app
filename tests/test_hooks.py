@@ -34,6 +34,23 @@ async def test_allow_safe_command():
     assert result == {}
 
 
+async def test_block_bash_write_to_plugins_registry():
+    """Sol #5: block_dangerous_bash also denies a Bash write into /config/plugins
+    (path_scope ignores Bash) — closes the claude_code executor HTTP-hook path."""
+    data = {"tool_name": "Bash",
+            "tool_input": {"command": "echo x > /config/plugins/registry.json"}}
+    result = await block_dangerous_commands(data, "tid-plugins", CTX)
+    assert _decision(result) == "deny"
+
+
+async def test_allow_bash_read_of_plugins_store():
+    """Reading the store (the plugin-developer's --plugin-dir'd content) is fine."""
+    data = {"tool_name": "Bash",
+            "tool_input": {"command": "cat /config/plugins/store/x/y/plugin.json"}}
+    result = await block_dangerous_commands(data, "tid-plug-read", CTX)
+    assert result == {}
+
+
 async def test_skip_non_bash_tools():
     data = {"tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}}
     result = await block_dangerous_commands(data, "tid-3", CTX)

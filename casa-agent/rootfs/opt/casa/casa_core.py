@@ -1150,13 +1150,17 @@ async def notify_plugin_health(
     if not fps:
         return
     fp_set = set(fps)
-    issues = [i for i in report.get("issues", [])
-              if i.get("fingerprint") in fp_set]
-    parts = [f"{i.get('name')} ({i.get('reason_code')})" for i in issues[:5]]
-    listed = ", ".join(parts) + (f" +{len(issues) - 5} more"
-                                 if len(issues) > 5 else "")
+    # Sol #17: the body must span issues AND warnings — new_fingerprints now
+    # includes warning fingerprints, so filtering only `issues` would announce a
+    # count of 0 for a warning-only change (and mark it notified anyway).
+    entries = [e for e in (list(report.get("issues", []))
+                           + list(report.get("warnings", [])))
+               if e.get("fingerprint") in fp_set]
+    parts = [f"{e.get('name')} ({e.get('reason_code')})" for e in entries[:5]]
+    listed = ", ".join(parts) + (f" +{len(entries) - 5} more"
+                                 if len(entries) > 5 else "")
     content = (
-        f"⚠️ Plugin health: {len(issues)} plugin issue(s) need attention: "
+        f"⚠️ Plugin health: {len(entries)} plugin item(s) need attention: "
         f"{listed}. See /data/plugin-health.json."
     )
     if "telegram" not in getattr(bus, "queues", {"telegram": None}):

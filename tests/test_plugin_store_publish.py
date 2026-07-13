@@ -31,6 +31,16 @@ pytestmark = pytest.mark.unit
 SHA = "a" * 40
 
 
+def _unfreeze(p: Path) -> None:
+    """Restore write on a published artifact file — publish() now freezes files
+    read-only (Sol #7). Tests that simulate corruption which BYPASSED the freeze
+    (privileged process / disk error) must defeat it first; the artifact_verdict
+    backstop must still catch the corruption."""
+    import os
+    import stat
+    os.chmod(p, stat.S_IMODE(os.lstat(p).st_mode) | 0o200)
+
+
 def _plugin_tree(tmp_path, name="probe", version="1.0.0") -> Path:
     root = tmp_path / "src"
     (root / ".claude-plugin").mkdir(parents=True)
@@ -155,7 +165,9 @@ def test_publish_existing_corrupt_fails_closed(tmp_path):
          patch("plugin_store.fetch_commit_tree", side_effect=_wire_fetch(src)):
         r1 = publish(name="probe", repo="o/r", ref="v1",
                      store_root=store, staging_root=staging)
-        # Tamper the published artifact.
+        # Tamper the published artifact (defeat the Sol #7 freeze to model
+        # corruption that bypassed it — the verdict backstop must still catch it).
+        _unfreeze(Path(r1.path) / "skills" / "s.md")
         (Path(r1.path) / "skills" / "s.md").write_text("evil", encoding="utf-8")
         with pytest.raises(StoreError) as ei:
             publish(name="probe", repo="o/r", ref="v1",
@@ -176,6 +188,7 @@ def test_publish_existing_wrong_identity_metadata_fails_closed(tmp_path):
         r1 = publish(name="probe", repo="o/r", ref="v1",
                      store_root=store, staging_root=staging)
         meta_path = Path(r1.path) / METADATA_FILENAME
+        _unfreeze(meta_path)
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         meta["revision"] = "git:" + "b" * 40      # wrong identity
         meta_path.write_text(json.dumps(meta), encoding="utf-8")
@@ -228,9 +241,29 @@ def test_import_bundle_idempotent_and_fail_closed(tmp_path):
     assert validate_artifact(dest)
     assert import_bundle(bundle, store_root=store) == []   # idempotent
     # Corrupt the store copy → issue raised, NOT silently replaced.
+    _unfreeze(dest / "skills" / "s.md")
     (dest / "skills" / "s.md").write_text("evil", encoding="utf-8")
     issues = import_bundle(bundle, store_root=store)
     assert [i.reason_code for i in issues] == ["corrupt_artifact"]
+
+
+def test_publish_freezes_artifact_files_readonly(tmp_path):
+    """Sol #7: a published artifact's files are read-only (no write bit for any
+    class) so in-place tampering can't defeat the cached deep-validation."""
+    import os
+    import stat
+    src = _plugin_tree(tmp_path)
+    store, staging = tmp_path / "store", tmp_path / "staging"
+    with patch("plugin_store.resolve_ref", return_value=SHA), \
+         patch("plugin_store.fetch_commit_tree", side_effect=_wire_fetch(src)):
+        r = publish(name="probe", repo="o/r", ref="v1",
+                    store_root=store, staging_root=staging)
+    skill = Path(r.path) / "skills" / "s.md"
+    mode = stat.S_IMODE(os.lstat(skill).st_mode)
+    assert mode & 0o222 == 0, f"artifact file still writable: {oct(mode)}"
+    # verify_bin backstop still readable (deep validation must pass).
+    from plugin_store import validate_artifact
+    assert validate_artifact(Path(r.path))
 
 
 def test_gc_disabled_returns_candidates_without_deleting(tmp_path):

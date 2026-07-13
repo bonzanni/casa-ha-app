@@ -319,8 +319,29 @@ def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
                    version=manifest["version"], checksum=checksum)
     dest.parent.mkdir(parents=True, exist_ok=True)
     os.rename(staged, dest)
+    _freeze_artifact_files(dest)
     return PublishResult(name, artifact_id, revision, manifest["version"],
                          str(dest), manifest)
+
+
+def _freeze_artifact_files(root: Path) -> None:
+    """Sol #7: strip write bits from a published artifact's FILES so the cached
+    deep-validation's immutability assumption holds against in-place tampering
+    (e.g. `echo >> skill.md` after the snapshot cached this artifact as valid).
+    Directories are left writable so plugin_remove / a future gc can still
+    rmtree without restoring perms. Best-effort — never fails a publish; the
+    /config/plugins write guards (Sol #5) are the primary barrier."""
+    import stat
+    try:
+        for dirpath, _dirs, files in os.walk(root):
+            for fn in files:
+                p = os.path.join(dirpath, fn)
+                try:
+                    os.chmod(p, stat.S_IMODE(os.lstat(p).st_mode) & ~0o222)
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
 
 def publish(*, name: str, repo: str, ref: str, subdir: str = "",

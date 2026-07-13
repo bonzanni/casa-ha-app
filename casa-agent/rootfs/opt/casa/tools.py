@@ -340,12 +340,26 @@ def _build_specialist_options(cfg) -> ClaudeAgentOptions:
         mcp_servers = {}
 
     resolved_hooks = resolve_hooks(cfg.hooks, default_cwd=cfg.cwd)
+    # Sol #5: inject the /config/plugins + settings.json guard code-side (like
+    # residents — agent.py step 5). A delegated specialist with Bash could
+    # otherwise `echo > /config/plugins/registry.json`, bypassing validation and
+    # §3.9 sequencing. Fresh dict so the shared resolved hooks aren't mutated.
+    from hooks import agent_home_settings_guard_matcher
+    resolved_hooks = dict(resolved_hooks)
+    resolved_hooks["PreToolUse"] = [
+        *resolved_hooks.get("PreToolUse", []),
+        agent_home_settings_guard_matcher(),
+    ]
 
-    # Unified plugin architecture (§3.3): resolve with the specialist's
-    # CONCRETE role (fixes the old role-less build_sdk_plugins that dropped
-    # project-scope plugins for specialists).
-    resolution = plugin_registry.resolve_for(
-        f"specialist:{getattr(cfg, 'role', 'unknown')}")
+    # Unified plugin architecture (§3.3): resolve with the CONCRETE tier + role.
+    # Sol #12: delegate_to_agent also routes RESIDENTS through this builder
+    # (sync/async delegation of e.g. butler), so a hardcoded "specialist:"
+    # dropped a delegated resident's resident:<role> plugins. Use the
+    # authoritative AgentRegistry tier; fall back to specialist for unknown roles.
+    _role = getattr(cfg, "role", "unknown")
+    _tier = (_agent_registry.tier_for_role(_role)
+             if _agent_registry is not None else None) or "specialist"
+    resolution = plugin_registry.resolve_for(f"{_tier}:{_role}")
     sdk_plugins = [{"type": "local", "path": rp.path}
                    for rp in resolution.plugins]
 
@@ -409,6 +423,15 @@ def _build_executor_options(defn, *, executor_type: str,
         hooks_cfg = HooksConfig(pre_tool_use=list(raw.get("pre_tool_use") or []))
 
     resolved_hooks = resolve_hooks(hooks_cfg, default_cwd="/config")
+    # Sol #5: in_casa executors (e.g. configurator, cwd=/config, Bash allowed)
+    # could `echo > /config/plugins/registry.json` — inject the same code-side
+    # guard so a Bash write to /config/plugins or settings.json is denied.
+    from hooks import agent_home_settings_guard_matcher
+    resolved_hooks = dict(resolved_hooks)
+    resolved_hooks["PreToolUse"] = [
+        *resolved_hooks.get("PreToolUse", []),
+        agent_home_settings_guard_matcher(),
+    ]
 
     if _mcp_registry is not None:
         mcp_servers = _mcp_registry.resolve(defn.mcp_server_names)
@@ -3119,7 +3142,18 @@ def _resolved_observability(name: str) -> dict:
     "Add a plugin to the registry: publish its pinned artifact, install any "
     "system requirements, assign it to targets, then reload + verify. Version "
     "is derived from the plugin manifest (never supplied).",
-    {"name": str, "repo": str, "ref": str, "subdir": str, "targets": list},
+    # Sol #15: an explicit JSON Schema — the shorthand {key: type} form marks
+    # EVERY key required, so a root-plugin call omitting `subdir` (defaulted by
+    # the handler) is rejected by the MCP input validator before the handler
+    # runs. `subdir` is the only optional field.
+    {"type": "object",
+     "properties": {
+         "name": {"type": "string"},
+         "repo": {"type": "string"},
+         "ref": {"type": "string"},
+         "subdir": {"type": "string"},
+         "targets": {"type": "array"}},
+     "required": ["name", "repo", "ref", "targets"]},
 )
 async def plugin_add(args: dict) -> dict:
     async with _PLUGIN_TOOLS_LOCK:

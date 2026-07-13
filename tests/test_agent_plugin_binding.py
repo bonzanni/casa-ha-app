@@ -269,3 +269,43 @@ def test_first_contact_healthy_turn_leaves_flag_pending(tmp_path, monkeypatch):
         assert a._health_notice_pending is False
 
     asyncio.run(run())
+
+
+def test_delegated_resident_resolves_resident_tier(tmp_path, monkeypatch):
+    """Sol #12: delegate_to_agent routes residents through
+    _build_specialist_options; it must resolve the RESIDENT tier (via
+    AgentRegistry.tier_for_role) — hardcoding specialist: dropped a delegated
+    resident's resident:<role> plugins."""
+    import tools as tools_mod
+    store = tmp_path / "store"
+    e = entry("butlerplug", ["resident:butler"])
+    art = mk_artifact(store, "butlerplug", e["artifact_id"])
+    reload_snapshot(registry_path=mk_registry(tmp_path, [e]), store_root=store)
+    monkeypatch.setattr(tools_mod, "_mcp_registry", None, raising=False)
+    monkeypatch.setattr(
+        tools_mod, "_agent_registry",
+        SimpleNamespace(tier_for_role=lambda r: "resident" if r == "butler"
+                        else None), raising=False)
+    opts = tools_mod._build_specialist_options(_spec_cfg("butler"))
+    assert opts.plugins == [{"type": "local", "path": str(art)}]
+
+
+def test_specialist_and_executor_options_inject_plugins_guard(tmp_path,
+                                                              monkeypatch):
+    """Sol #5: the /config/plugins + settings.json guard is injected code-side
+    into specialist AND executor options — not just residents."""
+    import tools as tools_mod
+    store = tmp_path / "store"
+    e = entry("p", ["specialist:finance"])
+    mk_artifact(store, "p", e["artifact_id"])
+    reload_snapshot(registry_path=mk_registry(tmp_path, [e]), store_root=store)
+    monkeypatch.setattr(tools_mod, "_mcp_registry", None, raising=False)
+
+    def _has_guard(opts):
+        pre = (opts.hooks or {}).get("PreToolUse", [])
+        return any(getattr(m, "matcher", None) == "Write|Edit|MultiEdit|Bash"
+                   for m in pre)
+
+    assert _has_guard(tools_mod._build_specialist_options(_spec_cfg("finance")))
+    assert _has_guard(tools_mod._build_executor_options(
+        _exec_defn(), executor_type="probe-exec"))

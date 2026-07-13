@@ -401,3 +401,15 @@ async def test_plugin_list_reports_presence_and_seeded(monkeypatch, tmp_path):
     assert row["seeded_default"] is True
     assert row["artifact_present"] is False           # store dir absent in test
     assert row["targets"] == ["executor:plugin-developer"]
+
+
+def test_plugin_add_schema_subdir_optional():
+    """Sol #15: the plugin_add schema must NOT mark subdir required — the
+    shorthand {key: type} form marked every key required, so a root-plugin call
+    omitting subdir was rejected by the MCP input validator before the handler
+    (which defaults it) ever ran."""
+    import tools
+    schema = tools.plugin_add.input_schema
+    assert schema.get("type") == "object"
+    assert "subdir" not in schema["required"]
+    assert set(schema["required"]) == {"name", "repo", "ref", "targets"}
