@@ -8,6 +8,8 @@ by tests/test_trigger_registry.py).
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from bus import MessageType
@@ -167,3 +169,43 @@ class TestWebhookRateLimit:
             assert r.status == 429
             payload = await r.json()
             assert payload == {"error": "rate_limited"}
+
+
+# ---------------------------------------------------------------------------
+# v0.75.0 (W5/Sol B3,B4, r4-B1/B3): graceful-shutdown broker drain barrier
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBrokerShutdownOrdering:
+    """Every live verdict_broker request must be resolved (cancelled) and
+    its keyboard-edit finish-hook flushed BEFORE channel_manager.stop_all()
+    tears the channels down — a finish hook firing after the channel is
+    stopped can't edit anything."""
+
+    async def test_broker_drained_before_channel_manager_stops(self, monkeypatch):
+        import verdict_broker
+        from casa_core import _drain_broker_before_channel_shutdown
+
+        order: list[str] = []
+
+        class _FakeBroker:
+            def cancel_all(self, *, reason):
+                order.append(f"cancel_all:{reason}")
+
+            async def drain_hooks(self):
+                order.append("drain_hooks")
+
+        monkeypatch.setattr(verdict_broker, "BROKER", _FakeBroker())
+
+        channel_manager = MagicMock()
+
+        async def _stop_all():
+            order.append("stop_all")
+
+        channel_manager.stop_all = AsyncMock(side_effect=_stop_all)
+
+        await _drain_broker_before_channel_shutdown(channel_manager)
+
+        assert order == ["cancel_all:casa_shutdown", "drain_hooks", "stop_all"]
+        channel_manager.stop_all.assert_awaited_once()

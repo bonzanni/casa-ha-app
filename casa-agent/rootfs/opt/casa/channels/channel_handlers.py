@@ -31,19 +31,21 @@ Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
 
 # ---------------------------------------------------------------------------
-# Module-level state — permission verdict queue
+# Module-level state — permission verdict queue (DEPRECATED, v0.75.0)
 # ---------------------------------------------------------------------------
 #
-# casa-main's CallbackQueryHandler posts onto /internal/channel/permission_verdict;
-# the per-engagement channel server long-polls /internal/channel/permission_pending
-# and drains entries to emit notifications/claude/channel/permission back to
-# Claude. Module-level since both handlers live in the same process.
+# v0.75.0 (W5/Sol B3,B4): _make_permission_verdict now delivers straight into
+# verdict_broker.BROKER — the long-poll consumer (_make_permission_pending)
+# this queue used to feed was removed. _PERMISSION_QUEUES is kept
+# accepted-and-ignored for one release (hooks.make_engagement_permission_relay
+# still accepts a now-unused ``queues=`` kwarg; _finalize_engagement still
+# pops the per-engagement entry as a no-op leak guard) — delete once every
+# call site has dropped the parameter.
 
 _PERMISSION_QUEUES: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
 
-# v0.37.2 (C-1): public alias for consumers outside this module
-# (the engagement_permission_relay hook in casa_core wires the same
-# dict so the Telegram callback producer + hook consumer share state).
+# v0.37.2 (C-1): public alias for consumers outside this module (deprecated
+# alongside _PERMISSION_QUEUES above).
 PERMISSION_QUEUES = _PERMISSION_QUEUES
 
 
@@ -174,19 +176,27 @@ def _make_post_inline_keyboard(
 def _make_permission_verdict(engagement_registry: Any) -> Handler:
     """POST /internal/channel/permission_verdict — casa-main → channel server.
 
-    Phase 2 (Task 21): CallbackQueryHandler posts here when an operator taps
-    the U1 inline-keyboard verdict button. Pushes onto the per-engagement
-    queue; the channel server's long-poll drain pulls it and emits
-    ``notifications/claude/channel/permission`` to Claude.
+    v0.75.0 (W5/Sol B3,B4): CallbackQueryHandler posts here when an operator
+    taps the U1 inline-keyboard verdict button. Delivers the verdict directly
+    into ``verdict_broker.BROKER`` (namespace ``"permission"``, scope =
+    engagement_id) — the ``engagement_permission_relay`` hook awaits that
+    same broker request, so this is a pure hand-off with no queue in between.
 
     Body shape: ``{engagement_id, request_id, verdict, operator_id?}``.
-    Response: ``{ok: bool, error?: <code>}``.
+    Response: ``{"ok": True, "result": <broker deliver() outcome>}`` or a
+    known failure ``{"ok": False, "error": <code>}``.
+
+    ``result`` is one of ``"delivered"`` (this tap won the live request),
+    ``"stale"`` (no live request — timed out/cancelled/already resolved), or
+    ``"duplicate"`` (a winning tap already claimed this request).
 
     Error codes: ``bad_json``, ``missing_engagement_id``, ``missing_request_id``,
     ``missing_verdict``, ``unknown_engagement``.
     """
 
     async def handler(request: web.Request) -> web.Response:
+        from verdict_broker import BROKER
+
         try:
             body = await request.json()
         except Exception:
@@ -215,43 +225,12 @@ def _make_permission_verdict(engagement_registry: Any) -> Handler:
                 {"ok": False, "error": "unknown_engagement"},
             )
 
-        await _PERMISSION_QUEUES[eng_id].put({
-            "request_id": request_id,
-            "verdict": verdict,
-            "operator_id": body.get("operator_id"),
-        })
-        return web.json_response({"ok": True})
-
-    return handler
-
-
-def _make_permission_pending() -> Handler:
-    """GET /internal/channel/permission_pending — channel server long-poll.
-
-    Phase 2 (Task 21): the per-engagement channel server polls this with
-    ``?engagement_id=<id>&timeout_s=<seconds>`` (default 25s). Returns
-    ``{}`` on timeout so the server can re-poll without inferring an error.
-
-    On verdict arrival, returns ``{request_id, verdict, operator_id}``.
-    """
-
-    async def handler(request: web.Request) -> web.Response:
-        eng_id = request.query.get("engagement_id")
-        if not eng_id:
-            return web.json_response({})
-        try:
-            timeout_s = float(request.query.get("timeout_s", "25"))
-        except ValueError:
-            timeout_s = 25.0
-        # ``defaultdict[asyncio.Queue]`` materialises a queue on first lookup;
-        # this is fine because the verdict-poster also keys by engagement_id
-        # and both producers/consumers run in the same loop.
-        q = _PERMISSION_QUEUES[eng_id]
-        try:
-            verdict = await asyncio.wait_for(q.get(), timeout=timeout_s)
-        except asyncio.TimeoutError:
-            return web.json_response({})
-        return web.json_response(verdict)
+        option_index = 0 if verdict == "allow" else 1
+        result = BROKER.deliver(
+            namespace="permission", scope=eng_id, request_id=request_id,
+            option_index=option_index, actor_id=body.get("operator_id"),
+        )
+        return web.json_response({"ok": True, "result": result})
 
     return handler
 
@@ -333,15 +312,16 @@ def _make_channel_get_handlers(
 ) -> dict[str, Handler]:
     """Return a path → handler dict for /internal/channel/* GETs.
 
-    Phase 2 (Task 21): ``permission_pending`` long-poll. Kept separate from
-    the POST family so the casa_core wiring can add them via ``router.add_get``
-    rather than ``router.add_post``.
+    v0.75.0 (W5/Sol B3,B4): the ``permission_pending`` long-poll (Task 21)
+    was removed — verdicts now flow through ``verdict_broker.BROKER``
+    directly (see ``_make_permission_verdict``), no queue/poll needed. Kept
+    as an (empty, for now) factory so ``casa_core``'s generic
+    ``router.add_get`` loop over this dict needs no changes when a real GET
+    handler is added here in the future.
     """
-    # engagement_registry isn't strictly needed by the GET handler today, but
-    # keeping the symmetric (engagement_registry=) signature lets a future
-    # GET (e.g. /internal/channel/status?engagement_id=) reuse it without
-    # adding another factory.
+    # engagement_registry isn't strictly needed by the GET handler family
+    # today, but keeping the symmetric (engagement_registry=) signature lets
+    # a future GET (e.g. /internal/channel/status?engagement_id=) reuse it
+    # without adding another factory.
     del engagement_registry
-    return {
-        "/internal/channel/permission_pending": _make_permission_pending(),
-    }
+    return {}

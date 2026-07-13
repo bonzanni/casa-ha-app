@@ -2143,6 +2143,22 @@ async def _finalize_engagement(
             )
             return False
 
+    # r5-B6: the instant THIS call won the terminal flip, cancel pending
+    # broker requests so a late ask/permission tap can't be answered
+    # post-terminal, and DRAIN finish-hooks so their keyboard "expired"
+    # edits land while the topic is STILL OPEN (below closes it). Must
+    # precede the topic ops, not follow driver teardown — the old placement
+    # let a pending ask resolve after the terminal flip and scheduled its
+    # edit only after topic closure.
+    try:
+        from verdict_broker import BROKER
+        for ns in ("permission", "engagement_ask"):
+            BROKER.cancel_scope(namespace=ns, scope=engagement.id,
+                                reason="engagement_terminal")
+        await BROKER.drain_hooks()      # flush keyboard edits BEFORE close_topic
+    except Exception:  # noqa: BLE001
+        pass
+
     # [AR-4] Topic-retention ledger (2026-07-10 design): record the topic
     # for the retention sweep the moment the record flips terminal — both
     # drivers, all outcomes, regardless of whether close_topic below

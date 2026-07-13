@@ -45,8 +45,8 @@ class TestPostPermKeyboard:
         assert len(rows) == 1 and len(rows[0]) == 2
         cd_allow = rows[0][0].callback_data
         cd_deny = rows[0][1].callback_data
-        assert cd_allow == "perm:allow:rid_abc"
-        assert cd_deny == "perm:deny:rid_abc"
+        assert cd_allow == "v1|permission|rid_abc|0"
+        assert cd_deny == "v1|permission|rid_abc|1"
 
     async def test_unknown_engagement_returns_none(self):
         from channels import telegram as tg_mod

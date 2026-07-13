@@ -669,6 +669,20 @@ def _wire_engagement_permission_relay(
     return cc_hook_policies
 
 
+async def _drain_broker_before_channel_shutdown(channel_manager: Any) -> None:
+    """Graceful-shutdown barrier (r4-B1/B3): resolve every live
+    ``verdict_broker`` request as ``cancelled`` and let its keyboard-edit
+    finish-hook flush, BEFORE the channels (Telegram bot, etc.) tear down.
+
+    Must run immediately before ``channel_manager.stop_all()`` — a finish
+    hook that fires after the channel is stopped can't edit anything.
+    """
+    from verdict_broker import BROKER
+    BROKER.cancel_all(reason="casa_shutdown")
+    await BROKER.drain_hooks()
+    await channel_manager.stop_all()
+
+
 _STATUS_PAGE = """\
 <!DOCTYPE html>
 <html lang="en"><head>
@@ -2203,7 +2217,7 @@ async def main() -> None:
         task.cancel()
     await asyncio.gather(*all_loop_tasks, return_exceptions=True)
 
-    await channel_manager.stop_all()
+    await _drain_broker_before_channel_shutdown(channel_manager)
     # Close the shared Hindsight client session (L32) so aiohttp does not
     # warn about an unclosed session; no-op for NoOp/other backends.
     try:
