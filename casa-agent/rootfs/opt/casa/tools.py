@@ -1487,6 +1487,27 @@ async def engage_executor(args: dict) -> dict:
                 "message": (f"required plugin(s) unavailable for "
                             f"{executor_type!r}: {detail}"),
             })
+        # Sol round-3 B4: also gate on CONFIGURED readiness — a resolvable plugin
+        # that is not ready (authorization_missing / unresolved secret / missing
+        # system requirement / malformed .mcp.json) must NOT launch with
+        # --plugin-dir. Check each assigned plugin's executor-target row through
+        # the same verification path.
+        target = f"executor:{executor_type}"
+        not_ready = []
+        for rp in res.plugins:
+            v = _tool_verify_plugin_state(plugin_name=rp.name)
+            row = next((r for r in v.get("targets", [])
+                        if r.get("target") == target), None)
+            if row is not None and not row.get("ready"):
+                not_ready.append((rp.name, (row.get("reasons") or ["not_ready"])[0]))
+            elif row is None and v.get("ready") is not True:
+                not_ready.append((rp.name, (v.get("reasons") or ["not_ready"])[0]))
+        if not_ready:
+            return res, (), _result({
+                "status": "error", "kind": "plugin_not_ready",
+                "message": (f"plugin(s) not ready for {executor_type!r}: "
+                            f"{not_ready} (see /data/plugin-health.json)"),
+            })
         arts = tuple(
             {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
             for rp in res.plugins)
@@ -2947,25 +2968,35 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
     seen = {(getattr(e, "name", None), getattr(e, "target", None),
              getattr(e, "reason_code", None)) for e in extra_issues}
     runtime_issues: list = []
+    def _add(name, target, reason):
+        key = (name, target, reason)
+        if key not in seen:
+            seen.add(key)
+            runtime_issues.append(PluginIssue(
+                name=name, target=target, stage="verify", reason_code=reason))
+
     reg = load_registry()
     if reg.valid:
         for entry in reg.entries:
             name = entry.get("name")
             try:
                 verify = _tool_verify_plugin_state(plugin_name=name)
-            except Exception:  # noqa: BLE001 — never fail health regen on one plugin
+            except Exception:  # noqa: BLE001
+                # Sol round-3 H13: a verifier crash is ITSELF a health problem —
+                # surface it, never silently drop the plugin from the report.
+                _add(name, None, "verify_exception")
                 continue
-            for row in (verify.get("targets") or []):
-                if row.get("ready"):
-                    continue
-                reason = (row.get("reasons") or ["not_ready"])[0]
-                key = (name, row.get("target"), reason)
-                if key in seen:
-                    continue
-                seen.add(key)
-                runtime_issues.append(PluginIssue(
-                    name=name, target=row.get("target"), stage="verify",
-                    reason_code=reason))
+            rows = verify.get("targets") or []
+            for row in rows:
+                if not row.get("ready"):
+                    _add(name, row.get("target"),
+                         (row.get("reasons") or ["not_ready"])[0])
+            # Sol round-3 H13: a top-level not-ready with NO target rows (e.g. an
+            # unassigned plugin with a missing secret / mcp_invalid) would else be
+            # erased — surface it against the plugin itself.
+            if verify.get("ready") is not True and not rows:
+                for reason in (verify.get("reasons") or ["not_ready"]):
+                    _add(name, None, reason)
     plugin_health.write_report(
         issues=list(res.issues) + list(extra_issues) + runtime_issues,
         warnings=list(res.warnings),
@@ -3055,6 +3086,20 @@ async def _reload_and_verify_targets(name: str, targets: list,
             else:
                 reload_errors.append({"target": target, **res})
         # executors: nothing to reconstruct (per-launch resolution).
+    # Sol round-3 B2a: reconstruction leaves the new Agent's _plugin_resolution
+    # lazy (None until its first turn) — verify would then classify a live,
+    # registered agent as "dormant" and green it BEFORE its binding is captured.
+    # Force resolution now so verify sees "active" and confirms binding==desired.
+    agents = getattr(runtime, "agents", {}) or {}
+    for target in reloaded:
+        _, _, role = target.partition(":")
+        agent = agents.get(role)
+        if agent is not None and getattr(agent, "_plugin_resolution", None) is None:
+            try:
+                await agent._get_plugin_resolution()
+            except Exception:  # noqa: BLE001 — never fail the mutation on resolve
+                logger.debug("post-reconstruct resolve failed for %s",
+                             role, exc_info=True)
     verify = await asyncio.to_thread(_tool_verify_plugin_state, plugin_name=name)
     ok = (not reload_errors
           and _postcondition_holds(verify, targets, expect=expect,
@@ -3406,12 +3451,16 @@ def _tool_verify_plugin_state(
     # drops (duplicate_name) or skips (entry_invalid) is unavailable to every
     # agent/executor — verify must not green it off the raw list. Select from
     # the VALIDATED entries and surface the resolver's own rejection reason.
-    bad = next((i for i in reg.entry_issues if i.name == plugin_name), None)
-    if bad is not None:
-        return {"ready": False, "reasons": [bad.reason_code], "targets": []}
+    # Sol round-3 M-shadow: PREFER a validated resolved entry. A rejection issue
+    # (entry_invalid / duplicate_name) only blocks when NO validated entry of
+    # this name survived — otherwise an unrelated same-name invalid entry would
+    # shadow the valid one the resolver actually serves.
     entry = next((e for e in reg.entries
                   if isinstance(e, dict) and e.get("name") == plugin_name), None)
     if entry is None:
+        bad = next((i for i in reg.entry_issues if i.name == plugin_name), None)
+        if bad is not None:
+            return {"ready": False, "reasons": [bad.reason_code], "targets": []}
         return {"ready": False, "reasons": ["not_registered"], "targets": []}
 
     store_root = _store_root if _store_root is not None else STORE_ROOT

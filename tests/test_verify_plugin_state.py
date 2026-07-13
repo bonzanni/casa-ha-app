@@ -412,3 +412,39 @@ def test_reload_track_and_drop_draining():
     assert runtime.draining == []
     assert _track_draining(
         runtime, "x", SimpleNamespace(active_plugin_binding={})) is None
+
+
+def test_verify_prefers_valid_entry_over_same_name_invalid(tmp_path):
+    """Sol round-3 M-shadow: a valid entry must not be shadowed by an unrelated
+    same-name invalid entry — verify serves the resolved (valid) one."""
+    store = tmp_path / "store"
+    valid = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", valid["artifact_id"])
+    invalid = dict(valid)
+    invalid["artifact_id"] = "z" * 64            # → entry_invalid (id mismatch)
+    mk_registry(tmp_path, [invalid, valid])      # invalid first
+    r = _verify(tmp_path)
+    assert r["ready"] is True                     # valid entry served, not shadowed
+
+
+def test_regenerate_health_surfaces_verify_exception(monkeypatch):
+    """Sol round-3 H13: a verifier crash on one plugin is surfaced as an issue,
+    not silently dropped."""
+    import tools
+    import plugin_health
+    import plugin_registry
+    captured = {}
+    monkeypatch.setattr(plugin_registry, "resolve_all",
+                        lambda: SimpleNamespace(issues=[], warnings=[]))
+    monkeypatch.setattr(plugin_registry, "load_registry",
+                        lambda *a, **k: SimpleNamespace(
+                            valid=True, entries=[{"name": "boom"}]))
+
+    def _verify_boom(*, plugin_name):
+        raise RuntimeError("verify crashed")
+
+    monkeypatch.setattr(tools, "_tool_verify_plugin_state", _verify_boom)
+    monkeypatch.setattr(plugin_health, "write_report",
+                        lambda **k: captured.update(k))
+    tools._regenerate_plugin_health([])
+    assert any(i.reason_code == "verify_exception" for i in captured["issues"])
