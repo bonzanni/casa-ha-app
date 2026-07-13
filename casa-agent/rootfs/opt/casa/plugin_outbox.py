@@ -1,0 +1,336 @@
+"""Shared /data media outbox — FD-based, TOCTOU-safe (v0.73.0, spec §3.4).
+
+A producing plugin writes a file into ``/data/plugin-outbox/`` (atomic
+``.part`` -> rename) and returns ONLY its path. The ``send_media`` tool then:
+
+  1. **claim** it by atomic rename into the private ``.claims/`` subdir under a
+     ``<epoch_ms>-<uuid4>`` name (exclusive ownership — removes cleanup and
+     concurrency races; exactly one caller wins, a loser gets ``missing``);
+  2. **capture** the bytes from a guarded ``O_NOFOLLOW`` FD opened *by the claim
+     name* (validate == read; never re-open by the original path);
+  3. **remove** the claim on EVERY outcome.
+
+The realpath-under-outbox check + an ``lstat`` regular-file type-gate +
+``O_NOFOLLOW`` + ``st_nlink == 1`` + fstat-then-read-the-same-FD is the
+exfiltration control; magic is a format/kind sanity gate, not the control.
+Same-uid-root producers are outside the model (§3.4): both dirs are
+``chmod 0770`` and the claim name is unpredictable, but a root racer is not
+defended against.
+
+Dependency-neutral: imports ``media_policies`` + stdlib only.
+"""
+from __future__ import annotations
+
+import errno
+import logging
+import os
+import shutil
+import stat
+import uuid
+
+from media_policies import MEDIA_POLICIES
+
+logger = logging.getLogger(__name__)
+
+OUTBOX_ENV = "CASA_PLUGIN_OUTBOX_DIR"
+CLAIMS_SUBDIR = ".claims"
+MAX_AGE_S = 2 * 3600  # orphan reap threshold for the sweep
+
+_DIR_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+class OutboxError(Exception):
+    """A guard/capture failure carrying a stable ``kind_error`` string."""
+
+    def __init__(self, kind: str, message: str = "") -> None:
+        super().__init__(message or kind)
+        self.kind = kind
+
+
+def _safe_basename(name: str) -> bool:
+    """True iff *name* is a single control-free path component (not . / ..)."""
+    if not name or name in (".", ".."):
+        return False
+    if "/" in name or "\0" in name:
+        return False
+    return not any(ord(c) < 0x20 for c in name)
+
+
+def _read_capped(fd: int, cap: int) -> bytes:
+    """Read at most ``cap + 1`` bytes from *fd* (one extra so the caller can
+    detect an over-cap file). Loops over short reads."""
+    limit = cap + 1
+    chunks: list[bytes] = []
+    total = 0
+    while total < limit:
+        block = os.read(fd, limit - total)
+        if not block:
+            break
+        chunks.append(block)
+        total += len(block)
+    return b"".join(chunks)
+
+
+def _listdir_quiet(dirfd: int) -> list[str]:
+    try:
+        return os.listdir(dirfd)
+    except OSError:
+        return []
+
+
+def _lstat_quiet(name: str, dirfd: int):
+    try:
+        return os.lstat(name, dir_fd=dirfd)
+    except OSError:
+        return None
+
+
+def _claim_epoch_ms(name: str):
+    """Parse the ``<epoch_ms>`` prefix of a claim name; None if unparseable."""
+    prefix = name.split("-", 1)[0]
+    try:
+        return int(prefix)
+    except ValueError:
+        return None
+
+
+class PluginOutbox:
+    def __init__(self, root: str) -> None:
+        self._root_realpath = os.path.realpath(root)
+        self._claims_realpath = os.path.join(self._root_realpath, CLAIMS_SUBDIR)
+        # Belt-and-suspenders: setup-configs.sh creates these at boot, but make
+        # the module self-sufficient (idempotent) for tests and cold starts.
+        os.makedirs(self._root_realpath, exist_ok=True)
+        os.makedirs(self._claims_realpath, exist_ok=True)
+        os.chmod(self._root_realpath, 0o770)
+        os.chmod(self._claims_realpath, 0o770)
+        # Long-lived dir FDs pinned to the real inodes: subsequent operations go
+        # through these, immune to a later swap of the /data/plugin-outbox path
+        # to a symlink.
+        self._outbox_dirfd = os.open(self._root_realpath, _DIR_OPEN_FLAGS)
+        self._claims_dirfd = os.open(self._claims_realpath, _DIR_OPEN_FLAGS)
+
+    # -- claim ----------------------------------------------------------------
+
+    def claim(self, requested_path: str) -> str:
+        """Atomically claim *requested_path* into ``.claims/`` and return the
+        claim name. Raises
+        ``OutboxError(bad_name|outside_outbox|missing|guard_error)``."""
+        basename = os.path.basename(requested_path)
+        if not _safe_basename(basename):
+            raise OutboxError("bad_name", f"unsafe basename {basename!r}")
+        # The path MUST carry a dirname that realpaths to the outbox root. A
+        # BARE basename (empty dirname) is refused deterministically — else
+        # ``realpath("")`` == CWD could accidentally match when CWD is the outbox.
+        parent = os.path.dirname(requested_path)
+        if not parent or os.path.realpath(parent) != self._root_realpath:
+            raise OutboxError("outside_outbox", "path is not directly under the outbox")
+        claim_name = f"{_now_ms()}-{uuid.uuid4().hex}"
+        try:
+            os.rename(basename, claim_name,
+                      src_dir_fd=self._outbox_dirfd, dst_dir_fd=self._claims_dirfd)
+        except FileNotFoundError as exc:
+            raise OutboxError("missing", "source vanished before claim") from exc
+        except OSError as exc:
+            # EXDEV/EACCES/EISDIR/etc. — a guard/FS failure, NOT a clean "missing".
+            raise OutboxError("guard_error",
+                              f"claim rename failed: errno {exc.errno}") from exc
+        return claim_name
+
+    # -- cleanup --------------------------------------------------------------
+
+    def remove_claim(self, claim_name: str) -> None:
+        """Remove a claim inode by type, ALL relative to the pinned ``.claims/``
+        dir-FD (no path-based op — keeps the FD boundary). ``shutil.rmtree``'s
+        ``dir_fd`` kwarg is **Python 3.11+** (verified against the 3.11 docs;
+        the container base is 3.11). A directory-typed claim (a misbehaving
+        producer) is rmtree'd — ``os.rmdir`` would fail on a non-empty dir.
+        Unconditional."""
+        try:
+            st = os.lstat(claim_name, dir_fd=self._claims_dirfd)
+        except FileNotFoundError:
+            return  # already gone — nothing to do
+        if stat.S_ISDIR(st.st_mode):
+            shutil.rmtree(claim_name, dir_fd=self._claims_dirfd)
+        else:
+            os.unlink(claim_name, dir_fd=self._claims_dirfd)
+
+    # -- capture --------------------------------------------------------------
+
+    def capture(self, claim_name: str, kind: str) -> bytes:
+        """Validate == read the claimed inode via a guarded FD, then return its
+        bytes. Never re-opens by the original path. Raises
+        ``OutboxError(not_regular|multi_link|too_large|magic_mismatch|guard_error)``.
+        Synchronous — the tool runs it via ``asyncio.to_thread``."""
+        cap = MEDIA_POLICIES[kind].size_cap
+        # Type-gate via lstat FIRST: only a regular file is deliverable. This
+        # rejects symlink/socket/fifo/dir/device UNIFORMLY as not_regular — a
+        # socket open() returns ENXIO (NOT ELOOP), so errno-matching on the open
+        # alone is insufficient. O_NOFOLLOW + the post-open fstat re-check then
+        # defend the lstat->open TOCTOU (a symlink swapped in after lstat -> ELOOP).
+        try:
+            st0 = os.lstat(claim_name, dir_fd=self._claims_dirfd)
+        except OSError as exc:
+            raise OutboxError("guard_error", f"lstat failed: errno {exc.errno}") from exc
+        if not stat.S_ISREG(st0.st_mode):
+            raise OutboxError("not_regular", "claimed inode is not a regular file")
+        try:
+            fd = os.open(
+                claim_name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=self._claims_dirfd,
+            )
+        except OSError as exc:
+            # A symlink swapped in AFTER the lstat (TOCTOU) -> O_NOFOLLOW ELOOP.
+            # Any other open failure is an unexpected guard fault, not a type verdict.
+            if exc.errno == errno.ELOOP:
+                raise OutboxError("not_regular",
+                                  "symlink swapped in; refused by O_NOFOLLOW") from exc
+            raise OutboxError("guard_error",
+                              f"open failed: errno {exc.errno}") from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OutboxError("not_regular", "inode changed type after lstat")
+            if st.st_nlink != 1:
+                raise OutboxError("multi_link", f"st_nlink={st.st_nlink}")
+            if st.st_size > cap:
+                raise OutboxError("too_large", f"{st.st_size} > {cap}")
+            content = _read_capped(fd, cap)
+            if len(content) > cap:
+                raise OutboxError("too_large", "read exceeded cap")
+            if len(content) < st.st_size:
+                # A claimed regular file shrinking between fstat and read is an
+                # integrity anomaly (only a root racer could) — refuse.
+                raise OutboxError("guard_error", "file shrank during read")
+            if not MEDIA_POLICIES[kind].accepts(content):
+                raise OutboxError("magic_mismatch",
+                                  f"head bytes not valid for kind {kind!r}")
+            return content
+        except OutboxError:
+            raise
+        except OSError as exc:
+            raise OutboxError("guard_error", f"read failed: {exc.errno}") from exc
+        finally:
+            os.close(fd)
+
+    # -- sweep ----------------------------------------------------------------
+
+    def sweep_once(self, now_ms: int) -> int:
+        """Reap orphans: outbox-root entries by lstat mtime, ``.claims/`` entries
+        by embedded epoch; both older than ``MAX_AGE_S``. Never follows symlinks.
+        Returns the count reaped. Synchronous (run via ``asyncio.to_thread``)."""
+        cutoff_ms = MAX_AGE_S * 1000
+        reaped = 0
+        # Outbox root — skip the .claims dir; reap producer leftovers by mtime.
+        for name in _listdir_quiet(self._outbox_dirfd):
+            if name == CLAIMS_SUBDIR:
+                continue
+            st = _lstat_quiet(name, self._outbox_dirfd)
+            if st is None:
+                continue
+            if now_ms - int(st.st_mtime * 1000) > cutoff_ms:
+                reaped += self._reap(self._outbox_dirfd, name, st)
+        # Claims — age is the embedded epoch (rename preserves source mtime, so
+        # mtime is NOT claim age). Unparseable names fall back to mtime.
+        for name in _listdir_quiet(self._claims_dirfd):
+            epoch_ms = _claim_epoch_ms(name)
+            st = _lstat_quiet(name, self._claims_dirfd)
+            if st is None:
+                continue
+            age_ref = epoch_ms if epoch_ms is not None else int(st.st_mtime * 1000)
+            if now_ms - age_ref > cutoff_ms:
+                reaped += self._reap(self._claims_dirfd, name, st)
+        return reaped
+
+    def _reap(self, dirfd: int, name: str, st: os.stat_result) -> int:
+        # All relative to the pinned dir-FD (rmtree dir_fd is 3.11+).
+        try:
+            if stat.S_ISDIR(st.st_mode):
+                shutil.rmtree(name, dir_fd=dirfd)
+            else:
+                os.unlink(name, dir_fd=dirfd)
+            return 1
+        except OSError as exc:
+            logger.warning("plugin-outbox: failed to reap %r: %s", name, exc)
+            return 0
+
+    def sweep_now(self) -> int:
+        """Production sweep entry — uses the module clock. Tests drive
+        ``sweep_once(now_ms)`` directly with a fixed clock."""
+        return self.sweep_once(_now_ms())
+
+    def close(self) -> None:
+        for fd_attr in ("_outbox_dirfd", "_claims_dirfd"):
+            fd = getattr(self, fd_attr, None)
+            if isinstance(fd, int):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                setattr(self, fd_attr, None)
+
+
+# ---------------------------------------------------------------------------
+# Module singleton + boot wiring (initialised once at boot by casa_core).
+# ---------------------------------------------------------------------------
+
+_OUTBOX: PluginOutbox | None = None
+
+
+def _now_ms() -> int:
+    import time
+    return int(time.time() * 1000)
+
+
+def init_outbox(root: str) -> PluginOutbox:
+    global _OUTBOX
+    _OUTBOX = PluginOutbox(root)
+    logger.info("plugin-outbox initialised at %s", _OUTBOX._root_realpath)
+    return _OUTBOX
+
+
+def get_outbox() -> PluginOutbox | None:
+    return _OUTBOX
+
+
+async def sweep_job() -> int:
+    """Off-loop sweep entry (boot + hourly). No-op when the outbox is
+    uninitialised. Runs the reap in a worker thread so the loop never blocks on
+    FS I/O. Self-contained: a failure is logged and swallowed (returns 0) so it
+    is safe both as the boot call and as the APScheduler job."""
+    import asyncio
+    ob = get_outbox()
+    if ob is None:
+        return 0
+    try:
+        reaped = await asyncio.to_thread(ob.sweep_now)
+        if reaped:
+            logger.info("plugin-outbox sweep reaped %d orphan(s)", reaped)
+        return reaped
+    except Exception:  # noqa: BLE001 — a sweep failure must not crash boot/scheduler
+        logger.warning("plugin-outbox sweep failed", exc_info=True)
+        return 0
+
+
+def register_sweep(scheduler) -> None:
+    """Register the hourly outbox sweep on an APScheduler instance. Extracted so
+    casa_core's wiring is unit-testable with a fake scheduler."""
+    scheduler.add_job(
+        sweep_job, trigger="interval", id="plugin_outbox_sweep", hours=1,
+        replace_existing=True, coalesce=True, max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+
+async def wire(scheduler, root: str) -> None:
+    """One-call boot wiring casa_core invokes in section 7 (BEFORE channels/HTTP
+    go live): init the outbox, run the boot reap, register the hourly sweep. A
+    failure never blocks boot. Unit-tested with a fake scheduler + tmp root."""
+    try:
+        init_outbox(root)
+    except Exception:  # noqa: BLE001
+        logger.warning("plugin-outbox init failed; send_media disabled", exc_info=True)
+        return
+    await sweep_job()          # boot-time immediate reap
+    register_sweep(scheduler)
