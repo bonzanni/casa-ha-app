@@ -135,3 +135,21 @@ def test_boot_skips_seed_when_migration_did_not_complete(monkeypatch, tmp_path):
     # Sentinel absent (migration did not complete).
     assert plugin_boot.main() == 0
     assert seeded["called"] is False              # seeding skipped
+
+
+def test_unresolved_migration_issues_replayed(tmp_path, monkeypatch):
+    """Sol round-4: an unresolved migration issue (plugin still absent from the
+    registry) is replayed into health; a now-present plugin's issue is dropped."""
+    import json
+    from plugin_registry import RegistryData
+    monkeypatch.setattr(plugin_boot, "MIGRATION_REPORT", tmp_path / "report.json")
+    (tmp_path / "report.json").write_text(json.dumps({"issues": [
+        {"name": "superpowers", "reason_code": "install_path_divergence",
+         "target": None},
+        {"name": "present-plugin", "reason_code": "x", "target": None}]}))
+    data = RegistryData(raw={"schema_version": 1,
+                             "plugins": [{"name": "present-plugin"}]}, valid=True)
+    out = plugin_boot._unresolved_migration_issues(data)
+    codes = [(i.name, i.reason_code) for i in out]
+    assert ("superpowers", "install_path_divergence") in codes   # absent → replayed
+    assert not any(i.name == "present-plugin" for i in out)      # present → dropped

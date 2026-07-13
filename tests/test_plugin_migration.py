@@ -336,13 +336,17 @@ def test_divergent_installpaths_refused(tmp_path, monkeypatch):
 
 
 def test_bundled_default_installpath_divergence_refused(tmp_path, monkeypatch):
-    """Sol round-3 H10b: a bundled default with >1 install paths is REFUSED (not
-    silently pinned to the bundled artifact — which would verify green after the
-    sentinel forgets the divergence). Absence + the seeded_defaults mark (no
-    resurrection) is the persistent signal."""
+    """Sol round-3 H10b + round-4 BLOCKER: a bundled default with >1 install
+    paths is REFUSED and STAYS refused even when a customized executor
+    plugins.yaml LISTS it (it must not be resurrected by _apply_executor/_ensure)."""
+    import yaml
     d = _dirs(tmp_path)
     _default_registry(d["defaults"], ["superpowers"])
-    (Path(d["agents"]) / "executors" / "plugin-developer").mkdir(parents=True)
+    ex = Path(d["agents"]) / "executors" / "plugin-developer"
+    ex.mkdir(parents=True)
+    # The decisive production input: a plugins.yaml that LISTS the refused default.
+    (ex / "plugins.yaml").write_text(
+        yaml.safe_dump({"plugins": [{"name": "superpowers"}]}))
     monkeypatch.setattr(pm, "_installed_state", lambda cc: {
         "superpowers": {"installPaths": {"/a", "/b"}, "scopes": {"user", "project"},
                         "enabled": True}})
@@ -350,8 +354,32 @@ def test_bundled_default_installpath_divergence_refused(tmp_path, monkeypatch):
     assert any(i["reason_code"] == "install_path_divergence"
                and i["name"] == "superpowers" for i in report["issues"])
     reg = json.loads((d["plugins"] / "registry.json").read_text())
-    assert not any(e["name"] == "superpowers" for e in reg["plugins"])   # refused
+    assert not any(e["name"] == "superpowers" for e in reg["plugins"])   # NOT resurrected
     assert "superpowers" in reg["seeded_defaults"]        # no-resurrection mark
+
+
+def test_divergent_adoption_failure_refused_not_bundled(tmp_path, monkeypatch):
+    """Sol round-4 BLOCKER: when adopting a DIVERGENT build fails, migration must
+    REFUSE (not silently substitute the bundled pin)."""
+    from plugin_store import StoreError
+    d = _dirs(tmp_path)
+    _default_registry(d["defaults"], ["superpowers"])
+    (Path(d["agents"]) / "executors" / "plugin-developer").mkdir(parents=True)
+    install = tmp_path / "sp-install"
+    install.mkdir()
+    monkeypatch.setattr(pm, "_installed_state", lambda cc: {
+        "superpowers": {"installPaths": {str(install)}, "scopes": {"user"},
+                        "enabled": True}})
+    # HEAD differs from the bundled pin (divergent) → adopt path taken.
+    monkeypatch.setattr(pm, "_offline_revision",
+                        lambda p, repo: ("git:" + "9" * 40, False))
+    monkeypatch.setattr(pm.plugin_store, "publish_from_tree",
+                        lambda **kw: (_ for _ in ()).throw(StoreError("boom")))
+    report, issues, warnings = _run(tmp_path, monkeypatch, d)
+    assert any(i["reason_code"] == "adoption_failed"
+               and i["name"] == "superpowers" for i in report["issues"])
+    reg = json.loads((d["plugins"] / "registry.json").read_text())
+    assert not any(e["name"] == "superpowers" for e in reg["plugins"])   # NOT bundled
 
 
 def test_append_idempotent_no_duplicate_names(tmp_path, monkeypatch):

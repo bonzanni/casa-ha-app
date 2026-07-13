@@ -282,6 +282,11 @@ def _migrate(data, cc_home, config_dir, defaults_dir, agents_dir,
 
     # entries being built: name -> registry entry dict
     new_entries: dict[str, dict] = {}
+    # Sol round-4 BLOCKER: names REFUSED by step (a) (divergent install / failed
+    # adoption). They must NEVER be resurrected by _assign_targets/_apply_executor
+    # (_ensure would otherwise copy the bundled default back when a customized
+    # plugins.yaml lists them) — absence is the intended persistent signal.
+    refused: set[str] = set()
 
     def _publish_offline_or_online(name, repo, ref, subdir=""):
         """Returns (entry-source-dict, origin) or (None, reason)."""
@@ -333,6 +338,7 @@ def _migrate(data, cc_home, config_dir, defaults_dir, agents_dir,
             # with the operator's divergence forgotten. Absence is the persistent
             # signal; the operator re-adds via plugin_add once resolved.
             add_issue(name, "install_path_divergence")
+            refused.add(name)
             continue
         if not (active_paths and Path(active_paths[0]).is_dir()):
             new_entries[name] = copy.deepcopy(entry)  # bundled pin verbatim
@@ -360,7 +366,11 @@ def _migrate(data, cc_home, config_dir, defaults_dir, agents_dir,
             report["divergence_from_default"].append(
                 {"name": name, "artifact_id": res.artifact_id})
         except plugin_store.StoreError:
-            new_entries[name] = copy.deepcopy(entry)  # adopt failed → bundled pin
+            # Sol round-4 BLOCKER: adoption of a DIVERGENT build failed — do NOT
+            # silently substitute the bundled pin (the operator was running a
+            # different build). Refuse; the operator resolves it via plugin_add.
+            add_issue(name, "adoption_failed")
+            refused.add(name)
 
     # (b) user-marketplace plugins active but not a default.
     for name in active:
@@ -388,7 +398,7 @@ def _migrate(data, cc_home, config_dir, defaults_dir, agents_dir,
 
     # (c) assignments from agent-homes + executor plugins.yaml.
     _assign_targets(new_entries, agents_dir, agent_home_root, default_reg,
-                    report, add_issue)
+                    report, add_issue, refused)
 
     # write entries + seeded_defaults (all default names considered).
     data.raw.setdefault("plugins", [])
@@ -426,17 +436,22 @@ def _entry_from_result(name, src, res) -> dict:
 
 
 def _assign_targets(new_entries, agents_dir, agent_home_root, default_reg,
-                    report, add_issue):
+                    report, add_issue, refused=frozenset()):
     agents_dir = Path(agents_dir)
     suppressed: set[tuple[str, str]] = set()   # (name, target) disabled
 
     def _ensure(name):
+        # Sol round-4 BLOCKER: a name refused by step (a) must NEVER be recreated
+        # from the bundled default here (that would resurrect a divergent/failed
+        # plugin an operator plugins.yaml happens to list).
+        if name in refused:
+            return None
         if name not in new_entries and name in default_reg:
             new_entries[name] = copy.deepcopy(default_reg[name])
         return new_entries.get(name)
 
     def _add_target(name, target):
-        if (name, target) in suppressed:
+        if name in refused or (name, target) in suppressed:
             return
         entry = _ensure(name)
         if entry is not None and target not in entry.setdefault("targets", []):
@@ -456,7 +471,7 @@ def _assign_targets(new_entries, agents_dir, agent_home_root, default_reg,
                 for edir in role_dir.iterdir():
                     if edir.is_dir():
                         _apply_executor(edir, default_reg, new_entries,
-                                        suppressed)
+                                        suppressed, refused)
             else:
                 _apply_enabled(role_dir.name, "resident", agent_home_root,
                                suppressed, _add_target, add_issue)
@@ -486,7 +501,8 @@ def _apply_enabled(role, tier, agent_home_root, suppressed, add_target,
             add_target(name, target)
 
 
-def _apply_executor(edir, default_reg, new_entries, suppressed):
+def _apply_executor(edir, default_reg, new_entries, suppressed,
+                    refused=frozenset()):
     import copy
     import yaml
     etype = edir.name
@@ -509,6 +525,8 @@ def _apply_executor(edir, default_reg, new_entries, suppressed):
             if ent is not None and target in ent.get("targets", []):
                 ent["targets"] = [t for t in ent["targets"] if t != target]
     for name in listed:
+        if name in refused:
+            continue        # Sol round-4 BLOCKER: never resurrect a refused name
         entry = new_entries.get(name)
         if entry is None and name in default_reg:
             entry = copy.deepcopy(default_reg[name])

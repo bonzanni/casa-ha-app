@@ -13,6 +13,32 @@ from pathlib import Path
 
 BUNDLE_ROOT = Path("/opt/casa/plugin-bundle")
 SENTINEL = Path("/config/plugins/.migration-done")
+MIGRATION_REPORT = Path("/data/plugin-migration-report.json")
+
+
+def _unresolved_migration_issues(data) -> list:
+    """Sol round-4: migration issues (install_path_divergence, adoption_failed,
+    …) for plugins STILL absent from the registry — replayed into the health
+    report every boot so a refused/divergent default doesn't silently go green
+    after the one-time migration's sentinel. Once the operator re-adds the plugin
+    (plugin_add) it is present and the issue naturally drops."""
+    import json
+    from plugin_registry import PluginIssue
+    try:
+        report = json.loads(MIGRATION_REPORT.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    present = {e.get("name")
+               for e in (data.raw.get("plugins", []) if getattr(data, "valid", False) else [])
+               if isinstance(e, dict)}
+    out = []
+    for i in report.get("issues", []):
+        name = i.get("name")
+        if name and name != "*" and name not in present:
+            out.append(PluginIssue(name=name, target=i.get("target"),
+                                   stage="migration",
+                                   reason_code=i.get("reason_code")))
+    return out
 
 
 def main() -> int:
@@ -67,6 +93,12 @@ def main() -> int:
                 reason_code="registry_invalid"))
         issues.extend(res.issues)
         warnings.extend(res.warnings)
+        # Sol round-4: replay UNRESOLVED migration issues so a refused/divergent
+        # plugin stays visible in health across boots (migration runs only once,
+        # so its report is the only record). An issue counts as unresolved iff its
+        # plugin is STILL absent from the registry — once the operator re-adds it
+        # (plugin_add), the issue naturally drops.
+        issues.extend(_unresolved_migration_issues(data))
         plugin_health.write_report(issues=issues, warnings=warnings)
     except Exception as exc:  # noqa: BLE001 — spec 3.6: never block svc-casa
         log.exception("plugin store boot degraded: %s", exc)
