@@ -34,6 +34,34 @@ def test_fallback_file_parsing():
     assert out["lesina-invoice"]["installPaths"] == {"/a"}
 
 
+def test_installed_plugins_v2_nested_schema():
+    """Sol #2: the REAL installed_plugins.json (CC 2.1.x) is
+    {"version":2,"plugins":{"<name>@<mkt>":[<records>]}} — the map is under
+    "plugins" and each value is a LIST. The old parser saw only "version"/
+    "plugins" keys and extracted zero plugins."""
+    doc = {"version": 2, "plugins": {
+        "lesina-invoice@casa-plugins": [
+            {"installPath": "/a", "scope": "user", "projectPath": None}],
+        "superpowers@casa-plugins-defaults": [
+            {"installPath": "/b", "scope": "user"}]}}
+    out = pm._parse_installed_rows(doc)
+    assert out["lesina-invoice"]["installPaths"] == {"/a"}
+    assert out["superpowers"]["installPaths"] == {"/b"}
+    # The envelope keys must NOT be mistaken for plugins.
+    assert "version" not in out and "plugins" not in out
+
+
+def test_installed_plugins_v2_multiple_records_flattened():
+    """Sol #2: several install records under one key (user + project scope) all
+    contribute their installPaths."""
+    doc = {"version": 2, "plugins": {"p@m": [
+        {"installPath": "/u", "scope": "user"},
+        {"installPath": "/pr", "scope": "project"}]}}
+    out = pm._parse_installed_rows(doc)
+    assert out["p"]["installPaths"] == {"/u", "/pr"}
+    assert out["p"]["scopes"] == {"user", "project"}
+
+
 def test_atomic_touch_creates_sentinel(tmp_path):
     s = tmp_path / "sub" / ".migration-done"
     pm._atomic_touch(s)
@@ -248,3 +276,80 @@ def test_report_before_sentinel_and_idempotent(tmp_path, monkeypatch):
     _run(tmp_path, monkeypatch, d)
     reg2 = json.loads((d["plugins"] / "registry.json").read_text())
     assert [e["name"] for e in reg1["plugins"]] == [e["name"] for e in reg2["plugins"]]
+
+
+def test_wholesale_exception_withholds_sentinel(tmp_path, monkeypatch):
+    """Sol #3: a mid-flight _migrate crash leaves `data` UNSAVED, so the sentinel
+    must be WITHHELD (not written) or migration is permanently skipped with no
+    retry and the registry frozen unmigrated."""
+    d = _dirs(tmp_path)
+    _default_registry(d["defaults"], ["superpowers"])
+    (Path(d["agents"]) / "executors" / "plugin-developer").mkdir(parents=True)
+    monkeypatch.setattr(pm, "_installed_state", lambda cc: {})
+    monkeypatch.setattr(pm, "_migrate",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    report, issues, warnings = _run(tmp_path, monkeypatch, d)
+    assert any(i["reason_code"] == "migration_exception" for i in report["issues"])
+    assert not (d["plugins"] / ".migration-done").is_file()      # sentinel withheld
+    assert not (d["plugins"] / "registry.json").is_file()        # data not saved
+
+
+def test_enabled_plugins_list_is_scoped_issue_not_crash(tmp_path, monkeypatch):
+    """Sol #3: a non-dict `enabledPlugins` (e.g. a hand-edited list) must become
+    a scoped issue, NOT crash the whole migration into a permanent skip."""
+    d = _dirs(tmp_path)
+    _default_registry(d["defaults"], ["superpowers"])
+    (Path(d["agents"]) / "executors" / "plugin-developer").mkdir(parents=True)
+    (Path(d["agents"]) / "assistant").mkdir(parents=True)
+    home = Path(d["homes"]) / "assistant" / ".claude"
+    home.mkdir(parents=True)
+    (home / "settings.json").write_text(
+        json.dumps({"enabledPlugins": ["superpowers@x"]}), encoding="utf-8")
+    monkeypatch.setattr(pm, "_installed_state", lambda cc: {})
+    report, issues, warnings = _run(tmp_path, monkeypatch, d)
+    assert (d["plugins"] / ".migration-done").is_file()          # completed → sentinel
+    assert any(i["reason_code"] == "enabled_plugins_malformed" for i in report["issues"])
+    assert not any(i["reason_code"] == "migration_exception" for i in report["issues"])
+
+
+def test_divergent_installpaths_refused(tmp_path, monkeypatch):
+    """Sol #10: multiple distinct installPaths for one name → refuse to adopt an
+    arbitrary (sorted-first) one; record the divergence, leave it unassigned."""
+    d = _dirs(tmp_path)
+    _default_registry(d["defaults"], [])
+    (d["config"] / "marketplace" / ".claude-plugin").mkdir(parents=True)
+    (d["config"] / "marketplace" / ".claude-plugin" / "marketplace.json").write_text(
+        json.dumps({"plugins": [{"name": "dup",
+                                 "source": {"repo": "o/d", "ref": "v1"}}]}))
+    (Path(d["agents"]) / "specialists" / "finance").mkdir(parents=True)
+    _agent_home(d["homes"], "finance", {"dup@casa-plugins": True})
+    monkeypatch.setattr(pm, "_installed_state", lambda cc: {
+        "dup": {"installPaths": {"/a", "/b"}, "scopes": {"user", "project"},
+                "enabled": True}})
+    monkeypatch.setattr(pm.plugin_store, "publish",
+                        lambda **kw: pytest.fail("must not adopt a divergent plugin"))
+    report, issues, warnings = _run(tmp_path, monkeypatch, d)
+    assert any(i["reason_code"] == "install_path_divergence" and i["name"] == "dup"
+               for i in report["issues"])
+    reg = json.loads((d["plugins"] / "registry.json").read_text())
+    assert not any(e["name"] == "dup" for e in reg["plugins"])   # NOT adopted
+
+
+def test_append_idempotent_no_duplicate_names(tmp_path, monkeypatch):
+    """Sol #1 defense-in-depth: even against a pre-populated registry (the old
+    seed-before-migrate order), migration never appends a duplicate name."""
+    d = _dirs(tmp_path)
+    _default_registry(d["defaults"], ["superpowers"])
+    (Path(d["agents"]) / "executors" / "plugin-developer").mkdir(parents=True)
+    reg_path = d["plugins"] / "registry.json"
+    reg_path.write_text(json.dumps({
+        "schema_version": 1, "seeded_defaults": ["superpowers"],
+        "plugins": [{"name": "superpowers",
+                     "source": {"type": "bundled", "repo": "o/r", "ref": "main",
+                                "revision": "git:" + "e" * 40, "subdir": ""},
+                     "artifact_id": "c" * 64, "version": "1.0.0",
+                     "targets": ["executor:plugin-developer"]}]}), encoding="utf-8")
+    monkeypatch.setattr(pm, "_installed_state", lambda cc: {})
+    report, issues, warnings = _run(tmp_path, monkeypatch, d)
+    reg = json.loads(reg_path.read_text())
+    assert [e["name"] for e in reg["plugins"]].count("superpowers") == 1

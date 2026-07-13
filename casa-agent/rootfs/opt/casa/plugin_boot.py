@@ -28,14 +28,13 @@ def main() -> int:
         plugin_registry.STORE_ROOT.mkdir(parents=True, exist_ok=True)
         issues.extend(plugin_store.import_bundle(BUNDLE_ROOT))
 
-        data = plugin_registry.load_registry()
-        if not data.valid:
-            issues.append(plugin_registry.PluginIssue(
-                name="*", target=None, stage="registry",
-                reason_code="registry_invalid"))
-        elif plugin_registry.seed_defaults(data):
-            plugin_registry.save_registry(data)
-
+        # §3.7: the one-time migration builds the registry from LEGACY installed
+        # state and MUST run BEFORE seed_defaults (Sol #1). Seeding first would
+        # pre-populate every default, so migration's existing_names would skip
+        # them all — divergent installs never adopted and a customized executor
+        # plugins.yaml duplicated (both copies then dropped by the duplicate-name
+        # rule → zero plugins resolve). Migration persists registry.json + the
+        # sentinel itself.
         if not SENTINEL.exists():
             import plugin_migration
             report, mig_issues, mig_warnings = plugin_migration.run_migration()
@@ -44,6 +43,18 @@ def main() -> int:
             log.info("migration ran: %d migrated, %d issues",
                      len(report.get("migrated", [])),
                      len(mig_issues))
+
+        # Seed AFTER migration: a no-op on the first boot (migration already
+        # considered every bundled default and marked seeded_defaults), active
+        # only for defaults introduced by a LATER release — no-resurrection
+        # honored so a removed default stays removed across upgrades.
+        data = plugin_registry.load_registry()
+        if not data.valid:
+            issues.append(plugin_registry.PluginIssue(
+                name="*", target=None, stage="registry",
+                reason_code="registry_invalid"))
+        elif plugin_registry.seed_defaults(data):
+            plugin_registry.save_registry(data)
 
         plugin_registry.reload_snapshot()
         res = plugin_registry.resolve_all()

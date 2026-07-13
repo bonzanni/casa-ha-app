@@ -59,13 +59,29 @@ def _parse_installed_rows(rows) -> dict:
             name = r.get("name") or str(r.get("id", "")).partition("@")[0]
             _row(name, r.get("installPath"), r.get("scope"), r.get("enabled"))
     elif isinstance(rows, dict):
-        for key, val in rows.items():
-            if not isinstance(val, dict):
-                continue
-            name = (val.get("name") or str(val.get("id", "")).partition("@")[0]
-                    or str(key).partition("@")[0])
-            _row(name, val.get("installPath"), val.get("scope"),
-                 val.get("enabled", True))
+        # Real v2 installed_plugins.json (CC 2.1.x, verified against the 2.1.207
+        # binary): {"version":2,"plugins":{"<name>@<marketplace>":[<records>]}}.
+        # The map lives under "plugins" and each value is a LIST of install
+        # records (installPath/scope/projectPath); the plugin name is ONLY in
+        # the "<name>@<marketplace>" key — records carry no name/enabled. Unwrap
+        # the versioned envelope; else treat rows as a flat {name: record} dict
+        # (older/hand-written fallback).
+        if "version" in rows and isinstance(rows.get("plugins"), dict):
+            inner = rows["plugins"]
+        else:
+            inner = rows
+        for key, val in inner.items():
+            key_name = str(key).partition("@")[0]
+            if isinstance(val, list):                 # v2: key -> [records]
+                for rec in val:
+                    if isinstance(rec, dict):
+                        _row(key_name, rec.get("installPath"), rec.get("scope"),
+                             rec.get("enabled", True))
+            elif isinstance(val, dict):               # flat legacy: name -> record
+                nm = (val.get("name")
+                      or str(val.get("id", "")).partition("@")[0] or key_name)
+                _row(nm, val.get("installPath"), val.get("scope"),
+                     val.get("enabled", True))
     return out
 
 
@@ -223,6 +239,7 @@ def run_migration(
         data = RegistryData(raw={"schema_version": 1, "seeded_defaults": [],
                                  "plugins": []})
 
+    migration_ok = True
     try:
         _migrate(data, cc_home, config_dir, defaults_dir, agents_dir,
                  agent_home_root, store_root, staging_root, report,
@@ -230,17 +247,27 @@ def run_migration(
         save_registry(data, registry_path)
         _config_git_untrack(config_dir, report, add_issue)
     except Exception as exc:  # noqa: BLE001 — never raise (spec 3.7)
+        migration_ok = False
         logger.exception("migration failed: %s", exc)
         add_issue("*", "migration_exception")
 
     # Report FIRST (fsynced), sentinel LAST (§3.7 cross-filesystem ordering).
-    # A sentinel-write failure leaves the sentinel absent → migration re-runs
-    # next boot (safe: content-addressed publishes converge). NEVER raises.
+    # The sentinel is written ONLY when migration completed without a WHOLESALE
+    # exception (Sol #3): a mid-flight crash leaves `data` UNSAVED (save_registry
+    # is inside the try), so writing the sentinel would permanently skip an
+    # un-migrated registry with no retry. Withholding it re-runs next boot —
+    # safe, since content-addressed publishes converge. Per-plugin issues that
+    # completed (add_issue, migration_ok stays True) still write the sentinel.
     _write_report_atomic(report_path, report)
-    try:
-        _atomic_touch(sentinel_path)
-    except OSError as exc:
-        logger.warning("migration: sentinel write failed (will re-run): %s", exc)
+    if migration_ok:
+        try:
+            _atomic_touch(sentinel_path)
+        except OSError as exc:
+            logger.warning("migration: sentinel write failed (will re-run): %s", exc)
+    else:
+        logger.warning(
+            "migration incomplete (wholesale exception) — sentinel withheld, "
+            "will retry next boot")
     return report, issues, warnings
 
 
@@ -298,6 +325,12 @@ def _migrate(data, cc_home, config_dir, defaults_dir, agents_dir,
             continue
         src = entry["source"]
         active_paths = sorted(active.get(name, {}).get("installPaths", set()))
+        if len(active_paths) > 1:
+            # Sol #10: ambiguous — several installs of one bundled default. Keep
+            # the known-good bundled pin (never an arbitrary adopt) and flag it.
+            add_issue(name, "install_path_divergence")
+            new_entries[name] = copy.deepcopy(entry)
+            continue
         if not (active_paths and Path(active_paths[0]).is_dir()):
             new_entries[name] = copy.deepcopy(entry)  # bundled pin verbatim
             continue
@@ -330,9 +363,13 @@ def _migrate(data, cc_home, config_dir, defaults_dir, agents_dir,
     for name in active:
         if name in default_reg or name in existing_names or name in new_entries:
             continue
-        # installPath divergence → issue (still try to migrate).
+        # Sol #10: multiple distinct installPaths for one name → we cannot know
+        # which build the operator intended. Refuse to adopt an arbitrary
+        # (sorted-first) one; record the divergence and leave the plugin
+        # unassigned/not-ready so the operator resolves it explicitly.
         if len(active[name]["installPaths"]) > 1:
             add_issue(name, "install_path_divergence")
+            continue
         if name in user_mkt:
             repo = user_mkt[name]["repo"]
             ref = user_mkt[name]["ref"]
@@ -348,13 +385,20 @@ def _migrate(data, cc_home, config_dir, defaults_dir, agents_dir,
 
     # (c) assignments from agent-homes + executor plugins.yaml.
     _assign_targets(new_entries, agents_dir, agent_home_root, default_reg,
-                    report)
+                    report, add_issue)
 
     # write entries + seeded_defaults (all default names considered).
     data.raw.setdefault("plugins", [])
+    # Sol #1 defense-in-depth: never append a name already present. The reorder
+    # (migration-before-seed) means `present` is empty on a first-boot migration,
+    # but this keeps the append idempotent against any pre-populated registry.
+    present = {e.get("name") for e in data.raw["plugins"] if isinstance(e, dict)}
     for entry in new_entries.values():
+        if entry["name"] in present:
+            continue
         if entry.get("targets"):                # only keep assigned plugins
             data.raw["plugins"].append(entry)
+            present.add(entry["name"])
             report["migrated"].append({
                 "name": entry["name"], "artifact_id": entry["artifact_id"],
                 "revision": entry["source"]["revision"],
@@ -379,7 +423,7 @@ def _entry_from_result(name, src, res) -> dict:
 
 
 def _assign_targets(new_entries, agents_dir, agent_home_root, default_reg,
-                    report):
+                    report, add_issue):
     agents_dir = Path(agents_dir)
     suppressed: set[tuple[str, str]] = set()   # (name, target) disabled
 
@@ -404,7 +448,7 @@ def _assign_targets(new_entries, agents_dir, agent_home_root, default_reg,
                 for sdir in role_dir.iterdir():
                     if sdir.is_dir():
                         _apply_enabled(sdir.name, "specialist", agent_home_root,
-                                       suppressed, _add_target)
+                                       suppressed, _add_target, add_issue)
             elif role_dir.name == "executors":
                 for edir in role_dir.iterdir():
                     if edir.is_dir():
@@ -412,15 +456,23 @@ def _assign_targets(new_entries, agents_dir, agent_home_root, default_reg,
                                         suppressed)
             else:
                 _apply_enabled(role_dir.name, "resident", agent_home_root,
-                               suppressed, _add_target)
+                               suppressed, _add_target, add_issue)
 
 
-def _apply_enabled(role, tier, agent_home_root, suppressed, add_target):
+def _apply_enabled(role, tier, agent_home_root, suppressed, add_target,
+                   add_issue):
     settings = (Path(agent_home_root) / role / ".claude" / "settings.json")
     try:
         enabled = json.loads(settings.read_text(encoding="utf-8")).get(
             "enabledPlugins") or {}
     except (OSError, ValueError):
+        enabled = {}
+    # Sol #3: `enabledPlugins` MUST be an object. A malformed non-dict (e.g. a
+    # hand-edited list) would raise AttributeError on `.items()` below and, via
+    # the wholesale except in run_migration, permanently disable migration.
+    # Record a scoped issue and skip this role instead.
+    if not isinstance(enabled, dict):
+        add_issue(role, "enabled_plugins_malformed", target=f"{tier}:{role}")
         enabled = {}
     for key, on in enabled.items():
         name = str(key).partition("@")[0]

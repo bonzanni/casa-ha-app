@@ -95,3 +95,21 @@ def test_exploding_migration_returns_zero_with_boot_exception(monkeypatch, tmp_p
     reports = _wire(monkeypatch, tmp_path, migration=_mig)
     assert plugin_boot.main() == 0
     assert any(i.reason_code == "boot_exception" for i in reports["issues"])
+
+
+def test_boot_runs_migration_before_seed(monkeypatch, tmp_path):
+    """Sol #1: migration MUST run BEFORE seed_defaults. Seeding first would
+    pre-populate every default, so migration's existing_names skips them all —
+    divergent installs never adopted and a customized executor plugins.yaml
+    duplicated (both copies then dropped → zero plugins resolve)."""
+    order = []
+
+    def _mig(**kw):
+        order.append("migrate")
+        return ({"migrated": [], "issues": []}, [], [])
+
+    _wire(monkeypatch, tmp_path, migration=_mig)
+    monkeypatch.setattr(plugin_registry, "seed_defaults",
+                        lambda *a, **k: (order.append("seed"), False)[1])
+    assert plugin_boot.main() == 0
+    assert order == ["migrate", "seed"]           # migration precedes seeding
