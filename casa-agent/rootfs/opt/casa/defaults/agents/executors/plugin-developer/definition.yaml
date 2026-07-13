@@ -33,12 +33,13 @@ tools:
     - WebFetch
     - WebSearch
     # v0.46.6: context7 = current library/SDK/CLI docs (boto3, the MCP SDK, …).
-    # It's a PLUGIN (see plugins.yaml; claude-plugins-official external_plugins/
-    # context7) that brings an MCP server via `npx @upstash/context7-mcp`.
-    # Server-level allow covers its tools (resolve-library-id, query-docs).
-    # Keyless works; optional CONTEXT7_API_KEY (set via plugin-env.conf — see the
-    # configurator's recipes/plugin/secrets.md) raises rate limits.
-    - mcp__context7
+    # It's a registry-assigned PLUGIN (external_plugins/context7) loaded via
+    # --plugin-dir, so its server namespace is plugin-scoped: the grant is
+    # mcp__plugin_context7_<server> (§3.4). The Task 18 build helper pins the
+    # real .mcp.json server key == "context7"; server-level allow covers its
+    # tools (resolve-library-id, query-docs). Keyless works; optional
+    # CONTEXT7_API_KEY (plugin-env.conf, configurator recipes/plugin/secrets.md).
+    - mcp__plugin_context7_context7
   permission_mode: auto
 mcp_server_names:
   - casa-framework

@@ -158,10 +158,10 @@ class TestNoArgToolsEmitObjectSchema:
             "expected {'type': 'object', 'properties': {}} per O-1 fix"
         )
 
-    def test_marketplace_list_plugins_schema(self):
+    def test_plugin_list_schema(self):
         from mcp_envelope import _tool_schema
-        from tools import marketplace_list_plugins
-        schema = _tool_schema(marketplace_list_plugins)
+        from tools import plugin_list
+        schema = _tool_schema(plugin_list)
         assert schema["inputSchema"] == {
             "type": "object", "properties": {}
         }

@@ -19,15 +19,6 @@ if TYPE_CHECKING:
     from trigger_registry import TriggerRegistry
 
 from executor_registry import ExecutorRegistry
-from marketplace_ops import (
-    MarketplaceError,
-    add_plugin_entry,
-    list_plugin_entries,
-    load_user_marketplace,
-    remove_plugin_entry,
-    update_plugin_entry,
-)
-from plugin_env_extractor import extract_env_vars
 from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — available for future use
 from system_requirements.orchestrator import install_requirements, OrchestrationError
 from system_requirements.manifest import add_plugin_entry as add_manifest
@@ -2865,129 +2856,6 @@ async def cleanup_engagement_topics(args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _tool_marketplace_add_plugin(
-    *,
-    plugin_name: str,
-    repo_url: str,
-    ref: str,
-    description: str,
-    category: str = "productivity",
-    version: str | None = None,
-    casa_system_requirements: list[dict] | None = None,
-) -> dict:
-    # Normalize repo_url → github source shape.
-    repo = repo_url.replace("https://github.com/", "").rstrip("/")
-    if repo.endswith(".git"):
-        repo = repo[:-4]
-
-    entry = {
-        "name": plugin_name,
-        "description": description,
-        "version": version or ref,
-        "source": {"source": "github", "repo": repo, "ref": ref},
-        "category": category,
-    }
-    if casa_system_requirements:
-        entry["casa"] = {"systemRequirements": casa_system_requirements}
-
-    try:
-        add_plugin_entry(entry)
-    except MarketplaceError as exc:
-        return {"added": False, "error": str(exc)}
-
-    # Refresh CC's view of the user marketplace.
-    subprocess.run(
-        ["claude", "plugin", "marketplace", "update", "casa-plugins"],
-        capture_output=True, text=True, timeout=30,
-    )
-    return {"added": True, "entry": entry}
-
-
-def _tool_marketplace_remove_plugin(*, plugin_name: str) -> dict:
-    try:
-        remove_plugin_entry(plugin_name)
-    except MarketplaceError as exc:
-        return {"removed": False, "error": str(exc)}
-    subprocess.run(
-        ["claude", "plugin", "marketplace", "update", "casa-plugins"],
-        capture_output=True, text=True, timeout=30,
-    )
-    return {"removed": True}
-
-
-def _tool_marketplace_update_plugin(*, plugin_name: str, new_ref: str) -> dict:
-    try:
-        update_plugin_entry(plugin_name, new_ref=new_ref)
-    except MarketplaceError as exc:
-        return {"updated": False, "error": str(exc)}
-    subprocess.run(
-        ["claude", "plugin", "marketplace", "update", "casa-plugins"],
-        capture_output=True, text=True, timeout=30,
-    )
-    return {"updated": True, "new_ref": new_ref}
-
-
-def _tool_marketplace_list_plugins() -> dict:
-    return {"plugins": list_plugin_entries()}
-
-
-# ---------------------------------------------------------------------------
-# Plan 4b §7.3 / §4.3.3: install_casa_plugin two-stage commit
-# ---------------------------------------------------------------------------
-
-_INSTALL_LOCK = "/config/cc-home/.claude/plugins/.install.lock"
-_AGENT_HOME_ROOT = Path("/config/agent-home")
-_CASA_PLUGIN_CACHE_ROOT = Path("/config/cc-home/.claude/plugins/cache/casa-plugins")
-
-# --- legacy plugin-grant helpers (deleted with the legacy tools in Task 14) --
-# The marketplace/install/verify tools below still resolve grants + env vars
-# from the version-keyed cache. Moved inline off plugin_grants.py (which now
-# owns only the resolver-based API); nothing new should call these.
-_LEGACY_CACHE_ROOT = Path("/config/cc-home/.claude/plugins/cache")
-
-
-def _legacy_version_key(p: Path) -> tuple:
-    parts: list[tuple[int, int | str]] = []
-    for part in p.name.split("."):
-        parts.append((0, int(part)) if part.isdecimal() else (1, part))
-    return tuple(parts)
-
-
-def highest_version_mcp_json(plugin_dir: "str | Path") -> "Path | None":
-    pd = Path(plugin_dir)
-    try:
-        versions = [d for d in pd.iterdir() if d.is_dir()]
-    except OSError:
-        return None
-    if not versions:
-        return None
-    mcp = max(versions, key=_legacy_version_key) / ".mcp.json"
-    return mcp if mcp.is_file() else None
-
-
-def grants_for_plugin(name: str, marketplace: str, *,
-                      cache_root: Path = _LEGACY_CACHE_ROOT) -> list[str]:
-    plugin_dir = Path(cache_root) / marketplace / name
-    try:
-        mcp_json = highest_version_mcp_json(plugin_dir)
-        if mcp_json is None:
-            return []
-        try:
-            data = json.loads(mcp_json.read_text(encoding="utf-8"))
-            servers = data.get("mcpServers") or {}
-        except (OSError, json.JSONDecodeError, AttributeError):
-            return []
-        if not isinstance(servers, dict):
-            return []
-        from plugin_grants import sanitize_segment
-        plugin_seg = sanitize_segment(name)
-        return sorted(
-            f"mcp__plugin_{plugin_seg}_{sanitize_segment(server)}"
-            for server in servers
-        )
-    except Exception:  # noqa: BLE001 — never-raise (I-1 belt)
-        return []
-
 # H16: serialize the mutating plugin/marketplace tools once their blocking
 # bodies move off the loop via asyncio.to_thread. On the single event loop
 # these handlers were previously mutually exclusive for free (they never
@@ -3401,301 +3269,172 @@ async def plugin_list(args: dict) -> dict:
     return _result(await asyncio.to_thread(_tool_plugin_list))
 
 
-def _tool_install_casa_plugin(
-    *,
-    plugin_name: str,
-    targets: list[str],
-) -> dict:
-    # 1. Validate marketplace entry exists.
-    data = load_user_marketplace()
-    entry = next((p for p in data["plugins"] if p["name"] == plugin_name), None)
-    if entry is None:
-        return {"ok": False, "error": "plugin_not_in_marketplace"}
-
-    # 2. Refresh CC's view.
-    subprocess.run(
-        ["claude", "plugin", "marketplace", "update", "casa-plugins"],
-        capture_output=True, text=True, timeout=30,
-    )
-
-    # 3. Stage 1 — install system requirements (if any).
-    reqs = (entry.get("casa") or {}).get("systemRequirements") or []
-    outcomes: list = []
-    if reqs:
-        try:
-            outcomes = install_requirements(
-                plugin_name=plugin_name,
-                requirements=reqs,
-                tools_root=Path("/config/tools"),
-            )
-        except OrchestrationError as exc:
-            return {"ok": False, "error": "system_requirements_failed", "detail": str(exc)}
-
-        # Record manifest BEFORE stage 2 so reconciler can recover on crash.
-        for outcome in outcomes:
-            add_manifest(outcome.manifest_entry(plugin_name))
-
-    # 4. Stage 2 — claude plugin install in each agent-home.
-    installed: list[str] = []
-    failed: list[str] = []
-    for role in targets:
-        agent_home = _AGENT_HOME_ROOT / role
-        agent_home.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            "flock", _INSTALL_LOCK,
-            "claude", "plugin", "install",
-            f"{plugin_name}@casa-plugins", "--scope", "project",
-        ]
-        r = subprocess.run(cmd, cwd=agent_home, capture_output=True, text=True, timeout=300)
-        if r.returncode == 0:
-            installed.append(role)
-        else:
-            failed.append(role)
-
-    if failed:
-        # Best-effort rollback of stage 1.
-        for outcome in outcomes:
-            shutil.rmtree(outcome.install_dir, ignore_errors=True)
-        return {
-            "ok": False,
-            "error": "agent_install_failed",
-            "failed": failed,
-            "installed": installed,
-        }
-
-    # 5. Extract required env vars from cached plugin's .mcp.json — from the
-    # SAME (highest) version dir the grant derivation reads (e, v0.69.7).
-    mcp_json = highest_version_mcp_json(_CASA_PLUGIN_CACHE_ROOT / plugin_name)
-    env_vars = extract_env_vars(mcp_json) if mcp_json else set()
-
-    return {
-        "ok": True,
-        "installed_on": installed,
-        "required_env_vars": sorted(env_vars),
-        "system_requirements_installed": len(outcomes),
-        # P-5a observability: grants now derive from installed state at every
-        # options build; report them so configurator/verify can confirm.
-        "granted_tools": grants_for_plugin(plugin_name, "casa-plugins"),
-    }
-
-
-@tool(
-    "marketplace_add_plugin",
-    "Add a plugin entry to the user marketplace.",
-    {
-        "plugin_name": str,
-        "repo_url": str,
-        "ref": str,
-        "description": str,
-        "category": str,
-        "version": str,
-        "casa_system_requirements": list,
-    },
-)
-async def marketplace_add_plugin(args: dict) -> dict:
-    async with _PLUGIN_TOOLS_LOCK:
-        return _result(await asyncio.to_thread(
-            _tool_marketplace_add_plugin,
-            plugin_name=args["plugin_name"],
-            repo_url=args["repo_url"],
-            ref=args["ref"],
-            description=args["description"],
-            category=args.get("category", "productivity"),
-            version=args.get("version"),
-            casa_system_requirements=args.get("casa_system_requirements"),
-        ))
-
-
-@tool(
-    "marketplace_remove_plugin",
-    "Remove a plugin entry from the user marketplace.",
-    {"plugin_name": str},
-)
-async def marketplace_remove_plugin(args: dict) -> dict:
-    async with _PLUGIN_TOOLS_LOCK:
-        return _result(await asyncio.to_thread(
-            _tool_marketplace_remove_plugin, plugin_name=args["plugin_name"],
-        ))
-
-
-@tool(
-    "marketplace_update_plugin",
-    "Update a plugin's sha/ref in the user marketplace.",
-    {"plugin_name": str, "new_ref": str},
-)
-async def marketplace_update_plugin(args: dict) -> dict:
-    async with _PLUGIN_TOOLS_LOCK:
-        return _result(await asyncio.to_thread(
-            _tool_marketplace_update_plugin,
-            plugin_name=args["plugin_name"],
-            new_ref=args["new_ref"],
-        ))
-
-
-@tool(
-    "marketplace_list_plugins",
-    "List all plugins in the user marketplace.",
-    {},
-)
-async def marketplace_list_plugins(args: dict) -> dict:
-    return _result(_tool_marketplace_list_plugins())
-
-
-@tool(
-    "install_casa_plugin",
-    "Install a plugin into target agents (two-stage commit: system requirements then per-agent-home plugin install).",
-    {
-        "plugin_name": str,
-        "targets": list,
-    },
-)
-async def install_casa_plugin(args: dict) -> dict:
-    async with _PLUGIN_TOOLS_LOCK:
-        return _result(await asyncio.to_thread(
-            _tool_install_casa_plugin,
-            plugin_name=args["plugin_name"],
-            targets=args["targets"],
-        ))
-
-
 # ---------------------------------------------------------------------------
 # Plan 4b §7.4–7.6: uninstall + verify_plugin_state + vault helper tools
 # ---------------------------------------------------------------------------
-
-
-def _tool_uninstall_casa_plugin(
-    *,
-    plugin_name: str,
-    targets: list[str] | None = None,
-) -> dict:
-    if targets is None:
-        targets = []
-        if _AGENT_HOME_ROOT.is_dir():
-            for d in _AGENT_HOME_ROOT.iterdir():
-                settings = d / ".claude" / "settings.json"
-                if not settings.is_file():
-                    continue
-                data = json.loads(settings.read_text(encoding="utf-8"))
-                if not isinstance(data, dict):
-                    continue
-                if any(k.startswith(f"{plugin_name}@") for k in data.get("enabledPlugins", {})):
-                    targets.append(d.name)
-
-    uninstalled: list[str] = []
-    for role in targets:
-        agent_home = _AGENT_HOME_ROOT / role
-        cmd = ["claude", "plugin", "uninstall",
-               f"{plugin_name}@casa-plugins", "--scope", "project"]
-        r = subprocess.run(cmd, cwd=agent_home, capture_output=True, text=True, timeout=60)
-        if r.returncode == 0:
-            uninstalled.append(role)
-
-    # R-9: `claude plugin uninstall` clears the agent-home's enabledPlugins but
-    # leaves the shared marketplace cache dir orphaned. Sweep it once NO
-    # agent-home still enables the plugin (the cache is shared across targets,
-    # so keep it while any remaining target uses it).
-    cache_swept = False
-    if uninstalled and not _any_agent_enables_plugin(plugin_name):
-        cache_dir = _CASA_PLUGIN_CACHE_ROOT / plugin_name
-        if cache_dir.is_dir():
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            cache_swept = True
-    return {"uninstalled_from": uninstalled, "cache_swept": cache_swept}
-
-
-def _any_agent_enables_plugin(plugin_name: str) -> bool:
-    """True if any agent-home still lists ``<plugin_name>@…`` in enabledPlugins."""
-    if not _AGENT_HOME_ROOT.is_dir():
-        return False
-    for d in _AGENT_HOME_ROOT.iterdir():
-        settings = d / ".claude" / "settings.json"
-        if not settings.is_file():
-            continue
-        try:
-            data = json.loads(settings.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            continue
-        if isinstance(data, dict) and any(
-            k.startswith(f"{plugin_name}@") for k in data.get("enabledPlugins", {})
-        ):
-            return True
-    return False
 
 
 def _tool_verify_plugin_state(
     *,
     plugin_name: str,
     _tools_bin: Path | None = None,
-    _cache_root: Path | None = None,
+    _registry_path=None,
+    _store_root=None,
 ) -> dict:
-    """Check tool readiness, secret resolution, and MCP cache for a plugin.
-
-    The optional ``_tools_bin`` and ``_cache_root`` parameters override the
-    production paths for testing.
+    """Tier-aware verification (§3.9): does the RUNNING state agree with the
+    registry's DESIRED state? Constructed residents/specialists must have the
+    desired artifact bound (else reload_required); dormant targets report
+    configured readiness only; executors also need their plugin MCP namespaces
+    authorized; running engagements on a previous artifact are informational.
+    Verification can never report active agreement while a running consumer
+    executes different code (FR3).
     """
-    from system_requirements.manifest import read_manifest
+    import agent as agent_mod
+    import cc_tool_pattern
     from plugin_env_conf import read_entries
+    from plugin_registry import ResolvedPlugin, STORE_ROOT, load_registry
+    from system_requirements.manifest import read_manifest
 
+    reg = (load_registry(_registry_path) if _registry_path is not None
+           else load_registry())
+    if not reg.valid:
+        return {"ready": False, "reasons": ["registry_invalid"],
+                "targets": []}
+    entry = next((e for e in reg.raw.get("plugins", [])
+                  if isinstance(e, dict) and e.get("name") == plugin_name), None)
+    if entry is None:
+        return {"ready": False, "reasons": ["not_registered"], "targets": []}
+
+    store_root = _store_root if _store_root is not None else STORE_ROOT
+    artifact_id = entry.get("artifact_id")
+    src = entry.get("source") or {}
+    revision = src.get("revision", "")
+    path = Path(store_root) / plugin_name / str(artifact_id)
+    reasons: list[str] = []
+    provenance_warning = revision.startswith("legacy-content:")
+    present = path.is_dir()
+    checksum_valid = False
+    if not present:
+        reasons.append("artifact_missing")
+    else:
+        verdict = plugin_store.artifact_verdict(
+            path, name=plugin_name, repo=src.get("repo", ""),
+            revision=revision, subdir=src.get("subdir", ""),
+            artifact_id=str(artifact_id))
+        if verdict is None:
+            checksum_valid = True
+        else:
+            reasons.append(verdict)          # artifact_invalid | corrupt_artifact
+
+    manifest: dict = {}
+    try:
+        manifest = json.loads((path / ".claude-plugin" / "plugin.json")
+                              .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    rp = ResolvedPlugin(name=plugin_name, artifact_id=str(artifact_id),
+                        path=str(path), version=str(entry.get("version", "")),
+                        manifest=manifest)
+    granted = grants_for_resolved(rp) if checksum_valid else []
+
+    # Tools (system-requirements manifest — verify_bin presence).
     data = read_manifest()
     tool_entries = [p for p in data["plugins"] if p["name"] == plugin_name]
-
     tools_bin = _tools_bin if _tools_bin is not None else Path("/config/tools/bin")
     tools_status = []
     for t in tool_entries:
         vb = t.get("verify_bin", "")
-        # is_file() follows symlinks; a dangling link (target wiped by a
-        # rollback) is correctly reported missing, not masked ready (M23).
-        if (tools_bin / vb).is_file():
-            tools_status.append({"requirement": t["winning_strategy"], "verify_bin": vb,
-                                 "status": "ready"})
-        else:
-            tools_status.append({"requirement": t["winning_strategy"], "verify_bin": vb,
-                                 "status": "missing",
-                                 "reason": f"{vb} not in tools/bin"})
+        ready_bin = (tools_bin / vb).is_file()   # follows symlinks (M23)
+        tools_status.append({
+            "requirement": t["winning_strategy"], "verify_bin": vb,
+            "status": "ready" if ready_bin else "missing",
+            **({} if ready_bin else {"reason": f"{vb} not in tools/bin"})})
 
-    cache_root = _cache_root if _cache_root is not None else _CASA_PLUGIN_CACHE_ROOT
-    mcp_json = highest_version_mcp_json(cache_root / plugin_name)  # (e, v0.69.7)
-    required = extract_env_vars(mcp_json) if mcp_json else set()
+    # Secrets from the ARTIFACT's .mcp.json (no version-dir guessing).
+    required = set(required_env_vars_for_resolved(rp)) if checksum_valid else set()
     env_conf = read_entries()
     secrets_status = []
     for var in sorted(required):
         if var in env_conf:
             source = "op" if env_conf[var].startswith("op://") else "plain"
-            secrets_status.append({"var": var, "source": source, "status": "resolved"})
+            secrets_status.append({"var": var, "source": source,
+                                   "status": "resolved"})
         else:
             secrets_status.append({"var": var, "source": "missing",
                                    "status": "unresolved",
                                    "reason": "not in plugin-env.conf"})
 
-    mcp_started = mcp_json is not None
-    mcp_errors: list[dict] = []
+    tools_ready = all(t["status"] == "ready" for t in tools_status)
+    secrets_ready = all(s["status"] == "resolved" for s in secrets_status)
+    configured_ready = (not reasons) and tools_ready and secrets_ready
 
-    # Readiness gates on satisfied tools + secrets, plus the absence of MCP
-    # startup errors. It does NOT require an .mcp.json to exist: a skill-only
-    # plugin (a recommended pattern) legitimately ships no MCP server, and after
-    # a successful install the presence of an .mcp.json only signals that a
-    # server is declared — whether it actually works is already covered by the
-    # tool and secret checks. Gating on mcp_started here would make every
-    # skill-only plugin report ready=False (R-1).
-    ready = (
-        all(t["status"] == "ready" for t in tools_status)
-        and all(s["status"] == "resolved" for s in secrets_status)
-        and not mcp_errors
-    )
+    runtime = getattr(agent_mod, "active_runtime", None)
+    agents = getattr(runtime, "agents", {}) or {}
+    exec_reg = getattr(runtime, "executor_registry", None)
+
+    target_rows = []
+    stale_targets = []
+    for target in entry.get("targets", []):
+        tier, _, role = target.partition(":")
+        row = {"target": target, "ready": configured_ready, "reasons": []}
+        if not configured_ready:
+            row["reasons"] = list(reasons) or ["not_ready"]
+        if tier in ("resident", "specialist"):
+            agent = agents.get(role)
+            constructed = (agent is not None
+                           and getattr(agent, "_plugin_resolution", None) is not None)
+            if constructed:
+                row["state"] = "active"
+                active_aid = getattr(agent, "active_plugin_binding", {}).get(plugin_name)
+                row["active_artifact_id"] = active_aid
+                if active_aid != artifact_id:
+                    row["ready"] = False
+                    row["reasons"] = ["reload_required"]
+                    stale_targets.append(target)
+            else:
+                row["state"] = "dormant"
+        elif tier == "executor":
+            row["state"] = "dormant"
+            defn = exec_reg.get(role) if exec_reg is not None else None
+            allowed = list(getattr(defn, "tools_allowed", []) or []) if defn else []
+            missing = [g for g in granted
+                       if not cc_tool_pattern.matches_any(allowed, g, {})]
+            row["authorization"] = {"required": granted, "missing": missing}
+            if missing:
+                row["ready"] = False
+                row["reasons"] = ["authorization_missing"]
+        target_rows.append(row)
+
+    # Running executor engagements on a PREVIOUS artifact — informational.
+    sessions = []
+    if _engagement_registry is not None:
+        try:
+            running = _engagement_registry.active_and_idle()
+        except Exception:  # noqa: BLE001
+            running = []
+        for rec in running:
+            for pa in getattr(rec, "plugin_artifacts", ()) or ():
+                if (pa.get("name") == plugin_name
+                        and pa.get("artifact_id") != artifact_id):
+                    sessions.append({"engagement_id": rec.id,
+                                     "artifact_id": pa.get("artifact_id")})
+
+    top_ready = (configured_ready
+                 and all(r["ready"] for r in target_rows))
     return {
+        "ready": top_ready,
+        "reasons": reasons,
+        "desired": {"artifact_id": artifact_id,
+                    "version": entry.get("version"),
+                    "revision": revision, "targets": entry.get("targets", [])},
+        "artifact": {"present": present, "checksum_valid": checksum_valid,
+                     "provenance_warning": provenance_warning},
         "tools": tools_status,
         "secrets": secrets_status,
-        "mcp_started": mcp_started,
-        # cache_root is the marketplace-level dir (<cache root>/casa-plugins);
-        # decompose it so the grant derivation reads the exact tree globbed
-        # above — threading the _cache_root test override. Production is
-        # unchanged: parent=/config/cc-home/.claude/plugins/cache (the
-        # plugin_grants default), name=casa-plugins.
-        "granted_tools": grants_for_plugin(
-            plugin_name, cache_root.name, cache_root=cache_root.parent,
-        ),
-        "mcp_errors": mcp_errors,
-        "ready": ready,
+        "granted_tools": granted,
+        "targets": target_rows,
+        "stale_targets": stale_targets,
+        "sessions_on_previous_artifact": sessions,
     }
 
 
@@ -3743,20 +3482,6 @@ def _tool_get_item_fields(*, item: str, vault: str = "") -> dict:
                         "section": (f.get("section") or {}).get("label", ""),
                         "type": f.get("type")}
                        for f in data.get("fields", [])]}
-
-
-@tool(
-    "uninstall_casa_plugin",
-    "Uninstall a plugin from target agent-homes (or all homes that have it enabled if targets omitted).",
-    {"plugin_name": str, "targets": list},
-)
-async def uninstall_casa_plugin(args: dict) -> dict:
-    async with _PLUGIN_TOOLS_LOCK:
-        return _result(await asyncio.to_thread(
-            _tool_uninstall_casa_plugin,
-            plugin_name=args["plugin_name"],
-            targets=args.get("targets") or None,
-        ))
 
 
 @tool(
@@ -3844,12 +3569,6 @@ CASA_TOOLS: tuple = (
     plugin_unassign,
     plugin_remove,
     plugin_list,
-    marketplace_add_plugin,        # legacy — deleted in Task 14
-    marketplace_remove_plugin,
-    marketplace_update_plugin,
-    marketplace_list_plugins,
-    install_casa_plugin,
-    uninstall_casa_plugin,
     verify_plugin_state,
     verify_plugin_secrets,
     set_plugin_env_reference,

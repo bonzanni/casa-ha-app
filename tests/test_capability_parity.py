@@ -55,9 +55,11 @@ KNOWN_BUILTINS = frozenset({
     "WebFetch", "WebSearch",
 })
 
-# MCP servers provided by installed plugins (plugins.yaml), NOT the static
-# `mcp_server_names` list — so an `mcp__<server>` grant for these is valid
-# even though the server is absent from mcp_server_names.
+# Plugin NAMES assigned via the registry (unified plugin architecture), NOT
+# the static `mcp_server_names` list. Registry-assigned plugins load via
+# --plugin-dir and grant `mcp__plugin_<name>_<server>` — validated at runtime
+# by verify_plugin_state's authorization check, so the static parity check
+# only sanity-checks the plugin name prefix here.
 KNOWN_PLUGIN_SERVERS = frozenset({"context7"})
 
 # Invariant C — verified self-use requirements. Key = role dir name; value =
@@ -105,6 +107,16 @@ def test_every_allowed_tool_resolves() -> None:
                 name = entry.removeprefix("mcp__casa-framework__")
                 if name not in FRAMEWORK_TOOLS:
                     violations.append(f"{role}: '{entry}' is not a CASA_TOOLS tool")
+            elif entry.startswith("mcp__plugin_"):
+                # Registry-assigned plugin grant mcp__plugin_<name>_<server>.
+                # Names + servers can both contain hyphens (single-underscore
+                # separated), so match by known-plugin-name prefix.
+                rest = entry.removeprefix("mcp__plugin_")
+                if not any(rest == p or rest.startswith(p + "_")
+                           for p in KNOWN_PLUGIN_SERVERS):
+                    violations.append(
+                        f"{role}: '{entry}' plugin not in known plugins "
+                        f"{sorted(KNOWN_PLUGIN_SERVERS)}")
             elif entry.startswith("mcp__"):
                 server = entry.removeprefix("mcp__").split("__", 1)[0]
                 if server not in servers:
