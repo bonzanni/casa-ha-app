@@ -26,8 +26,9 @@ Examples:
 
 ## What Casa consumes
 
-Casa installs your plugin via `claude plugin install <name>@casa-plugins --scope project`
-in the target agent-home. That means:
+Casa adds your plugin to its registry via the configurator's `plugin_add` /
+`plugin_update` tools, which publish an immutable content-addressed artifact
+from your pinned commit. That means:
 
 - `.claude-plugin/plugin.json` — required. `name`, `description`, `version`, and
   `author` **as an object** — `{"name": "..."}` (optionally `email`/`url`), NOT a
@@ -35,11 +36,15 @@ in the target agent-home. That means:
   (`author: Invalid input: expected object, received string`), which fails the
   whole install.
   - **`plugin.json::version` is THE plugin version** (P-2). Every change bumps
-    it — Casa's marketplace pin + install/verify read it, and it's what
+    it — Casa derives the registry version from it, and it's what
     `verify_plugin_state` reports. If the plugin ships an MCP server with its
     own `server/package.json`, keep that `version` in **sync** with
     `plugin.json` (bump both in the same commit) so the manifest and the
     running server never disagree.
+  - **Handoff (v0.71.0):** after you push a plugin release, hand the new tag to
+    the operator/configurator. Casa pins by RESOLVED commit via
+    `plugin_update(name, new_ref)` — pushing a tag alone changes nothing in
+    Casa until the configurator points the registry at it (§3.13).
 - `skills/<name>/SKILL.md` — skills pack. Single-line description triggers
   right. Keep it specific.
 - `agents/<name>.md` — optional subagents.
@@ -47,7 +52,7 @@ in the target agent-home. That means:
   and similar relative anchors.
 - `hooks/hooks.json` — optional.
 - `README.md` — required. Document required env vars + any
-  `casa.systemRequirements` declarations in the marketplace entry.
+  `casa.systemRequirements` declarations in `.claude-plugin/plugin.json`.
 
 Your plugin does NOT know about Casa. It's a plain CC plugin.
 
@@ -61,9 +66,9 @@ Your plugin does NOT know about Casa. It's a plain CC plugin.
 }
 ```
 
-At install time Configurator extracts every `${VAR}` reference (minus CC
-built-ins), asks the user for a 1P reference, and writes to
-`plugin-env.conf`. Values never appear in transcripts.
+When Configurator runs `plugin_add`, it reports every required `${VAR}`
+reference (minus CC built-ins); the configurator asks the user for a 1P
+reference and writes to `plugin-env.conf`. Values never appear in transcripts.
 
 ## Completion schema
 
@@ -82,7 +87,7 @@ When you finish, emit:
     "visibility": "public|private"
   }],
   "next_steps": [{
-    "action": "add_to_marketplace_and_install_with_confirmation",
+    "action": "add_to_registry_and_assign_with_confirmation",
     "plugin_name": "<slug>",
     "repo_url": "...",
     "ref": "<sha>",

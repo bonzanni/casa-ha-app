@@ -613,8 +613,8 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
 
     prompt = f"{delegation_context}\n\n{memory_block}{body_tail}"
 
-    # Off-loop: _build_specialist_options resolves the registry (file IO)
-    # (build_sdk_plugins) — keep it off the shared event loop (H2/M20).
+    # Off-loop: _build_specialist_options resolves the registry (file IO) —
+    # keep it off the shared event loop (H2/M20).
     options = await asyncio.to_thread(_build_specialist_options, cfg)
     text = ""
     token = agent_mod.origin_var.set(child_origin)
@@ -851,7 +851,7 @@ async def delegate_to_agent(args: dict) -> dict:
         except Exception as exc:  # noqa: BLE001
             logger.warning("set_channel_state(active) failed: %s", exc)
 
-        # Build options + start driver (off-loop: build_sdk_plugins shell-out).
+        # Build options + start driver (off-loop: registry resolve is file IO).
         options = await asyncio.to_thread(_build_specialist_options, cfg)
         # Augment allowed tools (additive) with query_engager + emit_completion
         injected = list(options.allowed_tools or [])

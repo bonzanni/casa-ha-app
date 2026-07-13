@@ -753,14 +753,13 @@ def make_agent_home_settings_guard() -> HookCallback:
     """Deny hand-edits to any ``.claude/settings.json`` (I-2) OR anything under
     ``/config/plugins/`` (unified plugin architecture §3.11/§3.13).
 
-    Plugin grants derive from an agent-home's ``.claude/settings.json``
-    (``enabledPlugins``). Residents hold Write/Edit under ``acceptEdits``, so a
-    prompt-injected resident could self-enable a cached plugin by editing its
-    own settings.json — bounded (``mcp__plugin_*`` namespace, ``disallowed``
-    wins, the cache is configurator-populated), but a self-grant vector.
     settings.json is configurator-managed; no agent should hand-edit it. The
-    match is by normalized-path suffix, so ``..`` traversal can't slip a write
-    through (see `_normalize_path`)."""
+    plugin registry + store (``/config/plugins/``) is the single plugin-
+    assignment authority (§3.13); a resident/executor with Write/Edit/Bash
+    could otherwise self-assign a plugin by editing the registry directly,
+    bypassing plugin_add's validation + §3.9 sequencing. Both guards match by
+    normalized path, so ``..`` traversal can't slip a write through (see
+    `_normalize_path`)."""
     async def _hook(
         input_data: dict[str, Any],
         tool_use_id: str | None,

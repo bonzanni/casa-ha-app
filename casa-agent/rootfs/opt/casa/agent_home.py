@@ -1,16 +1,18 @@
 """Agent-home directory provisioning for in_casa agents.
 
-Creates /config/agent-home/<role>/.claude/settings.json
-with `enabledPlugins` seeded from defaults/agents/<role>/plugins.yaml.
-Idempotent — preserves user-added entries (P-3 drift policy).
+Creates /config/agent-home/<role>/.claude/settings.json (for hooks + user
+edits). Idempotent — preserves user-added entries (P-3 drift policy).
+
+Under the unified plugin architecture (v0.71.0), plugin ASSIGNMENT lives in
+the registry, not in per-agent-home ``enabledPlugins`` — this module no longer
+seeds it. A pre-existing ``enabledPlugins`` key (from an older deploy) is left
+untouched (user data is never deleted); nothing reads it anymore.
 """
 from __future__ import annotations
 
 import json
 import logging
 from pathlib import Path
-
-from plugins_config import load_plugins_yaml
 
 logger = logging.getLogger(__name__)
 
@@ -42,14 +44,9 @@ def provision_agent_home(
             settings_path,
         )
         existing = {}
-    if not isinstance(existing.get("enabledPlugins"), dict):
-        existing["enabledPlugins"] = {}
 
-    # Apply default seeding (plugins.yaml entries become True; user edits preserved).
-    plugins_yaml = defaults_root / "defaults" / "agents" / role / "plugins.yaml"
-    cfg = load_plugins_yaml(plugins_yaml)
-    for ref in cfg.iter_refs():
-        existing["enabledPlugins"].setdefault(ref, True)
+    # v0.71.0: no enabledPlugins seeding — plugin assignment is the registry's
+    # job. A stale key from an older deploy is preserved (never deleted).
 
     # Write back.
     claude_dir.mkdir(parents=True, exist_ok=True)
