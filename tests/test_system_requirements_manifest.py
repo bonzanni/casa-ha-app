@@ -82,3 +82,10 @@ def test_read_manifest_tolerates_malformed_yaml(tmp_path, monkeypatch):
     # A top-level non-mapping (list) also degrades to empty.
     path.write_text("- a\n- b\n", encoding="utf-8")
     assert read_manifest() == {"plugins": []}
+    # Sol round-6: non-dict / nameless list entries are dropped (no p["name"] crash).
+    path.write_text("plugins:\n  - oops\n  - {}\n  - {name: keep, verify_bin: x}\n",
+                    encoding="utf-8")
+    assert [p["name"] for p in read_manifest()["plugins"]] == ["keep"]
+    # Invalid UTF-8 bytes degrade to empty, not a UnicodeDecodeError.
+    path.write_bytes(b"\xff\xfe bad bytes")
+    assert read_manifest() == {"plugins": []}
