@@ -698,6 +698,33 @@ async def test_plugin_guard_blocks_traversal_and_bash():
     assert _decision(await hook(bash, "t", CTX)) == "deny"
 
 
+async def test_plugin_guard_blocks_notebook_edit():
+    """Sol round-3 B3a: NotebookEdit to /config/plugins is denied (the matcher
+    now routes it too)."""
+    from hooks import make_agent_home_settings_guard, agent_home_settings_guard_matcher
+    hook = make_agent_home_settings_guard()
+    data = {"tool_name": "NotebookEdit", "tool_input": {
+        "notebook_path": "/config/plugins/store/x/nb.ipynb"}}
+    assert _decision(await hook(data, "t", CTX)) == "deny"
+    assert "NotebookEdit" in agent_home_settings_guard_matcher().matcher
+
+
+async def test_plugin_guard_blocks_python_open_write_and_chmod():
+    """Sol round-3 B3a: a python `open(...,'w')` write and a chmod of the path
+    are denied; a plain store READ is allowed."""
+    from hooks import make_agent_home_settings_guard
+    hook = make_agent_home_settings_guard()
+    for cmd in (
+        "python3 -c 'open(\"/config/plugins/registry.json\",\"w\").write(\"x\")'",
+        "chmod +w /config/plugins/registry.json",
+    ):
+        data = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+        assert _decision(await hook(data, "t", CTX)) == "deny", cmd
+    read = {"tool_name": "Bash", "tool_input": {
+        "command": "cat /config/plugins/store/x/y/plugin.json"}}
+    assert await hook(read, "t", CTX) == {}         # read allowed
+
+
 async def test_settings_guard_ignores_non_write_tools():
     from hooks import make_agent_home_settings_guard
     hook = make_agent_home_settings_guard()
@@ -711,7 +738,7 @@ async def test_settings_guard_matcher_shape_and_denies():
     callback denies a settings.json edit."""
     from hooks import agent_home_settings_guard_matcher
     m = agent_home_settings_guard_matcher()
-    assert m.matcher == "Write|Edit|MultiEdit|Bash"
+    assert m.matcher == "Write|Edit|MultiEdit|NotebookEdit|Bash"
     assert len(m.hooks) == 1
     data = {"tool_name": "Edit", "tool_input": {
         "file_path": "/config/agent-home/assistant/.claude/settings.json"}}

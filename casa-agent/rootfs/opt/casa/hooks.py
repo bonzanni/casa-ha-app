@@ -750,9 +750,22 @@ _PLUGINS_DENY_MSG = (
     "plugin_unassign / plugin_remove tools, never by hand."
 )
 _PLUGINS_WRITE_RE = re.compile(
-    r"(?:>>?|\btee\b|\bdd\b|\bcp\b|\bmv\b|\binstall\b|sed\s+-i|\btruncate\b|"
-    r"\brm\b|\bmkdir\b)"
-    r".*?/config/plugins/",
+    # A write-ish verb followed (anywhere) by the plugins path. Sol round-3 B3a:
+    # broadened with chmod/chown/ln/touch (mode/link tamper) + a trailing-slash-
+    # or word-boundary match so exact `/config/plugins` is covered too.
+    r"(?:>>?|\btee\b|\bdd\b|\bcp\b|\bmv\b|\bln\b|\binstall\b|sed\s+-i|"
+    r"\btruncate\b|\brm\b|\bmkdir\b|\bchmod\b|\bchown\b|\btouch\b|\bcd\b)"
+    r".*?/config/plugins(?:/|\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+# Language-runtime write to the path (python/node/perl `open(...,'w')`, etc.).
+# Targeted at WRITE modes so a plain READ of /config/plugins/store (the
+# plugin-developer's legitimate access) is not denied. Best-effort — a
+# determined obfuscated command still needs the filesystem/privilege boundary
+# (spec integrity = content-addressing + checksum DETECTION; tracked backlog).
+_PLUGINS_CODE_WRITE_RE = re.compile(
+    r"/config/plugins\b[^\n]{0,80}?['\"][wax]\+?b?['\"]"
+    r"|['\"][wax]\+?b?['\"][^\n]{0,80}?/config/plugins\b",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -780,7 +793,9 @@ def make_agent_home_settings_guard() -> HookCallback:
             norm = _normalize_path(raw)
             if norm.endswith(_SETTINGS_JSON_SUFFIX):
                 return _deny(_SETTINGS_DENY_MSG)
-            if norm.startswith(_PLUGINS_DIR_PREFIX):
+            # Sol round-3 B3a: cover the exact dir too (not just the trailing-
+            # slash prefix).
+            if norm.startswith(_PLUGINS_DIR_PREFIX) or norm == "/config/plugins":
                 return _deny(_PLUGINS_DENY_MSG)
         elif tool_name == "Bash":
             # Finding 1 (codex review v0.69.10): residents with Bash (Ellen)
@@ -794,7 +809,8 @@ def make_agent_home_settings_guard() -> HookCallback:
             command = input_data.get("tool_input", {}).get("command", "")
             if _SETTINGS_JSON_WRITE_RE.search(command):
                 return _deny(_SETTINGS_DENY_MSG)
-            if _PLUGINS_WRITE_RE.search(command):
+            if (_PLUGINS_WRITE_RE.search(command)
+                    or _PLUGINS_CODE_WRITE_RE.search(command)):
                 return _deny(_PLUGINS_DENY_MSG)
         return {}
 
@@ -807,7 +823,9 @@ def agent_home_settings_guard_matcher():
     so the self-grant guard is an always-on invariant, not config-removable."""
     from claude_agent_sdk import HookMatcher
     return HookMatcher(
-        matcher="Write|Edit|MultiEdit|Bash",
+        # Sol round-3 B3a: include NotebookEdit — the hook body already handles
+        # it, but the matcher must route it or NotebookEdit writes bypass entirely.
+        matcher="Write|Edit|MultiEdit|NotebookEdit|Bash",
         hooks=[make_agent_home_settings_guard()],
     )
 

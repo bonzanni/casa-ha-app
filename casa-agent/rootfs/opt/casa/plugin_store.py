@@ -295,6 +295,7 @@ def validate_manifest(root: Path, expected_name: str) -> dict:
 def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
                     store_root: Path) -> PublishResult:
     """Shared tail: validate -> checksum -> metadata-in-staging -> rename."""
+    _reject_escaping_symlinks(staged)            # Sol round-3 H7
     manifest = validate_manifest(staged, name)
     artifact_id = compute_artifact_id(repo=repo, revision=revision,
                                       subdir=subdir, name=name)
@@ -330,18 +331,48 @@ def _freeze_artifact_files(root: Path) -> None:
     (e.g. `echo >> skill.md` after the snapshot cached this artifact as valid).
     Directories are left writable so plugin_remove / a future gc can still
     rmtree without restoring perms. Best-effort — never fails a publish; the
-    /config/plugins write guards (Sol #5) are the primary barrier."""
+    /config/plugins write guards (Sol #5) are the primary barrier.
+
+    Sol round-3 H7: NEVER chmod through a symlink — `os.chmod(path)` follows
+    symlinks, so an artifact containing `x -> /etc/passwd` would change the
+    EXTERNAL target's mode. Symlinks are skipped here (and escaping symlinks are
+    rejected at publish/import time by `_reject_escaping_symlinks`)."""
     import stat
     try:
         for dirpath, _dirs, files in os.walk(root):
             for fn in files:
                 p = os.path.join(dirpath, fn)
                 try:
+                    if os.path.islink(p):
+                        continue
                     os.chmod(p, stat.S_IMODE(os.lstat(p).st_mode) & ~0o222)
                 except OSError:
                     pass
     except OSError:
         pass
+
+
+def _reject_escaping_symlinks(root: Path) -> None:
+    """Sol round-3 H7: reject an artifact tree containing a symlink whose target
+    escapes the artifact root (absolute path or `..`-escape). The online publish
+    path is already covered by safe_extract_tar, but the offline-adopt tree-copy
+    paths (publish_from_tree / publish_legacy_tree) and the bundle import copy an
+    arbitrary local tree — an escaping symlink there could expose or mutate an
+    external file when the plugin is loaded. Internal (in-artifact) symlinks are
+    allowed."""
+    root = Path(root).resolve()
+    for dirpath, dirnames, filenames in os.walk(root):    # followlinks=False
+        for nm in list(dirnames) + list(filenames):
+            p = Path(dirpath) / nm
+            if not p.is_symlink():
+                continue
+            try:
+                resolved = (Path(dirpath) / os.readlink(p)).resolve()
+                resolved.relative_to(root)                # ValueError ⇒ escapes
+            except (OSError, ValueError) as exc:
+                raise StoreError(
+                    f"escaping symlink in artifact: {p}",
+                    reason_code="unsafe_archive") from exc
 
 
 def publish(*, name: str, repo: str, ref: str, subdir: str = "",
@@ -444,10 +475,12 @@ def import_bundle(bundle_root: Path, store_root: Path = STORE_ROOT) -> list:
                     shutil.rmtree(tmp)
                 tmp.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(art_dir, tmp, symlinks=True)
+                _reject_escaping_symlinks(tmp)       # Sol round-3 H7
                 if not validate_artifact(tmp):
                     raise StoreError("bundle copy failed checksum",
                                      reason_code="corrupt_artifact")
                 os.rename(tmp, dest)
+                _freeze_artifact_files(dest)         # Sol round-3 H7: freeze imports too
             except (OSError, StoreError) as exc:
                 shutil.rmtree(tmp, ignore_errors=True)
                 code = getattr(exc, "reason_code", "import_failed")

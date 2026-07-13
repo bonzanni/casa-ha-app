@@ -296,3 +296,47 @@ def test_publish_legacy_tree_checksums_staged_not_raw(tmp_path):
                              src_root=src2, store_root=tmp_path / "store2",
                              staging_root=tmp_path / "stg2")
     assert r2.artifact_id == r1.artifact_id
+
+
+def test_publish_from_tree_rejects_escaping_symlink(tmp_path):
+    """Sol round-3 H7: an offline-adopt tree with a symlink escaping the artifact
+    root is rejected (unsafe_archive) — freezing/loading it must never touch or
+    expose an external file."""
+    import os
+    src = _plugin_tree(tmp_path)
+    os.symlink("/etc/passwd", src / "evil-link")      # escaping absolute symlink
+    store, staging = tmp_path / "store", tmp_path / "staging"
+    with pytest.raises(StoreError) as ei:
+        publish_from_tree(name="probe", repo="o/r", ref="master",
+                          revision="legacy-content:" + "c" * 64, subdir="",
+                          src_root=src, store_root=store, staging_root=staging)
+    assert ei.value.reason_code == "unsafe_archive"
+    assert not (store / "probe").exists()             # nothing published
+
+
+def test_publish_from_tree_allows_internal_symlink(tmp_path):
+    """Sol round-3 H7: an in-artifact symlink (non-escaping) is allowed; freeze
+    skips it without chmod-following."""
+    import os
+    src = _plugin_tree(tmp_path)
+    (src / "skills" / "target.md").write_text("t", encoding="utf-8")
+    os.symlink("target.md", src / "skills" / "link.md")   # internal, relative
+    store, staging = tmp_path / "store", tmp_path / "staging"
+    res = publish_from_tree(name="probe", repo="o/r", ref="master",
+                            revision="legacy-content:" + "c" * 64, subdir="",
+                            src_root=src, store_root=store, staging_root=staging)
+    assert (Path(res.path) / "skills" / "link.md").is_symlink()  # preserved
+
+
+def test_import_bundle_freezes_files(tmp_path):
+    """Sol round-3 H7: imported bundle artifacts are frozen read-only too."""
+    import os
+    import stat
+    src = _plugin_tree(tmp_path)
+    bundle, store = tmp_path / "bundle", tmp_path / "store"
+    res = publish_from_tree(name="probe", repo="o/r", ref="v1",
+                            revision=f"git:{SHA}", subdir="", src_root=src,
+                            store_root=bundle, staging_root=tmp_path / "stg")
+    import_bundle(bundle, store_root=store)
+    skill = store / "probe" / res.artifact_id / "skills" / "s.md"
+    assert stat.S_IMODE(os.lstat(skill).st_mode) & 0o222 == 0
