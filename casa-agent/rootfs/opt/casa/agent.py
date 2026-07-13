@@ -1038,6 +1038,19 @@ class Agent:
             tier = None
             if self._agent_registry is not None:      # agent.py:199 attr name
                 tier = self._agent_registry.tier_for_role(self.config.role)
+            if tier is None:
+                # v0.74.1 (live finding 2026-07-13): the AgentRegistry knows
+                # only residents + ENABLED specialists, so a reload-
+                # constructed DISABLED specialist lands here and the
+                # 'resident' fallback resolves the WRONG target — an empty,
+                # issueless resolution that looks like a healthy dormant
+                # agent. The fallback stays (back-compat; a disabled
+                # specialist takes no new turns), but it must be LOUD.
+                logger.warning(
+                    "plugin resolve tier-miss for role=%s: not in the "
+                    "AgentRegistry (disabled specialist?) — falling back to "
+                    "resident:%s, which likely resolves NO plugins",
+                    self.config.role, self.config.role)
             target = f"{tier or 'resident'}:{self.config.role}"
             resolution = await asyncio.to_thread(
                 plugin_registry.resolve_for, target,

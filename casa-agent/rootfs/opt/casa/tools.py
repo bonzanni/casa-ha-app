@@ -4141,7 +4141,24 @@ def _tool_verify_plugin_state(
         row = {"target": target, "ready": configured_ready, "reasons": []}
         if not configured_ready:
             row["reasons"] = list(reasons) or ["not_ready"]
-        if tier in ("resident", "specialist"):
+        if tier == "specialist" and (
+                spec_reg := getattr(runtime, "specialist_registry", None)
+        ) is not None and getattr(spec_reg, "is_disabled",
+                                  lambda r: False)(role) is True:
+            # (`is True`: a MagicMock registry in unit stand-ins returns a
+            # truthy Mock — never let that read as "disabled".)
+            # v0.74.1 (live finding 2026-07-13): the specialist-tier analogue
+            # of the v0.71.1 disabled-executor rule. A DISABLED specialist is
+            # dormant-by-config: reload tears it down (never registered), so
+            # no new turn can enter it (FR3: informational, not blocking) —
+            # its BINDING is never graded. Grading the tier-missed empty
+            # binding produced the §1.4 registry-wide "Plugin degraded"
+            # amplification. Sol v0.74.1-B2: configured readiness (secrets/
+            # sysreqs/artifact/mcp) is PRESERVED from the row init — being
+            # disabled must not mask a broken configuration. Re-checked for
+            # real the moment the operator enables the specialist.
+            row["state"] = "disabled"
+        elif tier in ("resident", "specialist"):
             # D2 (v0.74.0): read the ONE frozen snapshot — never the legacy
             # attribute pair — and guard against racing a reload swap: the
             # object we grade must still BE runtime.agents[role] after the

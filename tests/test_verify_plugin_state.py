@@ -823,3 +823,85 @@ def test_stale_absent_targets_reads_live_bindings():
     assert _stale_absent_targets(
         ["specialist:finance", "resident:butler", "executor:x"],
         "probe", runtime) == ["specialist:finance"]
+
+
+def test_verify_disabled_specialist_target_not_reload_required(
+        tmp_path, monkeypatch):
+    """v0.74.1 (live finding, proxy-drive 2026-07-13): a plugin targeting a
+    DISABLED specialist must verify state='disabled', never reload_required —
+    the specialist-tier analogue of the v0.71.1 disabled-executor rule. A
+    disabled specialist is excluded from the AgentRegistry, so a
+    reload-constructed instance tier-misses to resident:<role> and resolves
+    an EMPTY binding; grading that binding produced the §1.4 'Plugin
+    degraded' amplification (per FR3 it is dormant-by-config: no new turn
+    can enter a disabled specialist)."""
+    import agent as agent_mod
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"])
+    mk_registry(tmp_path, [e])
+    # The reload-constructed disabled specialist: resolved with EMPTY binding
+    # (the live signature: state would be active, active_artifact_id None).
+    a = _Agent({}, resolved=True)
+
+    class _SpecReg:
+        def is_disabled(self, role):
+            return role == "finance"
+
+    runtime = _runtime(agents={"finance": a})
+    runtime.specialist_registry = _SpecReg()
+    monkeypatch.setattr(agent_mod, "active_runtime", runtime, raising=False)
+    r = _verify(tmp_path)
+    row = r["targets"][0]
+    assert row["state"] == "disabled"
+    assert row["ready"] is True and row["reasons"] == []
+    assert r["stale_targets"] == []
+    assert r["ready"] is True                    # no health issue, no DM
+
+
+def test_verify_enabled_specialist_still_graded(tmp_path, monkeypatch):
+    """The disabled-specialist rule must not weaken FR3 for ENABLED ones: a
+    stale binding on an enabled specialist stays reload_required."""
+    import agent as agent_mod
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"])
+    mk_registry(tmp_path, [e])
+    a = _Agent({"probe": "old" * 21 + "o"})
+
+    class _SpecReg:
+        def is_disabled(self, role):
+            return False
+
+    runtime = _runtime(agents={"finance": a})
+    runtime.specialist_registry = _SpecReg()
+    monkeypatch.setattr(agent_mod, "active_runtime", runtime, raising=False)
+    r = _verify(tmp_path)
+    row = r["targets"][0]
+    assert row["ready"] is False and row["reasons"] == ["reload_required"]
+
+
+def test_verify_disabled_specialist_does_not_mask_config_failure(
+        tmp_path, monkeypatch):
+    """Sol v0.74.1-B2: being disabled must not mask a BROKEN configuration —
+    an unresolved secret still fails the row (like disabled executors)."""
+    import agent as agent_mod
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"],
+                mcp_servers={"s": {"env": {"K": "${MY_API_KEY}"}}})
+    mk_registry(tmp_path, [e])
+
+    class _SpecReg:
+        def is_disabled(self, role):
+            return role == "finance"
+
+    runtime = _runtime(agents={})
+    runtime.specialist_registry = _SpecReg()
+    monkeypatch.setattr(agent_mod, "active_runtime", runtime, raising=False)
+    r = _verify(tmp_path)
+    row = r["targets"][0]
+    assert row["state"] == "disabled"
+    assert row["ready"] is False                 # config problem NOT masked
+    assert r["ready"] is False
+    assert any(s["status"] == "unresolved" for s in r["secrets"])

@@ -1304,3 +1304,88 @@ class TestReloadFullSnapshotOrdering:
         assert order[0] == "snapshot"
         assert order.index("snapshot") < order.index("agents")
         assert order.index("snapshot") < order.index("executors")
+
+
+class TestDisabledSpecialistReload:
+    """v0.74.1 (Sol B1, live proxy-drive finding): reload of a DISABLED
+    specialist tears it down instead of constructing + registering it — a
+    registered handler stays reachable via /invoke and would execute with an
+    empty wrong-tier plugin binding."""
+
+    async def test_disabled_specialist_torn_down_not_registered(
+            self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from reload import dispatch, register_handler, reload_agent
+        register_handler("agent", reload_agent)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "specialists" / "finance").mkdir(parents=True)
+
+        new_cfg = SimpleNamespace(enabled=False, role="finance",
+                                  triggers=[], channels=[])
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: new_cfg)
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {}
+        stale_instance = MagicMock()
+        stale_instance.aclose = AsyncMock()      # real Agent.aclose is async
+        stale_instance.active_plugin_binding = {}
+        runtime.agents = {"finance": stale_instance}
+        runtime.specialist_registry.load = MagicMock()
+        runtime.specialist_registry.all_configs = MagicMock(return_value={})
+        runtime.trigger_registry.reregister_for = MagicMock()
+
+        result = await dispatch("agent", runtime=runtime, role="finance")
+
+        assert result["status"] == "ok"
+        assert "teardown_disabled_specialist" in result["actions"]
+        assert "construct_agent" not in result["actions"]
+        assert "finance" not in runtime.agents            # instance gone
+        runtime.bus.unregister.assert_called_with("finance")
+        runtime.bus.register.assert_not_called()          # never re-registered
+        # Triggers unwound (the _teardown_role path).
+        runtime.trigger_registry.reregister_for.assert_called_with(
+            "finance", [], [])
+
+    async def test_enabled_specialist_still_constructed(
+            self, tmp_path, monkeypatch):
+        """The teardown gate must not touch ENABLED specialists."""
+        from types import SimpleNamespace
+        from reload import dispatch, register_handler, reload_agent
+        import reload as reload_mod
+        register_handler("agent", reload_agent)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "specialists" / "finance").mkdir(parents=True)
+
+        new_cfg = SimpleNamespace(enabled=True, role="finance",
+                                  triggers=[], channels=[])
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: new_cfg)
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+        built = MagicMock()
+        monkeypatch.setattr(reload_mod, "_construct_agent",
+                            lambda *, cfg, runtime: built)
+        from agent_registry import AgentRegistry
+        monkeypatch.setattr(AgentRegistry, "build",
+                            classmethod(lambda cls, **kw: MagicMock()))
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {}
+        runtime.agents = {}
+        runtime.specialist_registry.load = MagicMock()
+        runtime.specialist_registry.all_configs = MagicMock(return_value={})
+        runtime.trigger_registry.reregister_for = MagicMock()
+
+        result = await dispatch("agent", runtime=runtime, role="finance")
+        assert result["status"] == "ok"
+        assert "construct_agent" in result["actions"]
+        assert runtime.agents["finance"] is built

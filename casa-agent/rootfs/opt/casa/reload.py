@@ -491,6 +491,36 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
 
     actions = ["load_config"]
 
+    # v0.74.1 (Sol B1, live proxy-drive finding): a DISABLED specialist must
+    # not be constructed or (re)registered. Reload used to install it into
+    # runtime.agents + register its bus handler, leaving it reachable via
+    # /invoke — and because the AgentRegistry excludes disabled specialists,
+    # its resolve tier-missed to resident:<role> and it would execute with an
+    # EMPTY plugin binding. Tear down any existing instance and deregister
+    # the role instead; verify reports its plugin targets state="disabled".
+    if tier == "specialist" and getattr(new_cfg, "enabled", True) is False:
+        old_agent = runtime.agents.pop(role, None)
+        _schedule_agent_close(old_agent, runtime=runtime, role=role)
+        await _teardown_role(runtime, role)
+        try:
+            await asyncio.to_thread(runtime.specialist_registry.load)
+        except Exception as exc:  # noqa: BLE001
+            raise ReloadError("specialist_reload_failed", str(exc)) from exc
+        from agent_registry import AgentRegistry
+        runtime.agent_registry = AgentRegistry.build(
+            residents=runtime.role_configs,
+            specialists=runtime.specialist_registry.all_configs(),
+        )
+        actions += ["teardown_disabled_specialist", "rebuild_agent_registry"]
+        try:
+            from tools import sync_agent_role_map
+            sync_agent_role_map(runtime)
+            actions.append("refresh_role_map")
+        except Exception as exc:  # noqa: BLE001 — log but don't fail
+            logger.warning("role-map refresh failed for role=%s: %s",
+                           role, exc)
+        return actions
+
     # Construct new Agent instance OUTSIDE the swap window.
     try:
         new_agent = await asyncio.to_thread(

@@ -415,3 +415,22 @@ def test_snapshot_and_binding_are_immutable(tmp_path):
             snap.binding["x"] = "y"          # MappingProxyType
 
     asyncio.run(run())
+
+
+def test_tier_miss_resolve_logs_warning(tmp_path, caplog):
+    """v0.74.1 (live finding): an Agent whose role the AgentRegistry does not
+    know (e.g. a DISABLED specialist reconstructed by reload) silently
+    resolved 'resident:<role>' — an empty, issueless resolution that looked
+    like a healthy dormant agent. The fallback stays (back-compat) but must
+    be LOUD."""
+    import logging
+    from agent_registry import AgentRegistry
+    from config import AgentConfig
+    reload_snapshot(registry_path=tmp_path / "absent.json",
+                    store_root=tmp_path / "store")
+    ar = AgentRegistry.build(residents={}, specialists={})   # knows nobody
+    a = _make_agent(tmp_path, role="finance", agent_registry=ar)
+    with caplog.at_level(logging.WARNING, logger="agent"):
+        asyncio.run(a._get_plugin_resolution())
+    assert any("tier" in rec.message and "finance" in rec.message
+               for rec in caplog.records)
