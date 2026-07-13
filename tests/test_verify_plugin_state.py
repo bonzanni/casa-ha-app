@@ -254,3 +254,128 @@ def test_bundled_registry_authorized_for_plugin_developer(tmp_path, monkeypatch)
         row = r["targets"][0]
         assert row["authorization"]["missing"] == [], (
             f"{e['name']}: unauthorized {row['authorization']['missing']}")
+
+
+# --- Sol review regressions -------------------------------------------------
+
+def _mk_artifact_raw(store, name, artifact_id, *, plugin_json, mcp_text=None,
+                     revision="git:" + "a" * 40):
+    """Build an artifact writing raw plugin.json / .mcp.json BEFORE the checksum
+    (so malformed content is captured as valid-checksum, not corrupt)."""
+    import json as _json
+    from plugin_store import content_checksum, write_metadata
+    root = Path(store) / name / artifact_id
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        _json.dumps(plugin_json), encoding="utf-8")
+    if mcp_text is not None:
+        (root / ".mcp.json").write_text(mcp_text, encoding="utf-8")
+    write_metadata(root, name=name, repo="o/r", ref="v1", revision=revision,
+                   subdir="", artifact_id=artifact_id,
+                   version=plugin_json.get("version", "1.0.0"),
+                   checksum=content_checksum(root))
+    return root
+
+
+def test_verify_duplicate_name_not_green(tmp_path):
+    """Sol #8: a duplicate-name entry that resolve_for() drops must not verify
+    ready off the raw registry list."""
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"])
+    mk_registry(tmp_path, [e, dict(e)])           # same name twice
+    r = _verify(tmp_path)
+    assert r["ready"] is False and r["reasons"] == ["duplicate_name"]
+
+
+def test_verify_entry_invalid_not_green(tmp_path):
+    """Sol #8: a per-entry-invalid registry entry (artifact_id mismatch) that
+    the resolver skips must not verify ready."""
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"])
+    e["artifact_id"] = "b" * 64                   # mismatch → entry_invalid
+    mk_registry(tmp_path, [e])
+    r = _verify(tmp_path)
+    assert r["ready"] is False and r["reasons"] == ["entry_invalid"]
+
+
+def test_verify_malformed_mcp_json_not_green(tmp_path):
+    """Sol #16: a present-but-malformed .mcp.json (broken MCP server) must not
+    verify ready even though grants/secrets silently degrade to []."""
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    _mk_artifact_raw(store, "probe", e["artifact_id"],
+                     plugin_json={"name": "probe", "version": "1.0.0"},
+                     mcp_text="{ this is : not valid json")
+    mk_registry(tmp_path, [e])
+    r = _verify(tmp_path)
+    assert r["ready"] is False and "mcp_invalid" in r["reasons"]
+
+
+def test_verify_declared_sysreq_not_installed_not_green(tmp_path):
+    """Sol #11: a plugin declaring a systemRequirement with no installed
+    manifest row must not verify ready on all([])."""
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    _mk_artifact_raw(store, "probe", e["artifact_id"], plugin_json={
+        "name": "probe", "version": "1.0.0",
+        "casa": {"systemRequirements": [{"type": "tarball", "verify_bin": "ffmpeg"}]}})
+    mk_registry(tmp_path, [e])
+    r = _verify(tmp_path)
+    assert r["ready"] is False
+    assert any(t["status"] == "missing" and t["verify_bin"] == "ffmpeg"
+               for t in r["tools"])
+
+
+def test_postcondition_present_requires_top_ready():
+    """Sol #9: zero target rows must not vacuously pass all([]) — the postcondition
+    now gates on the top-level readiness (which folds in artifact/tools/secrets
+    AND every row)."""
+    from tools import _postcondition_holds
+    # Zero rows + not ready (e.g. unresolved secret on an unassigned plugin) →
+    # must be False (was vacuously True).
+    assert _postcondition_holds({"ready": False, "targets": []}, [],
+                                expect="present") is False
+    # Zero rows but fully configured-ready → True.
+    assert _postcondition_holds({"ready": True, "targets": []}, [],
+                                expect="present") is True
+    # A ready plugin with rows → True.
+    v = {"ready": True,
+         "targets": [{"target": "specialist:finance", "ready": True}]}
+    assert _postcondition_holds(v, ["specialist:finance"],
+                                expect="present") is True
+    # Top-level not ready even though the listed row is ready → False.
+    v2 = {"ready": False,
+          "targets": [{"target": "specialist:finance", "ready": True}]}
+    assert _postcondition_holds(v2, ["specialist:finance"],
+                                expect="present") is False
+
+
+def test_regenerate_health_preserves_other_plugins_runtime_issue(monkeypatch):
+    """Sol #13: a successful mutation of B must not erase A's still-active
+    runtime issue (reload_required) from the health report."""
+    import tools
+    import plugin_health
+    import plugin_registry
+    captured = {}
+    monkeypatch.setattr(plugin_registry, "resolve_all",
+                        lambda: SimpleNamespace(issues=[], warnings=[]))
+    monkeypatch.setattr(plugin_registry, "load_registry",
+                        lambda *a, **k: SimpleNamespace(
+                            valid=True, entries=[{"name": "A"}, {"name": "B"}]))
+
+    def _verify_stub(*, plugin_name):
+        if plugin_name == "A":
+            return {"ready": False, "targets": [
+                {"target": "specialist:x", "ready": False,
+                 "reasons": ["reload_required"]}]}
+        return {"ready": True, "targets": [
+            {"target": "executor:y", "ready": True}]}
+
+    monkeypatch.setattr(tools, "_tool_verify_plugin_state", _verify_stub)
+    monkeypatch.setattr(plugin_health, "write_report",
+                        lambda **k: captured.update(k))
+    tools._regenerate_plugin_health([])           # mutating B, no extras
+    reasons = [i.reason_code for i in captured["issues"]]
+    assert "reload_required" in reasons

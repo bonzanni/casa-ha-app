@@ -26,7 +26,7 @@ import plugin_registry
 import plugin_store
 from plugin_grants import (
     grants_for_resolution, grants_for_resolved, make_fail_closed_can_use_tool,
-    required_env_vars_for_resolved,
+    mcp_json_malformed, required_env_vars_for_resolved,
 )
 from delegated_memory import delegated_recall, retain_delegated
 
@@ -2870,14 +2870,40 @@ _PLUGIN_HEALTH_PATH = "/data/plugin-health.json"
 
 
 def _regenerate_plugin_health(extra_issues: list) -> None:
-    """§3.10/R2-4: rewrite the health report from the CURRENT resolver state
-    PLUS this mutation's runtime failures (a failed mutation must never leave a
-    green health file). resolve_all().issues already carries registry-stage
-    issues — do not add them twice (Sol R3)."""
+    """§3.10/R2-4 + Sol #13: rewrite the health report from the CURRENT resolver
+    state PLUS the RUNTIME verify state of EVERY registered plugin — not just the
+    plugin this mutation touched. Otherwise a successful mutation of plugin B
+    would rewrite health from resolver issues + B's (empty) extras and ERASE
+    plugin A's still-active runtime failure (reload_required / authorization_
+    missing / unresolved secret). extra_issues carries this mutation's own
+    freshly-computed rows; they are de-duplicated against the recompute."""
     import plugin_health
+    from plugin_registry import PluginIssue, load_registry
     res = plugin_registry.resolve_all()
+    seen = {(getattr(e, "name", None), getattr(e, "target", None),
+             getattr(e, "reason_code", None)) for e in extra_issues}
+    runtime_issues: list = []
+    reg = load_registry()
+    if reg.valid:
+        for entry in reg.entries:
+            name = entry.get("name")
+            try:
+                verify = _tool_verify_plugin_state(plugin_name=name)
+            except Exception:  # noqa: BLE001 — never fail health regen on one plugin
+                continue
+            for row in (verify.get("targets") or []):
+                if row.get("ready"):
+                    continue
+                reason = (row.get("reasons") or ["not_ready"])[0]
+                key = (name, row.get("target"), reason)
+                if key in seen:
+                    continue
+                seen.add(key)
+                runtime_issues.append(PluginIssue(
+                    name=name, target=row.get("target"), stage="verify",
+                    reason_code=reason))
     plugin_health.write_report(
-        issues=list(res.issues) + list(extra_issues),
+        issues=list(res.issues) + list(extra_issues) + runtime_issues,
         warnings=list(res.warnings),
         path=_PLUGIN_HEALTH_PATH,
     )
@@ -2901,10 +2927,12 @@ def _postcondition_holds(verify: dict, targets: list, *, expect: str,
     remove): no RECONSTRUCTED in-casa agent still binds `name` — read the live
     agent's active_plugin_binding directly, independent of verify shape."""
     if expect == "present":
-        rows = verify.get("targets")
-        if rows is None:
-            return True
-        return all(r.get("ready") for r in rows)
+        # Sol #9: a plugin with zero target rows (e.g. fully unassigned, or an
+        # update whose new artifact has unresolved secrets) made all([]) == True
+        # → false-green. Require the TOP-LEVEL readiness, which folds in the
+        # artifact/tools/secrets checks AND every target row's readiness — so an
+        # empty-rows verify no longer passes vacuously.
+        return verify.get("ready") is True
     # absent
     if runtime is None or name is None:
         return True
@@ -3299,7 +3327,14 @@ def _tool_verify_plugin_state(
     if not reg.valid:
         return {"ready": False, "reasons": ["registry_invalid"],
                 "targets": []}
-    entry = next((e for e in reg.raw.get("plugins", [])
+    # Sol #8: verify MUST agree with the resolver. An entry that resolve_for()
+    # drops (duplicate_name) or skips (entry_invalid) is unavailable to every
+    # agent/executor — verify must not green it off the raw list. Select from
+    # the VALIDATED entries and surface the resolver's own rejection reason.
+    bad = next((i for i in reg.entry_issues if i.name == plugin_name), None)
+    if bad is not None:
+        return {"ready": False, "reasons": [bad.reason_code], "targets": []}
+    entry = next((e for e in reg.entries
                   if isinstance(e, dict) and e.get("name") == plugin_name), None)
     if entry is None:
         return {"ready": False, "reasons": ["not_registered"], "targets": []}
@@ -3334,9 +3369,16 @@ def _tool_verify_plugin_state(
     rp = ResolvedPlugin(name=plugin_name, artifact_id=str(artifact_id),
                         path=str(path), version=str(entry.get("version", "")),
                         manifest=manifest)
+    # Sol #16: a PRESENT-but-malformed .mcp.json silently degrades grants/secrets
+    # to [] (indistinguishable from skill-only), so a broken MCP server would
+    # otherwise verify ready. Treat it as a blocking reason.
+    if checksum_valid and mcp_json_malformed(rp):
+        reasons.append("mcp_invalid")
     granted = grants_for_resolved(rp) if checksum_valid else []
 
-    # Tools (system-requirements manifest — verify_bin presence).
+    # Tools (system-requirements — verify_bin presence). Sol #11: check BOTH the
+    # INSTALLED manifest rows AND every requirement the ARTIFACT declares, so a
+    # plugin declaring a sysreq with no installed row can't pass on all([]).
     data = read_manifest()
     tool_entries = [p for p in data["plugins"] if p["name"] == plugin_name]
     tools_bin = _tools_bin if _tools_bin is not None else Path("/config/tools/bin")
@@ -3348,6 +3390,16 @@ def _tool_verify_plugin_state(
             "requirement": t["winning_strategy"], "verify_bin": vb,
             "status": "ready" if ready_bin else "missing",
             **({} if ready_bin else {"reason": f"{vb} not in tools/bin"})})
+    # Declared-but-not-installed requirements (Sol #11): every requirement the
+    # artifact's manifest declares must have a corresponding installed entry.
+    installed_bins = {t.get("verify_bin", "") for t in tool_entries}
+    for req in (plugin_store.manifest_sysreqs(manifest) if checksum_valid else []):
+        vb = req.get("verify_bin", "")
+        if vb and vb not in installed_bins:
+            tools_status.append({
+                "requirement": req.get("type", "declared"), "verify_bin": vb,
+                "status": "missing",
+                "reason": f"declared requirement {vb!r} has no installed entry"})
 
     # Secrets from the ARTIFACT's .mcp.json (no version-dir guessing).
     required = set(required_env_vars_for_resolved(rp)) if checksum_valid else set()

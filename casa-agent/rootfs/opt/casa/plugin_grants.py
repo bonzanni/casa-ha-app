@@ -44,6 +44,28 @@ def _mcp_servers(mcp_json_path: Path) -> dict:
         return {}
 
 
+def mcp_json_malformed(rp) -> bool:
+    """Sol #16: True iff ``.mcp.json`` is PRESENT but unparseable, not a JSON
+    object, or has a non-mapping ``mcpServers`` — i.e. the plugin's declared MCP
+    server cannot load. An ABSENT ``.mcp.json`` (skill-only plugin) is NOT
+    malformed. Verify uses this so a broken MCP config can't report ready when
+    grants/secrets silently degrade to ``[]`` (which is indistinguishable from
+    skill-only otherwise)."""
+    mcp_json = Path(rp.path) / ".mcp.json"
+    if not mcp_json.is_file():
+        return False
+    try:
+        data = json.loads(mcp_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    if not isinstance(data, dict):
+        return True
+    servers = data.get("mcpServers")
+    # No mcpServers key = a valid server-less config. A present-but-non-mapping
+    # mcpServers is malformed.
+    return servers is not None and not isinstance(servers, dict)
+
+
 def grants_for_resolved(rp) -> list[str]:
     """Server-level grant strings for one resolved plugin (sorted). Skill-only
     plugins (no ``.mcp.json``) yield ``[]``."""
