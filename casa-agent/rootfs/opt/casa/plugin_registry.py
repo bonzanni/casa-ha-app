@@ -293,8 +293,11 @@ _RELOAD_LOCK = threading.Lock()
 
 def snapshot_generation() -> int:
     """The current snapshot's monotonic generation (bumped by every
-    reload_snapshot). Reads the one published snapshot object."""
-    return _current().generation
+    reload_snapshot). Reads the one published snapshot object; 0 when no
+    snapshot has ever been published (a stubbed reload_snapshot in tests —
+    the lazy load in _current normally guarantees one)."""
+    snap = _current()
+    return snap.generation if snap is not None else 0
 
 
 def reload_snapshot(*, registry_path: Path = REGISTRY_PATH,
