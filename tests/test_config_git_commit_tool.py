@@ -49,7 +49,7 @@ class TestConfigGitCommitTool:
         warning = payload.get("warning", "")
         assert "gitignored" in warning
         assert "plugin-env.conf" in warning   # the intentionally-secret case
-        assert "marketplace.json" in warning  # the tracked exception
+        assert "registry.json" in warning     # the tracked exception
 
     async def test_real_commit_has_no_warning(self, configurator_origin):
         from tools import config_git_commit

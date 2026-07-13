@@ -1141,8 +1141,8 @@ def _refuse_unprivileged(tool_name: str, caller: str | None) -> dict:
 @tool(
     "config_git_commit",
     "Stage and commit all tracked changes under /config/ (tracked: agents/, "
-    "policies/, schema/, marketplace/.claude-plugin/marketplace.json; "
-    "everything else incl. plugin-env.conf is gitignored by design). "
+    "policies/, schema/, plugins/registry.json; everything else incl. "
+    "plugins/store/, plugins/.staging/, and plugin-env.conf is gitignored). "
     "Returns the commit SHA — empty plus a warning when nothing tracked "
     "changed, which is the expected outcome for gitignored-only writes. "
     "Restricted to the configurator executor role.",
@@ -1203,13 +1203,12 @@ async def config_git_commit(args: dict) -> dict:
             "sha": "", "message": message,
             "warning": (
                 "No tracked changes to commit. The config repo tracks ONLY "
-                "agents/, policies/, schema/ and "
-                "marketplace/.claude-plugin/marketplace.json; every other "
-                "path is gitignored by design — plugin-env.conf in "
-                "particular is a secrets file and must never enter git "
-                "history. If you only wrote gitignored paths, an empty SHA "
-                "is the expected, correct outcome: report it as such and "
-                "do NOT retry the commit."
+                "agents/, policies/, schema/ and plugins/registry.json; every "
+                "other path is gitignored by design — plugins/store/, "
+                "plugins/.staging/, and plugin-env.conf (a secrets file) must "
+                "never enter git history. If you only wrote gitignored paths, "
+                "an empty SHA is the expected, correct outcome: report it as "
+                "such and do NOT retry the commit."
             ),
         })
     except Exception as exc:  # noqa: BLE001

@@ -138,14 +138,14 @@ elif [ ! -d "$CONFIG_DIR/.git" ]; then
 !policies/**
 !schema/
 !schema/**
-# P-3 (v0.69.1): the user-marketplace manifest is config, not a secret —
-# configurator recipes commit it after every marketplace op, and versioning
-# it gives an audit trail. ONLY the manifest: everything else under
-# marketplace/ (and plugin-env.conf, a mode-0600 secrets file) stays
-# untracked via the leading `*`.
-!marketplace/
-!marketplace/.claude-plugin/
-!marketplace/.claude-plugin/marketplace.json
+# Unified plugin architecture (v0.71.0): the registry is config — the single
+# plugin-assignment authority — and versioning it gives an audit trail.
+# ONLY registry.json: the artifact store and staging under plugins/ are
+# content-addressed binaries, never tracked.
+!plugins/
+!plugins/registry.json
+plugins/store/
+plugins/.staging/
 !.gitignore
 EOF
     git add -A 2>/dev/null || true
