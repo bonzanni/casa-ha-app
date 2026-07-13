@@ -54,13 +54,14 @@ uuid_count=$(echo "$webhook_keys" | grep -Ev "^webhook-(user-A|user-B)$" | grep 
     || fail "expected 2 UUID-backed invoke sessions, got $uuid_count (keys: $webhook_keys)"
 pass "C-3b each chat_id-less invoke gets its own session"
 
-log "C-4: cc-home has 5 default plugins after boot (seed-copy verified)"
-plugin_count=$(docker exec "$NAME" sh -c \
-    'export HOME=/config/cc-home; \
-     claude plugin list --json' \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); en=sum(1 for p in d if p.get('enabled')); print(f'{len(d)}/{en}')")
-# Format is "<total>/<enabled>". Both must be 5 — count alone isn't enough,
-# the binding layer (plugins_binding.py) filters out enabled=false plugins.
-[ "$plugin_count" = "5/5" ] \
-    || fail "expected 5/5 (total/enabled) default plugins from seed-copy, got $plugin_count"
-pass "C-4 default plugins seeded: 5/5 (all enabled)"
+log "C-4: 5 default plugins materialized (store + registry) after boot"
+# v0.71.0 unified arch: the init-plugin-store oneshot imports the bundled
+# artifacts into /config/plugins/store/<name>/<artifact_id>/ and seeds the
+# registry. No cc-home marketplace, no enabled-flag filter.
+store_count=$(docker exec "$NAME" sh -c 'ls -1 /config/plugins/store 2>/dev/null | wc -l')
+[ "$store_count" -ge 5 ] \
+    || fail "expected >=5 plugin dirs in /config/plugins/store, got $store_count"
+reg_count=$(docker exec "$NAME" sh -c 'jq ".plugins | length" /config/plugins/registry.json')
+[ "$reg_count" -ge 5 ] \
+    || fail "expected >=5 registry entries in registry.json, got $reg_count"
+pass "C-4 default plugins materialized: store=$store_count registry=$reg_count"

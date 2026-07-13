@@ -54,45 +54,21 @@ COPY test-local/mock-claude-sdk /tmp/mock-claude-sdk
 RUN /opt/casa/venv/bin/pip install --no-cache-dir --force-reinstall --no-deps /tmp/mock-claude-sdk \
  && python3 -c "from claude_agent_sdk import ClaudeSDKClient; print('mock SDK active')"
 
-# --- Populate /opt/claude-seed/ (mirrors production Dockerfile) ---
-# L31: run this network-bound seed install BEFORE `COPY casa-agent/rootfs /` so
-# a code change does not bust its layer cache. Its inputs (gitconfig +
-# credential helper + marketplace-defaults) are narrow-COPY'd here; the later
-# broad rootfs COPY re-copies them with identical content. v0.14.9 seed-copy at
-# boot expects /opt/claude-seed to exist with the install state for the default
-# plugins so setup-configs.sh's seed-copy block has something to copy from.
-# /etc/gitconfig handles the SSH→HTTPS rewrite for the github.com clones below.
+# --- Bundled plugin artifacts (mirrors production Dockerfile, spec 3.6) ---
+# Runs BEFORE `COPY casa-agent/rootfs /` (cache); pins are exact commits in
+# defaults/plugin-registry.json. /etc/gitconfig + credential helper narrow-
+# COPY'd for the authenticated github.com fetch.
 COPY casa-agent/rootfs/etc/gitconfig /etc/gitconfig
 COPY casa-agent/rootfs/opt/casa/scripts/git-credential-casa.sh /opt/casa/scripts/git-credential-casa.sh
-COPY casa-agent/rootfs/opt/casa/defaults/marketplace-defaults/ /opt/casa/defaults/marketplace-defaults/
-
-RUN id -u casa >/dev/null 2>&1 || useradd -m -s /bin/bash casa; \
-    mkdir -p /opt/claude-seed && chown -R casa:casa /opt/claude-seed
-
-USER casa
-
-RUN CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin marketplace add /opt/casa/defaults/marketplace-defaults/ \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin install superpowers@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin install plugin-dev@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin install skill-creator@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin install mcp-server-dev@casa-plugins-defaults \
- && CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-    claude plugin install context7@casa-plugins-defaults
-
-USER root
-
-RUN mkdir -p /opt/claude-seed/marketplaces \
- && cp -r /opt/casa/defaults/marketplace-defaults \
-          /opt/claude-seed/marketplaces/casa-plugins-defaults \
- && chmod -R a-w /opt/claude-seed \
- && chmod -R a+rX /opt/claude-seed
-
-ENV CLAUDE_CODE_PLUGIN_SEED_DIR=/opt/claude-seed
+COPY casa-agent/rootfs/opt/casa/plugin_registry.py casa-agent/rootfs/opt/casa/plugin_store.py /opt/casa/
+COPY casa-agent/rootfs/opt/casa/scripts/build_plugin_bundle.py /opt/casa/scripts/build_plugin_bundle.py
+COPY casa-agent/rootfs/opt/casa/defaults/plugin-registry.json /opt/casa/defaults/plugin-registry.json
+RUN python3 /opt/casa/scripts/build_plugin_bundle.py \
+      --registry /opt/casa/defaults/plugin-registry.json \
+      --out /opt/casa/plugin-bundle \
+ && rm -rf /opt/casa/.bundle-staging \
+ && chmod -R a-w /opt/casa/plugin-bundle \
+ && chmod -R a+rX /opt/casa/plugin-bundle
 
 COPY casa-agent/rootfs /
 
