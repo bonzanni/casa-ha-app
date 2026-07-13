@@ -20,6 +20,16 @@ mkdir -p "$CONFIG_DIR/agents" \
          "$DATA_DIR/casa-s6-services" \
          "$DATA_DIR/engagements"
 
+# Plugin media outbox (v0.73.0): a shared /data drop-box for producer plugins;
+# send_media claims files out of it. Private .claims/ holds in-flight claims.
+# Restrictive 0770 (root + root group); CASA_PLUGIN_OUTBOX_DIR is exported into
+# the s6 container environment so casa-main sees it at boot.
+mkdir -p "$DATA_DIR/plugin-outbox/.claims"
+chmod 0770 "$DATA_DIR/plugin-outbox" "$DATA_DIR/plugin-outbox/.claims"
+printf '%s' "$DATA_DIR/plugin-outbox" \
+    > /run/s6/container_environment/CASA_PLUGIN_OUTBOX_DIR
+bashio::log.info "Plugin outbox ready: $DATA_DIR/plugin-outbox"
+
 # Pre-1.0.0 doctrine (see memory/feedback_ship_gate_doctrine.md): no
 # migration blocks in this script. Breaking changes just update the
 # defaults; the overlay at /config/ is expected to

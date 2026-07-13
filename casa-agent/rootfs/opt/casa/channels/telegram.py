@@ -19,9 +19,10 @@ import collections
 import logging
 import os
 import time
+from io import BytesIO
 from typing import Any, Awaitable, Callable
 
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, NetworkError, TelegramError, TimedOut
 
@@ -36,6 +37,7 @@ from telegram.ext import (
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import Channel
+from media_policies import MEDIA_POLICIES
 from channels.telegram_supervisor import ReconnectSupervisor
 from log_cid import cid_var, new_cid
 from rate_limit import RateLimiter
@@ -1394,6 +1396,29 @@ class TelegramChannel(Channel):
                 chat_id=target_chat,
                 text=chunk,
             )
+
+    async def send_media(
+        self, content: bytes, kind: str, filename: str, context: dict[str, Any],
+        *, caption: str | None = None,
+    ) -> None:
+        """Deliver *content* as the given media *kind* to the resolved chat.
+
+        Dispatches positionally to the kind's PTB send method (§3.1) — each
+        takes the media as its 2nd positional arg under a different name
+        (document/photo/audio/voice), so positional avoids per-kind kwargs.
+        Raises when the channel isn't started (the tool maps that to
+        ``channel_unavailable``); lets TelegramError propagate (the tool
+        classifies it)."""
+        if self._app is None:
+            raise RuntimeError("Telegram channel not started; cannot send media")
+        target_chat = _resolve_chat_id(context, self.chat_id)
+        self._stop_typing(str(target_chat))
+        method = getattr(self._app.bot, MEDIA_POLICIES[kind].ptb_method)
+        await method(
+            target_chat,
+            InputFile(BytesIO(content), filename=filename),
+            caption=caption,
+        )
 
     # ------------------------------------------------------------------
     # Rich-text response delivery (v0.70.0). ONLY reached via the

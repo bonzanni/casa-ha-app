@@ -69,7 +69,7 @@ KNOWN_PLUGIN_SERVERS = frozenset({"context7"})
 REQUIRED_FRAMEWORK_TOOLS: dict[str, set[str]] = {
     "assistant": {
         "recall_memory", "delegate_to_agent", "engage_executor",
-        "send_message", "get_schedule",
+        "send_message", "get_schedule", "send_media",
     },
     "butler": {"recall_memory"},          # serves the voice channel; no auto-recall path
     "configurator": {

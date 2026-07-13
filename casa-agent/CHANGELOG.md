@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.73.0] - 2026-07-13
+
+### Added
+
+- **`send_media` capability** — agents can now deliver a document, photo, audio,
+  or voice file to the user over the originating channel. A producer drops the
+  file into a shared `/data/plugin-outbox/` and hands `send_media` only the path;
+  Casa streams the bytes to Telegram, so they never enter the model context.
+  Delivery is guarded by a TOCTOU-safe claim-by-atomic-rename with an
+  `O_NOFOLLOW` regular-file gate, single-hardlink and size checks, and a per-kind
+  magic sniff (PDF / JPEG-PNG / MP3 / Ogg-Opus); orphaned files are swept after
+  2 h. Granted to the assistant and finance agents. First consumer: the
+  on-demand invoice PDF preview (the plugin + n8n pieces land separately).
+
 ## [0.72.0] - 2026-07-13
 
 ### Removed

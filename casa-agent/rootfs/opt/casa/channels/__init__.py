@@ -22,6 +22,15 @@ class Channel(ABC):
     async def send(self, message: str, context: dict) -> None:
         """Send a message through the channel."""
 
+    async def send_media(
+        self, content: bytes, kind: str, filename: str, context: dict,
+        *, caption: str | None = None,
+    ) -> None:
+        """Deliver a media file. Concrete (not abstract): channels that can't
+        deliver media inherit this NotImplementedError, which the send_media
+        tool catches and maps to ``unsupported_channel``."""
+        raise NotImplementedError(f"{self.name} channel cannot deliver media")
+
     @abstractmethod
     async def stop(self) -> None:
         """Stop the channel and clean up resources."""

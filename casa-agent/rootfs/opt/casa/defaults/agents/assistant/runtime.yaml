@@ -15,6 +15,7 @@ tools:
     - mcp__casa-framework__get_schedule
     - mcp__casa-framework__recall_memory
     - mcp__casa-framework__send_message
+    - mcp__casa-framework__send_media
   disallowed: []
   permission_mode: acceptEdits
   max_turns: 20
