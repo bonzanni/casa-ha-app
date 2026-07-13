@@ -27,8 +27,18 @@ def _pr(name="probe", version="1.2.0", sysreqs=None):
                          path=f"/store/{name}/" + "a" * 64, manifest=manifest)
 
 
+def _entry(name="probe", version="1.0.0"):
+    """A valid registered entry (its stored revision predates _pr()'s)."""
+    return {"name": name,
+            "source": {"type": "github", "repo": "o/r", "ref": "v1",
+                       "revision": "git:" + "a" * 40, "subdir": ""},
+            "artifact_id": "e" * 64, "version": version,
+            "targets": ["resident:assistant"]}
+
+
 def _wire(monkeypatch, tmp_path, st, *, publish=None, publish_exc=None,
-          sysreq_exc=None, dispatch_status="ok", with_runtime=True):
+          sysreq_exc=None, dispatch_status="ok", with_runtime=True,
+          resolved_sha="b" * 40, resolve_exc=None):
     import tools as tools_mod
     import agent as agent_mod
     import plugin_registry as preg
@@ -43,7 +53,13 @@ def _wire(monkeypatch, tmp_path, st, *, publish=None, publish_exc=None,
         st.raw = copy.deepcopy(data.raw)
         st.log.append("save")
 
-    def fake_publish(*, name, repo, ref, subdir=""):
+    def fake_resolve(repo, ref, **k):
+        st.log.append("resolve")
+        if resolve_exc is not None:
+            raise resolve_exc
+        return resolved_sha
+
+    def fake_publish(*, name, repo, ref, subdir="", commit=None):
         st.log.append("publish")
         if publish_exc is not None:
             raise publish_exc
@@ -67,6 +83,7 @@ def _wire(monkeypatch, tmp_path, st, *, publish=None, publish_exc=None,
                         lambda: st.log.append("reload_snapshot"))
     monkeypatch.setattr(preg, "resolve_all",
                         lambda: ResolutionResult(registry_valid=True))
+    monkeypatch.setattr(tools_mod.plugin_store, "resolve_ref", fake_resolve)
     monkeypatch.setattr(tools_mod.plugin_store, "publish", fake_publish)
     monkeypatch.setattr(tools_mod, "install_requirements", fake_install_req)
     monkeypatch.setattr(tools_mod, "_tool_verify_plugin_state",
@@ -92,8 +109,9 @@ async def test_plugin_add_happy_activates_and_sequences(monkeypatch, tmp_path):
     assert payload["version"] == "1.2.0"
     # Registry gained the entry.
     assert [e["name"] for e in st.raw["plugins"]] == ["probe"]
-    # §3.9 ORDER is load-bearing: publish → sysreqs → save → snapshot → reload.
-    assert st.log == ["publish", "install_requirements", "save",
+    # §3.9/C.2 ORDER is load-bearing:
+    # resolve → publish → sysreqs → save → snapshot → reload.
+    assert st.log == ["resolve", "publish", "install_requirements", "save",
                       "reload_snapshot", "dispatch:assistant"]
 
 
@@ -445,6 +463,230 @@ def test_install_sysreqs_no_reqs_clears_stale_row(monkeypatch):
     r = tools_mod._install_plugin_sysreqs("p", {"name": "p", "version": "2"})
     assert r is None
     assert removed == ["p"]
+
+
+# --- C.2 identity guards (v0.74.0) ------------------------------------------
+
+
+async def test_update_revision_mismatch_aborts_before_everything(
+        monkeypatch, tmp_path):
+    """C.2 step 2: expected_revision mismatch is a hard abort BEFORE
+    publish/sysreqs/registry mutation."""
+    st = _State()
+    st.raw["plugins"].append(_entry())
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr(),
+                      resolved_sha="c" * 40)
+    core = tools_mod._plugin_update_sync(
+        name="probe", new_ref="v1.2.0", expected_revision="git:" + "b" * 40)
+    assert core == {"ok": False, "kind": "revision_mismatch",
+                    "expected_revision": "b" * 40,
+                    "resolved_revision": "c" * 40}
+    for step in ("publish", "install_requirements", "save"):
+        assert step not in st.log, step
+
+
+async def test_update_tag_version_mismatch_aborts_before_sysreqs(
+        monkeypatch, tmp_path):
+    """C.2 step 4: a vX.Y.Z ref must equal 'v'+manifest.version — abort
+    BEFORE sysreq install and registry mutation."""
+    st = _State()
+    st.raw["plugins"].append(_entry())
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr(version="1.2.0"))
+    core = tools_mod._plugin_update_sync(name="probe", new_ref="v9.9.9")
+    assert core["ok"] is False and core["kind"] == "tag_version_mismatch"
+    assert "install_requirements" not in st.log and "save" not in st.log
+
+
+async def test_update_non_tag_ref_skips_tag_version_guard(monkeypatch, tmp_path):
+    st = _State()
+    st.raw["plugins"].append(_entry())
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr(version="1.2.0"))
+    core = tools_mod._plugin_update_sync(name="probe", new_ref="master")
+    assert core["ok"] is True
+
+
+async def test_update_matching_tag_and_revision_proceeds_in_order(
+        monkeypatch, tmp_path):
+    st = _State()
+    st.raw["plugins"].append(_entry())
+    tools_mod = _wire(monkeypatch, tmp_path, st,
+                      publish=_pr(version="1.2.0",
+                                  sysreqs=[{"type": "tarball", "url": "x"}]))
+    core = tools_mod._plugin_update_sync(
+        name="probe", new_ref="v1.2.0", expected_revision="b" * 40)
+    assert core["ok"] is True
+    assert st.log.index("resolve") < st.log.index("publish") \
+        < st.log.index("install_requirements") < st.log.index("save")
+
+
+async def test_add_revision_mismatch_aborts(monkeypatch, tmp_path):
+    """C.2 applies to plugin_add too — abort BEFORE publish, sysreq install,
+    and registry mutation (r2-B4: ordering asserted, not just no-save)."""
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st,
+                      publish=_pr(sysreqs=[{"type": "tarball", "url": "x"}]),
+                      resolved_sha="c" * 40)
+    core = tools_mod._plugin_add_sync(
+        name="probe", repo="o/r", ref="v1.2.0",
+        targets=["resident:assistant"], expected_revision="b" * 40)
+    assert core["kind"] == "revision_mismatch"
+    assert st.log == ["resolve"]              # NOTHING after the guard ran
+    for step in ("publish", "install_requirements", "save"):
+        assert step not in st.log, step
+    assert st.raw["plugins"] == []            # registry byte-identical
+
+
+async def test_add_tag_version_mismatch_aborts_before_sysreqs_and_save(
+        monkeypatch, tmp_path):
+    """r2-B7: the add-side tag guard, with the same pre-sysreq/pre-save abort."""
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st,
+                      publish=_pr(version="1.2.0",
+                                  sysreqs=[{"type": "tarball", "url": "x"}]))
+    core = tools_mod._plugin_add_sync(
+        name="probe", repo="o/r", ref="v9.9.9",
+        targets=["resident:assistant"])
+    assert core["ok"] is False and core["kind"] == "tag_version_mismatch"
+    assert "install_requirements" not in st.log and "save" not in st.log
+    assert st.raw["plugins"] == []            # registry byte-identical
+
+
+async def test_add_invalid_expected_revision_rejected(monkeypatch, tmp_path):
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    core = tools_mod._plugin_add_sync(
+        name="probe", repo="o/r", ref="v1.2.0",
+        targets=["resident:assistant"], expected_revision="not-a-sha")
+    assert core == {"ok": False, "kind": "invalid_expected_revision",
+                    "expected_revision": "not-a-sha"}
+
+
+async def test_resolver_taxonomy_maps_to_envelope_kinds(monkeypatch, tmp_path):
+    import plugin_store
+    st = _State()
+    st.raw["plugins"].append(_entry())
+    cases = [
+        (plugin_store.RefNotFound("x"), {"ok": False, "kind": "ref_not_found"}),
+        (plugin_store.ResolveAuthFailed("x"),
+         {"ok": False, "kind": "resolve_auth_failed"}),
+        (plugin_store.SourceEmpty("x"), {"ok": False, "kind": "source_empty"}),
+        (plugin_store.ResolveUnavailable("x", retry_after_s=42.0),
+         {"ok": False, "kind": "resolve_unavailable", "retry_after_s": 42.0}),
+        (plugin_store.ResolveUnavailable("x"),
+         {"ok": False, "kind": "resolve_unavailable"}),
+    ]
+    for exc, expected in cases:
+        tools_mod = _wire(monkeypatch, tmp_path, st, resolve_exc=exc)
+        core = tools_mod._plugin_update_sync(name="probe", new_ref="v1.2.0")
+        assert core == expected, expected["kind"]
+
+
+# --- §E pinned mutation envelope (v0.74.0) -----------------------------------
+
+
+async def test_envelope_pre_activation_failure_is_pinned_shape(
+        monkeypatch, tmp_path):
+    """Guard failure: pin never moved; kind/verify still present (spec §E)."""
+    import plugin_store
+    st = _State()
+    st.raw["plugins"].append(_entry())
+    tools_mod = _wire(monkeypatch, tmp_path, st,
+                      resolve_exc=plugin_store.RefNotFound("x"))
+    res = await tools_mod.plugin_update.handler(
+        {"name": "probe", "new_ref": "v9.9.9"})
+    payload = json.loads(res["content"][0]["text"])
+    assert payload["ok"] is False
+    assert payload["kind"] == "ref_not_found"
+    assert payload["activation_committed"] is False
+    assert payload["runtime_ready"] is False
+    assert payload["verify"] == {}
+    assert res.get("is_error") is True          # outer MCP flag …
+    assert "is_error" not in payload            # … never a payload field
+
+
+async def test_envelope_committed_but_not_ready(monkeypatch, tmp_path):
+    """activation_committed:true + runtime_ready:false = 'pin moved, runtime
+    not caught up' — callers retry the RELOAD, never the activation."""
+    st = _State()
+    st.raw["plugins"].append(_entry())
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr(),
+                      dispatch_status="error")
+    res = await tools_mod.plugin_update.handler(
+        {"name": "probe", "new_ref": "v1.2.0"})
+    payload = json.loads(res["content"][0]["text"])
+    assert payload["activation_committed"] is True
+    assert payload["runtime_ready"] is False
+    assert payload["ok"] is False
+    assert payload["kind"] == "reload_failed"
+    assert "verify" in payload
+    assert res.get("is_error") is True
+
+
+async def test_envelope_fully_ok_has_kind_none(monkeypatch, tmp_path):
+    st = _State()
+    st.raw["plugins"].append(_entry())
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    res = await tools_mod.plugin_update.handler(
+        {"name": "probe", "new_ref": "v1.2.0"})
+    payload = json.loads(res["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["kind"] is None              # pinned shape: present, None
+    assert payload["activation_committed"] is True
+    assert payload["runtime_ready"] is True
+    assert payload["verify"] == {"ready": True}
+    assert res.get("is_error") is not True
+
+
+async def test_add_envelope_pre_activation_failure_is_pinned_shape(
+        monkeypatch, tmp_path):
+    """r2-B6: §E names plugin_add too — same pinned shape on its
+    pre-activation failure path."""
+    import plugin_store
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st,
+                      resolve_exc=plugin_store.RefNotFound("x"))
+    res = await tools_mod.plugin_add.handler(
+        {"name": "probe", "repo": "o/r", "ref": "v9.9.9",
+         "targets": ["resident:assistant"]})
+    payload = json.loads(res["content"][0]["text"])
+    assert payload["ok"] is False
+    assert payload["kind"] == "ref_not_found"
+    assert payload["activation_committed"] is False
+    assert payload["runtime_ready"] is False
+    assert payload["verify"] == {}
+    assert res.get("is_error") is True
+    assert "is_error" not in payload
+
+
+async def test_add_envelope_fully_ok_has_kind_none(monkeypatch, tmp_path):
+    """r2-B6: add-side success carries the full pinned payload."""
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    res = await tools_mod.plugin_add.handler(
+        {"name": "probe", "repo": "o/r", "ref": "v1.2.0",
+         "targets": ["resident:assistant"]})
+    payload = json.loads(res["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["kind"] is None
+    assert payload["activation_committed"] is True
+    assert payload["runtime_ready"] is True
+    assert payload["verify"] == {"ready": True}
+    assert res.get("is_error") is not True
+
+
+async def test_add_envelope_committed_but_not_ready(monkeypatch, tmp_path):
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr(),
+                      dispatch_status="error")
+    res = await tools_mod.plugin_add.handler(
+        {"name": "probe", "repo": "o/r", "ref": "v1.2.0",
+         "targets": ["resident:assistant"]})
+    payload = json.loads(res["content"][0]["text"])
+    assert payload["activation_committed"] is True
+    assert payload["runtime_ready"] is False
+    assert payload["ok"] is False
+    assert payload["kind"] == "reload_failed"
+    assert res.get("is_error") is True
 
 
 def test_plugin_remove_clears_manifest_row(monkeypatch, tmp_path):

@@ -3386,8 +3386,19 @@ async def _reload_and_verify_targets(name: str, targets: list,
         expect=expect, postcondition_ok=ok)
     await asyncio.to_thread(_regenerate_plugin_health, mutation_issues)
     await _notify_plugin_health_if_possible()
-    result = {"ok": ok, "reloaded": reloaded, "reload_errors": reload_errors,
-              "verify": verify}
+    result = {
+        # Spec §E pinned payload: activation_committed = the registry pin
+        # landed (this sequencer only runs post-commit); runtime_ready =
+        # reload + verify agree desired==active; ok = both; kind is present
+        # on EVERY payload (None on success). is_error is NOT a payload
+        # field — _result derives the outer MCP flag from ok:false.
+        "ok": ok,
+        "kind": None,
+        "activation_committed": True,
+        "runtime_ready": ok,
+        "reloaded": reloaded, "reload_errors": reload_errors,
+        "verify": verify,
+    }
     if not ok:
         result["kind"] = ("reload_failed" if reload_errors
                           else "postcondition_failed")
@@ -3428,11 +3439,61 @@ def _install_plugin_sysreqs(name: str, manifest: dict) -> dict | None:
     return None
 
 
+def _resolve_and_guard(*, repo: str, ref: str,
+                       expected_revision: str | None) -> "str | dict":
+    """C.2 steps 1-2 (v0.74.0): resolve ref -> sha, then the
+    expected_revision guard. Returns the 40-hex commit on success, else a
+    failure envelope dict. resolve_unavailable envelopes carry the
+    resolver's structured retry_after_s when known (C.3)."""
+    try:
+        commit = plugin_store.resolve_ref(repo, ref)
+    except plugin_store.RefNotFound:
+        return {"ok": False, "kind": "ref_not_found"}
+    except plugin_store.ResolveAuthFailed:
+        return {"ok": False, "kind": "resolve_auth_failed"}
+    except plugin_store.SourceEmpty:
+        return {"ok": False, "kind": "source_empty"}
+    except plugin_store.ResolveUnavailable as exc:
+        env = {"ok": False, "kind": "resolve_unavailable"}
+        if getattr(exc, "retry_after_s", None) is not None:
+            env["retry_after_s"] = exc.retry_after_s
+        return env
+    except plugin_store.StoreError as exc:
+        return {"ok": False, "kind": getattr(exc, "reason_code", "store_error")}
+    if expected_revision is not None:
+        want = plugin_store.normalize_revision(expected_revision)
+        if want is None:
+            return {"ok": False, "kind": "invalid_expected_revision",
+                    "expected_revision": expected_revision}
+        if want != commit:
+            # A tag that MOVED between the producer's build and this pin
+            # (spec C.2 step 2) — hard abort, nothing mutated.
+            return {"ok": False, "kind": "revision_mismatch",
+                    "expected_revision": want, "resolved_revision": commit}
+    return commit
+
+
+def _tag_version_guard(ref: str, manifest: dict) -> dict | None:
+    """C.2 step 4 (v0.74.0): a release-tag ref must equal 'v' + the FETCHED
+    manifest's version. None when the guard passes (or ref is not a release
+    tag). Runs BEFORE sysreq install and registry mutation."""
+    if not plugin_store.RELEASE_TAG_RE.match(ref or ""):
+        return None
+    version = str((manifest or {}).get("version", ""))
+    if ref != f"v{version}":
+        return {"ok": False, "kind": "tag_version_mismatch",
+                "ref": ref, "manifest_version": version}
+    return None
+
+
 def _plugin_add_sync(*, name: str, repo: str, ref: str, subdir: str = "",
-                     targets: list) -> dict:
-    """Blocking core of plugin_add: publish → sysreqs → activate. Pure-sync;
-    returns the exact envelope contract (ok True|False). Registry stays
-    byte-identical on any pre-activation failure (FR2)."""
+                     targets: list,
+                     expected_revision: str | None = None) -> dict:
+    """Blocking core of plugin_add. C.2 (v0.74.0) enforcement ORDER — all
+    identity guards run before any sysreq install or registry mutation:
+    resolve -> revision-check -> manifest-fetch (publish) -> tag/version-check
+    -> sysreqs -> activate. Registry stays byte-identical on any
+    pre-activation failure (FR2)."""
     if not plugin_registry.NAME_RE.match(name or ""):
         return {"ok": False, "kind": "invalid_name", "name": name}
     targets = list(targets or [])
@@ -3454,15 +3515,22 @@ def _plugin_add_sync(*, name: str, repo: str, ref: str, subdir: str = "",
     if any(isinstance(e, dict) and e.get("name") == name
            for e in data.raw.get("plugins", [])):
         return {"ok": False, "kind": "plugin_exists", "name": name}
+    guarded = _resolve_and_guard(repo=repo, ref=ref,
+                                 expected_revision=expected_revision)
+    if isinstance(guarded, dict):
+        return guarded
     try:
         result = plugin_store.publish(name=name, repo=repo, ref=ref,
-                                      subdir=subdir)
+                                      subdir=subdir, commit=guarded)
     except plugin_store.RefNotFound:
         return {"ok": False, "kind": "ref_not_found"}
     except plugin_store.ResolveUnavailable:
         return {"ok": False, "kind": "resolve_unavailable"}
     except plugin_store.StoreError as exc:
         return {"ok": False, "kind": getattr(exc, "reason_code", "store_error")}
+    err = _tag_version_guard(ref, result.manifest)             # BEFORE sysreqs
+    if err is not None:
+        return err
     err = _install_plugin_sysreqs(name, result.manifest)       # BEFORE activate
     if err is not None:
         return err
@@ -3479,10 +3547,13 @@ def _plugin_add_sync(*, name: str, repo: str, ref: str, subdir: str = "",
             "revision": result.revision, "path": result.path}
 
 
-def _plugin_update_sync(*, name: str, new_ref: str) -> dict:
-    """Blocking core of plugin_update: re-publish from new_ref (version DERIVED
-    from the fetched manifest, FR5), install new sysreqs BEFORE moving the
-    registry pointer, then repoint the entry. Old artifact retained."""
+def _plugin_update_sync(*, name: str, new_ref: str,
+                        expected_revision: str | None = None) -> dict:
+    """Blocking core of plugin_update. C.2 (v0.74.0) enforcement ORDER — all
+    identity guards run before any sysreq install or registry mutation:
+    resolve -> revision-check -> manifest-fetch (publish) -> tag/version-check
+    -> sysreqs -> registry repoint. Version DERIVED from the fetched manifest
+    (FR5). Old artifact retained."""
     data = plugin_registry.load_registry()
     if not data.valid:
         return {"ok": False, "kind": "registry_invalid"}
@@ -3492,15 +3563,22 @@ def _plugin_update_sync(*, name: str, new_ref: str) -> dict:
         return {"ok": False, "kind": "not_registered", "name": name}
     src = entry.get("source") or {}
     repo, subdir = src.get("repo", ""), src.get("subdir", "")
+    guarded = _resolve_and_guard(repo=repo, ref=new_ref,
+                                 expected_revision=expected_revision)
+    if isinstance(guarded, dict):
+        return guarded
     try:
         result = plugin_store.publish(name=name, repo=repo, ref=new_ref,
-                                      subdir=subdir)
+                                      subdir=subdir, commit=guarded)
     except plugin_store.RefNotFound:
         return {"ok": False, "kind": "ref_not_found"}
     except plugin_store.ResolveUnavailable:
         return {"ok": False, "kind": "resolve_unavailable"}
     except plugin_store.StoreError as exc:
         return {"ok": False, "kind": getattr(exc, "reason_code", "store_error")}
+    err = _tag_version_guard(new_ref, result.manifest)         # BEFORE sysreqs
+    if err is not None:
+        return err
     err = _install_plugin_sysreqs(name, result.manifest)       # BEFORE repoint
     if err is not None:
         return err
@@ -3540,6 +3618,9 @@ def _resolved_observability(name: str) -> dict:
          "repo": {"type": "string"},
          "ref": {"type": "string"},
          "subdir": {"type": "string"},
+         # C.2 (v0.74.0): the producer's handed-off revision — a tag that
+         # moved after the build aborts before activation.
+         "expected_revision": {"type": "string"},
          # Sol round-3 M: constrain items so a non-string target (`[1]`) is
          # rejected by the MCP validator, not by an uncaught TARGET_RE.match.
          "targets": {"type": "array", "items": {"type": "string"}}},
@@ -3550,8 +3631,14 @@ async def plugin_add(args: dict) -> dict:
         core = await asyncio.to_thread(
             _plugin_add_sync, name=args["name"], repo=args["repo"],
             ref=args["ref"], subdir=args.get("subdir", ""),
-            targets=args.get("targets") or [])
+            targets=args.get("targets") or [],
+            expected_revision=args.get("expected_revision"))
         if core.get("ok") is not True:
+            # Spec §E: the pinned payload shape holds on EVERY path.
+            core.setdefault("kind", "unknown")
+            core.setdefault("activation_committed", False)
+            core.setdefault("runtime_ready", False)
+            core.setdefault("verify", {})
             return _result(core)
         seq = await _reload_and_verify_targets(
             core["name"], core["targets"], expect="present")
@@ -3563,15 +3650,28 @@ async def plugin_add(args: dict) -> dict:
 @tool(
     "plugin_update",
     "Update a registered plugin to a new ref: re-publish, install new system "
-    "requirements, repoint the registry, reload + verify. Version derives from "
-    "the fetched manifest.",
-    {"name": str, "new_ref": str},
+    "requirements, repoint the registry, reload + verify. Version derives "
+    "from the fetched manifest. Pass expected_revision (the producer's "
+    "handed-off sha) so a tag that moved after the build aborts before "
+    "activation.",
+    {"type": "object",
+     "properties": {
+         "name": {"type": "string"},
+         "new_ref": {"type": "string"},
+         "expected_revision": {"type": "string"}},
+     "required": ["name", "new_ref"]},
 )
 async def plugin_update(args: dict) -> dict:
     async with _PLUGIN_TOOLS_LOCK:
         core = await asyncio.to_thread(
-            _plugin_update_sync, name=args["name"], new_ref=args["new_ref"])
+            _plugin_update_sync, name=args["name"], new_ref=args["new_ref"],
+            expected_revision=args.get("expected_revision"))
         if core.get("ok") is not True:
+            # Spec §E: the pinned payload shape holds on EVERY path.
+            core.setdefault("kind", "unknown")
+            core.setdefault("activation_committed", False)
+            core.setdefault("runtime_ready", False)
+            core.setdefault("verify", {})
             return _result(core)
         seq = await _reload_and_verify_targets(
             core["name"], core["targets"], expect="present")
@@ -3675,6 +3775,11 @@ async def plugin_assign(args: dict) -> dict:
         core = await asyncio.to_thread(
             _plugin_assign_sync, name=args["name"], target=args["target"])
         if core.get("ok") is not True:
+            # Spec §E: the pinned payload shape holds on EVERY path.
+            core.setdefault("kind", "unknown")
+            core.setdefault("activation_committed", False)
+            core.setdefault("runtime_ready", False)
+            core.setdefault("verify", {})
             return _result(core)
         seq = await _reload_and_verify_targets(
             core["name"], [core["target"]], expect="present")
@@ -3692,6 +3797,11 @@ async def plugin_unassign(args: dict) -> dict:
         core = await asyncio.to_thread(
             _plugin_unassign_sync, name=args["name"], target=args["target"])
         if core.get("ok") is not True:
+            # Spec §E: the pinned payload shape holds on EVERY path.
+            core.setdefault("kind", "unknown")
+            core.setdefault("activation_committed", False)
+            core.setdefault("runtime_ready", False)
+            core.setdefault("verify", {})
             return _result(core)
         seq = await _reload_and_verify_targets(
             core["name"], [core["target"]], expect="absent")
@@ -3708,6 +3818,11 @@ async def plugin_remove(args: dict) -> dict:
     async with _PLUGIN_TOOLS_LOCK:
         core = await asyncio.to_thread(_plugin_remove_sync, name=args["name"])
         if core.get("ok") is not True:
+            # Spec §E: the pinned payload shape holds on EVERY path.
+            core.setdefault("kind", "unknown")
+            core.setdefault("activation_committed", False)
+            core.setdefault("runtime_ready", False)
+            core.setdefault("verify", {})
             return _result(core)
         seq = await _reload_and_verify_targets(
             core["name"], core["targets"], expect="absent")
