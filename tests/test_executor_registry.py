@@ -53,6 +53,24 @@ class TestExecutorRegistry:
         r.load()
         assert r.list_types() == []
         assert r.get("configurator") is None
+        # v0.71.1: a disabled executor stays INSPECTABLE (is_disabled +
+        # definition_any) so verify/health can validate a plugin assigned to it
+        # without get()==None being read as empty tools.allowed (false alarm).
+        assert r.is_disabled("configurator") is True
+        d = r.definition_any("configurator")
+        assert d is not None and d.enabled is False
+        assert d.tools_allowed == ["Read"]
+
+    def test_definition_any_and_is_disabled_for_enabled(self, tmp_path):
+        from executor_registry import ExecutorRegistry
+        _write(str(tmp_path), "configurator")            # enabled
+        r = ExecutorRegistry(str(tmp_path / "executors"))
+        r.load()
+        assert r.is_disabled("configurator") is False
+        assert r.definition_any("configurator") is r.get("configurator")
+        # Unknown type: neither disabled nor present.
+        assert r.is_disabled("nope") is False
+        assert r.definition_any("nope") is None
 
     def test_load_missing_dir(self, tmp_path):
         from executor_registry import ExecutorRegistry

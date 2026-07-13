@@ -44,6 +44,45 @@ class TestDispatchUnknownScope:
         assert "ms" in result and result["ms"] >= 0
 
 
+class TestReloadExecutorsHealth:
+    async def test_executors_reload_regenerates_plugin_health(self, monkeypatch):
+        """v0.71.1 (Sol Task-5): enabling/disabling an executor changes plugin
+        authorization, so an executors reload must refresh plugin-health (regen +
+        notify) — else a newly-enabled executor whose plugin lacks a grant stays
+        stale-green with no DM until an unrelated trigger."""
+        import tools as tools_mod
+        from reload import reload_executors
+        regen_calls, notify_calls = [], []
+        monkeypatch.setattr(tools_mod, "_regenerate_plugin_health",
+                            lambda extra: regen_calls.append(extra))
+
+        async def _fake_notify():
+            notify_calls.append(True)
+
+        monkeypatch.setattr(tools_mod, "_notify_plugin_health_if_possible",
+                            _fake_notify)
+        runtime = _make_runtime()          # empty role_configs, MagicMock registry
+        actions = await reload_executors(runtime)
+        assert "rebuild_executor_registry" in actions
+        assert "plugin_health_regenerated" in actions
+        assert regen_calls == [[]]         # regen once, no mutation-specific extras
+        assert notify_calls == [True]
+
+    async def test_executors_reload_survives_health_regen_failure(self, monkeypatch):
+        """The health refresh must never fail the reload itself."""
+        import tools as tools_mod
+        from reload import reload_executors
+
+        def _boom(extra):
+            raise RuntimeError("regen blew up")
+
+        monkeypatch.setattr(tools_mod, "_regenerate_plugin_health", _boom)
+        runtime = _make_runtime()
+        actions = await reload_executors(runtime)
+        assert "rebuild_executor_registry" in actions
+        assert "plugin_health_regenerated" not in actions   # skipped, not fatal
+
+
 class TestReloadError:
     async def test_reload_error_caught_and_converted(self, monkeypatch):
         # Inject a fake handler that raises ReloadError; dispatch must

@@ -898,6 +898,22 @@ async def reload_executors(
         except Exception as exc:  # noqa: BLE001
             actions.append(f"agent:{r}:failed:{exc}")
 
+    # v0.71.1 (Sol Task-5): an executor enable/disable flip changes plugin
+    # authorization (a disabled executor is dormant; enabling it makes its
+    # grant checks real). Refresh plugin-health from the rebuilt registry so
+    # enabling an executor whose assigned plugin lacks a grant surfaces
+    # authorization_missing + a DM now, instead of leaving the report
+    # stale-green until an unrelated regeneration trigger. Never fail the
+    # reload on the refresh.
+    try:
+        from tools import (_notify_plugin_health_if_possible,
+                           _regenerate_plugin_health)
+        await asyncio.to_thread(_regenerate_plugin_health, [])
+        await _notify_plugin_health_if_possible()
+        actions.append("plugin_health_regenerated")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("executors reload: plugin-health regen skipped: %s", exc)
+
     return actions
 
 

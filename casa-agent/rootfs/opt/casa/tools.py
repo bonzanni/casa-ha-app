@@ -3722,13 +3722,23 @@ def _tool_verify_plugin_state(
             else:
                 row["state"] = "dormant"
         elif tier == "executor":
-            row["state"] = "dormant"
-            defn = exec_reg.get(role) if exec_reg is not None else None
+            # A DISABLED executor (enabled: false) is absent from the registry's
+            # get() by design, so its tools.allowed would read empty and every
+            # derived grant would look unauthorized — a false authorization_missing
+            # + operator DM on every boot. A plugin assigned to a disabled executor
+            # is dormant-by-config, NOT a health failure: report state="disabled"
+            # and never flag it not-ready. Its authorization is still recorded
+            # (validated against the disabled defn) and is re-checked for real the
+            # moment the operator enables the executor.
+            disabled = (exec_reg is not None and exec_reg.is_disabled(role))
+            row["state"] = "disabled" if disabled else "dormant"
+            defn = (exec_reg.definition_any(role) if disabled
+                    else (exec_reg.get(role) if exec_reg is not None else None))
             allowed = list(getattr(defn, "tools_allowed", []) or []) if defn else []
             missing = [g for g in granted
                        if not cc_tool_pattern.matches_any(allowed, g, {})]
             row["authorization"] = {"required": granted, "missing": missing}
-            if missing:
+            if missing and not disabled:
                 row["ready"] = False
                 row["reasons"] = ["authorization_missing"]
         target_rows.append(row)
