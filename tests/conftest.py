@@ -50,6 +50,26 @@ class _FakeBadRequest(_FakeNetworkError):
     pass
 
 
+class _FakeForbidden(_FakeTelegramError):
+    # Real PTB 22.7: Forbidden -> TelegramError.
+    pass
+
+
+class _FakeRetryAfter(_FakeTelegramError):
+    # Real PTB 22.7: RetryAfter -> TelegramError.
+    def __init__(self, *a, **k):
+        super().__init__(*a)
+
+
+class _FakeInputFile:
+    """Value-shape stand-in for telegram.InputFile — captures the wrapped bytes
+    and filename so send_media tests can assert on them."""
+
+    def __init__(self, obj, filename=None, **kw):
+        self.data = obj.getvalue() if hasattr(obj, "getvalue") else obj
+        self.filename = filename
+
+
 class _FakeMessageEntity:
     """Value-shape stand-in for telegram.MessageEntity.
 
@@ -107,9 +127,12 @@ def _install_telegram_stubs() -> None:
     tg_err.NetworkError = _FakeNetworkError
     tg_err.TimedOut = _FakeTimedOut
     tg_err.BadRequest = _FakeBadRequest
+    tg_err.Forbidden = _FakeForbidden
+    tg_err.RetryAfter = _FakeRetryAfter
     tg.error = tg_err
 
     tg.MessageEntity = _FakeMessageEntity
+    tg.InputFile = _FakeInputFile
 
     tg_ext = types.ModuleType("telegram.ext")
     tg_ext.Application = MagicMock()
