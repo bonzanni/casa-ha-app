@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.74.1] - 2026-07-13
+
+### Fixed
+
+- A plugin assigned to a **disabled specialist** no longer reports
+  `reload_required` after an update (the specialist-tier analogue of the
+  v0.71.1 disabled-executor rule; found live during the v0.74.0 release-flow
+  verify — this was the original "Plugin degraded" incident's actual
+  trigger). A disabled specialist is dormant-by-config: its target now
+  verifies `state:"disabled"` and is re-checked for real when enabled.
+- An agent whose role the registry does not recognize (e.g. a
+  reload-constructed disabled specialist) now logs a loud warning when its
+  plugin resolution falls back to the resident tier instead of silently
+  resolving no plugins.
+
 ## [0.74.0] - 2026-07-13
 
 ### Added
