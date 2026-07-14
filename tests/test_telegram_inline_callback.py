@@ -459,6 +459,43 @@ class TestEngagementAskStateAdvance:
         await ch._on_inline_callback(update2, context=None)
         update2.callback_query.answer.assert_awaited_once_with("✔")
 
+    async def test_real_registry_persist_failure_aborts_claim_and_stays_live(
+        self, fake_telegram_bot, engagement_fixture, _fresh_broker, monkeypatch,
+    ):
+        """B3 (Sol r1): end-to-end with the REAL registry — a genuine
+        tombstone-write failure (underlying file write raises) makes
+        advance_interaction_state raise, so the callback aborts the claim,
+        tells the operator to re-tap, and leaves the request live. The
+        in-memory interaction_state is rolled back (never left advanced)."""
+        import engagement_registry as er
+
+        ch = _mk_channel(fake_telegram_bot, engagement_fixture)
+        rec = engagement_fixture.active_record
+        # A real interaction-required engagement whose ask is pending.
+        rec.interaction_state = "first_contact_required"
+        _seed(_fresh_broker, ns="engagement_ask", scope=rec.id, rid="ask-b3",
+              topic_id=rec.topic_id, operator_id=999)
+
+        def _boom(*_a, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(er, "atomic_write_json", _boom)
+
+        update = _mk_callback_update(
+            data="v1|engagement_ask|ask-b3|0", thread_id=rec.topic_id,
+            chat_id=-1001, user_id=999,
+        )
+        await ch._on_inline_callback(update, context=None)
+
+        update.callback_query.answer.assert_awaited_once_with(
+            "couldn't record — please tap again",
+        )
+        # Request still live (claim aborted); state rolled back, not advanced.
+        assert _fresh_broker.pending(
+            namespace="engagement_ask", scope=rec.id,
+        ) == ["ask-b3"]
+        assert rec.interaction_state == "first_contact_required"
+
     async def test_real_registry_noninteraction_required_still_commits(
         self, fake_telegram_bot, engagement_fixture, _fresh_broker,
     ):

@@ -1280,6 +1280,68 @@ class TestMutatingToolViolationSeam:
         await drv.cancel(rec)
         assert rec.id not in drv._violation_notified
 
+    async def test_mutating_tool_notice_post_failure_retries_next_frame(
+        self, tmp_path,
+    ):
+        """B4 (Sol r1): a transient failure of the notice POST must not
+        permanently consume the once-guard — the next mutating_tool frame
+        retries and the notice lands exactly once (one SUCCESSFUL notice)."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock(side_effect=[RuntimeError("net down"), 123])
+        reg = _FakeInteractionRegistry("awaiting_operator")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        # Frame 1: notice post raises (swallowed, guard NOT consumed).
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+        # Frame 2: retried, this time it succeeds.
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Write"})
+
+        assert sender.await_count == 2  # retried after the transient failure
+        assert rec.id in drv._violation_notified  # eventually marked
+        # Flag persisted once (independent of the notice-post failure).
+        assert reg.violated == [rec.id]
+
+    async def test_mutating_tool_flag_failure_retries_next_frame(
+        self, tmp_path,
+    ):
+        """B4 (Sol r1): a transient failure of set_interaction_violated must
+        retry on the next frame while the notice still posts at-most-once."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        class _FlakyViolatedRegistry(_FakeInteractionRegistry):
+            def __init__(self, state, fail_times):
+                super().__init__(state)
+                self._fail_times = fail_times
+
+            async def set_interaction_violated(self, eng_id: str) -> None:
+                if self._fail_times > 0:
+                    self._fail_times -= 1
+                    raise RuntimeError("db down")
+                self.violated.append(eng_id)
+
+        sender = AsyncMock()
+        reg = _FlakyViolatedRegistry("awaiting_operator", fail_times=1)
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        # Frame 1: notice ok, flag raises (swallowed, flag-guard NOT consumed).
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+        # Frame 2: notice already posted (not re-sent); flag retries, succeeds.
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Write"})
+
+        assert sender.await_count == 1  # exactly one visible notice
+        assert reg.violated == [rec.id]  # flag eventually persisted once
+
 
 class TestCancelBypassesQueue:
     async def test_cancel_immediate_while_busy(self, monkeypatch, tmp_path):

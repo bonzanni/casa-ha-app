@@ -373,6 +373,50 @@ async def test_ask_keyboard_post_returns_none_is_delivery_failed(
     assert ch.edited_answered == [] and ch.edited_expired == []
 
 
+async def test_ask_delivery_failed_does_not_advance_first_contact(
+    app_with_ask,
+) -> None:
+    """B5 (Sol r1): first_contact must advance only AFTER the keyboard is
+    actually posted. A raising keyboard post → delivery_failed → the
+    interaction_state must NOT flip to awaiting_operator (otherwise the
+    engagement awaits a question the operator never received)."""
+    app, ch, reg, broker = app_with_ask
+
+    async def raising_post(**kw):
+        raise RuntimeError("network down")
+
+    ch.post_options_keyboard = raising_post
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/ask", json=_payload(request_id="rid-nf"),
+        )
+        body = await resp.json()
+
+    assert body == {"ok": False, "error": "delivery_failed"}
+    assert reg.advances == []  # never advanced past first_contact_required
+
+
+async def test_ask_delivery_failed_none_post_does_not_advance_first_contact(
+    app_with_ask,
+) -> None:
+    """B5 (Sol r1): a keyboard post that returns None (unresolvable topic) is
+    also a delivery failure — no first_contact advance."""
+    app, ch, reg, broker = app_with_ask
+
+    async def none_post(**kw):
+        return None
+
+    ch.post_options_keyboard = none_post
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/ask", json=_payload(request_id="rid-nf2"),
+        )
+        body = await resp.json()
+
+    assert body == {"ok": False, "error": "delivery_failed"}
+    assert reg.advances == []
+
+
 async def test_ask_terminal_engagement_rejected(app_with_ask) -> None:
     app, ch, reg, _broker = app_with_ask
     reg.set_record("eng-1", _FakeRecord("eng-1", topic_id=42, status="completed"))

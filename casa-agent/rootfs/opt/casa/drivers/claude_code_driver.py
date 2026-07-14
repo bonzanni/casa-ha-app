@@ -188,7 +188,12 @@ class ClaudeCodeDriver(DriverProtocol):
         self._epoch_pending: dict[str, int | None] = {}
         # W2/Sol B9 (Task 7): at most ONE in-topic violation notice per
         # engagement — guards the mutating_tool seam in _on_stream_event.
+        # B4 (Sol r1): the notice-post and the flag-persist are tracked
+        # INDEPENDENTLY; each marker is set only AFTER its own effect succeeds,
+        # so a transient failure of one retries on the next mutating_tool frame
+        # instead of permanently skipping both.
         self._violation_notified: set[str] = set()
+        self._violation_flagged: set[str] = set()
 
     # -- DriverProtocol ---------------------------------------------------
 
@@ -371,6 +376,7 @@ class ClaudeCodeDriver(DriverProtocol):
         self._reply_texts.pop(engagement.id, None)
         self._epoch_pending.pop(engagement.id, None)
         self._violation_notified.discard(engagement.id)
+        self._violation_flagged.discard(engagement.id)
 
         async with s6_rc._compile_lock:
             # Stop is tolerant of "already down" — log and continue.
@@ -683,17 +689,38 @@ class ClaudeCodeDriver(DriverProtocol):
             reg = self._registry
             rec = reg.get(eng_id) if reg is not None else None
             if (rec is not None
-                    and getattr(rec, "interaction_state", "") == "awaiting_operator"
-                    and eng_id not in self._violation_notified):
-                self._violation_notified.add(eng_id)
-                await self._send_to_topic(
-                    engagement.topic_id,
-                    "The agent took an action while waiting for your "
-                    "reply — flagging this engagement for review.",
-                )
-                set_violated = getattr(reg, "set_interaction_violated", None)
-                if set_violated is not None:
-                    await set_violated(eng_id)
+                    and getattr(rec, "interaction_state", "") == "awaiting_operator"):
+                # B4 (Sol r1): each effect is attempted and marked INDEPENDENTLY.
+                # A failure is swallowed (logged) so the relay keeps consuming
+                # and the NEXT mutating_tool frame retries the un-marked effect
+                # — the marker is set only after success, so at most one
+                # SUCCESSFUL notice + one flag-persist ever fire per engagement.
+                if eng_id not in self._violation_notified:
+                    try:
+                        await self._send_to_topic(
+                            engagement.topic_id,
+                            "The agent took an action while waiting for your "
+                            "reply — flagging this engagement for review.",
+                        )
+                        self._violation_notified.add(eng_id)
+                    except Exception:  # noqa: BLE001 — retry on the next frame
+                        logger.warning(
+                            "engagement %s: violation notice post failed; "
+                            "will retry on next mutating tool",
+                            eng_id[:8], exc_info=True,
+                        )
+                if eng_id not in self._violation_flagged:
+                    set_violated = getattr(reg, "set_interaction_violated", None)
+                    if set_violated is not None:
+                        try:
+                            await set_violated(eng_id)
+                            self._violation_flagged.add(eng_id)
+                        except Exception:  # noqa: BLE001 — retry on the next frame
+                            logger.warning(
+                                "engagement %s: set_interaction_violated failed; "
+                                "will retry on next mutating tool",
+                                eng_id[:8], exc_info=True,
+                            )
         elif kind == "result":
             self._epoch_pending[eng_id] = None
 

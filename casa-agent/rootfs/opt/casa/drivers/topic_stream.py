@@ -615,23 +615,26 @@ class TopicStreamRelay:
         ``turn_start == current`` past ``result``)."""
         coord = {"segment": list(seg), "offset": off_after}
         if not self._dropped and self.cursor.message_ids and self._per_message_text:
-            try:
-                await _maybe_await(
-                    self.edit_message(
-                        self.topic_id,
-                        self.cursor.message_ids[-1],
-                        self._per_message_text,  # NEVER the whole turn text
-                    )
+            # B2 (Sol r1): the closing edit carries this turn's FINAL fragment,
+            # so it must honor the at-least-once contract like every streaming
+            # op — route it through the SAME bounded retry/drop machinery
+            # (``_apply_op``) instead of a log-and-forget edit. A ``False``
+            # return (Telegram declined) is a failure that retries; only after
+            # the edit lands, OR the turn crosses the drop threshold (>=20
+            # consecutive failures → warn once, ``self._dropped`` set), may the
+            # closed-turn checkpoint below advance past ``result``.
+            applied, _ = await self._apply_op(
+                lambda: self.edit_message(
+                    self.topic_id,
+                    self.cursor.message_ids[-1],
+                    self._per_message_text,  # NEVER the whole turn text
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "topic stream final edit failed for engagement %s: %s",
-                    self.engagement_id, exc,
-                )
+            )
             # Reply de-dup: if this turn's whole text is byte-identical to a
             # reply already posted and exactly one message was streamed, delete
-            # the streamed message (best-effort).
-            if len(self.cursor.message_ids) == 1 and self._turn_text:
+            # the streamed message (best-effort). Only meaningful once the final
+            # fragment actually landed — skip it in the drop path.
+            if applied and len(self.cursor.message_ids) == 1 and self._turn_text:
                 try:
                     replies = await _maybe_await(self.reply_texts())
                     if replies and self._turn_text in replies:

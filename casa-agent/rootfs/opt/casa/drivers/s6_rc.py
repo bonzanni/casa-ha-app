@@ -136,6 +136,28 @@ def service_pair_complete(*, svc_root: str, engagement_id: str) -> bool:
     )
 
 
+# A run script is "current" (v0.75.0+) iff it carries at least one of these
+# streaming markers: the pre-exec ``casa_control`` spawn NDJSON frame or the
+# ``--output-format stream-json`` CLI flag. A pre-v0.75 script has neither, so
+# the driver's _InboundQueue never arms on a resumed engagement — operator
+# turns then queue forever. Boot replay uses this to migrate stale pairs.
+_CURRENT_RUN_MARKERS = ("casa_control", "--output-format stream-json")
+
+
+def run_script_is_stale(*, svc_root: str, engagement_id: str) -> bool:
+    """True iff the persisted MAIN run script predates the v0.75.0 streaming
+    contract (emits neither ``casa_control`` nor ``--output-format
+    stream-json``). Returns False when the run file is absent or unreadable —
+    there is nothing to migrate, and the pair-completeness / heal predicates
+    handle those cases."""
+    run_path = Path(svc_root) / _main_service_name(engagement_id) / "run"
+    try:
+        text = run_path.read_text()
+    except OSError:
+        return False
+    return not any(marker in text for marker in _CURRENT_RUN_MARKERS)
+
+
 def _prune_broken_pairs(*, svc_root: str) -> list[str]:
     """Make the engagement sources compilable again after a crash.
 

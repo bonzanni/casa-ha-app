@@ -652,6 +652,34 @@ class TestInteractionState:
         assert results.count(None) == 1
         assert rec.interaction_state == "authorized"
 
+    async def test_advance_raises_and_rolls_back_on_persist_failure(
+        self, registry, monkeypatch,
+    ):
+        """B3 (Sol r1): advance_interaction_state persists STRICTLY — a REAL
+        tombstone-write failure (the underlying file write raises, not the
+        method) must propagate AND roll the in-memory field back to its prior
+        value, so a restart never restores stale ``awaiting_operator`` after
+        the callback thinks it authorized."""
+        import engagement_registry as er
+
+        rec = await registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        rec.interaction_state = "first_contact_required"
+
+        def _boom(*_a, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(er, "atomic_write_json", _boom)
+
+        with pytest.raises(OSError):
+            await registry.advance_interaction_state(rec.id, "operator_answered")
+
+        # Rolled back: authorization never reached disk, so the in-memory
+        # field must NOT be left advanced.
+        assert rec.interaction_state == "first_contact_required"
+
     async def test_persists_across_tombstone_round_trip(self, tmp_path, bus):
         from engagement_registry import EngagementRegistry
 

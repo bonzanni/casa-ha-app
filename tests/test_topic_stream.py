@@ -306,6 +306,48 @@ async def test_finalize_persists_closed_turn_checkpoint(tmp_path):
     assert cur.current["offset"] == offs[-1]
 
 
+async def test_finalize_edit_retries_before_closing_checkpoint(tmp_path):
+    """B2 (Sol r1): the finalize edit must honor the at-least-once contract —
+    a transient Telegram failure retries via the bounded backoff and the
+    fragment IS delivered before the closed-turn checkpoint advances past
+    ``result``. The streaming path for a single text block is a SEND, so
+    ``edit_fails`` bites only the finalize edit here."""
+    rec, events = Recorder(), []
+    rec.edit_fails = 2  # finalize's closing edit fails twice, then succeeds
+    offs = _write_current(tmp_path, [_init(), _text("hello"), _result()])
+    cursor = tmp_path / ".stream_cursor.json"
+    await _make_relay(tmp_path, cursor, rec, events).run()
+
+    # The final fragment landed (retried, not silently dropped).
+    assert rec.edits and rec.edits[-1][2] == "hello"
+    cur = StreamCursor.load(cursor)
+    # Checkpoint closed ONLY after the edit succeeded — normal (non-drop) close.
+    assert cur.message_ids == []
+    assert cur.dropped_through is None
+    assert cur.current["offset"] == offs[-1]
+
+
+async def test_finalize_persistent_edit_failure_drops_once(tmp_path, caplog):
+    """B2 (Sol r1): if the finalize edit fails persistently, the turn enters
+    the documented drop path — warn ONCE, checkpoint closes via ``dropped_through``
+    (no silent loss), and there is no infinite retry loop."""
+    rec, events = Recorder(), []
+    rec.edit_fails = 10_000  # finalize edit never succeeds
+    offs = _write_current(tmp_path, [_init(), _text("hello"), _result()])
+    cursor = tmp_path / ".stream_cursor.json"
+    with caplog.at_level(logging.WARNING):
+        await _make_relay(tmp_path, cursor, rec, events).run()
+
+    cur = StreamCursor.load(cursor)
+    # Dropped through the terminal coordinate (not silently advanced).
+    assert cur.dropped_through is not None
+    assert cur.dropped_through["offset"] == offs[-1]
+    assert cur.current["offset"] == offs[-1]
+    assert cur.message_ids == []
+    drop_warnings = [r for r in caplog.records if "dropping remainder" in r.message]
+    assert len(drop_warnings) == 1  # exactly one WARNING
+
+
 async def test_restart_after_successful_dedup_no_ghost_edit(tmp_path):
     # Turn 1: single message whose whole text == a reply → de-dup deletes it.
     rec, events = Recorder(), []

@@ -512,7 +512,28 @@ async def replay_undergoing_engagements(
                     svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
                     engagement_id=rec.id,
                 ):
-                    continue
+                    # B1 (Sol r1): a COMPLETE pre-v0.75 pair still carries an
+                    # old run script that emits neither the stream-json output
+                    # nor the ``casa_control`` spawn NDJSON frame, so the new
+                    # _InboundQueue never arms and every resumed operator turn
+                    # queues forever. Detect the stale script and DROP the pair
+                    # so the heal path below re-renders it from the current
+                    # template (reusing the existing incomplete-pair heal — no
+                    # duplication). A current pair keeps the fast-path continue.
+                    if not s6_rc.run_script_is_stale(
+                        svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                        engagement_id=rec.id,
+                    ):
+                        continue
+                    logger.info(
+                        "boot replay: migrating pre-v0.75 run script for "
+                        "engagement %s (%s) — re-rendering pair",
+                        rec.id[:8], rec.role_or_type,
+                    )
+                    s6_rc.remove_service_dir(
+                        svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                        engagement_id=rec.id,
+                    )
 
                 # M7: never plant a service for an engagement whose workspace
                 # is gone. The generated run script does `set -e;

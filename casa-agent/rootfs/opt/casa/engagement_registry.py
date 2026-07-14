@@ -291,7 +291,7 @@ class EngagementRegistry:
 
     # -- Persist helper ---------------------------------------------------
 
-    async def _write_tombstone_locked(self) -> None:
+    async def _write_tombstone_locked(self, *, strict: bool = False) -> None:
         """Caller MUST hold self._lock.
 
         Terminal records are persisted as real tombstones (D-4, v0.69.0) —
@@ -299,6 +299,13 @@ class EngagementRegistry:
         forgot recent spawns across restarts and the file never matched its
         name. Tombstones age out after ``_TERMINAL_RETENTION_DAYS`` to bound
         the file.
+
+        ``strict`` (B3, Sol r1): when True, a persistence failure PROPAGATES
+        instead of being swallowed — used only by
+        ``advance_interaction_state``, where returning the new state while the
+        authorization never reached disk lets the telegram callback commit an
+        ask that a restart would then un-authorize. All other callers keep the
+        best-effort warn-and-continue semantics (strict=False).
         """
         cutoff = time.time() - _TERMINAL_RETENTION_DAYS * 86400
         snapshot = []
@@ -332,6 +339,8 @@ class EngagementRegistry:
         try:
             await asyncio.to_thread(self._write_tombstone, snapshot)
         except Exception as exc:
+            if strict:
+                raise
             logger.warning("Failed to persist engagement tombstone: %s", exc)
 
     def _write_tombstone(self, snapshot: list[dict[str, Any]]) -> None:
@@ -541,8 +550,19 @@ class EngagementRegistry:
             new_state = _pure_interaction_transition(rec.interaction_state, event)
             if new_state is None:
                 return None
+            # B3 (Sol r1): persist STRICTLY and roll back on failure — the
+            # telegram callback commits the ask on a successful return, so the
+            # authorization MUST have reached disk before we report the new
+            # state. On a write failure the callback's `except` path
+            # abort_claims + "please tap again" (verified end-to-end by
+            # test_telegram_inline_callback).
+            prev_state = rec.interaction_state
             rec.interaction_state = new_state
-            await self._write_tombstone_locked()
+            try:
+                await self._write_tombstone_locked(strict=True)
+            except Exception:
+                rec.interaction_state = prev_state
+                raise
             return new_state
 
     async def set_interaction_violated(self, engagement_id: str) -> None:

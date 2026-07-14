@@ -134,6 +134,78 @@ async def test_replay_heals_missing_service_dir_with_known_executor(
     assert (ws_root / "keep1" / "stdin.fifo").exists()
 
 
+async def test_replay_rerenders_stale_prev75_run_script(monkeypatch, tmp_path):
+    """B1 (Sol r1): a COMPLETE pre-v0.75 service pair (run script emits
+    neither ``--output-format stream-json`` nor the ``casa_control`` spawn
+    NDJSON frame) must be re-rendered on boot replay — otherwise the new
+    _InboundQueue never arms and operator turns queue forever. The stale pair
+    is dropped so the heal path re-plants it from the current template."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+    from config import ExecutorDefinition
+
+    svc_root = tmp_path / "svc"
+    svc_root.mkdir()
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+    # Seed a COMPLETE v0.74-style pair (real write_service_dir → main +
+    # producer-for + -log sibling), but with a run script that predates the
+    # v0.75 streaming frame markers.
+    s6_rc.write_service_dir(
+        svc_root=str(svc_root), engagement_id="keep1",
+        run_script=(
+            "#!/command/with-contenv bash\nset -e\n"
+            "exec claude --print --permission-mode acceptEdits\n"
+        ),
+        depends_on=["init-setup-configs"],
+        log_run_script="#!/command/with-contenv sh\nexec s6-log n20 s1000000 /x\n",
+    )
+    assert s6_rc.service_pair_complete(
+        svc_root=str(svc_root), engagement_id="keep1",
+    )
+
+    start_calls: list[str] = []
+    async def fake_cau(): return None
+    async def fake_start(*, engagement_id): start_calls.append(engagement_id)
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+
+    class FakeExecReg:
+        def __init__(self, defs): self._defs = defs
+        def get(self, t): return self._defs.get(t)
+
+    exec_reg = FakeExecReg({
+        "hello-driver": ExecutorDefinition(
+            type="hello-driver", description="test", model="haiku",
+            driver="claude_code", enabled=True, tools_allowed=[],
+            tools_disallowed=[], permission_mode="acceptEdits",
+            mcp_server_names=[], idle_reminder_days=1,
+            prompt_template_path="/nope/prompt.md", hooks_path=None,
+            observer_policy_path=None, doctrine_dir="/nope/doctrine",
+            extra_dirs=[], mirror_chat_to_topic=False, plugins_dir="",
+        ),
+    })
+
+    reg = await _make_registry([_rec("keep1")])
+    driver = AsyncMock()
+    driver._spawn_background_tasks = lambda rec: None
+
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, executor_registry=exec_reg,
+        engagements_root=str(ws_root),
+    )
+
+    # Pair re-rendered from the current template → both streaming markers now
+    # present in the persisted run script.
+    run_text = (svc_root / "engagement-keep1" / "run").read_text()
+    assert "--output-format stream-json" in run_text
+    assert "casa_control" in run_text
+    assert start_calls == ["keep1"]
+
+
 async def test_replay_leaves_alone_unknown_executor(monkeypatch, tmp_path):
     """Missing service dir + executor type NOT in registry → log + move on."""
     from casa_core import replay_undergoing_engagements

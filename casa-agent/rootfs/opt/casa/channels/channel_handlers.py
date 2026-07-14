@@ -385,15 +385,6 @@ def _make_ask(
         if getattr(rec, "status", None) not in ("active", "idle"):
             return web.json_response({"ok": False, "error": "engagement_terminal"})
 
-        # W2/Sol B9 (Task 7): asking is an outbound agent action too — the
-        # FIRST reply/ask flips first_contact_required -> awaiting_operator.
-        # getattr-tolerant (see _make_send_to_topic); a no-op past the first
-        # call (already awaiting_operator/authorized) or for a
-        # non-interaction-required engagement ("").
-        advance = getattr(engagement_registry, "advance_interaction_state", None)
-        if advance is not None:
-            await advance(eng_id, "first_contact")
-
         req, created = BROKER.register(
             namespace="engagement_ask", scope=eng_id, request_id=request_id,
             timeout_s=timeout_s,
@@ -416,6 +407,22 @@ def _make_ask(
             lambda mid: _ask_keyboard_finish(
                 telegram_channel, rec.topic_id, mid, question, options),
         )
+
+        # W2/Sol B9 (Task 7): asking is an outbound agent action too — the
+        # FIRST reply/ask flips first_contact_required -> awaiting_operator.
+        # B5 (Sol r1): advance ONLY after the keyboard actually posted (the
+        # broker setup sets req.meta["message_id"] on success; a raised/None
+        # post unregisters WITHOUT setting it → delivery_failed). Advancing
+        # before would leave a delivery_failed engagement awaiting a question
+        # the operator never received. Fast-tap correctness is preserved:
+        # operator_answered transitions directly from first_contact_required.
+        # getattr-tolerant (see _make_send_to_topic); a no-op past the first
+        # call or for a non-interaction-required engagement ("").
+        if isinstance(req.meta.get("message_id"), int):
+            advance = getattr(
+                engagement_registry, "advance_interaction_state", None)
+            if advance is not None:
+                await advance(eng_id, "first_contact")
         # Shielded future: a CancelledError here (transport disconnect)
         # propagates to OUR caller without cancelling the broker's shared
         # future -- the request stays live for a same-id reattach.
