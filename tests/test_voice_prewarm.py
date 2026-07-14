@@ -1,48 +1,25 @@
-"""Spec §4.3 — voice stt_start prewarm: session ensured, no overlay call.
+"""Spec §4.3 — voice stt_start prewarm: no session ensure, no overlay call.
 
 Under the tiered-memory model voice clearance is 'friends', which is below the
 'private' threshold required to push the overlay.  The overlay warm via
-profile() was therefore dead work and has been removed.  stt_start now only
-ensures a VoiceSession is bookmarked in the pool (for idle-sweep / dedup);
-no memory I/O is performed.
+profile() was therefore dead work and has been removed.
+
+v0.80.0 (spec A2): stt_start ALSO no longer ensure()s a VoiceSession — the
+frame carries no agent_role, and ensure() now requires one (role-scoped pool
+keying, so two residents on one device can't collide on a session). Pool
+registration happens lazily on the utterance frame instead, which does carry
+agent_role. The real end-to-end contract (stt_start touches nothing in the
+pool; the pool entry appears only after an utterance) is exercised against
+the actual `_ws_handler` in test_voice_channel_ws.py::TestWSTurn — this file
+keeps only the structural check below (no lightweight fake-pool simulation
+here duplicates that, since it wouldn't be driving real channel.py code).
 """
 
 from __future__ import annotations
 
-import asyncio
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
-
 import pytest
 
 pytestmark = [pytest.mark.unit]
-
-
-def _make_voice_channel(memory, agent_configs, default_agent="butler"):
-    from channels.voice.channel import VoiceChannel
-
-    # Bypass __init__ — we only need pool + default_agent for the stt_start path.
-    ch = VoiceChannel.__new__(VoiceChannel)
-    ch._memory = memory
-    ch._agent_configs = agent_configs
-    ch.default_agent = default_agent
-
-    from channels.voice.session import VoiceSessionPool
-    ch.pool = VoiceSessionPool(idle_timeout=300)
-    return ch
-
-
-async def test_stt_start_ensures_session_no_profile():
-    """stt_start no longer calls profile() — overlay is not used for voice."""
-    sem = AsyncMock()
-    cfg = SimpleNamespace()
-    ch = _make_voice_channel(sem, {"butler": cfg})
-
-    # Simulate what the WS handler does on stt_start.
-    ch.pool.ensure("room-1")
-
-    sem.profile.assert_not_awaited()
-    assert ch.pool.get("room-1") is not None
 
 
 async def test_no_prewarm_method_on_voice_channel():
@@ -51,21 +28,3 @@ async def test_no_prewarm_method_on_voice_channel():
     assert not hasattr(VoiceChannel, "_prewarm"), (
         "_prewarm was not removed; the obsolete overlay prewarm is still present"
     )
-
-
-async def test_schedule_prewarm_not_called_on_stt_start():
-    """schedule_prewarm should no longer be invoked on stt_start."""
-    sem = AsyncMock()
-    cfg = SimpleNamespace()
-    ch = _make_voice_channel(sem, {"butler": cfg})
-
-    pool_mock = MagicMock()
-    pool_mock.ensure = MagicMock()
-    pool_mock.schedule_prewarm = MagicMock()
-    ch.pool = pool_mock
-
-    # Simulate what the WS handler does on stt_start.
-    ch.pool.ensure("room-1")
-
-    pool_mock.ensure.assert_called_once_with("room-1")
-    pool_mock.schedule_prewarm.assert_not_called()

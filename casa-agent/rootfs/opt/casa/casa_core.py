@@ -1537,6 +1537,16 @@ async def main() -> None:
     # 4. Session registry + TTL sweeper (spec 5.2 §6)
     sessions_path = os.path.join(DATA_DIR, "sessions.json")
     session_registry = SessionRegistry(sessions_path)
+    # A2: one-shot boot migration off the v1 {channel}-{scope} key schema —
+    # idempotent (already-v2 entries are left alone), so safe to run on
+    # every boot. Only persists when something actually changed.
+    _migration_stats = session_registry.migrate_to_v2()
+    if _migration_stats["migrated"] or _migration_stats["dropped"]:
+        logger.info(
+            "session_registry v2 migration: migrated=%d dropped=%d",
+            _migration_stats["migrated"], _migration_stats["dropped"],
+        )
+        await session_registry.save()
     session_sweeper = SessionSweeper(
         registry=session_registry,
         session_ttl_days=_env_int_or("SESSION_TTL_DAYS", 30, min_value=1),

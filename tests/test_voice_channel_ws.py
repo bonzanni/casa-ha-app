@@ -92,9 +92,13 @@ class TestWSTurn:
             # pushed at 'friends' clearance; the overlay prewarm was removed.
             assert memory.profile.await_count == 0
 
-    async def test_stt_start_ensures_session(self, ws_app):
-        """stt_start ensures a VoiceSession is created in the pool; sending
-        it twice is idempotent (same session, no duplicate tasks).  The
+    async def test_stt_start_is_pool_noop(self, ws_app):
+        """v0.80.0 (spec A2): stt_start no longer touches the pool at all —
+        the frame carries no agent_role, and VoiceSessionPool.ensure() now
+        requires one (role-scoped keying, so two residents on one device
+        can't collide on a session_key). Pool registration happens lazily
+        on the utterance frame instead, which DOES carry agent_role.
+        Sending stt_start twice remains a harmless no-op either way. The
         obsolete overlay prewarm has been removed — no profile() is called."""
         client, _, memory, channel = ws_app
 
@@ -102,10 +106,7 @@ class TestWSTurn:
             await ws.send_json({"type": "stt_start", "scope_id": "s"})
             await ws.send_json({"type": "stt_start", "scope_id": "s"})
             await asyncio.sleep(0.05)
-            sess = channel.pool.get("s")
-            assert sess is not None
-            # No prewarm task — schedule_prewarm is no longer called.
-            assert sess.prewarm_task is None
+            assert channel.pool.get("s", role="butler") is None
             # No profile() call — overlay not used for voice.
             assert memory.profile.await_count == 0
 

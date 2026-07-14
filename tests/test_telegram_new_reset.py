@@ -15,8 +15,12 @@ import pytest
 
 from bus import BusMessage, MessageBus
 from channels.telegram import TelegramChannel
+from session_registry import build_scoped_session_key
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
+
+# /new keys off self.default_agent ("assistant" for _make_channel below).
+_KEY_42 = build_scoped_session_key("telegram", "assistant", "42")
 
 
 class _FakeBot:
@@ -87,7 +91,7 @@ class TestTelegramNewReset:
         from session_registry import SessionRegistry
 
         reg = SessionRegistry(str(tmp_path / "s.json"))
-        await reg.register("telegram-42", "assistant", "sid-1")
+        await reg.register(_KEY_42, "assistant", "sid-1")
         sem = AsyncMock()
         msgs = [
             type("M", (), {"type": "user", "message": {"content": "remember X"}})()
@@ -105,7 +109,7 @@ class TestTelegramNewReset:
         from session_registry import SessionRegistry
 
         reg = SessionRegistry(str(tmp_path / "s.json"))
-        await reg.register("telegram-42", "assistant", "sid-1")
+        await reg.register(_KEY_42, "assistant", "sid-1")
         sem = AsyncMock()
         msgs = [
             type("M", (), {"type": "user", "message": {"content": "hi"}})()
@@ -125,7 +129,7 @@ class TestTelegramNewReset:
         from session_registry import SessionRegistry
 
         reg = SessionRegistry(str(tmp_path / "s.json"))
-        await reg.register("telegram-42", "assistant", "sid-1")
+        await reg.register(_KEY_42, "assistant", "sid-1")
         sem = AsyncMock()
         msgs = [
             type("M", (), {"type": "user", "message": {"content": "hi"}})()
@@ -135,14 +139,14 @@ class TestTelegramNewReset:
         with patch("session_saver.get_session_messages", return_value=msgs):
             await ch._handle(_fake_update("42", "/new"), None)
 
-        assert reg.get("telegram-42") is None, "registry pointer must be cleared"
+        assert reg.get(_KEY_42) is None, "registry pointer must be cleared"
 
     async def test_new_retains_before_clearing(self, tmp_path):
         """retain() must be called (session saved) before the pointer is cleared."""
         from session_registry import SessionRegistry
 
         reg = SessionRegistry(str(tmp_path / "s.json"))
-        await reg.register("telegram-42", "assistant", "sid-1")
+        await reg.register(_KEY_42, "assistant", "sid-1")
         sem = AsyncMock()
         msgs = [
             type("M", (), {"type": "user", "message": {"content": "important data"}})()

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,6 +18,29 @@ logger = logging.getLogger(__name__)
 
 _SESSION_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _SESSION_KEY_MAX = 100  # mirrors the server-side max_length from the former upstream dependency
+
+# v2 scoped-key schema (spec A2): channel-role-scope identity, collision-safe
+# across residents sharing a device/channel. See build_scoped_session_key.
+SESSION_KEY_SCHEMA_V2 = "v2"
+_LEGACY_CHANNELS = ("telegram", "webhook", "voice")
+
+
+def _is_uuid_scope(scope_id: str) -> bool:
+    """True when `scope_id` parses as a UUID (any version).
+
+    Distinguishes a webhook one-shot (random chat_id fabricated by
+    `build_invoke_message`) from a deliberately-pinned webhook session
+    (e.g. `webhook-ha-automation-daily`). Only the former qualifies for
+    the short `webhook_session_ttl_days` (spec A2). Lives here (not in
+    session_sweeper) so BOTH the sweeper AND :meth:`SessionRegistry.migrate_to_v2`
+    can classify the RAW pre-hash scope without an import cycle — a v2
+    key's hashed remainder is never uuid-shaped, so the classification
+    must be made before hashing and persisted as ``scope_class``."""
+    try:
+        uuid.UUID(scope_id)
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
 
 
 def _build_key(*parts: str) -> str:
@@ -66,6 +91,24 @@ def build_session_key(channel: str, scope_id: str | int | None) -> str:
     return _build_key(channel, str(sid))
 
 
+def build_scoped_session_key(channel: str, role: str, scope_id: str | int | None) -> str:
+    """Collision-safe (channel, role, scope) identity, channel-FIRST so
+    existing ``key.partition('-')[0]`` consumers still read the channel
+    (spec A2). Two residents sharing one device/channel scope (e.g. voice
+    butler + concierge on the same kitchen satellite) get DISTINCT keys —
+    the v1 ``build_session_key`` collided on ``(channel, scope)`` alone.
+
+    Format: ``{channel}-v2-{sha256(channel\\x00role\\x00scope)[:24]}``.
+    """
+    if not channel:
+        raise ValueError("channel is required")
+    if not role:
+        raise ValueError("role is required")
+    sid = str(scope_id) if scope_id else "default"
+    digest = hashlib.sha256(f"{channel}\x00{role}\x00{sid}".encode()).hexdigest()[:24]
+    return _build_key(channel, SESSION_KEY_SCHEMA_V2, digest)
+
+
 class SessionRegistry:
     """Maps channel keys to session metadata and persists to disk.
 
@@ -107,19 +150,61 @@ class SessionRegistry:
         channel_key: str,
         agent: str,
         sdk_session_id: str,
+        scope_class: str | None = None,
     ) -> None:
         """Register (or overwrite) a session entry and persist.
 
         The session ID is *not* tracked here in the v0.17.1
         topology: it is derived at call time via :func:`_build_key`.
+
+        ``scope_class`` persists a caller-determined classification (spec
+        A2) — currently only ``"webhook_oneshot"`` — onto the entry so
+        :mod:`session_sweeper` can read it back at sweep time instead of
+        re-deriving it from the (now-hashed, never-uuid-shaped) v2 key.
         """
         async with self._lock:
-            self._data[channel_key] = {
+            entry: dict[str, Any] = {
                 "agent": agent,
                 "sdk_session_id": sdk_session_id,
                 "last_active": datetime.now(timezone.utc).isoformat(),
             }
+            if scope_class is not None:
+                entry["scope_class"] = scope_class
+            self._data[channel_key] = entry
             await self._save_locked()
+
+    def migrate_to_v2(self) -> dict[str, int]:
+        """One-shot boot migration (spec A2) from v1 ``{channel}-{scope}``
+        keys to role-scoped v2 keys. Telegram/webhook entries that carry a
+        stored ``agent`` migrate to :func:`build_scoped_session_key`; legacy
+        ``voice-*`` entries and any agent-less entry are DROPPED (their
+        session is simply invalidated once — the next turn starts fresh).
+        Idempotent: already-v2 keys are left untouched. Synchronous — the
+        caller is expected to ``await save()`` afterwards if anything
+        changed; this runs once at boot before concurrent access begins.
+
+        A webhook entry whose RAW pre-hash scope is uuid-shaped is a
+        one-shot; its ``scope_class`` MUST be stamped here because the v2
+        key's hash is never uuid-shaped, so the sweeper could no longer
+        re-derive the short webhook TTL from the migrated key — and a
+        one-shot never re-registers to acquire it later (spec A2)."""
+        migrated = dropped = 0
+        for key in list(self._data):
+            parts = key.split("-", 2)
+            if len(parts) >= 2 and parts[1] == SESSION_KEY_SCHEMA_V2:
+                continue  # already v2
+            entry = self._data.pop(key)
+            channel = next((c for c in _LEGACY_CHANNELS if key.startswith(f"{c}-")), None)
+            agent = entry.get("agent")
+            if channel is None or channel == "voice" or not agent:
+                dropped += 1
+                continue
+            scope = key[len(channel) + 1:]
+            if channel == "webhook" and _is_uuid_scope(scope):
+                entry["scope_class"] = "webhook_oneshot"
+            self._data[build_scoped_session_key(channel, agent, scope)] = entry
+            migrated += 1
+        return {"migrated": migrated, "dropped": dropped}
 
     def get(self, channel_key: str) -> dict[str, Any] | None:
         """Return the entry for *channel_key*, or ``None``."""

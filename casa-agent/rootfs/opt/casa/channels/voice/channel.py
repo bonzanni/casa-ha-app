@@ -150,8 +150,8 @@ class VoiceChannel(Channel):
             return web.json_response({"error": "unknown agent_role"}, status=404)
 
         scope_id = self._resolve_scope_id(payload)
-        self.pool.ensure(scope_id)
-        self.pool.touch(scope_id)
+        self.pool.ensure(scope_id, role=agent_role)
+        self.pool.touch(scope_id, role=agent_role)
 
         # Rate limit BEFORE opening the SSE stream (spec 5.2 §8).
         if self._rate_limiter is not None and self._rate_limiter.enabled:
@@ -336,9 +336,13 @@ class VoiceChannel(Channel):
             t = frame.get("type")
 
             if t == "stt_start":
-                scope_id = frame.get("scope_id") or "anon"
-                # register scope for idle-sweep/dedup; no memory prewarm (overlay unused at voice's friends clearance)
-                self.pool.ensure(scope_id)
+                # A2: stt_start carries no agent_role, so it cannot safely
+                # ensure() a role-scoped pool entry (guessing self.default_agent
+                # would silently mis-key a non-default resident's session).
+                # Pool registration now happens lazily on the utterance frame,
+                # which DOES carry agent_role. A future integration change
+                # that threads agent_role onto stt_start could re-enable a
+                # role-scoped prewarm here (see VoiceSessionPool.schedule_prewarm).
                 continue
 
             if t == "stage":
@@ -405,8 +409,8 @@ class VoiceChannel(Channel):
             "scope_id": frame.get("scope_id"),
             "context": frame.get("context") or {},
         })
-        self.pool.ensure(scope_id)
-        self.pool.touch(scope_id)
+        self.pool.ensure(scope_id, role=agent_role)
+        self.pool.touch(scope_id, role=agent_role)
 
         # Rate limit BEFORE dispatching to the agent (spec 5.2 §8).
         if self._rate_limiter is not None and self._rate_limiter.enabled:

@@ -41,8 +41,11 @@ from hindsight_ids import bank_id
 from sensitivity import clearance_for_channel, readable_tiers
 from session_saver import freshness_window, retain_cold_session, save_session
 from semantic_memory import NoOpSemanticMemory, SemanticMemory
-from session_registry import SessionRegistry, build_session_key
-from session_sweeper import _is_uuid_scope
+from session_registry import (
+    SessionRegistry,
+    _is_uuid_scope,
+    build_scoped_session_key,
+)
 from sdk_client_pool import (
     ManagedSdkClient,
     PoolUnavailable,
@@ -121,14 +124,22 @@ def _render_executors_block(executors) -> str:
 
 
 def _resume_decision(
-    channel: str, entry: dict | None, now: datetime,
+    channel: str, entry: dict | None, now: datetime, *, role: str | None = None,
 ) -> tuple[str, bool]:
     """Spec §3.3/§4.2: resume iff an entry exists and is within its channel
     freshness window; otherwise start new — and if a stale entry with a live
     sdk_session_id exists, signal save-before-overwrite (next-turn-after-gap).
     Returns (decision, save_old): decision in {"resume","new"}; save_old True
-    only when starting new over a stale-but-present session."""
+    only when starting new over a stale-but-present session.
+
+    A2: ``role``, when given, is a STRICT resume gate — an entry recorded
+    under a different (or absent) agent is never resumed, even if it's
+    otherwise fresh. Two residents sharing one channel_key's device/scope
+    must never hijack each other's SDK session. An agent-less entry seen
+    alongside a role is defense-in-depth (migrate_to_v2 already drops those)."""
     if not entry or not entry.get("sdk_session_id"):
+        return ("new", False)
+    if role is not None and entry.get("agent") != role:
         return ("new", False)
     la = entry.get("last_active")
     try:
@@ -249,7 +260,14 @@ class Agent:
         from tools import engagement_var as _engagement_var
         self._engagement_var = _engagement_var
         self._pool = SdkClientPool(
-            session_registry, decide=_resume_decision,
+            session_registry,
+            # A2: bind THIS agent's role into the resume decision — a role
+            # mismatch (another resident's entry under the same channel_key,
+            # impossible post-A2 collision-safety, but defense-in-depth) never
+            # resumes.
+            decide=lambda ch, entry, now: _resume_decision(
+                ch, entry, now, role=self.config.role,
+            ),
             origin_ctxvar=origin_var, cid_ctxvar=cid_var,
             engagement_ctxvar=_engagement_var,
         )
@@ -483,8 +501,9 @@ class Agent:
         msg: BusMessage,
         on_token: OnTokenCallback | None = None,
     ) -> str | None:
-        channel_key = build_session_key(
+        channel_key = build_scoped_session_key(
             msg.channel,
+            self.config.role,
             msg.context.get("chat_id"),
         )
         user_peer = user_peer_for_channel(msg.channel)
@@ -552,13 +571,18 @@ class Agent:
             # and any PoolUnavailable — fall to the per-turn bypass path, which
             # reproduces today's semantics exactly (decision here → one-shot
             # ManagedSdkClient → aclose in finally).
+            # A2: computed once and reused both for pool eligibility AND the
+            # persisted registry scope_class (a v2 key's hashed remainder is
+            # never uuid-shaped, so session_sweeper can no longer re-derive
+            # this from the key — it reads scope_class off the entry instead).
+            is_webhook_oneshot = (
+                msg.channel == "webhook"
+                and _is_uuid_scope(str(msg.context.get("chat_id", "")))
+            )
             use_pool = (
                 pool_enabled()
                 and msg.type != MessageType.SCHEDULED          # AR-6
-                and not (
-                    msg.channel == "webhook"
-                    and _is_uuid_scope(str(msg.context.get("chat_id", "")))
-                )
+                and not is_webhook_oneshot
             )
 
             # The pool decides the resume sid internally (AR-3), but the
@@ -612,6 +636,7 @@ class Agent:
                 existing = self._session_registry.get(channel_key)
                 decision, save_old = _resume_decision(
                     msg.channel, existing, datetime.now(timezone.utc),
+                    role=self.config.role,
                 )
                 resume_sid = (
                     existing.get("sdk_session_id")
@@ -714,6 +739,7 @@ class Agent:
                     channel_key=channel_key,
                     agent=self.config.role,
                     sdk_session_id=sdk_session_id,
+                    scope_class="webhook_oneshot" if is_webhook_oneshot else None,
                 )
 
             return response_text or None

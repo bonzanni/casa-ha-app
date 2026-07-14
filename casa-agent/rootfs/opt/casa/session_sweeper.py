@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
-from session_registry import SessionRegistry
+# _is_uuid_scope lives in session_registry (spec A2) so the boot migration
+# can classify the RAW pre-hash scope too; re-exported here for callers
+# (e.g. agent.py) that historically imported it from this module.
+from session_registry import SessionRegistry, _is_uuid_scope
 from session_saver import freshness_window
 
 logger = logging.getLogger(__name__)
@@ -37,21 +39,6 @@ _SWEEP_INTERVAL_HOURS = 6
 # Defaults, exported for casa_core fallback.
 _DEFAULT_SESSION_TTL_DAYS = 30
 _DEFAULT_WEBHOOK_SESSION_TTL_DAYS = 1
-
-
-def _is_uuid_scope(scope_id: str) -> bool:
-    """True when `scope_id` parses as a UUID (any version).
-
-    Used to distinguish a webhook one-shot (random chat_id fabricated
-    by `build_invoke_message`) from a deliberately-pinned webhook
-    session (e.g. `webhook-ha-automation-daily`). Only the former
-    qualifies for the short `webhook_session_ttl_days`.
-    """
-    try:
-        uuid.UUID(scope_id)
-        return True
-    except (ValueError, AttributeError, TypeError):
-        return False
 
 
 def _parse_last_active(value: object) -> datetime | None:
@@ -182,7 +169,20 @@ class SessionSweeper:
                     to_evict.append((key, str(entry.get("sdk_session_id") or ""), entry.get("agent", "assistant")))
                     continue
 
-                if channel == "webhook" and _is_uuid_scope(scope_id):
+                # A2: v2 keys are channel-role-scope hashes — the raw
+                # remainder is never uuid-shaped, so the webhook-one-shot
+                # classification can no longer be re-derived from the key.
+                # register() persists it explicitly as scope_class instead
+                # (falls back to the legacy key-shape check for any
+                # un-migrated v1 entry still on disk).
+                scope_class = entry.get("scope_class")
+                if scope_class is not None:
+                    is_webhook_oneshot = scope_class == "webhook_oneshot"
+                else:
+                    is_webhook_oneshot = (
+                        channel == "webhook" and _is_uuid_scope(scope_id)
+                    )
+                if is_webhook_oneshot:
                     ttl = self._webhook_ttl
                 else:
                     ttl = self._session_ttl
