@@ -183,7 +183,7 @@ class TestWSTurn:
         client, _, _, channel = ws_app
         task_refs: list[weakref.ref] = []
 
-        async def stub_ok(ws, frame, uid):
+        async def stub_ok(ws, frame, uid, voice_deadline):
             task_refs.append(weakref.ref(asyncio.current_task()))
             await ws.send_json({"type": "done", "utterance_id": uid})
 
@@ -205,7 +205,7 @@ class TestWSTurn:
 
             # Exception arm: a failing utterance task must be reaped +
             # logged, never left as an unretrieved-exception task.
-            async def stub_fail(ws_, frame, uid):
+            async def stub_fail(ws_, frame, uid, voice_deadline):
                 raise ConnectionResetError("Cannot write to closing transport")
             monkeypatch.setattr(channel, "_run_ws_utterance", stub_fail)
             with caplog.at_level("WARNING"):

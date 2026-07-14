@@ -540,6 +540,17 @@ class Agent:
         for _marker_key in ("synthetic", "button_answer"):
             if _marker_key in msg.context:
                 origin_snapshot[_marker_key] = msg.context[_marker_key]
+        # A4: voice turn budget + progress sink. Set by the SSE/WS handler
+        # on msg.context at ingress (channels/voice/channel.py); propagated
+        # into origin ONLY for the voice channel so delegate_to_agent's
+        # _prelaunch/sync-wait logic can read them off the trusted origin
+        # (which survives into the delegated-turn snapshot) rather than
+        # off msg.context directly.
+        if msg.channel == "voice":
+            if "_voice_deadline" in msg.context:
+                origin_snapshot["voice_deadline"] = msg.context["_voice_deadline"]
+            if "_progress_sink" in msg.context:
+                origin_snapshot["_progress_sink"] = msg.context["_progress_sink"]
         origin_token = origin_var.set(origin_snapshot)
         try:
             # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at

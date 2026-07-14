@@ -194,12 +194,14 @@ class TestWSChannelAuthz:
             ws_unauthorized,
             {"text": "hi", "agent_role": "assistant", "scope_id": "s"},
             "u1",
+            0.0,
         )
         ws_unknown = _FakeWS()
         await channel._run_ws_utterance(
             ws_unknown,
             {"text": "hi", "agent_role": "ghost", "scope_id": "s"},
             "u1",
+            0.0,
         )
 
         assert ws_unauthorized.sent == ws_unknown.sent, (

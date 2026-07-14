@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -559,6 +560,18 @@ _SYNC_WAIT_TIMEOUT_S: float = 60.0
 # Phase 3.5 (Plan 4b): max delegation depth. depth=0 is a direct call from
 # a resident; depth>=1 is a delegated turn. Cap at 1 to prevent chains.
 _MAX_DELEGATION_DEPTH: int = 1
+
+# A4: voice turn budget. Voice has no follow-up channel to deliver a LATER
+# completion notification on, so a synchronous specialist wait on voice is
+# bounded by the turn's own deadline (channels/voice/channel.py's
+# _voice_turn_budget_s(), propagated as origin["voice_deadline"]) instead
+# of the general _SYNC_WAIT_TIMEOUT_S ceiling. _VOICE_FALLBACK_RESERVE_S is
+# held back from the wait so there is always time left to cancel, tear
+# down, and speak the deadline_exceeded response before the client/infra
+# timeout fires. _VOICE_TEARDOWN_BOUND_S bounds how long we wait for a
+# cancelled specialist task to actually finish unwinding.
+_VOICE_FALLBACK_RESERVE_S: float = 5.0
+_VOICE_TEARDOWN_BOUND_S: float = 2.0
 
 
 # G-2 hotfix (v0.33.1): defensive reload guard.
@@ -1222,6 +1235,226 @@ def _attach_completion_callback(
     task.add_done_callback(_done)
 
 
+async def _prelaunch(
+    agent_name: str, origin: dict, mode: str,
+) -> tuple[Any, Any, dict | None]:
+    """The single unified prelaunch pipeline for delegate_to_agent (spec A4).
+
+    Runs EVERY pre-launch gate, in this order, so no gate is bypassable by
+    another and no side effect (topic, engagement/delegation record, task,
+    driver start, progress emission) can precede a clean return:
+
+        ACL (Task 1) -> not-initialized -> depth cap -> mode gate ->
+        target resolution -> resident-interactive-compat ->
+        requires (Task 5 seam) -> progress -> launch
+
+    The mode gate deliberately precedes both target resolution AND the
+    resident-interactive-compat check: on voice, async/interactive must
+    be denied as ``mode_unsupported_on_voice`` regardless of what (or
+    whether) the target resolves to — an earlier ``interactive_not_
+    supported`` (or ``unknown_agent``) would be an observable ordering
+    bypass of the voice mode gate.
+
+    Returns ``(cfg, resolution, error)``:
+    - ``error`` is a terminal tool-result dict the caller returns
+      immediately when a gate denies; ``cfg``/``resolution`` are ``None``.
+    - On success ``error`` is ``None``, ``cfg`` is the resolved target
+      config, and ``resolution`` is the Task 5/6 requires/concurrency
+      insertion seam (unpopulated in this task).
+    """
+    channel = str((origin or {}).get("channel", ""))
+
+    # A1 delegation ACL — the caller's DECLARED delegates are an
+    # authorization boundary, enforced FIRST so a missing, unknown, or
+    # undeclared caller is denied uniformly with one kind and cannot
+    # distinguish existing agents. Caller identity comes ONLY from the
+    # trusted origin, never from tool args. Key on execution_role — the
+    # agent actually RUNNING this turn — so a delegated specialist is
+    # judged by its OWN delegates, not its parent's: on a direct turn
+    # execution_role == role (agent.py sets both to self.config.role); on
+    # a delegated turn _run_delegated_agent overwrites execution_role with
+    # the delegate's role while `role` stays the delegator (read by the
+    # v0.76 provenance/authz system — leave it). The InCasaDriver
+    # interactive-executor inheritance path (in_casa_driver.py:113) is a
+    # tracked residual — unreachable today as no executor grants
+    # delegate_to_agent.
+    caller_role = str((origin or {}).get("execution_role")
+                      or (origin or {}).get("role", ""))
+    caller_cfg = _agent_role_map.get(caller_role) if caller_role else None
+    declared = {d.agent for d in (getattr(caller_cfg, "delegates", None) or [])}
+    if caller_cfg is None or agent_name not in declared:
+        return None, None, _result({
+            "status": "error", "kind": "delegation_not_declared",
+            "message": (f"Agent {caller_role or '(unknown)'!r} does not "
+                        f"declare {agent_name!r} as a delegate.")})
+
+    if _specialist_registry is None:
+        return None, None, _result({
+            "status": "error",
+            "kind": "not_initialized",
+            "message": "specialist registry not initialized",
+        })
+
+    # Depth cap: prevent delegation chains beyond depth=1.
+    current_depth = int((origin or {}).get("delegation_depth", 0))
+    if current_depth >= _MAX_DELEGATION_DEPTH:
+        return None, None, _result({
+            "status": "error",
+            "kind": "delegation_depth_exceeded",
+            "message": (
+                f"Delegation depth {current_depth} exceeds cap "
+                f"{_MAX_DELEGATION_DEPTH}; cannot chain further."
+            ),
+        })
+
+    # A4 mode gate — BEFORE target resolution and resident-compat. The
+    # voice channel has no follow-up surface to deliver a LATER completion
+    # notification on, so async/interactive (both of which can degrade to
+    # a `pending` marker) are rejected outright rather than silently
+    # coerced to sync. `pending` must never be returned on voice.
+    if channel == "voice" and mode != "sync":
+        return None, None, _result({
+            "status": "error",
+            "kind": "mode_unsupported_on_voice",
+            "message": (
+                f"mode={mode!r} is not supported on the voice channel — "
+                "only synchronous delegation can complete within a "
+                "spoken turn."
+            ),
+        })
+
+    # Resolve target. Look in the merged role map (residents + specialists)
+    # first; fall back to the specialist registry for back-compat with any
+    # caller still relying on the old wiring.
+    cfg = _agent_role_map.get(agent_name) or (
+        _specialist_registry.get(agent_name)
+        if _specialist_registry is not None else None
+    )
+    if cfg is None:
+        return None, None, _result({
+            "status": "error",
+            "kind": "unknown_agent",
+            "message": f"No enabled agent named {agent_name!r}",
+        })
+
+    # Resident-interactive-compat — AFTER the mode gate, so a voice
+    # interactive delegation to a declared resident still surfaces the
+    # voice mode denial (not this one).
+    is_resident = bool(getattr(cfg, "channels", []))
+    if mode == "interactive" and is_resident:
+        return None, None, _result({
+            "status": "error",
+            "kind": "interactive_not_supported",
+            "message": (
+                f"Cannot open a Telegram engagement for resident "
+                f"{agent_name!r} — residents already own their own channels."
+            ),
+        })
+
+    # resolution populated by the requires gate (Task 5)
+    resolution = None
+
+    # A4 progress: speak a deterministic "still working" block AFTER every
+    # gate above has passed, immediately before the launch side effects —
+    # a denied gate must never speak a misleading "checking" line. The
+    # sink itself (channels/voice/channel.py) enforces exactly-once-per-
+    # turn and suppresses this if the turn already spoke real content.
+    if channel == "voice":
+        sink = (origin or {}).get("_progress_sink")
+        if callable(sink):
+            try:
+                await sink("One moment — checking.")
+            except Exception:  # noqa: BLE001 — progress is best-effort
+                logger.warning(
+                    "voice progress sink raised for delegate_to_agent(%s)",
+                    agent_name, exc_info=True,
+                )
+
+    return cfg, resolution, None
+
+
+def _voice_wait_from_deadline(raw_deadline: Any, loop) -> float | None:
+    """A4: remaining voice budget, recomputed from the ABSOLUTE monotonic
+    deadline (``origin["voice_deadline"]``). Returns the wait in seconds,
+    or ``None`` when the budget is exhausted, missing, or NON-FINITE —
+    the caller then fails closed with ``deadline_exceeded``.
+
+    Must be called at each decision point (pre-register AND post-register)
+    because the value goes stale: ``loop.time()`` advances as the handler
+    awaits (register_delegation's tombstone lock + I/O), so a wait computed
+    before an await can be obsolete after it. A non-finite deadline/wait is
+    rejected explicitly — ``min(nan, 60)`` is unreliable and
+    ``asyncio.wait(timeout=nan)`` never expires (hang), so NaN must fail
+    closed here rather than silently disable the timeout."""
+    if raw_deadline is None:
+        return None
+    try:
+        deadline = float(raw_deadline)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(deadline):
+        return None
+    wait_s = min(
+        deadline - loop.time() - _VOICE_FALLBACK_RESERVE_S,
+        _SYNC_WAIT_TIMEOUT_S,
+    )
+    if not math.isfinite(wait_s) or wait_s <= 0:
+        return None
+    return wait_s
+
+
+def _deadline_exceeded_result(delegation_id: str, agent_name: str) -> dict:
+    """A4: the typed ``deadline_exceeded`` tool result. Shared by the
+    pre-launch expiry short-circuit (no task created) and the post-wait
+    teardown path (``_voice_deadline_exceeded``)."""
+    return _result({
+        "status": "error",
+        "delegation_id": delegation_id,
+        "agent": agent_name,
+        "kind": "deadline_exceeded",
+        "message": "Voice turn budget exceeded before the specialist finished.",
+    })
+
+
+async def _voice_deadline_exceeded(
+    task: asyncio.Task, delegation_id: str, agent_name: str,
+) -> dict:
+    """A4: voice turn-budget expiry AFTER the task was launched. Cancel it,
+    wait a bounded amount for it to actually unwind, and report a typed
+    error. Voice never degrades to `pending` — there is no channel to
+    deliver a later completion notification on."""
+    # Attach the exception-retrieval callback UNCONDITIONALLY, before the
+    # cancel — a task that catches CancelledError and raises within the
+    # teardown bound lands in `done` (not `pending`) with an exception that
+    # would otherwise never be retrieved (asyncio logs "exception was never
+    # retrieved"). The callback fires regardless of which set it ends in.
+    task.add_done_callback(_retrieve_late_task_exception)
+    task.cancel()
+    await asyncio.wait({task}, timeout=_VOICE_TEARDOWN_BOUND_S)
+    await _specialist_registry.cancel_delegation(delegation_id)
+    logger.info(
+        "Delegation %s → %s exceeded the voice turn budget — cancelled",
+        delegation_id[:8], agent_name,
+    )
+    return _deadline_exceeded_result(delegation_id, agent_name)
+
+
+def _retrieve_late_task_exception(t: asyncio.Task) -> None:
+    """Done-callback for a cancelled specialist task in the voice teardown
+    path — retrieves ``.exception()`` so asyncio never logs it as
+    "never retrieved", whether the task finished within the teardown bound
+    (landing in ``done`` with an exception it caught then re-raised) or
+    survived past it (landing in ``pending`` and finishing later)."""
+    if t.cancelled():
+        return
+    exc = t.exception()
+    if exc is not None:
+        logger.warning(
+            "voice deadline teardown: specialist task raised after "
+            "cancellation had already been requested: %s", exc,
+        )
+
+
 @tool(
     "delegate_to_agent",
     "Delegate a task to another agent (resident or specialist) and return its result.",
@@ -1251,72 +1484,15 @@ async def delegate_to_agent(args: dict) -> dict:
     # later turn has since rewritten in place.
     origin = _snapshot_origin()
 
-    # A1: delegation ACL — the caller's DECLARED delegates are an
-    # authorization boundary, enforced FIRST (before the init and depth-cap
-    # branches) so a missing, unknown, or undeclared caller is denied
-    # uniformly with one kind and cannot distinguish existing agents. Caller
-    # identity comes ONLY from the trusted origin, never from tool args. Key
-    # on execution_role — the agent actually RUNNING this turn — so a
-    # delegated specialist is judged by its OWN delegates, not its parent's:
-    # on a direct turn execution_role == role (agent.py sets both to
-    # self.config.role); on a delegated turn _run_delegated_agent overwrites
-    # execution_role with the delegate's role while `role` stays the
-    # delegator (read by the v0.76 provenance/authz system — leave it).
-    # Keyed on execution_role; the InCasaDriver interactive-executor
-    # inheritance path (in_casa_driver.py:113) is a tracked residual —
-    # unreachable today as no executor grants delegate_to_agent.
-    caller_role = str((origin or {}).get("execution_role")
-                      or (origin or {}).get("role", ""))
-    caller_cfg = _agent_role_map.get(caller_role) if caller_role else None
-    declared = {d.agent for d in (getattr(caller_cfg, "delegates", None) or [])}
-    if caller_cfg is None or agent_name not in declared:
-        return _result({"status": "error", "kind": "delegation_not_declared",
-                        "message": (f"Agent {caller_role or '(unknown)'!r} does not "
-                                    f"declare {agent_name!r} as a delegate.")})
-
-    if _specialist_registry is None:
-        return _result({
-            "status": "error",
-            "kind": "not_initialized",
-            "message": "specialist registry not initialized",
-        })
-
-    # Check depth cap: prevent delegation chains beyond depth=1.
-    current_depth = int((origin or {}).get("delegation_depth", 0))
-    if current_depth >= _MAX_DELEGATION_DEPTH:
-        return _result({
-            "status": "error",
-            "kind": "delegation_depth_exceeded",
-            "message": (
-                f"Delegation depth {current_depth} exceeds cap "
-                f"{_MAX_DELEGATION_DEPTH}; cannot chain further."
-            ),
-        })
-
-    # Resolve target. Look in the merged role map (residents + specialists)
-    # first; fall back to the specialist registry for back-compat with any
-    # caller still relying on the old wiring.
-    cfg = _agent_role_map.get(agent_name) or (
-        _specialist_registry.get(agent_name)
-        if _specialist_registry is not None else None
-    )
-    if cfg is None:
-        return _result({
-            "status": "error",
-            "kind": "unknown_agent",
-            "message": f"No enabled agent named {agent_name!r}",
-        })
-
-    is_resident = bool(getattr(cfg, "channels", []))
-    if mode == "interactive" and is_resident:
-        return _result({
-            "status": "error",
-            "kind": "interactive_not_supported",
-            "message": (
-                f"Cannot open a Telegram engagement for resident "
-                f"{agent_name!r} — residents already own their own channels."
-            ),
-        })
+    # A4: THE unified prelaunch pipeline — one call that runs EVERY
+    # pre-launch gate (ACL, depth, mode, target resolution, resident-compat,
+    # requires-seam, progress) in a fixed order, so no gate is bypassable by
+    # another and NO side effect (topic, engagement/delegation record, task,
+    # driver start, progress emission) can precede a clean return. It
+    # dominates both the interactive branch and the sync/async path below.
+    cfg, resolution, prelaunch_error = await _prelaunch(agent_name, origin, mode)
+    if prelaunch_error is not None:
+        return prelaunch_error
 
     if mode == "interactive":
         # Need telegram channel + supergroup configured.
@@ -1439,12 +1615,52 @@ async def delegate_to_agent(args: dict) -> dict:
         })
 
     delegation_id = str(uuid.uuid4())
+
+    # A4: voice turn budget. The deadline is ABSOLUTE (origin["voice_deadline"],
+    # a monotonic loop.time() value); the remaining wait is recomputed at
+    # every decision point because loop.time() advances as this handler
+    # awaits. `voice_wait_s` stays None for non-voice turns (they use the
+    # general 60s ceiling below). A None from _voice_wait_from_deadline means
+    # the budget is exhausted, missing, or non-finite → fail closed with
+    # deadline_exceeded rather than launch or (worse, on NaN) hang.
+    is_voice = str(origin.get("channel", "")) == "voice"
+    loop = asyncio.get_running_loop() if is_voice else None
+    raw_deadline = origin.get("voice_deadline") if is_voice else None
+
+    if is_voice:
+        # Pre-register short-circuit: an already-expired / missing /
+        # non-finite deadline never even registers a record (keeps the
+        # tombstone store clean for the common "spoke too late" case).
+        if _voice_wait_from_deadline(raw_deadline, loop) is None:
+            logger.info(
+                "Delegation → %s voice budget already exceeded at entry — "
+                "not registered", agent_name,
+            )
+            return _deadline_exceeded_result(delegation_id, agent_name)
+
     started_at = time.time()
     record = DelegationRecord(
         id=delegation_id, agent=agent_name, started_at=started_at,
         origin=dict(origin),
     )
     await _specialist_registry.register_delegation(record)
+
+    voice_wait_s: float | None = None
+    if is_voice:
+        # RECOMPUTE after register_delegation — its tombstone lock + I/O
+        # consumed wall-clock time, so the pre-register wait is now stale.
+        # If registration itself ate the remaining budget, remove the
+        # just-registered record (no orphan tombstone) and bail WITHOUT
+        # ever launching the specialist task.
+        voice_wait_s = _voice_wait_from_deadline(raw_deadline, loop)
+        if voice_wait_s is None:
+            await _specialist_registry.cancel_delegation(delegation_id)
+            logger.info(
+                "Delegation %s → %s voice budget exhausted during "
+                "registration — specialist not started",
+                delegation_id[:8], agent_name,
+            )
+            return _deadline_exceeded_result(delegation_id, agent_name)
 
     task = asyncio.create_task(_run_delegated_agent(cfg, task_text, context_text))
 
@@ -1462,32 +1678,47 @@ async def delegate_to_agent(args: dict) -> dict:
         })
 
     # mode == "sync"
-    try:
-        done, pending = await asyncio.wait({task}, timeout=_SYNC_WAIT_TIMEOUT_S)
-    except asyncio.CancelledError:
-        task.cancel()
-        await _specialist_registry.cancel_delegation(delegation_id)
-        raise
+    if voice_wait_s is not None:
+        # A4: voice never degrades to `pending` (async/interactive are
+        # already rejected in _prelaunch) — there is no follow-up channel
+        # to deliver a LATER completion notification on. Wait only up to
+        # the budget computed above (deadline − reserve, capped at 60s); on
+        # expiry cancel + bounded teardown + speak the typed error.
+        try:
+            done, pending = await asyncio.wait({task}, timeout=voice_wait_s)
+        except asyncio.CancelledError:
+            task.cancel()
+            await _specialist_registry.cancel_delegation(delegation_id)
+            raise
+        if pending:
+            return await _voice_deadline_exceeded(task, delegation_id, agent_name)
+    else:
+        try:
+            done, pending = await asyncio.wait({task}, timeout=_SYNC_WAIT_TIMEOUT_S)
+        except asyncio.CancelledError:
+            task.cancel()
+            await _specialist_registry.cancel_delegation(delegation_id)
+            raise
 
-    if pending:
-        # 60s elapsed; detach and degrade to pending with callback.
-        _attach_completion_callback(task, record)
-        logger.info(
-            "Delegation %s → %s timed out at 60s — degraded to pending",
-            delegation_id[:8], agent_name,
-        )
-        return _result({
-            "status": "pending",
-            "delegation_id": delegation_id,
-            "agent": agent_name,
-            "timeout_s": 60,
-            "note": (
-                "Delegation continues in background; you will receive a "
-                "NOTIFICATION when complete."
-            ),
-        })
+        if pending:
+            # 60s elapsed; detach and degrade to pending with callback.
+            _attach_completion_callback(task, record)
+            logger.info(
+                "Delegation %s → %s timed out at 60s — degraded to pending",
+                delegation_id[:8], agent_name,
+            )
+            return _result({
+                "status": "pending",
+                "delegation_id": delegation_id,
+                "agent": agent_name,
+                "timeout_s": 60,
+                "note": (
+                    "Delegation continues in background; you will receive a "
+                    "NOTIFICATION when complete."
+                ),
+            })
 
-    # Task finished within 60s — return ok or error synchronously.
+    # Task finished within budget — return ok or error synchronously.
     finished = next(iter(done))
     if finished.exception() is not None:
         exc = finished.exception()

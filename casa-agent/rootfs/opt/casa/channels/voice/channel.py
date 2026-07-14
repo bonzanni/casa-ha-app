@@ -12,6 +12,8 @@ import hashlib
 import hmac
 import json
 import logging
+import math
+import os
 import uuid
 from typing import Any, Awaitable, Callable, Mapping
 
@@ -39,6 +41,36 @@ _DEFAULT_ERROR_LINES = {
     "channel_error": "[flat] Something went wrong.",
     "unknown":       "[flat] Sorry, something went wrong.",
 }
+
+# A4 (spec A4): voice turn-budget envelope. INTEGRATION_TIMEOUT_TOTAL is
+# the total wall-clock time the voice transport (SSE/WS plus any fronting
+# proxy) gives one turn before ITS OWN timeout would fire — a synchronous
+# specialist delegation must always leave that much room. The hard cap
+# holds even if INTEGRATION_TIMEOUT_TOTAL is raised later.
+INTEGRATION_TIMEOUT_TOTAL: float = 30.0
+_VOICE_TURN_BUDGET_HARD_CAP_S: float = 27.0
+
+
+def _voice_turn_budget_s() -> float:
+    """Effective per-turn delegation budget (spec A4).
+
+    ``min(voice_turn_budget_seconds, INTEGRATION_TIMEOUT_TOTAL - 3)``,
+    configured via the ``VOICE_TURN_BUDGET_SECONDS`` env var (default 27),
+    hard-capped at 27s regardless of configuration.
+
+    A non-finite configured value (``nan``/``inf``) is REJECTED and falls
+    back to 27 — a NaN budget would propagate through ``min()`` and defeat
+    the deadline entirely (``asyncio.wait(timeout=nan)`` never reliably
+    expires), so it must fail closed here at the source.
+    """
+    try:
+        configured = float(os.environ.get("VOICE_TURN_BUDGET_SECONDS", "27"))
+    except (TypeError, ValueError):
+        configured = 27.0
+    if not math.isfinite(configured):
+        configured = 27.0
+    budget = min(configured, INTEGRATION_TIMEOUT_TOTAL - 3.0)
+    return min(budget, _VOICE_TURN_BUDGET_HARD_CAP_S)
 
 
 class VoiceChannel(Channel):
@@ -133,6 +165,13 @@ class VoiceChannel(Channel):
     # --- SSE ----------------------------------------------------------
 
     async def _sse_handler(self, request: web.Request) -> web.StreamResponse:
+        # A4: capture the deadline at TRUE ingress — the first line of the
+        # handler, BEFORE body-read/HMAC/JSON validation — so those (I/O-
+        # bound, potentially slow) steps are counted against the 27s window
+        # rather than silently extending it past HA's ~30s transport
+        # timeout. Monotonic (loop.time()).
+        voice_deadline = asyncio.get_running_loop().time() + _voice_turn_budget_s()
+
         body = await request.read()
         if not self._verify(request, body):
             return web.json_response({"error": "invalid signature"}, status=401)
@@ -196,9 +235,21 @@ class VoiceChannel(Channel):
         splitter = ProsodicSplitter()
         adapter = TagDialectAdapter(cfg.tts.tag_dialect)
         last_text = ""
+        # A4: write_lock serializes real SDK-streamed blocks (on_token)
+        # against the synthetic progress block (_progress_sink below). The
+        # flag CHECK, the wire WRITE, and the flag MUTATION all happen under
+        # the SAME held lock in both closures, so there is no window where
+        # the progress sink can observe speech_block_sent=False, queue
+        # behind an in-flight on_token write, and then emit progress AFTER
+        # real speech. speech_block_sent flips ONLY after a real block is
+        # actually written (not on any token/last_text update); progress_sent
+        # flips ONLY after the progress block is actually written.
+        write_lock = asyncio.Lock()
+        speech_block_sent = False
+        progress_sent = False
 
         async def on_token(accumulated: str) -> None:
-            nonlocal last_text, splitter
+            nonlocal last_text, splitter, speech_block_sent
             if not accumulated.startswith(last_text):
                 # AR-B (2026-07-11 design §2 point 3): a mid-turn SDK retry
                 # or a divergent canonical correction breaks the
@@ -218,10 +269,30 @@ class VoiceChannel(Channel):
             delta = accumulated[len(last_text):]
             last_text = accumulated
             for block in splitter.feed(delta):
+                async with write_lock:
+                    await _write_sse(response, "block", {
+                        "text": adapter.render(block),
+                        "final": False,
+                    })
+                    speech_block_sent = True
+
+        async def _progress_sink(text: str) -> None:
+            # A4: deterministic "still working" block for a mid-turn
+            # specialist delegation. Exactly once per outer voice turn
+            # (progress_sent) and suppressed once the turn has spoken any
+            # REAL content (speech_block_sent). The check + write + mutation
+            # are ALL under the lock — see the write_lock comment above.
+            # Writes a real wire `block` — NOT via on_token, whose
+            # cumulative-prefix `last_text` bookkeeping would corrupt on a
+            # manually-injected block not part of the accumulated SDK text.
+            nonlocal progress_sent
+            async with write_lock:
+                if progress_sent or speech_block_sent:
+                    return
                 await _write_sse(response, "block", {
-                    "text": adapter.render(block),
-                    "final": False,
+                    "text": adapter.render(text), "final": False,
                 })
+                progress_sent = True
 
         error_emitted = False
 
@@ -248,6 +319,8 @@ class VoiceChannel(Channel):
                 "cid": request["cid"],
                 "_on_token": on_token,
                 "_error_sink": _error_sink,
+                "_voice_deadline": voice_deadline,
+                "_progress_sink": _progress_sink,
             },
         )
 
@@ -362,8 +435,15 @@ class VoiceChannel(Channel):
 
             if t == "utterance":
                 uid = frame.get("utterance_id") or str(uuid.uuid4())
+                # A4: capture the deadline at TRUE ingress — the moment the
+                # utterance frame is RECEIVED here, not inside the separately-
+                # scheduled _run_ws_utterance task (which may not run for an
+                # unbounded interval under load). Monotonic (loop.time()).
+                voice_deadline = (
+                    asyncio.get_running_loop().time() + _voice_turn_budget_s()
+                )
                 task = asyncio.create_task(
-                    self._run_ws_utterance(ws, frame, uid),
+                    self._run_ws_utterance(ws, frame, uid, voice_deadline),
                 )
                 tasks[uid] = task
 
@@ -399,7 +479,12 @@ class VoiceChannel(Channel):
 
     async def _run_ws_utterance(
         self, ws: web.WebSocketResponse, frame: dict, uid: str,
+        voice_deadline: float,
     ) -> None:
+        # A4: `voice_deadline` (monotonic loop.time()) is captured by the
+        # caller at utterance-frame RECEIPT — see _ws_handler — so any delay
+        # between receipt and this task actually running is counted against
+        # the budget rather than silently extending it.
         agent_role = frame.get("agent_role", self.default_agent)
         cfg = self._agent_configs.get(agent_role)
         # Fail-closed channel-capability gate (spec A3): a 404 can't follow
@@ -441,9 +526,14 @@ class VoiceChannel(Channel):
         adapter = TagDialectAdapter(cfg.tts.tag_dialect)
         last_text = ""
         error_emitted = False
+        # A4: mirrors the SSE handler's write_lock/speech_block_sent —
+        # see its on_token for the full rationale.
+        write_lock = asyncio.Lock()
+        speech_block_sent = False
+        progress_sent = False
 
         async def on_token(accumulated: str) -> None:
-            nonlocal last_text, splitter
+            nonlocal last_text, splitter, speech_block_sent
             if not accumulated.startswith(last_text):
                 # AR-B — see the SSE handler's on_token for rationale.
                 logger.debug(
@@ -457,10 +547,26 @@ class VoiceChannel(Channel):
             delta = accumulated[len(last_text):]
             last_text = accumulated
             for block in splitter.feed(delta):
+                async with write_lock:
+                    await ws.send_json({
+                        "type": "block", "utterance_id": uid,
+                        "text": adapter.render(block), "final": False,
+                    })
+                    speech_block_sent = True
+
+        async def _progress_sink(text: str) -> None:
+            # A4: see the SSE handler's _progress_sink for the full
+            # exactly-once / suppress-after-real-speech rationale — the
+            # check + write + mutation all happen under the held lock.
+            nonlocal progress_sent
+            async with write_lock:
+                if progress_sent or speech_block_sent:
+                    return
                 await ws.send_json({
                     "type": "block", "utterance_id": uid,
-                    "text": adapter.render(block), "final": False,
+                    "text": adapter.render(text), "final": False,
                 })
+                progress_sent = True
 
         async def _error_sink(kind: str, spoken: str) -> None:
             nonlocal error_emitted
@@ -484,6 +590,8 @@ class VoiceChannel(Channel):
                 "cid": new_cid(),
                 "_on_token": on_token,
                 "_error_sink": _error_sink,
+                "_voice_deadline": voice_deadline,
+                "_progress_sink": _progress_sink,
             },
         )
 
