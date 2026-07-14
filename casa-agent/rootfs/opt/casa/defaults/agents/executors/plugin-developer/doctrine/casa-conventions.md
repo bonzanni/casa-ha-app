@@ -162,9 +162,11 @@ without the operator tapping Approve, declare it in
 }
 ```
 
-Each entry is either a bare tool-name string (no headline — the operator
-sees the raw tool id and arguments) or an object `{"name", "summary"}`
-that also gives the approval prompt a plain-language headline:
+Each entry is either a bare tool-name string (the approval prompt then
+uses the generic headline: agent name + short tool name + the exact
+arguments) or an object `{"name", "summary"}` that upgrades the headline
+to a plain-language action sentence (the exact arguments and the full
+tool id stay visible below in both cases):
 
 - `summary` is a single-line template, at most 200 chars, no control or
   bidi-control characters.
