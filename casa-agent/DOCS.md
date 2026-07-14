@@ -493,6 +493,22 @@ mints a grant that is:
 You'll see this for actions a plugin author has flagged as consequential.
 Deny leaves the call refused with no grant issued.
 
+A plugin author can also give the approval prompt a plain-language headline
+instead of the raw tool id, by pairing the tool name with a `summary`
+template in the manifest:
+
+```json
+"casa": {
+  "protectedTools": [
+    {"name": "invoice_reset", "summary": "Delete the invoice draft for {period}"}
+  ]
+}
+```
+
+`{period}` is filled in from that call's own arguments, so the prompt reads
+"Alex (finance) wants to: Delete the invoice draft for 2025-05" — the exact
+arguments still always appear below, unabridged.
+
 ### Disk usage
 
 The store lives on `/config` (the `addon_config` volume), so artifacts persist

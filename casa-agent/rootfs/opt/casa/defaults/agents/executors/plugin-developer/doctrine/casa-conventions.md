@@ -147,6 +147,39 @@ turn, then either retry with a different tool, describe what you
 would have done so the operator can decide whether to approve, or
 ask the operator directly via `mcp__casa-engagement-channel__reply`.
 
+## Protected tools (`casa.protectedTools`)
+
+If your plugin has a tool consequential enough that it should never run
+without the operator tapping Approve, declare it in
+`.claude-plugin/plugin.json`:
+
+```json
+"casa": {
+  "protectedTools": [
+    "reset_invoice",
+    {"name": "delete_draft", "summary": "Delete the invoice draft for {period}"}
+  ]
+}
+```
+
+Each entry is either a bare tool-name string (no headline — the operator
+sees the raw tool id and arguments) or an object `{"name", "summary"}`
+that also gives the approval prompt a plain-language headline:
+
+- `summary` is a single-line template, at most 200 chars, no control or
+  bidi-control characters.
+- `{arg}` placeholders are filled in from that call's OWN arguments only —
+  every placeholder must name a real, scalar (string/number/bool)
+  argument of the tool it decorates. A template that references an
+  argument that doesn't exist, or that uses anything beyond a bare
+  `{identifier}` (no `{x!r}`, `{x:>10}`, `{x[0]}`, `{x.y}`), silently
+  falls back to the raw-tool-id headline at render time rather than
+  breaking the prompt — write templates so they interpolate cleanly,
+  since a fallback loses the plain-language value you added.
+- The exact arguments are always shown too, in full, below the headline —
+  `summary` only adds a human-readable line, it never hides or replaces
+  the binding detail.
+
 ## MCP server naming = the grant namespace
 
 Your `.mcp.json` `mcpServers` key becomes part of every tool's callable name:
