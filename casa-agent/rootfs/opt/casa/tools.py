@@ -353,6 +353,196 @@ async def send_media(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# ask_user — resident DM button questions (v0.76.0 W5b, A:§2)
+#
+# Two-turn, detached: REGISTER -> POST -> RETURN. The tool never awaits the
+# operator's tap — it registers a `resident_ask` broker request scoped
+# `dm:<chat_id>`, posts the inline keyboard, and returns `awaiting_user`
+# immediately. The operator's tap (or a same-DM typed reply, or /new, or a
+# timeout, or Casa shutdown) resolves the request later; the broker finish
+# hook installed here is the SINGLE owner of the post-commit keyboard edit +
+# synthetic-turn dispatch (r2-B1/r3-B1 single-owner contract).
+# ---------------------------------------------------------------------------
+
+# W5 ask contract limits (design §W5, shared by ask_user — A:§2).
+_ASK_QUESTION_MAX = 1024
+_ASK_OPTIONS_MIN = 2
+_ASK_OPTIONS_MAX = 8
+_ASK_OPTION_LABEL_MAX = 48
+_ASK_TIMEOUT_DEFAULT = 300.0
+_ASK_TIMEOUT_MIN = 30.0
+_ASK_TIMEOUT_MAX = 570.0
+
+ASK_USER_SCHEMA = {
+    # r1-B3: explicit JSON Schema — only question+options are required;
+    # timeout_s is optional (defaults to _ASK_TIMEOUT_DEFAULT, clamped).
+    "type": "object",
+    "properties": {
+        "question": {"type": "string"},
+        "options": {"type": "array", "items": {"type": "string"}},
+        "timeout_s": {"type": "number"},
+    },
+    "required": ["question", "options"],
+}
+
+
+def _ask_user_validate(args: dict) -> tuple[str | None, list[str] | None, float | None, str | None]:
+    """Validate ask_user args against the W5 ask contract.
+
+    Returns ``(question, options, timeout_s, error_message)``. On success
+    ``error_message`` is ``None`` and the other three are populated
+    (``timeout_s`` already clamped to ``[_ASK_TIMEOUT_MIN,
+    _ASK_TIMEOUT_MAX]``). On failure only ``error_message`` is set.
+    """
+    question = args.get("question")
+    if not isinstance(question, str) or not question.strip():
+        return None, None, None, "question must be a non-empty string"
+    if len(question) > _ASK_QUESTION_MAX:
+        return None, None, None, (
+            f"question must be at most {_ASK_QUESTION_MAX} characters"
+        )
+
+    options = args.get("options")
+    if not isinstance(options, list):
+        return None, None, None, "options must be a list of strings"
+    if not (_ASK_OPTIONS_MIN <= len(options) <= _ASK_OPTIONS_MAX):
+        return None, None, None, (
+            f"options must have between {_ASK_OPTIONS_MIN} and "
+            f"{_ASK_OPTIONS_MAX} entries"
+        )
+    for opt in options:
+        if not isinstance(opt, str) or not opt.strip():
+            return None, None, None, "every option must be a non-empty string"
+        if len(opt) > _ASK_OPTION_LABEL_MAX:
+            return None, None, None, (
+                f"option labels must be at most {_ASK_OPTION_LABEL_MAX} "
+                "characters"
+            )
+    if len(set(options)) != len(options):
+        return None, None, None, "options must be unique"
+
+    timeout_arg = args.get("timeout_s")
+    if timeout_arg is None:
+        timeout_s = _ASK_TIMEOUT_DEFAULT
+    else:
+        if isinstance(timeout_arg, bool) or not isinstance(timeout_arg, (int, float)):
+            return None, None, None, "timeout_s must be a number"
+        timeout_s = float(timeout_arg)
+    timeout_s = max(_ASK_TIMEOUT_MIN, min(_ASK_TIMEOUT_MAX, timeout_s))
+
+    return question, list(options), timeout_s, None
+
+
+@tool(
+    "ask_user",
+    "Ask the operator a multiple-choice question with tappable buttons in "
+    "their DM. Two-turn: returns awaiting_user immediately; the answer "
+    "arrives as the user's next message. NOT an authorization mechanism.",
+    ASK_USER_SCHEMA,
+)
+async def ask_user(args: dict) -> dict:
+    question, options, timeout_s, err = _ask_user_validate(args)
+    if err is not None:
+        return _result({"status": "error", "kind": "invalid_arguments",
+                        "message": err})
+
+    from provenance import strict_positive_id, turn_provenance
+
+    prov = turn_provenance()
+    if prov.transport not in ("dm", "button") or prov.execution != "direct":
+        return _result({
+            "status": "error", "kind": "unsupported_origin",
+            "message": (
+                "ask_user requires a direct, genuine inbound-DM turn "
+                f"(got transport={prov.transport!r} execution={prov.execution!r})"
+            ),
+        })
+
+    origin = _snapshot_origin()
+    chat_id = strict_positive_id(origin.get("chat_id"))
+    operator_id = strict_positive_id(origin.get("user_id"))
+    if chat_id is None or operator_id is None:
+        return _result({
+            "status": "error", "kind": "unsupported_origin",
+            "message": "ask_user requires a valid chat_id/user_id origin",
+        })
+
+    if _channel_manager is None:
+        return _result({"status": "error", "kind": "delivery_failed",
+                        "message": "tools not initialized"})
+    channel = _channel_manager.get(origin.get("channel", "telegram"))
+    if channel is None:
+        return _result({"status": "error", "kind": "delivery_failed",
+                        "message": "channel not available"})
+
+    from verdict_broker import BROKER
+
+    rid = uuid.uuid4().hex
+    target_role = origin.get("role")
+    scope = f"dm:{chat_id}"
+    # Static meta BEFORE post (register() shallow-copies whatever dict we
+    # pass, so the complete dict is supplied up front rather than mutated
+    # after the fact). No `on_commit_sync` — plain asks record nothing at
+    # commit time (that's the authz challenge's job, Task 5+).
+    req, _created = BROKER.register(
+        namespace="resident_ask", scope=scope, request_id=rid,
+        timeout_s=timeout_s, detached=True, supersede=True,
+        meta={
+            "options": list(options),
+            "chat_id": chat_id,
+            "operator_id": operator_id,
+            "target_role": target_role,
+            "kind": "ask",
+            "_scope": scope,
+        },
+    )
+
+    async def _post():
+        return await channel.post_dm_keyboard(
+            chat_id=chat_id, request_id=rid, text=question, options=list(options),
+        )
+
+    def _finish_factory(message_id: int):
+        async def _finish(outcome: dict) -> None:
+            # r2-B1/r3-B1 single-owner finish hook: on `answered` edit the
+            # keyboard to the answered label FIRST, then dispatch the
+            # synthetic continuation, then overwrite with a visible failure
+            # text ONLY if dispatch failed. no_answer/cancelled -> expired.
+            if outcome.get("outcome") != "answered":
+                await channel.edit_dm_message(
+                    chat_id, message_id,
+                    f"{question}\n\n(this question has expired)",
+                )
+                return
+            idx = outcome["option_index"]
+            chosen = options[idx]
+            await channel.edit_dm_message(
+                chat_id, message_id, f"{question}\n\nAnswered: {chosen}",
+            )
+            ok = await channel._dispatch_button_continuation(
+                chat_id=chat_id, user_id=operator_id, target_role=target_role,
+                request_id=rid, text=f"[button answer to {rid}]: {chosen}",
+            )
+            if not ok:
+                await channel.edit_dm_message(
+                    chat_id, message_id,
+                    "answer received but delivery failed — please type it",
+                )
+        return _finish
+
+    await BROKER.ensure_posted(req, _post, _finish_factory)
+
+    if "message_id" not in req.meta:
+        # _run_setup already unregistered the request on a post failure
+        # (post() returned None or raised) — no dangling pending record.
+        return _result({
+            "status": "error", "kind": "delivery_failed",
+            "message": "could not deliver the question to the operator",
+        })
+    return _result({"status": "awaiting_user", "request_id": rid})
+
+
+# ---------------------------------------------------------------------------
 # delegate_to_agent — Phase 3.1
 # ---------------------------------------------------------------------------
 
@@ -4506,6 +4696,7 @@ async def get_item_fields(args: dict) -> dict:
 CASA_TOOLS: tuple = (
     send_message,
     send_media,
+    ask_user,
     delegate_to_agent,
     recall_memory,                 # §4.3 — shared-bank semantic recall (tier-clearance filtered)
     get_schedule,

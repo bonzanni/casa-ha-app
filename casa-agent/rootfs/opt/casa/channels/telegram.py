@@ -40,7 +40,7 @@ from channels import Channel
 from media_policies import MEDIA_POLICIES
 from channels.telegram_supervisor import ReconnectSupervisor
 from log_cid import cid_var, new_cid
-from provenance import sanitize_external_context
+from provenance import sanitize_external_context, strict_positive_id
 from rate_limit import RateLimiter
 
 import topic_ledger
@@ -686,6 +686,25 @@ class TelegramChannel(Channel):
         # forwarded/group-origin update could).
         _first = text.split()[0].lower() if text else ""
         if _first.split("@", 1)[0] == "/new":
+            # v0.76.0 (W5b, r1-B4): cancel any pending resident_ask/authz
+            # records and purge authorization grants for this chat
+            # SYNCHRONOUSLY, before the first await below — a /new reset
+            # must not race a still-pending question or a live grant. The
+            # channel's chat_id is a STRING; the broker/grant store are
+            # int-keyed, so convert via strict_positive_id first.
+            _chat_int = strict_positive_id(chat_id)
+            if _chat_int is not None:
+                from authz_grants import GRANTS
+                from verdict_broker import BROKER
+                BROKER.cancel_scope(
+                    namespace="resident_ask", scope=f"dm:{_chat_int}",
+                    reason="new_session",
+                )
+                BROKER.cancel_scope(
+                    namespace="resident_ask", scope=f"authz:{_chat_int}",
+                    reason="new_session",
+                )
+                GRANTS.purge_chat(_chat_int)
             # M29: ack BEFORE the (potentially multi-second) save so the user
             # gets instant feedback. reset_channel stays awaited (NOT
             # backgrounded) — the registry entry must survive until the retain
@@ -709,6 +728,20 @@ class TelegramChannel(Channel):
                     channel="telegram",
                 )
             return  # do NOT feed /new to the agent
+
+        # v0.76.0 (W5b, r1-B2): a same-DM plain-text reply resolves any
+        # pending resident_ask ("the text IS the answer") — cancel it BEFORE
+        # normal dispatch so the finish hook edits the stale keyboard to
+        # expired while this text still proceeds to the agent as a normal
+        # turn. Only the plain-ask `dm:` scope is affected; `authz:`
+        # challenges are untouched here (Task 5+).
+        _chat_int = strict_positive_id(chat_id)
+        if _chat_int is not None:
+            from verdict_broker import BROKER
+            BROKER.cancel_scope(
+                namespace="resident_ask", scope=f"dm:{_chat_int}",
+                reason="typed_answer",
+            )
 
         user = update.effective_user
         user_name = user.first_name if user else "unknown"

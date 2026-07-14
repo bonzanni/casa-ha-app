@@ -254,3 +254,71 @@ class TestBrokerShutdownOrdering:
 
         # The in-flight hook's edit+dispatch both completed before stop_all.
         assert order == ["edit", "dispatch", "stop_all"]
+
+    async def test_real_ask_user_pending_keyboard_edited_before_stop(
+        self, monkeypatch,
+    ):
+        """v0.76.0 (W5b, r1-B9): extends the shutdown-ordering barrier to a
+        REAL pending `ask_user` request (not a fake/synthetic finish hook) —
+        BROKER.cancel_all + drain_hooks must edit the pending ask's keyboard
+        to an expired state before channel_manager.stop_all() tears the
+        channel down."""
+        import agent as agent_mod
+        import tools
+        import verdict_broker
+        from verdict_broker import VerdictBroker
+        from casa_core import _drain_broker_before_channel_shutdown
+
+        broker = VerdictBroker()
+        monkeypatch.setattr(verdict_broker, "BROKER", broker)
+
+        edits: list[tuple] = []
+        order: list[str] = []
+
+        class _FakeAskChannel:
+            async def post_dm_keyboard(self, *, chat_id, request_id, text, options):
+                return 77
+
+            async def edit_dm_message(self, chat_id, message_id, text):
+                edits.append((chat_id, message_id, text))
+                order.append("edit")
+                return True
+
+            async def _dispatch_button_continuation(self, **kw):
+                return True
+
+        channel = _FakeAskChannel()
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        tools.init_tools(
+            channel_manager=cm, bus=MagicMock(), specialist_registry=MagicMock(),
+            mcp_registry=MagicMock(),
+        )
+        tok = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram", "chat_id": "500",
+            "user_id": 999, "message_type": "channel_in", "source": "telegram",
+            "execution_role": "assistant",
+        })
+        try:
+            result = await tools.ask_user.handler(
+                {"question": "Proceed?", "options": ["Yes", "No"]},
+            )
+        finally:
+            agent_mod.origin_var.reset(tok)
+        import json
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["status"] == "awaiting_user"
+
+        channel_manager = MagicMock()
+
+        async def _stop_all():
+            order.append("stop_all")
+
+        channel_manager.stop_all = AsyncMock(side_effect=_stop_all)
+
+        await _drain_broker_before_channel_shutdown(channel_manager)
+
+        assert edits, "the pending ask's keyboard must have been edited"
+        assert "expired" in edits[0][2].lower()
+        # The edit landed BEFORE stop_all — drain_hooks() is awaited first.
+        assert order == ["edit", "stop_all"]
