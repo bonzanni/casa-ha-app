@@ -814,7 +814,15 @@ def _build_specialist_options(cfg, *, resolution=None) -> ClaudeAgentOptions:
                   if _channel_manager is not None else None)
             if ch is None:
                 return None  # no DM reachable ⇒ unsupported-origin deny
-            return AuthzDeps(channel=ch, grants=GRANTS, challenges=CHALLENGES)
+            # Read the CURRENT loaded character name at call time (W2); a
+            # specialist reload rebuilds cfg, so the next challenge names the
+            # new display name. Defensive getattr: unusual cfgs degrade to the
+            # role string at render time, never raise.
+            _char = getattr(cfg, "character", None)
+            return AuthzDeps(
+                channel=ch, grants=GRANTS, challenges=CHALLENGES,
+                display_name=getattr(_char, "name", None),
+            )
 
         resolved_hooks["PreToolUse"] = [
             *resolved_hooks.get("PreToolUse", []),

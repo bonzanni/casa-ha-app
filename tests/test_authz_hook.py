@@ -21,6 +21,7 @@ outcomes are driven END-TO-END through the real coordinator.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -397,6 +398,29 @@ class TestConsumeAndChallenge:
         assert meta["target_role"] == "assistant"
         assert meta["enforcement_role"] == "finance"
 
+    async def test_hook_threads_summary_and_display_name_end_to_end(
+        self, monkeypatch,
+    ):
+        """The summary travels: hook reads it from ``protected_map`` next to
+        ``artifact_id`` → passes into get_or_create → coordinator renders. The
+        posted challenge carries the interpolated sentence AND the verbatim
+        canonical block AND the full tool id."""
+        broker, coord, channel = _fresh_coord(monkeypatch)
+        deps = AuthzDeps(channel=channel, grants=GrantStore(), challenges=coord,
+                         display_name="Alex")
+        protected = {TOOL: {"artifact_id": ARTIFACT,
+                            "summary": "Delete the invoice draft for {period}"}}
+        hook = _mk_hook(deps=deps, protected=protected)
+        with _OriginCtx(_origin()):
+            out = await _call(hook, tool_input={"period": "2025-05"})
+        assert _deny_reason(out) == _DENY_POSTED
+        ((_chat_id, _rid, text, _opts),) = channel.posts
+        assert (
+            "Alex (finance) wants to: Delete the invoice draft for 2025-05"
+        ) in text
+        assert '```\n{"period":"2025-05"}\n```' in text  # verbatim binding
+        assert f"Tool id: {TOOL}" in text
+
 
 # ===========================================================================
 # Unrenderable / oversized args
@@ -586,6 +610,16 @@ def _authz_matcher(opts):
     return None
 
 
+def _authz_hook(opts):
+    """The appended authz hook callable itself (carries ``_casa_authz_role``
+    and ``_casa_authz_deps_factory`` markers)."""
+    for m in (opts.hooks or {}).get("PreToolUse", []):
+        for h in getattr(m, "hooks", []):
+            if getattr(h, "_casa_authz_role", None) is not None:
+                return h
+    return None
+
+
 def _has_settings_guard(opts):
     pre = (opts.hooks or {}).get("PreToolUse", [])
     return any(getattr(m, "matcher", None)
@@ -689,3 +723,95 @@ class TestWiring:
         opts = tools_mod._build_executor_options(
             _exec_defn(), executor_type="probe-exec")
         assert _authz_matcher(opts) is None  # executors get NOTHING
+
+
+# ===========================================================================
+# Display-name threading through BOTH AuthzDeps factory sites (W2). The factory
+# reads the CURRENT loaded cfg.character.name at call time — never a boot-time
+# snapshot — so the challenge/settlement can name the agent.
+# ===========================================================================
+
+
+class TestDisplayNameFactoryWiring:
+    def test_resident_factory_threads_current_character_name(self, tmp_path):
+        from plugin_registry import reload_snapshot
+        from plugin_fixtures import entry, mk_artifact, mk_registry
+        from test_agent_plugin_binding import _make_agent
+
+        store = tmp_path / "store"
+        e = entry("p", ["resident:assistant"])
+        mk_artifact(store, "p", e["artifact_id"], mcp_servers={"p": {}},
+                    extra_manifest=_PROTECTED_MANIFEST)
+        reload_snapshot(registry_path=mk_registry(tmp_path, [e]),
+                        store_root=store)
+        a = _make_agent(tmp_path, role="assistant")
+        a.config.character.name = "Alex"
+        a._channel_manager.register(SimpleNamespace(name="telegram"))
+
+        async def run():
+            return await a._build_options(
+                channel="telegram", channel_key="k", is_fresh=True,
+                resume_sid=None, user_text="hi")
+
+        hook = _authz_hook(asyncio.run(run()))
+        assert hook is not None
+        deps = hook._casa_authz_deps_factory()
+        assert deps is not None and deps.display_name == "Alex"
+
+    def test_specialist_factory_threads_current_character_name(
+        self, tmp_path, monkeypatch,
+    ):
+        import plugin_registry
+        from plugin_registry import reload_snapshot
+        from plugin_fixtures import entry, mk_artifact, mk_registry
+        from test_agent_plugin_binding import _spec_cfg
+        from channels import ChannelManager
+
+        store = tmp_path / "store"
+        e = entry("p", ["specialist:finance"])
+        mk_artifact(store, "p", e["artifact_id"], mcp_servers={"p": {}},
+                    extra_manifest=_PROTECTED_MANIFEST)
+        reload_snapshot(registry_path=mk_registry(tmp_path, [e]),
+                        store_root=store)
+        monkeypatch.setattr(tools_mod, "_mcp_registry", None, raising=False)
+        cm = ChannelManager()
+        cm.register(SimpleNamespace(name="telegram"))
+        monkeypatch.setattr(tools_mod, "_channel_manager", cm, raising=False)
+        resolution = plugin_registry.resolve_for("specialist:finance")
+
+        cfg = _spec_cfg("finance")
+        cfg.character = SimpleNamespace(name="Alex")
+        opts = tools_mod._build_specialist_options(cfg, resolution=resolution)
+        hook = _authz_hook(opts)
+        assert hook is not None
+        deps = hook._casa_authz_deps_factory()
+        assert deps is not None and deps.display_name == "Alex"
+
+    def test_specialist_factory_without_character_degrades_not_raises(
+        self, tmp_path, monkeypatch,
+    ):
+        """A specialist cfg lacking a ``character`` (defensive) yields
+        display_name=None — the render-time guard then uses the role string;
+        the factory must never raise."""
+        import plugin_registry
+        from plugin_registry import reload_snapshot
+        from plugin_fixtures import entry, mk_artifact, mk_registry
+        from test_agent_plugin_binding import _spec_cfg
+        from channels import ChannelManager
+
+        store = tmp_path / "store"
+        e = entry("p", ["specialist:finance"])
+        mk_artifact(store, "p", e["artifact_id"], mcp_servers={"p": {}},
+                    extra_manifest=_PROTECTED_MANIFEST)
+        reload_snapshot(registry_path=mk_registry(tmp_path, [e]),
+                        store_root=store)
+        monkeypatch.setattr(tools_mod, "_mcp_registry", None, raising=False)
+        cm = ChannelManager()
+        cm.register(SimpleNamespace(name="telegram"))
+        monkeypatch.setattr(tools_mod, "_channel_manager", cm, raising=False)
+        resolution = plugin_registry.resolve_for("specialist:finance")
+
+        opts = tools_mod._build_specialist_options(
+            _spec_cfg("finance"), resolution=resolution)  # no .character
+        deps = _authz_hook(opts)._casa_authz_deps_factory()
+        assert deps is not None and deps.display_name is None
