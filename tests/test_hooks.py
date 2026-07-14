@@ -618,9 +618,12 @@ class TestEngagementPermissionRelayWired:
         assert callable(cb)
 
     def test_wiring_uses_shared_permission_queues(self):
-        """The relay consumes the same per-engagement queue dict that the
-        Telegram callback handler (``_make_permission_verdict``) populates;
-        otherwise verdicts never reach the hook."""
+        """v0.75.0 (W5/Sol B3,B4): the operator verdict now flows through
+        ``verdict_broker.BROKER``, not this queue dict — the relay accepts
+        ``queues=`` as a deprecated, accepted-and-ignored kwarg (see
+        ``channel_handlers.PERMISSION_QUEUES`` docstring) so mid-migration
+        callers don't crash. This just pins the public alias to the same
+        underlying dict until every wiring site drops the parameter."""
         from channels.channel_handlers import (
             PERMISSION_QUEUES,
             _PERMISSION_QUEUES,
