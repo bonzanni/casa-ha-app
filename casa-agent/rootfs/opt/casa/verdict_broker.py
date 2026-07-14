@@ -328,19 +328,54 @@ class VerdictBroker:
             logger.exception("verdict_broker: finish hook raised", exc_info=exc)
 
     async def drain_hooks(self) -> None:
-        while self._setup_tasks or self._hook_tasks:
-            setup_tasks = list(self._setup_tasks)
-            if setup_tasks:
-                results = await asyncio.gather(*setup_tasks, return_exceptions=True)
+        # Two-phase, setup-then-hooks. A completed setup task installs its
+        # finish hook synchronously (in _run_setup, before it returns), so by
+        # the time a setup task is done its hook already lives in _hook_tasks —
+        # hence draining all setup tasks first, then hooks.
+        #
+        # 3.12+ livelock guard: on Python 3.12+ `await asyncio.gather(*tasks)`
+        # completes EAGERLY WITHOUT YIELDING when every task is already done.
+        # Our done-callbacks (`set.discard`) only run on a loop turn, so a
+        # done-but-undiscarded task would keep the set non-empty forever and a
+        # `while set: await gather(set)` loop would tight-spin, starving the
+        # whole event loop (even same-loop timers never fire). Fix: sync-discard
+        # already-done tasks BEFORE gathering, and only await genuinely-pending
+        # ones (gather over a not-yet-done task always yields, terminating).
+        while True:
+            pending_setup = []
+            for t in list(self._setup_tasks):
+                if t.done():
+                    self._setup_tasks.discard(t)
+                else:
+                    pending_setup.append(t)
+            if pending_setup:
+                results = await asyncio.gather(*pending_setup, return_exceptions=True)
                 for r in results:
                     if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
                         logger.exception("verdict_broker: setup task raised", exc_info=r)
-            hook_tasks = list(self._hook_tasks)
-            if hook_tasks:
-                results = await asyncio.gather(*hook_tasks, return_exceptions=True)
+                await asyncio.sleep(0)  # belt-and-suspenders yield
+                continue  # re-drain setup (a completion may have added hooks)
+
+            pending_hooks = []
+            for t in list(self._hook_tasks):
+                if t.done():
+                    self._hook_tasks.discard(t)
+                else:
+                    pending_hooks.append(t)
+            if pending_hooks:
+                results = await asyncio.gather(*pending_hooks, return_exceptions=True)
                 for r in results:
                     if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
                         logger.exception("verdict_broker: finish hook raised", exc_info=r)
+                await asyncio.sleep(0)  # belt-and-suspenders yield
+                continue
+
+            # Nothing pending in either set. If both are empty we're done;
+            # otherwise a done-but-undiscarded task slipped in between the
+            # snapshots — yield once to let its discard callback run, re-check.
+            if not self._setup_tasks and not self._hook_tasks:
+                return
+            await asyncio.sleep(0)
 
     # -- keyboard-post lifecycle ---------------------------------------------
 
