@@ -947,6 +947,41 @@ class TestQuestionNumbering:
         # Rolled back — the number never reached disk, so it must not be consumed.
         assert rec.next_question_number == 1
 
+    async def test_pre_v0_79_0_tombstone_loads_with_safe_defaults(self, tmp_path, bus):
+        """Caller-audit item 5 (T5): a tombstone written before v0.79.0 lacks
+        next_question_number/open_questions/summary_message_id/summary_revision
+        entirely — loading it must not raise, and each field must fall back to
+        its safe default (matching test_pre_v0_75_0_tombstone_loads_with_empty_default's
+        pattern for interaction_state)."""
+        from engagement_registry import EngagementRegistry
+
+        path = tmp_path / "engagements.json"
+        path.write_text(json.dumps([{
+            "id": "c" * 32,
+            "kind": "executor",
+            "role_or_type": "configurator",
+            "driver": "claude_code",
+            "status": "active",
+            "topic_id": 42,
+            "started_at": 1700000000.0,
+            "last_user_turn_ts": 1700000000.0,
+            "last_idle_reminder_ts": 0.0,
+            "completed_at": None,
+            "sdk_session_id": None,
+            "origin": {},
+            "task": "legacy",
+        }]))
+        reg = EngagementRegistry(tombstone_path=str(path), bus=bus)
+        await reg.load()
+        rec = reg._records["c" * 32]
+        assert rec.next_question_number == 1
+        assert rec.open_questions == ()
+        assert rec.summary_message_id is None
+        assert rec.summary_revision == 0
+        # And the allocators work normally from that safe baseline.
+        assert await reg.allocate_question_number(rec.id) == 1
+        assert await reg.allocate_summary_revision(rec.id) == 0
+
 
 class TestSummaryState:
     """v0.79.0 (§5): summary_message_id persistence + monotonic revision."""

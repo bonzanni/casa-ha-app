@@ -868,7 +868,7 @@ class TestWriteToFifoBounded:
 
 
 class _FakeWriter:
-    """Injectable ``write_fifo`` for _InboundQueue — records calls, returns a
+    """Injectable ``write_fifo`` for _InboundSpool — records calls, returns a
     mutable ``result`` (True = whole line written)."""
 
     def __init__(self, result: bool = True):
@@ -2045,6 +2045,33 @@ class TestSummaryStreamWiring:
         await drv._on_stream_event(rec, "result", {"subtype": "success"})
         assert ctrl._status == STATUS_WAITING_REPLY
         assert any("waiting for your reply" in t for _m, t in edits)
+        ctrl.shutdown()
+
+    async def test_status_transition_warns_and_drops_on_alloc_failure(
+        self, tmp_path, caplog,
+    ):
+        """T4 F-1 (review): allocate_summary_revision raising must not be
+        silent — it now logs a WARNING — and the status transition itself is
+        STILL dropped (submit_status no-ops on revision=None; no fallback
+        revision is synthesized)."""
+        from drivers.summary_controller import STATUS_WORKING
+        drv, rec, ctrl, edits, reg = await self._driver_with_summary(tmp_path)
+
+        async def boom(eid):
+            raise RuntimeError("allocator unavailable")
+        reg.allocate_summary_revision = boom
+
+        prior_status, prior_rev = ctrl._status, ctrl._status_rev
+        with caplog.at_level("WARNING", logger="drivers.claude_code_driver"):
+            await drv._summary_status_transition(rec.id, STATUS_WORKING)
+
+        # Drop semantics preserved — no fallback revision, no state change.
+        assert ctrl._status == prior_status
+        assert ctrl._status_rev == prior_rev
+        assert any(
+            "allocate_summary_revision failed" in r.message
+            for r in caplog.records
+        )
         ctrl.shutdown()
 
     async def test_tool_use_updates_activity_and_plan(self, tmp_path):

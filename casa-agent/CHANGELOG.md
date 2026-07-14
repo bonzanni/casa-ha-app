@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.79.0] - 2026-07-15
+
+### Added
+
+- A pinned live summary on every engagement topic: status, plan progress,
+  current activity with elapsed time, and open questions, always visible at
+  the top.
+- Instant receipts and reply-quoting for your messages, so it's always clear
+  Casa saw what you sent and what it's responding to.
+- Numbered questions that visibly settle when answered.
+- A STOP/`redirect:` priority lane to interrupt and redirect an agent
+  mid-turn.
+
+### Changed
+
+- Engagement topics now read in strict chat order — the running narration
+  rolls to a new message instead of editing above newer messages.
+- Agents no longer ask a new question while your message is waiting to be
+  read.
+
+### Fixed
+
+- Answered questions now drop their buttons instead of only showing a toast.
+- The false "please retype" notice is gone.
+
 ## [0.78.1] - 2026-07-14
 
 ### Fixed

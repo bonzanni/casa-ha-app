@@ -520,7 +520,7 @@ async def replay_undergoing_engagements(
                     # B1 (Sol r1): a COMPLETE pre-v0.75 pair still carries an
                     # old run script that emits neither the stream-json output
                     # nor the ``casa_control`` spawn NDJSON frame, so the new
-                    # _InboundQueue never arms and every resumed operator turn
+                    # _InboundSpool never arms and every resumed operator turn
                     # queues forever. Detect the stale script and DROP the pair
                     # so the heal path below re-renders it from the current
                     # template (reusing the existing incomplete-pair heal — no

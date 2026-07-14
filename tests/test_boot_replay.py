@@ -139,7 +139,7 @@ async def test_replay_rerenders_stale_prev75_run_script(monkeypatch, tmp_path):
     """B1 (Sol r1): a COMPLETE pre-v0.75 service pair (run script emits
     neither ``--output-format stream-json`` nor the ``casa_control`` spawn
     NDJSON frame) must be re-rendered on boot replay — otherwise the new
-    _InboundQueue never arms and operator turns queue forever. The stale pair
+    _InboundSpool never arms and operator turns queue forever. The stale pair
     is dropped so the heal path re-plants it from the current template."""
     from casa_core import replay_undergoing_engagements
     from drivers import s6_rc

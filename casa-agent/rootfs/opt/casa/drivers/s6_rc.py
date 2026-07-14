@@ -139,7 +139,7 @@ def service_pair_complete(*, svc_root: str, engagement_id: str) -> bool:
 # A run script is "current" (v0.75.0+) iff it carries BOTH streaming markers:
 # the pre-exec ``casa_control`` spawn NDJSON frame AND the ``--output-format
 # stream-json`` CLI flag. v0.75 message-granularity streaming needs the two
-# together — the spawn frame arms the driver's _InboundQueue and the CLI flag
+# together — the spawn frame arms the driver's _InboundSpool and the CLI flag
 # makes the process actually emit the NDJSON the relay consumes. A script with
 # only one is half-wired and still stale; a pre-v0.75 script has neither. Boot
 # replay uses this to migrate stale pairs.

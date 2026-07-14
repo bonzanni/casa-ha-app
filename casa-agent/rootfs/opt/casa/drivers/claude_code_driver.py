@@ -1114,8 +1114,9 @@ class ClaudeCodeDriver(DriverProtocol):
             return (engagement.task or "").strip()
 
     async def _post_initial_summary(self, engagement: EngagementRecord) -> int | None:
-        """§5 boot: post the pinned live summary, persist its id, attempt the
-        pin. Raises ``RuntimeError`` on a post failure so ``start`` aborts.
+        """§5 boot: post the pinned live summary and persist its id. The pin
+        itself is owned by ``ensure_pinned()`` (T4 F-4 — see below). Raises
+        ``RuntimeError`` on a post failure so ``start`` aborts.
 
         A resumed/replayed engagement never calls this (it already has a
         persisted ``summary_message_id`` that the controller adopts on attach).
@@ -1150,23 +1151,15 @@ class ClaudeCodeDriver(DriverProtocol):
                     "engagement %s: persisting summary_message_id failed: %s",
                     engagement.id[:8], exc,
                 )
-        # Best-effort initial pin (WARN once on failure; retried on lifecycle
-        # flush by the controller). Never unpin other messages.
-        if self._pin_topic_message is not None:
-            try:
-                ok = await self._pin_topic_message(engagement.topic_id, mid)
-            except Exception:  # noqa: BLE001
-                ok = False
-            if not ok:
-                logger.warning(
-                    "engagement %s: could not pin the live summary message "
-                    "(best-effort; will retry on the next lifecycle flush)",
-                    engagement.id[:8],
-                )
-            else:
-                ctrl = self._summaries.get(engagement.id)
-                if ctrl is not None:
-                    ctrl._pinned = True
+        # T4 F-4 (review): the initial pin attempt is NOT made here — the
+        # per-engagement SummaryController doesn't exist yet at this point in
+        # ``start()`` (``_ensure_summary`` only runs later, from
+        # ``_spawn_background_tasks``), so any success here could never be
+        # recorded on a controller and ``ensure_pinned()`` would immediately
+        # redo the pin anyway once the controller is built. ``ensure_pinned()``
+        # (scheduled as a task in ``_spawn_background_tasks``, retried on every
+        # lifecycle flush) owns the pin attempt for both fresh and
+        # resumed/replayed engagements alike.
         return mid
 
     def _ensure_summary(self, engagement: EngagementRecord) -> "SummaryController":
@@ -1214,7 +1207,17 @@ class ClaudeCodeDriver(DriverProtocol):
             try:
                 rev = await alloc(engagement_id)
             except Exception as exc:  # noqa: BLE001 — degrade to no revision
-                logger.debug("allocate_summary_revision failed: %s", exc)
+                # T4 F-1 (review): this used to log at DEBUG only, so the drop
+                # below (submit_status silently no-ops on revision=None) was
+                # invisible in production. WARN — no fallback revision is
+                # synthesized; the status transition for THIS call is dropped,
+                # matching submit_status's existing "no revision, no update"
+                # contract.
+                logger.warning(
+                    "engagement %s: allocate_summary_revision failed — "
+                    "dropping this summary status transition (status=%s): %s",
+                    engagement_id[:8], status, exc,
+                )
         await ctrl.submit_status(status, rev)
 
     async def finalize_summary(

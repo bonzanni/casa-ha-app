@@ -304,14 +304,27 @@ If you accidentally post in the main feed, the bot will reply once
 per boot with a redirect hint, then silently ignore further main-feed
 messages.
 
-### While the engagement runs (v0.75.0)
+### While the engagement runs (v0.79.0)
 
-The engaged agent's narration streams into the topic live as it works,
-rather than arriving only as a single reply at the end — you can follow
-along turn by turn. If it needs a decision from you mid-task, it may ask
-via inline buttons (tap the option that applies) instead of waiting for a
-free-text reply; the same buttoned pattern the permission-approval keyboard
-already used for tool-use requests outside its pre-approved allow-list.
+A pinned summary message sits at the top of the topic for the whole
+engagement: current status, plan progress, what the agent is doing right
+now (with elapsed time), and any questions still waiting on you. Everything
+else — the agent's narration and your exchange with it — reads below it in
+strict chat order: as the agent works, its running narration streams live
+and rolls to a new message rather than editing above anything newer, so the
+topic always reads top-to-bottom in the order things actually happened.
+
+Every message you send gets an instant receipt, and the agent's reply is
+quoted back to yours so it's always clear what it's responding to. If it
+needs a decision from you, it asks one question at a time — via tappable
+inline buttons when the options are enumerable, or a numbered free-text
+question otherwise — and won't ask another while your last message is still
+waiting to be read. Once you answer, the question visibly settles (its
+buttons disappear) instead of just showing a toast.
+
+Need to interrupt? Send `STOP` as the first line of a message to make the
+agent drop what it's doing and check in with you, or prefix a message with
+`redirect:` to both interrupt and tell it what to do instead.
 
 ### In-topic slash commands
 
