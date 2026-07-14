@@ -131,7 +131,7 @@ def telegram_channel():
         default_agent="assistant",
         bus=bus,
     )
-    channel._start_typing = lambda _chat: None  # type: ignore[assignment]
+    channel._start_typing = lambda *a, **k: None  # type: ignore[assignment]
     channel._app = _FakeApp()  # type: ignore[assignment]
     # Expose bus on the channel so tests can drain it.
     channel._bus = bus  # type: ignore[attr-defined]

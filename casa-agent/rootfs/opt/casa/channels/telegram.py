@@ -58,6 +58,16 @@ _TYPING_BACKOFF_FACTOR = 2.0
 _TYPING_BACKOFF_MAX = 60.0
 _TYPING_CIRCUIT_BREAK = 10
 
+# r1-2 (Sol): every typing lease carries this TTL, enforced by the loop
+# itself, so the indicator is bounded even when no teardown ever runs. A
+# turn's delivery normally releases its lease; but an accepted-but-never-
+# consumed message (bus.py: a queue can be accepted then unregistered, or
+# lack a live consumer) would otherwise keep the loop alive forever. With a
+# TTL the loop drops the stale lease on its next pass — a >5-min turn merely
+# stops showing "typing…", which is strictly safer than the old unbounded
+# loop. Button-originated leases get this watchdog for free.
+_TYPING_LEASE_TTL_S = 300.0
+
 # One-liner sent when a chat exceeds TELEGRAM_RATE_PER_MIN. Only the
 # FIRST rejection in a streak triggers this reply (spec 5.2 §8.2);
 # subsequent rejects drop silently. Phrasing intentionally kept short
@@ -238,7 +248,15 @@ class TelegramChannel(Channel):
         # capacity=0 also admits every message.
         self._rate_limiter = rate_limiter
         self._app: Application | None = None
-        self._typing_tasks: dict[str, asyncio.Task] = {}
+        # r1-1/r1-2 (Sol): turn-owned typing leases. ``_typing_leases`` maps a
+        # chat_id to ``{lease_id: monotonic_expiry}``; ``_typing_loops`` holds
+        # ONE loop task per chat, running while that chat's lease dict is
+        # non-empty. Each lease is keyed by its turn's cid, so overlapping
+        # same-chat turns (the fast-tap timeline: the original turn still
+        # narrating while the button-continuation turn starts) don't cancel
+        # each other's indicator — a turn releases only ITS lease.
+        self._typing_leases: dict[str, dict[str, float]] = {}
+        self._typing_loops: dict[str, asyncio.Task] = {}
         # Typing backoff state (shared across all chats) — item-E-orthogonal.
         self._typing_consecutive_failures: int = 0
         self._typing_suspended: bool = False
@@ -316,9 +334,10 @@ class TelegramChannel(Channel):
 
     async def stop(self) -> None:
         """Stop the channel and clean up resources."""
-        for task in self._typing_tasks.values():
+        for task in self._typing_loops.values():
             task.cancel()
-        self._typing_tasks.clear()
+        self._typing_loops.clear()
+        self._typing_leases.clear()
 
         # M9: cancel any in-flight engagement-turn delivery tasks.
         for task in list(self._turn_tasks):
@@ -575,28 +594,77 @@ class TelegramChannel(Channel):
     # Typing indicator (with 401 backoff)
     # ------------------------------------------------------------------
 
-    def _start_typing(self, chat_id: str) -> None:
-        """Start a background loop that sends 'typing...' to *chat_id*."""
+    def _start_typing(
+        self, chat_id: str, lease_id: str, ttl_s: float = _TYPING_LEASE_TTL_S,
+    ) -> None:
+        """Add/refresh a turn-owned typing lease and ensure the chat's loop.
+
+        r1-1: the lease is keyed by *lease_id* (the turn's cid), so overlapping
+        same-chat turns each own a lease and one turn's finalizer can't cancel
+        another's indicator. r1-2: the lease carries an expiry (``ttl_s``,
+        default ``_TYPING_LEASE_TTL_S``) the loop enforces, so the indicator is
+        bounded even if no teardown ever runs. Suspended (401 circuit breaker)
+        → no-op, exactly as before.
+        """
         if self._typing_suspended:
             return
-        existing = self._typing_tasks.get(chat_id)
-        if existing and not existing.done():
-            return
-        self._typing_tasks[chat_id] = asyncio.create_task(
-            self._typing_loop(chat_id)
-        )
+        key = str(chat_id)
+        leases = self._typing_leases.setdefault(key, {})
+        leases[lease_id] = time.monotonic() + ttl_s
+        existing = self._typing_loops.get(key)
+        if existing is None or existing.done():
+            self._typing_loops[key] = asyncio.create_task(
+                self._typing_loop(key)
+            )
 
-    def _stop_typing(self, chat_id: str) -> None:
-        """Cancel the typing indicator for *chat_id*."""
-        task = self._typing_tasks.pop(chat_id, None)
-        if task and not task.done():
-            task.cancel()
+    def _stop_typing(self, chat_id: str, lease_id: str | None = None) -> None:
+        """Release a typing lease (idempotent).
+
+        With *lease_id* → discard ONLY that lease (r1-1: a turn releases its
+        own). Without → release ALL leases for the chat (the release-all
+        fallback for delivery paths that carry no cid, preserving today's
+        semantics). Once the chat's last lease is gone the loop is cancelled so
+        the indicator tears down promptly (matching the pre-lease behaviour);
+        while any lease remains the loop keeps running.
+        """
+        key = str(chat_id)
+        leases = self._typing_leases.get(key)
+        if not leases:
+            return
+        if lease_id is None:
+            leases.clear()
+        else:
+            leases.pop(lease_id, None)
+        if not leases:
+            self._typing_leases.pop(key, None)
+            task = self._typing_loops.pop(key, None)
+            if task and not task.done():
+                task.cancel()
 
     async def _typing_loop(self, chat_id: str) -> None:
-        """Send 'typing' chat action until cancelled, with backoff on failure."""
+        """Send 'typing' chat action while the chat holds a live lease.
+
+        r1-2: each pass drops EXPIRED leases and exits when none remain, so the
+        loop is bounded even if a teardown never runs. The 401 circuit-breaker
+        and transport backoff below are preserved verbatim.
+        """
         backoff = _TYPING_BACKOFF_INIT
         try:
             while True:
+                # r1-2: expire stale leases; exit (natural completion, not a
+                # cancel) when the chat holds none.
+                leases = self._typing_leases.get(chat_id)
+                if leases:
+                    now = time.monotonic()
+                    for lease_id in [
+                        lid for lid, exp in leases.items() if exp <= now
+                    ]:
+                        leases.pop(lease_id, None)
+                if not leases:
+                    self._typing_leases.pop(chat_id, None)
+                    if self._typing_loops.get(chat_id) is asyncio.current_task():
+                        self._typing_loops.pop(chat_id, None)
+                    return
                 if self._typing_suspended or self._app is None:
                     return
                 try:
@@ -646,6 +714,18 @@ class TelegramChannel(Channel):
                 await asyncio.sleep(_TYPING_INTERVAL)
         except asyncio.CancelledError:
             pass
+
+    def _release_typing(self, context: dict[str, Any], chat_id: str) -> None:
+        """Release THIS turn's typing lease by its cid (r1-1).
+
+        Falls back to releasing ALL leases for the chat when the delivery
+        context carries no cid (legacy / synthetic paths), preserving today's
+        release-all semantics.
+        """
+        cid = context.get("cid")
+        self._stop_typing(
+            str(chat_id), cid if isinstance(cid, str) and cid else None,
+        )
 
     # ------------------------------------------------------------------
     # Inbound
@@ -758,10 +838,13 @@ class TelegramChannel(Channel):
                     await self._send_rate_limit_reply(chat_id)
                 return
 
-        self._start_typing(chat_id)
-
         inherited = cid_var.get()
         cid = inherited if inherited != "-" else new_cid()
+
+        # r1-1: start this organic turn's typing lease keyed by its cid — the
+        # SAME cid placed in the delivery context below, so send()/streaming
+        # first-token/turn_finished release exactly this lease.
+        self._start_typing(chat_id, cid)
 
         # This context dict is entirely Casa-owned (built from the Telegram
         # `Update`, not caller-supplied) — routed through
@@ -1571,6 +1654,11 @@ class TelegramChannel(Channel):
         them).
         """
         delays = (0.5, 1.0)
+        # r1-1/W3 REQUIREMENT: the continuation lease id MUST equal the cid the
+        # dispatched turn carries, so the target agent's own delivery/teardown
+        # releases it. Compute the cid ONCE and reuse it across retries — a
+        # per-attempt new_cid() would desync the lease from the accepted turn.
+        cid = new_cid()
         for attempt in range(3):
             msg = BusMessage(
                 type=MessageType.CHANNEL_IN,
@@ -1581,13 +1669,18 @@ class TelegramChannel(Channel):
                 context={
                     "chat_id": chat_id,
                     "user_id": user_id,
-                    "cid": new_cid(),
+                    "cid": cid,
                     "synthetic": "button",
                     "button_answer": request_id,
                 },
             )
             try:
                 if await self._bus.send_checked(msg) == "accepted":
+                    # r1-1: start the typing lease ONLY after acceptance (retries
+                    # must not flap the indicator), keyed by this turn's cid so
+                    # it coexists with the original turn's still-active lease and
+                    # is released by the continuation turn's own delivery.
+                    self._start_typing(str(chat_id), cid)
                     return True
             except asyncio.CancelledError:
                 # Cooperative cancellation must propagate, never be swallowed
@@ -1924,7 +2017,7 @@ class TelegramChannel(Channel):
             return
 
         target_chat = _resolve_chat_id(context, self.chat_id)
-        self._stop_typing(str(target_chat))
+        self._release_typing(context, target_chat)
 
         for chunk in _split_message(message):
             await self._app.bot.send_message(
@@ -1947,7 +2040,7 @@ class TelegramChannel(Channel):
         if self._app is None:
             raise RuntimeError("Telegram channel not started; cannot send media")
         target_chat = _resolve_chat_id(context, self.chat_id)
-        self._stop_typing(str(target_chat))
+        self._release_typing(context, target_chat)
         method = getattr(self._app.bot, MEDIA_POLICIES[kind].ptb_method)
         await method(
             target_chat,
@@ -1989,7 +2082,7 @@ class TelegramChannel(Channel):
             await self.send(message, context)
             return
         target_chat = _resolve_chat_id(context, self.chat_id)
-        self._stop_typing(str(target_chat))
+        self._release_typing(context, target_chat)
         await self._send_one(target_chat, message, display, entities)
 
     async def finalize_response_stream(
@@ -2017,7 +2110,7 @@ class TelegramChannel(Channel):
             await self.finalize_stream(full_text, context, on_token)
             return
         target_chat = _resolve_chat_id(context, self.chat_id)
-        self._stop_typing(str(target_chat))
+        self._release_typing(context, target_chat)
         try:
             try:
                 await self._app.bot.edit_message_text(
@@ -2071,7 +2164,7 @@ class TelegramChannel(Channel):
         streaming first-token teardown never runs, so this is the only stop.
         """
         target_chat = _resolve_chat_id(context, self.chat_id)
-        self._stop_typing(str(target_chat))
+        self._release_typing(context, target_chat)
 
     # ------------------------------------------------------------------
     # Outbound: streaming
@@ -2091,6 +2184,10 @@ class TelegramChannel(Channel):
             return _noop
 
         target_chat = str(_resolve_chat_id(context, self.chat_id))
+        # r1-1: release THIS turn's lease by its cid on first-token teardown
+        # (captured once — the context is fixed for this callback's turn).
+        _lease_cid = context.get("cid")
+        _lease_cid = _lease_cid if isinstance(_lease_cid, str) and _lease_cid else None
         state: dict[str, Any] = {
             "message_id": None,
             "last_edit": 0.0,
@@ -2104,7 +2201,7 @@ class TelegramChannel(Channel):
 
             if state["message_id"] is None:
                 # First token: send new message, stop typing
-                self._stop_typing(target_chat)
+                self._stop_typing(target_chat, _lease_cid)
                 try:
                     result = await self._app.bot.send_message(
                         chat_id=target_chat,
@@ -2145,7 +2242,7 @@ class TelegramChannel(Channel):
             return
 
         target_chat = _resolve_chat_id(context, self.chat_id)
-        self._stop_typing(str(target_chat))
+        self._release_typing(context, target_chat)
 
         if self._delivery_mode != "stream":
             # Block mode: just send
