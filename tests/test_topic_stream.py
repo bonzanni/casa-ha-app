@@ -895,6 +895,81 @@ async def test_crash_interleave_after_checkpoint_no_edit_below(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# v0.79.0 (T1 review): replay models discrete-rollover boundaries so a
+# same-process poll re-run never stale-prepends a rolled narration message.
+# ---------------------------------------------------------------------------
+
+
+async def test_discrete_rollover_same_process_rerun_keeps_second_msg_text(tmp_path):
+    """Regression (T1 review): text → armed discrete post → text ROLLS the
+    narration to a SECOND message; a same-process 0.5s poll re-run (the driver's
+    ``while True: relay.run()`` on the SAME relay/sequencer) must rebuild the
+    per-message text at the RECORDED discrete-rollover boundaries so the second
+    narration message keeps ONLY its own text — never a stale-prepended merge.
+
+    Pre-fix, ``_replay_text`` split only at ``_MSG_MAX`` and ignored the discrete
+    rollover, rebuilding ``per_message_text="abcdef"``; with ``narration_msg_id``
+    still intact in-process, ``_reconcile`` then MERGE-edited msg 3 to ``abcdef``,
+    prepending the stale ``abc``.
+    """
+    rec, events = Recorder(), []
+    # Open turn (NO result): "abc" → armed reply seals → "def" rolls to msg 3.
+    _write_current(tmp_path, [
+        _init(), _text("abc"), _reply_tool_frame("R"), _text("def"),
+    ])
+    cursor = tmp_path / ".stream_cursor.json"
+    relay = _make_relay(tmp_path, cursor, rec, events)
+    _arm_reply(relay, rec, "R")
+    await relay.run()  # first LIVE pass
+
+    # Live state: msg1="abc", discrete "[reply]R"=msg2, msg3="def".
+    assert [t for _tp, t in rec.sends] == ["abc", "[reply]R", "def"]
+    assert relay.cursor.message_ids == [1, 3]
+    # The additive per-message boundary field mirrors the two narration msgs.
+    assert relay.cursor.message_text_lens == [3, 3]
+
+    # Same-process poll re-run on the SAME relay/sequencer: narration_msg_id is
+    # intact, so reconcile would MERGE-edit (not repost) — it must NOT prepend.
+    await relay.run()
+
+    assert all(text != "abcdef" for _tp, _mid, text in rec.edits)
+    # msg 3 (the rolled narration message) is never edited to carry "abc".
+    assert all(mid != 3 or "abc" not in text for _tp, mid, text in rec.edits)
+    # No duplicate discrete/narration re-post from the second pass either.
+    assert [t for _tp, t in rec.sends] == ["abc", "[reply]R", "def"]
+
+
+async def test_legacy_checkpoint_absent_lens_falls_back_and_seals(tmp_path):
+    """Legacy checkpoint (``message_text_lens`` ABSENT) still converges: with no
+    recorded boundaries ``_replay_text`` falls back to today's ``_MSG_MAX``-only
+    reconstruction, and the fresh-process CONSERVATIVE SEAL reposts the
+    reconstructed narration as a NEW message — no edit ever lands on a message
+    with content below it."""
+    rec, events = Recorder(), []
+    offs = _write_current(tmp_path, [
+        _init(), _text("abc"), _reply_tool_frame("R"), _text("def"),
+    ])
+    cur_path = tmp_path / ".stream_cursor.json"
+    seg = _ident(os.path.join(str(tmp_path), "current"))
+    # LEGACY checkpoint: message_ids present, message_text_lens field absent
+    # (default []); current is PAST the whole (result-less) open turn.
+    StreamCursor(
+        turn_start={"segment": seg, "offset": 0},
+        current={"segment": seg, "offset": offs[-1]},
+        message_ids=[7, 9],
+        last_posted_len=len("def"),
+    ).save(cur_path)
+
+    # FRESH relay + FRESH sequencer (models a process restart).
+    await _make_relay(tmp_path, cur_path, rec, events).run()
+
+    # Fallback folds all text into one message via _MSG_MAX; the conservative
+    # seal reposts it as a NEW message (id not among the checkpoint ids).
+    assert all(mid not in (7, 9) for _t, mid, _x in rec.edits)
+    assert rec.sends == [(42, "abcdef")]
+
+
+# ---------------------------------------------------------------------------
 # Cursor persistence round-trip.
 # ---------------------------------------------------------------------------
 
@@ -913,10 +988,12 @@ def test_stream_cursor_save_load_roundtrip(tmp_path):
         turn_start={"segment": [1, 2], "offset": 3},
         current={"segment": [1, 2], "offset": 9},
         message_ids=[7, 9],
+        message_text_lens=[3900, 8],
         last_posted_len=11,
         dropped_through={"segment": [1, 2], "offset": 9},
     ).save(path)
     back = StreamCursor.load(path)
     assert back.message_ids == [7, 9]
+    assert back.message_text_lens == [3900, 8]  # additive replay-boundary field
     assert back.current == {"segment": [1, 2], "offset": 9}
     assert back.dropped_through == {"segment": [1, 2], "offset": 9}

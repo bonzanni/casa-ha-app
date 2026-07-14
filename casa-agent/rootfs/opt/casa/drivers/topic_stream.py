@@ -198,6 +198,16 @@ class StreamCursor:
     turn_start: dict = field(default_factory=_zero_coord)
     current: dict = field(default_factory=_zero_coord)
     message_ids: list[int] = field(default_factory=list)
+    # Additive, backwards-tolerated (T1 review): per-message narration TEXT
+    # length, parallel to ``message_ids`` — the boundaries at which the live
+    # path split narration across messages (both _MSG_MAX and discrete-
+    # interleave/seal rollovers). ``_replay_text`` splits reconstructed text at
+    # these when present, falling back to _MSG_MAX-only when absent (legacy
+    # checkpoints — the conservative recovery seal already covers them). The
+    # design constraint pinned the cursor/checkpoint format UNCHANGED for the
+    # RECOVERY-SEALING option; an absent-tolerated additive field honors that
+    # intent (no incompatibility, replay converges).
+    message_text_lens: list[int] = field(default_factory=list)
     last_posted_len: int = 0
     dropped_through: dict | None = None
 
@@ -215,6 +225,7 @@ class StreamCursor:
             turn_start=data.get("turn_start") or _zero_coord(),
             current=data.get("current") or _zero_coord(),
             message_ids=list(data.get("message_ids") or []),
+            message_text_lens=list(data.get("message_text_lens") or []),
             last_posted_len=int(data.get("last_posted_len") or 0),
             dropped_through=data.get("dropped_through"),
         )
@@ -226,6 +237,7 @@ class StreamCursor:
                 "turn_start": self.turn_start,
                 "current": self.current,
                 "message_ids": self.message_ids,
+                "message_text_lens": self.message_text_lens,
                 "last_posted_len": self.last_posted_len,
                 "dropped_through": self.dropped_through,
             },
@@ -415,6 +427,11 @@ class TopicStreamRelay:
         self.cursor_path = cursor_path
         self.send_message = send_message
         self.edit_message = edit_message
+        # T3-intended seams: ``delete_message`` (de-dup delete) and
+        # ``reply_texts`` (reply-set lookup) are injected but currently UNUSED —
+        # §2(d) removed the finalize de-dup delete, and de-dup-before-post moves
+        # inside the sequencer when the reply ingress is wired (T3). Retained so
+        # the driver wiring is stable across the T2/T3 activation.
         self.delete_message = delete_message
         self.on_turn_event = on_turn_event
         self.reply_texts = reply_texts
@@ -466,6 +483,20 @@ class TopicStreamRelay:
         self.cursor.dropped_through = dict(coord)
         self._save()
 
+    def _sync_last_len(self) -> None:
+        """Keep ``message_text_lens`` parallel to ``message_ids`` with its last
+        entry == the current message's narration length (the additive replay-
+        boundary field). Prior entries are frozen at each message's final text
+        length, including a SEALED message the live path rolled off of."""
+        lens = self.cursor.message_text_lens
+        ids = self.cursor.message_ids
+        if len(lens) > len(ids):
+            del lens[len(ids):]
+        while len(lens) < len(ids):
+            lens.append(0)
+        if ids:
+            lens[-1] = len(self._per_message_text)
+
     # -- coordinate ordering ------------------------------------------------
 
     def _seg_rank(self, seg: tuple[int, int]) -> int:
@@ -500,8 +531,39 @@ class TopicStreamRelay:
     # -- replay-mode text reconstruction -----------------------------------
 
     def _replay_text(self, text: str) -> None:
-        """Rebuild ``per_message_text`` from a replayed text block — no sends."""
+        """Rebuild ``per_message_text`` from a replayed text block — no sends.
+
+        When the checkpoint recorded per-message narration boundaries
+        (``message_text_lens``, the additive field), the reconstructed turn text
+        is split at THOSE boundaries so a discrete-rollover message keeps only
+        its own text (the last message's slice becomes ``per_message_text``).
+        Legacy checkpoints (field absent) fall back to _MSG_MAX-only splitting —
+        their recovery is already covered by the conservative seal.
+        """
         self._turn_text += text
+        lens = self.cursor.message_text_lens
+        if lens:
+            # Boundary-aware: redistribute the whole replayed turn text across
+            # the recorded per-message lengths; the trailing slice is the
+            # current (last) message's narration.
+            full = self._turn_text
+            pos = 0
+            count = 0
+            pmt = ""
+            for n in lens:
+                if pos >= len(full) and count:
+                    break
+                pmt = full[pos:pos + n]
+                pos += len(pmt)
+                count += 1
+            if pos < len(full):
+                # Residual beyond the recorded boundaries → trailing message
+                # (should not occur at the checkpoint; tolerated defensively).
+                pmt = pmt + full[pos:]
+            self._per_message_text = pmt
+            self._replay_msg_count = count
+            return
+        # Legacy fallback: _MSG_MAX-only reconstruction (unchanged behavior).
         pmt = self._per_message_text
         if self._replay_msg_count == 0:
             head, text = text[:_MSG_MAX], text[_MSG_MAX:]
@@ -542,7 +604,12 @@ class TopicStreamRelay:
                     lambda: self.sequencer.open_narration(self._per_message_text)
                 )
                 if applied:
+                    # Reposted as a single new closing message — collapse the
+                    # boundary record to it.
                     self.cursor.message_ids = [mid]
+                    self.cursor.message_text_lens = [len(self._per_message_text)]
+            else:
+                self._sync_last_len()
             self.cursor.last_posted_len = len(self._per_message_text)
             self._save()
         except Exception as exc:  # noqa: BLE001
@@ -683,6 +750,9 @@ class TopicStreamRelay:
                 else:  # applied
                     self._per_message_text = value
                 self._last_edit_ts = self._now()
+            # Record this op's per-message narration boundary (send appended a
+            # new message; edit grew the current or rolled to a fresh one).
+            self._sync_last_len()
 
     async def _post_text(self, text: str, seg, off_after: int) -> None:
         """Text-only streaming path: throttle + single frame-end checkpoint."""
@@ -822,6 +892,7 @@ class TopicStreamRelay:
         self.cursor.current = coord
         self.cursor.turn_start = dict(coord)
         self.cursor.message_ids = []
+        self.cursor.message_text_lens = []
         self.cursor.last_posted_len = 0
         self._reset_turn_state()
         # §2(6): prune intents/tombstones/id→outcome + seal narration at turn end.
@@ -857,6 +928,7 @@ class TopicStreamRelay:
                 self._live = True
                 self._reconciled = True
                 self.cursor.message_ids = []
+                self.cursor.message_text_lens = []
                 self._reset_turn_state()
                 continue
 
@@ -909,6 +981,7 @@ class TopicStreamRelay:
             off_before = off_after - len(raw)
             self.cursor.turn_start = {"segment": list(seg), "offset": off_before}
             self.cursor.message_ids = []
+            self.cursor.message_text_lens = []
             self.cursor.last_posted_len = 0
             self._reset_turn_state()
             await _maybe_await(

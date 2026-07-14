@@ -377,7 +377,15 @@ class OutputSequencer:
     async def seal_narration(self) -> None:
         """Explicitly SEAL the open narration (nothing edits it again)."""
         async with self._lock:
-            self._narration_msg_id = None
+            self._seal_narration_locked()
+
+    def _seal_narration_locked(self) -> None:
+        """SEAL the open narration and drop its now-dead no-op edit-cache entry
+        (a sealed message is never edited again — its cache key is unreachable,
+        so retaining it only grows the cache unbounded)."""
+        if self._narration_msg_id is not None:
+            self._edit_cache.pop(self._narration_msg_id, None)
+        self._narration_msg_id = None
 
     async def advance_high_water_for_inbound(
         self, operator_msg_id: int | None = None,
@@ -389,7 +397,7 @@ class OutputSequencer:
         invokes.)
         """
         async with self._lock:
-            self._narration_msg_id = None
+            self._seal_narration_locked()
             if operator_msg_id is not None:
                 if self._high_water is None or operator_msg_id > self._high_water:
                     self._high_water = operator_msg_id
@@ -504,7 +512,7 @@ class OutputSequencer:
         """Post *intent* (caller holds the lock). SEALS open narration first —
         rollover-on-interleave (§2, "narration seals when anything else posts
         below")."""
-        self._narration_msg_id = None
+        self._seal_narration_locked()
         if warn:
             logger.warning(
                 "output sequencer: intent %s (%s) unmatched by any block for "
