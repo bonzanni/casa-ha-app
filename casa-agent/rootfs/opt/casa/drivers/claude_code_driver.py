@@ -38,6 +38,11 @@ _REDIRECT_PREFIX = (
     "[OPERATOR REDIRECT — drop your current agenda, re-plan from this message]"
 )
 _RECEIPT_COPY = "📥 Received — I'll get to this after the current step."
+# §4 boot reconciliation: appended below an open question's stored text when a
+# restart orphans it (matches channel_handlers._SETTLE_EXPIRED verbatim).
+_OPEN_Q_EXPIRED_SUFFIX = "\n⌛ expired — answer by text below"
+# §4 free-text anchor: appended when the next operator message answers it.
+_OPEN_Q_ANSWERED_SUFFIX = "\n✅ answered below"
 _EVICTION_COPY = (
     "⚠️ Dropped in favor of your redirect — resend if still relevant."
 )
@@ -186,6 +191,9 @@ class _InboundSpool:
         current_epoch: Callable[[], int | None] = lambda: None,
         sequencer: Any = None,
         registry: Any = None,
+        supersede_pending_asks: Callable[[], Awaitable[None]] | None = None,
+        settle_anchor_on_delivery: (
+            Callable[[int | None], Awaitable[int | None]] | None) = None,
     ) -> None:
         self._engagement_id = engagement_id
         self._spool_path = spool_path
@@ -195,10 +203,22 @@ class _InboundSpool:
         self._current_epoch = current_epoch
         self._sequencer = sequencer
         self._registry = registry
+        # v0.79.0 (§4): fired when a non-initial operator envelope is enqueued
+        # while an ask keyboard is still PENDING — casa-main cancels it as
+        # ``superseded_by_text`` so the operator's message doesn't dead-wait.
+        self._supersede_pending_asks = supersede_pending_asks
+        # §4: on delivery of an operator message, settle the oldest open
+        # free-text anchor (✅ answered below) and thread the turn to it.
+        # Returns the anchor's tg_message_id to thread to, or None.
+        self._settle_anchor_on_delivery = settle_anchor_on_delivery
         self._envelopes: list[_Envelope] = []
         self.reader_ready = False
         self._pump_lock = asyncio.Lock()
         self._next_seq = 0
+        # v0.79.0 (§4): monotonic operator-message generation — the ask inbound
+        # gate reserves this before BROKER.register and re-checks it after
+        # posting to close the arrival race.
+        self._generation = 0
         self._load()
 
     # -- persistence -------------------------------------------------------
@@ -279,6 +299,20 @@ class _InboundSpool:
             for e in self._envelopes
         )
 
+    # -- v0.79.0 (§4) inbound-gate reads -----------------------------------
+
+    def generation(self) -> int:
+        """Monotonic operator-message generation (bumped on each successful
+        enqueue). The ask gate reserves this, posts, then re-checks it — a
+        change means an operator message arrived in the race window."""
+        return self._generation
+
+    def unread_depth(self) -> int:
+        """Count of queued operator envelopes the agent has NOT yet seen
+        (deliverable, not-yet-delivered, non-initial). ``depth > 0`` at ask
+        entry means the operator is waiting — the ask is refused."""
+        return sum(1 for e in self._lane_members() if not e.is_initial)
+
     # -- enqueue -----------------------------------------------------------
 
     async def enqueue(
@@ -337,6 +371,17 @@ class _InboundSpool:
                         break
             await self._send_notice(_SPOOL_FAIL_COPY, tg_message_id)
             return "error"
+
+        # §4: the enqueue succeeded — bump the operator-message generation and,
+        # for a real operator turn (not the initial task), supersede any ask
+        # keyboard still waiting for a tap (it must not dead-wait behind a
+        # message the operator has already sent).
+        self._generation += 1
+        if not is_initial and self._supersede_pending_asks is not None:
+            try:
+                await self._supersede_pending_asks()
+            except Exception:  # noqa: BLE001 — supersession is best-effort
+                logger.debug("supersede_pending_asks failed", exc_info=True)
 
         await self._flush_pending()
         await self._pump()
@@ -465,11 +510,24 @@ class _InboundSpool:
                 env.delivery_epoch = self._current_epoch()
                 self.reader_ready = False           # one message per FIFO EOF
                 self._persist_quiet()
+                # §4: an operator message settles the oldest open free-text
+                # anchor (✅ answered below) and threads this turn to the ANCHOR
+                # instead of the operator's own message.
+                thread_to = env.tg_message_id
+                if not env.is_initial and self._settle_anchor_on_delivery is not None:
+                    try:
+                        anchor_id = await self._settle_anchor_on_delivery(
+                            env.tg_message_id)
+                        if anchor_id is not None:
+                            thread_to = anchor_id
+                    except Exception:  # noqa: BLE001 — anchor settle is advisory
+                        logger.debug("settle_anchor_on_delivery failed",
+                                     exc_info=True)
                 # Delivery context: thread this turn's first sequencer post to
-                # the operator's message (§3 reply-threading).
+                # the operator's message (§3) — or the anchor it answered (§4).
                 if self._sequencer is not None:
                     try:
-                        self._sequencer.set_turn_reply_to(env.tg_message_id)
+                        self._sequencer.set_turn_reply_to(thread_to)
                     except Exception:  # noqa: BLE001 — advisory threading only
                         logger.debug("set_turn_reply_to failed", exc_info=True)
                 # Advance interaction state for ordinary operator turns only.
@@ -538,6 +596,10 @@ class ClaudeCodeDriver(DriverProtocol):
         # resolving the driver via ``agent.active_claude_code_driver`` exactly
         # as tools.emit_completion already does.
         self._sequencers: dict[str, "OutputSequencer"] = {}
+        # v0.79.0 (§4): consecutive ask-inbound-gate refusals in the CURRENT
+        # turn (reset at turn_start). From the 3rd the refusal copy escalates +
+        # a WARN counter is logged (soft anti-livelock — no hard force-end).
+        self._ask_refusals: dict[str, int] = {}
 
     # -- DriverProtocol ---------------------------------------------------
 
@@ -886,6 +948,10 @@ class ClaudeCodeDriver(DriverProtocol):
             current_epoch=lambda: self._epoch_pending.get(engagement.id),
             sequencer=sequencer,
             registry=self._registry,
+            supersede_pending_asks=lambda: self._supersede_pending_asks(
+                engagement.id),
+            settle_anchor_on_delivery=lambda op_mid: self._settle_open_anchor(
+                engagement, op_mid),
         )
 
         tasks = [
@@ -928,6 +994,15 @@ class ClaudeCodeDriver(DriverProtocol):
         spool = self._inbound.get(engagement.id)
         if spool is not None and (ws / _SPOOL_FILENAME).exists():
             tasks.append(asyncio.create_task(spool.recover()))
+
+        # v0.79.0 (§4): boot reconciliation of open questions. The broker /
+        # finish hooks / reply anchors are memory-only, so a restart can leave a
+        # question visibly open with a stale keyboard nobody can settle. Any
+        # open_questions entry with no LIVE broker record settles here (expired
+        # copy, keyboard cleared) while next_question_number is preserved.
+        if getattr(engagement, "open_questions", ()):
+            tasks.append(asyncio.create_task(
+                self.reconcile_open_questions(engagement)))
 
         self._tasks[engagement.id] = tasks
 
@@ -1045,6 +1120,16 @@ class ClaudeCodeDriver(DriverProtocol):
         seq = self._sequencers.get(engagement_id)
         return seq.intent_outcome(request_id) if seq is not None else None
 
+    async def mark_send_intent_posted(
+        self, engagement_id: str, request_id: str, message_id: int | None,
+    ) -> Any:
+        """Record a discrete ingress' out-of-band post (§2(5) consumption debt +
+        reattach outcome). See ``OutputSequencer.mark_intent_posted``."""
+        seq = self._sequencers.get(engagement_id)
+        if seq is None:
+            return None
+        return await seq.mark_intent_posted(request_id, message_id)
+
     async def advance_topic_high_water_for_inbound(
         self, engagement_id: str, operator_msg_id: int | None = None,
     ) -> None:
@@ -1053,6 +1138,139 @@ class ClaudeCodeDriver(DriverProtocol):
         seq = self._sequencers.get(engagement_id)
         if seq is not None:
             await seq.advance_high_water_for_inbound(operator_msg_id)
+
+    # -- v0.79.0 (§4) ask inbound-gate reads + refusal escalation ----------
+
+    def inbound_generation(self, engagement_id: str) -> int:
+        """§4 gate: the current operator-message generation for the ask
+        race-close re-check. 0 when no spool exists (degraded / no driver)."""
+        spool = self._inbound.get(engagement_id)
+        return spool.generation() if spool is not None else 0
+
+    def inbound_unread_depth(self, engagement_id: str) -> int:
+        """§4 gate: number of unseen queued operator messages. ``> 0`` refuses
+        the ask. 0 when no spool exists."""
+        spool = self._inbound.get(engagement_id)
+        return spool.unread_depth() if spool is not None else 0
+
+    def record_ask_refusal(self, engagement_id: str) -> int:
+        """§4: bump + return the count of consecutive ask refusals THIS turn.
+        From the 3rd, log a WARN counter (observability for a future hard
+        turn-end primitive — OUT of scope here; the escalated copy is the only
+        mechanism)."""
+        n = self._ask_refusals.get(engagement_id, 0) + 1
+        self._ask_refusals[engagement_id] = n
+        if n >= 3:
+            logger.warning(
+                "engagement %s: %d consecutive ask refusals this turn — the "
+                "agent keeps asking while an operator message is unread "
+                "(no hard force-end primitive exists; soft escalation only)",
+                engagement_id[:8], n,
+            )
+        return n
+
+    async def reconcile_open_questions(
+        self, engagement: EngagementRecord,
+    ) -> None:
+        """§4 boot reconciliation: settle every open question with no live
+        broker record (at boot the in-memory broker is empty, so none survive).
+        Each stale keyboard/anchor is edited to the expired copy with the
+        keyboard cleared, then removed from the ledger; ``next_question_number``
+        is NEVER rewound. Tested for button, free-text, and the commit-then-kill
+        window."""
+        rec = engagement
+        open_qs = list(getattr(rec, "open_questions", ()) or ())
+        if not open_qs:
+            return
+        from verdict_broker import BROKER
+
+        live = set(BROKER.pending(namespace="engagement_ask", scope=rec.id))
+        close = getattr(self._registry, "close_open_question", None)
+        for q in open_qs:
+            n = q.get("n")
+            mid = q.get("tg_message_id")
+            # open_questions carries no request_id; the only live records are
+            # the ones the CURRENT process registered (empty at boot). If ANY
+            # ask is live for this scope we conservatively leave entries alone
+            # (a same-process reconcile mid-run must not settle a live ask).
+            if live:
+                continue
+            if mid is not None and self._edit_topic_message is not None:
+                display = q.get("text") or (f"Q{n}:" if n is not None else "")
+                text = f"{display}{_OPEN_Q_EXPIRED_SUFFIX}"
+                try:
+                    await self._edit_topic_message(
+                        rec.topic_id, mid, text, clear_keyboard=True)
+                except Exception:  # noqa: BLE001 — best-effort settle
+                    logger.warning(
+                        "engagement %s: open-question boot settle failed (n=%s)",
+                        rec.id[:8], n, exc_info=True,
+                    )
+            if close is not None and n is not None:
+                try:
+                    await close(rec.id, n)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "engagement %s: close_open_question failed (n=%s)",
+                        rec.id[:8], n, exc_info=True,
+                    )
+
+    async def _settle_open_anchor(
+        self, engagement: EngagementRecord, operator_msg_id: int | None,
+    ) -> int | None:
+        """§4: settle the oldest open free-text anchor when an operator message
+        is delivered — edit ``✅ answered below`` over the anchor, close its
+        ledger entry, and return the anchor's tg_message_id so the turn threads
+        to the QUESTION it answers. Returns ``None`` when no anchor is open."""
+        reg = self._registry
+        if reg is None:
+            return None
+        getter = getattr(reg, "oldest_open_anchor", None)
+        if getter is None:
+            return None
+        anchor = getter(engagement.id)
+        if anchor is None:
+            return None
+        n = anchor.get("n")
+        amid = anchor.get("tg_message_id")
+        display = anchor.get("text") or (f"Q{n}:" if n is not None else "")
+        if amid is not None and self._edit_topic_message is not None:
+            try:
+                await self._edit_topic_message(
+                    engagement.topic_id, amid,
+                    f"{display}{_OPEN_Q_ANSWERED_SUFFIX}", clear_keyboard=True)
+            except Exception:  # noqa: BLE001 — settle is advisory
+                logger.debug("anchor settle edit failed", exc_info=True)
+        close = getattr(reg, "close_open_question", None)
+        if close is not None and n is not None:
+            try:
+                await close(engagement.id, n)
+            except Exception:  # noqa: BLE001
+                logger.debug("close_open_question (anchor) failed", exc_info=True)
+        return amid
+
+    def set_engagement_reply_anchor(
+        self, engagement_id: str, message_id: int,
+    ) -> None:
+        """§4 causal handoff: a button answer continues the SAME CLI turn — the
+        telegram commit helper sets this one-shot anchor so the turn's FIRST
+        sequencer output threads its reply to the ask message. SYNCHRONOUS (no
+        await) — the caller relies on the pre-resumption guarantee."""
+        seq = self._sequencers.get(engagement_id)
+        if seq is not None:
+            seq.set_turn_reply_to(message_id)
+
+    async def _supersede_pending_asks(self, engagement_id: str) -> None:
+        """§4 live-ask supersession: a fresh operator message resolves any
+        PENDING engagement_ask keyboard as ``superseded_by_text`` (broker cancel
+        path) so it settles immediately instead of dead-waiting its timeout. The
+        keyboard's finish hook renders the superseded copy + clears the buttons.
+        Free-text anchors register no broker request, so they are untouched."""
+        from verdict_broker import BROKER
+        BROKER.cancel_scope(
+            namespace="engagement_ask", scope=engagement_id,
+            reason="superseded_by_text",
+        )
 
     async def _run_topic_relay(self, engagement: EngagementRecord) -> None:
         """Drive the always-on live topic-stream relay for one engagement.
@@ -1172,6 +1390,8 @@ class ClaudeCodeDriver(DriverProtocol):
             # the envelope this turn carried (§3 turn_start evidence).
             self._reply_texts[eng_id] = set()
             self._turn_running[eng_id] = True
+            # §4: a fresh turn resets the consecutive-ask-refusal escalation.
+            self._ask_refusals[eng_id] = 0
             spool = self._inbound.get(eng_id)
             if spool is not None:
                 await spool.on_turn_start()

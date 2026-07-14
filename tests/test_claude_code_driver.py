@@ -1711,3 +1711,112 @@ class TestTerminalSpoolDrainAndReconcile:
         assert any(_RECEIPT_COPY in c.args for c in sender.await_args_list)
         remaining = (tmp_path / rec.id / ".inbound_spool.jsonl").read_text()
         assert '"receipt": "pending"' not in remaining
+
+
+# ---------------------------------------------------------------------------
+# v0.79.0 (§4) — ask-lifecycle spool + driver seams
+# ---------------------------------------------------------------------------
+
+
+class TestAskLifecycleSeams:
+    async def test_generation_and_unread_depth_track_enqueue(self, tmp_path):
+        from drivers.claude_code_driver import _InboundSpool
+
+        s = _InboundSpool(
+            engagement_id="e", spool_path=str(tmp_path / "s.jsonl"),
+            write_fifo=_FakeWriter(True), send_notice=_RecordNotice(),
+        )
+        assert s.generation() == 0 and s.unread_depth() == 0
+        await s.enqueue("hi", tg_message_id=1)
+        assert s.generation() == 1
+        assert s.unread_depth() == 1  # queued, not yet delivered
+        await s.enqueue("again", tg_message_id=2)
+        assert s.generation() == 2 and s.unread_depth() == 2
+
+    async def test_supersede_fires_on_operator_message_not_initial(self, tmp_path):
+        from drivers.claude_code_driver import _InboundSpool
+
+        fired = {"n": 0}
+
+        async def _supersede():
+            fired["n"] += 1
+
+        s = _InboundSpool(
+            engagement_id="e", spool_path=str(tmp_path / "s.jsonl"),
+            write_fifo=_FakeWriter(False), send_notice=_RecordNotice(),
+            supersede_pending_asks=_supersede,
+        )
+        await s.enqueue("task", tg_message_id=1, is_initial=True)
+        assert fired["n"] == 0  # initial task never supersedes an ask
+        await s.enqueue("real operator msg", tg_message_id=2)
+        assert fired["n"] == 1
+
+    async def test_anchor_settle_threads_delivery_to_anchor(self, tmp_path):
+        from drivers.claude_code_driver import _InboundSpool
+
+        seq = _FakeSequencer()
+
+        async def _settle(op_mid):
+            return 8001  # the anchor's tg_message_id
+
+        s = _InboundSpool(
+            engagement_id="e", spool_path=str(tmp_path / "s.jsonl"),
+            write_fifo=_FakeWriter(True), send_notice=_RecordNotice(),
+            sequencer=seq, settle_anchor_on_delivery=_settle,
+        )
+        await s.enqueue("my answer", tg_message_id=42)
+        await s.on_spawn()  # arms + pumps → delivers
+        # Threaded to the ANCHOR (8001), not the operator's own message (42).
+        assert seq.reply_targets[-1] == 8001
+
+    async def test_boot_reconcile_settles_open_questions(self, tmp_path, monkeypatch):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            "executor", "configurator", "claude_code", "t", {}, topic_id=999)
+        # A button question and a free-text anchor both left open across a restart.
+        n1 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n1, 7001, text="Q1: Proceed?",
+                                    kind="button")
+        n2 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n2, 7002, text="Q2: DB name?",
+                                    kind="anchor")
+
+        edits: list = []
+
+        async def _edit(topic_id, message_id, text, *, clear_keyboard=False):
+            edits.append((message_id, text, clear_keyboard))
+            return True
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="http://x",
+            edit_topic_message=_edit,
+            registry=reg,
+        )
+        await drv.reconcile_open_questions(rec)
+
+        # BOTH settled: expired copy + keyboard cleared; ledger emptied;
+        # next_question_number preserved (never rewound).
+        assert len(edits) == 2
+        assert all(e[2] is True for e in edits)  # clear_keyboard
+        assert all(e[1].endswith("⌛ expired — answer by text below") for e in edits)
+        assert reg.open_question_numbers(rec.id) == []
+        assert rec.next_question_number == 3
+
+    async def test_set_reply_anchor_sets_sequencer_one_shot(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="http://x",
+        )
+        seq = _FakeSequencer()
+        drv._sequencers["eng"] = seq
+        drv.set_engagement_reply_anchor("eng", 5555)
+        assert seq.reply_targets == [5555]

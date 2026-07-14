@@ -871,3 +871,78 @@ class TestSetInteractionViolated:
         # must NOT be left set (else a restart would lose the un-persisted flag
         # silently while the driver believed it succeeded).
         assert rec.origin.get("interaction_violated") is None
+
+
+# ---------------------------------------------------------------------------
+# v0.79.0 (§4) — persisted question numbering + open-question ledger
+# ---------------------------------------------------------------------------
+
+
+class TestQuestionNumbering:
+    async def test_allocate_is_monotonic_and_persisted(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        tombstone = tmp_path / "engagements.json"
+        reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        rec = await reg.create("executor", "configurator", "claude_code", "t", {}, 1)
+
+        assert await reg.allocate_question_number(rec.id) == 1
+        assert await reg.allocate_question_number(rec.id) == 2
+        assert await reg.allocate_question_number(rec.id) == 3
+        assert rec.next_question_number == 4
+
+        # Survives a reload: numbering is NEVER rewound.
+        reg2 = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        await reg2.load()
+        assert await reg2.allocate_question_number(rec.id) == 4
+
+    async def test_open_question_ledger_add_close_accessor(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        tombstone = tmp_path / "engagements.json"
+        reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        rec = await reg.create("executor", "configurator", "claude_code", "t", {}, 1)
+
+        n1 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n1, 5001)
+        n2 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n2, 5002)
+        assert reg.open_question_numbers(rec.id) == [1, 2]
+
+        await reg.close_open_question(rec.id, n1)
+        assert reg.open_question_numbers(rec.id) == [2]
+
+        # open_questions survive reload; next_question_number preserved.
+        reg2 = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        await reg2.load()
+        assert reg2.open_question_numbers(rec.id) == [2]
+        assert reg2.get(rec.id).open_questions[0]["tg_message_id"] == 5002
+        assert await reg2.allocate_question_number(rec.id) == 3
+
+    async def test_add_open_question_idempotent_on_number(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        tombstone = tmp_path / "engagements.json"
+        reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        rec = await reg.create("executor", "configurator", "claude_code", "t", {}, 1)
+        await reg.add_open_question(rec.id, 1, 100)
+        await reg.add_open_question(rec.id, 1, 200)  # same number → update, no dup
+        assert reg.open_question_numbers(rec.id) == [1]
+        assert rec.open_questions[0]["tg_message_id"] == 200
+
+    async def test_allocate_rolls_back_on_persist_failure(self, tmp_path, monkeypatch):
+        import engagement_registry as er
+        from engagement_registry import EngagementRegistry
+
+        tombstone = tmp_path / "engagements.json"
+        reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        rec = await reg.create("executor", "configurator", "claude_code", "t", {}, 1)
+
+        def _boom(*_a, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(er, "atomic_write_json", _boom)
+        with pytest.raises(OSError):
+            await reg.allocate_question_number(rec.id)
+        # Rolled back — the number never reached disk, so it must not be consumed.
+        assert rec.next_question_number == 1

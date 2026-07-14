@@ -1885,11 +1885,11 @@ async def main() -> None:
         return None
 
     async def _edit_topic_message(
-        thread_id: int, message_id: int, text: str,
+        thread_id: int, message_id: int, text: str, *, clear_keyboard: bool = False,
     ) -> bool:
         if telegram_channel is not None:
             return await telegram_channel.edit_topic_message(
-                thread_id, message_id, text)
+                thread_id, message_id, text, clear_keyboard=clear_keyboard)
         return False
 
     async def _delete_topic_message(thread_id: int, message_id: int) -> bool:

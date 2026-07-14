@@ -1,0 +1,350 @@
+"""v0.79.0 (§4) — ask lifecycle: settle-edits, inbound gate, supersession,
+numbered free-text anchors, canonical Q-numbers, reply reattachment.
+
+Drives the ``/internal/channel/ask`` + ``/internal/channel/send_to_topic``
+handlers directly with a minimal ``_FakeRequest``, a REAL ``EngagementRegistry``
+(so durable numbering is exercised) and a fake ``claude_code`` driver injected
+via ``agent.active_claude_code_driver`` (the same seam production uses).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+
+import pytest
+from aiohttp import web
+
+import agent as agent_mod
+import verdict_broker
+from verdict_broker import VerdictBroker
+
+pytestmark = pytest.mark.asyncio
+
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+
+
+class _FakeChannel:
+    def __init__(self) -> None:
+        self.options_keyboards: list[dict] = []
+        self.sent_texts: list[tuple] = []
+        self.edits: list[dict] = []
+        self._next_id = 9000
+
+    async def post_options_keyboard(
+        self, *, engagement_id, request_id, question, options,
+    ) -> int | None:
+        self.options_keyboards.append(
+            {"question": question, "options": list(options),
+             "request_id": request_id})
+        mid = self._next_id
+        self._next_id += 1
+        return mid
+
+    async def send_response_to_topic(self, topic_id, text) -> int:
+        self.sent_texts.append((topic_id, text))
+        mid = self._next_id
+        self._next_id += 1
+        return mid
+
+    async def edit_topic_message(
+        self, topic_id, message_id, text, *, clear_keyboard=False,
+    ) -> bool:
+        self.edits.append(
+            {"message_id": message_id, "text": text,
+             "clear_keyboard": clear_keyboard})
+        return True
+
+
+class _FakeDriver:
+    """Fake claude_code driver — the §4 gate + discrete-intent seam only."""
+
+    def __init__(self) -> None:
+        self.depth = 0
+        self.gen = 0
+        self.refusals = 0
+        self.intents: dict[str, dict] = {}
+        self.posted: list[tuple] = []
+
+    # inbound gate reads
+    def inbound_unread_depth(self, eid) -> int:
+        return self.depth
+
+    def inbound_generation(self, eid) -> int:
+        return self.gen
+
+    def record_ask_refusal(self, eid) -> int:
+        self.refusals += 1
+        return self.refusals
+
+    # discrete-intent seam
+    def register_send_intent(self, *, engagement_id, request_id, tool_name,
+                             projection_hash, poster):
+        created = request_id not in self.intents
+        if created:
+            self.intents[request_id] = {
+                "state": "pending", "message_id": None, "outcome": None,
+                "tool": tool_name, "hash": projection_hash}
+        return self.intents[request_id], created
+
+    def arm_send_intent(self, eid, rid):
+        if rid in self.intents:
+            self.intents[rid]["state"] = "armed"
+
+    def cancel_send_intent(self, eid, rid):
+        if rid in self.intents:
+            self.intents[rid]["state"] = "cancelled"
+
+    def send_intent_outcome(self, eid, rid):
+        it = self.intents.get(rid)
+        return it["outcome"] if it else None
+
+    async def mark_send_intent_posted(self, eid, rid, mid):
+        it = self.intents.get(rid)
+        if it is not None:
+            it["state"] = "posted"
+            it["message_id"] = mid
+            it["outcome"] = {
+                "ok": mid is not None, "message_id": mid, "out_of_band": True}
+        self.posted.append((rid, mid))
+
+
+class _FakeRequest:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    async def json(self) -> dict:
+        return self._payload
+
+
+def _body(resp: web.Response) -> dict:
+    return json.loads(resp.text)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fresh_broker(monkeypatch):
+    fresh = VerdictBroker()
+    monkeypatch.setattr(verdict_broker, "BROKER", fresh)
+    return fresh
+
+
+@pytest.fixture
+async def env(tmp_path, fresh_broker, monkeypatch):
+    from engagement_registry import EngagementRegistry
+    from channels.channel_handlers import _make_channel_handlers
+
+    reg = EngagementRegistry(
+        tombstone_path=str(tmp_path / "engagements.json"), bus=None)
+    rec = await reg.create(
+        "executor", "configurator", "claude_code", "t",
+        {"user_id": 555}, topic_id=42)
+    ch = _FakeChannel()
+    driver = _FakeDriver()
+    monkeypatch.setattr(agent_mod, "active_claude_code_driver", driver)
+
+    handlers = _make_channel_handlers(telegram_channel=ch, engagement_registry=reg)
+    ask = handlers["/internal/channel/ask"]
+    send = handlers["/internal/channel/send_to_topic"]
+    return {
+        "reg": reg, "rec": rec, "ch": ch, "driver": driver,
+        "broker": fresh_broker, "ask": ask, "send": send,
+    }
+
+
+def _ask_payload(**over) -> dict:
+    base = {
+        "engagement_id": "PLACEHOLDER", "request_id": "rid-1",
+        "question": "Proceed?", "options": ["A", "B"], "timeout_s": 60,
+        "projection_hash": "hash-abc",
+    }
+    base.update(over)
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Settle-edit copies (clear_keyboard) + canonical Q-number
+# ---------------------------------------------------------------------------
+
+
+async def test_answered_settles_with_check_and_clears_keyboard(env):
+    eid = env["rec"].id
+    task = asyncio.ensure_future(env["ask"](
+        _FakeRequest(_ask_payload(engagement_id=eid, request_id="a1"))))
+    await asyncio.sleep(0.02)
+    assert env["broker"].deliver(
+        namespace="engagement_ask", scope=eid, request_id="a1",
+        option_index=1, actor_id=555) == "delivered"
+    resp = await asyncio.wait_for(task, timeout=1.0)
+    await env["broker"].drain_hooks()
+
+    assert _body(resp) == {
+        "ok": True, "outcome": "answered", "option": "B", "option_index": 1}
+    # Settle edit: PRESENT clear_keyboard, ✅ + label, canonical Q1 prefix.
+    edit = env["ch"].edits[-1]
+    assert edit["clear_keyboard"] is True
+    assert edit["text"] == "Q1: Proceed?\n✅ B"
+
+
+async def test_expired_settles_with_hourglass_and_clears_keyboard(env, monkeypatch):
+    import channels.channel_handlers  # noqa: F401
+    eid = env["rec"].id
+    # Fire the timeout immediately.
+    task = asyncio.ensure_future(env["ask"](
+        _FakeRequest(_ask_payload(engagement_id=eid, request_id="e1", timeout_s=30))))
+    await asyncio.sleep(0.02)
+    env["broker"]._on_timeout(("engagement_ask", eid, "e1"))
+    resp = await asyncio.wait_for(task, timeout=1.0)
+    await env["broker"].drain_hooks()
+
+    assert _body(resp) == {"ok": True, "outcome": "no_answer"}
+    edit = env["ch"].edits[-1]
+    assert edit["clear_keyboard"] is True
+    assert edit["text"] == "Q1: Proceed?\n⌛ expired — answer by text below"
+
+
+async def test_canonical_qnumber_strips_agent_authored_prefix(env):
+    eid = env["rec"].id
+    # Agent authored its own "Q7:" — must be stripped and re-prefixed with the
+    # ALLOCATED durable number so message == registry == summary accessor.
+    task = asyncio.ensure_future(env["ask"](_FakeRequest(_ask_payload(
+        engagement_id=eid, request_id="c1", question="Q7: Which DB?"))))
+    await asyncio.sleep(0.02)
+    posted_q = env["ch"].options_keyboards[-1]["question"]
+    assert posted_q == "Q1: Which DB?"
+    # open_questions ledger + summary accessor agree with the message.
+    assert env["reg"].open_question_numbers(eid) == [1]
+    env["broker"].deliver(
+        namespace="engagement_ask", scope=eid, request_id="c1",
+        option_index=0, actor_id=555)
+    await asyncio.wait_for(task, timeout=1.0)
+    await env["broker"].drain_hooks()
+    # Settled → closed in the ledger.
+    assert env["reg"].open_question_numbers(eid) == []
+
+
+# ---------------------------------------------------------------------------
+# Free-text anchor (options: [])
+# ---------------------------------------------------------------------------
+
+
+async def test_free_text_anchor_posts_numbered_and_registers(env):
+    eid = env["rec"].id
+    resp = await env["ask"](_FakeRequest(_ask_payload(
+        engagement_id=eid, request_id="ft1",
+        question="What's the DB name?", options=[])))
+    body = _body(resp)
+    assert body["ok"] is True and body["outcome"] == "anchored"
+    assert body["question_number"] == 1
+    # Posted as a plain numbered anchor (NO keyboard) + registered open.
+    assert env["ch"].sent_texts[-1] == (42, "Q1: What's the DB name?")
+    assert env["ch"].options_keyboards == []
+    assert env["reg"].open_question_numbers(eid) == [1]
+
+
+# ---------------------------------------------------------------------------
+# Inbound gate + escalation
+# ---------------------------------------------------------------------------
+
+
+async def test_unread_inbound_refuses_without_registering(env):
+    eid = env["rec"].id
+    env["driver"].depth = 1  # operator message waiting, unseen
+    resp = await env["ask"](_FakeRequest(_ask_payload(
+        engagement_id=eid, request_id="g1")))
+    body = _body(resp)
+    assert body["ok"] is False and body["error"] == "unread_inbound"
+    assert "end your turn now" in body["message"]
+    assert body["refusal_count"] == 1
+    # No keyboard posted, no live broker request, intent tombstoned.
+    assert env["ch"].options_keyboards == []
+    assert env["broker"].pending(namespace="engagement_ask", scope=eid) == []
+    assert env["driver"].intents["g1"]["state"] == "cancelled"
+
+
+async def test_free_text_anchor_also_gated_on_unread(env):
+    eid = env["rec"].id
+    env["driver"].depth = 1
+    resp = await env["ask"](_FakeRequest(_ask_payload(
+        engagement_id=eid, request_id="ga1", question="DB name?", options=[])))
+    body = _body(resp)
+    assert body["ok"] is False and body["error"] == "unread_inbound"
+    # No anchor posted, nothing registered.
+    assert env["ch"].sent_texts == []
+    assert env["reg"].open_question_numbers(eid) == []
+
+
+async def test_refusal_escalates_at_third(env):
+    eid = env["rec"].id
+    env["driver"].depth = 1
+    msgs = []
+    for i in range(3):
+        resp = await env["ask"](_FakeRequest(_ask_payload(
+            engagement_id=eid, request_id=f"r{i}")))
+        msgs.append(_body(resp)["message"])
+    assert msgs[0] == msgs[1]
+    assert msgs[2] != msgs[0]
+    assert "STOP ASKING" in msgs[2]
+
+
+# ---------------------------------------------------------------------------
+# Generation re-check supersession
+# ---------------------------------------------------------------------------
+
+
+async def test_generation_recheck_supersedes(env):
+    eid = env["rec"].id
+    ch = env["ch"]
+    driver = env["driver"]
+
+    # An operator message lands in the register→post window: bump the
+    # generation the moment the keyboard is posted.
+    orig_post = ch.post_options_keyboard
+
+    async def _post(*, engagement_id, request_id, question, options):
+        driver.gen += 1  # operator envelope arrived during the post
+        return await orig_post(
+            engagement_id=engagement_id, request_id=request_id,
+            question=question, options=options)
+
+    ch.post_options_keyboard = _post
+
+    resp = await env["ask"](_FakeRequest(_ask_payload(
+        engagement_id=eid, request_id="s1")))
+    body = _body(resp)
+    assert body["ok"] is False and body["error"] == "superseded"
+    await env["broker"].drain_hooks()
+    # Keyboard settled with the superseded copy + cleared.
+    edit = ch.edits[-1]
+    assert edit["clear_keyboard"] is True
+    assert edit["text"] == "Q1: Proceed?\n🚫 superseded by your message below"
+
+
+# ---------------------------------------------------------------------------
+# Reply reattachment (response-loss-after-post)
+# ---------------------------------------------------------------------------
+
+
+async def test_reply_retry_reattaches_no_double_post(env):
+    eid = env["rec"].id
+    p = {"engagement_id": eid, "text": "hello operator",
+         "request_id": "rep-1", "projection_hash": "rh"}
+    r1 = await env["send"](_FakeRequest(p))
+    b1 = _body(r1)
+    assert b1["ok"] is True
+    first_mid = b1["message_id"]
+    assert env["ch"].sent_texts.count((42, "hello operator")) == 1
+
+    # A transport retry with the SAME request_id must reattach — one post only.
+    r2 = await env["send"](_FakeRequest(p))
+    b2 = _body(r2)
+    assert b2 == {"ok": True, "message_id": first_mid}
+    assert env["ch"].sent_texts.count((42, "hello operator")) == 1

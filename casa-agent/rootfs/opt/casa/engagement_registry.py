@@ -148,6 +148,14 @@ class EngagementRecord:
     # first_contact_required -> awaiting_operator -> authorized. Never
     # backwards; see ``_pure_interaction_transition``.
     interaction_state: str = ""
+    # v0.79.0 (§4): persisted question numbering. ``next_question_number`` is a
+    # monotonic per-engagement allocator (never rewound, even when a question
+    # closes) so every displayed ``Q<n>`` is durable and unique across restarts.
+    # ``open_questions`` is the set of still-open (unsettled) questions, each a
+    # ``{"n": int, "tg_message_id": int|None}`` dict — boot reconciliation
+    # settles any entry whose broker record did not survive the restart.
+    next_question_number: int = 1
+    open_questions: tuple[dict, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +232,10 @@ class EngagementRegistry:
                     permission_mode=row.get("permission_mode") or "acceptEdits",
                     plugin_artifacts=tuple(row.get("plugin_artifacts") or ()),
                     interaction_state=row.get("interaction_state") or "",
+                    next_question_number=int(row.get("next_question_number", 1) or 1),
+                    open_questions=tuple(
+                        dict(q) for q in (row.get("open_questions") or ())
+                    ),
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed engagement row: %s", exc)
@@ -359,6 +371,8 @@ class EngagementRegistry:
                 "permission_mode": rec.permission_mode,
                 "plugin_artifacts": [dict(pa) for pa in rec.plugin_artifacts],
                 "interaction_state": rec.interaction_state,
+                "next_question_number": rec.next_question_number,
+                "open_questions": [dict(q) for q in rec.open_questions],
             })
         try:
             await asyncio.to_thread(self._write_tombstone, snapshot)
@@ -696,6 +710,96 @@ class EngagementRegistry:
                 else:
                     rec.origin.pop("interaction_violated", None)
                 raise
+
+    # -- v0.79.0 (§4) question numbering + open-question ledger --------------
+
+    async def allocate_question_number(self, engagement_id: str) -> int | None:
+        """Atomically allocate the next durable ``Q<n>`` for an engagement.
+
+        Bumps ``next_question_number`` under the lock and persists (same
+        transactional shield-and-await pattern as ``advance_interaction_state``
+        so a cancelled caller never tears the counter from disk). Returns the
+        allocated number, or ``None`` for an unknown engagement."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return None
+            allocated = rec.next_question_number
+            prev = rec.next_question_number
+            rec.next_question_number = allocated + 1
+
+            async def _mutate_and_persist() -> int:
+                try:
+                    await self._write_tombstone_locked(strict=True)
+                except Exception:
+                    rec.next_question_number = prev
+                    raise
+                return allocated
+
+            task = asyncio.ensure_future(_mutate_and_persist())
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
+                raise
+
+    async def add_open_question(
+        self, engagement_id: str, number: int, tg_message_id: int | None,
+        text: str | None = None, kind: str = "button",
+    ) -> None:
+        """Record a still-open question ``{n, tg_message_id, text, kind}``
+        (persisted). ``text`` is the canonical displayed question so boot
+        reconciliation can re-render the settle copy over it (memory-only broker
+        state does not survive a restart). ``kind`` is ``"button"`` (broker tap)
+        or ``"anchor"`` (free-text — settled by the next operator message).
+        Idempotent on ``number``."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            entries = [q for q in rec.open_questions if q.get("n") != number]
+            entry = {"n": number, "tg_message_id": tg_message_id, "kind": kind}
+            if text is not None:
+                entry["text"] = text
+            entries.append(entry)
+            rec.open_questions = tuple(entries)
+            await self._write_tombstone_locked()
+
+    def oldest_open_anchor(self, engagement_id: str) -> dict | None:
+        """The oldest still-open FREE-TEXT anchor (``kind == "anchor"``), or
+        ``None``. The next operator message settles it (§4)."""
+        rec = self._records.get(engagement_id)
+        if rec is None:
+            return None
+        anchors = [q for q in rec.open_questions if q.get("kind") == "anchor"]
+        if not anchors:
+            return None
+        return min(anchors, key=lambda q: q.get("n", 0))
+
+    async def close_open_question(self, engagement_id: str, number: int) -> None:
+        """Remove a settled question from the open-question ledger (persisted).
+        ``next_question_number`` is NEVER rewound. Unknown engagement/number is
+        a no-op."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            remaining = tuple(
+                q for q in rec.open_questions if q.get("n") != number
+            )
+            if len(remaining) == len(rec.open_questions):
+                return
+            rec.open_questions = remaining
+            await self._write_tombstone_locked()
+
+    def open_question_numbers(self, engagement_id: str) -> list[int]:
+        """Accessor for summary consumers (T4): the sorted list of still-open
+        question numbers (``Open questions: Q4, Q6``)."""
+        rec = self._records.get(engagement_id)
+        if rec is None:
+            return []
+        return sorted(q["n"] for q in rec.open_questions if "n" in q)
 
     async def sweep_idle_and_suspend(
         self, *, driver: Any, now_override: float | None = None,

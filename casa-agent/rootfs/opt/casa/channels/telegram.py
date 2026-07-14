@@ -1295,7 +1295,7 @@ class TelegramChannel(Channel):
                         BROKER.abort_claim(claim)
                         await _safe_answer(cq, "couldn't record — please tap again")
                         return
-            committed = BROKER.commit(claim)
+            committed = self._commit_ask_with_anchor(claim, ns, rec, meta)
         finally:
             # r7-B1: ANY exit without a commit (including CancelledError,
             # which `except Exception` above would not catch) must resolve the
@@ -1307,10 +1307,41 @@ class TelegramChannel(Channel):
             # idempotent + sync.
             if not committed:
                 if advanced:
-                    committed = BROKER.commit(claim)
+                    committed = self._commit_ask_with_anchor(claim, ns, rec, meta)
                 else:
                     BROKER.abort_claim(claim)
         await _safe_answer(cq, "✔" if committed else "expired")
+
+    def _commit_ask_with_anchor(
+        self, claim: Any, ns: str, rec: Any, meta: dict,
+    ) -> bool:
+        """ONE commit helper for BOTH engagement-ask commit paths (the normal
+        path and the ``finally`` recovery commit) — v0.79.0 §4 causal handoff.
+
+        ``BROKER.commit`` resolves the ask future FIRST; only then, and only for
+        ``engagement_ask``, do we SYNCHRONOUSLY set the sequencer's one-shot
+        reply anchor to the ask message id. PRE-RESUMPTION GUARANTEE: asyncio
+        run-to-completion means no awaiting coroutine RESUMES between the
+        synchronous ``commit()`` and this synchronous set, so the CLI's ask
+        response (which cannot be produced until its waiter resumes) can never
+        be emitted before the anchor is in place — the SAME turn's first output
+        threads to the question. Advisory only: no persistence, no rollback; a
+        crash leaves unthreaded output with nothing pending."""
+        from verdict_broker import BROKER
+
+        committed = BROKER.commit(claim)
+        if committed and ns == "engagement_ask":
+            mid = meta.get("message_id") if isinstance(meta, dict) else None
+            if isinstance(mid, int):
+                try:
+                    import agent as _agent_mod
+                    drv = getattr(_agent_mod, "active_claude_code_driver", None)
+                    setter = getattr(drv, "set_engagement_reply_anchor", None)
+                    if setter is not None:
+                        setter(rec.id, mid)
+                except Exception:  # noqa: BLE001 — advisory, never break commit
+                    logger.debug("reply-anchor set failed", exc_info=True)
+        return committed
 
     async def _on_resident_callback(self, cq: Any, rid: str, idx: int) -> None:
         """resident_ask tap — SINGLE-OWNER commit contract [A:§2, r1-B2/r3-B1].
@@ -1501,11 +1532,15 @@ class TelegramChannel(Channel):
         """
         if not self.engagement_supergroup_id:
             return
+        # v0.79.0 §4 (the real S1): send an EXPLICIT empty keyboard rather than
+        # ``reply_markup=None`` — PTB drops None params, so a None markup would
+        # leave the permission buttons tappable after the verdict settled.
+        from telegram import InlineKeyboardMarkup
         try:
             await self.bot.edit_message_reply_markup(
                 chat_id=self.engagement_supergroup_id,
                 message_id=message_id,
-                reply_markup=None,
+                reply_markup=InlineKeyboardMarkup([]),
             )
         except Exception as exc:  # noqa: BLE001 — best-effort, never raise
             logger.warning(
@@ -1560,24 +1595,43 @@ class TelegramChannel(Channel):
 
     async def edit_topic_message(
         self, topic_id: int | None, message_id: int, text: str,
+        *, clear_keyboard: bool = False,
     ) -> bool:
-        """Plain (no parse_mode, no reply_markup) text edit of a posted
-        topic message.
+        """Plain (no parse_mode) text edit of a posted topic message.
 
         Broker finish-hook target for the ``engagement_ask`` namespace
         (mirrors ``edit_perm_keyboard_outcome``'s role for ``permission``,
         see ``channel_handlers._ask_keyboard_finish``). "Message is not
         modified" (JC4 — an identical re-edit) is tolerated as success, not
         an error, since it means the desired end state already holds.
+
+        ``clear_keyboard`` (v0.79.0 §4, the real S1 fix): when True, send an
+        EXPLICIT empty ``InlineKeyboardMarkup([])`` alongside the text so the
+        settled question drops its tappable buttons. A bare ``edit_message_text``
+        with no ``reply_markup`` leaves the old keyboard in place (PTB drops the
+        None param, so ``editMessageText`` never touches the markup) — that was
+        the settle-path bug (S1): answered/expired questions stayed tappable.
         """
         if not self.engagement_supergroup_id:
             return False
+        reply_markup = None
+        if clear_keyboard:
+            from telegram import InlineKeyboardMarkup
+            reply_markup = InlineKeyboardMarkup([])
         try:
-            await self.bot.edit_message_text(
-                chat_id=self.engagement_supergroup_id,
-                message_id=message_id,
-                text=text,
-            )
+            if reply_markup is not None:
+                await self.bot.edit_message_text(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                )
+            else:
+                await self.bot.edit_message_text(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id,
+                    text=text,
+                )
             return True
         except BadRequest as exc:
             if "not modified" in str(exc).lower():

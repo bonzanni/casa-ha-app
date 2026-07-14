@@ -467,6 +467,36 @@ class OutputSequencer:
         intent = self.registry.by_request_id(request_id)
         return intent.outcome if intent is not None else None
 
+    async def mark_intent_posted(
+        self, request_id: str, message_id: int | None,
+    ) -> Any:
+        """Record that a discrete ingress POSTED its message out-of-band (the
+        keyboard/reply was sent eagerly by the handler rather than deferred to
+        the relay's content-block). Marks the intent ``posted`` and leaves the
+        §2(5) one-block CONSUMPTION DEBT (``timeout_posted``) so the relay
+        silently consumes the matching tool_use block — sealing open narration
+        at that position — instead of binding a later same-hash intent or
+        emitting stray narration. Records the outcome (incl. ``message_id``) for
+        response-loss-after-post retry reattachment (§2(1))."""
+        async with self._lock:
+            intent = self.registry.by_request_id(request_id)
+            if intent is None:
+                return None
+            intent.state = "posted"
+            intent.consumed = False
+            intent.timeout_posted = True
+            intent.message_id = message_id
+            intent.outcome = {
+                "ok": message_id is not None,
+                "message_id": message_id,
+                "out_of_band": True,
+            }
+            if message_id is not None and (
+                self._high_water is None or message_id > self._high_water
+            ):
+                self._high_water = message_id
+            return intent
+
     def prune_turn(self) -> None:
         """§2(6): prune intents/tombstones/outcomes at turn end."""
         self.registry.prune()
@@ -524,7 +554,13 @@ class OutputSequencer:
                 item.consumed = True
                 return "consumed_cancelled"
             if item.state == "posted" and item.timeout_posted:
-                item.consumed = True  # §2(5) debt consumed
+                # §2(5) debt consumed. SEAL open narration at this block's
+                # position: the debt's message was posted out-of-band (the
+                # timeout out-of-band post, or an eager ask/reply ingress post),
+                # so narration up to this causal point must close — nothing may
+                # edit/append to it below the discrete message.
+                self._seal_narration_locked()
+                item.consumed = True
                 return "debt_consumed"
             return None  # pending → HOLD
         if (

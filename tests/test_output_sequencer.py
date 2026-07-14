@@ -434,3 +434,33 @@ async def test_no_reply_target_keeps_two_arg_send():
     seq = _make_seq(rec, clock)
     await seq.open_narration("hi")
     assert rec.sends == [(42, "hi")]
+
+
+# ---------------------------------------------------------------------------
+# v0.79.0 (§4) — eager out-of-band post leaves a consumption debt so the relay
+# debt-consumes the ask/reply block (sealing narration, no double post) and a
+# retry reattaches to the recorded outcome.
+# ---------------------------------------------------------------------------
+
+
+async def test_mark_intent_posted_leaves_debt_relay_consumes_block():
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    await seq.open_narration("narration before the ask")
+    h = projection_hash(ASK_TOOL, {"question": "q", "options": ["a", "b"],
+                                   "timeout_s": None})
+    # Ingress registers the intent, the handler posts eagerly, then records it.
+    seq.register_intent(request_id="a1", tool_name=ASK_TOOL,
+                        projection_hash=h, poster=_poster(rec, "unused"))
+    intent = await seq.mark_intent_posted("a1", 777)
+    assert intent.state == "posted" and intent.message_id == 777
+    assert seq.high_water == 777
+    # The relay reaching the ask block DEBT-CONSUMES it (no second post) and
+    # seals the open narration at that position.
+    assert await seq.post_for_block(ASK_TOOL, h) == "debt_consumed"
+    assert seq.narration_msg_id is None  # narration sealed
+    # No extra sends beyond the one narration open (the eager post is external).
+    assert len(rec.sends) == 1
+    # Retry reattachment: the recorded outcome carries the posted message id.
+    assert seq.intent_outcome("a1") == {
+        "ok": True, "message_id": 777, "out_of_band": True}
