@@ -61,14 +61,34 @@ class _FakeChannel:
 
 
 class _FakeDriver:
-    """Fake claude_code driver — the §4 gate + discrete-intent seam only."""
+    """Fake claude_code driver backed by a REAL ``OutputSequencer`` (§2).
 
-    def __init__(self) -> None:
+    The discrete-intent seam delegates to the real registry so the deferred
+    relay-mediated posting model (review C1) is exercised end-to-end. Since
+    these tests have no live topic-stream relay, ``arm_send_intent`` SIMULATES
+    the relay reaching the intent's tool_use block right after arm — it
+    schedules ``post_for_block`` on the real sequencer, which invokes the
+    handler-installed poster (posts the keyboard/anchor/reply and records the
+    outcome), exactly as the production relay would.
+    """
+
+    def __init__(self, engagement_id: str = "e", topic_id: int = 42) -> None:
+        from channels.output_sequencer import OutputSequencer
+
         self.depth = 0
         self.gen = 0
         self.refusals = 0
-        self.intents: dict[str, dict] = {}
-        self.posted: list[tuple] = []
+        self._relay_tasks: list = []
+
+        async def _noop_send(topic, text, reply_to=None):
+            return None
+
+        async def _noop_edit(topic, mid, text):
+            return True
+
+        self.seq = OutputSequencer(
+            engagement_id=engagement_id, topic_id=topic_id,
+            send_message=_noop_send, edit_message=_noop_edit)
 
     # inbound gate reads
     def inbound_unread_depth(self, eid) -> int:
@@ -81,36 +101,36 @@ class _FakeDriver:
         self.refusals += 1
         return self.refusals
 
-    # discrete-intent seam
+    # discrete-intent seam (delegates to the real sequencer registry)
     def register_send_intent(self, *, engagement_id, request_id, tool_name,
                              projection_hash, poster):
-        created = request_id not in self.intents
-        if created:
-            self.intents[request_id] = {
-                "state": "pending", "message_id": None, "outcome": None,
-                "tool": tool_name, "hash": projection_hash}
-        return self.intents[request_id], created
+        return self.seq.register_intent(
+            request_id=request_id, tool_name=tool_name,
+            projection_hash=projection_hash, poster=poster)
+
+    def set_send_intent_poster(self, eid, rid, poster):
+        return self.seq.set_intent_poster(rid, poster)
 
     def arm_send_intent(self, eid, rid):
-        if rid in self.intents:
-            self.intents[rid]["state"] = "armed"
+        intent = self.seq.arm_intent(rid)
+        if intent is not None:
+            # Simulate the relay reaching this block just after arm.
+            self._relay_tasks.append(asyncio.ensure_future(
+                self.seq.post_for_block(intent.tool_name, intent.projection_hash)))
+        return intent
 
     def cancel_send_intent(self, eid, rid):
-        if rid in self.intents:
-            self.intents[rid]["state"] = "cancelled"
+        return self.seq.cancel_intent(rid)
 
     def send_intent_outcome(self, eid, rid):
-        it = self.intents.get(rid)
-        return it["outcome"] if it else None
+        return self.seq.intent_outcome(rid)
 
     async def mark_send_intent_posted(self, eid, rid, mid):
-        it = self.intents.get(rid)
-        if it is not None:
-            it["state"] = "posted"
-            it["message_id"] = mid
-            it["outcome"] = {
-                "ok": mid is not None, "message_id": mid, "out_of_band": True}
-        self.posted.append((rid, mid))
+        return await self.seq.mark_intent_posted(rid, mid)
+
+    def intent_state(self, rid):
+        intent = self.seq.registry.by_request_id(rid)
+        return intent.state if intent is not None else None
 
 
 class _FakeRequest:
@@ -244,6 +264,9 @@ async def test_free_text_anchor_posts_numbered_and_registers(env):
     body = _body(resp)
     assert body["ok"] is True and body["outcome"] == "anchored"
     assert body["question_number"] == 1
+    # Posting is RELAY-DEFERRED (§2, C1): the numbered anchor posts when the
+    # relay reaches the ask tool_use block. Drive the (simulated) relay.
+    await asyncio.sleep(0.01)
     # Posted as a plain numbered anchor (NO keyboard) + registered open.
     assert env["ch"].sent_texts[-1] == (42, "Q1: What's the DB name?")
     assert env["ch"].options_keyboards == []
@@ -267,7 +290,7 @@ async def test_unread_inbound_refuses_without_registering(env):
     # No keyboard posted, no live broker request, intent tombstoned.
     assert env["ch"].options_keyboards == []
     assert env["broker"].pending(namespace="engagement_ask", scope=eid) == []
-    assert env["driver"].intents["g1"]["state"] == "cancelled"
+    assert env["driver"].intent_state("g1") == "cancelled"
 
 
 async def test_free_text_anchor_also_gated_on_unread(env):
@@ -339,9 +362,12 @@ async def test_reply_retry_reattaches_no_double_post(env):
          "request_id": "rep-1", "projection_hash": "rh"}
     r1 = await env["send"](_FakeRequest(p))
     b1 = _body(r1)
-    assert b1["ok"] is True
-    first_mid = b1["message_id"]
+    assert b1["ok"] is True  # armed; posting is relay-deferred (§2, C1)
+    # Drive the (simulated) relay: the poster posts ONCE and records the outcome.
+    await asyncio.sleep(0.01)
     assert env["ch"].sent_texts.count((42, "hello operator")) == 1
+    first_mid = env["driver"].send_intent_outcome(eid, "rep-1")["message_id"]
+    assert first_mid is not None
 
     # A transport retry with the SAME request_id must reattach — one post only.
     r2 = await env["send"](_FakeRequest(p))

@@ -108,14 +108,41 @@ def _make_send_to_topic(
 
         text = body.get("text") or ""
 
-        # v0.79.0 (§2): the reply ingress registers a discrete-send INTENT so the
-        # relay consumes the reply's tool_use block (sealing narration) and a
-        # response-loss-after-post retry (same request_id) reattaches to the
-        # recorded outcome instead of posting a SECOND identical reply.
         request_id = body.get("request_id")
         projection_hash = body.get("projection_hash")
         driver = _resolve_active_driver()
-        intent_active = False
+
+        # The actual post + post-side bookkeeping (advance first-contact, reply
+        # de-dup hint). Invoked RELAY-SIDE (§2, review C1) at the reply's
+        # tool_use block position — AFTER any preceding narration — or directly
+        # here in the no-driver/degraded fallback (pre-v0.79 eager behavior).
+        async def _do_post() -> int | None:
+            try:
+                mid = await telegram_channel.send_response_to_topic(topic_id, text)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "send_to_topic failed for engagement=%s topic=%s: %s",
+                    engagement_id, topic_id, exc,
+                )
+                return None
+            # W2/Sol B9 (Task 7): the agent's first outbound reply flips
+            # first_contact_required -> awaiting_operator. getattr-tolerant.
+            advance = getattr(
+                engagement_registry, "advance_interaction_state", None)
+            if advance is not None:
+                await advance(engagement_id, "first_contact")
+            if record_reply is not None and text:
+                try:
+                    record_reply(engagement_id, text)
+                except Exception:  # noqa: BLE001 — de-dup hint is best-effort
+                    logger.debug("record_reply hook failed", exc_info=True)
+            return mid
+
+        # v0.79.0 (§2, review C1): DEFERRED posting. The reply ingress registers
+        # + arms a discrete-send INTENT whose poster performs the actual send;
+        # the RELAY posts it at the reply's tool_use block (sealing preceding
+        # narration first). A response-loss-after-post retry (same request_id)
+        # reattaches to the recorded outcome instead of posting a SECOND reply.
         if driver is not None and request_id and projection_hash:
             from channels.output_sequencer import REPLY_TOOL
             res = driver.register_send_intent(
@@ -132,39 +159,16 @@ def _make_send_to_topic(
                         # posted — return its id, no second post (§2(1)).
                         return web.json_response(
                             {"ok": True, "message_id": prior["message_id"]})
-                else:
-                    driver.arm_send_intent(engagement_id, request_id)
-                    intent_active = True
+                    # Reattach before the relay posted → still armed, will post.
+                    return web.json_response({"ok": True})
+                driver.set_send_intent_poster(engagement_id, request_id, _do_post)
+                driver.arm_send_intent(engagement_id, request_id)
+                return web.json_response({"ok": True})
 
-        try:
-            msg_id = await telegram_channel.send_response_to_topic(topic_id, text)
-        except Exception as exc:  # noqa: BLE001
-            if intent_active:
-                driver.cancel_send_intent(engagement_id, request_id)  # tombstone
-            logger.warning(
-                "send_to_topic failed for engagement=%s topic=%s: %s",
-                engagement_id, topic_id, exc,
-            )
+        # EAGER fallback (no live sequencer): post now and return the id.
+        msg_id = await _do_post()
+        if msg_id is None:
             return web.json_response({"ok": False, "error": "send_failed"})
-
-        if intent_active:
-            await driver.mark_send_intent_posted(
-                engagement_id, request_id, msg_id)
-
-        # W2/Sol B9 (Task 7): the agent's first outbound reply flips
-        # first_contact_required -> awaiting_operator. getattr-tolerant —
-        # a fake registry in a test may not carry the method; a no-op
-        # returns None for non-interaction-required engagements.
-        advance = getattr(engagement_registry, "advance_interaction_state", None)
-        if advance is not None:
-            await advance(engagement_id, "first_contact")
-
-        if record_reply is not None and text:
-            try:
-                record_reply(engagement_id, text)
-            except Exception:  # noqa: BLE001 — de-dup hint is best-effort
-                logger.debug("record_reply hook failed", exc_info=True)
-
         return web.json_response({"ok": True, "message_id": msg_id})
 
     return handler
@@ -546,35 +550,76 @@ def _make_ask(
 
         # --- FREE-TEXT ANCHOR (§4): options: [] posts a numbered anchor with
         # NO keyboard, registered in open_questions; the NEXT operator text
-        # settles it (driver-side). Non-blocking — no broker request, no tap. ---
+        # settles it (driver-side). Non-blocking — no broker request, no tap.
+        # Posting is RELAY-DEFERRED (§2, review C1): the handler registers+arms
+        # a discrete-send intent whose poster posts the numbered anchor, and the
+        # relay posts it at the ask tool_use block (AFTER any preceding
+        # narration). No driver/hash ⇒ eager fallback (pre-v0.79 behavior). ---
         if not options:
             if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
                 return _refusal_response()
             number = await _maybe_allocate_number(engagement_registry, eng_id)
             display = _canonical_question(question, number) if number else question
-            try:
-                mid = await telegram_channel.send_response_to_topic(
-                    rec.topic_id, display)
-            except Exception:  # noqa: BLE001
-                logger.warning("free-text anchor post failed (eng=%s)",
-                               eng_id[:8], exc_info=True)
-                return web.json_response({"ok": False, "error": "delivery_failed"})
+
+            async def _post_anchor() -> int | None:
+                try:
+                    mid = await telegram_channel.send_response_to_topic(
+                        rec.topic_id, display)
+                except Exception:  # noqa: BLE001
+                    logger.warning("free-text anchor post failed (eng=%s)",
+                                   eng_id[:8], exc_info=True)
+                    return None
+                if not isinstance(mid, int):
+                    return None
+                # open_questions registered ONLY after a successful post so a
+                # crash before the relay reaches the block leaves NO dangling
+                # ledger entry.
+                if number is not None:
+                    add = getattr(engagement_registry, "add_open_question", None)
+                    if add is not None:
+                        await add(eng_id, number, mid, text=display,
+                                  kind="anchor")
+                await _advance_first_contact()
+                return mid
+
+            if driver is not None and projection_hash:
+                res = driver.register_send_intent(
+                    engagement_id=eng_id, request_id=request_id,
+                    tool_name=ASK_TOOL, projection_hash=projection_hash,
+                    poster=_noop_poster,
+                )
+                if res is not None:
+                    _intent, created_intent = res
+                    if not created_intent:
+                        prior = driver.send_intent_outcome(eng_id, request_id)
+                        return web.json_response({
+                            "ok": True, "outcome": "anchored",
+                            "question_number": number,
+                            "message_id": prior.get("message_id") if prior else None,
+                        })
+                    driver.set_send_intent_poster(eng_id, request_id, _post_anchor)
+                    driver.arm_send_intent(eng_id, request_id)
+                    return web.json_response({
+                        "ok": True, "outcome": "anchored",
+                        "question_number": number, "message_id": None,
+                    })
+
+            # EAGER fallback (no live sequencer): post the anchor now.
+            mid = await _post_anchor()
             if mid is None:
                 return web.json_response({"ok": False, "error": "delivery_failed"})
-            if number is not None:
-                add = getattr(engagement_registry, "add_open_question", None)
-                if add is not None:
-                    await add(eng_id, number, mid, text=display, kind="anchor")
-            await _advance_first_contact()
             return web.json_response({
                 "ok": True, "outcome": "anchored",
                 "question_number": number, "message_id": mid,
             })
 
         # --- BUTTON ask ---------------------------------------------------
-        # Register the discrete-send INTENT (pending) at the ingress boundary so
-        # the relay consumes this ask's tool_use block (sealing narration) and a
-        # response-loss-after-post retry reattaches idempotently (§2(1)).
+        # Register the discrete-send INTENT (pending) at the ingress boundary for
+        # idempotent transport-retry REATTACHMENT (§2(1)). The REAL relay-invoked
+        # poster is installed just before we ARM (below) — posting is
+        # RELAY-DEFERRED (§2, review C1): the relay posts the keyboard at the
+        # ask's tool_use block, AFTER any preceding narration in the same frame.
+        intent_registered = False
         if driver is not None and projection_hash:
             res = driver.register_send_intent(
                 engagement_id=eng_id, request_id=request_id,
@@ -595,10 +640,12 @@ def _make_ask(
                         )
                         outcome = await BROKER.await_result(req)
                         return _ask_outcome_response(outcome, options)
+                else:
+                    intent_registered = True
 
         # INBOUND GATE (§4): an unseen operator message means "end your turn".
         if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
-            if projection_hash:
+            if intent_registered:
                 driver.cancel_send_intent(eng_id, request_id)  # tombstone
             return _refusal_response()
 
@@ -630,61 +677,68 @@ def _make_ask(
             if close is not None:
                 await close(eng_id, number)
 
-        # ARM the intent — the point of no return (validation passed + broker
-        # registered). Only armed intents are postable (§2(2)).
-        if driver is not None and projection_hash:
-            driver.arm_send_intent(eng_id, request_id)
-
-        await BROKER.ensure_posted(
-            req,
-            lambda: telegram_channel.post_options_keyboard(
-                engagement_id=eng_id, request_id=request_id,
-                question=display, options=options),
-            lambda mid: _ask_keyboard_finish(
-                telegram_channel, rec.topic_id, mid, display, options,
-                on_settle=_close_question),
-        )
-
-        mid = req.meta.get("message_id")
-
-        # GENERATION RE-CHECK (§4, Sol r1-4): an operator envelope that arrived
-        # between register and post supersedes this ask — settle it (broker
-        # cancel → finish hook renders the superseded copy + clears buttons),
-        # consuming no timeout budget. The awaited future returns immediately.
-        superseded = (
-            driver is not None and mid is not None
-            and driver.inbound_generation(eng_id) != gen_at_entry
-        )
-        if superseded:
-            BROKER.cancel(
-                namespace="engagement_ask", scope=eng_id, request_id=request_id,
-                reason="superseded_by_text",
+        # The DEFERRED poster (§2, review C1): the relay invokes this at the
+        # ask's tool_use block (or the slot/intent-timeout watcher posts it
+        # out-of-band). It posts the keyboard + wires the finish hook +
+        # message_id via ``ensure_posted`` (post-once contract preserved), then
+        # continues REACTIVELY off the posted message id: generation re-check,
+        # open_questions registration, first-contact advance. Registering the
+        # open question only AFTER a successful, non-superseded post means a
+        # crash before the relay reaches the block leaves NO dangling ledger
+        # entry — the broker TTL expires the ask instead.
+        async def _post_ask() -> int | None:
+            await BROKER.ensure_posted(
+                req,
+                lambda: telegram_channel.post_options_keyboard(
+                    engagement_id=eng_id, request_id=request_id,
+                    question=display, options=options),
+                lambda mid: _ask_keyboard_finish(
+                    telegram_channel, rec.topic_id, mid, display, options,
+                    on_settle=_close_question),
             )
-
-        # Record the out-of-band post (§2(5) debt so the relay consumes the ask
-        # block) or, on delivery failure, tombstone the intent.
-        if driver is not None and projection_hash:
-            if isinstance(mid, int):
-                await driver.mark_send_intent_posted(eng_id, request_id, mid)
-            else:
-                driver.cancel_send_intent(eng_id, request_id)
-
-        # Register the open question for boot reconciliation (unless already
-        # superseded, whose finish hook closes it).
-        if number is not None and isinstance(mid, int) and not superseded:
-            add = getattr(engagement_registry, "add_open_question", None)
-            if add is not None:
-                await add(eng_id, number, mid, text=display)
-
-        # W2/Sol B9 (Task 7): asking is an outbound agent action — advance ONLY
-        # after the keyboard actually posted (a raised/None post unregisters
-        # WITHOUT setting message_id → delivery_failed).
-        if isinstance(mid, int):
+            mid = req.meta.get("message_id")
+            if not isinstance(mid, int):
+                # ensure_posted unregistered the request (post raised/None) →
+                # await_result below returns delivery_failed.
+                return None
+            # GENERATION RE-CHECK (§4, Sol r1-4 — reserve→post→re-check, now
+            # relay-mediated): an operator envelope that arrived between reserve
+            # and post supersedes this ask — settle it (broker cancel → finish
+            # hook renders the superseded copy + clears buttons), consuming no
+            # timeout budget.
+            superseded = (
+                driver is not None
+                and driver.inbound_generation(eng_id) != gen_at_entry
+            )
+            if superseded:
+                BROKER.cancel(
+                    namespace="engagement_ask", scope=eng_id,
+                    request_id=request_id, reason="superseded_by_text",
+                )
+            elif number is not None:
+                add = getattr(engagement_registry, "add_open_question", None)
+                if add is not None:
+                    await add(eng_id, number, mid, text=display)
+            # W2/Sol B9 (Task 7): asking is an outbound agent action — advance
+            # only after the keyboard actually posted.
             await _advance_first_contact()
+            return mid
 
-        # Shielded future: a CancelledError here (transport disconnect)
-        # propagates to OUR caller without cancelling the broker's shared
-        # future -- the request stays live for a same-id reattach.
+        if intent_registered:
+            # Install the real poster and ARM — the point of no return
+            # (validation passed + broker registered). Only armed intents are
+            # postable (§2(2)); the relay posts at the ask's tool_use block.
+            driver.set_send_intent_poster(eng_id, request_id, _post_ask)
+            driver.arm_send_intent(eng_id, request_id)
+        else:
+            # EAGER fallback (no live sequencer / degraded boot): post now.
+            await _post_ask()
+
+        # Shielded future (in await_result): a CancelledError here (transport
+        # disconnect) propagates to OUR caller without cancelling the broker's
+        # shared future -- the request stays live for a same-id reattach. The
+        # future is decoupled from posting (resolved by the tap finish hook), so
+        # nothing here needs the posted message id synchronously.
         outcome = await BROKER.await_result(req)
         return _ask_outcome_response(outcome, options)
 
@@ -692,10 +746,12 @@ def _make_ask(
 
 
 async def _noop_poster() -> int | None:
-    """Placeholder poster for a discrete-send intent whose actual post is done
-    eagerly by the ask/reply handler (out-of-band) and recorded via
-    ``mark_send_intent_posted``. The relay never invokes it — the intent is a
-    consumption debt by the time a content block matches."""
+    """Placeholder poster used ONLY between an intent's early registration (for
+    idempotent transport-retry reattach detection) and the point where the ask/
+    reply handler installs the REAL relay-invoked poster via
+    ``set_send_intent_poster`` — always before ARMING (§2(2), review C1). The
+    relay never invokes this: a pending intent is never postable, and by arm
+    time the real poster is in place."""
     return None
 
 

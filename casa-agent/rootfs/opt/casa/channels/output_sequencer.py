@@ -201,6 +201,15 @@ class IntentRegistry:
         self._by_request[request_id] = intent
         return intent, True
 
+    def set_poster(self, request_id: str, poster: Any) -> SendIntent | None:
+        """Replace the intent's poster (T3: the ingress registers early for
+        idempotent reattach detection, then installs the REAL relay-invoked
+        poster before arming). No-op if the intent is gone."""
+        intent = self._by_request.get(request_id)
+        if intent is not None:
+            intent.poster = poster
+        return intent
+
     def arm(self, request_id: str) -> SendIntent | None:
         intent = self._by_request.get(request_id)
         if intent is not None and intent.state == "pending":
@@ -448,6 +457,13 @@ class OutputSequencer:
             projection_hash=projection_hash, poster=poster,
         )
 
+    def set_intent_poster(self, request_id: str, poster: Any) -> SendIntent | None:
+        """Install the REAL relay-invoked poster on a registered intent (§2(3),
+        T3). The ask/reply ingress registers the intent early (for reattach
+        idempotency), then sets this poster and ARMS — the relay invokes it when
+        it reaches the intent's tool_use block."""
+        return self.registry.set_poster(request_id, poster)
+
     def arm_intent(self, request_id: str) -> SendIntent | None:
         """Move a pending intent to ``armed`` — the point of no return (§2(2))."""
         intent = self.registry.arm(request_id)
@@ -498,8 +514,14 @@ class OutputSequencer:
             return intent
 
     def prune_turn(self) -> None:
-        """§2(6): prune intents/tombstones/outcomes at turn end."""
+        """§2(6): prune intents/tombstones/outcomes at turn end.
+
+        Also CLEARS the causal-handoff one-shot reply anchor (§4): it "expires at
+        turn end". A set-but-unconsumed anchor (a button answer that continued
+        the turn but produced no output) must NOT leak into the next turn and
+        mis-thread its first message."""
         self.registry.prune()
+        self._turn_reply_to = None
 
     # -- discrete posting driven by the relay at a content-block ------------
 

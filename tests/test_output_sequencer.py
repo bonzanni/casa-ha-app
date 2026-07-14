@@ -426,6 +426,24 @@ async def test_consume_turn_reply_to_is_one_shot():
     assert seq.consume_turn_reply_to() is None      # cleared
 
 
+async def test_prune_turn_clears_unconsumed_reply_anchor(caplog):
+    """Review M1: the causal-handoff one-shot anchor "expires at turn end". A
+    button answer that continued the turn but produced NO output leaves the
+    anchor set; ``prune_turn`` (the turn-finalize path) MUST clear it so it does
+    not leak into the next turn and mis-thread that turn's first message."""
+    rec = _ThreadRecorder()
+    clock = Clock()
+    seq = _make_seq(rec, clock)
+    # Anchor set (button answer), but the turn produced no output.
+    seq.set_turn_reply_to(4242)
+    # Turn ends → prune. The anchor must NOT survive.
+    seq.prune_turn()
+    assert seq.consume_turn_reply_to() is None
+    # Next turn's FIRST message is UNTHREADED (2-arg send, no reply_to target).
+    await seq.open_narration("next turn line one")
+    assert rec.sends[0] == (42, "next turn line one", None)
+
+
 async def test_no_reply_target_keeps_two_arg_send():
     # With no inbound target, open_narration uses the 2-arg send (back-compat
     # with the T1 Recorder that has no reply_to parameter).

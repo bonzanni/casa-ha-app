@@ -1000,9 +1000,17 @@ class ClaudeCodeDriver(DriverProtocol):
         # question visibly open with a stale keyboard nobody can settle. Any
         # open_questions entry with no LIVE broker record settles here (expired
         # copy, keyboard cleared) while next_question_number is preserved.
-        if getattr(engagement, "open_questions", ()):
+        # Snapshot the open_questions SYNCHRONOUSLY here (attach time): every
+        # entry on disk is by definition PRIOR-PROCESS (the in-memory broker
+        # starts empty), so the reconcile settles this exact snapshot
+        # unconditionally. Snapshotting at schedule time (not inside the task)
+        # keeps a fresh same-process ask — which registers a NEW numbered entry
+        # concurrently — out of the settle set (review I1: a live ask must not
+        # suppress settling genuinely-stale prior-process keyboards).
+        attach_open_qs = list(getattr(engagement, "open_questions", ()) or ())
+        if attach_open_qs:
             tasks.append(asyncio.create_task(
-                self.reconcile_open_questions(engagement)))
+                self.reconcile_open_questions(engagement, attach_open_qs)))
 
         self._tasks[engagement.id] = tasks
 
@@ -1105,6 +1113,15 @@ class ClaudeCodeDriver(DriverProtocol):
             projection_hash=projection_hash, poster=poster,
         )
 
+    def set_send_intent_poster(
+        self, engagement_id: str, request_id: str, poster: Any,
+    ) -> Any:
+        """Install the REAL relay-invoked poster on a registered intent (§2(3),
+        T3). The ask/reply ingress registers early (reattach idempotency), then
+        sets the poster and arms; the relay posts it at its tool_use block."""
+        seq = self._sequencers.get(engagement_id)
+        return seq.set_intent_poster(request_id, poster) if seq is not None else None
+
     def arm_send_intent(self, engagement_id: str, request_id: str) -> Any:
         """Move a pending intent to ``armed`` — the point of no return (§2(2))."""
         seq = self._sequencers.get(engagement_id)
@@ -1170,31 +1187,35 @@ class ClaudeCodeDriver(DriverProtocol):
         return n
 
     async def reconcile_open_questions(
-        self, engagement: EngagementRecord,
+        self, engagement: EngagementRecord, snapshot: list[dict] | None = None,
     ) -> None:
-        """§4 boot reconciliation: settle every open question with no live
-        broker record (at boot the in-memory broker is empty, so none survive).
-        Each stale keyboard/anchor is edited to the expired copy with the
-        keyboard cleared, then removed from the ledger; ``next_question_number``
-        is NEVER rewound. Tested for button, free-text, and the commit-then-kill
-        window."""
+        """§4 boot reconciliation: settle the ATTACH-TIME snapshot of open
+        questions. Each stale keyboard/anchor is edited to the expired copy with
+        the keyboard cleared, then removed from the ledger;
+        ``next_question_number`` is NEVER rewound. Tested for button, free-text,
+        and the commit-then-kill window.
+
+        Review I1: the entries reconciled are the attach-time snapshot, which is
+        by definition PRIOR-PROCESS (the in-memory broker starts empty at boot,
+        so no snapshot entry can have a live broker record). We therefore settle
+        them UNCONDITIONALLY — no blanket "any live ask ⇒ skip all" gate, which
+        would let a fresh same-process ask (registered concurrently with this
+        task) suppress settling genuinely-stale prior-process keyboards. A fresh
+        ask allocates a NEW question number and a NEW ledger entry not present in
+        the snapshot, so it is never touched here. Callers that omit ``snapshot``
+        (legacy / direct invocation) fall back to a fresh read of the record."""
         rec = engagement
-        open_qs = list(getattr(rec, "open_questions", ()) or ())
+        open_qs = (
+            list(snapshot) if snapshot is not None
+            else list(getattr(rec, "open_questions", ()) or ())
+        )
         if not open_qs:
             return
-        from verdict_broker import BROKER
 
-        live = set(BROKER.pending(namespace="engagement_ask", scope=rec.id))
         close = getattr(self._registry, "close_open_question", None)
         for q in open_qs:
             n = q.get("n")
             mid = q.get("tg_message_id")
-            # open_questions carries no request_id; the only live records are
-            # the ones the CURRENT process registered (empty at boot). If ANY
-            # ask is live for this scope we conservatively leave entries alone
-            # (a same-process reconcile mid-run must not settle a live ask).
-            if live:
-                continue
             if mid is not None and self._edit_topic_message is not None:
                 display = q.get("text") or (f"Q{n}:" if n is not None else "")
                 text = f"{display}{_OPEN_Q_EXPIRED_SUFFIX}"

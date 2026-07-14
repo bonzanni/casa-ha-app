@@ -1808,6 +1808,63 @@ class TestAskLifecycleSeams:
         assert reg.open_question_numbers(rec.id) == []
         assert rec.next_question_number == 3
 
+    async def test_reconcile_settles_stale_despite_concurrent_live_ask(
+        self, tmp_path, monkeypatch,
+    ):
+        """Review I1: reconcile settles the ATTACH-TIME snapshot (prior-process)
+        UNCONDITIONALLY. A fresh live in-scope ask registered concurrently (a
+        NEW numbered entry + a live broker record) must NOT suppress settling the
+        genuinely-stale prior-process keyboard."""
+        import verdict_broker
+        from verdict_broker import VerdictBroker
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from engagement_registry import EngagementRegistry
+
+        fresh = VerdictBroker()
+        monkeypatch.setattr(verdict_broker, "BROKER", fresh)
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            "executor", "configurator", "claude_code", "t", {}, topic_id=999)
+        # A PRIOR-PROCESS stale question (the attach-time snapshot).
+        n1 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n1, 7001, text="Q1: Proceed?",
+                                    kind="button")
+        snapshot = list(rec.open_questions)
+
+        # A fresh SAME-PROCESS ask registers CONCURRENTLY: a new numbered ledger
+        # entry AND a live broker record for the same scope.
+        n2 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n2, 8002, text="Q2: Which region?",
+                                    kind="button")
+        live_req, _created = fresh.register(
+            namespace="engagement_ask", scope=rec.id, request_id="live-rid",
+            timeout_s=300.0)
+
+        edits: list = []
+
+        async def _edit(topic_id, message_id, text, *, clear_keyboard=False):
+            edits.append((message_id, text, clear_keyboard))
+            return True
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="http://x",
+            edit_topic_message=_edit, registry=reg,
+        )
+        # Reconcile the attach-time snapshot (the stale entry only).
+        await drv.reconcile_open_questions(rec, snapshot)
+
+        # The stale entry SETTLED despite the live ask.
+        assert edits == [(7001, "Q1: Proceed?\n⌛ expired — answer by text below",
+                          True)]
+        # The fresh ask's entry is untouched and its broker request stays live.
+        assert reg.open_question_numbers(rec.id) == [n2]
+        assert fresh.pending(namespace="engagement_ask", scope=rec.id) == [
+            "live-rid"]
+        assert not live_req._future.done()
+
     async def test_set_reply_anchor_sets_sequencer_one_shot(self, tmp_path):
         from drivers.claude_code_driver import ClaudeCodeDriver
 
