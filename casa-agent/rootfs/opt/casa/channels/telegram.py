@@ -37,6 +37,19 @@ from telegram.ext import (
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import Channel
+# v0.79.0 (§2 Primitive A): the per-topic OUTPUT SEQUENCER + relay-mediated
+# discrete-posting intent registry. Implemented in the sibling module and
+# RE-EXPORTED here so ``channels.telegram.OutputSequencer`` resolves per the
+# design's "File: channels/telegram.py" reference; the class is deliberately
+# PTB-free (injected send/edit primitives) so it stays unit-testable in
+# isolation. The live per-engagement instances are owned by the claude_code
+# driver (which holds the topic send/edit primitives + the relay); the discrete
+# ingresses reach them through that driver's intent-registration API.
+from channels.output_sequencer import (  # noqa: F401 — re-export
+    IntentRegistry,
+    OutputSequencer,
+    projection_hash as discrete_projection_hash,
+)
 from media_policies import MEDIA_POLICIES
 from channels.telegram_supervisor import ReconnectSupervisor
 from log_cid import cid_var, new_cid

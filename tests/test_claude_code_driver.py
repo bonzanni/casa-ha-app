@@ -308,10 +308,11 @@ class TestNoRemoteControlNotices:
         with caplog.at_level(logging.DEBUG, logger="subprocess_cli"):
             drv._spawn_background_tasks(rec)
             tasks = drv._tasks[rec.id]
-            # respawn poller + session-id capture + always-on topic relay +
-            # DEBUG log relay; no URL capture. (v0.75.0 added the always-on
-            # topic relay, so DEBUG-enabled is now 4 tasks not 3.)
-            assert len(tasks) == 4
+            # respawn poller + sequencer watcher + session-id capture +
+            # always-on topic relay + DEBUG log relay; no URL capture.
+            # (v0.75.0 added the always-on topic relay; v0.79.0 added the
+            # per-engagement output-sequencer watcher, so DEBUG-enabled is 5.)
+            assert len(tasks) == 5
             await asyncio.sleep(0.3)
             for t in tasks:
                 t.cancel()
@@ -341,11 +342,13 @@ class TestRelaySpawnGate:
         try:
             drv._spawn_background_tasks(rec)
             tasks = drv._tasks[rec.id]
-            # respawn poller + session-id capture + always-on topic relay.
-            # The DEBUG raw-log relay is skipped; the topic relay is NOT.
-            assert len(tasks) == 3
+            # respawn poller + sequencer watcher + session-id capture +
+            # always-on topic relay. The DEBUG raw-log relay is skipped; the
+            # topic relay + sequencer watcher are NOT (v0.79.0: 4 tasks).
+            assert len(tasks) == 4
             names = [t.get_name() for t in tasks]
             assert any(n.startswith("topic_relay:") for n in names), names
+            assert any(n.startswith("seq_watcher:") for n in names), names
         finally:
             lg.setLevel(old_level)
             for t in tasks:

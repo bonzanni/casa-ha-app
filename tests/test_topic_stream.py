@@ -13,12 +13,14 @@ import json
 import logging
 import os
 
+from channels.output_sequencer import REPLY_TOOL, projection_hash
 from drivers.topic_stream import (
     SEGMENT_GAP,
     StreamCursor,
     TopicStreamRelay,
     extract_text_blocks,
     is_mutating_tooluse,
+    iter_content_blocks,
     iter_log_segments,
     parse_frame,
 )
@@ -39,6 +41,7 @@ class Recorder:
         self._next_id = 1
         self.send_fails = 0  # first N send() calls raise
         self.edit_fails = 0  # first N edit() calls return False
+        self.fail_edit_texts: dict[str, int] = {}  # per-text edit-fail counts
 
     async def send(self, topic_id: int, text: str) -> int | None:
         if self.send_fails > 0:
@@ -50,6 +53,9 @@ class Recorder:
         return mid
 
     async def edit(self, topic_id: int, message_id: int, text: str) -> bool:
+        if self.fail_edit_texts.get(text, 0) > 0:
+            self.fail_edit_texts[text] -= 1
+            return False
         if self.edit_fails > 0:
             self.edit_fails -= 1
             return False
@@ -129,6 +135,8 @@ def _ident(path) -> list[int]:
 
 
 def _make_relay(log_dir, cursor_path, rec, events, reply_texts=None, **kw):
+    kw.setdefault("edit_throttle", 0.0)
+    kw.setdefault("_sleep", _no_sleep)
     return TopicStreamRelay(
         engagement_id="eng-1",
         topic_id=42,
@@ -139,8 +147,6 @@ def _make_relay(log_dir, cursor_path, rec, events, reply_texts=None, **kw):
         delete_message=rec.delete,
         on_turn_event=lambda kind, payload: events.append((kind, payload)),
         reply_texts=reply_texts or (lambda: set()),
-        edit_throttle=0.0,
-        _sleep=_no_sleep,
         **kw,
     )
 
@@ -279,19 +285,20 @@ async def test_open_midturn_checkpoint_tracks_message_ids(tmp_path):
     assert StreamCursor.load(cursor).message_ids == [1, 2]
 
 
-async def test_finalize_edits_only_final_chunk_after_rollover(tmp_path):
+async def test_rollover_final_chunk_posted_never_whole_turn(tmp_path):
     rec, events = Recorder(), []
     _write_current(tmp_path, [_init(), _text("m" * 5000), _result()])
     cursor = tmp_path / ".stream_cursor.json"
     await _make_relay(tmp_path, cursor, rec, events).run()
 
-    # The final edit targets the LAST message with its OWN chunk, never the
-    # whole 5000-char turn text.
-    assert rec.edits, "expected a finalize edit"
-    last_topic, last_id, last_text = rec.edits[-1]
-    assert last_id == 2  # the second (last) message, not the first
-    assert len(last_text) <= 3900
-    assert last_text != "m" * 5000
+    # v0.79.0: rollover posts the final chunk as its OWN message (a send); the
+    # closing finalize edit is a no-op (the sequencer's F1 no-op gate skips it,
+    # since the send already cached that exact text). No message ever carries
+    # the whole 5000-char turn.
+    assert len(rec.sends) == 2
+    assert rec.sends[-1][1] == "m" * 1100  # last message = final chunk
+    assert all(len(t) <= 3900 for _tp, t in rec.sends)
+    assert rec.edits == []  # nothing to edit — the chunk was already posted
 
 
 async def test_finalize_persists_closed_turn_checkpoint(tmp_path):
@@ -310,16 +317,25 @@ async def test_finalize_edit_retries_before_closing_checkpoint(tmp_path):
     """B2 (Sol r1): the finalize edit must honor the at-least-once contract —
     a transient Telegram failure retries via the bounded backoff and the
     fragment IS delivered before the closed-turn checkpoint advances past
-    ``result``. The streaming path for a single text block is a SEND, so
-    ``edit_fails`` bites only the finalize edit here."""
+    ``result``.
+
+    v0.79.0: the closing edit is a real wire edit ONLY when the last streaming
+    edit was THROTTLED (held in memory, not posted). We force that with a
+    frozen clock + a large throttle window: "a"→send, "ab"→edit (posts, arms
+    the window), "abc"→edit (throttled, held); finalize flushes "abc" — the
+    edit that ``edit_fails`` bites."""
     rec, events = Recorder(), []
-    rec.edit_fails = 2  # finalize's closing edit fails twice, then succeeds
-    offs = _write_current(tmp_path, [_init(), _text("hello"), _result()])
+    rec.fail_edit_texts = {"abc": 2}  # ONLY the flushed finalize edit fails
+    offs = _write_current(
+        tmp_path, [_init(), _text("a"), _text("b"), _text("c"), _result()])
     cursor = tmp_path / ".stream_cursor.json"
-    await _make_relay(tmp_path, cursor, rec, events).run()
+    await _make_relay(
+        tmp_path, cursor, rec, events,
+        edit_throttle=100.0, _now=lambda: 1000.0,
+    ).run()
 
     # The final fragment landed (retried, not silently dropped).
-    assert rec.edits and rec.edits[-1][2] == "hello"
+    assert rec.edits and rec.edits[-1][2] == "abc"
     cur = StreamCursor.load(cursor)
     # Checkpoint closed ONLY after the edit succeeded — normal (non-drop) close.
     assert cur.message_ids == []
@@ -332,11 +348,15 @@ async def test_finalize_persistent_edit_failure_drops_once(tmp_path, caplog):
     the documented drop path — warn ONCE, checkpoint closes via ``dropped_through``
     (no silent loss), and there is no infinite retry loop."""
     rec, events = Recorder(), []
-    rec.edit_fails = 10_000  # finalize edit never succeeds
-    offs = _write_current(tmp_path, [_init(), _text("hello"), _result()])
+    rec.fail_edit_texts = {"abc": 10_000}  # the flushed finalize edit never lands
+    offs = _write_current(
+        tmp_path, [_init(), _text("a"), _text("b"), _text("c"), _result()])
     cursor = tmp_path / ".stream_cursor.json"
     with caplog.at_level(logging.WARNING):
-        await _make_relay(tmp_path, cursor, rec, events).run()
+        await _make_relay(
+            tmp_path, cursor, rec, events,
+            edit_throttle=100.0, _now=lambda: 1000.0,
+        ).run()
 
     cur = StreamCursor.load(cursor)
     # Dropped through the terminal coordinate (not silently advanced).
@@ -348,14 +368,16 @@ async def test_finalize_persistent_edit_failure_drops_once(tmp_path, caplog):
     assert len(drop_warnings) == 1  # exactly one WARNING
 
 
-async def test_restart_after_successful_dedup_no_ghost_edit(tmp_path):
-    # Turn 1: single message whose whole text == a reply → de-dup deletes it.
+async def test_restart_after_turn_no_delete_clean_second_turn(tmp_path):
+    # v0.79.0 (§2(d)): the reply de-dup DELETE is REMOVED — a duplicate is
+    # preferred over erasing history. Turn 1's message is KEPT.
     rec, events = Recorder(), []
     offs = _write_current(tmp_path, [_init(), _text("ping"), _result()])
     cursor = tmp_path / ".stream_cursor.json"
     reply = lambda: {"ping"}
     await _make_relay(tmp_path, cursor, rec, events, reply_texts=reply).run()
-    assert rec.deletes == [(42, 1)]  # sole message deleted
+    assert rec.deletes == []  # NEVER deleted (was [(42, 1)] pre-v0.79.0)
+    assert rec.sends == [(42, "ping")]  # message kept
     assert StreamCursor.load(cursor).message_ids == []
 
     # Turn 2 appended; a NEW relay resumes from the closed checkpoint.
@@ -366,8 +388,8 @@ async def test_restart_after_successful_dedup_no_ghost_edit(tmp_path):
     rec2._next_id = 100  # turn 2's new message gets a fresh, distinct id
     await _make_relay(tmp_path, cursor, rec2, events2).run()
 
-    # ZERO edits against the deleted id (1); the second turn streams cleanly
-    # into its OWN new message (id 100).
+    # The second turn streams cleanly into its OWN new message (id 100), never
+    # touching turn 1's message id (1).
     assert all(mid != 1 for _t, mid, _x in rec2.edits)
     assert rec2.sends and rec2.sends[0][1] == "second turn"
     assert StreamCursor.load(cursor).message_ids == []
@@ -433,9 +455,13 @@ async def test_recovery_replays_turn_edits_last_id(tmp_path):
 
     await _make_relay(tmp_path, cur_path, rec, events).run()
 
-    assert rec.sends == []  # no new message opened
-    assert rec.edits, "expected a reconcile / final edit"
-    assert all(mid == 7 for _t, mid, _x in rec.edits)  # only the last id
+    # v0.79.0 (§2 sealing across restart, option B): the checkpoint-named
+    # message is CONSERVATIVELY SEALED on recovery, so the reconciled state
+    # posts as a NEW closing message (a send) rather than editing id 7. The
+    # old message is never touched (accepting the documented duplicate risk).
+    assert rec.sends == [(42, "hello world")]
+    assert rec.edits == []
+    assert all(mid != 7 for _t, mid, _x in rec.edits)
 
 
 async def test_recovery_dropped_through_is_honored(tmp_path):
@@ -494,8 +520,10 @@ async def test_recovery_replays_turn_edits_last_id_after_more_live_text(tmp_path
 
     await _make_relay(tmp_path, cur_path, rec, events).run()
 
-    assert rec.sends == []
-    assert rec.edits[-1] == (42, 7, "hello more")
+    # Recovery seals id 7 → the reconciled "hello" reposts as a NEW message,
+    # then the LIVE " more" grows THAT new message (not the sealed id 7).
+    assert rec.sends == [(42, "hello")]
+    assert rec.edits[-1] == (42, 1, "hello more")
 
 
 # ---------------------------------------------------------------------------
@@ -568,9 +596,12 @@ async def test_rollover_plus_restart_recovers_editing_final_id(tmp_path):
 
     await _make_relay(tmp_path, cur_path, rec, events).run()
 
-    assert rec.sends == []  # never re-posts 7
-    assert rec.edits, "expected edits to the final id"
-    assert all(mid == 9 for _t, mid, _x in rec.edits)  # EDITS 9, the final id
+    # Recovery seals the final id (9) → the final chunk reposts as a NEW
+    # message (never editing a message with content below it). Only the final
+    # ≤3900 chunk is reposted, never the whole 5000-char turn.
+    assert len(rec.sends) == 1
+    assert rec.sends[0][1] == big[3900:]
+    assert rec.edits == []
 
 
 async def test_invisible_frames_checkpoint_and_no_spawn_replay(tmp_path):
@@ -613,9 +644,10 @@ async def test_recovery_suppresses_inturn_checkpointed_spawn_side_effect(tmp_pat
 
     await _make_relay(tmp_path, cur_path, rec, events).run()
 
-    # Text state rebuilt → reconcile edits the last id with the full text.
-    assert rec.sends == []
-    assert rec.edits[-1] == (42, 5, "alpha beta")
+    # Text state rebuilt → reconcile CONSERVATIVELY SEALS id 5 and reposts the
+    # full text as a NEW message (§2 sealing across restart).
+    assert rec.sends == [(42, "alpha beta")]
+    assert rec.edits == []
     # NO side effects re-fired for the in-turn checkpointed frames.
     assert [k for k, _p in events].count("spawn") == 0
     assert [k for k, _p in events].count("mutating_tool") == 0
@@ -641,14 +673,17 @@ async def test_segment_gap_warns_and_resumes(tmp_path, caplog):
     assert StreamCursor.load(cur_path).current["offset"] == offs[-1]
 
 
-async def test_reply_dedup_deletes_identical_final(tmp_path):
+async def test_reply_dedup_never_deletes_keeps_message(tmp_path):
+    # v0.79.0 (§2(d)): de-dup DELETE removed — the streamed message is KEPT
+    # even when byte-identical to a reply already recorded (no deletes ever).
     rec, events = Recorder(), []
     _write_current(tmp_path, [_init(), _text("the answer is 42"), _result()])
     cur_path = tmp_path / ".stream_cursor.json"
     reply = lambda: {"the answer is 42"}
     await _make_relay(tmp_path, cur_path, rec, events, reply_texts=reply).run()
 
-    assert rec.deletes == [(42, 1)]  # identical final text deleted
+    assert rec.deletes == []  # never deleted
+    assert rec.sends == [(42, "the answer is 42")]  # message kept
 
 
 async def test_spawn_frame_emits_event(tmp_path):
@@ -658,6 +693,205 @@ async def test_spawn_frame_emits_event(tmp_path):
     await _make_relay(tmp_path, cur_path, rec, events).run()
 
     assert ("spawn", {"epoch": 3}) in events
+
+
+# ---------------------------------------------------------------------------
+# v0.79.0 (§2): relay-mediated discrete posting + rollover-on-interleave +
+# crash/seal invariant.
+# ---------------------------------------------------------------------------
+
+
+def _reply_input(text: str) -> dict:
+    return {"chat_id": "x", "text": text}
+
+
+def _reply_tool_frame(text: str) -> dict:
+    return {
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "tool_use", "name": REPLY_TOOL, "input": _reply_input(text)},
+        ]},
+    }
+
+
+def _mixed_frame(before: str, reply_text: str, after: str) -> dict:
+    return {
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "text", "text": before},
+            {"type": "tool_use", "name": REPLY_TOOL, "input": _reply_input(reply_text)},
+            {"type": "text", "text": after},
+        ]},
+    }
+
+
+def _arm_reply(relay, rec, text: str, request_id: str = "r1") -> None:
+    """Register + arm a reply SEND INTENT on the relay's sequencer whose poster
+    posts a distinguishable ``[reply]<text>`` marker via ``rec.send``."""
+    h = projection_hash(REPLY_TOOL, {"text": text})
+
+    async def poster():
+        return await rec.send(42, f"[reply]{text}")
+
+    relay.sequencer.register_intent(
+        request_id=request_id, tool_name=REPLY_TOOL, projection_hash=h,
+        poster=poster,
+    )
+    relay.sequencer.arm_intent(request_id)
+
+
+def test_iter_content_blocks_preserves_order():
+    blocks = iter_content_blocks(_mixed_frame("pre", "R", "post"))
+    assert blocks == [
+        ("text", "pre"),
+        ("tool_use", REPLY_TOOL, {"chat_id": "x", "text": "R"}),
+        ("text", "post"),
+    ]
+
+
+async def test_multi_block_frame_posts_in_block_order(tmp_path):
+    """§2(3): text + a discrete post + text in ONE frame post in block order —
+    the armed reply intent posts at ITS block, between the two narration texts."""
+    rec, events = Recorder(), []
+    _write_current(tmp_path, [_init(), _mixed_frame("before ", "R", "after"),
+                              _result()])
+    cursor = tmp_path / ".stream_cursor.json"
+    relay = _make_relay(tmp_path, cursor, rec, events)
+    _arm_reply(relay, rec, "R")
+    await relay.run()
+
+    # before → discrete reply → after, strictly in block order.
+    assert [t for _tp, t in rec.sends] == ["before ", "[reply]R", "after"]
+
+
+async def test_discrete_post_seals_narration_rollover_on_interleave(tmp_path):
+    """§2: narration seals when anything else posts below it — a mid-turn
+    discrete post forces the next narration text into a NEW message rather than
+    editing the message now sitting above the discrete post."""
+    rec, events = Recorder(), []
+    _write_current(tmp_path, [
+        _init(), _text("part one"), _reply_tool_frame("R"), _text("part two"),
+        _result(),
+    ])
+    cursor = tmp_path / ".stream_cursor.json"
+    relay = _make_relay(tmp_path, cursor, rec, events)
+    _arm_reply(relay, rec, "R")
+    await relay.run()
+
+    # msg1 "part one"; discrete "[reply]R" below it seals it; "part two" opens
+    # a NEW message (never edits the sealed "part one").
+    assert [t for _tp, t in rec.sends] == ["part one", "[reply]R", "part two"]
+    assert all(text == "part one" or "part" not in text
+               for _tp, _mid, text in rec.edits)  # no edit merged the two
+
+
+async def test_no_discrete_hold_when_registry_empty(tmp_path):
+    """T1-stubbed safety: an ask/reply tool_use frame with NO registered intent
+    resolves instantly (no 2s slot stall) — the machinery is dormant until an
+    ingress registers something."""
+    import time as _time
+    rec, events = Recorder(), []
+    _write_current(tmp_path, [_init(), _reply_tool_frame("R"), _result()])
+    cursor = tmp_path / ".stream_cursor.json"
+    t0 = _time.monotonic()
+    await _make_relay(tmp_path, cursor, rec, events).run()
+    assert _time.monotonic() - t0 < 1.0  # never held for the 2s slot
+    assert rec.sends == []  # nothing to post (no intent)
+
+
+# -- the four crash / seal tests (§2, Sol r1-2): no post-recovery edit ever
+#    lands on a message with anything below it. --------------------------------
+
+
+async def test_crash_recovery_reconcile_seals_never_edits_prior(tmp_path):
+    """recovery-reconcile: an OPEN turn (message_ids=[7], no result) recovered
+    after a crash — reconcile conservatively SEALS id 7 and reposts as a new
+    message. NO edit lands on id 7."""
+    rec, events = Recorder(), []
+    offs = _write_current(tmp_path, [_init(), _text("hello world")])
+    cur_path = tmp_path / ".stream_cursor.json"
+    seg = _ident(os.path.join(str(tmp_path), "current"))
+    StreamCursor(
+        turn_start={"segment": seg, "offset": 0},
+        current={"segment": seg, "offset": offs[1]},
+        message_ids=[7], last_posted_len=len("hello world"),
+    ).save(cur_path)
+
+    await _make_relay(tmp_path, cur_path, rec, events).run()
+
+    assert all(mid != 7 for _t, mid, _x in rec.edits)  # never edits below-content id
+    assert rec.sends == [(42, "hello world")]  # reposted as a NEW message
+
+
+async def test_crash_result_finalize_seals_never_edits_prior(tmp_path):
+    """result-finalize: the result frame lands live on recovery; the finalize
+    edit routes through edit_narration_if_latest → SEALED → new closing
+    message. NO edit lands on id 7."""
+    rec, events = Recorder(), []
+    offs = _write_current(tmp_path, [_init(), _text("done text"), _result()])
+    cur_path = tmp_path / ".stream_cursor.json"
+    seg = _ident(os.path.join(str(tmp_path), "current"))
+    StreamCursor(
+        turn_start={"segment": seg, "offset": 0},
+        current={"segment": seg, "offset": offs[1]},  # through the text frame
+        message_ids=[7], last_posted_len=len("done text"),
+    ).save(cur_path)
+
+    await _make_relay(tmp_path, cur_path, rec, events).run()
+
+    assert all(mid != 7 for _t, mid, _x in rec.edits)
+    assert rec.sends == [(42, "done text")]
+    assert StreamCursor.load(cur_path).message_ids == []  # closed
+
+
+async def test_crash_interleave_before_checkpoint_no_edit_below(tmp_path):
+    """interleave-before-checkpoint: a discrete-posting tool_use frame sits
+    BELOW the narration and BEFORE the checkpoint boundary (replayed on
+    recovery). No intent survives the crash, so nothing re-posts, and the
+    reconcile seals id 7 — no edit lands on a message with content below it."""
+    rec, events = Recorder(), []
+    offs = _write_current(tmp_path, [
+        _init(), _text("narr"), _reply_tool_frame("R"),
+    ])
+    cur_path = tmp_path / ".stream_cursor.json"
+    seg = _ident(os.path.join(str(tmp_path), "current"))
+    # current is PAST the interleaved reply frame — everything replayed.
+    StreamCursor(
+        turn_start={"segment": seg, "offset": 0},
+        current={"segment": seg, "offset": offs[-1]},
+        message_ids=[7], last_posted_len=len("narr"),
+    ).save(cur_path)
+
+    await _make_relay(tmp_path, cur_path, rec, events).run()
+
+    assert all(mid != 7 for _t, mid, _x in rec.edits)
+    assert rec.sends == [(42, "narr")]  # sealed → reposted new; no re-fired discrete
+
+
+async def test_crash_interleave_after_checkpoint_no_edit_below(tmp_path):
+    """interleave-after-checkpoint: the discrete-posting tool_use frame sits
+    AFTER the checkpoint (live on recovery). Going live triggers reconcile
+    (seals id 7) BEFORE the live reply frame is handled — no edit lands on a
+    message with content below it."""
+    rec, events = Recorder(), []
+    offs = _write_current(tmp_path, [
+        _init(), _text("narr"), _reply_tool_frame("R"), _result(),
+    ])
+    cur_path = tmp_path / ".stream_cursor.json"
+    seg = _ident(os.path.join(str(tmp_path), "current"))
+    # current is through the TEXT frame only; the reply frame is live.
+    StreamCursor(
+        turn_start={"segment": seg, "offset": 0},
+        current={"segment": seg, "offset": offs[1]},
+        message_ids=[7], last_posted_len=len("narr"),
+    ).save(cur_path)
+
+    await _make_relay(tmp_path, cur_path, rec, events).run()
+
+    assert all(mid != 7 for _t, mid, _x in rec.edits)
+    # id 7 sealed → "narr" reposted as a new message; the live reply frame has
+    # no surviving intent (in-memory), so it resolves to no_match (nothing new).
+    assert rec.sends == [(42, "narr")]
 
 
 # ---------------------------------------------------------------------------

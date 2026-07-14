@@ -194,6 +194,16 @@ class ClaudeCodeDriver(DriverProtocol):
         # instead of permanently skipping both.
         self._violation_notified: set[str] = set()
         self._violation_flagged: set[str] = set()
+        # v0.79.0 (§2 Primitive A): ONE per-engagement OUTPUT SEQUENCER (the
+        # single serialized topic writer that owns the high-water mark, the
+        # no-op edit gate and the relay-mediated discrete-posting intent
+        # registry). Shared between this engagement's topic-stream relay and the
+        # discrete ingresses — the ask/reply/permission/emit_completion ingress
+        # adapters (T2/T3) reach it through this driver's intent-registration
+        # API (register_send_intent / arm_send_intent / cancel_send_intent),
+        # resolving the driver via ``agent.active_claude_code_driver`` exactly
+        # as tools.emit_completion already does.
+        self._sequencers: dict[str, "OutputSequencer"] = {}
 
     # -- DriverProtocol ---------------------------------------------------
 
@@ -377,6 +387,8 @@ class ClaudeCodeDriver(DriverProtocol):
         self._epoch_pending.pop(engagement.id, None)
         self._violation_notified.discard(engagement.id)
         self._violation_flagged.discard(engagement.id)
+        # v0.79.0 (§2): drop the sequencer (its watcher task is cancelled above).
+        self._sequencers.pop(engagement.id, None)
 
         async with s6_rc._compile_lock:
             # Stop is tolerant of "already down" — log and continue.
@@ -525,9 +537,16 @@ class ClaudeCodeDriver(DriverProtocol):
         )
         self._reply_texts.setdefault(engagement.id, set())
         self._epoch_pending.setdefault(engagement.id, None)
+        # v0.79.0 (§2): the shared per-engagement OUTPUT SEQUENCER + its late/
+        # timeout discrete-post watcher task. Created BEFORE the relay so a
+        # discrete ingress that registers an intent early always finds it.
+        sequencer = self._ensure_sequencer(engagement)
 
         tasks = [
             asyncio.create_task(self._poll_respawns(engagement)),
+            asyncio.create_task(
+                sequencer.run_watcher(),
+                name=f"seq_watcher:{engagement.id[:8]}"),
             # P31 (v0.37.10): capture the SDK session_id by watching the
             # claude CLI's own session-storage directory. Persists the
             # UUID to ``<workspace>/.session_id`` so the run script's
@@ -582,6 +601,73 @@ class ClaudeCodeDriver(DriverProtocol):
         self._tasks.setdefault(engagement.id, []).append(
             asyncio.create_task(_notify()))
 
+    def _ensure_sequencer(self, engagement: EngagementRecord) -> "OutputSequencer":
+        """Build (or return) the per-engagement OUTPUT SEQUENCER (§2).
+
+        Wraps the driver's own relay send/edit primitives so the sequencer, the
+        topic-stream relay and the discrete ingresses all drive ONE serialized
+        writer with a single high-water mark and intent registry.
+        """
+        from channels.output_sequencer import OutputSequencer
+
+        seq = self._sequencers.get(engagement.id)
+        if seq is None:
+            seq = OutputSequencer(
+                engagement_id=engagement.id,
+                topic_id=engagement.topic_id,
+                send_message=self._relay_send_message,
+                edit_message=self._relay_edit_message,
+            )
+            self._sequencers[engagement.id] = seq
+        return seq
+
+    # -- v0.79.0 (§2) discrete-posting intent-registration API (T2/T3 seam) --
+
+    def register_send_intent(
+        self, *, engagement_id: str, request_id: str, tool_name: str,
+        projection_hash: str, poster: Any,
+    ) -> Any:
+        """Register (or idempotently reattach to) a discrete-send INTENT (§2(1)).
+
+        The T2/T3 ingress adapters call this at fence entry. ``poster`` is an
+        ``async () -> int | None`` that performs the actual keyboard/text post
+        (the sequencer invokes it when the relay reaches the matching content
+        block). Returns ``(intent, created)`` or ``None`` if the engagement has
+        no live sequencer. A same-``request_id`` call reattaches idempotently
+        and the caller can read the recorded outcome via ``send_intent_outcome``.
+        """
+        seq = self._sequencers.get(engagement_id)
+        if seq is None:
+            return None
+        return seq.register_intent(
+            request_id=request_id, tool_name=tool_name,
+            projection_hash=projection_hash, poster=poster,
+        )
+
+    def arm_send_intent(self, engagement_id: str, request_id: str) -> Any:
+        """Move a pending intent to ``armed`` — the point of no return (§2(2))."""
+        seq = self._sequencers.get(engagement_id)
+        return seq.arm_intent(request_id) if seq is not None else None
+
+    def cancel_send_intent(self, engagement_id: str, request_id: str) -> Any:
+        """Cancel a pending/armed intent → tombstone (§2(2))."""
+        seq = self._sequencers.get(engagement_id)
+        return seq.cancel_intent(request_id) if seq is not None else None
+
+    def send_intent_outcome(self, engagement_id: str, request_id: str) -> Any:
+        """Recorded outcome (incl. posted message id) for a reattaching retry."""
+        seq = self._sequencers.get(engagement_id)
+        return seq.intent_outcome(request_id) if seq is not None else None
+
+    async def advance_topic_high_water_for_inbound(
+        self, engagement_id: str, operator_msg_id: int | None = None,
+    ) -> None:
+        """§2: an inbound operator message advances the high-water mark and
+        SEALS open narration. (The inbound-spool call site is wired by T2.)"""
+        seq = self._sequencers.get(engagement_id)
+        if seq is not None:
+            await seq.advance_high_water_for_inbound(operator_msg_id)
+
     async def _run_topic_relay(self, engagement: EngagementRecord) -> None:
         """Drive the always-on live topic-stream relay for one engagement.
 
@@ -607,6 +693,9 @@ class ClaudeCodeDriver(DriverProtocol):
                     engagement, kind, payload)
             ),
             reply_texts=lambda: self._reply_texts.get(engagement.id, set()),
+            # v0.79.0 (§2): the SHARED per-engagement sequencer, so the relay
+            # and the discrete ingresses agree on ordering + high-water.
+            sequencer=self._ensure_sequencer(engagement),
         )
         while True:
             try:

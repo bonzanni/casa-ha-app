@@ -50,6 +50,13 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from atomic_io import atomic_write_json
+from channels.output_sequencer import (
+    APPLIED,
+    FAILED,
+    SEALED,
+    OutputSequencer,
+    projection_hash,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +124,34 @@ def extract_text_blocks(frame: dict) -> list[str]:
             text = block.get("text")
             if isinstance(text, str) and text:
                 out.append(text)
+    return out
+
+
+def iter_content_blocks(frame: dict) -> list[tuple]:
+    """Assistant content blocks IN ORDER (§2(3): per-block positions).
+
+    Returns a list of ``("text", text)`` and ``("tool_use", name, input)``
+    tuples in the block order the CLI emitted them; ``thinking`` blocks are
+    dropped (never surfaced). One NDJSON assistant frame can interleave text
+    and multiple tool_use blocks, so the relay must walk them in order to place
+    a relay-mediated discrete post at exactly its block's position.
+    """
+    if not isinstance(frame, dict) or frame.get("type") != "assistant":
+        return []
+    message = frame.get("message") or {}
+    out: list[tuple] = []
+    for block in message.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                out.append(("text", text))
+        elif btype == "tool_use":
+            out.append((
+                "tool_use", block.get("name") or "", block.get("input") or {},
+            ))
     return out
 
 
@@ -370,6 +405,7 @@ class TopicStreamRelay:
         on_turn_event: OnTurnEvent,
         reply_texts: ReplyTexts,
         edit_throttle: float = 1.0,
+        sequencer: "OutputSequencer | None" = None,
         _now: Callable[[], float] = time.monotonic,
         _sleep: Callable[[float], Awaitable[None]] = _default_sleep,
     ) -> None:
@@ -385,6 +421,20 @@ class TopicStreamRelay:
         self._edit_throttle = edit_throttle
         self._now = _now
         self._sleep = _sleep
+        # v0.79.0 (§2): ALL topic output flows through ONE per-topic sequencer
+        # (the single writer that owns the high-water mark, the no-op edit gate
+        # and the relay-mediated discrete-posting intent registry). The driver
+        # passes the SHARED per-engagement sequencer so discrete ingresses and
+        # this relay agree on ordering; an internal one is built when none is
+        # injected (isolated relay tests + belt-and-suspenders).
+        self.sequencer = sequencer or OutputSequencer(
+            engagement_id=engagement_id,
+            topic_id=topic_id,
+            send_message=send_message,
+            edit_message=edit_message,
+            _now=_now,
+            _sleep=_sleep,
+        )
 
         self.cursor = StreamCursor()
         # Per-turn in-memory state (never persisted — rebuilt on recovery).
@@ -469,28 +519,37 @@ class TopicStreamRelay:
         self._per_message_text = pmt
 
     async def _reconcile(self) -> None:
-        """Re-edit the LAST message once to recover a lost-before-persist edit.
+        """Recover a lost-before-persist edit for the LAST message (§2:471).
 
         Only when ``message_ids`` is non-empty (an OPEN turn): a closed-turn
         checkpoint has ``message_ids == []`` so there is nothing to reconcile.
+        Routes through ``edit_narration_if_latest`` (§2 sealing across restart,
+        option B): on a fresh post-recovery sequencer the checkpoint-named
+        message is CONSERVATIVELY SEALED, so the reconciled state posts as a NEW
+        closing message rather than editing a message that may have discrete
+        posts under it. Any single duplicate is accepted (the documented
+        at-least-once risk).
         """
         self._reconciled = True
-        if self.cursor.message_ids and self._per_message_text:
-            try:
-                await _maybe_await(
-                    self.edit_message(
-                        self.topic_id,
-                        self.cursor.message_ids[-1],
-                        self._per_message_text,
-                    )
+        if not (self.cursor.message_ids and self._per_message_text):
+            return
+        try:
+            res = await self._apply_seq_edit(
+                self.cursor.message_ids[-1], self._per_message_text,
+            )
+            if res == "sealed":
+                applied, mid = await self._apply_op(
+                    lambda: self.sequencer.open_narration(self._per_message_text)
                 )
-                self.cursor.last_posted_len = len(self._per_message_text)
-                self._save()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "topic stream reconcile edit failed for engagement %s: %s",
-                    self.engagement_id, exc,
-                )
+                if applied:
+                    self.cursor.message_ids = [mid]
+            self.cursor.last_posted_len = len(self._per_message_text)
+            self._save()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "topic stream reconcile edit failed for engagement %s: %s",
+                self.engagement_id, exc,
+            )
 
     # -- live posting -------------------------------------------------------
 
@@ -531,6 +590,36 @@ class TopicStreamRelay:
                 return False, None
             await self._sleep(self._backoff())
 
+    async def _apply_seq_edit(self, msg_id: int, value: str) -> str:
+        """Route a narration edit through the sequencer's
+        ``edit_narration_if_latest`` while honoring the at-least-once
+        retry/drop contract. Returns ``"applied"`` | ``"sealed"`` |
+        ``"dropped"``.
+
+        ``SEALED`` (something posted below this message — §2 rollover) is NOT a
+        failure: the caller opens a fresh narration message for the pending
+        text. Only a ``FAILED`` wire edit counts toward the drop threshold.
+        """
+        while True:
+            try:
+                res = await _maybe_await(
+                    self.sequencer.edit_narration_if_latest(msg_id, value)
+                )
+            except Exception as exc:  # noqa: BLE001
+                res = FAILED
+                logger.debug("topic stream edit op failed (will retry): %s", exc)
+            if res == APPLIED:
+                self._fail_count = 0
+                return "applied"
+            if res == SEALED:
+                self._fail_count = 0
+                return "sealed"
+            self._fail_count += 1
+            if self._fail_count >= _DROP_THRESHOLD:
+                self._enter_drop()
+                return "dropped"
+            await self._sleep(self._backoff())
+
     def _plan_ops(self, text: str) -> list[tuple[str, str]]:
         """Ops to render *text* appended to the current message with rollover.
 
@@ -555,7 +644,48 @@ class TopicStreamRelay:
             pmt = piece
         return ops
 
+    async def _execute_ops(self, ops: list[tuple[str, str]]) -> None:
+        """Render *ops* (send/edit) through the sequencer. Sets ``self._dropped``
+        on a drop; NEVER checkpoints (the caller owns cursor advancement).
+
+        An ``edit`` that returns SEALED opens a NEW narration message for the
+        pending increment — §2 rollover-on-interleave / conservative recovery
+        seal."""
+        for kind, value in ops:
+            if self._dropped:
+                return
+            if kind == "send":
+                applied, mid = await self._apply_op(
+                    lambda v=value: self.sequencer.open_narration(v)
+                )
+                if not applied:
+                    return
+                self.cursor.message_ids.append(mid)
+                self._per_message_text = value
+            else:  # edit
+                prior = self._per_message_text
+                res = await self._apply_seq_edit(
+                    self.cursor.message_ids[-1], value
+                )
+                if res == "dropped":
+                    return
+                if res == "sealed":
+                    increment = (
+                        value[len(prior):] if value.startswith(prior) else value
+                    )
+                    applied, mid = await self._apply_op(
+                        lambda v=increment: self.sequencer.open_narration(v)
+                    )
+                    if not applied:
+                        return
+                    self.cursor.message_ids.append(mid)
+                    self._per_message_text = increment
+                else:  # applied
+                    self._per_message_text = value
+                self._last_edit_ts = self._now()
+
     async def _post_text(self, text: str, seg, off_after: int) -> None:
+        """Text-only streaming path: throttle + single frame-end checkpoint."""
         self._turn_text += text
         if self._dropped:
             self._advance_dropped(seg, off_after)
@@ -574,27 +704,74 @@ class TopicStreamRelay:
                 self._per_message_text = ops[0][1]
                 return
 
-        for kind, value in ops:
-            if kind == "send":
-                applied, mid = await self._apply_op(
-                    lambda v=value: self.send_message(self.topic_id, v)
-                )
-                if not applied:
+        await self._execute_ops(ops)
+        if self._dropped:
+            self._advance_dropped(seg, off_after)
+            return
+
+        self.cursor.current = {"segment": list(seg), "offset": off_after}
+        self.cursor.last_posted_len = len(self._per_message_text)
+        self._save()
+
+    async def _append_narration(self, text: str) -> None:
+        """Append narration text WITHOUT throttle or checkpoint (used by the
+        block-ordered mixed-frame path, which checkpoints once at frame end)."""
+        self._turn_text += text
+        if self._dropped:
+            return
+        ops = self._plan_ops(text)
+        await self._execute_ops(ops)
+
+    async def _match_discrete_block(self, name: str, tool_input: dict) -> None:
+        """Drive relay-mediated discrete matching for ONE tool_use block (§2(3)).
+
+        Computes the block's ``(tool, projection_hash)`` under the pinned
+        projection and asks the sequencer to resolve it at this position. An
+        armed intent posts here (sealing narration); a tombstone / debt consumes
+        the block silently; a pending/absent hold-eligible intent may hold the
+        slot. The T1-stubbed state (no intents registered) resolves to
+        ``no_match`` instantly, so this is inert until T2/T3 wire the
+        ingresses."""
+        try:
+            block_hash = projection_hash(name, tool_input)
+        except ValueError:
+            # Non-serializable tool_input can never match a hashed intent.
+            return
+        try:
+            await self.sequencer.post_for_block(name, block_hash)
+        except Exception as exc:  # noqa: BLE001 — discrete posting is best-effort
+            logger.warning(
+                "topic stream discrete-post match failed for engagement %s "
+                "(tool=%s): %s", self.engagement_id, name, exc,
+            )
+
+    async def _handle_assistant_blocks(
+        self, blocks: list[tuple], seg, off_after: int,
+    ) -> None:
+        """Process a tool-bearing assistant frame block-by-block (§2(3)).
+
+        Text blocks append to narration; each tool_use block fires the
+        mutating-tool event (once, for the first mutating tool) and drives
+        relay-mediated discrete matching AT ITS POSITION. Checkpoints ONCE at
+        frame end."""
+        if self._dropped:
+            self._advance_dropped(seg, off_after)
+            return
+        fired_mutating = False
+        for block in blocks:
+            if block[0] == "text":
+                await self._append_narration(block[1])
+                if self._dropped:
                     self._advance_dropped(seg, off_after)
                     return
-                self.cursor.message_ids.append(mid)
-                self._per_message_text = value
-            else:  # edit
-                applied, _ = await self._apply_op(
-                    lambda v=value: self.edit_message(
-                        self.topic_id, self.cursor.message_ids[-1], v
+            else:  # tool_use
+                _kind, name, tool_input = block
+                if not fired_mutating and name not in _NON_MUTATING_TOOLS:
+                    fired_mutating = True
+                    await _maybe_await(
+                        self.on_turn_event("mutating_tool", {"tool": name})
                     )
-                )
-                if not applied:
-                    self._advance_dropped(seg, off_after)
-                    return
-                self._per_message_text = value
-                self._last_edit_ts = self._now()
+                await self._match_discrete_block(name, tool_input)
 
         self.cursor.current = {"segment": list(seg), "offset": off_after}
         self.cursor.last_posted_len = len(self._per_message_text)
@@ -610,44 +787,33 @@ class TopicStreamRelay:
         self._last_edit_ts = float("-inf")
 
     async def _finalize(self, seg, off_after: int) -> None:
-        """Edit the last message with its OWN final chunk, reply de-dup, then
-        persist a CLOSED-TURN checkpoint (``message_ids=[]``,
-        ``turn_start == current`` past ``result``)."""
+        """Route the closing edit through ``edit_narration_if_latest`` (§2:612),
+        then persist a CLOSED-TURN checkpoint (``message_ids=[]``,
+        ``turn_start == current`` past ``result``).
+
+        §2(d): the reply de-dup DELETE (formerly here at :633) is REMOVED — no
+        message is ever deleted; a duplicate is preferred over erasing history.
+        De-dup, when wired (T3), happens BEFORE posting inside the sequencer.
+        §2(c): if the narration message was SEALED (a discrete post below it, or
+        a conservative seal after process recovery), the closing state posts as
+        a NEW message instead of editing one with content under it.
+        """
         coord = {"segment": list(seg), "offset": off_after}
         if not self._dropped and self.cursor.message_ids and self._per_message_text:
             # B2 (Sol r1): the closing edit carries this turn's FINAL fragment,
-            # so it must honor the at-least-once contract like every streaming
-            # op — route it through the SAME bounded retry/drop machinery
-            # (``_apply_op``) instead of a log-and-forget edit. A ``False``
-            # return (Telegram declined) is a failure that retries; only after
-            # the edit lands, OR the turn crosses the drop threshold (>=20
-            # consecutive failures → warn once, ``self._dropped`` set), may the
-            # closed-turn checkpoint below advance past ``result``.
-            applied, _ = await self._apply_op(
-                lambda: self.edit_message(
-                    self.topic_id,
-                    self.cursor.message_ids[-1],
-                    self._per_message_text,  # NEVER the whole turn text
-                )
+            # so it honors the at-least-once retry/drop contract via
+            # ``_apply_seq_edit``. Only after it lands (APPLIED/SEALED-then-new),
+            # or the turn crosses the drop threshold, may the closed-turn
+            # checkpoint below advance past ``result``.
+            res = await self._apply_seq_edit(
+                self.cursor.message_ids[-1], self._per_message_text,
             )
-            # Reply de-dup: if this turn's whole text is byte-identical to a
-            # reply already posted and exactly one message was streamed, delete
-            # the streamed message (best-effort). Only meaningful once the final
-            # fragment actually landed — skip it in the drop path.
-            if applied and len(self.cursor.message_ids) == 1 and self._turn_text:
-                try:
-                    replies = await _maybe_await(self.reply_texts())
-                    if replies and self._turn_text in replies:
-                        await _maybe_await(
-                            self.delete_message(
-                                self.topic_id, self.cursor.message_ids[0]
-                            )
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "topic stream reply de-dup failed for engagement %s: %s",
-                        self.engagement_id, exc,
-                    )
+            if res == "sealed":
+                applied, mid = await self._apply_op(
+                    lambda: self.sequencer.open_narration(self._per_message_text)
+                )
+                if applied:
+                    self.cursor.message_ids = [mid]
 
         if self._dropped:
             # The turn ended in drop mode: ``dropped_through`` reaches the
@@ -658,6 +824,9 @@ class TopicStreamRelay:
         self.cursor.message_ids = []
         self.cursor.last_posted_len = 0
         self._reset_turn_state()
+        # §2(6): prune intents/tombstones/id→outcome + seal narration at turn end.
+        self.sequencer.prune_turn()
+        await self.sequencer.seal_narration()
         self._save()
 
     # -- main loop ----------------------------------------------------------
@@ -751,16 +920,20 @@ class TopicStreamRelay:
             return
 
         if ftype == "assistant":
-            mutating, name = is_mutating_tooluse(frame)
-            if mutating:
-                await _maybe_await(
-                    self.on_turn_event("mutating_tool", {"tool": name})
-                )
-            texts = extract_text_blocks(frame)
+            blocks = iter_content_blocks(frame)
+            if any(b[0] == "tool_use" for b in blocks):
+                # Mixed / tool-bearing frame: process blocks IN ORDER so a
+                # relay-mediated discrete post lands at exactly its content-
+                # block position (§2(3)), interleaved with narration text.
+                await self._handle_assistant_blocks(blocks, seg, off_after)
+                return
+            # Text-only frame (the common streaming case): unchanged fast path —
+            # join, throttle, single checkpoint.
+            texts = [b[1] for b in blocks if b[0] == "text"]
             if texts:
                 await self._post_text("".join(texts), seg, off_after)
                 return
-            # No visible text (tool-only / mutating-only) → invisible checkpoint.
+            # No visible text (e.g. thinking-only) → invisible checkpoint.
             self._checkpoint(seg, off_after)
             return
 
