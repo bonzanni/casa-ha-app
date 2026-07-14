@@ -235,6 +235,215 @@ def _make_permission_verdict(engagement_registry: Any) -> Handler:
     return handler
 
 
+# ---------------------------------------------------------------------------
+# v0.75.0 (W5) — engagement_ask: operator-facing multiple-choice question,
+# posted by the casa_engagement_channel `ask` MCP tool.
+# ---------------------------------------------------------------------------
+
+# Telegram callback_data v1|engagement_ask|<rid>|<idx> caps request_id at the
+# same headroom the permission namespace uses (_RID_MAX_LEN in hooks.py); the
+# ask tool's request_id is always a full uuid4().hex (32 chars), well under.
+_ASK_MIN_OPTIONS = 2
+_ASK_MAX_OPTIONS = 8
+_ASK_MAX_LABEL_LEN = 48
+_ASK_MAX_QUESTION_LEN = 1024
+_ASK_MIN_TIMEOUT_S = 30.0
+_ASK_MAX_TIMEOUT_S = 570.0
+_ASK_DEFAULT_TIMEOUT_S = 300.0
+
+
+def _validate_ask_args(body: dict) -> tuple[str, list, float] | None:
+    """Validate + clamp the `ask` request body.
+
+    Returns ``(question, options, clamped_timeout_s)`` on success, or
+    ``None`` on any validation failure (caller maps to ``invalid_args``).
+    """
+    question = body.get("question")
+    if (not isinstance(question, str) or not question
+            or len(question) > _ASK_MAX_QUESTION_LEN):
+        return None
+    options = body.get("options")
+    if (not isinstance(options, list)
+            or not (_ASK_MIN_OPTIONS <= len(options) <= _ASK_MAX_OPTIONS)):
+        return None
+    if any(
+        not isinstance(o, str) or not o or len(o) > _ASK_MAX_LABEL_LEN
+        for o in options
+    ):
+        return None
+    if len(set(options)) != len(options):
+        return None
+    try:
+        timeout_s = float(body.get("timeout_s", _ASK_DEFAULT_TIMEOUT_S))
+    except (TypeError, ValueError):
+        return None
+    timeout_s = min(max(timeout_s, _ASK_MIN_TIMEOUT_S), _ASK_MAX_TIMEOUT_S)
+    return question, options, timeout_s
+
+
+def _ask_keyboard_finish(
+    telegram_channel: Any, topic_id: int | None, message_id: int,
+    question: str, options: list,
+) -> Callable[[dict], "Awaitable[None]"]:
+    """Broker finish-hook (r3-B3 shape, mirrors ``hooks._perm_keyboard_finish``)
+    -- the engagement_ask namespace's ONLY keyboard-message writer. Fires
+    exactly once on outcome (delivered by the broker even if the posting
+    HTTP handler was cancelled/disconnected) and edits the posted question
+    message to show the resolution. ``_on_inline_callback`` never edits the
+    message itself -- it only ``cq.answer()``s.
+    """
+
+    async def _finish(outcome: dict) -> None:
+        o = outcome.get("outcome")
+        if o == "answered":
+            idx = outcome.get("option_index")
+            label = (
+                options[idx]
+                if isinstance(idx, int) and 0 <= idx < len(options)
+                else "?"
+            )
+            text = f"{question}\n\n✅ Answered: {label}"
+        else:
+            text = f"{question}\n\n⌛ Expired"
+        try:
+            await telegram_channel.edit_topic_message(topic_id, message_id, text)
+        except Exception:  # noqa: BLE001 — finish hooks must never raise
+            logger.warning(
+                "ask keyboard finish-hook edit failed "
+                "(topic=%s message_id=%s)", topic_id, message_id, exc_info=True,
+            )
+
+    return _finish
+
+
+def _make_ask(
+    telegram_channel: Any, engagement_registry: Any,
+) -> Handler:
+    """POST /internal/channel/ask — casa_engagement_channel's `ask` MCP tool.
+
+    v0.75.0 (W5): registers on ``verdict_broker.BROKER`` (namespace
+    ``"engagement_ask"``, scope = engagement_id), posts a tappable
+    multiple-choice keyboard via the broker-owned shielded setup task
+    (``ensure_posted``), then awaits the operator's tap.
+
+    Body: ``{engagement_id, request_id, question, options: [str], timeout_s}``.
+    Response: ``{"ok": True, "outcome": "answered", "option": <label>,
+    "option_index": <int>}`` | ``{"ok": True, "outcome": "no_answer"}`` |
+    ``{"ok": False, "error": <code>}``.
+
+    A dropped HTTP connection (the caller's transport, not a logical
+    cancel) leaves the broker request live for a same-``request_id`` retry
+    to reattach -- ``await_result``'s shielded future is unaffected by this
+    handler's own task being cancelled. Genuine caller cancellation is the
+    separate explicit ``ask_cancel`` route (``_make_ask_cancel``).
+    """
+
+    async def handler(request: web.Request) -> web.Response:
+        from verdict_broker import BROKER
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid_args"})
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "invalid_args"})
+
+        eng_id = body.get("engagement_id")
+        request_id = body.get("request_id")
+        if not eng_id or not request_id:
+            return web.json_response({"ok": False, "error": "invalid_args"})
+
+        validated = _validate_ask_args(body)
+        if validated is None:
+            return web.json_response({"ok": False, "error": "invalid_args"})
+        question, options, timeout_s = validated
+
+        rec = engagement_registry.get(eng_id)
+        if rec is None:
+            return web.json_response({"ok": False, "error": "unknown_engagement"})
+        if getattr(rec, "status", None) not in ("active", "idle"):
+            return web.json_response({"ok": False, "error": "engagement_terminal"})
+
+        req, created = BROKER.register(
+            namespace="engagement_ask", scope=eng_id, request_id=request_id,
+            timeout_s=timeout_s,
+        )
+        if created:
+            # STATIC meta BEFORE posting so a fast tap never sees incomplete
+            # metadata (r3-B3 fast-tap). message_id + finish_hook are set by
+            # the broker-owned setup task (r8-B3).
+            req.meta.update({
+                "options": options,
+                "topic_id": rec.topic_id,
+                "operator_id": rec.origin.get("user_id"),
+            })
+
+        await BROKER.ensure_posted(
+            req,
+            lambda: telegram_channel.post_options_keyboard(
+                engagement_id=eng_id, request_id=request_id,
+                question=question, options=options),
+            lambda mid: _ask_keyboard_finish(
+                telegram_channel, rec.topic_id, mid, question, options),
+        )
+        # Shielded future: a CancelledError here (transport disconnect)
+        # propagates to OUR caller without cancelling the broker's shared
+        # future -- the request stays live for a same-id reattach.
+        outcome = await BROKER.await_result(req)
+
+        o = outcome.get("outcome")
+        if o == "answered":
+            idx = outcome["option_index"]
+            return web.json_response({
+                "ok": True, "outcome": "answered",
+                "option": options[idx], "option_index": idx,
+            })
+        if o == "no_answer":
+            return web.json_response({"ok": True, "outcome": "no_answer"})
+        if o == "cancelled":
+            return web.json_response({"ok": False, "error": "cancelled"})
+        # delivery_failed (keyboard post raised or returned None, r10-B3).
+        return web.json_response({"ok": False, "error": "delivery_failed"})
+
+    return handler
+
+
+def _make_ask_cancel() -> Handler:
+    """POST /internal/channel/ask_cancel — explicit caller cancellation.
+
+    v0.75.0 (W5): the `ask` MCP tool's ``finally`` calls this on genuine
+    cancellation (NOT a transport retry) so a same-id reattach can never
+    resurrect a stale keyboard tap. Always ``{"ok": True}`` -- cancelling an
+    already-resolved or never-registered request is a harmless no-op
+    (``BROKER.cancel`` returns False but we don't surface that distinction;
+    the caller only wants "stop waiting for this", which is unconditionally
+    true after the call returns).
+    """
+
+    async def handler(request: web.Request) -> web.Response:
+        from verdict_broker import BROKER
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid_args"})
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "invalid_args"})
+
+        eng_id = body.get("engagement_id")
+        request_id = body.get("request_id")
+        if not eng_id or not request_id:
+            return web.json_response({"ok": False, "error": "invalid_args"})
+
+        BROKER.cancel(
+            namespace="engagement_ask", scope=eng_id, request_id=request_id,
+            reason="caller_cancelled",
+        )
+        return web.json_response({"ok": True})
+
+    return handler
+
+
 def _make_update_state(telegram_channel: Any) -> Handler:
     """POST /internal/channel/update_state — channel server → casa-main.
 
@@ -287,6 +496,7 @@ def _make_channel_handlers(
     Phase 1: ``send_to_topic``.
     Phase 2: ``post_inline_keyboard`` (Task 19), ``permission_verdict`` (Task 21),
     ``update_state`` (Task 23).
+    v0.75.0 (W5): ``ask`` / ``ask_cancel`` (Task 3).
     Phase 2+ will extend with ``set_progress``, ``typing``, etc. — see spec §A.3.
     """
     return {
@@ -304,6 +514,11 @@ def _make_channel_handlers(
         "/internal/channel/update_state": _make_update_state(
             telegram_channel=telegram_channel,
         ),
+        "/internal/channel/ask": _make_ask(
+            telegram_channel=telegram_channel,
+            engagement_registry=engagement_registry,
+        ),
+        "/internal/channel/ask_cancel": _make_ask_cancel(),
     }
 
 

@@ -1221,6 +1221,110 @@ class TelegramChannel(Channel):
                 topic_id, message_id, outcome.get("outcome"), exc,
             )
 
+    # ------------------------------------------------------------------
+    # v0.75.0 (W5): engagement_ask keyboard composer + plain topic-message
+    # edit/delete helpers.
+    # ------------------------------------------------------------------
+
+    async def post_options_keyboard(
+        self,
+        *,
+        engagement_id: str,
+        request_id: str,
+        question: str,
+        options: list,
+    ) -> int | None:
+        """Post a plain-text multiple-choice question with one tappable
+        button per option (W5 `ask`).
+
+        Mirrors ``post_perm_keyboard``'s engagement/topic resolution but
+        skips MarkdownV2 entirely — the question/options are operator- or
+        agent-authored free text (not a static template around an escaped
+        tool-call preview), so a plain send sidesteps parse-entity 400s
+        without needing an escaping pass.
+        """
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        rec = self._engagement_registry.get(engagement_id)
+        if rec is None or rec.topic_id is None:
+            logger.warning(
+                "post_options_keyboard: unknown engagement or no topic_id "
+                "(engagement=%s)", engagement_id[:8],
+            )
+            return None
+
+        # v0.75.0 (W5): v1 broker callback_data, one button (its own row)
+        # per option — option_index is this option's position in `options`.
+        kbd = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                text=label,
+                callback_data=f"v1|engagement_ask|{request_id}|{i}",
+            )]
+            for i, label in enumerate(options)
+        ])
+
+        return await self.send_to_topic(rec.topic_id, question, reply_markup=kbd)
+
+    async def edit_topic_message(
+        self, topic_id: int | None, message_id: int, text: str,
+    ) -> bool:
+        """Plain (no parse_mode, no reply_markup) text edit of a posted
+        topic message.
+
+        Broker finish-hook target for the ``engagement_ask`` namespace
+        (mirrors ``edit_perm_keyboard_outcome``'s role for ``permission``,
+        see ``channel_handlers._ask_keyboard_finish``). "Message is not
+        modified" (JC4 — an identical re-edit) is tolerated as success, not
+        an error, since it means the desired end state already holds.
+        """
+        if not self.engagement_supergroup_id:
+            return False
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.engagement_supergroup_id,
+                message_id=message_id,
+                text=text,
+            )
+            return True
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            logger.warning(
+                "edit_topic_message failed (topic=%s message_id=%s): %s",
+                topic_id, message_id, exc,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+            logger.warning(
+                "edit_topic_message failed (topic=%s message_id=%s): %s",
+                topic_id, message_id, exc,
+            )
+            return False
+
+    async def delete_topic_message(
+        self, topic_id: int | None, message_id: int,
+    ) -> bool:
+        """Delete a single message from a topic (W5 companion to
+        ``edit_topic_message``).
+
+        Best-effort: any failure returns ``False`` rather than raising —
+        unlike whole-topic ``delete_topic``, losing one message is not
+        audit-critical.
+        """
+        if not self.engagement_supergroup_id:
+            return False
+        try:
+            return bool(await self.bot.delete_message(
+                chat_id=self.engagement_supergroup_id,
+                message_id=message_id,
+            ))
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+            logger.warning(
+                "delete_topic_message failed (topic=%s message_id=%s): %s",
+                topic_id, message_id, exc,
+            )
+            return False
+
     async def _internal_post(self, path: str, payload: dict) -> dict:
         """Dispatch an internal-handler call from inside casa-main.
 
