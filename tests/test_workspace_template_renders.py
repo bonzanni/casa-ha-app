@@ -316,6 +316,14 @@ def _harness_script(rendered: str, tmp_path, final_exec: str) -> Path:
     ws = tmp_path / "ws"; (ws / ".home").mkdir(parents=True, exist_ok=True)  # r6-B2: repeated calls
     s = rendered.replace(f"/data/engagements/{_PROBE_ID}", str(ws))
     s = s.replace("/opt/casa/scripts/ringlog.sh", _RINGLOG)
+    # Make STDERR_LOG absolute (the live script leaves it as a relative
+    # ".stderr.$EPOCH.log" filename, resolved via cwd at runtime) so ringlog's
+    # argv actually contains this test's tmp_path — otherwise
+    # `pgrep -f "ringlog.sh.*{marker}"` in _wait_ringlogs_exit never matches
+    # and the writer-exit barrier is a silent no-op. The files still land in
+    # `ws` either way, so `ws.glob(".stderr.*.log")` assertions are unaffected.
+    s = s.replace('STDERR_LOG=".stderr.$EPOCH.log"',
+                  f'STDERR_LOG="{ws}/.stderr.$EPOCH.log"')
     s = re.sub(r"exec <\S*stdin\.fifo", "exec </dev/null", s)
     s = re.sub(r"exec claude .*?(?=\n[A-Z#]|\Z)", final_exec, s, flags=re.S)
     p = tmp_path / "run"; p.write_text(s); return p
@@ -452,6 +460,7 @@ def test_sweep_removes_slipped_stale_file_next_spawn(tmp_path, rendered_probe_sc
     # advance until the sweep window covers it (epochs 3,4 → E-4 >= 0)
     subprocess.run([BASH, str(p)], capture_output=True)
     subprocess.run([BASH, str(p)], capture_output=True)
+    _wait_ringlogs_exit(str(tmp_path))                        # real writer barrier
     assert not (ws / ".stderr.0.log").exists()               # swept by a later spawn
 
 
