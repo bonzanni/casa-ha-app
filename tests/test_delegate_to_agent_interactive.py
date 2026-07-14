@@ -8,10 +8,22 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from config import (
-    AgentConfig, CharacterConfig, MemoryConfig, SessionConfig, ToolsConfig,
+    AgentConfig, CharacterConfig, DelegateEntry, MemoryConfig, SessionConfig,
+    ToolsConfig,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
+
+
+def _make_assistant_cfg():
+    """Caller cfg declaring `finance` as a delegate (spec A1 ACL fixture).
+
+    Mirrors the assistant's real `delegates.yaml`, which declares finance —
+    see `casa-agent/rootfs/opt/casa/defaults/agents/assistant/delegates.yaml`.
+    """
+    cfg = AgentConfig(role="assistant")
+    cfg.delegates = [DelegateEntry(agent="finance", purpose="p", when="w")]
+    return cfg
 
 
 def _make_alex_cfg():
@@ -50,6 +62,7 @@ class TestInteractiveMode:
             channel_manager=cm, bus=bus,
             specialist_registry=specialist_reg, mcp_registry=MagicMock(),
             trigger_registry=MagicMock(), engagement_registry=reg,
+            agent_role_map={"assistant": _make_assistant_cfg()},
         )
         # Driver + start side-effect
         driver = MagicMock()
@@ -93,6 +106,7 @@ class TestInteractiveMode:
             channel_manager=cm, bus=MagicMock(),
             specialist_registry=specialist_reg, mcp_registry=MagicMock(),
             trigger_registry=MagicMock(), engagement_registry=reg,
+            agent_role_map={"assistant": _make_assistant_cfg()},
         )
         token = agent_mod.origin_var.set({
             "role": "assistant", "channel": "telegram",
@@ -143,6 +157,7 @@ class TestInteractiveMode:
             channel_manager=cm, bus=bus,
             specialist_registry=specialist_reg, mcp_registry=MagicMock(),
             trigger_registry=MagicMock(), engagement_registry=reg,
+            agent_role_map={"assistant": _make_assistant_cfg()},
         )
         driver = MagicMock(); driver.start = AsyncMock()
         agent_mod.active_engagement_driver = driver
@@ -211,6 +226,7 @@ class TestInteractiveMode:
             channel_manager=cm, bus=bus,
             specialist_registry=specialist_reg, mcp_registry=MagicMock(),
             trigger_registry=MagicMock(), engagement_registry=reg,
+            agent_role_map={"assistant": _make_assistant_cfg()},
         )
         driver = MagicMock()
         driver.start = AsyncMock(side_effect=RuntimeError("boom"))

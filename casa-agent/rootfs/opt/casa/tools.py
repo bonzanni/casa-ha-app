@@ -103,8 +103,11 @@ def init_tools(
     servers — the specialist still runs but with only built-in tools).
 
     ``agent_role_map`` is a merged dict of role→AgentConfig covering both
-    residents and specialists. If omitted, ``delegate_to_agent`` falls back
-    to resolving against ``specialist_registry`` alone (back-compat).
+    residents and specialists. It is REQUIRED for delegation authorization
+    (A1): the ACL keys the caller's declared delegates off this map, so an
+    omitted or empty map means no caller can be authorized to delegate at
+    all. Only target *resolution* retains the ``specialist_registry``
+    fallback for back-compat.
 
     ``runtime`` is the CasaRuntime container. Optional during migration
     (Task C.1); becomes required once all callsites use it (Task C.4).
@@ -1243,26 +1246,39 @@ async def delegate_to_agent(args: dict) -> dict:
     context_text = args.get("context", "") or ""
     mode = args.get("mode", "sync") or "sync"
 
+    # AR-2: snapshot at entry — this handler awaits (channel setup,
+    # engagement/delegation dispatch) and must not read a holder that a
+    # later turn has since rewritten in place.
+    origin = _snapshot_origin()
+
+    # A1: delegation ACL — the caller's DECLARED delegates are an
+    # authorization boundary, enforced FIRST (before the init and depth-cap
+    # branches) so a missing, unknown, or undeclared caller is denied
+    # uniformly with one kind and cannot distinguish existing agents. Caller
+    # identity comes ONLY from the trusted origin, never from tool args. Key
+    # on execution_role — the agent actually RUNNING this turn — so a
+    # delegated specialist is judged by its OWN delegates, not its parent's:
+    # on a direct turn execution_role == role (agent.py sets both to
+    # self.config.role); on a delegated turn _run_delegated_agent overwrites
+    # execution_role with the delegate's role while `role` stays the
+    # delegator (read by the v0.76 provenance/authz system — leave it).
+    # Keyed on execution_role; the InCasaDriver interactive-executor
+    # inheritance path (in_casa_driver.py:113) is a tracked residual —
+    # unreachable today as no executor grants delegate_to_agent.
+    caller_role = str((origin or {}).get("execution_role")
+                      or (origin or {}).get("role", ""))
+    caller_cfg = _agent_role_map.get(caller_role) if caller_role else None
+    declared = {d.agent for d in (getattr(caller_cfg, "delegates", None) or [])}
+    if caller_cfg is None or agent_name not in declared:
+        return _result({"status": "error", "kind": "delegation_not_declared",
+                        "message": (f"Agent {caller_role or '(unknown)'!r} does not "
+                                    f"declare {agent_name!r} as a delegate.")})
+
     if _specialist_registry is None:
         return _result({
             "status": "error",
             "kind": "not_initialized",
             "message": "specialist registry not initialized",
-        })
-
-    # Check origin BEFORE agent lookup: the tool must never dispatch
-    # without an origin, even if the name is also invalid. Lets
-    # callers test the no-origin branch without first seeding a
-    # valid specialist.
-    # AR-2: snapshot at entry — this handler awaits (channel setup,
-    # engagement/delegation dispatch) and must not read a holder that a
-    # later turn has since rewritten in place.
-    origin = _snapshot_origin()
-    if not origin:
-        return _result({
-            "status": "error",
-            "kind": "no_origin",
-            "message": "delegate_to_agent called outside a turn",
         })
 
     # Check depth cap: prevent delegation chains beyond depth=1.
