@@ -175,7 +175,7 @@ tool id stay visible below in both cases):
   argument of the tool it decorates. A template that references an
   argument that doesn't exist, or that uses anything beyond a bare
   `{identifier}` (no `{x!r}`, `{x:>10}`, `{x[0]}`, `{x.y}`), silently
-  falls back to the raw-tool-id headline at render time rather than
+  falls back to the generic headline (agent name + short tool name; the full tool id stays visible below) at render time rather than
   breaking the prompt — write templates so they interpolate cleanly,
   since a fallback loses the plain-language value you added.
 - The exact arguments are always shown too, in full, below the headline —
