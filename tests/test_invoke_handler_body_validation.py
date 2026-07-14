@@ -24,16 +24,25 @@ class _StubBus:
         return _StubResult()
 
 
+class _StubCfg:
+    def __init__(self, channels):
+        self.channels = channels
+
+
 def _make_app(bus):
     from casa_core import _make_invoke_handler
     from casa_core_middleware import cid_middleware
     from rate_limit import RateLimiter
 
+    # A:§3—these body-validation tests all target the "assistant" role,
+    # which (per the real defaults/agents/assistant/runtime.yaml) declares
+    # webhook — so it stays invoke-reachable under the spec A3 gate.
     handler = _make_invoke_handler(
         webhook_rate_limiter=RateLimiter(capacity=0, window_s=60.0),  # 0 = disabled
         webhook_secret="",  # HMAC off
         bus=bus,
         assistant_role="assistant",
+        role_configs={"assistant": _StubCfg(["telegram", "webhook"])},
     )
     app = web.Application(middlewares=[cid_middleware])  # provides request["cid"], as prod does
     app.router.add_post("/invoke/{agent}", handler)

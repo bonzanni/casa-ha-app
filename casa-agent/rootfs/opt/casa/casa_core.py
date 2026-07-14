@@ -12,7 +12,7 @@ import signal
 import sys
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 # Ensure the Casa package root is on sys.path regardless of cwd
 _CASA_ROOT = str(Path(__file__).resolve().parent)
@@ -25,6 +25,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from agent_loader import load_all_agents
 from authz_grants import CHALLENGES, GRANTS
 from bus import BusMessage, MessageBus, MessageType
+from channel_authz import agent_allowed_on
 from channels import ChannelManager
 from config import AgentConfig
 from config_git import init_repo, snapshot_manual_edits
@@ -1063,6 +1064,7 @@ def _make_invoke_handler(
     webhook_secret: str,
     bus: Any,
     assistant_role: str,
+    role_configs: Mapping[str, Any],
 ):
     """Build the ``POST /invoke/{agent}`` direct-invocation handler.
 
@@ -1072,6 +1074,9 @@ def _make_invoke_handler(
     rejected with the same 400 the handler already uses for malformed
     JSON, and an explicit ``"context": null`` is normalized to ``{}``
     instead of raising ``TypeError`` at item-assignment.
+
+    Fail-closed channel-capability gate (spec A3): only a resident that
+    declares ``webhook`` in its ``channels:`` list is invoke-reachable.
     """
 
     def _verify(request: web.Request, body: bytes) -> bool:
@@ -1093,6 +1098,10 @@ def _make_invoke_handler(
             return web.json_response({"error": "invalid signature"}, status=401)
 
         agent_role = request.match_info.get("agent", assistant_role)
+        cfg = role_configs.get(agent_role)
+        if cfg is None or not agent_allowed_on("webhook", cfg):
+            return web.json_response({"error": "unknown agent"}, status=404)
+
         try:
             payload = await request.json()
         except Exception:
@@ -2041,6 +2050,7 @@ async def main() -> None:
         webhook_secret=webhook_secret,
         bus=bus,
         assistant_role=assistant_role,
+        role_configs=role_configs,
     )
 
     # 11. Telegram webhook route (only used when webhook_url is set).

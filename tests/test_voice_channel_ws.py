@@ -36,6 +36,7 @@ class _FakeCfg:
     memory = type("M", (), {"token_budget": 800})()
     role = "butler"
     voice_errors: dict = {}
+    channels: list[str] = ["ha_voice"]
 
 
 @pytest.fixture

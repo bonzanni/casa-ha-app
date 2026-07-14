@@ -47,6 +47,7 @@ class _FakeAgentConfig:
     memory = type("M", (), {"token_budget": 0})()
     role = "butler"
     voice_errors: dict[str, str] = {}
+    channels: list[str] = ["ha_voice"]
 
 
 class _DummyMemory:

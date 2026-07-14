@@ -19,6 +19,7 @@ from aiohttp import web
 
 from agent import _classify_error
 from bus import BusMessage, MessageBus, MessageType
+from channel_authz import agent_allowed_on
 from channels import Channel
 from log_cid import new_cid
 from provenance import sanitize_external_context
@@ -146,7 +147,10 @@ class VoiceChannel(Channel):
 
         agent_role = payload.get("agent_role", self.default_agent)
         cfg = self._agent_configs.get(agent_role)
-        if cfg is None:
+        # Fail-closed channel-capability gate (spec A3): unknown role and a
+        # role that never declared ha_voice get the SAME 404 body — no
+        # existence oracle for residents that exist but aren't voice-reachable.
+        if cfg is None or not agent_allowed_on("voice", cfg):
             return web.json_response({"error": "unknown agent_role"}, status=404)
 
         scope_id = self._resolve_scope_id(payload)
@@ -398,10 +402,14 @@ class VoiceChannel(Channel):
     ) -> None:
         agent_role = frame.get("agent_role", self.default_agent)
         cfg = self._agent_configs.get(agent_role)
-        if cfg is None:
+        # Fail-closed channel-capability gate (spec A3): a 404 can't follow
+        # the WS upgrade, so an unknown role AND a role that never declared
+        # ha_voice both get the same `unknown_agent` error frame, emitted
+        # BEFORE any bus dispatch.
+        if cfg is None or not agent_allowed_on("voice", cfg):
             await ws.send_json({
                 "type": "error", "utterance_id": uid,
-                "kind": "unknown", "spoken": "",
+                "kind": "unknown_agent", "spoken": "",
             })
             return
 
