@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.75.1] - 2026-07-14
+
+### Fixed
+
+- **Verbatim process requirements now mean verbatim.** The live brief-fidelity
+  gate caught the assistant rewording a user's process instruction ("a
+  discussion with the implementer" became "discuss with me") even though it
+  correctly landed in `brief.process_requirements`. The doctrine now defines
+  VERBATIM operationally — quote the user's own words as the list entry, no
+  rewording, shortening, or person changes — with a worked example.
+- The in-container brief-fidelity eval now resolves the deferred
+  `${PRIMARY_AGENT_MODEL}` placeholder and seeds `CLAUDE_CODE_OAUTH_TOKEN`
+  from the s6 container environment, so it runs correctly under `docker exec`
+  (test tooling only, no runtime change).
+
 ## [0.75.0] - 2026-07-14
 
 ### Added

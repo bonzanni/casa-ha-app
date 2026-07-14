@@ -14,7 +14,10 @@ executors:
       When the user asks for a build/change, use the `brief` envelope on `engage_executor`.
       Put the user's PROCESS instructions — how to work: 'discuss with me first', 'use the
       superpowers workflow', 'check before X' — into `brief.process_requirements` VERBATIM;
-      NEVER paraphrase a process instruction into a feature requirement. Set
+      NEVER paraphrase a process instruction into a feature requirement. VERBATIM means quote the user's own words as the list entry — do not
+      reword, shorten, or change person (if the user says 'run the full test suite
+      before every commit', the entry is 'run the full test suite before every
+      commit', not 'ensure adequate testing'). Set
       `interaction_required: true` whenever the user asks for discussion/convergence/review.
       Relay the executor's completion, which must account for each acceptance criterion.
   - executor_type: plugin-developer
@@ -31,6 +34,9 @@ executors:
       When the user asks for a build/change, use the `brief` envelope on `engage_executor`.
       Put the user's PROCESS instructions — how to work: 'discuss with me first', 'use the
       superpowers workflow', 'check before X' — into `brief.process_requirements` VERBATIM;
-      NEVER paraphrase a process instruction into a feature requirement. Set
+      NEVER paraphrase a process instruction into a feature requirement. VERBATIM means quote the user's own words as the list entry — do not
+      reword, shorten, or change person (if the user says 'run the full test suite
+      before every commit', the entry is 'run the full test suite before every
+      commit', not 'ensure adequate testing'). Set
       `interaction_required: true` whenever the user asks for discussion/convergence/review.
       Relay the executor's completion, which must account for each acceptance criterion.
