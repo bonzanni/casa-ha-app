@@ -997,3 +997,45 @@ def test_stream_cursor_save_load_roundtrip(tmp_path):
     assert back.message_text_lens == [3900, 8]  # additive replay-boundary field
     assert back.current == {"segment": [1, 2], "offset": 9}
     assert back.dropped_through == {"segment": [1, 2], "offset": 9}
+
+
+# ---------------------------------------------------------------------------
+# v0.79.0 (§5): per-block tool_use events drive the live-summary controller
+# (LIVE only — replay suppresses them so post-recovery state derives from the
+# lifecycle, never stale tool frames).
+# ---------------------------------------------------------------------------
+
+
+def _tool_in(name: str, inp: dict) -> dict:
+    return {
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": name, "input": inp}]},
+    }
+
+
+async def test_live_tool_use_emits_activity_event(tmp_path):
+    rec, events = Recorder(), []
+    _write_current(
+        tmp_path,
+        [_spawn(1), _init(), _tool_in("Bash", {"command": "ls"}), _result()],
+    )
+    cursor = tmp_path / ".stream_cursor.json"
+    await _make_relay(tmp_path, cursor, rec, events).run()
+    assert ("tool_use", {"tool": "Bash", "input": {"command": "ls"}}) in events
+
+
+async def test_replayed_tool_use_is_suppressed(tmp_path):
+    rec, events = Recorder(), []
+    offs = _write_current(tmp_path, [_init(), _tool("Read"), _result()])
+    cur_path = tmp_path / ".stream_cursor.json"
+    seg = _ident(os.path.join(str(tmp_path), "current"))
+    # Mid-turn checkpoint PAST the tool frame: it replays (no side effects).
+    StreamCursor(
+        turn_start={"segment": seg, "offset": 0},
+        current={"segment": seg, "offset": offs[1]},
+        message_ids=[],
+    ).save(cur_path)
+
+    await _make_relay(tmp_path, cur_path, rec, events).run()
+
+    assert not any(kind == "tool_use" for kind, _p in events)

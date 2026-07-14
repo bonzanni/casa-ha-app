@@ -841,6 +841,15 @@ class TopicStreamRelay:
                     await _maybe_await(
                         self.on_turn_event("mutating_tool", {"tool": name})
                     )
+                # v0.79.0 (§5): EVERY tool_use block drives the live-summary
+                # controller's activity + plan progress. Emitted here (LIVE
+                # only — replay never reaches _handle_assistant_blocks), so the
+                # controller derives post-recovery state from the lifecycle
+                # alone and never from stale, replayed tool frames.
+                await _maybe_await(
+                    self.on_turn_event(
+                        "tool_use", {"tool": name, "input": tool_input})
+                )
                 await self._match_discrete_block(name, tool_input)
 
         self.cursor.current = {"segment": list(seg), "offset": off_after}

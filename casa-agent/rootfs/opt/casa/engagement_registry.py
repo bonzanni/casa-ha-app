@@ -156,6 +156,15 @@ class EngagementRecord:
     # settles any entry whose broker record did not survive the restart.
     next_question_number: int = 1
     open_questions: tuple[dict, ...] = ()
+    # v0.79.0 (§5): the pinned live-summary controller state. ``summary_message_id``
+    # is the Telegram id of the first (pinned) topic message, posted at boot
+    # BEFORE the subprocess starts so a resumed engagement adopts it on attach.
+    # ``summary_revision`` is the engagement-wide monotonic revision allocator —
+    # every lifecycle status transition acquires the next revision here (totally
+    # ordered, collision-free), so a newer revision may lower the status rank
+    # while an older/equal one never overrides.
+    summary_message_id: int | None = None
+    summary_revision: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +245,8 @@ class EngagementRegistry:
                     open_questions=tuple(
                         dict(q) for q in (row.get("open_questions") or ())
                     ),
+                    summary_message_id=row.get("summary_message_id"),
+                    summary_revision=int(row.get("summary_revision", 0) or 0),
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed engagement row: %s", exc)
@@ -373,6 +384,8 @@ class EngagementRegistry:
                 "interaction_state": rec.interaction_state,
                 "next_question_number": rec.next_question_number,
                 "open_questions": [dict(q) for q in rec.open_questions],
+                "summary_message_id": rec.summary_message_id,
+                "summary_revision": rec.summary_revision,
             })
         try:
             await asyncio.to_thread(self._write_tombstone, snapshot)
@@ -800,6 +813,53 @@ class EngagementRegistry:
         if rec is None:
             return []
         return sorted(q["n"] for q in rec.open_questions if "n" in q)
+
+    # -- v0.79.0 (§5) live-summary state ------------------------------------
+
+    async def set_summary_message_id(
+        self, engagement_id: str, message_id: int | None,
+    ) -> None:
+        """Persist the pinned summary Telegram message id (posted at boot).
+        No-op for an unknown engagement."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            rec.summary_message_id = message_id
+            await self._write_tombstone_locked()
+
+    async def allocate_summary_revision(self, engagement_id: str) -> int | None:
+        """Atomically allocate the next monotonic summary REVISION (§5).
+
+        Every lifecycle status transition acquires its revision here, so the
+        three status sources (driver turn lifecycle, ``interaction_state``, ask
+        registry) are totally ordered and collision-free. Uses the same
+        transactional shield-and-await pattern as ``allocate_question_number``
+        (a cancelled caller never tears the counter from disk). Returns the
+        allocated revision, or ``None`` for an unknown engagement."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return None
+            allocated = rec.summary_revision
+            prev = rec.summary_revision
+            rec.summary_revision = allocated + 1
+
+            async def _mutate_and_persist() -> int:
+                try:
+                    await self._write_tombstone_locked(strict=True)
+                except Exception:
+                    rec.summary_revision = prev
+                    raise
+                return allocated
+
+            task = asyncio.ensure_future(_mutate_and_persist())
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
+                raise
 
     async def sweep_idle_and_suspend(
         self, *, driver: Any, now_override: float | None = None,

@@ -397,6 +397,33 @@ class OutputSequencer:
             self._edit_cache[msg_id] = (text, tri)
             return APPLIED
 
+    async def edit_summary(self, msg_id: int, text: str) -> str:
+        """Edit the pinned live SUMMARY message (§5 — the R1 exception).
+
+        The summary is the FIRST topic message and lives ABOVE the append-only
+        causal log; its edits are NON-narration. Unlike
+        :meth:`edit_narration_if_latest`, this path deliberately does NOT touch
+        the narration/high-water invariants: it never seals the open narration,
+        never advances the high-water mark, and the summary message is never
+        itself sealed. That keeps the summary a living message while the causal
+        log below it stays strictly append-only (T1 invariants intact — the
+        summary id is posted before any narration, so it is never the
+        high-water/open-narration id).
+
+        Still funnels through the single serialization lock (one writer) and the
+        F1 no-op edit gate: an identical edit skips (returns :data:`APPLIED`); a
+        FAILED edit invalidates the cache entry so a retry is never suppressed.
+        """
+        async with self._lock:
+            if self._edit_cache.get(msg_id) == (text, MARKUP_ABSENT):
+                return APPLIED
+            ok = await _maybe_await(self.edit_message(self.topic_id, msg_id, text))
+            if not ok:
+                self._edit_cache.pop(msg_id, None)
+                return FAILED
+            self._edit_cache[msg_id] = (text, MARKUP_ABSENT)
+            return APPLIED
+
     async def seal_narration(self) -> None:
         """Explicitly SEAL the open narration (nothing edits it again)."""
         async with self._lock:

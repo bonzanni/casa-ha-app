@@ -946,3 +946,49 @@ class TestQuestionNumbering:
             await reg.allocate_question_number(rec.id)
         # Rolled back — the number never reached disk, so it must not be consumed.
         assert rec.next_question_number == 1
+
+
+class TestSummaryState:
+    """v0.79.0 (§5): summary_message_id persistence + monotonic revision."""
+
+    async def test_set_summary_message_id_persists_and_reloads(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        path = str(tmp_path / "e.json")
+        reg = EngagementRegistry(tombstone_path=path, bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="hello", driver="claude_code",
+            task="t", origin={}, topic_id=5,
+        )
+        await reg.set_summary_message_id(rec.id, 4242)
+        assert reg.get(rec.id).summary_message_id == 4242
+        # Reload from disk.
+        reg2 = EngagementRegistry(tombstone_path=path, bus=None)
+        await reg2.load()
+        assert reg2.get(rec.id).summary_message_id == 4242
+
+    async def test_allocate_summary_revision_is_monotonic(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        path = str(tmp_path / "e.json")
+        reg = EngagementRegistry(tombstone_path=path, bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="hello", driver="claude_code",
+            task="t", origin={}, topic_id=5,
+        )
+        assert await reg.allocate_summary_revision(rec.id) == 0
+        assert await reg.allocate_summary_revision(rec.id) == 1
+        assert await reg.allocate_summary_revision(rec.id) == 2
+        assert reg.get(rec.id).summary_revision == 3
+        # Survives a reload (never rewound).
+        reg2 = EngagementRegistry(tombstone_path=path, bus=None)
+        await reg2.load()
+        assert reg2.get(rec.id).summary_revision == 3
+        assert await reg2.allocate_summary_revision(rec.id) == 3
+
+    async def test_allocate_unknown_engagement_returns_none(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        assert await reg.allocate_summary_revision("nope") is None
+        await reg.set_summary_message_id("nope", 1)  # no-op, no raise

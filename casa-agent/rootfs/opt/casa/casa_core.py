@@ -1898,6 +1898,12 @@ async def main() -> None:
                 thread_id, message_id)
         return False
 
+    async def _pin_topic_message(thread_id: int, message_id: int) -> bool:
+        # v0.79.0 (§5): best-effort pin of the live summary message.
+        if telegram_channel is not None:
+            return await telegram_channel.pin_topic_message(thread_id, message_id)
+        return False
+
     # Expose on the agent module so tools.emit_completion / cancel_engagement
     # can find it without circular imports.
     import agent as agent_mod
@@ -1925,6 +1931,8 @@ async def main() -> None:
         # seam for Task 7's inbound one-turn queue).
         edit_topic_message=_edit_topic_message,
         delete_topic_message=_delete_topic_message,
+        # v0.79.0 (§5): best-effort pin primitive for the live summary.
+        pin_topic_message=_pin_topic_message,
         registry=engagement_registry,
         # O-5 (v0.37.9): capture-and-persist SDK session_id so a Casa
         # restart mid-engagement preserves conversation continuity.

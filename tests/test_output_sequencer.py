@@ -482,3 +482,42 @@ async def test_mark_intent_posted_leaves_debt_relay_consumes_block():
     # Retry reattachment: the recorded outcome carries the posted message id.
     assert seq.intent_outcome("a1") == {
         "ok": True, "message_id": 777, "out_of_band": True}
+
+
+# ---------------------------------------------------------------------------
+# §5 R1 exception: edit_summary is a NON-narration edit.
+# ---------------------------------------------------------------------------
+
+
+async def test_edit_summary_does_not_touch_narration_or_high_water():
+    """The pinned SUMMARY (§5) lives ABOVE the causal log: editing it must not
+    seal the open narration, advance the high-water, or seal the summary
+    itself — so T1 narration invariants are preserved."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    # The summary is posted BEFORE any narration (lowest id); simulate id 500.
+    summary_id = 500
+    nid = await seq.open_narration("live narration")
+    assert seq.high_water == nid and seq.narration_msg_id == nid
+
+    assert await seq.edit_summary(summary_id, "goal\n⚙️ working") == APPLIED
+    # High-water + open narration are UNTOUCHED by the summary edit.
+    assert seq.high_water == nid
+    assert seq.narration_msg_id == nid
+    # The narration is still editable-if-latest (not sealed by the summary edit).
+    assert await seq.edit_narration_if_latest(nid, "live narration more") == APPLIED
+
+
+async def test_edit_summary_noop_gate_and_failed_invalidation():
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    assert await seq.edit_summary(500, "text-A") == APPLIED
+    assert len(rec.edits) == 1
+    # Identical edit is a no-op skip (still APPLIED, no new wire edit).
+    assert await seq.edit_summary(500, "text-A") == APPLIED
+    assert len(rec.edits) == 1
+    # A failed edit invalidates the cache so a retry is never suppressed.
+    rec.edit_fails = 1
+    assert await seq.edit_summary(500, "text-B") == FAILED
+    assert await seq.edit_summary(500, "text-B") == APPLIED
+    assert rec.edits[-1] == (42, 500, "text-B")

@@ -1856,6 +1856,7 @@ class TelegramChannel(Channel):
         Safe to call when ``engagement_supergroup_id`` is unset — no-op.
         """
         self.engagement_permission_ok = False
+        self.engagement_can_pin = False
         if not self.engagement_supergroup_id:
             return
         # Bot-permissions check
@@ -1880,6 +1881,18 @@ class TelegramChannel(Channel):
                 )
                 return
             self.engagement_permission_ok = True
+            # v0.79.0 (§5): probe can_pin_messages alongside can_manage_topics.
+            # Best-effort — the pinned live summary is nicer-to-have; without
+            # the grant the summary still lives, just unpinned (a WARN at
+            # pin-attempt time, never a hard failure).
+            self.engagement_can_pin = bool(
+                getattr(member, "can_pin_messages", False))
+            if not self.engagement_can_pin:
+                logger.info(
+                    "Engagement supergroup %s: bot lacks can_pin_messages; "
+                    "the live summary will not be pinned",
+                    self.engagement_supergroup_id,
+                )
             # v0.37.1 D-1: boot-time diagnostic for the topic-icon map.
             # Non-fatal — logged only if any of our IDs rotated out of
             # Telegram's curated set.
@@ -1950,6 +1963,34 @@ class TelegramChannel(Channel):
             **kwargs,
         )
         return msg.message_id
+
+    async def pin_topic_message(
+        self, thread_id: int, message_id: int,
+    ) -> bool:
+        """v0.79.0 (§5): pin the live-summary message within its forum topic.
+
+        Best-effort — returns ``False`` (never raises) when pinning is
+        unavailable (no ``can_pin_messages`` grant, or a Telegram error). A
+        pinned message in a forum-topic thread pins within that topic. Never
+        unpins any other message.
+        """
+        if not self.engagement_supergroup_id:
+            return False
+        if not getattr(self, "engagement_can_pin", False):
+            return False
+        try:
+            await self.bot.pin_chat_message(
+                chat_id=self.engagement_supergroup_id,
+                message_id=message_id,
+                disable_notification=True,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — pin is best-effort
+            logger.info(
+                "pin_topic_message failed (thread=%s message_id=%s): %s",
+                thread_id, message_id, exc,
+            )
+            return False
 
     async def update_topic_state(
         self, *, engagement_id: str, new_state: str,

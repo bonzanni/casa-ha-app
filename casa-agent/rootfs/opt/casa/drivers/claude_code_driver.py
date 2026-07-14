@@ -551,6 +551,7 @@ class ClaudeCodeDriver(DriverProtocol):
         persist_session_id: SessionIdPersister | None = None,
         edit_topic_message: Callable[[int, int, str], Awaitable[bool]] | None = None,
         delete_topic_message: Callable[[int, int], Awaitable[bool]] | None = None,
+        pin_topic_message: Callable[[int, int], Awaitable[bool]] | None = None,
         registry: Any = None,
     ) -> None:
         self._engagements_root = engagements_root
@@ -561,6 +562,10 @@ class ClaudeCodeDriver(DriverProtocol):
         self._send_to_topic = send_to_topic
         self._edit_topic_message = edit_topic_message
         self._delete_topic_message = delete_topic_message
+        # v0.79.0 (§5): best-effort pin of the live summary message. Takes
+        # ``(topic_id, message_id)`` and returns pin-ok. None (or an ungranted
+        # can_pin_messages) leaves the summary unpinned but still live.
+        self._pin_topic_message = pin_topic_message
         self._casa_framework_mcp_url = casa_framework_mcp_url
         self._persist_session_id = persist_session_id
         # ``advance_interaction_state`` (Task 7) lives on this registry; the
@@ -596,6 +601,10 @@ class ClaudeCodeDriver(DriverProtocol):
         # resolving the driver via ``agent.active_claude_code_driver`` exactly
         # as tools.emit_completion already does.
         self._sequencers: dict[str, "OutputSequencer"] = {}
+        # v0.79.0 (§5): ONE per-engagement live-SUMMARY controller (owns the
+        # pinned first topic message; consumers submit desired state and it
+        # coalesces/throttles edits through the sequencer). Dropped on teardown.
+        self._summaries: dict[str, "SummaryController"] = {}
         # v0.79.0 (§4): consecutive ask-inbound-gate refusals in the CURRENT
         # turn (reset at turn_start). From the 3rd the refusal copy escalates +
         # a WARN counter is logged (soft anti-livelock — no hard force-end).
@@ -703,6 +712,11 @@ class ClaudeCodeDriver(DriverProtocol):
 
                 # 3. Compile + update + change — lock held, inner helper.
                 await s6_rc._compile_and_update_locked()
+                # v0.79.0 (§5): post the pinned live SUMMARY and persist its id
+                # BEFORE the subprocess starts. A post FAILURE aborts the launch
+                # (rolled back by the handler below), so the operator never sees
+                # an engagement running without its summary anchor.
+                await self._post_initial_summary(engagement)
                 await s6_rc.start_service(engagement_id=engagement.id)
             except Exception as start_exc:  # noqa: BLE001 — rollback is opportunistic
                 logger.warning(
@@ -789,6 +803,11 @@ class ClaudeCodeDriver(DriverProtocol):
         self._violation_flagged.discard(engagement.id)
         # v0.79.0 (§2): drop the sequencer (its watcher task is cancelled above).
         self._sequencers.pop(engagement.id, None)
+        # v0.79.0 (§5): drop the summary controller and cancel its elapsed tick
+        # (not in self._tasks — the controller owns it).
+        ctrl = self._summaries.pop(engagement.id, None)
+        if ctrl is not None:
+            ctrl.shutdown()
 
         async with s6_rc._compile_lock:
             # Stop is tolerant of "already down" — log and continue.
@@ -935,6 +954,12 @@ class ClaudeCodeDriver(DriverProtocol):
         # discrete ingress that registers an intent early always finds it, and
         # BEFORE the spool so delivery can set the turn's reply-thread target.
         sequencer = self._ensure_sequencer(engagement)
+        # v0.79.0 (§5): the live-SUMMARY controller. Adopts the summary message
+        # id posted at boot (fresh engagement) or persisted across a restart
+        # (resumed engagement); its edits flow through the sequencer above.
+        summary = self._ensure_summary(engagement)
+        summary.adopt_message_id(
+            getattr(engagement, "summary_message_id", None))
         # v0.79.0 (§3): the durable inbound envelope spool. Loads any surviving
         # spool file so undelivered turns redeliver and pending receipts/notices
         # retry (recovery scheduled below).
@@ -973,6 +998,12 @@ class ClaudeCodeDriver(DriverProtocol):
             asyncio.create_task(
                 self._run_topic_relay(engagement),
                 name=f"topic_relay:{engagement.id[:8]}"),
+            # v0.79.0 (§5): initial best-effort pin attempt for the live summary
+            # (retried on every lifecycle flush by the controller). No-op when
+            # there is no pin primitive / no message id.
+            asyncio.create_task(
+                summary.ensure_pinned(),
+                name=f"summary_pin:{engagement.id[:8]}"),
         ]
         # Phase 4b G5: ALSO relay every raw s6-log line into Casa's logger at
         # DEBUG so operators have one greppable namespace for both drivers' CLI
@@ -1069,6 +1100,134 @@ class ClaudeCodeDriver(DriverProtocol):
             spool._persist_quiet()
             return
         await spool.drain()
+
+    # -- v0.79.0 (§5) live-summary controller -------------------------------
+
+    @staticmethod
+    def _summary_goal_line(engagement: EngagementRecord) -> str:
+        """The summary's stable header — the engagement's topic-name string
+        source (the concise task, minus the state emoji the status line owns)."""
+        try:
+            from channels.state_emoji import concise_task
+            return concise_task(engagement.task or "")
+        except Exception:  # noqa: BLE001 — a goal line is best-effort
+            return (engagement.task or "").strip()
+
+    async def _post_initial_summary(self, engagement: EngagementRecord) -> int | None:
+        """§5 boot: post the pinned live summary, persist its id, attempt the
+        pin. Raises ``RuntimeError`` on a post failure so ``start`` aborts.
+
+        A resumed/replayed engagement never calls this (it already has a
+        persisted ``summary_message_id`` that the controller adopts on attach).
+        """
+        if engagement.topic_id is None:
+            return None
+        from drivers.summary_controller import STATUS_WORKING, render_summary
+        text = render_summary(
+            goal_line=self._summary_goal_line(engagement),
+            status=STATUS_WORKING,
+        )
+        try:
+            mid = await self._send_to_topic(engagement.topic_id, text)
+        except Exception as exc:  # noqa: BLE001 — abort the launch
+            raise RuntimeError(
+                f"summary post failed for engagement {engagement.id[:8]}: {exc}"
+            ) from exc
+        if mid is None:
+            raise RuntimeError(
+                f"summary post returned no message id for engagement "
+                f"{engagement.id[:8]}"
+            )
+        # Persist on both the in-memory record (so _spawn_background_tasks'
+        # controller adopts it) and durably (so a restart resumes it).
+        engagement.summary_message_id = mid
+        setter = getattr(self._registry, "set_summary_message_id", None)
+        if setter is not None:
+            try:
+                await setter(engagement.id, mid)
+            except Exception as exc:  # noqa: BLE001 — id is in-memory regardless
+                logger.warning(
+                    "engagement %s: persisting summary_message_id failed: %s",
+                    engagement.id[:8], exc,
+                )
+        # Best-effort initial pin (WARN once on failure; retried on lifecycle
+        # flush by the controller). Never unpin other messages.
+        if self._pin_topic_message is not None:
+            try:
+                ok = await self._pin_topic_message(engagement.topic_id, mid)
+            except Exception:  # noqa: BLE001
+                ok = False
+            if not ok:
+                logger.warning(
+                    "engagement %s: could not pin the live summary message "
+                    "(best-effort; will retry on the next lifecycle flush)",
+                    engagement.id[:8],
+                )
+            else:
+                ctrl = self._summaries.get(engagement.id)
+                if ctrl is not None:
+                    ctrl._pinned = True
+        return mid
+
+    def _ensure_summary(self, engagement: EngagementRecord) -> "SummaryController":
+        """Build (or return) the per-engagement live-summary controller (§5)."""
+        from drivers.summary_controller import SummaryController
+
+        ctrl = self._summaries.get(engagement.id)
+        if ctrl is None:
+            reg = self._registry
+            eid = engagement.id
+            ctrl = SummaryController(
+                engagement_id=eid,
+                sequencer=self._ensure_sequencer(engagement),
+                goal_line=self._summary_goal_line(engagement),
+                open_question_numbers=(
+                    (lambda: reg.open_question_numbers(eid))
+                    if reg is not None
+                    and hasattr(reg, "open_question_numbers")
+                    else (lambda: [])
+                ),
+                pin_message=(
+                    (lambda mid: self._pin_topic_message(engagement.topic_id, mid))
+                    if self._pin_topic_message is not None
+                    and engagement.topic_id is not None
+                    else None
+                ),
+                message_id=getattr(engagement, "summary_message_id", None),
+            )
+            self._summaries[eid] = ctrl
+        return ctrl
+
+    async def _summary_status_transition(
+        self, engagement_id: str, status: str,
+    ) -> None:
+        """Acquire the next monotonic revision from the engagement-wide
+        allocator and submit a lifecycle STATUS to the controller (§5). A
+        lifecycle source (turn lifecycle / interaction_state / ask registry)
+        calls this so the three sources are totally ordered."""
+        ctrl = self._summaries.get(engagement_id)
+        if ctrl is None:
+            return
+        rev: int | None = None
+        alloc = getattr(self._registry, "allocate_summary_revision", None)
+        if alloc is not None:
+            try:
+                rev = await alloc(engagement_id)
+            except Exception as exc:  # noqa: BLE001 — degrade to no revision
+                logger.debug("allocate_summary_revision failed: %s", exc)
+        await ctrl.submit_status(status, rev)
+
+    async def finalize_summary(
+        self, engagement: EngagementRecord, outcome: str,
+    ) -> None:
+        """§5 engagement finalize: set the TERMINAL summary status (absolute),
+        cancel the tick and perform the mandatory finalize flush. Called by
+        ``_finalize_engagement`` while the topic is still open."""
+        from drivers.summary_controller import OUTCOME_STATUS, STATUS_ERROR
+        ctrl = self._summaries.get(engagement.id)
+        if ctrl is None:
+            return
+        await ctrl.finalize(OUTCOME_STATUS.get(outcome, STATUS_ERROR))
 
     def _ensure_sequencer(self, engagement: EngagementRecord) -> "OutputSequencer":
         """Build (or return) the per-engagement OUTPUT SEQUENCER (§2).
@@ -1416,6 +1575,13 @@ class ClaudeCodeDriver(DriverProtocol):
             spool = self._inbound.get(eng_id)
             if spool is not None:
                 await spool.on_turn_start()
+            # §5: a running turn ⇒ ⚙️ working. Reset the elapsed base + start the
+            # tick FIRST (so the working-status flush already reflects it).
+            summary = self._summaries.get(eng_id)
+            if summary is not None:
+                from drivers.summary_controller import STATUS_WORKING
+                await summary.note_turn_start()
+                await self._summary_status_transition(eng_id, STATUS_WORKING)
         elif kind == "mutating_tool":
             logger.debug(
                 "engagement %s mutating tool during turn: %s",
@@ -1456,12 +1622,36 @@ class ClaudeCodeDriver(DriverProtocol):
                                 "will retry on next mutating tool",
                                 eng_id[:8], exc_info=True,
                             )
+        elif kind == "tool_use":
+            # §5: EVERY tool_use block drives the summary's activity + plan
+            # progress (NEVER status). Skips the engagement-channel CONTROL
+            # tools (ask/reply/set_progress) — they are lifecycle-status
+            # signals, not work activity.
+            summary = self._summaries.get(eng_id)
+            if summary is not None:
+                name = payload.get("tool") or ""
+                if not name.startswith("mcp__casa-engagement-channel__"):
+                    from drivers.summary_controller import (
+                        activity_for_tool, extract_plan,
+                    )
+                    await summary.submit_activity(activity_for_tool(name))
+                    plan = extract_plan(name, payload.get("input") or {})
+                    if plan is not None:
+                        await summary.submit_plan(**plan)
         elif kind == "result":
             self._epoch_pending[eng_id] = None
             self._turn_running[eng_id] = False
             spool = self._inbound.get(eng_id)
             if spool is not None:
                 await spool.on_turn_end()
+            # §5: a finished turn ⇒ the ball is with the operator (⏳ waiting for
+            # your reply). Stop the elapsed tick + mandatory turn-end flush.
+            summary = self._summaries.get(eng_id)
+            if summary is not None:
+                from drivers.summary_controller import STATUS_WAITING_REPLY
+                await self._summary_status_transition(
+                    eng_id, STATUS_WAITING_REPLY)
+                await summary.note_turn_end()
 
     def _log_abnormal_exit(
         self, engagement: EngagementRecord, epoch: int | None,

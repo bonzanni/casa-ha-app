@@ -2532,6 +2532,18 @@ async def _finalize_engagement(
     except Exception:  # noqa: BLE001
         pass
 
+    # v0.79.0 (§5): terminal summary flush — set the pinned summary's absolute
+    # terminal status (✅/🛑/⚠️) and cancel its elapsed tick while the topic is
+    # STILL OPEN (before the U3 title flip + close_topic below).
+    if driver is not None and hasattr(driver, "finalize_summary"):
+        try:
+            await driver.finalize_summary(engagement, outcome)
+        except Exception as exc:  # noqa: BLE001 — never abort finalize
+            logger.warning(
+                "finalize engagement %s: summary finalize failed: %s",
+                engagement.id[:8], exc,
+            )
+
     # [AR-4] Topic-retention ledger (2026-07-10 design): record the topic
     # for the retention sweep the moment the record flips terminal — both
     # drivers, all outcomes, regardless of whether close_topic below

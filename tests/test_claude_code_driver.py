@@ -309,10 +309,11 @@ class TestNoRemoteControlNotices:
             drv._spawn_background_tasks(rec)
             tasks = drv._tasks[rec.id]
             # respawn poller + sequencer watcher + session-id capture +
-            # always-on topic relay + DEBUG log relay; no URL capture.
-            # (v0.75.0 added the always-on topic relay; v0.79.0 added the
-            # per-engagement output-sequencer watcher, so DEBUG-enabled is 5.)
-            assert len(tasks) == 5
+            # always-on topic relay + DEBUG log relay + summary-pin; no URL
+            # capture. (v0.75.0 added the always-on topic relay; v0.79.0 added
+            # the per-engagement output-sequencer watcher AND the summary
+            # initial-pin task, so DEBUG-enabled is 6.)
+            assert len(tasks) == 6
             await asyncio.sleep(0.3)
             for t in tasks:
                 t.cancel()
@@ -343,9 +344,10 @@ class TestRelaySpawnGate:
             drv._spawn_background_tasks(rec)
             tasks = drv._tasks[rec.id]
             # respawn poller + sequencer watcher + session-id capture +
-            # always-on topic relay. The DEBUG raw-log relay is skipped; the
-            # topic relay + sequencer watcher are NOT (v0.79.0: 4 tasks).
-            assert len(tasks) == 4
+            # always-on topic relay + summary-pin. The DEBUG raw-log relay is
+            # skipped; the topic relay + sequencer watcher + summary-pin are NOT
+            # (v0.79.0: 5 tasks).
+            assert len(tasks) == 5
             names = [t.get_name() for t in tasks]
             assert any(n.startswith("topic_relay:") for n in names), names
             assert any(n.startswith("seq_watcher:") for n in names), names
@@ -1877,3 +1879,206 @@ class TestAskLifecycleSeams:
         drv._sequencers["eng"] = seq
         drv.set_engagement_reply_anchor("eng", 5555)
         assert seq.reply_targets == [5555]
+
+
+class TestBootSummary:
+    """v0.79.0 (§5): the pinned live summary is posted + persisted BEFORE the
+    subprocess starts; a post failure aborts the launch."""
+
+    def _mock_s6(self, monkeypatch, tmp_path, order):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers import s6_rc
+
+        async def fake_cau():
+            return None
+
+        async def fake_start_kw(*, engagement_id):
+            order.append("start_service")
+
+        monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+        monkeypatch.setattr(s6_rc, "start_service", fake_start_kw)
+        monkeypatch.setattr(
+            s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(tmp_path / "svc-root"))
+        (tmp_path / "svc-root").mkdir()
+        monkeypatch.setattr(
+            ClaudeCodeDriver, "_spawn_background_tasks",
+            lambda self, engagement: None)
+
+        async def _noop_write(self, engagement, text):
+            return None
+        monkeypatch.setattr(ClaudeCodeDriver, "_write_to_fifo", _noop_write)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo (Linux-only)")
+    async def test_summary_posted_and_persisted_before_start_service(
+        self, monkeypatch, tmp_path,
+    ):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        order: list[str] = []
+        self._mock_s6(monkeypatch, tmp_path, order)
+
+        sent: list[tuple[int, str]] = []
+
+        async def send(topic_id, text, **kw):
+            order.append("summary_post")
+            sent.append((topic_id, text))
+            return 4242
+
+        class FakeReg:
+            def __init__(self):
+                self.persisted = None
+
+            async def set_summary_message_id(self, eid, mid):
+                self.persisted = (eid, mid)
+        reg = FakeReg()
+
+        defn = _make_defn(tmp_path)
+        rec = _make_record()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=send,
+            casa_framework_mcp_url="http://x",
+            registry=reg,
+        )
+        (tmp_path / "engagements").mkdir()
+
+        await drv.start(rec, prompt="p", options=defn)
+
+        assert order.index("summary_post") < order.index("start_service")
+        assert rec.summary_message_id == 4242
+        assert reg.persisted == (rec.id, 4242)
+        assert "⚙️ working" in sent[0][1]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo (Linux-only)")
+    async def test_summary_post_failure_aborts_launch(self, monkeypatch, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        order: list[str] = []
+        self._mock_s6(monkeypatch, tmp_path, order)
+
+        async def boom(topic_id, text, **kw):
+            raise RuntimeError("telegram down")
+
+        defn = _make_defn(tmp_path)
+        rec = _make_record()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=boom,
+            casa_framework_mcp_url="http://x",
+        )
+        (tmp_path / "engagements").mkdir()
+
+        with pytest.raises(RuntimeError):
+            await drv.start(rec, prompt="p", options=defn)
+        assert "start_service" not in order  # subprocess never started
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo (Linux-only)")
+    async def test_summary_post_none_id_aborts_launch(self, monkeypatch, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        order: list[str] = []
+        self._mock_s6(monkeypatch, tmp_path, order)
+
+        async def send(topic_id, text, **kw):
+            return None
+
+        defn = _make_defn(tmp_path)
+        rec = _make_record()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=send,
+            casa_framework_mcp_url="http://x",
+        )
+        (tmp_path / "engagements").mkdir()
+
+        with pytest.raises(RuntimeError):
+            await drv.start(rec, prompt="p", options=defn)
+        assert "start_service" not in order
+
+
+class TestSummaryStreamWiring:
+    """v0.79.0 (§5): _on_stream_event drives the summary controller."""
+
+    async def _driver_with_summary(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        edits: list[tuple[int, str]] = []
+
+        async def edit(topic_id, mid, text):
+            edits.append((mid, text))
+            return True
+
+        class FakeReg:
+            def __init__(self):
+                self.rev = 0
+                self.open: list[int] = []
+
+            async def allocate_summary_revision(self, eid):
+                r = self.rev
+                self.rev += 1
+                return r
+
+            def open_question_numbers(self, eid):
+                return list(self.open)
+        reg = FakeReg()
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=AsyncMock(return_value=1),
+            casa_framework_mcp_url="x",
+            edit_topic_message=edit,
+            registry=reg,
+        )
+        rec = _make_record()
+        rec.summary_message_id = 500
+        ctrl = drv._ensure_summary(rec)
+        ctrl.adopt_message_id(500)
+        return drv, rec, ctrl, edits, reg
+
+    async def test_turn_start_working_result_waiting(self, tmp_path):
+        from drivers.summary_controller import (
+            STATUS_WAITING_REPLY, STATUS_WORKING,
+        )
+        drv, rec, ctrl, edits, reg = await self._driver_with_summary(tmp_path)
+        await drv._on_stream_event(rec, "turn_start", {})
+        assert ctrl._status == STATUS_WORKING
+        await drv._on_stream_event(rec, "result", {"subtype": "success"})
+        assert ctrl._status == STATUS_WAITING_REPLY
+        assert any("waiting for your reply" in t for _m, t in edits)
+        ctrl.shutdown()
+
+    async def test_tool_use_updates_activity_and_plan(self, tmp_path):
+        drv, rec, ctrl, edits, reg = await self._driver_with_summary(tmp_path)
+        await drv._on_stream_event(rec, "turn_start", {})
+        await drv._on_stream_event(
+            rec, "tool_use", {"tool": "Bash", "input": {"command": "ls"}})
+        assert ctrl._activity == "running commands"
+        await drv._on_stream_event(
+            rec, "tool_use",
+            {"tool": "TodoWrite", "input": {"todos": [
+                {"content": "a", "status": "completed"},
+                {"content": "b", "status": "in_progress"},
+            ]}},
+        )
+        assert ctrl._plan_total == 2 and ctrl._plan_done == 1
+        ctrl.shutdown()
+
+    async def test_control_tool_ignored_for_activity(self, tmp_path):
+        drv, rec, ctrl, edits, reg = await self._driver_with_summary(tmp_path)
+        await drv._on_stream_event(rec, "turn_start", {})
+        await drv._on_stream_event(
+            rec, "tool_use",
+            {"tool": "mcp__casa-engagement-channel__ask", "input": {}})
+        assert ctrl._activity is None
+        ctrl.shutdown()
+
+    async def test_finalize_summary_terminal_absolute(self, tmp_path):
+        from drivers.summary_controller import STATUS_COMPLETED
+        drv, rec, ctrl, edits, reg = await self._driver_with_summary(tmp_path)
+        await drv._on_stream_event(rec, "turn_start", {})
+        await drv.finalize_summary(rec, "completed")
+        assert ctrl._status == STATUS_COMPLETED
+        # Terminal absolute: a later turn_start cannot revert it.
+        await drv._on_stream_event(rec, "turn_start", {})
+        assert ctrl._status == STATUS_COMPLETED
+        assert ctrl._tick_task is None  # tick cancelled at finalize
