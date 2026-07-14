@@ -278,6 +278,13 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
             return "corrupt_artifact"
     except (OSError, StoreError):
         return "corrupt_artifact"
+    # A:§3.7 (r2-B6/r3-4 upgrade path): re-check pre-v0.76 stored artifacts —
+    # a present-but-malformed casa.protectedTools excludes THIS artifact from
+    # resolution (per-plugin degradation), never a whole-role failure.
+    try:
+        manifest_protected_tools(manifest)
+    except StoreError:
+        return "protected_tools_invalid"
     return None
 
 
@@ -517,6 +524,34 @@ def manifest_sysreqs(manifest: dict) -> list:
     return [r for r in reqs if isinstance(r, dict)] if isinstance(reqs, list) else []
 
 
+def manifest_protected_tools(manifest: dict) -> list:
+    """Guarded + STRICT casa.protectedTools extraction (A:§3.7), beside
+    manifest_sysreqs. An ABSENT ``casa.protectedTools`` (no ``casa``, a
+    non-object ``casa``, or the key itself missing) means "no protected
+    tools" -> ``[]``. A PRESENT field that is not a list of non-empty
+    strings is a plugin-author error: raises
+    ``StoreError(reason_code="protected_tools_invalid")`` so each of the
+    THREE call sites decides what that means — ``validate_manifest`` refuses
+    an install/update, ``artifact_verdict`` excludes an already-stored
+    artifact from resolution (per-plugin degradation, never a whole-role
+    failure), and ``plugin_grants.protected_map`` excludes just that
+    plugin's tools from the map. B7 operator ruling: semantic typos (a
+    declared name that doesn't match a real tool) are an accepted
+    plugin-author trust boundary — this validates SHAPE only, never runtime
+    MCP enumeration."""
+    casa = manifest.get("casa") if isinstance(manifest, dict) else None
+    if not isinstance(casa, dict) or "protectedTools" not in casa:
+        return []
+    value = casa.get("protectedTools")
+    if not isinstance(value, list) or not all(
+        isinstance(t, str) and t for t in value
+    ):
+        raise StoreError(
+            "casa.protectedTools must be a list of non-empty strings",
+            reason_code="protected_tools_invalid")
+    return list(value)
+
+
 def validate_manifest(root: Path, expected_name: str) -> dict:
     mf = Path(root) / ".claude-plugin" / "plugin.json"
     try:
@@ -544,6 +579,9 @@ def validate_manifest(root: Path, expected_name: str) -> dict:
             raise StoreError(
                 f"package-manager requirement rejected: {req.get('type')}",
                 reason_code="apt_requirements_rejected")
+    # A:§3.7 (B7): a PRESENT-but-malformed casa.protectedTools refuses the
+    # install/update outright (strict; raises protected_tools_invalid).
+    manifest_protected_tools(manifest)
     return manifest
 
 

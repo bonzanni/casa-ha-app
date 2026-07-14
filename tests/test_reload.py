@@ -1389,3 +1389,341 @@ class TestDisabledSpecialistReload:
         assert result["status"] == "ok"
         assert "construct_agent" in result["actions"]
         assert runtime.agents["finance"] is built
+
+
+# --- A:§3.3/§3.4 lifecycle invalidation ordering (v0.76.0, r1-B8/r2-B5) ------
+
+
+def _patch_authz(monkeypatch):
+    """Spy on the process-wide GRANTS/CHALLENGES singletons so each
+    enumerated reload seam's purge/cancel calls can be observed in order,
+    without touching their real (side-effect-free-for-empty-state) logic."""
+    import authz_grants
+    calls: list[tuple] = []
+    monkeypatch.setattr(authz_grants.GRANTS, "purge_role",
+                        lambda role: calls.append(("purge_role", role)) or 0)
+    monkeypatch.setattr(
+        authz_grants.CHALLENGES, "cancel_matching",
+        lambda **kw: calls.append(("cancel_matching", kw.get("role"))) or 0)
+    return calls
+
+
+class TestGrantInvalidationSeams:
+    """Each of the enumerated seams (A:§3.7 r2-B5) purges grants + cancels
+    challenges by NORMALIZED role BEFORE the replacement/removed agent
+    becomes dispatchable."""
+
+    async def test_reload_agent_normal_swap_invalidates_before_new_agent_live(
+            self, tmp_path, monkeypatch):
+        from reload import dispatch, register_handler, reload_agent
+        from types import SimpleNamespace
+        register_handler("agent", reload_agent)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "ellen").mkdir(parents=True)
+        new_cfg = SimpleNamespace(role="ellen",
+                                  character=SimpleNamespace(name="E2", card=""),
+                                  triggers=[], channels=[])
+        new_agent = MagicMock()
+        new_agent.handle_message = MagicMock()
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: new_cfg)
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+        import reload as reload_mod
+        monkeypatch.setattr(reload_mod, "_construct_agent",
+                            lambda *a, **kw: new_agent)
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs["ellen"] = SimpleNamespace(
+            role="ellen", character=SimpleNamespace(name="Ellen", card=""))
+        old_agent = MagicMock()
+        old_agent.aclose = AsyncMock()
+        runtime.agents["ellen"] = old_agent
+
+        calls = _patch_authz(monkeypatch)
+        # Assert BEFORE-dispatchable ordering at call time: the swap must
+        # not yet have happened when invalidation runs.
+        original = runtime.agents.get
+        seen_before_swap = {}
+
+        def spy_purge(role):
+            seen_before_swap["ellen_is_old"] = runtime.agents.get("ellen") is old_agent
+            calls.append(("purge_role", role))
+            return 0
+        monkeypatch.setattr(__import__("authz_grants").GRANTS, "purge_role", spy_purge)
+
+        result = await dispatch("agent", runtime=runtime, role="ellen")
+        assert result["status"] == "ok"
+        assert runtime.agents["ellen"] is new_agent
+        assert ("purge_role", "ellen") in calls
+        assert seen_before_swap["ellen_is_old"] is True
+
+    async def test_disabled_specialist_teardown_invalidates_before_pop(
+            self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from reload import dispatch, register_handler, reload_agent
+        register_handler("agent", reload_agent)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "specialists" / "finance").mkdir(parents=True)
+        new_cfg = SimpleNamespace(enabled=False, role="finance",
+                                  triggers=[], channels=[])
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: new_cfg)
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {}
+        stale_instance = MagicMock()
+        stale_instance.aclose = AsyncMock()
+        stale_instance.active_plugin_binding = {}
+        runtime.agents = {"finance": stale_instance}
+        runtime.specialist_registry.load = MagicMock()
+        runtime.specialist_registry.all_configs = MagicMock(return_value={})
+        runtime.trigger_registry.reregister_for = MagicMock()
+
+        calls = _patch_authz(monkeypatch)
+        seen = {}
+
+        def spy_purge(role):
+            seen["still_present"] = "finance" in runtime.agents
+            calls.append(("purge_role", role))
+            return 0
+        monkeypatch.setattr(__import__("authz_grants").GRANTS, "purge_role", spy_purge)
+
+        result = await dispatch("agent", runtime=runtime, role="finance")
+        assert result["status"] == "ok"
+        assert "finance" not in runtime.agents
+        assert ("purge_role", "finance") in calls
+        assert seen["still_present"] is True
+
+    async def test_reload_role_after_policies_invalidates_before_swap(
+            self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from reload import _reload_role_after_policies
+        import reload as reload_mod
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "ellen").mkdir(parents=True)
+        new_cfg = SimpleNamespace(role="ellen",
+                                  character=SimpleNamespace(name="E2", card=""))
+        new_agent = MagicMock()
+        new_agent.handle_message = MagicMock()
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: new_cfg)
+        monkeypatch.setattr(reload_mod, "_construct_agent",
+                            lambda *a, **kw: new_agent)
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs["ellen"] = SimpleNamespace(role="ellen")
+        old_agent = MagicMock()
+        old_agent.aclose = AsyncMock()
+        runtime.agents["ellen"] = old_agent
+
+        calls = _patch_authz(monkeypatch)
+        seen = {}
+
+        def spy_purge(role):
+            seen["ellen_is_old"] = runtime.agents.get("ellen") is old_agent
+            calls.append(("purge_role", role))
+            return 0
+        monkeypatch.setattr(__import__("authz_grants").GRANTS, "purge_role", spy_purge)
+
+        await _reload_role_after_policies(runtime, "ellen")
+        assert runtime.agents["ellen"] is new_agent
+        assert ("purge_role", "ellen") in calls
+        assert seen["ellen_is_old"] is True
+
+    async def test_reload_agents_resident_add_invalidates_before_dispatchable(
+            self, tmp_path, monkeypatch):
+        from reload import dispatch, register_handler, reload_agents
+        from types import SimpleNamespace
+        register_handler("agents", reload_agents)
+
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "ellen").mkdir()
+        (agents_dir / "newcomer").mkdir()
+        new_cfg = SimpleNamespace(
+            role="newcomer", character=SimpleNamespace(name="N", card=""),
+            triggers=[], channels=[],
+            memory=SimpleNamespace(read_strategy="per_turn"))
+        new_agent = MagicMock()
+
+        def fake_load(d, **kw):
+            return new_cfg if "newcomer" in d else MagicMock(role="ellen")
+        monkeypatch.setattr("agent_loader.load_agent_from_dir", fake_load)
+        monkeypatch.setattr("policies.load_policies", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr("agent_home.provision_agent_home",
+                            lambda *, role, home_root, defaults_root: None)
+        import reload as reload_mod
+        monkeypatch.setattr(reload_mod, "_construct_agent",
+                            lambda **kw: new_agent)
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {"ellen": MagicMock()}
+        runtime.specialist_registry.all_configs = lambda: {}
+
+        calls = _patch_authz(monkeypatch)
+        seen = {}
+
+        def spy_purge(role):
+            if role == "newcomer":
+                seen["not_dispatchable_yet"] = "newcomer" not in runtime.agents
+            calls.append(("purge_role", role))
+            return 0
+        monkeypatch.setattr(__import__("authz_grants").GRANTS, "purge_role", spy_purge)
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        assert runtime.agents["newcomer"] is new_agent
+        assert ("purge_role", "newcomer") in calls
+        assert seen["not_dispatchable_yet"] is True
+
+    async def test_reload_agents_resident_evict_invalidates_before_teardown(
+            self, tmp_path, monkeypatch):
+        from bus import MessageBus
+        from reload import dispatch, register_handler, reload_agents
+        register_handler("agents", reload_agents)
+
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "ellen").mkdir()   # tina absent on disk -> evict
+
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: MagicMock())
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        bus = MessageBus()
+        bus.register("ellen", MagicMock())
+        bus.register("tina", MagicMock())
+        runtime.bus = bus
+        runtime.role_configs = {"ellen": MagicMock(), "tina": MagicMock()}
+        tina_agent = MagicMock()
+        tina_agent.aclose = AsyncMock()
+        runtime.agents = {"ellen": MagicMock(), "tina": tina_agent}
+        runtime.specialist_registry.all_configs = lambda: {}
+
+        calls = _patch_authz(monkeypatch)
+        seen = {}
+
+        def spy_purge(role):
+            if role == "tina":
+                seen["still_present"] = "tina" in runtime.agents
+            calls.append(("purge_role", role))
+            return 0
+        monkeypatch.setattr(__import__("authz_grants").GRANTS, "purge_role", spy_purge)
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        assert "tina" not in runtime.agents
+        assert ("purge_role", "tina") in calls
+        assert seen["still_present"] is True
+
+    async def test_reload_agents_specialist_add_invalidates_before_dispatchable(
+            self, tmp_path, monkeypatch):
+        from reload import dispatch, register_handler, reload_agents
+        register_handler("agents", reload_agents)
+
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "ellen").mkdir()
+        (agents_dir / "specialists" / "finance").mkdir(parents=True)
+
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: MagicMock(role="ellen"))
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+        monkeypatch.setattr("agent_home.provision_agent_home",
+                            lambda *, role, home_root, defaults_root: None)
+        new_agent = MagicMock()
+        import reload as reload_mod
+        monkeypatch.setattr(reload_mod, "_construct_agent",
+                            lambda **kw: new_agent)
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {"ellen": MagicMock()}
+        runtime.agents = {"ellen": MagicMock()}
+        runtime.specialist_registry.load = MagicMock()
+        runtime.specialist_registry.all_configs = MagicMock(
+            return_value={"finance": MagicMock()})
+        runtime.specialist_registry.load_failures = MagicMock(return_value=[])
+
+        calls = _patch_authz(monkeypatch)
+        seen = {}
+
+        def spy_purge(role):
+            if role == "finance":
+                seen["not_dispatchable_yet"] = "finance" not in runtime.agents
+            calls.append(("purge_role", role))
+            return 0
+        monkeypatch.setattr(__import__("authz_grants").GRANTS, "purge_role", spy_purge)
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        assert runtime.agents["finance"] is new_agent
+        assert ("purge_role", "finance") in calls
+        assert seen["not_dispatchable_yet"] is True
+
+    async def test_reload_agents_specialist_evict_invalidates_before_teardown(
+            self, tmp_path, monkeypatch):
+        from bus import MessageBus
+        from reload import dispatch, register_handler, reload_agents
+        register_handler("agents", reload_agents)
+
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "ellen").mkdir()
+        # No specialists/ dir on disk -> "finance" (previously live) evicted.
+
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: MagicMock(role="ellen"))
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        bus = MessageBus()
+        bus.register("ellen", MagicMock())
+        bus.register("finance", MagicMock())
+        runtime.bus = bus
+        runtime.role_configs = {"ellen": MagicMock()}
+        finance_agent = MagicMock()
+        finance_agent.aclose = AsyncMock()
+        runtime.agents = {"ellen": MagicMock(), "finance": finance_agent}
+        runtime.specialist_registry.load = MagicMock()
+        runtime.specialist_registry.all_configs = MagicMock(return_value={})
+        runtime.specialist_registry.load_failures = MagicMock(return_value=[])
+
+        calls = _patch_authz(monkeypatch)
+        seen = {}
+
+        def spy_purge(role):
+            if role == "finance":
+                seen["still_present"] = "finance" in runtime.agents
+            calls.append(("purge_role", role))
+            return 0
+        monkeypatch.setattr(__import__("authz_grants").GRANTS, "purge_role", spy_purge)
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        assert "finance" not in runtime.agents
+        assert ("purge_role", "finance") in calls
+        assert seen["still_present"] is True

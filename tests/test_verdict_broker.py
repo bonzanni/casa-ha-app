@@ -399,6 +399,53 @@ async def test_drain_isolates_raising_hook_and_waits_blocked_one():
     assert done == ["slow"]
 
 
+async def test_drain_hooks_terminates_with_done_undiscarded_task():
+    """3.12+ hard-livelock guard: a task that is ALREADY DONE but whose
+    ``discard`` done-callback has not yet run must be sync-discarded from the
+    set BEFORE gathering. On Python 3.12+, ``await asyncio.gather(*done_tasks)``
+    completes EAGERLY without yielding to the loop, so the queued discard
+    callback never runs, the set never empties, and the old ``while
+    self._setup_tasks: await gather(...)`` loop tight-spins forever — starving
+    the whole event loop (even same-loop ``wait_for`` timers never fire).
+
+    HANG SAFETY: because the regression is a same-loop livelock, an
+    ``asyncio.wait_for`` here would itself be starved and could NOT bound the
+    test. Instead the drain scenario runs in a dedicated thread with its own
+    event loop via ``asyncio.run``, and we ``join(timeout=10)`` + assert the
+    thread finished.
+    """
+    import threading
+
+    def _run() -> None:
+        async def _scenario() -> None:
+            b = VerdictBroker()
+
+            async def _noop() -> None:
+                return None
+
+            t = asyncio.ensure_future(_noop())
+            await asyncio.sleep(0)          # let it actually finish
+            assert t.done()
+            # Reconstruct the race: the task is done, it lives in the set, and
+            # its discard callback is QUEUED (add_done_callback on an
+            # already-done future schedules via call_soon — it does NOT run
+            # synchronously) but has not yet executed.
+            b._setup_tasks.add(t)
+            t.add_done_callback(b._setup_tasks.discard)
+            assert t in b._setup_tasks       # discard still pending
+            await b.drain_hooks()            # must RETURN, not livelock
+
+        asyncio.run(_scenario())
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    th.join(timeout=10)
+    assert not th.is_alive(), (
+        "drain_hooks livelocked on a done-but-undiscarded task "
+        "(3.12+ gather eager-completion)"
+    )
+
+
 async def test_retired_reattach_never_reposts(monkeypatch):
     """r9-B2: after answered/no_answer/cancelled retirement, a same-id retry gets
     a pre-resolved tombstone request; ensure_posted must NO-OP (no second

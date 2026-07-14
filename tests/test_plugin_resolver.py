@@ -151,6 +151,25 @@ def test_unscopable_invalid_entry_only_in_resolve_all(tmp_path):
     assert "bad" in {i.name for i in plugin_registry.resolve_all().issues}
 
 
+def test_malformed_protected_tools_degrades_only_that_plugin(tmp_path):
+    """A:§3.7 (r2-B6/r3-4): a stored artifact with a malformed
+    casa.protectedTools is EXCLUDED (protected_tools_invalid) while a
+    healthy sibling assigned to the SAME target still loads — per-plugin
+    degradation, never a whole-role failure."""
+    store = tmp_path / "store"
+    good = _entry("good", ["specialist:finance"])
+    _mk_artifact(store, "good", good["artifact_id"])
+    bad = _entry("bad", ["specialist:finance"])
+    _mk_artifact(store, "bad", bad["artifact_id"],
+                 extra_manifest={"casa": {"protectedTools": ["x", 1]}})
+    reload_snapshot(registry_path=_mk_registry(tmp_path, [bad, good]),
+                    store_root=store)
+    res = resolve_for("specialist:finance")
+    assert [rp.name for rp in res.plugins] == ["good"]
+    codes = {i.name: i.reason_code for i in res.issues}
+    assert codes == {"bad": "protected_tools_invalid"}
+
+
 def test_one_bad_entry_never_defeats_the_rest(tmp_path):
     store = tmp_path / "store"
     good = _entry("good", ["executor:plugin-developer"])

@@ -12,6 +12,7 @@ tools:
     - mcp__casa-framework__cleanup_engagement_topics
     - mcp__casa-framework__delegate_to_agent
     - mcp__casa-framework__engage_executor
+    - mcp__casa-framework__ask_user
     - mcp__casa-framework__get_schedule
     - mcp__casa-framework__recall_memory
     - mcp__casa-framework__send_message

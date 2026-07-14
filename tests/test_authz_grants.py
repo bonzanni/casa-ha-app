@@ -1,0 +1,928 @@
+"""Tests for authz_grants.py — canonical argument JSON + the single-use,
+TTL-bound GrantStore (A:§3.3, §3.6), plus the casa_core.py hourly sweep
+wiring.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import threading
+from pathlib import Path
+
+import pytest
+
+from authz_grants import (
+    DEFAULT_GRANT_TTL_S,
+    GRANTS,
+    ChallengeCoordinator,
+    ChallengeHandle,
+    GrantKey,
+    GrantStore,
+    canonical_args_hash,
+    canonical_args_json,
+)
+
+
+# ---------------------------------------------------------------------------
+# canonical_args_json (A:§3.6)
+# ---------------------------------------------------------------------------
+
+
+class TestCanonicalArgsJson:
+    def test_keys_are_sorted(self):
+        assert canonical_args_json({"b": 1, "a": 2}) == '{"a":2,"b":1}'
+
+    def test_nested_dict_keys_are_sorted(self):
+        assert (
+            canonical_args_json({"b": 1, "a": {"z": 1, "y": 2}})
+            == '{"a":{"y":2,"z":1},"b":1}'
+        )
+
+    def test_separators_are_compact_no_spaces(self):
+        out = canonical_args_json({"a": 1, "b": 2})
+        assert " " not in out
+
+    def test_unicode_is_not_escaped(self):
+        out = canonical_args_json({"name": "héllo wörld", "emoji": "\U0001F389"})
+        assert out == '{"emoji":"\U0001F389","name":"héllo wörld"}'
+        assert "\\u" not in out
+
+    def test_list_order_is_preserved_not_sorted(self):
+        assert canonical_args_json({"a": [3, 1, 2]}) == '{"a":[3,1,2]}'
+
+    def test_list_of_dicts_each_dict_sorted(self):
+        out = canonical_args_json({"a": [{"b": 1, "a": 2}]})
+        assert out == '{"a":[{"a":2,"b":1}]}'
+
+    def test_exact_string_shared_prefix_inputs_differ(self):
+        a = canonical_args_json({"invoice_id": "INV-1"})
+        b = canonical_args_json({"invoice_id": "INV-10"})
+        assert a != b
+        assert a == '{"invoice_id":"INV-1"}'
+        assert b == '{"invoice_id":"INV-10"}'
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_raises_valueerror_on_non_finite_float(self, bad):
+        with pytest.raises(ValueError):
+            canonical_args_json({"amount": bad})
+
+    def test_raises_valueerror_on_unserializable_value(self):
+        with pytest.raises(ValueError):
+            canonical_args_json({"tags": {1, 2, 3}})
+
+    def test_unserializable_error_message_is_clear(self):
+        with pytest.raises(ValueError, match="not JSON-serializable"):
+            canonical_args_json({"tags": {1, 2, 3}})
+
+
+# ---------------------------------------------------------------------------
+# canonical_args_hash
+# ---------------------------------------------------------------------------
+
+
+class TestCanonicalArgsHash:
+    def test_is_sha256_hexdigest(self):
+        h = canonical_args_hash({"a": 1})
+        assert len(h) == 64
+        assert re.fullmatch(r"[0-9a-f]{64}", h)
+
+    def test_stable_for_same_input(self):
+        assert canonical_args_hash({"a": 1, "b": 2}) == canonical_args_hash(
+            {"b": 2, "a": 1}
+        )
+
+    def test_distinct_for_shared_prefix_inputs(self):
+        h1 = canonical_args_hash({"invoice_id": "INV-1"})
+        h2 = canonical_args_hash({"invoice_id": "INV-10"})
+        assert h1 != h2
+
+    def test_raises_valueerror_on_non_finite_float(self):
+        with pytest.raises(ValueError):
+            canonical_args_hash({"amount": float("nan")})
+
+
+# ---------------------------------------------------------------------------
+# GrantKey
+# ---------------------------------------------------------------------------
+
+
+def _key(**overrides) -> GrantKey:
+    base = dict(
+        operator_id=1,
+        chat_id=100,
+        enforcement_role="finance",
+        artifact_id="artifact-abc",
+        tool_name="invoice_reset",
+        args_hash="deadbeef",
+    )
+    base.update(overrides)
+    return GrantKey(**base)
+
+
+class TestGrantKey:
+    def test_frozen_and_hashable(self):
+        k1 = _key()
+        k2 = _key()
+        assert k1 == k2
+        assert hash(k1) == hash(k2)
+        assert {k1: "x"}[k2] == "x"
+
+    def test_distinct_field_differs(self):
+        assert _key() != _key(tool_name="other_tool")
+
+
+# ---------------------------------------------------------------------------
+# GrantStore
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """Injectable monotonic-like clock for TTL tests."""
+
+    def __init__(self, t: float = 0.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
+class TestGrantStoreMintConsume:
+    def test_consume_without_mint_is_false(self):
+        store = GrantStore(_now=_FakeClock())
+        assert store.consume(_key()) is False
+
+    def test_mint_then_consume_is_true_then_false(self):
+        clock = _FakeClock()
+        store = GrantStore(_now=clock)
+        key = _key()
+        store.mint(key)
+        assert store.consume(key) is True
+        assert store.consume(key) is False
+
+    def test_default_ttl_matches_module_constant(self):
+        assert DEFAULT_GRANT_TTL_S == 300.0
+
+    def test_mint_expires_after_ttl_via_injected_clock(self):
+        clock = _FakeClock()
+        store = GrantStore(_now=clock)
+        key = _key()
+        store.mint(key, ttl_s=10.0)
+        clock.advance(10.0)  # exactly at expiry -> expired
+        assert store.consume(key) is False
+
+    def test_mint_not_yet_expired_still_consumable(self):
+        clock = _FakeClock()
+        store = GrantStore(_now=clock)
+        key = _key()
+        store.mint(key, ttl_s=10.0)
+        clock.advance(9.999)
+        assert store.consume(key) is True
+
+    def test_mint_uses_default_ttl_when_unspecified(self):
+        clock = _FakeClock()
+        store = GrantStore(_now=clock)
+        key = _key()
+        store.mint(key)
+        clock.advance(DEFAULT_GRANT_TTL_S - 1)
+        assert store.consume(key) is True
+
+    def test_mint_replaces_existing_grant_resets_used(self):
+        clock = _FakeClock()
+        store = GrantStore(_now=clock)
+        key = _key()
+        store.mint(key)
+        assert store.consume(key) is True
+        assert store.consume(key) is False
+        store.mint(key)  # replace -> fresh, unused grant
+        assert store.consume(key) is True
+
+    def test_mint_replaces_expired_grant_with_fresh_one(self):
+        clock = _FakeClock()
+        store = GrantStore(_now=clock)
+        key = _key()
+        store.mint(key, ttl_s=5.0)
+        clock.advance(10.0)
+        assert store.consume(key) is False  # expired
+        store.mint(key, ttl_s=5.0)
+        assert store.consume(key) is True
+
+
+class TestGrantStorePurges:
+    def test_purge_chat_removes_only_matching_returns_count(self):
+        store = GrantStore(_now=_FakeClock())
+        k1 = _key(chat_id=100)
+        k2 = _key(chat_id=100, tool_name="other_tool")
+        k3 = _key(chat_id=200)
+        for k in (k1, k2, k3):
+            store.mint(k)
+        assert store.purge_chat(100) == 2
+        assert store.consume(k1) is False
+        assert store.consume(k2) is False
+        assert store.consume(k3) is True
+
+    def test_purge_role_removes_only_matching_returns_count(self):
+        store = GrantStore(_now=_FakeClock())
+        k1 = _key(enforcement_role="finance")
+        k2 = _key(enforcement_role="finance", tool_name="other_tool")
+        k3 = _key(enforcement_role="ops")
+        for k in (k1, k2, k3):
+            store.mint(k)
+        assert store.purge_role("finance") == 2
+        assert store.consume(k1) is False
+        assert store.consume(k2) is False
+        assert store.consume(k3) is True
+
+    def test_purge_artifact_removes_only_matching_returns_count(self):
+        store = GrantStore(_now=_FakeClock())
+        k1 = _key(artifact_id="artifact-abc")
+        k2 = _key(artifact_id="artifact-abc", tool_name="other_tool")
+        k3 = _key(artifact_id="artifact-xyz")
+        for k in (k1, k2, k3):
+            store.mint(k)
+        assert store.purge_artifact("artifact-abc") == 2
+        assert store.consume(k1) is False
+        assert store.consume(k2) is False
+        assert store.consume(k3) is True
+
+    def test_purge_on_empty_store_returns_zero(self):
+        store = GrantStore(_now=_FakeClock())
+        assert store.purge_chat(1) == 0
+        assert store.purge_role("x") == 0
+        assert store.purge_artifact("y") == 0
+
+
+class TestGrantStoreSweep:
+    def test_sweep_drops_only_expired(self):
+        clock = _FakeClock()
+        store = GrantStore(_now=clock)
+        expired_key = _key(tool_name="expired_tool")
+        live_key = _key(tool_name="live_tool")
+        store.mint(expired_key, ttl_s=5.0)
+        store.mint(live_key, ttl_s=100.0)
+        clock.advance(10.0)  # expired_key is now past TTL, live_key is not
+        removed = store.sweep()
+        assert removed == 1
+        assert store.consume(expired_key) is False
+        assert store.consume(live_key) is True
+
+    def test_sweep_returns_zero_when_nothing_expired(self):
+        clock = _FakeClock()
+        store = GrantStore(_now=clock)
+        store.mint(_key(), ttl_s=100.0)
+        assert store.sweep() == 0
+
+    def test_sweep_does_not_remove_consumed_but_unexpired_grant(self):
+        clock = _FakeClock()
+        store = GrantStore(_now=clock)
+        key = _key()
+        store.mint(key, ttl_s=100.0)
+        assert store.consume(key) is True
+        assert store.sweep() == 0
+
+
+class TestGrantStoreRealThreadConcurrency:
+    def test_exactly_one_thread_consumes(self):
+        """r1-B6: N real threads behind a barrier all consume the SAME
+        grant concurrently — the store's lock must serialize compare-and-
+        mark so exactly one thread sees True."""
+        store = GrantStore()  # real clock: default time.monotonic
+        key = _key()
+        store.mint(key, ttl_s=60.0)
+
+        n = 32
+        barrier = threading.Barrier(n)
+        results: list[bool] = []
+        results_lock = threading.Lock()
+
+        def worker():
+            barrier.wait()
+            r = store.consume(key)
+            with results_lock:
+                results.append(r)
+
+        threads = [threading.Thread(target=worker) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(results) == n
+        assert results.count(True) == 1
+        assert results.count(False) == n - 1
+
+
+def test_grants_singleton_is_a_grant_store():
+    assert isinstance(GRANTS, GrantStore)
+
+
+# ---------------------------------------------------------------------------
+# casa_core.py wiring: the hourly _authz_grant_sweep job
+# ---------------------------------------------------------------------------
+
+
+def test_authz_grant_sweep_calls_grants_sweep(monkeypatch):
+    import casa_core
+
+    calls: list[str] = []
+
+    class _FakeStore:
+        def sweep(self) -> int:
+            calls.append("swept")
+            return 2
+
+    monkeypatch.setattr(casa_core, "GRANTS", _FakeStore())
+    asyncio.run(casa_core._authz_grant_sweep())
+    assert calls == ["swept"]
+
+
+def test_authz_grant_sweep_survives_store_exception(monkeypatch):
+    """A sweep failure must not kill the shared scheduler job (same
+    contract as every other sweep in this file)."""
+    import casa_core
+
+    class _BrokenStore:
+        def sweep(self) -> int:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(casa_core, "GRANTS", _BrokenStore())
+    asyncio.run(casa_core._authz_grant_sweep())  # must not raise
+
+
+def test_authz_grant_sweep_is_a_coroutine_function():
+    import casa_core
+
+    assert asyncio.iscoroutinefunction(casa_core._authz_grant_sweep)
+
+
+_CASA_CORE_SRC = (
+    Path(__file__).resolve().parent.parent
+    / "casa-agent"
+    / "rootfs"
+    / "opt"
+    / "casa"
+    / "casa_core.py"
+)
+
+
+def test_authz_grant_sweep_registered_hourly_beside_engagement_sweep():
+    """Static wiring guard, mirroring test_scheduled_sweeper_jobs.py: the
+    new job must be registered as an hourly interval job, using the
+    coroutine function directly (never a sync lambda wrapper — the
+    v0.13.0 regression this file's sibling test guards against)."""
+    text = _CASA_CORE_SRC.read_text(encoding="utf-8")
+
+    m = re.search(
+        r"scheduler\.add_job\(\s*_authz_grant_sweep,(?P<kwargs>.*?)\)",
+        text,
+        re.S,
+    )
+    assert m, (
+        "casa_core.py must register _authz_grant_sweep with "
+        "scheduler.add_job(_authz_grant_sweep, ...)"
+    )
+    kwargs = m.group("kwargs")
+    assert re.search(r"trigger\s*=\s*\"interval\"", kwargs), (
+        "_authz_grant_sweep must be an interval job"
+    )
+    assert re.search(r"hours\s*=\s*1\b", kwargs), (
+        "_authz_grant_sweep must run hourly (hours=1)"
+    )
+    assert re.search(r'id\s*=\s*"authz_grant_sweep"', kwargs)
+
+    # Registered "beside" _engagement_daily_sweep: both add_job calls
+    # exist and _authz_grant_sweep is not defined as a sync lambda.
+    assert "_engagement_daily_sweep" in text
+    assert not re.search(r"lambda:\s*asyncio\.create_task\(\s*_authz_grant_sweep", text)
+
+
+# ===========================================================================
+# ChallengeCoordinator (Task 5, A:§3.4) — atomic challenge registration, an
+# async-settled setup driver, two-latch cleanup, the authz finish hook, and
+# the pinned shutdown drain.
+# ===========================================================================
+
+
+class _FakeChannel:
+    """Records every post/edit/dispatch the coordinator drives, and can be
+    configured to block, fail, or raise on demand.
+
+    ``post_dm_keyboard`` optionally awaits ``post_gate`` first so a test can
+    hold the setup driver mid-post and race a timeout / cancel / caller
+    cancellation against it. ``log`` is a shared ordered event trace used by
+    the mint-before-dispatch ordering test."""
+
+    def __init__(self, *, log: list | None = None) -> None:
+        self.posts: list = []
+        self.edits: list = []
+        self.dispatches: list = []
+        self.post_result: int | None = 55
+        self.post_raises = False
+        self.post_gate: asyncio.Event | None = None
+        self.dispatch_result = True
+        self.edit_raises = False
+        self.log = log if log is not None else []
+
+    async def post_dm_keyboard(self, *, chat_id, request_id, text, options):
+        self.posts.append((chat_id, request_id, text, tuple(options)))
+        if self.post_gate is not None:
+            await self.post_gate.wait()
+        if self.post_raises:
+            raise RuntimeError("post boom")
+        return self.post_result
+
+    async def edit_dm_message(self, chat_id, message_id, text):
+        self.edits.append((chat_id, message_id, text))
+        self.log.append(("edit", text))
+        if self.edit_raises:
+            raise RuntimeError("edit boom")
+        return True
+
+    async def _dispatch_button_continuation(
+        self, *, chat_id, user_id, target_role, request_id, text,
+    ):
+        self.dispatches.append(
+            dict(chat_id=chat_id, user_id=user_id, target_role=target_role,
+                 request_id=request_id, text=text)
+        )
+        self.log.append(("dispatch", text))
+        return self.dispatch_result
+
+
+class _SpyGrants:
+    """A GrantStore stand-in that records mint order into a shared log while
+    still behaving like a real single-use store for consume()."""
+
+    def __init__(self, log: list) -> None:
+        self._log = log
+        self._real = GrantStore()
+
+    def mint(self, key, **kw):
+        self._log.append(("mint", key))
+        self._real.mint(key, **kw)
+
+    def consume(self, key):
+        return self._real.consume(key)
+
+
+def _fresh_env(monkeypatch, *, ttl=None, log=None):
+    """A fresh broker (monkeypatched into the singleton slot the coordinator
+    resolves at call time), a fresh coordinator, and a fake channel."""
+    import verdict_broker
+
+    broker = verdict_broker.VerdictBroker()
+    monkeypatch.setattr(verdict_broker, "BROKER", broker)
+    if ttl is not None:
+        import authz_grants
+        monkeypatch.setattr(authz_grants, "_CHALLENGE_TTL_S", ttl)
+    coord = ChallengeCoordinator()
+    channel = _FakeChannel(log=log)
+    return broker, coord, channel
+
+
+def _create(coord, channel, key=None, *, chat_id=100, operator_id=7,
+            target_role="finance-full", tool_name="invoice_reset",
+            canonical_json='{"amount":10,"id":"INV-1"}',
+            enforcement_role="finance"):
+    if key is None:
+        key = _key(chat_id=chat_id, enforcement_role=enforcement_role,
+                   tool_name=tool_name, args_hash=canonical_args_hash({"x": 1}))
+    handle = coord.get_or_create(
+        key, chat_id=chat_id, operator_id=operator_id, target_role=target_role,
+        tool_name=tool_name, canonical_json=canonical_json,
+        enforcement_role=enforcement_role, channel=channel,
+    )
+    return key, handle
+
+
+async def _settle(n: int = 6):
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+def _tap(broker, ch, idx, *, actor=7, run_sync_step=True):
+    """Replicate the telegram callback's claim → commit → (immediate) sync
+    step ordering, without any await between commit and the sync step."""
+    claim = broker.claim(
+        namespace="resident_ask", scope=ch.scope, request_id=ch.rid,
+        option_index=idx, actor_id=actor,
+    )
+    assert not isinstance(claim, str), f"claim rejected: {claim}"
+    assert broker.commit(claim) is True
+    if run_sync_step:
+        step = ch.req.meta.get("on_commit_sync")
+        if step is not None:
+            step(idx)
+
+
+class TestChallengeAtomicRegistration:
+    async def test_concurrent_hook_coroutines_one_record_one_keyboard(
+        self, monkeypatch,
+    ):
+        """r2-B2 production shape: many hook coroutines racing the SAME key on
+        ONE loop → exactly ONE broker record and ONE keyboard; exactly one
+        handle reports created=True."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key = _key()
+
+        results: list[ChallengeHandle] = []
+
+        async def hook():
+            _k, handle = _create(coord, channel, key)
+            results.append(handle)
+            await handle.settled_post()
+
+        await asyncio.gather(*[hook() for _ in range(16)])
+        await _settle()
+
+        assert sum(1 for h in results if h.created) == 1
+        assert sum(1 for h in results if not h.created) == 15
+        # exactly ONE live broker record (still pending — nobody answered)
+        assert broker.pending(namespace="resident_ask", scope="authz:100") == \
+            [coord._entries[key].rid]
+        # exactly one keyboard was ever posted
+        assert len(channel.posts) == 1
+
+    async def test_refused_when_oversized_no_entry_no_keyboard(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        huge = '{"blob":"' + "x" * 4000 + '"}'
+        key, handle = _create(coord, channel, canonical_json=huge)
+        await _settle()
+
+        assert handle.created is True
+        assert handle.refused == "args_too_large"
+        assert key not in coord._entries
+        assert channel.posts == []
+        assert broker.pending(namespace="resident_ask", scope="authz:100") == []
+
+    async def test_registration_is_synchronous_before_first_turn(
+        self, monkeypatch,
+    ):
+        """r4-B2/r5-B1: the broker request exists the moment get_or_create
+        returns — BEFORE the driver's first event-loop turn — so /new /
+        shutdown always see a cancellable record."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        # No await yet: the record must already be live and cancellable.
+        assert broker.pending(namespace="resident_ask", scope="authz:100") == \
+            [coord._entries[key].rid]
+        assert channel.posts == []  # the driver has not run its first turn
+        await handle.settled_post()
+
+
+class TestSettledPostClassification:
+    async def test_pending_is_posted(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        _key_, handle = _create(coord, channel)
+        assert await handle.settled_post() == "posted"
+        assert len(channel.posts) == 1
+
+    async def test_post_none_is_delivery_failed(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.post_result = None
+        _key_, handle = _create(coord, channel)
+        assert await handle.settled_post() == "delivery_failed"
+
+    async def test_post_raises_is_delivery_failed(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.post_raises = True
+        _key_, handle = _create(coord, channel)
+        assert await handle.settled_post() == "delivery_failed"
+
+    async def test_timeout_while_posting_is_inactive_even_if_post_succeeds(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch, ttl=0.02)
+        channel.post_gate = asyncio.Event()
+        key, handle = _create(coord, channel)
+        task = asyncio.ensure_future(handle.settled_post())
+        await asyncio.sleep(0)          # driver starts, post blocks on the gate
+        await asyncio.sleep(0.05)       # the 0.02s TTL timer fires while blocked
+        channel.post_gate.set()         # NOW the post completes (returns a mid)
+        assert await task == "inactive"
+        await _settle()
+        assert len(channel.posts) == 1  # exactly one keyboard
+        # the finish hook edited it to an expired state
+        assert any("expired" in e[2].lower() for e in channel.edits)
+        assert key not in coord._entries
+
+    async def test_new_while_posting_is_inactive_even_if_post_succeeds(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.post_gate = asyncio.Event()
+        key, handle = _create(coord, channel)
+        task = asyncio.ensure_future(handle.settled_post())
+        await asyncio.sleep(0)          # driver starts, post blocks
+        broker.cancel_scope(namespace="resident_ask", scope="authz:100",
+                            reason="new_session")
+        channel.post_gate.set()
+        assert await task == "inactive"
+        await _settle()
+        assert len(channel.posts) == 1
+        assert key not in coord._entries
+
+    async def test_survives_caller_cancellation_one_keyboard(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.post_gate = asyncio.Event()
+        key, handle = _create(coord, channel)
+        task = asyncio.ensure_future(handle.settled_post())
+        await asyncio.sleep(0)          # driver posting, blocked on the gate
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        channel.post_gate.set()         # driver completes on its own
+        await coord.drain()
+        await _settle()
+        assert len(channel.posts) == 1  # exactly ONE keyboard ever
+
+
+class TestPrePostAndShutdownTerminal:
+    async def test_immediate_new_before_first_turn(self, monkeypatch):
+        """/new fired synchronously after get_or_create, BEFORE the driver's
+        first turn → record cancelled, NO keyboard, NO entry, NO lingering
+        task (r4-B2)."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        # synchronous /new, before any await
+        broker.cancel_scope(namespace="resident_ask", scope="authz:100",
+                            reason="new_session")
+        assert await handle.settled_post() == "inactive"
+        await _settle()
+        assert channel.posts == []          # ensure_posted no-op'd on done future
+        assert key not in coord._entries
+        assert all(d.done() for d in coord._drivers)
+
+    async def test_shutdown_before_first_turn(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        broker.cancel_all(reason="casa_shutdown")
+        await coord.drain()
+        await broker.drain_hooks()
+        await _settle()
+        assert channel.posts == []
+        assert key not in coord._entries
+        assert all(d.done() for d in coord._drivers)
+
+    async def test_pre_post_terminal_marks_setup_directly(self, monkeypatch):
+        """Request cancelled before ensure_posted ran → req._setup_task stays
+        None and the driver settles setup DIRECTLY (both latches land → entry
+        removed)."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        req = coord._entries[key].req
+        broker.cancel(namespace="resident_ask", scope="authz:100",
+                      request_id=coord._entries[key].rid, reason="x")
+        await handle.settled_post()
+        await _settle()
+        assert req._setup_task is None
+        assert key not in coord._entries
+
+
+class TestAuthzFinishHook:
+    async def test_approve_event_order_mint_edit_dispatch_verbatim(
+        self, monkeypatch,
+    ):
+        import authz_grants
+        log: list = []
+        monkeypatch.setattr(authz_grants, "GRANTS", _SpyGrants(log))
+        broker, coord, channel = _fresh_env(monkeypatch, log=log)
+        canonical = '{"amount":10,"id":"INV-1"}'
+        key, handle = _create(coord, channel, canonical_json=canonical)
+        assert await handle.settled_post() == "posted"
+        ch = coord._entries[key]
+        _tap(broker, ch, 0)
+        await _settle()
+
+        kinds = [e[0] for e in log]
+        assert kinds == ["mint", "edit", "dispatch"]
+        assert log[0][1] == key                         # minted the exact key
+        # the approved edit precedes the dispatch and names the tool
+        assert "approved" in channel.edits[-1][2].lower()
+        assert channel.dispatches[0]["target_role"] == "finance-full"
+        # canonical JSON embedded verbatim in the continuation text
+        assert canonical in channel.dispatches[0]["text"]
+        assert "[authorization approved]" in channel.dispatches[0]["text"]
+        assert "finance" in channel.dispatches[0]["text"]  # enforcement_role
+
+    async def test_deny_no_mint_edit_then_dispatch(self, monkeypatch):
+        import authz_grants
+        log: list = []
+        monkeypatch.setattr(authz_grants, "GRANTS", _SpyGrants(log))
+        broker, coord, channel = _fresh_env(monkeypatch, log=log)
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 1)
+        await _settle()
+
+        assert [e[0] for e in log] == ["edit", "dispatch"]   # NO mint
+        assert "denied" in channel.edits[-1][2].lower() or \
+            "denied" in channel.edits[0][2].lower()
+        assert "[authorization denied]" in channel.dispatches[0]["text"]
+
+    async def test_minted_absent_internal_error_no_dispatch(self, monkeypatch):
+        """Approve committed but the sync step never recorded the mint (raised
+        and was swallowed) → edit the internal-error text, NEVER dispatch."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 0, run_sync_step=False)   # commit, but no mint recorded
+        await _settle()
+
+        assert channel.dispatches == []
+        assert "internal error" in channel.edits[-1][2].lower()
+        assert "call the tool again" in channel.edits[-1][2].lower()
+
+    async def test_approve_dispatch_exhaustion_overwrites_failure(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.dispatch_result = False
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 0)
+        await _settle()
+
+        assert channel.dispatches, "dispatch was attempted"
+        # last edit is the visible-failure overwrite
+        last = channel.edits[-1][2].lower()
+        assert "delivery to finance-full failed" in last
+        assert "retry" in last
+
+    async def test_deny_dispatch_exhaustion_overwrites_failure(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.dispatch_result = False
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 1)
+        await _settle()
+
+        last = channel.edits[-1][2].lower()
+        assert "failed" in last
+
+    async def test_no_answer_edits_expired(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        broker.cancel(namespace="resident_ask", scope=ch.scope,
+                      request_id=ch.rid, reason="timeout")
+        await _settle()
+        assert any("expired" in e[2].lower() for e in channel.edits)
+        assert channel.dispatches == []
+
+
+class TestTwoLatchCleanup:
+    async def test_answered_removes_entry(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 0)
+        await _settle()
+        assert key not in coord._entries
+
+    async def test_cancel_then_post_failure_removes_entry(self, monkeypatch):
+        """Future latch (cancel) + setup latch (post failure) both land →
+        entry removed even though the post failed."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.post_gate = asyncio.Event()
+        channel.post_result = None      # post will report delivery failure
+        key, handle = _create(coord, channel)
+        task = asyncio.ensure_future(handle.settled_post())
+        await asyncio.sleep(0)
+        broker.cancel_scope(namespace="resident_ask", scope="authz:100",
+                            reason="new")
+        channel.post_gate.set()
+        await task
+        await _settle()
+        assert key not in coord._entries
+
+    async def test_edit_raise_does_not_block_removal(self, monkeypatch):
+        """The keyboard edit is owned by a SEPARATE broker hook task; a raise
+        there must not stop the coordinator's two-latch removal."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.edit_raises = True
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        broker.cancel(namespace="resident_ask", scope=ch.scope,
+                      request_id=ch.rid, reason="x")
+        await _settle()
+        assert key not in coord._entries
+
+    async def test_stale_late_cleanup_cannot_remove_newer(self, monkeypatch):
+        """Identity-guarded removal: an old challenge object's late latch
+        landing must NOT evict a newer challenge registered under the same
+        key."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        old = coord._entries[key]
+        # A newer challenge takes the slot (simulating a completed retry).
+        newer = coord._entries[key].__class__(
+            key=key, scope=old.scope, rid="newer-rid", req=old.req,
+            broker=broker,
+        )
+        coord._entries[key] = newer
+        # The OLD challenge's latches land late.
+        coord._settle_request(old)
+        coord._settle_setup(old)
+        assert coord._entries.get(key) is newer   # newer survived
+
+    async def test_retry_after_deny_is_fresh_challenge(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        first_rid = coord._entries[key].rid
+        _tap(broker, coord._entries[key], 1)  # deny
+        await _settle()
+        assert key not in coord._entries
+        # retry -> brand new challenge with a distinct rid
+        key2, handle2 = _create(coord, channel, key)
+        assert handle2.created is True
+        assert coord._entries[key].rid != first_rid
+        await handle2.settled_post()
+
+    async def test_retry_after_post_failure_is_fresh_challenge(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.post_result = None
+        key, handle = _create(coord, channel)
+        assert await handle.settled_post() == "delivery_failed"
+        await _settle()
+        assert key not in coord._entries
+        channel.post_result = 99
+        key2, handle2 = _create(coord, channel, key)
+        assert handle2.created is True
+        assert await handle2.settled_post() == "posted"
+
+
+class TestCancelMatching:
+    async def test_cancel_by_role(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        k1, h1 = _create(coord, channel, enforcement_role="finance",
+                         tool_name="a")
+        k2, h2 = _create(coord, channel, enforcement_role="ops", tool_name="b",
+                         chat_id=100)
+        await h1.settled_post()
+        await h2.settled_post()
+        n = coord.cancel_matching(role="finance")
+        await _settle()
+        assert n == 1
+        assert any("expired" in e[2].lower() for e in channel.edits)
+        assert k1 not in coord._entries
+        assert k2 in coord._entries
+
+    async def test_cancel_by_artifact(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        k1 = _key(artifact_id="art-1", tool_name="a")
+        k2 = _key(artifact_id="art-2", tool_name="b")
+        _c, h1 = _create(coord, channel, k1)
+        _c, h2 = _create(coord, channel, k2)
+        await h1.settled_post()
+        await h2.settled_post()
+        assert coord.cancel_matching(artifact="art-1") == 1
+        await _settle()
+        assert k1 not in coord._entries
+        assert k2 in coord._entries
+
+    async def test_cancel_by_chat(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        k1, h1 = _create(coord, channel, chat_id=100, tool_name="a")
+        k2, h2 = _create(coord, channel, chat_id=200, tool_name="b")
+        await h1.settled_post()
+        await h2.settled_post()
+        assert coord.cancel_matching(chat=100) == 1
+        await _settle()
+        assert k1 not in coord._entries
+        assert k2 in coord._entries
+
+
+async def test_drain_awaits_outstanding_drivers(monkeypatch):
+    broker, coord, channel = _fresh_env(monkeypatch)
+    channel.post_gate = asyncio.Event()
+    key, handle = _create(coord, channel)
+    task = asyncio.ensure_future(handle.settled_post())
+    await asyncio.sleep(0)                 # driver posting, blocked
+    channel.post_gate.set()
+    await coord.drain()
+    assert all(d.done() for d in coord._drivers)
+    await task
+
+
+def test_challenges_singleton_is_a_coordinator():
+    from authz_grants import CHALLENGES
+    assert isinstance(CHALLENGES, ChallengeCoordinator)

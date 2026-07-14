@@ -156,6 +156,16 @@ When `enable_terminal` is enabled, a web terminal is available at the `/terminal
 - **Long-term memory not working**: Long-term recall requires the `hindsight_api_url` option to be set to a reachable Hindsight app (which auto-enables `MEMORY_BACKEND=hindsight`). If recall is empty, check that `hindsight_api_url` is set and the Hindsight app is running, and check container logs for Hindsight connection errors. With `hindsight_api_url` empty, only short-term per-session continuity works.
 - **502 errors on ingress**: The Python process may still be starting. Wait up to 60 seconds after app start.
 
+## DM button questions (v0.76.0)
+
+Ellen (and the specialists she delegates to) can pause a turn to ask you a
+quick multiple-choice question, posted as inline buttons right in your 1:1
+Telegram DM — the same tap-to-answer pattern engagements use, without
+opening a topic. Tap an option and the agent picks up from there; a
+plain-text reply in the same DM answers it too. An unanswered question
+expires after a few minutes, and starting a fresh session (`/new`)
+cancels any question still pending.
+
 ## Engagements (v0.11.0)
 
 Casa supports **engagements** — bounded conversational threads where a
@@ -465,6 +475,23 @@ via `${VAR}` references in its `.mcp.json`. When you add a plugin, the
 configurator reports the required variables and asks for a 1Password reference
 (`op://…`) for each, stored in `plugin-env.conf`. Secret values never appear in
 transcripts.
+
+### Protected plugin tools (v0.76.0)
+
+A plugin can declare that one of its tools requires your approval before
+Casa will run it (`casa.protectedTools` in the plugin's manifest). When an
+agent tries to call a protected tool, Casa refuses the call and posts a
+one-tap Approve/Deny button in your DM instead of running it blind. Approve
+mints a grant that is:
+
+- **single-use** — consumed the moment the retried call succeeds, so a
+  second call needs a second approval;
+- **argument-bound** — the grant only covers the exact arguments you
+  approved; any change to the call needs a fresh approval;
+- **time-limited** — a grant you never act on expires after 5 minutes.
+
+You'll see this for actions a plugin author has flagged as consequential.
+Deny leaves the call refused with no grant issued.
 
 ### Disk usage
 

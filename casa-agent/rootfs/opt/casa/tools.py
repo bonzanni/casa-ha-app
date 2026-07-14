@@ -30,6 +30,7 @@ from plugin_grants import (
     grants_for_resolution, grants_for_resolved, make_fail_closed_can_use_tool,
     mcp_json_malformed, required_env_vars_for_resolved,
 )
+from authz_grants import CHALLENGES, GRANTS, normalize_role
 from delegated_memory import delegated_recall, retain_delegated
 
 from claude_agent_sdk import (
@@ -353,6 +354,196 @@ async def send_media(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# ask_user — resident DM button questions (v0.76.0 W5b, A:§2)
+#
+# Two-turn, detached: REGISTER -> POST -> RETURN. The tool never awaits the
+# operator's tap — it registers a `resident_ask` broker request scoped
+# `dm:<chat_id>`, posts the inline keyboard, and returns `awaiting_user`
+# immediately. The operator's tap (or a same-DM typed reply, or /new, or a
+# timeout, or Casa shutdown) resolves the request later; the broker finish
+# hook installed here is the SINGLE owner of the post-commit keyboard edit +
+# synthetic-turn dispatch (r2-B1/r3-B1 single-owner contract).
+# ---------------------------------------------------------------------------
+
+# W5 ask contract limits (design §W5, shared by ask_user — A:§2).
+_ASK_QUESTION_MAX = 1024
+_ASK_OPTIONS_MIN = 2
+_ASK_OPTIONS_MAX = 8
+_ASK_OPTION_LABEL_MAX = 48
+_ASK_TIMEOUT_DEFAULT = 300.0
+_ASK_TIMEOUT_MIN = 30.0
+_ASK_TIMEOUT_MAX = 570.0
+
+ASK_USER_SCHEMA = {
+    # r1-B3: explicit JSON Schema — only question+options are required;
+    # timeout_s is optional (defaults to _ASK_TIMEOUT_DEFAULT, clamped).
+    "type": "object",
+    "properties": {
+        "question": {"type": "string"},
+        "options": {"type": "array", "items": {"type": "string"}},
+        "timeout_s": {"type": "number"},
+    },
+    "required": ["question", "options"],
+}
+
+
+def _ask_user_validate(args: dict) -> tuple[str | None, list[str] | None, float | None, str | None]:
+    """Validate ask_user args against the W5 ask contract.
+
+    Returns ``(question, options, timeout_s, error_message)``. On success
+    ``error_message`` is ``None`` and the other three are populated
+    (``timeout_s`` already clamped to ``[_ASK_TIMEOUT_MIN,
+    _ASK_TIMEOUT_MAX]``). On failure only ``error_message`` is set.
+    """
+    question = args.get("question")
+    if not isinstance(question, str) or not question.strip():
+        return None, None, None, "question must be a non-empty string"
+    if len(question) > _ASK_QUESTION_MAX:
+        return None, None, None, (
+            f"question must be at most {_ASK_QUESTION_MAX} characters"
+        )
+
+    options = args.get("options")
+    if not isinstance(options, list):
+        return None, None, None, "options must be a list of strings"
+    if not (_ASK_OPTIONS_MIN <= len(options) <= _ASK_OPTIONS_MAX):
+        return None, None, None, (
+            f"options must have between {_ASK_OPTIONS_MIN} and "
+            f"{_ASK_OPTIONS_MAX} entries"
+        )
+    for opt in options:
+        if not isinstance(opt, str) or not opt.strip():
+            return None, None, None, "every option must be a non-empty string"
+        if len(opt) > _ASK_OPTION_LABEL_MAX:
+            return None, None, None, (
+                f"option labels must be at most {_ASK_OPTION_LABEL_MAX} "
+                "characters"
+            )
+    if len(set(options)) != len(options):
+        return None, None, None, "options must be unique"
+
+    timeout_arg = args.get("timeout_s")
+    if timeout_arg is None:
+        timeout_s = _ASK_TIMEOUT_DEFAULT
+    else:
+        if isinstance(timeout_arg, bool) or not isinstance(timeout_arg, (int, float)):
+            return None, None, None, "timeout_s must be a number"
+        timeout_s = float(timeout_arg)
+    timeout_s = max(_ASK_TIMEOUT_MIN, min(_ASK_TIMEOUT_MAX, timeout_s))
+
+    return question, list(options), timeout_s, None
+
+
+@tool(
+    "ask_user",
+    "Ask the operator a multiple-choice question with tappable buttons in "
+    "their DM. Two-turn: returns awaiting_user immediately; the answer "
+    "arrives as the user's next message. NOT an authorization mechanism.",
+    ASK_USER_SCHEMA,
+)
+async def ask_user(args: dict) -> dict:
+    question, options, timeout_s, err = _ask_user_validate(args)
+    if err is not None:
+        return _result({"status": "error", "kind": "invalid_arguments",
+                        "message": err})
+
+    from provenance import strict_positive_id, turn_provenance
+
+    prov = turn_provenance()
+    if prov.transport not in ("dm", "button") or prov.execution != "direct":
+        return _result({
+            "status": "error", "kind": "unsupported_origin",
+            "message": (
+                "ask_user requires a direct, genuine inbound-DM turn "
+                f"(got transport={prov.transport!r} execution={prov.execution!r})"
+            ),
+        })
+
+    origin = _snapshot_origin()
+    chat_id = strict_positive_id(origin.get("chat_id"))
+    operator_id = strict_positive_id(origin.get("user_id"))
+    if chat_id is None or operator_id is None:
+        return _result({
+            "status": "error", "kind": "unsupported_origin",
+            "message": "ask_user requires a valid chat_id/user_id origin",
+        })
+
+    if _channel_manager is None:
+        return _result({"status": "error", "kind": "delivery_failed",
+                        "message": "tools not initialized"})
+    channel = _channel_manager.get(origin.get("channel", "telegram"))
+    if channel is None:
+        return _result({"status": "error", "kind": "delivery_failed",
+                        "message": "channel not available"})
+
+    from verdict_broker import BROKER
+
+    rid = uuid.uuid4().hex
+    target_role = origin.get("role")
+    scope = f"dm:{chat_id}"
+    # Static meta BEFORE post (register() shallow-copies whatever dict we
+    # pass, so the complete dict is supplied up front rather than mutated
+    # after the fact). No `on_commit_sync` — plain asks record nothing at
+    # commit time (that's the authz challenge's job, Task 5+).
+    req, _created = BROKER.register(
+        namespace="resident_ask", scope=scope, request_id=rid,
+        timeout_s=timeout_s, detached=True, supersede=True,
+        meta={
+            "options": list(options),
+            "chat_id": chat_id,
+            "operator_id": operator_id,
+            "target_role": target_role,
+            "kind": "ask",
+            "_scope": scope,
+        },
+    )
+
+    async def _post():
+        return await channel.post_dm_keyboard(
+            chat_id=chat_id, request_id=rid, text=question, options=list(options),
+        )
+
+    def _finish_factory(message_id: int):
+        async def _finish(outcome: dict) -> None:
+            # r2-B1/r3-B1 single-owner finish hook: on `answered` edit the
+            # keyboard to the answered label FIRST, then dispatch the
+            # synthetic continuation, then overwrite with a visible failure
+            # text ONLY if dispatch failed. no_answer/cancelled -> expired.
+            if outcome.get("outcome") != "answered":
+                await channel.edit_dm_message(
+                    chat_id, message_id,
+                    f"{question}\n\n(this question has expired)",
+                )
+                return
+            idx = outcome["option_index"]
+            chosen = options[idx]
+            await channel.edit_dm_message(
+                chat_id, message_id, f"{question}\n\nAnswered: {chosen}",
+            )
+            ok = await channel._dispatch_button_continuation(
+                chat_id=chat_id, user_id=operator_id, target_role=target_role,
+                request_id=rid, text=f"[button answer to {rid}]: {chosen}",
+            )
+            if not ok:
+                await channel.edit_dm_message(
+                    chat_id, message_id,
+                    "answer received but delivery failed — please type it",
+                )
+        return _finish
+
+    await BROKER.ensure_posted(req, _post, _finish_factory)
+
+    if "message_id" not in req.meta:
+        # _run_setup already unregistered the request on a post failure
+        # (post() returned None or raised) — no dangling pending record.
+        return _result({
+            "status": "error", "kind": "delivery_failed",
+            "message": "could not deliver the question to the operator",
+        })
+    return _result({"status": "awaiting_user", "request_id": rid})
+
+
+# ---------------------------------------------------------------------------
 # delegate_to_agent — Phase 3.1
 # ---------------------------------------------------------------------------
 
@@ -510,9 +701,16 @@ def _resolution_from_recorded(plugin_artifacts) -> "plugin_registry.ResolutionRe
     """Sol round-3 H7b: rebuild a ResolutionResult from an engagement's RECORDED
     plugin_artifacts (§3.8) so a resumed specialist loads exactly what it started
     with (paths AND derived grants), never re-resolving current assignments.
-    Fails closed (raises) if a recorded artifact path is gone."""
-    from plugin_registry import ResolutionResult, ResolvedPlugin
+    Fails closed (raises) if a recorded artifact path is gone/corrupt/identity-
+    mismatched — those are pre-v0.76 failure modes, unchanged here.
+
+    A:§3.7 (r2-B6/r3-4): a malformed ``casa.protectedTools`` in one RECORDED
+    artifact's manifest is PER-PLUGIN degradation, not a whole-resume abort —
+    that one plugin is excluded (recorded as an issue) while every other
+    recorded artifact, however many, still resolves and loads normally."""
+    from plugin_registry import PluginIssue, ResolutionResult, ResolvedPlugin
     plugins = []
+    issues = []
     for pa in plugin_artifacts or ():
         path = pa.get("path") if isinstance(pa, dict) else None
         if not path or not os.path.isdir(path):
@@ -535,10 +733,18 @@ def _resolution_from_recorded(plugin_artifacts) -> "plugin_registry.ResolutionRe
                                   .read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
+        try:
+            plugin_store.manifest_protected_tools(manifest)
+        except plugin_store.StoreError:
+            issues.append(PluginIssue(
+                name=pa.get("name", ""), target=None, stage="resolve",
+                reason_code="protected_tools_invalid",
+                artifact_id=pa.get("artifact_id", "")))
+            continue
         plugins.append(ResolvedPlugin(
             name=pa.get("name", ""), artifact_id=pa.get("artifact_id", ""),
             path=path, version=str(manifest.get("version", "")), manifest=manifest))
-    return ResolutionResult(registry_valid=True, plugins=plugins)
+    return ResolutionResult(registry_valid=True, plugins=plugins, issues=issues)
 
 
 def _build_specialist_options(cfg, *, resolution=None) -> ClaudeAgentOptions:
@@ -586,6 +792,35 @@ def _build_specialist_options(cfg, *, resolution=None) -> ClaudeAgentOptions:
         resolution = plugin_registry.resolve_for(f"{_tier}:{_role}")
     sdk_plugins = [{"type": "local", "path": rp.path}
                    for rp in resolution.plugins]
+
+    # Authorization grants (A:§3.2): APPEND the fail-closed PreToolUse authz
+    # matcher for this specialist's PROTECTED plugin tools, preserving the
+    # settings guard already appended above. protected_map derives from the
+    # SAME resolution — supplying GrantKey.artifact_id. The hook branches on
+    # provenance, so this ONE builder (ephemeral delegations AND in_casa
+    # specialist engagements) is correct: engagement turns deny cleanly. Only
+    # appended when there are protected tools (matcher=None routes every call).
+    from authz_grants import (
+        AuthzDeps, CHALLENGES, GRANTS, make_resident_authz_hook,
+    )
+    from plugin_grants import protected_map
+    _protected = protected_map(resolution)
+    if _protected:
+        from claude_agent_sdk import HookMatcher
+        _authz_role = getattr(cfg, "role", "unknown")
+
+        def _authz_deps_factory():
+            ch = (_channel_manager.get("telegram")
+                  if _channel_manager is not None else None)
+            if ch is None:
+                return None  # no DM reachable ⇒ unsupported-origin deny
+            return AuthzDeps(channel=ch, grants=GRANTS, challenges=CHALLENGES)
+
+        resolved_hooks["PreToolUse"] = [
+            *resolved_hooks.get("PreToolUse", []),
+            HookMatcher(hooks=[make_resident_authz_hook(
+                _authz_role, _protected, _authz_deps_factory)]),
+        ]
 
     agent_home = (cfg.cwd
                   or f"/config/agent-home/{getattr(cfg, 'role', 'unknown')}")
@@ -822,6 +1057,10 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
     child_origin = {
         **parent,
         "delegation_depth": int(parent.get("delegation_depth", 0)) + 1,
+        # Provenance foundation (A:§1, v0.76.0): the delegate's own role,
+        # distinct from parent["role"] (the caller) — turn_provenance()
+        # compares the two to classify this turn as "delegated".
+        "execution_role": cfg.role,
     }
 
     # Resolve caller display name; fall back to role.
@@ -3824,6 +4063,9 @@ def _plugin_update_sync(*, name: str, new_ref: str,
                   if isinstance(e, dict) and e.get("name") == name), None)
     if entry is None:
         return {"ok": False, "kind": "not_registered", "name": name}
+    # A:§3.3 (r1-B8): capture the OLD artifact_id BEFORE the mutation — the
+    # caller invalidates its grants/challenges only after this commits.
+    old_artifact_id = entry.get("artifact_id")
     src = entry.get("source") or {}
     repo, subdir = src.get("repo", ""), src.get("subdir", "")
     guarded = _resolve_and_guard(repo=repo, ref=new_ref,
@@ -3852,7 +4094,30 @@ def _plugin_update_sync(*, name: str, new_ref: str,
     plugin_registry.save_registry(data)
     return {"ok": True, "name": name, "targets": list(entry.get("targets") or []),
             "artifact_id": result.artifact_id, "version": result.version,
-            "revision": result.revision, "path": result.path}
+            "revision": result.revision, "path": result.path,
+            "old_artifact_id": old_artifact_id}
+
+
+def _invalidate_lifecycle(*, artifact_id: "str | None" = None,
+                          roles: "list[str] | None" = None) -> None:
+    """Purge authorization grants + cancel pending challenges for an
+    invalidated artifact and/or role (A:§3.3/§3.4, r1-B8/r2-B5). Call sites
+    invoke this AFTER the registry mutation COMMITS and BEFORE the first
+    post-commit await/reload — an ABORTED mutation (validation failure)
+    must invalidate NOTHING. A stale challenge referencing the invalidated
+    artifact/role must never survive to be approved (an obsolete keyboard
+    dispatching an unusable continuation is a broken lifecycle even though
+    artifact/role binding already blocks consumption). ``roles`` entries may
+    be tier-qualified plugin targets (``"specialist:finance"``) — normalized
+    via :func:`authz_grants.normalize_role` before purge/cancel, since
+    ``GrantKey.enforcement_role`` is always plain."""
+    if artifact_id:
+        GRANTS.purge_artifact(artifact_id)
+        CHALLENGES.cancel_matching(artifact=artifact_id)
+    for target in roles or ():
+        role = normalize_role(target)
+        GRANTS.purge_role(role)
+        CHALLENGES.cancel_matching(role=role)
 
 
 def _resolved_observability(name: str) -> dict:
@@ -3936,6 +4201,10 @@ async def plugin_update(args: dict) -> dict:
             core.setdefault("runtime_ready", False)
             core.setdefault("verify", {})
             return _result(core)
+        # A:§3.3 (r1-B8): the artifact just changed under this plugin —
+        # invalidate the OLD artifact's grants/challenges right after the
+        # mutation commits, before the first post-commit await (reload).
+        _invalidate_lifecycle(artifact_id=core.get("old_artifact_id"))
         seq = await _reload_and_verify_targets(
             core["name"], core["targets"], expect="present")
         core.update(seq)
@@ -3990,6 +4259,10 @@ def _plugin_remove_sync(*, name: str) -> dict:
     if entry is None:
         return {"ok": False, "kind": "not_registered", "name": name}
     targets = list(entry.get("targets") or [])
+    # A:§3.3 (r1-B8): capture the artifact_id + targets BEFORE the mutation —
+    # the caller invalidates grants/challenges by artifact AND by each
+    # former target's role only after this commits.
+    artifact_id = entry.get("artifact_id")
     data.raw["plugins"] = [
         e for e in data.raw.get("plugins", [])
         if not (isinstance(e, dict) and e.get("name") == name)]
@@ -4002,7 +4275,7 @@ def _plugin_remove_sync(*, name: str) -> dict:
     # reload/verify tail that runs after the sync core returns ok.
     _safe_remove_manifest(name)
     return {"ok": True, "name": name, "targets": targets,
-            "artifact_retained": True}
+            "artifact_retained": True, "artifact_id": artifact_id}
 
 
 def _tool_plugin_list() -> dict:
@@ -4066,6 +4339,12 @@ async def plugin_unassign(args: dict) -> dict:
             core.setdefault("runtime_ready", False)
             core.setdefault("verify", {})
             return _result(core)
+        # A:§3.3 (r2-B5): invalidate by the (normalized) unassigned role only
+        # — the plugin/artifact stays valid for its OTHER targets. A NO-OP
+        # unassign (plugin was never assigned to this target) invalidates
+        # NOTHING.
+        if core.get("was_assigned"):
+            _invalidate_lifecycle(roles=[core["target"]])
         seq = await _reload_and_verify_targets(
             core["name"], [core["target"]], expect="absent")
         core.update(seq)
@@ -4087,6 +4366,10 @@ async def plugin_remove(args: dict) -> dict:
             core.setdefault("runtime_ready", False)
             core.setdefault("verify", {})
             return _result(core)
+        # A:§3.3 (r1-B8): the plugin is gone entirely — invalidate by its
+        # (retained-for-GC) artifact AND by every former target's role.
+        _invalidate_lifecycle(artifact_id=core.get("artifact_id"),
+                              roles=core.get("targets"))
         seq = await _reload_and_verify_targets(
             core["name"], core["targets"], expect="absent")
         core.update(seq)
@@ -4198,6 +4481,15 @@ def _tool_verify_plugin_state(
     if checksum_valid and mcp_json_malformed(rp):
         reasons.append("mcp_invalid")
     granted = grants_for_resolved(rp) if checksum_valid else []
+    # A:§3.7 (B7): eyeball-checkable declared protected tools. A malformed
+    # field already surfaced as a blocking "protected_tools_invalid" reason
+    # above (via artifact_verdict); this is purely informational disclosure
+    # of the declared list, tolerant of that same malformed case.
+    try:
+        protected_tools = (plugin_store.manifest_protected_tools(manifest)
+                           if checksum_valid else [])
+    except plugin_store.StoreError:
+        protected_tools = []
 
     # Tools (system-requirements — verify_bin presence). Sol #11: check BOTH the
     # INSTALLED manifest rows AND every requirement the ARTIFACT declares, so a
@@ -4386,6 +4678,7 @@ def _tool_verify_plugin_state(
         "tools": tools_status,
         "secrets": secrets_status,
         "granted_tools": granted,
+        "protected_tools": sorted(protected_tools),
         "targets": target_rows,
         "stale_targets": stale_targets,
         "sessions_on_previous_artifact": sessions,
@@ -4502,6 +4795,7 @@ async def get_item_fields(args: dict) -> dict:
 CASA_TOOLS: tuple = (
     send_message,
     send_media,
+    ask_user,
     delegate_to_agent,
     recall_memory,                 # §4.3 — shared-bank semantic recall (tier-clearance filtered)
     get_schedule,

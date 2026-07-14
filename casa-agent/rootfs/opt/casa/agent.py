@@ -505,7 +505,22 @@ class Agent:
             "user_id": msg.context.get("user_id"),
             "cid": cid_var.get(),
             "user_text": user_text,
+            # Provenance foundation (A:§1, v0.76.0): message_type/source
+            # let turn_provenance() classify transport (dm vs button vs
+            # other); execution_role starts equal to `role` here (a direct
+            # turn) and is overwritten by _run_delegated_agent's
+            # child_origin for delegated turns so the two can be compared.
+            "message_type": msg.type.value,
+            "source": msg.source,
+            "execution_role": self.config.role,
         }
+        # Reserved provenance markers (synthetic turn replay, button
+        # answers) ride on msg.context when a LATER task (ask_user/button
+        # broker) sets them; copy through only if actually present so a
+        # normal turn's origin stays free of stray None-valued keys.
+        for _marker_key in ("synthetic", "button_answer"):
+            if _marker_key in msg.context:
+                origin_snapshot[_marker_key] = msg.context[_marker_key]
         origin_token = origin_var.set(origin_snapshot)
         try:
             # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at
@@ -805,6 +820,34 @@ class Agent:
         # tier:role assignment into immutable artifact paths. Resolved
         # off-loop + cached per instance (see _get_plugin_resolution).
         resolution = await self._get_plugin_resolution()
+
+        # Authorization grants (A:§3.2): APPEND the fail-closed PreToolUse authz
+        # matcher for this role's PROTECTED plugin tools, preserving the
+        # settings guard already in hooks["PreToolUse"]. protected_map derives
+        # from the SAME resolution the options use — it supplies
+        # GrantKey.artifact_id, so a mid-TTL plugin update invalidates grants.
+        # Only appended when the role actually has protected tools (an authz
+        # matcher with matcher=None routes EVERY tool call, so skip the no-op).
+        from authz_grants import (
+            AuthzDeps, CHALLENGES, GRANTS, make_resident_authz_hook,
+        )
+        from plugin_grants import protected_map
+        _protected = protected_map(resolution)
+        if _protected:
+            from claude_agent_sdk import HookMatcher
+            _cm = self._channel_manager
+
+            def _authz_deps_factory(_cm=_cm):
+                ch = _cm.get("telegram") if _cm is not None else None
+                if ch is None:
+                    return None  # no DM reachable ⇒ unsupported-origin deny
+                return AuthzDeps(channel=ch, grants=GRANTS, challenges=CHALLENGES)
+
+            hooks["PreToolUse"] = [
+                *hooks.get("PreToolUse", []),
+                HookMatcher(hooks=[make_resident_authz_hook(
+                    self.config.role, _protected, _authz_deps_factory)]),
+            ]
 
         # Skills are enabled via the `skills="all"` option below, NOT by
         # putting "Skill" in allowed_tools ((f) v0.69.9: bare "Skill" is

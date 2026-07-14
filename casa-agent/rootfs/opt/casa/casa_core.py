@@ -23,6 +23,7 @@ from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from agent_loader import load_all_agents
+from authz_grants import CHALLENGES, GRANTS
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig
@@ -33,6 +34,7 @@ from casa_core_middleware import cid_middleware, CasaAccessLogger
 from mcp_registry import McpServerRegistry
 from semantic_memory import SemanticMemory
 from policies import load_policies
+from provenance import sanitize_external_context
 from session_registry import SessionRegistry
 from session_sweeper import SessionSweeper
 from rate_limit import RateLimiter, rate_limit_response
@@ -806,9 +808,15 @@ async def _drain_broker_before_channel_shutdown(channel_manager: Any) -> None:
 
     Must run immediately before ``channel_manager.stop_all()`` — a finish
     hook that fires after the channel is stopped can't edit anything.
+
+    Pinned order (r5-B2): cancel the broker records FIRST so a still-draining
+    authorization-challenge setup driver can only find a cancelled request
+    (never posts a fresh keyboard during shutdown); THEN await the coordinator
+    drivers; THEN flush the broker finish hooks; THEN stop the channels.
     """
     from verdict_broker import BROKER
     BROKER.cancel_all(reason="casa_shutdown")
+    await CHALLENGES.drain()
     await BROKER.drain_hooks()
     await channel_manager.stop_all()
 
@@ -1127,8 +1135,15 @@ def build_invoke_message(
     Every invoke also gets a fresh correlation id (spec 5.2 §7.2).
     Caller-supplied ``context.cid`` wins so external systems can thread
     their own trace ids through; missing or empty entries are replaced.
+
+    Sanitize-and-preserve (A:§3.5): the caller-supplied ``context`` is an
+    EXTERNAL dict (webhook payload) — it is stripped of Casa-reserved
+    provenance keys via ``sanitize_external_context`` before Casa's own
+    keys (``chat_id``, ``cid``) are merged in, so a caller can never spoof
+    ``execution_role``/``message_type``/``source``/etc. Every other
+    caller-supplied key (e.g. a caller's own ``cid`` above) is preserved.
     """
-    context = dict(payload.get("context") or {})
+    context = sanitize_external_context(payload.get("context"))
     if not context.get("chat_id"):
         context["chat_id"] = str(uuid.uuid4())
     if not context.get("cid"):
@@ -1402,6 +1417,30 @@ async def _sweep_engagement_topics(channel_manager: Any, bus: Any) -> None:
                 logger.warning(
                     "topic sweep: permission nag notify failed: %s", exc,
                 )
+
+
+# ------------------------------------------------------------------
+# Authorization-grant TTL sweep (A:§3.3) — hourly, beside the engagement
+# daily sweep. GrantStore has no private loop of its own (unlike
+# session_sweeper.py, which owns one) — this scheduler job is its only
+# sweep seam.
+# ------------------------------------------------------------------
+
+
+async def _authz_grant_sweep() -> None:
+    """Drop every authorization grant past its TTL.
+
+    A grant that is never consumed (the operator never taps Approve, or
+    taps after the tool call was abandoned) would otherwise sit in
+    memory forever — GrantStore has no other reaper. Never raises: a
+    sweep failure must not kill the shared scheduler job.
+    """
+    try:
+        removed = GRANTS.sweep()
+        if removed:
+            logger.info("authz grant sweep: dropped %d expired grant(s)", removed)
+    except Exception:  # noqa: BLE001 — never kill the scheduler job
+        logger.warning("authz grant sweep failed", exc_info=True)
 
 
 # ------------------------------------------------------------------
@@ -2291,6 +2330,19 @@ async def main() -> None:
         id="engagement_idle_sweep",
         hour=8, minute=0,
         replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    # A:§3.3 — authorization-grant TTL sweep, hourly. GrantStore has no
+    # private loop of its own (unlike session_sweeper.py); this job is
+    # its only reap seam.
+    scheduler.add_job(
+        _authz_grant_sweep,
+        trigger="interval",
+        id="authz_grant_sweep",
+        hours=1,
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
         misfire_grace_time=3600,
     )
     # Plan 4a.1 §8: workspace sweeper — every 6 hours, removes terminal

@@ -124,12 +124,27 @@ class MessageBus:
         return list(self._loop_tasks.values())
 
     async def send(self, msg: BusMessage) -> None:
-        """Send a message to msg.target's queue."""
+        """Send a message to msg.target's queue (unknown targets are silently
+        dropped). Thin wrapper over :meth:`send_checked` that discards the
+        delivery signal."""
+        await self.send_checked(msg)
+
+    async def send_checked(self, msg: BusMessage) -> str:
+        """Enqueue like :meth:`send` but REPORT delivery.
+
+        Returns ``"accepted"`` when ``msg.target`` has a registered queue (the
+        message was enqueued) or ``"no_target"`` when it was silently dropped
+        (unknown target — the same drop ``send`` performs, just observable).
+        The button-continuation dispatcher (telegram
+        ``_dispatch_button_continuation``) uses this signal to retry a target
+        that may still be (re)registering vs. give up.
+        """
         if msg.target not in self.queues:
-            return  # silently drop for unknown targets
+            return "no_target"  # silently drop for unknown targets
         self._log.append(msg)
         self._seq += 1
         await self.queues[msg.target].put((msg.priority, self._seq, msg))
+        return "accepted"
 
     async def request(
         self, msg: BusMessage, timeout: float = 300

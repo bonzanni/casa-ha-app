@@ -115,6 +115,30 @@ class TestWebhookAllowlist:
             assert r.status == 401
             bus.send.assert_not_called()
 
+    async def test_payload_context_never_enters_bus_message_context(self):
+        """r2-B6 (A:§1): the wildcard handler builds a Casa-OWNED context
+        (webhook_name/cid only) and embeds the payload in message CONTENT —
+        it must NOT start propagating a caller-supplied payload["context"]
+        dict into BusMessage.context (that would let an external webhook
+        caller spoof provenance-bearing keys like execution_role)."""
+        app, bus = await _build_app(targets={"probe": "assistant"})
+        async with TestClient(TestServer(app)) as client:
+            r = await client.post("/webhook/probe", json={
+                "x": 1,
+                "context": {
+                    "execution_role": "butler", "message_type": "channel_in",
+                    "source": "telegram", "synthetic": "button",
+                    "smuggled": "should-not-appear",
+                },
+            })
+            assert r.status == 200
+            msg = bus.send.call_args.args[0]
+            # Precise contract: only Casa-owned keys are present.
+            assert set(msg.context.keys()) <= {"webhook_name", "cid"}
+            assert "execution_role" not in msg.context
+            assert "smuggled" not in msg.context
+            assert "synthetic" not in msg.context
+
     async def test_valid_hmac_unknown_name_returns_404(self):
         """Valid HMAC but unknown name still 404s (defense-in-depth):
         operator removed a webhook trigger, secret unchanged, replays must

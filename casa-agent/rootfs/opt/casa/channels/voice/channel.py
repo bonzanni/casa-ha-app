@@ -21,6 +21,7 @@ from agent import _classify_error
 from bus import BusMessage, MessageBus, MessageType
 from channels import Channel
 from log_cid import new_cid
+from provenance import sanitize_external_context
 from rate_limit import RateLimiter
 from channels.voice.prosodic import ProsodicSplitter
 from channels.voice.session import VoiceSessionPool
@@ -234,7 +235,10 @@ class VoiceChannel(Channel):
             content=prompt,
             channel="voice",
             context={
-                **(payload.get("context") or {}),
+                # Sanitize-and-preserve (A:§3.5): payload["context"] is
+                # caller-supplied (the SSE POST body) — strip Casa-reserved
+                # provenance keys before Casa's own keys are merged in below.
+                **sanitize_external_context(payload.get("context")),
                 "chat_id": scope_id,
                 "utterance_id": utterance_id,
                 "cid": request["cid"],
@@ -459,7 +463,11 @@ class VoiceChannel(Channel):
             content=frame.get("text", ""),
             channel="voice",
             context={
-                **(frame.get("context") or {}),
+                # Sanitize-and-preserve (A:§3.5): frame["context"] is
+                # caller-supplied (the WS utterance frame) — strip
+                # Casa-reserved provenance keys before Casa's own keys are
+                # merged in below.
+                **sanitize_external_context(frame.get("context")),
                 "chat_id": scope_id, "utterance_id": uid,
                 "cid": new_cid(),
                 "_on_token": on_token,

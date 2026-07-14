@@ -184,6 +184,41 @@ class TestWebhook:
             reg.register_agent("butler", [_trigger_webhook()],
                                channels=["webhook"])
 
+    async def test_registered_trigger_payload_context_never_enters_bus_message(self):
+        """r2-B6 (A:§1): the per-trigger registered handler embeds the
+        payload in message CONTENT and builds a Casa-OWNED context
+        (webhook_name/chat_id/cid) — it must NOT propagate a caller-supplied
+        payload["context"] dict into BusMessage.context."""
+        from aiohttp.test_utils import TestClient, TestServer
+        from trigger_registry import TriggerRegistry
+
+        sched = _make_scheduler()
+        app = web.Application()
+        bus = _make_bus()
+        reg = TriggerRegistry(scheduler=sched, app=app, bus=bus)
+        reg.register_agent(
+            "assistant", [_trigger_webhook(name="gh", path="/webhook/gh")],
+            channels=["webhook"],
+        )
+
+        async with TestClient(TestServer(app)) as client:
+            r = await client.post("/webhook/gh", json={
+                "x": 1,
+                "context": {
+                    "execution_role": "butler", "message_type": "channel_in",
+                    "source": "telegram", "synthetic": "button",
+                    "smuggled": "should-not-appear",
+                },
+            })
+            assert r.status == 200
+
+        bus.send.assert_awaited_once()
+        msg = bus.send.call_args.args[0]
+        assert set(msg.context.keys()) <= {"webhook_name", "chat_id", "cid"}
+        assert "execution_role" not in msg.context
+        assert "smuggled" not in msg.context
+        assert "synthetic" not in msg.context
+
 
 class TestCrossRoleWebhookNameCollision:
     """L79/L28: two agents each declaring a webhook trigger with the same

@@ -16,6 +16,7 @@ from plugin_grants import (
     grants_for_resolved,
     grants_for_resolution,
     make_fail_closed_can_use_tool,
+    protected_map,
     required_env_vars_for_resolved,
     sanitize_segment,
 )
@@ -24,7 +25,8 @@ from plugin_registry import ResolutionResult, ResolvedPlugin
 pytestmark = pytest.mark.unit
 
 
-def _artifact(tmp_path, name="lesina-invoice", servers=None) -> ResolvedPlugin:
+def _artifact(tmp_path, name="lesina-invoice", servers=None,
+             manifest=None, artifact_id="0" * 64) -> ResolvedPlugin:
     """A store-artifact dir with an optional .mcp.json at its ROOT, wrapped as
     a ResolvedPlugin (the resolved object grants derive from)."""
     root = tmp_path / name
@@ -32,8 +34,8 @@ def _artifact(tmp_path, name="lesina-invoice", servers=None) -> ResolvedPlugin:
     if servers is not None:
         (root / ".mcp.json").write_text(
             json.dumps({"mcpServers": servers}), encoding="utf-8")
-    return ResolvedPlugin(name=name, artifact_id="0" * 64, path=str(root),
-                          version="1.0.0", manifest={})
+    return ResolvedPlugin(name=name, artifact_id=artifact_id, path=str(root),
+                          version="1.0.0", manifest=manifest or {})
 
 
 def test_sanitize_keeps_hyphens_and_underscores():
@@ -200,3 +202,80 @@ def test_parse_url_only_server_is_valid(tmp_path):
     servers, malformed = _parse(
         tmp_path, {"mcpServers": {"s": {"url": "http://x"}}})
     assert list(servers) == ["s"] and malformed is False
+
+
+# --- A:§3.7 protected_map (v0.76.0) ------------------------------------------
+
+
+def test_protected_map_absent_is_empty(tmp_path):
+    rp = _artifact(tmp_path, "lesina-invoice",
+                   {"lesina-invoice": {"command": "node"}})
+    res = ResolutionResult(registry_valid=True, plugins=[rp])
+    assert protected_map(res) == {}
+
+
+def test_protected_map_single_server(tmp_path):
+    rp = _artifact(
+        tmp_path, "lesina-invoice", {"lesina-invoice": {"command": "node"}},
+        manifest={"casa": {"protectedTools": ["invoice_reset"]}})
+    res = ResolutionResult(registry_valid=True, plugins=[rp])
+    assert protected_map(res) == {
+        "mcp__plugin_lesina-invoice_lesina-invoice__invoice_reset":
+            "0" * 64,
+    }
+
+
+def test_protected_map_expands_across_two_declared_servers(tmp_path):
+    """A bare tool name protects that tool on EVERY server the plugin
+    declares."""
+    rp = _artifact(
+        tmp_path, "multi", {"alpha": {"command": "x"}, "beta": {"command": "y"}},
+        manifest={"casa": {"protectedTools": ["do_thing"]}},
+        artifact_id="a" * 64)
+    res = ResolutionResult(registry_valid=True, plugins=[rp])
+    assert protected_map(res) == {
+        "mcp__plugin_multi_alpha__do_thing": "a" * 64,
+        "mcp__plugin_multi_beta__do_thing": "a" * 64,
+    }
+
+
+def test_protected_map_sanitizes_segments(tmp_path):
+    rp = _artifact(
+        tmp_path, "weird-name", {"srv.one two": {"command": "x"}},
+        manifest={"casa": {"protectedTools": ["do the thing"]}})
+    res = ResolutionResult(registry_valid=True, plugins=[rp])
+    assert protected_map(res) == {
+        "mcp__plugin_weird-name_srv_one_two__do_the_thing": "0" * 64,
+    }
+
+
+def test_protected_map_per_plugin_degradation(tmp_path, caplog):
+    """A malformed casa.protectedTools in ONE resolved plugin excludes just
+    that plugin's tools; a healthy sibling still contributes normally."""
+    good = _artifact(
+        tmp_path, "good", {"good": {"command": "x"}},
+        manifest={"casa": {"protectedTools": ["safe_tool"]}},
+        artifact_id="a" * 64)
+    bad = _artifact(
+        tmp_path, "bad", {"bad": {"command": "x"}},
+        manifest={"casa": {"protectedTools": ["ok", 1]}},
+        artifact_id="b" * 64)
+    res = ResolutionResult(registry_valid=True, plugins=[good, bad])
+    with caplog.at_level(logging.WARNING, logger="plugin_grants"):
+        out = protected_map(res)
+    assert out == {"mcp__plugin_good_good__safe_tool": "a" * 64}
+    assert any("bad" in r.message for r in caplog.records)
+
+
+def test_protected_map_no_servers_contributes_nothing(tmp_path):
+    """A skill-only plugin (no .mcp.json) declaring protectedTools has no
+    server to qualify the tool name with — contributes nothing."""
+    rp = _artifact(
+        tmp_path, "skills-only", servers=None,
+        manifest={"casa": {"protectedTools": ["x"]}})
+    res = ResolutionResult(registry_valid=True, plugins=[rp])
+    assert protected_map(res) == {}
+
+
+def test_protected_map_empty_resolution():
+    assert protected_map(ResolutionResult(registry_valid=True)) == {}

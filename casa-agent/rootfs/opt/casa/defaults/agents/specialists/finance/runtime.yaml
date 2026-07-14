@@ -2,7 +2,7 @@ schema_version: 1
 model: sonnet
 enabled: false
 tools:
-  allowed: [Read, Skill, mcp__casa-framework__get_schedule, mcp__casa-framework__send_media]
+  allowed: [Read, Skill, mcp__casa-framework__get_schedule, mcp__casa-framework__send_media, mcp__casa-framework__ask_user]
   disallowed: [Bash, Write, Edit]
   permission_mode: acceptEdits
   max_turns: 10

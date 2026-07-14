@@ -16,12 +16,15 @@ from plugin_store import content_checksum, write_metadata
 def mk_artifact(store: Path, name: str, artifact_id: str,
                 version: str = "1.0.0", manifest_name: str | None = None,
                 revision: str = "git:" + "a" * 40, subdir: str = "",
-                mcp_servers: dict | None = None) -> Path:
+                mcp_servers: dict | None = None,
+                extra_manifest: dict | None = None) -> Path:
     root = Path(store) / name / artifact_id
     (root / ".claude-plugin").mkdir(parents=True)
-    (root / ".claude-plugin" / "plugin.json").write_text(json.dumps(
-        {"name": manifest_name or name, "version": version}),
-        encoding="utf-8")
+    manifest = {"name": manifest_name or name, "version": version}
+    if extra_manifest:
+        manifest.update(extra_manifest)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(manifest), encoding="utf-8")
     if mcp_servers is not None:
         # Fixtures declare servers by NAME (for grant/secret derivation); ensure
         # each has a runnable command so the strict malformed check (Sol) treats

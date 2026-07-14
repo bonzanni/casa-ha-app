@@ -286,6 +286,23 @@ register_handler("triggers", reload_triggers)
 _AGENT_CLOSE_TASKS: set[asyncio.Task] = set()
 
 
+def _invalidate_role_grants(role: str | None) -> None:
+    """Purge authorization grants + cancel pending challenges for `role`
+    BEFORE its replacement/removed Agent becomes dispatchable (A:§3.3/§3.4,
+    r1-B8/r2-B5). A stale grant, or an approved-but-stale challenge whose
+    keyboard tap would dispatch a synthetic continuation to an Agent that no
+    longer exists (or now runs different code), must never survive a role's
+    Agent being swapped or torn down. ``role`` is normalized (a plain reload
+    role is already plain; normalize_role is a harmless no-op for it) so
+    every purge/cancel call site agrees on ONE shape."""
+    if not role:
+        return
+    from authz_grants import CHALLENGES, GRANTS, normalize_role
+    r = normalize_role(role)
+    GRANTS.purge_role(r)
+    CHALLENGES.cancel_matching(role=r)
+
+
 def _track_draining(runtime, role, old_agent):
     """Sol #4: record a swapped-out agent's plugin binding on runtime.draining
     so verify can DISCLOSE it as a consumer still on the PREVIOUS artifact while
@@ -499,6 +516,9 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     # EMPTY plugin binding. Tear down any existing instance and deregister
     # the role instead; verify reports its plugin targets state="disabled".
     if tier == "specialist" and getattr(new_cfg, "enabled", True) is False:
+        # A:§3.3/§3.4 (r2-B5 enumerated seam): purge+cancel BEFORE teardown
+        # proceeds — the role is about to become undispatchable entirely.
+        _invalidate_role_grants(role)
         old_agent = runtime.agents.pop(role, None)
         _schedule_agent_close(old_agent, runtime=runtime, role=role)
         await _teardown_role(runtime, role)
@@ -532,6 +552,9 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
 
     # --- ATOMIC SWAP WINDOW ---
     old_agent = runtime.agents.get(role)  # AR-7: capture before overwrite
+    # A:§3.3/§3.4 (r2-B5 enumerated seam): purge+cancel BEFORE the
+    # replacement agent becomes dispatchable.
+    _invalidate_role_grants(role)
     if tier == "resident":
         runtime.role_configs[role] = new_cfg
     else:
@@ -627,6 +650,9 @@ async def _reload_role_after_policies(runtime: Any, role: str) -> None:
         _construct_agent, cfg=new_cfg, runtime=runtime,
     )
     old_agent = runtime.agents.get(role)  # AR-7: capture before overwrite
+    # A:§3.3/§3.4 (r2-B5 enumerated seam): purge+cancel BEFORE the
+    # replacement agent becomes dispatchable.
+    _invalidate_role_grants(role)
     if tier == "resident":
         runtime.role_configs[role] = new_cfg
     runtime.agents[role] = new_agent
@@ -787,6 +813,9 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("reload_agents: failed to add %s: %s", r, exc)
             continue
+        # A:§3.3/§3.4 (r2-B5 enumerated seam): purge+cancel BEFORE the
+        # (re)constructed agent becomes dispatchable.
+        _invalidate_role_grants(r)
         runtime.role_configs[r] = new_cfg
         runtime.agents[r] = new_agent
         runtime.bus.register(r, new_agent.handle_message)
@@ -799,6 +828,9 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
     # consumer, drop queue/handler, unwind triggers), mirroring the add
     # path's register + start.
     for r in known_residents - on_disk_residents:
+        # A:§3.3/§3.4 (r2-B5 enumerated seam): purge+cancel BEFORE teardown —
+        # the role is about to become undispatchable entirely.
+        _invalidate_role_grants(r)
         runtime.role_configs.pop(r, None)
         old_agent = runtime.agents.pop(r, None)  # AR-7: capture before drop
         _schedule_agent_close(old_agent)  # F12
@@ -852,6 +884,9 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("reload_agents: failed to add specialist %s: %s", s, exc)
             continue
+        # A:§3.3/§3.4 (r2-B5 enumerated seam): purge+cancel BEFORE the
+        # (re)constructed specialist becomes dispatchable.
+        _invalidate_role_grants(s)
         runtime.agents[s] = new_agent
         runtime.bus.register(s, new_agent.handle_message)
         _start_bus_loop(runtime, s)
@@ -863,6 +898,9 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         # No-op — handled in resident block above.
         pass
     for s in set(runtime.agents.keys()) - on_disk_residents - on_disk_specialists:
+        # A:§3.3/§3.4 (r2-B5 enumerated seam): purge+cancel BEFORE teardown —
+        # the role is about to become undispatchable entirely.
+        _invalidate_role_grants(s)
         old_agent = runtime.agents.pop(s, None)  # AR-7: capture before drop
         _schedule_agent_close(old_agent)  # F12
         await _teardown_role(runtime, s)

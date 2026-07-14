@@ -341,6 +341,113 @@ def test_validate_manifest_rejects_apt(tmp_path):
     assert ei.value.reason_code == "apt_requirements_rejected"
 
 
+# --- A:§3.7 casa.protectedTools (v0.76.0) ------------------------------------
+
+
+def test_manifest_protected_tools_absent_is_empty():
+    from plugin_store import manifest_protected_tools
+    assert manifest_protected_tools({"name": "p", "version": "1.0.0"}) == []
+    assert manifest_protected_tools({"name": "p", "casa": {}}) == []
+    # Sol R2-3-style tolerance: a non-object casa degrades to [], not a raise.
+    assert manifest_protected_tools({"name": "p", "casa": "oops"}) == []
+    assert manifest_protected_tools({}) == []
+
+
+def test_manifest_protected_tools_present_valid():
+    from plugin_store import manifest_protected_tools
+    manifest = {"name": "p", "casa": {"protectedTools": ["invoice_reset"]}}
+    assert manifest_protected_tools(manifest) == ["invoice_reset"]
+
+
+def test_manifest_protected_tools_present_empty_list_is_valid():
+    """The key PRESENT but an empty list is a valid (vacuous) list of
+    non-empty strings — not malformed."""
+    from plugin_store import manifest_protected_tools
+    assert manifest_protected_tools(
+        {"name": "p", "casa": {"protectedTools": []}}) == []
+
+
+@pytest.mark.parametrize("bad_value", [
+    "invoice_reset",                 # str, not a list
+    ["invoice_reset", ""],           # list-with-empty-string
+    ["invoice_reset", 1],            # list-with-int
+    {"invoice_reset": True},         # dict, not a list
+])
+def test_manifest_protected_tools_malformed_shapes_raise(bad_value):
+    from plugin_store import manifest_protected_tools
+    manifest = {"name": "p", "casa": {"protectedTools": bad_value}}
+    with pytest.raises(StoreError) as ei:
+        manifest_protected_tools(manifest)
+    assert ei.value.reason_code == "protected_tools_invalid"
+
+
+def test_validate_manifest_accepts_absent_protected_tools(tmp_path):
+    root = _plugin_tree(tmp_path)
+    assert validate_manifest(root, "probe")["version"] == "1.0.0"
+
+
+def test_validate_manifest_accepts_valid_protected_tools(tmp_path):
+    root = _plugin_tree(tmp_path)
+    (root / ".claude-plugin" / "plugin.json").write_text(json.dumps({
+        "name": "probe", "version": "1.0.0",
+        "casa": {"protectedTools": ["invoice_reset"]},
+    }), encoding="utf-8")
+    assert validate_manifest(root, "probe")["version"] == "1.0.0"
+
+
+@pytest.mark.parametrize("bad_value", [
+    "invoice_reset", ["invoice_reset", ""], ["invoice_reset", 1],
+    {"invoice_reset": True},
+])
+def test_validate_manifest_rejects_malformed_protected_tools(tmp_path, bad_value):
+    """A PRESENT but malformed casa.protectedTools FAILS validate_manifest —
+    install/update refused (A:§3.7 B7 strict validator)."""
+    root = _plugin_tree(tmp_path)
+    (root / ".claude-plugin" / "plugin.json").write_text(json.dumps({
+        "name": "probe", "version": "1.0.0",
+        "casa": {"protectedTools": bad_value},
+    }), encoding="utf-8")
+    with pytest.raises(StoreError) as ei:
+        validate_manifest(root, "probe")
+    assert ei.value.reason_code == "protected_tools_invalid"
+
+
+def test_artifact_verdict_flags_stored_malformed_protected_tools(tmp_path):
+    """A:§3.7 (r2-B6/r3-4): a PRE-EXISTING stored artifact whose manifest is
+    re-checked by artifact_verdict() (the shared strict extension runs
+    inside deep validation too) yields protected_tools_invalid — excluding
+    it from resolution, never a whole-role failure."""
+    from plugin_store import artifact_verdict, content_checksum, write_metadata
+    root = tmp_path / "art"
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(json.dumps({
+        "name": "probe", "version": "1.0.0",
+        "casa": {"protectedTools": ["invoice_reset", 1]},   # malformed
+    }), encoding="utf-8")
+    write_metadata(root, name="probe", repo="o/r", ref="v1",
+                   revision="git:" + SHA, subdir="", artifact_id="a" * 64,
+                   version="1.0.0", checksum=content_checksum(root))
+    verdict = artifact_verdict(root, name="probe", repo="o/r",
+                               revision="git:" + SHA, subdir="",
+                               artifact_id="a" * 64)
+    assert verdict == "protected_tools_invalid"
+
+
+def test_artifact_verdict_absent_protected_tools_is_valid(tmp_path):
+    from plugin_store import artifact_verdict, content_checksum, write_metadata
+    root = tmp_path / "art"
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "probe", "version": "1.0.0"}), encoding="utf-8")
+    write_metadata(root, name="probe", repo="o/r", ref="v1",
+                   revision="git:" + SHA, subdir="", artifact_id="a" * 64,
+                   version="1.0.0", checksum=content_checksum(root))
+    verdict = artifact_verdict(root, name="probe", repo="o/r",
+                               revision="git:" + SHA, subdir="",
+                               artifact_id="a" * 64)
+    assert verdict is None
+
+
 def _wire_fetch(src_root):
     """publish() fetches into staging: fake fetch_commit_tree by copying."""
     import shutil

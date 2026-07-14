@@ -360,6 +360,33 @@ def test_resolution_from_recorded_empty_and_identity_mismatch(tmp_path):
             [{"name": "p", "artifact_id": "d" * 64, "path": str(art)}])
 
 
+def test_resolution_from_recorded_malformed_protected_tools_excludes_one(
+        tmp_path):
+    """A:§3.7 (r2-B6/r3-4): a RECORDED legacy plugin with a malformed
+    casa.protectedTools is excluded (per-plugin degradation, an issue is
+    recorded) while a healthy sibling in the SAME recorded set still loads —
+    never a whole-resume abort."""
+    import tools as tools_mod
+    store = tmp_path / "store"
+    good_e = entry("good", ["specialist:finance"])
+    good_art = mk_artifact(store, "good", good_e["artifact_id"],
+                           mcp_servers={"good": {}})
+    bad_e = entry("bad", ["specialist:finance"])
+    bad_art = mk_artifact(
+        store, "bad", bad_e["artifact_id"], mcp_servers={"bad": {}},
+        extra_manifest={"casa": {"protectedTools": ["x", 1]}})
+    recorded = [
+        {"name": "good", "artifact_id": good_e["artifact_id"],
+         "path": str(good_art)},
+        {"name": "bad", "artifact_id": bad_e["artifact_id"],
+         "path": str(bad_art)},
+    ]
+    res = tools_mod._resolution_from_recorded(recorded)
+    assert [rp.name for rp in res.plugins] == ["good"]
+    codes = {i.name: i.reason_code for i in res.issues}
+    assert codes == {"bad": "protected_tools_invalid"}
+
+
 # --- D2 (v0.74.0): one-assignment PluginBindingSnapshot ----------------------
 
 

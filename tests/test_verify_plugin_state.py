@@ -881,6 +881,43 @@ def test_verify_enabled_specialist_still_graded(tmp_path, monkeypatch):
     assert row["ready"] is False and row["reasons"] == ["reload_required"]
 
 
+def test_verify_shows_protected_tools(tmp_path):
+    """A:§3.7 (B7): verify_plugin_state discloses the declared protected
+    tools list (eyeball-checkable)."""
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"],
+                extra_manifest={"casa": {"protectedTools": ["b_tool", "a_tool"]}})
+    mk_registry(tmp_path, [e])
+    r = _verify(tmp_path)
+    assert r["ready"] is True
+    assert r["protected_tools"] == ["a_tool", "b_tool"]      # sorted
+
+
+def test_verify_absent_protected_tools_is_empty_list(tmp_path):
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"])
+    mk_registry(tmp_path, [e])
+    r = _verify(tmp_path)
+    assert r["protected_tools"] == []
+
+
+def test_verify_malformed_protected_tools_not_green(tmp_path):
+    """A malformed casa.protectedTools is a blocking artifact_verdict
+    reason (protected_tools_invalid), disclosed via 'protected_tools': []."""
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    _mk_artifact_raw(store, "probe", e["artifact_id"], plugin_json={
+        "name": "probe", "version": "1.0.0",
+        "casa": {"protectedTools": ["x", 1]}})
+    mk_registry(tmp_path, [e])
+    r = _verify(tmp_path)
+    assert r["ready"] is False
+    assert "protected_tools_invalid" in r["reasons"]
+    assert r["protected_tools"] == []
+
+
 def test_verify_disabled_specialist_does_not_mask_config_failure(
         tmp_path, monkeypatch):
     """Sol v0.74.1-B2: being disabled must not mask a BROKEN configuration —

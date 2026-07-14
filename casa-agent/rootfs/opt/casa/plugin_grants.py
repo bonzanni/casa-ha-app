@@ -89,6 +89,52 @@ def required_env_vars_for_resolved(rp) -> list[str]:
         return []
 
 
+def protected_map(resolution) -> dict[str, str]:
+    """Full-tool-name -> artifact_id map for every ``casa.protectedTools``
+    entry across a RESOLVED ``ResolutionResult`` (A:§3.7). Derived from the
+    RESOLVED ARTIFACT's manifest (the content-addressed store copy named by
+    the ``ResolutionResult`` — never a duplicated registry field).
+
+    Namespacing reuses the grant-derivation sanitization
+    (``mcp__plugin_<plugin>_<server>__<tool>``); a BARE tool name expands
+    across EVERY MCP server the plugin declares (a plugin with two servers
+    protects the tool on both).
+
+    PER-PLUGIN DEGRADATION (r2-B6/r3-4): a malformed ``casa.protectedTools``
+    in one resolved plugin's manifest excludes JUST that plugin's protected
+    tools from the map (logged at WARNING) — every other resolved plugin
+    still contributes normally, matching the existing artifact-failure
+    ``PluginIssue`` pattern. A plugin declaring no MCP servers (skill-only,
+    or a malformed ``.mcp.json``) contributes nothing either, since there is
+    no server to qualify the tool name with (no runtime MCP enumeration —
+    B7).
+    """
+    from plugin_store import StoreError, manifest_protected_tools
+
+    out: dict[str, str] = {}
+    for rp in getattr(resolution, "plugins", None) or []:
+        try:
+            names = manifest_protected_tools(rp.manifest)
+        except StoreError:
+            logger.warning(
+                "protected_tools_invalid: excluding %s (artifact_id=%s) "
+                "from the protected-tool map", rp.name, rp.artifact_id)
+            continue
+        if not names:
+            continue
+        servers = sorted(_mcp_servers(Path(rp.path) / ".mcp.json"))
+        if not servers:
+            continue
+        plugin_seg = sanitize_segment(rp.name)
+        for tool in names:
+            tool_seg = sanitize_segment(tool)
+            for server in servers:
+                full = (f"mcp__plugin_{plugin_seg}_"
+                        f"{sanitize_segment(server)}__{tool_seg}")
+                out[full] = rp.artifact_id
+    return out
+
+
 def make_fail_closed_can_use_tool(role: str):
     """Fail-closed ``can_use_tool`` for in-casa agents (P-5b).
 

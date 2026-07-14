@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.76.0] - 2026-07-14
+
+### Added
+
+- DM button questions from Ellen and specialists.
+- Operator-approved protected plugin tools with single-use argument-bound
+  grants.
+
+### Changed
+
+- Inbound message contexts sanitized at every ingress.
+
+### Fixed
+
+- A verdict-broker drain loop could livelock the whole agent core on
+  Python 3.12+ when a completed hook task was drained before its cleanup
+  callback ran; done tasks are now discarded synchronously before waiting.
+  (Harmless on the current Python 3.11 base image; fixed ahead of any
+  future base-image upgrade.)
+- Button-answer delivery now retries on transient send errors instead of
+  aborting on the first exception, so a failed delivery is always reported
+  back on the button message.
+
 ## [0.75.1] - 2026-07-14
 
 ### Fixed
