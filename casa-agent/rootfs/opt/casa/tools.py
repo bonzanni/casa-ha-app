@@ -2469,18 +2469,45 @@ async def _finalize_engagement(
     """
     now = time.time()
 
+    # 0. Pre-close spool drain (v0.79.0 §3): flush any pending inbound receipts
+    #    / eviction notices BEFORE the terminal commit + topic close, while the
+    #    topic is still open. Best-effort — the terminal boot-reconciliation
+    #    owner covers a crash-after-commit or a drain-send failure. Idempotent
+    #    (at-least-once), so running it ahead of the win/lose gate is safe.
+    if driver is not None and hasattr(driver, "drain_inbound_spool"):
+        try:
+            await driver.drain_inbound_spool(engagement)
+        except Exception as exc:  # noqa: BLE001 — never abort finalize
+            logger.warning(
+                "finalize engagement %s: inbound spool drain failed: %s",
+                engagement.id[:8], exc,
+            )
+
     # 1. Registry transition — atomic and authoritative. Only the first
     #    caller to flip the record terminal runs the finalize side effects
     #    below (L75/L24: guards against a concurrent /cancel racing this
     #    call across a real suspension point, e.g. the G-2 forced-reload
     #    await, which the naive check-then-act in emit_completion cannot).
+    #    v0.79.0 (§3, Sol r6-2): STRICT persistence — a tombstone-write failure
+    #    rolls the record back (full-field) and re-raises rather than leaving a
+    #    closed topic with no terminal record; treat that as "did not win" so
+    #    the record stays live for a retry / boot replay instead of a torn close.
     if _engagement_registry is not None:
-        won = await _engagement_registry.try_transition_terminal(
-            engagement.id, outcome,
-            completed_at=now if outcome == "completed" else None,
-            error_kind="emit_completion_error", error_message=text,
-            stale_before=stale_before,
-        )
+        try:
+            won = await _engagement_registry.try_transition_terminal(
+                engagement.id, outcome,
+                completed_at=now if outcome == "completed" else None,
+                error_kind="emit_completion_error", error_message=text,
+                stale_before=stale_before,
+                strict=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — strict persist failed + rolled back
+            logger.warning(
+                "Engagement %s terminal transition failed to persist "
+                "(rolled back, left live): %s",
+                engagement.id[:8], exc,
+            )
+            return False
         if not won:
             logger.info(
                 "Engagement %s not finalized — already terminal or revived "

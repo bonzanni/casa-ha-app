@@ -204,6 +204,32 @@ class TestSlashCommands:
         ch._finalize_cancel.assert_awaited_once()
         ch._driver_send_user_turn.assert_not_called()
 
+    async def test_user_turn_threads_message_id_and_seals_narration(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """v0.79.0 (§3): an engagement user turn passes the operator's Telegram
+        message id to the driver (reply-threading) and advances the topic
+        high-water at handler entry (seal open narration)."""
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = engagement_fixture.registry
+        ch._driver_send_user_turn = AsyncMock()
+        ch._driver_advance_high_water = AsyncMock()
+        rec = engagement_fixture.active_record
+
+        u = _mk_update(chat_id=-1001, text="operator says hi",
+                       thread_id=rec.topic_id)
+        await ch.handle_update(u)
+        await _drain_turns(ch)
+
+        ch._driver_advance_high_water.assert_awaited_once_with(rec, 999)
+        ch._driver_send_user_turn.assert_awaited_once()
+        # message id threaded through as a kwarg.
+        assert ch._driver_send_user_turn.await_args.kwargs.get(
+            "tg_message_id") == 999
+
     async def test_slash_command_for_other_bot_falls_through(
         self, fake_telegram_bot, engagement_fixture,
     ):
@@ -603,7 +629,7 @@ class TestHandleUpdateConcurrencyRace:
         b_routed = asyncio.Event()
         a_can_finish = asyncio.Event()
 
-        async def driver_send(rec_arg, text):
+        async def driver_send(rec_arg, text, *, tg_message_id=None):
             if rec_arg.id == rec_a.id:
                 # A holds its lock; wait for B to also be routed.
                 await asyncio.wait_for(b_routed.wait(), timeout=2.0)
@@ -643,7 +669,7 @@ class TestHandleUpdateConcurrencyRace:
         turn_started = asyncio.Event()
         release_turn = asyncio.Event()
 
-        async def slow_turn(rec_arg, text):
+        async def slow_turn(rec_arg, text, *, tg_message_id=None):
             turn_started.set()
             await release_turn.wait()  # simulates a minutes-long SDK turn
 

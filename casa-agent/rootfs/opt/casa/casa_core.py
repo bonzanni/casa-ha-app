@@ -692,6 +692,31 @@ async def replay_undergoing_engagements(
             )
 
 
+async def reconcile_terminal_spools(*, registry, driver) -> None:
+    """v0.79.0 (§3): terminal boot-reconciliation owner.
+
+    Alongside the active-engagement replay scan, drain the inbound spools of
+    TERMINAL engagements that still hold pending receipts/notices — a drain
+    that crashed after the terminal commit, or a Telegram send that failed
+    before finalize. Each drains to the topic if it still exists, else
+    WARN-drops (the topic is gone; nothing to notify into). Pending entries
+    therefore retry across restarts until sent or their topic disappears.
+    """
+    reconcile = getattr(driver, "reconcile_terminal_spool", None)
+    if reconcile is None:
+        return
+    for rec in registry.terminal_records():
+        if rec.driver != "claude_code":
+            continue
+        try:
+            await reconcile(rec)
+        except Exception as exc:  # noqa: BLE001 — best-effort per record
+            logger.warning(
+                "terminal spool reconcile failed for %s: %s",
+                rec.id[:8], exc,
+            )
+
+
 # ------------------------------------------------------------------
 # /hooks/resolve — CC hook_proxy.sh loopback endpoint
 # ------------------------------------------------------------------
@@ -1841,8 +1866,21 @@ async def main() -> None:
     # claude_code driver: send_to_topic doubles as the live TopicStreamRelay's
     # send_message primitive (W1), so it must RETURN the posted message_id (the
     # relay edits the rolling message by id). Notice/warning callers ignore it.
-    async def _send_to_topic(thread_id: int, text: str) -> int | None:
+    async def _send_to_topic(
+        thread_id: int, text: str, reply_to_message_id: int | None = None,
+    ) -> int | None:
         if telegram_channel is not None:
+            if reply_to_message_id is not None:
+                # v0.79.0 (§3): reply-quote the operator's message (Sol-verified
+                # PTB 22.7 spelling).
+                from telegram import ReplyParameters
+                return await telegram_channel.send_to_topic(
+                    thread_id, text,
+                    reply_parameters=ReplyParameters(
+                        message_id=reply_to_message_id,
+                        allow_sending_without_reply=True,
+                    ),
+                )
             return await telegram_channel.send_to_topic(thread_id, text)
         return None
 
@@ -1924,6 +1962,15 @@ async def main() -> None:
             "in an inconsistent state: %s", exc,
         )
 
+    # v0.79.0 (§3): terminal boot-reconciliation — drain terminal engagements
+    # whose inbound spool still holds pending receipts/notices.
+    try:
+        await reconcile_terminal_spools(
+            registry=engagement_registry, driver=claude_code_driver,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("terminal spool reconciliation failed: %s", exc)
+
     from observer import Observer
     observer = Observer(
         bus=bus,
@@ -1942,12 +1989,23 @@ async def main() -> None:
         telegram_channel._session_registry = session_registry
         telegram_channel._semantic_memory = semantic_memory
 
-        async def _driver_send_user_turn(rec, text):
+        async def _driver_send_user_turn(rec, text, *, tg_message_id=None):
             if rec.driver == "claude_code":
-                await claude_code_driver.send_user_turn(rec, text)
+                await claude_code_driver.send_user_turn(
+                    rec, text, tg_message_id=tg_message_id)
             else:
+                # in_casa driver has no durable spool / reply-threading (§7
+                # follow-up) — drop the id.
                 await engagement_driver.send_user_turn(rec, text)
         telegram_channel._driver_send_user_turn = _driver_send_user_turn
+
+        # v0.79.0 (§3): seal open narration at inbound-handler entry for
+        # claude_code engagements (the T1 high-water seam).
+        async def _driver_advance_high_water(rec, msg_id):
+            if rec.driver == "claude_code":
+                await claude_code_driver.advance_topic_high_water_for_inbound(
+                    rec.id, msg_id)
+        telegram_channel._driver_advance_high_water = _driver_advance_high_water
 
         async def _finalize_cancel(rec, reason="user"):
             from tools import _finalize_engagement

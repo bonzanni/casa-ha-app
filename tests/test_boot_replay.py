@@ -1081,3 +1081,41 @@ async def test_replay_b2_migration_succeeds_when_removal_confirmed(
     assert "casa_control" in run_text
     assert start_ids == ["keep1"]
     assert reg._records["keep1"].status in ("active", "idle")
+
+
+class TestReconcileTerminalSpools:
+    async def test_drains_only_terminal_claude_code_records(self):
+        from casa_core import reconcile_terminal_spools
+
+        live = _rec("a" * 16, driver="claude_code", status="active")
+        gone = _rec("b" * 16, driver="claude_code", status="completed")
+        in_casa_gone = _rec("c" * 16, driver="in_casa", status="cancelled")
+        reg = await _make_registry([live, gone, in_casa_gone])
+
+        drained: list[str] = []
+
+        class _Driver:
+            async def reconcile_terminal_spool(self, rec):
+                drained.append(rec.id)
+
+        await reconcile_terminal_spools(registry=reg, driver=_Driver())
+        # Only the TERMINAL claude_code record is drained.
+        assert drained == [gone.id]
+
+    async def test_one_failure_does_not_abort_others(self):
+        from casa_core import reconcile_terminal_spools
+
+        r1 = _rec("d" * 16, driver="claude_code", status="completed")
+        r2 = _rec("e" * 16, driver="claude_code", status="error")
+        reg = await _make_registry([r1, r2])
+
+        drained: list[str] = []
+
+        class _Driver:
+            async def reconcile_terminal_spool(self, rec):
+                if rec.id == r1.id:
+                    raise RuntimeError("boom")
+                drained.append(rec.id)
+
+        await reconcile_terminal_spools(registry=reg, driver=_Driver())
+        assert drained == [r2.id]        # r2 still drained despite r1 failing

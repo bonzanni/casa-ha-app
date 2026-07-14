@@ -324,6 +324,11 @@ class OutputSequencer:
         # F1 no-op edit gate: msg_id -> (text, markup_tristate).
         self._edit_cache: dict[int, tuple[str, Any]] = {}
         self._arm_event = asyncio.Event()
+        # v0.79.0 (§3, Primitive B): reply-threading. An inbound operator
+        # envelope's delivery sets this to its Telegram message id; the turn's
+        # FIRST sequencer-posted message (narration open, or an ask/reply
+        # poster via ``consume_turn_reply_to``) threads to it, then clears it.
+        self._turn_reply_to: int | None = None
 
     # -- narration ----------------------------------------------------------
 
@@ -342,7 +347,16 @@ class OutputSequencer:
             return await self._open_narration_locked(text)
 
     async def _open_narration_locked(self, text: str) -> int | None:
-        mid = await _maybe_await(self.send_message(self.topic_id, text))
+        # v0.79.0 (§3): thread the turn's FIRST post to the inbound envelope
+        # that triggered the turn (reply-quoting). Consumed once — a later post
+        # this turn is not a reply to the operator's message.
+        reply_to = self._turn_reply_to
+        self._turn_reply_to = None
+        if reply_to is not None:
+            mid = await _maybe_await(
+                self.send_message(self.topic_id, text, reply_to=reply_to))
+        else:
+            mid = await _maybe_await(self.send_message(self.topic_id, text))
         if mid is None:
             return None
         self._high_water = mid
@@ -401,6 +415,24 @@ class OutputSequencer:
             if operator_msg_id is not None:
                 if self._high_water is None or operator_msg_id > self._high_water:
                     self._high_water = operator_msg_id
+
+    # -- reply-threading (v0.79.0 §3, Primitive B) -------------------------
+
+    def set_turn_reply_to(self, message_id: int | None) -> None:
+        """Record the inbound operator message id that the turn's FIRST
+        sequencer post should reply-thread to (§3). Overwrites any prior
+        un-consumed value — the most-recently delivered envelope wins."""
+        self._turn_reply_to = message_id
+
+    def consume_turn_reply_to(self) -> int | None:
+        """Return and CLEAR the pending reply-threading target (§3).
+
+        Used by ask/reply posters (T3) so whichever output posts first this
+        turn — narration open or a discrete send — threads to the operator's
+        message and the rest do not."""
+        mid = self._turn_reply_to
+        self._turn_reply_to = None
+        return mid
 
     # -- intent registration (the T2/T3 ingress API) -----------------------
 

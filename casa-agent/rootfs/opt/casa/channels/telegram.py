@@ -302,6 +302,9 @@ class TelegramChannel(Channel):
         self._engagement_registry = None
         self._observer = None
         self._driver_send_user_turn = None
+        # v0.79.0 (§3): seal open narration on inbound (claude_code engagements);
+        # wired by casa_core, None-safe for tests.
+        self._driver_advance_high_water = None
         self._engagement_driver = None
         self._finalize_cancel = None
         self._finalize_complete_user = None
@@ -1062,8 +1065,22 @@ class TelegramChannel(Channel):
                 if self._engagement_registry is not None:
                     import time as _time
                     await self._engagement_registry.update_user_turn(rec.id, _time.time())
+                # v0.79.0 (§3): an inbound operator message is a causal event —
+                # advance the topic high-water mark and SEAL open narration at
+                # handler entry (the T1 seam), so mid-turn narration can't
+                # append below the operator's message.
+                if self._driver_advance_high_water is not None:
+                    try:
+                        await self._driver_advance_high_water(rec, msg.message_id)
+                    except Exception as exc:  # noqa: BLE001 — advisory sealing
+                        logger.debug(
+                            "advance_high_water failed for %s: %s",
+                            rec.id[:8], exc,
+                        )
                 if self._driver_send_user_turn is not None:
-                    task = asyncio.create_task(self._deliver_turn_bg(rec, text))
+                    task = asyncio.create_task(
+                        self._deliver_turn_bg(
+                            rec, text, tg_message_id=msg.message_id))
                     self._turn_tasks.add(task)
                     task.add_done_callback(self._turn_tasks.discard)
                 return
@@ -1084,7 +1101,9 @@ class TelegramChannel(Channel):
             return
         return await self._route_to_ellen(update)
 
-    async def _deliver_turn_bg(self, rec, text: str) -> None:
+    async def _deliver_turn_bg(
+        self, rec, text: str, *, tg_message_id: int | None = None,
+    ) -> None:
         """M9 (v0.52.0): run one engagement user-turn to completion.
 
         Spawned by handle_update as a tracked background task so the
@@ -1092,9 +1111,13 @@ class TelegramChannel(Channel):
         concurrent /cancel finalised the driver mid-turn, send_user_turn
         raises (DriverNotAliveError / transport-closed) and we stay quiet —
         that is the expected end of an interrupted turn, not a failure.
+
+        v0.79.0 (§3): ``tg_message_id`` threads the durable inbound envelope to
+        the operator's Telegram message (reply-quoting / receipts).
         """
         try:
-            await self._driver_send_user_turn(rec, text)
+            await self._driver_send_user_turn(
+                rec, text, tg_message_id=tg_message_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001

@@ -895,105 +895,269 @@ class _FakeRegistry:
         self.advances.append((eng_id, kind))
 
 
-def _make_queue(tmp_path, *, writer=None, notices=None, registry=None):
-    from drivers.claude_code_driver import _InboundQueue
+class _FakeSequencer:
+    """Records set_turn_reply_to targets (§3 reply-threading)."""
+
+    def __init__(self):
+        self.reply_targets: list = []
+
+    def set_turn_reply_to(self, message_id):
+        self.reply_targets.append(message_id)
+
+
+def _make_spool(
+    tmp_path, *, writer=None, notices=None, registry=None,
+    is_turn_running=None, current_epoch=None, sequencer=None,
+    spool_path=None,
+):
+    """Build an _InboundSpool with injectable primitives.
+
+    ``notices`` collects ``(text, reply_to)`` tuples; the send always succeeds.
+    Pass an ``notices`` object that is a ``_FlakyNotice`` to model send failure.
+    """
+    from drivers.claude_code_driver import _InboundSpool
 
     writer = writer if writer is not None else _FakeWriter(True)
-    notices = notices if notices is not None else []
-    return _InboundQueue(
-        engagement_id="eng1",
-        marker_path=str(tmp_path / ".inbound_pending"),
+    notices = notices if notices is not None else _RecordNotice()
+    return _InboundSpool(
+        engagement_id="eng1abc",
+        spool_path=spool_path or str(tmp_path / ".inbound_spool.jsonl"),
         write_fifo=writer,
-        post_notice=_async_recorder(notices),
+        send_notice=notices,
+        is_turn_running=is_turn_running or (lambda: False),
+        current_epoch=current_epoch or (lambda: None),
         registry=registry,
+        sequencer=sequencer,
     )
 
 
-class TestInboundQueue:
-    async def test_message_then_spawn_delivers(self, tmp_path):
-        writer = _FakeWriter(True)
-        q = _make_queue(tmp_path, writer=writer)
-        await q.enqueue("hello")          # reader_ready False → queued only
-        assert writer.calls == []
-        await q.on_spawn()                # arm → deliver
-        assert writer.calls == ["hello"]
-        assert q.reader_ready is False    # disarmed after one message
+class _RecordNotice:
+    """A ``send_notice`` that records (text, reply_to) and always delivers."""
 
-    async def test_spawn_then_message_delivers_no_deadlock(self, tmp_path):
-        # Edge-triggered pump (r2-B6): a spawn arms the reader while the queue
-        # is empty; a LATER enqueue must deliver immediately — never wait for
-        # another spawn that would never come without input.
+    def __init__(self, ok: bool = True):
+        self.ok = ok
+        self.calls: list[tuple[str, "int | None"]] = []
+
+    async def __call__(self, text, reply_to):
+        self.calls.append((text, reply_to))
+        return self.ok
+
+
+class TestInboundSpool:
+    async def test_message_then_spawn_delivers_round_trip(self, tmp_path):
         writer = _FakeWriter(True)
-        q = _make_queue(tmp_path, writer=writer)
-        await q.on_spawn()                # arm, empty queue → nothing yet
+        s = _make_spool(tmp_path, writer=writer)
+        await s.enqueue("hello", tg_message_id=5)   # reader unarmed → queued
         assert writer.calls == []
-        assert q.reader_ready is True
-        await q.enqueue("later")          # delivered immediately
-        assert writer.calls == ["later"]
+        # Durable: the envelope is on disk with state=queued.
+        assert (tmp_path / ".inbound_spool.jsonl").exists()
+        await s.on_spawn()                          # arm → deliver
+        assert writer.calls == ["hello"]
+        assert s.reader_ready is False              # disarmed after one message
+
+    async def test_spool_recovery_reloads_queued_envelope(self, tmp_path):
+        writer = _FakeWriter(True)
+        s = _make_spool(tmp_path, writer=writer)
+        await s.enqueue("survive me", tg_message_id=9)
+        # New spool over the SAME file (Casa restart) reloads the envelope.
+        s2 = _make_spool(tmp_path, writer=writer)
+        assert len(s2._lane_members()) == 1
+        await s2.on_spawn()
+        assert writer.calls == ["survive me"]
 
     async def test_one_message_per_spawn(self, tmp_path):
         writer = _FakeWriter(True)
-        q = _make_queue(tmp_path, writer=writer)
-        await q.enqueue("a")
-        await q.enqueue("b")
-        await q.on_spawn()
-        assert writer.calls == ["a"]      # exactly one per spawn
-        await q.on_spawn()
+        s = _make_spool(tmp_path, writer=writer)
+        await s.enqueue("a")
+        await s.enqueue("b")
+        await s.on_spawn()
+        assert writer.calls == ["a"]                # exactly one per spawn
+        await s.on_turn_start()                     # "a" consumed (turn ran)
+        await s.on_spawn()
         assert writer.calls == ["a", "b"]
 
-    async def test_failed_write_retains_item(self, tmp_path):
-        writer = _FakeWriter(False)       # no reader — write fails
-        q = _make_queue(tmp_path, writer=writer)
-        await q.enqueue("a")
-        await q.on_spawn()
-        assert writer.calls == ["a"]      # attempted
-        assert len(q._queue) == 1         # retained, not dropped
-        # Redelivered on the next spawn once the write can succeed.
+    async def test_failed_write_retains_and_redelivers(self, tmp_path):
+        writer = _FakeWriter(False)                 # no reader — write fails
+        s = _make_spool(tmp_path, writer=writer)
+        await s.enqueue("a")
+        await s.on_spawn()
+        assert writer.calls == ["a"]                # attempted
+        assert len(s._lane_members()) == 1          # retained, not dropped
         writer.result = True
-        await q.on_spawn()
+        await s.on_spawn()
         assert writer.calls == ["a", "a"]
-        assert len(q._queue) == 0
 
-    async def test_overflow_notice_at_depth_10(self, tmp_path):
+    async def test_consumed_only_on_turn_start_evidence(self, tmp_path):
+        # delivered → NOT consumed until turn_start for the SAME epoch.
+        epoch = {"v": 7}
         writer = _FakeWriter(True)
-        notices: list[str] = []
-        q = _make_queue(tmp_path, writer=writer, notices=notices)
-        for i in range(10):               # reader unarmed → all queued
-            await q.enqueue(f"m{i}")
-        assert len(q._queue) == 10
-        assert notices == []
-        await q.enqueue("overflow")       # 11th → dropped with one notice
-        assert len(q._queue) == 10
-        assert len(notices) == 1
-        assert "10" in notices[0]
+        s = _make_spool(
+            tmp_path, writer=writer, current_epoch=lambda: epoch["v"])
+        await s.enqueue("do it", tg_message_id=3)
+        await s.on_spawn()
+        env = s._envelopes[0]
+        assert env.state == "delivered" and env.delivery_epoch == 7
+        await s.on_turn_start()
+        assert s._envelopes and s._envelopes[0].state == "consumed"
 
-    async def test_initial_prompt_through_queue_no_state_transition(self, tmp_path):
+    async def test_delivered_but_no_turn_start_redelivers_next_spawn(self, tmp_path):
+        # Process died pre-turn_start ⇒ the delivered envelope reverts to
+        # queued and redelivers on the next spawn (§3 redelivery-by-construction).
+        epoch = {"v": 1}
         writer = _FakeWriter(True)
+        s = _make_spool(
+            tmp_path, writer=writer, current_epoch=lambda: epoch["v"])
+        await s.enqueue("again")
+        await s.on_spawn()
+        assert writer.calls == ["again"]
+        # No turn_start; a NEW spawn (new epoch) reverts + redelivers.
+        epoch["v"] = 2
+        await s.on_spawn()
+        assert writer.calls == ["again", "again"]
+
+    async def test_initial_prompt_no_state_transition(self, tmp_path):
         reg = _FakeRegistry()
-        q = _make_queue(tmp_path, writer=writer, registry=reg)
-        await q.enqueue("system prompt", is_initial=True)
-        await q.on_spawn()
-        assert writer.calls == ["system prompt"]
-        # The initial prompt must NOT advance interaction state (r2-B7).
+        s = _make_spool(tmp_path, registry=reg)
+        await s.enqueue("system prompt", is_initial=True)
+        await s.on_spawn()
         assert reg.advances == []
 
     async def test_ordinary_message_advances_interaction_state(self, tmp_path):
-        writer = _FakeWriter(True)
         reg = _FakeRegistry()
-        q = _make_queue(tmp_path, writer=writer, registry=reg)
-        await q.enqueue("operator says hi")
-        await q.on_spawn()
-        assert writer.calls == ["operator says hi"]
-        assert reg.advances == [("eng1", "operator_turn")]
+        s = _make_spool(tmp_path, registry=reg)
+        await s.enqueue("operator says hi")
+        await s.on_spawn()
+        assert reg.advances == [("eng1abc", "operator_turn")]
 
-    async def test_marker_tracks_pending_depth(self, tmp_path):
+    async def test_disposition_queued_and_dropped_full(self, tmp_path):
+        notices = _RecordNotice()
+        s = _make_spool(tmp_path, notices=notices)
+        for i in range(10):
+            assert await s.enqueue(f"m{i}") == "queued"
+        # 11th ordinary at cap → dropped_full with the existing notice.
+        assert await s.enqueue("overflow", tg_message_id=99) == "dropped_full"
+        assert len(s._lane_members()) == 10
+        assert len(notices.calls) == 1
+        assert notices.calls[0][1] == 99                # threaded to the message
+
+    async def test_receipt_only_while_turn_running(self, tmp_path):
+        notices = _RecordNotice()
+        running = {"v": False}
+        s = _make_spool(
+            tmp_path, notices=notices, is_turn_running=lambda: running["v"])
+        # Idle ⇒ not_required, no receipt.
+        await s.enqueue("idle msg", tg_message_id=1)
+        assert notices.calls == []
+        assert s._envelopes[-1].receipt == "not_required"
+        # Turn running ⇒ pending receipt, sent after the atomic write.
+        running["v"] = True
+        await s.enqueue("busy msg", tg_message_id=2)
+        assert (RECEIPT, 2) in [(c[0], c[1]) for c in notices.calls]
+        assert s._envelopes[-1].receipt == "sent"
+
+    async def test_receipt_pre_send_crash_retries_at_touchpoint(self, tmp_path):
+        # Receipt send fails at enqueue (stays pending) then succeeds at the
+        # next touchpoint (turn end) — at-least-once with a durable tri-state.
+        notices = _RecordNotice(ok=False)
+        s = _make_spool(
+            tmp_path, notices=notices, is_turn_running=lambda: True)
+        await s.enqueue("busy", tg_message_id=4)
+        assert s._envelopes[-1].receipt == "pending"    # not sent
+        notices.ok = True
+        await s.on_turn_end()                            # retry touchpoint
+        assert s._envelopes and s._envelopes[-1].receipt == "sent"
+
+
+class TestRedirectLane:
+    async def test_redirect_detection_stop_and_prefix(self):
+        from drivers.claude_code_driver import _is_redirect
+        assert _is_redirect("STOP")
+        assert _is_redirect("stop\ndo the other thing")
+        assert _is_redirect("redirect: pivot now")
+        assert _is_redirect("REDIRECT: pivot")
+        assert not _is_redirect("please stop by later")
+        assert not _is_redirect("continue as planned")
+
+    async def test_redirect_delivered_with_prefix_ahead_of_ordinary(self, tmp_path):
+        from drivers.claude_code_driver import _REDIRECT_PREFIX
         writer = _FakeWriter(True)
-        q = _make_queue(tmp_path, writer=writer)
-        marker = tmp_path / ".inbound_pending"
-        await q.enqueue("a")
-        assert marker.read_text().strip() == "1"
-        await q.on_spawn()
-        assert marker.read_text().strip() == "0"
+        s = _make_spool(tmp_path, writer=writer)
+        await s.enqueue("ordinary work")
+        await s.enqueue("STOP\nchange plans")           # redirect → priority lane
+        await s.on_spawn()
+        # Priority lane drains first, with the redirect prefix.
+        assert writer.calls == [f"{_REDIRECT_PREFIX}\nSTOP\nchange plans"]
+        await s.on_turn_start()                         # redirect consumed
+        await s.on_spawn()
+        assert writer.calls[-1] == "ordinary work"
+
+    async def test_redirects_fifo_within_priority(self, tmp_path):
+        from drivers.claude_code_driver import _REDIRECT_PREFIX
+        writer = _FakeWriter(True)
+        s = _make_spool(tmp_path, writer=writer)
+        await s.enqueue("redirect: first")
+        await s.enqueue("redirect: second")
+        await s.on_spawn()
+        await s.on_turn_start()
+        await s.on_spawn()
+        assert writer.calls == [
+            f"{_REDIRECT_PREFIX}\nredirect: first",
+            f"{_REDIRECT_PREFIX}\nredirect: second",
+        ]
+
+    async def test_redirect_evicts_newest_ordinary_with_notice(self, tmp_path):
+        from drivers.claude_code_driver import _EVICTION_COPY
+        notices = _RecordNotice()
+        s = _make_spool(tmp_path, notices=notices)
+        for i in range(10):
+            await s.enqueue(f"m{i}", tg_message_id=100 + i)   # fill ordinary lane
+        disp = await s.enqueue("STOP", tg_message_id=200)
+        # Newest ordinary (m9, tg 109) evicted, threaded eviction notice.
+        assert disp == "evicted_other(109)"
+        assert (_EVICTION_COPY, 109) in notices.calls
+        assert s._ordinary_count() == 9
+        assert s._priority_count() == 1
+
+    async def test_priority_cap_drops_with_notice(self, tmp_path):
+        from drivers.claude_code_driver import _PRIORITY_CAP_COPY
+        notices = _RecordNotice()
+        s = _make_spool(tmp_path, notices=notices)
+        for i in range(3):
+            await s.enqueue(f"redirect: r{i}")
+        disp = await s.enqueue("STOP\none too many", tg_message_id=77)
+        assert disp == "dropped_full"
+        assert (_PRIORITY_CAP_COPY, 77) in notices.calls
+        assert s._priority_count() == 3
+
+    async def test_notice_first_suppression(self, tmp_path):
+        # An evicted envelope holding BOTH pending receipt and pending notice
+        # sends ONLY the notice; its receipt flips to not_required.
+        from drivers.claude_code_driver import _EVICTION_COPY, _RECEIPT_COPY
+        notices = _RecordNotice(ok=False)               # receipts fail at enqueue
+        s = _make_spool(
+            tmp_path, notices=notices, is_turn_running=lambda: True)
+        for i in range(10):
+            await s.enqueue(f"m{i}", tg_message_id=100 + i)
+        # The newest ordinary now has receipt=pending (send failed).
+        victim = max(s._lane_members(), key=lambda e: e.seq)
+        victim_tg = victim.tg_message_id
+        assert victim.receipt == "pending"
+        notices.ok = True
+        pre = len(notices.calls)
+        await s.enqueue("STOP", tg_message_id=200)       # evicts victim
+        after = notices.calls[pre:]
+        # After eviction, the victim gets ONLY its eviction notice (no receipt),
+        # and its receipt flips to not_required (notice-first suppression).
+        victim_sends = [c for c in after if c[1] == victim_tg]
+        assert victim_sends == [(_EVICTION_COPY, victim_tg)]
+        # No receipt was ever sent to the victim (notice-first suppression), and
+        # the fully-settled evicted envelope is pruned from the spool.
+        assert all(c[0] != _RECEIPT_COPY for c in after if c[1] == victim_tg)
+        assert not any(e.tg_message_id == victim_tg for e in s._envelopes)
+
+
+# Convenience aliases for the exact copies (asserted above).
+from drivers.claude_code_driver import _RECEIPT_COPY as RECEIPT  # noqa: E402
 
 
 class TestSpawnBackgroundTasksInbound:
@@ -1023,13 +1187,14 @@ class TestSpawnBackgroundTasksInbound:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def test_marker_and_boot_reconcile_in_spawn_background_tasks(
-        self, tmp_path,
-    ):
-        """Sol r2-B6: boot replay calls _spawn_background_tasks DIRECTLY. A
-        surviving non-zero .inbound_pending posts a one-time reconcile notice
-        and is zeroed."""
-        from drivers.claude_code_driver import ClaudeCodeDriver
+    async def test_spool_recovery_redelivers_on_boot(self, tmp_path):
+        """v0.79.0 (§3): boot replay calls _spawn_background_tasks DIRECTLY. A
+        surviving spool file with an undelivered (queued) envelope is loaded and
+        redelivered on the next spawn — no zero-with-uncertainty 'please resend'
+        notice is ever posted."""
+        from drivers.claude_code_driver import (
+            ClaudeCodeDriver, _RECEIPT_COPY,
+        )
 
         sender = AsyncMock()
         drv = ClaudeCodeDriver(
@@ -1039,15 +1204,42 @@ class TestSpawnBackgroundTasksInbound:
         rec = _make_record()
         ws = tmp_path / rec.id
         ws.mkdir()
-        (ws / ".inbound_pending").write_text("2\n", encoding="utf-8")
+        # A surviving spool with one queued envelope + one consumed envelope
+        # still owing a receipt (pending).
+        import json
+        lines = [
+            json.dumps({
+                "text": "not delivered yet", "tg_message_id": 11,
+                "priority": False, "receipt": "not_required", "notice": "none",
+                "enqueued_at": 1.0, "delivery_epoch": None, "state": "queued",
+                "seq": 0, "is_initial": False,
+            }),
+            json.dumps({
+                "text": "consumed but owes a receipt", "tg_message_id": 12,
+                "priority": False, "receipt": "pending", "notice": "none",
+                "enqueued_at": 2.0, "delivery_epoch": 5, "state": "consumed",
+                "seq": 1, "is_initial": False,
+            }),
+        ]
+        (ws / ".inbound_spool.jsonl").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8")
         try:
             drv._spawn_background_tasks(rec)
-            await asyncio.sleep(0.1)            # let the notice task run
-            assert sender.await_count == 1
-            posted = sender.await_args[0]
-            assert posted[0] == rec.topic_id
-            assert "2" in posted[1]
-            assert (ws / ".inbound_pending").read_text().strip() == "0"
+            await asyncio.sleep(0.1)            # let recover() run
+            spool = drv._inbound[rec.id]
+            # The queued envelope survived; the pending receipt was retried.
+            assert any(e.text == "not delivered yet" and e.state == "queued"
+                       for e in spool._envelopes)
+            receipt_posts = [
+                c for c in sender.await_args_list
+                if _RECEIPT_COPY in c.args
+            ]
+            assert receipt_posts, "pending receipt should retry on boot recovery"
+            # NO 'please resend' zero-uncertainty notice.
+            assert not any(
+                "please resend" in str(c.args) or "may not have been delivered"
+                in str(c.args) for c in sender.await_args_list
+            )
         finally:
             for t in drv._tasks.get(rec.id, []):
                 t.cancel()
@@ -1370,17 +1562,152 @@ class TestCancelBypassesQueue:
         rec = _make_record()
         (tmp_path / rec.id).mkdir()
 
-        # Wire the queue; enqueue while unarmed (busy — no spawn yet).
+        # Wire the spool; enqueue while unarmed (busy — no spawn yet).
         drv._spawn_background_tasks(rec)
         writer = _FakeWriter(True)
         drv._inbound[rec.id]._write_fifo = writer      # observe FIFO writes
         await drv.send_user_turn(rec, "queued but never delivered")
-        assert len(drv._inbound[rec.id]._queue) == 1
+        assert len(drv._inbound[rec.id]._lane_members()) == 1
 
         await drv.cancel(rec)
 
-        # Queue state torn down; the message was NEVER written to the FIFO.
+        # Spool state torn down; the message was NEVER written to the FIFO.
         assert rec.id not in drv._inbound
         assert rec.id not in drv._reply_texts
         assert rec.id not in drv._epoch_pending
+        assert rec.id not in drv._turn_running
         assert writer.calls == []
+
+
+class TestSpoolThreadingAndSeam:
+    async def test_delivery_sets_sequencer_reply_target(self, tmp_path):
+        """§3 reply-threading: delivering an envelope sets the turn's reply
+        target to the operator's Telegram message id."""
+        seq = _FakeSequencer()
+        writer = _FakeWriter(True)
+        s = _make_spool(tmp_path, writer=writer, sequencer=seq)
+        await s.enqueue("hello", tg_message_id=4242)
+        await s.on_spawn()
+        assert writer.calls == ["hello"]
+        assert seq.reply_targets == [4242]
+
+    async def test_advance_high_water_seals_narration(self, tmp_path):
+        """§3 T1 seam: an inbound operator message advances the topic high-water
+        and SEALS open narration."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=AsyncMock(return_value=7),
+            edit_topic_message=AsyncMock(return_value=True),
+            casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+        seq = drv._ensure_sequencer(rec)
+        await seq.open_narration("mid-turn narration")
+        assert seq.narration_msg_id is not None
+        await drv.advance_topic_high_water_for_inbound(rec.id, 99)
+        assert seq.narration_msg_id is None          # sealed
+        assert seq.high_water == 99
+
+
+class TestTerminalSpoolDrainAndReconcile:
+    def _write_spool(self, ws, *, receipt="pending", notice="none", tg=12):
+        import json
+        ws.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({
+            "text": "owes a receipt", "tg_message_id": tg,
+            "priority": False, "receipt": receipt, "notice": notice,
+            "enqueued_at": 1.0, "delivery_epoch": 5, "state": "consumed",
+            "seq": 0, "is_initial": False,
+        })
+        (ws / ".inbound_spool.jsonl").write_text(line + "\n", encoding="utf-8")
+
+    async def test_drain_inbound_spool_flushes_pending_receipt(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver, _RECEIPT_COPY
+
+        sender = AsyncMock(return_value=1)
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+        ws = tmp_path / rec.id
+        self._write_spool(ws)
+        drv._spawn_background_tasks(rec)
+        # Cancel the recover task so it doesn't also drain (isolate the drain).
+        for t in drv._tasks.get(rec.id, []):
+            t.cancel()
+        await asyncio.gather(*drv._tasks.get(rec.id, []), return_exceptions=True)
+        # Re-load a fresh spool over the (still pending) file and drain it.
+        drv._spawn_background_tasks(rec)
+        for t in drv._tasks.get(rec.id, []):
+            t.cancel()
+        await asyncio.gather(*drv._tasks.get(rec.id, []), return_exceptions=True)
+        await drv.drain_inbound_spool(rec)
+        assert any(_RECEIPT_COPY in c.args for c in sender.await_args_list)
+
+    async def test_reconcile_terminal_spool_posts_when_topic_exists(self, tmp_path):
+        """terminal-commit→kill→boot-drain: a terminal spool with a pending
+        receipt is drained to the (existing) topic on boot reconciliation."""
+        from drivers.claude_code_driver import ClaudeCodeDriver, _RECEIPT_COPY
+
+        sender = AsyncMock(return_value=1)
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+        )
+        rec = _make_record()                          # topic_id = 999
+        self._write_spool(tmp_path / rec.id)
+        await drv.reconcile_terminal_spool(rec)
+        posts = [c for c in sender.await_args_list if _RECEIPT_COPY in c.args]
+        assert posts and posts[0].args[0] == rec.topic_id
+        # Settled + pruned on disk (no pending left).
+        remaining = (tmp_path / rec.id / ".inbound_spool.jsonl").read_text()
+        assert '"receipt": "pending"' not in remaining
+
+    async def test_reconcile_terminal_spool_warn_drops_when_topic_gone(
+        self, tmp_path,
+    ):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from engagement_registry import EngagementRecord
+
+        sender = AsyncMock()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+        )
+        rec = EngagementRecord(
+            id="deadbeefdeadbeef", kind="executor", role_or_type="hello-driver",
+            driver="claude_code", status="completed", topic_id=None,
+            started_at=0.0, last_user_turn_ts=0.0, last_idle_reminder_ts=0.0,
+            completed_at=1.0, sdk_session_id=None,
+            origin={"channel": "telegram"}, task="t",
+        )
+        self._write_spool(tmp_path / rec.id)
+        await drv.reconcile_terminal_spool(rec)
+        # Topic gone → WARN-drop, nothing sent, pending settled so it won't retry.
+        assert sender.await_count == 0
+        remaining = (tmp_path / rec.id / ".inbound_spool.jsonl").read_text()
+        assert '"receipt": "pending"' not in remaining
+
+    async def test_drain_failure_then_restart_retries(self, tmp_path):
+        """drain-failure→restart→retry: a send that fails at drain leaves the
+        receipt pending; a later reconcile (restart) retries and succeeds."""
+        from drivers.claude_code_driver import ClaudeCodeDriver, _RECEIPT_COPY
+
+        # First send raises (drain fails), later sends succeed.
+        sender = AsyncMock(side_effect=[RuntimeError("telegram down"), 1, 1])
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+        self._write_spool(tmp_path / rec.id)
+        await drv.reconcile_terminal_spool(rec)       # send fails → still pending
+        remaining = (tmp_path / rec.id / ".inbound_spool.jsonl").read_text()
+        assert '"receipt": "pending"' in remaining
+        await drv.reconcile_terminal_spool(rec)       # restart → retry, succeeds
+        assert any(_RECEIPT_COPY in c.args for c in sender.await_args_list)
+        remaining = (tmp_path / rec.id / ".inbound_spool.jsonl").read_text()
+        assert '"receipt": "pending"' not in remaining

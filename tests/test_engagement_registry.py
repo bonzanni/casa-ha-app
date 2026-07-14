@@ -288,6 +288,93 @@ class TestRegistryStateTransitions:
         assert rec.origin.get("error_kind") == "emit_completion_error"
         assert rec.origin.get("error_message") == "boom"
 
+    async def test_strict_transition_rolls_back_full_field_on_persist_failure(
+        self, tmp_path,
+    ):
+        """v0.79.0 (§3, Sol r7-2): the STRICT terminal transition snapshots
+        EVERY mutated field (status, completed_at, error metadata) and, on a
+        tombstone-write failure, restores the FULL snapshot and re-raises — no
+        closed topic with a torn (memory ≠ disk) terminal record."""
+        import engagement_registry as er_mod
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+        # Baseline: an active record with no error metadata.
+        assert rec.status == "active"
+        assert "error_kind" not in rec.origin
+
+        # Fail the tombstone write only for the strict transition.
+        import unittest.mock as _mock
+        with _mock.patch.object(
+            reg, "_write_tombstone", side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError):
+                await reg.try_transition_terminal(
+                    rec.id, "error", error_kind="k", error_message="m",
+                    strict=True,
+                )
+        # FULL-FIELD rollback: status, completed_at AND the error metadata that
+        # the transition added are all reverted (the added keys are removed,
+        # not left as None).
+        assert rec.status == "active"
+        assert rec.completed_at is None
+        assert "error_kind" not in rec.origin
+        assert "error_message" not in rec.origin
+
+    async def test_strict_transition_cancel_during_persist_completes_write(
+        self, tmp_path,
+    ):
+        """v0.79.0 (§3, Sol r7-2): cancelling the CALLER during the strict
+        transition's ``to_thread`` persist cannot tear memory from disk — the
+        shielded mutate+persist runs to completion before the cancel is honored.
+        """
+        import asyncio
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+
+        async def _driver():
+            await reg.try_transition_terminal(rec.id, "completed", strict=True)
+
+        task = asyncio.ensure_future(_driver())
+        await asyncio.sleep(0)          # let it enter the shielded persist
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The durable write completed under the shield: memory is terminal AND
+        # a fresh registry load sees the same terminal status.
+        assert rec.status == "completed"
+        reg2 = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        await reg2.load()
+        assert reg2.get(rec.id).status == "completed"
+
+    async def test_non_strict_transition_swallows_persist_failure(self, tmp_path):
+        """The historical non-strict path keeps best-effort semantics: a
+        tombstone-write failure is swallowed and the in-memory flip stands."""
+        import unittest.mock as _mock
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+        with _mock.patch.object(
+            reg, "_write_tombstone", side_effect=OSError("disk full"),
+        ):
+            won = await reg.try_transition_terminal(rec.id, "cancelled")
+        assert won is True
+        assert rec.status == "cancelled"
+
+    async def test_terminal_records_accessor(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        live = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+        gone = await reg.create("specialist", "ops", "claude_code", "t", {}, 2)
+        await reg.try_transition_terminal(gone.id, "completed")
+        ids = {r.id for r in reg.terminal_records()}
+        assert gone.id in ids and live.id not in ids
+
     async def test_update_last_idle_reminder(self, tmp_path):
         from engagement_registry import EngagementRegistry
 

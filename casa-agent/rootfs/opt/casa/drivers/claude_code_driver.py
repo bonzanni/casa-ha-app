@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import json
 import logging
 import os
 import re
 import time
-from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -26,9 +27,48 @@ from engagement_registry import EngagementRecord
 
 logger = logging.getLogger(__name__)
 
-# W1/Sol B8: at most this many undelivered operator turns are held per
-# engagement before a further enqueue is dropped with a one-time topic notice.
-_INBOUND_MAX_DEPTH = 10
+# v0.79.0 (§3 Primitive B) — durable inbound envelope spool.
+# Priority lanes: ordinary FIFO (cap 10) + redirect FIFO (cap 3), total 13.
+_ORDINARY_LANE_CAP = 10
+_PRIORITY_LANE_CAP = 3
+_SPOOL_FILENAME = ".inbound_spool.jsonl"
+
+# Exact operator-facing copies (§3 "Exact copies"; wording is binding).
+_REDIRECT_PREFIX = (
+    "[OPERATOR REDIRECT — drop your current agenda, re-plan from this message]"
+)
+_RECEIPT_COPY = "📥 Received — I'll get to this after the current step."
+_EVICTION_COPY = (
+    "⚠️ Dropped in favor of your redirect — resend if still relevant."
+)
+_PRIORITY_CAP_COPY = "⚠️ Too many pending redirects — this one was dropped."
+_SPOOL_FAIL_COPY = "your message could not be recorded — please resend"
+# An ordinary message arriving with the ordinary lane full keeps the existing
+# dropped-full notice (§3: "an ordinary message at cap keeps the existing
+# dropped-full notice").
+_ORDINARY_FULL_COPY = (
+    f"Your engagement already has {_ORDINARY_LANE_CAP} messages waiting to be "
+    "delivered — this one was dropped. Please wait for it to catch up, then "
+    "resend."
+)
+
+
+async def _never_deliver() -> bool:
+    """A ``write_fifo`` for a drain-only spool view (reconcile): never delivers.
+    """
+    return False
+
+
+def _is_redirect(text: str) -> bool:
+    """§3 redirect detection: ``STOP`` as the (case-insensitive) first line, or
+    a ``redirect:`` prefix."""
+    if not text:
+        return False
+    stripped = text.strip()
+    if stripped.lower().startswith("redirect:"):
+        return True
+    first_line = stripped.splitlines()[0].strip() if stripped else ""
+    return first_line.lower() == "stop"
 # P31 (v0.37.10): match a UUID as a complete filename stem — the
 # claude CLI names its session-storage files ``<uuid>.jsonl``. Replaces
 # v0.37.9's free-text session_id regex (which tailed a log file that
@@ -46,103 +86,394 @@ SessionIdPersister = Callable[[str, str], Awaitable[None]]
 Matches engagement_registry.persist_session_id's bound-method signature."""
 
 
-def _atomic_write_text(path: str, text: str) -> None:
-    """Best-effort temp+rename write; swallow OSError (marker is advisory)."""
-    tmp = f"{path}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
-    except OSError as exc:  # noqa: BLE001 — advisory marker, never fatal
-        logger.debug("inbound marker write failed (%s): %s", path, exc)
+# Notice sender: (text, reply_to_message_id) -> delivered_ok.
+NoticeSender = Callable[[str, "int | None"], Awaitable[bool]]
+
+# Persisted envelope fields (§3 schema) + the impl-only fields the spool needs.
+_ENVELOPE_PERSIST_FIELDS = (
+    "text", "tg_message_id", "priority", "receipt", "notice",
+    "enqueued_at", "delivery_epoch", "state", "seq", "is_initial",
+)
+
+
+@dataclass
+class _Envelope:
+    """One durable inbound operator message (§3).
+
+    Persisted schema: ``{text, tg_message_id, priority, receipt, notice,
+    enqueued_at, delivery_epoch, state}``. ``seq`` (FIFO order within a lane)
+    and ``is_initial`` (suppress interaction-state advance for the initial
+    prompt) are impl fields carried on the same line.
+
+    * ``receipt`` ∈ ``not_required | pending | sent`` — at-least-once receipt.
+    * ``notice`` ∈ ``none | pending | sent`` — a pending eviction notice.
+    * ``state`` ∈ ``queued | delivered | consumed`` — ``consumed`` only on
+      turn_start evidence; ``delivered`` but died pre-turn_start ⇒ redelivered.
+    """
+
+    text: str
+    tg_message_id: int | None
+    priority: bool
+    receipt: str
+    notice: str
+    enqueued_at: float
+    delivery_epoch: int | None
+    state: str
+    seq: int
+    is_initial: bool = False
+
+    def to_line(self) -> str:
+        return json.dumps(
+            {k: getattr(self, k) for k in _ENVELOPE_PERSIST_FIELDS},
+            ensure_ascii=False,
+        )
+
+    @classmethod
+    def from_line(cls, line: str) -> "_Envelope | None":
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+            data = json.loads(line)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(data, dict) or "text" not in data:
+            return None
+        return cls(
+            text=data.get("text", ""),
+            tg_message_id=data.get("tg_message_id"),
+            priority=bool(data.get("priority", False)),
+            receipt=data.get("receipt", "not_required"),
+            notice=data.get("notice", "none"),
+            enqueued_at=float(data.get("enqueued_at", 0.0)),
+            delivery_epoch=data.get("delivery_epoch"),
+            state=data.get("state", "queued"),
+            seq=int(data.get("seq", 0)),
+            is_initial=bool(data.get("is_initial", False)),
+        )
 
 
-class _InboundItem:
-    __slots__ = ("text", "is_initial")
+class _InboundSpool:
+    """Durable JSON-lines inbound envelope spool per engagement (§3).
 
-    def __init__(self, text: str, is_initial: bool = False) -> None:
-        self.text = text
-        self.is_initial = is_initial
+    Replaces the ephemeral ``_InboundQueue``/``.inbound_pending`` marker. Every
+    operator message is a durable envelope; delivery is REDELIVERY-BY-
+    CONSTRUCTION (a message clears to ``consumed`` only on positive turn_start
+    evidence, so a process death pre-turn_start redelivers it on the next
+    spawn). Receipts and eviction notices are at-least-once with a durable
+    tri-state, retried at every spool touchpoint (enqueue, turn start, turn
+    end, boot recovery, terminal drain).
 
+    Priority lanes: redirects (``STOP``/``redirect:``) drain ahead of the
+    ordinary FIFO. Caps 10 (ordinary) / 3 (priority); a redirect at ordinary
+    cap evicts the newest ordinary (threaded notice), a redirect at priority
+    cap drops, an ordinary at cap drops.
 
-class _InboundQueue:
-    """Spawn-keyed one-turn inbound message queue (design §W1 r4-3, Sol B8/r2-B6).
-
-    Each claude_code turn is one FIFO reader that consumes exactly one line
-    then reaches EOF; the s6 respawn for the next turn prints a ``spawn``
-    control frame the relay surfaces as ``on_turn_event("spawn")``. This queue
-    couples the two: a spawn ARMS a ``reader_ready`` flag (edge-triggered), and
-    the pump delivers **at most one** queued message per arm, then disarms.
-
-    The arm is edge-triggered on the flag, NOT "await the next spawn": a spawn
-    that arms the reader while the queue is empty must still deliver a message
-    enqueued *later* — waiting for another spawn would deadlock, since no new
-    spawn arrives without input. So ``on_spawn`` and ``enqueue`` both pump.
-
-    Delivery persists a ``.inbound_pending`` depth marker so a Casa restart that
-    lost undelivered turns can warn the operator (boot reconcile in
-    ``_spawn_background_tasks``).
+    Injected primitives keep it unit-testable in isolation:
+    ``write_fifo(text) -> ok``, ``send_notice(text, reply_to) -> ok`` (a
+    delivered-ok bool so a failed send stays pending for retry),
+    ``is_turn_running() -> bool`` (receipt is due iff a turn is running),
+    ``current_epoch() -> int|None`` (stamps delivery / correlates consumption),
+    and an optional ``sequencer`` (delivery sets the turn's reply-thread target)
+    plus ``registry`` (interaction-state advance).
     """
 
     def __init__(
         self,
         *,
         engagement_id: str,
-        marker_path: str,
+        spool_path: str,
         write_fifo: Callable[[str], Awaitable[bool]],
-        post_notice: Callable[[str], Awaitable[Any]],
+        send_notice: NoticeSender,
+        is_turn_running: Callable[[], bool] = lambda: False,
+        current_epoch: Callable[[], int | None] = lambda: None,
+        sequencer: Any = None,
         registry: Any = None,
     ) -> None:
         self._engagement_id = engagement_id
-        self._marker_path = marker_path
+        self._spool_path = spool_path
         self._write_fifo = write_fifo
-        self._post_notice = post_notice
+        self._send_notice = send_notice
+        self._is_turn_running = is_turn_running
+        self._current_epoch = current_epoch
+        self._sequencer = sequencer
         self._registry = registry
-        self._queue: deque[_InboundItem] = deque()
+        self._envelopes: list[_Envelope] = []
         self.reader_ready = False
         self._pump_lock = asyncio.Lock()
+        self._next_seq = 0
+        self._load()
 
-    def _write_marker(self) -> None:
-        _atomic_write_text(self._marker_path, f"{len(self._queue)}\n")
+    # -- persistence -------------------------------------------------------
+
+    def _load(self) -> None:
+        try:
+            raw = Path(self._spool_path).read_text(encoding="utf-8")
+        except OSError:
+            return
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            env = _Envelope.from_line(line)
+            if env is not None:
+                self._envelopes.append(env)
+        self._next_seq = max((e.seq for e in self._envelopes), default=-1) + 1
+
+    def _persist(self) -> None:
+        """Atomic whole-file rewrite (temp + os.replace). Raises OSError on
+        failure so the enqueue path can surface the spool-write-FAILURE notice.
+        """
+        payload = "".join(e.to_line() + "\n" for e in self._envelopes)
+        tmp = f"{self._spool_path}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self._spool_path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    # -- lane / prune helpers ---------------------------------------------
+
+    def _lane_members(self) -> list[_Envelope]:
+        """Envelopes still eligible for delivery (queued, not evicted)."""
+        return [
+            e for e in self._envelopes
+            if e.state == "queued" and e.notice == "none"
+        ]
+
+    def _ordinary_count(self) -> int:
+        return sum(1 for e in self._lane_members() if not e.priority)
+
+    def _priority_count(self) -> int:
+        return sum(1 for e in self._lane_members() if e.priority)
+
+    def _next_deliverable(self) -> "_Envelope | None":
+        members = self._lane_members()
+        if not members:
+            return None
+        priority = [e for e in members if e.priority]
+        pool = priority if priority else members
+        return min(pool, key=lambda e: e.seq)
+
+    @staticmethod
+    def _should_retain(env: _Envelope) -> bool:
+        if env.notice == "pending":
+            return True            # eviction notice still owed
+        if env.receipt == "pending":
+            return True            # receipt still owed (retried at touchpoints)
+        # A live delivery candidate (queued/delivered and NOT an evicted
+        # envelope whose notice already went out).
+        if env.state in ("queued", "delivered") and env.notice != "sent":
+            return True
+        return False
+
+    def _prune(self) -> None:
+        self._envelopes = [e for e in self._envelopes if self._should_retain(e)]
+
+    def has_pending(self) -> bool:
+        return any(
+            e.receipt == "pending" or e.notice == "pending"
+            for e in self._envelopes
+        )
+
+    # -- enqueue -----------------------------------------------------------
+
+    async def enqueue(
+        self, text: str, *, tg_message_id: int | None = None,
+        is_initial: bool = False,
+    ) -> str:
+        """Append an operator envelope; return a durable disposition string
+        (§3): ``queued`` | ``dropped_full`` | ``evicted_other(<tg_id>)`` |
+        ``error`` — reported AFTER the atomic spool write.
+        """
+        is_redirect = (not is_initial) and _is_redirect(text)
+        evicted_tg: int | None = None
+        evicted = False
+        if is_redirect:
+            if self._priority_count() >= _PRIORITY_LANE_CAP:
+                await self._send_notice(_PRIORITY_CAP_COPY, tg_message_id)
+                return "dropped_full"
+            if self._ordinary_count() >= _ORDINARY_LANE_CAP:
+                victim = max(
+                    (e for e in self._lane_members() if not e.priority),
+                    key=lambda e: e.seq, default=None,
+                )
+                if victim is not None:
+                    victim.notice = "pending"       # retained for its notice
+                    evicted_tg = victim.tg_message_id
+                    evicted = True
+        elif self._ordinary_count() >= _ORDINARY_LANE_CAP:
+            await self._send_notice(_ORDINARY_FULL_COPY, tg_message_id)
+            return "dropped_full"
+
+        receipt = (
+            "pending" if (not is_initial and self._is_turn_running())
+            else "not_required"
+        )
+        env = _Envelope(
+            text=text, tg_message_id=tg_message_id, priority=is_redirect,
+            receipt=receipt, notice="none", enqueued_at=time.time(),
+            delivery_epoch=None, state="queued", seq=self._next_seq,
+            is_initial=is_initial,
+        )
+        self._next_seq += 1
+        self._envelopes.append(env)
+        try:
+            self._persist()
+        except OSError as exc:
+            # Spool-write FAILURE — the ONLY enqueue-time notice (§3, S4 fix).
+            logger.warning(
+                "engagement %s: inbound spool write failed: %s",
+                self._engagement_id[:8], exc,
+            )
+            self._envelopes.pop()               # roll the in-memory add back
+            if evicted:                         # un-evict the victim we touched
+                for e in self._envelopes:
+                    if e.tg_message_id == evicted_tg and e.notice == "pending":
+                        e.notice = "none"
+                        break
+            await self._send_notice(_SPOOL_FAIL_COPY, tg_message_id)
+            return "error"
+
+        await self._flush_pending()
+        await self._pump()
+        if evicted:
+            return f"evicted_other({evicted_tg})"
+        return "queued"
+
+    # -- receipt / notice at-least-once flush ------------------------------
+
+    async def _flush_pending(self) -> None:
+        """Retry every pending receipt/notice (§3 touchpoint). Notice-first
+        suppression: an envelope with BOTH pending sends ONLY the notice, then
+        flips its receipt to ``not_required`` (one operator message, never two).
+        """
+        changed = False
+        for env in self._envelopes:
+            if env.notice == "pending":
+                ok = await self._send_notice(_EVICTION_COPY, env.tg_message_id)
+                if ok:
+                    env.notice = "sent"
+                    if env.receipt == "pending":
+                        env.receipt = "not_required"   # notice-first suppression
+                    changed = True
+            elif env.receipt == "pending":
+                ok = await self._send_notice(_RECEIPT_COPY, env.tg_message_id)
+                if ok:
+                    env.receipt = "sent"
+                    changed = True
+        if changed:
+            self._prune()
+            try:
+                self._persist()
+            except OSError as exc:                 # best-effort; retried next tick
+                logger.warning(
+                    "engagement %s: spool persist after flush failed: %s",
+                    self._engagement_id[:8], exc,
+                )
+
+    def mark_all_settled(self) -> None:
+        """Boot-reconciliation WARN-drop (§3): topic is gone — settle every
+        pending receipt/notice so it stops retrying, WITHOUT sending."""
+        for env in self._envelopes:
+            if env.notice == "pending":
+                env.notice = "sent"
+            if env.receipt == "pending":
+                env.receipt = "not_required"
+        self._prune()
+
+    # -- lifecycle touchpoints --------------------------------------------
 
     async def on_spawn(self) -> None:
-        """A ``spawn`` control frame arrived — arm the reader and pump."""
+        """A ``spawn`` control frame — arm the reader, REDELIVER any envelope
+        still ``delivered`` (a prior epoch that never reached turn_start), pump.
+        """
         self.reader_ready = True
+        reverted = False
+        for env in self._envelopes:
+            if env.state == "delivered":
+                env.state = "queued"
+                env.delivery_epoch = None
+                reverted = True
+        if reverted:
+            self._persist_quiet()
         await self._pump()
 
-    async def enqueue(self, text: str, *, is_initial: bool = False) -> None:
-        """Append an operator turn (or drop with a one-time overflow notice)."""
-        if len(self._queue) >= _INBOUND_MAX_DEPTH:
-            await self._post_notice(
-                f"Your engagement already has {_INBOUND_MAX_DEPTH} messages "
-                "waiting to be delivered — this one was dropped. Please wait "
-                "for it to catch up, then resend."
-            )
-            return
-        self._queue.append(_InboundItem(text, is_initial))
-        self._write_marker()
+    async def on_turn_start(self) -> None:
+        """turn_start evidence: the envelope delivered THIS epoch is now
+        ``consumed``. Retry pending receipts/notices."""
+        epoch = self._current_epoch()
+        changed = False
+        for env in self._envelopes:
+            if env.state == "delivered" and env.delivery_epoch == epoch:
+                env.state = "consumed"
+                changed = True
+        if changed:
+            self._persist_quiet()
+        await self._flush_pending()
+
+    async def on_turn_end(self) -> None:
+        """result / turn boundary: retry pending receipts/notices, prune."""
+        await self._flush_pending()
+
+    async def recover(self) -> None:
+        """Boot recovery (replaces the zero-with-uncertainty notice path):
+        revert stale ``delivered`` envelopes to ``queued`` (redelivery), retry
+        pending receipts/notices, pump if already armed."""
+        reverted = False
+        for env in self._envelopes:
+            if env.state == "delivered":
+                env.state = "queued"
+                env.delivery_epoch = None
+                reverted = True
+        if reverted:
+            self._persist_quiet()
+        await self._flush_pending()
         await self._pump()
+
+    async def drain(self) -> None:
+        """Terminal pre-close drain (§3): flush pending receipts/notices while
+        the topic is still open."""
+        await self._flush_pending()
+
+    def _persist_quiet(self) -> None:
+        try:
+            self._persist()
+        except OSError as exc:
+            logger.warning(
+                "engagement %s: spool persist failed: %s",
+                self._engagement_id[:8], exc,
+            )
 
     async def _pump(self) -> None:
         async with self._pump_lock:
-            while self.reader_ready and self._queue:
-                item = self._queue[0]
-                ok = await self._write_fifo(item.text)
-                if not ok:
-                    # Retain the item and stay armed — retry on the next
-                    # spawn / enqueue (writer transiently had no reader).
+            while self.reader_ready:
+                env = self._next_deliverable()
+                if env is None:
                     break
-                self._queue.popleft()
-                self.reader_ready = False   # one message per FIFO EOF
-                self._write_marker()
-                # B7 seam: advance interaction state for ordinary operator
-                # turns only — NEVER the initial prompt. No-op until Task 7
-                # adds advance_interaction_state to the registry.
-                if not item.is_initial:
+                text = env.text
+                if env.priority:
+                    text = f"{_REDIRECT_PREFIX}\n{env.text}"
+                ok = await self._write_fifo(text)
+                if not ok:
+                    # Retain + stay armed — retry on the next spawn / enqueue.
+                    break
+                env.state = "delivered"
+                env.delivery_epoch = self._current_epoch()
+                self.reader_ready = False           # one message per FIFO EOF
+                self._persist_quiet()
+                # Delivery context: thread this turn's first sequencer post to
+                # the operator's message (§3 reply-threading).
+                if self._sequencer is not None:
+                    try:
+                        self._sequencer.set_turn_reply_to(env.tg_message_id)
+                    except Exception:  # noqa: BLE001 — advisory threading only
+                        logger.debug("set_turn_reply_to failed", exc_info=True)
+                # Advance interaction state for ordinary operator turns only.
+                if not env.is_initial and self._registry is not None:
                     fn = getattr(
                         self._registry, "advance_interaction_state", None,
                     )
@@ -181,11 +512,14 @@ class ClaudeCodeDriver(DriverProtocol):
         # ALWAYS-on live topic-stream relay, DEBUG log relay).
         self._tasks: dict[str, list[asyncio.Task]] = {}
         self._last_turn_ts: dict[str, float] = {}
-        # W1: spawn-keyed inbound queue + per-turn reply-text set (relay reply
-        # de-dup) + current spawn epoch pending a result (abnormal-exit probe).
-        self._inbound: dict[str, _InboundQueue] = {}
+        # v0.79.0 (§3): durable inbound envelope spool + per-turn reply-text set
+        # (relay reply de-dup) + current spawn epoch pending a result
+        # (abnormal-exit probe) + per-engagement turn-running flag (receipt is
+        # due iff a turn is running — set at turn_start, cleared at result/spawn).
+        self._inbound: dict[str, _InboundSpool] = {}
         self._reply_texts: dict[str, set[str]] = {}
         self._epoch_pending: dict[str, int | None] = {}
+        self._turn_running: dict[str, bool] = {}
         # W2/Sol B9 (Task 7): at most ONE in-topic violation notice per
         # engagement — guards the mutating_tool seam in _on_stream_event.
         # B4 (Sol r1): the notice-post and the flag-persist are tracked
@@ -354,9 +688,9 @@ class ClaudeCodeDriver(DriverProtocol):
         #    arms the reader and delivers it. Enqueue is instant while the
         #    reader is unarmed, so no background task is needed.
         if prompt:
-            q = self._inbound.get(engagement.id)
-            if q is not None:
-                await q.enqueue(prompt, is_initial=True)
+            spool = self._inbound.get(engagement.id)
+            if spool is not None:
+                await spool.enqueue(prompt, is_initial=True)
             else:
                 # Background tasks disabled (e.g. a unit test) — legacy direct
                 # write so start() still delivers the prompt.
@@ -366,18 +700,21 @@ class ClaudeCodeDriver(DriverProtocol):
 
     async def send_user_turn(
         self, engagement: EngagementRecord, text: str,
+        *, tg_message_id: int | None = None,
     ) -> None:
-        q = self._inbound.get(engagement.id)
-        if q is not None:
-            await q.enqueue(text)
+        spool = self._inbound.get(engagement.id)
+        if spool is not None:
+            await spool.enqueue(text, tg_message_id=tg_message_id)
         else:
             await self._write_to_fifo(engagement, text)
 
     async def cancel(self, engagement: EngagementRecord) -> None:
         """Teardown for a terminal transition (cancelled or completed).
 
-        ``/cancel`` bypasses the inbound queue entirely — any messages still
-        waiting for a spawn are dropped, not flushed."""
+        The durable spool FILE is intentionally left on disk: any pending
+        receipts/notices are drained pre-close by ``_finalize_engagement`` and,
+        if that drain crashed, the terminal boot-reconciliation owner picks
+        them up. Only the in-memory spool object is dropped here."""
         # Cancel background tasks
         for t in self._tasks.pop(engagement.id, []):
             t.cancel()
@@ -385,6 +722,7 @@ class ClaudeCodeDriver(DriverProtocol):
         self._inbound.pop(engagement.id, None)
         self._reply_texts.pop(engagement.id, None)
         self._epoch_pending.pop(engagement.id, None)
+        self._turn_running.pop(engagement.id, None)
         self._violation_notified.discard(engagement.id)
         self._violation_flagged.discard(engagement.id)
         # v0.79.0 (§2): drop the sequencer (its watcher task is cancelled above).
@@ -524,23 +862,31 @@ class ClaudeCodeDriver(DriverProtocol):
 
     def _spawn_background_tasks(self, engagement: EngagementRecord) -> None:
         # Sol r2-B6: boot replay calls this DIRECTLY (not start), so the inbound
-        # queue, reply-text set, epoch tracker AND the marker reconcile all live
+        # spool, reply-text set, epoch tracker AND the spool recovery all live
         # here — a resumed engagement gets the same wiring as a fresh one.
         ws = Path(self._engagements_root) / engagement.id
-        self._inbound[engagement.id] = _InboundQueue(
-            engagement_id=engagement.id,
-            marker_path=str(ws / ".inbound_pending"),
-            write_fifo=lambda text: self._write_to_fifo(engagement, text),
-            post_notice=lambda text: self._send_to_topic(
-                engagement.topic_id, text),
-            registry=self._registry,
-        )
         self._reply_texts.setdefault(engagement.id, set())
         self._epoch_pending.setdefault(engagement.id, None)
+        self._turn_running.setdefault(engagement.id, False)
         # v0.79.0 (§2): the shared per-engagement OUTPUT SEQUENCER + its late/
         # timeout discrete-post watcher task. Created BEFORE the relay so a
-        # discrete ingress that registers an intent early always finds it.
+        # discrete ingress that registers an intent early always finds it, and
+        # BEFORE the spool so delivery can set the turn's reply-thread target.
         sequencer = self._ensure_sequencer(engagement)
+        # v0.79.0 (§3): the durable inbound envelope spool. Loads any surviving
+        # spool file so undelivered turns redeliver and pending receipts/notices
+        # retry (recovery scheduled below).
+        self._inbound[engagement.id] = _InboundSpool(
+            engagement_id=engagement.id,
+            spool_path=str(ws / _SPOOL_FILENAME),
+            write_fifo=lambda text: self._write_to_fifo(engagement, text),
+            send_notice=lambda text, reply_to: self._spool_send_notice(
+                engagement, text, reply_to),
+            is_turn_running=lambda: self._turn_running.get(engagement.id, False),
+            current_epoch=lambda: self._epoch_pending.get(engagement.id),
+            sequencer=sequencer,
+            registry=self._registry,
+        )
 
         tasks = [
             asyncio.create_task(self._poll_respawns(engagement)),
@@ -574,32 +920,72 @@ class ClaudeCodeDriver(DriverProtocol):
                 engagement_log_dir(engagement.id), "current")
             tasks.append(asyncio.create_task(
                 self._relay_log_lines(engagement, log_path=log_path)))
+        # v0.79.0 (§3): spool recovery replaces the zero-with-uncertainty
+        # notice. A surviving spool redelivers undelivered turns by construction
+        # and retries any pending receipts/notices — no "please resend" guess.
+        # Scheduled only when a spool file survives (a fresh engagement has
+        # nothing to recover), mirroring the old conditional marker reconcile.
+        spool = self._inbound.get(engagement.id)
+        if spool is not None and (ws / _SPOOL_FILENAME).exists():
+            tasks.append(asyncio.create_task(spool.recover()))
+
         self._tasks[engagement.id] = tasks
 
-        # Boot reconcile (Sol r2-B6): a surviving non-zero .inbound_pending
-        # means operator turns may have been lost before the last restart.
-        self._reconcile_inbound_marker(engagement)
-
-    def _reconcile_inbound_marker(self, engagement: EngagementRecord) -> None:
-        marker = Path(self._engagements_root) / engagement.id / ".inbound_pending"
+    async def _spool_send_notice(
+        self, engagement: EngagementRecord, text: str, reply_to: int | None,
+    ) -> bool:
+        """Send a spool receipt/notice into the topic, threaded to the operator
+        message when given. Returns delivered-ok so a failed send stays pending
+        for at-least-once retry (§3)."""
         try:
-            pending = int(marker.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            return
-        if pending <= 0:
-            return
-        # Zero it synchronously so a second boot never re-warns.
-        _atomic_write_text(str(marker), "0\n")
-
-        async def _notify() -> None:
-            await self._send_to_topic(
-                engagement.topic_id,
-                f"Up to {pending} queued message(s) may not have been "
-                "delivered before the last restart — please resend if needed.",
+            if reply_to is not None:
+                await self._send_to_topic(
+                    engagement.topic_id, text, reply_to_message_id=reply_to)
+            else:
+                await self._send_to_topic(engagement.topic_id, text)
+            return True
+        except Exception as exc:  # noqa: BLE001 — retried at the next touchpoint
+            logger.warning(
+                "engagement %s: spool notice send failed (retried): %s",
+                engagement.id[:8], exc,
             )
+            return False
 
-        self._tasks.setdefault(engagement.id, []).append(
-            asyncio.create_task(_notify()))
+    async def drain_inbound_spool(self, engagement: EngagementRecord) -> None:
+        """§3 terminal pre-close drain: flush pending receipts/notices while
+        the topic is still open (called by ``_finalize_engagement`` BEFORE the
+        terminal commit + topic close)."""
+        spool = self._inbound.get(engagement.id)
+        if spool is not None:
+            await spool.drain()
+
+    async def reconcile_terminal_spool(self, engagement: EngagementRecord) -> None:
+        """§3 terminal boot-reconciliation: a TERMINAL engagement whose spool
+        file still holds pending receipts/notices (a drain that crashed / a
+        send that failed pre-terminal) is drained here — posting to the topic
+        if it still exists, else WARN-dropping (the topic is gone)."""
+        ws = Path(self._engagements_root) / engagement.id
+        spool_path = ws / _SPOOL_FILENAME
+        if not spool_path.exists():
+            return
+        spool = _InboundSpool(
+            engagement_id=engagement.id,
+            spool_path=str(spool_path),
+            write_fifo=lambda text: _never_deliver(),
+            send_notice=lambda text, reply_to: self._spool_send_notice(
+                engagement, text, reply_to),
+        )
+        if not spool.has_pending():
+            return
+        if engagement.topic_id is None:
+            logger.warning(
+                "engagement %s: terminal spool has pending receipts/notices "
+                "but its topic is gone — dropping", engagement.id[:8],
+            )
+            spool.mark_all_settled()
+            spool._persist_quiet()
+            return
+        await spool.drain()
 
     def _ensure_sequencer(self, engagement: EngagementRecord) -> "OutputSequencer":
         """Build (or return) the per-engagement OUTPUT SEQUENCER (§2).
@@ -711,7 +1097,15 @@ class ClaudeCodeDriver(DriverProtocol):
 
     # -- relay-injected Telegram primitives -------------------------------
 
-    async def _relay_send_message(self, topic_id: int, text: str) -> int | None:
+    async def _relay_send_message(
+        self, topic_id: int, text: str, reply_to: int | None = None,
+    ) -> int | None:
+        # v0.79.0 (§3): the sequencer threads the turn's first post to the
+        # inbound operator message (reply-quoting). Only pass the kwarg when a
+        # target exists so the common no-thread path stays 2-arg.
+        if reply_to is not None:
+            return await self._send_to_topic(
+                topic_id, text, reply_to_message_id=reply_to)
         return await self._send_to_topic(topic_id, text)
 
     async def _relay_edit_message(
@@ -744,8 +1138,10 @@ class ClaudeCodeDriver(DriverProtocol):
     ) -> None:
         """Fan the relay's ordered ``on_turn_event`` kinds into driver state.
 
-        ``spawn`` → arm the inbound queue + epoch/abnormal-exit correlation;
-        ``turn_start`` → reset the reply-text de-dup set; ``mutating_tool``
+        ``spawn`` → arm the inbound spool (redeliver survivors) + epoch/
+        abnormal-exit correlation; ``turn_start`` → reset the reply-text de-dup
+        set + mark the turn running + consume the delivered envelope (§3
+        turn_start evidence) + retry receipts; ``mutating_tool``
         → W2/Sol B9 (Task 7): while the engagement's ``interaction_state``
         is ``awaiting_operator``, post ONE in-topic violation notice (per
         engagement) and flag ``rec.origin["interaction_violated"]`` via
@@ -763,13 +1159,22 @@ class ClaudeCodeDriver(DriverProtocol):
                 # this new spawn — abnormal exit. ``result`` is at-most-once,
                 # so a spawn-without-result is an equally valid turn boundary.
                 self._log_abnormal_exit(engagement, prev)
+            # A new spawn means the prior turn ended (result) or died
+            # (abnormal) — no turn is running until turn_start.
+            self._turn_running[eng_id] = False
             self._epoch_pending[eng_id] = epoch
-            q = self._inbound.get(eng_id)
-            if q is not None:
-                await q.on_spawn()
+            spool = self._inbound.get(eng_id)
+            if spool is not None:
+                await spool.on_spawn()
         elif kind == "turn_start":
-            # Fresh turn — drop the prior turn's reply-text de-dup set.
+            # Fresh turn — drop the prior turn's reply-text de-dup set, mark the
+            # turn running (receipts are now due for new inbound), and consume
+            # the envelope this turn carried (§3 turn_start evidence).
             self._reply_texts[eng_id] = set()
+            self._turn_running[eng_id] = True
+            spool = self._inbound.get(eng_id)
+            if spool is not None:
+                await spool.on_turn_start()
         elif kind == "mutating_tool":
             logger.debug(
                 "engagement %s mutating tool during turn: %s",
@@ -812,6 +1217,10 @@ class ClaudeCodeDriver(DriverProtocol):
                             )
         elif kind == "result":
             self._epoch_pending[eng_id] = None
+            self._turn_running[eng_id] = False
+            spool = self._inbound.get(eng_id)
+            if spool is not None:
+                await spool.on_turn_end()
 
     def _log_abnormal_exit(
         self, engagement: EngagementRecord, epoch: int | None,
@@ -1006,28 +1415,12 @@ class ClaudeCodeDriver(DriverProtocol):
                     "new_pid": pid,
                     "ts": time.time(),
                 })
-                await self._maybe_warn_of_lost_turn(engagement)
             last_pid = pid
 
     async def _publish_bus_event(self, event: dict) -> None:
         """Overridable (tests inject). Default no-op at driver layer —
         casa_core wires a real bus sink in at construction time (see Phase E)."""
         logger.debug("bus event (no sink wired): %s", event)
-
-    async def _maybe_warn_of_lost_turn(
-        self, engagement: EngagementRecord,
-    ) -> None:
-        """If the last send_user_turn was within 5 seconds of now, post a
-        topic warning that the turn may have been lost during respawn."""
-        last_ts = self._last_turn_ts.get(engagement.id)
-        if last_ts is None:
-            return
-        if time.time() - last_ts < 5.0:
-            await self._send_to_topic(
-                engagement.topic_id,
-                "Your last message may not have reached the engagement — "
-                "please retype it.",
-            )
 
 
 def _iso_now() -> str:

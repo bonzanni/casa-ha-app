@@ -378,3 +378,59 @@ def test_registry_oldest_matchable_is_fifo_on_equal_hash():
     assert first.request_id == "a"
     first.consumed = True
     assert reg.oldest_matchable(REPLY_TOOL, "H").request_id == "b"
+
+
+# ---------------------------------------------------------------------------
+# v0.79.0 (§3, Primitive B) — reply-threading of the turn's first post.
+# ---------------------------------------------------------------------------
+
+
+class _ThreadRecorder:
+    """Send recorder that records the reply_to target (3-arg send)."""
+
+    def __init__(self) -> None:
+        self.sends: list[tuple[int, str, "int | None"]] = []
+        self._next_id = 200
+
+    async def send(self, topic_id, text, reply_to=None):
+        self.sends.append((topic_id, text, reply_to))
+        mid = self._next_id
+        self._next_id += 1
+        return mid
+
+    async def edit(self, topic_id, message_id, text):
+        return True
+
+
+async def test_turn_first_narration_threads_to_inbound_then_clears():
+    rec = _ThreadRecorder()
+    clock = Clock()
+    seq = _make_seq(rec, clock)
+    # Delivery of an inbound envelope sets the turn's reply-thread target.
+    seq.set_turn_reply_to(555)
+    await seq.open_narration("first line of the turn")
+    # The FIRST post threads to the operator's message.
+    assert rec.sends[0] == (42, "first line of the turn", 555)
+    # A SECOND post this turn is NOT a reply (target consumed once).
+    seq._narration_msg_id = None      # force a fresh open
+    await seq.open_narration("second line")
+    assert rec.sends[1] == (42, "second line", None)
+
+
+async def test_consume_turn_reply_to_is_one_shot():
+    rec = _ThreadRecorder()
+    clock = Clock()
+    seq = _make_seq(rec, clock)
+    seq.set_turn_reply_to(777)
+    assert seq.consume_turn_reply_to() == 777
+    assert seq.consume_turn_reply_to() is None      # cleared
+
+
+async def test_no_reply_target_keeps_two_arg_send():
+    # With no inbound target, open_narration uses the 2-arg send (back-compat
+    # with the T1 Recorder that has no reply_to parameter).
+    rec = Recorder()
+    clock = Clock()
+    seq = _make_seq(rec, clock)
+    await seq.open_narration("hi")
+    assert rec.sends == [(42, "hi")]

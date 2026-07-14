@@ -44,6 +44,22 @@ _IDLE_SWEEP_CRON = "0 8 * * *"            # daily 08:00 user TZ
 # duplicate-task guard and post-mortems working across restarts.
 _TERMINAL_RETENTION_DAYS = 30
 
+# v0.79.0 (§3): sentinel for the strict terminal transition's full-field
+# snapshot — distinguishes "origin had no such key" from "key was None" so the
+# rollback can DELETE a key the transition added rather than leaving it None.
+_FIELD_MISSING = object()
+
+
+def _restore_origin_field(rec: "EngagementRecord", key: str, snapped: Any) -> None:
+    """Restore ``rec.origin[key]`` to a strict-transition snapshot value.
+
+    ``_FIELD_MISSING`` means the key was ABSENT before the transition — the
+    rollback removes it rather than resurrecting it as ``None``."""
+    if snapped is _FIELD_MISSING:
+        rec.origin.pop(key, None)
+    else:
+        rec.origin[key] = snapped
+
 
 # ---------------------------------------------------------------------------
 # W2/Sol B9 (Task 7) — interaction_state pure transition core.
@@ -242,6 +258,14 @@ class EngagementRegistry:
     def active_and_idle(self) -> list[EngagementRecord]:
         return [r for r in self._records.values() if r.status in ("active", "idle")]
 
+    def terminal_records(self) -> list[EngagementRecord]:
+        """v0.79.0 (§3): terminal records, for the boot spool-reconciliation
+        owner (drains inbound spools still holding pending receipts/notices)."""
+        return [
+            r for r in self._records.values()
+            if r.status in ("completed", "cancelled", "error")
+        ]
+
     def get(self, engagement_id: str) -> EngagementRecord | None:
         return self._records.get(engagement_id)
 
@@ -433,6 +457,7 @@ class EngagementRegistry:
         error_kind: str = "",
         error_message: str = "",
         stale_before: float | None = None,
+        strict: bool = False,
     ) -> bool:
         """Atomically move a record to a terminal status. Returns True only
         for the first caller; False if missing or already terminal.
@@ -449,6 +474,19 @@ class EngagementRegistry:
         still older than the cutoff. The reap checks staleness before this
         call at a suspension point away; without this guard a user turn that
         revives the record in that window would still be reaped.
+
+        ``strict`` (v0.79.0 §3, Sol r6-2/r7-2): the finalize path uses STRICT
+        transactional persistence. Non-strict callers keep the historical
+        best-effort behavior (a tombstone write failure is swallowed and the
+        in-memory flip stands, which could leave a closed topic with no
+        terminal record for boot reconciliation to find). Strict snapshots
+        EVERY field the transition mutates (status, completed_at, and the
+        error metadata on ``origin``) and, on tombstone-write failure, restores
+        the FULL snapshot and re-raises — so a persistence failure leaves the
+        record exactly as it was (live), never a memory/disk split. The
+        mutate+persist runs under a shield-and-await (mirroring
+        ``advance_interaction_state``) so cancellation during ``to_thread``
+        cannot tear the pair.
         """
         async with self._lock:
             rec = self._records.get(engagement_id)
@@ -457,13 +495,56 @@ class EngagementRegistry:
             if stale_before is not None and rec.last_user_turn_ts >= stale_before:
                 # Revived since the reap snapshot — never cancel a live engagement.
                 return False
-            rec.status = outcome if outcome in ("completed", "cancelled") else "error"
-            rec.completed_at = completed_at if completed_at is not None else time.time()
-            if rec.status == "error":
-                rec.origin["error_kind"] = error_kind or "emit_completion_error"
-                rec.origin["error_message"] = error_message
-            await self._write_tombstone_locked()
-            return True
+            new_status = (
+                outcome if outcome in ("completed", "cancelled") else "error"
+            )
+            new_completed = (
+                completed_at if completed_at is not None else time.time()
+            )
+            if not strict:
+                rec.status = new_status
+                rec.completed_at = new_completed
+                if new_status == "error":
+                    rec.origin["error_kind"] = error_kind or "emit_completion_error"
+                    rec.origin["error_message"] = error_message
+                await self._write_tombstone_locked()
+                return True
+
+            # STRICT: full-field snapshot + shield-and-await + rollback-on-fail.
+            snap_status = rec.status
+            snap_completed = rec.completed_at
+            snap_error_kind = rec.origin.get("error_kind", _FIELD_MISSING)
+            snap_error_message = rec.origin.get("error_message", _FIELD_MISSING)
+
+            def _restore() -> None:
+                rec.status = snap_status
+                rec.completed_at = snap_completed
+                _restore_origin_field(rec, "error_kind", snap_error_kind)
+                _restore_origin_field(rec, "error_message", snap_error_message)
+
+            async def _mutate_and_persist() -> bool:
+                rec.status = new_status
+                rec.completed_at = new_completed
+                if new_status == "error":
+                    rec.origin["error_kind"] = error_kind or "emit_completion_error"
+                    rec.origin["error_message"] = error_message
+                try:
+                    await self._write_tombstone_locked(strict=True)
+                except Exception:
+                    _restore()
+                    raise
+                return True
+
+            task = asyncio.ensure_future(_mutate_and_persist())
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    # Let the inner mutate+persist (and, on failure, the
+                    # rollback) finish under the lock before honoring the
+                    # cancel — never a torn memory/disk pair.
+                    await asyncio.gather(task, return_exceptions=True)
+                raise
 
     async def mark_idle(self, engagement_id: str) -> None:
         async with self._lock:
