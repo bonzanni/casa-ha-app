@@ -15,6 +15,8 @@ import pytest
 from authz_grants import (
     DEFAULT_GRANT_TTL_S,
     GRANTS,
+    ChallengeCoordinator,
+    ChallengeHandle,
     GrantKey,
     GrantStore,
     canonical_args_hash,
@@ -395,3 +397,532 @@ def test_authz_grant_sweep_registered_hourly_beside_engagement_sweep():
     # exist and _authz_grant_sweep is not defined as a sync lambda.
     assert "_engagement_daily_sweep" in text
     assert not re.search(r"lambda:\s*asyncio\.create_task\(\s*_authz_grant_sweep", text)
+
+
+# ===========================================================================
+# ChallengeCoordinator (Task 5, A:§3.4) — atomic challenge registration, an
+# async-settled setup driver, two-latch cleanup, the authz finish hook, and
+# the pinned shutdown drain.
+# ===========================================================================
+
+
+class _FakeChannel:
+    """Records every post/edit/dispatch the coordinator drives, and can be
+    configured to block, fail, or raise on demand.
+
+    ``post_dm_keyboard`` optionally awaits ``post_gate`` first so a test can
+    hold the setup driver mid-post and race a timeout / cancel / caller
+    cancellation against it. ``log`` is a shared ordered event trace used by
+    the mint-before-dispatch ordering test."""
+
+    def __init__(self, *, log: list | None = None) -> None:
+        self.posts: list = []
+        self.edits: list = []
+        self.dispatches: list = []
+        self.post_result: int | None = 55
+        self.post_raises = False
+        self.post_gate: asyncio.Event | None = None
+        self.dispatch_result = True
+        self.edit_raises = False
+        self.log = log if log is not None else []
+
+    async def post_dm_keyboard(self, *, chat_id, request_id, text, options):
+        self.posts.append((chat_id, request_id, text, tuple(options)))
+        if self.post_gate is not None:
+            await self.post_gate.wait()
+        if self.post_raises:
+            raise RuntimeError("post boom")
+        return self.post_result
+
+    async def edit_dm_message(self, chat_id, message_id, text):
+        self.edits.append((chat_id, message_id, text))
+        self.log.append(("edit", text))
+        if self.edit_raises:
+            raise RuntimeError("edit boom")
+        return True
+
+    async def _dispatch_button_continuation(
+        self, *, chat_id, user_id, target_role, request_id, text,
+    ):
+        self.dispatches.append(
+            dict(chat_id=chat_id, user_id=user_id, target_role=target_role,
+                 request_id=request_id, text=text)
+        )
+        self.log.append(("dispatch", text))
+        return self.dispatch_result
+
+
+class _SpyGrants:
+    """A GrantStore stand-in that records mint order into a shared log while
+    still behaving like a real single-use store for consume()."""
+
+    def __init__(self, log: list) -> None:
+        self._log = log
+        self._real = GrantStore()
+
+    def mint(self, key, **kw):
+        self._log.append(("mint", key))
+        self._real.mint(key, **kw)
+
+    def consume(self, key):
+        return self._real.consume(key)
+
+
+def _fresh_env(monkeypatch, *, ttl=None, log=None):
+    """A fresh broker (monkeypatched into the singleton slot the coordinator
+    resolves at call time), a fresh coordinator, and a fake channel."""
+    import verdict_broker
+
+    broker = verdict_broker.VerdictBroker()
+    monkeypatch.setattr(verdict_broker, "BROKER", broker)
+    if ttl is not None:
+        import authz_grants
+        monkeypatch.setattr(authz_grants, "_CHALLENGE_TTL_S", ttl)
+    coord = ChallengeCoordinator()
+    channel = _FakeChannel(log=log)
+    return broker, coord, channel
+
+
+def _create(coord, channel, key=None, *, chat_id=100, operator_id=7,
+            target_role="finance-full", tool_name="invoice_reset",
+            canonical_json='{"amount":10,"id":"INV-1"}',
+            enforcement_role="finance"):
+    if key is None:
+        key = _key(chat_id=chat_id, enforcement_role=enforcement_role,
+                   tool_name=tool_name, args_hash=canonical_args_hash({"x": 1}))
+    handle = coord.get_or_create(
+        key, chat_id=chat_id, operator_id=operator_id, target_role=target_role,
+        tool_name=tool_name, canonical_json=canonical_json,
+        enforcement_role=enforcement_role, channel=channel,
+    )
+    return key, handle
+
+
+async def _settle(n: int = 6):
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+def _tap(broker, ch, idx, *, actor=7, run_sync_step=True):
+    """Replicate the telegram callback's claim → commit → (immediate) sync
+    step ordering, without any await between commit and the sync step."""
+    claim = broker.claim(
+        namespace="resident_ask", scope=ch.scope, request_id=ch.rid,
+        option_index=idx, actor_id=actor,
+    )
+    assert not isinstance(claim, str), f"claim rejected: {claim}"
+    assert broker.commit(claim) is True
+    if run_sync_step:
+        step = ch.req.meta.get("on_commit_sync")
+        if step is not None:
+            step(idx)
+
+
+class TestChallengeAtomicRegistration:
+    async def test_concurrent_hook_coroutines_one_record_one_keyboard(
+        self, monkeypatch,
+    ):
+        """r2-B2 production shape: many hook coroutines racing the SAME key on
+        ONE loop → exactly ONE broker record and ONE keyboard; exactly one
+        handle reports created=True."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key = _key()
+
+        results: list[ChallengeHandle] = []
+
+        async def hook():
+            _k, handle = _create(coord, channel, key)
+            results.append(handle)
+            await handle.settled_post()
+
+        await asyncio.gather(*[hook() for _ in range(16)])
+        await _settle()
+
+        assert sum(1 for h in results if h.created) == 1
+        assert sum(1 for h in results if not h.created) == 15
+        # exactly ONE live broker record (still pending — nobody answered)
+        assert broker.pending(namespace="resident_ask", scope="authz:100") == \
+            [coord._entries[key].rid]
+        # exactly one keyboard was ever posted
+        assert len(channel.posts) == 1
+
+    async def test_refused_when_oversized_no_entry_no_keyboard(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        huge = '{"blob":"' + "x" * 4000 + '"}'
+        key, handle = _create(coord, channel, canonical_json=huge)
+        await _settle()
+
+        assert handle.created is True
+        assert handle.refused == "args_too_large"
+        assert key not in coord._entries
+        assert channel.posts == []
+        assert broker.pending(namespace="resident_ask", scope="authz:100") == []
+
+    async def test_registration_is_synchronous_before_first_turn(
+        self, monkeypatch,
+    ):
+        """r4-B2/r5-B1: the broker request exists the moment get_or_create
+        returns — BEFORE the driver's first event-loop turn — so /new /
+        shutdown always see a cancellable record."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        # No await yet: the record must already be live and cancellable.
+        assert broker.pending(namespace="resident_ask", scope="authz:100") == \
+            [coord._entries[key].rid]
+        assert channel.posts == []  # the driver has not run its first turn
+        await handle.settled_post()
+
+
+class TestSettledPostClassification:
+    async def test_pending_is_posted(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        _key_, handle = _create(coord, channel)
+        assert await handle.settled_post() == "posted"
+        assert len(channel.posts) == 1
+
+    async def test_post_none_is_delivery_failed(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.post_result = None
+        _key_, handle = _create(coord, channel)
+        assert await handle.settled_post() == "delivery_failed"
+
+    async def test_post_raises_is_delivery_failed(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.post_raises = True
+        _key_, handle = _create(coord, channel)
+        assert await handle.settled_post() == "delivery_failed"
+
+    async def test_timeout_while_posting_is_inactive_even_if_post_succeeds(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch, ttl=0.02)
+        channel.post_gate = asyncio.Event()
+        key, handle = _create(coord, channel)
+        task = asyncio.ensure_future(handle.settled_post())
+        await asyncio.sleep(0)          # driver starts, post blocks on the gate
+        await asyncio.sleep(0.05)       # the 0.02s TTL timer fires while blocked
+        channel.post_gate.set()         # NOW the post completes (returns a mid)
+        assert await task == "inactive"
+        await _settle()
+        assert len(channel.posts) == 1  # exactly one keyboard
+        # the finish hook edited it to an expired state
+        assert any("expired" in e[2].lower() for e in channel.edits)
+        assert key not in coord._entries
+
+    async def test_new_while_posting_is_inactive_even_if_post_succeeds(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.post_gate = asyncio.Event()
+        key, handle = _create(coord, channel)
+        task = asyncio.ensure_future(handle.settled_post())
+        await asyncio.sleep(0)          # driver starts, post blocks
+        broker.cancel_scope(namespace="resident_ask", scope="authz:100",
+                            reason="new_session")
+        channel.post_gate.set()
+        assert await task == "inactive"
+        await _settle()
+        assert len(channel.posts) == 1
+        assert key not in coord._entries
+
+    async def test_survives_caller_cancellation_one_keyboard(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.post_gate = asyncio.Event()
+        key, handle = _create(coord, channel)
+        task = asyncio.ensure_future(handle.settled_post())
+        await asyncio.sleep(0)          # driver posting, blocked on the gate
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        channel.post_gate.set()         # driver completes on its own
+        await coord.drain()
+        await _settle()
+        assert len(channel.posts) == 1  # exactly ONE keyboard ever
+
+
+class TestPrePostAndShutdownTerminal:
+    async def test_immediate_new_before_first_turn(self, monkeypatch):
+        """/new fired synchronously after get_or_create, BEFORE the driver's
+        first turn → record cancelled, NO keyboard, NO entry, NO lingering
+        task (r4-B2)."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        # synchronous /new, before any await
+        broker.cancel_scope(namespace="resident_ask", scope="authz:100",
+                            reason="new_session")
+        assert await handle.settled_post() == "inactive"
+        await _settle()
+        assert channel.posts == []          # ensure_posted no-op'd on done future
+        assert key not in coord._entries
+        assert all(d.done() for d in coord._drivers)
+
+    async def test_shutdown_before_first_turn(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        broker.cancel_all(reason="casa_shutdown")
+        await coord.drain()
+        await broker.drain_hooks()
+        await _settle()
+        assert channel.posts == []
+        assert key not in coord._entries
+        assert all(d.done() for d in coord._drivers)
+
+    async def test_pre_post_terminal_marks_setup_directly(self, monkeypatch):
+        """Request cancelled before ensure_posted ran → req._setup_task stays
+        None and the driver settles setup DIRECTLY (both latches land → entry
+        removed)."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        req = coord._entries[key].req
+        broker.cancel(namespace="resident_ask", scope="authz:100",
+                      request_id=coord._entries[key].rid, reason="x")
+        await handle.settled_post()
+        await _settle()
+        assert req._setup_task is None
+        assert key not in coord._entries
+
+
+class TestAuthzFinishHook:
+    async def test_approve_event_order_mint_edit_dispatch_verbatim(
+        self, monkeypatch,
+    ):
+        import authz_grants
+        log: list = []
+        monkeypatch.setattr(authz_grants, "GRANTS", _SpyGrants(log))
+        broker, coord, channel = _fresh_env(monkeypatch, log=log)
+        canonical = '{"amount":10,"id":"INV-1"}'
+        key, handle = _create(coord, channel, canonical_json=canonical)
+        assert await handle.settled_post() == "posted"
+        ch = coord._entries[key]
+        _tap(broker, ch, 0)
+        await _settle()
+
+        kinds = [e[0] for e in log]
+        assert kinds == ["mint", "edit", "dispatch"]
+        assert log[0][1] == key                         # minted the exact key
+        # the approved edit precedes the dispatch and names the tool
+        assert "approved" in channel.edits[-1][2].lower()
+        assert channel.dispatches[0]["target_role"] == "finance-full"
+        # canonical JSON embedded verbatim in the continuation text
+        assert canonical in channel.dispatches[0]["text"]
+        assert "[authorization approved]" in channel.dispatches[0]["text"]
+        assert "finance" in channel.dispatches[0]["text"]  # enforcement_role
+
+    async def test_deny_no_mint_edit_then_dispatch(self, monkeypatch):
+        import authz_grants
+        log: list = []
+        monkeypatch.setattr(authz_grants, "GRANTS", _SpyGrants(log))
+        broker, coord, channel = _fresh_env(monkeypatch, log=log)
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 1)
+        await _settle()
+
+        assert [e[0] for e in log] == ["edit", "dispatch"]   # NO mint
+        assert "denied" in channel.edits[-1][2].lower() or \
+            "denied" in channel.edits[0][2].lower()
+        assert "[authorization denied]" in channel.dispatches[0]["text"]
+
+    async def test_minted_absent_internal_error_no_dispatch(self, monkeypatch):
+        """Approve committed but the sync step never recorded the mint (raised
+        and was swallowed) → edit the internal-error text, NEVER dispatch."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 0, run_sync_step=False)   # commit, but no mint recorded
+        await _settle()
+
+        assert channel.dispatches == []
+        assert "internal error" in channel.edits[-1][2].lower()
+        assert "call the tool again" in channel.edits[-1][2].lower()
+
+    async def test_approve_dispatch_exhaustion_overwrites_failure(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.dispatch_result = False
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 0)
+        await _settle()
+
+        assert channel.dispatches, "dispatch was attempted"
+        # last edit is the visible-failure overwrite
+        last = channel.edits[-1][2].lower()
+        assert "delivery to finance-full failed" in last
+        assert "retry" in last
+
+    async def test_deny_dispatch_exhaustion_overwrites_failure(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.dispatch_result = False
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 1)
+        await _settle()
+
+        last = channel.edits[-1][2].lower()
+        assert "failed" in last
+
+    async def test_no_answer_edits_expired(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        broker.cancel(namespace="resident_ask", scope=ch.scope,
+                      request_id=ch.rid, reason="timeout")
+        await _settle()
+        assert any("expired" in e[2].lower() for e in channel.edits)
+        assert channel.dispatches == []
+
+
+class TestTwoLatchCleanup:
+    async def test_answered_removes_entry(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 0)
+        await _settle()
+        assert key not in coord._entries
+
+    async def test_cancel_then_post_failure_removes_entry(self, monkeypatch):
+        """Future latch (cancel) + setup latch (post failure) both land →
+        entry removed even though the post failed."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.post_gate = asyncio.Event()
+        channel.post_result = None      # post will report delivery failure
+        key, handle = _create(coord, channel)
+        task = asyncio.ensure_future(handle.settled_post())
+        await asyncio.sleep(0)
+        broker.cancel_scope(namespace="resident_ask", scope="authz:100",
+                            reason="new")
+        channel.post_gate.set()
+        await task
+        await _settle()
+        assert key not in coord._entries
+
+    async def test_edit_raise_does_not_block_removal(self, monkeypatch):
+        """The keyboard edit is owned by a SEPARATE broker hook task; a raise
+        there must not stop the coordinator's two-latch removal."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.edit_raises = True
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        ch = coord._entries[key]
+        broker.cancel(namespace="resident_ask", scope=ch.scope,
+                      request_id=ch.rid, reason="x")
+        await _settle()
+        assert key not in coord._entries
+
+    async def test_stale_late_cleanup_cannot_remove_newer(self, monkeypatch):
+        """Identity-guarded removal: an old challenge object's late latch
+        landing must NOT evict a newer challenge registered under the same
+        key."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        old = coord._entries[key]
+        # A newer challenge takes the slot (simulating a completed retry).
+        newer = coord._entries[key].__class__(
+            key=key, scope=old.scope, rid="newer-rid", req=old.req,
+            broker=broker,
+        )
+        coord._entries[key] = newer
+        # The OLD challenge's latches land late.
+        coord._settle_request(old)
+        coord._settle_setup(old)
+        assert coord._entries.get(key) is newer   # newer survived
+
+    async def test_retry_after_deny_is_fresh_challenge(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel)
+        await handle.settled_post()
+        first_rid = coord._entries[key].rid
+        _tap(broker, coord._entries[key], 1)  # deny
+        await _settle()
+        assert key not in coord._entries
+        # retry -> brand new challenge with a distinct rid
+        key2, handle2 = _create(coord, channel, key)
+        assert handle2.created is True
+        assert coord._entries[key].rid != first_rid
+        await handle2.settled_post()
+
+    async def test_retry_after_post_failure_is_fresh_challenge(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.post_result = None
+        key, handle = _create(coord, channel)
+        assert await handle.settled_post() == "delivery_failed"
+        await _settle()
+        assert key not in coord._entries
+        channel.post_result = 99
+        key2, handle2 = _create(coord, channel, key)
+        assert handle2.created is True
+        assert await handle2.settled_post() == "posted"
+
+
+class TestCancelMatching:
+    async def test_cancel_by_role(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        k1, h1 = _create(coord, channel, enforcement_role="finance",
+                         tool_name="a")
+        k2, h2 = _create(coord, channel, enforcement_role="ops", tool_name="b",
+                         chat_id=100)
+        await h1.settled_post()
+        await h2.settled_post()
+        n = coord.cancel_matching(role="finance")
+        await _settle()
+        assert n == 1
+        assert any("expired" in e[2].lower() for e in channel.edits)
+        assert k1 not in coord._entries
+        assert k2 in coord._entries
+
+    async def test_cancel_by_artifact(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        k1 = _key(artifact_id="art-1", tool_name="a")
+        k2 = _key(artifact_id="art-2", tool_name="b")
+        _c, h1 = _create(coord, channel, k1)
+        _c, h2 = _create(coord, channel, k2)
+        await h1.settled_post()
+        await h2.settled_post()
+        assert coord.cancel_matching(artifact="art-1") == 1
+        await _settle()
+        assert k1 not in coord._entries
+        assert k2 in coord._entries
+
+    async def test_cancel_by_chat(self, monkeypatch):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        k1, h1 = _create(coord, channel, chat_id=100, tool_name="a")
+        k2, h2 = _create(coord, channel, chat_id=200, tool_name="b")
+        await h1.settled_post()
+        await h2.settled_post()
+        assert coord.cancel_matching(chat=100) == 1
+        await _settle()
+        assert k1 not in coord._entries
+        assert k2 in coord._entries
+
+
+async def test_drain_awaits_outstanding_drivers(monkeypatch):
+    broker, coord, channel = _fresh_env(monkeypatch)
+    channel.post_gate = asyncio.Event()
+    key, handle = _create(coord, channel)
+    task = asyncio.ensure_future(handle.settled_post())
+    await asyncio.sleep(0)                 # driver posting, blocked
+    channel.post_gate.set()
+    await coord.drain()
+    assert all(d.done() for d in coord._drivers)
+    await task
+
+
+def test_challenges_singleton_is_a_coordinator():
+    from authz_grants import CHALLENGES
+    assert isinstance(CHALLENGES, ChallengeCoordinator)

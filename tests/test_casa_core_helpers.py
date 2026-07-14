@@ -185,6 +185,7 @@ class TestBrokerShutdownOrdering:
     stopped can't edit anything."""
 
     async def test_broker_drained_before_channel_manager_stops(self, monkeypatch):
+        import casa_core
         import verdict_broker
         from casa_core import _drain_broker_before_channel_shutdown
 
@@ -197,7 +198,15 @@ class TestBrokerShutdownOrdering:
             async def drain_hooks(self):
                 order.append("drain_hooks")
 
+        class _FakeChallenges:
+            async def drain(self):
+                order.append("challenges_drain")
+
         monkeypatch.setattr(verdict_broker, "BROKER", _FakeBroker())
+        # v0.76.0 (A:§3.4 r5-B2): CHALLENGES.drain() joins the pinned ladder
+        # AFTER cancel_all (so a draining setup driver can't post) and BEFORE
+        # drain_hooks — the ordering test asserts all FOUR steps.
+        monkeypatch.setattr(casa_core, "CHALLENGES", _FakeChallenges())
 
         channel_manager = MagicMock()
 
@@ -208,7 +217,10 @@ class TestBrokerShutdownOrdering:
 
         await _drain_broker_before_channel_shutdown(channel_manager)
 
-        assert order == ["cancel_all:casa_shutdown", "drain_hooks", "stop_all"]
+        assert order == [
+            "cancel_all:casa_shutdown", "challenges_drain",
+            "drain_hooks", "stop_all",
+        ]
         channel_manager.stop_all.assert_awaited_once()
 
     async def test_in_flight_finish_hook_dispatch_completes_before_stop(

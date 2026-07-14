@@ -23,7 +23,7 @@ from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from agent_loader import load_all_agents
-from authz_grants import GRANTS
+from authz_grants import CHALLENGES, GRANTS
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig
@@ -808,9 +808,15 @@ async def _drain_broker_before_channel_shutdown(channel_manager: Any) -> None:
 
     Must run immediately before ``channel_manager.stop_all()`` — a finish
     hook that fires after the channel is stopped can't edit anything.
+
+    Pinned order (r5-B2): cancel the broker records FIRST so a still-draining
+    authorization-challenge setup driver can only find a cancelled request
+    (never posts a fresh keyboard during shutdown); THEN await the coordinator
+    drivers; THEN flush the broker finish hooks; THEN stop the channels.
     """
     from verdict_broker import BROKER
     BROKER.cancel_all(reason="casa_shutdown")
+    await CHALLENGES.drain()
     await BROKER.drain_hooks()
     await channel_manager.stop_all()
 
