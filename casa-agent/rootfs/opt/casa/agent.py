@@ -821,6 +821,34 @@ class Agent:
         # off-loop + cached per instance (see _get_plugin_resolution).
         resolution = await self._get_plugin_resolution()
 
+        # Authorization grants (A:§3.2): APPEND the fail-closed PreToolUse authz
+        # matcher for this role's PROTECTED plugin tools, preserving the
+        # settings guard already in hooks["PreToolUse"]. protected_map derives
+        # from the SAME resolution the options use — it supplies
+        # GrantKey.artifact_id, so a mid-TTL plugin update invalidates grants.
+        # Only appended when the role actually has protected tools (an authz
+        # matcher with matcher=None routes EVERY tool call, so skip the no-op).
+        from authz_grants import (
+            AuthzDeps, CHALLENGES, GRANTS, make_resident_authz_hook,
+        )
+        from plugin_grants import protected_map
+        _protected = protected_map(resolution)
+        if _protected:
+            from claude_agent_sdk import HookMatcher
+            _cm = self._channel_manager
+
+            def _authz_deps_factory(_cm=_cm):
+                ch = _cm.get("telegram") if _cm is not None else None
+                if ch is None:
+                    return None  # no DM reachable ⇒ unsupported-origin deny
+                return AuthzDeps(channel=ch, grants=GRANTS, challenges=CHALLENGES)
+
+            hooks["PreToolUse"] = [
+                *hooks.get("PreToolUse", []),
+                HookMatcher(hooks=[make_resident_authz_hook(
+                    self.config.role, _protected, _authz_deps_factory)]),
+            ]
+
         # Skills are enabled via the `skills="all"` option below, NOT by
         # putting "Skill" in allowed_tools ((f) v0.69.9: bare "Skill" is
         # deprecated by the SDK; skills="all" auto-allows the Skill tool +

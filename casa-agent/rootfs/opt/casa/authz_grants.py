@@ -24,11 +24,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Canonical JSON (A:§3.6)
@@ -560,3 +563,197 @@ class ChallengeCoordinator:
 # Process-wide singleton (mirrors GRANTS): casa_core's shutdown ladder and the
 # resident authz hook (Task 7) import THIS instance.
 CHALLENGES = ChallengeCoordinator()
+
+
+# ---------------------------------------------------------------------------
+# make_resident_authz_hook + AuthzDeps (A:§3.2) — Part 3 (Task 7)
+# ---------------------------------------------------------------------------
+#
+# The enforcement core: a fail-closed PreToolUse hook the SDK invokes for EVERY
+# tool call. It passes through unprotected tools untouched, and for a PROTECTED
+# plugin tool it gates on turn provenance, consumes a single-use grant if one
+# exists, and otherwise posts (or reuses) an operator confirmation challenge and
+# DENIES the call — telling the model to retry the identical call after the
+# operator taps Approve.
+#
+# The approval token is server-side only (``GrantStore``); it never enters model
+# context. Every degraded path (wrong provenance, restart, expiry, oversized /
+# unserializable args, unconfirmed teardown, ANY internal exception) fails
+# CLOSED to an explicit SDK ``deny`` — an ESCAPED callback exception would
+# become an SDK error control response, not a deny, which would violate the
+# §3.1 fail-closed contract, so the entire protected path runs inside a
+# try/except that re-raises only ``CancelledError``.
+
+
+@dataclass
+class AuthzDeps:
+    """Runtime deps the hook resolves LAZILY at call time (r1-B7).
+
+    ``channel`` is the Telegram channel object (``post_dm_keyboard`` /
+    ``edit_dm_message`` / ``_dispatch_button_continuation``) — the DM the
+    confirmation button is posted to. ``grants`` / ``challenges`` are the
+    process-wide ``GRANTS`` / ``CHALLENGES`` singletons in production, injected
+    here so tests can substitute fakes.
+    """
+
+    channel: Any
+    grants: GrantStore
+    challenges: ChallengeCoordinator
+
+
+# Deny reasons — one source of truth (tests assert on these exact strings).
+_DENY_ENGAGEMENT = (
+    "protected tools are not available inside engagements yet "
+    "(operator ruling 2026-07-14)"
+)
+_DENY_UNSUPPORTED_ORIGIN = (
+    "protected action requires operator confirmation over the Telegram DM "
+    "(unsupported origin)"
+)
+_DENY_ROLE_MISMATCH = "execution-role mismatch"
+_DENY_UNRENDERABLE = (
+    "arguments cannot be rendered for confirmation (unserializable / too "
+    "large) — narrow the call"
+)
+_DENY_PENDING = "confirmation still pending — waiting for the user's tap"
+_DENY_DELIVERY_FAILED = "could not post the confirmation button — try again"
+_DENY_INACTIVE = (
+    "the confirmation expired before it could be delivered — call again"
+)
+_DENY_POSTED = (
+    "a confirmation button was posted to the user. After they tap Approve, "
+    "retry the SAME call with EXACTLY the same arguments."
+)
+_DENY_INTERNAL = "internal authorization error — the call was not executed"
+
+
+def make_resident_authz_hook(
+    role: str,
+    protected: dict[str, str],
+    deps_factory: "Callable[[], AuthzDeps | None]",
+) -> "Callable":
+    """Build the fail-closed PreToolUse authz hook for one resident/specialist.
+
+    ``role`` is the agent's own (plain, tier-stripped) role — asserted equal to
+    ``origin.execution_role`` as defense in depth and used as
+    ``GrantKey.enforcement_role``. ``protected`` maps each full tool name to the
+    resolved plugin ``artifact_id`` (from ``plugin_grants.protected_map`` over
+    the SAME ``ResolutionResult`` used to build the agent's options — a
+    mid-TTL plugin update changes the artifact and invalidates the grant).
+    ``deps_factory`` resolves the Telegram channel + stores LAZILY at call time;
+    ``None`` (no DM reachable) is the unsupported-origin deny.
+
+    The returned callable matches the SDK ``HookCallback`` signature
+    ``(input_data, tool_use_id, context) -> HookJSONOutput``: ``{}`` passthrough,
+    or the shipped ``PreToolUseHookSpecificOutput`` deny shape (mirrors
+    ``hooks._deny`` — the engagement relay's precedent).
+    """
+    from hooks import _deny  # mirror the shipped PreToolUse deny shape
+
+    async def _hook(
+        input_data: "dict[str, Any]",
+        tool_use_id: "str | None",
+        context: "dict[str, Any]",
+    ) -> "dict[str, Any]":
+        tool_name = (input_data or {}).get("tool_name", "")
+        if tool_name not in protected:
+            # Passthrough: unprotected tool — never touch the store/coordinator
+            # or even resolve deps.
+            return {}
+        # ---- fail-closed wrapper (r4-B2): everything below returns a VALID
+        # deny on any non-cancellation exception; CancelledError re-raises. ----
+        try:
+            import agent as agent_mod
+            from provenance import strict_positive_id, turn_provenance
+
+            prov = turn_provenance()
+
+            # 1. Engagement deny FIRST — no challenge, and NO closure-role
+            # assertion on this path (an in_casa specialist engagement inherits
+            # the outer execution_role and must deny cleanly, never assert).
+            if prov.execution == "engagement":
+                return _deny(_DENY_ENGAGEMENT)
+
+            # 2. Transport/execution gate — no challenge. Provenance is consulted
+            # BEFORE any grant lookup (a copied chat_id/user_id on a webhook turn
+            # can never consume a grant).
+            if (prov.transport not in ("dm", "button")
+                    or prov.execution not in ("direct", "delegated")):
+                return _deny(_DENY_UNSUPPORTED_ORIGIN)
+
+            origin = agent_mod.origin_var.get(None) or {}
+
+            # 3. Explicit role-mismatch deny (defense in depth) — AFTER the
+            # engagement/origin denials; an explicit deny, never an assert.
+            if role != origin.get("execution_role"):
+                return _deny(_DENY_ROLE_MISMATCH)
+
+            # 4. Resolve the DM channel + stores lazily. None ⇒ no DM reachable.
+            deps = deps_factory()
+            if deps is None:
+                return _deny(_DENY_UNSUPPORTED_ORIGIN)
+
+            operator_id = strict_positive_id(origin.get("user_id"))
+            chat_id = strict_positive_id(origin.get("chat_id"))
+            if operator_id is None or chat_id is None:
+                # The transport gate already guarantees these; stay fail-closed.
+                return _deny(_DENY_UNSUPPORTED_ORIGIN)
+
+            tool_input = (input_data or {}).get("tool_input") or {}
+
+            # 5. Canonicalize — the args_hash for the grant key AND the challenge
+            # body. Unserializable ⇒ deny with NO challenge (an unrenderable
+            # call can never match a grant, which was minted from a valid hash).
+            try:
+                canonical_json = canonical_args_json(tool_input)
+            except ValueError:
+                return _deny(_DENY_UNRENDERABLE)
+            args_hash = hashlib.sha256(
+                canonical_json.encode("utf-8")).hexdigest()
+
+            key = GrantKey(
+                operator_id=operator_id, chat_id=chat_id,
+                enforcement_role=role, artifact_id=protected[tool_name],
+                tool_name=tool_name, args_hash=args_hash,
+            )
+
+            # 6. Single-use consume (provenance already gated above).
+            if deps.grants.consume(key):
+                return {}  # allow — the operator freshly approved THIS call.
+
+            # 7. No grant — post (or reuse) a confirmation challenge and deny.
+            # target_role is the ORIGINATING resident (for a delegated
+            # specialist this is origin.role, i.e. Ellen — the continuation
+            # routes back to her; B1 ruling). get_or_create renders + size-
+            # validates BEFORE any coordinator insert (too-large ⇒ refused).
+            handle = deps.challenges.get_or_create(
+                key, chat_id=chat_id, operator_id=operator_id,
+                target_role=origin.get("role"), tool_name=tool_name,
+                canonical_json=canonical_json, enforcement_role=role,
+                channel=deps.channel,
+            )
+            if handle.refused == "args_too_large":
+                return _deny(_DENY_UNRENDERABLE)
+            if handle.created is False:
+                return _deny(_DENY_PENDING)  # identical challenge already up.
+
+            # settled_post awaits the coordinator-owned setup driver (shielded);
+            # deny latency ≈ one Telegram post RTT (accepted judgment call).
+            outcome = await handle.settled_post()
+            if outcome == "delivery_failed":
+                return _deny(_DENY_DELIVERY_FAILED)
+            if outcome == "inactive":
+                return _deny(_DENY_INACTIVE)
+            return _deny(_DENY_POSTED)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — fail closed, never let it escape
+            logger.exception(
+                "authz hook internal error (tool=%s role=%s) — denying",
+                tool_name, role)
+            return _deny(_DENY_INTERNAL)
+
+    # Marker so the options-build wiring tests can identify the appended matcher
+    # without depending on the closure's name.
+    _hook._casa_authz_role = role  # type: ignore[attr-defined]
+    return _hook

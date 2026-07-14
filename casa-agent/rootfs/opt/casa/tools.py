@@ -793,6 +793,35 @@ def _build_specialist_options(cfg, *, resolution=None) -> ClaudeAgentOptions:
     sdk_plugins = [{"type": "local", "path": rp.path}
                    for rp in resolution.plugins]
 
+    # Authorization grants (A:§3.2): APPEND the fail-closed PreToolUse authz
+    # matcher for this specialist's PROTECTED plugin tools, preserving the
+    # settings guard already appended above. protected_map derives from the
+    # SAME resolution — supplying GrantKey.artifact_id. The hook branches on
+    # provenance, so this ONE builder (ephemeral delegations AND in_casa
+    # specialist engagements) is correct: engagement turns deny cleanly. Only
+    # appended when there are protected tools (matcher=None routes every call).
+    from authz_grants import (
+        AuthzDeps, CHALLENGES, GRANTS, make_resident_authz_hook,
+    )
+    from plugin_grants import protected_map
+    _protected = protected_map(resolution)
+    if _protected:
+        from claude_agent_sdk import HookMatcher
+        _authz_role = getattr(cfg, "role", "unknown")
+
+        def _authz_deps_factory():
+            ch = (_channel_manager.get("telegram")
+                  if _channel_manager is not None else None)
+            if ch is None:
+                return None  # no DM reachable ⇒ unsupported-origin deny
+            return AuthzDeps(channel=ch, grants=GRANTS, challenges=CHALLENGES)
+
+        resolved_hooks["PreToolUse"] = [
+            *resolved_hooks.get("PreToolUse", []),
+            HookMatcher(hooks=[make_resident_authz_hook(
+                _authz_role, _protected, _authz_deps_factory)]),
+        ]
+
     agent_home = (cfg.cwd
                   or f"/config/agent-home/{getattr(cfg, 'role', 'unknown')}")
 
