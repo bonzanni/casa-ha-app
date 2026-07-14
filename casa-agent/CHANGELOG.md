@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.78.0] - 2026-07-14
+
+### Added
+
+- Plugins can declare a plain-language summary for protected tools, shown
+  as the approval headline.
+
+### Changed
+
+- Approval prompts lead with the agent's name and the action summary; the
+  exact arguments are demoted below but always shown.
+
 ## [0.77.0] - 2026-07-14
 
 ### Changed

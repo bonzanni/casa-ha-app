@@ -22,8 +22,11 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from plugin_registry import STORE_ROOT, compute_artifact_id, normalize_subdir
+from text_util import is_unsafe_text, sanitize_segment
 
 logger = logging.getLogger(__name__)
+
+_PROTECTED_TOOL_SUMMARY_MAX_CHARS = 200
 
 STAGING_ROOT = Path("/config/plugins/.staging")
 METADATA_FILENAME = ".casa-artifact.json"
@@ -525,31 +528,102 @@ def manifest_sysreqs(manifest: dict) -> list:
 
 
 def manifest_protected_tools(manifest: dict) -> list:
-    """Guarded + STRICT casa.protectedTools extraction (A:§3.7), beside
-    manifest_sysreqs. An ABSENT ``casa.protectedTools`` (no ``casa``, a
-    non-object ``casa``, or the key itself missing) means "no protected
-    tools" -> ``[]``. A PRESENT field that is not a list of non-empty
-    strings is a plugin-author error: raises
-    ``StoreError(reason_code="protected_tools_invalid")`` so each of the
-    THREE call sites decides what that means — ``validate_manifest`` refuses
-    an install/update, ``artifact_verdict`` excludes an already-stored
-    artifact from resolution (per-plugin degradation, never a whole-role
-    failure), and ``plugin_grants.protected_map`` excludes just that
-    plugin's tools from the map. B7 operator ruling: semantic typos (a
-    declared name that doesn't match a real tool) are an accepted
-    plugin-author trust boundary — this validates SHAPE only, never runtime
-    MCP enumeration."""
+    """Guarded + STRICT casa.protectedTools extraction (A:§3.7, extended
+    v0.78.0 W1), beside manifest_sysreqs. An ABSENT ``casa.protectedTools``
+    (no ``casa``, a non-object ``casa``, or the key itself missing) means "no
+    protected tools" -> ``[]``.
+
+    Each entry is EITHER a non-empty string (legacy form, meaning: no
+    summary) OR an object ``{"name": "<tool>", "summary": "<template>"}``
+    with ``name`` a non-empty string and ``summary`` OPTIONAL — when present,
+    a non-empty string of at most 200 chars that also passes the
+    ``text_util.is_unsafe_text`` UNSAFE-TEXT predicate (must NOT be unsafe).
+    Any other shape (wrong type, empty name, non-string/empty/oversized/
+    unsafe summary, unknown object keys) is a plugin-author error: raises
+    ``StoreError(reason_code="protected_tools_invalid")``.
+
+    DUPLICATE names — equal AFTER ``text_util.sanitize_segment`` (the same
+    sanitization ``plugin_grants`` applies when deriving the runtime tool
+    id, so e.g. ``"do thing"`` and ``"do_thing"`` collide), across string
+    AND object forms, in any order — also raise ``protected_tools_invalid``;
+    there is no last-wins summary semantics.
+
+    Each of the THREE call sites decides what a raise means —
+    ``validate_manifest`` refuses an install/update, ``artifact_verdict``
+    excludes an already-stored artifact from resolution (per-plugin
+    degradation, never a whole-role failure), and
+    ``plugin_grants.protected_map`` excludes just that plugin's tools from
+    the map. B7 operator ruling: semantic typos (a declared name that
+    doesn't match a real tool) are an accepted plugin-author trust boundary
+    — this validates SHAPE only, never runtime MCP enumeration.
+
+    Returns a NORMALIZED list of ``{"name": str, "summary": str | None}``
+    (declaration order preserved); existing callers that only need names
+    adapt via ``[e["name"] for e in manifest_protected_tools(manifest)]``.
+    """
     casa = manifest.get("casa") if isinstance(manifest, dict) else None
     if not isinstance(casa, dict) or "protectedTools" not in casa:
         return []
     value = casa.get("protectedTools")
-    if not isinstance(value, list) or not all(
-        isinstance(t, str) and t for t in value
-    ):
+    if not isinstance(value, list):
         raise StoreError(
-            "casa.protectedTools must be a list of non-empty strings",
+            "casa.protectedTools must be a list",
             reason_code="protected_tools_invalid")
-    return list(value)
+
+    out: list[dict] = []
+    seen_segments: set[str] = set()
+    for entry in value:
+        if isinstance(entry, str):
+            name, summary = entry, None
+            if not name:
+                raise StoreError(
+                    "casa.protectedTools string entry must be non-empty",
+                    reason_code="protected_tools_invalid")
+        elif isinstance(entry, dict):
+            unknown = set(entry) - {"name", "summary"}
+            if unknown:
+                raise StoreError(
+                    f"casa.protectedTools object entry has unknown "
+                    f"key(s): {sorted(unknown)!r}",
+                    reason_code="protected_tools_invalid")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                raise StoreError(
+                    "casa.protectedTools object entry needs a non-empty "
+                    "string 'name'",
+                    reason_code="protected_tools_invalid")
+            if "summary" in entry:
+                summary = entry["summary"]
+                if (not isinstance(summary, str) or not summary
+                        or len(summary) > _PROTECTED_TOOL_SUMMARY_MAX_CHARS):
+                    raise StoreError(
+                        "casa.protectedTools object entry 'summary' must "
+                        "be a non-empty string of at most "
+                        f"{_PROTECTED_TOOL_SUMMARY_MAX_CHARS} chars",
+                        reason_code="protected_tools_invalid")
+                if is_unsafe_text(summary):
+                    raise StoreError(
+                        "casa.protectedTools object entry 'summary' "
+                        "contains an unsafe control/bidi/line-separator "
+                        "codepoint",
+                        reason_code="protected_tools_invalid")
+            else:
+                summary = None
+        else:
+            raise StoreError(
+                "casa.protectedTools entries must be a non-empty string "
+                "or an object with 'name'",
+                reason_code="protected_tools_invalid")
+
+        segment = sanitize_segment(name)
+        if segment in seen_segments:
+            raise StoreError(
+                f"casa.protectedTools has a duplicate tool after "
+                f"sanitization: {name!r}",
+                reason_code="protected_tools_invalid")
+        seen_segments.add(segment)
+        out.append({"name": name, "summary": summary})
+    return out
 
 
 def validate_manifest(root: Path, expected_name: str) -> dict:

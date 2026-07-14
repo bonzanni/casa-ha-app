@@ -883,7 +883,7 @@ def test_verify_enabled_specialist_still_graded(tmp_path, monkeypatch):
 
 def test_verify_shows_protected_tools(tmp_path):
     """A:§3.7 (B7): verify_plugin_state discloses the declared protected
-    tools list (eyeball-checkable)."""
+    tools list (eyeball-checkable) — legacy string entries, no summaries."""
     store = tmp_path / "store"
     e = entry("probe", ["specialist:finance"])
     mk_artifact(store, "probe", e["artifact_id"],
@@ -892,6 +892,7 @@ def test_verify_shows_protected_tools(tmp_path):
     r = _verify(tmp_path)
     assert r["ready"] is True
     assert r["protected_tools"] == ["a_tool", "b_tool"]      # sorted
+    assert r["protected_tool_summaries"] == {}
 
 
 def test_verify_absent_protected_tools_is_empty_list(tmp_path):
@@ -901,6 +902,7 @@ def test_verify_absent_protected_tools_is_empty_list(tmp_path):
     mk_registry(tmp_path, [e])
     r = _verify(tmp_path)
     assert r["protected_tools"] == []
+    assert r["protected_tool_summaries"] == {}
 
 
 def test_verify_malformed_protected_tools_not_green(tmp_path):
@@ -916,6 +918,32 @@ def test_verify_malformed_protected_tools_not_green(tmp_path):
     assert r["ready"] is False
     assert "protected_tools_invalid" in r["reasons"]
     assert r["protected_tools"] == []
+    assert r["protected_tool_summaries"] == {}
+
+
+def test_verify_shows_protected_tool_summaries_for_object_entries(tmp_path):
+    """v0.78.0 W1: object-form protectedTools entries surface their exact
+    template via the NEW protected_tool_summaries field (name -> template),
+    keeping protected_tools names-only. A mixed legacy string entry
+    contributes to protected_tools but not to protected_tool_summaries."""
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"], extra_manifest={"casa": {
+        "protectedTools": [
+            {"name": "invoice_reset",
+             "summary": "Delete the invoice draft for {period}"},
+            {"name": "no_summary_tool"},
+            "legacy_tool",
+        ],
+    }})
+    mk_registry(tmp_path, [e])
+    r = _verify(tmp_path)
+    assert r["ready"] is True
+    assert r["protected_tools"] == ["invoice_reset", "legacy_tool",
+                                    "no_summary_tool"]
+    assert r["protected_tool_summaries"] == {
+        "invoice_reset": "Delete the invoice draft for {period}",
+    }
 
 
 def test_verify_disabled_specialist_does_not_mask_config_failure(

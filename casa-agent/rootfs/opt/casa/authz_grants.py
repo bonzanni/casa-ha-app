@@ -25,11 +25,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+from text_util import is_unsafe_text
 
 logger = logging.getLogger(__name__)
 
@@ -247,21 +250,156 @@ def short_tool_name(tool_name: str) -> str:
     return tool_name
 
 
+# -- W2 challenge-renderer helpers ------------------------------------------
+#
+# Display-name render-time guard bound: a ``cfg.character.name`` longer than
+# this (or empty / UNSAFE-TEXT) falls back to the role string — a render-time
+# fallback, NEVER a validation error (character.yaml is operator-owned config
+# and must not brick a reload). 64 is ACCEPTED; 65 falls back (boundary).
+_DISPLAY_NAME_MAX = 64
+
+# Interpolated summary-value handling: a STRING value longer than this is
+# ellipsized to 77 + '…'; exactly 80 passes untouched (boundary).
+_SUMMARY_VALUE_MAX = 80
+_SUMMARY_ELLIPSIS_BODY = 77
+_SUMMARY_ELLIPSIS = "…"
+
+# A summary placeholder is EXACTLY ``{identifier}`` where identifier matches
+# this (Python-identifier-ish); ANY other brace syntax ⇒ fail-safe fallback.
+_SUMMARY_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _resolve_display_name(name: "str | None", role: str) -> str:
+    """Render-time guard (W2): return *name* when it is a safe, non-empty,
+    ≤ ``_DISPLAY_NAME_MAX``-char display name; otherwise fall back to *role*.
+    Never raises — the character schema permits arbitrary non-empty strings, so
+    the guard runs at render time and a bad name simply degrades to the role."""
+    if not name or len(name) > _DISPLAY_NAME_MAX or is_unsafe_text(name):
+        return role
+    return name
+
+
+def _render_summary_value(val: Any) -> "str | None":
+    """Render ONE canonical-arg value for summary interpolation, or ``None`` to
+    signal fallback. SCALARS ONLY (str/int/float/bool). ``bool`` renders
+    ``true``/``false`` to match the canonical JSON (never ``True``/``0``);
+    numbers render via ``json.dumps`` so they match the binding block exactly.
+    STRING values that are UNSAFE-TEXT or brace-bearing ⇒ ``None`` (the
+    no-leftover-braces guarantee applies to the FINAL output); > 80 chars ⇒ a
+    successful ellipsis (77 + '…'); exactly 80 passes untouched."""
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if isinstance(val, (int, float)):
+        return json.dumps(val)
+    if isinstance(val, str):
+        if is_unsafe_text(val) or "{" in val or "}" in val:
+            return None
+        if len(val) > _SUMMARY_VALUE_MAX:
+            return val[:_SUMMARY_ELLIPSIS_BODY] + _SUMMARY_ELLIPSIS
+        return val
+    return None
+
+
+def _interpolate_summary(template: str, args: dict) -> "str | None":
+    """Fail-safe literal substitutor (deliberately NOT ``str.format`` — Sol
+    r1-3). Scan for ``{identifier}`` tokens and replace each with its scalar
+    canonical-arg value. Returns the interpolated string, or ``None`` when the
+    caller must fall back to the v0.77 headline.
+
+    ANY of the following ⇒ ``None``: a lone/unmatched ``{`` or ``}``; an
+    escaped ``{{`` / ``}}``; a conversion (``{x!r}``), format spec
+    (``{x:>10}``), indexing (``{x[0]}``), or attribute access (``{x.y}``); a
+    placeholder that does not resolve to a key; a non-scalar / unsafe /
+    brace-bearing value; or ANY leftover brace in the final output."""
+    out: list[str] = []
+    i = 0
+    n = len(template)
+    while i < n:
+        ch = template[i]
+        if ch == "}":
+            return None  # lone/unmatched (or escaped '}}') closing brace
+        if ch == "{":
+            j = template.find("}", i + 1)
+            if j == -1:
+                return None  # unmatched '{'
+            inner = template[i + 1:j]
+            if _SUMMARY_IDENT_RE.fullmatch(inner) is None:
+                # '{{', '{}', '{x!r}', '{x:>10}', '{x[0]}', '{x.y}', '{a{b}' …
+                return None
+            if inner not in args:
+                return None  # placeholder does not resolve
+            rendered = _render_summary_value(args[inner])
+            if rendered is None:
+                return None  # non-scalar / unsafe / brace-bearing value
+            out.append(rendered)
+            i = j + 1
+            continue
+        out.append(ch)
+        i += 1
+    result = "".join(out)
+    if "{" in result or "}" in result:
+        return None  # defensive: no leftover braces in the FINAL output
+    if is_unsafe_text(result):
+        # Belt-and-suspenders: the template is UNSAFE-TEXT-validated at install
+        # time (W1), but a control/bidi codepoint from the template text itself
+        # (never from a value — those are pre-checked) must still never render.
+        return None
+    return result
+
+
+def _interpolated_summary_or_none(
+    summary: "str | None", canonical_json: str,
+) -> "str | None":
+    """Parse ``canonical_json`` back into the canonical args and interpolate
+    *summary* against them (``None`` when there is no summary, the JSON is not
+    a top-level object, or interpolation fails). The args come from the SAME
+    canonical string shown in the binding block, so the sentence can never
+    disagree with the exact-action block."""
+    if not summary:
+        return None
+    try:
+        args = json.loads(canonical_json)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(args, dict):
+        return None
+    return _interpolate_summary(summary, args)
+
+
 def render_challenge_message(
     *, tool_name: str, enforcement_role: str, canonical_json: str,
+    summary: "str | None" = None, display_name: "str | None" = None,
 ) -> str:
-    """Render the operator-facing challenge body: a humanized header naming
-    the SHORT tool name, then the FULL canonical args in a fenced block, then
-    the FULL tool id on its own line (B8: both the canonical args and the
-    complete tool id stay verbatim in the message). Size is measured on THIS
-    string (``get_or_create`` refuses when it exceeds ``_CHALLENGE_MAX_CHARS``).
-    """
+    """Render the operator-facing challenge body (W2).
+
+    When a plugin-declared *summary* template exists AND interpolates cleanly
+    against the canonical args, the headline leads with the agent's display
+    name and a plain-language sentence, then DEMOTES the exact action (the FULL
+    canonical args in a fenced block) below, then the FULL tool id. Otherwise
+    it falls back to the v0.77-form headline (still name-led). BOTH forms keep
+    the canonical args and the complete tool id verbatim (B8); size is measured
+    on THIS string (``get_or_create`` refuses over ``_CHALLENGE_MAX_CHARS``).
+
+    *display_name* is the CURRENT ``cfg.character.name`` threaded from the
+    AuthzDeps factory; it passes through ``_resolve_display_name`` (empty / >64
+    / UNSAFE-TEXT ⇒ the role string). Sent WITHOUT ``parse_mode`` — there is no
+    Markdown/entity escaping here (pinned by a test)."""
     short = short_tool_name(tool_name)
+    display = _resolve_display_name(display_name, enforcement_role)
+    interpolated = _interpolated_summary_or_none(summary, canonical_json)
+    if interpolated is not None:
+        return (
+            "\U0001F510 Approval needed\n\n"
+            f"{display} ({enforcement_role}) wants to: {interpolated}\n\n"
+            "Exact action (binding):\n"
+            f"```\n{canonical_json}\n```\n"
+            f"Tool id: {tool_name}"
+        )
     return (
         "\U0001F510 Approval needed\n\n"
-        f"{enforcement_role} wants to run {short} with EXACTLY these "
-        "arguments:\n\n"
-        f"```\n{canonical_json}\n```\n\n"
+        f"{display} ({enforcement_role}) wants to run {short} with EXACTLY "
+        "these arguments:\n\n"
+        f"```\n{canonical_json}\n```\n"
         f"Tool id: {tool_name}"
     )
 
@@ -354,6 +492,7 @@ class ChallengeCoordinator:
         self, key: GrantKey, *, chat_id: int, operator_id: int,
         target_role: str, tool_name: str, canonical_json: str,
         enforcement_role: str, channel: Any,
+        summary: "str | None" = None, display_name: "str | None" = None,
     ) -> ChallengeHandle:
         existing = self._entries.get(key)
         if existing is not None:
@@ -361,9 +500,13 @@ class ChallengeCoordinator:
 
         # Rendering + size validation runs BEFORE any insert [A:§3.4]:
         # oversized -> refused handle, NO entry, NO keyboard, NO registration.
+        # The plugin-declared *summary* + the current *display_name* are
+        # captured here (W2) into the challenge render AND, below, the
+        # settlement finish hook.
         challenge_text = render_challenge_message(
             tool_name=tool_name, enforcement_role=enforcement_role,
-            canonical_json=canonical_json,
+            canonical_json=canonical_json, summary=summary,
+            display_name=display_name,
         )
         if len(challenge_text) > _CHALLENGE_MAX_CHARS:
             return ChallengeHandle(created=True, refused="args_too_large")
@@ -422,6 +565,7 @@ class ChallengeCoordinator:
                 target_role=target_role, enforcement_role=enforcement_role,
                 tool_name=tool_name, canonical_json=canonical_json,
                 rid=rid, message_id=message_id, req=req,
+                display_name=display_name,
             )
 
         # Spawn the owned SETUP DRIVER (strong-ref'd): it does ONLY the
@@ -464,8 +608,12 @@ class ChallengeCoordinator:
         self, *, channel: Any, chat_id: int, operator_id: int,
         target_role: str, enforcement_role: str, tool_name: str,
         canonical_json: str, rid: str, message_id: int, req: Any,
+        display_name: "str | None" = None,
     ) -> Callable[[dict], Any]:
         short = short_tool_name(tool_name)
+        # Same render-time guard as the challenge headline (W2): the approved
+        # settlement names the agent; deny/expired are name-free by decision.
+        display = _resolve_display_name(display_name, enforcement_role)
 
         async def _finish(outcome: dict) -> None:
             o = outcome.get("outcome") if isinstance(outcome, dict) else None
@@ -490,8 +638,8 @@ class ChallengeCoordinator:
                 # ONLY on dispatch failure (ordered inside this one hook task).
                 await channel.edit_dm_message(
                     chat_id, message_id,
-                    f"✅ Approved — {enforcement_role} may run {short} "
-                    "once with exactly these arguments",
+                    f"✅ Approved — {display} ({enforcement_role}) may run "
+                    f"{short} once with exactly these arguments",
                 )
                 ok = await channel._dispatch_button_continuation(
                     chat_id=chat_id, user_id=operator_id,
@@ -621,6 +769,10 @@ class AuthzDeps:
     channel: Any
     grants: GrantStore
     challenges: ChallengeCoordinator
+    # CURRENT ``cfg.character.name`` (W2) — resolved LAZILY at call time by the
+    # factory so a reload's new name surfaces on the next challenge; ``None`` /
+    # empty / unsafe falls back to the role string at render time.
+    display_name: "str | None" = None
 
 
 # Deny reasons — one source of truth (tests assert on these exact strings).
@@ -651,17 +803,20 @@ _DENY_INTERNAL = "internal authorization error — the call was not executed"
 
 def make_resident_authz_hook(
     role: str,
-    protected: dict[str, str],
+    protected: dict[str, dict],
     deps_factory: "Callable[[], AuthzDeps | None]",
 ) -> "Callable":
     """Build the fail-closed PreToolUse authz hook for one resident/specialist.
 
     ``role`` is the agent's own (plain, tier-stripped) role — asserted equal to
     ``origin.execution_role`` as defense in depth and used as
-    ``GrantKey.enforcement_role``. ``protected`` maps each full tool name to the
-    resolved plugin ``artifact_id`` (from ``plugin_grants.protected_map`` over
-    the SAME ``ResolutionResult`` used to build the agent's options — a
+    ``GrantKey.enforcement_role``. ``protected`` maps each full tool name to
+    ``{"artifact_id": ..., "summary": ...}`` (from ``plugin_grants.protected_map``
+    over the SAME ``ResolutionResult`` used to build the agent's options — a
     mid-TTL plugin update changes the artifact and invalidates the grant).
+    This hook consumes ONLY ``artifact_id`` — exactly as before v0.78.0, no
+    grant/GrantKey/enforcement change; ``summary`` is advisory copy threaded
+    to the challenge render by the coordinator (W2), not read here.
     ``deps_factory`` resolves the Telegram channel + stores LAZILY at call time;
     ``None`` (no DM reachable) is the unsupported-origin deny.
 
@@ -735,7 +890,8 @@ def make_resident_authz_hook(
 
             key = GrantKey(
                 operator_id=operator_id, chat_id=chat_id,
-                enforcement_role=role, artifact_id=protected[tool_name],
+                enforcement_role=role,
+                artifact_id=protected[tool_name]["artifact_id"],
                 tool_name=tool_name, args_hash=args_hash,
             )
 
@@ -753,6 +909,8 @@ def make_resident_authz_hook(
                 target_role=origin.get("role"), tool_name=tool_name,
                 canonical_json=canonical_json, enforcement_role=role,
                 channel=deps.channel,
+                summary=protected[tool_name].get("summary"),
+                display_name=deps.display_name,
             )
             if handle.refused == "args_too_large":
                 return _deny(_DENY_UNRENDERABLE)
@@ -775,7 +933,9 @@ def make_resident_authz_hook(
                 tool_name, role)
             return _deny(_DENY_INTERNAL)
 
-    # Marker so the options-build wiring tests can identify the appended matcher
-    # without depending on the closure's name.
+    # Markers so the options-build wiring tests can identify the appended
+    # matcher (without depending on the closure's name) and exercise the
+    # display-name factory threaded through both AuthzDeps factory sites.
     _hook._casa_authz_role = role  # type: ignore[attr-defined]
+    _hook._casa_authz_deps_factory = deps_factory  # type: ignore[attr-defined]
     return _hook

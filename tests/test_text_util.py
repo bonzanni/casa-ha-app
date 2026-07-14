@@ -1,4 +1,5 @@
-"""Tests for casa.text_util.truncate_for_topic.
+"""Tests for casa.text_util: truncate_for_topic, sanitize_segment, and the
+pinned UNSAFE-TEXT predicate (is_unsafe_text) added in v0.78.0 W1.
 
 Telegram's createForumTopic name parameter is limited to ~128 bytes
 (per Bot API). The helper must respect this BYTE budget (not char),
@@ -10,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from text_util import truncate_for_topic
+from text_util import is_unsafe_text, sanitize_segment, truncate_for_topic
 
 
 def test_truncate_short_text_passes_through():
@@ -74,3 +75,77 @@ def test_truncate_single_long_word():
     assert len(out.encode("utf-8")) <= 10
     # First chars must be a prefix of the original word.
     assert text.startswith(out[:-1])
+
+
+# --- sanitize_segment (moved here from plugin_grants in v0.78.0 W1;
+# re-exported by plugin_grants for its existing callers/tests) -------------
+
+
+def test_sanitize_segment_keeps_hyphens_and_underscores():
+    assert sanitize_segment("lesina-invoice") == "lesina-invoice"
+    assert sanitize_segment("a_b-c9") == "a_b-c9"
+
+
+def test_sanitize_segment_replaces_other_chars():
+    assert sanitize_segment("my plugin.v2") == "my_plugin_v2"
+
+
+# --- is_unsafe_text: pinned UNSAFE-TEXT predicate (v0.78.0 W1/W2 design) ---
+
+
+def test_is_unsafe_text_safe_ascii_and_unicode_pass():
+    assert is_unsafe_text("hello world") is False
+    assert is_unsafe_text("Delete the draft for {period} — café") is False
+    assert is_unsafe_text("") is False
+
+
+@pytest.mark.parametrize("codepoint", [
+    0x0000,   # C0: NUL
+    0x0009,   # C0: TAB
+    0x000A,   # C0: newline
+    0x000D,   # C0: CR
+    0x001F,   # C0: last C0 codepoint
+])
+def test_is_unsafe_text_c0_group(codepoint):
+    assert is_unsafe_text(f"pre{chr(codepoint)}post") is True
+
+
+@pytest.mark.parametrize("codepoint", [0x007F, 0x0080, 0x009F])
+def test_is_unsafe_text_c1_group(codepoint):
+    assert is_unsafe_text(f"pre{chr(codepoint)}post") is True
+
+
+def test_is_unsafe_text_line_paragraph_separators():
+    assert is_unsafe_text(f"pre{chr(0x2028)}post") is True  # U+2028
+    assert is_unsafe_text(f"pre{chr(0x2029)}post") is True  # U+2029
+
+
+def test_is_unsafe_text_arabic_letter_mark():
+    assert is_unsafe_text(f"pre{chr(0x061C)}post") is True  # U+061C
+
+
+@pytest.mark.parametrize("codepoint", [0x200E, 0x200F])
+def test_is_unsafe_text_lrm_rlm_group(codepoint):
+    assert is_unsafe_text(f"pre{chr(codepoint)}post") is True
+
+
+@pytest.mark.parametrize("codepoint", [0x202A, 0x202B, 0x202C, 0x202D, 0x202E])
+def test_is_unsafe_text_bidi_embedding_override_group(codepoint):
+    assert is_unsafe_text(f"pre{chr(codepoint)}post") is True
+
+
+@pytest.mark.parametrize("codepoint", [0x2066, 0x2067, 0x2068, 0x2069])
+def test_is_unsafe_text_bidi_isolate_group(codepoint):
+    assert is_unsafe_text(f"pre{chr(codepoint)}post") is True
+
+
+def test_is_unsafe_text_boundary_just_outside_ranges_is_safe():
+    """Codepoints immediately adjacent to a pinned range must NOT trigger —
+    guards against an off-by-one in the range table."""
+    assert is_unsafe_text(chr(0x0020)) is False   # just after C0 (space)
+    assert is_unsafe_text(chr(0x007E)) is False   # just before C1 (~)
+    assert is_unsafe_text(chr(0x00A0)) is False   # just after C1
+    assert is_unsafe_text(chr(0x2027)) is False   # just before U+2028
+    assert is_unsafe_text(chr(0x202F)) is False   # just after bidi embed group
+    assert is_unsafe_text(chr(0x2065)) is False   # just before bidi isolates
+    assert is_unsafe_text(chr(0x206A)) is False   # just after bidi isolates

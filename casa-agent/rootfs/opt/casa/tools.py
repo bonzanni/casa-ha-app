@@ -814,7 +814,15 @@ def _build_specialist_options(cfg, *, resolution=None) -> ClaudeAgentOptions:
                   if _channel_manager is not None else None)
             if ch is None:
                 return None  # no DM reachable ⇒ unsupported-origin deny
-            return AuthzDeps(channel=ch, grants=GRANTS, challenges=CHALLENGES)
+            # Read the CURRENT loaded character name at call time (W2); a
+            # specialist reload rebuilds cfg, so the next challenge names the
+            # new display name. Defensive getattr: unusual cfgs degrade to the
+            # role string at render time, never raise.
+            _char = getattr(cfg, "character", None)
+            return AuthzDeps(
+                channel=ch, grants=GRANTS, challenges=CHALLENGES,
+                display_name=getattr(_char, "name", None),
+            )
 
         resolved_hooks["PreToolUse"] = [
             *resolved_hooks.get("PreToolUse", []),
@@ -4485,11 +4493,20 @@ def _tool_verify_plugin_state(
     # field already surfaced as a blocking "protected_tools_invalid" reason
     # above (via artifact_verdict); this is purely informational disclosure
     # of the declared list, tolerant of that same malformed case.
+    # v0.78.0 W1: manifest_protected_tools now returns a NORMALIZED
+    # [{"name", "summary"}] list. `protected_tools` KEEPS its existing
+    # machine-readable names-only contract; the new `protected_tool_summaries`
+    # field (below) surfaces the declared templates for entries that have one,
+    # so the trusted template text is eyeball-checkable too.
     try:
-        protected_tools = (plugin_store.manifest_protected_tools(manifest)
-                           if checksum_valid else [])
+        protected_entries = (plugin_store.manifest_protected_tools(manifest)
+                             if checksum_valid else [])
     except plugin_store.StoreError:
-        protected_tools = []
+        protected_entries = []
+    protected_tools = [e["name"] for e in protected_entries]
+    protected_tool_summaries = {
+        e["name"]: e["summary"] for e in protected_entries if e.get("summary")
+    }
 
     # Tools (system-requirements — verify_bin presence). Sol #11: check BOTH the
     # INSTALLED manifest rows AND every requirement the ARTIFACT declares, so a
@@ -4679,6 +4696,7 @@ def _tool_verify_plugin_state(
         "secrets": secrets_status,
         "granted_tools": granted,
         "protected_tools": sorted(protected_tools),
+        "protected_tool_summaries": protected_tool_summaries,
         "targets": target_rows,
         "stale_targets": stale_targets,
         "sessions_on_previous_artifact": sessions,

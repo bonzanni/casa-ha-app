@@ -221,7 +221,7 @@ def test_protected_map_single_server(tmp_path):
     res = ResolutionResult(registry_valid=True, plugins=[rp])
     assert protected_map(res) == {
         "mcp__plugin_lesina-invoice_lesina-invoice__invoice_reset":
-            "0" * 64,
+            {"artifact_id": "0" * 64, "summary": None},
     }
 
 
@@ -234,8 +234,10 @@ def test_protected_map_expands_across_two_declared_servers(tmp_path):
         artifact_id="a" * 64)
     res = ResolutionResult(registry_valid=True, plugins=[rp])
     assert protected_map(res) == {
-        "mcp__plugin_multi_alpha__do_thing": "a" * 64,
-        "mcp__plugin_multi_beta__do_thing": "a" * 64,
+        "mcp__plugin_multi_alpha__do_thing": {"artifact_id": "a" * 64,
+                                              "summary": None},
+        "mcp__plugin_multi_beta__do_thing": {"artifact_id": "a" * 64,
+                                             "summary": None},
     }
 
 
@@ -245,7 +247,8 @@ def test_protected_map_sanitizes_segments(tmp_path):
         manifest={"casa": {"protectedTools": ["do the thing"]}})
     res = ResolutionResult(registry_valid=True, plugins=[rp])
     assert protected_map(res) == {
-        "mcp__plugin_weird-name_srv_one_two__do_the_thing": "0" * 64,
+        "mcp__plugin_weird-name_srv_one_two__do_the_thing":
+            {"artifact_id": "0" * 64, "summary": None},
     }
 
 
@@ -263,8 +266,27 @@ def test_protected_map_per_plugin_degradation(tmp_path, caplog):
     res = ResolutionResult(registry_valid=True, plugins=[good, bad])
     with caplog.at_level(logging.WARNING, logger="plugin_grants"):
         out = protected_map(res)
-    assert out == {"mcp__plugin_good_good__safe_tool": "a" * 64}
+    assert out == {"mcp__plugin_good_good__safe_tool":
+                   {"artifact_id": "a" * 64, "summary": None}}
     assert any("bad" in r.message for r in caplog.records)
+
+
+def test_protected_map_object_entry_carries_summary(tmp_path):
+    """v0.78.0 W1: an object-form protectedTools entry with a summary
+    threads it into the map value alongside artifact_id."""
+    rp = _artifact(
+        tmp_path, "lesina-invoice", {"lesina-invoice": {"command": "node"}},
+        manifest={"casa": {"protectedTools": [
+            {"name": "invoice_reset",
+             "summary": "Delete the invoice draft for {period}"},
+        ]}})
+    res = ResolutionResult(registry_valid=True, plugins=[rp])
+    assert protected_map(res) == {
+        "mcp__plugin_lesina-invoice_lesina-invoice__invoice_reset": {
+            "artifact_id": "0" * 64,
+            "summary": "Delete the invoice draft for {period}",
+        },
+    }
 
 
 def test_protected_map_no_servers_contributes_nothing(tmp_path):

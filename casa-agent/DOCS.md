@@ -493,6 +493,23 @@ mints a grant that is:
 You'll see this for actions a plugin author has flagged as consequential.
 Deny leaves the call refused with no grant issued.
 
+A plugin author can also upgrade the approval prompt's headline to a
+plain-language action sentence (the exact arguments and tool id always
+remain visible below it), by pairing the tool name with a `summary`
+template in the manifest:
+
+```json
+"casa": {
+  "protectedTools": [
+    {"name": "invoice_reset", "summary": "Delete the invoice draft for {period}"}
+  ]
+}
+```
+
+`{period}` is filled in from that call's own arguments, so the prompt reads
+"Alex (finance) wants to: Delete the invoice draft for 2025-05" — the exact
+arguments still always appear below, unabridged.
+
 ### Disk usage
 
 The store lives on `/config` (the `addon_config` volume), so artifacts persist
@@ -520,8 +537,13 @@ separate, later hardening item.
 The registry (`/config/plugins/registry.json`) is the single source of truth. On
 a fresh install Casa seeds it with the bundled default plugins; a newer release
 adds any newly-introduced defaults on the next boot, and a default you remove is
-never re-added. Rollback is safe: the registry format is stable across releases,
-so downgrading the app image reads the same registry as before.
+never re-added. Rollback is safe — the registry format is stable across
+releases, so a downgraded app image reads the same registry as before —
+with one boundary: a plugin version whose manifest uses the object form of
+`casa.protectedTools` (with a `summary`, introduced in 0.78.0) is rejected
+by pre-0.78.0 releases as invalid and excluded from loading; downgrade the
+plugin to its last string-form release before (or after) downgrading the
+app past 0.78.0.
 
 ### Troubleshooting
 

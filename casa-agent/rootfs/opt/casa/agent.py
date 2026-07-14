@@ -841,7 +841,13 @@ class Agent:
                 ch = _cm.get("telegram") if _cm is not None else None
                 if ch is None:
                     return None  # no DM reachable ⇒ unsupported-origin deny
-                return AuthzDeps(channel=ch, grants=GRANTS, challenges=CHALLENGES)
+                # Read the CURRENT loaded character name at call time (W2) — a
+                # reload swaps self.config, so the next challenge names the new
+                # display name; never a boot-time snapshot.
+                return AuthzDeps(
+                    channel=ch, grants=GRANTS, challenges=CHALLENGES,
+                    display_name=self.config.character.name,
+                )
 
             hooks["PreToolUse"] = [
                 *hooks.get("PreToolUse", []),

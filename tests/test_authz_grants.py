@@ -6,6 +6,7 @@ wiring.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import threading
 from pathlib import Path
@@ -426,14 +427,23 @@ class TestShortToolName:
 
 
 class TestRenderChallengeMessage:
-    def test_header_names_enforcement_role_and_short_tool_name(self):
+    def test_header_names_display_role_and_short_tool_name(self):
         text = render_challenge_message(
             tool_name="mcp__plugin_p_s__invoice_reset",
             enforcement_role="finance",
-            canonical_json='{"id":"INV-1"}',
+            canonical_json='{"id":"INV-1"}', display_name="Alex",
         )
-        assert "finance wants to run invoice_reset" in text
+        assert "Alex (finance) wants to run invoice_reset" in text
         assert text.startswith("\U0001F510 Approval needed")
+
+    def test_no_display_name_falls_back_to_role_in_both_parens(self):
+        """Legacy/absent display name ⇒ the render-time guard substitutes the
+        role string, giving ``{role} ({role})`` (Part 2 fallback proof)."""
+        text = render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json="{}",
+        )
+        assert "finance (finance) wants to run invoice_reset" in text
 
     def test_canonical_json_embedded_verbatim_in_fenced_block(self):
         canonical = '{"amount":10,"id":"INV-1"}'
@@ -454,9 +464,9 @@ class TestRenderChallengeMessage:
     def test_plain_tool_name_short_and_full_are_identical_but_both_present(self):
         text = render_challenge_message(
             tool_name="invoice_reset", enforcement_role="finance",
-            canonical_json="{}",
+            canonical_json="{}", display_name="Alex",
         )
-        assert "finance wants to run invoice_reset" in text
+        assert "Alex (finance) wants to run invoice_reset" in text
         assert "Tool id: invoice_reset" in text
 
     def test_size_gate_measures_the_rendered_string(self):
@@ -469,6 +479,201 @@ class TestRenderChallengeMessage:
             canonical_json=huge,
         )
         assert len(text) > _CHALLENGE_MAX_CHARS
+
+    def test_fallback_form_is_exact_pinned_string(self):
+        """Pinned fallback challenge (no/failed summary), byte for byte."""
+        text = render_challenge_message(
+            tool_name="mcp__plugin_p_s__invoice_reset",
+            enforcement_role="finance", canonical_json='{"id":"INV-1"}',
+            display_name="Alex",
+        )
+        assert text == (
+            "\U0001F510 Approval needed\n\n"
+            "Alex (finance) wants to run invoice_reset with EXACTLY these "
+            "arguments:\n\n"
+            "```\n{\"id\":\"INV-1\"}\n```\n"
+            "Tool id: mcp__plugin_p_s__invoice_reset"
+        )
+
+    def test_summarized_form_is_exact_pinned_string(self):
+        """Pinned summarized challenge, byte for byte."""
+        text = render_challenge_message(
+            tool_name="mcp__plugin_p_s__invoice_reset",
+            enforcement_role="finance", canonical_json='{"period":"2025-05"}',
+            summary="Delete the invoice draft for {period}",
+            display_name="Alex",
+        )
+        assert text == (
+            "\U0001F510 Approval needed\n\n"
+            "Alex (finance) wants to: Delete the invoice draft for 2025-05\n\n"
+            "Exact action (binding):\n"
+            "```\n{\"period\":\"2025-05\"}\n```\n"
+            "Tool id: mcp__plugin_p_s__invoice_reset"
+        )
+
+    def test_no_parse_mode_no_escaping_markdown_metachars_pass_through(self):
+        """No parse_mode is used: the renderer must NOT HTML/Markdown-escape.
+        A canonical block with backticks/underscores/asterisks stays verbatim
+        (the challenge is posted without parse_mode — pinned here)."""
+        canonical = '{"note":"a_*b*_ `c`"}'
+        text = render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json=canonical, display_name="Alex",
+        )
+        assert canonical in text
+        assert "&" not in text  # no HTML entity escaping
+        assert "\\" not in text  # no Markdown backslash escaping
+
+
+class TestSummaryInterpolationFailSafe:
+    """The literal substitutor is deliberately NOT ``str.format``: any brace
+    syntax other than a bare ``{identifier}`` — or any unresolved / non-scalar
+    / unsafe / brace-bearing value — falls back to the v0.77 headline. Each
+    fail class is pinned by asserting the SUMMARIZED wording is absent."""
+
+    def _render(self, summary, canonical='{"x":"y"}'):
+        return render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json=canonical, summary=summary, display_name="Alex",
+        )
+
+    def _is_summarized(self, text):
+        return "wants to: " in text and "Exact action (binding):" in text
+
+    def test_happy_path_interpolates(self):
+        text = self._render("do {x}")
+        assert self._is_summarized(text)
+        assert "wants to: do y" in text
+
+    def test_missing_key_falls_back(self):
+        assert not self._is_summarized(self._render("do {absent}"))
+
+    def test_non_scalar_value_falls_back(self):
+        assert not self._is_summarized(
+            self._render("do {x}", canonical='{"x":{"n":1}}'))
+
+    def test_conversion_bang_r_falls_back(self):
+        assert not self._is_summarized(self._render("do {x!r}"))
+
+    def test_format_spec_falls_back(self):
+        assert not self._is_summarized(self._render("do {x:>10}"))
+
+    def test_indexing_falls_back(self):
+        assert not self._is_summarized(self._render("do {x[0]}"))
+
+    def test_attribute_access_falls_back(self):
+        assert not self._is_summarized(self._render("do {x.y}"))
+
+    def test_nested_braces_fall_back(self):
+        assert not self._is_summarized(self._render("do {a{x}}"))
+
+    def test_unmatched_open_brace_falls_back(self):
+        assert not self._is_summarized(self._render("do {x"))
+
+    def test_unmatched_close_brace_falls_back(self):
+        assert not self._is_summarized(self._render("do x}"))
+
+    def test_escaped_double_brace_falls_back(self):
+        assert not self._is_summarized(self._render("do {{x}}"))
+
+    def test_interpolated_value_with_open_brace_falls_back(self):
+        assert not self._is_summarized(
+            self._render("do {x}", canonical='{"x":"a{b"}'))
+
+    def test_interpolated_value_with_close_brace_falls_back(self):
+        assert not self._is_summarized(
+            self._render("do {x}", canonical='{"x":"a}b"}'))
+
+    def test_unsafe_unicode_interpolated_value_falls_back(self):
+        # U+2028 line separator in the arg value (built via json.dumps so
+        # no raw control/bidi glyph lives in the test source).
+        canonical = json.dumps({"x": "a" + chr(0x2028) + "b"},
+                               ensure_ascii=False, separators=(",", ":"))
+        assert not self._is_summarized(self._render("do {x}", canonical=canonical))
+
+    def test_bool_renders_true_false_lowercase(self):
+        text = self._render("flag {x}", canonical='{"x":true}')
+        assert "wants to: flag true" in text
+        text2 = self._render("flag {x}", canonical='{"x":false}')
+        assert "wants to: flag false" in text2
+
+    def test_int_value_renders_matching_canonical(self):
+        text = self._render("n {x}", canonical='{"x":10}')
+        assert "wants to: n 10" in text
+
+    def test_string_value_exactly_80_untouched(self):
+        v = "a" * 80
+        text = self._render("v {x}", canonical=f'{{"x":"{v}"}}')
+        assert f"wants to: v {v}" in text  # no ellipsis
+
+    def test_string_value_81_ellipsized_to_77_plus_ellipsis(self):
+        v = "a" * 81
+        text = self._render("v {x}", canonical=f'{{"x":"{v}"}}')
+        assert f"wants to: v {'a' * 77}…" in text
+
+
+class TestSummaryTemplateUnsafeUnicodeFallback:
+    """A template carrying an UNSAFE-TEXT codepoint is refused at install time
+    (W1); should one still reach the renderer, each disjoint UNSAFE-TEXT group
+    makes interpolation fall back rather than emit a control/bidi glyph."""
+
+    def _summarized(self, template):
+        text = render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json='{"x":"y"}', summary=template, display_name="Alex",
+        )
+        return "wants to: " in text and "Exact action (binding):" in text
+
+    def test_c0_control_template_falls_back(self):
+        assert not self._summarized("do \x01 {x}")
+
+    def test_c1_control_template_falls_back(self):
+        assert not self._summarized("do \x85 {x}")
+
+    def test_u2028_line_separator_template_falls_back(self):
+        assert not self._summarized("do " + chr(0x2028) + " {x}")
+
+    def test_u2029_paragraph_separator_template_falls_back(self):
+        assert not self._summarized("do " + chr(0x2029) + " {x}")
+
+    def test_u061c_arabic_letter_mark_template_falls_back(self):
+        assert not self._summarized("do " + chr(0x61c) + " {x}")
+
+    def test_u200e_lrm_template_falls_back(self):
+        assert not self._summarized("do " + chr(0x200e) + " {x}")
+
+    def test_u202e_bidi_override_template_falls_back(self):
+        assert not self._summarized("do " + chr(0x202e) + " {x}")
+
+    def test_u2066_bidi_isolate_template_falls_back(self):
+        assert not self._summarized("do " + chr(0x2066) + " {x}")
+
+
+class TestDisplayNameRenderGuard:
+    def _render(self, display_name):
+        return render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json="{}", display_name=display_name,
+        )
+
+    def test_name_present_used_verbatim(self):
+        assert "Alex (finance)" in self._render("Alex")
+
+    def test_empty_name_falls_back_to_role(self):
+        assert "finance (finance)" in self._render("")
+
+    def test_none_name_falls_back_to_role(self):
+        assert "finance (finance)" in self._render(None)
+
+    def test_unsafe_name_falls_back_to_role(self):
+        assert "finance (finance)" in self._render("Al" + chr(0x202E) + "ex")
+
+    def test_length_64_accepted(self):
+        name = "N" * 64
+        assert f"{name} (finance)" in self._render(name)
+
+    def test_length_65_falls_back(self):
+        assert "finance (finance)" in self._render("N" * 65)
 
 
 class TestChallengeExpiredText:
@@ -569,7 +774,7 @@ def _fresh_env(monkeypatch, *, ttl=None, log=None):
 def _create(coord, channel, key=None, *, chat_id=100, operator_id=7,
             target_role="finance-full", tool_name="invoice_reset",
             canonical_json='{"amount":10,"id":"INV-1"}',
-            enforcement_role="finance"):
+            enforcement_role="finance", summary=None, display_name=None):
     if key is None:
         key = _key(chat_id=chat_id, enforcement_role=enforcement_role,
                    tool_name=tool_name, args_hash=canonical_args_hash({"x": 1}))
@@ -577,6 +782,7 @@ def _create(coord, channel, key=None, *, chat_id=100, operator_id=7,
         key, chat_id=chat_id, operator_id=operator_id, target_role=target_role,
         tool_name=tool_name, canonical_json=canonical_json,
         enforcement_role=enforcement_role, channel=channel,
+        summary=summary, display_name=display_name,
     )
     return key, handle
 
@@ -668,12 +874,34 @@ class TestChallengeAtomicRegistration:
         key, handle = _create(
             coord, channel, tool_name="invoice_reset",
             enforcement_role="finance", canonical_json=canonical,
+            summary="reset invoice {id}", display_name="Alex",
         )
         await handle.settled_post()
+        # The posted keyboard text is EXACTLY what render_challenge_message
+        # renders with the SAME summary + display name threaded through.
         assert channel.posts[0][2] == render_challenge_message(
             tool_name="invoice_reset", enforcement_role="finance",
-            canonical_json=canonical,
+            canonical_json=canonical, summary="reset invoice {id}",
+            display_name="Alex",
         )
+
+    async def test_summary_inflated_message_over_ceiling_is_refused(
+        self, monkeypatch,
+    ):
+        """B8: the size gate measures the WHOLE rendered string, so a summary
+        that interpolates a huge value can push it over the ceiling — refused,
+        NO entry, NO keyboard."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        big = "x" * 4000
+        canonical = json.dumps({"blob": big}, separators=(",", ":"))
+        key, handle = _create(
+            coord, channel, tool_name="invoice_reset",
+            enforcement_role="finance", canonical_json=canonical,
+            summary="do {blob}", display_name="Alex",
+        )
+        assert handle.refused == "args_too_large"
+        assert channel.posts == []
+        assert key not in coord._entries
 
 
 class TestSettledPostClassification:
@@ -895,8 +1123,24 @@ class TestAuthzFinishHook:
         ch = coord._entries[key]
         _tap(broker, ch, 0)
         await _settle()
+        # No display name threaded ⇒ render-time guard substitutes the role.
         assert channel.edits[-1][2] == (
-            "✅ Approved — finance may run invoice_reset once with "
+            "✅ Approved — finance (finance) may run invoice_reset once with "
+            "exactly these arguments"
+        )
+
+    async def test_approved_edit_names_display_name_when_threaded(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel, tool_name="invoice_reset",
+                               enforcement_role="finance", display_name="Alex")
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 0)
+        await _settle()
+        assert channel.edits[-1][2] == (
+            "✅ Approved — Alex (finance) may run invoice_reset once with "
             "exactly these arguments"
         )
 
@@ -954,6 +1198,29 @@ class TestAuthzFinishHook:
             "⚠️ Denied, but delivery to finance-full failed — "
             "say 'retry' in chat"
         )
+
+    async def test_delegated_delivery_failure_names_originating_resident(
+        self, monkeypatch,
+    ):
+        """r3-2: the delivery-failure overwrite reports failure to
+        ``target_role`` — the ORIGINATING resident (e.g. Ellen) — verbatim
+        v0.77 bytes, and the EXECUTING specialist's display name ('Alex') does
+        NOT appear in it."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.dispatch_result = False
+        key, handle = _create(
+            coord, channel, tool_name="invoice_reset",
+            enforcement_role="finance", target_role="assistant",
+            display_name="Alex",
+        )
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 0)
+        await _settle()
+        assert channel.edits[-1][2] == (
+            "⚠️ Approved, but delivery to assistant failed — say 'retry' in chat"
+        )
+        assert "Alex" not in channel.edits[-1][2]
 
 
 class TestTwoLatchCleanup:

@@ -1727,3 +1727,56 @@ class TestGrantInvalidationSeams:
         assert "finance" not in runtime.agents
         assert ("purge_role", "finance") in calls
         assert seen["still_present"] is True
+
+
+# ===========================================================================
+# W2: a reload swaps the resident's config, so the AuthzDeps factory — which
+# reads cfg.character.name LAZILY at call time — surfaces the NEW display name
+# on the next challenge (never a boot-time snapshot).
+# ===========================================================================
+
+
+class TestReloadUpdatesDisplayName:
+    async def test_post_reload_challenge_shows_the_new_name(self, tmp_path):
+        from types import SimpleNamespace
+        from plugin_registry import reload_snapshot
+        from plugin_fixtures import entry, mk_artifact, mk_registry
+        from test_agent_plugin_binding import _make_agent
+        from authz_grants import render_challenge_message
+
+        def _authz_hook(opts):
+            for m in (opts.hooks or {}).get("PreToolUse", []):
+                for h in getattr(m, "hooks", []):
+                    if getattr(h, "_casa_authz_role", None) is not None:
+                        return h
+            return None
+
+        store = tmp_path / "store"
+        e = entry("p", ["resident:assistant"])
+        mk_artifact(store, "p", e["artifact_id"], mcp_servers={"p": {}},
+                    extra_manifest={"casa": {"protectedTools": ["invoice_reset"]}})
+        reload_snapshot(registry_path=mk_registry(tmp_path, [e]),
+                        store_root=store)
+        a = _make_agent(tmp_path, role="assistant")
+        a._channel_manager.register(SimpleNamespace(name="telegram"))
+
+        async def build():
+            return await a._build_options(
+                channel="telegram", channel_key="k", is_fresh=True,
+                resume_sid=None, user_text="hi")
+
+        a.config.character.name = "Ellen"
+        deps1 = _authz_hook(await build())._casa_authz_deps_factory()
+        assert deps1.display_name == "Ellen"
+
+        # Simulate what reload does: the live config's name changes; the NEXT
+        # options build (a fresh turn) reads it lazily.
+        a.config.character.name = "Ellen-2"
+        deps2 = _authz_hook(await build())._casa_authz_deps_factory()
+        assert deps2.display_name == "Ellen-2"
+
+        # A post-reload challenge names the new display name.
+        text = render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="assistant",
+            canonical_json="{}", display_name=deps2.display_name)
+        assert "Ellen-2 (assistant)" in text
