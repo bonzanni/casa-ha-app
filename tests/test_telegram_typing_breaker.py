@@ -8,6 +8,7 @@ breaker so a past outage doesn't kill typing for the process lifetime.
 from __future__ import annotations
 
 import asyncio
+import time
 import types
 from unittest.mock import AsyncMock, MagicMock
 
@@ -20,11 +21,18 @@ from telegram.error import NetworkError
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
+def _seed_lease(ch: TelegramChannel, chat_id: str = "1") -> None:
+    """Give the chat a long-lived lease so ``_typing_loop`` (invoked directly)
+    keeps running — the loop now exits when no live lease remains (r1-2)."""
+    ch._typing_leases[chat_id] = {"cid": time.monotonic() + 3600.0}
+
+
 async def test_network_errors_do_not_trip_typing_breaker(monkeypatch):
     monkeypatch.setattr(tg, "_TYPING_BACKOFF_INIT", 0.0)
     monkeypatch.setattr(tg, "_TYPING_BACKOFF_MAX", 0.0)
     monkeypatch.setattr(tg, "_TYPING_INTERVAL", 0.0)
     ch = TelegramChannel(bot_token="T", chat_id="1")
+    _seed_lease(ch)
     calls = {"n": 0}
 
     async def failing_send(**_kw):
@@ -50,6 +58,7 @@ async def test_non_transport_error_still_trips_breaker(monkeypatch):
     monkeypatch.setattr(tg, "_TYPING_BACKOFF_MAX", 0.0)
     monkeypatch.setattr(tg, "_TYPING_INTERVAL", 0.0)
     ch = TelegramChannel(bot_token="T", chat_id="1")
+    _seed_lease(ch)
 
     async def failing_send(**_kw):
         raise tg.TelegramError("Unauthorized")

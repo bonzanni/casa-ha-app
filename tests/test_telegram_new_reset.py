@@ -73,7 +73,7 @@ def _make_channel(
         default_agent="assistant",
         bus=bus,
     )
-    ch._start_typing = lambda _: None  # type: ignore[assignment]
+    ch._start_typing = lambda *a, **k: None  # type: ignore[assignment]
     app = _FakeApp()
     ch._app = app  # type: ignore[assignment]
     ch._session_registry = session_registry

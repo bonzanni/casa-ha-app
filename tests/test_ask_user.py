@@ -600,7 +600,7 @@ class TestSameDmTextCancel:
         bus.register("assistant", _noop)
         bot = _FakeBot()
         ch = TelegramChannel(bot_token="T", chat_id="0", default_agent="assistant", bus=bus)
-        ch._start_typing = lambda _chat: None
+        ch._start_typing = lambda *a, **k: None
         ch._app = types.SimpleNamespace(bot=bot)
 
         req, created = _fresh_broker.register(

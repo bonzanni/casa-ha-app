@@ -56,7 +56,7 @@ def _channel():
     channel = TelegramChannel(
         bot_token="T", chat_id="0", default_agent="assistant", bus=bus,
     )
-    channel._start_typing = lambda _chat: None  # type: ignore[assignment]
+    channel._start_typing = lambda *a, **k: None  # type: ignore[assignment]
     channel._app = _FakeApp()  # type: ignore[assignment]
     return channel, bus
 

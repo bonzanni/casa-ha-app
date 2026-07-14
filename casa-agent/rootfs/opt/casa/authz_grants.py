@@ -233,23 +233,41 @@ _CHALLENGE_MAX_CHARS = 3900
 _CHALLENGE_TTL_S = 120.0
 
 
+def short_tool_name(tool_name: str) -> str:
+    """The operator-facing short form of *tool_name*: the segment after the
+    LAST ``__`` when the name is MCP-namespaced
+    (``mcp__plugin_<p>_<s>__<tool>`` -> ``<tool>``), else *tool_name*
+    unchanged. Purely syntactic — works for ANY tool name, MCP or not, and
+    for names with exactly one ``__`` too. B8 note: this is display-only —
+    the FULL name is still carried verbatim elsewhere in the challenge/
+    continuation text (see ``render_challenge_message`` / the finish hook).
+    """
+    if "__" in tool_name:
+        return tool_name.rsplit("__", 1)[-1]
+    return tool_name
+
+
 def render_challenge_message(
     *, tool_name: str, enforcement_role: str, canonical_json: str,
 ) -> str:
-    """Render the operator-facing challenge body: the FULL canonical args in a
-    fenced block, framed by a single-question header. Size is measured on THIS
+    """Render the operator-facing challenge body: a humanized header naming
+    the SHORT tool name, then the FULL canonical args in a fenced block, then
+    the FULL tool id on its own line (B8: both the canonical args and the
+    complete tool id stay verbatim in the message). Size is measured on THIS
     string (``get_or_create`` refuses when it exceeds ``_CHALLENGE_MAX_CHARS``).
     """
+    short = short_tool_name(tool_name)
     return (
-        "\U0001F510 Authorization required\n\n"
-        f"Approve {enforcement_role} calling {tool_name} with EXACTLY these "
-        "arguments?\n\n"
-        f"```\n{canonical_json}\n```"
+        "\U0001F510 Approval needed\n\n"
+        f"{enforcement_role} wants to run {short} with EXACTLY these "
+        "arguments:\n\n"
+        f"```\n{canonical_json}\n```\n\n"
+        f"Tool id: {tool_name}"
     )
 
 
 def _challenge_expired_text(tool_name: str) -> str:
-    return f"⌛ this authorization request expired — {tool_name}"
+    return f"⌛ Expired — {short_tool_name(tool_name)} was not approved in time"
 
 
 def _broker() -> Any:
@@ -447,6 +465,8 @@ class ChallengeCoordinator:
         target_role: str, enforcement_role: str, tool_name: str,
         canonical_json: str, rid: str, message_id: int, req: Any,
     ) -> Callable[[dict], Any]:
+        short = short_tool_name(tool_name)
+
         async def _finish(outcome: dict) -> None:
             o = outcome.get("outcome") if isinstance(outcome, dict) else None
             if o != "answered":
@@ -469,7 +489,9 @@ class ChallengeCoordinator:
                 # Edit the SUCCESS state FIRST, then dispatch, then overwrite
                 # ONLY on dispatch failure (ordered inside this one hook task).
                 await channel.edit_dm_message(
-                    chat_id, message_id, f"✅ approved — {tool_name}",
+                    chat_id, message_id,
+                    f"✅ Approved — {enforcement_role} may run {short} "
+                    "once with exactly these arguments",
                 )
                 ok = await channel._dispatch_button_continuation(
                     chat_id=chat_id, user_id=operator_id,
@@ -483,12 +505,12 @@ class ChallengeCoordinator:
                 if not ok:
                     await channel.edit_dm_message(
                         chat_id, message_id,
-                        f"approved, but delivery to {target_role} failed — "
-                        "say 'retry' in chat",
+                        f"⚠️ Approved, but delivery to {target_role} "
+                        "failed — say 'retry' in chat",
                     )
             else:
                 await channel.edit_dm_message(
-                    chat_id, message_id, "❌ denied",
+                    chat_id, message_id, f"❌ Denied — {short} will not run",
                 )
                 ok = await channel._dispatch_button_continuation(
                     chat_id=chat_id, user_id=operator_id,
@@ -498,8 +520,8 @@ class ChallengeCoordinator:
                 if not ok:
                     await channel.edit_dm_message(
                         chat_id, message_id,
-                        f"denied, but delivery to {target_role} failed — "
-                        "say 'retry' in chat",
+                        f"⚠️ Denied, but delivery to {target_role} "
+                        "failed — say 'retry' in chat",
                     )
 
         return _finish

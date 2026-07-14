@@ -86,7 +86,7 @@ def _channel_factory():
             rate_limiter=limiter,
         )
         # Short-circuit _start_typing — no real typing loop in tests.
-        channel._start_typing = lambda _chat: None  # type: ignore[assignment]
+        channel._start_typing = lambda *a, **k: None  # type: ignore[assignment]
         app = _FakeApp()
         channel._app = app  # type: ignore[assignment]
         return channel, bus, app
@@ -156,7 +156,7 @@ class TestTelegramRateLimit:
             default_agent="assistant", bus=bus,
             # no rate_limiter kwarg
         )
-        channel._start_typing = lambda _chat: None  # type: ignore[assignment]
+        channel._start_typing = lambda *a, **k: None  # type: ignore[assignment]
         channel._app = _FakeApp()  # type: ignore[assignment]
 
         for i in range(100):
@@ -169,7 +169,7 @@ class TestTelegramRateLimit:
         the user sees the reject line, not the typing dots."""
         channel, bus, app = _channel_factory(1)
         started: list[str] = []
-        channel._start_typing = lambda chat: started.append(chat)  # type: ignore[assignment]
+        channel._start_typing = lambda chat, *a, **k: started.append(chat)  # type: ignore[assignment]
 
         await channel._handle(_fake_update("42", "first"), None)
         assert started == ["42"]

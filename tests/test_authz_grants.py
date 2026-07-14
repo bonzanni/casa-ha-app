@@ -19,8 +19,12 @@ from authz_grants import (
     ChallengeHandle,
     GrantKey,
     GrantStore,
+    _CHALLENGE_MAX_CHARS,
+    _challenge_expired_text,
     canonical_args_hash,
     canonical_args_json,
+    render_challenge_message,
+    short_tool_name,
 )
 
 
@@ -400,6 +404,85 @@ def test_authz_grant_sweep_registered_hourly_beside_engagement_sweep():
 
 
 # ===========================================================================
+# W1 — humanized approval copy (generic templates)
+# ===========================================================================
+
+
+class TestShortToolName:
+    def test_mcp_namespaced_name_returns_segment_after_last_dunder(self):
+        assert (
+            short_tool_name("mcp__plugin_lesina-invoice_finance__invoice_reset")
+            == "invoice_reset"
+        )
+
+    def test_plain_name_without_dunder_is_unchanged(self):
+        assert short_tool_name("invoice_reset") == "invoice_reset"
+
+    def test_name_with_exactly_one_dunder_returns_segment_after_it(self):
+        assert short_tool_name("foo__bar") == "bar"
+
+    def test_multiple_dunders_uses_the_last_one(self):
+        assert short_tool_name("a__b__c__d") == "d"
+
+
+class TestRenderChallengeMessage:
+    def test_header_names_enforcement_role_and_short_tool_name(self):
+        text = render_challenge_message(
+            tool_name="mcp__plugin_p_s__invoice_reset",
+            enforcement_role="finance",
+            canonical_json='{"id":"INV-1"}',
+        )
+        assert "finance wants to run invoice_reset" in text
+        assert text.startswith("\U0001F510 Approval needed")
+
+    def test_canonical_json_embedded_verbatim_in_fenced_block(self):
+        canonical = '{"amount":10,"id":"INV-1"}'
+        text = render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json=canonical,
+        )
+        assert f"```\n{canonical}\n```" in text
+
+    def test_full_tool_id_present_verbatim_even_when_mcp_namespaced(self):
+        full = "mcp__plugin_lesina-invoice_finance__invoice_reset"
+        text = render_challenge_message(
+            tool_name=full, enforcement_role="finance",
+            canonical_json='{"id":"INV-1"}',
+        )
+        assert f"Tool id: {full}" in text
+
+    def test_plain_tool_name_short_and_full_are_identical_but_both_present(self):
+        text = render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json="{}",
+        )
+        assert "finance wants to run invoice_reset" in text
+        assert "Tool id: invoice_reset" in text
+
+    def test_size_gate_measures_the_rendered_string(self):
+        """B8/size-gate: overflow is still refused, and the ceiling applies
+        to the FULL rendered message (short header + full args + full tool
+        id), not just the args."""
+        huge = '{"blob":"' + "x" * 4000 + '"}'
+        text = render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json=huge,
+        )
+        assert len(text) > _CHALLENGE_MAX_CHARS
+
+
+class TestChallengeExpiredText:
+    def test_uses_short_name_only(self):
+        text = _challenge_expired_text("mcp__plugin_p_s__invoice_reset")
+        assert text == "⌛ Expired — invoice_reset was not approved in time"
+
+    def test_plain_tool_name_matches_settlement_pattern(self):
+        assert _challenge_expired_text("invoice_reset") == (
+            "⌛ Expired — invoice_reset was not approved in time"
+        )
+
+
+# ===========================================================================
 # ChallengeCoordinator (Task 5, A:§3.4) — atomic challenge registration, an
 # async-settled setup driver, two-latch cleanup, the authz finish hook, and
 # the pinned shutdown drain.
@@ -573,6 +656,24 @@ class TestChallengeAtomicRegistration:
             [coord._entries[key].rid]
         assert channel.posts == []  # the driver has not run its first turn
         await handle.settled_post()
+
+    async def test_posted_text_uses_humanized_render_challenge_message(
+        self, monkeypatch,
+    ):
+        """Wiring check: the ACTUAL posted keyboard text is exactly what
+        ``render_challenge_message`` renders — no separate/duplicated
+        template lives inside ``get_or_create``."""
+        broker, coord, channel = _fresh_env(monkeypatch)
+        canonical = '{"amount":10,"id":"INV-1"}'
+        key, handle = _create(
+            coord, channel, tool_name="invoice_reset",
+            enforcement_role="finance", canonical_json=canonical,
+        )
+        await handle.settled_post()
+        assert channel.posts[0][2] == render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json=canonical,
+        )
 
 
 class TestSettledPostClassification:
@@ -781,6 +882,78 @@ class TestAuthzFinishHook:
         await _settle()
         assert any("expired" in e[2].lower() for e in channel.edits)
         assert channel.dispatches == []
+
+    # -- W1: exact humanized settlement copy --------------------------------
+
+    async def test_approved_edit_uses_humanized_settlement_copy(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel, tool_name="invoice_reset",
+                               enforcement_role="finance")
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 0)
+        await _settle()
+        assert channel.edits[-1][2] == (
+            "✅ Approved — finance may run invoice_reset once with "
+            "exactly these arguments"
+        )
+
+    async def test_denied_edit_uses_humanized_settlement_copy(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel, tool_name="invoice_reset")
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 1)
+        await _settle()
+        assert channel.edits[-1][2] == "❌ Denied — invoice_reset will not run"
+
+    async def test_no_answer_edit_uses_humanized_expired_copy(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        key, handle = _create(coord, channel, tool_name="invoice_reset")
+        await handle.settled_post()
+        ch = coord._entries[key]
+        broker.cancel(namespace="resident_ask", scope=ch.scope,
+                      request_id=ch.rid, reason="timeout")
+        await _settle()
+        assert channel.edits[-1][2] == (
+            "⌛ Expired — invoice_reset was not approved in time"
+        )
+
+    async def test_approved_dispatch_failure_overwrite_uses_humanized_copy(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.dispatch_result = False
+        key, handle = _create(coord, channel, tool_name="invoice_reset")
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 0)
+        await _settle()
+        assert channel.edits[-1][2] == (
+            "⚠️ Approved, but delivery to finance-full failed — "
+            "say 'retry' in chat"
+        )
+
+    async def test_denied_dispatch_failure_overwrite_uses_humanized_copy(
+        self, monkeypatch,
+    ):
+        broker, coord, channel = _fresh_env(monkeypatch)
+        channel.dispatch_result = False
+        key, handle = _create(coord, channel, tool_name="invoice_reset")
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 1)
+        await _settle()
+        assert channel.edits[-1][2] == (
+            "⚠️ Denied, but delivery to finance-full failed — "
+            "say 'retry' in chat"
+        )
 
 
 class TestTwoLatchCleanup:

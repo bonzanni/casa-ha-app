@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.77.0] - 2026-07-14
+
+### Changed
+
+- Operator approval prompts and their outcome messages are now written in
+  plain language; the exact tool arguments remain shown verbatim.
+- Agents no longer narrate approval prompts — the button is the prompt.
+- The typing indicator now also shows while an approved action is running.
+
 ## [0.76.0] - 2026-07-14
 
 ### Added
