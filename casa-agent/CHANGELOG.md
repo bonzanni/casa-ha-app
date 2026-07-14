@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.78.1] - 2026-07-14
+
+### Fixed
+
+- The end-to-end test harness image failed to build after 0.78.0 (its own
+  copy of the bundle build stage was missing the new `text_util` module);
+  no runtime change.
+
 ## [0.78.0] - 2026-07-14
 
 ### Added

@@ -9,8 +9,10 @@ import pytest
 
 pytestmark = pytest.mark.unit
 
-_DOCKERFILE = (Path(__file__).resolve().parent.parent / "casa-agent"
-               / "Dockerfile").read_text(encoding="utf-8")
+_REPO = Path(__file__).resolve().parent.parent
+_DOCKERFILE = (_REPO / "casa-agent" / "Dockerfile").read_text(encoding="utf-8")
+_TEST_DOCKERFILE = (_REPO / "test-local"
+                    / "Dockerfile.test").read_text(encoding="utf-8")
 
 
 def test_build_helper_runs_before_broad_copy():
@@ -45,3 +47,19 @@ def test_narrow_copy_ships_text_util_for_plugin_store():
     line_end = _DOCKERFILE.index("\n", narrow_copy + 1)
     line = _DOCKERFILE[narrow_copy:line_end]
     assert "rootfs/opt/casa/text_util.py" in line
+
+
+def test_test_harness_narrow_copy_ships_text_util_too():
+    """v0.78.0 post-merge QA red (2026-07-14): test-local/Dockerfile.test has
+    ITS OWN narrow COPY for the bundle stage and was missed by the production
+    Dockerfile fix — the QA tiers' image build failed with
+    ModuleNotFoundError: text_util while deploy.yml (production Dockerfile)
+    was green. Guard BOTH files: any stdlib-only module plugin_store imports
+    must ride BOTH narrow COPY lines."""
+    narrow_copy = _TEST_DOCKERFILE.find(
+        "\nCOPY casa-agent/rootfs/opt/casa/plugin_registry.py "
+        "casa-agent/rootfs/opt/casa/plugin_store.py")
+    assert narrow_copy != -1
+    line_end = _TEST_DOCKERFILE.index("\n", narrow_copy + 1)
+    line = _TEST_DOCKERFILE[narrow_copy:line_end]
+    assert "casa-agent/rootfs/opt/casa/text_util.py" in line
