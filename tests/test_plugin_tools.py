@@ -745,3 +745,120 @@ async def test_mutation_generation_race_retries_reload_then_fails_explicit(
     assert payload["kind"] == "snapshot_raced"
     # ONE retry: the agent reload was dispatched twice for the target.
     assert st.log.count("dispatch:assistant") == 2
+
+
+# --- A:§3.3/§3.4 lifecycle invalidation ordering (v0.76.0, r1-B8/r2-B5) ------
+
+
+def _spy_grants_and_challenges(monkeypatch, tools_mod, st):
+    """Patch GRANTS.purge_artifact/purge_role + CHALLENGES.cancel_matching to
+    log into st.log so ordering can be asserted against the existing
+    resolve/publish/save/reload_snapshot/dispatch trail."""
+    monkeypatch.setattr(
+        tools_mod.GRANTS, "purge_artifact",
+        lambda aid: st.log.append(f"purge_artifact:{aid}") or 0)
+    monkeypatch.setattr(
+        tools_mod.GRANTS, "purge_role",
+        lambda role: st.log.append(f"purge_role:{role}") or 0)
+    monkeypatch.setattr(
+        tools_mod.CHALLENGES, "cancel_matching",
+        lambda **kw: st.log.append(
+            f"cancel_matching:role={kw.get('role')}:"
+            f"artifact={kw.get('artifact')}") or 0)
+
+
+async def test_plugin_update_invalidates_old_artifact_post_commit_pre_await(
+        monkeypatch, tmp_path):
+    """r1-B8: plugin_update captures the OLD artifact_id BEFORE the mutation
+    and invalidates its grants/challenges AFTER commit, BEFORE the first
+    post-commit await (reload_snapshot)."""
+    st = _State()
+    st.raw["plugins"].append({
+        "name": "probe",
+        "source": {"type": "github", "repo": "o/r", "ref": "v1",
+                   "revision": "git:" + "c" * 40, "subdir": ""},
+        "artifact_id": "c" * 64, "version": "1.1.0",
+        "targets": ["specialist:finance"]})
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr(version="2.0.0"))
+    _spy_grants_and_challenges(monkeypatch, tools_mod, st)
+    r = await tools_mod.plugin_update.handler({"name": "probe", "new_ref": "v2"})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True
+    old_id = "c" * 64
+    assert f"purge_artifact:{old_id}" in st.log
+    assert f"cancel_matching:role=None:artifact={old_id}" in st.log
+    i_save = st.log.index("save")
+    i_purge = st.log.index(f"purge_artifact:{old_id}")
+    i_reload = st.log.index("reload_snapshot")
+    assert i_save < i_purge < i_reload
+    # Only the OLD artifact is invalidated, never the NEW one.
+    assert f"purge_artifact:{'a' * 64}" not in st.log
+
+
+async def test_aborted_plugin_update_invalidates_nothing(monkeypatch, tmp_path):
+    """An ABORTED mutation (a pre-activation guard/resolve failure)
+    invalidates NOTHING."""
+    from plugin_store import RefNotFound
+    st = _State()
+    st.raw["plugins"].append(_entry())
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish_exc=RefNotFound("404"))
+    _spy_grants_and_challenges(monkeypatch, tools_mod, st)
+    r = await tools_mod.plugin_update.handler({"name": "probe", "new_ref": "v2"})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is False
+    assert not any(e.startswith(("purge_artifact", "purge_role", "cancel_matching"))
+                  for e in st.log)
+
+
+async def test_plugin_remove_invalidates_artifact_and_every_target_role(
+        monkeypatch, tmp_path):
+    """plugin_remove purges by the retained artifact_id AND by every former
+    target's NORMALIZED role (a tier-qualified target invalidates the
+    PLAIN-role grant, r2-B5)."""
+    st = _State()
+    _registered(st, name="probe",
+               targets=["specialist:finance", "resident:butler"])
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    _spy_grants_and_challenges(monkeypatch, tools_mod, st)
+    r = await tools_mod.plugin_remove.handler({"name": "probe"})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True
+    assert f"purge_artifact:{'c' * 64}" in st.log
+    assert "purge_role:finance" in st.log     # tier prefix stripped
+    assert "purge_role:butler" in st.log
+
+
+async def test_plugin_unassign_invalidates_by_normalized_role(
+        monkeypatch, tmp_path):
+    """r2-B5: a tier-qualified target ('specialist:finance') invalidates the
+    PLAIN-role grant ('finance') via normalize_role. Removing ONE target
+    must not purge_artifact — the plugin/artifact stays valid for its other
+    targets."""
+    st = _State()
+    _registered(st, targets=["specialist:finance"])
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    _spy_grants_and_challenges(monkeypatch, tools_mod, st)
+    monkeypatch.setattr(__import__("agent"), "active_runtime",
+                        _FakeRuntime({"finance": _FakeAgent({})}), raising=False)
+    r = await tools_mod.plugin_unassign.handler({
+        "name": "probe", "target": "specialist:finance"})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True and payload["was_assigned"] is True
+    assert "purge_role:finance" in st.log
+    assert "cancel_matching:role=finance:artifact=None" in st.log
+    assert not any(e.startswith("purge_artifact") for e in st.log)
+
+
+async def test_noop_unassign_invalidates_nothing(monkeypatch, tmp_path):
+    """r2-B5: a NO-OP unassign (the plugin was never assigned to this
+    target) invalidates NOTHING."""
+    st = _State()
+    _registered(st, targets=["resident:butler"])   # NOT assigned to finance
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    _spy_grants_and_challenges(monkeypatch, tools_mod, st)
+    r = await tools_mod.plugin_unassign.handler({
+        "name": "probe", "target": "specialist:finance"})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True and payload["was_assigned"] is False
+    assert not any(e.startswith(("purge_artifact", "purge_role", "cancel_matching"))
+                  for e in st.log)

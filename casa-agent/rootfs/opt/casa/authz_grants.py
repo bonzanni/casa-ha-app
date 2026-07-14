@@ -79,6 +79,21 @@ def canonical_args_hash(tool_input: dict) -> str:
 DEFAULT_GRANT_TTL_S = 300.0
 
 
+def normalize_role(target: str) -> str:
+    """Strip a plugin target's tier qualifier so it matches
+    ``GrantKey.enforcement_role`` (r2-B5): plugin targets are tier-qualified
+    (``"specialist:finance"``) while the enforcement role is always plain
+    (``"finance"``). Already-plain input (no ``":"``) is returned unchanged.
+    Used at EVERY purge/cancel call site — tools.py's plugin-lifecycle
+    mutations (plugin_update/plugin_remove/plugin_unassign) and reload.py's
+    per-role reload seams — so a tier-qualified target reliably invalidates
+    the plain-role grants/challenges it actually governs."""
+    if not isinstance(target, str):
+        return target
+    _, sep, role = target.partition(":")
+    return role if sep else target
+
+
 @dataclass(frozen=True)
 class GrantKey:
     """Identifies exactly one operator-approved tool call.

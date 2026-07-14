@@ -30,6 +30,7 @@ from plugin_grants import (
     grants_for_resolution, grants_for_resolved, make_fail_closed_can_use_tool,
     mcp_json_malformed, required_env_vars_for_resolved,
 )
+from authz_grants import CHALLENGES, GRANTS, normalize_role
 from delegated_memory import delegated_recall, retain_delegated
 
 from claude_agent_sdk import (
@@ -700,9 +701,16 @@ def _resolution_from_recorded(plugin_artifacts) -> "plugin_registry.ResolutionRe
     """Sol round-3 H7b: rebuild a ResolutionResult from an engagement's RECORDED
     plugin_artifacts (§3.8) so a resumed specialist loads exactly what it started
     with (paths AND derived grants), never re-resolving current assignments.
-    Fails closed (raises) if a recorded artifact path is gone."""
-    from plugin_registry import ResolutionResult, ResolvedPlugin
+    Fails closed (raises) if a recorded artifact path is gone/corrupt/identity-
+    mismatched — those are pre-v0.76 failure modes, unchanged here.
+
+    A:§3.7 (r2-B6/r3-4): a malformed ``casa.protectedTools`` in one RECORDED
+    artifact's manifest is PER-PLUGIN degradation, not a whole-resume abort —
+    that one plugin is excluded (recorded as an issue) while every other
+    recorded artifact, however many, still resolves and loads normally."""
+    from plugin_registry import PluginIssue, ResolutionResult, ResolvedPlugin
     plugins = []
+    issues = []
     for pa in plugin_artifacts or ():
         path = pa.get("path") if isinstance(pa, dict) else None
         if not path or not os.path.isdir(path):
@@ -725,10 +733,18 @@ def _resolution_from_recorded(plugin_artifacts) -> "plugin_registry.ResolutionRe
                                   .read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
+        try:
+            plugin_store.manifest_protected_tools(manifest)
+        except plugin_store.StoreError:
+            issues.append(PluginIssue(
+                name=pa.get("name", ""), target=None, stage="resolve",
+                reason_code="protected_tools_invalid",
+                artifact_id=pa.get("artifact_id", "")))
+            continue
         plugins.append(ResolvedPlugin(
             name=pa.get("name", ""), artifact_id=pa.get("artifact_id", ""),
             path=path, version=str(manifest.get("version", "")), manifest=manifest))
-    return ResolutionResult(registry_valid=True, plugins=plugins)
+    return ResolutionResult(registry_valid=True, plugins=plugins, issues=issues)
 
 
 def _build_specialist_options(cfg, *, resolution=None) -> ClaudeAgentOptions:
@@ -4018,6 +4034,9 @@ def _plugin_update_sync(*, name: str, new_ref: str,
                   if isinstance(e, dict) and e.get("name") == name), None)
     if entry is None:
         return {"ok": False, "kind": "not_registered", "name": name}
+    # A:§3.3 (r1-B8): capture the OLD artifact_id BEFORE the mutation — the
+    # caller invalidates its grants/challenges only after this commits.
+    old_artifact_id = entry.get("artifact_id")
     src = entry.get("source") or {}
     repo, subdir = src.get("repo", ""), src.get("subdir", "")
     guarded = _resolve_and_guard(repo=repo, ref=new_ref,
@@ -4046,7 +4065,30 @@ def _plugin_update_sync(*, name: str, new_ref: str,
     plugin_registry.save_registry(data)
     return {"ok": True, "name": name, "targets": list(entry.get("targets") or []),
             "artifact_id": result.artifact_id, "version": result.version,
-            "revision": result.revision, "path": result.path}
+            "revision": result.revision, "path": result.path,
+            "old_artifact_id": old_artifact_id}
+
+
+def _invalidate_lifecycle(*, artifact_id: "str | None" = None,
+                          roles: "list[str] | None" = None) -> None:
+    """Purge authorization grants + cancel pending challenges for an
+    invalidated artifact and/or role (A:§3.3/§3.4, r1-B8/r2-B5). Call sites
+    invoke this AFTER the registry mutation COMMITS and BEFORE the first
+    post-commit await/reload — an ABORTED mutation (validation failure)
+    must invalidate NOTHING. A stale challenge referencing the invalidated
+    artifact/role must never survive to be approved (an obsolete keyboard
+    dispatching an unusable continuation is a broken lifecycle even though
+    artifact/role binding already blocks consumption). ``roles`` entries may
+    be tier-qualified plugin targets (``"specialist:finance"``) — normalized
+    via :func:`authz_grants.normalize_role` before purge/cancel, since
+    ``GrantKey.enforcement_role`` is always plain."""
+    if artifact_id:
+        GRANTS.purge_artifact(artifact_id)
+        CHALLENGES.cancel_matching(artifact=artifact_id)
+    for target in roles or ():
+        role = normalize_role(target)
+        GRANTS.purge_role(role)
+        CHALLENGES.cancel_matching(role=role)
 
 
 def _resolved_observability(name: str) -> dict:
@@ -4130,6 +4172,10 @@ async def plugin_update(args: dict) -> dict:
             core.setdefault("runtime_ready", False)
             core.setdefault("verify", {})
             return _result(core)
+        # A:§3.3 (r1-B8): the artifact just changed under this plugin —
+        # invalidate the OLD artifact's grants/challenges right after the
+        # mutation commits, before the first post-commit await (reload).
+        _invalidate_lifecycle(artifact_id=core.get("old_artifact_id"))
         seq = await _reload_and_verify_targets(
             core["name"], core["targets"], expect="present")
         core.update(seq)
@@ -4184,6 +4230,10 @@ def _plugin_remove_sync(*, name: str) -> dict:
     if entry is None:
         return {"ok": False, "kind": "not_registered", "name": name}
     targets = list(entry.get("targets") or [])
+    # A:§3.3 (r1-B8): capture the artifact_id + targets BEFORE the mutation —
+    # the caller invalidates grants/challenges by artifact AND by each
+    # former target's role only after this commits.
+    artifact_id = entry.get("artifact_id")
     data.raw["plugins"] = [
         e for e in data.raw.get("plugins", [])
         if not (isinstance(e, dict) and e.get("name") == name)]
@@ -4196,7 +4246,7 @@ def _plugin_remove_sync(*, name: str) -> dict:
     # reload/verify tail that runs after the sync core returns ok.
     _safe_remove_manifest(name)
     return {"ok": True, "name": name, "targets": targets,
-            "artifact_retained": True}
+            "artifact_retained": True, "artifact_id": artifact_id}
 
 
 def _tool_plugin_list() -> dict:
@@ -4260,6 +4310,12 @@ async def plugin_unassign(args: dict) -> dict:
             core.setdefault("runtime_ready", False)
             core.setdefault("verify", {})
             return _result(core)
+        # A:§3.3 (r2-B5): invalidate by the (normalized) unassigned role only
+        # — the plugin/artifact stays valid for its OTHER targets. A NO-OP
+        # unassign (plugin was never assigned to this target) invalidates
+        # NOTHING.
+        if core.get("was_assigned"):
+            _invalidate_lifecycle(roles=[core["target"]])
         seq = await _reload_and_verify_targets(
             core["name"], [core["target"]], expect="absent")
         core.update(seq)
@@ -4281,6 +4337,10 @@ async def plugin_remove(args: dict) -> dict:
             core.setdefault("runtime_ready", False)
             core.setdefault("verify", {})
             return _result(core)
+        # A:§3.3 (r1-B8): the plugin is gone entirely — invalidate by its
+        # (retained-for-GC) artifact AND by every former target's role.
+        _invalidate_lifecycle(artifact_id=core.get("artifact_id"),
+                              roles=core.get("targets"))
         seq = await _reload_and_verify_targets(
             core["name"], core["targets"], expect="absent")
         core.update(seq)
@@ -4392,6 +4452,15 @@ def _tool_verify_plugin_state(
     if checksum_valid and mcp_json_malformed(rp):
         reasons.append("mcp_invalid")
     granted = grants_for_resolved(rp) if checksum_valid else []
+    # A:§3.7 (B7): eyeball-checkable declared protected tools. A malformed
+    # field already surfaced as a blocking "protected_tools_invalid" reason
+    # above (via artifact_verdict); this is purely informational disclosure
+    # of the declared list, tolerant of that same malformed case.
+    try:
+        protected_tools = (plugin_store.manifest_protected_tools(manifest)
+                           if checksum_valid else [])
+    except plugin_store.StoreError:
+        protected_tools = []
 
     # Tools (system-requirements — verify_bin presence). Sol #11: check BOTH the
     # INSTALLED manifest rows AND every requirement the ARTIFACT declares, so a
@@ -4580,6 +4649,7 @@ def _tool_verify_plugin_state(
         "tools": tools_status,
         "secrets": secrets_status,
         "granted_tools": granted,
+        "protected_tools": sorted(protected_tools),
         "targets": target_rows,
         "stale_targets": stale_targets,
         "sessions_on_previous_artifact": sessions,
