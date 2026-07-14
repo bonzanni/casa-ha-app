@@ -16,6 +16,7 @@ send so the loop's call history can't accumulate unbounded.
 from __future__ import annotations
 
 import asyncio
+import types
 
 import pytest
 
@@ -140,6 +141,114 @@ async def test_release_all_fallback_when_context_lacks_cid():
     assert "1" not in ch._typing_leases
     assert "1" not in ch._typing_loops
     assert loop_task.done()
+
+
+# --------------------------------------------------------------------------
+# (reconnect regression, v0.77.x) — a terminal loop exit must NOT leave a
+# stale lease + loop entry that a future turn's _start_typing revives.
+# Every terminal `return` of _typing_loop performs identity-guarded cleanup;
+# outbound teardown releases the lease BEFORE any availability guard.
+# --------------------------------------------------------------------------
+
+
+async def test_reconnect_app_gone_cleans_both_maps_and_next_turn_is_clean(
+    monkeypatch,
+):
+    # (a) loop running with an active lease → channel drops (`_app = None`) →
+    # loop exits and BOTH maps are clean → a new organic turn starts+finishes
+    # with no typing surviving on a stale lease.
+    monkeypatch.setattr(tg, "_TYPING_INTERVAL", 0.0)
+    ch = _channel()
+    _install_bot(ch)
+
+    ch._start_typing("1", "cidA")
+    loop_task = ch._typing_loops["1"]
+    assert set(ch._typing_leases["1"]) == {"cidA"}
+    await asyncio.sleep(0)  # let the loop run at least one live pass
+
+    # Channel availability drops mid-lease (reconnect window).
+    ch._app = None
+
+    # The loop must exit (terminal return, not a cancel) and clean BOTH maps.
+    await asyncio.wait_for(loop_task, timeout=2.0)
+    assert loop_task.done()
+    assert loop_task.cancelled() is False
+    assert "1" not in ch._typing_leases
+    assert "1" not in ch._typing_loops
+
+    # A NEW organic turn on the reconnected channel starts from a clean slate.
+    _install_bot(ch)
+    ch._start_typing("1", "cidB")
+    new_task = ch._typing_loops["1"]
+    assert new_task is not loop_task
+    assert set(ch._typing_leases["1"]) == {"cidB"}
+
+    # When it finishes, no typing continues — no stale lease, loop gone.
+    await ch.turn_finished({"chat_id": "1", "cid": "cidB"})
+    await asyncio.sleep(0)
+    assert "1" not in ch._typing_leases
+    assert "1" not in ch._typing_loops
+    assert new_task.done()
+
+
+async def test_breaker_trip_mid_lease_cleans_both_maps(monkeypatch):
+    # (b) a 401-class breaker trip mid-lease must clean both maps too, so a
+    # later _start_typing (once un-suspended) can't revive the dead loop.
+    monkeypatch.setattr(tg, "_TYPING_BACKOFF_INIT", 0.0)
+    monkeypatch.setattr(tg, "_TYPING_BACKOFF_MAX", 0.0)
+    monkeypatch.setattr(tg, "_TYPING_INTERVAL", 0.0)
+    ch = _channel()
+
+    async def failing_send(**_kw):
+        raise tg.TelegramError("Unauthorized")
+
+    ch._app = types.SimpleNamespace(
+        bot=types.SimpleNamespace(send_chat_action=failing_send)
+    )
+
+    ch._start_typing("1", "cidA")
+    loop_task = ch._typing_loops["1"]
+
+    await asyncio.wait_for(loop_task, timeout=2.0)
+    assert loop_task.done()
+    assert loop_task.cancelled() is False
+    assert ch._typing_suspended is True
+    assert ch._typing_consecutive_failures >= tg._TYPING_CIRCUIT_BREAK
+    assert "1" not in ch._typing_leases
+    assert "1" not in ch._typing_loops
+
+
+async def test_teardown_releases_lease_even_when_app_gone():
+    # (c) a turn ends during a reconnect window (`_app is None`). The lease is
+    # STILL released — release precedes the availability guard in the outbound
+    # teardown paths (finalize_stream + first-token callback both covered).
+    ch = _channel()  # block mode
+    _install_bot(ch)
+    ch._start_typing("1", "cidA")
+    ch._app = None  # reconnect window at teardown
+
+    await ch.finalize_stream("hi", {"chat_id": "1", "cid": "cidA"}, on_token=None)
+    await asyncio.sleep(0)
+    assert "1" not in ch._typing_leases
+    assert "1" not in ch._typing_loops
+
+
+async def test_first_token_releases_lease_even_when_app_gone():
+    # Streaming first-token teardown must release the lease before its
+    # `_app is None` short-circuit as well.
+    ch = TelegramChannel(
+        bot_token="t", chat_id="1", default_agent="a", delivery_mode="stream",
+    )
+    _install_bot(ch)
+    ctx = {"chat_id": "1", "cid": "cidA"}
+    ch._start_typing("1", "cidA")
+    on_token = ch.create_on_token(ctx)
+
+    ch._app = None  # reconnect window before the first token arrives
+    await on_token("hello")
+    await asyncio.sleep(0)  # let any loop cancellation propagate
+    assert "1" not in ch._typing_leases
+    assert "1" not in ch._typing_loops
 
 
 async def test_start_typing_noop_when_suspended():

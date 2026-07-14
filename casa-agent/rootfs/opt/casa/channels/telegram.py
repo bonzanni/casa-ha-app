@@ -641,6 +641,23 @@ class TelegramChannel(Channel):
             if task and not task.done():
                 task.cancel()
 
+    def _clear_typing_loop(self, chat_id: str) -> None:
+        """Identity-guarded teardown of a chat's typing state, called from
+        inside its own loop on every terminal exit (natural empty-exit,
+        app-gone, suspended, or breaker trip).
+
+        Once the loop abandons its duty its leases are meaningless, so the
+        chat's lease dict is dropped wholesale and the next turn's
+        ``_start_typing`` begins from a clean slate. The ``_typing_loops``
+        entry is popped ONLY when it is still THIS task — a concurrent
+        ``_start_typing`` that already installed a fresh loop must not be
+        evicted. Contains no ``await`` so the empty-check → return window
+        stays atomic (T3).
+        """
+        self._typing_leases.pop(chat_id, None)
+        if self._typing_loops.get(chat_id) is asyncio.current_task():
+            self._typing_loops.pop(chat_id, None)
+
     async def _typing_loop(self, chat_id: str) -> None:
         """Send 'typing' chat action while the chat holds a live lease.
 
@@ -661,11 +678,13 @@ class TelegramChannel(Channel):
                     ]:
                         leases.pop(lease_id, None)
                 if not leases:
-                    self._typing_leases.pop(chat_id, None)
-                    if self._typing_loops.get(chat_id) is asyncio.current_task():
-                        self._typing_loops.pop(chat_id, None)
+                    self._clear_typing_loop(chat_id)
                     return
                 if self._typing_suspended or self._app is None:
+                    # Channel unavailable / breaker suspended: abandon the loop
+                    # and clean both maps so a reconnect window can't leave a
+                    # stale lease the next turn's _start_typing would revive.
+                    self._clear_typing_loop(chat_id)
                     return
                 try:
                     await self._app.bot.send_chat_action(
@@ -700,6 +719,7 @@ class TelegramChannel(Channel):
                             "Bot token may be invalid.",
                             self._typing_consecutive_failures,
                         )
+                        self._clear_typing_loop(chat_id)
                         return
                     logger.warning(
                         "Typing failed (%d/%d): %s — backing off %.1fs",
@@ -2012,12 +2032,14 @@ class TelegramChannel(Channel):
 
     async def send(self, message: str, context: dict[str, Any]) -> None:
         """Send a complete message (block mode fallback)."""
+        # Release THIS turn's lease BEFORE the availability guard — lease
+        # bookkeeping is local and must not be skipped in a reconnect window.
+        target_chat = _resolve_chat_id(context, self.chat_id)
+        self._release_typing(context, target_chat)
+
         if self._app is None:
             logger.warning("Telegram channel not started; cannot send message")
             return
-
-        target_chat = _resolve_chat_id(context, self.chat_id)
-        self._release_typing(context, target_chat)
 
         for chunk in _split_message(message):
             await self._app.bot.send_message(
@@ -2037,10 +2059,12 @@ class TelegramChannel(Channel):
         Raises when the channel isn't started (the tool maps that to
         ``channel_unavailable``); lets TelegramError propagate (the tool
         classifies it)."""
-        if self._app is None:
-            raise RuntimeError("Telegram channel not started; cannot send media")
+        # Release the lease before the availability guard (local bookkeeping
+        # must survive a reconnect window even when the send itself can't run).
         target_chat = _resolve_chat_id(context, self.chat_id)
         self._release_typing(context, target_chat)
+        if self._app is None:
+            raise RuntimeError("Telegram channel not started; cannot send media")
         method = getattr(self._app.bot, MEDIA_POLICIES[kind].ptb_method)
         await method(
             target_chat,
@@ -2071,6 +2095,9 @@ class TelegramChannel(Channel):
 
     async def send_response(self, message: str, context: dict[str, Any]) -> None:
         """Block-mode agent response with rich-text rendering (plain fallback)."""
+        # Release the lease before the availability guard (reconnect-safe).
+        target_chat = _resolve_chat_id(context, self.chat_id)
+        self._release_typing(context, target_chat)
         if self._app is None:
             logger.warning("Telegram channel not started; cannot send message")
             return
@@ -2081,8 +2108,6 @@ class TelegramChannel(Channel):
         if entities is None:
             await self.send(message, context)
             return
-        target_chat = _resolve_chat_id(context, self.chat_id)
-        self._release_typing(context, target_chat)
         await self._send_one(target_chat, message, display, entities)
 
     async def finalize_response_stream(
@@ -2093,6 +2118,9 @@ class TelegramChannel(Channel):
         Block mode / no streamed message → send_response(). Plain (no markup) or
         oversize → the existing plain finalize_stream(). Entity edit falls back to
         the ORIGINAL text edited into the SAME message on BadRequest."""
+        # Release the lease before the availability guard (reconnect-safe).
+        target_chat = _resolve_chat_id(context, self.chat_id)
+        self._release_typing(context, target_chat)
         if self._app is None:
             return
         if not self._rich_text_enabled:
@@ -2109,8 +2137,6 @@ class TelegramChannel(Channel):
         if entities is None:
             await self.finalize_stream(full_text, context, on_token)
             return
-        target_chat = _resolve_chat_id(context, self.chat_id)
-        self._release_typing(context, target_chat)
         try:
             try:
                 await self._app.bot.edit_message_text(
@@ -2194,14 +2220,20 @@ class TelegramChannel(Channel):
         }
 
         async def _stream_token(accumulated_text: str) -> None:
+            # First-token teardown releases THIS turn's lease BEFORE the
+            # availability guard — local bookkeeping must not depend on channel
+            # health. Idempotent, so repeated pre-message calls during a
+            # reconnect window stay a no-op.
+            if state["message_id"] is None:
+                self._stop_typing(target_chat, _lease_cid)
+
             if self._app is None:
                 return
 
             now = time.monotonic()
 
             if state["message_id"] is None:
-                # First token: send new message, stop typing
-                self._stop_typing(target_chat, _lease_cid)
+                # First token: send new message (typing already stopped above).
                 try:
                     result = await self._app.bot.send_message(
                         chat_id=target_chat,
@@ -2238,11 +2270,12 @@ class TelegramChannel(Channel):
         is displayed.  Falls back to send() if streaming never started
         (e.g., empty response or stream mode was block).
         """
-        if self._app is None:
-            return
-
+        # Release the lease before the availability guard (reconnect-safe).
         target_chat = _resolve_chat_id(context, self.chat_id)
         self._release_typing(context, target_chat)
+
+        if self._app is None:
+            return
 
         if self._delivery_mode != "stream":
             # Block mode: just send
