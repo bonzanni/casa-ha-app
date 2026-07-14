@@ -1586,8 +1586,23 @@ class TelegramChannel(Channel):
                     "button_answer": request_id,
                 },
             )
-            if await self._bus.send_checked(msg) == "accepted":
-                return True
+            try:
+                if await self._bus.send_checked(msg) == "accepted":
+                    return True
+            except asyncio.CancelledError:
+                # Cooperative cancellation must propagate, never be swallowed
+                # as a failed attempt.
+                raise
+            except Exception as exc:  # noqa: BLE001 — counts as a failed attempt
+                # An escaping exception would abort the finish hook before the
+                # delivery-failure overwrite edit; treat it as a failed attempt
+                # and let the retry/backoff loop run its course (return False on
+                # exhaustion so the caller can overwrite the keyboard).
+                logger.warning(
+                    "button continuation dispatch attempt %d/3 raised "
+                    "(target=%s request_id=%s): %s",
+                    attempt + 1, target_role, request_id, exc,
+                )
             if attempt < len(delays):
                 await _sleep(delays[attempt])
         return False

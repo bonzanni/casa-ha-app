@@ -1368,6 +1368,63 @@ class TestDispatchButtonContinuation:
         assert ok is True
         assert fake_sleep.await_count == 1
 
+    async def test_send_checked_exception_retries_thrice_then_false(
+        self, fake_telegram_bot,
+    ):
+        """Contract: a non-CancelledError raised by ``send_checked`` is caught +
+        logged, counts as a FAILED attempt, and all 3 attempts are exhausted
+        with the existing backoff → return False (an escaping exception would
+        abort the finish hook before the delivery-failure overwrite edit)."""
+        bus = MagicMock()
+        bus.send_checked = AsyncMock(side_effect=RuntimeError("bus boom"))
+        ch = _mk_dm_channel(fake_telegram_bot, bus=bus)
+        fake_sleep = AsyncMock()
+
+        ok = await ch._dispatch_button_continuation(
+            chat_id=500, user_id=999, target_role="assistant",
+            request_id="rid-x", text="Yes", _sleep=fake_sleep,
+        )
+        assert ok is False
+        assert bus.send_checked.await_count == 3
+        assert fake_sleep.await_count == 2
+        assert [c.args[0] for c in fake_sleep.await_args_list] == [0.5, 1.0]
+
+    async def test_send_checked_exception_then_success_returns_true(
+        self, fake_telegram_bot,
+    ):
+        """A raising attempt followed by an accepted one still succeeds."""
+        bus = MagicMock()
+        bus.send_checked = AsyncMock(
+            side_effect=[RuntimeError("transient"), "accepted"],
+        )
+        ch = _mk_dm_channel(fake_telegram_bot, bus=bus)
+        fake_sleep = AsyncMock()
+
+        ok = await ch._dispatch_button_continuation(
+            chat_id=500, user_id=999, target_role="assistant",
+            request_id="rid-x", text="Yes", _sleep=fake_sleep,
+        )
+        assert ok is True
+        assert bus.send_checked.await_count == 2
+        assert fake_sleep.await_count == 1
+
+    async def test_send_checked_cancelled_error_propagates(
+        self, fake_telegram_bot,
+    ):
+        """asyncio.CancelledError must re-raise immediately, never swallowed as
+        a failed attempt."""
+        bus = MagicMock()
+        bus.send_checked = AsyncMock(side_effect=asyncio.CancelledError())
+        ch = _mk_dm_channel(fake_telegram_bot, bus=bus)
+        fake_sleep = AsyncMock()
+
+        with pytest.raises(asyncio.CancelledError):
+            await ch._dispatch_button_continuation(
+                chat_id=500, user_id=999, target_role="assistant",
+                request_id="rid-x", text="Yes", _sleep=fake_sleep,
+            )
+        fake_sleep.assert_not_awaited()
+
 
 class TestDmKeyboardApis:
     async def test_post_dm_keyboard_composes_callback_data_and_returns_mid(
