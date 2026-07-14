@@ -46,6 +46,34 @@ _TERMINAL_RETENTION_DAYS = 30
 
 
 # ---------------------------------------------------------------------------
+# W2/Sol B9 (Task 7) — interaction_state pure transition core.
+# ---------------------------------------------------------------------------
+#
+# Transition table (normative — design §W2, Sol r3-B4):
+#   first_contact      : first_contact_required -> awaiting_operator
+#   operator_answered  : {first_contact_required, awaiting_operator} -> authorized
+#   operator_turn      : {first_contact_required, awaiting_operator} -> authorized
+#   anything else (including from "authorized", from "" (not
+#   interaction-required), or an event not valid from the current state)
+#   -> no-op (None). Never backwards.
+
+
+def _pure_interaction_transition(current: str, event: str) -> str | None:
+    """Compute the next ``interaction_state``, or ``None`` for a no-op.
+
+    Pure (no I/O, no locking) so it's trivially unit-testable and reusable
+    by the atomic locked mutator below.
+    """
+    if event == "first_contact":
+        return "awaiting_operator" if current == "first_contact_required" else None
+    if event in ("operator_answered", "operator_turn"):
+        if current in ("first_contact_required", "awaiting_operator"):
+            return "authorized"
+        return None
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Record
 # ---------------------------------------------------------------------------
 
@@ -97,6 +125,13 @@ class EngagementRecord:
     # replay renders --plugin-dir flags from THESE recorded paths, never a
     # re-resolution of current assignments. Preserved by every rewrite.
     plugin_artifacts: tuple[dict, ...] = ()
+    # W2/Sol B9 (Task 7): observational turn-taking state. "" (default) =
+    # not interaction-required (most engagements). Interaction-required
+    # engagements start at "first_contact_required" (set by engage_executor
+    # at create — Task 8) and advance via ``advance_interaction_state``:
+    # first_contact_required -> awaiting_operator -> authorized. Never
+    # backwards; see ``_pure_interaction_transition``.
+    interaction_state: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +207,7 @@ class EngagementRegistry:
                     tools_allowed=tuple(row.get("tools_allowed") or ()),
                     permission_mode=row.get("permission_mode") or "acceptEdits",
                     plugin_artifacts=tuple(row.get("plugin_artifacts") or ()),
+                    interaction_state=row.get("interaction_state") or "",
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed engagement row: %s", exc)
@@ -291,6 +327,7 @@ class EngagementRegistry:
                 "tools_allowed": list(rec.tools_allowed),
                 "permission_mode": rec.permission_mode,
                 "plugin_artifacts": [dict(pa) for pa in rec.plugin_artifacts],
+                "interaction_state": rec.interaction_state,
             })
         try:
             await asyncio.to_thread(self._write_tombstone, snapshot)
@@ -481,6 +518,43 @@ class EngagementRegistry:
                 rec.progress_message_id = progress_message_id
             if current_state_emoji is not None:
                 rec.current_state_emoji = current_state_emoji
+            await self._write_tombstone_locked()
+
+    async def advance_interaction_state(
+        self, engagement_id: str, event: str,
+    ) -> str | None:
+        """W2/Sol B9 (Task 7): atomic compare-and-set on ``interaction_state``.
+
+        Read record -> compute the pure transition -> write field +
+        persist, all under ``self._lock`` so two coroutines racing the same
+        event on the same record resolve to exactly one transition (the
+        second sees the already-advanced state and gets a no-op). Returns
+        the new state, or ``None`` for an unknown engagement or a no-op
+        transition (never backwards — see ``_pure_interaction_transition``).
+        """
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return None
+            new_state = _pure_interaction_transition(rec.interaction_state, event)
+            if new_state is None:
+                return None
+            rec.interaction_state = new_state
+            await self._write_tombstone_locked()
+            return new_state
+
+    async def set_interaction_violated(self, engagement_id: str) -> None:
+        """W2/Sol B9 (Task 7): flag a mutating tool-use taken while
+        ``awaiting_operator`` — ``_finalize_engagement`` reads
+        ``rec.origin.get("interaction_violated")`` to append a violation
+        line to the completion summary. Unknown engagement is a no-op
+        (matches the other mutators' tolerance for stale callers).
+        """
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            rec.origin["interaction_violated"] = True
             await self._write_tombstone_locked()
 
     async def sweep_idle_and_suspend(

@@ -459,15 +459,18 @@ class TestEngagementAskStateAdvance:
         await ch._on_inline_callback(update2, context=None)
         update2.callback_query.answer.assert_awaited_once_with("✔")
 
-    async def test_missing_advance_method_no_ops_to_commit(
+    async def test_real_registry_noninteraction_required_still_commits(
         self, fake_telegram_bot, engagement_fixture, _fresh_broker,
     ):
-        """The real EngagementRegistry has no advance_interaction_state yet
-        (Task 7) — getattr(...) is None, so the branch is skipped straight
-        to commit."""
+        """Task 7 activates the seam: the real EngagementRegistry now HAS
+        advance_interaction_state. For a non-interaction-required
+        engagement (interaction_state == "", the default), the pure
+        transition is a no-op (returns None, no exception) — the tap
+        still commits and the state stays untouched."""
         ch = _mk_channel(fake_telegram_bot, engagement_fixture)
         rec = engagement_fixture.active_record
-        assert not hasattr(engagement_fixture.registry, "advance_interaction_state")
+        assert hasattr(engagement_fixture.registry, "advance_interaction_state")
+        assert rec.interaction_state == ""
         req = _seed(_fresh_broker, ns="engagement_ask", scope=rec.id,
                    rid="ask-2", topic_id=rec.topic_id, operator_id=999)
 
@@ -479,6 +482,7 @@ class TestEngagementAskStateAdvance:
         update.callback_query.answer.assert_awaited_once_with("✔")
         outcome = await asyncio.wait_for(_fresh_broker.await_result(req), 0.1)
         assert outcome["outcome"] == "answered"
+        assert rec.interaction_state == ""
 
     async def test_cancelled_after_claim_releases_it(
         self, fake_telegram_bot, engagement_fixture, _fresh_broker,
@@ -514,6 +518,125 @@ class TestEngagementAskStateAdvance:
             option_index=1, actor_id=999,
         )
         assert not isinstance(claim, str)
+
+
+class TestInteractionStateActivation:
+    """W2/Sol B9 (Task 7): the real EngagementRegistry now carries
+    ``interaction_state`` + ``advance_interaction_state`` — these drive the
+    callback against a record seeded ``awaiting_operator`` directly (per
+    the brief: "your registry tests can set the field directly")."""
+
+    async def test_winning_tap_authorizes_before_commit_resolves(
+        self, fake_telegram_bot, engagement_fixture, _fresh_broker,
+    ):
+        """B9/r2-B7: ordered event list — claim -> advance_interaction_state
+        -> commit — so the state is ALREADY authorized at the moment commit
+        resolves the awaiting handler."""
+        ch = _mk_channel(fake_telegram_bot, engagement_fixture)
+        rec = engagement_fixture.active_record
+        rec.interaction_state = "awaiting_operator"
+        _seed(_fresh_broker, ns="engagement_ask", scope=rec.id, rid="ask-order",
+              topic_id=rec.topic_id, operator_id=999)
+
+        seen_state_at_commit: list[str] = []
+        orig_commit = _fresh_broker.commit
+
+        def _spy_commit(claim):
+            seen_state_at_commit.append(rec.interaction_state)
+            return orig_commit(claim)
+
+        _fresh_broker.commit = _spy_commit
+        try:
+            update = _mk_callback_update(
+                data="v1|engagement_ask|ask-order|0", thread_id=rec.topic_id,
+                chat_id=-1001, user_id=999,
+            )
+            await ch._on_inline_callback(update, context=None)
+        finally:
+            del _fresh_broker.commit
+
+        assert seen_state_at_commit == ["authorized"]
+        assert rec.interaction_state == "authorized"
+        update.callback_query.answer.assert_awaited_once_with("✔")
+
+    async def test_fast_tap_wins_and_authorizes_from_first_contact_required(
+        self, fake_telegram_bot, engagement_fixture, _fresh_broker,
+    ):
+        """r3-B4: a tap that beats the agent's first `reply` (state still
+        ``first_contact_required``) still wins the claim and authorizes
+        directly — never left stuck awaiting."""
+        ch = _mk_channel(fake_telegram_bot, engagement_fixture)
+        rec = engagement_fixture.active_record
+        rec.interaction_state = "first_contact_required"
+        _seed(_fresh_broker, ns="engagement_ask", scope=rec.id, rid="ask-fast",
+              topic_id=rec.topic_id, operator_id=999)
+
+        update = _mk_callback_update(
+            data="v1|engagement_ask|ask-fast|0", thread_id=rec.topic_id,
+            chat_id=-1001, user_id=999,
+        )
+        await ch._on_inline_callback(update, context=None)
+        update.callback_query.answer.assert_awaited_once_with("✔")
+        assert rec.interaction_state == "authorized"
+
+    async def test_late_tap_after_timeout_does_not_authorize(
+        self, fake_telegram_bot, engagement_fixture, _fresh_broker,
+    ):
+        """r5-B1: register -> await no_answer (retired), then a valid tap:
+        claim returns "stale", advance_interaction_state is never reached,
+        state stays awaiting_operator."""
+        ch = _mk_channel(fake_telegram_bot, engagement_fixture)
+        rec = engagement_fixture.active_record
+        rec.interaction_state = "awaiting_operator"
+        req = _seed(_fresh_broker, ns="engagement_ask", scope=rec.id,
+                   rid="ask-stale", topic_id=rec.topic_id, operator_id=999,
+                   timeout_s=0.05)
+        await asyncio.wait_for(_fresh_broker.await_result(req), 1.0)  # times out
+
+        update = _mk_callback_update(
+            data="v1|engagement_ask|ask-stale|0", thread_id=rec.topic_id,
+            chat_id=-1001, user_id=999,
+        )
+        await ch._on_inline_callback(update, context=None)
+        update.callback_query.answer.assert_awaited_once_with("expired")
+        assert rec.interaction_state == "awaiting_operator"
+
+    async def test_late_tap_after_cancel_does_not_authorize(
+        self, fake_telegram_bot, engagement_fixture, _fresh_broker,
+    ):
+        """r5-B1: the cancel-flavoured sibling of the timeout case — a
+        cancel_scope tombstone between register and tap also makes claim
+        return "stale" without ever touching interaction_state."""
+        ch = _mk_channel(fake_telegram_bot, engagement_fixture)
+        rec = engagement_fixture.active_record
+        rec.interaction_state = "awaiting_operator"
+        _seed(_fresh_broker, ns="engagement_ask", scope=rec.id, rid="ask-cxl2",
+              topic_id=rec.topic_id, operator_id=999)
+        _fresh_broker.cancel_scope(
+            namespace="engagement_ask", scope=rec.id, reason="test_cancel",
+        )
+
+        update = _mk_callback_update(
+            data="v1|engagement_ask|ask-cxl2|0", thread_id=rec.topic_id,
+            chat_id=-1001, user_id=999,
+        )
+        await ch._on_inline_callback(update, context=None)
+        update.callback_query.answer.assert_awaited_once_with("expired")
+        assert rec.interaction_state == "awaiting_operator"
+
+    async def test_no_answer_leaves_awaiting_operator(
+        self, fake_telegram_bot, engagement_fixture, _fresh_broker,
+    ):
+        """A timed-out ask (no_answer outcome) never touches
+        interaction_state — no tap ever claimed it."""
+        rec = engagement_fixture.active_record
+        rec.interaction_state = "awaiting_operator"
+        req = _seed(_fresh_broker, ns="engagement_ask", scope=rec.id,
+                   rid="ask-noans", topic_id=rec.topic_id, operator_id=999,
+                   timeout_s=0.05)
+        outcome = await asyncio.wait_for(_fresh_broker.await_result(req), 1.0)
+        assert outcome["outcome"] == "no_answer"
+        assert rec.interaction_state == "awaiting_operator"
 
 
 class TestKeyboardOwnership:

@@ -59,6 +59,9 @@ class _FakeRegistry:
         self._by_id: dict[str, _FakeRecord] = {
             "eng-1": _FakeRecord("eng-1", topic_id=42),
         }
+        # W2/Sol B9 (Task 7): the `ask` handler's first_contact seam calls
+        # this — track for the dedicated assert below.
+        self.advances: list[tuple[str, str]] = []
 
     def set_record(self, eng_id: str, rec: _FakeRecord | None) -> None:
         if rec is None:
@@ -68,6 +71,9 @@ class _FakeRegistry:
 
     def get(self, eng_id: str) -> _FakeRecord | None:
         return self._by_id.get(eng_id)
+
+    async def advance_interaction_state(self, eng_id: str, event: str) -> None:
+        self.advances.append((eng_id, event))
 
 
 class _AskFakeChannel:
@@ -188,6 +194,28 @@ async def test_ask_answered_edits_answered(app_with_ask) -> None:
     assert len(ch.edited_answered) == 1
     assert "B" in ch.edited_answered[0][2]
     assert ch.edited_expired == []
+
+
+async def test_ask_calls_advance_interaction_state_first_contact(
+    app_with_ask,
+) -> None:
+    """W2/Sol B9 (Task 7): asking is an outbound agent action too — the
+    `ask` handler fires advance_interaction_state(eng, "first_contact")
+    once the engagement/status checks pass (before registering the
+    broker request)."""
+    app, ch, reg, broker = app_with_ask
+    async with TestClient(TestServer(app)) as client:
+        task = asyncio.ensure_future(client.post(
+            "/internal/channel/ask", json=_payload(request_id="rid-fc"),
+        ))
+        await asyncio.sleep(0.05)
+        assert broker.deliver(
+            namespace="engagement_ask", scope="eng-1", request_id="rid-fc",
+            option_index=0, actor_id=999,
+        ) == "delivered"
+        await asyncio.wait_for(task, timeout=1.0)
+
+    assert reg.advances == [("eng-1", "first_contact")]
 
 
 async def test_ask_timeout_no_answer_edits_expired(

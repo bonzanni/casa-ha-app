@@ -2199,9 +2199,21 @@ async def _finalize_engagement(
         tch = _channel_manager.get(engagement.origin.get("channel", "telegram"))
         if tch is not None:
             try:
+                summary_text = (
+                    f"Engagement {outcome}. Summary:\n{text}"
+                    if text else f"Engagement {outcome}."
+                )
+                # W2/Sol B9 (Task 7): surface a mutating tool-use taken while
+                # the engagement was awaiting_operator — set by the
+                # claude_code driver's _on_stream_event mutating_tool seam.
+                if engagement.origin.get("interaction_violated"):
+                    summary_text += (
+                        "\n\n⚠️ This engagement took an action before you "
+                        "responded — please review."
+                    )
                 await tch.send_to_topic(
                     engagement.topic_id,
-                    f"Engagement {outcome}. Summary:\n{text}" if text else f"Engagement {outcome}.",
+                    summary_text,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(

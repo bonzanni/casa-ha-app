@@ -116,6 +116,14 @@ def _make_send_to_topic(
             )
             return web.json_response({"ok": False, "error": "send_failed"})
 
+        # W2/Sol B9 (Task 7): the agent's first outbound reply flips
+        # first_contact_required -> awaiting_operator. getattr-tolerant —
+        # a fake registry in a test may not carry the method; a no-op
+        # returns None for non-interaction-required engagements.
+        advance = getattr(engagement_registry, "advance_interaction_state", None)
+        if advance is not None:
+            await advance(engagement_id, "first_contact")
+
         if record_reply is not None and text:
             try:
                 record_reply(engagement_id, text)
@@ -376,6 +384,15 @@ def _make_ask(
             return web.json_response({"ok": False, "error": "unknown_engagement"})
         if getattr(rec, "status", None) not in ("active", "idle"):
             return web.json_response({"ok": False, "error": "engagement_terminal"})
+
+        # W2/Sol B9 (Task 7): asking is an outbound agent action too — the
+        # FIRST reply/ask flips first_contact_required -> awaiting_operator.
+        # getattr-tolerant (see _make_send_to_topic); a no-op past the first
+        # call (already awaiting_operator/authorized) or for a
+        # non-interaction-required engagement ("").
+        advance = getattr(engagement_registry, "advance_interaction_state", None)
+        if advance is not None:
+            await advance(eng_id, "first_contact")
 
         req, created = BROKER.register(
             namespace="engagement_ask", scope=eng_id, request_id=request_id,

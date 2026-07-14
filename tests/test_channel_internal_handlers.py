@@ -71,13 +71,16 @@ class _FakeRegistry:
 
     Pre-seeds one record (``eng-1`` → topic 42). Tests that need other
     shapes (missing record / record with no topic_id) override via
-    ``set_record``.
+    ``set_record``. Carries ``advance_interaction_state`` (W2/Sol B9, Task
+    7) so send_to_topic's first_contact seam has something to call; most
+    tests never assert on ``self.advances``.
     """
 
     def __init__(self) -> None:
         self._by_id: dict[str, _FakeRecord] = {
             "eng-1": _FakeRecord("eng-1", topic_id=42),
         }
+        self.advances: list[tuple[str, str]] = []
 
     def set_record(self, eng_id: str, rec: _FakeRecord | None) -> None:
         if rec is None:
@@ -87,6 +90,9 @@ class _FakeRegistry:
 
     def get(self, eng_id: str) -> _FakeRecord | None:
         return self._by_id.get(eng_id)
+
+    async def advance_interaction_state(self, eng_id: str, event: str) -> None:
+        self.advances.append((eng_id, event))
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +181,21 @@ async def test_send_to_topic_missing_topic_id_returns_error(
         assert body == {"ok": False, "error": "no_topic_bound"}
 
     assert ch.calls == []
+
+
+async def test_send_to_topic_advances_interaction_state_first_contact(
+    app_factory,
+) -> None:
+    """W2/Sol B9 (Task 7): a successful reply-through-send_to_topic is the
+    agent's outbound act — fires advance_interaction_state(eng, "first_contact")."""
+    app, ch, reg = app_factory()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/send_to_topic",
+            json={"engagement_id": "eng-1", "text": "hello operator"},
+        )
+        assert resp.status == 200
+    assert reg.advances == [("eng-1", "first_contact")]
 
 
 # ---------------------------------------------------------------------------

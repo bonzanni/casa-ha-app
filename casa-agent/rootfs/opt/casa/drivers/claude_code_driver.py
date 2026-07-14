@@ -185,6 +185,9 @@ class ClaudeCodeDriver(DriverProtocol):
         self._inbound: dict[str, _InboundQueue] = {}
         self._reply_texts: dict[str, set[str]] = {}
         self._epoch_pending: dict[str, int | None] = {}
+        # W2/Sol B9 (Task 7): at most ONE in-topic violation notice per
+        # engagement — guards the mutating_tool seam in _on_stream_event.
+        self._violation_notified: set[str] = set()
 
     # -- DriverProtocol ---------------------------------------------------
 
@@ -361,6 +364,7 @@ class ClaudeCodeDriver(DriverProtocol):
         self._inbound.pop(engagement.id, None)
         self._reply_texts.pop(engagement.id, None)
         self._epoch_pending.pop(engagement.id, None)
+        self._violation_notified.discard(engagement.id)
 
         async with s6_rc._compile_lock:
             # Stop is tolerant of "already down" — log and continue.
@@ -640,8 +644,14 @@ class ClaudeCodeDriver(DriverProtocol):
         """Fan the relay's ordered ``on_turn_event`` kinds into driver state.
 
         ``spawn`` → arm the inbound queue + epoch/abnormal-exit correlation;
-        ``turn_start`` → reset the reply-text de-dup set (Task-7 interaction
-        seam); ``mutating_tool`` → Task-7 seam (record only); ``result`` →
+        ``turn_start`` → reset the reply-text de-dup set; ``mutating_tool``
+        → W2/Sol B9 (Task 7): while the engagement's ``interaction_state``
+        is ``awaiting_operator``, post ONE in-topic violation notice (per
+        engagement) and flag ``rec.origin["interaction_violated"]`` via
+        ``registry.set_interaction_violated`` — ``_finalize_engagement``
+        surfaces it in the completion summary. A ``reply``/``ask``/
+        ``set_progress`` control tool-use never reaches here —
+        ``topic_stream.is_mutating_tooluse`` excludes them. ``result`` →
         clear the epoch pending a result (normal turn boundary)."""
         eng_id = engagement.id
         if kind == "spawn":
@@ -660,11 +670,24 @@ class ClaudeCodeDriver(DriverProtocol):
             # Fresh turn — drop the prior turn's reply-text de-dup set.
             self._reply_texts[eng_id] = set()
         elif kind == "mutating_tool":
-            # Task-7 seam: interaction_state is not built yet — record only.
             logger.debug(
                 "engagement %s mutating tool during turn: %s",
                 eng_id[:8], payload.get("tool"),
             )
+            reg = self._registry
+            rec = reg.get(eng_id) if reg is not None else None
+            if (rec is not None
+                    and getattr(rec, "interaction_state", "") == "awaiting_operator"
+                    and eng_id not in self._violation_notified):
+                self._violation_notified.add(eng_id)
+                await self._send_to_topic(
+                    engagement.topic_id,
+                    "The agent took an action while waiting for your "
+                    "reply — flagging this engagement for review.",
+                )
+                set_violated = getattr(reg, "set_interaction_violated", None)
+                if set_violated is not None:
+                    await set_violated(eng_id)
         elif kind == "result":
             self._epoch_pending[eng_id] = None
 

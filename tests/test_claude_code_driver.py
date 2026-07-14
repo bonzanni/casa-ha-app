@@ -1068,6 +1068,164 @@ class TestAbnormalExitCorrelation:
         assert not any("abnormal" in m for m in warnings), warnings
 
 
+class _FakeInteractionRegistry:
+    """Registry stand-in for the mutating_tool seam — carries a single
+    record whose ``interaction_state`` the test sets directly, plus a
+    tracked ``set_interaction_violated``."""
+
+    def __init__(self, interaction_state: str):
+        from types import SimpleNamespace
+        self._rec = SimpleNamespace(interaction_state=interaction_state)
+        self.violated: list[str] = []
+
+    def get(self, eng_id: str):
+        return self._rec
+
+    async def set_interaction_violated(self, eng_id: str) -> None:
+        self.violated.append(eng_id)
+
+
+class TestMutatingToolViolationSeam:
+    """W2/Sol B9 (Task 7): ``_on_stream_event``'s ``mutating_tool`` branch —
+    activated now that the registry carries ``interaction_state`` +
+    ``set_interaction_violated``. The invariant that a ``reply``/``ask``/
+    ``set_progress`` control tool-use never REACHES this branch as a
+    ``mutating_tool`` event is enforced upstream by
+    ``topic_stream.is_mutating_tooluse`` (pinned by
+    ``test_topic_stream.py::test_is_mutating_tooluse_allowlist``) — the
+    driver trusts the event kind it's handed and does not re-inspect the
+    tool name.
+    """
+
+    async def test_mutating_tool_while_awaiting_operator_notifies_and_flags(
+        self, tmp_path,
+    ):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock()
+        reg = _FakeInteractionRegistry("awaiting_operator")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+
+        sender.assert_awaited_once()
+        assert sender.await_args.args[0] == rec.topic_id
+        assert reg.violated == [rec.id]
+
+    async def test_mutating_tool_notice_fires_only_once_per_engagement(
+        self, tmp_path,
+    ):
+        """A second mutating_tool event during the SAME awaiting_operator
+        window must not re-post the notice (per-engagement guard)."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock()
+        reg = _FakeInteractionRegistry("awaiting_operator")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Write"})
+
+        assert sender.await_count == 1
+
+    async def test_mutating_tool_while_authorized_does_not_flag(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock()
+        reg = _FakeInteractionRegistry("authorized")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+
+        sender.assert_not_awaited()
+        assert reg.violated == []
+
+    async def test_mutating_tool_with_non_interaction_required_state_does_not_flag(
+        self, tmp_path,
+    ):
+        """Default ("") interaction_state — most engagements aren't
+        interaction-required at all — never flags."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock()
+        reg = _FakeInteractionRegistry("")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+
+        sender.assert_not_awaited()
+        assert reg.violated == []
+
+    async def test_mutating_tool_without_registry_is_noop(self, tmp_path):
+        """No registry wired (e.g. a unit test) — the seam must not raise."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+
+        sender.assert_not_awaited()
+
+    async def test_cancel_clears_violation_notified_guard(
+        self, monkeypatch, tmp_path,
+    ):
+        """cancel() drops the per-engagement notified flag — bounded growth,
+        matches the other per-engagement dict pops."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers import s6_rc
+
+        async def fake_stop(*, engagement_id):
+            pass
+
+        async def fake_cau():
+            pass
+
+        monkeypatch.setattr(s6_rc, "stop_service", fake_stop)
+        monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+        monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(tmp_path / "svc"))
+        (tmp_path / "svc").mkdir()
+
+        sender = AsyncMock()
+        reg = _FakeInteractionRegistry("awaiting_operator")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "eng"),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+        assert rec.id in drv._violation_notified
+
+        await drv.cancel(rec)
+        assert rec.id not in drv._violation_notified
+
+
 class TestCancelBypassesQueue:
     async def test_cancel_immediate_while_busy(self, monkeypatch, tmp_path):
         """/cancel drops any messages still waiting for a spawn — it never
