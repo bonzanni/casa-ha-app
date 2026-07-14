@@ -42,7 +42,9 @@ pytestmark = pytest.mark.unit
 
 TOOL = "mcp__plugin_p_p__invoice_reset"
 ARTIFACT = "artifact-1"
-PROTECTED = {TOOL: ARTIFACT}
+# v0.78.0 W1: protected_map values are {"artifact_id", "summary"} — the hook
+# consumes ONLY artifact_id (zero enforcement change); summary is unused here.
+PROTECTED = {TOOL: {"artifact_id": ARTIFACT, "summary": None}}
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +356,9 @@ class TestConsumeAndChallenge:
         store.mint(_expected_key(ti, artifact="OLD-artifact"))
         deps = AuthzDeps(channel=channel, grants=store, challenges=coord)
         # hook's protected map names the NEW artifact.
-        hook = _mk_hook(protected={TOOL: ARTIFACT}, deps=deps)
+        hook = _mk_hook(
+            protected={TOOL: {"artifact_id": ARTIFACT, "summary": None}},
+            deps=deps)
         with _OriginCtx(_origin()):
             out = await _call(hook, tool_input=ti)
         assert _deny_reason(out) == _DENY_POSTED
@@ -645,7 +649,8 @@ class TestWiring:
         # artifact ids flow from protected_map, not an injected set.
         from plugin_grants import protected_map
         assert protected_map(resolution) == {
-            "mcp__plugin_p_p__invoice_reset": e["artifact_id"]}
+            "mcp__plugin_p_p__invoice_reset":
+                {"artifact_id": e["artifact_id"], "summary": None}}
 
     def test_specialist_without_protected_tools_has_no_authz_matcher(
         self, tmp_path, monkeypatch,

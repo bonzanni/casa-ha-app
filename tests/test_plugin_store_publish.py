@@ -354,9 +354,11 @@ def test_manifest_protected_tools_absent_is_empty():
 
 
 def test_manifest_protected_tools_present_valid():
+    """Legacy string form normalizes to {"name", "summary": None}."""
     from plugin_store import manifest_protected_tools
     manifest = {"name": "p", "casa": {"protectedTools": ["invoice_reset"]}}
-    assert manifest_protected_tools(manifest) == ["invoice_reset"]
+    assert manifest_protected_tools(manifest) == [
+        {"name": "invoice_reset", "summary": None}]
 
 
 def test_manifest_protected_tools_present_empty_list_is_valid():
@@ -376,6 +378,122 @@ def test_manifest_protected_tools_present_empty_list_is_valid():
 def test_manifest_protected_tools_malformed_shapes_raise(bad_value):
     from plugin_store import manifest_protected_tools
     manifest = {"name": "p", "casa": {"protectedTools": bad_value}}
+    with pytest.raises(StoreError) as ei:
+        manifest_protected_tools(manifest)
+    assert ei.value.reason_code == "protected_tools_invalid"
+
+
+# --- v0.78.0 W1: object-form entries with summaries --------------------------
+
+
+def test_manifest_protected_tools_object_entry_normalization():
+    """An object entry with a summary normalizes to {"name", "summary"}."""
+    from plugin_store import manifest_protected_tools
+    manifest = {"name": "p", "casa": {"protectedTools": [
+        {"name": "invoice_reset", "summary": "Delete the draft for {period}"},
+    ]}}
+    assert manifest_protected_tools(manifest) == [
+        {"name": "invoice_reset", "summary": "Delete the draft for {period}"}]
+
+
+def test_manifest_protected_tools_object_entry_without_summary():
+    """Object form WITHOUT a summary key normalizes summary to None, same as
+    the legacy string form."""
+    from plugin_store import manifest_protected_tools
+    manifest = {"name": "p", "casa": {"protectedTools": [
+        {"name": "invoice_reset"},
+    ]}}
+    assert manifest_protected_tools(manifest) == [
+        {"name": "invoice_reset", "summary": None}]
+
+
+def test_manifest_protected_tools_mixed_string_and_object_entries():
+    from plugin_store import manifest_protected_tools
+    manifest = {"name": "p", "casa": {"protectedTools": [
+        "legacy_tool",
+        {"name": "new_tool", "summary": "Does the new thing"},
+    ]}}
+    assert manifest_protected_tools(manifest) == [
+        {"name": "legacy_tool", "summary": None},
+        {"name": "new_tool", "summary": "Does the new thing"},
+    ]
+
+
+@pytest.mark.parametrize("bad_entry", [
+    123,                                          # wrong type (not str/dict)
+    None,                                         # wrong type
+    [],                                           # wrong type (list)
+    {"summary": "no name"},                       # missing name
+    {"name": ""},                                 # empty name
+    {"name": "t", "summary": ""},                 # empty summary
+    {"name": "t", "summary": 5},                  # non-string summary
+    {"name": "t", "summary": "x" * 201},          # oversized summary (>200)
+    {"name": "t", "summary": "line one\nline two"},   # multiline (C0 \n)
+    {"name": "t", "summary": "bad\x01char"},           # C0 control
+    {"name": "t", "summary": "bad" + chr(0x9c) + "char"},  # C1 control
+    {"name": "t", "summary": "line" + chr(0x2028) + "sep"},  # U+2028
+    {"name": "t", "summary": "bidi" + chr(0x200e) + "mark"},  # U+200E LRM
+    {"name": "t", "summary": "bidi" + chr(0x202a) + "embed"},  # U+202A
+    {"name": "t", "unknown_key": "x"},            # unknown key
+    {"name": "t", "summary": "ok", "extra": 1},   # unknown key alongside valid
+])
+def test_manifest_protected_tools_object_shapes_refuse(bad_entry):
+    from plugin_store import manifest_protected_tools
+    manifest = {"name": "p", "casa": {"protectedTools": [bad_entry]}}
+    with pytest.raises(StoreError) as ei:
+        manifest_protected_tools(manifest)
+    assert ei.value.reason_code == "protected_tools_invalid"
+
+
+def test_manifest_protected_tools_object_summary_exactly_200_chars_ok():
+    from plugin_store import manifest_protected_tools
+    manifest = {"name": "p", "casa": {"protectedTools": [
+        {"name": "t", "summary": "x" * 200},
+    ]}}
+    assert manifest_protected_tools(manifest) == [
+        {"name": "t", "summary": "x" * 200}]
+
+
+# --- v0.78.0 W1: duplicate names after sanitize_segment ----------------------
+
+
+def test_manifest_protected_tools_duplicate_string_string_refuses():
+    from plugin_store import manifest_protected_tools
+    manifest = {"name": "p", "casa": {"protectedTools": ["a_tool", "a_tool"]}}
+    with pytest.raises(StoreError) as ei:
+        manifest_protected_tools(manifest)
+    assert ei.value.reason_code == "protected_tools_invalid"
+
+
+def test_manifest_protected_tools_duplicate_object_object_refuses():
+    from plugin_store import manifest_protected_tools
+    manifest = {"name": "p", "casa": {"protectedTools": [
+        {"name": "a_tool", "summary": "first"},
+        {"name": "a_tool", "summary": "second"},
+    ]}}
+    with pytest.raises(StoreError) as ei:
+        manifest_protected_tools(manifest)
+    assert ei.value.reason_code == "protected_tools_invalid"
+
+
+def test_manifest_protected_tools_duplicate_mixed_string_object_refuses():
+    from plugin_store import manifest_protected_tools
+    manifest = {"name": "p", "casa": {"protectedTools": [
+        "a_tool",
+        {"name": "a_tool", "summary": "obj form"},
+    ]}}
+    with pytest.raises(StoreError) as ei:
+        manifest_protected_tools(manifest)
+    assert ei.value.reason_code == "protected_tools_invalid"
+
+
+def test_manifest_protected_tools_sanitized_collision_duplicate_refuses():
+    """r3-1: 'do thing' and 'do_thing' sanitize to the same runtime tool id —
+    no order-dependent last-wins summary semantics."""
+    from plugin_store import manifest_protected_tools
+    manifest = {"name": "p", "casa": {"protectedTools": [
+        "do thing", "do_thing",
+    ]}}
     with pytest.raises(StoreError) as ei:
         manifest_protected_tools(manifest)
     assert ei.value.reason_code == "protected_tools_invalid"

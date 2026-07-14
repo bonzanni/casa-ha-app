@@ -651,17 +651,20 @@ _DENY_INTERNAL = "internal authorization error — the call was not executed"
 
 def make_resident_authz_hook(
     role: str,
-    protected: dict[str, str],
+    protected: dict[str, dict],
     deps_factory: "Callable[[], AuthzDeps | None]",
 ) -> "Callable":
     """Build the fail-closed PreToolUse authz hook for one resident/specialist.
 
     ``role`` is the agent's own (plain, tier-stripped) role — asserted equal to
     ``origin.execution_role`` as defense in depth and used as
-    ``GrantKey.enforcement_role``. ``protected`` maps each full tool name to the
-    resolved plugin ``artifact_id`` (from ``plugin_grants.protected_map`` over
-    the SAME ``ResolutionResult`` used to build the agent's options — a
+    ``GrantKey.enforcement_role``. ``protected`` maps each full tool name to
+    ``{"artifact_id": ..., "summary": ...}`` (from ``plugin_grants.protected_map``
+    over the SAME ``ResolutionResult`` used to build the agent's options — a
     mid-TTL plugin update changes the artifact and invalidates the grant).
+    This hook consumes ONLY ``artifact_id`` — exactly as before v0.78.0, no
+    grant/GrantKey/enforcement change; ``summary`` is advisory copy threaded
+    to the challenge render by the coordinator (W2), not read here.
     ``deps_factory`` resolves the Telegram channel + stores LAZILY at call time;
     ``None`` (no DM reachable) is the unsupported-origin deny.
 
@@ -735,7 +738,8 @@ def make_resident_authz_hook(
 
             key = GrantKey(
                 operator_id=operator_id, chat_id=chat_id,
-                enforcement_role=role, artifact_id=protected[tool_name],
+                enforcement_role=role,
+                artifact_id=protected[tool_name]["artifact_id"],
                 tool_name=tool_name, args_hash=args_hash,
             )
 

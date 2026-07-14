@@ -18,19 +18,17 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from pathlib import Path
 
 from claude_agent_sdk import PermissionResultDeny
 
+from text_util import sanitize_segment  # noqa: F401 — re-exported (existing
+# callers/tests import `sanitize_segment` from this module; the canonical
+# implementation now lives in text_util so plugin_store.py — stdlib-only,
+# imported by the Dockerfile build helper before any venv — can share it
+# without importing this (claude_agent_sdk-dependent) module.
+
 logger = logging.getLogger(__name__)
-
-_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_-]")
-
-
-def sanitize_segment(s: str) -> str:
-    """Documented CC sanitization for namespace segments."""
-    return _SANITIZE_RE.sub("_", s)
 
 
 def _mcp_servers(mcp_json_path: Path) -> dict:
@@ -89,11 +87,16 @@ def required_env_vars_for_resolved(rp) -> list[str]:
         return []
 
 
-def protected_map(resolution) -> dict[str, str]:
-    """Full-tool-name -> artifact_id map for every ``casa.protectedTools``
-    entry across a RESOLVED ``ResolutionResult`` (A:§3.7). Derived from the
-    RESOLVED ARTIFACT's manifest (the content-addressed store copy named by
-    the ``ResolutionResult`` — never a duplicated registry field).
+def protected_map(resolution) -> dict[str, dict]:
+    """Full-tool-name -> ``{"artifact_id": str, "summary": str | None}`` map
+    for every ``casa.protectedTools`` entry across a RESOLVED
+    ``ResolutionResult`` (A:§3.7, value shape extended v0.78.0 W1). Derived
+    from the RESOLVED ARTIFACT's manifest (the content-addressed store copy
+    named by the ``ResolutionResult`` — never a duplicated registry field).
+    ``summary`` is the plugin-declared advisory copy (``None`` for a legacy
+    string entry or an object entry without one) — the authz hook consumes
+    ``artifact_id`` exactly as before (NO grant/GrantKey/enforcement
+    change); ``summary`` is threaded to the challenge render only (W2).
 
     Namespacing reuses the grant-derivation sanitization
     (``mcp__plugin_<plugin>_<server>__<tool>``); a BARE tool name expands
@@ -111,27 +114,28 @@ def protected_map(resolution) -> dict[str, str]:
     """
     from plugin_store import StoreError, manifest_protected_tools
 
-    out: dict[str, str] = {}
+    out: dict[str, dict] = {}
     for rp in getattr(resolution, "plugins", None) or []:
         try:
-            names = manifest_protected_tools(rp.manifest)
+            entries = manifest_protected_tools(rp.manifest)
         except StoreError:
             logger.warning(
                 "protected_tools_invalid: excluding %s (artifact_id=%s) "
                 "from the protected-tool map", rp.name, rp.artifact_id)
             continue
-        if not names:
+        if not entries:
             continue
         servers = sorted(_mcp_servers(Path(rp.path) / ".mcp.json"))
         if not servers:
             continue
         plugin_seg = sanitize_segment(rp.name)
-        for tool in names:
-            tool_seg = sanitize_segment(tool)
+        for tool_entry in entries:
+            tool_seg = sanitize_segment(tool_entry["name"])
             for server in servers:
                 full = (f"mcp__plugin_{plugin_seg}_"
                         f"{sanitize_segment(server)}__{tool_seg}")
-                out[full] = rp.artifact_id
+                out[full] = {"artifact_id": rp.artifact_id,
+                             "summary": tool_entry["summary"]}
     return out
 
 
