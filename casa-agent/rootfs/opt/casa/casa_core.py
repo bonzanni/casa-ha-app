@@ -133,9 +133,23 @@ async def start_internal_unix_runner(
             _make_channel_handlers,
             _make_channel_get_handlers,
         )
+        # W1: record each reply() text for the claude_code driver's live
+        # topic-stream relay reply de-dup. Resolved lazily — the driver is
+        # constructed later (in main), so this closure looks it up at request
+        # time via the agent module.
+        def _record_engagement_reply(engagement_id: str, text: str) -> None:
+            try:
+                import agent as _agent_mod
+                drv = getattr(_agent_mod, "active_claude_code_driver", None)
+                if drv is not None:
+                    drv.record_reply_text(engagement_id, text)
+            except Exception:  # noqa: BLE001 — de-dup hint is best-effort
+                pass
+
         channel_handlers = _make_channel_handlers(
             telegram_channel=telegram_channel,
             engagement_registry=engagement_registry,
+            record_reply=_record_engagement_reply,
         )
         for path, handler_fn in channel_handlers.items():
             internal_app.router.add_post(path, handler_fn)
@@ -1669,11 +1683,27 @@ async def main() -> None:
         persist_session_id=engagement_registry.persist_session_id,
     )
 
-    # claude_code driver still uses the buffered send_to_topic path
-    # (different driver, separate streaming work parked in Phase 4 / E-12).
-    async def _send_to_topic(thread_id: int, text: str) -> None:
+    # claude_code driver: send_to_topic doubles as the live TopicStreamRelay's
+    # send_message primitive (W1), so it must RETURN the posted message_id (the
+    # relay edits the rolling message by id). Notice/warning callers ignore it.
+    async def _send_to_topic(thread_id: int, text: str) -> int | None:
         if telegram_channel is not None:
-            await telegram_channel.send_to_topic(thread_id, text)
+            return await telegram_channel.send_to_topic(thread_id, text)
+        return None
+
+    async def _edit_topic_message(
+        thread_id: int, message_id: int, text: str,
+    ) -> bool:
+        if telegram_channel is not None:
+            return await telegram_channel.edit_topic_message(
+                thread_id, message_id, text)
+        return False
+
+    async def _delete_topic_message(thread_id: int, message_id: int) -> bool:
+        if telegram_channel is not None:
+            return await telegram_channel.delete_topic_message(
+                thread_id, message_id)
+        return False
 
     # Expose on the agent module so tools.emit_completion / cancel_engagement
     # can find it without circular imports.
@@ -1698,6 +1728,11 @@ async def main() -> None:
         engagements_root="/data/engagements",
         send_to_topic=_send_to_topic,
         casa_framework_mcp_url=_casa_framework_mcp_url,
+        # W1: relay edit/delete primitives + registry (advance_interaction_state
+        # seam for Task 7's inbound one-turn queue).
+        edit_topic_message=_edit_topic_message,
+        delete_topic_message=_delete_topic_message,
+        registry=engagement_registry,
         # O-5 (v0.37.9): capture-and-persist SDK session_id so a Casa
         # restart mid-engagement preserves conversation continuity.
         # The driver writes <workspace>/.session_id from its log-tail

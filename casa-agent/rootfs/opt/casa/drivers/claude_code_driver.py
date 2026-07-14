@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -23,6 +24,10 @@ from drivers.workspace import (
 from engagement_registry import EngagementRecord
 
 logger = logging.getLogger(__name__)
+
+# W1/Sol B8: at most this many undelivered operator turns are held per
+# engagement before a further enqueue is dropped with a one-time topic notice.
+_INBOUND_MAX_DEPTH = 10
 # P31 (v0.37.10): match a UUID as a complete filename stem — the
 # claude CLI names its session-storage files ``<uuid>.jsonl``. Replaces
 # v0.37.9's free-text session_id regex (which tailed a log file that
@@ -33,11 +38,115 @@ _UUID_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-TopicSender = Callable[[int, str], Awaitable[None]]
+TopicSender = Callable[[int, str], Awaitable[Any]]
 SessionIdPersister = Callable[[str, str], Awaitable[None]]
 """(engagement_id, session_id) → None — registry persist hook.
 
 Matches engagement_registry.persist_session_id's bound-method signature."""
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    """Best-effort temp+rename write; swallow OSError (marker is advisory)."""
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except OSError as exc:  # noqa: BLE001 — advisory marker, never fatal
+        logger.debug("inbound marker write failed (%s): %s", path, exc)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+class _InboundItem:
+    __slots__ = ("text", "is_initial")
+
+    def __init__(self, text: str, is_initial: bool = False) -> None:
+        self.text = text
+        self.is_initial = is_initial
+
+
+class _InboundQueue:
+    """Spawn-keyed one-turn inbound message queue (design §W1 r4-3, Sol B8/r2-B6).
+
+    Each claude_code turn is one FIFO reader that consumes exactly one line
+    then reaches EOF; the s6 respawn for the next turn prints a ``spawn``
+    control frame the relay surfaces as ``on_turn_event("spawn")``. This queue
+    couples the two: a spawn ARMS a ``reader_ready`` flag (edge-triggered), and
+    the pump delivers **at most one** queued message per arm, then disarms.
+
+    The arm is edge-triggered on the flag, NOT "await the next spawn": a spawn
+    that arms the reader while the queue is empty must still deliver a message
+    enqueued *later* — waiting for another spawn would deadlock, since no new
+    spawn arrives without input. So ``on_spawn`` and ``enqueue`` both pump.
+
+    Delivery persists a ``.inbound_pending`` depth marker so a Casa restart that
+    lost undelivered turns can warn the operator (boot reconcile in
+    ``_spawn_background_tasks``).
+    """
+
+    def __init__(
+        self,
+        *,
+        engagement_id: str,
+        marker_path: str,
+        write_fifo: Callable[[str], Awaitable[bool]],
+        post_notice: Callable[[str], Awaitable[Any]],
+        registry: Any = None,
+    ) -> None:
+        self._engagement_id = engagement_id
+        self._marker_path = marker_path
+        self._write_fifo = write_fifo
+        self._post_notice = post_notice
+        self._registry = registry
+        self._queue: deque[_InboundItem] = deque()
+        self.reader_ready = False
+        self._pump_lock = asyncio.Lock()
+
+    def _write_marker(self) -> None:
+        _atomic_write_text(self._marker_path, f"{len(self._queue)}\n")
+
+    async def on_spawn(self) -> None:
+        """A ``spawn`` control frame arrived — arm the reader and pump."""
+        self.reader_ready = True
+        await self._pump()
+
+    async def enqueue(self, text: str, *, is_initial: bool = False) -> None:
+        """Append an operator turn (or drop with a one-time overflow notice)."""
+        if len(self._queue) >= _INBOUND_MAX_DEPTH:
+            await self._post_notice(
+                f"Your engagement already has {_INBOUND_MAX_DEPTH} messages "
+                "waiting to be delivered — this one was dropped. Please wait "
+                "for it to catch up, then resend."
+            )
+            return
+        self._queue.append(_InboundItem(text, is_initial))
+        self._write_marker()
+        await self._pump()
+
+    async def _pump(self) -> None:
+        async with self._pump_lock:
+            while self.reader_ready and self._queue:
+                item = self._queue[0]
+                ok = await self._write_fifo(item.text)
+                if not ok:
+                    # Retain the item and stay armed — retry on the next
+                    # spawn / enqueue (writer transiently had no reader).
+                    break
+                self._queue.popleft()
+                self.reader_ready = False   # one message per FIFO EOF
+                self._write_marker()
+                # B7 seam: advance interaction state for ordinary operator
+                # turns only — NEVER the initial prompt. No-op until Task 7
+                # adds advance_interaction_state to the registry.
+                if not item.is_initial:
+                    fn = getattr(
+                        self._registry, "advance_interaction_state", None,
+                    )
+                    if fn is not None:
+                        await fn(self._engagement_id, "operator_turn")
 
 
 class ClaudeCodeDriver(DriverProtocol):
@@ -50,15 +159,32 @@ class ClaudeCodeDriver(DriverProtocol):
         send_to_topic: TopicSender,
         casa_framework_mcp_url: str,
         persist_session_id: SessionIdPersister | None = None,
+        edit_topic_message: Callable[[int, int, str], Awaitable[bool]] | None = None,
+        delete_topic_message: Callable[[int, int], Awaitable[bool]] | None = None,
+        registry: Any = None,
     ) -> None:
         self._engagements_root = engagements_root
+        # ``send_to_topic`` doubles as the relay's ``send_message`` primitive:
+        # casa_core wires it to return the posted Telegram message_id (the relay
+        # needs it to edit the rolling message), while notice/warning callers
+        # ignore the return.
         self._send_to_topic = send_to_topic
+        self._edit_topic_message = edit_topic_message
+        self._delete_topic_message = delete_topic_message
         self._casa_framework_mcp_url = casa_framework_mcp_url
         self._persist_session_id = persist_session_id
-        # Per-engagement background tasks (respawn poller, session-id
-        # capture, DEBUG log relay).
+        # ``advance_interaction_state`` (Task 7) lives on this registry; the
+        # inbound queue reaches for it via getattr (no-op until it exists).
+        self._registry = registry
+        # Per-engagement background tasks (respawn poller, session-id capture,
+        # ALWAYS-on live topic-stream relay, DEBUG log relay).
         self._tasks: dict[str, list[asyncio.Task]] = {}
         self._last_turn_ts: dict[str, float] = {}
+        # W1: spawn-keyed inbound queue + per-turn reply-text set (relay reply
+        # de-dup) + current spawn epoch pending a result (abnormal-exit probe).
+        self._inbound: dict[str, _InboundQueue] = {}
+        self._reply_texts: dict[str, set[str]] = {}
+        self._epoch_pending: dict[str, int | None] = {}
 
     # -- DriverProtocol ---------------------------------------------------
 
@@ -200,27 +326,41 @@ class ClaudeCodeDriver(DriverProtocol):
         #    session-id capture, and (at DEBUG) the log relay.
         self._spawn_background_tasks(engagement)
 
-        # 5. Write initial prompt to FIFO — background, non-blocking.
+        # 5. Enqueue the initial prompt (is_initial=True) — the first spawn
+        #    arms the reader and delivers it. Enqueue is instant while the
+        #    reader is unarmed, so no background task is needed.
         if prompt:
-            prompt_task = asyncio.create_task(
-                self._write_to_fifo(engagement, prompt),
-                name=f"initial_prompt:{engagement.id[:8]}",
-            )
-            self._tasks.setdefault(engagement.id, []).append(prompt_task)
+            q = self._inbound.get(engagement.id)
+            if q is not None:
+                await q.enqueue(prompt, is_initial=True)
+            else:
+                # Background tasks disabled (e.g. a unit test) — legacy direct
+                # write so start() still delivers the prompt.
+                await self._write_to_fifo(engagement, prompt)
 
         logger.info("claude_code engagement %s started", engagement.id[:8])
 
     async def send_user_turn(
         self, engagement: EngagementRecord, text: str,
     ) -> None:
-        await self._write_to_fifo(engagement, text)
+        q = self._inbound.get(engagement.id)
+        if q is not None:
+            await q.enqueue(text)
+        else:
+            await self._write_to_fifo(engagement, text)
 
     async def cancel(self, engagement: EngagementRecord) -> None:
-        """Teardown for a terminal transition (cancelled or completed)."""
+        """Teardown for a terminal transition (cancelled or completed).
+
+        ``/cancel`` bypasses the inbound queue entirely — any messages still
+        waiting for a spawn are dropped, not flushed."""
         # Cancel background tasks
         for t in self._tasks.pop(engagement.id, []):
             t.cancel()
         self._last_turn_ts.pop(engagement.id, None)
+        self._inbound.pop(engagement.id, None)
+        self._reply_texts.pop(engagement.id, None)
+        self._epoch_pending.pop(engagement.id, None)
 
         async with s6_rc._compile_lock:
             # Stop is tolerant of "already down" — log and continue.
@@ -278,7 +418,14 @@ class ClaudeCodeDriver(DriverProtocol):
     async def _write_to_fifo(
         self, engagement: EngagementRecord, text: str,
         *, timeout_s: float = 20.0, poll_s: float = 0.25,
-    ) -> None:
+    ) -> bool:
+        """Write one newline-terminated line to the engagement FIFO.
+
+        Returns ``True`` iff the WHOLE line was written (the inbound queue
+        keys one-message-per-spawn delivery + retention on this). Any
+        no-reader / stall / broken-pipe / missing-FIFO outcome returns
+        ``False`` so the caller retains the item for the next spawn.
+        """
         # M13: a blocking open(fifo, "a") parks a pooled executor thread
         # FOREVER when no reader exists (crash-looping/downed s6 service).
         # asyncio.to_thread threads are uncancellable, so a handful of stuck
@@ -287,7 +434,7 @@ class ClaudeCodeDriver(DriverProtocol):
         fifo = (Path(self._engagements_root) / engagement.id / "stdin.fifo")
         if not fifo.exists():
             logger.warning("FIFO missing for engagement %s", engagement.id[:8])
-            return
+            return False
         data = (text + "\n").encode("utf-8")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
@@ -305,7 +452,7 @@ class ClaudeCodeDriver(DriverProtocol):
                             "FIFO open failed for engagement %s: %s",
                             engagement.id[:8], exc,
                         )
-                        return
+                        return False
                     if loop.time() >= deadline:
                         logger.warning(
                             "engagement %s: no FIFO reader after %.0fs — "
@@ -317,7 +464,7 @@ class ClaudeCodeDriver(DriverProtocol):
                             "your message was not delivered. Try again, or "
                             "/cancel if it stays unresponsive.",
                         )
-                        return
+                        return False
                     await asyncio.sleep(poll_s)
             # Reader exists; write non-blocking under the same deadline. Turns
             # are far below the 64KB pipe buffer, so the first write virtually
@@ -333,20 +480,36 @@ class ClaudeCodeDriver(DriverProtocol):
                             "engagement %s: FIFO write stalled — dropping "
                             "remainder of turn", engagement.id[:8],
                         )
-                        return
+                        return False
                     await asyncio.sleep(poll_s)
                 except BrokenPipeError:
                     logger.warning(
                         "engagement %s: FIFO reader vanished mid-write",
                         engagement.id[:8],
                     )
-                    return
+                    return False
         finally:
             if fd is not None:
                 os.close(fd)
         self._last_turn_ts[engagement.id] = time.time()
+        return True
 
     def _spawn_background_tasks(self, engagement: EngagementRecord) -> None:
+        # Sol r2-B6: boot replay calls this DIRECTLY (not start), so the inbound
+        # queue, reply-text set, epoch tracker AND the marker reconcile all live
+        # here — a resumed engagement gets the same wiring as a fresh one.
+        ws = Path(self._engagements_root) / engagement.id
+        self._inbound[engagement.id] = _InboundQueue(
+            engagement_id=engagement.id,
+            marker_path=str(ws / ".inbound_pending"),
+            write_fifo=lambda text: self._write_to_fifo(engagement, text),
+            post_notice=lambda text: self._send_to_topic(
+                engagement.topic_id, text),
+            registry=self._registry,
+        )
+        self._reply_texts.setdefault(engagement.id, set())
+        self._epoch_pending.setdefault(engagement.id, None)
+
         tasks = [
             asyncio.create_task(self._poll_respawns(engagement)),
             # P31 (v0.37.10): capture the SDK session_id by watching the
@@ -355,13 +518,22 @@ class ClaudeCodeDriver(DriverProtocol):
             # ``--resume $(cat .session_id)`` plumbing picks up after a
             # Casa restart.
             asyncio.create_task(self._capture_session_id(engagement)),
+            # W1: the LIVE topic-stream relay is spawned ALWAYS, regardless of
+            # LOG_LEVEL — it is the operator's live window on the engagement,
+            # not a debug aid. It fans ``on_turn_event`` into _on_stream_event
+            # (arm the inbound queue on spawn, abnormal-exit correlation,
+            # reply-text reset, Task-7 seams).
+            asyncio.create_task(
+                self._run_topic_relay(engagement),
+                name=f"topic_relay:{engagement.id[:8]}"),
         ]
-        # Phase 4b G5: relay every s6-log line into Casa's logger at DEBUG
-        # so operators have one greppable namespace for both drivers' CLI
+        # Phase 4b G5: ALSO relay every raw s6-log line into Casa's logger at
+        # DEBUG so operators have one greppable namespace for both drivers' CLI
         # subprocess output. Spawned only when DEBUG-enabled: the tailer
-        # re-opens and reads the (v0.64.0: now real) file at 10 Hz, and at
-        # INFO every line would be discarded. A LOG_LEVEL flip requires an
-        # add-on restart, which respawns these tasks anyway.
+        # re-opens and reads the file at 10 Hz, and at INFO every line would be
+        # discarded. A LOG_LEVEL flip requires an add-on restart, which
+        # respawns these tasks anyway. (Distinct from the always-on relay
+        # above, which drives the operator-visible topic stream.)
         if logging.getLogger("subprocess_cli").isEnabledFor(logging.DEBUG):
             log_path = os.path.join(
                 engagement_log_dir(engagement.id), "current")
@@ -369,19 +541,196 @@ class ClaudeCodeDriver(DriverProtocol):
                 self._relay_log_lines(engagement, log_path=log_path)))
         self._tasks[engagement.id] = tasks
 
+        # Boot reconcile (Sol r2-B6): a surviving non-zero .inbound_pending
+        # means operator turns may have been lost before the last restart.
+        self._reconcile_inbound_marker(engagement)
+
+    def _reconcile_inbound_marker(self, engagement: EngagementRecord) -> None:
+        marker = Path(self._engagements_root) / engagement.id / ".inbound_pending"
+        try:
+            pending = int(marker.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return
+        if pending <= 0:
+            return
+        # Zero it synchronously so a second boot never re-warns.
+        _atomic_write_text(str(marker), "0\n")
+
+        async def _notify() -> None:
+            await self._send_to_topic(
+                engagement.topic_id,
+                f"Up to {pending} queued message(s) may not have been "
+                "delivered before the last restart — please resend if needed.",
+            )
+
+        self._tasks.setdefault(engagement.id, []).append(
+            asyncio.create_task(_notify()))
+
+    async def _run_topic_relay(self, engagement: EngagementRecord) -> None:
+        """Drive the always-on live topic-stream relay for one engagement.
+
+        The relay reads the engagement's NDJSON s6-log to the live end then
+        returns; each claude_code turn is a fresh CLI spawn that appends a
+        burst then exits, so we re-run on a short poll — the crash-safe cursor
+        (``<ws>/.stream_cursor.json``) resumes exactly where the last run left
+        off, and REPLAY-mode side-effect suppression keeps re-runs idempotent.
+        """
+        from drivers.topic_stream import TopicStreamRelay
+
+        ws = Path(self._engagements_root) / engagement.id
+        relay = TopicStreamRelay(
+            engagement_id=engagement.id,
+            topic_id=engagement.topic_id,
+            log_dir=engagement_log_dir(engagement.id),
+            cursor_path=str(ws / ".stream_cursor.json"),
+            send_message=self._relay_send_message,
+            edit_message=self._relay_edit_message,
+            delete_message=self._relay_delete_message,
+            on_turn_event=(
+                lambda kind, payload: self._on_stream_event(
+                    engagement, kind, payload)
+            ),
+            reply_texts=lambda: self._reply_texts.get(engagement.id, set()),
+        )
+        while True:
+            try:
+                await relay.run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — relay is best-effort
+                logger.warning(
+                    "topic relay for engagement %s errored (will retry): %s",
+                    engagement.id[:8], exc,
+                )
+            await asyncio.sleep(0.5)
+
+    # -- relay-injected Telegram primitives -------------------------------
+
+    async def _relay_send_message(self, topic_id: int, text: str) -> int | None:
+        return await self._send_to_topic(topic_id, text)
+
+    async def _relay_edit_message(
+        self, topic_id: int, message_id: int, text: str,
+    ) -> bool:
+        if self._edit_topic_message is None:
+            return False
+        return await self._edit_topic_message(topic_id, message_id, text)
+
+    async def _relay_delete_message(
+        self, topic_id: int, message_id: int,
+    ) -> bool:
+        if self._delete_topic_message is None:
+            return False
+        return await self._delete_topic_message(topic_id, message_id)
+
+    # -- stream-event fan-out ---------------------------------------------
+
+    def record_reply_text(self, engagement_id: str, text: str) -> None:
+        """Record a ``reply()`` text for the relay's per-turn de-dup.
+
+        Called by the /internal/channel/send_to_topic handler (the engagement
+        reply path). The set is cleared on each ``turn_start`` (see
+        ``_on_stream_event``)."""
+        if text:
+            self._reply_texts.setdefault(engagement_id, set()).add(text)
+
+    async def _on_stream_event(
+        self, engagement: EngagementRecord, kind: str, payload: dict,
+    ) -> None:
+        """Fan the relay's ordered ``on_turn_event`` kinds into driver state.
+
+        ``spawn`` → arm the inbound queue + epoch/abnormal-exit correlation;
+        ``turn_start`` → reset the reply-text de-dup set (Task-7 interaction
+        seam); ``mutating_tool`` → Task-7 seam (record only); ``result`` →
+        clear the epoch pending a result (normal turn boundary)."""
+        eng_id = engagement.id
+        if kind == "spawn":
+            epoch = payload.get("epoch")
+            prev = self._epoch_pending.get(eng_id)
+            if prev is not None:
+                # A previous epoch spawned but never emitted a result before
+                # this new spawn — abnormal exit. ``result`` is at-most-once,
+                # so a spawn-without-result is an equally valid turn boundary.
+                self._log_abnormal_exit(engagement, prev)
+            self._epoch_pending[eng_id] = epoch
+            q = self._inbound.get(eng_id)
+            if q is not None:
+                await q.on_spawn()
+        elif kind == "turn_start":
+            # Fresh turn — drop the prior turn's reply-text de-dup set.
+            self._reply_texts[eng_id] = set()
+        elif kind == "mutating_tool":
+            # Task-7 seam: interaction_state is not built yet — record only.
+            logger.debug(
+                "engagement %s mutating tool during turn: %s",
+                eng_id[:8], payload.get("tool"),
+            )
+        elif kind == "result":
+            self._epoch_pending[eng_id] = None
+
+    def _log_abnormal_exit(
+        self, engagement: EngagementRecord, epoch: int | None,
+    ) -> None:
+        tail = self._read_epoch_stderr_tail(engagement, epoch)
+        short = engagement.id[:8]
+        if tail is None:
+            logger.warning(
+                "engagement %s: epoch %s exited without a result frame "
+                "(abnormal); stderr diagnostics unavailable", short, epoch,
+            )
+        else:
+            logger.warning(
+                "engagement %s: epoch %s exited without a result frame "
+                "(abnormal); stderr tail:\n%s", short, epoch, tail,
+            )
+
+    def _read_epoch_stderr_tail(
+        self, engagement: EngagementRecord, epoch: int | None,
+        *, max_bytes: int = 4000,
+    ) -> str | None:
+        """Read the UNIQUE per-epoch stderr ring (Sol r5-B2).
+
+        The filename carries the epoch, so no sidecar / ownership check is
+        needed — a lingering ringlog consumer only ever writes ITS OWN epoch's
+        file. Reads ``.stderr.<epoch>.log.1`` (older rotated chunk) then
+        ``.stderr.<epoch>.log`` (newest), returning the tail; both absent
+        (never created / already pruned) → ``None`` (diagnostics unavailable,
+        never misattributed to a reused slot)."""
+        if epoch is None:
+            return None
+        ws = Path(self._engagements_root) / engagement.id
+        chunks: list[str] = []
+        for name in (f".stderr.{epoch}.log.1", f".stderr.{epoch}.log"):
+            try:
+                chunks.append(
+                    (ws / name).read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+        if not chunks:
+            return None
+        return "".join(chunks)[-max_bytes:]
+
     async def _relay_log_lines(
         self, engagement: EngagementRecord, *, log_path: str,
     ) -> None:
         """Tail the per-engagement s6-log file and emit each line at DEBUG.
 
         Phase 4b G5 — companion to Bug 4's stderr callback. Stderr from the
-        in_casa-driver path lands on the ``subprocess_cli`` logger via the
-        SDK callback (sdk_logging.make_stderr_logger); claude_code's CLI
-        subprocess merges its own stdout+stderr into s6-log
-        (engagement_run_template.sh ``exec 2>&1``). This task reuses
-        ``_tail_file`` so inode rotation is handled, and emits every line at
-        DEBUG so prod operators see nothing and debugging operators see
-        everything (single LOG_LEVEL=DEBUG flip).
+        in_casa-driver path lands on the ``subprocess_cli`` logger via the SDK
+        callback (sdk_logging.make_stderr_logger).
+
+        v0.75.0/JC3: claude_code's CLI subprocess NO LONGER merges stderr into
+        s6-log — the run script redirects stderr into a bounded per-epoch ring
+        (``exec 2> >(ringlog.sh .stderr.<EPOCH>.log ...)``), so s6-log/current
+        carries only the CLI's NDJSON stdout. This DEBUG relay simply mirrors
+        that stdout stream (``_tail_file`` with ``from_end=True``, inode
+        rotation handled) into the ``subprocess_cli`` logger, staying
+        DEBUG-only: prod operators see nothing, a single LOG_LEVEL=DEBUG flip
+        surfaces everything. It is INDEPENDENT of the always-on
+        ``TopicStreamRelay`` (which parses the same NDJSON into the operator's
+        live topic window and is spawned regardless of LOG_LEVEL). Per-epoch
+        stderr is surfaced separately by the abnormal-exit correlation in
+        ``_on_stream_event`` / ``_read_epoch_stderr_tail``.
 
         v0.64.0 removed the sibling ``_capture_url`` task: headless claude
         auto-degrades to one-shot --print mode on non-TTY stdout and never

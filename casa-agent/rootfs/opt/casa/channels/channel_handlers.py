@@ -82,8 +82,15 @@ def _resolve_topic(
 
 def _make_send_to_topic(
     telegram_channel: Any, engagement_registry: Any,
+    record_reply: Callable[[str, str], None] | None = None,
 ) -> Handler:
-    """Build the aiohttp POST handler for /internal/channel/send_to_topic."""
+    """Build the aiohttp POST handler for /internal/channel/send_to_topic.
+
+    ``record_reply`` (W1, optional): every text through this endpoint is a
+    ``reply()`` from the engagement; on a successful post it is recorded per
+    engagement so the claude_code driver's live topic-stream relay can de-dup
+    a streamed turn that is byte-identical to a reply already posted.
+    """
 
     async def handler(request: web.Request) -> web.Response:
         try:
@@ -108,6 +115,12 @@ def _make_send_to_topic(
                 engagement_id, topic_id, exc,
             )
             return web.json_response({"ok": False, "error": "send_failed"})
+
+        if record_reply is not None and text:
+            try:
+                record_reply(engagement_id, text)
+            except Exception:  # noqa: BLE001 — de-dup hint is best-effort
+                logger.debug("record_reply hook failed", exc_info=True)
 
         return web.json_response({"ok": True, "message_id": msg_id})
 
@@ -490,6 +503,7 @@ def _make_update_state(telegram_channel: Any) -> Handler:
 
 def _make_channel_handlers(
     *, telegram_channel: Any, engagement_registry: Any,
+    record_reply: Callable[[str, str], None] | None = None,
 ) -> dict[str, Handler]:
     """Return a path → handler dict for /internal/channel/* POSTs.
 
@@ -497,12 +511,15 @@ def _make_channel_handlers(
     Phase 2: ``post_inline_keyboard`` (Task 19), ``permission_verdict`` (Task 21),
     ``update_state`` (Task 23).
     v0.75.0 (W5): ``ask`` / ``ask_cancel`` (Task 3).
+    v0.75.0 (W1): ``record_reply`` hook threads reply() texts to the
+    claude_code driver's live topic-stream relay de-dup.
     Phase 2+ will extend with ``set_progress``, ``typing``, etc. — see spec §A.3.
     """
     return {
         "/internal/channel/send_to_topic": _make_send_to_topic(
             telegram_channel=telegram_channel,
             engagement_registry=engagement_registry,
+            record_reply=record_reply,
         ),
         "/internal/channel/post_inline_keyboard": _make_post_inline_keyboard(
             telegram_channel=telegram_channel,
