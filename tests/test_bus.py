@@ -60,6 +60,44 @@ async def test_send_to_unknown_target():
     # No exception -- pass
 
 
+async def test_send_checked_accepted_enqueues_on_real_bus():
+    """v0.76.0 (r1-B2): send_checked returns "accepted" for a registered
+    target AND actually enqueues the message (the same enqueue send() does)."""
+    bus = MessageBus()
+    bus.register("b")
+
+    result = await bus.send_checked(_msg(target="b", content="hi"))
+
+    assert result == "accepted"
+    assert bus.queues["b"].qsize() == 1
+    _priority, _seq, msg = bus.queues["b"].get_nowait()
+    assert msg.content == "hi"
+    # Enqueued messages are logged (parity with send()).
+    assert bus.get_log()[-1].content == "hi"
+
+
+async def test_send_checked_no_target_drops_and_reports():
+    """send_checked returns "no_target" for an unregistered target and drops
+    the message exactly like send() (no queue created, nothing logged)."""
+    bus = MessageBus()
+    bus.register("a")
+
+    result = await bus.send_checked(_msg(target="nonexistent"))
+
+    assert result == "no_target"
+    assert "nonexistent" not in bus.queues
+    assert bus.get_log() == []
+
+
+async def test_send_delegates_to_send_checked():
+    """send() is a thin wrapper: it enqueues via send_checked and discards
+    the signal (returns None)."""
+    bus = MessageBus()
+    bus.register("b")
+    assert await bus.send(_msg(target="b")) is None
+    assert bus.queues["b"].qsize() == 1
+
+
 async def test_request_response():
     """request() resolves when respond() is called."""
     bus = MessageBus()

@@ -1018,6 +1018,13 @@ class TelegramChannel(Channel):
             await _safe_answer(cq, "expired")
             return
 
+        # v0.76.0 (W5b, r1-B2): resident_ask is DM-scoped (dm:/authz:), NOT
+        # topic-scoped — it is handled fully by its own single-owner branch
+        # BEFORE any engagement/topic lookup and returns.
+        if ns == "resident_ask":
+            await self._on_resident_callback(cq, request_id, idx)
+            return
+
         if cq.from_user is None:
             # r3-B5: fail closed — an anonymous/missing actor can never
             # authorize a verdict.
@@ -1132,6 +1139,91 @@ class TelegramChannel(Channel):
                 else:
                     BROKER.abort_claim(claim)
         await _safe_answer(cq, "✔" if committed else "expired")
+
+    async def _on_resident_callback(self, cq: Any, rid: str, idx: int) -> None:
+        """resident_ask tap — SINGLE-OWNER commit contract [A:§2, r1-B2/r3-B1].
+
+        DM-scoped (``dm:<chat>`` plain asks / ``authz:<chat>`` authorization
+        challenges — DISJOINT scopes). Ordering is the frozen addendum:
+        ``claim → commit() succeeds → on_commit_sync (mint) runs IMMEDIATELY
+        after, with NO await in between`` — commit() is synchronous and
+        schedules the finish-hook task, so nothing can run between commit and
+        the sync step. The sync step mutates the BROKER-OWNED ``req.meta``
+        (``get_meta`` returns it by reference for live requests; ``register``
+        shallow-copies the creator's dict, so creators must never rely on
+        their original). A sync-step exception is logged and swallowed —
+        commit already succeeded, ``minted`` stays absent, and the finish hook
+        edits the internal-error text.
+
+        This handler NEVER edits the keyboard or dispatches — the broker
+        finish hook (installed by each record creator in T4/T5) is the single
+        serialized owner of ALL post-commit async work (edit-first → dispatch
+        → overwrite-on-failure). The toast is an explicit task shielded so
+        exactly one answer completes even under cancellation (r3-B2).
+        """
+        from verdict_broker import BROKER
+
+        committed = False
+        toast = "expired"
+        try:
+            if cq.message is None or cq.message.chat is None:
+                return  # toast "expired" in finally
+            chat = cq.message.chat.id
+            meta = (
+                BROKER.get_meta(
+                    namespace="resident_ask", scope=f"dm:{chat}", request_id=rid,
+                )
+                or BROKER.get_meta(
+                    namespace="resident_ask", scope=f"authz:{chat}", request_id=rid,
+                )
+            )
+            if meta is None:
+                return
+            if meta.get("chat_id") != chat:
+                return
+            options = meta.get("options") or []
+            if not (0 <= idx < len(options)):
+                toast = "invalid"
+                return
+            expected = meta.get("operator_id")
+            if (
+                cq.from_user is None
+                or expected is None
+                or cq.from_user.id != expected
+            ):
+                toast = "not for you"
+                return
+            claim = BROKER.claim(
+                namespace="resident_ask", scope=meta["_scope"], request_id=rid,
+                option_index=idx, actor_id=cq.from_user.id,
+            )
+            if isinstance(claim, str):
+                toast = {"duplicate": "already answered", "stale": "expired"}[claim]
+                return
+            committed = BROKER.commit(claim)
+            if committed:
+                # r3-B1: the SYNCHRONOUS record/mint step runs IMMEDIATELY
+                # after a successful commit — commit() is synchronous and there
+                # is NO await between it and this call, so the finish-hook task
+                # scheduled by commit() cannot run first. Exception ⇒ logged;
+                # minted stays absent; the finish hook edits the internal-error
+                # text.
+                step = meta.get("on_commit_sync")
+                if step is not None:
+                    try:
+                        step(idx)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("on_commit_sync failed")
+                toast = "✔"
+            # NO dispatch/edit here: the finish hook owns everything after.
+        finally:
+            # r3-B2: exactly one COMPLETED answer even under cancellation.
+            t = asyncio.create_task(_safe_answer(cq, toast))
+            try:
+                await asyncio.shield(t)
+            except asyncio.CancelledError:
+                await t
+                raise
 
     # ------------------------------------------------------------------
     # v0.37.2 (C-1): permission-relay keyboard composer
@@ -1353,6 +1445,119 @@ class TelegramChannel(Channel):
                 topic_id, message_id, exc,
             )
             return False
+
+    # ------------------------------------------------------------------
+    # v0.76.0 (W5b/resident_ask): DM keyboard composer + plain DM-message
+    # edit helper + button-continuation dispatch. Chat-addressed analogues
+    # of the v0.75.0 engagement-topic helpers (no topic thread) — the
+    # resident-tap spine [A:§2, r1-B2/r3-B1].
+    # ------------------------------------------------------------------
+
+    async def post_dm_keyboard(
+        self, *, chat_id: int, request_id: str, text: str, options: list[str],
+    ) -> int | None:
+        """Post a plain-text question to a DM chat with one tappable button
+        per option (resident_ask).
+
+        DM analogue of ``post_options_keyboard``: chat-addressed (no topic
+        thread), plain send (operator-/agent-authored free text, no MarkdownV2
+        escaping pass). ``callback_data`` is ``v1|resident_ask|<request_id>|<i>``
+        where ``i`` is the option's position. Returns the Telegram
+        ``message_id``, or ``None`` on send failure — the broker's
+        ``ensure_posted`` treats ``None`` as a delivery failure (r10-B3).
+        """
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        kbd = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                text=label,
+                callback_data=f"v1|resident_ask|{request_id}|{i}",
+            )]
+            for i, label in enumerate(options)
+        ])
+        try:
+            msg = await self.bot.send_message(
+                chat_id=chat_id, text=text, reply_markup=kbd,
+            )
+        except Exception as exc:  # noqa: BLE001 — delivery failure, not fatal
+            logger.warning(
+                "post_dm_keyboard send failed (chat=%s): %s", chat_id, exc,
+            )
+            return None
+        return msg.message_id
+
+    async def edit_dm_message(
+        self, chat_id: int, message_id: int, text: str,
+    ) -> bool:
+        """Plain (no parse_mode, no reply_markup) text edit of a posted DM
+        message — resident_ask finish-hook target.
+
+        DM analogue of ``edit_topic_message`` (chat-addressed, no supergroup
+        guard). "Message is not modified" (an identical re-edit) is tolerated
+        as success, not an error, since the desired end state already holds.
+        """
+        try:
+            await self.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text,
+            )
+            return True
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            logger.warning(
+                "edit_dm_message failed (chat=%s message_id=%s): %s",
+                chat_id, message_id, exc,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+            logger.warning(
+                "edit_dm_message failed (chat=%s message_id=%s): %s",
+                chat_id, message_id, exc,
+            )
+            return False
+
+    async def _dispatch_button_continuation(
+        self, *, chat_id: int, user_id: int, target_role: str,
+        request_id: str, text: str,
+        _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> bool:
+        """Deliver a button answer/approval to ``target_role`` as a synthetic
+        CHANNEL_IN turn (r1-B2/r1-B3).
+
+        The bus ``button_answer`` marker carries ``request_id`` (r1-B3) so the
+        target agent can correlate the tap to its detached ``ask_user`` /
+        protected-tool call. Because the target role may still be
+        (re)registering when the operator taps, retries up to 3 times on a
+        ``no_target`` drop (backoff 0.5s / 1s — injectable ``_sleep`` so tests
+        never touch the shared ``asyncio.sleep``). Returns ``True`` iff the bus
+        accepted the message.
+
+        This is INTERNAL, Casa-composed context (not external ingress), so the
+        reserved ``synthetic`` / ``button_answer`` markers are set directly and
+        NOT passed through ``sanitize_external_context`` (which would strip
+        them).
+        """
+        delays = (0.5, 1.0)
+        for attempt in range(3):
+            msg = BusMessage(
+                type=MessageType.CHANNEL_IN,
+                source="telegram",
+                target=target_role,
+                content=text,
+                channel="telegram",
+                context={
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "cid": new_cid(),
+                    "synthetic": "button",
+                    "button_answer": request_id,
+                },
+            )
+            if await self._bus.send_checked(msg) == "accepted":
+                return True
+            if attempt < len(delays):
+                await _sleep(delays[attempt])
+        return False
 
     async def _internal_post(self, path: str, payload: dict) -> dict:
         """Dispatch an internal-handler call from inside casa-main.

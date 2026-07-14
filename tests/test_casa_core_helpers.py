@@ -8,6 +8,7 @@ by tests/test_trigger_registry.py).
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -209,3 +210,47 @@ class TestBrokerShutdownOrdering:
 
         assert order == ["cancel_all:casa_shutdown", "drain_hooks", "stop_all"]
         channel_manager.stop_all.assert_awaited_once()
+
+    async def test_in_flight_finish_hook_dispatch_completes_before_stop(
+        self, monkeypatch,
+    ):
+        """v0.76.0 (r1-B2): a REAL committed resident_ask whose finish hook is
+        still running its post-commit continuation (edit -> dispatch) must be
+        DRAINED by BROKER.drain_hooks before channel_manager.stop_all() — a
+        dispatch/edit firing after the channel stops can't be delivered."""
+        import verdict_broker
+        from verdict_broker import VerdictBroker
+        from casa_core import _drain_broker_before_channel_shutdown
+
+        broker = VerdictBroker()
+        monkeypatch.setattr(verdict_broker, "BROKER", broker)
+
+        order: list[str] = []
+        req, _ = broker.register(
+            namespace="resident_ask", scope="dm:500", request_id="rid-drain",
+            timeout_s=30.0,
+        )
+
+        async def _finish(outcome):
+            order.append("edit")
+            await asyncio.sleep(0)      # simulate the async edit_dm_message
+            order.append("dispatch")    # simulate the dispatch continuation
+
+        broker.set_finish_hook(req, _finish)
+        # Commit synchronously -> schedules (does NOT await) the finish hook.
+        assert broker.deliver(
+            namespace="resident_ask", scope="dm:500", request_id="rid-drain",
+            option_index=0, actor_id=999,
+        ) == "delivered"
+
+        channel_manager = MagicMock()
+
+        async def _stop_all():
+            order.append("stop_all")
+
+        channel_manager.stop_all = AsyncMock(side_effect=_stop_all)
+
+        await _drain_broker_before_channel_shutdown(channel_manager)
+
+        # The in-flight hook's edit+dispatch both completed before stop_all.
+        assert order == ["edit", "dispatch", "stop_all"]
