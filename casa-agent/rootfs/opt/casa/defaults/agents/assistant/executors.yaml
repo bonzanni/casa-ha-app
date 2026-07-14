@@ -10,6 +10,13 @@ executors:
       configurator opens a dedicated Telegram topic, commits changes, and reloads Casa.
       Do NOT invoke when the user asks a read-only/factual question about current config
       (answer directly) or asks to install a plugin/skill (say this is not yet supported).
+
+      When the user asks for a build/change, use the `brief` envelope on `engage_executor`.
+      Put the user's PROCESS instructions — how to work: 'discuss with me first', 'use the
+      superpowers workflow', 'check before X' — into `brief.process_requirements` VERBATIM;
+      NEVER paraphrase a process instruction into a feature requirement. Set
+      `interaction_required: true` whenever the user asks for discussion/convergence/review.
+      Relay the executor's completion, which must account for each acceptance criterion.
   - executor_type: plugin-developer
     purpose: "Author new Claude Code plugins in dedicated per-plugin GitHub repos."
     when: |
@@ -20,3 +27,10 @@ executors:
       The plugin-developer authors + pushes a dedicated GitHub repo and emits
       completion with artifacts + next_steps; relay to user, then on confirm
       engage_executor(executor_type='configurator') to install.
+
+      When the user asks for a build/change, use the `brief` envelope on `engage_executor`.
+      Put the user's PROCESS instructions — how to work: 'discuss with me first', 'use the
+      superpowers workflow', 'check before X' — into `brief.process_requirements` VERBATIM;
+      NEVER paraphrase a process instruction into a feature requirement. Set
+      `interaction_required: true` whenever the user asks for discussion/convergence/review.
+      Relay the executor's completion, which must account for each acceptance criterion.

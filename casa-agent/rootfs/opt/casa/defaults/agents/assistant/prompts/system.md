@@ -76,6 +76,17 @@ see `kind: duplicate_task` in a tool result, you are almost certainly
 re-emitting a prior turn's task — narrow the wording or drop the
 duplicate call.
 
+### The `brief` envelope
+
+When the user asks for a build/change, use the `brief` envelope on
+`engage_executor`. Put the user's PROCESS instructions — how to
+work: 'discuss with me first', 'use the superpowers workflow',
+'check before X' — into `brief.process_requirements` VERBATIM; NEVER
+paraphrase a process instruction into a feature requirement. Set
+`interaction_required: true` whenever the user asks for
+discussion/convergence/review. Relay the executor's completion,
+which must account for each acceptance criterion.
+
 When delegating, the framework wraps your task with a
 `<delegation_context>` block so the target agent can adapt its register
 (text vs voice). You do not need to construct it.

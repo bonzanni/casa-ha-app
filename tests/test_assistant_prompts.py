@@ -8,6 +8,7 @@ behavior. These tests catch accidental reverts.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,13 @@ def _system_md_path() -> Path:
     return root / (
         "casa-agent/rootfs/opt/casa/defaults/agents/assistant/prompts/system.md"
     )
+
+
+def _collapse_ws(text: str) -> str:
+    """Collapse whitespace runs (incl. markdown line-wrap newlines) to a
+    single space so a VERBATIM prose anchor can be matched regardless of
+    where the source file happens to wrap it across lines."""
+    return re.sub(r"\s+", " ", text)
 
 
 @pytest.fixture(scope="module")
@@ -112,6 +120,51 @@ def test_system_prompt_teaches_sync_vs_interactive_delegation(system_md_text):
     assert "engagements supergroup" in text, (
         "system prompt must reference the Engagements supergroup as "
         "the destination for interactive delegations."
+    )
+
+
+def test_ellen_brief_doctrine_present(system_md_text):
+    """W3/Sol B11 regression guard: Ellen's brief-envelope doctrine must be
+    present VERBATIM in both executors.yaml cards + system.md, or a future
+    edit could silently revert it back to a bare `task=` string — the exact
+    failure mode that produced the invoice_reset mistranslation this
+    release fixes (a process instruction like "discuss with me first"
+    getting paraphrased into a feature requirement instead of landing in
+    ``brief.process_requirements`` verbatim).
+    """
+    executors_path = (
+        _system_md_path().parent.parent / "executors.yaml"
+    )
+    executors_text_raw = executors_path.read_text(encoding="utf-8")
+    system_text = _collapse_ws(system_md_text)
+    executors_text = _collapse_ws(executors_text_raw)
+
+    doctrine_anchors = [
+        "use the `brief` envelope on `engage_executor`",
+        "into `brief.process_requirements` VERBATIM",
+        "NEVER paraphrase a process instruction into a feature requirement",
+        "Set `interaction_required: true` whenever the user asks for "
+        "discussion/convergence/review",
+        "Relay the executor's completion, which must account for each "
+        "acceptance criterion",
+    ]
+
+    for anchor in doctrine_anchors:
+        assert anchor in system_text, (
+            f"system.md missing Ellen brief-envelope doctrine anchor: "
+            f"{anchor!r}"
+        )
+        assert anchor in executors_text, (
+            f"executors.yaml missing Ellen brief-envelope doctrine anchor: "
+            f"{anchor!r}"
+        )
+
+    # Both executor cards must carry the doctrine — not just one card with
+    # the other silently exempted from the process-fidelity requirement.
+    assert executors_text.count(doctrine_anchors[0]) == 2, (
+        "the brief-envelope doctrine must appear on BOTH executor cards "
+        "(configurator + plugin-developer) in executors.yaml, found "
+        f"{executors_text.count(doctrine_anchors[0])} occurrence(s)"
     )
 
 
