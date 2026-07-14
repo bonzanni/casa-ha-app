@@ -1069,6 +1069,7 @@ class TelegramChannel(Channel):
             return
 
         committed = False
+        advanced = False
         try:
             if ns == "engagement_ask":
                 # r2-B7/r3-B4: persist `authorized` under the registry lock
@@ -1082,6 +1083,21 @@ class TelegramChannel(Channel):
                 if advance is not None:
                     try:
                         await advance(rec.id, "operator_answered")
+                        advanced = True
+                    except asyncio.CancelledError:
+                        # B4 (Sol diff r2): advance SHIELDS its mutate+persist,
+                        # so by the time it re-raises CancelledError the durable
+                        # write has RESOLVED. If it authorized durably (state
+                        # now "authorized"), mark `advanced` so the finally
+                        # COMMITS rather than re-arming a request that would
+                        # later expire no_answer DESPITE disk authorization. A
+                        # rolled-back persist failure leaves the state != authorized
+                        # → fall through to abort. Then honor the cancellation.
+                        if getattr(
+                            rec, "interaction_state", "",
+                        ) == "authorized":
+                            advanced = True
+                        raise
                     except Exception:  # noqa: BLE001
                         # Could NOT authorize — do not resolve the ask
                         # unauthorized (frozen W2 contract). Release + re-arm
@@ -1097,11 +1113,18 @@ class TelegramChannel(Channel):
             committed = BROKER.commit(claim)
         finally:
             # r7-B1: ANY exit without a commit (including CancelledError,
-            # which `except Exception` above would not catch) must release
-            # the claim so a claimed live request whose timer was cancelled
-            # is never stranded. abort_claim is idempotent + sync.
+            # which `except Exception` above would not catch) must resolve the
+            # claim so a claimed live request whose timer was cancelled is never
+            # stranded. B4 (Sol diff r2): an authorized-but-uncommitted ask —
+            # the caller was cancelled in the persist window AFTER the durable
+            # write landed — must COMMIT (commit is identity-checked and safe),
+            # else abort_claim (re-arm the timer for a re-tap). abort_claim is
+            # idempotent + sync.
             if not committed:
-                BROKER.abort_claim(claim)
+                if advanced:
+                    committed = BROKER.commit(claim)
+                else:
+                    BROKER.abort_claim(claim)
         await _safe_answer(cq, "✔" if committed else "expired")
 
     # ------------------------------------------------------------------

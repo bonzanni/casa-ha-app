@@ -661,6 +661,57 @@ class TestInteractionStateActivation:
         update.callback_query.answer.assert_awaited_once_with("expired")
         assert rec.interaction_state == "awaiting_operator"
 
+    async def test_cancel_during_blocked_persist_commits_authorized_ask(
+        self, fake_telegram_bot, engagement_fixture, _fresh_broker,
+    ):
+        """B4 (Sol diff r2): the callback task is cancelled while the tombstone
+        write is BLOCKED (real registry, gated writer). advance shields its
+        mutate+persist, so once the gate releases the durable write completes
+        and the state is authorized. The callback must COMMIT the ask (the
+        awaiting handler resolves ``answered``) rather than abort/re-arm it into
+        ``no_answer``."""
+        ch = _mk_channel(fake_telegram_bot, engagement_fixture)
+        rec = engagement_fixture.active_record
+        registry = engagement_fixture.registry
+        rec.interaction_state = "awaiting_operator"
+        req = _seed(_fresh_broker, ns="engagement_ask", scope=rec.id,
+                    rid="ask-cxl-persist", topic_id=rec.topic_id,
+                    operator_id=999)
+
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+        orig_write = registry._write_tombstone_locked
+
+        async def _gated_write(*, strict=False):
+            entered.set()
+            await gate.wait()
+            await orig_write(strict=strict)
+
+        registry._write_tombstone_locked = _gated_write
+
+        update = _mk_callback_update(
+            data="v1|engagement_ask|ask-cxl-persist|0", thread_id=rec.topic_id,
+            chat_id=-1001, user_id=999,
+        )
+        task = asyncio.create_task(ch._on_inline_callback(update, context=None))
+        # Wait until the shielded write is in flight, THEN cancel the callback.
+        await asyncio.wait_for(entered.wait(), 1.0)
+        task.cancel()
+        await asyncio.sleep(0)      # deliver the cancel at the shield await
+        gate.set()                  # release the blocked durable write
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Durable authorization landed despite the cancel...
+        assert rec.interaction_state == "authorized"
+        # ...and the ask was COMMITTED, not re-armed into no_answer.
+        outcome = await asyncio.wait_for(_fresh_broker.await_result(req), 0.5)
+        assert outcome["outcome"] == "answered"
+        assert outcome["option_index"] == 0
+        assert _fresh_broker.pending(
+            namespace="engagement_ask", scope=rec.id,
+        ) == []
+
     async def test_no_answer_leaves_awaiting_operator(
         self, fake_telegram_bot, engagement_fixture, _fresh_broker,
     ):

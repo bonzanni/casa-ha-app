@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -921,3 +922,162 @@ async def test_replay_true_exhaustion_marks_error_via_real_registry(
     rec = reg._records["keep1"]
     assert rec.status == "error"
     assert rec.origin["error_kind"] == "refuse_teardown_failed"
+
+
+# ---------------------------------------------------------------------------
+# B2 (Sol diff r2): the stale-run-script migration path must VERIFY the
+# remove_service_dir actually removed the pair before re-planting — the helper
+# swallows rmtree failures, so a survivor (full or partial) fails CLOSED like
+# the brief-refusal path (no compile / start / background spawn for the stale
+# engagement).
+# ---------------------------------------------------------------------------
+
+
+def _seed_stale_pair(svc_root, eid):
+    """Plant a COMPLETE pair whose run script predates the v0.75 markers."""
+    from drivers import s6_rc
+    s6_rc.write_service_dir(
+        svc_root=str(svc_root), engagement_id=eid,
+        run_script=(
+            "#!/command/with-contenv bash\nset -e\n"
+            "exec claude --print --permission-mode acceptEdits\n"
+        ),
+        depends_on=["init-setup-configs"],
+        log_run_script="#!/command/with-contenv sh\nexec s6-log n20 s1000000 /x\n",
+    )
+
+
+async def test_replay_b2_stale_migration_removal_fails_refuses_closed(
+    monkeypatch, tmp_path,
+):
+    """remove_service_dir fully no-ops (rmtree swallowed) → the surviving old
+    pair is detected via service_dirs_absent → refuse CLOSED: ensure_service_down
+    ran, mark_error(refuse_migration_failed) landed (down unconfirmable), and
+    start_service AND _spawn_background_tasks are BOTH uncalled."""
+    from unittest.mock import MagicMock
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+    from engagement_registry import EngagementRegistry
+
+    svc_root = tmp_path / "svc"; svc_root.mkdir()
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+    _seed_stale_pair(svc_root, "keep1")
+    assert s6_rc.service_pair_complete(svc_root=str(svc_root), engagement_id="keep1")
+
+    # remove_service_dir SWALLOWS the failure (survivor stays) — simulate by
+    # making it a no-op, so the pair remains present after the "removal".
+    monkeypatch.setattr(
+        s6_rc, "remove_service_dir",
+        lambda *, svc_root, engagement_id: None)
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", AsyncMock())
+    start_ids: list[str] = []
+    async def fake_start(*, engagement_id): start_ids.append(engagement_id)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+    # Down unconfirmable → mark_error path exercised on the real registry.
+    monkeypatch.setattr(s6_rc, "ensure_service_down", AsyncMock(return_value=False))
+    write_ids: list[str] = []
+    monkeypatch.setattr(
+        s6_rc, "write_service_dir",
+        lambda **kw: write_ids.append(kw["engagement_id"]))
+
+    exec_reg = _exec_reg_any(_brief_defn(tmp_path))
+    ws_root = tmp_path / "eng"; (ws_root / "keep1").mkdir(parents=True)
+
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "tomb.json"), bus=None)
+    reg._records["keep1"] = _brief_rec("keep1", _BRIEF)
+    driver = AsyncMock(); bg = MagicMock(); driver._spawn_background_tasks = bg
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, executor_registry=exec_reg,
+        engagements_root=str(ws_root))
+
+    rec = reg._records["keep1"]
+    assert rec.status == "error"
+    assert rec.origin["error_kind"] == "refuse_migration_failed"
+    assert start_ids == []
+    assert bg.call_count == 0
+    assert write_ids == []  # never re-planted a stale pair
+
+
+async def test_replay_b2_partial_removal_main_survives_refuses_closed(
+    monkeypatch, tmp_path,
+):
+    """PARTIAL removal — the -log half is removed but the main dir survives —
+    also refuses CLOSED (service_dirs_absent is False), never re-planting."""
+    from unittest.mock import MagicMock
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+
+    svc_root = tmp_path / "svc"; svc_root.mkdir()
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+    _seed_stale_pair(svc_root, "keep1")
+
+    # Partial removal: drop only the -log sibling, leave the main behind.
+    def _partial_remove(*, svc_root, engagement_id):
+        import shutil
+        shutil.rmtree(
+            Path(svc_root) / s6_rc._log_service_name(engagement_id),
+            ignore_errors=True)
+    monkeypatch.setattr(s6_rc, "remove_service_dir", _partial_remove)
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", AsyncMock())
+    start_ids: list[str] = []
+    async def fake_start(*, engagement_id): start_ids.append(engagement_id)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+    ensure_down = AsyncMock(return_value=True)
+    monkeypatch.setattr(s6_rc, "ensure_service_down", ensure_down)
+    write_ids: list[str] = []
+    monkeypatch.setattr(
+        s6_rc, "write_service_dir",
+        lambda **kw: write_ids.append(kw["engagement_id"]))
+
+    exec_reg = _exec_reg_any(_brief_defn(tmp_path))
+    ws_root = tmp_path / "eng"; (ws_root / "keep1").mkdir(parents=True)
+
+    from engagement_registry import EngagementRegistry
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "tomb.json"), bus=None)
+    reg._records["keep1"] = _brief_rec("keep1", _BRIEF)
+    driver = AsyncMock(); bg = MagicMock(); driver._spawn_background_tasks = bg
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, executor_registry=exec_reg,
+        engagements_root=str(ws_root))
+
+    ensure_down.assert_awaited()
+    assert start_ids == []
+    assert bg.call_count == 0
+    assert write_ids == []
+
+
+async def test_replay_b2_migration_succeeds_when_removal_confirmed(
+    monkeypatch, tmp_path,
+):
+    """Control: when remove_service_dir genuinely removes the pair, migration
+    proceeds — the pair is re-planted from the current template and started."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+
+    svc_root = tmp_path / "svc"; svc_root.mkdir()
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+    _seed_stale_pair(svc_root, "keep1")
+
+    async def fake_cau(): return None
+    start_ids: list[str] = []
+    async def fake_start(*, engagement_id): start_ids.append(engagement_id)
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+
+    exec_reg = _exec_reg_any(_brief_defn(tmp_path))
+    ws_root = tmp_path / "eng"; (ws_root / "keep1").mkdir(parents=True)
+
+    reg = await _make_registry([_brief_rec("keep1", _BRIEF)])
+    driver = AsyncMock(); driver._spawn_background_tasks = lambda r: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, executor_registry=exec_reg,
+        engagements_root=str(ws_root))
+
+    run_text = (svc_root / "engagement-keep1" / "run").read_text()
+    assert "--output-format stream-json" in run_text
+    assert "casa_control" in run_text
+    assert start_ids == ["keep1"]
+    assert reg._records["keep1"].status in ("active", "idle")

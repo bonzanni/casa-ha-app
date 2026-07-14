@@ -753,3 +753,89 @@ class TestDirectKillpg:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=5)
+
+
+class TestRunScriptIsStale:
+    """B1 (Sol diff r2): v0.75.0 streaming requires BOTH markers
+    (``casa_control`` AND ``--output-format stream-json``). A script carrying
+    only one is still stale, and a missing/unreadable run file fails CLOSED
+    (stale=True) so boot replay re-plants rather than resuming an unarmed pair.
+    """
+
+    def _write_run(self, svc_root: Path, eid: str, run_text: str) -> None:
+        from drivers.s6_rc import _main_service_name
+        main = svc_root / _main_service_name(eid)
+        main.mkdir(parents=True)
+        (main / "run").write_text(run_text)
+
+    async def test_only_stream_json_is_stale(self, tmp_path):
+        from drivers.s6_rc import run_script_is_stale
+        self._write_run(
+            tmp_path, "e1",
+            "#!/bin/sh\nexec claude --print --output-format stream-json\n")
+        assert run_script_is_stale(svc_root=str(tmp_path), engagement_id="e1")
+
+    async def test_only_casa_control_is_stale(self, tmp_path):
+        from drivers.s6_rc import run_script_is_stale
+        self._write_run(
+            tmp_path, "e2",
+            "#!/bin/sh\ncasa_control spawn\nexec claude --print\n")
+        assert run_script_is_stale(svc_root=str(tmp_path), engagement_id="e2")
+
+    async def test_both_markers_is_fresh(self, tmp_path):
+        from drivers.s6_rc import run_script_is_stale
+        self._write_run(
+            tmp_path, "e3",
+            "#!/bin/sh\ncasa_control spawn\n"
+            "exec claude --print --output-format stream-json\n")
+        assert not run_script_is_stale(svc_root=str(tmp_path), engagement_id="e3")
+
+    async def test_missing_run_file_is_stale(self, tmp_path):
+        from drivers.s6_rc import _main_service_name, run_script_is_stale
+        # main dir exists but no run file (torn) — fail closed.
+        (tmp_path / _main_service_name("e4")).mkdir()
+        assert run_script_is_stale(svc_root=str(tmp_path), engagement_id="e4")
+
+    async def test_absent_dir_is_stale(self, tmp_path):
+        from drivers.s6_rc import run_script_is_stale
+        # nothing planted at all — fail closed.
+        assert run_script_is_stale(svc_root=str(tmp_path), engagement_id="nope")
+
+    async def test_unreadable_run_file_is_stale(self, tmp_path, monkeypatch):
+        from drivers import s6_rc
+        self._write_run(
+            tmp_path, "e5",
+            "#!/bin/sh\ncasa_control spawn\n"
+            "exec claude --print --output-format stream-json\n")
+
+        # Even a BOTH-marker script must classify stale if the file cannot be
+        # read (permission/OSError) — patch Path.read_text to raise.
+        real_read_text = Path.read_text
+
+        def _boom(self, *a, **k):
+            if self.name == "run":
+                raise PermissionError("no access")
+            return real_read_text(self, *a, **k)
+
+        monkeypatch.setattr(Path, "read_text", _boom)
+        assert s6_rc.run_script_is_stale(svc_root=str(tmp_path), engagement_id="e5")
+
+
+class TestServiceDirsAbsent:
+    """B2 (Sol diff r2): verify BOTH the main and -log service source dirs are
+    gone after a remove_service_dir in the migration path (remove swallows
+    failures, so a survivor must read as NOT absent → fail closed)."""
+
+    async def test_both_gone_is_absent(self, tmp_path):
+        from drivers.s6_rc import service_dirs_absent
+        assert service_dirs_absent(svc_root=str(tmp_path), engagement_id="e1")
+
+    async def test_surviving_main_is_not_absent(self, tmp_path):
+        from drivers.s6_rc import _main_service_name, service_dirs_absent
+        (tmp_path / _main_service_name("e2")).mkdir()
+        assert not service_dirs_absent(svc_root=str(tmp_path), engagement_id="e2")
+
+    async def test_surviving_log_is_not_absent(self, tmp_path):
+        from drivers.s6_rc import _log_service_name, service_dirs_absent
+        (tmp_path / _log_service_name("e3")).mkdir()
+        assert not service_dirs_absent(svc_root=str(tmp_path), engagement_id="e3")

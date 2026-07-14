@@ -557,13 +557,34 @@ class EngagementRegistry:
             # abort_claims + "please tap again" (verified end-to-end by
             # test_telegram_inline_callback).
             prev_state = rec.interaction_state
-            rec.interaction_state = new_state
+
+            async def _mutate_and_persist() -> str:
+                rec.interaction_state = new_state
+                try:
+                    await self._write_tombstone_locked(strict=True)
+                except Exception:
+                    rec.interaction_state = prev_state
+                    raise
+                return new_state
+
+            # B4 (Sol diff r2): SHIELD the mutate+persist so cancelling the
+            # CALLER (e.g. the telegram callback task) cannot tear the pair.
+            # The inner task runs to completion UNDER THE LOCK — on cancel we
+            # await it to completion BEFORE re-raising, so the durable write
+            # (and, on failure, the rollback) always finishes while we still
+            # hold the lock. Without this a CancelledError mid-``to_thread``
+            # left the request armed-then-aborted despite disk authorization
+            # (expiring ``no_answer`` on an answered ask). The callback treats
+            # a cancellation-after-authorization as committable.
+            task = asyncio.ensure_future(_mutate_and_persist())
             try:
-                await self._write_tombstone_locked(strict=True)
-            except Exception:
-                rec.interaction_state = prev_state
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    # Retrieve any inner exception (already rolled back) so it
+                    # is not flagged "never retrieved"; then honor the cancel.
+                    await asyncio.gather(task, return_exceptions=True)
                 raise
-            return new_state
 
     async def set_interaction_violated(self, engagement_id: str) -> None:
         """W2/Sol B9 (Task 7): flag a mutating tool-use taken while
@@ -571,13 +592,29 @@ class EngagementRegistry:
         ``rec.origin.get("interaction_violated")`` to append a violation
         line to the completion summary. Unknown engagement is a no-op
         (matches the other mutators' tolerance for stale callers).
+
+        B3 (Sol diff r2): persist STRICTLY and roll back on failure, mirroring
+        ``advance_interaction_state``. The driver seam
+        (``claude_code_driver._on_stream_event``) only marks
+        ``_violation_flagged`` after a SUCCESSFUL return, so a swallowed write
+        failure would permanently drop the completion warning after a restart;
+        raising lets the seam retry on the next mutating-tool frame.
         """
         async with self._lock:
             rec = self._records.get(engagement_id)
             if rec is None:
                 return
+            had_flag = "interaction_violated" in rec.origin
+            prev = rec.origin.get("interaction_violated")
             rec.origin["interaction_violated"] = True
-            await self._write_tombstone_locked()
+            try:
+                await self._write_tombstone_locked(strict=True)
+            except Exception:
+                if had_flag:
+                    rec.origin["interaction_violated"] = prev
+                else:
+                    rec.origin.pop("interaction_violated", None)
+                raise
 
     async def sweep_idle_and_suspend(
         self, *, driver: Any, now_override: float | None = None,

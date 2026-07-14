@@ -412,18 +412,21 @@ async def replay_undergoing_engagements(
     # background-task loops below, not merely skipped during rendering.
     refused_ids: set[str] = set()
 
-    async def _refuse_brief_resume(rec, reason: str) -> None:
-        """Fail-closed teardown of a brief-bearing engagement we refuse to
-        resume (r11-B1/r13-B1/r14-B1). Source removal + recompile alone is NOT
-        reliable — ``remove_service_dir`` swallows OSError and the later
-        compile can fail-and-continue — so run the CHECKED teardown ladder,
-        and land a TERMINAL ``refuse_teardown_failed`` when physical
-        containment can't be confirmed (the marking ACCOMPANIES the removal,
-        it does not replace it). ``registry`` is the real parameter name here;
-        ``_engagement_registry`` does not exist in this function and would
-        NameError straight into the per-record warn-and-continue."""
+    async def _refuse_brief_resume(
+        rec, reason: str, *, kind: str = "refuse_teardown_failed",
+    ) -> None:
+        """Fail-closed teardown of an engagement we refuse to resume
+        (r11-B1/r13-B1/r14-B1; B2 Sol r2 reuses it for the migration path via
+        ``kind``). Source removal + recompile alone is NOT reliable —
+        ``remove_service_dir`` swallows OSError and the later compile can
+        fail-and-continue — so run the CHECKED teardown ladder, and land a
+        TERMINAL ``kind`` mark when physical containment can't be confirmed
+        (the marking ACCOMPANIES the removal, it does not replace it).
+        ``registry`` is the real parameter name here; ``_engagement_registry``
+        does not exist in this function and would NameError straight into the
+        per-record warn-and-continue."""
         logger.warning(
-            "boot replay: engagement %s refuses brief resume — %s; "
+            "boot replay: engagement %s refuses resume — %s; "
             "tearing down", rec.id[:8], reason,
         )
         refused_ids.add(rec.id)
@@ -431,16 +434,16 @@ async def replay_undergoing_engagements(
         if down is False:
             try:
                 await registry.mark_error(
-                    rec.id, kind="refuse_teardown_failed",
+                    rec.id, kind=kind,
                     message=(
-                        f"brief resume refused ({reason}) but the engagement "
+                        f"resume refused ({reason}) but the engagement "
                         "service could not be confirmed down"
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 — best-effort terminal mark
                 logger.warning(
-                    "boot replay: mark_error(refuse_teardown_failed) failed "
-                    "for %s: %s", rec.id[:8], exc,
+                    "boot replay: mark_error(%s) failed for %s: %s",
+                    kind, rec.id[:8], exc,
                 )
         s6_rc.remove_service_dir(
             svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT, engagement_id=rec.id,
@@ -534,6 +537,24 @@ async def replay_undergoing_engagements(
                         svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
                         engagement_id=rec.id,
                     )
+                    # B2 (Sol r2): remove_service_dir SWALLOWS rmtree failures,
+                    # so a surviving old main (full or partial removal) would
+                    # collide with write_service_dir's exist_ok=False re-plant
+                    # and leave a stale, unlogged main whose spawn frames never
+                    # reach the relay. VERIFY the pair is actually gone; if not,
+                    # fail CLOSED (checked teardown + terminal mark) rather than
+                    # compiling/starting a stale pair.
+                    if not s6_rc.service_dirs_absent(
+                        svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                        engagement_id=rec.id,
+                    ):
+                        await _refuse_brief_resume(
+                            rec,
+                            "stale pre-v0.75 pair removal did not complete "
+                            "(service dir survivor)",
+                            kind="refuse_migration_failed",
+                        )
+                        continue
 
                 # M7: never plant a service for an engagement whose workspace
                 # is gone. The generated run script does `set -e;

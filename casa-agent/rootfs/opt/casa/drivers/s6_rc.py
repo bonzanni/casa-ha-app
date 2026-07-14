@@ -136,26 +136,47 @@ def service_pair_complete(*, svc_root: str, engagement_id: str) -> bool:
     )
 
 
-# A run script is "current" (v0.75.0+) iff it carries at least one of these
-# streaming markers: the pre-exec ``casa_control`` spawn NDJSON frame or the
-# ``--output-format stream-json`` CLI flag. A pre-v0.75 script has neither, so
-# the driver's _InboundQueue never arms on a resumed engagement — operator
-# turns then queue forever. Boot replay uses this to migrate stale pairs.
+# A run script is "current" (v0.75.0+) iff it carries BOTH streaming markers:
+# the pre-exec ``casa_control`` spawn NDJSON frame AND the ``--output-format
+# stream-json`` CLI flag. v0.75 message-granularity streaming needs the two
+# together — the spawn frame arms the driver's _InboundQueue and the CLI flag
+# makes the process actually emit the NDJSON the relay consumes. A script with
+# only one is half-wired and still stale; a pre-v0.75 script has neither. Boot
+# replay uses this to migrate stale pairs.
 _CURRENT_RUN_MARKERS = ("casa_control", "--output-format stream-json")
 
 
 def run_script_is_stale(*, svc_root: str, engagement_id: str) -> bool:
-    """True iff the persisted MAIN run script predates the v0.75.0 streaming
-    contract (emits neither ``casa_control`` nor ``--output-format
-    stream-json``). Returns False when the run file is absent or unreadable —
-    there is nothing to migrate, and the pair-completeness / heal predicates
-    handle those cases."""
+    """True iff the persisted MAIN run script is NOT the v0.75.0 streaming
+    contract — i.e. it does not carry BOTH ``casa_control`` AND
+    ``--output-format stream-json``.
+
+    Fails CLOSED (stale=True) when the run file is missing or unreadable: a
+    resumed pair we cannot prove is current must be re-planted rather than
+    started on a possibly-unarmed script (``service_pair_complete`` does NOT
+    inspect the run file, so this predicate is the only gate that does)."""
     run_path = Path(svc_root) / _main_service_name(engagement_id) / "run"
     try:
         text = run_path.read_text()
     except OSError:
-        return False
-    return not any(marker in text for marker in _CURRENT_RUN_MARKERS)
+        return True
+    return not all(marker in text for marker in _CURRENT_RUN_MARKERS)
+
+
+def service_dirs_absent(*, svc_root: str, engagement_id: str) -> bool:
+    """True iff BOTH the main and ``-log`` service source dirs are gone.
+
+    Boot replay's stale-pair migration calls this AFTER ``remove_service_dir``
+    to VERIFY the removal actually happened before re-planting.
+    ``remove_service_dir`` swallows rmtree failures, so a surviving old main —
+    or a partial removal (log gone, main survives) — must read as NOT absent
+    (fail closed): a survivor would collide with ``write_service_dir``'s
+    ``exist_ok=False`` re-plant and leave a stale, unlogged main whose spawn
+    frames never reach the relay."""
+    root = Path(svc_root)
+    main = root / _main_service_name(engagement_id)
+    log = root / _log_service_name(engagement_id)
+    return not main.exists() and not log.exists()
 
 
 def _prune_broken_pairs(*, svc_root: str) -> list[str]:

@@ -754,3 +754,33 @@ class TestSetInteractionViolated:
         rec2 = reg2.get(rec.id)
         assert rec2 is not None
         assert rec2.origin.get("interaction_violated") is True
+
+    async def test_raises_and_rolls_back_on_persist_failure(
+        self, registry, monkeypatch,
+    ):
+        """B3 (Sol diff r2): set_interaction_violated persists STRICTLY — a
+        REAL tombstone-write failure must PROPAGATE and roll the in-memory
+        origin flag back, so the driver seam (which only marks
+        ``_violation_flagged`` after a successful return) retries next frame
+        instead of permanently losing the completion warning across a
+        restart."""
+        import engagement_registry as er
+
+        rec = await registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        assert rec.origin.get("interaction_violated") is None
+
+        def _boom(*_a, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(er, "atomic_write_json", _boom)
+
+        with pytest.raises(OSError):
+            await registry.set_interaction_violated(rec.id)
+
+        # Rolled back: the flag never reached disk, so the in-memory origin
+        # must NOT be left set (else a restart would lose the un-persisted flag
+        # silently while the driver believed it succeeded).
+        assert rec.origin.get("interaction_violated") is None
