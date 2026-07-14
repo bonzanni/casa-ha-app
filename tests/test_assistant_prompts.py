@@ -169,64 +169,84 @@ def test_ellen_brief_doctrine_present(system_md_text):
 
 
 def test_system_prompt_teaches_protected_tool_challenge_and_relay(system_md_text):
-    """v0.76.0 [A:§3.8] doctrine anchor: Ellen's system prompt must carry the
+    """v0.77.0 [W2] doctrine anchor: Ellen's system prompt must carry the
     Sol-accepted protected-tool doctrine VERBATIM (a refused call posts a
-    confirmation button; Ellen ends her turn and retries with EXACTLY the
-    same arguments on approval), plus her resident-specific relay/re-delegate
-    paragraph for a delegated specialist's pending confirmation. A future
-    prose rewrite that silently drops or paraphrases this text would leave
-    Ellen without the doctrine that keeps a re-tried protected call
-    argument-identical (grants are argument-bound — see authz_grants.py)."""
+    confirmation button; Ellen must NOT narrate/announce the approval
+    prompt — PREFER ZERO narration, and if one sentence is unavoidable it
+    must be timing-invariant, e.g. "I won't run this action without your
+    approval."; then she ends her turn and retries with EXACTLY the same
+    arguments on approval), plus her resident-specific relay/re-delegate
+    paragraph for a delegated specialist's pending confirmation (same
+    no-narration rule applies there too). A future prose rewrite that
+    silently drops or paraphrases this text would leave Ellen either
+    narrating a stale/pre-tap approval prompt or without the doctrine that
+    keeps a re-tried protected call argument-identical (grants are
+    argument-bound — see authz_grants.py)."""
     text = _collapse_ws(system_md_text)
     doctrine_anchors = [
         "your call will be refused and a confirmation button posted to the "
         "user",
+        "Do not announce, describe, or explain the approval prompt",
+        "Prefer zero narration",
+        "I won't run this action without your approval.",
+        "never phrasing like \"waiting for you\" or \"you'll receive a "
+        "prompt\"",
         "END YOUR TURN",
         "retry the SAME call with EXACTLY the same arguments",
-        "relay that to the user and, after the approval message arrives, "
+        "apply the same no-narration rule",
         "re-delegate the exact same action",
     ]
     for anchor in doctrine_anchors:
         assert anchor in text, (
-            f"system.md missing v0.76.0 protected-tool doctrine anchor: "
+            f"system.md missing v0.77.0 protected-tool doctrine anchor: "
             f"{anchor!r}"
         )
 
 
 def test_butler_prompt_teaches_protected_tool_challenge_only():
-    """v0.76.0 [A:§3.8] doctrine anchor: the butler prompt gets the
-    protected-tool challenge/retry paragraph (butler is a delegate target,
-    same as Ellen). It does NOT get the relay/re-delegate paragraph — per
-    design §3.8 that paragraph is scoped to Ellen (the assistant), who is
-    the one that delegates to specialists; butler's runtime.yaml carries no
-    delegate_to_agent/engage_executor, so the relay guidance would be inert
-    there."""
+    """v0.77.0 [W2] doctrine anchor: the butler prompt gets the
+    protected-tool challenge/retry paragraph, including the no-narration
+    rule and the timing-invariant fallback sentence (butler is a delegate
+    target, same as Ellen). It does NOT get the relay/re-delegate
+    paragraph — per design §3.8/W2 that paragraph is scoped to Ellen (the
+    assistant), who is the one that delegates to specialists; butler's
+    runtime.yaml carries no delegate_to_agent/engage_executor, so the
+    relay guidance would be inert there."""
     agents_dir = _system_md_path().parent.parent.parent
     butler_path = agents_dir / "butler" / "prompts" / "system.md"
     text = _collapse_ws(butler_path.read_text(encoding="utf-8"))
     doctrine_anchors = [
         "your call will be refused and a confirmation button posted to the "
         "user",
+        "Do not announce, describe, or explain the approval prompt",
+        "Prefer zero narration",
+        "I won't run this action without your approval.",
         "END YOUR TURN",
         "retry the SAME call with EXACTLY the same arguments",
     ]
     for anchor in doctrine_anchors:
         assert anchor in text, (
-            f"butler system.md missing v0.76.0 protected-tool doctrine "
+            f"butler system.md missing v0.77.0 protected-tool doctrine "
             f"anchor: {anchor!r}"
         )
     assert "re-delegate the exact same action" not in text, (
         "butler system.md should NOT carry the resident-only relay/"
         "re-delegate paragraph — butler never delegates (per design "
-        "§3.8, that paragraph is scoped to Ellen only)."
+        "§3.8/W2, that paragraph is scoped to Ellen only)."
+    )
+    assert "apply the same no-narration rule" not in text, (
+        "butler system.md should NOT carry the Ellen-only relay "
+        "no-narration sentence — butler has no relay paragraph at all."
     )
 
 
 def test_finance_specialist_prompt_teaches_protected_tool_challenge():
-    """v0.76.0 [A:§3.8] doctrine anchor: the finance specialist prompt gets
-    the protected-tool challenge/retry paragraph (specialists never relay a
-    delegated specialist's confirmation — that's the delegator's job — so
-    the relay/re-delegate paragraph is intentionally absent here)."""
+    """v0.77.0 [W2] doctrine anchor: the finance specialist prompt gets
+    the protected-tool challenge/retry paragraph, including the
+    no-narration rule and the timing-invariant fallback sentence
+    (specialists never relay a delegated specialist's confirmation —
+    that's the delegator's job — so the relay/re-delegate paragraph is
+    intentionally absent here)."""
     agents_dir = _system_md_path().parent.parent.parent
     finance_path = (
         agents_dir / "specialists" / "finance" / "prompts" / "system.md"
@@ -235,18 +255,25 @@ def test_finance_specialist_prompt_teaches_protected_tool_challenge():
     doctrine_anchors = [
         "your call will be refused and a confirmation button posted to the "
         "user",
+        "Do not announce, describe, or explain the approval prompt",
+        "Prefer zero narration",
+        "I won't run this action without your approval.",
         "END YOUR TURN",
         "retry the SAME call with EXACTLY the same arguments",
     ]
     for anchor in doctrine_anchors:
         assert anchor in text, (
-            f"finance system.md missing v0.76.0 protected-tool doctrine "
+            f"finance system.md missing v0.77.0 protected-tool doctrine "
             f"anchor: {anchor!r}"
         )
     assert "re-delegate the exact same action" not in text, (
         "finance system.md should NOT carry the resident-only relay/"
         "re-delegate paragraph — that's Ellen/butler's job, not the "
         "specialist's."
+    )
+    assert "apply the same no-narration rule" not in text, (
+        "finance system.md should NOT carry the Ellen-only relay "
+        "no-narration sentence — finance has no relay paragraph at all."
     )
 
 
