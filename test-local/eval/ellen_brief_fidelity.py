@@ -28,6 +28,8 @@ Exit 0 = PASS (doctrine held), exit 1 = FAIL (diff printed).
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sys
 import tempfile
 import traceback
@@ -91,10 +93,48 @@ def _diff_report(captured: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _seed_container_env(*names: str) -> None:
+    """Seed env vars from s6-overlay's container_environment directory.
+
+    ``docker exec`` shells do not inherit the ``with-contenv`` environment the
+    supervised casa-main process runs under; the values live as one-file-per-var
+    under /run/s6/container_environment/ (e.g. CLAUDE_CODE_OAUTH_TOKEN — without
+    it the SDK subprocess reports "Not logged in").
+    """
+    for name in names:
+        if os.environ.get(name):
+            continue
+        try:
+            with open(f"/run/s6/container_environment/{name}",
+                      encoding="utf-8") as fh:
+                os.environ[name] = fh.read().strip("\n\x00")
+        except OSError:
+            pass
+
+
 async def _run() -> bool:
+    _seed_container_env("CLAUDE_CODE_OAUTH_TOKEN")
     policies = load_policies("/config/policies/disclosure.yaml")
     cfg = load_agent_from_dir("/config/agents/assistant", policies=policies)
-    print(f"loaded assistant config: model={cfg.model!r}")
+
+    # runtime.yaml carries a DEFERRED "${PRIMARY_AGENT_MODEL}" placeholder that
+    # boot resolves from the svc-casa run script's env (bashio option export,
+    # s6-rc.d/svc-casa/run:44). A `docker exec` shell does not inherit that
+    # env, so resolve it here the same way boot does: seed the var from
+    # /data/options.json, then apply the loader's own _substitute_env +
+    # resolve_model.
+    model = cfg.model
+    if "${" in model:
+        from config import _substitute_env, resolve_model
+        try:
+            with open("/data/options.json", encoding="utf-8") as fh:
+                _opts = json.load(fh)
+            os.environ.setdefault(
+                "PRIMARY_AGENT_MODEL", str(_opts.get("primary_agent_model", "")))
+        except OSError:
+            pass
+        model = resolve_model(_substitute_env(model))
+    print(f"loaded assistant config: model={model!r}")
 
     captured: list[dict] = []
     fake_tool = _build_fake_engage_executor(captured)
@@ -107,7 +147,7 @@ async def _run() -> bool:
     # filesystem settings, and `cwd` is an isolated tempdir — so the ONLY
     # tool the model can reach is the fake engage_executor above.
     opts = ClaudeAgentOptions(
-        model=cfg.model,
+        model=model,
         system_prompt=cfg.system_prompt,
         mcp_servers={"casa-framework": server},
         tools=[],
