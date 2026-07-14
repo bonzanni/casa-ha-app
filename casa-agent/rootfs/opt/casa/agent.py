@@ -505,7 +505,22 @@ class Agent:
             "user_id": msg.context.get("user_id"),
             "cid": cid_var.get(),
             "user_text": user_text,
+            # Provenance foundation (A:§1, v0.76.0): message_type/source
+            # let turn_provenance() classify transport (dm vs button vs
+            # other); execution_role starts equal to `role` here (a direct
+            # turn) and is overwritten by _run_delegated_agent's
+            # child_origin for delegated turns so the two can be compared.
+            "message_type": msg.type.value,
+            "source": msg.source,
+            "execution_role": self.config.role,
         }
+        # Reserved provenance markers (synthetic turn replay, button
+        # answers) ride on msg.context when a LATER task (ask_user/button
+        # broker) sets them; copy through only if actually present so a
+        # normal turn's origin stays free of stray None-valued keys.
+        for _marker_key in ("synthetic", "button_answer"):
+            if _marker_key in msg.context:
+                origin_snapshot[_marker_key] = msg.context[_marker_key]
         origin_token = origin_var.set(origin_snapshot)
         try:
             # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at

@@ -90,3 +90,38 @@ async def test_missing_prompt_still_returns_400():
         r = await client.post("/invoke/assistant", json={})
         assert r.status == 400
         assert (await r.json()) == {"error": "missing 'prompt' field"}
+
+
+@pytest.mark.asyncio
+async def test_caller_supplied_reserved_keys_are_stripped():
+    """A:§3.5 sanitize-and-preserve: an external /invoke caller cannot spoof
+    provenance-bearing keys (execution_role/message_type/source/synthetic/
+    button_answer) via the context dict — they must never reach the
+    dispatched BusMessage. Ordinary caller-supplied keys are preserved."""
+    bus = _StubBus()
+    app = _make_app(bus)
+    async with TestClient(TestServer(app)) as client:
+        r = await client.post(
+            "/invoke/assistant",
+            json={
+                "prompt": "status",
+                "context": {
+                    "chat_id": "caller-1",
+                    "device": "kitchen-panel",
+                    "synthetic": "button",
+                    "button_answer": "yes",
+                    "execution_role": "butler",
+                    "message_type": "channel_in",
+                    "source": "telegram",
+                },
+            },
+        )
+        assert r.status == 200
+        ctx = bus.last_msg.context
+        assert ctx["chat_id"] == "caller-1"     # preserved
+        assert ctx["device"] == "kitchen-panel"  # preserved
+        for key in (
+            "synthetic", "button_answer", "execution_role",
+            "message_type", "source",
+        ):
+            assert key not in ctx, f"reserved key {key!r} leaked into BusMessage.context"

@@ -1206,6 +1206,68 @@ class TestOriginVar:
         # After the turn, ContextVar is back to None.
         assert agent_mod.origin_var.get(None) is None
 
+    async def test_origin_snapshot_carries_provenance_fields(self, tmp_path):
+        """A:§1: the origin snapshot must carry message_type/source (for
+        turn_provenance's transport classification) and execution_role,
+        which starts equal to `role` for a direct (non-delegated) turn."""
+        import agent as agent_mod
+        from bus import MessageType
+
+        captured: dict[str, Any] = {}
+
+        class CapturingClient(FakeClient):
+            async def receive_response(self):
+                captured["origin"] = agent_mod.origin_var.get(None)
+                async for m in super().receive_response():
+                    yield m
+
+        a = _make_agent(tmp_path, role="assistant")
+        msg = _msg("telegram", "777", "hello")
+        with patch("sdk_client_pool._default_make_client", CapturingClient):
+            await a._process(msg)
+
+        origin = captured["origin"]
+        assert origin["message_type"] == MessageType.CHANNEL_IN.value
+        assert origin["source"] == "telegram"
+        assert origin["execution_role"] == "assistant"
+        # No synthetic/button_answer markers were on msg.context — they
+        # must not appear (not even as None) in the snapshot.
+        assert "synthetic" not in origin
+        assert "button_answer" not in origin
+
+    async def test_origin_snapshot_copies_marker_keys_when_present(self, tmp_path):
+        """synthetic/button_answer ride on msg.context (set by a LATER
+        task's button-broker replay) and must be copied through verbatim."""
+        import agent as agent_mod
+        from bus import BusMessage, MessageType
+
+        captured: dict[str, Any] = {}
+
+        class CapturingClient(FakeClient):
+            async def receive_response(self):
+                captured["origin"] = agent_mod.origin_var.get(None)
+                async for m in super().receive_response():
+                    yield m
+
+        a = _make_agent(tmp_path, role="assistant")
+        msg = BusMessage(
+            type=MessageType.CHANNEL_IN,
+            source="telegram",
+            target="assistant",
+            content="yes",
+            channel="telegram",
+            context={
+                "chat_id": "777", "synthetic": "button",
+                "button_answer": "yes",
+            },
+        )
+        with patch("sdk_client_pool._default_make_client", CapturingClient):
+            await a._process(msg)
+
+        origin = captured["origin"]
+        assert origin["synthetic"] == "button"
+        assert origin["button_answer"] == "yes"
+
     async def test_origin_var_inherited_by_child_task(self, tmp_path):
         """A task spawned from inside receive_response must see the same
         origin value — this is the pattern delegate_to_agent relies on."""

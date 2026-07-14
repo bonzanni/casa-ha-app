@@ -33,6 +33,7 @@ from casa_core_middleware import cid_middleware, CasaAccessLogger
 from mcp_registry import McpServerRegistry
 from semantic_memory import SemanticMemory
 from policies import load_policies
+from provenance import sanitize_external_context
 from session_registry import SessionRegistry
 from session_sweeper import SessionSweeper
 from rate_limit import RateLimiter, rate_limit_response
@@ -1127,8 +1128,15 @@ def build_invoke_message(
     Every invoke also gets a fresh correlation id (spec 5.2 §7.2).
     Caller-supplied ``context.cid`` wins so external systems can thread
     their own trace ids through; missing or empty entries are replaced.
+
+    Sanitize-and-preserve (A:§3.5): the caller-supplied ``context`` is an
+    EXTERNAL dict (webhook payload) — it is stripped of Casa-reserved
+    provenance keys via ``sanitize_external_context`` before Casa's own
+    keys (``chat_id``, ``cid``) are merged in, so a caller can never spoof
+    ``execution_role``/``message_type``/``source``/etc. Every other
+    caller-supplied key (e.g. a caller's own ``cid`` above) is preserved.
     """
-    context = dict(payload.get("context") or {})
+    context = sanitize_external_context(payload.get("context"))
     if not context.get("chat_id"):
         context["chat_id"] = str(uuid.uuid4())
     if not context.get("cid"):

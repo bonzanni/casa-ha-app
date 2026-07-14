@@ -822,6 +822,10 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
     child_origin = {
         **parent,
         "delegation_depth": int(parent.get("delegation_depth", 0)) + 1,
+        # Provenance foundation (A:§1, v0.76.0): the delegate's own role,
+        # distinct from parent["role"] (the caller) — turn_provenance()
+        # compares the two to classify this turn as "delegated".
+        "execution_role": cfg.role,
     }
 
     # Resolve caller display name; fall back to role.

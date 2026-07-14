@@ -40,6 +40,7 @@ from channels import Channel
 from media_policies import MEDIA_POLICIES
 from channels.telegram_supervisor import ReconnectSupervisor
 from log_cid import cid_var, new_cid
+from provenance import sanitize_external_context
 from rate_limit import RateLimiter
 
 import topic_ledger
@@ -729,13 +730,18 @@ class TelegramChannel(Channel):
         inherited = cid_var.get()
         cid = inherited if inherited != "-" else new_cid()
 
+        # This context dict is entirely Casa-owned (built from the Telegram
+        # `Update`, not caller-supplied) — routed through
+        # sanitize_external_context() for uniformity with the other
+        # ingresses (A:§3.5); a no-op here since none of these keys are
+        # reserved.
         msg = BusMessage(
             type=MessageType.CHANNEL_IN,
             source="telegram",
             target=self.default_agent,
             content=update.message.text,
             channel="telegram",
-            context={
+            context=sanitize_external_context({
                 "chat_id": chat_id,
                 # Bug 8 (v0.14.6): user_id is needed downstream to enforce
                 # originator-only /cancel and /complete on engagement topics.
@@ -744,7 +750,7 @@ class TelegramChannel(Channel):
                 "user_name": user_name,
                 "message_id": str(update.message.message_id),
                 "cid": cid,
-            },
+            }),
         )
         await self._bus.send(msg)
 
