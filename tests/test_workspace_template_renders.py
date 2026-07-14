@@ -5,6 +5,12 @@ run-script --plugin-dir plumbing."""
 from __future__ import annotations
 
 import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -197,3 +203,284 @@ def test_template_path_fires_without_plugins_yaml(tmp_path, executor_defaults):
         "# test-fixture engagement")
     settings = json.loads((Path(ws) / ".claude" / "settings.json").read_text())
     assert "enabledPlugins" not in settings
+
+
+# --- run-script v2: explicit stream-json CLI + per-spawn epoch + ringlog ---
+# (v0.75.0, W1/Sol B5/r5-B2/r5-B3/r6-B2/r6-B3/r7-B4/r8-B4/r9-B4/r10-B1). All
+# of these tests drive the REAL repo copies of engagement_run_template.sh /
+# ringlog.sh as subprocesses — skip cleanly if bash isn't on PATH.
+
+BASH = shutil.which("bash")
+_bash_required = pytest.mark.skipif(BASH is None, reason="bash not found on PATH")
+
+# render the template with a KNOWN id so the paths are concrete (r3-B6:
+# {ID} is already substituted by render_run_script — operate on the result).
+_PROBE_ID = "probe0000"
+_RINGLOG = os.path.abspath(
+    "casa-agent/rootfs/opt/casa/scripts/ringlog.sh")
+
+
+@pytest.fixture
+def rendered_run_script():
+    from drivers.workspace import render_run_script
+    return render_run_script(engagement_id="e" * 32, permission_mode="acceptEdits",
+                              extra_dirs=[], plugin_dirs=[])
+
+
+@pytest.fixture
+def rendered_probe_script():
+    from drivers.workspace import render_run_script
+    return render_run_script(engagement_id=_PROBE_ID, permission_mode="acceptEdits",
+                              extra_dirs=[], plugin_dirs=[])
+
+
+@_bash_required
+def test_rendered_run_script_is_valid_bash(tmp_path, rendered_run_script):
+    p = tmp_path / "run"; p.write_text(rendered_run_script)
+    r = subprocess.run([BASH, "-n", str(p)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+@_bash_required
+def test_rendered_run_script_contract(rendered_run_script):
+    s = rendered_run_script
+    assert s.startswith("#!/command/with-contenv bash")
+    assert "--print --verbose --output-format stream-json" in s
+    assert '"casa_control": "spawn"' in s
+    assert "MCP_TOOL_TIMEOUT=660000" in s
+    assert "exec 2>&1" not in s
+    assert 'exec claude ' in s and s.index('exec claude') > s.index('ringlog.sh')
+
+
+@_bash_required
+def test_ringlog_streams_before_eof_via_fifo(tmp_path):
+    # r6-B3: PIN streaming — a buffer-whole impl writes nothing until EOF. Feed a
+    # 3000-byte chunk (>1 CHUNK) through a FIFO, keep the write end OPEN, and
+    # assert the log already has >= CHUNK bytes BEFORE we close (EOF). The old
+    # read-whole-line impl would show 0 here.
+    fifo = tmp_path / "f"; os.mkfifo(fifo)
+    log = tmp_path / "e.log"
+    rfd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    wfd = os.open(str(fifo), os.O_WRONLY)          # reader exists → won't block
+    os.set_blocking(rfd, True)
+    proc = subprocess.Popen([BASH, "scripts/ringlog.sh", str(log), "65536"],
+                            stdin=rfd, cwd="casa-agent/rootfs/opt/casa")
+    os.close(rfd)                                  # child holds its own copy
+    os.write(wfd, b"A" * 3000); time.sleep(0.3)
+    assert log.stat().st_size >= 2048              # streamed BEFORE EOF, not buffered
+    os.close(wfd); proc.wait(timeout=5)
+    assert log.stat().st_size == 3000              # all bytes preserved
+
+
+@_bash_required
+def test_ringlog_byte_exact_multibyte_not_codepoint(tmp_path):
+    # r6-B3: 4096 'é' = 8192 BYTES, MAX huge (no rotation). Byte-oriented
+    # ingestion preserves ALL 8192 bytes; the OLD codepoint clamp (${line:0:2048})
+    # would keep only ~2048 codepoints ≈ 4096 bytes — so == 8192 FAILS the old impl.
+    log = tmp_path / "e.log"
+    r = subprocess.run([BASH, "scripts/ringlog.sh", str(log), "1000000"],
+                       input=("é" * 4096).encode("utf-8"),
+                       capture_output=True, cwd="casa-agent/rootfs/opt/casa")
+    assert r.returncode == 0
+    assert log.stat().st_size == 8192          # EXACT bytes, not codepoint-clamped
+
+
+@_bash_required
+def test_ringlog_large_no_newline_flood_bounded(tmp_path):
+    # r5-B3/r6-B3: 1 MB no-newline flood → memory bounded per read; on-disk
+    # window byte-bounded (each of FILE and FILE.1 ≤ MAX+CHUNK).
+    log = tmp_path / "e.log"
+    r = subprocess.run([BASH, "scripts/ringlog.sh", str(log), "65536"],
+                       input=b"x" * 1_000_000, capture_output=True,
+                       cwd="casa-agent/rootfs/opt/casa")
+    assert r.returncode == 0
+    assert log.stat().st_size <= 65536 + 2048
+    if (tmp_path / "e.log.1").exists():
+        assert (tmp_path / "e.log.1").stat().st_size <= 65536 + 2048
+
+
+@_bash_required
+def test_ringlog_rotates_on_threshold(tmp_path):
+    log = tmp_path / "e.log"
+    r = subprocess.run([BASH, "scripts/ringlog.sh", str(log), "64"],
+                       input=b"y" * 512, capture_output=True,
+                       cwd="casa-agent/rootfs/opt/casa")
+    assert (tmp_path / "e.log.1").exists()
+
+
+def _harness_script(rendered: str, tmp_path, final_exec: str) -> Path:
+    """Rewrite the rendered run script (id already substituted to _PROBE_ID)
+    for a NON-BLOCKING local run: real ws tmp dir, stdin </dev/null (not the
+    FIFO), the ringlog path pointed at the REPO copy (the /opt/casa host path
+    doesn't exist — r3-B6), and the final `exec claude …` replaced."""
+    ws = tmp_path / "ws"; (ws / ".home").mkdir(parents=True, exist_ok=True)  # r6-B2: repeated calls
+    s = rendered.replace(f"/data/engagements/{_PROBE_ID}", str(ws))
+    s = s.replace("/opt/casa/scripts/ringlog.sh", _RINGLOG)
+    s = re.sub(r"exec <\S*stdin\.fifo", "exec </dev/null", s)
+    s = re.sub(r"exec claude .*?(?=\n[A-Z#]|\Z)", final_exec, s, flags=re.S)
+    p = tmp_path / "run"; p.write_text(s); return p
+
+
+@_bash_required
+def test_run_script_exit_status_propagates(tmp_path, rendered_probe_script):
+    """r2/r3-B6: process substitution keeps claude the exec'd child, so a
+    fake 'claude' exit code surfaces as the script's exit code."""
+    p = _harness_script(rendered_probe_script, tmp_path, "exec bash -c 'exit 7'")
+    r = subprocess.run([BASH, str(p)])
+    assert r.returncode == 7
+
+
+@_bash_required
+def test_run_script_signal_propagates(tmp_path, rendered_probe_script):
+    """A SIGTERM to the exec'd child surfaces as -SIGTERM (r3-B6: Python
+    reports signal death as a NEGATIVE returncode, not 143)."""
+    p = _harness_script(rendered_probe_script, tmp_path,
+                        "exec bash -c 'kill -TERM $$; sleep 5'")
+    r = subprocess.run([BASH, str(p)])
+    assert r.returncode == -signal.SIGTERM        # == -15
+
+
+@_bash_required
+def test_run_script_epoch_unique_files_and_sweep_prunes(
+        tmp_path, rendered_probe_script):
+    """r5-B2/r6-B2: N spawns → epochs 1..N, each a UNIQUE .stderr.<E>.log; the
+    run script SWEEP-prunes every file <= E-4 at spawn, so total .stderr.*.log
+    count stays bounded (~4). Deterministic (all writers exit before assert)."""
+    p = _harness_script(rendered_probe_script, tmp_path,
+                        "exec bash -c 'echo err >&2; true'")
+    for expect in range(1, 8):
+        r = subprocess.run([BASH, str(p)], capture_output=True, text=True)
+        assert f'{{"casa_control": "spawn", "epoch": {expect}}}' in r.stdout
+    ws = tmp_path / "ws"
+    assert (ws / ".spawn_epoch").read_text().strip() == "7"
+    _wait_ringlogs_exit(str(tmp_path))                  # r9-B4: writer barrier here too
+    logs = sorted(f.name for f in ws.glob(".stderr.*.log"))
+    assert logs == [".stderr.4.log", ".stderr.5.log",
+                    ".stderr.6.log", ".stderr.7.log"]   # <=E-4 all swept, bounded
+
+
+def _await_file_bytes(path, n, timeout=5.0):
+    # r9-B4: explicit opened/written barrier — poll until the file exists with
+    # >= n bytes (replaces bare sleep(0.2) races).
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if path.stat().st_size >= n:
+                return
+        except FileNotFoundError:
+            pass
+        time.sleep(0.02)
+    raise AssertionError(f"{path} never reached {n} bytes")
+
+
+@_bash_required
+def test_ringlog_stale_epoch_fence_delayed_open(tmp_path):
+    # r7-B4: a ringlog whose epoch is ALREADY stale (current spawn >= epoch+4)
+    # when it starts must NOT create its file at all (delayed-open case). Drive
+    # ringlog directly with MY_EPOCH=1 and .spawn_epoch=5.
+    (tmp_path / ".spawn_epoch").write_text("5")
+    log = tmp_path / ".stderr.1.log"
+    r = subprocess.run([BASH, _RINGLOG, str(log), "65536", "1"],
+                       input=b"hello\n", capture_output=True, cwd=str(tmp_path))
+    assert r.returncode == 0
+    assert not log.exists()                          # fenced — never created
+
+
+@_bash_required
+def test_ringlog_stale_epoch_fence_rotation_after_prune(tmp_path):
+    # r7-B4: ringlog opens fresh (epoch current), then the epoch advances and the
+    # sweep prunes its path; a FORCED rotation must NOT recreate the stale path.
+    # Explicitly await the process (no sleep-race).
+    (tmp_path / ".spawn_epoch").write_text("1")
+    fifo = tmp_path / "f"; os.mkfifo(fifo)
+    log = tmp_path / ".stderr.1.log"
+    rfd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    wfd = os.open(str(fifo), os.O_WRONLY); os.set_blocking(rfd, True)
+    # r10-B1: MAX=3000 > CHUNK=2048 — `read -N 2048` emits nothing until a FULL
+    # chunk (or EOF), so the barrier must be a whole chunk, not 2 bytes.
+    proc = subprocess.Popen([BASH, _RINGLOG, str(log), "3000", "1"],
+                            stdin=rfd, cwd=str(tmp_path))
+    os.close(rfd)
+    os.write(wfd, b"a" * 2048)                       # one FULL chunk → emitted
+    _await_file_bytes(log, 2048)                     # opened/written barrier
+    (tmp_path / ".spawn_epoch").write_text("5")      # epoch 1 now stale
+    os.remove(log)                                   # sweep prunes it (file existed — barrier)
+    os.write(wfd, b"z" * 2048)                       # 2nd chunk → 4096 > 3000 → rotation
+    os.close(wfd); proc.wait(timeout=5)              # explicit await
+    assert proc.returncode == 0
+    assert not log.exists()                          # fence stopped recreation
+
+
+@_bash_required
+def test_ringlog_stale_fence_self_unlinks_without_sweep(tmp_path):
+    # r8-B4/r9-B4 (concrete — the SWEEP NEVER RUNS): epoch flips stale while
+    # ringlog holds its file open; the rotation's post-check makes ringlog REMOVE
+    # ITS OWN paths — the invariant doesn't depend on winning a race with the
+    # sweeper.
+    (tmp_path / ".spawn_epoch").write_text("1")
+    fifo = tmp_path / "f"; os.mkfifo(fifo)
+    log = tmp_path / ".stderr.1.log"
+    rfd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    wfd = os.open(str(fifo), os.O_WRONLY); os.set_blocking(rfd, True)
+    # r10-B1: full-chunk barrier (read -N 2048 emits nothing until a full chunk).
+    proc = subprocess.Popen([BASH, _RINGLOG, str(log), "3000", "1"],
+                            stdin=rfd, cwd=str(tmp_path))
+    os.close(rfd)
+    os.write(wfd, b"a" * 2048)                       # one FULL chunk → emitted
+    _await_file_bytes(log, 2048)                     # opened/written barrier
+    (tmp_path / ".spawn_epoch").write_text("5")      # stale — but NO sweep runs
+    os.write(wfd, b"z" * 2048)                       # 4096 > 3000 → rotation → fence
+    os.close(wfd); proc.wait(timeout=5)
+    assert proc.returncode == 0
+    assert not log.exists()                          # self-unlinked own FILE
+    assert not (tmp_path / ".stderr.1.log.1").exists()   # …and own FILE.1
+
+
+@_bash_required
+def test_sweep_removes_slipped_stale_file_next_spawn(tmp_path, rendered_probe_script):
+    # r8-B4 (check→open TOCTOU backstop): a file that slips through the tiny
+    # pre-check→open window while going stale persists ONLY until the next
+    # spawn — the SWEEP visits ALL files <= E-4 every spawn (not just exact
+    # E-4), and the exited writer holds no fd, so removal is final. Simulate
+    # the slipped file directly, run one template spawn, assert it is gone.
+    p = _harness_script(rendered_probe_script, tmp_path,
+                        "exec bash -c 'true'")
+    ws = tmp_path / "ws"
+    subprocess.run([BASH, str(p)], capture_output=True)      # epoch 1
+    (ws / ".stderr.0.log").write_text("slipped stale file")   # simulate the window
+    subprocess.run([BASH, str(p)], capture_output=True)      # epoch 2 → sweeps <= -2…
+    # advance until the sweep window covers it (epochs 3,4 → E-4 >= 0)
+    subprocess.run([BASH, str(p)], capture_output=True)
+    subprocess.run([BASH, str(p)], capture_output=True)
+    assert not (ws / ".stderr.0.log").exists()               # swept by a later spawn
+
+
+def _wait_ringlogs_exit(marker: str, timeout: float = 5.0) -> None:
+    # r8-B4: subprocess.run does NOT wait for process-substitution consumers —
+    # the run script's exec'd child can exit while its ringlog still drains.
+    # Poll pgrep for ringlog processes whose argv contains this test's tmp dir.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        r = subprocess.run(["pgrep", "-f", f"ringlog.sh.*{marker}"],
+                           capture_output=True)
+        if r.returncode != 0:            # no matches → all writers exited
+            return
+        time.sleep(0.05)
+    raise AssertionError("ringlog writers did not exit in time")
+
+
+@_bash_required
+def test_run_script_lingering_writer_no_resurrection(
+        tmp_path, rendered_probe_script):
+    """r6-B2/r7-B4/r8-B4 end-to-end: run several spawns via the real template;
+    WAIT for every ringlog consumer to actually exit (poll pgrep — the exec'd
+    child's exit does NOT imply the proc-sub consumer exited), then assert the
+    file set is the bounded un-pruned window and nothing stale lingers."""
+    p = _harness_script(rendered_probe_script, tmp_path,
+                        "exec bash -c 'echo err >&2; true'")
+    for _ in range(7):
+        subprocess.run([BASH, str(p)], capture_output=True, text=True)
+    _wait_ringlogs_exit(str(tmp_path))               # r8-B4: real writer barrier
+    ws = tmp_path / "ws"
+    assert not (ws / ".stderr.1.log").exists()       # swept, not resurrected
+    assert len(list(ws.glob(".stderr.*.log"))) <= 4  # bounded total
