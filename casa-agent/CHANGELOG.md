@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.76.0] - 2026-07-14
+
+### Added
+
+- DM button questions from Ellen and specialists.
+- Operator-approved protected plugin tools with single-use argument-bound
+  grants.
+
+### Changed
+
+- Inbound message contexts sanitized at every ingress.
+
 ## [0.75.1] - 2026-07-14
 
 ### Fixed
