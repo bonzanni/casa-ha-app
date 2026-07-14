@@ -149,6 +149,12 @@ def test_template_path_handles_bundled_plugin_developer(tmp_path):
     assert len(settings["hooks"]["PreToolUse"]) >= 1
     assert "enabledPlugins" not in settings          # §3.3
 
+    # Task 10 doctrine: first contact + as-directed brainstorming + completion accounting
+    claude_md = (dest / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "## First contact" in claude_md
+    assert "intended approach" in claude_md
+    assert "process requirement" in claude_md
+
 
 # --- run-script --plugin-dir plumbing (§3.8) --------------------------------
 

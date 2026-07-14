@@ -40,8 +40,8 @@ COMPLETION_ACCOUNTING_LINE = (
 FIRST_CONTACT_PARAGRAPH = (
     "## First contact required (turn-taking)\n"
     "Before doing any substantive work, make first contact with the operator: "
-    "briefly restate your understanding of the objective, surface any "
-    "assumptions or clarifying questions, and use your reply/ask tools to send "
+    "briefly restate your understanding of the objective, your intended approach, "
+    "surface any assumptions or clarifying questions, and use your reply/ask tools to send "
     "that first message — then wait for the operator's answer before "
     "proceeding. Do not begin working through the acceptance criteria until "
     "the operator has responded."
