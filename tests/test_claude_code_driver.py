@@ -120,6 +120,61 @@ class TestStart:
         assert (tmp_path / "engagements" / rec.id / "stdin.fifo").exists()
 
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="workspace provisioning uses mkfifo/symlink (Linux-only)",
+    )
+    async def test_start_carries_brief_envelope_into_claude_md(
+        self, monkeypatch, tmp_path,
+    ):
+        """W3 (Task 8): a brief-bearing record → CLAUDE.md carries the actual
+        acceptance criteria + VERBATIM process requirements + completion
+        accounting (start passes task=brief_task_for(engagement, defn))."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers import s6_rc
+        from drivers.brief import COMPLETION_ACCOUNTING_LINE
+
+        async def fake_cau():
+            return None
+        async def fake_start_kw(*, engagement_id):
+            return None
+        monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+        monkeypatch.setattr(s6_rc, "start_service", fake_start_kw)
+        monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT",
+                            str(tmp_path / "svc-root"))
+        (tmp_path / "svc-root").mkdir()
+        monkeypatch.setattr(
+            ClaudeCodeDriver, "_spawn_background_tasks",
+            lambda self, engagement: None,
+        )
+        async def _noop_write(self, engagement, text):
+            return None
+        monkeypatch.setattr(ClaudeCodeDriver, "_write_to_fifo", _noop_write)
+
+        defn = _make_defn(tmp_path)
+        rec = _make_record()
+        rec.origin["brief"] = {
+            "objective": "Rotate the API keys",
+            "acceptance_criteria": ["old keys revoked"],
+            "process_requirements": ["Announce the rotation window first"],
+        }
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        )
+        (tmp_path / "engagements").mkdir()
+
+        await drv.start(rec, prompt="ignored fifo prompt", options=defn)
+
+        claude_md = (tmp_path / "engagements" / rec.id / "CLAUDE.md").read_text()
+        assert "Rotate the API keys" in claude_md
+        assert "old keys revoked" in claude_md
+        assert "Announce the rotation window first" in claude_md
+        assert COMPLETION_ACCOUNTING_LINE in claude_md
+
+
 class TestStartRollback:
     """Bug 13 (v0.14.6): if any step in start() fails, the partial
     workspace + service-dir + s6-rc compile must be rolled back.

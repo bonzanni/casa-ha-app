@@ -399,7 +399,7 @@ async def replay_undergoing_engagements(
     """
     from drivers import s6_rc
     from drivers.workspace import (
-        render_log_run_script, render_run_script,
+        refresh_claude_md, render_log_run_script, render_run_script,
     )
 
     undergoing = [
@@ -411,6 +411,40 @@ async def replay_undergoing_engagements(
     # refused resume — and MUST be excluded from the start_service and
     # background-task loops below, not merely skipped during rendering.
     refused_ids: set[str] = set()
+
+    async def _refuse_brief_resume(rec, reason: str) -> None:
+        """Fail-closed teardown of a brief-bearing engagement we refuse to
+        resume (r11-B1/r13-B1/r14-B1). Source removal + recompile alone is NOT
+        reliable — ``remove_service_dir`` swallows OSError and the later
+        compile can fail-and-continue — so run the CHECKED teardown ladder,
+        and land a TERMINAL ``refuse_teardown_failed`` when physical
+        containment can't be confirmed (the marking ACCOMPANIES the removal,
+        it does not replace it). ``registry`` is the real parameter name here;
+        ``_engagement_registry`` does not exist in this function and would
+        NameError straight into the per-record warn-and-continue."""
+        logger.warning(
+            "boot replay: engagement %s refuses brief resume — %s; "
+            "tearing down", rec.id[:8], reason,
+        )
+        refused_ids.add(rec.id)
+        down = await s6_rc.ensure_service_down(engagement_id=rec.id)
+        if down is False:
+            try:
+                await registry.mark_error(
+                    rec.id, kind="refuse_teardown_failed",
+                    message=(
+                        f"brief resume refused ({reason}) but the engagement "
+                        "service could not be confirmed down"
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort terminal mark
+                logger.warning(
+                    "boot replay: mark_error(refuse_teardown_failed) failed "
+                    "for %s: %s", rec.id[:8], exc,
+                )
+        s6_rc.remove_service_dir(
+            svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT, engagement_id=rec.id,
+        )
 
     async with s6_rc._compile_lock:
         # 1. Orphan sweep — dirs for non-UNDERGOING engagements, remove them.
@@ -440,6 +474,40 @@ async def replay_undergoing_engagements(
         # compile/start below.
         for rec in undergoing:
             try:
+                # W3 (r8-B5/r9-B5): re-render the workspace CLAUDE.md from the
+                # VERBATIM origin["brief"] for EVERY resumed brief-bearing
+                # engagement — placed at the TOP of the loop, BEFORE the
+                # service_pair_complete fast path. /data/casa-s6-services
+                # persists across restarts, so an ordinary restart takes the
+                # early `continue`; a refresh after the pair-rewrite would never
+                # run. Resolve the executor via definition_any (r10-B5) so a
+                # specialist DISABLED after launch still resumes; registry
+                # absent OR unresolved → fail-closed refuse (checked teardown).
+                brief_defn = None
+                has_brief = bool(rec.origin.get("brief"))
+                if has_brief:
+                    brief_defn = (
+                        executor_registry.definition_any(rec.role_or_type)
+                        if executor_registry is not None else None
+                    )
+                    if brief_defn is None:
+                        await _refuse_brief_resume(
+                            rec,
+                            "no executor_registry passed"
+                            if executor_registry is None
+                            else f"executor type {rec.role_or_type!r} "
+                                 "not resolvable (definition_any → None)",
+                        )
+                        continue
+                    ws_dir = os.path.join(engagements_root, rec.id)
+                    try:
+                        refresh_claude_md(ws_dir, defn=brief_defn, rec=rec)
+                    except Exception as exc:  # noqa: BLE001 — fail-closed
+                        await _refuse_brief_resume(
+                            rec, f"CLAUDE.md refresh failed: {exc}",
+                        )
+                        continue
+
                 if s6_rc.service_pair_complete(
                     svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
                     engagement_id=rec.id,
@@ -468,7 +536,13 @@ async def replay_undergoing_engagements(
                     )
                     continue
 
-                defn = executor_registry.get(rec.role_or_type)
+                # r11-B2: for brief-bearing records reuse the already-resolved
+                # definition_any result (which resolves DISABLED specialists),
+                # so a disabled-definition engagement with an INCOMPLETE pair
+                # heals instead of silently not healing. Brief-LESS records keep
+                # today's get() behaviour EXACTLY (None for disabled → refuse).
+                defn = brief_defn if has_brief else executor_registry.get(
+                    rec.role_or_type)
                 if defn is None:
                     logger.warning(
                         "boot replay: cannot heal engagement %s — executor "

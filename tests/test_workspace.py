@@ -723,3 +723,141 @@ class TestDoctrineProvisioning:
             task="t", context="c",
             casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework")
         assert not (__import__("pathlib").Path(path) / "doctrine").exists()
+
+
+class TestRefreshClaudeMd:
+    """W3/Sol r8-B5 + r10-B4: refresh_claude_md re-derives CLAUDE.md from the
+    engagement record's VERBATIM origin["brief"], re-running the SAME whole-file
+    interpolation as provision (both template paths)."""
+
+    def _defn_legacy(self, tmp_path, executor_type="hello-driver"):
+        from config import ExecutorDefinition
+        exec_dir = tmp_path / "defaults-executors" / executor_type
+        exec_dir.mkdir(parents=True)
+        (exec_dir / "prompt.md").write_text(
+            "You are the {executor_type} executor.\nTASK:\n{task}\n"
+            "CTX:{context}\nMEM:{executor_memory}\n"
+        )
+        return ExecutorDefinition(
+            type=executor_type, description="test executor twenty chars ok!!",
+            model="sonnet", driver="claude_code",
+            prompt_template_path=str(exec_dir / "prompt.md"),
+            mcp_server_names=["casa-framework"],
+        )
+
+    def _defn_template(self, tmp_path, executor_type="tmpl-driver"):
+        from config import ExecutorDefinition
+        exec_dir = tmp_path / "defaults-executors" / executor_type
+        (exec_dir / "workspace-template").mkdir(parents=True)
+        (exec_dir / "prompt.md").write_text("unused legacy prompt")
+        (exec_dir / "workspace-template" / "CLAUDE.md.tmpl").write_text(
+            "EXEC:{executor_type}\nTASK:\n{task}\n"
+            "CTX:{context}\nWORLD:{world_state_summary}\nMEM:{executor_memory}\n"
+        )
+        return ExecutorDefinition(
+            type=executor_type, description="template executor twenty chars",
+            model="sonnet", driver="claude_code",
+            prompt_template_path=str(exec_dir / "prompt.md"),
+            mcp_server_names=["casa-framework"],
+        )
+
+    def _rec(self, brief=None, task="canon task", context="", world=""):
+        from engagement_registry import EngagementRecord
+        origin = {"context": context, "world_state_summary": world}
+        if brief is not None:
+            origin["brief"] = brief
+        return EngagementRecord(
+            id="eng-refresh", kind="executor", role_or_type="hello-driver",
+            driver="claude_code", status="active", topic_id=1,
+            started_at=0.0, last_user_turn_ts=0.0, last_idle_reminder_ts=0.0,
+            completed_at=None, sdk_session_id=None, origin=origin, task=task,
+        )
+
+    async def test_provision_carries_brief_envelope(self, tmp_path):
+        """A claude_code workspace provisioned with the rendered brief task →
+        CLAUDE.md carries objective + criteria + verbatim process strings +
+        completion accounting (not just the bare objective)."""
+        from drivers.workspace import provision_workspace
+        from drivers.brief import brief_task_for, COMPLETION_ACCOUNTING_LINE
+
+        defn = self._defn_legacy(tmp_path)
+        rec = self._rec(brief={
+            "objective": "Ship the release",
+            "acceptance_criteria": ["CI is green"],
+            "process_requirements": ["Squash-merge only"],
+        })
+        ws = tmp_path / "engagements"
+        ws.mkdir()
+        path = await provision_workspace(
+            engagements_root=str(ws), engagement_id=rec.id, defn=defn,
+            task=brief_task_for(rec, defn), context="",
+            casa_framework_mcp_url="http://x",
+        )
+        claude_md = (__import__("pathlib").Path(path) / "CLAUDE.md").read_text()
+        assert "Ship the release" in claude_md
+        assert "CI is green" in claude_md
+        assert "Squash-merge only" in claude_md
+        assert COMPLETION_ACCOUNTING_LINE in claude_md
+
+    async def test_refresh_regression_template_all_sections_return(self, tmp_path):
+        """Provision (template path) with non-empty context/world-state/memory,
+        blank the CLAUDE.md, refresh → brief sections AND
+        context/world_state/memory sections are ALL present again (r10-B4)."""
+        from pathlib import Path
+        from drivers.workspace import provision_workspace, refresh_claude_md
+        from drivers.brief import brief_task_for, COMPLETION_ACCOUNTING_LINE
+
+        defn = self._defn_template(tmp_path)
+        brief = {
+            "objective": "Rebuild the index",
+            "acceptance_criteria": ["index size < 1GB"],
+            "process_requirements": ["Take a snapshot first"],
+        }
+        rec = self._rec(brief=brief, context="ctx-marker",
+                        world="world-marker")
+        rec.role_or_type = defn.type
+        ws = tmp_path / "engagements"
+        ws.mkdir()
+        path = await provision_workspace(
+            engagements_root=str(ws), engagement_id=rec.id, defn=defn,
+            task=brief_task_for(rec, defn), context="ctx-marker",
+            world_state_summary="world-marker", executor_memory="mem-marker",
+            casa_framework_mcp_url="http://x",
+        )
+        ws_dir = Path(path)
+        # Memory was cached for a later boot refresh.
+        assert (ws_dir / ".executor_memory").read_text() == "mem-marker"
+
+        # Blank CLAUDE.md (simulate a wiped workspace file), then refresh.
+        (ws_dir / "CLAUDE.md").write_text("")
+        refresh_claude_md(str(ws_dir), defn=defn, rec=rec)
+
+        claude_md = (ws_dir / "CLAUDE.md").read_text()
+        # Brief sections back.
+        assert "Rebuild the index" in claude_md
+        assert "index size < 1GB" in claude_md
+        assert "Take a snapshot first" in claude_md
+        assert COMPLETION_ACCOUNTING_LINE in claude_md
+        # Every pre-existing placeholder section survived the refresh.
+        assert "CTX:ctx-marker" in claude_md
+        assert "WORLD:world-marker" in claude_md
+        assert "MEM:mem-marker" in claude_md
+
+    async def test_refresh_legacy_path_briefless_uses_task_fallback(self, tmp_path):
+        from pathlib import Path
+        from drivers.workspace import provision_workspace, refresh_claude_md
+
+        defn = self._defn_legacy(tmp_path)
+        rec = self._rec(brief=None, task="plain fallback task", context="c1")
+        ws = tmp_path / "engagements"
+        ws.mkdir()
+        path = await provision_workspace(
+            engagements_root=str(ws), engagement_id=rec.id, defn=defn,
+            task=rec.task, context="c1", executor_memory="",
+            casa_framework_mcp_url="http://x",
+        )
+        (Path(path) / "CLAUDE.md").write_text("")
+        refresh_claude_md(str(Path(path)), defn=defn, rec=rec)
+        claude_md = (Path(path) / "CLAUDE.md").read_text()
+        assert "plain fallback task" in claude_md
+        assert "CTX:c1" in claude_md

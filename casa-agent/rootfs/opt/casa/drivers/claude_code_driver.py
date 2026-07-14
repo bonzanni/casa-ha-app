@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from drivers import s6_rc
+from drivers.brief import brief_task_for
 from drivers.driver_protocol import DriverProtocol
 from drivers.workspace import (
     engagement_log_dir, provision_workspace, render_log_run_script,
@@ -237,7 +238,12 @@ class ClaudeCodeDriver(DriverProtocol):
                     engagements_root=self._engagements_root,
                     engagement_id=engagement.id,
                     defn=defn,
-                    task=engagement.task,
+                    # W3 (Task 8): the CLAUDE.md {task} carries the full brief
+                    # envelope (acceptance criteria + verbatim process
+                    # requirements + completion accounting), derived from the
+                    # RAW origin["brief"]; falls back to engagement.task when
+                    # the engagement has no brief.
+                    task=brief_task_for(engagement, defn),
                     context=engagement.origin.get("context", ""),
                     world_state_summary=engagement.origin.get("world_state_summary", ""),
                     casa_framework_mcp_url=self._casa_framework_mcp_url,

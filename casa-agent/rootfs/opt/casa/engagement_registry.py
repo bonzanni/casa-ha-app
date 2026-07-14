@@ -352,6 +352,7 @@ class EngagementRegistry:
         tools_allowed: tuple[str, ...] | list[str] = (),
         permission_mode: str = "acceptEdits",
         plugin_artifacts: tuple[dict, ...] | list[dict] = (),
+        interaction_state: str = "",
     ) -> EngagementRecord:
         engagement_id = uuid.uuid4().hex
         now = time.time()
@@ -372,6 +373,7 @@ class EngagementRegistry:
             tools_allowed=tuple(tools_allowed),
             permission_mode=permission_mode or "acceptEdits",
             plugin_artifacts=tuple(dict(pa) for pa in plugin_artifacts),
+            interaction_state=interaction_state,
         )
         async with self._lock:
             self._records[engagement_id] = rec
