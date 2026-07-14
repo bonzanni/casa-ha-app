@@ -1165,83 +1165,55 @@ def _engagement_id_from_cwd(cwd: str) -> str | None:
     return m.group(1) if m else None
 
 
-async def _await_matching_verdict(
-    q: asyncio.Queue,
-    expected_rid: str,
-    *,
-    mailbox: dict[str, str],
-    lock: asyncio.Lock,
-) -> str:
-    """Return the verdict for ``expected_rid``, correlated by request_id.
-
-    Concurrency contract (M18, v0.53.0). Claude Code issues parallel tool
-    calls, so several PreToolUse relays for ONE engagement may await the same
-    per-engagement queue at once. The previous implementation had every waiter
-    call ``q.get()`` directly and discard any item whose request_id was not its
-    own — so whichever waiter won ``q.get()`` for the operator's verdict
-    destroyed it when the rid did not match, and the owning request was denied
-    by timeout despite an explicit operator approval.
-
-    Fix: exactly one waiter drains the shared queue at a time (``lock``); a
-    dequeued verdict whose request_id is not the drainer's own is stashed in
-    ``mailbox`` keyed by request_id and picked up by its owning waiter. Only
-    the lock holder ever calls ``q.get()``, so no two waiters race the queue,
-    and the mailbox is the per-request keyed map that guarantees each waiter
-    receives only its own verdict.
-
-    Matching remains keyed by request_id, so the original stale-click defence
-    holds: a late/stale verdict for a timed-out request lands in the mailbox
-    under its own (now unowned) rid and can never approve a DIFFERENT tool
-    call — request_ids are unique per tool call.
+def _perm_keyboard_finish(
+    telegram_channel: Any, topic_id: int | None, message_id: int,
+) -> Callable[[dict], "Awaitable[None]"]:
+    """Broker finish-hook (r3-B3): keyboard-edit owner for the permission
+    namespace. Fires exactly once on outcome (delivered by the broker even if
+    the creating hook task was cancelled) and edits the posted keyboard
+    message to reflect the outcome. The callback path NEVER edits the
+    keyboard — this is the only writer.
     """
-    while True:
-        # A concurrent drainer may already have delivered our verdict.
-        if expected_rid in mailbox:
-            return mailbox.pop(expected_rid) or "deny"
-        async with lock:
-            # Re-check under the lock: it may have arrived while we queued
-            # for the lock.
-            if expected_rid in mailbox:
-                return mailbox.pop(expected_rid) or "deny"
-            item = await q.get()
-            rid = item.get("request_id")
-            verdict = item.get("verdict") or "deny"
-            if rid == expected_rid:
-                return verdict
-            # Not ours — hand off to the owning waiter via its mailbox. The
-            # lock release below wakes the next waiter, which collects it.
-            mailbox[rid] = verdict
-        # Lock released: loop so another waiter can drain / collect, and we
-        # re-check the mailbox for our own verdict before draining again.
+
+    async def _finish(outcome: dict) -> None:
+        try:
+            await telegram_channel.edit_perm_keyboard_outcome(
+                topic_id=topic_id, message_id=message_id, outcome=outcome,
+            )
+        except Exception:  # noqa: BLE001 — finish hooks must never raise
+            _logger.warning(
+                "permission keyboard finish-hook edit failed "
+                "(topic=%s message_id=%s)", topic_id, message_id, exc_info=True,
+            )
+
+    return _finish
 
 
 def make_engagement_permission_relay(
     *,
     engagement_registry: Any,
     telegram_channel: Any,
-    queues: dict,
+    queues: dict | None = None,
     timeout_s: float = 600.0,
 ) -> HookCallback:
     """Build the PreToolUse hook that relays non-allow-listed tool calls
-    through the engagement's Telegram inline-keyboard.
+    through the engagement's Telegram inline-keyboard, via the
+    Casa-owned ``verdict_broker`` (W5/Sol B3,B4).
 
     Args:
         engagement_registry: registry exposing ``.get(engagement_id) -> record | None``.
-        telegram_channel: object with async ``update_topic_state(*, engagement_id, new_state)``
-            and ``post_perm_keyboard(*, engagement_id, request_id, tool_name, tool_input)``.
-        queues: dict mapping engagement_id -> ``asyncio.Queue`` of verdict items
-            (each item shaped ``{"request_id": str, "verdict": "allow"|"deny",
-            "operator_id": int | None}``).
+        telegram_channel: object with async ``update_topic_state(*, engagement_id, new_state)``,
+            ``post_perm_keyboard(*, engagement_id, request_id, tool_name, tool_input) -> int | None``,
+            and ``edit_perm_keyboard_outcome(*, topic_id, message_id, outcome)``.
+        queues: DEPRECATED — accepted-and-ignored (one release, v0.75.0). The
+            operator verdict now flows through ``verdict_broker.BROKER``
+            (namespace ``"permission"``), delivered by
+            ``channel_handlers._make_permission_verdict``. Kept as a no-op
+            kwarg so callers mid-migration don't crash on an unexpected
+            keyword; remove once every wiring site has dropped it.
         timeout_s: how long to wait for the operator before treating as deny.
     """
-
-    # M18 (v0.53.0): per-engagement verdict demux shared across every
-    # concurrent ``_hook`` invocation. ``_drain_locks`` ensures exactly one
-    # waiter drains the shared verdict queue at a time; ``_mailboxes`` is the
-    # per-engagement, per-request-id keyed map a drainer stashes another
-    # waiter's verdict into. See ``_await_matching_verdict``.
-    _mailboxes: dict[str, dict[str, str]] = {}
-    _drain_locks: dict[str, asyncio.Lock] = {}
+    del queues  # deprecated, accepted-and-ignored (see docstring)
 
     async def _hook(
         input_data: dict[str, Any],
@@ -1276,7 +1248,8 @@ def make_engagement_permission_relay(
         ):
             return {}  # pass-through: CC's allow-rule approves
 
-        # Not allow-listed — post inline keyboard and await operator verdict.
+        # Not allow-listed — post inline keyboard and await operator verdict
+        # via the broker.
         cc_tool_use_id = input_data.get("tool_use_id") or ""
         rid = cc_tool_use_id[:_RID_MAX_LEN] or uuid.uuid4().hex
         tool_name = input_data.get("tool_name", "")
@@ -1285,45 +1258,64 @@ def make_engagement_permission_relay(
         await telegram_channel.update_topic_state(
             engagement_id=eng_id, new_state="awaiting",
         )
-        # CancelledError-safe: ensure 'active' is restored on every exit path,
-        # including engagement cancellation mid-await. (Code-review #1.)
-        try:
+        from verdict_broker import BROKER
+
+        req, created = BROKER.register(
+            namespace="permission", scope=eng_id, request_id=rid,
+            timeout_s=timeout_s,
+        )
+        outcome: dict[str, Any] = {}
+        try:  # r7-B3: whole lifecycle guarded — restore 'active' on any exit
+            if created:
+                # STATIC meta BEFORE posting so a fast tap never sees
+                # incomplete metadata (r3-B3). message_id + finish_hook are
+                # set by the broker-owned setup task (r8-B3).
+                req.meta.update({
+                    "options": ["allow", "deny"],
+                    "topic_id": rec.topic_id,
+                    "operator_id": rec.origin.get("user_id"),
+                })
             try:
-                await telegram_channel.post_perm_keyboard(
-                    engagement_id=eng_id,
-                    request_id=rid,
-                    tool_name=tool_name,
-                    tool_input=tool_input,
+                # r8-B3: the post runs in a broker-owned SHIELDED setup task
+                # — cancelling THIS hook never interrupts an in-flight
+                # Telegram post (which may already be accepted server-side),
+                # so a same-id retry can never produce a second keyboard.
+                # Post FAILURE inside the task unregisters (waiters get
+                # delivery_failed).
+                await BROKER.ensure_posted(
+                    req,
+                    lambda: telegram_channel.post_perm_keyboard(
+                        engagement_id=eng_id, request_id=rid,
+                        tool_name=tool_name, tool_input=tool_input),
+                    lambda mid: _perm_keyboard_finish(
+                        telegram_channel, rec.topic_id, mid),
                 )
-            except Exception as exc:  # noqa: BLE001
-                return _deny(f"keyboard post failed: {exc}")
-
-            # v0.37.3 hotfix: ``_PERMISSION_QUEUES`` is a
-            # ``defaultdict(asyncio.Queue)`` — use ``[]`` so the queue is
-            # created on first hook fire (mirrors the producer side at
-            # ``_make_permission_verdict``). Earlier ``.get()`` returned
-            # None on the first fire, instantly denying the call before the
-            # operator could tap.
-            q = queues[eng_id]
-            mailbox = _mailboxes.setdefault(eng_id, {})
-            lock = _drain_locks.setdefault(eng_id, asyncio.Lock())
-
-            try:
-                verdict = await asyncio.wait_for(
-                    _await_matching_verdict(
-                        q, rid, mailbox=mailbox, lock=lock,
-                    ),
-                    timeout=timeout_s,
+                outcome = await BROKER.await_result(req)
+                if outcome.get("outcome") == "delivery_failed":
+                    return _deny("keyboard post failed")
+            except asyncio.CancelledError:
+                # r4-B3: single in-process awaiter, no reattach —
+                # cancellation IS logical cancel (during post OR await). The
+                # setup task completes in the background; BROKER.cancel
+                # resolves the request, and the finish-hook (installed by
+                # setup even after completion — r4-B1) edits the keyboard to
+                # "expired". NOT engagement-terminal.
+                BROKER.cancel(
+                    namespace="permission", scope=eng_id, request_id=rid,
+                    reason="tool_invocation_cancelled",
                 )
-            except asyncio.TimeoutError:
-                return _deny(f"operator timeout ({timeout_s:g}s)")
-
-            if verdict == "allow":
-                return {}
-            return _deny("operator denied via Telegram")
+                raise
         finally:
+            # r7-B3: restore topic state on EVERY exit — post failure,
+            # cancellation during post or await, or normal completion.
             await telegram_channel.update_topic_state(
                 engagement_id=eng_id, new_state="active",
             )
+        o = outcome.get("outcome")
+        if o == "answered" and outcome.get("option_index") == 0:
+            return {}
+        if o == "no_answer":
+            return _deny("operator did not respond within the window")
+        return _deny("Operator denied via Telegram")
 
     return _hook

@@ -541,3 +541,301 @@ class TestSweepOrphanCompiledDbs:
 
         missing = tmp_path / "does-not-exist"
         assert s6_rc.sweep_orphan_compiled_dbs(tmp_root=str(missing)) == []
+
+
+# ---------------------------------------------------------------------------
+# ensure_service_down — checked-teardown ladder (W3/Task 8, r13-B1/r14-B1..3)
+# ---------------------------------------------------------------------------
+
+import subprocess as _subprocess  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+
+class _FakeSup:
+    """A scriptable fake s6 supervisor for the ensure_service_down ladder.
+
+    Commands drive/observe ``self.up_out`` (the ``up,wantedup`` string) and
+    ``self.up_rc`` (the s6-svstat -o returncode). ``up_responses`` (if set) is
+    a queue of ``(rc, stdout)`` for successive -o probes (last repeats).
+    """
+
+    def __init__(self):
+        self.up_out = "true true"
+        self.up_rc = 0
+        self.up_responses = None
+        self.rc_d_raises = False
+        self.on_svc_D = None
+        self.on_combined = None
+        self.pid_rc = 0
+        self.pid_out = "0"
+        self.calls = []
+
+    def run(self, cmd, **kw):
+        self.calls.append(list(cmd))
+        prog = cmd[0]
+        if cmd[:3] == ["s6-rc", "-d", "change"]:
+            if self.rc_d_raises:
+                raise _subprocess.CalledProcessError(1, cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if prog == "s6-svstat" and "-o" in cmd:
+            if self.up_responses:
+                if len(self.up_responses) > 1:
+                    rc, out = self.up_responses.pop(0)
+                else:
+                    rc, out = self.up_responses[0]
+            else:
+                rc, out = self.up_rc, self.up_out
+            return SimpleNamespace(returncode=rc, stdout=out, stderr="")
+        if prog == "s6-svstat" and "-p" in cmd:
+            return SimpleNamespace(returncode=self.pid_rc, stdout=self.pid_out,
+                                   stderr="")
+        if cmd[:2] == ["s6-svc", "-D"]:
+            if self.on_svc_D:
+                self.on_svc_D()
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if prog == "s6-svc" and "-KD" in cmd:      # combined containment rung
+            if self.on_combined:
+                self.on_combined()
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+def _wire_fake(monkeypatch, tmp_path, fake, *, make_scandir=True, eid="e1"):
+    from drivers import s6_rc
+    root = tmp_path / "run-service"
+    root.mkdir()
+    if make_scandir:
+        (root / f"engagement-{eid}").mkdir()
+    monkeypatch.setattr(s6_rc, "SERVICE_SCANDIR_ROOT", str(root))
+    monkeypatch.setattr(s6_rc, "_ENSURE_DOWN_WAIT_S", 0)
+    monkeypatch.setattr(s6_rc.subprocess, "run", fake.run)
+    return root
+
+
+def _has_combined(fake):
+    return any("-KD" in c for c in fake.calls)
+
+
+class TestEnsureServiceDown:
+    async def test_scandir_absent_is_down(self, monkeypatch, tmp_path):
+        from drivers import s6_rc
+        fake = _FakeSup()
+        _wire_fake(monkeypatch, tmp_path, fake, make_scandir=False)
+        assert await s6_rc.ensure_service_down(engagement_id="e1") is True
+        # No svstat -o probe was needed (absent scandir short-circuits to down).
+        assert not any(c[:2] == ["s6-svstat", "-o"] for c in fake.calls)
+
+    async def test_stop_failure_svc_fallback_confirms(self, monkeypatch, tmp_path):
+        from drivers import s6_rc
+        fake = _FakeSup()
+        fake.rc_d_raises = True                    # s6-rc -d raises
+        fake.up_out = "true true"
+        fake.on_svc_D = lambda: setattr(fake, "up_out", "false false")
+        _wire_fake(monkeypatch, tmp_path, fake)
+        assert await s6_rc.ensure_service_down(engagement_id="e1") is True
+        assert any(c[:3] == ["s6-rc", "-d", "change"] for c in fake.calls)
+        assert any(c[:2] == ["s6-svc", "-D"] for c in fake.calls)
+
+    async def test_persistent_pid_fallback_downs(self, monkeypatch, tmp_path):
+        from drivers import s6_rc
+        fake = _FakeSup()
+        fake.rc_d_raises = False                   # s6-rc -d succeeds...
+        fake.up_out = "true true"                  # ...but probe still up
+        fake.on_svc_D = lambda: setattr(fake, "up_out", "false false")
+        _wire_fake(monkeypatch, tmp_path, fake)
+        assert await s6_rc.ensure_service_down(engagement_id="e1") is True
+
+    async def test_status_query_failure_retries_then_confirms(
+        self, monkeypatch, tmp_path,
+    ):
+        from drivers import s6_rc
+        fake = _FakeSup()
+        # Unknown (rc=1) on the first probes, resolves to down later. Unknown
+        # must NOT be treated as down.
+        fake.up_responses = [(1, ""), (1, ""), (0, "false false")]
+        _wire_fake(monkeypatch, tmp_path, fake)
+        assert await s6_rc.ensure_service_down(engagement_id="e1") is True
+        probes = [c for c in fake.calls if c[:2] == ["s6-svstat", "-o"]]
+        assert len(probes) >= 3
+
+    async def test_respawn_race_false_true_not_down(self, monkeypatch, tmp_path):
+        from drivers import s6_rc
+        fake = _FakeSup()
+        fake.up_out = "false true"                  # dead but wanted-up → NOT down
+        fake.on_svc_D = lambda: setattr(fake, "up_out", "false false")
+        _wire_fake(monkeypatch, tmp_path, fake)
+        assert await s6_rc.ensure_service_down(engagement_id="e1") is True
+        # It only confirmed AFTER the -D latch flipped wantedup to false.
+        assert any(c[:2] == ["s6-svc", "-D"] for c in fake.calls)
+
+    async def test_probe_classifies_false_true_as_up(self, monkeypatch, tmp_path):
+        from drivers import s6_rc
+        fake = _FakeSup()
+        fake.up_out = "false true"
+        root = _wire_fake(monkeypatch, tmp_path, fake)
+        scandir = str(root / "engagement-e1")
+        assert await s6_rc._probe_service_down(scandir) == "up"
+
+    async def test_exhaustion_combined_rung_confirms(self, monkeypatch, tmp_path):
+        from drivers import s6_rc
+        fake = _FakeSup()
+        fake.up_out = "true true"                   # -rc/-D both ineffective
+        fake.on_combined = lambda: setattr(fake, "up_out", "false false")
+        _wire_fake(monkeypatch, tmp_path, fake)
+        assert await s6_rc.ensure_service_down(engagement_id="e1") is True
+        assert _has_combined(fake), "final rung must run the combined -wD -KD -T"
+
+    async def test_true_exhaustion_returns_false(self, monkeypatch, tmp_path):
+        from drivers import s6_rc
+        fake = _FakeSup()
+        fake.up_rc = 1                              # persistent query failure
+        fake.pid_rc = 1                             # -p query also fails → no kill
+        _wire_fake(monkeypatch, tmp_path, fake)
+        assert await s6_rc.ensure_service_down(engagement_id="e1") is False
+
+
+class TestDirectKillpg:
+    @pytest.mark.skipif(sys.platform == "win32", reason="posix process groups")
+    async def test_group_kill_takes_leader_and_child(self, monkeypatch, tmp_path):
+        import time
+        from drivers import s6_rc
+
+        code = (
+            "import os,sys,time\n"
+            "pid=os.fork()\n"
+            "if pid==0:\n"
+            "    time.sleep(60)\n"
+            "else:\n"
+            "    sys.stdout.write(str(pid)+chr(10)); sys.stdout.flush()\n"
+            "    time.sleep(60)\n"
+        )
+        proc = _subprocess.Popen(
+            [sys.executable, "-c", code], start_new_session=True,
+            stdout=_subprocess.PIPE, text=True,
+        )
+        child_pid = int(proc.stdout.readline())
+        leader_pid = proc.pid
+
+        root = tmp_path / "run-service"
+        root.mkdir()
+        (root / "engagement-e1").mkdir()
+        monkeypatch.setattr(s6_rc, "SERVICE_SCANDIR_ROOT", str(root))
+
+        real_run = _subprocess.run
+
+        def fake_run(cmd, **kw):
+            if cmd[0] == "s6-svstat" and "-p" in cmd:
+                return SimpleNamespace(returncode=0, stdout=str(leader_pid),
+                                       stderr="")
+            return real_run(cmd, **kw)
+
+        monkeypatch.setattr(s6_rc.subprocess, "run", fake_run)
+
+        scandir = str(root / "engagement-e1")
+        killed = await s6_rc._direct_killpg(scandir)
+        assert killed is True
+
+        def _dead(pid):
+            for _ in range(50):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return True
+                time.sleep(0.1)
+            return False
+
+        try:
+            # Child is an orphan (reaped by init) — os.kill eventually raises.
+            assert _dead(child_pid), "child must be group-killed too"
+            # Leader is our Popen child — SIGKILL leaves a zombie until wait().
+            assert proc.wait(timeout=5) == -9, "leader must be SIGKILLed"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+class TestRunScriptIsStale:
+    """B1 (Sol diff r2): v0.75.0 streaming requires BOTH markers
+    (``casa_control`` AND ``--output-format stream-json``). A script carrying
+    only one is still stale, and a missing/unreadable run file fails CLOSED
+    (stale=True) so boot replay re-plants rather than resuming an unarmed pair.
+    """
+
+    def _write_run(self, svc_root: Path, eid: str, run_text: str) -> None:
+        from drivers.s6_rc import _main_service_name
+        main = svc_root / _main_service_name(eid)
+        main.mkdir(parents=True)
+        (main / "run").write_text(run_text)
+
+    async def test_only_stream_json_is_stale(self, tmp_path):
+        from drivers.s6_rc import run_script_is_stale
+        self._write_run(
+            tmp_path, "e1",
+            "#!/bin/sh\nexec claude --print --output-format stream-json\n")
+        assert run_script_is_stale(svc_root=str(tmp_path), engagement_id="e1")
+
+    async def test_only_casa_control_is_stale(self, tmp_path):
+        from drivers.s6_rc import run_script_is_stale
+        self._write_run(
+            tmp_path, "e2",
+            "#!/bin/sh\ncasa_control spawn\nexec claude --print\n")
+        assert run_script_is_stale(svc_root=str(tmp_path), engagement_id="e2")
+
+    async def test_both_markers_is_fresh(self, tmp_path):
+        from drivers.s6_rc import run_script_is_stale
+        self._write_run(
+            tmp_path, "e3",
+            "#!/bin/sh\ncasa_control spawn\n"
+            "exec claude --print --output-format stream-json\n")
+        assert not run_script_is_stale(svc_root=str(tmp_path), engagement_id="e3")
+
+    async def test_missing_run_file_is_stale(self, tmp_path):
+        from drivers.s6_rc import _main_service_name, run_script_is_stale
+        # main dir exists but no run file (torn) — fail closed.
+        (tmp_path / _main_service_name("e4")).mkdir()
+        assert run_script_is_stale(svc_root=str(tmp_path), engagement_id="e4")
+
+    async def test_absent_dir_is_stale(self, tmp_path):
+        from drivers.s6_rc import run_script_is_stale
+        # nothing planted at all — fail closed.
+        assert run_script_is_stale(svc_root=str(tmp_path), engagement_id="nope")
+
+    async def test_unreadable_run_file_is_stale(self, tmp_path, monkeypatch):
+        from drivers import s6_rc
+        self._write_run(
+            tmp_path, "e5",
+            "#!/bin/sh\ncasa_control spawn\n"
+            "exec claude --print --output-format stream-json\n")
+
+        # Even a BOTH-marker script must classify stale if the file cannot be
+        # read (permission/OSError) — patch Path.read_text to raise.
+        real_read_text = Path.read_text
+
+        def _boom(self, *a, **k):
+            if self.name == "run":
+                raise PermissionError("no access")
+            return real_read_text(self, *a, **k)
+
+        monkeypatch.setattr(Path, "read_text", _boom)
+        assert s6_rc.run_script_is_stale(svc_root=str(tmp_path), engagement_id="e5")
+
+
+class TestServiceDirsAbsent:
+    """B2 (Sol diff r2): verify BOTH the main and -log service source dirs are
+    gone after a remove_service_dir in the migration path (remove swallows
+    failures, so a survivor must read as NOT absent → fail closed)."""
+
+    async def test_both_gone_is_absent(self, tmp_path):
+        from drivers.s6_rc import service_dirs_absent
+        assert service_dirs_absent(svc_root=str(tmp_path), engagement_id="e1")
+
+    async def test_surviving_main_is_not_absent(self, tmp_path):
+        from drivers.s6_rc import _main_service_name, service_dirs_absent
+        (tmp_path / _main_service_name("e2")).mkdir()
+        assert not service_dirs_absent(svc_root=str(tmp_path), engagement_id="e2")
+
+    async def test_surviving_log_is_not_absent(self, tmp_path):
+        from drivers.s6_rc import _log_service_name, service_dirs_absent
+        (tmp_path / _log_service_name("e3")).mkdir()
+        assert not service_dirs_absent(svc_root=str(tmp_path), engagement_id="e3")

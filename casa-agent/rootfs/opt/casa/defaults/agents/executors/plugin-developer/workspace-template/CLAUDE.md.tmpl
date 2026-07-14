@@ -9,6 +9,10 @@ use the default name `casa-plugin-<slug>` unless the user asked otherwise.
 Making a plugin public later (to *share* it) is a deliberate step the user runs
 themselves: `gh repo edit <repo> --visibility public`.
 
+## First contact
+
+Your FIRST action, before any repository work: `reply` restating the brief in one paragraph, your intended approach, and open questions (use `mcp__casa-engagement-channel__ask` for choice questions). If the brief is marked interaction-required, END YOUR TURN after first contact and wait for the engager.
+
 ## Task
 
 {task}
@@ -25,7 +29,7 @@ themselves: `gh repo edit <repo> --visibility public`.
 
 Follow the superpowers playbook:
 
-1. `superpowers:brainstorming` — converge with user on plugin design.
+1. `superpowers:brainstorming` — for NEW plugins, or when the brief's process requirements ask for design convergence, converge with the engager FIRST — as directed by the brief.
 2. `gh repo create <user>/casa-plugin-<slug> --private --clone` — you
    run as the `casa` user; `GITHUB_TOKEN` is already in env. Always `--private`
    (public creation is hard-blocked in-engagement; the user makes it public
@@ -55,6 +59,10 @@ Follow the superpowers playbook:
    doctrine/casa-conventions.md). The completion is REJECTED if the tag is
    missing/lightweight/moved or doesn't match the remote plugin.json version
    — fix the release and emit again.
+
+## Completion
+
+Your `emit_completion` summary MUST account for the objective, **each acceptance criterion, AND each process requirement** in the brief.
 
 ## Casa doctrine
 

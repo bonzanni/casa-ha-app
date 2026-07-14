@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.75.0] - 2026-07-14
+
+### Added
+
+- **Live engagement topic streaming.** An engaged agent's narration now
+  streams into its Telegram topic turn by turn as the agent works, instead of
+  arriving only at the end.
+- **Button questions (`ask`) for engaged executors.** An executor can pose a
+  multiple-choice question to the operator as inline Telegram buttons and
+  await the tap, the same broker-backed pattern the permission relay uses.
+- **Structured briefs.** Engagements now carry a brief envelope that passes
+  the operator's process requirements to the executor **verbatim** (never
+  paraphrased into a feature requirement) and tracks completion accounting.
+- **Turn-taking state.** Engagements track whether they're waiting on the
+  operator or the agent, and surface it when an agent acts before the
+  operator has responded.
+
+### Changed
+
+- The engagement CLI now runs in explicit `--print --verbose --output-format
+  stream-json` mode instead of relying on implicit defaults.
+- Permission-relay internals are rebuilt on a Casa-owned verdict broker
+  (behavior unchanged for operators — allow/deny still works the same way).
+- `bash` is now a runtime dependency of engagements (the run script uses
+  process substitution).
+
+### Fixed
+
+- An engagement's stderr is now bounded per spawn (a ring buffer), instead of
+  growing without limit across the engagement's lifetime.
+
 ## [0.74.2] - 2026-07-13
 
 ### Fixed

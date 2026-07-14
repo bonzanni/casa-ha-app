@@ -583,3 +583,204 @@ class TestTombstoneAtomicity:
         assert on_disk == first  # prior tombstone intact, not truncated
         import os as _os
         assert [f for f in _os.listdir(tmp_path) if f != "engagements.json"] == []
+
+
+# ---------------------------------------------------------------------------
+# TestInteractionState — W2/Sol B9 (Task 7): observational turn-taking.
+# ---------------------------------------------------------------------------
+
+
+class TestInteractionState:
+    async def test_default_is_empty_string(self, registry):
+        rec = await registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        assert rec.interaction_state == ""
+
+    @pytest.mark.parametrize("current,event,expected", [
+        # first_contact: only valid from first_contact_required.
+        ("first_contact_required", "first_contact", "awaiting_operator"),
+        ("awaiting_operator", "first_contact", None),
+        ("authorized", "first_contact", None),
+        ("", "first_contact", None),
+        # operator_answered / operator_turn: valid from EITHER
+        # pre-authorized state (r3-B4 — a fast tap beats the agent's
+        # first reply), never backwards, never from "" or "authorized".
+        ("first_contact_required", "operator_answered", "authorized"),
+        ("awaiting_operator", "operator_answered", "authorized"),
+        ("authorized", "operator_answered", None),
+        ("", "operator_answered", None),
+        ("first_contact_required", "operator_turn", "authorized"),
+        ("awaiting_operator", "operator_turn", "authorized"),
+        ("authorized", "operator_turn", None),
+        ("", "operator_turn", None),
+        # Unknown event is always a no-op.
+        ("first_contact_required", "bogus_event", None),
+        ("awaiting_operator", "bogus_event", None),
+    ])
+    async def test_transition_table(self, registry, current, event, expected):
+        rec = await registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        rec.interaction_state = current
+        result = await registry.advance_interaction_state(rec.id, event)
+        assert result == expected
+        assert rec.interaction_state == (expected if expected is not None else current)
+
+    async def test_unknown_engagement_returns_none(self, registry):
+        assert await registry.advance_interaction_state(
+            "ghost", "first_contact",
+        ) is None
+
+    async def test_atomicity_concurrent_calls_resolve_to_one_transition(self, registry):
+        """Two coroutines race the SAME event on the SAME record: the lock
+        serializes read-compute-write, so exactly one call sees the
+        pre-transition state (and wins) while the other sees the
+        already-advanced state (and no-ops)."""
+        rec = await registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        rec.interaction_state = "awaiting_operator"
+        results = await asyncio.gather(
+            registry.advance_interaction_state(rec.id, "operator_answered"),
+            registry.advance_interaction_state(rec.id, "operator_answered"),
+        )
+        assert results.count("authorized") == 1
+        assert results.count(None) == 1
+        assert rec.interaction_state == "authorized"
+
+    async def test_advance_raises_and_rolls_back_on_persist_failure(
+        self, registry, monkeypatch,
+    ):
+        """B3 (Sol r1): advance_interaction_state persists STRICTLY — a REAL
+        tombstone-write failure (the underlying file write raises, not the
+        method) must propagate AND roll the in-memory field back to its prior
+        value, so a restart never restores stale ``awaiting_operator`` after
+        the callback thinks it authorized."""
+        import engagement_registry as er
+
+        rec = await registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        rec.interaction_state = "first_contact_required"
+
+        def _boom(*_a, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(er, "atomic_write_json", _boom)
+
+        with pytest.raises(OSError):
+            await registry.advance_interaction_state(rec.id, "operator_answered")
+
+        # Rolled back: authorization never reached disk, so the in-memory
+        # field must NOT be left advanced.
+        assert rec.interaction_state == "first_contact_required"
+
+    async def test_persists_across_tombstone_round_trip(self, tmp_path, bus):
+        from engagement_registry import EngagementRegistry
+
+        path = str(tmp_path / "engagements.json")
+        reg1 = EngagementRegistry(tombstone_path=path, bus=bus)
+        rec = await reg1.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        rec.interaction_state = "first_contact_required"
+        result = await reg1.advance_interaction_state(rec.id, "first_contact")
+        assert result == "awaiting_operator"
+
+        reg2 = EngagementRegistry(tombstone_path=path, bus=bus)
+        await reg2.load()
+        rec2 = reg2.get(rec.id)
+        assert rec2 is not None
+        assert rec2.interaction_state == "awaiting_operator"
+
+    async def test_pre_v0_75_0_tombstone_loads_with_empty_default(self, tmp_path, bus):
+        """Back-compat: tombstones written before Task 7 lack the field."""
+        from engagement_registry import EngagementRegistry
+
+        path = tmp_path / "engagements.json"
+        path.write_text(json.dumps([{
+            "id": "b" * 32,
+            "kind": "executor",
+            "role_or_type": "configurator",
+            "driver": "claude_code",
+            "status": "active",
+            "topic_id": 42,
+            "started_at": 1700000000.0,
+            "last_user_turn_ts": 1700000000.0,
+            "last_idle_reminder_ts": 0.0,
+            "completed_at": None,
+            "sdk_session_id": None,
+            "origin": {},
+            "task": "legacy",
+        }]))
+        reg = EngagementRegistry(tombstone_path=str(path), bus=bus)
+        await reg.load()
+        rec = reg._records["b" * 32]
+        assert rec.interaction_state == ""
+
+
+class TestSetInteractionViolated:
+    async def test_sets_origin_flag(self, registry):
+        rec = await registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        assert rec.origin.get("interaction_violated") is None
+        await registry.set_interaction_violated(rec.id)
+        assert rec.origin.get("interaction_violated") is True
+
+    async def test_unknown_engagement_is_noop(self, registry):
+        await registry.set_interaction_violated("ghost")  # must not raise
+
+    async def test_persists_through_tombstone(self, tmp_path, bus):
+        from engagement_registry import EngagementRegistry
+
+        path = str(tmp_path / "engagements.json")
+        reg1 = EngagementRegistry(tombstone_path=path, bus=bus)
+        rec = await reg1.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        await reg1.set_interaction_violated(rec.id)
+
+        reg2 = EngagementRegistry(tombstone_path=path, bus=bus)
+        await reg2.load()
+        rec2 = reg2.get(rec.id)
+        assert rec2 is not None
+        assert rec2.origin.get("interaction_violated") is True
+
+    async def test_raises_and_rolls_back_on_persist_failure(
+        self, registry, monkeypatch,
+    ):
+        """B3 (Sol diff r2): set_interaction_violated persists STRICTLY — a
+        REAL tombstone-write failure must PROPAGATE and roll the in-memory
+        origin flag back, so the driver seam (which only marks
+        ``_violation_flagged`` after a successful return) retries next frame
+        instead of permanently losing the completion warning across a
+        restart."""
+        import engagement_registry as er
+
+        rec = await registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        assert rec.origin.get("interaction_violated") is None
+
+        def _boom(*_a, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(er, "atomic_write_json", _boom)
+
+        with pytest.raises(OSError):
+            await registry.set_interaction_violated(rec.id)
+
+        # Rolled back: the flag never reached disk, so the in-memory origin
+        # must NOT be left set (else a restart would lose the un-persisted flag
+        # silently while the driver believed it succeeded).
+        assert rec.origin.get("interaction_violated") is None

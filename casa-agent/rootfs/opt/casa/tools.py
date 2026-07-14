@@ -48,6 +48,7 @@ import plugin_outbox
 from error_kinds import _classify_error
 from mcp_registry import McpServerRegistry
 import sdk_logging
+from drivers.brief import normalize_brief, render_brief_task, validate_brief
 from engagement_registry import EngagementRecord, EngagementRegistry
 from specialist_registry import (
     DelegationComplete,
@@ -1664,8 +1665,41 @@ async def _fetch_executor_archive(
 @tool(
     "engage_executor",
     "Start a Tier 3 Executor engagement (configurator, ha-developer, etc.). "
-    "Returns engagement_id; result arrives later as a NOTIFICATION.",
-    {"executor_type": str, "task": str, "context": str},
+    "Provide EITHER a plain 'task' string OR a structured 'brief' object "
+    "(objective + acceptance_criteria + process_requirements + context + "
+    "interaction_required), not both. Returns engagement_id; result arrives "
+    "later as a NOTIFICATION.",
+    # W3/Sol r3-B8: an explicit JSON Schema so task/brief/context are all
+    # schema-OPTIONAL (only executor_type is required). The task-XOR-brief and
+    # legacy-top-level-context rules are enforced in the handler — a JSON
+    # Schema can't cleanly express the cross-field XOR. The old
+    # required-everything shorthand ({"executor_type": str, "task": str,
+    # "context": str}) made all three required, so the MCP validator rejected
+    # BOTH XOR branches before the handler ever ran.
+    {
+        "type": "object",
+        "properties": {
+            "executor_type": {"type": "string"},
+            "task": {"type": "string"},
+            "context": {"type": "string"},
+            "brief": {
+                "type": "object",
+                "properties": {
+                    "objective": {"type": "string"},
+                    "acceptance_criteria": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "process_requirements": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "context": {"type": "string"},
+                    "interaction_required": {"type": "boolean"},
+                },
+                "required": ["objective"],
+            },
+        },
+        "required": ["executor_type"],
+    },
 )
 async def engage_executor(args: dict) -> dict:
     import agent as agent_mod
@@ -1683,6 +1717,45 @@ async def engage_executor(args: dict) -> dict:
     executor_type = args.get("executor_type", "")
     task_text = args.get("task", "") or ""
     context_text = args.get("context", "") or ""
+
+    # W3/Sol B10: task XOR brief. The brief object is the alternative to a
+    # plain task string; the handler enforces the cross-field rules a JSON
+    # Schema can't. ``brief`` is persisted VERBATIM later — validate but never
+    # mutate it here; the normalized (defaults-applied) VIEW drives rendering.
+    brief = args.get("brief")
+    has_brief = brief is not None
+    has_task = bool(task_text)
+    normalized_brief: dict | None = None
+    if has_brief and has_task:
+        return _result({
+            "status": "error", "kind": "invalid_arguments",
+            "message": "provide EITHER task OR brief, not both",
+        })
+    if not has_brief and not has_task:
+        return _result({
+            "status": "error", "kind": "invalid_arguments",
+            "message": "provide either a task string or a brief object",
+        })
+    if has_brief and context_text:
+        return _result({
+            "status": "error", "kind": "invalid_arguments",
+            "message": (
+                "legacy top-level 'context' is not allowed alongside 'brief' — "
+                "put context inside brief.context"
+            ),
+        })
+    if has_brief:
+        _brief_err = validate_brief(brief)
+        if _brief_err is not None:
+            return _result({
+                "status": "error", "kind": "invalid_arguments",
+                "message": _brief_err,
+            })
+        normalized_brief = normalize_brief(brief)
+        # Canonical string = the objective — drives concise_task titles, the
+        # P32 Jaccard compare, and engagement.task (those call sites below are
+        # UNCHANGED; only the value they read is now the objective).
+        task_text = normalized_brief["objective"]
 
     if _executor_registry is None or not _executor_registry.list_types():
         return _result({
@@ -1884,15 +1957,30 @@ async def engage_executor(args: dict) -> dict:
         # of engagement.origin when provisioning the workspace CLAUDE.md.
         world_state = _build_world_state_summary()
 
+        # W3 (Task 8): persist the RAW brief VERBATIM on origin (no injected
+        # default keys) — the single authoritative source every consumer
+        # re-renders from (design §211). W2 is claude_code-ONLY: the same gate
+        # sets interaction_state="first_contact_required" at create; in_casa
+        # (synchronous configurator, no turn-taking transition path) never
+        # enters that state and would otherwise get stuck awaiting.
+        _origin_extra = {"context": context_text, "world_state_summary": world_state}
+        if brief is not None:
+            _origin_extra["brief"] = brief
+        _two_phase = bool(
+            defn.driver == "claude_code"
+            and normalized_brief is not None
+            and normalized_brief["interaction_required"]
+        )
+
         rec = await _engagement_registry.create(
             kind="executor", role_or_type=executor_type, driver=defn.driver,
             task=task_text,
-            origin={**origin, "context": context_text,
-                    "world_state_summary": world_state},
+            origin={**origin, **_origin_extra},
             topic_id=topic_id,
             tools_allowed=tuple(defn.tools_allowed or ()),
             permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
             plugin_artifacts=plugin_artifacts,      # §3.8 recorded binding
+            interaction_state="first_contact_required" if _two_phase else "",
         )
 
     # Sol round-4: the manual-edit seam `casa_reload(scope="full")` bumps the
@@ -1945,9 +2033,20 @@ async def engage_executor(args: dict) -> dict:
             token_budget=defn.memory.token_budget,
         )
 
+    # W3/Sol r5-B8: the {task} value reaches BOTH driver paths through this ONE
+    # seam (in_casa options.system_prompt AND claude_code initial FIFO prompt).
+    # When a brief is present it becomes the full rendered markdown block
+    # (render_brief_task, two-phase gated to claude_code+interaction_required —
+    # ``_two_phase`` computed at create above); no brief → the canonical
+    # task_text (the else branch is task_text, NOT `task`, which doesn't exist
+    # here — using it would break every legacy task= invocation).
+    task_for_prompt = (
+        render_brief_task(normalized_brief, two_phase=_two_phase)
+        if brief is not None else task_text
+    )
     prompt = (
         prompt_template
-        .replace("{task}", task_text)
+        .replace("{task}", task_for_prompt)
         .replace("{context}", context_text or "(none)")
         .replace("{world_state_summary}", world_state)
         .replace("{executor_memory}", executor_memory_block)
@@ -2143,6 +2242,22 @@ async def _finalize_engagement(
             )
             return False
 
+    # r5-B6: the instant THIS call won the terminal flip, cancel pending
+    # broker requests so a late ask/permission tap can't be answered
+    # post-terminal, and DRAIN finish-hooks so their keyboard "expired"
+    # edits land while the topic is STILL OPEN (below closes it). Must
+    # precede the topic ops, not follow driver teardown — the old placement
+    # let a pending ask resolve after the terminal flip and scheduled its
+    # edit only after topic closure.
+    try:
+        from verdict_broker import BROKER
+        for ns in ("permission", "engagement_ask"):
+            BROKER.cancel_scope(namespace=ns, scope=engagement.id,
+                                reason="engagement_terminal")
+        await BROKER.drain_hooks()      # flush keyboard edits BEFORE close_topic
+    except Exception:  # noqa: BLE001
+        pass
+
     # [AR-4] Topic-retention ledger (2026-07-10 design): record the topic
     # for the retention sweep the moment the record flips terminal — both
     # drivers, all outcomes, regardless of whether close_topic below
@@ -2183,9 +2298,21 @@ async def _finalize_engagement(
         tch = _channel_manager.get(engagement.origin.get("channel", "telegram"))
         if tch is not None:
             try:
+                summary_text = (
+                    f"Engagement {outcome}. Summary:\n{text}"
+                    if text else f"Engagement {outcome}."
+                )
+                # W2/Sol B9 (Task 7): surface a mutating tool-use taken while
+                # the engagement was awaiting_operator — set by the
+                # claude_code driver's _on_stream_event mutating_tool seam.
+                if engagement.origin.get("interaction_violated"):
+                    summary_text += (
+                        "\n\n⚠️ This engagement took an action before you "
+                        "responded — please review."
+                    )
                 await tch.send_to_topic(
                     engagement.topic_id,
-                    f"Engagement {outcome}. Summary:\n{text}" if text else f"Engagement {outcome}.",
+                    summary_text,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(

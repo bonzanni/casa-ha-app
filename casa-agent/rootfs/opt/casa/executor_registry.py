@@ -77,9 +77,13 @@ class ExecutorRegistry:
 
     def definition_any(self, type_name: str) -> ExecutorDefinition | None:
         """The definition whether the executor is ENABLED or DISABLED — for
-        verify/health only, so a plugin assigned to a disabled executor can still
-        have its tools.allowed inspected. Engagement launch must keep using
-        ``get()`` (None for disabled) to refuse a disabled type."""
+        verify/health AND boot resume of EXISTING engagements (Task 8): a
+        specialist disabled AFTER an engagement launched must still resume,
+        so ``replay_undergoing_engagements`` resolves a brief-bearing record's
+        executor through here, not ``get()``. A plugin assigned to a disabled
+        executor can likewise still have its tools.allowed inspected.
+        Engagement LAUNCH (a NEW engagement) must keep using ``get()`` (None
+        for disabled) to refuse a disabled type."""
         return self._defs.get(type_name) or self._disabled_defs.get(type_name)
 
     def list_types(self) -> list[str]:

@@ -1,0 +1,775 @@
+"""NDJSON engagement-log → Telegram topic relay (design §W1 — live topic streaming).
+
+A ``claude_code`` engagement's CLI is invoked ``--print --verbose
+--output-format stream-json`` (Task 4 run template), so its stdout is strictly
+NDJSON captured by the s6-log producer/consumer pair. Each line is either a
+Casa control frame (``{"casa_control": "spawn", "epoch": N}`` printed pre-exec)
+or a CLI stream-json frame (``system``/``init``, ``assistant`` with content
+blocks, ``result``, plus a tolerated ``rate_limit_event``). This module turns
+that stream into a *live window* on the engagement: assistant TEXT accumulates
+into ONE edited topic message per turn (rolling to a new message past Telegram's
+limit), tool names/args/results and thinking are NEVER surfaced, and a
+crash-safe SEGMENT-QUALIFIED cursor gives honest **at-least-once** visible
+delivery (a documented rare duplicate — never exactly-once).
+
+Design invariants pinned here (Sol adversarial review, §W1):
+
+* **Checkpoint every fully-handled frame (Sol r3-B7)** — including invisible
+  ones (spawn, ``system``/init, tool-only assistant, ``rate_limit_event``,
+  unknown, textless result). Only a visible-text frame whose post/edit has not
+  yet succeeded blocks cursor advancement. ``current`` therefore marks the
+  boundary between already-applied side effects (``<= current``) and un-applied
+  ones (``> current``).
+* **Recovery with side-effect suppression (Sol r4-B5)** — recovery re-reads
+  from ``turn_start``; frames ``<= current`` replay in REPLAY mode (rebuild the
+  visible-text state ONLY; NO ``on_turn_event``, NO ``send_message``, NO failure
+  counting), so a checkpointed in-turn ``spawn`` does not re-arm the inbound
+  queue and a checkpointed ``mutating_tool`` does not re-flag. Past ``current``
+  the relay goes LIVE.
+* **Closed-turn checkpoint at ``result`` (Sol r5-B5)** — after the final edit
+  and reply de-dup delete, persist ``message_ids=[]``,
+  ``turn_start == current`` (past ``result``) so a restart-after-dedup never
+  ghost-edits a deleted message.
+* **Split a huge block (Sol r5-B4)** — a single 8-10K assistant text block
+  becomes repeated ``<= _MSG_MAX`` sends in a loop, never one oversized message.
+* **Drop mode (Sol r2-B5)** — after ``_DROP_THRESHOLD`` consecutive failures,
+  one WARNING, keep consuming and advance ``dropped_through`` to the turn's
+  terminal coordinate so a restart never replays the discarded tail.
+* **Held-fd rotation drainage (Sol B6)** — when ``current``'s inode changes the
+  held fd is drained to EOF before opening the successor; a missing start
+  segment yields a retention-gap WARNING and resumes at ``current`` offset 0.
+"""
+from __future__ import annotations
+
+import inspect
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable
+
+from atomic_io import atomic_write_json
+
+logger = logging.getLogger(__name__)
+
+_MSG_MAX = 3900          # roll to a new topic message past this many chars
+_DROP_THRESHOLD = 20     # consecutive Telegram failures before dropping the turn
+_BACKOFF_BASE = 1.0      # seconds
+_BACKOFF_MAX = 30.0      # seconds
+_ZERO_SEG = (0, 0)
+
+# Segment sentinel yielded by iter_log_segments when turn_start's segment is
+# absent from disk (retention gap) — the relay logs a WARNING and resumes.
+SEGMENT_GAP = "__gap__"
+
+# Explicit non-mutating allowlist (Sol r3-B4). Everything else — including an
+# unknown ``mcp__*`` tool — is treated as mutating. The engagement CONTROL
+# tools are how the agent interacts while awaiting_operator, so they must NEVER
+# flag a violation.
+_NON_MUTATING_TOOLS = frozenset(
+    {
+        "Read",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "WebSearch",
+        "ToolSearch",
+        "Skill",
+        "mcp__casa-engagement-channel__reply",
+        "mcp__casa-engagement-channel__ask",
+        "mcp__casa-engagement-channel__set_progress",
+    }
+)
+
+
+# ---------------------------------------------------------------------------
+# Frame parsing / classification (pure functions).
+# ---------------------------------------------------------------------------
+
+
+def parse_frame(line: bytes) -> dict | None:
+    """``json.loads`` one NDJSON line; return the object dict or ``None``.
+
+    Non-JSON, non-object, or empty input → ``None`` (the caller skips and
+    debug-logs). Never raises.
+    """
+    try:
+        obj = json.loads(line)
+    except (ValueError, TypeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def extract_text_blocks(frame: dict) -> list[str]:
+    """Assistant ``TextBlock`` text ONLY — never ``tool_use`` / ``thinking``.
+
+    Mirrors ``agent.py::_make_on_message``'s TextBlock filter, but on raw
+    stream-json dicts: ``{"type": "assistant", "message": {"content": [...]}}``.
+    """
+    if not isinstance(frame, dict) or frame.get("type") != "assistant":
+        return []
+    message = frame.get("message") or {}
+    content = message.get("content") or []
+    out: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                out.append(text)
+    return out
+
+
+def is_mutating_tooluse(frame: dict) -> tuple[bool, str]:
+    """``(True, tool_name)`` iff *frame* is an assistant ``tool_use`` for a
+    mutating tool.
+
+    Read-only tools (Read/Glob/Grep/WebFetch/WebSearch/ToolSearch/Skill) and the
+    engagement control tools (``mcp__casa-engagement-channel__{reply,ask,
+    set_progress}``) are non-mutating → ``(False, "")``. Anything else — every
+    other tool, including unknown ``mcp__*`` — is mutating. The first mutating
+    ``tool_use`` block found wins.
+    """
+    if not isinstance(frame, dict) or frame.get("type") != "assistant":
+        return (False, "")
+    message = frame.get("message") or {}
+    for block in message.get("content") or []:
+        if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+            continue
+        name = block.get("name") or ""
+        if name not in _NON_MUTATING_TOOLS:
+            return (True, name)
+    return (False, "")
+
+
+# ---------------------------------------------------------------------------
+# Segment-qualified crash-safe cursor.
+# ---------------------------------------------------------------------------
+
+
+def _zero_coord() -> dict:
+    return {"segment": [0, 0], "offset": 0}
+
+
+@dataclass
+class StreamCursor:
+    """Persisted at ``<ws>/.stream_cursor.json`` via temp+rename (atomic_io).
+
+    Coordinates are SEGMENT-QUALIFIED: ``segment`` is a log file's stable
+    ``[st_dev, st_ino]`` identity recorded at open, so an offset is never
+    ambiguous across an s6-log rotation while Casa was down.
+    """
+
+    turn_start: dict = field(default_factory=_zero_coord)
+    current: dict = field(default_factory=_zero_coord)
+    message_ids: list[int] = field(default_factory=list)
+    last_posted_len: int = 0
+    dropped_through: dict | None = None
+
+    @classmethod
+    def load(cls, path: str | os.PathLike[str]) -> "StreamCursor":
+        """Load the cursor; an absent/corrupt file yields an all-zero cursor."""
+        try:
+            with open(path, "rb") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return cls()
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            turn_start=data.get("turn_start") or _zero_coord(),
+            current=data.get("current") or _zero_coord(),
+            message_ids=list(data.get("message_ids") or []),
+            last_posted_len=int(data.get("last_posted_len") or 0),
+            dropped_through=data.get("dropped_through"),
+        )
+
+    def save(self, path: str | os.PathLike[str]) -> None:
+        atomic_write_json(
+            path,
+            {
+                "turn_start": self.turn_start,
+                "current": self.current,
+                "message_ids": self.message_ids,
+                "last_posted_len": self.last_posted_len,
+                "dropped_through": self.dropped_through,
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Held-fd segment generator (Sol B6).
+# ---------------------------------------------------------------------------
+
+
+def _seg_ident(path: str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _ordered_segments(log_dir: str) -> list[tuple[str, tuple[int, int]]]:
+    """``@*.s`` archives (chronological — TAI64N sorts lexically) then ``current``."""
+    entries: list[tuple[str, tuple[int, int]]] = []
+    try:
+        names = sorted(os.listdir(log_dir))
+    except OSError:
+        names = []
+    for name in names:
+        if name.startswith("@") and name.endswith(".s"):
+            path = os.path.join(log_dir, name)
+            ident = _seg_ident(path)
+            if ident is not None:
+                entries.append((path, ident))
+    cur = os.path.join(log_dir, "current")
+    cur_ident = _seg_ident(cur)
+    if cur_ident is not None:
+        entries.append((cur, cur_ident))
+    return entries
+
+
+def _find_segment(log_dir: str, seg: tuple[int, int]) -> str | None:
+    for path, ident in _ordered_segments(log_dir):
+        if ident == seg:
+            return path
+    return None
+
+
+def _successor_path(log_dir: str, seg: tuple[int, int]) -> str | None:
+    """The path of the segment that follows *seg*, or ``None`` at the live end.
+
+    Rebuilt fresh each call so a rotation that renamed the held ``current`` to
+    an ``@*.s`` archive (and created a new ``current``) resolves correctly.
+    """
+    entries = _ordered_segments(log_dir)
+    for i, (_path, ident) in enumerate(entries):
+        if ident == seg:
+            return entries[i + 1][0] if i + 1 < len(entries) else None
+    # *seg* is no longer named on disk (fully drained held fd). If a different
+    # ``current`` now exists, it is the successor; otherwise we are at the end.
+    cur = os.path.join(log_dir, "current")
+    cur_ident = _seg_ident(cur)
+    if cur_ident is not None and cur_ident != seg:
+        return cur
+    return None
+
+
+def _open_seg(path: str, offset: int):
+    """``os.open`` + ``os.fdopen('rb')``; return ``(reader, (dev, ino))``."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        return None
+    reader = os.fdopen(fd, "rb")
+    if offset:
+        reader.seek(offset)
+    return reader, (st.st_dev, st.st_ino)
+
+
+async def iter_log_segments(log_dir: str, start: dict):
+    """Yield ``(segment, byte_offset_after, raw_line)`` from *start* onward.
+
+    ``segment`` is the yielding file's ``(st_dev, st_ino)``; ``byte_offset_after``
+    is the offset in that file just past the yielded line's newline. Opens the
+    segment matching *start*'s ``(dev, ino)`` among ``current`` + ``@*.s``
+    archives (or ``current`` at offset 0 when *start* is zero). On EOF it drains
+    to the successor: an archive → the next segment at offset 0; the held
+    ``current`` whose inode has since changed → the new ``current`` at offset 0
+    (held-fd rotation drainage). A *start* segment absent from disk first yields
+    a ``(SEGMENT_GAP, 0, b"")`` sentinel, then resumes at ``current`` offset 0.
+    """
+    start_seg = tuple(start.get("segment", (0, 0)))
+    start_off = int(start.get("offset", 0))
+
+    opened = None
+    if start_seg == _ZERO_SEG:
+        opened = _open_seg(os.path.join(log_dir, "current"), 0)
+    else:
+        path = _find_segment(log_dir, start_seg)
+        if path is None:
+            # Retention gap: the turn's start segment rotated out while down.
+            yield (SEGMENT_GAP, 0, b"")
+            opened = _open_seg(os.path.join(log_dir, "current"), 0)
+        else:
+            opened = _open_seg(path, start_off)
+    if opened is None:
+        return
+
+    reader, seg = opened
+    try:
+        while True:
+            line = reader.readline()
+            if line.endswith(b"\n"):
+                yield (seg, reader.tell(), line)
+                continue
+            # No complete line: EOF (or a partial tail we do not surface).
+            successor = _successor_path(log_dir, seg)
+            if successor is None:
+                return
+            reader.close()
+            nxt = _open_seg(successor, 0)
+            if nxt is None:
+                return
+            reader, seg = nxt
+    finally:
+        try:
+            reader.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ---------------------------------------------------------------------------
+# The relay.
+# ---------------------------------------------------------------------------
+
+SendMessage = Callable[[int, str], Awaitable[int | None]]
+EditMessage = Callable[[int, int, str], Awaitable[bool]]
+DeleteMessage = Callable[[int, int], Awaitable[bool]]
+OnTurnEvent = Callable[[str, dict], Any]
+ReplyTexts = Callable[[], Any]
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _default_sleep(seconds: float) -> None:  # pragma: no cover - trivial
+    import asyncio
+
+    await asyncio.sleep(seconds)
+
+
+class TopicStreamRelay:
+    """Relay one engagement's NDJSON log to its Telegram topic (plain sender).
+
+    Mirrors ``channels.telegram.TopicStreamHandle``'s STRUCTURE (one edited
+    message per turn, rolling past ``_MSG_MAX``) but drives injected PLAIN
+    senders rather than the rich channel primitive, so it is testable in
+    isolation and reusable by the driver (Task 6 wires it in).
+    """
+
+    def __init__(
+        self,
+        *,
+        engagement_id: str,
+        topic_id: int,
+        log_dir: str,
+        cursor_path: str,
+        send_message: SendMessage,
+        edit_message: EditMessage,
+        delete_message: DeleteMessage,
+        on_turn_event: OnTurnEvent,
+        reply_texts: ReplyTexts,
+        edit_throttle: float = 1.0,
+        _now: Callable[[], float] = time.monotonic,
+        _sleep: Callable[[float], Awaitable[None]] = _default_sleep,
+    ) -> None:
+        self.engagement_id = engagement_id
+        self.topic_id = topic_id
+        self.log_dir = log_dir
+        self.cursor_path = cursor_path
+        self.send_message = send_message
+        self.edit_message = edit_message
+        self.delete_message = delete_message
+        self.on_turn_event = on_turn_event
+        self.reply_texts = reply_texts
+        self._edit_throttle = edit_throttle
+        self._now = _now
+        self._sleep = _sleep
+
+        self.cursor = StreamCursor()
+        # Per-turn in-memory state (never persisted — rebuilt on recovery).
+        self._turn_text = ""
+        self._per_message_text = ""
+        self._replay_msg_count = 0
+        self._fail_count = 0
+        self._dropped = False
+        self._drop_warned = False
+        self._last_edit_ts = float("-inf")
+        # Recovery bookkeeping.
+        self._live = True
+        self._reconciled = False
+        self._passed_cur_seg = False
+
+    # -- persistence helpers ------------------------------------------------
+
+    def _save(self) -> None:
+        self.cursor.save(self.cursor_path)
+
+    def _checkpoint(self, seg, off_after: int) -> None:
+        """Advance ``current`` past a fully-handled (usually invisible) frame."""
+        self.cursor.current = {"segment": list(seg), "offset": off_after}
+        self._save()
+
+    def _advance_dropped(self, seg, off_after: int) -> None:
+        coord = {"segment": list(seg), "offset": off_after}
+        self.cursor.current = coord
+        self.cursor.dropped_through = dict(coord)
+        self._save()
+
+    # -- coordinate ordering ------------------------------------------------
+
+    def _seg_rank(self, seg: tuple[int, int]) -> int:
+        for i, (_p, ident) in enumerate(_ordered_segments(self.log_dir)):
+            if ident == seg:
+                return i
+        return 1 << 30
+
+    def _coord_le(self, seg, off_after: int, target: dict) -> bool:
+        tseg = tuple(target.get("segment", (0, 0)))
+        toff = int(target.get("offset", 0))
+        st = tuple(seg)
+        if st == tseg:
+            return off_after <= toff
+        return self._seg_rank(st) < self._seg_rank(tseg)
+
+    def _update_live(self, seg, off_after: int) -> None:
+        """Latch REPLAY→LIVE using monotonic segment order (turn_start<=current)."""
+        if self._live:
+            return
+        cur_seg = tuple(self.cursor.current.get("segment", (0, 0)))
+        cur_off = int(self.cursor.current.get("offset", 0))
+        st = tuple(seg)
+        if st == cur_seg:
+            if off_after > cur_off:
+                self._live = True
+            self._passed_cur_seg = True
+        else:
+            if self._passed_cur_seg:
+                self._live = True
+
+    # -- replay-mode text reconstruction -----------------------------------
+
+    def _replay_text(self, text: str) -> None:
+        """Rebuild ``per_message_text`` from a replayed text block — no sends."""
+        self._turn_text += text
+        pmt = self._per_message_text
+        if self._replay_msg_count == 0:
+            head, text = text[:_MSG_MAX], text[_MSG_MAX:]
+            pmt = head
+            self._replay_msg_count += 1
+        else:
+            space = _MSG_MAX - len(pmt)
+            if space > 0 and text:
+                head, text = text[:space], text[space:]
+                pmt = pmt + head
+        while text:
+            piece, text = text[:_MSG_MAX], text[_MSG_MAX:]
+            pmt = piece
+            self._replay_msg_count += 1
+        self._per_message_text = pmt
+
+    async def _reconcile(self) -> None:
+        """Re-edit the LAST message once to recover a lost-before-persist edit.
+
+        Only when ``message_ids`` is non-empty (an OPEN turn): a closed-turn
+        checkpoint has ``message_ids == []`` so there is nothing to reconcile.
+        """
+        self._reconciled = True
+        if self.cursor.message_ids and self._per_message_text:
+            try:
+                await _maybe_await(
+                    self.edit_message(
+                        self.topic_id,
+                        self.cursor.message_ids[-1],
+                        self._per_message_text,
+                    )
+                )
+                self.cursor.last_posted_len = len(self._per_message_text)
+                self._save()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "topic stream reconcile edit failed for engagement %s: %s",
+                    self.engagement_id, exc,
+                )
+
+    # -- live posting -------------------------------------------------------
+
+    def _backoff(self) -> float:
+        return min(_BACKOFF_MAX, _BACKOFF_BASE * (2 ** min(self._fail_count, 5)))
+
+    def _enter_drop(self) -> None:
+        if not self._drop_warned:
+            self._drop_warned = True
+            logger.warning(
+                "topic stream for engagement %s: dropping remainder of turn "
+                "after %d consecutive Telegram failures",
+                self.engagement_id, self._fail_count,
+            )
+        self._dropped = True
+
+    async def _apply_op(self, factory: Callable[[], Any]) -> tuple[bool, Any]:
+        """Run one Telegram op, retrying with bounded backoff until it succeeds
+        or the turn crosses ``_DROP_THRESHOLD`` consecutive failures (→ drop).
+
+        Returns ``(applied, result)``; ``applied is False`` means we entered
+        drop mode and gave up on this op.
+        """
+        while True:
+            try:
+                res = await _maybe_await(factory())
+                ok = res is not None and res is not False
+            except Exception as exc:  # noqa: BLE001
+                ok = False
+                res = None
+                logger.debug("topic stream op failed (will retry): %s", exc)
+            if ok:
+                self._fail_count = 0
+                return True, res
+            self._fail_count += 1
+            if self._fail_count >= _DROP_THRESHOLD:
+                self._enter_drop()
+                return False, None
+            await self._sleep(self._backoff())
+
+    def _plan_ops(self, text: str) -> list[tuple[str, str]]:
+        """Ops to render *text* appended to the current message with rollover.
+
+        First text of a turn → one ``send``; otherwise fill the current message
+        via one ``edit``; any surplus past ``_MSG_MAX`` splits into ``send``s.
+        """
+        ops: list[tuple[str, str]] = []
+        pmt = self._per_message_text
+        if not self.cursor.message_ids:
+            head, text = text[:_MSG_MAX], text[_MSG_MAX:]
+            ops.append(("send", head))
+            pmt = head
+        else:
+            space = _MSG_MAX - len(pmt)
+            if space > 0 and text:
+                head, text = text[:space], text[space:]
+                pmt = pmt + head
+                ops.append(("edit", pmt))
+        while text:
+            piece, text = text[:_MSG_MAX], text[_MSG_MAX:]
+            ops.append(("send", piece))
+            pmt = piece
+        return ops
+
+    async def _post_text(self, text: str, seg, off_after: int) -> None:
+        self._turn_text += text
+        if self._dropped:
+            self._advance_dropped(seg, off_after)
+            return
+
+        ops = self._plan_ops(text)
+        if not ops:
+            self._checkpoint(seg, off_after)
+            return
+
+        # Throttle only the rapid single-edit streaming case: skip the live
+        # edit within the window (text is retained in memory and flushed by the
+        # next edit or at finalize), and do NOT advance the cursor.
+        if len(ops) == 1 and ops[0][0] == "edit":
+            if self._now() - self._last_edit_ts < self._edit_throttle:
+                self._per_message_text = ops[0][1]
+                return
+
+        for kind, value in ops:
+            if kind == "send":
+                applied, mid = await self._apply_op(
+                    lambda v=value: self.send_message(self.topic_id, v)
+                )
+                if not applied:
+                    self._advance_dropped(seg, off_after)
+                    return
+                self.cursor.message_ids.append(mid)
+                self._per_message_text = value
+            else:  # edit
+                applied, _ = await self._apply_op(
+                    lambda v=value: self.edit_message(
+                        self.topic_id, self.cursor.message_ids[-1], v
+                    )
+                )
+                if not applied:
+                    self._advance_dropped(seg, off_after)
+                    return
+                self._per_message_text = value
+                self._last_edit_ts = self._now()
+
+        self.cursor.current = {"segment": list(seg), "offset": off_after}
+        self.cursor.last_posted_len = len(self._per_message_text)
+        self._save()
+
+    def _reset_turn_state(self) -> None:
+        self._turn_text = ""
+        self._per_message_text = ""
+        self._replay_msg_count = 0
+        self._fail_count = 0
+        self._dropped = False
+        self._drop_warned = False
+        self._last_edit_ts = float("-inf")
+
+    async def _finalize(self, seg, off_after: int) -> None:
+        """Edit the last message with its OWN final chunk, reply de-dup, then
+        persist a CLOSED-TURN checkpoint (``message_ids=[]``,
+        ``turn_start == current`` past ``result``)."""
+        coord = {"segment": list(seg), "offset": off_after}
+        if not self._dropped and self.cursor.message_ids and self._per_message_text:
+            # B2 (Sol r1): the closing edit carries this turn's FINAL fragment,
+            # so it must honor the at-least-once contract like every streaming
+            # op — route it through the SAME bounded retry/drop machinery
+            # (``_apply_op``) instead of a log-and-forget edit. A ``False``
+            # return (Telegram declined) is a failure that retries; only after
+            # the edit lands, OR the turn crosses the drop threshold (>=20
+            # consecutive failures → warn once, ``self._dropped`` set), may the
+            # closed-turn checkpoint below advance past ``result``.
+            applied, _ = await self._apply_op(
+                lambda: self.edit_message(
+                    self.topic_id,
+                    self.cursor.message_ids[-1],
+                    self._per_message_text,  # NEVER the whole turn text
+                )
+            )
+            # Reply de-dup: if this turn's whole text is byte-identical to a
+            # reply already posted and exactly one message was streamed, delete
+            # the streamed message (best-effort). Only meaningful once the final
+            # fragment actually landed — skip it in the drop path.
+            if applied and len(self.cursor.message_ids) == 1 and self._turn_text:
+                try:
+                    replies = await _maybe_await(self.reply_texts())
+                    if replies and self._turn_text in replies:
+                        await _maybe_await(
+                            self.delete_message(
+                                self.topic_id, self.cursor.message_ids[0]
+                            )
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "topic stream reply de-dup failed for engagement %s: %s",
+                        self.engagement_id, exc,
+                    )
+
+        if self._dropped:
+            # The turn ended in drop mode: ``dropped_through`` reaches the
+            # turn's TERMINAL coordinate so a restart never replays the tail.
+            self.cursor.dropped_through = dict(coord)
+        self.cursor.current = coord
+        self.cursor.turn_start = dict(coord)
+        self.cursor.message_ids = []
+        self.cursor.last_posted_len = 0
+        self._reset_turn_state()
+        self._save()
+
+    # -- main loop ----------------------------------------------------------
+
+    async def run(self) -> None:
+        self.cursor = StreamCursor.load(self.cursor_path)
+        cur_seg = tuple(self.cursor.current.get("segment", (0, 0)))
+        recovering = (
+            cur_seg != _ZERO_SEG
+            or bool(self.cursor.message_ids)
+            or self.cursor.dropped_through is not None
+        )
+        self._live = not recovering
+        self._reconciled = False
+        self._passed_cur_seg = False
+        self._reset_turn_state()
+
+        async for seg, off_after, raw in iter_log_segments(
+            self.log_dir, self.cursor.turn_start
+        ):
+            if seg == SEGMENT_GAP:
+                logger.warning(
+                    "topic stream retention gap for engagement %s: turn_start "
+                    "segment %s absent on disk; resuming at current offset 0",
+                    self.engagement_id, self.cursor.turn_start.get("segment"),
+                )
+                # The turn's history is unrecoverable — resume fresh and live.
+                self._live = True
+                self._reconciled = True
+                self.cursor.message_ids = []
+                self._reset_turn_state()
+                continue
+
+            # Drop-mode tail from a prior run: skip entirely (no side effects).
+            if self.cursor.dropped_through is not None and self._coord_le(
+                seg, off_after, self.cursor.dropped_through
+            ):
+                continue
+
+            was_live = self._live
+            self._update_live(seg, off_after)
+            if self._live and not was_live and not self._reconciled:
+                await self._reconcile()
+
+            await self._handle_frame(seg, off_after, raw)
+
+        # Stream ended while still replaying an open turn — reconcile now.
+        if recovering and not self._reconciled:
+            await self._reconcile()
+
+    async def _handle_frame(self, seg, off_after: int, raw: bytes) -> None:
+        frame = parse_frame(raw)
+
+        if not self._live:
+            # REPLAY: rebuild visible-text state ONLY; suppress all side effects.
+            if frame is not None and frame.get("type") == "assistant":
+                texts = extract_text_blocks(frame)
+                if texts:
+                    self._replay_text("".join(texts))
+            return
+
+        if frame is None:
+            logger.debug(
+                "topic stream: skipping non-JSON line for engagement %s",
+                self.engagement_id,
+            )
+            self._checkpoint(seg, off_after)
+            return
+
+        if frame.get("casa_control") == "spawn":
+            await _maybe_await(
+                self.on_turn_event("spawn", {"epoch": frame.get("epoch")})
+            )
+            self._checkpoint(seg, off_after)
+            return
+
+        ftype = frame.get("type")
+
+        if ftype == "system" and frame.get("subtype") == "init":
+            off_before = off_after - len(raw)
+            self.cursor.turn_start = {"segment": list(seg), "offset": off_before}
+            self.cursor.message_ids = []
+            self.cursor.last_posted_len = 0
+            self._reset_turn_state()
+            await _maybe_await(
+                self.on_turn_event(
+                    "turn_start", {"session_id": frame.get("session_id")}
+                )
+            )
+            self._checkpoint(seg, off_after)
+            return
+
+        if ftype == "assistant":
+            mutating, name = is_mutating_tooluse(frame)
+            if mutating:
+                await _maybe_await(
+                    self.on_turn_event("mutating_tool", {"tool": name})
+                )
+            texts = extract_text_blocks(frame)
+            if texts:
+                await self._post_text("".join(texts), seg, off_after)
+                return
+            # No visible text (tool-only / mutating-only) → invisible checkpoint.
+            self._checkpoint(seg, off_after)
+            return
+
+        if ftype == "result":
+            await self._finalize(seg, off_after)
+            await _maybe_await(
+                self.on_turn_event("result", {"subtype": frame.get("subtype")})
+            )
+            return
+
+        # rate_limit_event / unknown type → invisible checkpoint.
+        self._checkpoint(seg, off_after)

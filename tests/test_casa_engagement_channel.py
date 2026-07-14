@@ -18,8 +18,10 @@ Permission gating now flows through the casa-main PreToolUse hook
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
+import uuid
 
 import pytest
 
@@ -122,3 +124,221 @@ class TestDeclaredCapabilities:
         from channels.casa_engagement_channel import declared_capabilities
         caps = declared_capabilities()
         assert caps == {"claude/channel": {}}
+
+
+# ---------------------------------------------------------------------------
+# v0.75.0 (W5, Task 3) — the `ask` tool.
+# ---------------------------------------------------------------------------
+
+
+class TestAskTool:
+    async def test_ask_registered(self, channel_server):
+        tools = await channel_server._list_tools_for_tests()
+        names = [t.name for t in tools]
+        assert "ask" in names
+
+    async def test_invalid_args_never_posts(self, channel_server, monkeypatch):
+        """Client-side validation short-circuits BEFORE any HTTP round trip
+        (saves a wasted call, gives an immediate structured error)."""
+        calls: list = []
+
+        async def fake_post(path, payload, **kw):
+            calls.append((path, payload))
+            return {"ok": True}
+
+        monkeypatch.setattr(channel_server, "_internal_post", fake_post)
+
+        cases = [
+            {"question": "Q?", "options": ["A"]},              # 1 option
+            {"question": "Q?", "options": [f"o{i}" for i in range(9)]},  # 9
+            {"question": "Q?", "options": ["A", "A"]},          # dup
+            {"question": "x" * 1025, "options": ["A", "B"]},    # long q
+            {"question": "Q?", "options": ["x" * 49, "B"]},     # long label
+            {"question": "", "options": ["A", "B"]},            # empty q
+        ]
+        for args in cases:
+            result = await channel_server._invoke_tool_for_tests("ask", args)
+            assert result == {"ok": False, "error": "invalid_args"}, args
+
+        assert calls == []
+
+    async def test_client_timeout_total_matches_timeout_s_plus_15(
+        self, channel_server, monkeypatch,
+    ):
+        captured: dict = {}
+
+        class _FakeResp:
+            def raise_for_status(self):
+                pass
+
+            async def json(self):
+                return {"ok": True, "outcome": "no_answer"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        class _FakeSession:
+            def __init__(self, *, connector=None, timeout=None):
+                captured["timeout"] = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            def post(self, url, json=None):
+                captured["payload"] = json
+                return _FakeResp()
+
+        monkeypatch.setattr(channel_server.aiohttp, "ClientSession", _FakeSession)
+
+        result = await channel_server._invoke_tool_for_tests(
+            "ask", {"question": "Proceed?", "options": ["A", "B"], "timeout_s": 100},
+        )
+        assert captured["timeout"].total == 100 + 15
+        assert result == {"ok": True, "outcome": "no_answer"}
+
+    async def test_timeout_s_is_clamped_into_payload(
+        self, channel_server, monkeypatch,
+    ):
+        captured: list = []
+
+        async def fake_post(path, payload, **kw):
+            captured.append(dict(payload))
+            return {"ok": True, "outcome": "no_answer"}
+
+        monkeypatch.setattr(channel_server, "_internal_post", fake_post)
+
+        await channel_server._invoke_tool_for_tests(
+            "ask", {"question": "Q?", "options": ["A", "B"], "timeout_s": 20},
+        )
+        await channel_server._invoke_tool_for_tests(
+            "ask", {"question": "Q?", "options": ["A", "B"], "timeout_s": 600},
+        )
+        assert captured[0]["timeout_s"] == 30.0
+        assert captured[1]["timeout_s"] == 570.0
+
+    async def test_retries_with_same_request_id_on_transport_error(
+        self, channel_server, monkeypatch,
+    ):
+        """A transport-level retry (inside _internal_post) is a reattach --
+        the SAME request_id must go out on every attempt, never a fresh
+        one. Shrinks the retry backoff schedule (a plain data value, not
+        asyncio.sleep) so the test stays fast without touching the shared
+        asyncio module."""
+        monkeypatch.setattr(
+            channel_server, "_RETRY_DELAYS_S", (0.001, 0.001, 0.001),
+        )
+
+        import aiohttp
+
+        posted_payloads: list = []
+        attempt = {"n": 0}
+
+        class _FakeOkResp:
+            def raise_for_status(self):
+                pass
+
+            async def json(self):
+                return {"ok": True, "outcome": "no_answer"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        class _FakeFailingResp:
+            async def __aenter__(self):
+                raise aiohttp.ClientConnectionError("boom")
+
+            async def __aexit__(self, *a):
+                return False
+
+        class _FakeSession:
+            def __init__(self, *, connector=None, timeout=None):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            def post(self, url, json=None):
+                posted_payloads.append(dict(json))
+                attempt["n"] += 1
+                if attempt["n"] < 3:
+                    return _FakeFailingResp()
+                return _FakeOkResp()
+
+        monkeypatch.setattr(channel_server.aiohttp, "ClientSession", _FakeSession)
+
+        result = await channel_server._invoke_tool_for_tests(
+            "ask", {"question": "Proceed?", "options": ["A", "B"]},
+        )
+        assert len(posted_payloads) == 3
+        rids = {p["request_id"] for p in posted_payloads}
+        assert len(rids) == 1  # SAME request_id across every retry attempt
+        assert result == {"ok": True, "outcome": "no_answer"}
+
+    async def test_finally_posts_ask_cancel_on_genuine_cancellation(
+        self, channel_server, monkeypatch,
+    ):
+        calls: list = []
+        started = asyncio.Event()
+
+        async def fake_internal_post(path, payload, **kw):
+            calls.append((path, dict(payload)))
+            if path == "/internal/channel/ask":
+                started.set()
+                await asyncio.sleep(10)  # never completes on its own
+            return {"ok": True}
+
+        monkeypatch.setattr(channel_server, "_internal_post", fake_internal_post)
+
+        task = asyncio.create_task(channel_server._invoke_tool_for_tests(
+            "ask", {"question": "Proceed?", "options": ["A", "B"]},
+        ))
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        ask_calls = [c for c in calls if c[0] == "/internal/channel/ask"]
+        cancel_calls = [c for c in calls if c[0] == "/internal/channel/ask_cancel"]
+        assert len(ask_calls) == 1
+        assert len(cancel_calls) == 1
+        # SAME request_id across both calls (reattach identity).
+        assert ask_calls[0][1]["request_id"] == cancel_calls[0][1]["request_id"]
+
+    async def test_finally_does_not_post_ask_cancel_on_success(
+        self, channel_server, monkeypatch,
+    ):
+        calls: list = []
+
+        async def fake_post(path, payload, **kw):
+            calls.append(path)
+            return {"ok": True, "outcome": "no_answer"}
+
+        monkeypatch.setattr(channel_server, "_internal_post", fake_post)
+
+        result = await channel_server._invoke_tool_for_tests(
+            "ask", {"question": "Proceed?", "options": ["A", "B"]},
+        )
+        assert result == {"ok": True, "outcome": "no_answer"}
+        assert calls == ["/internal/channel/ask"]
+
+    async def test_callback_data_fits_64_bytes_for_max_options(self):
+        """W5 design invariant the `ask` tool relies on: v1|engagement_ask|
+        <32-hex-rid>|<idx> must fit Telegram's 64-byte callback_data cap for
+        the max option count (8) -- the tool generates a full-length
+        uuid4().hex request_id."""
+        rid = uuid.uuid4().hex
+        for i in range(8):
+            data = f"v1|engagement_ask|{rid}|{i}"
+            assert len(data.encode("utf-8")) <= 64

@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import uuid
@@ -23,6 +24,16 @@ S6_OVERLAY_SOURCES = "/package/admin/s6-overlay-3.2.2.0/etc/s6-rc/sources"
 CASA_SOURCES = "/etc/s6-overlay/s6-rc.d"
 ENGAGEMENT_SOURCES_ROOT = "/data/casa-s6-services"
 LIVE_DB_SYMLINK = "/run/s6-rc/compiled"
+
+# The live s6 scandir root where s6-svscan supervises each running service.
+# Split out as a constant so the checked-teardown ladder can be tested with a
+# tmp scandir root (monkeypatch), same pattern as ENGAGEMENT_SOURCES_ROOT.
+SERVICE_SCANDIR_ROOT = "/run/service"
+
+# Short wait between checked-teardown attempts (overridable in tests so the
+# ladder retries without a real sleep). NOT a patch of asyncio.sleep — the
+# memory-cage rule forbids patching <module>.asyncio.sleep globally.
+_ENSURE_DOWN_WAIT_S = 0.2
 
 # v0.64.0: every engagement service has a sibling logger service. The
 # suffix/name convention is owned HERE — no caller formats these names.
@@ -123,6 +134,49 @@ def service_pair_complete(*, svc_root: str, engagement_id: str) -> bool:
         and (main / "producer-for").is_file()
         and (root / _log_service_name(engagement_id)).is_dir()
     )
+
+
+# A run script is "current" (v0.75.0+) iff it carries BOTH streaming markers:
+# the pre-exec ``casa_control`` spawn NDJSON frame AND the ``--output-format
+# stream-json`` CLI flag. v0.75 message-granularity streaming needs the two
+# together — the spawn frame arms the driver's _InboundQueue and the CLI flag
+# makes the process actually emit the NDJSON the relay consumes. A script with
+# only one is half-wired and still stale; a pre-v0.75 script has neither. Boot
+# replay uses this to migrate stale pairs.
+_CURRENT_RUN_MARKERS = ("casa_control", "--output-format stream-json")
+
+
+def run_script_is_stale(*, svc_root: str, engagement_id: str) -> bool:
+    """True iff the persisted MAIN run script is NOT the v0.75.0 streaming
+    contract — i.e. it does not carry BOTH ``casa_control`` AND
+    ``--output-format stream-json``.
+
+    Fails CLOSED (stale=True) when the run file is missing or unreadable: a
+    resumed pair we cannot prove is current must be re-planted rather than
+    started on a possibly-unarmed script (``service_pair_complete`` does NOT
+    inspect the run file, so this predicate is the only gate that does)."""
+    run_path = Path(svc_root) / _main_service_name(engagement_id) / "run"
+    try:
+        text = run_path.read_text()
+    except OSError:
+        return True
+    return not all(marker in text for marker in _CURRENT_RUN_MARKERS)
+
+
+def service_dirs_absent(*, svc_root: str, engagement_id: str) -> bool:
+    """True iff BOTH the main and ``-log`` service source dirs are gone.
+
+    Boot replay's stale-pair migration calls this AFTER ``remove_service_dir``
+    to VERIFY the removal actually happened before re-planting.
+    ``remove_service_dir`` swallows rmtree failures, so a surviving old main —
+    or a partial removal (log gone, main survives) — must read as NOT absent
+    (fail closed): a survivor would collide with ``write_service_dir``'s
+    ``exist_ok=False`` re-plant and leave a stale, unlogged main whose spawn
+    frames never reach the relay."""
+    root = Path(svc_root)
+    main = root / _main_service_name(engagement_id)
+    log = root / _log_service_name(engagement_id)
+    return not main.exists() and not log.exists()
 
 
 def _prune_broken_pairs(*, svc_root: str) -> list[str]:
@@ -275,6 +329,184 @@ async def stop_log_service(*, engagement_id: str) -> None:
     if not log_dir.is_dir():
         return
     await stop_service(engagement_id=f"{engagement_id}{LOG_SERVICE_SUFFIX}")
+
+
+def _service_scandir(engagement_id: str) -> str:
+    return os.path.join(SERVICE_SCANDIR_ROOT, _main_service_name(engagement_id))
+
+
+async def _probe_service_down(scandir: str) -> str:
+    """The ONE strict status probe used EVERYWHERE in the teardown ladder
+    (r16-B1 — there is NO ``-o up``-only probe anywhere). Returns exactly one
+    of ``"down"`` / ``"up"`` / ``"unknown"``:
+
+      - scandir ABSENT → ``"down"``.
+      - ``s6-svstat -o up,wantedup`` == ``"false false"`` → ``"down"`` (process
+        down AND down-intent latched — a respawning supervisor cannot revive
+        it).
+      - ``"false true"`` → ``"up"`` — transiently dead but wanted-up, s6 WILL
+        respawn it; NOT down (explicitly, the respawn-race case).
+      - ``"true *"`` → ``"up"``.
+      - non-zero rc / unparseable output WITH the scandir present → ``"unknown"``
+        (a query failure is NOT proof of down; the ladder retries).
+
+    ``service_pid`` returning None is deliberately NOT used here: it maps
+    ``s6-svstat`` errors AND malformed output to None, so None is not strict
+    proof of down.
+    """
+    if not os.path.isdir(scandir):
+        return "down"
+    result = await asyncio.to_thread(
+        subprocess.run,
+        ["s6-svstat", "-o", "up,wantedup", scandir],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return "unknown"
+    fields = result.stdout.split()
+    if len(fields) != 2:
+        return "unknown"
+    up, wantedup = fields[0], fields[1]
+    if up == "false" and wantedup == "false":
+        return "down"
+    if up == "false" and wantedup == "true":
+        return "up"        # respawn-race: wanted up, will be revived → NOT down
+    if up == "true":
+        return "up"
+    return "unknown"
+
+
+async def _direct_killpg(scandir: str) -> bool:
+    """Last-resort SIGKILL of the supervised leader's whole PROCESS GROUP.
+
+    Used only AFTER a durable ``s6-svc -D`` down-latch when the supervisor is
+    unresponsive. Reads the leader PID from ``s6-svstat -p``, SIGKILLs its
+    process group (``os.killpg`` — so Claude's MCP/tool subprocesses die with
+    the leader, not orphaned), falling back to ``os.kill`` only when the leader
+    is not itself a group leader. Returns True iff a kill signal was delivered
+    (False on a kernel-refused / vanished PID — that keeps a genuine
+    ``refuse_teardown_failed`` reachable)."""
+    result = await asyncio.to_thread(
+        subprocess.run,
+        ["s6-svstat", "-p", scandir],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return False
+    try:
+        pid = int(result.stdout.strip())
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = None
+    try:
+        if pgid is not None and pgid == pid:
+            os.killpg(pgid, signal.SIGKILL)
+        else:
+            # Leader is not a group leader — kill it directly (r14 fallback).
+            os.kill(pid, signal.SIGKILL)
+        return True
+    except OSError as exc:
+        logger.warning(
+            "ensure_service_down: direct SIGKILL of pid %s failed: %s",
+            pid, exc,
+        )
+        return False
+
+
+async def ensure_service_down(*, engagement_id: str, attempts: int = 3) -> bool:
+    """Checked teardown ladder for a refused/torn engagement (r13-B1).
+
+    ``stop_service`` (``s6-rc -d change``) uses ``check=True`` so its own raise
+    would fall into replay's warn-and-continue, and a still-up PID was
+    previously only logged — this helper turns teardown into a CHECKED result.
+    Per attempt:
+
+      1. ``s6-rc -d change engagement-<id>`` with CalledProcessError CAUGHT (a
+         failed s6-rc is an INPUT to the ladder, not an escape from it).
+      2. the strict ``_probe_service_down`` probe → ``"down"`` ⇒ return True.
+      3. still up/unknown → direct supervisor fallback ``s6-svc -D <scandir>``
+         (capital ``-D`` also writes ``./down``, so the down survives an
+         ``s6-supervise`` restart) → re-probe (short wait first).
+      4. on the LAST attempt, the PHYSICAL-CONTAINMENT rung: the COMBINED
+         ``s6-svc -wD -KD -T 5000 <scandir>`` — ``-D`` durably latches down,
+         ``-K`` SIGKILLs the whole process GROUP, ``-wD`` blocks until really
+         down, ``-T`` bounds the wait. If the supervisor is unresponsive, a
+         direct ``os.killpg`` fallback follows (only after the ``-D`` latch).
+
+    Returns True ONLY on the strict ``false false`` / scandir-absent
+    confirmation. False stays reachable via a kernel-refused SIGKILL OR a
+    persistent status-query failure — the caller lands a terminal
+    ``mark_error(kind="refuse_teardown_failed")`` + operator-visible ERROR.
+    """
+    scandir = _service_scandir(engagement_id)
+    main = _main_service_name(engagement_id)
+
+    for attempt in range(attempts):
+        last = attempt == attempts - 1
+
+        # (1) s6-rc -d change — CAUGHT (a failed s6-rc is an input, not an exit).
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["s6-rc", "-d", "change", main],
+                check=True, capture_output=True, text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "ensure_service_down: s6-rc -d change %s failed (rc=%s) — "
+                "continuing ladder", main, exc.returncode,
+            )
+
+        # (2) strict probe.
+        if await _probe_service_down(scandir) == "down":
+            return True
+
+        if not last:
+            # (3) supervisor fallback: capital -D latches ./down too.
+            try:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["s6-svc", "-D", scandir],
+                    capture_output=True, text=True,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "ensure_service_down: s6-svc -D %s failed: %s",
+                    scandir, exc,
+                )
+            if _ENSURE_DOWN_WAIT_S:
+                await asyncio.sleep(_ENSURE_DOWN_WAIT_S)
+            if await _probe_service_down(scandir) == "down":
+                return True
+            continue
+
+        # (4) PHYSICAL-CONTAINMENT final rung: durable latch + group SIGKILL +
+        #     bounded wait, all in one supervisor command.
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["s6-svc", "-wD", "-KD", "-T", "5000", scandir],
+                capture_output=True, text=True,
+            )
+        except OSError as exc:
+            logger.warning(
+                "ensure_service_down: s6-svc -wD -KD -T %s failed: %s",
+                scandir, exc,
+            )
+        if await _probe_service_down(scandir) == "down":
+            return True
+
+        # Supervisor unresponsive AFTER the -D latch → direct group SIGKILL.
+        if await _direct_killpg(scandir):
+            if await _probe_service_down(scandir) == "down":
+                return True
+
+    return False
 
 
 def sweep_orphan_compiled_dbs(*, tmp_root: str = "/tmp") -> list[str]:

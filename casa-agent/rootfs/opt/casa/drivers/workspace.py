@@ -263,6 +263,12 @@ async def provision_workspace(
             json.dumps(settings, indent=2), encoding="utf-8",
         )
 
+    # W3 (Task 8): cache the fetched executor_memory block at <ws>/.executor_memory
+    # so a later ``refresh_claude_md`` (boot replay) can re-interpolate the SAME
+    # {executor_memory} section — the block is a LIVE Hindsight fetch, not
+    # re-derivable at boot, so it must be persisted alongside the workspace.
+    (ws / ".executor_memory").write_text(executor_memory or "", encoding="utf-8")
+
     # v0.74.2 (live finding 2026-07-13): provision the executor's doctrine/
     # into the workspace — the rendered CLAUDE.md references doctrine/*.md,
     # which never existed in claude_code workspaces (the plugin-developer
@@ -321,6 +327,72 @@ async def provision_workspace(
 def _read_text(path: str) -> str:
     with open(path, "r", encoding="utf-8") as fh:
         return fh.read()
+
+
+def refresh_claude_md(ws_dir: str, *, defn, rec) -> None:
+    """Re-render an existing workspace's CLAUDE.md from the engagement record
+    (W3/Sol r8-B5, Task 8).
+
+    Boot replay calls this for EVERY resumed brief-bearing engagement so the
+    workspace CLAUDE.md is re-derived from the VERBATIM ``origin["brief"]``
+    (per design §211 the resume path re-renders from the raw brief; a persisted
+    derived form could go stale). Runs the SAME whole-file interpolation as
+    provisioning — the same template-vs-legacy CHOICE, and every pre-existing
+    placeholder section ({context}/{world_state_summary}/{executor_memory}/
+    {executor_type}) survives the refresh:
+
+      - ``{task}``               = ``brief_task_for(rec, defn)`` (derives from
+        the raw brief; the canonical ``rec.task`` fallback when no brief).
+      - ``{context}``            = ``rec.origin.get("context", "")``.
+      - ``{world_state_summary}``= ``rec.origin.get("world_state_summary", "")``.
+      - ``{executor_type}``      = ``defn.type``.
+      - ``{executor_memory}``    = contents of ``<ws>/.executor_memory`` cached
+        at provision (absent → "").
+
+    ``rec`` (not just its origin) is required because ``brief_task_for`` needs
+    the canonical ``.task`` fallback for a brief-less record. Raises on I/O
+    failure — the caller (boot replay) treats a raised refresh as a fail-closed
+    refuse-to-resume.
+    """
+    from drivers.brief import brief_task_for
+
+    ws = Path(ws_dir)
+    task = brief_task_for(rec, defn)
+    context = rec.origin.get("context", "")
+    world_state_summary = rec.origin.get("world_state_summary", "")
+
+    mem_path = ws / ".executor_memory"
+    executor_memory = (
+        mem_path.read_text(encoding="utf-8") if mem_path.is_file() else ""
+    )
+
+    # Same selection as provision (workspace.py:228-253): a workspace-template/
+    # beside the prompt template selects the template render path; else legacy.
+    exec_dir = Path(defn.prompt_template_path).parent
+    template_root = exec_dir / "workspace-template"
+
+    if template_root.is_dir():
+        # Mirror render_workspace_template (workspace.py:489-496) EXACTLY.
+        text = (template_root / "CLAUDE.md.tmpl").read_text(encoding="utf-8")
+        text = (
+            text.replace("{executor_type}", defn.type)
+                .replace("{task}", task)
+                .replace("{context}", context)
+                .replace("{world_state_summary}", world_state_summary)
+                .replace("{executor_memory}", executor_memory or "")
+        )
+        (ws / "CLAUDE.md").write_text(text, encoding="utf-8")
+    else:
+        # Mirror the legacy provision branch (workspace.py:245-253) EXACTLY.
+        prompt_text = _read_text(defn.prompt_template_path)
+        prompt_interpolated = (
+            prompt_text
+            .replace("{task}", task or "")
+            .replace("{context}", context or "(none)")
+            .replace("{executor_type}", defn.type)
+            .replace("{executor_memory}", executor_memory or "")
+        )
+        (ws / "CLAUDE.md").write_text(prompt_interpolated, encoding="utf-8")
 
 
 def write_casa_meta(

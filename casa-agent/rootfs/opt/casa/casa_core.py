@@ -133,9 +133,23 @@ async def start_internal_unix_runner(
             _make_channel_handlers,
             _make_channel_get_handlers,
         )
+        # W1: record each reply() text for the claude_code driver's live
+        # topic-stream relay reply de-dup. Resolved lazily — the driver is
+        # constructed later (in main), so this closure looks it up at request
+        # time via the agent module.
+        def _record_engagement_reply(engagement_id: str, text: str) -> None:
+            try:
+                import agent as _agent_mod
+                drv = getattr(_agent_mod, "active_claude_code_driver", None)
+                if drv is not None:
+                    drv.record_reply_text(engagement_id, text)
+            except Exception:  # noqa: BLE001 — de-dup hint is best-effort
+                pass
+
         channel_handlers = _make_channel_handlers(
             telegram_channel=telegram_channel,
             engagement_registry=engagement_registry,
+            record_reply=_record_engagement_reply,
         )
         for path, handler_fn in channel_handlers.items():
             internal_app.router.add_post(path, handler_fn)
@@ -385,7 +399,7 @@ async def replay_undergoing_engagements(
     """
     from drivers import s6_rc
     from drivers.workspace import (
-        render_log_run_script, render_run_script,
+        refresh_claude_md, render_log_run_script, render_run_script,
     )
 
     undergoing = [
@@ -397,6 +411,43 @@ async def replay_undergoing_engagements(
     # refused resume — and MUST be excluded from the start_service and
     # background-task loops below, not merely skipped during rendering.
     refused_ids: set[str] = set()
+
+    async def _refuse_brief_resume(
+        rec, reason: str, *, kind: str = "refuse_teardown_failed",
+    ) -> None:
+        """Fail-closed teardown of an engagement we refuse to resume
+        (r11-B1/r13-B1/r14-B1; B2 Sol r2 reuses it for the migration path via
+        ``kind``). Source removal + recompile alone is NOT reliable —
+        ``remove_service_dir`` swallows OSError and the later compile can
+        fail-and-continue — so run the CHECKED teardown ladder, and land a
+        TERMINAL ``kind`` mark when physical containment can't be confirmed
+        (the marking ACCOMPANIES the removal, it does not replace it).
+        ``registry`` is the real parameter name here; ``_engagement_registry``
+        does not exist in this function and would NameError straight into the
+        per-record warn-and-continue."""
+        logger.warning(
+            "boot replay: engagement %s refuses resume — %s; "
+            "tearing down", rec.id[:8], reason,
+        )
+        refused_ids.add(rec.id)
+        down = await s6_rc.ensure_service_down(engagement_id=rec.id)
+        if down is False:
+            try:
+                await registry.mark_error(
+                    rec.id, kind=kind,
+                    message=(
+                        f"resume refused ({reason}) but the engagement "
+                        "service could not be confirmed down"
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort terminal mark
+                logger.warning(
+                    "boot replay: mark_error(%s) failed for %s: %s",
+                    kind, rec.id[:8], exc,
+                )
+        s6_rc.remove_service_dir(
+            svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT, engagement_id=rec.id,
+        )
 
     async with s6_rc._compile_lock:
         # 1. Orphan sweep — dirs for non-UNDERGOING engagements, remove them.
@@ -426,11 +477,84 @@ async def replay_undergoing_engagements(
         # compile/start below.
         for rec in undergoing:
             try:
+                # W3 (r8-B5/r9-B5): re-render the workspace CLAUDE.md from the
+                # VERBATIM origin["brief"] for EVERY resumed brief-bearing
+                # engagement — placed at the TOP of the loop, BEFORE the
+                # service_pair_complete fast path. /data/casa-s6-services
+                # persists across restarts, so an ordinary restart takes the
+                # early `continue`; a refresh after the pair-rewrite would never
+                # run. Resolve the executor via definition_any (r10-B5) so a
+                # specialist DISABLED after launch still resumes; registry
+                # absent OR unresolved → fail-closed refuse (checked teardown).
+                brief_defn = None
+                has_brief = bool(rec.origin.get("brief"))
+                if has_brief:
+                    brief_defn = (
+                        executor_registry.definition_any(rec.role_or_type)
+                        if executor_registry is not None else None
+                    )
+                    if brief_defn is None:
+                        await _refuse_brief_resume(
+                            rec,
+                            "no executor_registry passed"
+                            if executor_registry is None
+                            else f"executor type {rec.role_or_type!r} "
+                                 "not resolvable (definition_any → None)",
+                        )
+                        continue
+                    ws_dir = os.path.join(engagements_root, rec.id)
+                    try:
+                        refresh_claude_md(ws_dir, defn=brief_defn, rec=rec)
+                    except Exception as exc:  # noqa: BLE001 — fail-closed
+                        await _refuse_brief_resume(
+                            rec, f"CLAUDE.md refresh failed: {exc}",
+                        )
+                        continue
+
                 if s6_rc.service_pair_complete(
                     svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
                     engagement_id=rec.id,
                 ):
-                    continue
+                    # B1 (Sol r1): a COMPLETE pre-v0.75 pair still carries an
+                    # old run script that emits neither the stream-json output
+                    # nor the ``casa_control`` spawn NDJSON frame, so the new
+                    # _InboundQueue never arms and every resumed operator turn
+                    # queues forever. Detect the stale script and DROP the pair
+                    # so the heal path below re-renders it from the current
+                    # template (reusing the existing incomplete-pair heal — no
+                    # duplication). A current pair keeps the fast-path continue.
+                    if not s6_rc.run_script_is_stale(
+                        svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                        engagement_id=rec.id,
+                    ):
+                        continue
+                    logger.info(
+                        "boot replay: migrating pre-v0.75 run script for "
+                        "engagement %s (%s) — re-rendering pair",
+                        rec.id[:8], rec.role_or_type,
+                    )
+                    s6_rc.remove_service_dir(
+                        svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                        engagement_id=rec.id,
+                    )
+                    # B2 (Sol r2): remove_service_dir SWALLOWS rmtree failures,
+                    # so a surviving old main (full or partial removal) would
+                    # collide with write_service_dir's exist_ok=False re-plant
+                    # and leave a stale, unlogged main whose spawn frames never
+                    # reach the relay. VERIFY the pair is actually gone; if not,
+                    # fail CLOSED (checked teardown + terminal mark) rather than
+                    # compiling/starting a stale pair.
+                    if not s6_rc.service_dirs_absent(
+                        svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                        engagement_id=rec.id,
+                    ):
+                        await _refuse_brief_resume(
+                            rec,
+                            "stale pre-v0.75 pair removal did not complete "
+                            "(service dir survivor)",
+                            kind="refuse_migration_failed",
+                        )
+                        continue
 
                 # M7: never plant a service for an engagement whose workspace
                 # is gone. The generated run script does `set -e;
@@ -454,7 +578,13 @@ async def replay_undergoing_engagements(
                     )
                     continue
 
-                defn = executor_registry.get(rec.role_or_type)
+                # r11-B2: for brief-bearing records reuse the already-resolved
+                # definition_any result (which resolves DISABLED specialists),
+                # so a disabled-definition engagement with an INCOMPLETE pair
+                # heals instead of silently not healing. Brief-LESS records keep
+                # today's get() behaviour EXACTLY (None for disabled → refuse).
+                defn = brief_defn if has_brief else executor_registry.get(
+                    rec.role_or_type)
                 if defn is None:
                     logger.warning(
                         "boot replay: cannot heal engagement %s — executor "
@@ -667,6 +797,20 @@ def _wire_engagement_permission_relay(
         ),
     )
     return cc_hook_policies
+
+
+async def _drain_broker_before_channel_shutdown(channel_manager: Any) -> None:
+    """Graceful-shutdown barrier (r4-B1/B3): resolve every live
+    ``verdict_broker`` request as ``cancelled`` and let its keyboard-edit
+    finish-hook flush, BEFORE the channels (Telegram bot, etc.) tear down.
+
+    Must run immediately before ``channel_manager.stop_all()`` — a finish
+    hook that fires after the channel is stopped can't edit anything.
+    """
+    from verdict_broker import BROKER
+    BROKER.cancel_all(reason="casa_shutdown")
+    await BROKER.drain_hooks()
+    await channel_manager.stop_all()
 
 
 _STATUS_PAGE = """\
@@ -1655,11 +1799,27 @@ async def main() -> None:
         persist_session_id=engagement_registry.persist_session_id,
     )
 
-    # claude_code driver still uses the buffered send_to_topic path
-    # (different driver, separate streaming work parked in Phase 4 / E-12).
-    async def _send_to_topic(thread_id: int, text: str) -> None:
+    # claude_code driver: send_to_topic doubles as the live TopicStreamRelay's
+    # send_message primitive (W1), so it must RETURN the posted message_id (the
+    # relay edits the rolling message by id). Notice/warning callers ignore it.
+    async def _send_to_topic(thread_id: int, text: str) -> int | None:
         if telegram_channel is not None:
-            await telegram_channel.send_to_topic(thread_id, text)
+            return await telegram_channel.send_to_topic(thread_id, text)
+        return None
+
+    async def _edit_topic_message(
+        thread_id: int, message_id: int, text: str,
+    ) -> bool:
+        if telegram_channel is not None:
+            return await telegram_channel.edit_topic_message(
+                thread_id, message_id, text)
+        return False
+
+    async def _delete_topic_message(thread_id: int, message_id: int) -> bool:
+        if telegram_channel is not None:
+            return await telegram_channel.delete_topic_message(
+                thread_id, message_id)
+        return False
 
     # Expose on the agent module so tools.emit_completion / cancel_engagement
     # can find it without circular imports.
@@ -1684,6 +1844,11 @@ async def main() -> None:
         engagements_root="/data/engagements",
         send_to_topic=_send_to_topic,
         casa_framework_mcp_url=_casa_framework_mcp_url,
+        # W1: relay edit/delete primitives + registry (advance_interaction_state
+        # seam for Task 7's inbound one-turn queue).
+        edit_topic_message=_edit_topic_message,
+        delete_topic_message=_delete_topic_message,
+        registry=engagement_registry,
         # O-5 (v0.37.9): capture-and-persist SDK session_id so a Casa
         # restart mid-engagement preserves conversation continuity.
         # The driver writes <workspace>/.session_id from its log-tail
@@ -2203,7 +2368,7 @@ async def main() -> None:
         task.cancel()
     await asyncio.gather(*all_loop_tasks, return_exceptions=True)
 
-    await channel_manager.stop_all()
+    await _drain_broker_before_channel_shutdown(channel_manager)
     # Close the shared Hindsight client session (L32) so aiohttp does not
     # warn about an unclosed session; no-op for NoOp/other backends.
     try:

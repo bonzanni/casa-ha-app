@@ -239,6 +239,136 @@ class TestFinalizeU3Transition:
         assert rec.status == "completed"
 
 
+class TestFinalizeEngagementBrokerCleanup:
+    """v0.75.0 (W5/Sol B3,B4, r5-B6): _finalize_engagement must cancel_scope
+    + drain_hooks IMMEDIATELY after winning the terminal transition, BEFORE
+    the topic-close ops — so a pending ask's keyboard-edit finish-hook lands
+    while the topic is still open, and a tap arriving after the terminal
+    flip is rejected (stale)."""
+
+    async def test_broker_cleanup_precedes_topic_close_and_taps_go_stale(
+        self, tmp_path, monkeypatch,
+    ):
+        import verdict_broker
+        from verdict_broker import VerdictBroker
+        from engagement_registry import EngagementRegistry
+        from tools import _finalize_engagement, init_tools
+
+        fresh_broker = VerdictBroker()
+        monkeypatch.setattr(verdict_broker, "BROKER", fresh_broker)
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            kind="specialist", role_or_type="finance", driver="in_casa",
+            task="t",
+            origin={"role": "assistant", "channel": "telegram", "chat_id": "1"},
+            topic_id=42,
+        )
+
+        order: list[str] = []
+        telegram = MagicMock()
+
+        async def _send_to_topic(*a, **kw):
+            order.append("send_to_topic")
+            return 1
+
+        async def _close_topic(*a, **kw):
+            order.append("close_topic")
+
+        telegram.send_to_topic = AsyncMock(side_effect=_send_to_topic)
+        telegram.close_topic = AsyncMock(side_effect=_close_topic)
+        cm = MagicMock()
+        cm.get.return_value = telegram
+        bus = MagicMock()
+        bus.notify = AsyncMock()
+
+        init_tools(
+            channel_manager=cm, bus=bus,
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=reg,
+        )
+
+        # A pending engagement_ask on this engagement, with a finish hook
+        # that records into the SAME order list.
+        req, created = fresh_broker.register(
+            namespace="engagement_ask", scope=rec.id, request_id="ask-1",
+            timeout_s=5.0,
+        )
+        assert created is True
+
+        async def _hook(outcome):
+            order.append("keyboard_edit")
+
+        fresh_broker.set_finish_hook(req, lambda outcome: _hook(outcome))
+
+        driver = MagicMock()
+        driver.cancel = AsyncMock()
+
+        won = await _finalize_engagement(
+            rec, outcome="completed", text="done", artifacts=[],
+            next_steps=[], driver=driver,
+        )
+        assert won is True
+
+        assert "keyboard_edit" in order
+        assert order.index("keyboard_edit") < order.index("send_to_topic")
+        assert order.index("keyboard_edit") < order.index("close_topic")
+
+        # A tap arriving after the terminal flip is rejected (stale) — the
+        # cancel_scope call already resolved (and retired) the request.
+        claim = fresh_broker.claim(
+            namespace="engagement_ask", scope=rec.id, request_id="ask-1",
+            option_index=0, actor_id=1,
+        )
+        assert claim == "stale"
+
+    async def test_broker_cleanup_swallows_drain_failure(
+        self, tmp_path, monkeypatch,
+    ):
+        """A drain_hooks()/cancel_scope() failure must not abort the rest of
+        the finalize funnel — the topic must still close."""
+        import verdict_broker
+        from engagement_registry import EngagementRegistry
+        from tools import _finalize_engagement, init_tools
+
+        class _ExplodingBroker:
+            def cancel_scope(self, **kw):
+                raise RuntimeError("broker down")
+
+            async def drain_hooks(self):
+                raise AssertionError("unreachable — cancel_scope raised first")
+
+        monkeypatch.setattr(verdict_broker, "BROKER", _ExplodingBroker())
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            kind="specialist", role_or_type="finance", driver="in_casa",
+            task="t", origin={"role": "assistant", "channel": "telegram"},
+            topic_id=42,
+        )
+
+        telegram = MagicMock()
+        telegram.send_to_topic = AsyncMock()
+        telegram.close_topic = AsyncMock()
+        cm = MagicMock()
+        cm.get.return_value = telegram
+        bus = MagicMock()
+        bus.notify = AsyncMock()
+
+        init_tools(
+            channel_manager=cm, bus=bus,
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=reg,
+        )
+
+        won = await _finalize_engagement(
+            rec, outcome="completed", text="done", artifacts=[],
+            next_steps=[], driver=None,
+        )
+        assert won is True
+        telegram.close_topic.assert_awaited_once()
+
+
 async def test_finalize_engagement_pops_permission_queue(tmp_path, monkeypatch):
     """L5 leak guard: _finalize_engagement must drop this engagement's
     permission-verdict queue (and any undrained verdict inside it) so it
@@ -277,50 +407,50 @@ async def test_finalize_engagement_pops_permission_queue(tmp_path, monkeypatch):
     finally:
         PERMISSION_QUEUES.clear()
 
-    async def test_finalize_preserves_plugin_artifacts_in_casa_meta(
-            self, tmp_path, monkeypatch):
-        """§3.8: the terminal .casa-meta.json rewrite must NOT drop the
-        immutable plugin_artifacts recorded at engagement start."""
-        import os
-        import tools as tools_mod
-        from drivers.workspace import load_casa_meta, write_casa_meta
-        from engagement_registry import EngagementRegistry
-        from tools import _finalize_engagement, init_tools
 
-        eng_root = tmp_path / "engagements"
-        monkeypatch.setattr(tools_mod, "_ENGAGEMENTS_ROOT", str(eng_root))
+async def test_finalize_preserves_plugin_artifacts_in_casa_meta(
+        tmp_path, monkeypatch):
+    """§3.8: the terminal .casa-meta.json rewrite must NOT drop the
+    immutable plugin_artifacts recorded at engagement start."""
+    import tools as tools_mod
+    from drivers.workspace import load_casa_meta, write_casa_meta
+    from engagement_registry import EngagementRegistry
+    from tools import _finalize_engagement, init_tools
 
-        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
-        rec = await reg.create(
-            kind="executor", role_or_type="plugin-developer",
-            driver="claude_code", task="t",
-            origin={"role": "assistant", "channel": "telegram", "chat_id": "1"},
-            topic_id=42)
+    eng_root = tmp_path / "engagements"
+    monkeypatch.setattr(tools_mod, "_ENGAGEMENTS_ROOT", str(eng_root))
 
-        ws = eng_root / rec.id
-        ws.mkdir(parents=True)
-        artifacts = [{"name": "superpowers", "artifact_id": "a" * 64,
-                      "path": "/config/plugins/store/superpowers/" + "a" * 64}]
-        write_casa_meta(
-            workspace_path=str(ws), engagement_id=rec.id,
-            executor_type="plugin-developer", status="UNDERGOING",
-            created_at="2026-07-13T00:00:00Z", finished_at=None,
-            retention_until=None, plugin_artifacts=artifacts)
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+    rec = await reg.create(
+        kind="executor", role_or_type="plugin-developer",
+        driver="claude_code", task="t",
+        origin={"role": "assistant", "channel": "telegram", "chat_id": "1"},
+        topic_id=42)
 
-        telegram = MagicMock()
-        telegram.send_to_topic = AsyncMock()
-        telegram.close_topic = AsyncMock()
-        cm = MagicMock()
-        cm.get.return_value = telegram
-        init_tools(channel_manager=cm, bus=MagicMock(),
-                   specialist_registry=MagicMock(), mcp_registry=MagicMock(),
-                   trigger_registry=MagicMock(), engagement_registry=reg)
-        driver = MagicMock()
-        driver.cancel = AsyncMock()
+    ws = eng_root / rec.id
+    ws.mkdir(parents=True)
+    artifacts = [{"name": "superpowers", "artifact_id": "a" * 64,
+                  "path": "/config/plugins/store/superpowers/" + "a" * 64}]
+    write_casa_meta(
+        workspace_path=str(ws), engagement_id=rec.id,
+        executor_type="plugin-developer", status="UNDERGOING",
+        created_at="2026-07-13T00:00:00Z", finished_at=None,
+        retention_until=None, plugin_artifacts=artifacts)
 
-        await _finalize_engagement(rec, outcome="completed", text="s",
-                                   artifacts=[], next_steps=[], driver=driver)
+    telegram = MagicMock()
+    telegram.send_to_topic = AsyncMock()
+    telegram.close_topic = AsyncMock()
+    cm = MagicMock()
+    cm.get.return_value = telegram
+    init_tools(channel_manager=cm, bus=MagicMock(),
+               specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+               trigger_registry=MagicMock(), engagement_registry=reg)
+    driver = MagicMock()
+    driver.cancel = AsyncMock()
 
-        meta = load_casa_meta(str(ws))
-        assert meta["status"] == "COMPLETED"
-        assert meta["plugin_artifacts"] == artifacts       # NOT dropped
+    await _finalize_engagement(rec, outcome="completed", text="s",
+                               artifacts=[], next_steps=[], driver=driver)
+
+    meta = load_casa_meta(str(ws))
+    assert meta["status"] == "COMPLETED"
+    assert meta["plugin_artifacts"] == artifacts       # NOT dropped

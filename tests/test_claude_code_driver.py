@@ -120,6 +120,61 @@ class TestStart:
         assert (tmp_path / "engagements" / rec.id / "stdin.fifo").exists()
 
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="workspace provisioning uses mkfifo/symlink (Linux-only)",
+    )
+    async def test_start_carries_brief_envelope_into_claude_md(
+        self, monkeypatch, tmp_path,
+    ):
+        """W3 (Task 8): a brief-bearing record → CLAUDE.md carries the actual
+        acceptance criteria + VERBATIM process requirements + completion
+        accounting (start passes task=brief_task_for(engagement, defn))."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers import s6_rc
+        from drivers.brief import COMPLETION_ACCOUNTING_LINE
+
+        async def fake_cau():
+            return None
+        async def fake_start_kw(*, engagement_id):
+            return None
+        monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+        monkeypatch.setattr(s6_rc, "start_service", fake_start_kw)
+        monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT",
+                            str(tmp_path / "svc-root"))
+        (tmp_path / "svc-root").mkdir()
+        monkeypatch.setattr(
+            ClaudeCodeDriver, "_spawn_background_tasks",
+            lambda self, engagement: None,
+        )
+        async def _noop_write(self, engagement, text):
+            return None
+        monkeypatch.setattr(ClaudeCodeDriver, "_write_to_fifo", _noop_write)
+
+        defn = _make_defn(tmp_path)
+        rec = _make_record()
+        rec.origin["brief"] = {
+            "objective": "Rotate the API keys",
+            "acceptance_criteria": ["old keys revoked"],
+            "process_requirements": ["Announce the rotation window first"],
+        }
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        )
+        (tmp_path / "engagements").mkdir()
+
+        await drv.start(rec, prompt="ignored fifo prompt", options=defn)
+
+        claude_md = (tmp_path / "engagements" / rec.id / "CLAUDE.md").read_text()
+        assert "Rotate the API keys" in claude_md
+        assert "old keys revoked" in claude_md
+        assert "Announce the rotation window first" in claude_md
+        assert COMPLETION_ACCOUNTING_LINE in claude_md
+
+
 class TestStartRollback:
     """Bug 13 (v0.14.6): if any step in start() fails, the partial
     workspace + service-dir + s6-rc compile must be rolled back.
@@ -253,8 +308,10 @@ class TestNoRemoteControlNotices:
         with caplog.at_level(logging.DEBUG, logger="subprocess_cli"):
             drv._spawn_background_tasks(rec)
             tasks = drv._tasks[rec.id]
-            # log relay + respawn poller + session-id capture; no URL capture.
-            assert len(tasks) == 3
+            # respawn poller + session-id capture + always-on topic relay +
+            # DEBUG log relay; no URL capture. (v0.75.0 added the always-on
+            # topic relay, so DEBUG-enabled is now 4 tasks not 3.)
+            assert len(tasks) == 4
             await asyncio.sleep(0.3)
             for t in tasks:
                 t.cancel()
@@ -263,10 +320,11 @@ class TestNoRemoteControlNotices:
 
 
 class TestRelaySpawnGate:
-    """v0.64.0 efficiency: the relay tails a now-real file at 10 Hz only to
-    discard every line unless subprocess_cli is DEBUG-enabled — so the task
-    is only spawned when it is. (A LOG_LEVEL flip requires an add-on
-    restart, which respawns these tasks anyway.)"""
+    """v0.64.0 efficiency: the DEBUG raw-log relay tails a now-real file at
+    10 Hz only to discard every line unless subprocess_cli is DEBUG-enabled —
+    so THAT task is only spawned when it is. (A LOG_LEVEL flip requires an
+    add-on restart, which respawns these tasks anyway.) v0.75.0: the SEPARATE
+    always-on topic-stream relay is spawned regardless of LOG_LEVEL."""
 
     async def test_relay_skipped_when_debug_disabled(self, tmp_path):
         import logging
@@ -283,8 +341,11 @@ class TestRelaySpawnGate:
         try:
             drv._spawn_background_tasks(rec)
             tasks = drv._tasks[rec.id]
-            # respawn poller + session-id capture only.
-            assert len(tasks) == 2
+            # respawn poller + session-id capture + always-on topic relay.
+            # The DEBUG raw-log relay is skipped; the topic relay is NOT.
+            assert len(tasks) == 3
+            names = [t.get_name() for t in tasks]
+            assert any(n.startswith("topic_relay:") for n in names), names
         finally:
             lg.setLevel(old_level)
             for t in tasks:
@@ -794,3 +855,529 @@ class TestWriteToFifoBounded:
         assert got == ["hi there\n"]
         assert sent == []
         assert rec.id in driver._last_turn_ts
+
+
+# ---------------------------------------------------------------------------
+# W1/Sol B8 — spawn-keyed one-turn inbound queue.
+# ---------------------------------------------------------------------------
+
+
+class _FakeWriter:
+    """Injectable ``write_fifo`` for _InboundQueue — records calls, returns a
+    mutable ``result`` (True = whole line written)."""
+
+    def __init__(self, result: bool = True):
+        self.result = result
+        self.calls: list[str] = []
+
+    async def __call__(self, text: str) -> bool:
+        self.calls.append(text)
+        return self.result
+
+
+def _async_recorder(store: list):
+    async def _fn(text: str) -> None:
+        store.append(text)
+    return _fn
+
+
+class _FakeRegistry:
+    """Fake engagement registry WITH advance_interaction_state (Task-7 contract
+    pinned now)."""
+
+    def __init__(self):
+        self.advances: list[tuple[str, str]] = []
+
+    async def advance_interaction_state(self, eng_id: str, kind: str) -> None:
+        self.advances.append((eng_id, kind))
+
+
+def _make_queue(tmp_path, *, writer=None, notices=None, registry=None):
+    from drivers.claude_code_driver import _InboundQueue
+
+    writer = writer if writer is not None else _FakeWriter(True)
+    notices = notices if notices is not None else []
+    return _InboundQueue(
+        engagement_id="eng1",
+        marker_path=str(tmp_path / ".inbound_pending"),
+        write_fifo=writer,
+        post_notice=_async_recorder(notices),
+        registry=registry,
+    )
+
+
+class TestInboundQueue:
+    async def test_message_then_spawn_delivers(self, tmp_path):
+        writer = _FakeWriter(True)
+        q = _make_queue(tmp_path, writer=writer)
+        await q.enqueue("hello")          # reader_ready False → queued only
+        assert writer.calls == []
+        await q.on_spawn()                # arm → deliver
+        assert writer.calls == ["hello"]
+        assert q.reader_ready is False    # disarmed after one message
+
+    async def test_spawn_then_message_delivers_no_deadlock(self, tmp_path):
+        # Edge-triggered pump (r2-B6): a spawn arms the reader while the queue
+        # is empty; a LATER enqueue must deliver immediately — never wait for
+        # another spawn that would never come without input.
+        writer = _FakeWriter(True)
+        q = _make_queue(tmp_path, writer=writer)
+        await q.on_spawn()                # arm, empty queue → nothing yet
+        assert writer.calls == []
+        assert q.reader_ready is True
+        await q.enqueue("later")          # delivered immediately
+        assert writer.calls == ["later"]
+
+    async def test_one_message_per_spawn(self, tmp_path):
+        writer = _FakeWriter(True)
+        q = _make_queue(tmp_path, writer=writer)
+        await q.enqueue("a")
+        await q.enqueue("b")
+        await q.on_spawn()
+        assert writer.calls == ["a"]      # exactly one per spawn
+        await q.on_spawn()
+        assert writer.calls == ["a", "b"]
+
+    async def test_failed_write_retains_item(self, tmp_path):
+        writer = _FakeWriter(False)       # no reader — write fails
+        q = _make_queue(tmp_path, writer=writer)
+        await q.enqueue("a")
+        await q.on_spawn()
+        assert writer.calls == ["a"]      # attempted
+        assert len(q._queue) == 1         # retained, not dropped
+        # Redelivered on the next spawn once the write can succeed.
+        writer.result = True
+        await q.on_spawn()
+        assert writer.calls == ["a", "a"]
+        assert len(q._queue) == 0
+
+    async def test_overflow_notice_at_depth_10(self, tmp_path):
+        writer = _FakeWriter(True)
+        notices: list[str] = []
+        q = _make_queue(tmp_path, writer=writer, notices=notices)
+        for i in range(10):               # reader unarmed → all queued
+            await q.enqueue(f"m{i}")
+        assert len(q._queue) == 10
+        assert notices == []
+        await q.enqueue("overflow")       # 11th → dropped with one notice
+        assert len(q._queue) == 10
+        assert len(notices) == 1
+        assert "10" in notices[0]
+
+    async def test_initial_prompt_through_queue_no_state_transition(self, tmp_path):
+        writer = _FakeWriter(True)
+        reg = _FakeRegistry()
+        q = _make_queue(tmp_path, writer=writer, registry=reg)
+        await q.enqueue("system prompt", is_initial=True)
+        await q.on_spawn()
+        assert writer.calls == ["system prompt"]
+        # The initial prompt must NOT advance interaction state (r2-B7).
+        assert reg.advances == []
+
+    async def test_ordinary_message_advances_interaction_state(self, tmp_path):
+        writer = _FakeWriter(True)
+        reg = _FakeRegistry()
+        q = _make_queue(tmp_path, writer=writer, registry=reg)
+        await q.enqueue("operator says hi")
+        await q.on_spawn()
+        assert writer.calls == ["operator says hi"]
+        assert reg.advances == [("eng1", "operator_turn")]
+
+    async def test_marker_tracks_pending_depth(self, tmp_path):
+        writer = _FakeWriter(True)
+        q = _make_queue(tmp_path, writer=writer)
+        marker = tmp_path / ".inbound_pending"
+        await q.enqueue("a")
+        assert marker.read_text().strip() == "1"
+        await q.on_spawn()
+        assert marker.read_text().strip() == "0"
+
+
+class TestSpawnBackgroundTasksInbound:
+    async def test_relay_task_always_spawned(self, tmp_path):
+        """The always-on TopicStreamRelay task is registered regardless of
+        LOG_LEVEL (it is the operator's live window, not a debug aid)."""
+        import logging
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+        lg = logging.getLogger("subprocess_cli")
+        old = lg.level
+        lg.setLevel(logging.WARNING)          # DEBUG raw-log relay OFF
+        try:
+            drv._spawn_background_tasks(rec)
+            tasks = drv._tasks[rec.id]
+            names = [t.get_name() for t in tasks]
+            assert any(n.startswith("topic_relay:") for n in names), names
+            assert rec.id in drv._inbound       # queue wired
+        finally:
+            lg.setLevel(old)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_marker_and_boot_reconcile_in_spawn_background_tasks(
+        self, tmp_path,
+    ):
+        """Sol r2-B6: boot replay calls _spawn_background_tasks DIRECTLY. A
+        surviving non-zero .inbound_pending posts a one-time reconcile notice
+        and is zeroed."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+        ws = tmp_path / rec.id
+        ws.mkdir()
+        (ws / ".inbound_pending").write_text("2\n", encoding="utf-8")
+        try:
+            drv._spawn_background_tasks(rec)
+            await asyncio.sleep(0.1)            # let the notice task run
+            assert sender.await_count == 1
+            posted = sender.await_args[0]
+            assert posted[0] == rec.topic_id
+            assert "2" in posted[1]
+            assert (ws / ".inbound_pending").read_text().strip() == "0"
+        finally:
+            for t in drv._tasks.get(rec.id, []):
+                t.cancel()
+            await asyncio.gather(
+                *drv._tasks.get(rec.id, []), return_exceptions=True)
+
+
+class TestAbnormalExitCorrelation:
+    async def test_abnormal_exit_correlates_epoch_stderr(self, tmp_path, caplog):
+        """r5-B2: spawn(1) then spawn(2) with no intervening result → the
+        driver reads the UNIQUE .stderr.1.log and WARNs its tail."""
+        import logging
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+        ws = tmp_path / rec.id
+        ws.mkdir()
+        (ws / ".stderr.1.log").write_text(
+            "traceback: boom on epoch 1\n", encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING):
+            await drv._on_stream_event(rec, "spawn", {"epoch": 1})
+            await drv._on_stream_event(rec, "spawn", {"epoch": 2})
+
+        warnings = [r.getMessage() for r in caplog.records
+                    if r.levelno == logging.WARNING]
+        assert any("boom on epoch 1" in m for m in warnings), warnings
+        assert any("epoch 1" in m and "abnormal" in m for m in warnings)
+
+    async def test_abnormal_exit_pruned_epoch_diagnostics_unavailable(
+        self, tmp_path, caplog,
+    ):
+        """r5-B2: an abnormal-exit lookup for an epoch whose .stderr.<e>.log
+        was pruned → 'diagnostics unavailable', never misattributed."""
+        import logging
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+        ws = tmp_path / rec.id
+        ws.mkdir()
+        # No .stderr.1.log — epoch 1 was pruned after advancing >= 4 epochs.
+        with caplog.at_level(logging.WARNING):
+            await drv._on_stream_event(rec, "spawn", {"epoch": 1})
+            await drv._on_stream_event(rec, "spawn", {"epoch": 5})
+
+        warnings = [r.getMessage() for r in caplog.records
+                    if r.levelno == logging.WARNING]
+        assert any("diagnostics unavailable" in m for m in warnings), warnings
+
+    async def test_result_clears_abnormal_flag(self, tmp_path, caplog):
+        """A normal result between spawns clears the pending epoch — the next
+        spawn is NOT flagged abnormal."""
+        import logging
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+        (tmp_path / rec.id).mkdir()
+        with caplog.at_level(logging.WARNING):
+            await drv._on_stream_event(rec, "spawn", {"epoch": 1})
+            await drv._on_stream_event(rec, "result", {"subtype": "success"})
+            await drv._on_stream_event(rec, "spawn", {"epoch": 2})
+        warnings = [r.getMessage() for r in caplog.records
+                    if r.levelno == logging.WARNING]
+        assert not any("abnormal" in m for m in warnings), warnings
+
+
+class _FakeInteractionRegistry:
+    """Registry stand-in for the mutating_tool seam — carries a single
+    record whose ``interaction_state`` the test sets directly, plus a
+    tracked ``set_interaction_violated``."""
+
+    def __init__(self, interaction_state: str):
+        from types import SimpleNamespace
+        self._rec = SimpleNamespace(interaction_state=interaction_state)
+        self.violated: list[str] = []
+
+    def get(self, eng_id: str):
+        return self._rec
+
+    async def set_interaction_violated(self, eng_id: str) -> None:
+        self.violated.append(eng_id)
+
+
+class TestMutatingToolViolationSeam:
+    """W2/Sol B9 (Task 7): ``_on_stream_event``'s ``mutating_tool`` branch —
+    activated now that the registry carries ``interaction_state`` +
+    ``set_interaction_violated``. The invariant that a ``reply``/``ask``/
+    ``set_progress`` control tool-use never REACHES this branch as a
+    ``mutating_tool`` event is enforced upstream by
+    ``topic_stream.is_mutating_tooluse`` (pinned by
+    ``test_topic_stream.py::test_is_mutating_tooluse_allowlist``) — the
+    driver trusts the event kind it's handed and does not re-inspect the
+    tool name.
+    """
+
+    async def test_mutating_tool_while_awaiting_operator_notifies_and_flags(
+        self, tmp_path,
+    ):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock()
+        reg = _FakeInteractionRegistry("awaiting_operator")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+
+        sender.assert_awaited_once()
+        assert sender.await_args.args[0] == rec.topic_id
+        assert reg.violated == [rec.id]
+
+    async def test_mutating_tool_notice_fires_only_once_per_engagement(
+        self, tmp_path,
+    ):
+        """A second mutating_tool event during the SAME awaiting_operator
+        window must not re-post the notice (per-engagement guard)."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock()
+        reg = _FakeInteractionRegistry("awaiting_operator")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Write"})
+
+        assert sender.await_count == 1
+
+    async def test_mutating_tool_while_authorized_does_not_flag(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock()
+        reg = _FakeInteractionRegistry("authorized")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+
+        sender.assert_not_awaited()
+        assert reg.violated == []
+
+    async def test_mutating_tool_with_non_interaction_required_state_does_not_flag(
+        self, tmp_path,
+    ):
+        """Default ("") interaction_state — most engagements aren't
+        interaction-required at all — never flags."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock()
+        reg = _FakeInteractionRegistry("")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+
+        sender.assert_not_awaited()
+        assert reg.violated == []
+
+    async def test_mutating_tool_without_registry_is_noop(self, tmp_path):
+        """No registry wired (e.g. a unit test) — the seam must not raise."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+
+        sender.assert_not_awaited()
+
+    async def test_cancel_clears_violation_notified_guard(
+        self, monkeypatch, tmp_path,
+    ):
+        """cancel() drops the per-engagement notified flag — bounded growth,
+        matches the other per-engagement dict pops."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers import s6_rc
+
+        async def fake_stop(*, engagement_id):
+            pass
+
+        async def fake_cau():
+            pass
+
+        monkeypatch.setattr(s6_rc, "stop_service", fake_stop)
+        monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+        monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(tmp_path / "svc"))
+        (tmp_path / "svc").mkdir()
+
+        sender = AsyncMock()
+        reg = _FakeInteractionRegistry("awaiting_operator")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "eng"),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+        assert rec.id in drv._violation_notified
+
+        await drv.cancel(rec)
+        assert rec.id not in drv._violation_notified
+
+    async def test_mutating_tool_notice_post_failure_retries_next_frame(
+        self, tmp_path,
+    ):
+        """B4 (Sol r1): a transient failure of the notice POST must not
+        permanently consume the once-guard — the next mutating_tool frame
+        retries and the notice lands exactly once (one SUCCESSFUL notice)."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sender = AsyncMock(side_effect=[RuntimeError("net down"), 123])
+        reg = _FakeInteractionRegistry("awaiting_operator")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        # Frame 1: notice post raises (swallowed, guard NOT consumed).
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+        # Frame 2: retried, this time it succeeds.
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Write"})
+
+        assert sender.await_count == 2  # retried after the transient failure
+        assert rec.id in drv._violation_notified  # eventually marked
+        # Flag persisted once (independent of the notice-post failure).
+        assert reg.violated == [rec.id]
+
+    async def test_mutating_tool_flag_failure_retries_next_frame(
+        self, tmp_path,
+    ):
+        """B4 (Sol r1): a transient failure of set_interaction_violated must
+        retry on the next frame while the notice still posts at-most-once."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        class _FlakyViolatedRegistry(_FakeInteractionRegistry):
+            def __init__(self, state, fail_times):
+                super().__init__(state)
+                self._fail_times = fail_times
+
+            async def set_interaction_violated(self, eng_id: str) -> None:
+                if self._fail_times > 0:
+                    self._fail_times -= 1
+                    raise RuntimeError("db down")
+                self.violated.append(eng_id)
+
+        sender = AsyncMock()
+        reg = _FlakyViolatedRegistry("awaiting_operator", fail_times=1)
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x",
+            registry=reg,
+        )
+        rec = _make_record()
+
+        # Frame 1: notice ok, flag raises (swallowed, flag-guard NOT consumed).
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+        # Frame 2: notice already posted (not re-sent); flag retries, succeeds.
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Write"})
+
+        assert sender.await_count == 1  # exactly one visible notice
+        assert reg.violated == [rec.id]  # flag eventually persisted once
+
+
+class TestCancelBypassesQueue:
+    async def test_cancel_immediate_while_busy(self, monkeypatch, tmp_path):
+        """/cancel drops any messages still waiting for a spawn — it never
+        flushes the inbound queue."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers import s6_rc
+
+        async def fake_stop(*, engagement_id):
+            pass
+        async def fake_cau():
+            pass
+        monkeypatch.setattr(s6_rc, "stop_service", fake_stop)
+        monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+        monkeypatch.setattr(
+            s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(tmp_path / "svc"))
+        (tmp_path / "svc").mkdir()
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="x",
+        )
+        rec = _make_record()
+        (tmp_path / rec.id).mkdir()
+
+        # Wire the queue; enqueue while unarmed (busy — no spawn yet).
+        drv._spawn_background_tasks(rec)
+        writer = _FakeWriter(True)
+        drv._inbound[rec.id]._write_fifo = writer      # observe FIFO writes
+        await drv.send_user_turn(rec, "queued but never delivered")
+        assert len(drv._inbound[rec.id]._queue) == 1
+
+        await drv.cancel(rec)
+
+        # Queue state torn down; the message was NEVER written to the FIFO.
+        assert rec.id not in drv._inbound
+        assert rec.id not in drv._reply_texts
+        assert rec.id not in drv._epoch_pending
+        assert writer.calls == []

@@ -129,6 +129,64 @@ def _escape_mdv2_pre(text: str) -> str:
     return "".join("\\" + c if c in _MDV2_PRE_SPECIALS else c for c in text)
 
 
+# ---------------------------------------------------------------------------
+# v0.75.0 (W5/Sol B3,B4): inline-callback data — v1 broker format + legacy
+# perm:<verdict>:<rid> back-compat.
+# ---------------------------------------------------------------------------
+
+# Telegram hard-caps callback_data at 64 bytes.
+_CALLBACK_DATA_MAX_BYTES = 64
+_CALLBACK_NAMESPACES = ("permission", "engagement_ask", "resident_ask")
+
+
+async def _safe_answer(cq: Any, text: str) -> None:
+    """Exactly one ``cq.answer(text)`` per callback path (r7-B2).
+
+    ``CallbackQuery.answer`` is async; a transport failure clearing the
+    Telegram client-side spinner is caught non-fatally so one failed answer
+    never crashes the handler.
+    """
+    try:
+        await cq.answer(text)
+    except Exception as exc:  # noqa: BLE001 — defensive, never propagate
+        logger.warning("callback_query.answer failed: %s", exc)
+
+
+def _parse_callback_data(data: str) -> tuple[str | None, str | None, int | None]:
+    """Parse inline-keyboard ``callback_data`` into ``(namespace, request_id,
+    option_index)``, or ``(None, None, None)`` on any malformed shape.
+
+    Two accepted shapes:
+    - v1 (current): ``v1|<ns>|<request_id>|<option_index>``, ``ns`` one of
+      the broker's three namespaces, ``option_index`` an int.
+    - legacy (back-compat): ``perm:<allow|deny>:<request_id>`` — pre-v0.75.0
+      keyboards still in flight across an upgrade must keep routing.
+
+    Oversized payloads (> 64 bytes, Telegram's own cap) are rejected
+    defensively even though nothing this process composes should ever
+    generate one.
+    """
+    if len(data.encode("utf-8")) > _CALLBACK_DATA_MAX_BYTES:
+        return None, None, None
+    if data.startswith("v1|"):
+        parts = data.split("|", 3)
+        if len(parts) != 4:
+            return None, None, None
+        _, ns, request_id, idx_s = parts
+        if ns not in _CALLBACK_NAMESPACES or not request_id:
+            return None, None, None
+        try:
+            idx = int(idx_s)
+        except ValueError:
+            return None, None, None
+        return ns, request_id, idx
+    parts = data.split(":", 2)
+    if (len(parts) == 3 and parts[0] == "perm"
+            and parts[1] in ("allow", "deny") and parts[2]):
+        return "permission", parts[2], (0 if parts[1] == "allow" else 1)
+    return None, None, None
+
+
 # Reconnect supervisor backoff schedule (spec 5.2 §4.2): 1s, 2s, 4s, 8s,
 # 16s, cap 60s, unbounded. Reuses retry.compute_backoff_ms via
 # ReconnectSupervisor. Module-level so tests can monkey-patch short
@@ -921,69 +979,153 @@ class TelegramChannel(Channel):
             logger.warning("main-feed redirect send failed: %s", exc)
 
     # ------------------------------------------------------------------
-    # E-12 (v0.37.0) Task 20: inline-keyboard callback dispatch
+    # E-12 (v0.37.0) Task 20 / v0.75.0 (W5/Sol B3,B4): inline-keyboard
+    # callback dispatch — fail-closed contract, single `cq.answer()`.
     # ------------------------------------------------------------------
 
     async def _on_inline_callback(
         self, update: Any, context: Any = None,
     ) -> None:
-        """Dispatch inline-keyboard callbacks (U1 perm verdict, U6 URL noop, …).
+        """Dispatch inline-keyboard callbacks (permission / ask verdicts, …).
 
-        Telegram requires ``callback_query.answer()`` regardless of outcome so
-        the client-side spinner clears. After that, parse the ``callback_data``
-        prefix and route — unknown / malformed prefixes are silently dropped
-        (already logged at the trace level).
+        v0.75.0 [D:§W5 callback, Sol B4/B5/r2-B3/r3-B5/r7-B2/B6]: EXACTLY ONE
+        ``await cq.answer(toast)`` per path (via :func:`_safe_answer`, which
+        swallows a transport failure so it never crashes the handler). Order:
+        parse ``v1|ns|rid|idx`` (or the legacy ``perm:<allow|deny>:<rid>``
+        shape) FIRST; ``cq.from_user is None`` fails closed; resolve the
+        engagement from the topic; reject a TERMINAL record BEFORE claiming
+        (r7-B6 — closes the window where ``try_transition_terminal`` has
+        flipped status but is still awaiting tombstone I/O); look up the
+        broker request's static meta; reject wrong-topic / out-of-range
+        option / wrong-actor WITHOUT claiming; only then claim + (for
+        ``engagement_ask``) persist the state advance BEFORE committing, so
+        the awaiting handler never resumes un-authorized.
 
-        Resolves topic_id → engagement_id locally; the POST to
-        ``/internal/channel/permission_verdict`` carries ``engagement_id``
-        directly so the casa-main handler (Task 21) doesn't need to redo the
-        lookup.
+        This handler NEVER edits the keyboard — that is owned exclusively by
+        the broker finish-hook set at post time (r3-B3), which fires once on
+        outcome even if the posting hook task was cancelled.
         """
         cq = update.callback_query
-        try:
-            await cq.answer()
-        except Exception as exc:  # noqa: BLE001 — defensive, never propagate
-            logger.warning("callback_query.answer failed: %s", exc)
-
-        data = (cq.data or "")
-        parts = data.split(":", 2)
-        if len(parts) != 3 or parts[0] != "perm" or parts[1] not in ("allow", "deny"):
-            logger.debug("inline callback dropped (data=%r)", data)
+        data = cq.data or ""
+        ns, request_id, idx = _parse_callback_data(data)
+        if ns is None:
+            await _safe_answer(cq, "expired")
             return
-        verdict, request_id = parts[1], parts[2]
-        if not request_id:
+
+        if cq.from_user is None:
+            # r3-B5: fail closed — an anonymous/missing actor can never
+            # authorize a verdict.
+            await _safe_answer(cq, "expired")
             return
 
         thread_id = getattr(cq.message, "message_thread_id", None)
         if thread_id is None or self._engagement_registry is None:
-            logger.warning(
-                "inline callback dropped: no thread_id or registry "
-                "(thread_id=%s)", thread_id,
-            )
+            await _safe_answer(cq, "expired")
             return
         rec = self._engagement_registry.by_topic_id(thread_id)
         if rec is None:
-            logger.warning(
-                "inline callback dropped: unknown topic_id=%s (verdict=%s)",
-                thread_id, verdict,
+            await _safe_answer(cq, "expired")
+            return
+        # r7-B6: reject a TERMINAL record BEFORE claiming — closes the
+        # window where try_transition_terminal has flipped rec.status but is
+        # still awaiting tombstone I/O before _finalize_engagement reaches
+        # cancel_scope.
+        if getattr(rec, "status", None) not in ("active", "idle"):
+            await _safe_answer(cq, "expired")
+            return
+
+        from verdict_broker import BROKER
+
+        meta = BROKER.get_meta(namespace=ns, scope=rec.id, request_id=request_id)
+        if meta is None:
+            await _safe_answer(cq, "expired")
+            return
+        if meta.get("topic_id") != thread_id:
+            await _safe_answer(cq, "expired")
+            return
+        options = meta.get("options") or []
+        if idx not in range(len(options)):
+            await _safe_answer(cq, "invalid")
+            return
+
+        # Fail closed on actor (r3-B5/r7-B2): no operator_id on record, or a
+        # tap from someone other than the bound operator, is refused WITHOUT
+        # claiming — a late/wrong tap must never consume the live request.
+        expected = meta.get("operator_id")
+        if expected is None or cq.from_user.id != expected:
+            await _safe_answer(cq, "not for you")
+            return
+
+        claim = BROKER.claim(
+            namespace=ns, scope=rec.id, request_id=request_id,
+            option_index=idx, actor_id=cq.from_user.id,
+        )
+        if isinstance(claim, str):
+            # Non-winning: a late tap on an already-retired keyboard never
+            # authorizes anything (no state change).
+            await _safe_answer(
+                cq, {"duplicate": "already answered", "stale": "expired"}[claim],
             )
             return
 
-        payload = {
-            "request_id": request_id,
-            "verdict": verdict,
-            "engagement_id": rec.id,
-            "operator_id": getattr(cq.from_user, "id", None),
-        }
+        committed = False
+        advanced = False
         try:
-            await self._internal_post(
-                "/internal/channel/permission_verdict", payload,
-            )
-        except Exception as exc:  # noqa: BLE001 — never propagate into PTB loop
-            logger.warning(
-                "permission_verdict internal POST failed (engagement=%s rid=%s): %s",
-                rec.id[:8], request_id, exc,
-            )
+            if ns == "engagement_ask":
+                # r2-B7/r3-B4: persist `authorized` under the registry lock
+                # BEFORE the awaiting handler resumes. r7-B1 (strict):
+                # advance_interaction_state doesn't exist until Task 7 — a
+                # registry lacking it takes the no-op skip-to-commit path
+                # (Task 7 activates the guard automatically once it lands).
+                advance = getattr(
+                    self._engagement_registry, "advance_interaction_state", None,
+                )
+                if advance is not None:
+                    try:
+                        await advance(rec.id, "operator_answered")
+                        advanced = True
+                    except asyncio.CancelledError:
+                        # B4 (Sol diff r2): advance SHIELDS its mutate+persist,
+                        # so by the time it re-raises CancelledError the durable
+                        # write has RESOLVED. If it authorized durably (state
+                        # now "authorized"), mark `advanced` so the finally
+                        # COMMITS rather than re-arming a request that would
+                        # later expire no_answer DESPITE disk authorization. A
+                        # rolled-back persist failure leaves the state != authorized
+                        # → fall through to abort. Then honor the cancellation.
+                        if getattr(
+                            rec, "interaction_state", "",
+                        ) == "authorized":
+                            advanced = True
+                        raise
+                    except Exception:  # noqa: BLE001
+                        # Could NOT authorize — do not resolve the ask
+                        # unauthorized (frozen W2 contract). Release + re-arm
+                        # the timer; the operator can re-tap.
+                        logger.warning(
+                            "engagement_ask advance_interaction_state failed "
+                            "(engagement=%s rid=%s)",
+                            rec.id[:8], request_id, exc_info=True,
+                        )
+                        BROKER.abort_claim(claim)
+                        await _safe_answer(cq, "couldn't record — please tap again")
+                        return
+            committed = BROKER.commit(claim)
+        finally:
+            # r7-B1: ANY exit without a commit (including CancelledError,
+            # which `except Exception` above would not catch) must resolve the
+            # claim so a claimed live request whose timer was cancelled is never
+            # stranded. B4 (Sol diff r2): an authorized-but-uncommitted ask —
+            # the caller was cancelled in the persist window AFTER the durable
+            # write landed — must COMMIT (commit is identity-checked and safe),
+            # else abort_claim (re-arm the timer for a re-tap). abort_claim is
+            # idempotent + sync.
+            if not committed:
+                if advanced:
+                    committed = BROKER.commit(claim)
+                else:
+                    BROKER.abort_claim(claim)
+        await _safe_answer(cq, "✔" if committed else "expired")
 
     # ------------------------------------------------------------------
     # v0.37.2 (C-1): permission-relay keyboard composer
@@ -1027,14 +1169,16 @@ class TelegramChannel(Channel):
             body_lines.append(f"```\n{_escape_mdv2_pre(preview)}\n```")
         body = "\n".join(body_lines)
 
+        # v0.75.0 (W5/Sol B3,B4): v1 broker callback_data — option_index
+        # 0=allow, 1=deny (verdict_broker.py meta["options"]=["allow","deny"]).
         kbd = InlineKeyboardMarkup([[
             InlineKeyboardButton(
                 text="✅ Allow",
-                callback_data=f"perm:allow:{request_id}",
+                callback_data=f"v1|permission|{request_id}|0",
             ),
             InlineKeyboardButton(
                 text="❌ Deny",
-                callback_data=f"perm:deny:{request_id}",
+                callback_data=f"v1|permission|{request_id}|1",
             ),
         ]])
 
@@ -1071,6 +1215,138 @@ class TelegramChannel(Channel):
         if tool_name.startswith("mcp__"):
             return ""  # MCP tool calls — no useful primary field
         return ""
+
+    async def edit_perm_keyboard_outcome(
+        self, *, topic_id: int | None, message_id: int, outcome: dict,
+    ) -> None:
+        """Broker finish-hook target (r3-B3) — the ONLY writer that mutates a
+        posted permission keyboard after the fact.
+
+        Strips the inline buttons so a resolved / expired / cancelled
+        keyboard can never be tapped again. ``_on_inline_callback`` itself
+        never edits the keyboard — this method (invoked by the broker's
+        finish-hook machinery, ``hooks._perm_keyboard_finish``) is the sole
+        writer, and it fires exactly once per request regardless of which
+        task set it up.
+        """
+        if not self.engagement_supergroup_id:
+            return
+        try:
+            await self.bot.edit_message_reply_markup(
+                chat_id=self.engagement_supergroup_id,
+                message_id=message_id,
+                reply_markup=None,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+            logger.warning(
+                "edit_perm_keyboard_outcome failed (topic=%s message_id=%s "
+                "outcome=%s): %s",
+                topic_id, message_id, outcome.get("outcome"), exc,
+            )
+
+    # ------------------------------------------------------------------
+    # v0.75.0 (W5): engagement_ask keyboard composer + plain topic-message
+    # edit/delete helpers.
+    # ------------------------------------------------------------------
+
+    async def post_options_keyboard(
+        self,
+        *,
+        engagement_id: str,
+        request_id: str,
+        question: str,
+        options: list,
+    ) -> int | None:
+        """Post a plain-text multiple-choice question with one tappable
+        button per option (W5 `ask`).
+
+        Mirrors ``post_perm_keyboard``'s engagement/topic resolution but
+        skips MarkdownV2 entirely — the question/options are operator- or
+        agent-authored free text (not a static template around an escaped
+        tool-call preview), so a plain send sidesteps parse-entity 400s
+        without needing an escaping pass.
+        """
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        rec = self._engagement_registry.get(engagement_id)
+        if rec is None or rec.topic_id is None:
+            logger.warning(
+                "post_options_keyboard: unknown engagement or no topic_id "
+                "(engagement=%s)", engagement_id[:8],
+            )
+            return None
+
+        # v0.75.0 (W5): v1 broker callback_data, one button (its own row)
+        # per option — option_index is this option's position in `options`.
+        kbd = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                text=label,
+                callback_data=f"v1|engagement_ask|{request_id}|{i}",
+            )]
+            for i, label in enumerate(options)
+        ])
+
+        return await self.send_to_topic(rec.topic_id, question, reply_markup=kbd)
+
+    async def edit_topic_message(
+        self, topic_id: int | None, message_id: int, text: str,
+    ) -> bool:
+        """Plain (no parse_mode, no reply_markup) text edit of a posted
+        topic message.
+
+        Broker finish-hook target for the ``engagement_ask`` namespace
+        (mirrors ``edit_perm_keyboard_outcome``'s role for ``permission``,
+        see ``channel_handlers._ask_keyboard_finish``). "Message is not
+        modified" (JC4 — an identical re-edit) is tolerated as success, not
+        an error, since it means the desired end state already holds.
+        """
+        if not self.engagement_supergroup_id:
+            return False
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.engagement_supergroup_id,
+                message_id=message_id,
+                text=text,
+            )
+            return True
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            logger.warning(
+                "edit_topic_message failed (topic=%s message_id=%s): %s",
+                topic_id, message_id, exc,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+            logger.warning(
+                "edit_topic_message failed (topic=%s message_id=%s): %s",
+                topic_id, message_id, exc,
+            )
+            return False
+
+    async def delete_topic_message(
+        self, topic_id: int | None, message_id: int,
+    ) -> bool:
+        """Delete a single message from a topic (W5 companion to
+        ``edit_topic_message``).
+
+        Best-effort: any failure returns ``False`` rather than raising —
+        unlike whole-topic ``delete_topic``, losing one message is not
+        audit-critical.
+        """
+        if not self.engagement_supergroup_id:
+            return False
+        try:
+            return bool(await self.bot.delete_message(
+                chat_id=self.engagement_supergroup_id,
+                message_id=message_id,
+            ))
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+            logger.warning(
+                "delete_topic_message failed (topic=%s message_id=%s): %s",
+                topic_id, message_id, exc,
+            )
+            return False
 
     async def _internal_post(self, path: str, payload: dict) -> dict:
         """Dispatch an internal-handler call from inside casa-main.

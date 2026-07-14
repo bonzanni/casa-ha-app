@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import logging
 import os
+import uuid
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -49,6 +50,22 @@ INSTRUCTIONS = (
 
 server: FastMCP = FastMCP("casa-engagement-channel", instructions=INSTRUCTIONS)
 
+# v0.75.0 (W5): `ask` client-side validation — mirrors
+# channel_handlers._validate_ask_args on the casa-main side (defense in
+# depth: this copy saves a wasted round trip on bad args; the server-side
+# copy is the actual gate).
+_ASK_MIN_OPTIONS = 2
+_ASK_MAX_OPTIONS = 8
+_ASK_MAX_LABEL_LEN = 48
+_ASK_MAX_QUESTION_LEN = 1024
+_ASK_MIN_TIMEOUT_S = 30.0
+_ASK_MAX_TIMEOUT_S = 570.0
+# The broker itself waits up to _ASK_MAX_TIMEOUT_S for an operator tap; a
+# same-length (or shorter) aiohttp ClientTimeout would race that wait and
+# abort the HTTP call out from under a still-legitimately-pending ask. Pad
+# by 15s so the transport always outlives the broker's own deadline.
+_ASK_CLIENT_TIMEOUT_PAD_S = 15.0
+
 
 def declared_capabilities() -> dict[str, dict]:
     """Experimental capabilities advertised in MCP InitializationOptions.
@@ -66,23 +83,42 @@ def declared_capabilities() -> dict[str, dict]:
 # Internal HTTP-over-Unix-socket client.
 # ---------------------------------------------------------------------------
 
-async def _internal_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+# Exponential backoff schedule shared by every _internal_post retry loop.
+# Module-level so a test can shrink it (rather than patching asyncio.sleep,
+# which mutates the process-wide asyncio module — see CLAUDE.md's memory
+# cage note) to make a retry-path test run fast.
+_RETRY_DELAYS_S: tuple[float, ...] = (0.5, 1.0, 2.0)
+
+
+async def _internal_post(
+    path: str, payload: dict[str, Any], *, timeout_s: float | None = None,
+) -> dict[str, Any]:
     """POST ``payload`` to ``path`` on the casa-main internal Unix socket.
 
     Auto-merges ``engagement_id=ENGAGEMENT_ID`` if not already present in
-    ``payload``. Retries with exponential backoff: 3 attempts at 0.5s / 1s / 2s.
-    Returns the parsed JSON response body on success; raises the last
-    ``aiohttp`` exception if all attempts fail.
+    ``payload``. Retries with exponential backoff (``_RETRY_DELAYS_S``),
+    reusing the SAME ``payload`` (and therefore the same ``request_id``,
+    when the caller included one) across every attempt — a transport-level
+    retry is a reattach, never a fresh request. Returns the parsed JSON
+    response body on success; raises the last ``aiohttp`` exception if all
+    attempts fail.
+
+    ``timeout_s``: optional total ``aiohttp.ClientTimeout`` override. Left
+    ``None`` (aiohttp's own ~300s default) for every pre-W5 caller; the `ask`
+    tool passes an explicit, longer budget (see ``_ASK_CLIENT_TIMEOUT_PAD_S``)
+    so the transport timeout can never race the broker's own wait.
     """
     body = dict(payload)
     if "engagement_id" not in body and ENGAGEMENT_ID is not None:
         body["engagement_id"] = ENGAGEMENT_ID
 
     connector = UnixConnector(path=INTERNAL_SOCKET)
-    delays = (0.5, 1.0, 2.0)
+    session_kwargs: dict[str, Any] = {"connector": connector}
+    if timeout_s is not None:
+        session_kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout_s)
     last_exc: BaseException | None = None
-    async with aiohttp.ClientSession(connector=connector) as session:
-        for attempt, delay in enumerate(delays):
+    async with aiohttp.ClientSession(**session_kwargs) as session:
+        for attempt, delay in enumerate(_RETRY_DELAYS_S):
             try:
                 async with session.post(
                     f"http://localhost{path}", json=body,
@@ -91,10 +127,30 @@ async def _internal_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
                     return await resp.json()
             except (aiohttp.ClientError, OSError) as exc:
                 last_exc = exc
-                if attempt < len(delays) - 1:
+                if attempt < len(_RETRY_DELAYS_S) - 1:
                     await asyncio.sleep(delay)
     assert last_exc is not None
     raise last_exc
+
+
+def _validate_ask_args(question: Any, options: list) -> bool:
+    """Client-side mirror of ``channel_handlers._validate_ask_args``'s
+    shape checks (timeout clamping happens separately — invalid timeout
+    values are simply clamped, never rejected)."""
+    if (not isinstance(question, str) or not question
+            or len(question) > _ASK_MAX_QUESTION_LEN):
+        return False
+    if (not isinstance(options, list)
+            or not (_ASK_MIN_OPTIONS <= len(options) <= _ASK_MAX_OPTIONS)):
+        return False
+    if any(
+        not isinstance(o, str) or not o or len(o) > _ASK_MAX_LABEL_LEN
+        for o in options
+    ):
+        return False
+    if len(set(options)) != len(options):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +171,57 @@ async def reply(chat_id: str, text: str) -> dict[str, Any]:
     if ENGAGEMENT_ID is not None:
         payload["engagement_id"] = ENGAGEMENT_ID
     return await _internal_post("/internal/channel/send_to_topic", payload)
+
+
+@server.tool()
+async def ask(
+    question: str, options: list[str], timeout_s: float = 300,
+) -> dict[str, Any]:
+    """Ask the operator a multiple-choice question with tappable buttons.
+
+    Returns the selected label, or outcome=no_answer on timeout (then fall
+    back to a plain `reply` question). NOT an authorization mechanism.
+    """
+    if not _validate_ask_args(question, options):
+        return {"ok": False, "error": "invalid_args"}
+
+    clamped_timeout = min(
+        max(float(timeout_s), _ASK_MIN_TIMEOUT_S), _ASK_MAX_TIMEOUT_S,
+    )
+    # Generated ONCE: every retry attempt (transport-level, inside
+    # _internal_post) and any explicit ask_cancel reuse this SAME id so a
+    # retry reattaches to the one live broker request instead of posting a
+    # second keyboard.
+    request_id = uuid.uuid4().hex
+    payload: dict[str, Any] = {
+        "request_id": request_id,
+        "question": question,
+        "options": options,
+        "timeout_s": clamped_timeout,
+    }
+    if ENGAGEMENT_ID is not None:
+        payload["engagement_id"] = ENGAGEMENT_ID
+
+    completed = False
+    try:
+        result = await _internal_post(
+            "/internal/channel/ask", payload,
+            timeout_s=clamped_timeout + _ASK_CLIENT_TIMEOUT_PAD_S,
+        )
+        completed = True
+        return result
+    finally:
+        # Genuine caller cancellation (or any other early exit that never
+        # reached a response) — tell casa-main to stop waiting, so a later
+        # same-id reattach can't resurrect a stale tap. Best-effort: never
+        # let a failure here mask the real cancellation/exception.
+        if not completed:
+            try:
+                await _internal_post(
+                    "/internal/channel/ask_cancel", {"request_id": request_id},
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # ---------------------------------------------------------------------------

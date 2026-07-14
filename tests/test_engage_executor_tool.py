@@ -1249,3 +1249,257 @@ class TestEngageExecutorPluginGate:
         arts = er.create.await_args.kwargs["plugin_artifacts"]
         assert [a["artifact_id"] for a in arts] == ["b" * 64], (
             f"record must pin the FRESH artifact after a mid-launch update: {arts}")
+
+
+# ---------------------------------------------------------------------------
+# W3 (Task 8): structured brief envelope — schema, validation, both drivers.
+# ---------------------------------------------------------------------------
+
+
+def _real_registry(tmp_path):
+    from engagement_registry import EngagementRegistry
+    return EngagementRegistry(
+        tombstone_path=str(tmp_path / "eng-tomb.json"), bus=None,
+    )
+
+
+async def _brief_setup(reg, defn, registry, driver_attr, monkeypatch, tmp_path):
+    """Wire init_tools with a REAL engagement registry + a mock driver, and a
+    prompt template that carries {task}. Returns the driver mock."""
+    from tools import init_tools
+    import agent as agent_mod
+
+    p = tmp_path / "prompt.md"
+    p.write_text("SYS-PROMPT task=<{task}> ctx=<{context}> ws=<{world_state_summary}>")
+    defn.prompt_template_path = str(p)
+
+    channel = MagicMock()
+    channel.engagement_supergroup_id = -100123
+    channel.engagement_permission_ok = True
+    channel.open_engagement_topic = AsyncMock(return_value=42)
+    channel.bot = MagicMock()
+    channel.bot.edit_forum_topic = AsyncMock()
+    cm = MagicMock()
+    cm.get = MagicMock(return_value=channel)
+    init_tools(
+        channel_manager=cm, bus=MagicMock(),
+        specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+        trigger_registry=MagicMock(), engagement_registry=registry,
+        executor_registry=reg,
+    )
+    driver_mock = MagicMock(start=AsyncMock())
+    monkeypatch.setattr(agent_mod, driver_attr, driver_mock, raising=False)
+    return driver_mock
+
+
+class TestEngageExecutorSchema:
+    def test_input_schema_only_executor_type_required(self):
+        from tools import engage_executor
+        schema = engage_executor.input_schema
+        assert schema["required"] == ["executor_type"]
+        props = schema["properties"]
+        for k in ("task", "brief", "context"):
+            assert k in props, k
+        # brief itself only requires objective.
+        assert schema["properties"]["brief"]["required"] == ["objective"]
+
+
+class TestEngageExecutorBriefValidation:
+    async def _invalid(self, args):
+        from tools import engage_executor
+        import agent as agent_mod
+
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=_mock_executor_def())
+        reg.list_types = MagicMock(return_value=["configurator"])
+        await _setup(reg)
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r = await engage_executor.handler({"executor_type": "configurator", **args})
+        finally:
+            agent_mod.origin_var.reset(token)
+        payload = json.loads(r["content"][0]["text"])
+        assert payload["kind"] == "invalid_arguments", payload
+        assert r.get("is_error") is True
+
+    async def test_both_task_and_brief(self):
+        await self._invalid({"task": "t", "brief": {"objective": "o"}})
+
+    async def test_neither_task_nor_brief(self):
+        await self._invalid({})
+
+    async def test_brief_with_top_level_context(self):
+        await self._invalid({"brief": {"objective": "o"}, "context": "c"})
+
+    async def test_interaction_required_truthy_non_bool(self):
+        await self._invalid({"brief": {"objective": "o", "interaction_required": "yes"}})
+
+    async def test_acceptance_criteria_empty_entry(self):
+        await self._invalid({"brief": {"objective": "o", "acceptance_criteria": ["", "x"]}})
+
+    async def test_process_requirements_str_not_list(self):
+        await self._invalid({"brief": {"objective": "o", "process_requirements": "x"}})
+
+    async def test_brief_context_wrong_type(self):
+        await self._invalid({"brief": {"objective": "o", "context": 5}})
+
+
+class TestEngageExecutorBriefDelivery:
+    async def test_objective_only_brief_persisted_verbatim(self, tmp_path, monkeypatch):
+        from tools import engage_executor
+        import agent as agent_mod
+
+        defn = _mock_executor_def(driver="in_casa")
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["configurator"])
+        registry = _real_registry(tmp_path)
+        await _brief_setup(reg, defn, registry, "active_engagement_driver",
+                           monkeypatch, tmp_path)
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "configurator",
+                "brief": {"objective": "Reset the invoice counter"},
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(r["content"][0]["text"])
+        assert payload["status"] == "pending", payload
+        rec = list(registry._records.values())[0]
+        # RAW brief persisted verbatim — no injected default keys.
+        assert rec.origin["brief"] == {"objective": "Reset the invoice counter"}
+        assert "interaction_required" not in rec.origin["brief"]
+        assert "acceptance_criteria" not in rec.origin["brief"]
+        # objective drives the canonical task (title/P32/engagement.task).
+        assert rec.task == "Reset the invoice counter"
+        # not interaction-required → no first_contact_required state.
+        assert rec.interaction_state == ""
+
+    async def test_configurator_in_casa_delivery(self, tmp_path, monkeypatch):
+        from tools import engage_executor
+        from drivers.brief import FIRST_CONTACT_PARAGRAPH, COMPLETION_ACCOUNTING_LINE
+        import agent as agent_mod
+
+        defn = _mock_executor_def(driver="in_casa")
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["configurator"])
+        registry = _real_registry(tmp_path)
+        driver_mock = await _brief_setup(
+            reg, defn, registry, "active_engagement_driver", monkeypatch, tmp_path)
+
+        brief = {
+            "objective": "Reset invoice counter to 1000",
+            "acceptance_criteria": ["counter reads 1000", "audit log updated"],
+            "process_requirements": ["Confirm with operator before writing",
+                                     "NEVER touch prod without a backup"],
+            "context": "quarterly rollover",
+            "interaction_required": True,   # ignored for in_casa (W2 claude_code-only)
+        }
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "configurator", "brief": brief,
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(r["content"][0]["text"])
+        assert payload["status"] == "pending", payload
+        sys_prompt = driver_mock.start.await_args.kwargs["options"].system_prompt
+        # W3 content reaches the in_casa configurator's system_prompt.
+        assert "Reset invoice counter to 1000" in sys_prompt
+        assert "counter reads 1000" in sys_prompt
+        assert "audit log updated" in sys_prompt
+        assert "Confirm with operator before writing" in sys_prompt
+        assert "NEVER touch prod without a backup" in sys_prompt
+        assert COMPLETION_ACCOUNTING_LINE in sys_prompt
+        # W2 is claude_code-only: no first-contact paragraph, no stuck state.
+        assert FIRST_CONTACT_PARAGRAPH not in sys_prompt
+        rec = list(registry._records.values())[0]
+        assert rec.interaction_state == ""
+
+    async def test_claude_code_delivery_two_phase(self, tmp_path, monkeypatch):
+        from tools import engage_executor
+        from drivers.brief import FIRST_CONTACT_PARAGRAPH, COMPLETION_ACCOUNTING_LINE
+        import agent as agent_mod
+
+        defn = _mock_executor_def(driver="claude_code")
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["configurator"])
+        registry = _real_registry(tmp_path)
+        driver_mock = await _brief_setup(
+            reg, defn, registry, "active_claude_code_driver", monkeypatch, tmp_path)
+
+        brief = {
+            "objective": "Migrate the widgets table",
+            "process_requirements": ["Run migrations in a transaction"],
+            "interaction_required": True,
+        }
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "configurator", "brief": brief,
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(r["content"][0]["text"])
+        assert payload["status"] == "pending", payload
+        prompt = driver_mock.start.await_args.kwargs["prompt"]
+        assert "Migrate the widgets table" in prompt
+        assert "Run migrations in a transaction" in prompt
+        assert COMPLETION_ACCOUNTING_LINE in prompt
+        # claude_code + interaction_required → two-phase paragraph + state.
+        assert FIRST_CONTACT_PARAGRAPH in prompt
+        rec = list(registry._records.values())[0]
+        assert rec.interaction_state == "first_contact_required"
+
+    async def test_claude_code_no_interaction_no_two_phase(self, tmp_path, monkeypatch):
+        from tools import engage_executor
+        from drivers.brief import FIRST_CONTACT_PARAGRAPH
+        import agent as agent_mod
+
+        defn = _mock_executor_def(driver="claude_code")
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["configurator"])
+        registry = _real_registry(tmp_path)
+        driver_mock = await _brief_setup(
+            reg, defn, registry, "active_claude_code_driver", monkeypatch, tmp_path)
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            r = await engage_executor.handler({
+                "executor_type": "configurator",
+                "brief": {"objective": "o", "acceptance_criteria": [],
+                          "process_requirements": []},
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(r["content"][0]["text"])
+        assert payload["status"] == "pending", payload   # empty lists are valid
+        prompt = driver_mock.start.await_args.kwargs["prompt"]
+        assert FIRST_CONTACT_PARAGRAPH not in prompt
+        rec = list(registry._records.values())[0]
+        assert rec.interaction_state == ""

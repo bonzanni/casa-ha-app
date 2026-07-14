@@ -9,3 +9,9 @@ manifest at small bank scale — re-run these when the `casa` bank grows 10–10
 - `phase0_memory_baseline.py` — extraction/recall baseline per access tier
 - `phase0_1_pollution_rank.py` — cross-domain pollution ranking + recall-budget sweep
 - `context7_keytest.py` — probe: context7 MCP key wiring through add-on options
+- `ellen_brief_fidelity.py` — live-model gate (W3/Sol B11): pins the
+  invoice_reset mistranslation — Ellen's `engage_executor` call must carry
+  process instructions VERBATIM in `brief.process_requirements` with
+  `interaction_required=True`, never paraphrased into a feature requirement.
+  REQUIRED pre-merge command (see script header for the in-container run
+  command); not part of the pytest unit gate (needs a live model).

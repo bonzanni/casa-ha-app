@@ -294,6 +294,15 @@ If you accidentally post in the main feed, the bot will reply once
 per boot with a redirect hint, then silently ignore further main-feed
 messages.
 
+### While the engagement runs (v0.75.0)
+
+The engaged agent's narration streams into the topic live as it works,
+rather than arriving only as a single reply at the end — you can follow
+along turn by turn. If it needs a decision from you mid-task, it may ask
+via inline buttons (tap the option that applies) instead of waiting for a
+free-text reply; the same buttoned pattern the permission-approval keyboard
+already used for tool-use requests outside its pre-approved allow-list.
+
 ### In-topic slash commands
 
 | Command | What it does |

@@ -11,6 +11,7 @@ returned by ``_make_channel_handlers`` (see spec §A.3).
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -70,13 +71,16 @@ class _FakeRegistry:
 
     Pre-seeds one record (``eng-1`` → topic 42). Tests that need other
     shapes (missing record / record with no topic_id) override via
-    ``set_record``.
+    ``set_record``. Carries ``advance_interaction_state`` (W2/Sol B9, Task
+    7) so send_to_topic's first_contact seam has something to call; most
+    tests never assert on ``self.advances``.
     """
 
     def __init__(self) -> None:
         self._by_id: dict[str, _FakeRecord] = {
             "eng-1": _FakeRecord("eng-1", topic_id=42),
         }
+        self.advances: list[tuple[str, str]] = []
 
     def set_record(self, eng_id: str, rec: _FakeRecord | None) -> None:
         if rec is None:
@@ -86,6 +90,9 @@ class _FakeRegistry:
 
     def get(self, eng_id: str) -> _FakeRecord | None:
         return self._by_id.get(eng_id)
+
+    async def advance_interaction_state(self, eng_id: str, event: str) -> None:
+        self.advances.append((eng_id, event))
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +181,21 @@ async def test_send_to_topic_missing_topic_id_returns_error(
         assert body == {"ok": False, "error": "no_topic_bound"}
 
     assert ch.calls == []
+
+
+async def test_send_to_topic_advances_interaction_state_first_contact(
+    app_factory,
+) -> None:
+    """W2/Sol B9 (Task 7): a successful reply-through-send_to_topic is the
+    agent's outbound act — fires advance_interaction_state(eng, "first_contact")."""
+    app, ch, reg = app_factory()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/send_to_topic",
+            json={"engagement_id": "eng-1", "text": "hello operator"},
+        )
+        assert resp.status == 200
+    assert reg.advances == [("eng-1", "first_contact")]
 
 
 # ---------------------------------------------------------------------------
@@ -275,18 +297,18 @@ async def test_post_inline_keyboard_send_failure_returns_error(
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — permission verdict queue + long-poll drain (Task 21)
+# v0.75.0 (W5/Sol B3,B4) — permission verdict → verdict_broker.BROKER.deliver
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 def channel_full_app_factory():
     """Build an aiohttp app with BOTH POST handlers from _make_channel_handlers
-    AND the GET handlers from _make_channel_get_handlers (Task 21's
-    /internal/channel/permission_pending lives in the GET family).
+    AND the (now empty — v0.75.0 removed permission_pending) GET handlers
+    from _make_channel_get_handlers.
 
-    Also resets the module-level _PERMISSION_QUEUES so tests don't bleed
-    state into each other.
+    Also resets the module-level _PERMISSION_QUEUES (deprecated,
+    accepted-and-ignored — kept one release) so tests don't bleed state.
     """
     from channels.channel_handlers import (
         _make_channel_handlers,
@@ -314,61 +336,98 @@ def channel_full_app_factory():
     _PERMISSION_QUEUES.clear()
 
 
-async def test_permission_verdict_queues_then_pending_drains(
-    channel_full_app_factory,
+@pytest.fixture
+def _fresh_broker(monkeypatch):
+    """Isolate broker-touching tests on their own VerdictBroker — the
+    handler resolves ``from verdict_broker import BROKER`` per-request, so
+    redirecting the module attribute here is picked up transparently."""
+    import verdict_broker
+    from verdict_broker import VerdictBroker
+
+    fresh = VerdictBroker()
+    monkeypatch.setattr(verdict_broker, "BROKER", fresh)
+    return fresh
+
+
+async def test_get_channel_handlers_no_longer_registers_permission_pending() -> None:
+    """v0.75.0: the queue+long-poll indirection is retired — verdicts flow
+    straight into verdict_broker.BROKER.deliver from the POST handler."""
+    from channels.channel_handlers import _make_channel_get_handlers
+
+    handlers = _make_channel_get_handlers(engagement_registry=_FakeRegistry())
+    assert "/internal/channel/permission_pending" not in handlers
+    assert handlers == {}
+
+
+async def test_permission_verdict_allow_delivers_to_broker(
+    channel_full_app_factory, _fresh_broker,
 ) -> None:
-    app, _ch, _reg = channel_full_app_factory()
+    reg = _FakeRegistry()
+    reg.set_record("eng-1", _FakeRecord("eng-1", topic_id=42, status="active"))
+    app, _ch, _reg = channel_full_app_factory(registry=reg)
+
+    req, created = _fresh_broker.register(
+        namespace="permission", scope="eng-1", request_id="rid-001",
+        timeout_s=5.0,
+    )
+    assert created is True
+
     async with TestClient(TestServer(app)) as client:
-        # 1. casa-main posts the verdict (channel CallbackQueryHandler →
-        #    /internal/channel/permission_verdict).
-        post_resp = await client.post(
+        resp = await client.post(
             "/internal/channel/permission_verdict",
             json={"engagement_id": "eng-1", "request_id": "rid-001",
                   "verdict": "allow", "operator_id": 999},
         )
-        assert (await post_resp.json()) == {"ok": True}
+        body = await resp.json()
+    assert body == {"ok": True, "result": "delivered"}
 
-        # 2. Channel server long-polls /internal/channel/permission_pending
-        #    and gets the verdict.
-        get_resp = await client.get(
-            "/internal/channel/permission_pending"
-            "?engagement_id=eng-1&timeout_s=5",
-        )
-        assert (await get_resp.json()) == {
-            "request_id": "rid-001",
-            "verdict": "allow",
-            "operator_id": 999,
-        }
-
-        # 3. Drained — a second poll with short timeout returns empty.
-        get_resp2 = await client.get(
-            "/internal/channel/permission_pending"
-            "?engagement_id=eng-1&timeout_s=0",
-        )
-        assert (await get_resp2.json()) == {}
+    outcome = await asyncio.wait_for(_fresh_broker.await_result(req), 0.1)
+    assert outcome == {"outcome": "answered", "option_index": 0,
+                       "actor_id": 999}
 
 
-async def test_permission_pending_long_poll_returns_empty_on_timeout(
-    channel_full_app_factory,
+async def test_permission_verdict_deny_delivers_to_broker(
+    channel_full_app_factory, _fresh_broker,
 ) -> None:
-    """No verdict queued + timeout_s=0 → empty dict (so the channel server's
-    drain loop can re-poll without crash-looping)."""
-    app, _ch, _reg = channel_full_app_factory()
+    reg = _FakeRegistry()
+    reg.set_record("eng-1", _FakeRecord("eng-1", topic_id=42, status="active"))
+    app, _ch, _reg = channel_full_app_factory(registry=reg)
+
+    req, _created = _fresh_broker.register(
+        namespace="permission", scope="eng-1", request_id="rid-002",
+        timeout_s=5.0,
+    )
+
     async with TestClient(TestServer(app)) as client:
-        resp = await client.get(
-            "/internal/channel/permission_pending"
-            "?engagement_id=eng-1&timeout_s=0",
+        resp = await client.post(
+            "/internal/channel/permission_verdict",
+            json={"engagement_id": "eng-1", "request_id": "rid-002",
+                  "verdict": "deny", "operator_id": 7},
         )
-        assert (await resp.json()) == {}
+        body = await resp.json()
+    assert body == {"ok": True, "result": "delivered"}
+
+    outcome = await asyncio.wait_for(_fresh_broker.await_result(req), 0.1)
+    assert outcome["option_index"] == 1
 
 
-async def test_permission_pending_missing_engagement_id_returns_empty(
-    channel_full_app_factory,
+async def test_permission_verdict_no_live_request_returns_stale(
+    channel_full_app_factory, _fresh_broker,
 ) -> None:
-    app, _ch, _reg = channel_full_app_factory()
+    """No matching BROKER request (timed out/cancelled/never registered) —
+    deliver() reports 'stale', the HTTP call still succeeds (ok=True)."""
+    reg = _FakeRegistry()
+    reg.set_record("eng-1", _FakeRecord("eng-1", topic_id=42, status="active"))
+    app, _ch, _reg = channel_full_app_factory(registry=reg)
+
     async with TestClient(TestServer(app)) as client:
-        resp = await client.get("/internal/channel/permission_pending")
-        assert (await resp.json()) == {}
+        resp = await client.post(
+            "/internal/channel/permission_verdict",
+            json={"engagement_id": "eng-1", "request_id": "no-such-rid",
+                  "verdict": "allow", "operator_id": 999},
+        )
+        body = await resp.json()
+    assert body == {"ok": True, "result": "stale"}
 
 
 async def test_permission_verdict_unknown_engagement_returns_error(
@@ -389,16 +448,21 @@ async def test_permission_verdict_unknown_engagement_returns_error(
 
 
 async def test_permission_verdict_terminal_engagement_returns_error(
-    channel_full_app_factory,
+    channel_full_app_factory, _fresh_broker,
 ) -> None:
     """L5 leak guard: a late verdict tap for an engagement that has already
-    finalized (status no longer active/idle) must be refused, not silently
-    re-materialize a queue entry that would then leak forever."""
-    from channels.channel_handlers import _PERMISSION_QUEUES
-
+    finalized (status no longer active/idle) must be refused — and must
+    NOT deliver into the broker even if a live request happens to exist
+    under that (now-stale) engagement id."""
     reg = _FakeRegistry()
     reg.set_record("eng-1", _FakeRecord("eng-1", topic_id=42, status="completed"))
     app, _ch, _reg = channel_full_app_factory(registry=reg)
+
+    req, _created = _fresh_broker.register(
+        namespace="permission", scope="eng-1", request_id="rid-001",
+        timeout_s=5.0,
+    )
+
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
             "/internal/channel/permission_verdict",
@@ -408,7 +472,10 @@ async def test_permission_verdict_terminal_engagement_returns_error(
         assert (await resp.json()) == {
             "ok": False, "error": "unknown_engagement",
         }
-        assert "eng-1" not in _PERMISSION_QUEUES
+    # Never delivered: the request is still live/unresolved.
+    assert _fresh_broker.pending(namespace="permission", scope="eng-1") == [
+        "rid-001",
+    ]
 
 
 async def test_permission_verdict_bad_json_returns_error(

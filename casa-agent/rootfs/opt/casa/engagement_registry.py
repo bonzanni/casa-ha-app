@@ -46,6 +46,34 @@ _TERMINAL_RETENTION_DAYS = 30
 
 
 # ---------------------------------------------------------------------------
+# W2/Sol B9 (Task 7) — interaction_state pure transition core.
+# ---------------------------------------------------------------------------
+#
+# Transition table (normative — design §W2, Sol r3-B4):
+#   first_contact      : first_contact_required -> awaiting_operator
+#   operator_answered  : {first_contact_required, awaiting_operator} -> authorized
+#   operator_turn      : {first_contact_required, awaiting_operator} -> authorized
+#   anything else (including from "authorized", from "" (not
+#   interaction-required), or an event not valid from the current state)
+#   -> no-op (None). Never backwards.
+
+
+def _pure_interaction_transition(current: str, event: str) -> str | None:
+    """Compute the next ``interaction_state``, or ``None`` for a no-op.
+
+    Pure (no I/O, no locking) so it's trivially unit-testable and reusable
+    by the atomic locked mutator below.
+    """
+    if event == "first_contact":
+        return "awaiting_operator" if current == "first_contact_required" else None
+    if event in ("operator_answered", "operator_turn"):
+        if current in ("first_contact_required", "awaiting_operator"):
+            return "authorized"
+        return None
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Record
 # ---------------------------------------------------------------------------
 
@@ -97,6 +125,13 @@ class EngagementRecord:
     # replay renders --plugin-dir flags from THESE recorded paths, never a
     # re-resolution of current assignments. Preserved by every rewrite.
     plugin_artifacts: tuple[dict, ...] = ()
+    # W2/Sol B9 (Task 7): observational turn-taking state. "" (default) =
+    # not interaction-required (most engagements). Interaction-required
+    # engagements start at "first_contact_required" (set by engage_executor
+    # at create — Task 8) and advance via ``advance_interaction_state``:
+    # first_contact_required -> awaiting_operator -> authorized. Never
+    # backwards; see ``_pure_interaction_transition``.
+    interaction_state: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +207,7 @@ class EngagementRegistry:
                     tools_allowed=tuple(row.get("tools_allowed") or ()),
                     permission_mode=row.get("permission_mode") or "acceptEdits",
                     plugin_artifacts=tuple(row.get("plugin_artifacts") or ()),
+                    interaction_state=row.get("interaction_state") or "",
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed engagement row: %s", exc)
@@ -255,7 +291,7 @@ class EngagementRegistry:
 
     # -- Persist helper ---------------------------------------------------
 
-    async def _write_tombstone_locked(self) -> None:
+    async def _write_tombstone_locked(self, *, strict: bool = False) -> None:
         """Caller MUST hold self._lock.
 
         Terminal records are persisted as real tombstones (D-4, v0.69.0) —
@@ -263,6 +299,13 @@ class EngagementRegistry:
         forgot recent spawns across restarts and the file never matched its
         name. Tombstones age out after ``_TERMINAL_RETENTION_DAYS`` to bound
         the file.
+
+        ``strict`` (B3, Sol r1): when True, a persistence failure PROPAGATES
+        instead of being swallowed — used only by
+        ``advance_interaction_state``, where returning the new state while the
+        authorization never reached disk lets the telegram callback commit an
+        ask that a restart would then un-authorize. All other callers keep the
+        best-effort warn-and-continue semantics (strict=False).
         """
         cutoff = time.time() - _TERMINAL_RETENTION_DAYS * 86400
         snapshot = []
@@ -291,10 +334,13 @@ class EngagementRegistry:
                 "tools_allowed": list(rec.tools_allowed),
                 "permission_mode": rec.permission_mode,
                 "plugin_artifacts": [dict(pa) for pa in rec.plugin_artifacts],
+                "interaction_state": rec.interaction_state,
             })
         try:
             await asyncio.to_thread(self._write_tombstone, snapshot)
         except Exception as exc:
+            if strict:
+                raise
             logger.warning("Failed to persist engagement tombstone: %s", exc)
 
     def _write_tombstone(self, snapshot: list[dict[str, Any]]) -> None:
@@ -315,6 +361,7 @@ class EngagementRegistry:
         tools_allowed: tuple[str, ...] | list[str] = (),
         permission_mode: str = "acceptEdits",
         plugin_artifacts: tuple[dict, ...] | list[dict] = (),
+        interaction_state: str = "",
     ) -> EngagementRecord:
         engagement_id = uuid.uuid4().hex
         now = time.time()
@@ -335,6 +382,7 @@ class EngagementRegistry:
             tools_allowed=tuple(tools_allowed),
             permission_mode=permission_mode or "acceptEdits",
             plugin_artifacts=tuple(dict(pa) for pa in plugin_artifacts),
+            interaction_state=interaction_state,
         )
         async with self._lock:
             self._records[engagement_id] = rec
@@ -482,6 +530,91 @@ class EngagementRegistry:
             if current_state_emoji is not None:
                 rec.current_state_emoji = current_state_emoji
             await self._write_tombstone_locked()
+
+    async def advance_interaction_state(
+        self, engagement_id: str, event: str,
+    ) -> str | None:
+        """W2/Sol B9 (Task 7): atomic compare-and-set on ``interaction_state``.
+
+        Read record -> compute the pure transition -> write field +
+        persist, all under ``self._lock`` so two coroutines racing the same
+        event on the same record resolve to exactly one transition (the
+        second sees the already-advanced state and gets a no-op). Returns
+        the new state, or ``None`` for an unknown engagement or a no-op
+        transition (never backwards — see ``_pure_interaction_transition``).
+        """
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return None
+            new_state = _pure_interaction_transition(rec.interaction_state, event)
+            if new_state is None:
+                return None
+            # B3 (Sol r1): persist STRICTLY and roll back on failure — the
+            # telegram callback commits the ask on a successful return, so the
+            # authorization MUST have reached disk before we report the new
+            # state. On a write failure the callback's `except` path
+            # abort_claims + "please tap again" (verified end-to-end by
+            # test_telegram_inline_callback).
+            prev_state = rec.interaction_state
+
+            async def _mutate_and_persist() -> str:
+                rec.interaction_state = new_state
+                try:
+                    await self._write_tombstone_locked(strict=True)
+                except Exception:
+                    rec.interaction_state = prev_state
+                    raise
+                return new_state
+
+            # B4 (Sol diff r2): SHIELD the mutate+persist so cancelling the
+            # CALLER (e.g. the telegram callback task) cannot tear the pair.
+            # The inner task runs to completion UNDER THE LOCK — on cancel we
+            # await it to completion BEFORE re-raising, so the durable write
+            # (and, on failure, the rollback) always finishes while we still
+            # hold the lock. Without this a CancelledError mid-``to_thread``
+            # left the request armed-then-aborted despite disk authorization
+            # (expiring ``no_answer`` on an answered ask). The callback treats
+            # a cancellation-after-authorization as committable.
+            task = asyncio.ensure_future(_mutate_and_persist())
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    # Retrieve any inner exception (already rolled back) so it
+                    # is not flagged "never retrieved"; then honor the cancel.
+                    await asyncio.gather(task, return_exceptions=True)
+                raise
+
+    async def set_interaction_violated(self, engagement_id: str) -> None:
+        """W2/Sol B9 (Task 7): flag a mutating tool-use taken while
+        ``awaiting_operator`` — ``_finalize_engagement`` reads
+        ``rec.origin.get("interaction_violated")`` to append a violation
+        line to the completion summary. Unknown engagement is a no-op
+        (matches the other mutators' tolerance for stale callers).
+
+        B3 (Sol diff r2): persist STRICTLY and roll back on failure, mirroring
+        ``advance_interaction_state``. The driver seam
+        (``claude_code_driver._on_stream_event``) only marks
+        ``_violation_flagged`` after a SUCCESSFUL return, so a swallowed write
+        failure would permanently drop the completion warning after a restart;
+        raising lets the seam retry on the next mutating-tool frame.
+        """
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            had_flag = "interaction_violated" in rec.origin
+            prev = rec.origin.get("interaction_violated")
+            rec.origin["interaction_violated"] = True
+            try:
+                await self._write_tombstone_locked(strict=True)
+            except Exception:
+                if had_flag:
+                    rec.origin["interaction_violated"] = prev
+                else:
+                    rec.origin.pop("interaction_violated", None)
+                raise
 
     async def sweep_idle_and_suspend(
         self, *, driver: Any, now_override: float | None = None,
