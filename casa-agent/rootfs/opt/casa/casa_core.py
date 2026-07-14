@@ -23,6 +23,7 @@ from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from agent_loader import load_all_agents
+from authz_grants import GRANTS
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
 from config import AgentConfig
@@ -1413,6 +1414,30 @@ async def _sweep_engagement_topics(channel_manager: Any, bus: Any) -> None:
 
 
 # ------------------------------------------------------------------
+# Authorization-grant TTL sweep (A:§3.3) — hourly, beside the engagement
+# daily sweep. GrantStore has no private loop of its own (unlike
+# session_sweeper.py, which owns one) — this scheduler job is its only
+# sweep seam.
+# ------------------------------------------------------------------
+
+
+async def _authz_grant_sweep() -> None:
+    """Drop every authorization grant past its TTL.
+
+    A grant that is never consumed (the operator never taps Approve, or
+    taps after the tool call was abandoned) would otherwise sit in
+    memory forever — GrantStore has no other reaper. Never raises: a
+    sweep failure must not kill the shared scheduler job.
+    """
+    try:
+        removed = GRANTS.sweep()
+        if removed:
+            logger.info("authz grant sweep: dropped %d expired grant(s)", removed)
+    except Exception:  # noqa: BLE001 — never kill the scheduler job
+        logger.warning("authz grant sweep failed", exc_info=True)
+
+
+# ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
 
@@ -2299,6 +2324,19 @@ async def main() -> None:
         id="engagement_idle_sweep",
         hour=8, minute=0,
         replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    # A:§3.3 — authorization-grant TTL sweep, hourly. GrantStore has no
+    # private loop of its own (unlike session_sweeper.py); this job is
+    # its only reap seam.
+    scheduler.add_job(
+        _authz_grant_sweep,
+        trigger="interval",
+        id="authz_grant_sweep",
+        hours=1,
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
         misfire_grace_time=3600,
     )
     # Plan 4a.1 §8: workspace sweeper — every 6 hours, removes terminal
