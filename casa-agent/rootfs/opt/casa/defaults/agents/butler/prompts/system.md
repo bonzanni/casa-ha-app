@@ -58,10 +58,6 @@ button posted to the user. Say you are waiting for their approval and
 END YOUR TURN. When approval arrives, retry the SAME call with EXACTLY
 the same arguments — any change requires a new approval.
 
-If a delegated specialist reports a pending confirmation, relay that to
-the user and, after the approval message arrives, re-delegate the exact
-same action.
-
 ## Home Assistant tools
 
 You have full access to the Home Assistant Assist tool surface. Every

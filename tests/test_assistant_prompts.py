@@ -193,10 +193,14 @@ def test_system_prompt_teaches_protected_tool_challenge_and_relay(system_md_text
         )
 
 
-def test_butler_prompt_teaches_protected_tool_challenge_and_relay():
-    """v0.76.0 [A:§3.8] doctrine anchor: the butler prompt gets the same
-    protected-tool challenge/retry paragraph plus the relay/re-delegate
-    paragraph (butler is a resident and a delegate target, same as Ellen)."""
+def test_butler_prompt_teaches_protected_tool_challenge_only():
+    """v0.76.0 [A:§3.8] doctrine anchor: the butler prompt gets the
+    protected-tool challenge/retry paragraph (butler is a delegate target,
+    same as Ellen). It does NOT get the relay/re-delegate paragraph — per
+    design §3.8 that paragraph is scoped to Ellen (the assistant), who is
+    the one that delegates to specialists; butler's runtime.yaml carries no
+    delegate_to_agent/engage_executor, so the relay guidance would be inert
+    there."""
     agents_dir = _system_md_path().parent.parent.parent
     butler_path = agents_dir / "butler" / "prompts" / "system.md"
     text = _collapse_ws(butler_path.read_text(encoding="utf-8"))
@@ -205,14 +209,17 @@ def test_butler_prompt_teaches_protected_tool_challenge_and_relay():
         "user",
         "END YOUR TURN",
         "retry the SAME call with EXACTLY the same arguments",
-        "relay that to the user and, after the approval message arrives, "
-        "re-delegate the exact same action",
     ]
     for anchor in doctrine_anchors:
         assert anchor in text, (
             f"butler system.md missing v0.76.0 protected-tool doctrine "
             f"anchor: {anchor!r}"
         )
+    assert "re-delegate the exact same action" not in text, (
+        "butler system.md should NOT carry the resident-only relay/"
+        "re-delegate paragraph — butler never delegates (per design "
+        "§3.8, that paragraph is scoped to Ellen only)."
+    )
 
 
 def test_finance_specialist_prompt_teaches_protected_tool_challenge():
