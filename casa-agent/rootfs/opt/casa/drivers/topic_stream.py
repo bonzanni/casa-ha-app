@@ -479,6 +479,17 @@ class TopicStreamRelay:
         self._live = True
         self._reconciled = False
         self._passed_cur_seg = False
+        # §A1(1) WARM re-entry (F-DUP): the relay object survives the driver's
+        # 0.5s poll; a CLEAN re-entry resumes IN PLACE instead of reloading the
+        # cursor, resetting turn state, replaying, and reconciling (which sealed
+        # + reposted the open narration on EVERY poll — the every-turn dup).
+        # ``_warm`` latches at clean exhaustion; ``_read_coord`` is a MEMORY-ONLY
+        # resume coordinate ({"segment": [dev, ino], "offset": N}) set for EVERY
+        # frame consumed (replay AND live) — NOT ``cursor.current`` (which sits
+        # behind a throttle-held text frame that returned without checkpointing;
+        # resuming there would re-read and duplicate the held suffix, Sol r1-1).
+        self._warm = False
+        self._read_coord: dict | None = None
 
     # -- persistence helpers ------------------------------------------------
 
@@ -995,7 +1006,33 @@ class TopicStreamRelay:
     # -- main loop ----------------------------------------------------------
 
     async def run(self) -> None:
+        """Relay the log to the topic. COLD on the first call / after any error
+        (reload the cursor, compute ``recovering``, replay from ``turn_start``,
+        reconcile on going live); WARM on a clean re-entry (resume from
+        ``_read_coord`` live — no reload, no state reset, no replay, no
+        reconcile). ``_reconcile`` is thereby confined to genuine restarts."""
+        if self._warm and self._read_coord is not None:
+            await self._run_warm()
+        else:
+            await self._run_cold()
+
+    async def _run_cold(self) -> None:
         self.cursor = StreamCursor.load(self.cursor_path)
+        # §A1 (Sol r3-3): clear a STALE ``dropped_through`` whose segment has
+        # rotated off disk. Such a phantom segment ranks at infinity in
+        # ``_seg_rank`` (:515-519), so EVERY subsequent frame compares
+        # ``<= dropped_through`` and is skipped forever — a latent permanent-mute
+        # bug. Everything the drop covered has rotated away, so drop it.
+        dt = self.cursor.dropped_through
+        if dt is not None:
+            dt_seg = tuple(dt.get("segment", (0, 0)))
+            if dt_seg != _ZERO_SEG and _find_segment(self.log_dir, dt_seg) is None:
+                logger.warning(
+                    "topic stream for engagement %s: clearing stale "
+                    "dropped_through (segment %s absent on disk)",
+                    self.engagement_id, list(dt_seg),
+                )
+                self.cursor.dropped_through = None
         cur_seg = tuple(self.cursor.current.get("segment", (0, 0)))
         recovering = (
             cur_seg != _ZERO_SEG
@@ -1006,40 +1043,110 @@ class TopicStreamRelay:
         self._reconciled = False
         self._passed_cur_seg = False
         self._reset_turn_state()
+        self._read_coord = None
+        gap_seen = False
 
-        async for seg, off_after, raw in iter_log_segments(
-            self.log_dir, self.cursor.turn_start
-        ):
-            if seg == SEGMENT_GAP:
-                logger.warning(
-                    "topic stream retention gap for engagement %s: turn_start "
-                    "segment %s absent on disk; resuming at current offset 0",
-                    self.engagement_id, self.cursor.turn_start.get("segment"),
-                )
-                # The turn's history is unrecoverable — resume fresh and live.
-                self._live = True
-                self._reconciled = True
-                self.cursor.message_ids = []
-                self.cursor.message_text_lens = []
-                self._reset_turn_state()
-                continue
-
-            # Drop-mode tail from a prior run: skip entirely (no side effects).
-            if self.cursor.dropped_through is not None and self._coord_le(
-                seg, off_after, self.cursor.dropped_through
+        try:
+            async for seg, off_after, raw in iter_log_segments(
+                self.log_dir, self.cursor.turn_start
             ):
-                continue
+                if seg == SEGMENT_GAP:
+                    logger.warning(
+                        "topic stream retention gap for engagement %s: "
+                        "turn_start segment %s absent on disk; resuming at "
+                        "current offset 0",
+                        self.engagement_id,
+                        self.cursor.turn_start.get("segment"),
+                    )
+                    # The turn's history is unrecoverable — resume fresh and
+                    # live. The sentinel NEVER becomes a coordinate: after a gap,
+                    # ``_read_coord`` is seeded only by the first REAL frame
+                    # consumed post-gap (and a gap-only run stays cold).
+                    self._live = True
+                    self._reconciled = True
+                    self.cursor.message_ids = []
+                    self.cursor.message_text_lens = []
+                    self._reset_turn_state()
+                    gap_seen = True
+                    continue
 
-            was_live = self._live
-            self._update_live(seg, off_after)
-            if self._live and not was_live and not self._reconciled:
+                # The warm resume coordinate: set for EVERY real frame consumed
+                # (replay AND live) BEFORE dispatch (Sol r1-1 / r2-1b).
+                self._read_coord = {"segment": list(seg), "offset": off_after}
+
+                # Drop-mode tail from a prior run: skip entirely (no side
+                # effects) but still advance ``_read_coord`` past it.
+                if self.cursor.dropped_through is not None and self._coord_le(
+                    seg, off_after, self.cursor.dropped_through
+                ):
+                    continue
+
+                was_live = self._live
+                self._update_live(seg, off_after)
+                if self._live and not was_live and not self._reconciled:
+                    await self._reconcile()
+
+                await self._handle_frame(seg, off_after, raw)
+
+            # Stream ended while still replaying an open turn — reconcile now.
+            if recovering and not self._reconciled:
                 await self._reconcile()
+        except BaseException:
+            # Any error escaping the loop invalidates the warm latch so the
+            # driver's retry does a full cold recovery (reconcile stays
+            # restart-only).
+            self._warm = False
+            raise
 
-            await self._handle_frame(seg, off_after, raw)
+        self._latch_warm(gap_seen)
 
-        # Stream ended while still replaying an open turn — reconcile now.
-        if recovering and not self._reconciled:
-            await self._reconcile()
+    def _latch_warm(self, gap_seen: bool) -> None:
+        """Latch WARM re-entry at clean exhaustion when the resume coordinate is
+        valid (§A1(1), Sol r3-3). ``_read_coord`` is non-``None`` iff at least
+        one real frame was consumed; when ZERO frames were consumed it may be
+        seeded from ``cursor.current`` ONLY at a closed-turn boundary
+        (``message_ids == []`` — memory-empty matches disk) and only when no
+        retention gap intervened. A zero-frame run over an OPEN turn — or any
+        gap-only run — does NOT latch; the next poll runs cold again."""
+        if self._read_coord is not None:
+            self._warm = True
+            return
+        if not gap_seen and not self.cursor.message_ids:
+            self._read_coord = dict(self.cursor.current)
+            self._warm = True
+
+    async def _run_warm(self) -> None:
+        """Resume IN PLACE from ``_read_coord``: no cursor reload, no turn-state
+        reset, live from the first frame, no replay, no reconcile (§A1(1))."""
+        self._reconciled = True  # warm never reconciles
+        self._live = True
+        try:
+            async for seg, off_after, raw in iter_log_segments(
+                self.log_dir, self._read_coord
+            ):
+                if seg == SEGMENT_GAP:
+                    # The resume segment rotated off disk between polls (rare):
+                    # drop the warm latch and let the next poll cold-recover
+                    # from ``turn_start`` (the sentinel never becomes a coord).
+                    logger.warning(
+                        "topic stream for engagement %s: retention gap on warm "
+                        "resume; falling back to cold recovery",
+                        self.engagement_id,
+                    )
+                    self._warm = False
+                    return
+
+                self._read_coord = {"segment": list(seg), "offset": off_after}
+
+                if self.cursor.dropped_through is not None and self._coord_le(
+                    seg, off_after, self.cursor.dropped_through
+                ):
+                    continue
+
+                await self._handle_frame(seg, off_after, raw)
+        except BaseException:
+            self._warm = False
+            raise
 
     async def _handle_frame(self, seg, off_after: int, raw: bytes) -> None:
         frame = parse_frame(raw)
