@@ -167,6 +167,7 @@ async def main():
     # Synthetic Telegram update: user message in the topic.
     update = SimpleNamespace(
         message=SimpleNamespace(
+            message_id=90001,
             chat=SimpleNamespace(id=supergroup),
             message_thread_id=tid,
             text="hello from user",
@@ -337,6 +338,7 @@ async def main():
 
     update = SimpleNamespace(
         message=SimpleNamespace(
+            message_id=90001,
             chat=SimpleNamespace(id=supergroup),
             message_thread_id=tid, text="/cancel",
             from_user=SimpleNamespace(id=7777),
@@ -399,6 +401,7 @@ async def main():
 
     update = SimpleNamespace(
         message=SimpleNamespace(
+            message_id=90001,
             chat=SimpleNamespace(id=supergroup),
             message_thread_id=tid, text="/silent",
             from_user=SimpleNamespace(id=7777),
@@ -526,6 +529,7 @@ async def main():
     # User turn arrives — handle_update should resume + forward the turn.
     update = SimpleNamespace(
         message=SimpleNamespace(
+            message_id=90001,
             chat=SimpleNamespace(id=supergroup),
             message_thread_id=tid, text="are you there?",
             from_user=SimpleNamespace(id=7777),
@@ -742,6 +746,7 @@ async def main():
     # 7. User approval message arrives in the topic — routed to driver.
     update = SimpleNamespace(
         message=SimpleNamespace(
+            message_id=90001,
             chat=SimpleNamespace(id=supergroup),
             message_thread_id=tid, text="yes do it",
             from_user=SimpleNamespace(id=7777),
