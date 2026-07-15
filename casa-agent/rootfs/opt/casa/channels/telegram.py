@@ -1402,9 +1402,8 @@ class TelegramChannel(Channel):
             await self._rollback_answer(rec, answer_token)
             raise
         except Exception as exc:  # noqa: BLE001
-            # The enqueue raised (never durably spooled) — roll the reservation
-            # back so the answer-lifecycle isn't left falsely promoted.
-            await self._rollback_answer(rec, answer_token)
+            # The enqueue raised (never durably spooled) — the reservation must
+            # roll back so the answer-lifecycle isn't left falsely promoted.
             latest = (
                 self._engagement_registry.get(rec.id)
                 if self._engagement_registry is not None else None
@@ -1412,6 +1411,7 @@ class TelegramChannel(Channel):
             if latest is not None and latest.status in (
                 "completed", "cancelled", "error",
             ):
+                await self._rollback_answer(rec, answer_token)
                 logger.info(
                     "turn delivery ended by finalize for %s: %s",
                     rec.id[:8], exc,
@@ -1424,6 +1424,10 @@ class TelegramChannel(Channel):
                 await self._post_engagement_notice(rec, f"Turn failed: {exc}")
             except Exception:  # noqa: BLE001 — best-effort user notice
                 pass
+            # Sol r12-1: rollback AFTER the platform notice — the rollback
+            # consumer re-anchors the question, and the re-posted question must
+            # land BELOW the notice (last item), never above it.
+            await self._rollback_answer(rec, answer_token)
             return
         # §A3: a durable-enqueue REJECTION (capacity drop / spool-write error)
         # rolls the reservation back; an accepted enqueue already promoted it.

@@ -774,17 +774,19 @@ class TestFourthConsumerReanchorMatrix:
         await ch.handle_update(u)
         await _drain_turns(ch)
 
-        # The rollback consumer REALLY re-anchors (markup re-post), and the entry
-        # tracks the re-posted copy — the vacuous seq-is-None path is gone. NOTE:
-        # ``_deliver_turn_bg`` rolls back (→ re-anchor) BEFORE it posts the
-        # "Turn failed" notice, so the informational failure notice legitimately
-        # follows the re-posted question here (telegram.py ordering, out of scope
-        # for this wave); we assert the re-anchor occurred + tracks, not strict
-        # last-ness.
+        # Sol r12-1 (fixed in telegram.py): ``_deliver_turn_bg`` posts the
+        # "Turn failed" notice FIRST and only then rolls back — so the rollback
+        # consumer's re-posted question is the strictly LAST wire message,
+        # below the notice.
         reanchor = [(k, mid) for k, mid, _ in wire.posts if k == "markup"]
         assert reanchor, "the rollback consumer did not re-anchor"
         reanchor_mid = reanchor[-1][1]
         assert any(k == "text" and "Turn failed" in t for k, _, t in wire.posts)
+        assert wire.posts[-1][0] == "markup", (
+            "the re-anchored question must be the LAST wire message "
+            f"(got trailing {wire.posts[-1]!r})"
+        )
+        assert wire.posts[-1][1] == reanchor_mid
         assert _entry(reg, rec, n)["tg_message_id"] == reanchor_mid
         assert _entry(reg, rec, n).get("answered") is False
 
