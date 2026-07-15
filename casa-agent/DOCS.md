@@ -64,6 +64,9 @@ setting by hand:
 | `webhook_secret` | HMAC-SHA256 secret for authenticating webhook requests. Leave empty to skip verification. |
 | `engagement_reap_days` | Auto-close engagements after this many days without activity (daily sweep cancels them and closes their Telegram topic; the engaging agent is notified). Set `0` to disable. Default: `7`. |
 | `log_level` | Log verbosity: `debug`, `info`, `warning`, or `error`. Default: `info`. Flip to `debug` for verbose troubleshooting without rebuilding the image. |
+| `voice_turn_budget_seconds` | Max seconds a synchronous specialist delegation may run during one voice turn (see [Voice pipeline](#voice-pipeline)). Range 10-27; hard-capped at 27 regardless of this value. Default: `27`. |
+| `specialist_max_concurrency` | Max specialist delegations in flight fleet-wide at once (see [Delegation limits](#delegation-limits)). Range 1-20. Default: `2`. |
+| `specialist_cost_alert_threshold` | Cumulative per-specialist USD spend past which Casa logs a warning on further delegations (see [Delegation limits](#delegation-limits)). Default: `5.0`. |
 
 ## How it works
 
@@ -124,6 +127,12 @@ Toggle the transports via environment variables on the app:
 | `VOICE_WS_PATH`     | `/api/converse/ws` | Override WS path |
 | `VOICE_IDLE_TIMEOUT_SECONDS` | (butler.session.idle_timeout, 300) | Session pool eviction timeout |
 
+A synchronous specialist delegation started mid-voice-turn (`delegate_to_agent`
+from the voice butler) is bounded by the `voice_turn_budget_seconds` app
+option (default 27) so it always leaves room for the voice transport's own
+30s timeout — the effective budget is hard-capped at 27 seconds no matter
+how high the option is set.
+
 Per-agent voice config (`butler.yaml`):
 
 ```yaml
@@ -179,6 +188,22 @@ The setup is a one-time Telegram configuration. Skip this section to
 keep Casa running in 1:1-only mode (Ellen delegates synchronously and
 returns a single response; `delegate_to_agent(mode="interactive")`
 will return `engagement_not_configured`).
+
+### Delegation limits
+
+Every `delegate_to_agent` call, interactive or synchronous, is bounded by
+two app options:
+
+- `specialist_max_concurrency` (default `2`) — the total number of
+  specialist delegations allowed in flight fleet-wide at once. Once the cap
+  is reached, further delegation attempts are denied as "busy" until a slot
+  frees up. A given calling scope (one voice session or chat) may also only
+  have one active delegation to the same specialist at a time — that
+  per-scope cap is fixed at 1 and is not configurable.
+- `specialist_cost_alert_threshold` (default `5.0`, in USD) — once a
+  specialist's cumulative delegated spend passes this figure, every further
+  delegation to it logs an operator-visible warning (spend is not blocked,
+  only flagged).
 
 ### Setup
 
