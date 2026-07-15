@@ -535,6 +535,19 @@ class TopicStreamRelay:
         st = tuple(seg)
         if st == tseg:
             return off_after <= toff
+        # §A1(3) comparison-level absence rule (Sol A1 review): when the target's
+        # segment is NOT the frame's segment AND the target segment is absent from
+        # disk (``_seg_rank`` == the sentinel), its data is gone — no readable
+        # frame can be ``<=`` it, so never mute. This replaces the racy cold-start
+        # ``dropped_through`` clear: it fixes the WARM path too (a live marker
+        # whose segment rotates out mid-run no longer rank-infinity-mutes every
+        # frame) and never mutates persisted state from a scan. Accepted rare
+        # residual: during a rotation race a transient ``_ordered_segments`` miss
+        # lets at most the frames read in that window through (one stray message
+        # class) — preferred over permanently muting the relay or clearing a live
+        # marker.
+        if self._seg_rank(tseg) == (1 << 30):
+            return False
         return self._seg_rank(st) < self._seg_rank(tseg)
 
     def _update_live(self, seg, off_after: int) -> None:
@@ -640,10 +653,32 @@ class TopicStreamRelay:
                     )
                     if applied:
                         # Adopt the delta message exactly like ``_execute_ops``'
-                        # sealed branch: the new message carries ONLY ``pending``;
-                        # the visible prefix stays in the now-sealed prior message.
-                        self.cursor.message_ids = [mid]
-                        self.cursor.message_text_lens = [len(pending)]
+                        # sealed branch, which APPENDS — the state must stay
+                        # REPLAY-CONVERGENT because ``turn_start`` still covers the
+                        # FULL turn (a cold restart re-reads and reconstructs the
+                        # WHOLE narration, then re-splits it at ``message_text_lens``
+                        # boundaries). FREEZE the old current message's boundary at
+                        # the WIRE truth (its visible prefix == ``last_posted_len``)
+                        # and APPEND the delta message carrying ONLY ``pending``.
+                        # On the next restart the trailing slice re-derives EXACTLY
+                        # ``pending`` and the persisted ``last_posted_len ==
+                        # len(pending)`` makes that restart's pending empty (posts
+                        # NOTHING) — so successive restarts converge instead of
+                        # re-posting overlapping fragments forever. (Replacing the
+                        # boundaries here, as the pre-fix code did, left
+                        # ``turn_start`` covering the full turn but the boundaries
+                        # sized to the delta, so replay mis-split the reconstructed
+                        # text and the next reconcile re-posted a shifted overlap.)
+                        lens = self.cursor.message_text_lens
+                        ids = self.cursor.message_ids
+                        if len(lens) > len(ids):
+                            del lens[len(ids):]
+                        while len(lens) < len(ids):
+                            lens.append(0)
+                        if ids:
+                            lens[-1] = self.cursor.last_posted_len
+                        self.cursor.message_ids.append(mid)
+                        self.cursor.message_text_lens.append(len(pending))
                         self._per_message_text = pending
                         self._posted_len = len(pending)
                         self.cursor.last_posted_len = len(pending)
@@ -1018,21 +1053,16 @@ class TopicStreamRelay:
 
     async def _run_cold(self) -> None:
         self.cursor = StreamCursor.load(self.cursor_path)
-        # §A1 (Sol r3-3): clear a STALE ``dropped_through`` whose segment has
-        # rotated off disk. Such a phantom segment ranks at infinity in
-        # ``_seg_rank`` (:515-519), so EVERY subsequent frame compares
-        # ``<= dropped_through`` and is skipped forever — a latent permanent-mute
-        # bug. Everything the drop covered has rotated away, so drop it.
-        dt = self.cursor.dropped_through
-        if dt is not None:
-            dt_seg = tuple(dt.get("segment", (0, 0)))
-            if dt_seg != _ZERO_SEG and _find_segment(self.log_dir, dt_seg) is None:
-                logger.warning(
-                    "topic stream for engagement %s: clearing stale "
-                    "dropped_through (segment %s absent on disk)",
-                    self.engagement_id, list(dt_seg),
-                )
-                self.cursor.dropped_through = None
+        # §A1(3) (Sol A1 review): a STALE ``dropped_through`` whose segment has
+        # rotated off disk is NO LONGER cleared here. The prior cold-start clear
+        # (a) never helped the WARM path (a live marker whose segment rotated out
+        # while warm still rank-infinity-muted everything) and (b) had a TOCTOU —
+        # ``_ordered_segments`` can transiently miss a segment mid-rotation, so the
+        # clear could erase a LIVE marker and let deliberately-dropped bytes
+        # reconcile back onto the wire. The permanent-mute bug is instead handled
+        # at comparison level in ``_coord_le`` (an absent target segment is never
+        # ``>=`` a readable frame), which fixes both paths without mutating
+        # persisted state from a racy scan.
         cur_seg = tuple(self.cursor.current.get("segment", (0, 0)))
         recovering = (
             cur_seg != _ZERO_SEG

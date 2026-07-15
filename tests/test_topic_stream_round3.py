@@ -82,12 +82,67 @@ async def test_cold_reconcile_sealed_posts_only_unposted_tail(tmp_path):
     # ONLY the unposted tail "world" is reposted — never the visible "hello ".
     assert rec.sends == [(42, "world")]
     assert all(mid != 7 for _t, mid, _x in rec.edits)  # never edits below-content id
-    # Adopt the delta message per spec §A1(2) (mid 1 = the reposted "world").
-    assert relay.cursor.message_ids == [1]
-    assert relay.cursor.message_text_lens == [len("world")]
+    # §A1(2) REPLAY-CONVERGENT adoption (Sol A1 review): APPEND the delta message
+    # (mirroring ``_execute_ops``' sealed branch) and FREEZE the old current
+    # message's boundary at the wire truth (``last_posted_len`` == len("hello ")).
+    # ``turn_start`` still covers the full turn, so the persisted boundaries must
+    # re-split the reconstructed "hello world" as ["hello ", "world"].
+    assert relay.cursor.message_ids == [7, 1]  # old sealed msg + delta msg
+    assert relay.cursor.message_text_lens == [len("hello "), len("world")]
     assert relay.cursor.last_posted_len == len("world")
     assert relay._posted_len == len("world")
     assert relay._per_message_text == "world"
+
+
+async def test_cold_reconcile_delta_converges_across_restarts(tmp_path):
+    """§A1(2) BLOCKER (Sol A1 review): the delta repost must persist REPLAY-
+    CONVERGENT state. ``turn_start`` still covers the FULL turn, so every cold
+    restart re-reads and reconstructs the WHOLE narration and re-splits it at the
+    persisted ``message_text_lens``. After the FIRST delta repost, a SECOND fresh
+    relay over the SAME on-disk log+cursor must reconstruct ``_per_message_text ==
+    pending`` and reconcile NOTHING (empty slice / no-op edit) — and a THIRD
+    restart likewise. Pre-fix (boundaries REPLACED, turn_start unchanged) the
+    reconstructed text mis-split and successive restarts re-posted overlapping
+    fragments ("world", " world", …)."""
+    rec, events = Recorder(), []
+    offs = _write_current(tmp_path, [
+        _init(), _text("hello "), _text("world"), _reply_tool_frame("R"),
+    ])
+    cur_path = tmp_path / ".stream_cursor.json"
+    seg = _ident(os.path.join(str(tmp_path), "current"))
+    StreamCursor(
+        turn_start={"segment": seg, "offset": 0},
+        current={"segment": seg, "offset": offs[-1]},
+        message_ids=[7],
+        last_posted_len=len("hello "),
+    ).save(cur_path)
+
+    # FIRST restart: posts only the unposted "world" delta and saves convergent
+    # boundaries.
+    r1 = _make_relay(tmp_path, cur_path, rec, events)
+    await r1.run()
+    assert [t for _tp, t in rec.sends] == ["world"]
+    assert r1.cursor.message_ids == [7, 1]
+    assert r1.cursor.message_text_lens == [len("hello "), len("world")]
+    # _sync_last_len interaction: it retargets ONLY the LAST entry, so the frozen
+    # prefix boundary survives a subsequent live-path normalization.
+    r1._sync_last_len()
+    assert r1.cursor.message_text_lens[0] == len("hello ")
+
+    # SECOND restart: fresh relay + sequencer over the same on-disk state. Replay
+    # reconstructs "hello world", re-splits it at [6, 5] → _per_message_text ==
+    # "world", and reconcile posts NOTHING (pending empty).
+    rec2, events2 = Recorder(), []
+    r2 = _make_relay(tmp_path, cur_path, rec2, events2)
+    await r2.run()
+    assert rec2.sends == []
+    assert r2._per_message_text == "world"
+    assert all(mid != 7 for _t, mid, _x in rec2.edits)
+
+    # THIRD restart for good measure: still converged, still posts nothing.
+    rec3, events3 = Recorder(), []
+    await _make_relay(tmp_path, cur_path, rec3, events3).run()
+    assert rec3.sends == []
 
 
 async def test_cold_reconcile_no_repost_when_fully_posted(tmp_path):
@@ -203,19 +258,29 @@ async def test_warm_reentry_seal_then_new_frame_posts_only_delta(tmp_path):
 
 
 async def test_warm_reentry_pure_poll_posts_nothing(tmp_path):
-    """§A1 RED 2: a pure poll tick (warm re-entry with NO new frames) performs
-    zero sends and zero edits."""
+    """§A1 RED 2 (Sol A1 review — discriminating form): narration is SEALED via a
+    discrete post through the SHARED sequencer BEFORE the pure poll, so the test
+    actually exercises the warm-vs-cold difference. A per-poll cold reconcile
+    would repost the whole sealed narration on this tick; warm re-entry (no
+    replay, no reconcile) must post NOTHING. The prior form never sealed, so even
+    a cold per-poll reconcile passed it via the identical-edit no-op gate."""
     rec, events = Recorder(), []
     _write_current(tmp_path, [_init(), _text("streaming body")])
     cur_path = tmp_path / ".stream_cursor.json"
     relay = _make_relay(tmp_path, cur_path, rec, events)
     await relay.run()
     assert relay._warm is True
+    assert [t for _tp, t in rec.sends] == ["streaming body"]
+
+    # SEAL the open narration with a discrete post through the shared sequencer.
+    notice_id = await relay.sequencer.post_platform_notice("[notice]")
+    assert notice_id is not None
     before = (list(rec.sends), list(rec.edits))
 
-    await relay.run()  # pure poll — nothing new on disk
+    await relay.run()  # pure poll — nothing new on disk, narration now sealed
 
-    assert (rec.sends, rec.edits) == before
+    assert (rec.sends, rec.edits) == before  # zero new sends/edits
+    assert relay._warm is True
 
 
 async def test_warm_reentry_inbound_seal_no_repost(tmp_path):
@@ -358,11 +423,13 @@ async def test_gap_only_run_stays_cold(tmp_path):
     assert relay._read_coord is None
 
 
-async def test_stale_dropped_through_cleared_frames_flow(tmp_path):
-    """§A1 RED 7 (Sol r3-3): a persisted ``dropped_through`` whose segment has
-    rotated off disk ranks at infinity in ``_seg_rank`` → every future frame
-    compares ``<= dropped_through`` and is skipped forever. Cold start must CLEAR
-    the stale entry so frames flow again."""
+async def test_absent_dropped_through_frames_flow_marker_preserved(tmp_path):
+    """§A1(3) test (i) (Sol A1 review): a persisted ``dropped_through`` whose
+    segment has rotated off disk ranks at infinity in ``_seg_rank``. The
+    comparison-level absence rule in ``_coord_le`` returns False for such an
+    absent target, so frames flow again — WITHOUT clearing the marker (the prior
+    cold-start clear was racy and could erase a LIVE marker). The marker is
+    PRESERVED, not mutated by a scan."""
     rec, events = Recorder(), []
     _write_current(tmp_path, [_init(), _text("flowing"), _result()])
     cur_path = tmp_path / ".stream_cursor.json"
@@ -376,8 +443,55 @@ async def test_stale_dropped_through_cleared_frames_flow(tmp_path):
     relay = _make_relay(tmp_path, cur_path, rec, events)
     await relay.run()
 
-    assert relay.cursor.dropped_through is None
+    assert relay.cursor.dropped_through is not None  # PRESERVED, never cleared
     assert [t for _tp, t in rec.sends] == ["flowing"]
+
+
+async def test_present_dropped_through_still_honors_skip(tmp_path):
+    """§A1(3) test (ii) (Sol A1 review): when the ``dropped_through`` marker's
+    segment IS present on disk, the drop-tail skip is honored exactly as before
+    (existing behavior). A whole-turn drop marker at the terminal coordinate
+    suppresses re-post of every covered frame."""
+    rec, events = Recorder(), []
+    offs = _write_current(tmp_path, [_init(), _text("dropped"), _result()])
+    cur_path = tmp_path / ".stream_cursor.json"
+    seg = _ident(os.path.join(str(tmp_path), "current"))
+    StreamCursor(
+        turn_start={"segment": seg, "offset": 0},
+        current={"segment": seg, "offset": offs[-1]},
+        message_ids=[],
+        dropped_through={"segment": seg, "offset": offs[-1]},  # present, terminal
+    ).save(cur_path)
+    await _make_relay(tmp_path, cur_path, rec, events).run()
+
+    assert rec.sends == []  # covered frames stay dropped
+    assert rec.edits == []
+
+
+async def test_warm_aging_marker_segment_removed_frames_flow(tmp_path):
+    """§A1(3) test (iii) (Sol A1 review) — the WARM-path fix. The relay goes warm
+    with a LIVE ``dropped_through`` marker; the marker's segment is then removed
+    from disk (rotated out) while warm. The next warm poll's new frames must still
+    flow. Pre-fix, the warm path's ``_coord_le`` ranked the now-absent marker
+    segment at infinity and muted EVERY subsequent frame forever."""
+    rec, events = Recorder(), []
+    _write_current(tmp_path, [_init(), _text("A")])
+    cur_path = tmp_path / ".stream_cursor.json"
+    relay = _make_relay(tmp_path, cur_path, rec, events)
+    await relay.run()  # cold → posts "A", latches warm
+    assert relay._warm is True
+    assert [t for _tp, t in rec.sends] == ["A"]
+
+    # A live marker whose segment then rotates off disk while warm (modeled by a
+    # phantom absent segment): the resume coordinate stays on the present current
+    # segment, but the marker segment is gone.
+    relay.cursor.dropped_through = {"segment": [1234, 999999999], "offset": 0}
+
+    _append_current(tmp_path, [_text("B")])
+    await relay.run()  # WARM poll — the absent marker must NOT mute "B"
+
+    assert relay._per_message_text == "AB"  # "B" flowed (edit), not muted
+    assert rec.edits[-1] == (42, 1, "AB")
 
 
 async def test_warm_throttled_hold_flushes_no_reread_duplication(tmp_path):
