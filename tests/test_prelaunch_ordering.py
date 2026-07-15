@@ -58,7 +58,7 @@ class TestPrelaunchOrdering:
             },
         )
 
-        async def _fake_run(cfg, task_text, context_text):
+        async def _fake_run(cfg, task_text, context_text, resolution=None):
             trace.append("task")
             return "ok"
 

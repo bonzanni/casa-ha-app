@@ -23,6 +23,7 @@ from config import (
     ExecutorMemoryConfig,
     HooksConfig,
     MemoryConfig,
+    RequiresConfig,
     ResponseShapeConfig,
     SessionConfig,
     ToolsConfig,
@@ -701,6 +702,15 @@ def _build_runtime_fields(
     cfg.voice_errors = dict(runtime.get("voice_errors") or {})
     cfg.channels = list(runtime.get("channels") or [])
     cfg.cwd = runtime.get("cwd", "") or ""
+
+    # requires (spec A5): fail-closed launch dependencies. Absent/empty
+    # block -> RequiresConfig() default (both fields empty), which skips
+    # the _prelaunch requires gate entirely.
+    req = runtime.get("requires") or {}
+    cfg.requires = RequiresConfig(
+        plugins=list(req.get("plugins") or []),
+        tools=list(req.get("tools") or []),
+    )
 
 
 # --- Prompt composer -------------------------------------------------------

@@ -73,6 +73,47 @@ def grants_for_resolution(res) -> list[str]:
     return sorted(out)
 
 
+def declared_tools_for_resolution(res) -> set[str]:
+    """Union of manifest-declared tool-level names for every resolved
+    plugin (spec A5). ``grants_for_resolution`` is SERVER-level
+    (``mcp__plugin_mtg_mtg``) — a ``requires.tools`` entry is TOOL-level
+    (``mcp__plugin_mtg_mtg__lookup_rule``), so it must be checked against
+    a manifest-declared inventory instead, never against server grants
+    directly. Each plugin declares its own tools via
+    ``casa.provides_tools: list[str]`` in its manifest — no "observe from
+    grants" bootstrap; WS-B's plugin.json ships the names verbatim.
+
+    FAIL CLOSED on malformed metadata (r1-review): a non-dict ``manifest``,
+    a non-dict ``casa``, or a ``provides_tools`` that is not a list all
+    contribute NOTHING, and only non-empty ``str`` entries survive from a
+    valid list. This is deliberate — a dict ``provides_tools`` would
+    otherwise leak its KEYS (a malformed manifest could then satisfy a tool
+    requirement), and a non-list would raise a ``TypeError`` that escapes
+    ``_prelaunch`` instead of denying with ``dependency_unavailable``.
+    Malformed metadata degrades to "no declared tools", which makes the
+    requirement unmet → ``dependency_unavailable`` (same never-raise
+    contract as the other grant helpers in this module)."""
+    out: set[str] = set()
+    for rp in getattr(res, "plugins", None) or []:
+        manifest = getattr(rp, "manifest", None)
+        if not isinstance(manifest, dict):
+            continue
+        casa = manifest.get("casa")
+        if not isinstance(casa, dict):
+            continue
+        provided = casa.get("provides_tools")
+        if not isinstance(provided, list):
+            if provided is not None:
+                logger.debug(
+                    "declared_tools_for_resolution: %s casa.provides_tools is "
+                    "%s not a list — contributing nothing",
+                    getattr(rp, "name", "?"), type(provided).__name__,
+                )
+            continue
+        out.update(t for t in provided if isinstance(t, str) and t)
+    return out
+
+
 def required_env_vars_for_resolved(rp) -> list[str]:
     """Skill-only plugins (no .mcp.json) require nothing; malformed JSON
     degrades to [] at DEBUG — same never-raise contract as grants."""

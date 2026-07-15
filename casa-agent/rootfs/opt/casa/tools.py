@@ -28,8 +28,9 @@ from system_requirements.manifest import (
 import plugin_registry
 import plugin_store
 from plugin_grants import (
-    grants_for_resolution, grants_for_resolved, make_fail_closed_can_use_tool,
-    mcp_json_malformed, required_env_vars_for_resolved,
+    declared_tools_for_resolution, grants_for_resolution, grants_for_resolved,
+    make_fail_closed_can_use_tool, mcp_json_malformed,
+    required_env_vars_for_resolved,
 )
 from authz_grants import CHALLENGES, GRANTS, normalize_role
 from delegated_memory import delegated_recall, retain_delegated
@@ -1071,8 +1072,18 @@ def _build_world_state_summary() -> str:
 _specialist_bg_tasks: set[asyncio.Task[Any]] = set()
 
 
-async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
-    """Run one ephemeral delegated turn and return the concatenated text."""
+async def _run_delegated_agent(
+    cfg, task_text: str, context_text: str, resolution=None,
+) -> str:
+    """Run one ephemeral delegated turn and return the concatenated text.
+
+    ``resolution`` (spec A5): when the caller's requires gate already
+    resolved this agent's plugins, that SAME ``ResolutionResult`` is
+    passed through to ``_build_specialist_options`` — no second resolve,
+    so the gate's decision and what actually launches can never drift.
+    ``None`` (the common no-``requires`` case) lets the options builder
+    resolve fresh, exactly as before Task 5.
+    """
     import agent as agent_mod
     # AR-2: snapshot BEFORE any await — this coroutine outlives the parent
     # turn (async delegations especially), and a pooled client's origin_var
@@ -1142,7 +1153,8 @@ async def _run_delegated_agent(cfg, task_text: str, context_text: str) -> str:
     # window is transient and self-healing (the next delegation resolves the new
     # artifact); the PERSISTENT stale-binding incident is fully closed. Tracked
     # for a future live-binding registry (docs/ROADMAP-backlog.md).
-    options = await asyncio.to_thread(_build_specialist_options, cfg)
+    options = await asyncio.to_thread(
+        _build_specialist_options, cfg, resolution=resolution)
     text = ""
     token = agent_mod.origin_var.set(child_origin)
     try:
@@ -1246,7 +1258,7 @@ async def _prelaunch(
 
         ACL (Task 1) -> not-initialized -> depth cap -> mode gate ->
         target resolution -> resident-interactive-compat ->
-        requires (Task 5 seam) -> progress -> launch
+        requires (Task 5) -> progress -> launch
 
     The mode gate deliberately precedes both target resolution AND the
     resident-interactive-compat check: on voice, async/interactive must
@@ -1259,8 +1271,14 @@ async def _prelaunch(
     - ``error`` is a terminal tool-result dict the caller returns
       immediately when a gate denies; ``cfg``/``resolution`` are ``None``.
     - On success ``error`` is ``None``, ``cfg`` is the resolved target
-      config, and ``resolution`` is the Task 5/6 requires/concurrency
-      insertion seam (unpopulated in this task).
+      config, and ``resolution`` is the plugin ResolutionResult the
+      requires gate (spec A5) resolved for ``agent_name`` — ``None`` when
+      ``cfg.requires`` is empty (gate skipped, no resolve performed).
+      Callers with a non-``None`` resolution MUST reuse it verbatim
+      (``_build_specialist_options(cfg, resolution=resolution)`` and the
+      interactive engagement-record binding) rather than re-resolving, so
+      the gate's decision and what actually launches never drift (Task 6
+      concurrency seam reuses the same value).
     """
     channel = str((origin or {}).get("channel", ""))
 
@@ -1351,8 +1369,40 @@ async def _prelaunch(
             ),
         })
 
-    # resolution populated by the requires gate (Task 5)
+    # A5 requires gate: a delegated agent that declares `requires:` refuses
+    # to launch (typed `dependency_unavailable`) unless its required
+    # plugins/tools are ACTUALLY resolved for its own tier:role target —
+    # never "assume model memory has the tool". Skipped entirely (resolution
+    # stays None) when `cfg.requires` is empty, so a delegate with no
+    # requires: block behaves exactly as before Task 5. `grants_for_resolution`
+    # is SERVER-level (`mcp__plugin_mtg_mtg`), so a tool-level requirement is
+    # checked against `declared_tools_for_resolution` (manifest
+    # `casa.provides_tools`) AND, for the server prefix, the actual grant —
+    # both must hold for the tool to be genuinely usable.
     resolution = None
+    req = getattr(cfg, "requires", None)
+    if req is not None and (req.plugins or req.tools):
+        tier = (_agent_registry.tier_for_role(agent_name)
+                if _agent_registry is not None else None) or "specialist"
+        resolution = await asyncio.to_thread(
+            plugin_registry.resolve_for, f"{tier}:{agent_name}")
+        names = {rp.name for rp in resolution.plugins}
+        declared = declared_tools_for_resolution(resolution)
+        servers = set(grants_for_resolution(resolution))  # server actually attached
+        missing_plugins = [p for p in req.plugins if p not in names]
+        missing_tools = [
+            t for t in req.tools
+            if t not in declared or t.rsplit("__", 1)[0] not in servers
+        ]
+        if missing_plugins or missing_tools or not resolution.registry_valid:
+            return None, None, _result({
+                "status": "error", "kind": "dependency_unavailable",
+                "agent": agent_name,
+                "missing_plugins": missing_plugins,
+                "missing_tools": missing_tools,
+                "registry_valid": resolution.registry_valid,
+                "message": f"Agent {agent_name!r} launch deps unavailable.",
+            })
 
     # A4 progress: speak a deterministic "still working" block AFTER every
     # gate above has passed, immediately before the launch side effects —
@@ -1548,9 +1598,18 @@ async def delegate_to_agent(args: dict) -> dict:
         # Sol round-3 H7b: resolve ONCE and feed the SAME result to both the
         # engagement record and the options builder, so a concurrent update can't
         # make the recorded binding disagree with what actually launches.
-        _spec_tier = (_agent_registry.tier_for_role(agent_name)
-                      if _agent_registry is not None else None) or "specialist"
-        _spec_res = plugin_registry.resolve_for(f"{_spec_tier}:{agent_name}")
+        # A5: when the requires gate (Task 5) already resolved this agent's
+        # plugins (non-empty `cfg.requires`), reuse that SAME ResolutionResult
+        # instead of resolving again — the engagement record's binding must
+        # never disagree with what the requires gate actually validated.
+        # `resolution` (from `_prelaunch`) is None whenever `cfg.requires` is
+        # empty, in which case this resolves fresh exactly as before Task 5.
+        if resolution is not None:
+            _spec_res = resolution
+        else:
+            _spec_tier = (_agent_registry.tier_for_role(agent_name)
+                          if _agent_registry is not None else None) or "specialist"
+            _spec_res = plugin_registry.resolve_for(f"{_spec_tier}:{agent_name}")
         _spec_arts = tuple(
             {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
             for rp in _spec_res.plugins)
@@ -1662,7 +1721,8 @@ async def delegate_to_agent(args: dict) -> dict:
             )
             return _deadline_exceeded_result(delegation_id, agent_name)
 
-    task = asyncio.create_task(_run_delegated_agent(cfg, task_text, context_text))
+    task = asyncio.create_task(
+        _run_delegated_agent(cfg, task_text, context_text, resolution=resolution))
 
     if mode == "async":
         _attach_completion_callback(task, record)

@@ -121,7 +121,7 @@ class TestVoiceModes:
 
         tm, reg = _init_tools_for_voice()
 
-        async def _fake_run(cfg, task_text, context_text):
+        async def _fake_run(cfg, task_text, context_text, resolution=None):
             return "ok"
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _fake_run)
@@ -198,7 +198,7 @@ class TestVoiceDeadline:
 
         launched = False
 
-        async def _run(cfg, task_text, context_text):
+        async def _run(cfg, task_text, context_text, resolution=None):
             nonlocal launched
             launched = True
             return "should never run"
@@ -237,7 +237,7 @@ class TestVoiceDeadline:
 
         tm, reg = _init_tools_for_voice()
 
-        async def _instant(cfg, task_text, context_text):
+        async def _instant(cfg, task_text, context_text, resolution=None):
             return "done instantly"
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _instant)
@@ -269,7 +269,7 @@ class TestVoiceDeadline:
 
         launched = False
 
-        async def _run(cfg, task_text, context_text):
+        async def _run(cfg, task_text, context_text, resolution=None):
             nonlocal launched
             launched = True
             return "should never run"
@@ -300,7 +300,7 @@ class TestVoiceDeadline:
 
         tm, reg = _init_tools_for_voice()
 
-        async def _slow(cfg, task_text, context_text):
+        async def _slow(cfg, task_text, context_text, resolution=None):
             await asyncio.sleep(10)  # cooperatively cancellable
             return "too late"
 
@@ -342,7 +342,7 @@ class TestVoiceDeadline:
 
         launched = False
 
-        async def _run(cfg, task_text, context_text):
+        async def _run(cfg, task_text, context_text, resolution=None):
             nonlocal launched
             launched = True
             return "should never run"
@@ -388,7 +388,7 @@ class TestVoiceDeadline:
 
         launched = False
 
-        async def _run(cfg, task_text, context_text):
+        async def _run(cfg, task_text, context_text, resolution=None):
             nonlocal launched
             launched = True
             await asyncio.sleep(10)

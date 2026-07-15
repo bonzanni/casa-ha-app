@@ -635,7 +635,7 @@ class TestMergedRoleMap:
             "user_id": 1, "cid": "abc", "user_text": "x",
         })
         try:
-            async def _fake_run(cfg, task_text, context_text):
+            async def _fake_run(cfg, task_text, context_text, resolution=None):
                 return f"Tina says ok: {task_text}"
             monkeypatch.setattr(tools, "_run_delegated_agent", _fake_run)
 
