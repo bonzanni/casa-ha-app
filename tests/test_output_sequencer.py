@@ -906,19 +906,10 @@ async def test_cross_task_ask_poster_vs_summary_flush_no_deadlock():
     rec, clock = Recorder(), Clock()
     seq = _make_seq(rec, clock)
     open_qs = [11]
-    state = {"b_active": False}
-    b_in_render = asyncio.Event()
-
-    def _oqn():
-        # Called under the summary lock inside _render_locked. Fires only for B's
-        # render so A's setup/poster renders don't trip it.
-        if state["b_active"]:
-            b_in_render.set()
-        return list(open_qs)
 
     controller = SummaryController(
         engagement_id="eng-1", sequencer=seq, goal_line="Gmail plugin",
-        open_question_numbers=_oqn, message_id=500,
+        open_question_numbers=lambda: list(open_qs), message_id=500,
         _now=lambda: 0.0, _sleep=_park_forever,
     )
 
@@ -944,12 +935,14 @@ async def test_cross_task_ask_poster_vs_summary_flush_no_deadlock():
 
     # Task B: a WORKING(-1 default) → WAITING transition — text changes, so
     # _flush_locked actually reaches edit_summary (and thus the sequencer lock).
-    state["b_active"] = True
     task_b = asyncio.ensure_future(
         controller.submit_status(STATUS_WAITING_REPLY, 5))
-    # Let B run to its blocking point: on 88beebe it acquires the summary lock and
-    # blocks on the sequencer lock; on the fix it blocks on the sequencer lock
-    # FIRST (never holding summary). A few event-loop turns reach either state.
+    # Advance B to its blocking point. This cannot be a single event-gate because
+    # the two code paths block in DIFFERENT places: on 88beebe B acquires the
+    # summary lock and then blocks on the sequencer lock (it renders); on the fix
+    # B blocks on the sequencer lock FIRST and never holds the summary lock (so it
+    # never renders). A bounded run of scheduler turns reaches whichever blocking
+    # point applies before we release A.
     for _ in range(6):
         await asyncio.sleep(0)
     b_released.set()  # release A's poster into the summary lock
@@ -996,10 +989,15 @@ async def test_global_lock_order_completes_regardless_of_start_order():
             poster=_ask_poster)
         seq.arm_intent("ask-X")
 
-        poster = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, "h"))
-        flush = asyncio.ensure_future(controller.submit_activity("reading files"))
+        # Vary the ACTUAL scheduling order: whichever is created first is the
+        # first coroutine the loop steps. (Swapping references after both are
+        # scheduled would not change scheduling at all.)
         if summary_first:
-            flush, poster = poster, flush  # start order swap is scheduling-order
+            flush = asyncio.ensure_future(controller.submit_activity("reading files"))
+            poster = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, "h"))
+        else:
+            poster = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, "h"))
+            flush = asyncio.ensure_future(controller.submit_activity("reading files"))
         res = await asyncio.wait_for(
             asyncio.gather(poster, flush), timeout=0.5)
         assert "posted" in res  # the poster resolved
