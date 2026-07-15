@@ -150,7 +150,7 @@ async def main():
     class StubDriver:
         def __init__(self): self.turns = []
         def is_alive(self, rec): return True
-        async def send_user_turn(self, rec, text): self.turns.append((rec.id, text))
+        async def send_user_turn(self, rec, text, *, tg_message_id=None): self.turns.append((rec.id, text))
         async def resume(self, rec, sid): pass
         def get_session_id(self, rec): return None
         async def cancel(self, rec): pass
@@ -505,7 +505,7 @@ async def main():
         async def resume(self, rec, session_id):
             assert session_id == "mock-session-e7", f"resume got {session_id}"
             self._alive[rec.id] = True
-        async def send_user_turn(self, rec, text): self.turns.append(text)
+        async def send_user_turn(self, rec, text, *, tg_message_id=None): self.turns.append(text)
     drv = StubDriver()
     ch._engagement_registry = reg
     ch._engagement_driver = drv
@@ -670,7 +670,7 @@ async def main():
         async def start(self, rec, prompt, options):
             self.start_calls.append((rec.id, prompt[:40], len(options.allowed_tools)))
             self._alive[rec.id] = True
-        async def send_user_turn(self, rec, text):
+        async def send_user_turn(self, rec, text, *, tg_message_id=None):
             self.turns.append(text)
             if text.strip().lower().startswith("yes"):
                 # Simulate the Configurator's Write tool patching triggers.yaml.

@@ -160,7 +160,11 @@ class InCasaDriver(DriverProtocol):
 
     async def send_user_turn(
         self, engagement: EngagementRecord, text: str,
+        *, tg_message_id: int | None = None,
     ) -> None:
+        # tg_message_id is part of the uniform driver interface (v0.79
+        # reply-threading); in_casa turns have no topic-stream threading,
+        # so it is accepted and ignored.
         if not self.is_alive(engagement):
             raise DriverNotAliveError(
                 f"engagement {engagement.id[:8]} has no live client"

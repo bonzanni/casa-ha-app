@@ -2404,3 +2404,22 @@ class TestF7StrictSetterRollback:
         # the TRUE prior value (None) — NOT the new 555 the old pre-assign left.
         assert rec.summary_message_id is None
         assert reg.get(rec.id).summary_message_id is None
+
+
+def test_all_drivers_accept_tg_message_id_kwarg():
+    """v0.79.2: telegram passes tg_message_id to send_user_turn
+    unconditionally — every driver must accept it (in_casa ignored it and
+    TypeErrored on operator topic messages; caught by the e2e E-block)."""
+    import inspect
+    import drivers.in_casa_driver as icd
+    import drivers.claude_code_driver as ccd
+    for cls_mod, name in ((icd, "InCasaDriver"), (ccd, "ClaudeCodeDriver")):
+        cls = getattr(cls_mod, name, None)
+        if cls is None:  # fall back: find the class exposing send_user_turn
+            cands = [v for v in vars(cls_mod).values()
+                     if inspect.isclass(v) and hasattr(v, "send_user_turn")]
+            assert cands, f"no driver class in {cls_mod.__name__}"
+            cls = cands[0]
+        sig = inspect.signature(cls.send_user_turn)
+        assert "tg_message_id" in sig.parameters, (
+            f"{cls.__name__}.send_user_turn must accept tg_message_id")
