@@ -277,9 +277,23 @@ async def test_warm_reentry_pure_poll_posts_nothing(tmp_path):
     assert notice_id is not None
     before = (list(rec.sends), list(rec.edits))
 
+    # Sol A1 re-review MINOR: the wire assertions alone cannot discriminate the
+    # warm skip from a cold pass whose delta reconcile computes an EMPTY pending
+    # (last_posted_len == full length ⇒ posts nothing). Spy _reconcile so the
+    # test pins the PATH: a pure warm poll must never reconcile at all.
+    reconcile_calls = []
+    real_reconcile = relay._reconcile
+
+    async def _spy_reconcile():
+        reconcile_calls.append(True)
+        await real_reconcile()
+
+    relay._reconcile = _spy_reconcile
+
     await relay.run()  # pure poll — nothing new on disk, narration now sealed
 
     assert (rec.sends, rec.edits) == before  # zero new sends/edits
+    assert reconcile_calls == []  # warm path: no reconcile, not even a no-op one
     assert relay._warm is True
 
 
