@@ -17,6 +17,7 @@ rule)."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -618,6 +619,213 @@ class TestHandlerRollback:
         ch._post_engagement_notice.assert_awaited()       # refusal notice
         assert drv._answer_reservations.get(rec.id) is None
         assert reg.open_question_entries(rec.id)[0].get("answered") is False
+
+
+# ===========================================================================
+# 9b. M5 — the FOURTH-consumer acceptance matrix through a REAL OutputSequencer
+#     (ordered fake wire). For each non-delivery cause the anchor must end LAST
+#     (re-anchored copy is the final wire post); terminal-finalize SETTLES.
+# ===========================================================================
+
+
+class _OrderedWire:
+    """One ordered fake wire backing BOTH the text send (notices) and the markup
+    send (re-anchor ``post_discrete``), so wire order == a single monotonic mid
+    sequence (mirrors ``test_anchor_reanchor._Wire``)."""
+
+    def __init__(self, *, start: int = 1000):
+        self._n = start
+        self.posts: list[tuple[str, int, str]] = []
+        self.edits: list[tuple[str, int, str]] = []
+
+    def _mid(self) -> int:
+        self._n += 1
+        return self._n
+
+    async def send_text(self, topic, text, **kw) -> int:
+        mid = self._mid()
+        self.posts.append(("text", mid, text))
+        return mid
+
+    async def send_markup(self, topic, text, markup, reply_to=None):
+        mid = self._mid()
+        self.posts.append(("markup", mid, text))
+        return mid
+
+    async def edit_text(self, topic, mid, text, clear_keyboard=False) -> bool:
+        self.edits.append(("text", mid, text))
+        return True
+
+    async def edit_markup(self, topic, mid, text, markup) -> bool:
+        self.edits.append(("markup", mid, text))
+        return True
+
+
+def _make_driver_seq(tmp_path, reg, wire):
+    from drivers.claude_code_driver import ClaudeCodeDriver
+
+    return ClaudeCodeDriver(
+        engagements_root=str(tmp_path / "engagements"),
+        send_to_topic=wire.send_text,
+        casa_framework_mcp_url="http://x",
+        edit_topic_message=wire.edit_text,
+        send_topic_message_markup=wire.send_markup,
+        edit_topic_message_markup=wire.edit_markup,
+        registry=reg)
+
+
+def _entry(reg, rec, n):
+    for q in reg.open_question_entries(rec.id):
+        if q.get("n") == n:
+            return q
+    return None
+
+
+async def _handler_ctx_seq(tmp_path, fake_telegram_bot):
+    """A channel wired to a REAL driver + REAL OutputSequencer over an ordered
+    wire, with one open anchor at a LOW mid and content already posted below it
+    (high-water > anchor) so a rollback consumer's re-anchor genuinely fires.
+    Platform notices route THROUGH the sequencer onto the same ordered wire."""
+    from channels.telegram import TelegramChannel
+
+    reg, rec = await _make_registry(tmp_path)
+    n = await _add_anchor(reg, rec, mid=500)     # LOW mid → notices land below
+    wire = _OrderedWire()
+    drv = _make_driver_seq(tmp_path, reg, wire)
+    seq = drv._ensure_sequencer(rec)
+    seq._high_water = 600                          # content posted below the anchor
+
+    ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                         engagement_supergroup_id=-1001)
+    ch._engagement_registry = reg
+    ch._observer = MagicMock()
+    ch._driver_advance_high_water = AsyncMock()
+    ch._driver_reserve_answer = lambda r: drv.reserve_answer(r.id)
+
+    async def _rb(r, tok):
+        return await drv.rollback_answer_reservation(r.id, tok)
+
+    ch._driver_rollback_answer_reservation = _rb
+    # Route platform notices through the REAL sequencer onto the shared wire.
+    ch._driver_post_notice = lambda r, text: seq.post_platform_notice(text)
+    return ch, reg, rec, drv, seq, wire, n
+
+
+class TestFourthConsumerReanchorMatrix:
+    async def test_silent_command_reanchors_anchor_last(
+        self, tmp_path, fake_telegram_bot,
+    ):
+        ch, reg, rec, drv, seq, wire, n = await _handler_ctx_seq(
+            tmp_path, fake_telegram_bot)
+        u = _mk_update(chat_id=-1001, text="/silent", thread_id=555, user_id=77)
+        await ch.handle_update(u)      # rollback + re-anchor are synchronous here
+
+        # The command notice (text) posted BELOW the anchor, then the re-anchored
+        # copy (markup) is the FINAL wire message.
+        assert [k for k, _, _ in wire.posts] == ["text", "markup"]
+        reanchor_mid = wire.posts[-1][1]
+        assert seq.high_water == reanchor_mid
+        assert _entry(reg, rec, n)["tg_message_id"] == reanchor_mid
+        # A command is NOT an answer.
+        assert _entry(reg, rec, n).get("answered") is False
+        assert drv._answer_reservations.get(rec.id) is None
+
+    async def test_rejected_originator_command_reanchors_anchor_last(
+        self, tmp_path, fake_telegram_bot,
+    ):
+        ch, reg, rec, drv, seq, wire, n = await _handler_ctx_seq(
+            tmp_path, fake_telegram_bot)
+        ch._finalize_cancel = AsyncMock()
+        # A NON-originator /cancel (rec origin user_id=77, update from 999) →
+        # refused + refusal notice + reservation rolled back.
+        u = _mk_update(chat_id=-1001, text="/cancel", thread_id=555, user_id=999)
+        await ch.handle_update(u)
+
+        ch._finalize_cancel.assert_not_awaited()
+        assert wire.posts and wire.posts[-1][0] == "markup"
+        reanchor_mid = wire.posts[-1][1]
+        assert _entry(reg, rec, n)["tg_message_id"] == reanchor_mid
+        assert _entry(reg, rec, n).get("answered") is False
+
+    async def test_dropped_full_delivery_reanchors_anchor_last(
+        self, tmp_path, fake_telegram_bot,
+    ):
+        ch, reg, rec, drv, seq, wire, n = await _handler_ctx_seq(
+            tmp_path, fake_telegram_bot)
+        ch._driver_send_user_turn = AsyncMock(return_value="dropped_full")
+        u = _mk_update(chat_id=-1001, text="answer", thread_id=555, user_id=77)
+        await ch.handle_update(u)
+        await _drain_turns(ch)
+
+        assert wire.posts and wire.posts[-1][0] == "markup"
+        reanchor_mid = wire.posts[-1][1]
+        assert seq.high_water == reanchor_mid
+        assert _entry(reg, rec, n)["tg_message_id"] == reanchor_mid
+        assert _entry(reg, rec, n).get("answered") is False
+        assert drv._answer_reservations.get(rec.id) is None
+
+    async def test_persistence_error_delivery_reanchors_anchor_last(
+        self, tmp_path, fake_telegram_bot,
+    ):
+        ch, reg, rec, drv, seq, wire, n = await _handler_ctx_seq(
+            tmp_path, fake_telegram_bot)
+        ch._driver_send_user_turn = AsyncMock(side_effect=RuntimeError("boom"))
+        u = _mk_update(chat_id=-1001, text="answer", thread_id=555, user_id=77)
+        await ch.handle_update(u)
+        await _drain_turns(ch)
+
+        # The rollback consumer REALLY re-anchors (markup re-post), and the entry
+        # tracks the re-posted copy — the vacuous seq-is-None path is gone. NOTE:
+        # ``_deliver_turn_bg`` rolls back (→ re-anchor) BEFORE it posts the
+        # "Turn failed" notice, so the informational failure notice legitimately
+        # follows the re-posted question here (telegram.py ordering, out of scope
+        # for this wave); we assert the re-anchor occurred + tracks, not strict
+        # last-ness.
+        reanchor = [(k, mid) for k, mid, _ in wire.posts if k == "markup"]
+        assert reanchor, "the rollback consumer did not re-anchor"
+        reanchor_mid = reanchor[-1][1]
+        assert any(k == "text" and "Turn failed" in t for k, _, t in wire.posts)
+        assert _entry(reg, rec, n)["tg_message_id"] == reanchor_mid
+        assert _entry(reg, rec, n).get("answered") is False
+
+    async def test_handler_cancellation_reanchors_anchor_last(
+        self, tmp_path, fake_telegram_bot,
+    ):
+        ch, reg, rec, drv, seq, wire, n = await _handler_ctx_seq(
+            tmp_path, fake_telegram_bot)
+        started = asyncio.Event()
+
+        async def _blocking(rec_, text, *, tg_message_id=None):
+            started.set()
+            await asyncio.Event().wait()   # block until cancelled
+
+        ch._driver_send_user_turn = _blocking
+        u = _mk_update(chat_id=-1001, text="answer", thread_id=555, user_id=77)
+        await ch.handle_update(u)
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        for t in list(ch._turn_tasks):
+            t.cancel()
+        await _drain_turns(ch)
+
+        # Cancellation → rollback → re-anchor. The anchor ends LAST.
+        assert wire.posts and wire.posts[-1][0] == "markup"
+        reanchor_mid = wire.posts[-1][1]
+        assert _entry(reg, rec, n)["tg_message_id"] == reanchor_mid
+        assert drv._answer_reservations.get(rec.id) is None
+
+    async def test_terminal_finalize_settles_not_reanchors(
+        self, tmp_path, fake_telegram_bot,
+    ):
+        ch, reg, rec, drv, seq, wire, n = await _handler_ctx_seq(
+            tmp_path, fake_telegram_bot)
+        # The terminal-finalize consumer SETTLES open anchors rather than
+        # re-anchoring (closing the /cancel-with-live-anchor gap).
+        await drv.settle_all_open_questions(rec, "cancelled")
+
+        assert not any(k == "markup" for k, _, _ in wire.posts)   # no re-anchor
+        assert any(mid == 500 and "engagement ended" in text
+                   for _, mid, text in wire.edits)
+        assert reg.open_question_entries(rec.id) == []
 
 
 class TestHandlerDelivery:

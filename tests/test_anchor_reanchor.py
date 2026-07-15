@@ -306,6 +306,130 @@ class TestMidReanchorAnswer:
 
 
 # ===========================================================================
+# 4b. B2 — the Sol interleaving: an answer settlement racing a re-anchor caught
+#     between step-2 (new copy posted) and step-3 (mid persisted) must serialize
+#     behind the maintenance lock and settle the NEW current copy; the entry
+#     never closes with a live untracked copy.
+# ===========================================================================
+
+
+class TestB2SettleInterleaving:
+    async def test_answer_settle_serializes_after_reanchor_step3(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire)
+        seq = drv._ensure_sequencer(rec)
+        seq._high_water = 600   # content posted below the anchor this turn
+
+        # Event-gate step 3 (update_question_mid): re-anchor gets caught between
+        # POSTING the new copy (step 2 accepted) and PERSISTING its mid (step 3).
+        gate = asyncio.Event()
+        orig_update = reg.update_question_mid
+
+        async def _gated_update(eid, num, new_mid):
+            await gate.wait()
+            return await orig_update(eid, num, new_mid)
+
+        reg.update_question_mid = _gated_update
+
+        ra = asyncio.ensure_future(drv._reanchor_pass(rec))
+        await asyncio.sleep(0.02)
+        # Step 2 accepted: the NEW copy is on the wire (markup), high-water moved.
+        assert len(wire.posts) == 1 and wire.posts[0][0] == "markup"
+        new_mid = wire.posts[0][1]
+        assert seq.high_water == new_mid
+
+        # The operator answer arrives + settles — must BLOCK on the maintenance
+        # lock re-anchor still holds (it is mid-step-3), not race an old snapshot.
+        settle = asyncio.ensure_future(drv._promote_answer_on_enqueue(rec))
+        await asyncio.sleep(0.02)
+        assert not settle.done()          # serialized BEHIND the re-anchor
+
+        gate.set()
+        assert await ra is True
+        await settle
+
+        # The settle edited the NEW current copy (post step-3) with ✅ answered,
+        # and the entry closed with NO live untracked copy left behind.
+        assert _entry(reg, rec, n) is None
+        assert any(mid == new_mid and "answered below" in text
+                   for _, mid, text in wire.edits)
+        # The OLD copy was re-anchor-settled (re-posted-below), never left live.
+        assert any(mid == 500 for _, mid, _ in wire.edits)
+
+
+# ===========================================================================
+# 4c. M4 — entry-removal invariant: a failed unstage / failed close RETAINS the
+#     entry (never closes with a durable stale_mid; strict close rolls back).
+# ===========================================================================
+
+
+class TestM4EntryRemovalInvariant:
+    async def test_failed_unstage_retains_entry_with_mid_staged(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        await reg.stage_stale_mid(rec.id, n, 400)   # a staged OLD copy
+        wire = _Wire()                              # edit_ok=True → both confirm
+        drv = _make_driver(tmp_path, reg, wire)
+        drv._ensure_sequencer(rec)
+
+        async def _boom(*a, **k):
+            raise RuntimeError("unstage persist down")
+
+        reg.unstage_stale_mid = _boom
+
+        snapshot = reg.open_question_entries(rec.id)
+        await drv.reconcile_open_questions(rec, snapshot)
+
+        # M4: the confirmed stale copy's strict un-stage RAISED, so the entry must
+        # NOT close — it is retained with the stale mid still staged for retry.
+        e = _entry(reg, rec, n)
+        assert e is not None
+        assert 400 in (e.get("stale_mids") or [])
+
+    async def test_failed_close_retains_entry(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire)
+        drv._ensure_sequencer(rec)
+
+        # The STRICT close's tombstone write fails → rollback + raise; the driver
+        # treats the raise as RETAINED.
+        orig = reg._write_tombstone_locked
+
+        async def _fail_strict(*, strict=False):
+            if strict:
+                raise RuntimeError("disk full")
+            return await orig(strict=strict)
+
+        reg._write_tombstone_locked = _fail_strict
+
+        snapshot = reg.open_question_entries(rec.id)
+        await drv.reconcile_open_questions(rec, snapshot)
+
+        assert _entry(reg, rec, n) is not None      # retained, not dropped
+
+    async def test_close_open_question_strict_rolls_back_and_raises(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        orig = reg._write_tombstone_locked
+
+        async def _fail_strict(*, strict=False):
+            if strict:
+                raise RuntimeError("disk full")
+            return await orig(strict=strict)
+
+        reg._write_tombstone_locked = _fail_strict
+
+        with pytest.raises(RuntimeError):
+            await reg.close_open_question(rec.id, n)
+        # Rolled back full-tuple: the entry survives in memory (never split).
+        assert _entry(reg, rec, n) is not None
+
+
+# ===========================================================================
 # 5. step-2→3 crash residual: tracked copies settled, orphan documented
 # ===========================================================================
 
@@ -711,32 +835,60 @@ class TestBootReplayOwner:
         assert 900 in wire.edit_mids()
         assert reg.open_question_entries(term.id) == []
 
-    async def test_fresh_same_process_ask_not_expired(self, tmp_path):
-        # A record with NO open questions at snapshot time — a later ask must not
-        # be captured. Since the pre-service snapshot is empty, no reconcile is
-        # scheduled for it at all.
+    async def test_active_fresh_ask_between_snapshot_and_attach_not_expired(
+        self, tmp_path, monkeypatch,
+    ):
+        # B3: an ACTIVE (undergoing) record with NO open questions at the
+        # PRE-SERVICE snapshot. The resumed CLI registers a fresh ask BETWEEN the
+        # snapshot and attach (``start_service`` here) — casa_core must pass the
+        # per-record snapshot as ``[]`` (NOT missing/None), so ``_spawn_background_
+        # tasks`` reconciles NOTHING and the fresh ask is never expired.
         import casa_core
+        from drivers import s6_rc
         from engagement_registry import EngagementRegistry
+        from unittest.mock import AsyncMock, MagicMock
+
+        svc_root = tmp_path / "svc"
+        svc_root.mkdir()
+        monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+        # Skip the heal machinery: pretend the service pair is complete + current.
+        monkeypatch.setattr(s6_rc, "service_pair_complete", lambda **kw: True)
+        monkeypatch.setattr(s6_rc, "run_script_is_stale", lambda **kw: False)
+        monkeypatch.setattr(s6_rc, "_compile_and_update_locked", AsyncMock())
 
         reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
         rec = await reg.create("executor", "configurator", "claude_code", "t",
-                               {"user_id": 1}, topic_id=222)
-        rec.status = "cancelled"   # terminal, but NO open questions
-        wire = _Wire()
-        drv = _make_driver(tmp_path, reg, wire)
+                               {"user_id": 1}, topic_id=333)
+        # ACTIVE (default) → undergoing; empty open_questions at snapshot time.
 
-        scheduled: list[str] = []
-        orig = drv.schedule_boot_reconcile
-        drv.schedule_boot_reconcile = lambda r, s, tr, *, claimed=None: (
-            scheduled.append(r.id) or orig(r, s, tr, claimed=claimed))
+        captured: dict = {}
 
-        ready = asyncio.Event(); ready.set()
+        def _spawn(r, *, reconcile_snapshot=None, reconcile_claimed=None,
+                   telegram_ready=None):
+            captured["snapshot"] = reconcile_snapshot
+
+        async def _fake_start(*, engagement_id):
+            # The resumed CLI registers a FRESH ask AFTER the pre-service snapshot
+            # but BEFORE _spawn_background_tasks (attach) runs.
+            nn = await reg.allocate_question_number(engagement_id)
+            await reg.add_open_question(engagement_id, nn, 800, text="Q: fresh?",
+                                        kind="anchor")
+
+        monkeypatch.setattr(s6_rc, "start_service", _fake_start)
+
+        driver = AsyncMock()
+        driver._spawn_background_tasks = _spawn
+        driver.adopt_summary_if_missing = AsyncMock()
+        # schedule_boot_reconcile is SYNC in production (returns a task/None); the
+        # casa_core refused-pass calls it un-awaited, so keep it a sync mock.
+        driver.schedule_boot_reconcile = MagicMock(return_value=None)
+
         await casa_core.replay_undergoing_engagements(
-            registry=reg, driver=drv, executor_registry=None,
-            engagements_root=str(tmp_path / "eng"), telegram_ready=ready)
+            registry=reg, driver=driver, executor_registry=None,
+            engagements_root=str(tmp_path / "eng"), telegram_ready=None)
 
-        # A fresh ask registered AFTER the snapshot is never in a reconcile set.
-        n = await reg.allocate_question_number(rec.id)
-        await reg.add_open_question(rec.id, n, 700, text="Q: fresh?", kind="anchor")
-        assert rec.id not in scheduled
-        assert reg.open_question_entries(rec.id)   # the fresh ask survives
+        # B3: the empty-oq record was snapshotted as [] (NOT None) — the fresh ask
+        # created between snapshot and attach is NOT in the reconcile set.
+        assert captured.get("snapshot") == []
+        # And the fresh question survives in the ledger (never expired).
+        assert reg.open_question_entries(rec.id)

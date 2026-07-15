@@ -1031,18 +1031,25 @@ class EngagementRegistry:
     async def close_open_question(self, engagement_id: str, number: int) -> None:
         """Remove a settled question from the open-question ledger (persisted).
         ``next_question_number`` is NEVER rewound. Unknown engagement/number is
-        a no-op."""
+        a no-op.
+
+        v0.83.0 (§A3, M4): the closing removal is now STRICT — a tombstone-write
+        failure ROLLS BACK ``open_questions`` (full-tuple) and RE-RAISES, like the
+        sibling mutators, so the entry can never vanish from memory while surviving
+        on disk. Callers (``_settle_ledger_entry``) treat a raise as RETAINED — the
+        entry stays present for a later settle / boot-reconcile pass."""
         async with self._lock:
             rec = self._records.get(engagement_id)
             if rec is None:
                 return
+            prev = rec.open_questions
             remaining = tuple(
                 q for q in rec.open_questions if q.get("n") != number
             )
             if len(remaining) == len(rec.open_questions):
                 return
             rec.open_questions = remaining
-            await self._write_tombstone_locked()
+            await self._commit_open_questions_strict(rec, prev)
 
     def open_question_numbers(self, engagement_id: str) -> list[int]:
         """Accessor for summary consumers (T4): the sorted list of still-open,

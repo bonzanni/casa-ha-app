@@ -1315,10 +1315,24 @@ class ClaudeCodeDriver(DriverProtocol):
         # channel readiness — so its confirmed settle edits never fire against a
         # ``None`` bot. Direct/legacy callers (driver unit tests, fresh start with
         # no snapshot) keep the immediate attach-time read + ungated schedule.
-        if reconcile_snapshot is not None or reconcile_claimed is not None \
-                or telegram_ready is not None:
-            snap = (reconcile_snapshot if reconcile_snapshot is not None
-                    else list(getattr(engagement, "open_questions", ()) or ()))
+        # B3 — explicit snapshot contract: a replay context passes an EXPLICIT
+        # per-record snapshot (possibly ``[]``). A snapshot that is not None means
+        # replay ran — settle EXACTLY that pre-service snapshot (``[]`` ⇒ nothing
+        # prior-process; a fresh same-process ask created between the snapshot and
+        # this attachment is NOT in it and must NOT be expired). ``None`` means NO
+        # replay context (legacy / direct callers, driver unit tests) → keep the
+        # immediate attach-time fresh read + ungated schedule.
+        if reconcile_snapshot is not None:
+            rt = self.schedule_boot_reconcile(
+                engagement, reconcile_snapshot, telegram_ready,
+                claimed=reconcile_claimed)
+            if rt is not None:
+                tasks.append(rt)
+        elif reconcile_claimed is not None or telegram_ready is not None:
+            # Boot context but no per-record snapshot supplied (not produced by
+            # casa_core post-B3; kept for a caller that gates without a snapshot):
+            # fresh attach-time read, still claimed + readiness-gated.
+            snap = list(getattr(engagement, "open_questions", ()) or ())
             rt = self.schedule_boot_reconcile(
                 engagement, snap, telegram_ready, claimed=reconcile_claimed)
             if rt is not None:
@@ -1851,14 +1865,21 @@ class ClaudeCodeDriver(DriverProtocol):
                 await mark(engagement_id, number)
             except Exception:  # noqa: BLE001 — overlay covers the live process
                 self.mark_answered_overlay(engagement_id, number)
-        anchor = None
-        entries = getattr(reg, "open_question_entries", None)
-        if entries is not None:
-            for q in entries(engagement_id):
-                if q.get("n") == number:
-                    anchor = q
-                    break
-        return await self._settle_open_anchor(engagement, anchor=anchor)
+        # DEADLOCK NOTE (B2): this runs on the relay poster task UNDER the
+        # sequencer lock, so it MUST stay lock-free — acquiring the maintenance
+        # lock here would deadlock a concurrent re-anchor that holds maintenance
+        # and is blocked on the sequencer lock at ``post_discrete``. Safe without
+        # the lock: the entry was JUST marked answered above, so a racing
+        # re-anchor's step-2 revalidate (which itself blocks on the sequencer lock
+        # WE hold) declines and never posts a competing copy. Re-read fresh by
+        # number and settle the CURRENT copy.
+        amid = await self._settle_anchor_entry_locked(engagement, number)
+        try:
+            await self.recompute_engagement_status(engagement_id)
+        except Exception:  # noqa: BLE001 — status recompute is advisory
+            logger.debug("recompute after answered-anchor settle failed",
+                         exc_info=True)
+        return amid
 
     def reserve_answer(self, engagement_id: str) -> str | None:
         """§A3 (Sol r7-1): reserve the oldest UNANSWERED anchor as answered by
@@ -2006,9 +2027,16 @@ class ClaudeCodeDriver(DriverProtocol):
                     try:
                         await unstage(rec.id, n, smid)
                     except Exception:  # noqa: BLE001
-                        logger.debug(
-                            "unstage_stale_mid failed (n=%s mid=%s)", n, smid,
-                            exc_info=True)
+                        # M4: a confirmed stale-copy edit whose STRICT unstage
+                        # persist RAISES must NOT let the entry close with a
+                        # durable stale_mid still staged — keep the mid in
+                        # ``remaining_stale`` so no close happens this pass and
+                        # boot/settle reconciliation retries it.
+                        logger.warning(
+                            "engagement %s: unstage_stale_mid persist failed "
+                            "(n=%s mid=%s) — retaining entry", rec.id[:8], n,
+                            smid, exc_info=True)
+                        remaining_stale.append(smid)
             else:
                 remaining_stale.append(smid)
         # Entry-removal invariant: remove ONLY when the current copy is confirmed
@@ -2456,10 +2484,25 @@ class ClaudeCodeDriver(DriverProtocol):
         # is chosen by the ``answered`` flag (∪ the live overlay): an answered
         # entry reads ``✅ answered below`` — R1 recovery unchanged, an ordinary
         # prior-process open question reads ``⌛ expired``.
-        for q in open_qs:
-            answered = bool(q.get("answered", False)) or self._overlay_answered(
-                rec.id, q.get("n"))
-            await self._settle_ledger_entry(rec, q, answered_suffix=answered)
+        #
+        # DEADLOCK AUDIT (B2, Sol r5-3): take the engagement's maintenance lock
+        # around the per-entry work and RE-READ each entry FRESH by number in-lock
+        # — the pre-service SNAPSHOT only determines WHICH questions are
+        # prior-process; their CURRENT mids/state come from the in-lock re-read, so
+        # a settle/re-anchor concurrent with boot serializes here instead of racing
+        # a captured snapshot. Lock order maintenance → registry; the settle's wire
+        # edits use the RAW edit primitive (never the sequencer lock) — no cycle.
+        # This task runs at boot with no sequencer lock held.
+        async with self.ask_maintenance_lock(rec.id):
+            for q in open_qs:
+                n = q.get("n")
+                fresh = (self._reread_open_question(rec.id, n)
+                         if n is not None else None)
+                entry = fresh if fresh is not None else q
+                answered = bool(entry.get("answered", False)) or \
+                    self._overlay_answered(rec.id, n)
+                await self._settle_ledger_entry(
+                    rec, entry, answered_suffix=answered)
 
         # F1 (Sol diff gate): entries were closed above without touching the
         # pinned summary — refresh it so its open-questions line reflects the
@@ -2493,6 +2536,41 @@ class ClaudeCodeDriver(DriverProtocol):
         getter = getattr(reg, "oldest_open_anchor", None)  # legacy registry
         return getter(engagement_id) if getter is not None else None
 
+    def _reread_open_question(
+        self, engagement_id: str, n: int | None,
+    ) -> dict | None:
+        """FRESH registry re-read of one open-question entry by number (§A3, B2).
+        Returns the CURRENT entry (its live ``tg_message_id`` + ``stale_mids``) or
+        ``None``. Callers use this INSIDE the maintenance lock so a settle never
+        acts on a pre-lock snapshot that a concurrent re-anchor has superseded."""
+        reg = self._registry
+        if reg is None or n is None:
+            return None
+        getter = getattr(reg, "open_question_entries", None)
+        if getter is None:
+            return None
+        for q in getter(engagement_id):
+            if q.get("n") == n:
+                return q
+        return None
+
+    async def _settle_anchor_entry_locked(
+        self, engagement: EngagementRecord, n: int | None,
+        *, fallback: dict | None = None,
+    ) -> int | None:
+        """Settle ONE anchor entry, re-read FRESH by number (§A3, B2). Assumes the
+        caller either holds the maintenance lock (the ordinary answer path) OR is
+        the relay poster running lock-free under the sequencer lock (the entry is
+        already answered there, so a racing re-anchor's revalidate declines). A
+        legacy no-number entry (``n is None``) settles the ``fallback`` dict."""
+        entry = self._reread_open_question(engagement.id, n) if n is not None else None
+        if entry is None:
+            entry = fallback
+        if entry is None:
+            return None
+        return await self._settle_ledger_entry(
+            engagement, entry, answered_suffix=True)
+
     async def _settle_open_anchor(
         self, engagement: EngagementRecord, operator_msg_id: int | None = None,
         *, anchor: dict | None = None,
@@ -2504,19 +2582,36 @@ class ClaudeCodeDriver(DriverProtocol):
         answers. Returns ``None`` when no anchor is open.
 
         The enqueue-time PROMOTION and the delivery-time settle share this one
-        implementation: promotion passes the explicit ``anchor`` it just marked
-        answered; the delivery-time path (legacy envelopes) passes none and the
-        oldest raw anchor is selected. Every staged stale copy is settled behind
-        the same confirmed-gate."""
-        if anchor is None:
-            anchor = self._select_oldest_anchor_entry(engagement.id)
-        if anchor is None:
-            return None
-        amid = await self._settle_ledger_entry(
-            engagement, anchor, answered_suffix=True)
+        implementation: promotion passes the explicit ``anchor`` (only to pick the
+        question NUMBER); the delivery-time path passes none and the oldest raw
+        anchor number is selected. Every staged stale copy is settled behind the
+        same confirmed-gate.
+
+        DEADLOCK AUDIT (B2, Sol interleaving): this acquires the per-engagement
+        ``ask_maintenance_lock`` and RE-READS the entry FRESH by number INSIDE the
+        lock — never a pre-lock snapshot — so an answer settlement can no longer
+        edit a stale OLD copy and close the entry while a concurrent re-anchor
+        persisted a NEW current copy. Lock order is maintenance → registry (the
+        SAME order re-anchor uses); the settle's wire edits use the RAW edit
+        primitive, never the sequencer lock, so no maintenance→sequencer→
+        maintenance cycle can form. MUST NOT be called while holding the sequencer
+        lock — the relay poster's ``settle_answered_anchor`` path uses the
+        lock-free ``_settle_anchor_entry_locked`` helper for exactly that reason."""
+        n = None
+        if anchor is not None:
+            n = anchor.get("n")
+        else:
+            sel = self._select_oldest_anchor_entry(engagement.id)
+            if sel is None:
+                return None
+            n = sel.get("n")
+            anchor = sel
+        async with self.ask_maintenance_lock(engagement.id):
+            amid = await self._settle_anchor_entry_locked(
+                engagement, n, fallback=anchor)
         # W-R2: recompute the summary status from the remaining open questions
         # (still ⏳ waiting while another question is open; ⚙️ working once none
-        # remain and the turn is running).
+        # remain and the turn is running). Done OUTSIDE the maintenance lock.
         try:
             await self.recompute_engagement_status(engagement.id)
         except Exception:  # noqa: BLE001 — status recompute is advisory

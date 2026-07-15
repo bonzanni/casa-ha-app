@@ -440,9 +440,13 @@ async def replay_undergoing_engagements(
             continue
         if getattr(_rec, "topic_id", None) is None:
             continue
+        # B3: record the per-record snapshot ALWAYS — an EMPTY list stays [] (a
+        # replay context that reconciles NOTHING), distinct from a missing entry.
+        # A record whose open_questions is empty at snapshot time must reconcile
+        # nothing so a fresh same-process ask created BETWEEN this snapshot and
+        # attach is never fresh-read + expired as prior-process.
         _oq = list(getattr(_rec, "open_questions", ()) or ())
-        if _oq:
-            reconcile_snapshots[_rec.id] = [dict(q) for q in _oq]
+        reconcile_snapshots[_rec.id] = [dict(q) for q in _oq]
 
     async def _refuse_brief_resume(
         rec, reason: str, *, kind: str = "refuse_teardown_failed",

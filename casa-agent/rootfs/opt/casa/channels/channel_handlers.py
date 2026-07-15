@@ -1073,6 +1073,16 @@ def _make_ask(
                 if created_intent:
                     _record_intent_internal_error(driver, eng_id, request_id)
                 return web.json_response({"ok": False, "error": "internal_error"})
+            except BaseException:
+                # B1: from the moment ``set_ask_inflight`` claimed the marker, ANY
+                # non-durable-ownership exit MUST clear it. Transport CANCELLATION
+                # (CancelledError) during this awaited allocation bypasses ``except
+                # Exception``; without this the marker wedges and every later
+                # ask/reply is refused ``question_pending`` until restart. The CAS
+                # clear is a no-op once durable ownership took over (add_open_question
+                # clears it synchronously), so it is safe on every path.
+                _clear_ask_marker(driver, eng_id, request_id)
+                raise
             # W-R3: canonical body (anchor ⇒ options == [] ⇒ numbered question
             # ALONE, no option list — unchanged from the pre-W-R3 anchor copy).
             display = render_ask_body(number, question, options)
@@ -1322,6 +1332,14 @@ def _make_ask(
             if intent_registered:
                 _record_intent_internal_error(driver, eng_id, request_id)
             return web.json_response({"ok": False, "error": "internal_error"})
+        except BaseException:
+            # B1: transport CANCELLATION during the awaited allocation (the only
+            # await between ``set_ask_inflight`` and the durable ``BROKER.register``
+            # handoff below) must NOT wedge the ingress marker — clear it (CAS)
+            # before re-raising. Durable ownership disarms this by clearing the
+            # marker itself synchronously at register.
+            _clear_ask_marker(driver, eng_id, request_id)
+            raise
         # W-R3 (Sol r1-5): the SINGLE canonical body — full options VERBATIM,
         # numbered, below the question. This exact string feeds the keyboard
         # post, the persisted ``open_questions[].text``, the finish-hook settle
@@ -1359,7 +1377,16 @@ def _make_ask(
             if number is not None:
                 close = getattr(engagement_registry, "close_open_question", None)
                 if close is not None:
-                    await close(eng_id, number)
+                    try:
+                        await close(eng_id, number)
+                    except Exception:  # noqa: BLE001
+                        # M4: close_open_question is now STRICT (rollback + raise).
+                        # Treat a raise as RETAINED — the entry stays for a later
+                        # settle / boot-reconcile; still recompute the summary.
+                        logger.warning(
+                            "engagement %s: close_open_question failed on settle "
+                            "(Q%s) — entry retained", eng_id[:8], number,
+                            exc_info=True)
             # Recompute the summary status from the remaining open questions
             # (still ⏳ waiting while any question is open; ⚙️ working once none
             # remain and the turn is running).

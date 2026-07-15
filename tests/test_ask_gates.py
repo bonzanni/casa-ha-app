@@ -482,6 +482,77 @@ class TestAddFailureCompensation:
 # ===========================================================================
 
 
+class TestMarkerCancellationWedge:
+    """B1: a transport CANCELLATION mid number-allocation must clear the ingress
+    marker — cleanup previously lived only in ``except Exception`` paths that a
+    ``CancelledError`` bypasses, wedging every later ask/reply ``question_pending``
+    until restart."""
+
+    async def test_cancel_mid_allocation_clears_marker_anchor(
+        self, wired, monkeypatch,
+    ):
+        eid = wired["rec"].id
+        gate = asyncio.Event()
+
+        async def _slow(_eid):
+            await gate.wait()
+            return 1
+
+        monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "cx"))))
+        await asyncio.sleep(0.02)
+        # Marker claimed, coroutine parked in the awaited allocation.
+        assert wired["drv"].ask_inflight(eid) == "cx"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # B1: cleared despite the CancelledError.
+        assert wired["drv"].ask_inflight(eid) is None
+        # A subsequent genuinely-new anchor ask is NOT wedged question_pending
+        # (distinct projection hash — the cancelled attempt's unarmed intent is a
+        # separate block).
+        gate.set()
+        t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "cy", hash="anchor-hash-2"))))
+        resp2 = await _drive_anchor(wired, t2, hash="anchor-hash-2")
+        assert _body(resp2)["outcome"] == "anchored"
+
+    async def test_cancel_mid_allocation_clears_marker_button(
+        self, wired, monkeypatch,
+    ):
+        eid = wired["rec"].id
+        gate = asyncio.Event()
+
+        async def _slow(_eid):
+            await gate.wait()
+            return 1
+
+        monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(eid, "cx"))))
+        await asyncio.sleep(0.02)
+        assert wired["drv"].ask_inflight(eid) == "cx"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert wired["drv"].ask_inflight(eid) is None
+        # A subsequent button ask is admitted (registers a live broker request),
+        # not refused question_pending.
+        gate.set()
+        t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(eid, "cy"))))
+        await asyncio.sleep(0.02)
+        await wired["seq"].post_for_block(ASK_TOOL, _BTN_HASH)
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=eid) == ["cy"]
+        wired["broker"].deliver(
+            namespace="engagement_ask", scope=eid, request_id="cy",
+            option_index=0, actor_id=555)
+        await asyncio.wait_for(t2, timeout=1.0)
+        await wired["broker"].drain_hooks()
+
+
 class TestPostAddGenRecheck:
     async def test_gen_bump_between_reserve_and_add_marks_answered(
         self, wired, monkeypatch,
