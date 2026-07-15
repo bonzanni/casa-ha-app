@@ -30,12 +30,23 @@ log "Inspecting /data/sessions.json"
 keys=$(docker exec "$NAME" sh -c \
     'python3 -c "import json,sys; print(\",\".join(sorted(json.load(open(\"/data/sessions.json\")).keys())))"')
 echo "  registry keys: $keys"
-echo "$keys" | grep -q "webhook-user-A" \
-    || fail "missing 'webhook-user-A' entry"
-echo "$keys" | grep -q "webhook-user-B" \
-    || fail "missing 'webhook-user-B' entry"
-echo "$keys" | grep -q "webhook-default" \
-    && fail "unwanted 'webhook-default' entry present (BUG-I1 regression)"
+# v0.80.0 (spec A2): session identity is now the collision-safe, role-scoped
+# channel-first v2 key (webhook-v2-<sha256(channel\0role\0scope)[:24]>), not
+# the legacy webhook-<scope>. Compute the expected keys the same way the code
+# does (invoke uses the target agent's role — here `assistant`) so this test
+# tracks the real format instead of hardcoding it.
+key_for() {  # key_for <scope>
+    docker exec "$NAME" sh -c \
+        "python3 -c \"import sys; sys.path.insert(0,'/opt/casa'); from session_registry import build_scoped_session_key as k; print(k('webhook','assistant','$1'))\""
+}
+exp_a=$(key_for user-A); exp_b=$(key_for user-B); exp_default=$(key_for default)
+echo "  expected: A=$exp_a B=$exp_b (default MUST be absent: $exp_default)"
+echo "$keys" | grep -q "$exp_a" \
+    || fail "missing v2 session entry for chat_id user-A ($exp_a)"
+echo "$keys" | grep -q "$exp_b" \
+    || fail "missing v2 session entry for chat_id user-B ($exp_b)"
+echo "$keys" | grep -q "$exp_default" \
+    && fail "unwanted default-scoped entry present (BUG-I1 regression)"
 pass "C-3a distinct caller-supplied chat_ids"
 
 log "C-3b: two /invoke calls WITHOUT chat_id get unique UUIDs"
@@ -49,7 +60,10 @@ curl -sf -X POST "http://localhost:${HOST_PORT}/invoke/assistant" \
 sleep 1
 webhook_keys=$(docker exec "$NAME" sh -c \
     'python3 -c "import json; d=json.load(open(\"/data/sessions.json\")); print(chr(10).join(k for k in d if k.startswith(\"webhook-\")))"')
-uuid_count=$(echo "$webhook_keys" | grep -Ev "^webhook-(user-A|user-B)$" | grep -c "^webhook-" || true)
+# The two chat_id-less invokes each get a distinct UUID scope, so their v2
+# keys differ from the user-A/user-B keys computed above. Count webhook
+# sessions that are neither of those two → expect exactly 2.
+uuid_count=$(echo "$webhook_keys" | grep -Ev "^($exp_a|$exp_b)$" | grep -c "^webhook-" || true)
 [ "$uuid_count" -eq 2 ] \
     || fail "expected 2 UUID-backed invoke sessions, got $uuid_count (keys: $webhook_keys)"
 pass "C-3b each chat_id-less invoke gets its own session"
