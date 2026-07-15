@@ -527,6 +527,15 @@ def _killpg(pgid: int, sig: int) -> None:
     os.killpg(pgid, sig)
 
 
+def _getpgid(pid: int) -> int:
+    """Thin injectable seam over ``os.getpgid`` (tests inject a fake so the
+    recorded pgid can differ from the pid without a real process). Raises
+    ``ProcessLookupError`` if the pid is already gone. The run template never
+    calls setsid, so the supervised leader is NOT guaranteed to be its own
+    group leader — the real pgid must be READ, never assumed to equal the pid."""
+    return os.getpgid(pid)
+
+
 async def _poll_group_extinct(
     pgid: int, *, attempts: int, interval: float,
     sleep,
@@ -536,14 +545,17 @@ async def _poll_group_extinct(
     empty. Returns True on extinction, False if the group is still alive after
     the last attempt. A kernel-refused probe (EPERM etc.) reads as still-alive
     (not proof of extinction)."""
-    for _ in range(attempts):
+    for attempt in range(attempts):
         try:
             _killpg(pgid, 0)
         except ProcessLookupError:
             return True
         except OSError:
             pass  # e.g. EPERM — group exists, just not signalable; still alive
-        await sleep(interval)
+        # Sleep only BETWEEN probes — the timeout path (last failed probe) pays
+        # no trailing sleep before returning False.
+        if attempt < attempts - 1:
+            await sleep(interval)
     return False
 
 
@@ -562,9 +574,15 @@ async def force_turn_boundary(
          ``down`` → already suspended → True; ``unknown`` → WARN + return False
          truthfully ("not suspending blind" — a query failure is NOT proof);
          ``up`` → read the live pid and proceed.
-      2. Record the pre-signal pgid (= pid; the run script is the session/group
-         leader) and ``os.killpg(pid, SIGTERM)`` the whole group
-         (``ProcessLookupError`` → already gone → True).
+      2. Record the pre-signal pgid via ``os.getpgid(pid)`` — READ, never
+         assumed to equal the pid (the run template never calls setsid, so the
+         leader may not be its own group leader; a hardcoded ``pgid = pid``
+         would make ``os.killpg`` raise ``ProcessLookupError`` and be misread as
+         "already extinct" → a FALSE verified-suspended). If ``os.getpgid``
+         raises ``ProcessLookupError`` (leader vanished in the probe→getpgid
+         window) the group cannot be identified → WARN + return False (never
+         guess a pgid). Then ``os.killpg(recorded_pgid, SIGTERM)`` the whole
+         group (``ProcessLookupError`` → group genuinely empty → True).
       3. Bounded verification of GROUP EXTINCTION (not leader turnover): poll
          ``os.killpg(recorded_pgid, 0)`` until ``ProcessLookupError``.
       4. Timeout → ``os.killpg(recorded_pgid, SIGKILL)`` (never a re-read pid — a
@@ -592,10 +610,21 @@ async def force_turn_boundary(
         )
         return False
 
-    # The fresh run-script spawn is its own session/group leader, so the pgid is
-    # the pid — recorded here, BEFORE the signal, and used for every subsequent
-    # probe (a respawn may reuse the pid but never this whole group).
-    pgid = pid
+    # Record the pgid BEFORE any signal, by READING os.getpgid — the run
+    # template never calls setsid, so the leader is NOT guaranteed to be its own
+    # group leader. A hardcoded ``pgid = pid`` would make killpg raise
+    # ProcessLookupError on a non-leader and be misread as "already extinct" → a
+    # false verified-suspended. This recorded pgid drives the SIGTERM, the
+    # SIGKILL escalation and every emptiness probe (a respawn may reuse the pid
+    # but never this whole group).
+    try:
+        pgid = _getpgid(pid)
+    except ProcessLookupError:
+        logger.warning(
+            "force_turn_boundary %s: leader vanished before its process group "
+            "could be recorded — cannot verify suspension", engagement_id,
+        )
+        return False
     try:
         _killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:

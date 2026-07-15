@@ -12,9 +12,11 @@ speed. The kill is a VERIFIED, GROUP-WIDE ladder in ``s6_rc``:
   * timeout → ``os.killpg(RECORDED pgid, SIGKILL)`` → re-poll the same probe;
   * truthful bool — a False is WARN-logged, never falsely reported suspended.
 
-Fakes inject the probe / pid / killpg / sleep seams; no real signals, no real
-s6. The ladder tests assert EXACT call sequences so a mis-ordered ladder fails
-meaningfully.
+Fakes inject the probe / pid / getpgid / killpg / sleep seams; no real signals,
+no real s6. The ladder tests assert EXACT call sequences so a mis-ordered ladder
+fails meaningfully. The recorded pgid comes from ``os.getpgid`` (NOT an assumed
+pid — the run template never calls setsid), so a leader that is not its own
+group leader still gets its whole group signalled on the RECORDED pgid.
 """
 
 from __future__ import annotations
@@ -35,15 +37,21 @@ pytestmark = pytest.mark.asyncio
 # ---------------------------------------------------------------------------
 
 
-def _install(monkeypatch, *, probe, pid=4242, killpg):
+def _install(monkeypatch, *, probe, pid=4242, killpg, getpgid=None):
     async def _fake_probe(scandir):
         return probe() if callable(probe) else probe
 
     async def _fake_pid(*, engagement_id):
         return pid
 
+    def _fake_getpgid(p):
+        # Default: the leader IS its own group leader (pgid == pid). Cases that
+        # need a divergent group or a vanished leader pass an explicit callable.
+        return p if getpgid is None else getpgid(p)
+
     monkeypatch.setattr(s6_rc, "_probe_service_down", _fake_probe)
     monkeypatch.setattr(s6_rc, "service_pid", _fake_pid)
+    monkeypatch.setattr(s6_rc, "_getpgid", _fake_getpgid)
     monkeypatch.setattr(s6_rc, "_killpg", killpg)
 
 
@@ -194,6 +202,68 @@ async def test_processlookup_on_sigterm_is_extinct(monkeypatch):
     assert result is True
     # SIGTERM raised extinct → no emptiness probing needed.
     assert seq == [(111, signal.SIGTERM)]
+
+
+# ---------------------------------------------------------------------------
+# 7. leader NOT a group leader → all signals/probes use the RECORDED pgid
+#    (os.getpgid), never the pid. Guards against the false verified-suspended:
+#    killpg(pid) would raise ProcessLookupError → misread as "already extinct".
+# ---------------------------------------------------------------------------
+
+
+async def test_leader_not_group_leader_uses_recorded_pgid(monkeypatch):
+    seq: list[tuple] = []
+    state = {"zero": 0}
+
+    def killpg(pgid, sig):
+        seq.append((pgid, sig))
+        if sig == 0:
+            state["zero"] += 1
+            if state["zero"] >= 2:          # extinct on the 2nd emptiness probe
+                raise ProcessLookupError
+
+    # Leader pid 777, but its process GROUP is 700 (run template never setsid).
+    _install(
+        monkeypatch, probe="up", pid=777, killpg=killpg,
+        getpgid=lambda p: 700,
+    )
+    calls, sleep = await _no_sleep_recorder()
+    result = await s6_rc.force_turn_boundary(engagement_id="e1", sleep=sleep)
+
+    assert result is True
+    # SIGTERM first, then emptiness probes — ALL on the recorded pgid 700.
+    assert seq[0] == (700, signal.SIGTERM)
+    assert seq[1:] == [(700, 0), (700, 0)]
+    # The pid 777 is NEVER signalled directly (that is the whole bug).
+    assert all(pgid == 700 for pgid, _ in seq)
+
+
+# ---------------------------------------------------------------------------
+# 8. getpgid raises ProcessLookupError (leader vanished in the probe→getpgid
+#    window) → cannot identify the group → truthful False, WARN, ZERO signals.
+# ---------------------------------------------------------------------------
+
+
+async def test_getpgid_vanished_returns_false_no_signals(monkeypatch, caplog):
+    seq: list[tuple] = []
+
+    def killpg(pgid, sig):
+        seq.append((pgid, sig))
+
+    def _vanished(p):
+        raise ProcessLookupError
+
+    _install(
+        monkeypatch, probe="up", pid=888, killpg=killpg, getpgid=_vanished,
+    )
+    with caplog.at_level(logging.WARNING, logger="drivers.s6_rc"):
+        result = await s6_rc.force_turn_boundary(engagement_id="e1")
+
+    assert result is False
+    assert seq == []               # never guess a pgid → never signal
+    assert any(
+        "cannot verify suspension" in r.message for r in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------
