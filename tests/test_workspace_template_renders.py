@@ -155,6 +155,20 @@ def test_template_path_handles_bundled_plugin_developer(tmp_path):
     assert "intended approach" in claude_md
     assert "process requirement" in claude_md
 
+    # v0.79.0 (§6/T5) doctrine: turn discipline — one question at a time via
+    # the ask tool, the inbound gate, and the redirect/STOP priority lane.
+    assert "## Turn discipline" in claude_md
+    assert "One question at a time" in claude_md
+    assert "options: []" in claude_md
+    assert "unread_inbound" in claude_md
+    assert "[OPERATOR REDIRECT" in claude_md
+    assert "doctrine/engagement-conduct.md" in claude_md
+    doctrine_card = (
+        plugin_dev_dir / "doctrine" / "engagement-conduct.md"
+    ).read_text(encoding="utf-8")
+    assert "STOP" in doctrine_card
+    assert "redirect: <text>" in doctrine_card
+
 
 # --- run-script --plugin-dir plumbing (§3.8) --------------------------------
 

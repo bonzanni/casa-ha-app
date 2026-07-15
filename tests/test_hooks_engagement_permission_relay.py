@@ -539,3 +539,83 @@ class TestKeyboardFailure:
         assert "keyboard post failed" in _reason(result)
         # State returned to active even on keyboard failure.
         assert tg.state_calls[-1] == (eid, "active")
+
+
+class TestPermissionRetryReattach:
+    """F1 (Sol r2): a permission RETRY (BROKER created=False) must follow the
+    reattach discipline — reuse the live intent, NEVER eager-post the keyboard
+    around the sequencer. Probe: no keyboard posted before any relay involvement.
+    """
+
+    async def test_retry_reattaches_without_eager_keyboard(
+        self, _fresh_broker, monkeypatch,
+    ):
+        from hooks import make_engagement_permission_relay
+        from channels.output_sequencer import OutputSequencer
+        import agent as agent_mod
+
+        eid = "7" * 32
+        reg = _FakeRegistry({eid: _FakeRecord()})
+        tg = _FakeTelegramChannel()
+
+        posts: list = []
+        orig_post = tg.post_perm_keyboard
+
+        async def _counting_post(**kw):
+            posts.append(kw)
+            return await orig_post(**kw)
+
+        tg.post_perm_keyboard = _counting_post
+
+        async def _noop_send(topic, text, reply_to=None):
+            return None
+
+        async def _noop_edit(topic, mid, text):
+            return True
+
+        # A live sequencer whose ``arm`` does NOT drive the relay — the keyboard
+        # is relay-DEFERRED and stays unposted here, so ANY post is an eager one.
+        seq = OutputSequencer(
+            engagement_id=eid, topic_id=555,
+            send_message=_noop_send, edit_message=_noop_edit)
+
+        class _Drv:
+            def register_send_intent(self, *, engagement_id, request_id,
+                                     tool_name, projection_hash, poster):
+                return seq.register_intent(
+                    request_id=request_id, tool_name=tool_name,
+                    projection_hash=projection_hash, poster=poster)
+
+            def set_send_intent_poster(self, e, r, p):
+                return seq.set_intent_poster(r, p)
+
+            def arm_send_intent(self, e, r):
+                return seq.arm_intent(r)  # arm only — relay not driven
+
+        monkeypatch.setattr(agent_mod, "active_claude_code_driver", _Drv())
+
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg, timeout_s=5.0)
+        payload = {
+            "tool_name": "Bash", "tool_input": {"command": "x"},
+            "cwd": f"/data/engagements/{eid}", "tool_use_id": "rid-retry",
+        }
+
+        # First attempt: registers + arms the intent (relay-deferred, unposted).
+        t1 = asyncio.create_task(hook(payload, None, {}))
+        await asyncio.sleep(0.02)
+        # RETRY with the SAME id while the first still awaits → BROKER created=
+        # False. Old code eager-posts the keyboard here; the fix reattaches.
+        t2 = asyncio.create_task(hook(payload, None, {}))
+        await asyncio.sleep(0.02)
+
+        assert posts == []  # no eager keyboard on EITHER attempt
+        # Exactly ONE intent exists for the request (reattach, not a duplicate).
+        assert seq.registry.by_request_id("rid-retry") is not None
+
+        # Resolve so both hook invocations finish.
+        assert _fresh_broker.deliver(
+            namespace="permission", scope=eid, request_id="rid-retry",
+            option_index=0, actor_id=1) == "delivered"
+        await asyncio.wait_for(asyncio.gather(t1, t2), timeout=1.0)
+        assert posts == []  # still never eager-posted

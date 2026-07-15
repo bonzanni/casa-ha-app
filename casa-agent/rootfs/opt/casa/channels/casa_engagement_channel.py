@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import uuid
@@ -50,21 +52,50 @@ INSTRUCTIONS = (
 
 server: FastMCP = FastMCP("casa-engagement-channel", instructions=INSTRUCTIONS)
 
-# v0.75.0 (W5): `ask` client-side validation — mirrors
-# channel_handlers._validate_ask_args on the casa-main side (defense in
-# depth: this copy saves a wasted round trip on bad args; the server-side
-# copy is the actual gate).
-_ASK_MIN_OPTIONS = 2
-_ASK_MAX_OPTIONS = 8
-_ASK_MAX_LABEL_LEN = 48
-_ASK_MAX_QUESTION_LEN = 1024
-_ASK_MIN_TIMEOUT_S = 30.0
+# v0.79.0 (§2, r8-1): ask/reply are RAW-DICT ingresses — NO client-side
+# validation. The subprocess transmits the raw args, the per-logical-call
+# request_id, and the pinned projection hash; casa-main validates server-side
+# and refuses bad args (the zero-HTTP fail-fast contract flipped in T3). Timeout
+# is still CLAMPED into the payload here (the broker needs a bounded wait), but
+# the projection hash is computed over the timeout AS GIVEN so it matches the
+# relay's hash of the tool_use frame.
 _ASK_MAX_TIMEOUT_S = 570.0
+_ASK_MIN_TIMEOUT_S = 30.0
+_ASK_DEFAULT_TIMEOUT_S = 300.0
 # The broker itself waits up to _ASK_MAX_TIMEOUT_S for an operator tap; a
 # same-length (or shorter) aiohttp ClientTimeout would race that wait and
 # abort the HTTP call out from under a still-legitimately-pending ask. Pad
 # by 15s so the transport always outlives the broker's own deadline.
 _ASK_CLIENT_TIMEOUT_PAD_S = 15.0
+
+
+# ---------------------------------------------------------------------------
+# Pinned projection → hash (§2 "Hash identity"). Computed AT THE INGRESS
+# BOUNDARY over RAW args, INLINE (this subprocess cannot import casa modules —
+# only its own directory is on sys.path). Byte-for-byte identical to
+# ``authz_grants.canonical_args_hash`` so casa-main's relay, which recomputes
+# the hash from the tool_use frame via ``channels.output_sequencer``, agrees.
+# ---------------------------------------------------------------------------
+
+def _canonical_hash(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _ask_projection_hash(question: Any, options: Any, timeout_s: Any) -> str:
+    """ask → ``{question, options, timeout_s-as-given}``."""
+    return _canonical_hash(
+        {"question": question, "options": options, "timeout_s": timeout_s},
+    )
+
+
+def _reply_projection_hash(text: Any) -> str:
+    """reply → ``{text}`` (drops the SDK-compat ``chat_id``)."""
+    return _canonical_hash({"text": text})
 
 
 def declared_capabilities() -> dict[str, dict]:
@@ -133,26 +164,6 @@ async def _internal_post(
     raise last_exc
 
 
-def _validate_ask_args(question: Any, options: list) -> bool:
-    """Client-side mirror of ``channel_handlers._validate_ask_args``'s
-    shape checks (timeout clamping happens separately — invalid timeout
-    values are simply clamped, never rejected)."""
-    if (not isinstance(question, str) or not question
-            or len(question) > _ASK_MAX_QUESTION_LEN):
-        return False
-    if (not isinstance(options, list)
-            or not (_ASK_MIN_OPTIONS <= len(options) <= _ASK_MAX_OPTIONS)):
-        return False
-    if any(
-        not isinstance(o, str) or not o or len(o) > _ASK_MAX_LABEL_LEN
-        for o in options
-    ):
-        return False
-    if len(set(options)) != len(options):
-        return False
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Tools.
 # ---------------------------------------------------------------------------
@@ -165,9 +176,19 @@ async def reply(chat_id: str, text: str) -> dict[str, Any]:
     NEVER forwarded. The casa-main handler resolves the target chat/topic from
     ``engagement_id``, which we pass explicitly so the outbound payload is
     self-describing (auditable in logs / test capture-fakes).
+
+    v0.79.0 (§2): mints a per-logical-call ``request_id`` (reused by transport
+    retries inside ``_internal_post``) and transmits the pinned ``{text}``
+    projection hash so casa-main can register a discrete-send intent and a
+    post-loss retry reattaches idempotently (no double post).
     """
     del chat_id  # D2: explicitly discarded.
-    payload: dict[str, Any] = {"text": text}
+    request_id = uuid.uuid4().hex
+    payload: dict[str, Any] = {
+        "text": text,
+        "request_id": request_id,
+        "projection_hash": _reply_projection_hash(text),
+    }
     if ENGAGEMENT_ID is not None:
         payload["engagement_id"] = ENGAGEMENT_ID
     return await _internal_post("/internal/channel/send_to_topic", payload)
@@ -175,19 +196,27 @@ async def reply(chat_id: str, text: str) -> dict[str, Any]:
 
 @server.tool()
 async def ask(
-    question: str, options: list[str], timeout_s: float = 300,
+    question: str, options: list, timeout_s: Any = None,
 ) -> dict[str, Any]:
-    """Ask the operator a multiple-choice question with tappable buttons.
+    """Ask the operator a question. With 2-8 ``options`` it renders tappable
+    buttons; with ``options: []`` it posts a numbered free-text question anchor.
 
-    Returns the selected label, or outcome=no_answer on timeout (then fall
-    back to a plain `reply` question). NOT an authorization mechanism.
+    Returns the selected label, or outcome=no_answer on timeout. NOT an
+    authorization mechanism.
+
+    v0.79.0 (§2, r8-1): RAW-DICT ingress — no client-side validation. The raw
+    args, the per-logical-call ``request_id`` (minted BEFORE attempt 1, reused
+    by retries) and the pinned projection hash (over the timeout AS GIVEN) are
+    transmitted; casa-main validates + refuses server-side.
     """
-    if not _validate_ask_args(question, options):
-        return {"ok": False, "error": "invalid_args"}
-
-    clamped_timeout = min(
-        max(float(timeout_s), _ASK_MIN_TIMEOUT_S), _ASK_MAX_TIMEOUT_S,
-    )
+    # timeout is clamped for the broker payload; the hash is over the RAW value.
+    try:
+        raw_t = (
+            float(timeout_s) if timeout_s is not None else _ASK_DEFAULT_TIMEOUT_S
+        )
+    except (TypeError, ValueError):
+        raw_t = _ASK_DEFAULT_TIMEOUT_S
+    clamped_timeout = min(max(raw_t, _ASK_MIN_TIMEOUT_S), _ASK_MAX_TIMEOUT_S)
     # Generated ONCE: every retry attempt (transport-level, inside
     # _internal_post) and any explicit ask_cancel reuse this SAME id so a
     # retry reattaches to the one live broker request instead of posting a
@@ -195,6 +224,7 @@ async def ask(
     request_id = uuid.uuid4().hex
     payload: dict[str, Any] = {
         "request_id": request_id,
+        "projection_hash": _ask_projection_hash(question, options, timeout_s),
         "question": question,
         "options": options,
         "timeout_s": clamped_timeout,

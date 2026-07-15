@@ -137,14 +137,18 @@ class TestAskTool:
         names = [t.name for t in tools]
         assert "ask" in names
 
-    async def test_invalid_args_never_posts(self, channel_server, monkeypatch):
-        """Client-side validation short-circuits BEFORE any HTTP round trip
-        (saves a wasted call, gives an immediate structured error)."""
+    async def test_invalid_args_are_posted_and_refused_server_side(
+        self, channel_server, monkeypatch,
+    ):
+        """v0.79.0 (§2, r8-1): the ask ingress is now a RAW-DICT pass-through —
+        the zero-HTTP fail-fast contract FLIPPED. Bad args are no longer
+        short-circuited client-side; the request IS made and casa-main refuses
+        it server-side (all validation lives on the server)."""
         calls: list = []
 
         async def fake_post(path, payload, **kw):
             calls.append((path, payload))
-            return {"ok": True}
+            return {"ok": False, "error": "invalid_args"}
 
         monkeypatch.setattr(channel_server, "_internal_post", fake_post)
 
@@ -160,7 +164,90 @@ class TestAskTool:
             result = await channel_server._invoke_tool_for_tests("ask", args)
             assert result == {"ok": False, "error": "invalid_args"}, args
 
-        assert calls == []
+        # Every bad-args call DID reach the server (no client short-circuit).
+        assert len(calls) == len(cases)
+        assert all(c[0] == "/internal/channel/ask" for c in calls)
+
+    async def test_ask_transmits_request_id_and_projection_hash(
+        self, channel_server, monkeypatch,
+    ):
+        """The ask ingress mints a request_id and a projection hash over the
+        RAW args (question, options, timeout_s-as-given) and transmits both."""
+        captured: list = []
+
+        async def fake_post(path, payload, **kw):
+            captured.append(dict(payload))
+            return {"ok": True, "outcome": "no_answer"}
+
+        monkeypatch.setattr(channel_server, "_internal_post", fake_post)
+        await channel_server._invoke_tool_for_tests(
+            "ask", {"question": "Q?", "options": ["A", "B"]},
+        )
+        p = captured[0]
+        assert len(p["request_id"]) == 32
+        # Hash is over the timeout AS GIVEN (None here) — matches the relay's
+        # project_args which reads timeout_s via .get() (absent → None).
+        assert p["projection_hash"] == channel_server._ask_projection_hash(
+            "Q?", ["A", "B"], None,
+        )
+
+    async def test_ask_empty_options_is_transmitted_not_refused(
+        self, channel_server, monkeypatch,
+    ):
+        """options: [] (free-text anchor) is a VALID raw-dict call — it must be
+        transmitted, never short-circuited."""
+        captured: list = []
+
+        async def fake_post(path, payload, **kw):
+            captured.append(dict(payload))
+            return {"ok": True, "outcome": "anchored"}
+
+        monkeypatch.setattr(channel_server, "_internal_post", fake_post)
+        result = await channel_server._invoke_tool_for_tests(
+            "ask", {"question": "What's the DB name?", "options": []},
+        )
+        assert len(captured) == 1
+        assert captured[0]["options"] == []
+        assert result == {"ok": True, "outcome": "anchored"}
+
+    async def test_reply_transmits_request_id_and_projection_hash(
+        self, channel_server, monkeypatch,
+    ):
+        captured: list = []
+
+        async def fake_post(path, payload, **kw):
+            captured.append(dict(payload))
+            return {"ok": True, "message_id": 7}
+
+        monkeypatch.setattr(channel_server, "_internal_post", fake_post)
+        await channel_server._invoke_tool_for_tests(
+            "reply", {"chat_id": "ignored", "text": "hi there"},
+        )
+        p = captured[0]
+        assert len(p["request_id"]) == 32
+        assert p["projection_hash"] == channel_server._reply_projection_hash(
+            "hi there",
+        )
+        assert "chat_id" not in p  # D2 still holds
+
+    async def test_ingress_hash_matches_relay_projection_hash(self, channel_server):
+        """The channel's INLINE projection hash must be byte-for-byte identical
+        to the relay's ``output_sequencer.projection_hash`` of the tool_use
+        frame — otherwise a registered intent never binds its content block.
+        This is the REAL ingress hash path the §2 reversed-arrival regression
+        relies on."""
+        from channels.output_sequencer import projection_hash, ASK_TOOL, REPLY_TOOL
+
+        # ask, timeout omitted: frame has no timeout_s → project_args .get()=None.
+        assert channel_server._ask_projection_hash("Q?", ["A", "B"], None) == \
+            projection_hash(ASK_TOOL, {"question": "Q?", "options": ["A", "B"]})
+        # ask, explicit int timeout: no float coercion divergence.
+        assert channel_server._ask_projection_hash("Q?", ["A", "B"], 100) == \
+            projection_hash(
+                ASK_TOOL, {"question": "Q?", "options": ["A", "B"], "timeout_s": 100})
+        # reply: frame carries chat_id+text; projection drops chat_id.
+        assert channel_server._reply_projection_hash("hello") == \
+            projection_hash(REPLY_TOOL, {"chat_id": "x", "text": "hello"})
 
     async def test_client_timeout_total_matches_timeout_s_plus_15(
         self, channel_server, monkeypatch,

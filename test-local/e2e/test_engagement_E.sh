@@ -150,7 +150,7 @@ async def main():
     class StubDriver:
         def __init__(self): self.turns = []
         def is_alive(self, rec): return True
-        async def send_user_turn(self, rec, text): self.turns.append((rec.id, text))
+        async def send_user_turn(self, rec, text, *, tg_message_id=None): self.turns.append((rec.id, text))
         async def resume(self, rec, sid): pass
         def get_session_id(self, rec): return None
         async def cancel(self, rec): pass
@@ -167,6 +167,7 @@ async def main():
     # Synthetic Telegram update: user message in the topic.
     update = SimpleNamespace(
         message=SimpleNamespace(
+            message_id=90001,
             chat=SimpleNamespace(id=supergroup),
             message_thread_id=tid,
             text="hello from user",
@@ -337,6 +338,7 @@ async def main():
 
     update = SimpleNamespace(
         message=SimpleNamespace(
+            message_id=90001,
             chat=SimpleNamespace(id=supergroup),
             message_thread_id=tid, text="/cancel",
             from_user=SimpleNamespace(id=7777),
@@ -399,6 +401,7 @@ async def main():
 
     update = SimpleNamespace(
         message=SimpleNamespace(
+            message_id=90001,
             chat=SimpleNamespace(id=supergroup),
             message_thread_id=tid, text="/silent",
             from_user=SimpleNamespace(id=7777),
@@ -502,7 +505,7 @@ async def main():
         async def resume(self, rec, session_id):
             assert session_id == "mock-session-e7", f"resume got {session_id}"
             self._alive[rec.id] = True
-        async def send_user_turn(self, rec, text): self.turns.append(text)
+        async def send_user_turn(self, rec, text, *, tg_message_id=None): self.turns.append(text)
     drv = StubDriver()
     ch._engagement_registry = reg
     ch._engagement_driver = drv
@@ -526,6 +529,7 @@ async def main():
     # User turn arrives — handle_update should resume + forward the turn.
     update = SimpleNamespace(
         message=SimpleNamespace(
+            message_id=90001,
             chat=SimpleNamespace(id=supergroup),
             message_thread_id=tid, text="are you there?",
             from_user=SimpleNamespace(id=7777),
@@ -666,7 +670,7 @@ async def main():
         async def start(self, rec, prompt, options):
             self.start_calls.append((rec.id, prompt[:40], len(options.allowed_tools)))
             self._alive[rec.id] = True
-        async def send_user_turn(self, rec, text):
+        async def send_user_turn(self, rec, text, *, tg_message_id=None):
             self.turns.append(text)
             if text.strip().lower().startswith("yes"):
                 # Simulate the Configurator's Write tool patching triggers.yaml.
@@ -742,6 +746,7 @@ async def main():
     # 7. User approval message arrives in the topic — routed to driver.
     update = SimpleNamespace(
         message=SimpleNamespace(
+            message_id=90001,
             chat=SimpleNamespace(id=supergroup),
             message_thread_id=tid, text="yes do it",
             from_user=SimpleNamespace(id=7777),

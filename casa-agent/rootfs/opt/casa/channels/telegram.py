@@ -37,6 +37,19 @@ from telegram.ext import (
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import Channel
+# v0.79.0 (§2 Primitive A): the per-topic OUTPUT SEQUENCER + relay-mediated
+# discrete-posting intent registry. Implemented in the sibling module and
+# RE-EXPORTED here so ``channels.telegram.OutputSequencer`` resolves per the
+# design's "File: channels/telegram.py" reference; the class is deliberately
+# PTB-free (injected send/edit primitives) so it stays unit-testable in
+# isolation. The live per-engagement instances are owned by the claude_code
+# driver (which holds the topic send/edit primitives + the relay); the discrete
+# ingresses reach them through that driver's intent-registration API.
+from channels.output_sequencer import (  # noqa: F401 — re-export
+    IntentRegistry,
+    OutputSequencer,
+    projection_hash as discrete_projection_hash,
+)
 from media_policies import MEDIA_POLICIES
 from channels.telegram_supervisor import ReconnectSupervisor
 from log_cid import cid_var, new_cid
@@ -289,6 +302,15 @@ class TelegramChannel(Channel):
         self._engagement_registry = None
         self._observer = None
         self._driver_send_user_turn = None
+        # v0.79.0 (§3): seal open narration on inbound (claude_code engagements);
+        # wired by casa_core, None-safe for tests.
+        self._driver_advance_high_water = None
+        # v0.79.0 (§3, F2): route a platform-origin topic notice (command
+        # replies, resume errors) through the engagement's OUTPUT SEQUENCER so
+        # it seals open narration + advances the high-water under the single
+        # writer — a notice can never land BELOW live narration. Wired by
+        # casa_core; None-safe (falls back to a direct send).
+        self._driver_post_notice = None
         self._engagement_driver = None
         self._finalize_cancel = None
         self._finalize_complete_user = None
@@ -900,6 +922,17 @@ class TelegramChannel(Channel):
         """Default behavior for non-engagement chats: feed into existing _handle."""
         await self._handle(update, None)
 
+    async def _post_engagement_notice(self, rec, text: str) -> None:
+        """v0.79.0 (§3, F2): post a platform-origin notice into an engagement
+        topic THROUGH the output sequencer (seals open narration + advances the
+        high-water under the single writer) so it can never land BELOW live
+        narration. Falls back to a direct send when the sequencer seam is not
+        wired (tests) or the engagement's driver has no sequencer (in_casa)."""
+        if self._driver_post_notice is not None:
+            await self._driver_post_notice(rec, text)
+        else:
+            await self.send_to_topic(rec.topic_id, text)
+
     async def handle_update(
         self, update, _context: ContextTypes.DEFAULT_TYPE | None = None
     ) -> None:
@@ -945,6 +978,23 @@ class TelegramChannel(Channel):
                     await self.send_to_topic(thread_id, "No active engagement in this topic.")
                     return
 
+                # v0.79.0 (§3, F2/F5): an inbound operator message is a causal
+                # event, visible on Telegram the instant it arrives. SEAL open
+                # narration + advance the topic high-water at TRUE handler entry
+                # — BEFORE command handling and BEFORE update_user_turn()'s
+                # await. This must precede any command reply (/silent, a rejected
+                # /cancel|/complete) AND any suspension, else a reply or mid-turn
+                # narration could append BELOW the operator's message.
+                if self._driver_advance_high_water is not None:
+                    try:
+                        await self._driver_advance_high_water(
+                            rec, getattr(msg, "message_id", None))
+                    except Exception as exc:  # noqa: BLE001 — advisory sealing
+                        logger.debug(
+                            "advance_high_water failed for %s: %s",
+                            rec.id[:8], exc,
+                        )
+
                 if text.startswith("/"):
                     # M10 (v0.52.0): group command menus send "/cancel@botname"
                     # (Telegram appends @botusername to menu-selected commands
@@ -970,8 +1020,10 @@ class TelegramChannel(Channel):
                             and user_id is not None
                             and int(owner_id) != int(user_id)
                         ):
-                            await self.send_to_topic(
-                                thread_id,
+                            # F2: route through the sequencer so this reply
+                            # cannot land below open narration.
+                            await self._post_engagement_notice(
+                                rec,
                                 f"Only the engagement originator can {command}. "
                                 "Ask them, or start your own engagement.",
                             )
@@ -982,8 +1034,9 @@ class TelegramChannel(Channel):
                     if command == "/silent":
                         if self._observer is not None:
                             self._observer.silence(rec.id)
-                        await self.send_to_topic(
-                            thread_id, "Observer quieted for this engagement.",
+                        # F2: route through the sequencer (single writer).
+                        await self._post_engagement_notice(
+                            rec, "Observer quieted for this engagement.",
                         )
                         return
 
@@ -1048,11 +1101,18 @@ class TelegramChannel(Channel):
                 # still ran under the lock, preserving the Bug-10 guarantee
                 # (a cancel that already finalised the driver blanks the turn
                 # here before any task is spawned).
+                # v0.79.0 (§3, F2/F5): the high-water advance + narration seal
+                # now happens at TRUE handler entry above (before command
+                # handling and any suspension) — see the block after the
+                # active-status check.
                 if self._engagement_registry is not None:
                     import time as _time
                     await self._engagement_registry.update_user_turn(rec.id, _time.time())
                 if self._driver_send_user_turn is not None:
-                    task = asyncio.create_task(self._deliver_turn_bg(rec, text))
+                    task = asyncio.create_task(
+                        self._deliver_turn_bg(
+                            rec, text,
+                            tg_message_id=getattr(msg, "message_id", None)))
                     self._turn_tasks.add(task)
                     task.add_done_callback(self._turn_tasks.discard)
                 return
@@ -1073,7 +1133,9 @@ class TelegramChannel(Channel):
             return
         return await self._route_to_ellen(update)
 
-    async def _deliver_turn_bg(self, rec, text: str) -> None:
+    async def _deliver_turn_bg(
+        self, rec, text: str, *, tg_message_id: int | None = None,
+    ) -> None:
         """M9 (v0.52.0): run one engagement user-turn to completion.
 
         Spawned by handle_update as a tracked background task so the
@@ -1081,9 +1143,13 @@ class TelegramChannel(Channel):
         concurrent /cancel finalised the driver mid-turn, send_user_turn
         raises (DriverNotAliveError / transport-closed) and we stay quiet —
         that is the expected end of an interrupted turn, not a failure.
+
+        v0.79.0 (§3): ``tg_message_id`` threads the durable inbound envelope to
+        the operator's Telegram message (reply-quoting / receipts).
         """
         try:
-            await self._driver_send_user_turn(rec, text)
+            await self._driver_send_user_turn(
+                rec, text, tg_message_id=tg_message_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -1101,7 +1167,9 @@ class TelegramChannel(Channel):
                 return
             logger.warning("turn delivery failed for %s: %s", rec.id[:8], exc)
             try:
-                await self.send_to_topic(rec.topic_id, f"Turn failed: {exc}")
+                # F2 sweep (Sol r3): route through the sequencer (single writer)
+                # so this failure notice can't land below open narration.
+                await self._post_engagement_notice(rec, f"Turn failed: {exc}")
             except Exception:  # noqa: BLE001 — best-effort user notice
                 pass
 
@@ -1261,7 +1329,7 @@ class TelegramChannel(Channel):
                         BROKER.abort_claim(claim)
                         await _safe_answer(cq, "couldn't record — please tap again")
                         return
-            committed = BROKER.commit(claim)
+            committed = self._commit_ask_with_anchor(claim, ns, rec, meta)
         finally:
             # r7-B1: ANY exit without a commit (including CancelledError,
             # which `except Exception` above would not catch) must resolve the
@@ -1273,10 +1341,41 @@ class TelegramChannel(Channel):
             # idempotent + sync.
             if not committed:
                 if advanced:
-                    committed = BROKER.commit(claim)
+                    committed = self._commit_ask_with_anchor(claim, ns, rec, meta)
                 else:
                     BROKER.abort_claim(claim)
         await _safe_answer(cq, "✔" if committed else "expired")
+
+    def _commit_ask_with_anchor(
+        self, claim: Any, ns: str, rec: Any, meta: dict,
+    ) -> bool:
+        """ONE commit helper for BOTH engagement-ask commit paths (the normal
+        path and the ``finally`` recovery commit) — v0.79.0 §4 causal handoff.
+
+        ``BROKER.commit`` resolves the ask future FIRST; only then, and only for
+        ``engagement_ask``, do we SYNCHRONOUSLY set the sequencer's one-shot
+        reply anchor to the ask message id. PRE-RESUMPTION GUARANTEE: asyncio
+        run-to-completion means no awaiting coroutine RESUMES between the
+        synchronous ``commit()`` and this synchronous set, so the CLI's ask
+        response (which cannot be produced until its waiter resumes) can never
+        be emitted before the anchor is in place — the SAME turn's first output
+        threads to the question. Advisory only: no persistence, no rollback; a
+        crash leaves unthreaded output with nothing pending."""
+        from verdict_broker import BROKER
+
+        committed = BROKER.commit(claim)
+        if committed and ns == "engagement_ask":
+            mid = meta.get("message_id") if isinstance(meta, dict) else None
+            if isinstance(mid, int):
+                try:
+                    import agent as _agent_mod
+                    drv = getattr(_agent_mod, "active_claude_code_driver", None)
+                    setter = getattr(drv, "set_engagement_reply_anchor", None)
+                    if setter is not None:
+                        setter(rec.id, mid)
+                except Exception:  # noqa: BLE001 — advisory, never break commit
+                    logger.debug("reply-anchor set failed", exc_info=True)
+        return committed
 
     async def _on_resident_callback(self, cq: Any, rid: str, idx: int) -> None:
         """resident_ask tap — SINGLE-OWNER commit contract [A:§2, r1-B2/r3-B1].
@@ -1467,11 +1566,15 @@ class TelegramChannel(Channel):
         """
         if not self.engagement_supergroup_id:
             return
+        # v0.79.0 §4 (the real S1): send an EXPLICIT empty keyboard rather than
+        # ``reply_markup=None`` — PTB drops None params, so a None markup would
+        # leave the permission buttons tappable after the verdict settled.
+        from telegram import InlineKeyboardMarkup
         try:
             await self.bot.edit_message_reply_markup(
                 chat_id=self.engagement_supergroup_id,
                 message_id=message_id,
-                reply_markup=None,
+                reply_markup=InlineKeyboardMarkup([]),
             )
         except Exception as exc:  # noqa: BLE001 — best-effort, never raise
             logger.warning(
@@ -1526,24 +1629,43 @@ class TelegramChannel(Channel):
 
     async def edit_topic_message(
         self, topic_id: int | None, message_id: int, text: str,
+        *, clear_keyboard: bool = False,
     ) -> bool:
-        """Plain (no parse_mode, no reply_markup) text edit of a posted
-        topic message.
+        """Plain (no parse_mode) text edit of a posted topic message.
 
         Broker finish-hook target for the ``engagement_ask`` namespace
         (mirrors ``edit_perm_keyboard_outcome``'s role for ``permission``,
         see ``channel_handlers._ask_keyboard_finish``). "Message is not
         modified" (JC4 — an identical re-edit) is tolerated as success, not
         an error, since it means the desired end state already holds.
+
+        ``clear_keyboard`` (v0.79.0 §4, the real S1 fix): when True, send an
+        EXPLICIT empty ``InlineKeyboardMarkup([])`` alongside the text so the
+        settled question drops its tappable buttons. A bare ``edit_message_text``
+        with no ``reply_markup`` leaves the old keyboard in place (PTB drops the
+        None param, so ``editMessageText`` never touches the markup) — that was
+        the settle-path bug (S1): answered/expired questions stayed tappable.
         """
         if not self.engagement_supergroup_id:
             return False
+        reply_markup = None
+        if clear_keyboard:
+            from telegram import InlineKeyboardMarkup
+            reply_markup = InlineKeyboardMarkup([])
         try:
-            await self.bot.edit_message_text(
-                chat_id=self.engagement_supergroup_id,
-                message_id=message_id,
-                text=text,
-            )
+            if reply_markup is not None:
+                await self.bot.edit_message_text(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                )
+            else:
+                await self.bot.edit_message_text(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id,
+                    text=text,
+                )
             return True
         except BadRequest as exc:
             if "not modified" in str(exc).lower():
@@ -1768,6 +1890,7 @@ class TelegramChannel(Channel):
         Safe to call when ``engagement_supergroup_id`` is unset — no-op.
         """
         self.engagement_permission_ok = False
+        self.engagement_can_pin = False
         if not self.engagement_supergroup_id:
             return
         # Bot-permissions check
@@ -1792,6 +1915,18 @@ class TelegramChannel(Channel):
                 )
                 return
             self.engagement_permission_ok = True
+            # v0.79.0 (§5): probe can_pin_messages alongside can_manage_topics.
+            # Best-effort — the pinned live summary is nicer-to-have; without
+            # the grant the summary still lives, just unpinned (a WARN at
+            # pin-attempt time, never a hard failure).
+            self.engagement_can_pin = bool(
+                getattr(member, "can_pin_messages", False))
+            if not self.engagement_can_pin:
+                logger.info(
+                    "Engagement supergroup %s: bot lacks can_pin_messages; "
+                    "the live summary will not be pinned",
+                    self.engagement_supergroup_id,
+                )
             # v0.37.1 D-1: boot-time diagnostic for the topic-icon map.
             # Non-fatal — logged only if any of our IDs rotated out of
             # Telegram's curated set.
@@ -1862,6 +1997,34 @@ class TelegramChannel(Channel):
             **kwargs,
         )
         return msg.message_id
+
+    async def pin_topic_message(
+        self, thread_id: int, message_id: int,
+    ) -> bool:
+        """v0.79.0 (§5): pin the live-summary message within its forum topic.
+
+        Best-effort — returns ``False`` (never raises) when pinning is
+        unavailable (no ``can_pin_messages`` grant, or a Telegram error). A
+        pinned message in a forum-topic thread pins within that topic. Never
+        unpins any other message.
+        """
+        if not self.engagement_supergroup_id:
+            return False
+        if not getattr(self, "engagement_can_pin", False):
+            return False
+        try:
+            await self.bot.pin_chat_message(
+                chat_id=self.engagement_supergroup_id,
+                message_id=message_id,
+                disable_notification=True,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — pin is best-effort
+            logger.info(
+                "pin_topic_message failed (thread=%s message_id=%s): %s",
+                thread_id, message_id, exc,
+            )
+            return False
 
     async def update_topic_state(
         self, *, engagement_id: str, new_state: str,

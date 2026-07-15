@@ -87,6 +87,8 @@ class _AskFakeChannel:
         self.options_keyboards: list[dict[str, Any]] = []
         self.edited_answered: list[tuple] = []
         self.edited_expired: list[tuple] = []
+        self.edited_clear_keyboard: list[bool] = []
+        self.sent_texts: list[tuple] = []
         self._next_id = 9000
 
     async def post_options_keyboard(
@@ -100,8 +102,18 @@ class _AskFakeChannel:
         self._next_id += 1
         return mid
 
-    async def edit_topic_message(self, topic_id, message_id, text) -> bool:
-        if "Answered" in text:
+    async def send_response_to_topic(self, topic_id, text) -> int:
+        self.sent_texts.append((topic_id, text))
+        mid = self._next_id
+        self._next_id += 1
+        return mid
+
+    async def edit_topic_message(
+        self, topic_id, message_id, text, *, clear_keyboard=False,
+    ) -> bool:
+        # v0.79.0 §4 settle copy: answered ⇒ "✅ <label>", else expired/other.
+        self.edited_clear_keyboard.append(clear_keyboard)
+        if "✅" in text:
             self.edited_answered.append((topic_id, message_id, text))
         else:
             self.edited_expired.append((topic_id, message_id, text))

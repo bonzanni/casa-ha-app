@@ -34,6 +34,49 @@ available for tuning.
 - New options: `voice_turn_budget_seconds` (default 27), `specialist_max_concurrency`
   (default 2), `specialist_cost_alert_threshold` (default 5.0).
 
+## [0.79.2] - 2026-07-15
+
+### Fixed
+
+- In-Casa engagements (configurator, specialist topics) crashed on operator
+  topic messages after 0.79.0 — the new reply-threading argument was not
+  accepted by their driver. Caught by the end-to-end suite before any
+  deployment; claude_code engagements were unaffected.
+
+## [0.79.1] - 2026-07-15
+
+### Fixed
+
+- The end-to-end test harness (and any message object without an id) no
+  longer crashes the engagement inbound path — reply-threading and
+  ordering degrade gracefully instead; no change for real Telegram
+  traffic.
+
+## [0.79.0] - 2026-07-15
+
+### Added
+
+- A pinned live summary on every engagement topic: status, plan progress,
+  current activity with elapsed time, and open questions, always visible at
+  the top.
+- Instant receipts and reply-quoting for your messages, so it's always clear
+  Casa saw what you sent and what it's responding to.
+- Numbered questions that visibly settle when answered.
+- A STOP/`redirect:` priority lane to interrupt and redirect an agent
+  mid-turn.
+
+### Changed
+
+- Engagement topics now read in strict chat order — the running narration
+  rolls to a new message instead of editing above newer messages.
+- Agents no longer ask a new question while your message is waiting to be
+  read.
+
+### Fixed
+
+- Answered questions now drop their buttons instead of only showing a toast.
+- The false "please retype" notice is gone.
+
 ## [0.78.1] - 2026-07-14
 
 ### Fixed
