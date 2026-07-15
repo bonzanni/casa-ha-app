@@ -845,7 +845,17 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
             if ent.is_dir():
                 on_disk_specialists.add(ent.name)
 
-    # Defer to specialist_registry's own re-scan, then diff.
+    # Defer to specialist_registry's own re-scan, then diff. S-3 (block-S
+    # live finding 2026-07-15, N150 07:49:56Z): the add/evict REPORT is a
+    # before/after diff of the REGISTRY, not of runtime.agents — boot never
+    # puts specialists into runtime.agents (they are direct-loaded), so the
+    # first agents reload after boot used to mis-report every boot-loaded
+    # specialist as `added_specialist_<role>`. The runtime.agents backfill
+    # below still runs for registry-known specialists missing an Agent
+    # object (plugin-verify grades specialists through runtime.agents) —
+    # it just no longer drives the report.
+    known_specialists_before = set(
+        runtime.specialist_registry.all_configs().keys())
     try:
         await asyncio.to_thread(runtime.specialist_registry.load)
     except Exception as exc:  # noqa: BLE001
@@ -863,10 +873,23 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         # Pre-v0.37.9 registry mock without load_failures(); legacy path.
         pass
 
-    known_specialists = set(runtime.specialist_registry.all_configs().keys())
+    known_specialists_after = set(
+        runtime.specialist_registry.all_configs().keys())
 
-    # New specialists need agent-home + Agent construction; eviction is
-    # handled by the registry's own load() (tombstone-tracked).
+    # S-3: the report comes from the registry before/after diff exclusively.
+    # An added specialist is delegatable the moment the registry re-scan
+    # picked it up (direct-load), independent of whether the Agent-object
+    # backfill below succeeds — so the diff, not the backfill, is the truth.
+    for s in sorted(known_specialists_after - known_specialists_before):
+        actions.append(f"added_specialist_{s}")
+    evicted_from_registry = known_specialists_before - known_specialists_after
+    for s in sorted(evicted_from_registry):
+        actions.append(f"evicted_specialist_{s}")
+
+    # Registry-known specialists missing an Agent object need agent-home +
+    # Agent construction (boot direct-loads them without one); eviction is
+    # handled by the registry's own load() (tombstone-tracked). Reporting
+    # already happened above — this loop is state backfill only.
     for s in on_disk_specialists - set(runtime.agents.keys()):
         cfg = runtime.specialist_registry.all_configs().get(s)
         if cfg is None:
@@ -890,7 +913,6 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         runtime.agents[s] = new_agent
         runtime.bus.register(s, new_agent.handle_message)
         _start_bus_loop(runtime, s)
-        actions.append(f"added_specialist_{s}")
 
     # Evict missing specialists from runtime.agents (registry already
     # forgot them via its own load()).
@@ -904,7 +926,14 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         old_agent = runtime.agents.pop(s, None)  # AR-7: capture before drop
         _schedule_agent_close(old_agent)  # F12
         await _teardown_role(runtime, s)
-        actions.append(f"evicted_specialist_{s}")
+        # S-3: the registry diff above already reported registry-known
+        # evictions; only a runtime.agents entry the diff did NOT cover
+        # still needs surfacing here (a leaked entry, or the second step of
+        # a disabled-then-deleted specialist: the registry entry went in an
+        # earlier reload, the backfilled runtime Agent only now — each run
+        # reports the layer it actually tore down).
+        if s not in evicted_from_registry:
+            actions.append(f"evicted_specialist_{s}")
 
     # Rebuild agent_registry with fresh state.
     from agent_registry import AgentRegistry

@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.82.0] - 2026-07-15
+
+Fixes for the three findings of the 2026-07-15 live verification round
+(voice-latency, runaway-delegation resilience, reload reporting). No new
+options; no configuration change required.
+
+### Fixed
+
+- Voice agents no longer spend the first seconds of a fresh conversation
+  silently "searching" for their own built-in abilities before acting.
+  (Framework tools are now pre-loaded for every agent session instead of
+  being discovered on demand — cold-session hand-offs stop timing out.)
+- A voice turn that ends with nothing to say now speaks a brief apology
+  line instead of going silent. The line is customizable per agent via the
+  new `empty_turn` key in `voice_errors`.
+- Background (async) hand-offs to specialists now have a hard time ceiling
+  (10 minutes). A stuck specialist is cancelled and reported back as a
+  failure instead of blocking new hand-offs indefinitely — previously two
+  stuck hand-offs could freeze delegation for every agent until a restart.
+- `casactl reload --scope=agents` no longer reports long-installed
+  specialists as freshly "added" on the first reload after boot; the
+  action list now reflects only real additions and removals.
+
 ## [0.80.0] - 2026-07-15
 
 Voice-fleet hardening: generic delegation, session, and ingress safety

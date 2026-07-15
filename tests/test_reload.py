@@ -686,6 +686,161 @@ class TestReloadAgents:
         assert any("runtime.yaml" in a for a in failed_actions)
 
 
+class TestReloadAgentsSpecialistReporting:
+    """S-3 (block-S live finding 2026-07-15, N150 log 07:49:56Z): the FIRST
+    ``--scope=agents`` reload after boot reported ``added_specialist_finance``
+    although finance had been installed and untouched since boot. Root cause:
+    boot never puts specialists into ``runtime.agents`` (they are
+    direct-loaded via the SpecialistRegistry), while ``reload_agents`` diffs
+    "added" against ``runtime.agents`` — so every boot-loaded specialist is
+    mis-reported as added (and silently re-constructed) once. The action
+    list must instead reflect the REGISTRY diff: what genuinely appeared on
+    / vanished from disk across this reload's re-scan."""
+
+    def _setup_common(self, tmp_path, monkeypatch):
+        from reload import register_handler, reload_agents
+        register_handler("agents", reload_agents)
+
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "ellen").mkdir()
+
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: MagicMock(role="ellen"))
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+        monkeypatch.setattr(
+            "agent_home.provision_agent_home",
+            lambda *, role, home_root, defaults_root: None,
+        )
+        import reload as reload_mod
+        monkeypatch.setattr(reload_mod, "_construct_agent",
+                            lambda **kw: MagicMock())
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {"ellen": MagicMock()}
+        runtime.agents = {"ellen": MagicMock()}
+        runtime.specialist_registry.load_failures = MagicMock(return_value=[])
+        return runtime, agents_dir
+
+    async def test_boot_loaded_specialist_not_reported_added(
+        self, tmp_path, monkeypatch,
+    ):
+        """finance was in the registry BEFORE this reload's re-scan (boot
+        loaded it) and is still there after — the action list must not call
+        it added, even though runtime.agents has no entry for it yet."""
+        from reload import dispatch
+
+        runtime, agents_dir = self._setup_common(tmp_path, monkeypatch)
+        (agents_dir / "specialists").mkdir()
+        (agents_dir / "specialists" / "finance").mkdir()
+
+        # Registry knows finance before AND after load() — boot loaded it.
+        runtime.specialist_registry.load = MagicMock()
+        runtime.specialist_registry.all_configs = MagicMock(
+            return_value={"finance": MagicMock(role="finance")})
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        assert "added_specialist_finance" not in result["actions"], (
+            "a boot-loaded, untouched specialist must not be re-reported "
+            f"as added; actions={result['actions']!r}"
+        )
+        # The runtime.agents backfill itself stays (plugin-verify grades
+        # specialists through runtime.agents) — only the REPORT was wrong.
+        assert "finance" in runtime.agents
+
+    async def test_genuinely_new_specialist_reported_added(
+        self, tmp_path, monkeypatch,
+    ):
+        """A specialist whose directory appeared since the last scan IS
+        added — the report must keep saying so."""
+        from reload import dispatch
+
+        runtime, agents_dir = self._setup_common(tmp_path, monkeypatch)
+        (agents_dir / "specialists").mkdir()
+        (agents_dir / "specialists" / "probe").mkdir()
+
+        # Registry: empty before load(), knows probe after (fresh dir picked
+        # up by the re-scan).
+        configs: dict = {}
+        runtime.specialist_registry.all_configs = MagicMock(
+            side_effect=lambda: dict(configs))
+        runtime.specialist_registry.load = MagicMock(
+            side_effect=lambda: configs.update(
+                {"probe": MagicMock(role="probe")}))
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        assert "added_specialist_probe" in result["actions"]
+        assert "probe" in runtime.agents
+
+    async def test_removed_specialist_reported_evicted_even_if_never_backfilled(
+        self, tmp_path, monkeypatch,
+    ):
+        """A boot-loaded specialist whose directory was removed before any
+        agents reload was never backfilled into runtime.agents — the
+        registry re-scan drops it, and the action list must still say
+        evicted."""
+        from reload import dispatch
+
+        runtime, agents_dir = self._setup_common(tmp_path, monkeypatch)
+        (agents_dir / "specialists").mkdir()  # ghost's dir already gone
+
+        configs: dict = {"ghost": MagicMock(role="ghost")}
+        runtime.specialist_registry.all_configs = MagicMock(
+            side_effect=lambda: dict(configs))
+        runtime.specialist_registry.load = MagicMock(
+            side_effect=configs.clear)
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        assert "evicted_specialist_ghost" in result["actions"], (
+            f"registry-dropped specialist must be reported evicted; "
+            f"actions={result['actions']!r}"
+        )
+
+    async def test_removed_backfilled_specialist_reported_evicted_exactly_once(
+        self, tmp_path, monkeypatch,
+    ):
+        """The probe-spec live case: specialist present in runtime.agents
+        (a prior reload backfilled it), dir removed → exactly ONE
+        evicted_specialist action, and the runtime.agents teardown still
+        happens."""
+        from bus import MessageBus
+        from reload import dispatch
+
+        runtime, agents_dir = self._setup_common(tmp_path, monkeypatch)
+        (agents_dir / "specialists").mkdir()
+
+        bus = MessageBus()
+        bus.register("ellen", MagicMock())
+        bus.register("probe", MagicMock())
+        runtime.bus = bus
+        probe_agent = MagicMock()
+        probe_agent.aclose = AsyncMock()
+        runtime.agents["probe"] = probe_agent
+
+        configs: dict = {"probe": MagicMock(role="probe")}
+        runtime.specialist_registry.all_configs = MagicMock(
+            side_effect=lambda: dict(configs))
+        runtime.specialist_registry.load = MagicMock(
+            side_effect=configs.clear)
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        evicted = [a for a in result["actions"]
+                   if a == "evicted_specialist_probe"]
+        assert len(evicted) == 1, (
+            f"expected exactly one eviction action; "
+            f"actions={result['actions']!r}"
+        )
+        assert "probe" not in runtime.agents
+        assert "probe" not in bus.queues
+
+
 @pytest.mark.unit
 class TestReloadBusLoopLifecycle:
     """H10 + H11 (v0.49.0): the resident add/remove lifecycle against a

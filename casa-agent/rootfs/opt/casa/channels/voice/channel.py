@@ -40,6 +40,11 @@ _DEFAULT_ERROR_LINES = {
     "memory_error":  "",
     "channel_error": "[flat] Something went wrong.",
     "unknown":       "[flat] Sorry, something went wrong.",
+    # S-1 (2026-07-15, cid 93f501bb): a turn that completes with ZERO spoken
+    # output (e.g. max_turns exhausted on ToolSearch round-trips) must never
+    # end as a bare `done` — a voice user just hears silence.
+    "empty_turn":    "[apologetic] Sorry, I lost my train of thought — "
+                     "could you ask that again?",
 }
 
 # A4 (spec A4): voice turn-budget envelope. INTEGRATION_TIMEOUT_TOTAL is
@@ -340,6 +345,16 @@ class VoiceChannel(Channel):
                     "text": adapter.render(tail),
                     "final": True,
                 })
+            elif not speech_block_sent:
+                # S-1: zero spoken output for the whole turn — emit a typed
+                # empty_turn error line instead of a silent bare `done`
+                # (mirrors every other error path: error frame, no done).
+                line = self._error_line_for_kind(cfg, "empty_turn")
+                await _write_sse(response, "error", {
+                    "kind": "empty_turn",
+                    "spoken": adapter.render(line) if line else "",
+                })
+                return response
             await _write_sse(response, "done", {})
         except asyncio.CancelledError:
             # Client disconnect mid-stream — do NOT emit `event: done`.
@@ -611,6 +626,16 @@ class VoiceChannel(Channel):
                     "type": "block", "utterance_id": uid,
                     "text": adapter.render(tail), "final": True,
                 })
+            elif not speech_block_sent:
+                # S-1: zero spoken output — typed empty_turn error, never a
+                # silent bare `done`. See the SSE handler for rationale.
+                line = self._error_line_for_kind(cfg, "empty_turn")
+                await ws.send_json({
+                    "type": "error", "utterance_id": uid,
+                    "kind": "empty_turn",
+                    "spoken": adapter.render(line) if line else "",
+                })
+                return
             await ws.send_json({"type": "done", "utterance_id": uid})
         except asyncio.CancelledError:
             # Cancellation from a `cancel` frame — drop partial state; do

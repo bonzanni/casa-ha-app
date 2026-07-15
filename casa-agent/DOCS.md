@@ -147,6 +147,7 @@ voice_errors:
   memory_error:  ""                    # silent degrade
   channel_error: "[flat] Something went wrong sending that."
   unknown:       "[flat] Sorry, something went wrong."
+  empty_turn:    "[apologetic] Sorry, I lost my train of thought — could you ask that again?"
 ```
 
 `tag_dialect` selects how inline emotion tags (`[confident]`, `[warm]`,

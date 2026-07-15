@@ -1713,6 +1713,129 @@ def _retrieve_late_task_exception(t: asyncio.Task) -> None:
         )
 
 
+# S-2 (block-S live finding 2026-07-15): wall-clock ceiling on every
+# launched sync/async delegation task. Async mode (and sync degraded to
+# pending at the 60s wait) previously had NO time bound at all — a runaway
+# specialist (live: >12 min repetition loop, delegation 07bfeb0b) held its
+# per-scope Permit + a global slot until someone killed the CLI subprocess.
+# 10× the sync degrade wait: minutes-scale so legitimate long specialist
+# turns (the EMIT:2500 sibling run finished after producing 127k chars)
+# still complete, but far below the observed indefinite hang. Deliberately
+# a module constant, not an add-on option — voice has its own (configurable)
+# budget, and the sync/interactive paths have their own bounds; this is a
+# runaway backstop, not a tuning knob.
+_DELEGATION_CEILING_S: float = 10 * _SYNC_WAIT_TIMEOUT_S
+# Bounded wait for the cancelled inner task to unwind (SDK client __aexit__
+# terminates the CLI subprocess — its own terminate→kill escalation runs in
+# seconds) before the failure is reported. 30s comfortably covers a healthy
+# teardown while never letting a wedged one postpone the typed failure
+# indefinitely; giving up early is LOUD (see the warning below) because the
+# permit then frees while the zombie is still unwinding — a deliberate,
+# bounded overshoot of the concurrency cap in the double-failure case only.
+_CEILING_TEARDOWN_BOUND_S: float = 30.0
+
+
+class DelegationCeilingExceeded(asyncio.TimeoutError):
+    """A delegated turn exceeded the wall-clock ceiling and was cancelled.
+
+    Subclasses ``asyncio.TimeoutError`` so ``_classify_error`` yields the
+    typed kind ``"timeout"`` — the task then FAILS (rather than ending
+    cancelled), which routes ``_attach_completion_callback`` into its
+    exception branch: ``fail_delegation`` + a ``DelegationComplete`` error
+    NOTIFICATION to the engager — the exact path the live kill-subprocess
+    probe proved releases the permit and notifies correctly. A bare
+    ``task.cancel()`` would instead hit the cancelled-branch, which posts
+    NO notification."""
+
+
+async def _run_delegated_agent_bounded(
+    cfg, task_text: str, context_text: str, resolution=None,
+) -> str:
+    """Run ``_run_delegated_agent`` under ``_DELEGATION_CEILING_S``.
+
+    Transparent wrapper on the happy path (result and exceptions propagate
+    unchanged, so error classification is untouched). On ceiling expiry the
+    inner task is cancelled, given ``_CEILING_TEARDOWN_BOUND_S`` to unwind
+    (the SDK client's ``__aexit__`` terminates the CLI subprocess), and
+    ``DelegationCeilingExceeded`` is raised. On cancellation of the OUTER
+    task (voice deadline teardown / caller cancel) the inner task is
+    cancelled and awaited to completion before re-raising, so the permit —
+    released by the outer task's done-callback — is never freed while the
+    delegated work is still unwinding (preserves the pre-S-2 release
+    timing exactly).
+
+    Both bounds are read off the module at call time so tests can
+    monkeypatch them."""
+    inner = asyncio.create_task(
+        _run_delegated_agent(cfg, task_text, context_text,
+                             resolution=resolution))
+    ceiling = _DELEGATION_CEILING_S
+    if not math.isfinite(ceiling) or ceiling <= 0:
+        ceiling = 600.0  # fail closed to the shipped default, never hang
+    try:
+        done, pending = await asyncio.wait({inner}, timeout=ceiling)
+    except asyncio.CancelledError:
+        inner.cancel()
+        # Await the actual unwind so the permit (released by the OUTER
+        # task's done-callback) never frees while the delegated work is
+        # still running — matching the pre-S-2 release timing, where the
+        # outer task WAS the delegated coroutine. Tolerates overlapping
+        # re-cancellation (Codex review finding 2) up to the teardown
+        # bound; the voice teardown's own asyncio.wait bounds how long
+        # the CALLER waits regardless.
+        if not await _await_task_teardown(inner, _CEILING_TEARDOWN_BOUND_S):
+            logger.warning(
+                "delegation cancel: delegated task still unwinding after "
+                "%.0fs teardown bound — permit will free early (S-2)",
+                _CEILING_TEARDOWN_BOUND_S,
+            )
+        raise
+    if pending:
+        inner.add_done_callback(_retrieve_late_task_exception)
+        inner.cancel()
+        if not await _await_task_teardown(inner, _CEILING_TEARDOWN_BOUND_S):
+            logger.warning(
+                "delegation ceiling: delegated task still unwinding after "
+                "%.0fs teardown bound — permit will free early (S-2)",
+                _CEILING_TEARDOWN_BOUND_S,
+            )
+        raise DelegationCeilingExceeded(
+            f"delegated turn exceeded the {ceiling:.0f}s wall-clock "
+            f"ceiling and was cancelled (S-2 runaway backstop)")
+    return inner.result()
+
+
+async def _await_task_teardown(inner: asyncio.Task, bound_s: float) -> bool:
+    """Wait up to *bound_s* for *inner* to actually finish, tolerating
+    repeated cancellation of the CALLING task.
+
+    Each re-cancellation of the caller lands here as a CancelledError out
+    of ``asyncio.wait``; it is absorbed and the wait re-entered with the
+    REMAINING budget, so an overlapping second cancel (voice deadline
+    teardown racing a shutdown sweep) cannot end the outer task — and
+    thereby free its permit — while the delegated work is still unwinding.
+    Absorbing the extra cancels is safe: the cancel-path caller re-raises
+    its original CancelledError immediately after this returns, and the
+    wait is hard-bounded by *bound_s*. One deliberate consequence (Codex
+    round-2 residual, accepted): a cancel that FIRST arrives during the
+    ceiling-path teardown is absorbed too, so the task ends with
+    ``DelegationCeilingExceeded`` rather than cancelled — bounded by
+    *bound_s*, and it routes completion to the NOTIFYING failure branch
+    instead of the silent cancelled branch, which is strictly more
+    informative for the engager. Returns True when *inner* really ended."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + bound_s
+    while not inner.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.wait({inner}, timeout=remaining)
+        except asyncio.CancelledError:
+            continue
+    return inner.done()
+
+
 @tool(
     "delegate_to_agent",
     "Delegate a task to another agent (resident or specialist) and return its result.",
@@ -1997,7 +2120,8 @@ async def delegate_to_agent(args: dict) -> dict:
         # finally to release the now-live task's permit (the count goes through
         # the non-raising wrapper).
         task = asyncio.create_task(
-            _run_delegated_agent(cfg, task_text, context_text, resolution=resolution))
+            _run_delegated_agent_bounded(
+                cfg, task_text, context_text, resolution=resolution))
         if permit is not None:
             task.add_done_callback(_permit_release_callback(permit))
         owned = None  # __TRANSFER_SYNC__
@@ -5534,4 +5658,15 @@ def create_casa_tools() -> dict[str, Any]:
         name="casa-framework",
         tools=list(CASA_TOOLS),
     )
+    # S-1 (block-S live finding 2026-07-15): opt the framework server out of
+    # Claude Code's ToolSearch deferral. Since CLI ~2.1.69 ALL MCP tool
+    # schemas are deferred by default (allow-listing does not exempt them);
+    # cold voice sessions burned 1-4 ToolSearch model round-trips (4.7→27.5s,
+    # escalating) resolving delegate_to_agent before they could call it —
+    # eating the 27s voice budget. `alwaysLoad` (CLI ≥2.1.121; our pin
+    # 2.1.150) eager-loads every tool of THIS server at session start; the
+    # SDK transport forwards all non-`instance` keys of an sdk-type server
+    # config to --mcp-config verbatim. Plugin/HA/n8n servers deliberately
+    # keep deferral — this is the small always-needed core surface only.
+    server["alwaysLoad"] = True
     return server
