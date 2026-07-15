@@ -941,8 +941,14 @@ class ClaudeCodeDriver(DriverProtocol):
                             "engagement %s: no FIFO reader after %.0fs — "
                             "dropping turn", engagement.id[:8], timeout_s,
                         )
-                        await self._send_to_topic(
-                            engagement.topic_id,
+                        # F3 (Sol r3): route the no-reader notice THROUGH the
+                        # single writer (post_platform_notice: seals narration +
+                        # advances high-water), not a direct send that bypasses
+                        # the sequencer on an abnormal respawn. ``post_topic_notice``
+                        # falls back to a direct send only when no live sequencer
+                        # exists.
+                        await self.post_topic_notice(
+                            engagement,
                             "The engagement isn't accepting input right now — "
                             "your message was not delivered. Try again, or "
                             "/cancel if it stays unresponsive.",
@@ -1113,6 +1119,21 @@ class ClaudeCodeDriver(DriverProtocol):
                 engagement.id[:8], exc,
             )
             return False
+
+    async def post_topic_notice(
+        self, engagement: EngagementRecord, text: str,
+        reply_to: int | None = None,
+    ) -> bool:
+        """§2 F2: post a platform-origin notice (a Telegram command reply, a
+        resume error) into the engagement topic THROUGH the single writer.
+
+        Command replies used to post via a direct ``send_to_topic`` that
+        bypassed the sequencer — a reply slipping in below open narration while
+        ``edit_narration_if_latest`` still returns APPLIED is the exact ordering
+        violation §2 forbids. Delegates to the same ``post_platform_notice``
+        seam receipts use (seals narration + advances high-water under the one
+        lock; direct send only when no live sequencer)."""
+        return await self._spool_send_notice(engagement, text, reply_to)
 
     async def drain_inbound_spool(self, engagement: EngagementRecord) -> None:
         """§3 terminal pre-close drain: flush pending receipts/notices while

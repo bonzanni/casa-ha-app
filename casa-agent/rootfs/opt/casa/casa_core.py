@@ -2056,6 +2056,17 @@ async def main() -> None:
                     rec.id, msg_id)
         telegram_channel._driver_advance_high_water = _driver_advance_high_water
 
+        # v0.79.0 (§3, F2): route platform-origin topic notices (command
+        # replies, resume errors) through the engagement's OUTPUT SEQUENCER so
+        # they seal narration + advance the high-water under the single writer.
+        # Non-claude_code engagements have no sequencer — post directly.
+        async def _driver_post_notice(rec, text):
+            if rec.driver == "claude_code":
+                await claude_code_driver.post_topic_notice(rec, text)
+            else:
+                await telegram_channel.send_to_topic(rec.topic_id, text)
+        telegram_channel._driver_post_notice = _driver_post_notice
+
         async def _finalize_cancel(rec, reason="user"):
             from tools import _finalize_engagement
             driver = (claude_code_driver if rec.driver == "claude_code"

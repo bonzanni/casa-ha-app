@@ -305,6 +305,12 @@ class TelegramChannel(Channel):
         # v0.79.0 (§3): seal open narration on inbound (claude_code engagements);
         # wired by casa_core, None-safe for tests.
         self._driver_advance_high_water = None
+        # v0.79.0 (§3, F2): route a platform-origin topic notice (command
+        # replies, resume errors) through the engagement's OUTPUT SEQUENCER so
+        # it seals open narration + advances the high-water under the single
+        # writer — a notice can never land BELOW live narration. Wired by
+        # casa_core; None-safe (falls back to a direct send).
+        self._driver_post_notice = None
         self._engagement_driver = None
         self._finalize_cancel = None
         self._finalize_complete_user = None
@@ -914,6 +920,17 @@ class TelegramChannel(Channel):
         """Default behavior for non-engagement chats: feed into existing _handle."""
         await self._handle(update, None)
 
+    async def _post_engagement_notice(self, rec, text: str) -> None:
+        """v0.79.0 (§3, F2): post a platform-origin notice into an engagement
+        topic THROUGH the output sequencer (seals open narration + advances the
+        high-water under the single writer) so it can never land BELOW live
+        narration. Falls back to a direct send when the sequencer seam is not
+        wired (tests) or the engagement's driver has no sequencer (in_casa)."""
+        if self._driver_post_notice is not None:
+            await self._driver_post_notice(rec, text)
+        else:
+            await self.send_to_topic(rec.topic_id, text)
+
     async def handle_update(
         self, update, _context: ContextTypes.DEFAULT_TYPE | None = None
     ) -> None:
@@ -959,6 +976,22 @@ class TelegramChannel(Channel):
                     await self.send_to_topic(thread_id, "No active engagement in this topic.")
                     return
 
+                # v0.79.0 (§3, F2/F5): an inbound operator message is a causal
+                # event, visible on Telegram the instant it arrives. SEAL open
+                # narration + advance the topic high-water at TRUE handler entry
+                # — BEFORE command handling and BEFORE update_user_turn()'s
+                # await. This must precede any command reply (/silent, a rejected
+                # /cancel|/complete) AND any suspension, else a reply or mid-turn
+                # narration could append BELOW the operator's message.
+                if self._driver_advance_high_water is not None:
+                    try:
+                        await self._driver_advance_high_water(rec, msg.message_id)
+                    except Exception as exc:  # noqa: BLE001 — advisory sealing
+                        logger.debug(
+                            "advance_high_water failed for %s: %s",
+                            rec.id[:8], exc,
+                        )
+
                 if text.startswith("/"):
                     # M10 (v0.52.0): group command menus send "/cancel@botname"
                     # (Telegram appends @botusername to menu-selected commands
@@ -984,8 +1017,10 @@ class TelegramChannel(Channel):
                             and user_id is not None
                             and int(owner_id) != int(user_id)
                         ):
-                            await self.send_to_topic(
-                                thread_id,
+                            # F2: route through the sequencer so this reply
+                            # cannot land below open narration.
+                            await self._post_engagement_notice(
+                                rec,
                                 f"Only the engagement originator can {command}. "
                                 "Ask them, or start your own engagement.",
                             )
@@ -996,8 +1031,9 @@ class TelegramChannel(Channel):
                     if command == "/silent":
                         if self._observer is not None:
                             self._observer.silence(rec.id)
-                        await self.send_to_topic(
-                            thread_id, "Observer quieted for this engagement.",
+                        # F2: route through the sequencer (single writer).
+                        await self._post_engagement_notice(
+                            rec, "Observer quieted for this engagement.",
                         )
                         return
 
@@ -1062,20 +1098,10 @@ class TelegramChannel(Channel):
                 # still ran under the lock, preserving the Bug-10 guarantee
                 # (a cancel that already finalised the driver blanks the turn
                 # here before any task is spawned).
-                # v0.79.0 (§3, F5): an inbound operator message is a causal event
-                # and is visible on Telegram the moment it arrives — SEAL open
-                # narration + advance the topic high-water mark at TRUE handler
-                # entry, BEFORE update_user_turn()'s await. Sealing must precede
-                # any suspension, else mid-turn narration could append below the
-                # operator's message across the update_user_turn await.
-                if self._driver_advance_high_water is not None:
-                    try:
-                        await self._driver_advance_high_water(rec, msg.message_id)
-                    except Exception as exc:  # noqa: BLE001 — advisory sealing
-                        logger.debug(
-                            "advance_high_water failed for %s: %s",
-                            rec.id[:8], exc,
-                        )
+                # v0.79.0 (§3, F2/F5): the high-water advance + narration seal
+                # now happens at TRUE handler entry above (before command
+                # handling and any suspension) — see the block after the
+                # active-status check.
                 if self._engagement_registry is not None:
                     import time as _time
                     await self._engagement_registry.update_user_turn(rec.id, _time.time())
@@ -1137,7 +1163,9 @@ class TelegramChannel(Channel):
                 return
             logger.warning("turn delivery failed for %s: %s", rec.id[:8], exc)
             try:
-                await self.send_to_topic(rec.topic_id, f"Turn failed: {exc}")
+                # F2 sweep (Sol r3): route through the sequencer (single writer)
+                # so this failure notice can't land below open narration.
+                await self._post_engagement_notice(rec, f"Turn failed: {exc}")
             except Exception:  # noqa: BLE001 — best-effort user notice
                 pass
 

@@ -553,3 +553,68 @@ async def test_anchor_retry_reattaches_without_new_qnumber(env):
     assert env["reg"].get(eid).next_question_number == 2
     assert env["ch"].sent_texts == sent_before          # no second anchor
     assert env["reg"].open_question_numbers(eid) == [1]  # single open question
+
+
+# ---------------------------------------------------------------------------
+# F1 (Sol r3) — button-ask reattach/creation race must not lose static metadata
+# ---------------------------------------------------------------------------
+
+
+async def test_button_ask_reattach_race_preserves_static_metadata(env, monkeypatch):
+    """F1: a button-ask transport RETRY that CREATES the broker request while
+    the first attempt is suspended in number allocation must not strip the
+    keyboard's static metadata.
+
+    Regression (Sol r3 re-probe): the reattach path created the broker request
+    WITHOUT options/topic_id/operator_id; the first attempt then resumed, saw
+    ``created=False`` and skipped the meta init, leaving broker meta =
+    {"message_id": ...} only ⇒ every tap rejected.
+    """
+    eid = env["rec"].id
+    reg = env["reg"]
+
+    parked = asyncio.Event()   # set once the first attempt is inside allocation
+    resume = asyncio.Event()   # released after the retry has registered
+    orig_alloc = reg.allocate_question_number
+    calls = {"n": 0}
+
+    async def _slow_alloc(engagement_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # First attempt suspends INSIDE allocation; hand off to the retry.
+            parked.set()
+            await resume.wait()
+        return await orig_alloc(engagement_id)
+
+    monkeypatch.setattr(reg, "allocate_question_number", _slow_alloc)
+
+    p = _ask_payload(engagement_id=eid, request_id="race-1")
+    first = asyncio.ensure_future(env["ask"](_FakeRequest(p)))
+    await asyncio.wait_for(parked.wait(), timeout=1.0)
+
+    # The RETRY (same request_id) reattaches and, in the race, CREATES the
+    # broker request. It must seed the complete static metadata.
+    second = asyncio.ensure_future(env["ask"](_FakeRequest(p)))
+    await asyncio.sleep(0.02)   # let the retry register the broker request
+
+    # Let the first attempt resume: its main-path register now sees created=False.
+    resume.set()
+    await asyncio.sleep(0.02)
+
+    meta = env["broker"].get_meta(
+        namespace="engagement_ask", scope=eid, request_id="race-1")
+    assert meta is not None
+    assert meta.get("topic_id") == 42
+    assert meta.get("operator_id") == 555
+    assert meta.get("options") == ["A", "B"]
+
+    # A tap is accepted — it resolves the ask to "answered" (the meta the
+    # inline-callback handler validates against — topic_id/operator_id/options —
+    # is all present, so the tap is not rejected).
+    assert env["broker"].deliver(
+        namespace="engagement_ask", scope=eid, request_id="race-1",
+        option_index=0, actor_id=555) == "delivered"
+    resp = await asyncio.wait_for(first, timeout=1.0)
+    assert _body(resp)["outcome"] == "answered"
+    await asyncio.gather(second, return_exceptions=True)
+    await env["broker"].drain_hooks()

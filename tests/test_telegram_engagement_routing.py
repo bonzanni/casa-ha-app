@@ -230,6 +230,74 @@ class TestSlashCommands:
         assert ch._driver_send_user_turn.await_args.kwargs.get(
             "tg_message_id") == 999
 
+    async def test_command_reply_seals_narration_at_entry(
+        self, fake_telegram_bot, tmp_path,
+    ):
+        """F2 (Sol r3): the high-water advance + narration seal happens at TRUE
+        handler entry (before command handling), and command replies route
+        through the OUTPUT SEQUENCER.
+
+        Regression probe: /silent (and a rejected /cancel|/complete) posted its
+        reply via a direct send and the high-water advance ran only on the
+        user-turn path AFTER the command returned — so a narration edit on a
+        pre-command message still returned APPLIED, letting narration append
+        below the operator's message + the reply.
+        """
+        from channels.telegram import TelegramChannel
+        from channels.output_sequencer import OutputSequencer, SEALED
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={"user_id": 42}, topic_id=555,
+        )
+
+        posts: list[tuple[int, str]] = []
+        counter = {"n": 9}
+
+        async def _send(topic, text, reply_to=None):
+            counter["n"] += 1
+            posts.append((topic, text))
+            return counter["n"]
+
+        async def _edit(topic, mid, text):
+            return True
+
+        seq = OutputSequencer(
+            engagement_id=rec.id, topic_id=555,
+            send_message=_send, edit_message=_edit)
+        narration_mid = await seq.open_narration("agent is working…")
+        assert narration_mid is not None
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = reg
+        observer = MagicMock()
+        observer.silence = MagicMock()
+        ch._observer = observer
+
+        async def _advance(r, mid):
+            await seq.advance_high_water_for_inbound(mid)
+
+        async def _notice(r, text):
+            await seq.post_platform_notice(text)
+
+        ch._driver_advance_high_water = _advance
+        ch._driver_post_notice = _notice
+
+        u = _mk_update(chat_id=-1001, text="/silent", thread_id=555, user_id=42)
+        await ch.handle_update(u)
+
+        observer.silence.assert_called_once_with(rec.id)
+        # The reply went THROUGH the sequencer (single writer), not a direct
+        # bot send.
+        assert any("Observer quieted" in t for _, t in posts)
+        # The narration was SEALED at entry: an edit on the pre-command message
+        # is no longer APPLIED.
+        assert await seq.edit_narration_if_latest(
+            narration_mid, "late narration") == SEALED
+
     async def test_slash_command_for_other_bot_falls_through(
         self, fake_telegram_bot, engagement_fixture,
     ):

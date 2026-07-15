@@ -674,6 +674,26 @@ def _make_ask(
         # poster is installed just before we ARM (below) — posting is
         # RELAY-DEFERRED (§2, review C1): the relay posts the keyboard at the
         # ask's tool_use block, AFTER any preceding narration in the same frame.
+
+        def _ask_static_meta() -> dict:
+            # F1 (Sol r3): the keyboard's STATIC metadata (options + topic_id +
+            # operator_id), seeded ATOMICALLY at broker creation. The old code
+            # seeded meta AFTER register (``if created: req.meta.update(...)``)
+            # ONLY on the main path, which lost the metadata whenever a
+            # concurrent same-request_id RETRY created the broker request first:
+            # the first attempt, suspended in number allocation, resumed to find
+            # ``created=False`` and skipped the init, leaving meta =
+            # {"message_id": ...} only ⇒ every tap rejected (topic_id/operator_id
+            # both absent). Now BOTH the reattach path and the main path pass
+            # ``meta=`` to ``register`` (a single synchronous op — register only
+            # seeds meta on creation, with no await between), so whichever call
+            # wins the create race installs the complete static metadata.
+            return {
+                "options": options,
+                "topic_id": rec.topic_id,
+                "operator_id": rec.origin.get("user_id"),
+            }
+
         intent_registered = False
         if driver is not None and projection_hash:
             res = driver.register_send_intent(
@@ -695,9 +715,15 @@ def _make_ask(
                     # otherwise fell through — allocating a fresh Q-number and
                     # posting a SECOND keyboard eagerly (the probe: Q2 posting
                     # before the relay's Q1, both ledger entries surviving).
+                    # F1: create-with-metadata atomically. If THIS reattach wins
+                    # the create race (the first attempt is still suspended in
+                    # number allocation), it seeds the complete static metadata;
+                    # if the request already exists, ``meta`` is ignored (register
+                    # only seeds on creation) and the existing meta is reused.
                     req, _c = BROKER.register(
                         namespace="engagement_ask", scope=eng_id,
                         request_id=request_id, timeout_s=timeout_s,
+                        meta=_ask_static_meta(),
                     )
                     outcome = await BROKER.await_result(req)
                     return _ask_outcome_response(outcome, options)
@@ -716,19 +742,15 @@ def _make_ask(
         number = await _maybe_allocate_number(engagement_registry, eng_id)
         display = _canonical_question(question, number) if number else question
 
-        req, created = BROKER.register(
+        # F1: create-with-metadata atomically (STATIC meta seeded at creation so
+        # a fast tap never sees incomplete metadata — r3-B3 fast-tap — AND a
+        # concurrent reattach that created the request first still finds it
+        # complete). message_id + finish_hook are set later by the broker-owned
+        # setup task (r8-B3). ``meta`` is ignored if the request already exists.
+        req, _created = BROKER.register(
             namespace="engagement_ask", scope=eng_id, request_id=request_id,
-            timeout_s=timeout_s,
+            timeout_s=timeout_s, meta=_ask_static_meta(),
         )
-        if created:
-            # STATIC meta BEFORE posting so a fast tap never sees incomplete
-            # metadata (r3-B3 fast-tap). message_id + finish_hook are set by
-            # the broker-owned setup task (r8-B3).
-            req.meta.update({
-                "options": options,
-                "topic_id": rec.topic_id,
-                "operator_id": rec.origin.get("user_id"),
-            })
 
         async def _close_question() -> None:
             if number is None:

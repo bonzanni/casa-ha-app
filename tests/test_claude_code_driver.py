@@ -2245,6 +2245,81 @@ class TestF2ViolationNoticeThroughSequencer:
         assert rec.id in drv._violation_notified
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="mkfifo Linux-only")
+class TestNoReaderNoticeThroughSequencer:
+    """F3 (Sol r3): the FIFO no-reader ('not accepting input') notice is a
+    PLATFORM notice — on an abnormal respawn with a live sequencer it MUST route
+    through post_platform_notice (seals open narration + posts under the one
+    lock), never a direct send around the writer."""
+
+    async def test_no_reader_notice_routes_through_sequencer_and_seals(
+        self, tmp_path,
+    ):
+        import os
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from channels.output_sequencer import OutputSequencer, SEALED
+
+        sent_direct = AsyncMock()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path), send_to_topic=sent_direct,
+            casa_framework_mcp_url="x")
+        rec = _make_record()
+        ws = tmp_path / rec.id
+        ws.mkdir()
+        os.mkfifo(str(ws / "stdin.fifo"))  # exists, but NO reader ⇒ deadline hit
+
+        posts: list = []
+
+        async def _send(topic, text, reply_to=None):
+            posts.append((topic, text))
+            return 700 + len(posts)
+
+        async def _edit(topic, mid, text):
+            return True
+
+        seq = OutputSequencer(
+            engagement_id=rec.id, topic_id=rec.topic_id,
+            send_message=_send, edit_message=_edit)
+        drv._sequencers[rec.id] = seq
+        nar = await seq.open_narration("live narration")
+
+        ok = await asyncio.wait_for(
+            drv._write_to_fifo(rec, "hello", timeout_s=0.3, poll_s=0.05),
+            timeout=5.0,
+        )
+        assert ok is False  # turn retained for the next spawn
+
+        # Notice posted THROUGH the sequencer, which SEALED open narration.
+        assert any("isn't accepting input" in t for _, t in posts)
+        assert seq.narration_msg_id is None
+        assert await seq.edit_narration_if_latest(nar, "late") == SEALED
+        # NOT a direct send around the writer.
+        sent_direct.assert_not_awaited()
+
+    async def test_no_reader_notice_falls_back_to_direct_send_without_sequencer(
+        self, tmp_path,
+    ):
+        """No live sequencer ⇒ the pre-v0.79 direct send is still used."""
+        import os
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sent_direct = AsyncMock()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path), send_to_topic=sent_direct,
+            casa_framework_mcp_url="x")
+        rec = _make_record()
+        ws = tmp_path / rec.id
+        ws.mkdir()
+        os.mkfifo(str(ws / "stdin.fifo"))
+
+        ok = await asyncio.wait_for(
+            drv._write_to_fifo(rec, "hello", timeout_s=0.3, poll_s=0.05),
+            timeout=5.0,
+        )
+        assert ok is False
+        sent_direct.assert_awaited_once()
+
+
 class TestF3FinalizeDrainsToCompletionBlock:
     """F3 (Sol r2): finalize_completion_post must DRAIN the relay to the
     emit_completion block (wait for its consumption debt) BEFORE posting the
