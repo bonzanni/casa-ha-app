@@ -401,6 +401,26 @@ class OutputSequencer:
             finally:
                 self._lock_owner = None
 
+    def serialized(self):
+        """PUBLIC alias of :meth:`_serialized` — the reentrant-per-task writer CM.
+
+        GLOBAL LOCK-ORDER (Sol diff gate r3): the sequencer writer lock is the
+        OUTER lock in the one sanctioned order ``sequencer → summary``.
+        :class:`drivers.summary_controller.SummaryController` acquires THIS
+        (reentrantly, if the caller — e.g. an armed ask poster the sequencer
+        awaits under the held writer lock — already owns it) BEFORE its own
+        summary lock, so *no code ever holds the summary lock while acquiring the
+        sequencer lock*. That removes the former summary→sequencer ordering
+        entirely, making an AB-BA cross-task cycle impossible: because holding the
+        summary lock now REQUIRES first holding this writer lock, and only one task
+        holds it at a time, a second task can never hold the summary lock while the
+        first holds the sequencer lock.
+
+        Returns the SAME reentrant-per-task context manager as ``_serialized``;
+        internal callers keep using ``_serialized`` unchanged.
+        """
+        return self._serialized()
+
     # -- narration ----------------------------------------------------------
 
     @property

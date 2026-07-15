@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from typing import Awaitable, Callable
 
 from channels.output_sequencer import FAILED
@@ -272,6 +273,39 @@ class SummaryController:
         # The SINGLE sanctioned timer (§5 B1).
         self._tick_task: asyncio.Task | None = None
 
+    # -- serialization (GLOBAL LOCK-ORDER: sequencer OUTER, summary INNER) ---
+    @asynccontextmanager
+    async def _writing(self):
+        """Acquire the writer locks in the ONE sanctioned order: the OUTPUT
+        SEQUENCER lock OUTER, then this controller's summary lock INNER.
+
+        INVARIANT (Sol diff gate r3): *no code may hold ``self._lock`` (the summary
+        lock) while acquiring the OutputSequencer lock.* Every summary mutator that
+        can reach :meth:`_flush_locked` / ``edit_summary`` / :meth:`_maybe_pin_locked`
+        enters through here, so the sequencer's writer lock is ALWAYS taken first —
+        reentrantly for the owning task, so an ask poster the sequencer already
+        awaits under its held writer lock re-enters rather than deadlocking.
+
+        Why this kills the cross-task AB-BA deadlock: the two paths that used to
+        acquire the two locks in OPPOSITE orders —
+
+        * ``post_for_block`` → armed ask poster (holds the sequencer lock) →
+          ``note_ask_waiting`` → :meth:`submit_status` (wants the summary lock), and
+        * a summary mutator (holds the summary lock) → :meth:`_flush_locked` →
+          ``edit_summary`` (wants the sequencer lock) —
+
+        now share ONE order. Because holding the summary lock REQUIRES first holding
+        the sequencer lock, and only one task holds the sequencer lock at a time, a
+        second task can never hold the summary lock while the first holds the
+        sequencer lock. ``edit_summary``, reached from under the summary lock inside
+        :meth:`_flush_locked`, is therefore always already under the sequencer lock
+        (reentrant for this task). :meth:`_maybe_pin_locked`'s ``pin_message``
+        primitive does NOT touch the sequencer, so it adds no third ordering.
+        """
+        async with self._sequencer.serialized():   # OUTER (reentrant if held)
+            async with self._lock:                  # INNER
+                yield
+
     # -- message-id adoption ------------------------------------------------
     def adopt_message_id(self, message_id: int | None) -> None:
         """Bind the summary Telegram message id (posted at boot, persisted in
@@ -295,7 +329,7 @@ class SummaryController:
         the pinned summary. The rendered-text no-op gate in ``_flush_locked``
         suppresses a redundant wire edit when nothing actually moved.
         """
-        async with self._lock:
+        async with self._writing():
             if self._status in _TERMINAL_STATUSES:
                 return  # terminal absolute
             if revision is None or revision <= self._status_rev:
@@ -310,7 +344,7 @@ class SummaryController:
         perform the mandatory engagement-finalize flush. Ignores the revision
         ordering: a terminal status wins unconditionally and, once set,
         :meth:`submit_status` rejects every later submission."""
-        async with self._lock:
+        async with self._writing():
             self._status = status
             self._turn_running = False
             self._cancel_tick_locked()
@@ -325,7 +359,7 @@ class SummaryController:
         reconciliation — without a status-class change — the driver calls this
         to reflow the open-questions line. The rendered-text no-op gate in
         ``_flush_locked`` suppresses a redundant wire edit when nothing moved."""
-        async with self._lock:
+        async with self._writing():
             await self._flush_locked(force=True)
 
     # -- activity / plan (never status) -------------------------------------
@@ -333,7 +367,7 @@ class SummaryController:
         """Submit the current ACTIVITY (§5 S5). DESIRED-STATE coalescing: the
         edit is throttled, so alternating tools yield at most one edit per
         throttle window (rate limiting, not just dedup)."""
-        async with self._lock:
+        async with self._writing():
             self._activity = activity
             await self._flush_locked(force=False)
 
@@ -346,7 +380,7 @@ class SummaryController:
     ) -> None:
         """Merge a plan-progress fragment (§5 B2). ``None`` fields are left
         unchanged (a Task* subject update keeps the last TodoWrite counts)."""
-        async with self._lock:
+        async with self._writing():
             if done is not None:
                 self._plan_done = done
             if total is not None:
@@ -359,7 +393,7 @@ class SummaryController:
     async def note_turn_start(self) -> None:
         """A CLI turn started: reset the elapsed base and (re)start the tick if
         the status is working."""
-        async with self._lock:
+        async with self._writing():
             self._turn_running = True
             self._turn_base = self._now()
             self._reconcile_tick_locked()
@@ -367,7 +401,7 @@ class SummaryController:
     async def note_turn_end(self) -> None:
         """A CLI turn ended: stop the tick and perform the mandatory
         turn-end lifecycle flush (§5)."""
-        async with self._lock:
+        async with self._writing():
             self._turn_running = False
             self._reconcile_tick_locked()
             await self._flush_locked(force=True)
@@ -376,7 +410,7 @@ class SummaryController:
     async def ensure_pinned(self) -> None:
         """Attempt to pin the summary (best-effort; §5). Retried on every
         lifecycle flush until it succeeds."""
-        async with self._lock:
+        async with self._writing():
             await self._maybe_pin_locked()
 
     async def _maybe_pin_locked(self) -> None:
@@ -420,7 +454,7 @@ class SummaryController:
         """One elapsed-refresh tick (§5 B1): submit ONLY an elapsed refresh
         (never status), routed through the same throttle/no-op gate. Returns
         ``False`` when no longer eligible (working+turn-running lapsed)."""
-        async with self._lock:
+        async with self._writing():
             if not self._tick_should_run():
                 return False
             await self._flush_locked(force=False)

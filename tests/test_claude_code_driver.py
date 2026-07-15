@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -2025,6 +2026,10 @@ class TestAskLifecycleSeams:
         class _SumSeq:
             def __init__(self):
                 self.edits: list = []
+
+            @asynccontextmanager
+            async def serialized(self):
+                yield
 
             async def edit_summary(self, mid, text):
                 self.edits.append((mid, text))

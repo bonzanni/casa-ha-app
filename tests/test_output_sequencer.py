@@ -875,3 +875,131 @@ async def test_serialized_still_mutually_exclusive_across_tasks():
     assert await asyncio.wait_for(task_b, 1.0) == APPLIED
     # B's edit only ran AFTER A released the lock.
     assert order == ["A-in", "B-blocked", "A-out"]
+
+
+# ---------------------------------------------------------------------------
+# Sol diff gate r3 — CROSS-TASK AB-BA lock inversion between the sequencer
+# writer lock and the summary lock. Per-task reentrancy (r2) fixes a poster
+# re-entering on its OWN task; it CANNOT fix a DIFFERENT-task cycle:
+#   * Task A (ask poster): holds sequencer lock, then wants summary lock;
+#   * Task B (submit_status / tick): holds summary lock, then wants sequencer.
+# The fix imposes ONE order (sequencer OUTER, summary INNER via _writing), so
+# holding the summary lock REQUIRES first holding the sequencer lock — no cycle.
+# REAL sequencer + REAL SummaryController (a fake sequencer hides this).
+# ---------------------------------------------------------------------------
+
+
+async def test_cross_task_ask_poster_vs_summary_flush_no_deadlock():
+    """Sol's cross-task repro. Task A runs an armed ask poster that, WHILE holding
+    the sequencer writer lock, calls ``submit_status`` (wants the summary lock).
+    Task B concurrently runs ``submit_status`` on a DIFFERENT task — a text-changing
+    transition that acquires the summary lock and then reaches ``edit_summary``
+    (wants the sequencer lock). Interleaved so B grabs the summary lock before A's
+    poster asks for it.
+
+    On 88beebe (summary→sequencer order still present) this is a classic AB-BA
+    deadlock: A holds sequencer + waits summary; B holds summary + waits sequencer
+    — the bounded ``asyncio.wait_for`` TIMES OUT and this asserts the deadlock
+    (RED). With the global sequencer-OUTER/summary-INNER order, B can never hold
+    the summary lock while A holds the sequencer (it blocks on the sequencer FIRST),
+    so both tasks complete and the intent is marked posted (GREEN)."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    open_qs = [11]
+    state = {"b_active": False}
+    b_in_render = asyncio.Event()
+
+    def _oqn():
+        # Called under the summary lock inside _render_locked. Fires only for B's
+        # render so A's setup/poster renders don't trip it.
+        if state["b_active"]:
+            b_in_render.set()
+        return list(open_qs)
+
+    controller = SummaryController(
+        engagement_id="eng-1", sequencer=seq, goal_line="Gmail plugin",
+        open_question_numbers=_oqn, message_id=500,
+        _now=lambda: 0.0, _sleep=_park_forever,
+    )
+
+    poster_holds_seq = asyncio.Event()
+    b_released = asyncio.Event()
+
+    async def _ask_poster():
+        # Runs UNDER the held sequencer writer lock (post_for_block posts armed
+        # intents from inside _serialized). Signal ownership, wait until B has had
+        # its chance to grab the summary lock, THEN cross into the summary lock.
+        poster_holds_seq.set()
+        await b_released.wait()
+        await controller.submit_status(STATUS_WAITING_REPLY, 10)  # wants summary
+        return await rec.send(42, "Q11: Proceed?")
+
+    seq.register_intent(
+        request_id="ask-A", tool_name=ASK_TOOL, projection_hash="h",
+        poster=_ask_poster)
+    seq.arm_intent("ask-A")
+
+    task_a = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, "h"))
+    await asyncio.wait_for(poster_holds_seq.wait(), 1.0)  # A holds the sequencer
+
+    # Task B: a WORKING(-1 default) → WAITING transition — text changes, so
+    # _flush_locked actually reaches edit_summary (and thus the sequencer lock).
+    state["b_active"] = True
+    task_b = asyncio.ensure_future(
+        controller.submit_status(STATUS_WAITING_REPLY, 5))
+    # Let B run to its blocking point: on 88beebe it acquires the summary lock and
+    # blocks on the sequencer lock; on the fix it blocks on the sequencer lock
+    # FIRST (never holding summary). A few event-loop turns reach either state.
+    for _ in range(6):
+        await asyncio.sleep(0)
+    b_released.set()  # release A's poster into the summary lock
+
+    try:
+        res_a, _ = await asyncio.wait_for(
+            asyncio.gather(task_a, task_b), timeout=0.5)
+    except asyncio.TimeoutError:
+        task_a.cancel()
+        task_b.cancel()
+        await asyncio.gather(task_a, task_b, return_exceptions=True)
+        raise AssertionError(
+            "CROSS-TASK DEADLOCK: ask poster holds the sequencer lock and waits "
+            "for the summary lock while submit_status holds the summary lock and "
+            "waits for the sequencer lock (AB-BA inversion)")
+    assert res_a == "posted"
+    intent = seq.registry.by_request_id("ask-A")
+    assert intent.state == "posted" and intent.outcome["ok"] is True
+    # Both status submissions applied; the summary reflects the waiting status.
+    assert controller._status == STATUS_WAITING_REPLY
+    assert any(STATUS_WAITING_REPLY in text for _, _, text in rec.edits)
+
+
+async def test_global_lock_order_completes_regardless_of_start_order():
+    """The single global order (sequencer OUTER, summary INNER) is symmetric: a
+    summary flush and an ask poster running concurrently both complete no matter
+    which task starts first — there is no ordering-dependent hang."""
+    for summary_first in (True, False):
+        rec, clock = Recorder(), Clock()
+        seq = _make_seq(rec, clock)
+        open_qs = [11]
+        controller = SummaryController(
+            engagement_id="eng-1", sequencer=seq, goal_line="Gmail plugin",
+            open_question_numbers=lambda: list(open_qs), message_id=500,
+            _now=lambda: 0.0, _sleep=_park_forever,
+        )
+
+        async def _ask_poster():
+            await controller.submit_status(STATUS_WAITING_REPLY, 7)
+            return await rec.send(42, "Q11?")
+
+        seq.register_intent(
+            request_id="ask-X", tool_name=ASK_TOOL, projection_hash="h",
+            poster=_ask_poster)
+        seq.arm_intent("ask-X")
+
+        poster = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, "h"))
+        flush = asyncio.ensure_future(controller.submit_activity("reading files"))
+        if summary_first:
+            flush, poster = poster, flush  # start order swap is scheduling-order
+        res = await asyncio.wait_for(
+            asyncio.gather(poster, flush), timeout=0.5)
+        assert "posted" in res  # the poster resolved

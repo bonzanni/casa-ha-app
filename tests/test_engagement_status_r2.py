@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 
 import pytest
 from aiohttp import web
@@ -35,6 +36,11 @@ from drivers.summary_controller import (  # noqa: E402
 class _FakeSequencer:
     def __init__(self) -> None:
         self.edits: list[tuple[int, str]] = []
+
+    @asynccontextmanager
+    async def serialized(self):
+        # GLOBAL LOCK-ORDER: controller ``_writing`` takes this OUTER; no-op here.
+        yield
 
     async def edit_summary(self, msg_id: int, text: str) -> str:
         from channels.output_sequencer import APPLIED

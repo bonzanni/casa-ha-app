@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -42,6 +43,12 @@ class FakeSequencer:
     def __init__(self) -> None:
         self.edits: list[tuple[int, str]] = []
         self.fail_next = 0
+
+    @asynccontextmanager
+    async def serialized(self):
+        # GLOBAL LOCK-ORDER: the controller's ``_writing`` takes this OUTER lock
+        # before the summary lock. A no-op CM suffices for these single-task tests.
+        yield
 
     async def edit_summary(self, msg_id: int, text: str) -> str:
         if self.fail_next > 0:
