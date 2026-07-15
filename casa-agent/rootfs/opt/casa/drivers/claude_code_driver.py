@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -109,6 +110,7 @@ NoticeSender = Callable[[str, "int | None"], Awaitable[bool]]
 _ENVELOPE_PERSIST_FIELDS = (
     "text", "tg_message_id", "priority", "receipt", "notice", "notice_text",
     "enqueued_at", "delivery_epoch", "state", "seq", "is_initial",
+    "answer_anchor_mid",
 )
 
 
@@ -143,6 +145,12 @@ class _Envelope:
     # notice-only envelope so the drop notice is durable + retried, not
     # fire-and-forget.
     notice_text: str | None = None
+    # v0.83.0 (§A3, Sol r7-1): the tg_message_id of the free-text anchor this
+    # message ANSWERED, recorded at durable-enqueue promotion. When set,
+    # delivery only THREADS the turn's first post to it (the promotion already
+    # ran the visual settle) — delivery never re-settles. ``None`` (field
+    # absent on legacy spooled envelopes) keeps the delivery-time settle path.
+    answer_anchor_mid: int | None = None
 
     def to_line(self) -> str:
         return json.dumps(
@@ -170,6 +178,7 @@ class _Envelope:
             state=data.get("state", "queued"),
             seq=int(data.get("seq", 0)),
             is_initial=bool(data.get("is_initial", False)),
+            answer_anchor_mid=data.get("answer_anchor_mid"),
         )
 
 
@@ -213,6 +222,8 @@ class _InboundSpool:
         settle_anchor_on_delivery: (
             Callable[[int | None], Awaitable[int | None]] | None) = None,
         on_operator_enqueued: Callable[[], Awaitable[None]] | None = None,
+        promote_answer_on_enqueue: (
+            Callable[[], Awaitable[int | None]] | None) = None,
     ) -> None:
         self._engagement_id = engagement_id
         self._spool_path = spool_path
@@ -236,6 +247,13 @@ class _InboundSpool:
         # free-text anchor (✅ answered below) and thread the turn to it.
         # Returns the anchor's tg_message_id to thread to, or None.
         self._settle_anchor_on_delivery = settle_anchor_on_delivery
+        # §A3 (Sol r7-1/r9-1): at durable non-initial enqueue, PROMOTE the
+        # answer — mark the oldest unanswered anchor answered, run the visual
+        # settle, CONSUME any reservation. UNCONDITIONAL (any delivered
+        # operator message answers the one open question). Returns the anchor's
+        # tg_message_id (recorded on the envelope so delivery only THREADS),
+        # or None when no anchor is open.
+        self._promote_answer_on_enqueue = promote_answer_on_enqueue
         self._envelopes: list[_Envelope] = []
         self.reader_ready = False
         self._pump_lock = asyncio.Lock()
@@ -417,6 +435,23 @@ class _InboundSpool:
             except Exception:  # noqa: BLE001 — away-clear is best-effort
                 logger.debug("on_operator_enqueued failed", exc_info=True)
 
+        # §A3 (Sol r7-1/r9-1): PROMOTE the answer at durable enqueue — the
+        # message is now durably spooled, so the agent WILL receive it and the
+        # question is answered. Promotion marks the oldest unanswered anchor
+        # answered + runs its visual settle + CONSUMES any reservation, and
+        # records the anchor mid on THIS envelope so delivery only threads
+        # (never re-settles). Runs BEFORE ``_pump`` so an immediate delivery
+        # sees the recorded mid. Best-effort: a failure only degrades the
+        # delivery reply-thread (pinned advisory).
+        if not is_initial and self._promote_answer_on_enqueue is not None:
+            try:
+                anchor_mid = await self._promote_answer_on_enqueue()
+                if anchor_mid is not None:
+                    env.answer_anchor_mid = anchor_mid
+                    self._persist_quiet()
+            except Exception:  # noqa: BLE001 — promotion settle is advisory
+                logger.debug("promote_answer_on_enqueue failed", exc_info=True)
+
         await self._flush_pending()
         await self._pump()
         if evicted:
@@ -567,19 +602,26 @@ class _InboundSpool:
                 env.delivery_epoch = self._current_epoch()
                 self.reader_ready = False           # one message per FIFO EOF
                 self._persist_quiet()
-                # §4: an operator message settles the oldest open free-text
-                # anchor (✅ answered below) and threads this turn to the ANCHOR
-                # instead of the operator's own message.
+                # §4/§A3: thread this turn to the ANCHOR the message answered,
+                # not the operator's own message. Promotion (at durable enqueue)
+                # already ran the visual settle and recorded the anchor mid on
+                # the envelope — so delivery only THREADS to it (no second
+                # settle edit). A LEGACY envelope spooled before ``answer_anchor
+                # _mid`` existed carries no mid → fall back to the delivery-time
+                # settle path.
                 thread_to = env.tg_message_id
-                if not env.is_initial and self._settle_anchor_on_delivery is not None:
-                    try:
-                        anchor_id = await self._settle_anchor_on_delivery(
-                            env.tg_message_id)
-                        if anchor_id is not None:
-                            thread_to = anchor_id
-                    except Exception:  # noqa: BLE001 — anchor settle is advisory
-                        logger.debug("settle_anchor_on_delivery failed",
-                                     exc_info=True)
+                if not env.is_initial:
+                    if env.answer_anchor_mid is not None:
+                        thread_to = env.answer_anchor_mid
+                    elif self._settle_anchor_on_delivery is not None:
+                        try:
+                            anchor_id = await self._settle_anchor_on_delivery(
+                                env.tg_message_id)
+                            if anchor_id is not None:
+                                thread_to = anchor_id
+                        except Exception:  # noqa: BLE001 — anchor settle advisory
+                            logger.debug("settle_anchor_on_delivery failed",
+                                         exc_info=True)
                 # Delivery context: thread this turn's first sequencer post to
                 # the operator's message (§3) — or the anchor it answered (§4).
                 if self._sequencer is not None:
@@ -688,6 +730,17 @@ class ClaudeCodeDriver(DriverProtocol):
         # RETRIES the strict persist; crash convergence is owned by boot
         # reconciliation (the overlay is memory-only, dropped at teardown).
         self._answered_overlay: dict[str, set[int]] = {}
+        # v0.83.0 (§A3, Sol r7-1/r8-1/r9-1): the answered-RESERVATION token map,
+        # ``engagement_id -> (token, question_n)``. Set at Telegram handler entry
+        # (same synchronous section as the high-water advance) for the oldest
+        # unanswered anchor, carrying a unique per-message uuid token — so any
+        # finalize that observed the answer's high-water also observes the
+        # reservation. A reserved-but-unpromoted question counts as ANSWERED for
+        # the effective/union view (gates/summary/re-anchor). ROLLBACK is
+        # token-CAS'd (a later message's reservation is never clobbered);
+        # PROMOTION at durable enqueue is UNCONDITIONAL and CONSUMES it.
+        # Memory-only (crash convergence is boot reconciliation's job).
+        self._answer_reservations: dict[str, tuple[str, int]] = {}
         # F-EXPIRE (v0.83.0, A2a): operator-away suspend state. ``_operator_away``
         # is SET on ask expiry (generation-CAS, ``note_operator_away``) and
         # CLEARED on the next durable inbound operator envelope; while set, every
@@ -881,12 +934,17 @@ class ClaudeCodeDriver(DriverProtocol):
     async def send_user_turn(
         self, engagement: EngagementRecord, text: str,
         *, tg_message_id: int | None = None,
-    ) -> None:
+    ) -> str | None:
+        """Enqueue an operator turn; return the durable enqueue DISPOSITION
+        (§A3, Sol r10-2) — ``queued`` / ``evicted_other(<tg>)`` (accepted, the
+        promotion already ran) or ``dropped_full`` / ``error`` (rejected — the
+        caller rolls back the answer reservation). ``None`` when there is no
+        spool (legacy direct write)."""
         spool = self._inbound.get(engagement.id)
         if spool is not None:
-            await spool.enqueue(text, tg_message_id=tg_message_id)
-        else:
-            await self._write_to_fifo(engagement, text)
+            return await spool.enqueue(text, tg_message_id=tg_message_id)
+        await self._write_to_fifo(engagement, text)
+        return None
 
     async def cancel(self, engagement: EngagementRecord) -> None:
         """Teardown for a terminal transition (cancelled or completed).
@@ -906,9 +964,11 @@ class ClaudeCodeDriver(DriverProtocol):
         self._violation_notified.discard(engagement.id)
         self._violation_flagged.discard(engagement.id)
         self._ask_refusals.pop(engagement.id, None)
-        # v0.83.0 (§A3): drop the in-memory answered overlay (memory-only;
-        # crash convergence is owned by boot reconciliation, not the overlay).
+        # v0.83.0 (§A3): drop the in-memory answered overlay + answer
+        # reservation (memory-only; crash convergence is owned by boot
+        # reconciliation, not these).
         self._answered_overlay.pop(engagement.id, None)
+        self._answer_reservations.pop(engagement.id, None)
         # F-EXPIRE: drop the operator-away suspend state on teardown.
         self._operator_away.pop(engagement.id, None)
         self._away_refusals.pop(engagement.id, None)
@@ -1102,6 +1162,8 @@ class ClaudeCodeDriver(DriverProtocol):
                 engagement, op_mid),
             on_operator_enqueued=lambda: self._clear_operator_away(
                 engagement.id),
+            promote_answer_on_enqueue=lambda: self._promote_answer_on_enqueue(
+                engagement),
         )
 
         tasks = [
@@ -1509,9 +1571,10 @@ class ClaudeCodeDriver(DriverProtocol):
 
     def _effective_open_question_numbers(self, engagement_id: str) -> list[int]:
         """The A3 gates / pinned summary / recompute read UNANSWERED questions as
-        ``persisted-unanswered MINUS overlay-answered`` (overlay ∪ persisted flag,
-        Sol r6-4): a question whose ``answered`` write failed but is overlay-marked
-        stops gating immediately, before the durable retry converges."""
+        ``persisted-unanswered MINUS overlay-answered MINUS reserved`` (Sol r6-4 +
+        r7-1): a question whose ``answered`` write failed but is overlay-marked —
+        or one whose answer is still only RESERVED (handler entry, pre-promotion)
+        — stops gating immediately, before the durable flag lands."""
         reg = self._registry
         if reg is None or not hasattr(reg, "open_question_numbers"):
             return []
@@ -1519,10 +1582,132 @@ class ClaudeCodeDriver(DriverProtocol):
             nums = reg.open_question_numbers(engagement_id)
         except Exception:  # noqa: BLE001 — degrade to "no open questions"
             return []
-        overlay = self._answered_overlay.get(engagement_id)
-        if not overlay:
+        excluded = set(self._answered_overlay.get(engagement_id) or ())
+        reserved_n = self._reserved_question_number(engagement_id)
+        if reserved_n is not None:
+            excluded.add(reserved_n)
+        if not excluded:
             return list(nums)
-        return [n for n in nums if n not in overlay]
+        return [n for n in nums if n not in excluded]
+
+    # -- v0.83.0 (§A3) answered-reservation token lifecycle -------------------
+    def _reserved_question_number(self, engagement_id: str) -> int | None:
+        """The question number currently RESERVED for this engagement (counts as
+        answered for the effective/union view), or ``None``."""
+        res = self._answer_reservations.get(engagement_id)
+        return res[1] if res is not None else None
+
+    def _oldest_unanswered_anchor(
+        self, engagement_id: str, *, exclude_reserved: bool,
+    ) -> dict | None:
+        """The oldest open free-text anchor that is not yet answered — where
+        "answered" is ``persisted flag ∪ overlay`` and, when ``exclude_reserved``,
+        also ``∪ reserved``. Returns the RAW entry dict or ``None``.
+
+        ``exclude_reserved=True`` is the RESERVE selection (never re-reserve an
+        already-reserved anchor). ``exclude_reserved=False`` is the PROMOTION
+        selection (a reserved anchor is exactly the one promotion consumes)."""
+        reg = self._registry
+        if reg is None:
+            return None
+        entries_getter = getattr(reg, "open_question_entries", None)
+        if entries_getter is None:  # legacy registry without the raw accessor
+            getter = getattr(reg, "oldest_open_anchor", None)
+            return getter(engagement_id) if getter is not None else None
+        reserved_n = (
+            self._reserved_question_number(engagement_id)
+            if exclude_reserved else None
+        )
+        anchors = [
+            q for q in entries_getter(engagement_id)
+            if q.get("kind") == "anchor"
+            and not q.get("answered", False)
+            and not self._overlay_answered(engagement_id, q.get("n"))
+            and q.get("n") != reserved_n
+        ]
+        if not anchors:
+            return None
+        return min(anchors, key=lambda q: q.get("n", 0))
+
+    def reserve_answer(self, engagement_id: str) -> str | None:
+        """§A3 (Sol r7-1): reserve the oldest UNANSWERED anchor as answered by
+        the current operator message, carrying a unique token. Returns the token,
+        or ``None`` when no unanswered anchor is open (nothing to reserve — the
+        message still enqueues; promotion is unconditional). Called SYNCHRONOUSLY
+        at Telegram handler entry, in the same section as the high-water advance
+        (no await between), so a concurrent result-finalize that observed the
+        answer's high-water also observes the reservation."""
+        anchor = self._oldest_unanswered_anchor(
+            engagement_id, exclude_reserved=True)
+        if anchor is None:
+            return None
+        n = anchor.get("n")
+        if n is None:
+            return None
+        token = uuid.uuid4().hex
+        self._answer_reservations[engagement_id] = (token, n)
+        return token
+
+    async def rollback_answer_reservation(
+        self, engagement_id: str, token: str | None,
+    ) -> bool:
+        """§A3 (Sol r7-1/r9-1): CAS-roll-back a reservation — clear it ONLY when
+        the CURRENT reservation still carries ``token`` (never clobber a later
+        message's reservation) AND it was not already promoted (promotion deletes
+        the entry, so a consumed reservation is simply absent → CAS fails).
+        Returns ``True`` on a successful clear. On success calls the Task-9 seam
+        ``_on_reservation_rolled_back`` (a last-reservation-clearing rollback
+        schedules a compensating re-anchor pass there — a no-op today)."""
+        if token is None:
+            return False
+        res = self._answer_reservations.get(engagement_id)
+        if res is None or res[0] != token:
+            return False
+        del self._answer_reservations[engagement_id]
+        await self._on_reservation_rolled_back(engagement_id)
+        return True
+
+    async def _on_reservation_rolled_back(self, engagement_id: str) -> None:
+        """Task-9 SEAM (Sol r10-1/r12-1): a CAS rollback that cleared a still-
+        un-promoted reservation calls this. Task 9 replaces it with the
+        re-anchor-due latch handshake (a last-reservation-clearing rollback with
+        no running turn schedules a compensating, fully-revalidated re-anchor
+        pass). No-op for now — the reservation machinery is complete without it.
+        """
+        return None
+
+    async def _promote_answer_on_enqueue(
+        self, engagement: EngagementRecord,
+    ) -> int | None:
+        """§A3 (Sol r9-1): PROMOTE the answer at a durable non-initial enqueue.
+        UNCONDITIONAL — any delivered operator message answers the one open
+        question, regardless of which token (if any) holds the reservation:
+        mark the oldest unanswered anchor answered (``mark_question_answered``
+        strict; on raise → overlay per Task-6 policy), run the SAME visual settle
+        the delivery-time path uses, and CONSUME the reservation. Returns the
+        anchor's tg_message_id (recorded on the envelope so delivery only
+        threads), or ``None`` when no anchor is open."""
+        eid = engagement.id
+        anchor = self._oldest_unanswered_anchor(eid, exclude_reserved=False)
+        # Consume the reservation regardless of whether an anchor was found —
+        # promotion is the reservation's terminal state (Sol r9-1).
+        self._answer_reservations.pop(eid, None)
+        if anchor is None:
+            return None
+        n = anchor.get("n")
+        reg = self._registry
+        mark = getattr(reg, "mark_question_answered", None) if reg else None
+        if mark is not None and n is not None:
+            try:
+                await mark(eid, n)
+            except Exception:  # noqa: BLE001 — strict persist failed
+                # §A3 answered-persist-failure policy (Sol r6-4/r7-2): the
+                # envelope is already durably spooled, so the question must not
+                # keep gating. The overlay covers the live process; the strict
+                # write retries at each later settle attempt.
+                self.mark_answered_overlay(eid, n)
+        # Visual settle for THIS anchor — shared with the delivery-time path.
+        return await self._settle_open_anchor(engagement, anchor=anchor)
 
     async def _settle_ledger_entry(
         self, rec: EngagementRecord, q: dict, *, answered_suffix: bool,
@@ -1995,36 +2180,42 @@ class ClaudeCodeDriver(DriverProtocol):
                     "summary refresh after open-question reconcile failed",
                     exc_info=True)
 
-    async def _settle_open_anchor(
-        self, engagement: EngagementRecord, operator_msg_id: int | None,
-    ) -> int | None:
-        """§4: settle the oldest open free-text anchor when an operator message
-        is delivered — edit ``✅ answered below`` over the anchor, remove its
-        ledger entry (per the §A3 entry-removal invariant — only when the current
-        settle is confirmed AND no ``stale_mids`` copy remains), and return the
-        anchor's tg_message_id so the turn threads to the QUESTION it answers.
-        Returns ``None`` when no anchor is open.
-
-        §A3: the anchor is selected from the RAW ledger (answered or not) — the
-        answer-lifecycle may already have flagged it answered (invisible to
-        ``oldest_open_anchor``), and visual settlement iterates raw entries. Every
-        staged stale copy is settled behind the same confirmed-gate."""
+    def _select_oldest_anchor_entry(self, engagement_id: str) -> dict | None:
+        """The oldest free-text anchor from the RAW ledger (answered or not) —
+        the answer-lifecycle may already have flagged it answered (invisible to
+        ``oldest_open_anchor``), and visual settlement iterates raw entries."""
         reg = self._registry
         if reg is None:
             return None
-        anchor = None
         entries_getter = getattr(reg, "open_question_entries", None)
         if entries_getter is not None:
             anchors = [
-                q for q in entries_getter(engagement.id)
+                q for q in entries_getter(engagement_id)
                 if q.get("kind") == "anchor"
             ]
             if anchors:
-                anchor = min(anchors, key=lambda q: q.get("n", 0))
-        else:  # legacy registry without the raw accessor
-            getter = getattr(reg, "oldest_open_anchor", None)
-            if getter is not None:
-                anchor = getter(engagement.id)
+                return min(anchors, key=lambda q: q.get("n", 0))
+            return None
+        getter = getattr(reg, "oldest_open_anchor", None)  # legacy registry
+        return getter(engagement_id) if getter is not None else None
+
+    async def _settle_open_anchor(
+        self, engagement: EngagementRecord, operator_msg_id: int | None = None,
+        *, anchor: dict | None = None,
+    ) -> int | None:
+        """§4/§A3: settle a free-text anchor — edit ``✅ answered below`` over it,
+        remove its ledger entry (per the §A3 entry-removal invariant — only when
+        the current settle is confirmed AND no ``stale_mids`` copy remains), and
+        return the anchor's tg_message_id so the turn threads to the QUESTION it
+        answers. Returns ``None`` when no anchor is open.
+
+        The enqueue-time PROMOTION and the delivery-time settle share this one
+        implementation: promotion passes the explicit ``anchor`` it just marked
+        answered; the delivery-time path (legacy envelopes) passes none and the
+        oldest raw anchor is selected. Every staged stale copy is settled behind
+        the same confirmed-gate."""
+        if anchor is None:
+            anchor = self._select_oldest_anchor_entry(engagement.id)
         if anchor is None:
             return None
         amid = await self._settle_ledger_entry(

@@ -344,6 +344,14 @@ class TelegramChannel(Channel):
         # v0.79.0 (§3): seal open narration on inbound (claude_code engagements);
         # wired by casa_core, None-safe for tests.
         self._driver_advance_high_water = None
+        # v0.83.0 (§A3, Sol r7-1/r8-1): the answered-RESERVATION seam. SYNCHRONOUS
+        # ``reserve_answer(rec) -> token|None`` set in the SAME section as the
+        # high-water advance (no await between); ``rollback_answer_reservation(
+        # rec, token) -> bool`` (CAS) fires on every non-delivery path (command
+        # classification, handler cancellation, spool enqueue rejection). Wired by
+        # casa_core, None-safe for tests.
+        self._driver_reserve_answer = None
+        self._driver_rollback_answer_reservation = None
         # v0.79.0 (§3, F2): route a platform-origin topic notice (command
         # replies, resume errors) through the engagement's OUTPUT SEQUENCER so
         # it seals open narration + advances the high-water under the single
@@ -1034,127 +1042,167 @@ class TelegramChannel(Channel):
                             rec.id[:8], exc,
                         )
 
-                if text.startswith("/"):
-                    # M10 (v0.52.0): group command menus send "/cancel@botname"
-                    # (Telegram appends @botusername to menu-selected commands
-                    # in groups). Strip the mention so the command matches. A
-                    # command explicitly addressed to a DIFFERENT bot is
-                    # blanked (falls through to the user-turn path, matching
-                    # PTB's CommandHandler semantics). When our username isn't
-                    # cached yet, strip unconditionally — safe inside Casa's
-                    # own supergroup.
-                    token = text.split()[0].lower()
-                    command, _, mention = token.partition("@")
-                    if mention and self._bot_username and mention != self._bot_username:
-                        command = ""  # addressed to another bot — not ours
-                    # Bug 8 (v0.14.6): /cancel and /complete are originator-only.
-                    # Pre-fix any user in the supergroup could terminate any
-                    # engagement; user_id wasn't even checked. /silent stays
-                    # open since it's local to the engagement (anyone reading
-                    # along can quiet the observer in their topic).
-                    if command in ("/cancel", "/complete"):
-                        owner_id = rec.origin.get("user_id")
-                        if (
-                            owner_id is not None
-                            and user_id is not None
-                            and int(owner_id) != int(user_id)
-                        ):
-                            # F2: route through the sequencer so this reply
-                            # cannot land below open narration.
-                            await self._post_engagement_notice(
-                                rec,
-                                f"Only the engagement originator can {command}. "
-                                "Ask them, or start your own engagement.",
-                            )
-                            return
-                        if command == "/cancel":
-                            return await self._finalize_cancel(rec, reason="user")
-                        return await self._finalize_complete_user(rec)
-                    if command == "/silent":
-                        if self._observer is not None:
-                            self._observer.silence(rec.id)
-                        # F2: route through the sequencer (single writer).
-                        await self._post_engagement_notice(
-                            rec, "Observer quieted for this engagement.",
-                        )
-                        return
-
-                # Resume suspended client if needed (in_casa driver only — the
-                # claude_code driver has s6 keeping the subprocess alive across
-                # Casa restarts, and its engagements never have sdk_session_id).
-                if rec.driver != "claude_code" and self._engagement_driver is not None:
-                    drv = self._engagement_driver
-                    if not drv.is_alive(rec) and rec.sdk_session_id:
-                        fail_count = rec.origin.get("_resume_fail_count", 0)
-                        try:
-                            await drv.resume(rec, rec.sdk_session_id)
-                            rec.origin["_resume_fail_count"] = 0
-                        except Exception as exc:  # noqa: BLE001
-                            fail_count += 1
-                            rec.origin["_resume_fail_count"] = fail_count
-                            logger.warning(
-                                "resume failed (%d/2) for engagement %s: %s",
-                                fail_count, rec.id[:8], exc,
-                            )
-                            if fail_count >= 2:
-                                await self._engagement_registry.mark_error(
-                                    rec.id, kind="resume_failed", message=str(exc),
+                # v0.83.0 (§A3, Sol r7-1): set the answered RESERVATION in the
+                # SAME synchronous section as the high-water advance — NO await
+                # between the advance above and this reserve — so a concurrent
+                # result-finalize that observed the answer's high-water also
+                # observes the reservation. ``reserve_answer`` is SYNCHRONOUS.
+                # The reservation counts the oldest unanswered anchor as ANSWERED
+                # (gates/summary/re-anchor) until the message either PROMOTES it
+                # (durable enqueue) or ROLLS it back (every non-delivery path
+                # below: command classification, resume failure, handler
+                # cancellation, spool enqueue rejection). ``handed_off`` transfers
+                # ownership to ``_deliver_turn_bg`` on the delivery path.
+                answer_token = None
+                if self._driver_reserve_answer is not None:
+                    try:
+                        answer_token = self._driver_reserve_answer(rec)
+                    except Exception:  # noqa: BLE001 — reservation is advisory
+                        answer_token = None
+                handed_off = False
+                try:
+                    if text.startswith("/"):
+                        # M10 (v0.52.0): group command menus send "/cancel@botname"
+                        # (Telegram appends @botusername to menu-selected commands
+                        # in groups). Strip the mention so the command matches. A
+                        # command explicitly addressed to a DIFFERENT bot is
+                        # blanked (falls through to the user-turn path, matching
+                        # PTB's CommandHandler semantics). When our username isn't
+                        # cached yet, strip unconditionally — safe inside Casa's
+                        # own supergroup.
+                        token = text.split()[0].lower()
+                        command, _, mention = token.partition("@")
+                        if mention and self._bot_username and mention != self._bot_username:
+                            command = ""  # addressed to another bot — not ours
+                        # Bug 8 (v0.14.6): /cancel and /complete are originator-only.
+                        # Pre-fix any user in the supergroup could terminate any
+                        # engagement; user_id wasn't even checked. /silent stays
+                        # open since it's local to the engagement (anyone reading
+                        # along can quiet the observer in their topic). §A3: a
+                        # command NEVER becomes a delivered user turn — CAS-roll
+                        # back the reservation (Sol r8-1). Ordered AFTER the notice
+                        # so the Task-9 seam's re-anchor lands below it (Sol r12-1).
+                        if command in ("/cancel", "/complete"):
+                            owner_id = rec.origin.get("user_id")
+                            if (
+                                owner_id is not None
+                                and user_id is not None
+                                and int(owner_id) != int(user_id)
+                            ):
+                                # F2: route through the sequencer so this reply
+                                # cannot land below open narration.
+                                await self._post_engagement_notice(
+                                    rec,
+                                    f"Only the engagement originator can {command}. "
+                                    "Ask them, or start your own engagement.",
                                 )
-                            await self.send_to_topic(
-                                thread_id,
-                                f"Could not resume this engagement: {exc}. "
-                                f"Start a fresh one if needed.",
+                                await self._rollback_answer(rec, answer_token)
+                                return
+                            await self._rollback_answer(rec, answer_token)
+                            if command == "/cancel":
+                                return await self._finalize_cancel(rec, reason="user")
+                            return await self._finalize_complete_user(rec)
+                        if command == "/silent":
+                            if self._observer is not None:
+                                self._observer.silence(rec.id)
+                            # F2: route through the sequencer (single writer).
+                            await self._post_engagement_notice(
+                                rec, "Observer quieted for this engagement.",
                             )
-                            if fail_count >= 2:
-                                # [AR-1] (v0.65.0): this terminal path
-                                # bypasses finalize — title-mark, close +
-                                # ledger the topic here (best-effort,
-                                # never raises). After the notice: posting
-                                # into a just-closed topic works only
-                                # while the bot keeps can_manage_topics —
-                                # mirror the funnel's send-then-close
-                                # order.
-                                await self._cleanup_error_topic(rec)
+                            await self._rollback_answer(rec, answer_token)
                             return
-                    elif not drv.is_alive(rec):
-                        # No session to resume — orphan
-                        await self._engagement_registry.mark_error(
-                            rec.id, kind="orphan_no_session",
-                            message="no sdk_session_id to resume with",
-                        )
-                        await self.send_to_topic(
-                            thread_id, "This engagement can't be resumed.",
-                        )
-                        # [AR-1] (v0.65.0): this terminal path bypasses
-                        # finalize — title-mark, close + ledger the topic
-                        # here (best-effort, never raises). After the
-                        # notice — the funnel's send-then-close order.
-                        await self._cleanup_error_topic(rec)
-                        return
 
-                # M9 (v0.52.0): deliver the user turn in a tracked background
-                # task so the per-topic lock (and, in polling mode, PTB's
-                # update fetcher) is NOT held across the whole multi-minute
-                # SDK turn — a subsequent /cancel can then acquire the lock
-                # and interrupt the in-flight turn. The status re-check above
-                # still ran under the lock, preserving the Bug-10 guarantee
-                # (a cancel that already finalised the driver blanks the turn
-                # here before any task is spawned).
-                # v0.79.0 (§3, F2/F5): the high-water advance + narration seal
-                # now happens at TRUE handler entry above (before command
-                # handling and any suspension) — see the block after the
-                # active-status check.
-                if self._engagement_registry is not None:
-                    import time as _time
-                    await self._engagement_registry.update_user_turn(rec.id, _time.time())
-                if self._driver_send_user_turn is not None:
-                    task = asyncio.create_task(
-                        self._deliver_turn_bg(
-                            rec, text,
-                            tg_message_id=getattr(msg, "message_id", None)))
-                    self._turn_tasks.add(task)
-                    task.add_done_callback(self._turn_tasks.discard)
-                return
+                    # Resume suspended client if needed (in_casa driver only — the
+                    # claude_code driver has s6 keeping the subprocess alive across
+                    # Casa restarts, and its engagements never have sdk_session_id).
+                    if rec.driver != "claude_code" and self._engagement_driver is not None:
+                        drv = self._engagement_driver
+                        if not drv.is_alive(rec) and rec.sdk_session_id:
+                            fail_count = rec.origin.get("_resume_fail_count", 0)
+                            try:
+                                await drv.resume(rec, rec.sdk_session_id)
+                                rec.origin["_resume_fail_count"] = 0
+                            except Exception as exc:  # noqa: BLE001
+                                fail_count += 1
+                                rec.origin["_resume_fail_count"] = fail_count
+                                logger.warning(
+                                    "resume failed (%d/2) for engagement %s: %s",
+                                    fail_count, rec.id[:8], exc,
+                                )
+                                if fail_count >= 2:
+                                    await self._engagement_registry.mark_error(
+                                        rec.id, kind="resume_failed", message=str(exc),
+                                    )
+                                await self.send_to_topic(
+                                    thread_id,
+                                    f"Could not resume this engagement: {exc}. "
+                                    f"Start a fresh one if needed.",
+                                )
+                                if fail_count >= 2:
+                                    # [AR-1] (v0.65.0): this terminal path
+                                    # bypasses finalize — title-mark, close +
+                                    # ledger the topic here (best-effort,
+                                    # never raises). After the notice: posting
+                                    # into a just-closed topic works only
+                                    # while the bot keeps can_manage_topics —
+                                    # mirror the funnel's send-then-close
+                                    # order.
+                                    await self._cleanup_error_topic(rec)
+                                return
+                        elif not drv.is_alive(rec):
+                            # No session to resume — orphan
+                            await self._engagement_registry.mark_error(
+                                rec.id, kind="orphan_no_session",
+                                message="no sdk_session_id to resume with",
+                            )
+                            await self.send_to_topic(
+                                thread_id, "This engagement can't be resumed.",
+                            )
+                            # [AR-1] (v0.65.0): this terminal path bypasses
+                            # finalize — title-mark, close + ledger the topic
+                            # here (best-effort, never raises). After the
+                            # notice — the funnel's send-then-close order.
+                            await self._cleanup_error_topic(rec)
+                            return
+
+                    # M9 (v0.52.0): deliver the user turn in a tracked background
+                    # task so the per-topic lock (and, in polling mode, PTB's
+                    # update fetcher) is NOT held across the whole multi-minute
+                    # SDK turn — a subsequent /cancel can then acquire the lock
+                    # and interrupt the in-flight turn. The status re-check above
+                    # still ran under the lock, preserving the Bug-10 guarantee
+                    # (a cancel that already finalised the driver blanks the turn
+                    # here before any task is spawned).
+                    # v0.79.0 (§3, F2/F5): the high-water advance + narration seal
+                    # now happens at TRUE handler entry above (before command
+                    # handling and any suspension) — see the block after the
+                    # active-status check.
+                    if self._engagement_registry is not None:
+                        import time as _time
+                        await self._engagement_registry.update_user_turn(rec.id, _time.time())
+                    if self._driver_send_user_turn is not None:
+                        # §A3: the message becomes a delivered user turn — TRANSFER
+                        # reservation ownership to the background task, which
+                        # promotes (accepted) or CAS-rolls-back (rejected) per the
+                        # enqueue disposition. ``handed_off`` stops the finally
+                        # below from clobbering the in-flight reservation.
+                        handed_off = True
+                        task = asyncio.create_task(
+                            self._deliver_turn_bg(
+                                rec, text,
+                                tg_message_id=getattr(msg, "message_id", None),
+                                answer_token=answer_token))
+                        self._turn_tasks.add(task)
+                        task.add_done_callback(self._turn_tasks.discard)
+                    return
+                finally:
+                    # §A3 (Sol r8-1): every path that did NOT hand the reservation
+                    # to the delivery task — command classification, resume
+                    # failure/orphan, handler CANCELLATION — CAS-rolls it back.
+                    # The CAS no-ops if a command branch already rolled it back,
+                    # if promotion consumed it, or if a later message re-reserved.
+                    if not handed_off:
+                        await self._rollback_answer(rec, answer_token)
 
         # 3) Other chats. When telegram_chat_id is configured it is an
         #    allowlist (DOCS.md: "Telegram chat ID to restrict messages
@@ -1172,8 +1220,21 @@ class TelegramChannel(Channel):
             return
         return await self._route_to_ellen(update)
 
+    async def _rollback_answer(self, rec, token) -> None:
+        """§A3: best-effort CAS rollback of an answered reservation (a no-op when
+        unwired, the token is None, or the CAS loses ownership). Swallows its own
+        errors so no non-delivery path is aborted by a rollback failure."""
+        if token is None or self._driver_rollback_answer_reservation is None:
+            return
+        try:
+            await self._driver_rollback_answer_reservation(rec, token)
+        except Exception:  # noqa: BLE001 — rollback is advisory
+            logger.debug("rollback_answer_reservation failed for %s",
+                         rec.id[:8], exc_info=True)
+
     async def _deliver_turn_bg(
         self, rec, text: str, *, tg_message_id: int | None = None,
+        answer_token: str | None = None,
     ) -> None:
         """M9 (v0.52.0): run one engagement user-turn to completion.
 
@@ -1185,13 +1246,25 @@ class TelegramChannel(Channel):
 
         v0.79.0 (§3): ``tg_message_id`` threads the durable inbound envelope to
         the operator's Telegram message (reply-quoting / receipts).
+
+        v0.83.0 (§A3, Sol r9-1/r10-2): this task OWNS the answered reservation
+        after hand-off. The enqueue DISPOSITION drives its fate — an ACCEPTED
+        enqueue (``queued``/``evicted_other``) already PROMOTED (consumed) the
+        reservation inside ``enqueue``; a REJECTED enqueue (``dropped_full`` /
+        ``error``) or a raised/cancelled delivery CAS-rolls it back so the
+        question stops being treated as answered.
         """
         try:
-            await self._driver_send_user_turn(
+            disposition = await self._driver_send_user_turn(
                 rec, text, tg_message_id=tg_message_id)
         except asyncio.CancelledError:
+            # Cancelled before a durable enqueue could promote — roll back.
+            await self._rollback_answer(rec, answer_token)
             raise
         except Exception as exc:  # noqa: BLE001
+            # The enqueue raised (never durably spooled) — roll the reservation
+            # back so the answer-lifecycle isn't left falsely promoted.
+            await self._rollback_answer(rec, answer_token)
             latest = (
                 self._engagement_registry.get(rec.id)
                 if self._engagement_registry is not None else None
@@ -1211,6 +1284,11 @@ class TelegramChannel(Channel):
                 await self._post_engagement_notice(rec, f"Turn failed: {exc}")
             except Exception:  # noqa: BLE001 — best-effort user notice
                 pass
+            return
+        # §A3: a durable-enqueue REJECTION (capacity drop / spool-write error)
+        # rolls the reservation back; an accepted enqueue already promoted it.
+        if disposition in ("dropped_full", "error"):
+            await self._rollback_answer(rec, answer_token)
 
     async def _maybe_redirect_main_feed(self, user_id: int | None) -> None:
         if user_id is None:

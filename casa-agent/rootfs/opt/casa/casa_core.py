@@ -2154,14 +2154,35 @@ async def main() -> None:
         telegram_channel._semantic_memory = semantic_memory
 
         async def _driver_send_user_turn(rec, text, *, tg_message_id=None):
+            # §A3 (Sol r10-2): PROPAGATE the enqueue disposition so
+            # _deliver_turn_bg can promote (accepted) vs roll back (rejected)
+            # the answered reservation.
             if rec.driver == "claude_code":
-                await claude_code_driver.send_user_turn(
+                return await claude_code_driver.send_user_turn(
                     rec, text, tg_message_id=tg_message_id)
-            else:
-                # in_casa driver has no durable spool / reply-threading (§7
-                # follow-up) — drop the id.
-                await engagement_driver.send_user_turn(rec, text)
+            # in_casa driver has no durable spool / reply-threading (§7
+            # follow-up) — drop the id; no reservation disposition.
+            await engagement_driver.send_user_turn(rec, text)
+            return None
         telegram_channel._driver_send_user_turn = _driver_send_user_turn
+
+        # v0.83.0 (§A3, Sol r7-1): the answered-RESERVATION seam. reserve is
+        # SYNCHRONOUS (set in the handler's same section as the high-water
+        # advance); rollback is a CAS. Only claude_code engagements have the
+        # spool/anchor machinery — in_casa is a no-op.
+        def _driver_reserve_answer(rec):
+            if rec.driver == "claude_code":
+                return claude_code_driver.reserve_answer(rec.id)
+            return None
+        telegram_channel._driver_reserve_answer = _driver_reserve_answer
+
+        async def _driver_rollback_answer_reservation(rec, token):
+            if rec.driver == "claude_code" and token is not None:
+                return await claude_code_driver.rollback_answer_reservation(
+                    rec.id, token)
+            return False
+        telegram_channel._driver_rollback_answer_reservation = (
+            _driver_rollback_answer_reservation)
 
         # v0.79.0 (§3): seal open narration at inbound-handler entry for
         # claude_code engagements (the T1 high-water seam).
