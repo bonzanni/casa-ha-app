@@ -520,7 +520,7 @@ async def replay_undergoing_engagements(
                     # B1 (Sol r1): a COMPLETE pre-v0.75 pair still carries an
                     # old run script that emits neither the stream-json output
                     # nor the ``casa_control`` spawn NDJSON frame, so the new
-                    # _InboundQueue never arms and every resumed operator turn
+                    # _InboundSpool never arms and every resumed operator turn
                     # queues forever. Detect the stale script and DROP the pair
                     # so the heal path below re-renders it from the current
                     # template (reusing the existing incomplete-pair heal — no
@@ -667,10 +667,47 @@ async def replay_undergoing_engagements(
         # 3. Single compile + update pass.
         await s6_rc._compile_and_update_locked()
 
-        # 4. Start each (idempotent under s6-rc change).
+        # 4. v0.79.0 (§5/F7): adopt the pinned summary BEFORE starting each
+        # service, then start. §5 forbids a running engagement without a
+        # summary, so an adoption failure ABORTS that engagement (mark error +
+        # skip start) rather than starting it summary-less — fail-closed, not
+        # the old fail-open "log and continue after start". A fresh v0.79 record
+        # (summary already persisted) or a topic-less one adopts as a no-op.
+        adopt = getattr(driver, "adopt_summary_if_missing", None)
         for rec in undergoing:
             if rec.id in refused_ids:        # Sol F5: no service was written
                 continue
+            if adopt is not None:
+                try:
+                    await adopt(rec)
+                except Exception as exc:  # noqa: BLE001 — §5 abort rule
+                    logger.warning(
+                        "boot replay: summary adopt-on-attach failed for %s: "
+                        "%s — aborting resume (not starting summary-less)",
+                        rec.id[:8], exc,
+                    )
+                    refused_ids.add(rec.id)
+                    try:
+                        await registry.mark_error(
+                            rec.id, kind="summary_adopt_failed",
+                            message=(
+                                "resume aborted: pinned-summary adoption failed "
+                                f"({exc})"
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001 — best-effort terminal mark
+                        logger.warning(
+                            "boot replay: mark_error(summary_adopt_failed) "
+                            "failed for %s", rec.id[:8], exc_info=True,
+                        )
+                    try:
+                        await s6_rc.ensure_service_down(engagement_id=rec.id)
+                    except Exception:  # noqa: BLE001 — best-effort teardown
+                        logger.warning(
+                            "boot replay: ensure_service_down after adopt "
+                            "failure for %s failed", rec.id[:8], exc_info=True,
+                        )
+                    continue
             try:
                 await s6_rc.start_service(engagement_id=rec.id)
             except Exception as exc:  # noqa: BLE001
@@ -681,13 +718,42 @@ async def replay_undergoing_engagements(
 
     # 5. Background tasks OUTSIDE the lock (long-lived).
     for rec in undergoing:
-        if rec.id in refused_ids:            # Sol F5: refused resume
+        if rec.id in refused_ids:            # Sol F5: refused resume / F7 abort
             continue
+        # v0.79.0 (§5, F7): the pinned-summary adopt-on-attach now runs in the
+        # start loop ABOVE (BEFORE service start, aborting the resume on failure)
+        # — a summary-less running engagement is no longer possible. Background
+        # tasks build the controller that adopts the (now-guaranteed) summary id.
         try:
             driver._spawn_background_tasks(rec)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "boot replay: background tasks for %s failed: %s",
+                rec.id[:8], exc,
+            )
+
+
+async def reconcile_terminal_spools(*, registry, driver) -> None:
+    """v0.79.0 (§3): terminal boot-reconciliation owner.
+
+    Alongside the active-engagement replay scan, drain the inbound spools of
+    TERMINAL engagements that still hold pending receipts/notices — a drain
+    that crashed after the terminal commit, or a Telegram send that failed
+    before finalize. Each drains to the topic if it still exists, else
+    WARN-drops (the topic is gone; nothing to notify into). Pending entries
+    therefore retry across restarts until sent or their topic disappears.
+    """
+    reconcile = getattr(driver, "reconcile_terminal_spool", None)
+    if reconcile is None:
+        return
+    for rec in registry.terminal_records():
+        if rec.driver != "claude_code":
+            continue
+        try:
+            await reconcile(rec)
+        except Exception as exc:  # noqa: BLE001 — best-effort per record
+            logger.warning(
+                "terminal spool reconcile failed for %s: %s",
                 rec.id[:8], exc,
             )
 
@@ -1841,23 +1907,42 @@ async def main() -> None:
     # claude_code driver: send_to_topic doubles as the live TopicStreamRelay's
     # send_message primitive (W1), so it must RETURN the posted message_id (the
     # relay edits the rolling message by id). Notice/warning callers ignore it.
-    async def _send_to_topic(thread_id: int, text: str) -> int | None:
+    async def _send_to_topic(
+        thread_id: int, text: str, reply_to_message_id: int | None = None,
+    ) -> int | None:
         if telegram_channel is not None:
+            if reply_to_message_id is not None:
+                # v0.79.0 (§3): reply-quote the operator's message (Sol-verified
+                # PTB 22.7 spelling).
+                from telegram import ReplyParameters
+                return await telegram_channel.send_to_topic(
+                    thread_id, text,
+                    reply_parameters=ReplyParameters(
+                        message_id=reply_to_message_id,
+                        allow_sending_without_reply=True,
+                    ),
+                )
             return await telegram_channel.send_to_topic(thread_id, text)
         return None
 
     async def _edit_topic_message(
-        thread_id: int, message_id: int, text: str,
+        thread_id: int, message_id: int, text: str, *, clear_keyboard: bool = False,
     ) -> bool:
         if telegram_channel is not None:
             return await telegram_channel.edit_topic_message(
-                thread_id, message_id, text)
+                thread_id, message_id, text, clear_keyboard=clear_keyboard)
         return False
 
     async def _delete_topic_message(thread_id: int, message_id: int) -> bool:
         if telegram_channel is not None:
             return await telegram_channel.delete_topic_message(
                 thread_id, message_id)
+        return False
+
+    async def _pin_topic_message(thread_id: int, message_id: int) -> bool:
+        # v0.79.0 (§5): best-effort pin of the live summary message.
+        if telegram_channel is not None:
+            return await telegram_channel.pin_topic_message(thread_id, message_id)
         return False
 
     # Expose on the agent module so tools.emit_completion / cancel_engagement
@@ -1887,6 +1972,8 @@ async def main() -> None:
         # seam for Task 7's inbound one-turn queue).
         edit_topic_message=_edit_topic_message,
         delete_topic_message=_delete_topic_message,
+        # v0.79.0 (§5): best-effort pin primitive for the live summary.
+        pin_topic_message=_pin_topic_message,
         registry=engagement_registry,
         # O-5 (v0.37.9): capture-and-persist SDK session_id so a Casa
         # restart mid-engagement preserves conversation continuity.
@@ -1924,6 +2011,15 @@ async def main() -> None:
             "in an inconsistent state: %s", exc,
         )
 
+    # v0.79.0 (§3): terminal boot-reconciliation — drain terminal engagements
+    # whose inbound spool still holds pending receipts/notices.
+    try:
+        await reconcile_terminal_spools(
+            registry=engagement_registry, driver=claude_code_driver,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("terminal spool reconciliation failed: %s", exc)
+
     from observer import Observer
     observer = Observer(
         bus=bus,
@@ -1942,12 +2038,34 @@ async def main() -> None:
         telegram_channel._session_registry = session_registry
         telegram_channel._semantic_memory = semantic_memory
 
-        async def _driver_send_user_turn(rec, text):
+        async def _driver_send_user_turn(rec, text, *, tg_message_id=None):
             if rec.driver == "claude_code":
-                await claude_code_driver.send_user_turn(rec, text)
+                await claude_code_driver.send_user_turn(
+                    rec, text, tg_message_id=tg_message_id)
             else:
+                # in_casa driver has no durable spool / reply-threading (§7
+                # follow-up) — drop the id.
                 await engagement_driver.send_user_turn(rec, text)
         telegram_channel._driver_send_user_turn = _driver_send_user_turn
+
+        # v0.79.0 (§3): seal open narration at inbound-handler entry for
+        # claude_code engagements (the T1 high-water seam).
+        async def _driver_advance_high_water(rec, msg_id):
+            if rec.driver == "claude_code":
+                await claude_code_driver.advance_topic_high_water_for_inbound(
+                    rec.id, msg_id)
+        telegram_channel._driver_advance_high_water = _driver_advance_high_water
+
+        # v0.79.0 (§3, F2): route platform-origin topic notices (command
+        # replies, resume errors) through the engagement's OUTPUT SEQUENCER so
+        # they seal narration + advance the high-water under the single writer.
+        # Non-claude_code engagements have no sequencer — post directly.
+        async def _driver_post_notice(rec, text):
+            if rec.driver == "claude_code":
+                await claude_code_driver.post_topic_notice(rec, text)
+            else:
+                await telegram_channel.send_to_topic(rec.topic_id, text)
+        telegram_channel._driver_post_notice = _driver_post_notice
 
         async def _finalize_cancel(rec, reason="user"):
             from tools import _finalize_engagement

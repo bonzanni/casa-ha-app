@@ -57,6 +57,55 @@ class TestFinalizeEngagement:
         assert rec.status == "completed"
         assert rec.completed_at is not None
 
+    async def test_spool_drain_precedes_topic_close(self, tmp_path):
+        """v0.79.0 (§3): the pre-close inbound spool drain runs BEFORE the
+        topic is closed (so pending receipts/notices post while the topic is
+        still open), and the terminal transition is STRICT."""
+        from engagement_registry import EngagementRegistry
+        from tools import _finalize_engagement, init_tools
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="hello", driver="claude_code",
+            task="t",
+            origin={"role": "assistant", "channel": "telegram", "chat_id": "1"},
+            topic_id=42,
+        )
+
+        order: list[str] = []
+        telegram = MagicMock()
+        telegram.send_to_topic = AsyncMock()
+
+        async def _close(*, thread_id):
+            order.append("close_topic")
+        telegram.close_topic = AsyncMock(side_effect=_close)
+        cm = MagicMock()
+        cm.get.return_value = telegram
+        bus = MagicMock()
+        bus.notify = AsyncMock()
+
+        init_tools(
+            channel_manager=cm, bus=bus,
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=reg,
+        )
+
+        driver = MagicMock()
+        driver.cancel = AsyncMock()
+
+        async def _drain(engagement):
+            order.append("drain")
+        driver.drain_inbound_spool = AsyncMock(side_effect=_drain)
+
+        await _finalize_engagement(
+            rec, outcome="completed", text="s", artifacts=[], next_steps=[],
+            driver=driver,
+        )
+
+        assert order == ["drain", "close_topic"]
+        driver.drain_inbound_spool.assert_awaited_once_with(rec)
+        assert rec.status == "completed"
+
     async def test_cancel_outcome_uses_cancel_path(self, tmp_path):
         from engagement_registry import EngagementRegistry
         from tools import _finalize_engagement, init_tools

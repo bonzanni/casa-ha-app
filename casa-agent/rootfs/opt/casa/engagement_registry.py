@@ -44,6 +44,22 @@ _IDLE_SWEEP_CRON = "0 8 * * *"            # daily 08:00 user TZ
 # duplicate-task guard and post-mortems working across restarts.
 _TERMINAL_RETENTION_DAYS = 30
 
+# v0.79.0 (§3): sentinel for the strict terminal transition's full-field
+# snapshot — distinguishes "origin had no such key" from "key was None" so the
+# rollback can DELETE a key the transition added rather than leaving it None.
+_FIELD_MISSING = object()
+
+
+def _restore_origin_field(rec: "EngagementRecord", key: str, snapped: Any) -> None:
+    """Restore ``rec.origin[key]`` to a strict-transition snapshot value.
+
+    ``_FIELD_MISSING`` means the key was ABSENT before the transition — the
+    rollback removes it rather than resurrecting it as ``None``."""
+    if snapped is _FIELD_MISSING:
+        rec.origin.pop(key, None)
+    else:
+        rec.origin[key] = snapped
+
 
 # ---------------------------------------------------------------------------
 # W2/Sol B9 (Task 7) — interaction_state pure transition core.
@@ -132,6 +148,23 @@ class EngagementRecord:
     # first_contact_required -> awaiting_operator -> authorized. Never
     # backwards; see ``_pure_interaction_transition``.
     interaction_state: str = ""
+    # v0.79.0 (§4): persisted question numbering. ``next_question_number`` is a
+    # monotonic per-engagement allocator (never rewound, even when a question
+    # closes) so every displayed ``Q<n>`` is durable and unique across restarts.
+    # ``open_questions`` is the set of still-open (unsettled) questions, each a
+    # ``{"n": int, "tg_message_id": int|None}`` dict — boot reconciliation
+    # settles any entry whose broker record did not survive the restart.
+    next_question_number: int = 1
+    open_questions: tuple[dict, ...] = ()
+    # v0.79.0 (§5): the pinned live-summary controller state. ``summary_message_id``
+    # is the Telegram id of the first (pinned) topic message, posted at boot
+    # BEFORE the subprocess starts so a resumed engagement adopts it on attach.
+    # ``summary_revision`` is the engagement-wide monotonic revision allocator —
+    # every lifecycle status transition acquires the next revision here (totally
+    # ordered, collision-free), so a newer revision may lower the status rank
+    # while an older/equal one never overrides.
+    summary_message_id: int | None = None
+    summary_revision: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +241,12 @@ class EngagementRegistry:
                     permission_mode=row.get("permission_mode") or "acceptEdits",
                     plugin_artifacts=tuple(row.get("plugin_artifacts") or ()),
                     interaction_state=row.get("interaction_state") or "",
+                    next_question_number=int(row.get("next_question_number", 1) or 1),
+                    open_questions=tuple(
+                        dict(q) for q in (row.get("open_questions") or ())
+                    ),
+                    summary_message_id=row.get("summary_message_id"),
+                    summary_revision=int(row.get("summary_revision", 0) or 0),
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed engagement row: %s", exc)
@@ -241,6 +280,14 @@ class EngagementRegistry:
 
     def active_and_idle(self) -> list[EngagementRecord]:
         return [r for r in self._records.values() if r.status in ("active", "idle")]
+
+    def terminal_records(self) -> list[EngagementRecord]:
+        """v0.79.0 (§3): terminal records, for the boot spool-reconciliation
+        owner (drains inbound spools still holding pending receipts/notices)."""
+        return [
+            r for r in self._records.values()
+            if r.status in ("completed", "cancelled", "error")
+        ]
 
     def get(self, engagement_id: str) -> EngagementRecord | None:
         return self._records.get(engagement_id)
@@ -335,6 +382,10 @@ class EngagementRegistry:
                 "permission_mode": rec.permission_mode,
                 "plugin_artifacts": [dict(pa) for pa in rec.plugin_artifacts],
                 "interaction_state": rec.interaction_state,
+                "next_question_number": rec.next_question_number,
+                "open_questions": [dict(q) for q in rec.open_questions],
+                "summary_message_id": rec.summary_message_id,
+                "summary_revision": rec.summary_revision,
             })
         try:
             await asyncio.to_thread(self._write_tombstone, snapshot)
@@ -433,6 +484,7 @@ class EngagementRegistry:
         error_kind: str = "",
         error_message: str = "",
         stale_before: float | None = None,
+        strict: bool = False,
     ) -> bool:
         """Atomically move a record to a terminal status. Returns True only
         for the first caller; False if missing or already terminal.
@@ -449,6 +501,19 @@ class EngagementRegistry:
         still older than the cutoff. The reap checks staleness before this
         call at a suspension point away; without this guard a user turn that
         revives the record in that window would still be reaped.
+
+        ``strict`` (v0.79.0 §3, Sol r6-2/r7-2): the finalize path uses STRICT
+        transactional persistence. Non-strict callers keep the historical
+        best-effort behavior (a tombstone write failure is swallowed and the
+        in-memory flip stands, which could leave a closed topic with no
+        terminal record for boot reconciliation to find). Strict snapshots
+        EVERY field the transition mutates (status, completed_at, and the
+        error metadata on ``origin``) and, on tombstone-write failure, restores
+        the FULL snapshot and re-raises — so a persistence failure leaves the
+        record exactly as it was (live), never a memory/disk split. The
+        mutate+persist runs under a shield-and-await (mirroring
+        ``advance_interaction_state``) so cancellation during ``to_thread``
+        cannot tear the pair.
         """
         async with self._lock:
             rec = self._records.get(engagement_id)
@@ -457,13 +522,56 @@ class EngagementRegistry:
             if stale_before is not None and rec.last_user_turn_ts >= stale_before:
                 # Revived since the reap snapshot — never cancel a live engagement.
                 return False
-            rec.status = outcome if outcome in ("completed", "cancelled") else "error"
-            rec.completed_at = completed_at if completed_at is not None else time.time()
-            if rec.status == "error":
-                rec.origin["error_kind"] = error_kind or "emit_completion_error"
-                rec.origin["error_message"] = error_message
-            await self._write_tombstone_locked()
-            return True
+            new_status = (
+                outcome if outcome in ("completed", "cancelled") else "error"
+            )
+            new_completed = (
+                completed_at if completed_at is not None else time.time()
+            )
+            if not strict:
+                rec.status = new_status
+                rec.completed_at = new_completed
+                if new_status == "error":
+                    rec.origin["error_kind"] = error_kind or "emit_completion_error"
+                    rec.origin["error_message"] = error_message
+                await self._write_tombstone_locked()
+                return True
+
+            # STRICT: full-field snapshot + shield-and-await + rollback-on-fail.
+            snap_status = rec.status
+            snap_completed = rec.completed_at
+            snap_error_kind = rec.origin.get("error_kind", _FIELD_MISSING)
+            snap_error_message = rec.origin.get("error_message", _FIELD_MISSING)
+
+            def _restore() -> None:
+                rec.status = snap_status
+                rec.completed_at = snap_completed
+                _restore_origin_field(rec, "error_kind", snap_error_kind)
+                _restore_origin_field(rec, "error_message", snap_error_message)
+
+            async def _mutate_and_persist() -> bool:
+                rec.status = new_status
+                rec.completed_at = new_completed
+                if new_status == "error":
+                    rec.origin["error_kind"] = error_kind or "emit_completion_error"
+                    rec.origin["error_message"] = error_message
+                try:
+                    await self._write_tombstone_locked(strict=True)
+                except Exception:
+                    _restore()
+                    raise
+                return True
+
+            task = asyncio.ensure_future(_mutate_and_persist())
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    # Let the inner mutate+persist (and, on failure, the
+                    # rollback) finish under the lock before honoring the
+                    # cancel — never a torn memory/disk pair.
+                    await asyncio.gather(task, return_exceptions=True)
+                raise
 
     async def mark_idle(self, engagement_id: str) -> None:
         async with self._lock:
@@ -614,6 +722,187 @@ class EngagementRegistry:
                     rec.origin["interaction_violated"] = prev
                 else:
                     rec.origin.pop("interaction_violated", None)
+                raise
+
+    # -- v0.79.0 (§4) question numbering + open-question ledger --------------
+
+    async def allocate_question_number(self, engagement_id: str) -> int | None:
+        """Atomically allocate the next durable ``Q<n>`` for an engagement.
+
+        Bumps ``next_question_number`` under the lock and persists (same
+        transactional shield-and-await pattern as ``advance_interaction_state``
+        so a cancelled caller never tears the counter from disk). Returns the
+        allocated number, or ``None`` for an unknown engagement."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return None
+            allocated = rec.next_question_number
+            prev = rec.next_question_number
+            rec.next_question_number = allocated + 1
+
+            async def _mutate_and_persist() -> int:
+                try:
+                    await self._write_tombstone_locked(strict=True)
+                except Exception:
+                    rec.next_question_number = prev
+                    raise
+                return allocated
+
+            task = asyncio.ensure_future(_mutate_and_persist())
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
+                raise
+
+    async def add_open_question(
+        self, engagement_id: str, number: int, tg_message_id: int | None,
+        text: str | None = None, kind: str = "button",
+    ) -> None:
+        """Record a still-open question ``{n, tg_message_id, text, kind}``
+        (persisted). ``text`` is the canonical displayed question so boot
+        reconciliation can re-render the settle copy over it (memory-only broker
+        state does not survive a restart). ``kind`` is ``"button"`` (broker tap)
+        or ``"anchor"`` (free-text — settled by the next operator message).
+        Idempotent on ``number``.
+
+        v0.79.0 (§4, Sol F6): STRICT persistence — a tombstone-write failure
+        rolls ``open_questions`` back (full-field) and RE-RAISES rather than
+        silently leaving a keyboard that the ledger/summary/boot-reconciler
+        cannot see. The ask handler settles the keyboard fail-closed on the
+        raise. Uses the shield-and-await transactional pattern so cancellation
+        during ``to_thread`` cannot split memory from disk."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            prev = rec.open_questions
+            entries = [q for q in rec.open_questions if q.get("n") != number]
+            entry = {"n": number, "tg_message_id": tg_message_id, "kind": kind}
+            if text is not None:
+                entry["text"] = text
+            entries.append(entry)
+            rec.open_questions = tuple(entries)
+
+            async def _mutate_and_persist() -> None:
+                try:
+                    await self._write_tombstone_locked(strict=True)
+                except Exception:
+                    rec.open_questions = prev
+                    raise
+
+            task = asyncio.ensure_future(_mutate_and_persist())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
+                raise
+
+    def oldest_open_anchor(self, engagement_id: str) -> dict | None:
+        """The oldest still-open FREE-TEXT anchor (``kind == "anchor"``), or
+        ``None``. The next operator message settles it (§4)."""
+        rec = self._records.get(engagement_id)
+        if rec is None:
+            return None
+        anchors = [q for q in rec.open_questions if q.get("kind") == "anchor"]
+        if not anchors:
+            return None
+        return min(anchors, key=lambda q: q.get("n", 0))
+
+    async def close_open_question(self, engagement_id: str, number: int) -> None:
+        """Remove a settled question from the open-question ledger (persisted).
+        ``next_question_number`` is NEVER rewound. Unknown engagement/number is
+        a no-op."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            remaining = tuple(
+                q for q in rec.open_questions if q.get("n") != number
+            )
+            if len(remaining) == len(rec.open_questions):
+                return
+            rec.open_questions = remaining
+            await self._write_tombstone_locked()
+
+    def open_question_numbers(self, engagement_id: str) -> list[int]:
+        """Accessor for summary consumers (T4): the sorted list of still-open
+        question numbers (``Open questions: Q4, Q6``)."""
+        rec = self._records.get(engagement_id)
+        if rec is None:
+            return []
+        return sorted(q["n"] for q in rec.open_questions if "n" in q)
+
+    # -- v0.79.0 (§5) live-summary state ------------------------------------
+
+    async def set_summary_message_id(
+        self, engagement_id: str, message_id: int | None,
+    ) -> None:
+        """Persist the pinned summary Telegram message id (posted at boot).
+        No-op for an unknown engagement.
+
+        v0.79.0 (§5, Sol F6): STRICT persistence — a tombstone-write failure
+        rolls ``summary_message_id`` back and RE-RAISES rather than leaving a
+        posted-but-unpersisted summary that a restart cannot resume; the boot
+        summary post ABORTS the launch on the raise (§5 post-failure-aborts).
+        Shield-and-await so cancellation during ``to_thread`` cannot split
+        memory from disk."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            prev = rec.summary_message_id
+            rec.summary_message_id = message_id
+
+            async def _mutate_and_persist() -> None:
+                try:
+                    await self._write_tombstone_locked(strict=True)
+                except Exception:
+                    rec.summary_message_id = prev
+                    raise
+
+            task = asyncio.ensure_future(_mutate_and_persist())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
+                raise
+
+    async def allocate_summary_revision(self, engagement_id: str) -> int | None:
+        """Atomically allocate the next monotonic summary REVISION (§5).
+
+        Every lifecycle status transition acquires its revision here, so the
+        three status sources (driver turn lifecycle, ``interaction_state``, ask
+        registry) are totally ordered and collision-free. Uses the same
+        transactional shield-and-await pattern as ``allocate_question_number``
+        (a cancelled caller never tears the counter from disk). Returns the
+        allocated revision, or ``None`` for an unknown engagement."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return None
+            allocated = rec.summary_revision
+            prev = rec.summary_revision
+            rec.summary_revision = allocated + 1
+
+            async def _mutate_and_persist() -> int:
+                try:
+                    await self._write_tombstone_locked(strict=True)
+                except Exception:
+                    rec.summary_revision = prev
+                    raise
+                return allocated
+
+            task = asyncio.ensure_future(_mutate_and_persist())
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
                 raise
 
     async def sweep_idle_and_suspend(

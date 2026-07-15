@@ -288,6 +288,93 @@ class TestRegistryStateTransitions:
         assert rec.origin.get("error_kind") == "emit_completion_error"
         assert rec.origin.get("error_message") == "boom"
 
+    async def test_strict_transition_rolls_back_full_field_on_persist_failure(
+        self, tmp_path,
+    ):
+        """v0.79.0 (§3, Sol r7-2): the STRICT terminal transition snapshots
+        EVERY mutated field (status, completed_at, error metadata) and, on a
+        tombstone-write failure, restores the FULL snapshot and re-raises — no
+        closed topic with a torn (memory ≠ disk) terminal record."""
+        import engagement_registry as er_mod
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+        # Baseline: an active record with no error metadata.
+        assert rec.status == "active"
+        assert "error_kind" not in rec.origin
+
+        # Fail the tombstone write only for the strict transition.
+        import unittest.mock as _mock
+        with _mock.patch.object(
+            reg, "_write_tombstone", side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError):
+                await reg.try_transition_terminal(
+                    rec.id, "error", error_kind="k", error_message="m",
+                    strict=True,
+                )
+        # FULL-FIELD rollback: status, completed_at AND the error metadata that
+        # the transition added are all reverted (the added keys are removed,
+        # not left as None).
+        assert rec.status == "active"
+        assert rec.completed_at is None
+        assert "error_kind" not in rec.origin
+        assert "error_message" not in rec.origin
+
+    async def test_strict_transition_cancel_during_persist_completes_write(
+        self, tmp_path,
+    ):
+        """v0.79.0 (§3, Sol r7-2): cancelling the CALLER during the strict
+        transition's ``to_thread`` persist cannot tear memory from disk — the
+        shielded mutate+persist runs to completion before the cancel is honored.
+        """
+        import asyncio
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+
+        async def _driver():
+            await reg.try_transition_terminal(rec.id, "completed", strict=True)
+
+        task = asyncio.ensure_future(_driver())
+        await asyncio.sleep(0)          # let it enter the shielded persist
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The durable write completed under the shield: memory is terminal AND
+        # a fresh registry load sees the same terminal status.
+        assert rec.status == "completed"
+        reg2 = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        await reg2.load()
+        assert reg2.get(rec.id).status == "completed"
+
+    async def test_non_strict_transition_swallows_persist_failure(self, tmp_path):
+        """The historical non-strict path keeps best-effort semantics: a
+        tombstone-write failure is swallowed and the in-memory flip stands."""
+        import unittest.mock as _mock
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+        with _mock.patch.object(
+            reg, "_write_tombstone", side_effect=OSError("disk full"),
+        ):
+            won = await reg.try_transition_terminal(rec.id, "cancelled")
+        assert won is True
+        assert rec.status == "cancelled"
+
+    async def test_terminal_records_accessor(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        live = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+        gone = await reg.create("specialist", "ops", "claude_code", "t", {}, 2)
+        await reg.try_transition_terminal(gone.id, "completed")
+        ids = {r.id for r in reg.terminal_records()}
+        assert gone.id in ids and live.id not in ids
+
     async def test_update_last_idle_reminder(self, tmp_path):
         from engagement_registry import EngagementRegistry
 
@@ -784,3 +871,194 @@ class TestSetInteractionViolated:
         # must NOT be left set (else a restart would lose the un-persisted flag
         # silently while the driver believed it succeeded).
         assert rec.origin.get("interaction_violated") is None
+
+
+# ---------------------------------------------------------------------------
+# v0.79.0 (§4) — persisted question numbering + open-question ledger
+# ---------------------------------------------------------------------------
+
+
+class TestQuestionNumbering:
+    async def test_allocate_is_monotonic_and_persisted(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        tombstone = tmp_path / "engagements.json"
+        reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        rec = await reg.create("executor", "configurator", "claude_code", "t", {}, 1)
+
+        assert await reg.allocate_question_number(rec.id) == 1
+        assert await reg.allocate_question_number(rec.id) == 2
+        assert await reg.allocate_question_number(rec.id) == 3
+        assert rec.next_question_number == 4
+
+        # Survives a reload: numbering is NEVER rewound.
+        reg2 = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        await reg2.load()
+        assert await reg2.allocate_question_number(rec.id) == 4
+
+    async def test_open_question_ledger_add_close_accessor(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        tombstone = tmp_path / "engagements.json"
+        reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        rec = await reg.create("executor", "configurator", "claude_code", "t", {}, 1)
+
+        n1 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n1, 5001)
+        n2 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n2, 5002)
+        assert reg.open_question_numbers(rec.id) == [1, 2]
+
+        await reg.close_open_question(rec.id, n1)
+        assert reg.open_question_numbers(rec.id) == [2]
+
+        # open_questions survive reload; next_question_number preserved.
+        reg2 = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        await reg2.load()
+        assert reg2.open_question_numbers(rec.id) == [2]
+        assert reg2.get(rec.id).open_questions[0]["tg_message_id"] == 5002
+        assert await reg2.allocate_question_number(rec.id) == 3
+
+    async def test_add_open_question_idempotent_on_number(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        tombstone = tmp_path / "engagements.json"
+        reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        rec = await reg.create("executor", "configurator", "claude_code", "t", {}, 1)
+        await reg.add_open_question(rec.id, 1, 100)
+        await reg.add_open_question(rec.id, 1, 200)  # same number → update, no dup
+        assert reg.open_question_numbers(rec.id) == [1]
+        assert rec.open_questions[0]["tg_message_id"] == 200
+
+    async def test_allocate_rolls_back_on_persist_failure(self, tmp_path, monkeypatch):
+        import engagement_registry as er
+        from engagement_registry import EngagementRegistry
+
+        tombstone = tmp_path / "engagements.json"
+        reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)
+        rec = await reg.create("executor", "configurator", "claude_code", "t", {}, 1)
+
+        def _boom(*_a, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(er, "atomic_write_json", _boom)
+        with pytest.raises(OSError):
+            await reg.allocate_question_number(rec.id)
+        # Rolled back — the number never reached disk, so it must not be consumed.
+        assert rec.next_question_number == 1
+
+    async def test_pre_v0_79_0_tombstone_loads_with_safe_defaults(self, tmp_path, bus):
+        """Caller-audit item 5 (T5): a tombstone written before v0.79.0 lacks
+        next_question_number/open_questions/summary_message_id/summary_revision
+        entirely — loading it must not raise, and each field must fall back to
+        its safe default (matching test_pre_v0_75_0_tombstone_loads_with_empty_default's
+        pattern for interaction_state)."""
+        from engagement_registry import EngagementRegistry
+
+        path = tmp_path / "engagements.json"
+        path.write_text(json.dumps([{
+            "id": "c" * 32,
+            "kind": "executor",
+            "role_or_type": "configurator",
+            "driver": "claude_code",
+            "status": "active",
+            "topic_id": 42,
+            "started_at": 1700000000.0,
+            "last_user_turn_ts": 1700000000.0,
+            "last_idle_reminder_ts": 0.0,
+            "completed_at": None,
+            "sdk_session_id": None,
+            "origin": {},
+            "task": "legacy",
+        }]))
+        reg = EngagementRegistry(tombstone_path=str(path), bus=bus)
+        await reg.load()
+        rec = reg._records["c" * 32]
+        assert rec.next_question_number == 1
+        assert rec.open_questions == ()
+        assert rec.summary_message_id is None
+        assert rec.summary_revision == 0
+        # And the allocators work normally from that safe baseline.
+        assert await reg.allocate_question_number(rec.id) == 1
+        assert await reg.allocate_summary_revision(rec.id) == 0
+
+
+class TestSummaryState:
+    """v0.79.0 (§5): summary_message_id persistence + monotonic revision."""
+
+    async def test_set_summary_message_id_persists_and_reloads(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        path = str(tmp_path / "e.json")
+        reg = EngagementRegistry(tombstone_path=path, bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="hello", driver="claude_code",
+            task="t", origin={}, topic_id=5,
+        )
+        await reg.set_summary_message_id(rec.id, 4242)
+        assert reg.get(rec.id).summary_message_id == 4242
+        # Reload from disk.
+        reg2 = EngagementRegistry(tombstone_path=path, bus=None)
+        await reg2.load()
+        assert reg2.get(rec.id).summary_message_id == 4242
+
+    async def test_allocate_summary_revision_is_monotonic(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        path = str(tmp_path / "e.json")
+        reg = EngagementRegistry(tombstone_path=path, bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="hello", driver="claude_code",
+            task="t", origin={}, topic_id=5,
+        )
+        assert await reg.allocate_summary_revision(rec.id) == 0
+        assert await reg.allocate_summary_revision(rec.id) == 1
+        assert await reg.allocate_summary_revision(rec.id) == 2
+        assert reg.get(rec.id).summary_revision == 3
+        # Survives a reload (never rewound).
+        reg2 = EngagementRegistry(tombstone_path=path, bus=None)
+        await reg2.load()
+        assert reg2.get(rec.id).summary_revision == 3
+        assert await reg2.allocate_summary_revision(rec.id) == 3
+
+    async def test_allocate_unknown_engagement_returns_none(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        assert await reg.allocate_summary_revision("nope") is None
+        await reg.set_summary_message_id("nope", 1)  # no-op, no raise
+
+
+class TestF6StrictLedgerPersistence:
+    """v0.79.0 (§4/§5, Sol F6): ``add_open_question`` and
+    ``set_summary_message_id`` are STRICT — a tombstone-write failure rolls the
+    mutated field back (full-field) and RE-RAISES so a caller can fail closed."""
+
+    async def test_add_open_question_strict_rolls_back_and_raises(self, tmp_path):
+        import unittest.mock as _mock
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("executor", "configurator", "claude_code", "t", {}, 1)
+        assert rec.open_questions == ()
+        with _mock.patch.object(
+            reg, "_write_tombstone", side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError):
+                await reg.add_open_question(rec.id, 1, 500, text="Q1: hi")
+        # Rolled back — no phantom open question the ledger/summary can't back.
+        assert rec.open_questions == ()
+
+    async def test_set_summary_message_id_strict_rolls_back_and_raises(self, tmp_path):
+        import unittest.mock as _mock
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("executor", "configurator", "claude_code", "t", {}, 1)
+        assert rec.summary_message_id is None
+        with _mock.patch.object(
+            reg, "_write_tombstone", side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError):
+                await reg.set_summary_message_id(rec.id, 777)
+        assert rec.summary_message_id is None

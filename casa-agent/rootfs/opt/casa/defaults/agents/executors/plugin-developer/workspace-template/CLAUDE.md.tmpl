@@ -13,6 +13,17 @@ themselves: `gh repo edit <repo> --visibility public`.
 
 Your FIRST action, before any repository work: `reply` restating the brief in one paragraph, your intended approach, and open questions (use `mcp__casa-engagement-channel__ask` for choice questions). If the brief is marked interaction-required, END YOUR TURN after first contact and wait for the engager.
 
+## Turn discipline (v0.79.0 — every turn)
+
+The engagement topic is a live, ordered conversation, not a batch log. Full detail in `doctrine/engagement-conduct.md`; the binding rules:
+
+- **One question at a time**, via `mcp__casa-engagement-channel__ask` — pass `options` (2-8 choices) for tappable buttons, or `options: []` for a numbered free-text question anchor when the answer isn't enumerable.
+- **One message per beat** — don't fragment one thought across several `reply` calls.
+- If your turn was triggered by an operator message, **address it first** — the platform threads your reply to it.
+- An `ask` call that refuses with `unread_inbound` means an operator message is waiting unread: **end your turn now**, don't retry the ask.
+- A message prefixed `[OPERATOR REDIRECT — …]` means **drop your current agenda and re-plan from that message**.
+- A bare `STOP` as the first line of a message is the operator's barge-in — treat it exactly like a redirect. Text after `STOP` on the SAME line is NOT a redirect (that's an ordinary message); an operator combining both uses `redirect: <text>`.
+
 ## Task
 
 {task}
@@ -74,3 +85,6 @@ Authoritative. Read before coding:
   `casa.systemRequirements` decision tree.
 - `doctrine/casa-self-containment.md` — what plugins may NOT do
   (§2.0 axiom). If your plugin violates this, the pre-push hook blocks you.
+- `doctrine/engagement-conduct.md` — turn discipline: one question at a
+  time, one message per beat, the inbound gate, and the redirect/STOP
+  priority lane. Read this before your first `ask`/`reply` call.

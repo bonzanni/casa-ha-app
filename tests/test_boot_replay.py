@@ -139,7 +139,7 @@ async def test_replay_rerenders_stale_prev75_run_script(monkeypatch, tmp_path):
     """B1 (Sol r1): a COMPLETE pre-v0.75 service pair (run script emits
     neither ``--output-format stream-json`` nor the ``casa_control`` spawn
     NDJSON frame) must be re-rendered on boot replay — otherwise the new
-    _InboundQueue never arms and operator turns queue forever. The stale pair
+    _InboundSpool never arms and operator turns queue forever. The stale pair
     is dropped so the heal path re-plants it from the current template."""
     from casa_core import replay_undergoing_engagements
     from drivers import s6_rc
@@ -1081,3 +1081,128 @@ async def test_replay_b2_migration_succeeds_when_removal_confirmed(
     assert "casa_control" in run_text
     assert start_ids == ["keep1"]
     assert reg._records["keep1"].status in ("active", "idle")
+
+
+class TestReconcileTerminalSpools:
+    async def test_drains_only_terminal_claude_code_records(self):
+        from casa_core import reconcile_terminal_spools
+
+        live = _rec("a" * 16, driver="claude_code", status="active")
+        gone = _rec("b" * 16, driver="claude_code", status="completed")
+        in_casa_gone = _rec("c" * 16, driver="in_casa", status="cancelled")
+        reg = await _make_registry([live, gone, in_casa_gone])
+
+        drained: list[str] = []
+
+        class _Driver:
+            async def reconcile_terminal_spool(self, rec):
+                drained.append(rec.id)
+
+        await reconcile_terminal_spools(registry=reg, driver=_Driver())
+        # Only the TERMINAL claude_code record is drained.
+        assert drained == [gone.id]
+
+    async def test_one_failure_does_not_abort_others(self):
+        from casa_core import reconcile_terminal_spools
+
+        r1 = _rec("d" * 16, driver="claude_code", status="completed")
+        r2 = _rec("e" * 16, driver="claude_code", status="error")
+        reg = await _make_registry([r1, r2])
+
+        drained: list[str] = []
+
+        class _Driver:
+            async def reconcile_terminal_spool(self, rec):
+                if rec.id == r1.id:
+                    raise RuntimeError("boom")
+                drained.append(rec.id)
+
+        await reconcile_terminal_spools(registry=reg, driver=_Driver())
+        assert drained == [r2.id]        # r2 still drained despite r1 failing
+
+
+async def test_replay_aborts_resume_when_summary_adopt_fails(monkeypatch, tmp_path):
+    """F7 (Sol r2): pinned-summary adoption failure ABORTS the resume — the
+    service is NOT started and the record is marked error (§5: never run a
+    summary-less engagement). Adoption runs BEFORE start."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+
+    svc_root = tmp_path / "svc"
+    svc_root.mkdir()
+    (svc_root / "engagement-keep1").mkdir()
+    (svc_root / "engagement-keep1" / "type").write_text("longrun\n")
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+    start_calls: list = []
+    down_calls: list = []
+
+    async def fake_cau():
+        pass
+
+    async def fake_start(*, engagement_id):
+        start_calls.append(engagement_id)
+
+    async def fake_down(*, engagement_id):
+        down_calls.append(engagement_id)
+        return True
+
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+    monkeypatch.setattr(s6_rc, "ensure_service_down", fake_down)
+
+    reg = await _make_registry([_rec("keep1")])
+
+    adopt_calls: list = []
+
+    async def _adopt_boom(rec):
+        adopt_calls.append(rec.id)
+        raise RuntimeError("telegram down")
+
+    driver = AsyncMock()
+    driver._spawn_background_tasks = lambda rec: None
+    driver.adopt_summary_if_missing = _adopt_boom
+
+    await replay_undergoing_engagements(registry=reg, driver=driver)
+
+    # Adoption was ATTEMPTED, and its failure aborted the resume:
+    assert adopt_calls == ["keep1"]
+    assert start_calls == []                       # NOT started summary-less
+    assert down_calls == ["keep1"]                 # confirmed down
+    assert reg.get("keep1").status == "error"      # marked error
+
+
+async def test_replay_adopts_summary_before_start(monkeypatch, tmp_path):
+    """F7: on the happy path, adoption runs BEFORE start_service (ordering)."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+
+    svc_root = tmp_path / "svc"
+    svc_root.mkdir()
+    (svc_root / "engagement-keep1").mkdir()
+    (svc_root / "engagement-keep1" / "type").write_text("longrun\n")
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+    order: list = []
+
+    async def fake_cau():
+        pass
+
+    async def fake_start(*, engagement_id):
+        order.append(("start", engagement_id))
+
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+
+    reg = await _make_registry([_rec("keep1")])
+
+    async def _adopt(rec):
+        order.append(("adopt", rec.id))
+
+    driver = AsyncMock()
+    driver._spawn_background_tasks = lambda rec: None
+    driver.adopt_summary_if_missing = _adopt
+
+    await replay_undergoing_engagements(registry=reg, driver=driver)
+
+    assert order == [("adopt", "keep1"), ("start", "keep1")]
