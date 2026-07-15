@@ -132,6 +132,17 @@ class EngagementRecord:
     # first_contact_required -> awaiting_operator -> authorized. Never
     # backwards; see ``_pure_interaction_transition``.
     interaction_state: str = ""
+    # Task 6 (spec §4.6): the concurrency Permit this interactive
+    # specialist delegation holds, if any (set by tools.py's
+    # delegate_to_agent right after `create()`, None for executor
+    # engagements — they never acquire one). NOT persisted to the
+    # tombstone (`_write_tombstone_locked` below lists fields explicitly)
+    # — a live Permit cannot survive a restart; concurrency state is
+    # memory-only and resets with the process. Released exactly once by
+    # `_finalize_engagement` (the shared completion/cancel/reap funnel)
+    # or, for a pre-finalize failure (topic/driver-start), inline at the
+    # point of failure — see delegate_to_agent's interactive branch.
+    permit: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +406,25 @@ class EngagementRegistry:
         )
         return rec
 
+    @staticmethod
+    def _release_permit(rec: "EngagementRecord") -> None:
+        """Task 6 (spec §4.6): release the specialist concurrency permit this
+        record holds, if any. Called synchronously by EVERY terminal
+        transition below (right after the status change, BEFORE tombstone
+        I/O) so a leaked permit can never outlive its engagement — including
+        direct ``mark_error`` routes (resume/orphan failures in
+        channels/telegram.py) that bypass ``_finalize_engagement``.
+        ``Permit.release()`` is idempotent, so ``_finalize_engagement``'s
+        own release (and re-entrant terminal calls) are safe no-ops.
+        Executor engagements carry ``permit=None`` → guarded no-op."""
+        permit = getattr(rec, "permit", None)
+        if permit is not None:
+            try:
+                permit.release()
+            except Exception:  # noqa: BLE001 — a bookkeeping release must never break a terminal transition
+                logger.warning("engagement %s permit release raised",
+                               rec.id[:8], exc_info=True)
+
     async def mark_completed(self, engagement_id: str, completed_at: float) -> None:
         async with self._lock:
             rec = self._records.get(engagement_id)
@@ -402,6 +432,7 @@ class EngagementRegistry:
                 return
             rec.status = "completed"
             rec.completed_at = completed_at
+            self._release_permit(rec)
             await self._write_tombstone_locked()
 
     async def mark_cancelled(self, engagement_id: str) -> None:
@@ -411,6 +442,7 @@ class EngagementRegistry:
                 return
             rec.status = "cancelled"
             rec.completed_at = time.time()
+            self._release_permit(rec)
             await self._write_tombstone_locked()
 
     async def mark_error(self, engagement_id: str, kind: str, message: str) -> None:
@@ -422,6 +454,7 @@ class EngagementRegistry:
             rec.completed_at = time.time()
             rec.origin["error_kind"] = kind
             rec.origin["error_message"] = message
+            self._release_permit(rec)
             await self._write_tombstone_locked()
 
     async def try_transition_terminal(
@@ -462,6 +495,7 @@ class EngagementRegistry:
             if rec.status == "error":
                 rec.origin["error_kind"] = error_kind or "emit_completion_error"
                 rec.origin["error_message"] = error_message
+            self._release_permit(rec)  # Task 6 (spec §4.6)
             await self._write_tombstone_locked()
             return True
 

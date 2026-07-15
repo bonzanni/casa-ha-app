@@ -46,6 +46,12 @@ class DelegationRecord:
     # origin carries the channel/chat_id/cid/role/user_text of the
     # delegating resident's turn so the late-completion NOTIFICATION
     # can be delivered back to the right user via the right channel.
+    # Task 6 (spec §4.6): the concurrency Permit this delegation holds, if
+    # any (None when no SpecialistLimiter is wired). NOT persisted to the
+    # tombstone — `_write_tombstone_locked` below lists fields explicitly
+    # and a live Permit object cannot (and need not) survive a restart;
+    # concurrency state is memory-only and resets with the process.
+    permit: Any = None
 
 
 @dataclass
@@ -61,6 +67,10 @@ class DelegationComplete:
     message: str = ""
     origin: dict[str, Any] = field(default_factory=dict)
     elapsed_s: float = 0.0
+    # Task 6 (spec §4.6): True when the delegated output was clipped to
+    # `_MAX_OUTPUT_CHARS` before this notification was assembled, so the
+    # narrating resident can disclose the answer was cut short.
+    output_truncated: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +219,18 @@ class SpecialistRegistry:
             self._delegations[record.id] = record
             await self._write_tombstone_locked()
 
+    # Task 6 (spec §4.6): these terminal transitions deliberately do NOT
+    # release the concurrency permit. For a LAUNCHED sync/async delegation
+    # the task's ``_permit_release_callback`` done-callback is the SOLE
+    # authoritative release — it fires only when the task ACTUALLY ends
+    # (honouring cancellation). ``cancel_delegation`` in particular is called
+    # by the voice teardown after only a bounded wait (tools._voice_deadline_
+    # exceeded), while the specialist task may still be unwinding; releasing
+    # here would free the slot for a NEW delegation while the original is
+    # still executing (idempotence cannot undo a premature release). Pre-
+    # launch cancellation is covered by the lexical ``owned`` guard in
+    # delegate_to_agent. (Interactive engagements, which have no task done-
+    # callback, DO release in EngagementRegistry terminal transitions.)
     async def complete_delegation(self, delegation_id: str) -> None:
         async with self._lock:
             self._delegations.pop(delegation_id, None)

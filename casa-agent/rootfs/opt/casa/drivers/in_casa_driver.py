@@ -35,6 +35,12 @@ TopicStreamFactory = Callable[[int], "TopicStreamHandle"]
 Returned handle exposes async ``emit(accumulated_text)`` and async
 ``finalize(full_text)``. See channels.telegram.TopicStreamHandle."""
 
+ResultObserver = Callable[[EngagementRecord, ResultMessage], None]
+"""(engagement, ResultMessage) → None — Task 6 (spec §4.6) per-turn cost/usage
+observer. Called synchronously for every ``ResultMessage`` seen on an
+engagement turn; casa_core wires it to feed interactive specialist cost into
+``SpecialistTelemetry`` (filtering by ``engagement.kind``). Must not raise."""
+
 SessionIdPersister = Callable[[str, str], Awaitable[None]]
 """(engagement_id, session_id) → None — registry persist hook.
 
@@ -81,9 +87,12 @@ class InCasaDriver(DriverProtocol):
         *,
         topic_stream_factory: TopicStreamFactory,
         persist_session_id: SessionIdPersister | None = None,
+        result_observer: "ResultObserver | None" = None,
     ) -> None:
         self._topic_stream_factory = topic_stream_factory
         self._persist_session_id = persist_session_id
+        # Task 6 (spec §4.6): optional per-turn cost/usage observer.
+        self._result_observer = result_observer
         self._clients: dict[str, ClaudeSDKClient] = {}
         self._ctx_stack: dict[str, Any] = {}
         # Per-engagement asyncio.Lock guards query/receive_response sequencing:
@@ -262,6 +271,13 @@ class InCasaDriver(DriverProtocol):
         # entire turn.
         stream = self._topic_stream_factory(engagement.topic_id)
         accumulated = ""
+        # Task 6 (spec §4.6): per-turn output bound for INTERACTIVE SPECIALIST
+        # engagements — the streamed assistant text was otherwise unbounded
+        # before emit_completion. Once the accumulator crosses the cap it is
+        # frozen with a marker and further assistant text is skipped (the
+        # stream still drains). Executor engagements are out of scope.
+        cap_output = getattr(engagement, "kind", "") == "specialist"
+        stream_truncated = False
         idx = 0  # Phase 4b: per-turn AssistantMessage counter.
         started_ms = time.monotonic() * 1000  # Phase 4b: turn duration anchor.
         # Per-call tool name lookup so log_tool_result can render name=.
@@ -316,22 +332,48 @@ class InCasaDriver(DriverProtocol):
                             sdk_logging.log_turn_done(
                                 sdk_msg, started_ms=started_ms,
                             )
+                            # Task 6 (spec §4.6): feed interactive specialist
+                            # cost/usage to the telemetry observer. Guarded —
+                            # an observability hook must never abort the turn.
+                            if self._result_observer is not None:
+                                try:
+                                    self._result_observer(engagement, sdk_msg)
+                                except Exception:  # noqa: BLE001
+                                    logger.warning(
+                                        "result_observer raised for engagement %s",
+                                        engagement.id[:8], exc_info=True,
+                                    )
                     except Exception as dispatch_exc:  # noqa: BLE001
                         logger.warning(
                             "phase4b dispatch failed: %s", dispatch_exc,
                             exc_info=True,
                         )
-                    # Phase 3b streaming — unchanged.
-                    if isinstance(sdk_msg, AssistantMessage):
+                    # Phase 3b streaming — Task 6 output bound for specialists.
+                    if isinstance(sdk_msg, AssistantMessage) and not stream_truncated:
                         msg_text = "".join(
                             b.text for b in getattr(sdk_msg, "content", [])
                             if isinstance(b, TextBlock)
                         )
                         if msg_text:
-                            accumulated = (
+                            candidate = (
                                 f"{accumulated}\n\n{msg_text}"
                                 if accumulated else msg_text
                             )
+                            import specialist_limits
+                            cap = specialist_limits._MAX_OUTPUT_CHARS
+                            if cap_output and len(candidate) > cap:
+                                accumulated = candidate[:cap] + " … [truncated]"
+                                stream_truncated = True
+                                # Persist a flag so the finalize/notification
+                                # path can disclose the clipped stream.
+                                engagement.origin["stream_output_truncated"] = True
+                                logger.warning(
+                                    "engagement %s specialist stream output "
+                                    "truncated at %d chars (spec §4.6)",
+                                    engagement.id[:8], cap,
+                                )
+                            else:
+                                accumulated = candidate
                             await stream.emit(accumulated)
         finally:
             engagement_var.reset(token)

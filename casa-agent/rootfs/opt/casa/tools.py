@@ -39,6 +39,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    ResultMessage,
     TextBlock,
     create_sdk_mcp_server,
     tool,
@@ -51,6 +52,8 @@ import plugin_outbox
 from error_kinds import _classify_error
 from mcp_registry import McpServerRegistry
 import sdk_logging
+import specialist_limits
+from tokens import extract_usage
 from drivers.brief import normalize_brief, render_brief_task, validate_brief
 from engagement_registry import EngagementRecord, EngagementRegistry
 from specialist_registry import (
@@ -76,6 +79,11 @@ _engagement_registry: EngagementRegistry | None = None
 _executor_registry: "ExecutorRegistry | None" = None
 _agent_registry = None  # AgentRegistry | None
 _runtime = None  # CasaRuntime | None — set by init_tools(runtime=...)
+# Task 6 (spec §4.6): specialist concurrency cap + per-role telemetry. Both
+# default to None (no limiting / no telemetry) so callers that don't wire
+# them — including every pre-Task-6 test — keep the old unbounded behaviour.
+_specialist_limiter: "specialist_limits.SpecialistLimiter | None" = None
+_specialist_telemetry: "specialist_limits.SpecialistTelemetry | None" = None
 engagement_var: ContextVar[EngagementRecord | None] = ContextVar(
     "engagement_var", default=None,
 )
@@ -93,6 +101,8 @@ def init_tools(
     engagement_registry=None,
     executor_registry=None,
     runtime=None,                         # NEW — Task C.1
+    specialist_limiter=None,              # Task 6 (spec §4.6)
+    specialist_telemetry=None,            # Task 6 (spec §4.6)
 ) -> None:
     """Initialize module-level references used by tool implementations.
 
@@ -113,10 +123,17 @@ def init_tools(
 
     ``runtime`` is the CasaRuntime container. Optional during migration
     (Task C.1); becomes required once all callsites use it (Task C.4).
+
+    ``specialist_limiter``/``specialist_telemetry`` (Task 6, spec §4.6):
+    optional concurrency cap + per-role telemetry. ``None`` (the default)
+    disables both — ``_prelaunch`` skips the concurrency gate entirely and
+    ``_run_delegated_agent`` skips cost/usage recording, matching the
+    pre-Task-6 unbounded behaviour for every caller that doesn't wire them.
     """
     global _channel_manager, _bus, _specialist_registry, _mcp_registry, \
         _agent_role_map, _agent_registry, _trigger_registry, \
-        _engagement_registry, _executor_registry, _runtime  # noqa: PLW0603
+        _engagement_registry, _executor_registry, _runtime, \
+        _specialist_limiter, _specialist_telemetry  # noqa: PLW0603
     _channel_manager = channel_manager
     _bus = bus
     _specialist_registry = specialist_registry
@@ -127,6 +144,8 @@ def init_tools(
     _engagement_registry = engagement_registry
     _executor_registry = executor_registry
     _runtime = runtime
+    _specialist_limiter = specialist_limiter
+    _specialist_telemetry = specialist_telemetry
 
 
 def sync_agent_role_map(runtime: Any) -> None:
@@ -1156,6 +1175,7 @@ async def _run_delegated_agent(
     options = await asyncio.to_thread(
         _build_specialist_options, cfg, resolution=resolution)
     text = ""
+    result_msg: ResultMessage | None = None
     token = agent_mod.origin_var.set(child_origin)
     try:
         async with ClaudeSDKClient(
@@ -1167,8 +1187,32 @@ async def _run_delegated_agent(
                     for block in getattr(sdk_msg, "content", []):
                         if isinstance(block, TextBlock):
                             text += block.text
+                elif isinstance(sdk_msg, ResultMessage):
+                    # Task 6 (spec §4.6): previously discarded — captured
+                    # below (in `finally`, so it's recorded even when the
+                    # client raises before the loop reaches a ResultMessage).
+                    result_msg = sdk_msg
     finally:
         agent_mod.origin_var.reset(token)
+        # Task 6 (spec §4.6): aggregate cost/usage from the captured
+        # ResultMessage. COUNTING is separate (`record_launch`, done by the
+        # caller at ownership transfer) so a delegation that fails during
+        # setup — or whose ResultMessage never arrived — is still counted;
+        # here we only aggregate cost when a ResultMessage actually arrived.
+        if _specialist_telemetry is not None and result_msg is not None:
+            cost_usd = float(getattr(result_msg, "total_cost_usd", 0.0) or 0.0)
+            usage = extract_usage(result_msg)
+            _specialist_telemetry.record_cost(
+                cfg.role, cost_usd=cost_usd, usage=usage,
+            )
+
+    # Task 6 (spec §4.6): output bounding is applied by the CALLER (see
+    # `specialist_limits.truncate_output` at the sync-result / async-
+    # DelegationComplete assembly sites) rather than here, so the
+    # `output_truncated` flag survives this task's str boundary and reaches
+    # the wire. The raw text is returned; memory retain below stores it as
+    # exchanged (the bound is a caller-facing surface concern, not a memory
+    # one — and token_budget>0 specialists are rare).
 
     # Specialist write: one explicit tier-classified retain of the exchange to
     # the shared bank, gated by the PARENT channel's write-trust (voice → no
@@ -1189,6 +1233,39 @@ async def _run_delegated_agent(
     return text
 
 
+def _record_launch_safe(agent_name: str) -> None:
+    """Count one delegation launch, never raising (spec §4.6).
+
+    Called AFTER permit ownership has already transferred (``owned = None``),
+    and guarded so a telemetry/logging failure can never propagate into the
+    caller and — worse — never reach the ``owned`` finally to release a
+    permit whose task/driver is already live."""
+    if _specialist_telemetry is None:
+        return
+    try:
+        _specialist_telemetry.record_launch(agent_name)
+    except Exception:  # noqa: BLE001 — telemetry must never affect permit ownership or the launch
+        logger.warning(
+            "specialist telemetry record_launch raised for %s",
+            agent_name, exc_info=True,
+        )
+
+
+def _permit_release_callback(permit) -> "callable":
+    """Return an asyncio task done-callback that releases *permit* (spec §4.6).
+
+    Attaching this to the delegated task is strictly more robust than a
+    ``finally`` inside the coroutine: a task cancelled BEFORE its coroutine
+    ever starts running has no coroutine-`finally` to run, but its done
+    callbacks still fire. The callback fires exactly once per task
+    (normal completion, exception, or cancellation) and ``Permit.release()``
+    is idempotent, so a redundant release elsewhere (registry terminal
+    transition, `_finalize_engagement`) is a safe no-op."""
+    def _cb(_task: asyncio.Task) -> None:
+        permit.release()
+    return _cb
+
+
 def _attach_completion_callback(
     task: asyncio.Task,
     record: DelegationRecord,
@@ -1197,6 +1274,13 @@ def _attach_completion_callback(
 
     Used by the degraded-sync and async paths. Task 7's sync-ok /
     sync-error paths bookkeep inline.
+
+    Task 6 (spec §4.6): the permit release is NOT here — it rides on the
+    dedicated `_permit_release_callback` done-callback attached to the same
+    task (robust even against a cancelled-before-start task, which has no
+    coroutine `finally`). This callback bounds the notified output via
+    `truncate_output` and propagates the `output_truncated` flag onto the
+    `DelegationComplete`.
     """
     loop = asyncio.get_running_loop()
 
@@ -1207,13 +1291,21 @@ def _attach_completion_callback(
         complete: DelegationComplete | None = None
         try:
             text = t.result()
+            bounded, output_truncated = specialist_limits.truncate_output(text)
+            if output_truncated:
+                logger.warning(
+                    "delegated agent %s output truncated: %d > %d chars "
+                    "(spec §4.6)", record.agent, len(text),
+                    specialist_limits._MAX_OUTPUT_CHARS,
+                )
             complete = DelegationComplete(
                 delegation_id=record.id,
                 agent=record.agent,
                 status="ok",
-                text=text,
+                text=bounded,
                 origin=record.origin,
                 elapsed_s=time.time() - record.started_at,
+                output_truncated=output_truncated,
             )
             loop.create_task(_specialist_registry.complete_delegation(record.id))
         except Exception as exc:
@@ -1247,9 +1339,33 @@ def _attach_completion_callback(
     task.add_done_callback(_done)
 
 
+def _delegation_scope(origin: dict, agent_name: str) -> str:
+    """Concurrency scope key for the per-scope specialist cap (spec §4.6).
+
+    The voice channel's per-turn rate limiter (``channels/voice/channel.py``
+    ``_resolve_scope_id`` / ``VoiceRateLimiter``) already keys off a
+    ``scope_id`` — a per-session identifier — and threads that SAME value
+    through as ``origin["chat_id"]`` for every voice-channel turn. Reusing
+    it here makes spec §4.6's "one active MTG delegation per voice scope"
+    literal: at most one delegation to a GIVEN specialist may be in flight
+    per calling session at a time (a session may still run concurrent
+    delegations to two DIFFERENT specialists — each gets its own scope key
+    — bounded only by the global cap). Non-voice channels' chat_id serves
+    the same "one calling session" role, so the same cap applies uniformly.
+
+    Falls back to ``cid`` (the per-turn correlation id) when chat_id is
+    empty/missing so an unscoped caller still gets its own bucket instead
+    of colliding with every other unscoped caller under one ``"-"`` key.
+    """
+    chat_id = str((origin or {}).get("chat_id") or "")
+    if not chat_id:
+        chat_id = str((origin or {}).get("cid") or "-")
+    return f"{chat_id}:{agent_name}"
+
+
 async def _prelaunch(
     agent_name: str, origin: dict, mode: str,
-) -> tuple[Any, Any, dict | None]:
+) -> tuple[Any, Any, "specialist_limits.Permit | None", dict | None]:
     """The single unified prelaunch pipeline for delegate_to_agent (spec A4).
 
     Runs EVERY pre-launch gate, in this order, so no gate is bypassable by
@@ -1258,7 +1374,8 @@ async def _prelaunch(
 
         ACL (Task 1) -> not-initialized -> depth cap -> mode gate ->
         target resolution -> resident-interactive-compat ->
-        requires (Task 5) -> progress -> launch
+        requires (Task 5) -> concurrency (Task 6, spec §4.6) ->
+        progress -> launch
 
     The mode gate deliberately precedes both target resolution AND the
     resident-interactive-compat check: on voice, async/interactive must
@@ -1267,18 +1384,28 @@ async def _prelaunch(
     supported`` (or ``unknown_agent``) would be an observable ordering
     bypass of the voice mode gate.
 
-    Returns ``(cfg, resolution, error)``:
+    Returns ``(cfg, resolution, permit, error)``:
     - ``error`` is a terminal tool-result dict the caller returns
-      immediately when a gate denies; ``cfg``/``resolution`` are ``None``.
+      immediately when a gate denies; ``cfg``/``resolution``/``permit``
+      are ``None``. A concurrency (``busy``) denial in particular has NO
+      side effects yet — it is checked before progress/record/task, same
+      as every earlier gate.
     - On success ``error`` is ``None``, ``cfg`` is the resolved target
-      config, and ``resolution`` is the plugin ResolutionResult the
-      requires gate (spec A5) resolved for ``agent_name`` — ``None`` when
-      ``cfg.requires`` is empty (gate skipped, no resolve performed).
+      config, ``resolution`` is the plugin ResolutionResult the requires
+      gate (spec A5) resolved for ``agent_name`` — ``None`` when
+      ``cfg.requires`` is empty (gate skipped, no resolve performed) —
+      and ``permit`` is the concurrency slot acquired for this delegation
+      (``None`` only when no ``SpecialistLimiter`` is wired at all — see
+      ``init_tools``). ``permit`` is ALWAYS acquired when a limiter is
+      wired, independent of whether ``resolution`` is ``None`` — a permit
+      does not depend on the requires gate having run.
       Callers with a non-``None`` resolution MUST reuse it verbatim
       (``_build_specialist_options(cfg, resolution=resolution)`` and the
       interactive engagement-record binding) rather than re-resolving, so
-      the gate's decision and what actually launches never drift (Task 6
-      concurrency seam reuses the same value).
+      the gate's decision and what actually launches never drift. The
+      caller (``delegate_to_agent``) is responsible for the permit's
+      lifetime from here — see ``_run_delegated_agent_with_permit`` (sync/
+      async path) and the interactive branch's ``rec.permit`` handoff.
     """
     channel = str((origin or {}).get("channel", ""))
 
@@ -1301,13 +1428,13 @@ async def _prelaunch(
     caller_cfg = _agent_role_map.get(caller_role) if caller_role else None
     declared = {d.agent for d in (getattr(caller_cfg, "delegates", None) or [])}
     if caller_cfg is None or agent_name not in declared:
-        return None, None, _result({
+        return None, None, None, _result({
             "status": "error", "kind": "delegation_not_declared",
             "message": (f"Agent {caller_role or '(unknown)'!r} does not "
                         f"declare {agent_name!r} as a delegate.")})
 
     if _specialist_registry is None:
-        return None, None, _result({
+        return None, None, None, _result({
             "status": "error",
             "kind": "not_initialized",
             "message": "specialist registry not initialized",
@@ -1316,7 +1443,7 @@ async def _prelaunch(
     # Depth cap: prevent delegation chains beyond depth=1.
     current_depth = int((origin or {}).get("delegation_depth", 0))
     if current_depth >= _MAX_DELEGATION_DEPTH:
-        return None, None, _result({
+        return None, None, None, _result({
             "status": "error",
             "kind": "delegation_depth_exceeded",
             "message": (
@@ -1331,7 +1458,7 @@ async def _prelaunch(
     # a `pending` marker) are rejected outright rather than silently
     # coerced to sync. `pending` must never be returned on voice.
     if channel == "voice" and mode != "sync":
-        return None, None, _result({
+        return None, None, None, _result({
             "status": "error",
             "kind": "mode_unsupported_on_voice",
             "message": (
@@ -1349,7 +1476,7 @@ async def _prelaunch(
         if _specialist_registry is not None else None
     )
     if cfg is None:
-        return None, None, _result({
+        return None, None, None, _result({
             "status": "error",
             "kind": "unknown_agent",
             "message": f"No enabled agent named {agent_name!r}",
@@ -1360,7 +1487,7 @@ async def _prelaunch(
     # voice mode denial (not this one).
     is_resident = bool(getattr(cfg, "channels", []))
     if mode == "interactive" and is_resident:
-        return None, None, _result({
+        return None, None, None, _result({
             "status": "error",
             "kind": "interactive_not_supported",
             "message": (
@@ -1395,7 +1522,7 @@ async def _prelaunch(
             if t not in declared or t.rsplit("__", 1)[0] not in servers
         ]
         if missing_plugins or missing_tools or not resolution.registry_valid:
-            return None, None, _result({
+            return None, None, None, _result({
                 "status": "error", "kind": "dependency_unavailable",
                 "agent": agent_name,
                 "missing_plugins": missing_plugins,
@@ -1404,23 +1531,60 @@ async def _prelaunch(
                 "message": f"Agent {agent_name!r} launch deps unavailable.",
             })
 
+    # Task 6 concurrency gate (spec §4.6): AFTER requires, BEFORE progress —
+    # a denied gate must never speak the "checking" line, and a delegation
+    # that fails the requires gate must never occupy a concurrency slot.
+    # Acquired regardless of whether `resolution` is None (a permit does
+    # NOT depend on the requires gate having run — see docstring). No
+    # limiter wired (`_specialist_limiter is None`) means no cap: `permit`
+    # stays None and every downstream release is a guarded no-op.
+    permit = None
+    if _specialist_limiter is not None:
+        scope = _delegation_scope(origin, agent_name)
+        permit = _specialist_limiter.try_acquire(scope)
+        if permit is None:
+            if _specialist_telemetry is not None:
+                _specialist_telemetry.record_denial(agent_name, kind="busy")
+            return None, None, None, _result({
+                "status": "error",
+                "kind": "busy",
+                "agent": agent_name,
+                "message": (
+                    f"Agent {agent_name!r} is already at its concurrency "
+                    "cap — try again shortly."
+                ),
+            })
+
     # A4 progress: speak a deterministic "still working" block AFTER every
     # gate above has passed, immediately before the launch side effects —
     # a denied gate must never speak a misleading "checking" line. The
     # sink itself (channels/voice/channel.py) enforces exactly-once-per-
     # turn and suppresses this if the turn already spoke real content.
-    if channel == "voice":
-        sink = (origin or {}).get("_progress_sink")
-        if callable(sink):
-            try:
-                await sink("One moment — checking.")
-            except Exception:  # noqa: BLE001 — progress is best-effort
-                logger.warning(
-                    "voice progress sink raised for delegate_to_agent(%s)",
-                    agent_name, exc_info=True,
-                )
+    #
+    # Task 6 (spec §4.6): the progress sink is the ONE await between
+    # acquiring the permit above and returning it to the caller. If THIS
+    # coroutine is cancelled here (voice barge-in), the caller never
+    # receives `permit` to release it — so guard the await and release on
+    # any BaseException (CancelledError included) before re-raising. The
+    # sink's own errors are still swallowed (best-effort) and do NOT
+    # release the permit — a launch still proceeds.
+    try:
+        if channel == "voice":
+            sink = (origin or {}).get("_progress_sink")
+            if callable(sink):
+                try:
+                    await sink("One moment — checking.")
+                except Exception:  # noqa: BLE001 — progress is best-effort
+                    logger.warning(
+                        "voice progress sink raised for delegate_to_agent(%s)",
+                        agent_name, exc_info=True,
+                    )
+    except BaseException:
+        if permit is not None:
+            permit.release()
+        raise
 
-    return cfg, resolution, None
+    return cfg, resolution, permit, None
 
 
 def _voice_wait_from_deadline(raw_deadline: Any, loop) -> float | None:
@@ -1529,6 +1693,34 @@ async def delegate_to_agent(args: dict) -> dict:
     context_text = args.get("context", "") or ""
     mode = args.get("mode", "sync") or "sync"
 
+    # Task 6 input bounds (spec §4.6): checked at handler entry, BEFORE
+    # _prelaunch — an oversized task/context is rejected with ZERO side
+    # effects (no ACL/depth/mode gate run, no concurrency slot consumed).
+    if len(task_text) > specialist_limits._MAX_TASK_CHARS:
+        if _specialist_telemetry is not None:
+            _specialist_telemetry.record_denial(agent_name, kind="input_too_large")
+        return _result({
+            "status": "error", "kind": "input_too_large", "field": "task",
+            "agent": agent_name, "length": len(task_text),
+            "limit": specialist_limits._MAX_TASK_CHARS,
+            "message": (
+                f"task ({len(task_text)} chars) exceeds the "
+                f"{specialist_limits._MAX_TASK_CHARS}-char limit."
+            ),
+        })
+    if len(context_text) > specialist_limits._MAX_CONTEXT_CHARS:
+        if _specialist_telemetry is not None:
+            _specialist_telemetry.record_denial(agent_name, kind="input_too_large")
+        return _result({
+            "status": "error", "kind": "input_too_large", "field": "context",
+            "agent": agent_name, "length": len(context_text),
+            "limit": specialist_limits._MAX_CONTEXT_CHARS,
+            "message": (
+                f"context ({len(context_text)} chars) exceeds the "
+                f"{specialist_limits._MAX_CONTEXT_CHARS}-char limit."
+            ),
+        })
+
     # AR-2: snapshot at entry — this handler awaits (channel setup,
     # engagement/delegation dispatch) and must not read a holder that a
     # later turn has since rewritten in place.
@@ -1536,282 +1728,358 @@ async def delegate_to_agent(args: dict) -> dict:
 
     # A4: THE unified prelaunch pipeline — one call that runs EVERY
     # pre-launch gate (ACL, depth, mode, target resolution, resident-compat,
-    # requires-seam, progress) in a fixed order, so no gate is bypassable by
-    # another and NO side effect (topic, engagement/delegation record, task,
-    # driver start, progress emission) can precede a clean return. It
-    # dominates both the interactive branch and the sync/async path below.
-    cfg, resolution, prelaunch_error = await _prelaunch(agent_name, origin, mode)
+    # requires-seam, concurrency, progress) in a fixed order, so no gate is
+    # bypassable by another and NO side effect (topic, engagement/delegation
+    # record, task, driver start, progress emission) can precede a clean
+    # return. It dominates both the interactive branch and the sync/async
+    # path below. `permit` (Task 6, spec §4.6) is the concurrency slot this
+    # delegation now owns — the caller (this function) owns its lifetime
+    # from here: sync/async hands it to `_run_delegated_agent_with_permit`;
+    # interactive hands it to the just-created engagement record.
+    cfg, resolution, permit, prelaunch_error = await _prelaunch(
+        agent_name, origin, mode)
     if prelaunch_error is not None:
         return prelaunch_error
 
-    if mode == "interactive":
-        # Need telegram channel + supergroup configured.
-        if _channel_manager is None:
-            return _result({"status": "error", "kind": "no_channel_manager",
-                            "message": "channel manager missing"})
-        channel = _channel_manager.get(origin.get("channel", "telegram"))
-        # E-F (v0.30.0): if supergroup IS configured but
-        # engagement_permission_ok is still False, the boot-time setup may
-        # have lost a race with a transient network blip. The setup is now
-        # wired into _rebuild's tail (self-healing on every reconnect), but
-        # in the rare window where the user spawns an engagement before any
-        # rebuild has completed, attempt one in-line retry before giving up.
-        # Idempotent; cheap on success.
-        if (channel is not None
-                and getattr(channel, "engagement_supergroup_id", 0)
-                and not getattr(channel, "engagement_permission_ok", False)):
+    # Task 6 (spec §4.6): lexical ownership guard. `owned` holds the permit
+    # from _prelaunch's acquire until launch transfers it. The finally
+    # releases on ANY exit before transfer — including a CancelledError
+    # raised at an await between here and launch (which `except Exception`
+    # would miss), and every early error return. At each true ownership
+    # transfer (task done-callback attached / driver.start succeeded) the
+    # body sets `owned = None`. Every release is idempotent, so the
+    # registry terminal transitions and `_finalize_engagement` releasing
+    # the SAME permit are safe no-ops.
+    owned = permit
+    try:
+        if mode == "interactive":
+            # Task 6 (spec §4.6): the `owned` lexical ownership guard (try/finally
+            # around this whole body) releases `permit` on ANY exit before launch
+            # transfer — including a CancelledError raised at any await below and
+            # every early error return here — so these paths need no inline
+            # release. Ownership transfers to the engagement record only AFTER
+            # driver.start() succeeds (see the `owned = None` there).
+            # Need telegram channel + supergroup configured.
+            if _channel_manager is None:
+                return _result({"status": "error", "kind": "no_channel_manager",
+                                "message": "channel manager missing"})
+            channel = _channel_manager.get(origin.get("channel", "telegram"))
+            # E-F (v0.30.0): if supergroup IS configured but
+            # engagement_permission_ok is still False, the boot-time setup may
+            # have lost a race with a transient network blip. The setup is now
+            # wired into _rebuild's tail (self-healing on every reconnect), but
+            # in the rare window where the user spawns an engagement before any
+            # rebuild has completed, attempt one in-line retry before giving up.
+            # Idempotent; cheap on success.
+            if (channel is not None
+                    and getattr(channel, "engagement_supergroup_id", 0)
+                    and not getattr(channel, "engagement_permission_ok", False)):
+                try:
+                    await channel.setup_engagement_features()  # type: ignore[attr-defined]
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "engage_executor: in-line setup_engagement_features "
+                        "retry failed: %s", exc,
+                    )
+            if (channel is None
+                    or not getattr(channel, "engagement_supergroup_id", 0)
+                    or not getattr(channel, "engagement_permission_ok", False)):
+                return _engagement_unavailable_result(origin)  # R-2 (v0.69.7)
+            # v0.37.1 D-1: U3 title format for specialist engagements too
+            # (was legacy `#[<role>] <task> · <id8>`). Bubble carries the
+            # role icon via icon_id_for_role; title is `<state> <task>`.
+            from channels.state_emoji import (
+                STATE_EMOJI, compose_topic_title, concise_task,
+            )
+            first_line = (task_text or "").splitlines()[0]
+            short_task = concise_task(first_line) or "engagement"
+            topic_name = compose_topic_title(
+                state="active", short_task=short_task,
+            )
             try:
-                await channel.setup_engagement_features()  # type: ignore[attr-defined]
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "engage_executor: in-line setup_engagement_features "
-                    "retry failed: %s", exc,
+                topic_id = await channel.open_engagement_topic(
+                    name=topic_name,
+                    role=agent_name,
                 )
-        if (channel is None
-                or not getattr(channel, "engagement_supergroup_id", 0)
-                or not getattr(channel, "engagement_permission_ok", False)):
-            return _engagement_unavailable_result(origin)  # R-2 (v0.69.7)
-        # v0.37.1 D-1: U3 title format for specialist engagements too
-        # (was legacy `#[<role>] <task> · <id8>`). Bubble carries the
-        # role icon via icon_id_for_role; title is `<state> <task>`.
-        from channels.state_emoji import (
-            STATE_EMOJI, compose_topic_title, concise_task,
-        )
-        first_line = (task_text or "").splitlines()[0]
-        short_task = concise_task(first_line) or "engagement"
-        topic_name = compose_topic_title(
-            state="active", short_task=short_task,
-        )
-        try:
-            topic_id = await channel.open_engagement_topic(
-                name=topic_name,
-                role=agent_name,
+            except Exception as exc:  # noqa: BLE001
+                return _result({"status": "error", "kind": "topic_create_failed",
+                                "message": str(exc)})
+            # §3.8 (Sol #4): record the specialist's plugin binding so verify can
+            # disclose this engagement if a later plugin_update supersedes its
+            # artifact (informational — mirrors the executor-engagement case). The
+            # specialist runs on the same tier:role resolution _build_specialist_
+            # options uses below.
+            # Sol round-3 H7b: resolve ONCE and feed the SAME result to both the
+            # engagement record and the options builder, so a concurrent update can't
+            # make the recorded binding disagree with what actually launches.
+            # A5: when the requires gate (Task 5) already resolved this agent's
+            # plugins (non-empty `cfg.requires`), reuse that SAME ResolutionResult
+            # instead of resolving again — the engagement record's binding must
+            # never disagree with what the requires gate actually validated.
+            # `resolution` (from `_prelaunch`) is None whenever `cfg.requires` is
+            # empty, in which case this resolves fresh exactly as before Task 5.
+            if resolution is not None:
+                _spec_res = resolution
+            else:
+                _spec_tier = (_agent_registry.tier_for_role(agent_name)
+                              if _agent_registry is not None else None) or "specialist"
+                _spec_res = plugin_registry.resolve_for(f"{_spec_tier}:{agent_name}")
+            _spec_arts = tuple(
+                {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
+                for rp in _spec_res.plugins)
+            # Create record
+            rec = await _engagement_registry.create(
+                kind="specialist", role_or_type=agent_name, driver="in_casa",
+                task=task_text, origin=dict(origin), topic_id=topic_id,
+                plugin_artifacts=_spec_arts,
             )
-        except Exception as exc:  # noqa: BLE001
-            return _result({"status": "error", "kind": "topic_create_failed",
-                            "message": str(exc)})
-        # §3.8 (Sol #4): record the specialist's plugin binding so verify can
-        # disclose this engagement if a later plugin_update supersedes its
-        # artifact (informational — mirrors the executor-engagement case). The
-        # specialist runs on the same tier:role resolution _build_specialist_
-        # options uses below.
-        # Sol round-3 H7b: resolve ONCE and feed the SAME result to both the
-        # engagement record and the options builder, so a concurrent update can't
-        # make the recorded binding disagree with what actually launches.
-        # A5: when the requires gate (Task 5) already resolved this agent's
-        # plugins (non-empty `cfg.requires`), reuse that SAME ResolutionResult
-        # instead of resolving again — the engagement record's binding must
-        # never disagree with what the requires gate actually validated.
-        # `resolution` (from `_prelaunch`) is None whenever `cfg.requires` is
-        # empty, in which case this resolves fresh exactly as before Task 5.
-        if resolution is not None:
-            _spec_res = resolution
-        else:
-            _spec_tier = (_agent_registry.tier_for_role(agent_name)
-                          if _agent_registry is not None else None) or "specialist"
-            _spec_res = plugin_registry.resolve_for(f"{_spec_tier}:{agent_name}")
-        _spec_arts = tuple(
-            {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
-            for rp in _spec_res.plugins)
-        # Create record
-        rec = await _engagement_registry.create(
-            kind="specialist", role_or_type=agent_name, driver="in_casa",
-            task=task_text, origin=dict(origin), topic_id=topic_id,
-            plugin_artifacts=_spec_arts,
+            # Task 6 (spec §4.6): stash the permit on the engagement record so
+            # EVERY registry terminal transition (mark_error, mark_cancelled,
+            # mark_completed, try_transition_terminal) releases it — including
+            # the direct mark_error routes (resume/orphan failures in
+            # channels/telegram.py) that bypass `_finalize_engagement`.
+            # `_finalize_engagement` also releases it as an idempotent fallback.
+            # Ownership is NOT yet transferred here: `owned` stays set until
+            # driver.start() succeeds, so a cancellation/error at any await
+            # before that still releases via the outer finally (all releases
+            # are idempotent).
+            rec.permit = permit
+            # Persist initial state emoji so update_topic_state knows
+            # whether it needs to edit the title (no-op when state didn't change).
+            try:
+                await _engagement_registry.set_channel_state(
+                    rec.id, current_state_emoji=STATE_EMOJI["active"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("set_channel_state(active) failed: %s", exc)
+
+            # Build options + start driver (off-loop: registry resolve is file IO).
+            options = await asyncio.to_thread(
+                _build_specialist_options, cfg, resolution=_spec_res)
+            # Augment allowed tools (additive) with query_engager + emit_completion
+            injected = list(options.allowed_tools or [])
+            for t in ("mcp__casa-framework__query_engager",
+                      "mcp__casa-framework__emit_completion"):
+                if t not in injected:
+                    injected.append(t)
+            options.allowed_tools = injected
+
+            prompt = (
+                f"You are engaged with the user in a Telegram forum topic.\n"
+                f"Task: {task_text}\n\n"
+                f"Context from Ellen:\n{context_text or '(none)'}\n\n"
+                f"When the task is complete, call emit_completion(text=..., "
+                f"artifacts=..., next_steps=..., status='ok')."
+            )
+
+            driver = getattr(agent_mod, "active_engagement_driver", None)
+            if driver is None:
+                await _engagement_registry.mark_error(
+                    rec.id, kind="no_driver",
+                    message="engagement driver not initialized",
+                )
+                await _abort_engagement_topic(channel, rec.id, topic_id)
+                # permit released by mark_error (registry terminal transition)
+                # + the outer finally (owned still set) — both idempotent.
+                return _result({"status": "error", "kind": "no_driver",
+                                "message": "engagement driver not initialized"})
+            try:
+                await driver.start(rec, prompt=prompt, options=options)
+            except Exception as exc:  # noqa: BLE001
+                await _engagement_registry.mark_error(rec.id, kind="driver_start_failed",
+                                                      message=str(exc))
+                await _abort_engagement_topic(channel, rec.id, topic_id)
+                # permit released by mark_error + the outer finally (idempotent).
+                return _result({"status": "error", "kind": "driver_start_failed",
+                                "message": str(exc)})
+
+            # Task 6 (spec §4.6): driver is live — transfer permit ownership to
+            # the engagement record (released by an EngagementRegistry terminal
+            # transition or _finalize_engagement) by clearing `owned` FIRST, so
+            # the following non-raising launch count can never reach the outer
+            # finally to release the now-live engagement's permit.
+            owned = None  # __TRANSFER_INTERACTIVE__
+            _record_launch_safe(agent_name)
+            return _result({
+                "status": "pending",
+                "engagement_id": rec.id,
+                "agent": agent_name,
+                "mode": "interactive",
+                "topic_id": topic_id,
+            })
+
+        delegation_id = str(uuid.uuid4())
+
+        # A4: voice turn budget. The deadline is ABSOLUTE (origin["voice_deadline"],
+        # a monotonic loop.time() value); the remaining wait is recomputed at
+        # every decision point because loop.time() advances as this handler
+        # awaits. `voice_wait_s` stays None for non-voice turns (they use the
+        # general 60s ceiling below). A None from _voice_wait_from_deadline means
+        # the budget is exhausted, missing, or non-finite → fail closed with
+        # deadline_exceeded rather than launch or (worse, on NaN) hang.
+        is_voice = str(origin.get("channel", "")) == "voice"
+        loop = asyncio.get_running_loop() if is_voice else None
+        raw_deadline = origin.get("voice_deadline") if is_voice else None
+
+        if is_voice:
+            # Pre-register short-circuit: an already-expired / missing /
+            # non-finite deadline never even registers a record (keeps the
+            # tombstone store clean for the common "spoke too late" case).
+            # Task 6: no task is created on this path — the outer finally
+            # (`owned` still set) releases the permit.
+            if _voice_wait_from_deadline(raw_deadline, loop) is None:
+                logger.info(
+                    "Delegation → %s voice budget already exceeded at entry — "
+                    "not registered", agent_name,
+                )
+                return _deadline_exceeded_result(delegation_id, agent_name)
+
+        started_at = time.time()
+        record = DelegationRecord(
+            id=delegation_id, agent=agent_name, started_at=started_at,
+            origin=dict(origin),
         )
-        # Persist initial state emoji so update_topic_state knows
-        # whether it needs to edit the title (no-op when state didn't change).
-        try:
-            await _engagement_registry.set_channel_state(
-                rec.id, current_state_emoji=STATE_EMOJI["active"],
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("set_channel_state(active) failed: %s", exc)
+        # Task 6 (spec §4.6): stash for observability + registry terminal-
+        # transition release (complete/fail/cancel_delegation). The PRIMARY
+        # release for the sync/async path is the `_permit_release_callback`
+        # done-callback attached to the task below (robust even if the task is
+        # cancelled before its coroutine starts). All releases are idempotent.
+        record.permit = permit
+        await _specialist_registry.register_delegation(record)
 
-        # Build options + start driver (off-loop: registry resolve is file IO).
-        options = await asyncio.to_thread(
-            _build_specialist_options, cfg, resolution=_spec_res)
-        # Augment allowed tools (additive) with query_engager + emit_completion
-        injected = list(options.allowed_tools or [])
-        for t in ("mcp__casa-framework__query_engager",
-                  "mcp__casa-framework__emit_completion"):
-            if t not in injected:
-                injected.append(t)
-        options.allowed_tools = injected
+        voice_wait_s: float | None = None
+        if is_voice:
+            # RECOMPUTE after register_delegation — its tombstone lock + I/O
+            # consumed wall-clock time, so the pre-register wait is now stale.
+            # If registration itself ate the remaining budget, remove the
+            # just-registered record (no orphan tombstone) and bail WITHOUT
+            # ever launching the specialist task. Task 6: no task created →
+            # the outer finally releases the permit (owned still set).
+            voice_wait_s = _voice_wait_from_deadline(raw_deadline, loop)
+            if voice_wait_s is None:
+                await _specialist_registry.cancel_delegation(delegation_id)
+                logger.info(
+                    "Delegation %s → %s voice budget exhausted during "
+                    "registration — specialist not started",
+                    delegation_id[:8], agent_name,
+                )
+                return _deadline_exceeded_result(delegation_id, agent_name)
 
-        prompt = (
-            f"You are engaged with the user in a Telegram forum topic.\n"
-            f"Task: {task_text}\n\n"
-            f"Context from Ellen:\n{context_text or '(none)'}\n\n"
-            f"When the task is complete, call emit_completion(text=..., "
-            f"artifacts=..., next_steps=..., status='ok')."
-        )
+        # Task 6 (spec §4.6): create the task, then ATOMICALLY (no await between)
+        # attach the unconditional permit-release done-callback and transfer
+        # ownership (`owned = None`). Attaching the release as a done-callback —
+        # not the coroutine's own finally — means even a task cancelled before
+        # its coroutine ever runs still releases the slot. Clear `owned` BEFORE
+        # counting the launch so a telemetry failure can never reach the outer
+        # finally to release the now-live task's permit (the count goes through
+        # the non-raising wrapper).
+        task = asyncio.create_task(
+            _run_delegated_agent(cfg, task_text, context_text, resolution=resolution))
+        if permit is not None:
+            task.add_done_callback(_permit_release_callback(permit))
+        owned = None  # __TRANSFER_SYNC__
+        _record_launch_safe(agent_name)
 
-        driver = getattr(agent_mod, "active_engagement_driver", None)
-        if driver is None:
-            await _engagement_registry.mark_error(
-                rec.id, kind="no_driver",
-                message="engagement driver not initialized",
-            )
-            await _abort_engagement_topic(channel, rec.id, topic_id)
-            return _result({"status": "error", "kind": "no_driver",
-                            "message": "engagement driver not initialized"})
-        try:
-            await driver.start(rec, prompt=prompt, options=options)
-        except Exception as exc:  # noqa: BLE001
-            await _engagement_registry.mark_error(rec.id, kind="driver_start_failed",
-                                                  message=str(exc))
-            await _abort_engagement_topic(channel, rec.id, topic_id)
-            return _result({"status": "error", "kind": "driver_start_failed",
-                            "message": str(exc)})
-
-        return _result({
-            "status": "pending",
-            "engagement_id": rec.id,
-            "agent": agent_name,
-            "mode": "interactive",
-            "topic_id": topic_id,
-        })
-
-    delegation_id = str(uuid.uuid4())
-
-    # A4: voice turn budget. The deadline is ABSOLUTE (origin["voice_deadline"],
-    # a monotonic loop.time() value); the remaining wait is recomputed at
-    # every decision point because loop.time() advances as this handler
-    # awaits. `voice_wait_s` stays None for non-voice turns (they use the
-    # general 60s ceiling below). A None from _voice_wait_from_deadline means
-    # the budget is exhausted, missing, or non-finite → fail closed with
-    # deadline_exceeded rather than launch or (worse, on NaN) hang.
-    is_voice = str(origin.get("channel", "")) == "voice"
-    loop = asyncio.get_running_loop() if is_voice else None
-    raw_deadline = origin.get("voice_deadline") if is_voice else None
-
-    if is_voice:
-        # Pre-register short-circuit: an already-expired / missing /
-        # non-finite deadline never even registers a record (keeps the
-        # tombstone store clean for the common "spoke too late" case).
-        if _voice_wait_from_deadline(raw_deadline, loop) is None:
-            logger.info(
-                "Delegation → %s voice budget already exceeded at entry — "
-                "not registered", agent_name,
-            )
-            return _deadline_exceeded_result(delegation_id, agent_name)
-
-    started_at = time.time()
-    record = DelegationRecord(
-        id=delegation_id, agent=agent_name, started_at=started_at,
-        origin=dict(origin),
-    )
-    await _specialist_registry.register_delegation(record)
-
-    voice_wait_s: float | None = None
-    if is_voice:
-        # RECOMPUTE after register_delegation — its tombstone lock + I/O
-        # consumed wall-clock time, so the pre-register wait is now stale.
-        # If registration itself ate the remaining budget, remove the
-        # just-registered record (no orphan tombstone) and bail WITHOUT
-        # ever launching the specialist task.
-        voice_wait_s = _voice_wait_from_deadline(raw_deadline, loop)
-        if voice_wait_s is None:
-            await _specialist_registry.cancel_delegation(delegation_id)
-            logger.info(
-                "Delegation %s → %s voice budget exhausted during "
-                "registration — specialist not started",
-                delegation_id[:8], agent_name,
-            )
-            return _deadline_exceeded_result(delegation_id, agent_name)
-
-    task = asyncio.create_task(
-        _run_delegated_agent(cfg, task_text, context_text, resolution=resolution))
-
-    if mode == "async":
-        _attach_completion_callback(task, record)
-        logger.info(
-            "Delegation %s → %s (async mode)",
-            delegation_id[:8], agent_name,
-        )
-        return _result({
-            "status": "pending",
-            "delegation_id": delegation_id,
-            "agent": agent_name,
-            "mode": "async",
-        })
-
-    # mode == "sync"
-    if voice_wait_s is not None:
-        # A4: voice never degrades to `pending` (async/interactive are
-        # already rejected in _prelaunch) — there is no follow-up channel
-        # to deliver a LATER completion notification on. Wait only up to
-        # the budget computed above (deadline − reserve, capped at 60s); on
-        # expiry cancel + bounded teardown + speak the typed error.
-        try:
-            done, pending = await asyncio.wait({task}, timeout=voice_wait_s)
-        except asyncio.CancelledError:
-            task.cancel()
-            await _specialist_registry.cancel_delegation(delegation_id)
-            raise
-        if pending:
-            return await _voice_deadline_exceeded(task, delegation_id, agent_name)
-    else:
-        try:
-            done, pending = await asyncio.wait({task}, timeout=_SYNC_WAIT_TIMEOUT_S)
-        except asyncio.CancelledError:
-            task.cancel()
-            await _specialist_registry.cancel_delegation(delegation_id)
-            raise
-
-        if pending:
-            # 60s elapsed; detach and degrade to pending with callback.
+        if mode == "async":
             _attach_completion_callback(task, record)
             logger.info(
-                "Delegation %s → %s timed out at 60s — degraded to pending",
+                "Delegation %s → %s (async mode)",
                 delegation_id[:8], agent_name,
             )
             return _result({
                 "status": "pending",
                 "delegation_id": delegation_id,
                 "agent": agent_name,
-                "timeout_s": 60,
-                "note": (
-                    "Delegation continues in background; you will receive a "
-                    "NOTIFICATION when complete."
-                ),
+                "mode": "async",
             })
 
-    # Task finished within budget — return ok or error synchronously.
-    finished = next(iter(done))
-    if finished.exception() is not None:
-        exc = finished.exception()
-        kind = _classify_error(exc).value
-        await _specialist_registry.fail_delegation(delegation_id, exc)
+        # mode == "sync"
+        if voice_wait_s is not None:
+            # A4: voice never degrades to `pending` (async/interactive are
+            # already rejected in _prelaunch) — there is no follow-up channel
+            # to deliver a LATER completion notification on. Wait only up to
+            # the budget computed above (deadline − reserve, capped at 60s); on
+            # expiry cancel + bounded teardown + speak the typed error.
+            try:
+                done, pending = await asyncio.wait({task}, timeout=voice_wait_s)
+            except asyncio.CancelledError:
+                task.cancel()
+                await _specialist_registry.cancel_delegation(delegation_id)
+                raise
+            if pending:
+                return await _voice_deadline_exceeded(task, delegation_id, agent_name)
+        else:
+            try:
+                done, pending = await asyncio.wait({task}, timeout=_SYNC_WAIT_TIMEOUT_S)
+            except asyncio.CancelledError:
+                task.cancel()
+                await _specialist_registry.cancel_delegation(delegation_id)
+                raise
+
+            if pending:
+                # 60s elapsed; detach and degrade to pending with callback.
+                _attach_completion_callback(task, record)
+                logger.info(
+                    "Delegation %s → %s timed out at 60s — degraded to pending",
+                    delegation_id[:8], agent_name,
+                )
+                return _result({
+                    "status": "pending",
+                    "delegation_id": delegation_id,
+                    "agent": agent_name,
+                    "timeout_s": 60,
+                    "note": (
+                        "Delegation continues in background; you will receive a "
+                        "NOTIFICATION when complete."
+                    ),
+                })
+
+        # Task finished within budget — return ok or error synchronously.
+        finished = next(iter(done))
+        if finished.exception() is not None:
+            exc = finished.exception()
+            kind = _classify_error(exc).value
+            await _specialist_registry.fail_delegation(delegation_id, exc)
+            elapsed = time.time() - started_at
+            logger.info(
+                "Delegation %s → %s failed: %s (%s)",
+                delegation_id[:8], agent_name, kind, exc,
+            )
+            return _result({
+                "status": "error",
+                "delegation_id": delegation_id,
+                "agent": agent_name,
+                "kind": kind,
+                "message": str(exc),
+                "elapsed_s": elapsed,
+            })
+
+        text = finished.result()
+        # Task 6 (spec §4.6): bound the synchronous result + expose the flag on
+        # the wire so the narrating resident can disclose a clipped answer.
+        text, output_truncated = specialist_limits.truncate_output(text)
+        if output_truncated:
+            logger.warning(
+                "delegated agent %s output truncated: %d > %d chars (spec §4.6)",
+                agent_name, len(finished.result()), specialist_limits._MAX_OUTPUT_CHARS,
+            )
+        await _specialist_registry.complete_delegation(delegation_id)
         elapsed = time.time() - started_at
         logger.info(
-            "Delegation %s → %s failed: %s (%s)",
-            delegation_id[:8], agent_name, kind, exc,
+            "Delegation %s → %s ok (%.2fs)",
+            delegation_id[:8], agent_name, elapsed,
         )
         return _result({
-            "status": "error",
+            "status": "ok",
             "delegation_id": delegation_id,
             "agent": agent_name,
-            "kind": kind,
-            "message": str(exc),
             "elapsed_s": elapsed,
+            "text": text,
+            "output_truncated": output_truncated,
         })
-
-    text = finished.result()
-    await _specialist_registry.complete_delegation(delegation_id)
-    elapsed = time.time() - started_at
-    logger.info(
-        "Delegation %s → %s ok (%.2fs)",
-        delegation_id[:8], agent_name, elapsed,
-    )
-    return _result({
-        "status": "ok",
-        "delegation_id": delegation_id,
-        "agent": agent_name,
-        "elapsed_s": elapsed,
-        "text": text,
-    })
+    finally:
+        if owned is not None:
+            owned.release()
 
 
 # ---------------------------------------------------------------------------
@@ -2759,6 +3027,7 @@ async def _finalize_engagement(
     next_steps: list[dict],
     driver: Any | None,
     stale_before: float | None = None,
+    output_truncated: bool = False,     # Task 6 (spec §4.6)
 ) -> bool:
     """End an engagement: update registry, close topic, NOTIFY Ellen,
     retain a tier-classified engagement summary on the shared ``casa`` bank.
@@ -2795,6 +3064,16 @@ async def _finalize_engagement(
                 engagement.id[:8], outcome,
             )
             return False
+
+    # Task 6 (spec §4.6): THIS call just won the terminal flip — release
+    # the specialist concurrency permit (if any; executor engagements and
+    # any engagement created before a SpecialistLimiter was wired never
+    # have one) unconditionally, before any of the best-effort side effects
+    # below that might raise. Idempotent — safe even if something else
+    # already released it via the pre-finalize failure paths in
+    # delegate_to_agent's interactive branch (which also null it out).
+    if engagement.permit is not None:
+        engagement.permit.release()
 
     # r5-B6: the instant THIS call won the terminal flip, cancel pending
     # broker requests so a late ask/permission tap can't be answered
@@ -2930,6 +3209,7 @@ async def _finalize_engagement(
             message=text,
             origin=dict(engagement.origin),
             elapsed_s=now - engagement.started_at,
+            output_truncated=output_truncated,  # Task 6 (spec §4.6)
         )
         try:
             await _bus.notify(BusMessage(
@@ -3295,7 +3575,12 @@ async def emit_completion(args: dict) -> dict:
                         f"{type(next_steps).__name__}). The engagement is "
                         "still active — call emit_completion again."),
         })
-    if len(text) > _COMPLETION_TEXT_MAX:
+    # Task 6 (spec §4.6): the interactive output bound. This ALSO records
+    # the `output_truncated` flag that flows to the DelegationComplete
+    # notification, so a clipped engagement answer is disclosed to the
+    # narrating resident (mirrors the sync/async truncation flag).
+    output_truncated = len(text) > _COMPLETION_TEXT_MAX
+    if output_truncated:
         logger.warning(
             "emit_completion text truncated (%d > %d chars) for engagement %s",
             len(text), _COMPLETION_TEXT_MAX, engagement.id[:8],
@@ -3404,6 +3689,7 @@ async def emit_completion(args: dict) -> dict:
         artifacts=artifacts,
         next_steps=next_steps,
         driver=driver,
+        output_truncated=output_truncated,  # Task 6 (spec §4.6)
     )
     # Drain on terminal paths (e.g., outcome=error or
     # already-terminal short-circuit above) — the engagement is gone.
