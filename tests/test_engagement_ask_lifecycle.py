@@ -239,7 +239,8 @@ async def test_expired_settles_with_hourglass_and_clears_keyboard(env, monkeypat
     edit = env["ch"].edits[-1]
     assert edit["clear_keyboard"] is True
     assert edit["text"] == (
-        "Q1: Proceed?\n\n1. A\n2. B\n⌛ expired — answer by text below")
+        "Q1: Proceed?\n\n1. A\n2. B\n"
+        "⌛ expired — engagement paused; reply here to continue")
 
 
 async def test_canonical_qnumber_strips_agent_authored_prefix(env):

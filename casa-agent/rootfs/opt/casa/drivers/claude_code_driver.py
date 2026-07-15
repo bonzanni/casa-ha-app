@@ -40,7 +40,11 @@ _REDIRECT_PREFIX = (
 )
 _RECEIPT_COPY = "📥 Received — I'll get to this after the current step."
 # §4 boot reconciliation: appended below an open question's stored text when a
-# restart orphans it (matches channel_handlers._SETTLE_EXPIRED verbatim).
+# restart orphans it. This is the RESTART-orphaned copy — distinct from the
+# live-ask expiry settle (``channel_handlers._SETTLE_EXPIRED``, which becomes
+# the operator-away "engagement paused" copy under F-EXPIRE): a boot-orphaned
+# question has no live operator-away episode, so the plain "answer by text
+# below" wording still applies.
 _OPEN_Q_EXPIRED_SUFFIX = "\n⌛ expired — answer by text below"
 # §4 free-text anchor: appended when the next operator message answers it.
 _OPEN_Q_ANSWERED_SUFFIX = "\n✅ answered below"
@@ -208,6 +212,7 @@ class _InboundSpool:
         supersede_pending_asks: Callable[[], Awaitable[None]] | None = None,
         settle_anchor_on_delivery: (
             Callable[[int | None], Awaitable[int | None]] | None) = None,
+        on_operator_enqueued: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._engagement_id = engagement_id
         self._spool_path = spool_path
@@ -221,6 +226,12 @@ class _InboundSpool:
         # while an ask keyboard is still PENDING — casa-main cancels it as
         # ``superseded_by_text`` so the operator's message doesn't dead-wait.
         self._supersede_pending_asks = supersede_pending_asks
+        # F-EXPIRE (A2a): on a durable non-initial operator enqueue (a real
+        # inbound envelope — NOT a dropped/capacity notice), end any operator-away
+        # suspend episode. Fires from the SAME successful-persist path that bumps
+        # the generation, so it is exactly "a durably-enqueued operator message
+        # exists". The driver wires this to clear ``_operator_away`` + recompute.
+        self._on_operator_enqueued = on_operator_enqueued
         # §4: on delivery of an operator message, settle the oldest open
         # free-text anchor (✅ answered below) and thread the turn to it.
         # Returns the anchor's tg_message_id to thread to, or None.
@@ -396,6 +407,15 @@ class _InboundSpool:
                 await self._supersede_pending_asks()
             except Exception:  # noqa: BLE001 — supersession is best-effort
                 logger.debug("supersede_pending_asks failed", exc_info=True)
+        # F-EXPIRE (A2a) EXIT: a durably-enqueued operator message ends the
+        # operator-away episode (clear the flag + recompute the summary so the
+        # ⏸ coercion window closes crisply). Best-effort; the initial task never
+        # clears (there is no away state at spawn).
+        if not is_initial and self._on_operator_enqueued is not None:
+            try:
+                await self._on_operator_enqueued()
+            except Exception:  # noqa: BLE001 — away-clear is best-effort
+                logger.debug("on_operator_enqueued failed", exc_info=True)
 
         await self._flush_pending()
         await self._pump()
@@ -658,6 +678,16 @@ class ClaudeCodeDriver(DriverProtocol):
         # turn (reset at turn_start). From the 3rd the refusal copy escalates +
         # a WARN counter is logged (soft anti-livelock — no hard force-end).
         self._ask_refusals: dict[str, int] = {}
+        # F-EXPIRE (v0.83.0, A2a): operator-away suspend state. ``_operator_away``
+        # is SET on ask expiry (generation-CAS, ``note_operator_away``) and
+        # CLEARED on the next durable inbound operator envelope; while set, every
+        # further ask is refused and the summary coerces to ⏸ paused.
+        # ``_away_refusals`` counts consecutive away-refusals in the current
+        # away-episode (Task 5's force-turn-boundary backstop reads it; reset when
+        # away clears). In-memory only — a Casa restart lands in the same
+        # FIFO-blocked suspended state anyway, so nothing is persisted.
+        self._operator_away: dict[str, bool] = {}
+        self._away_refusals: dict[str, int] = {}
 
     # -- DriverProtocol ---------------------------------------------------
 
@@ -850,6 +880,10 @@ class ClaudeCodeDriver(DriverProtocol):
         self._turn_running.pop(engagement.id, None)
         self._violation_notified.discard(engagement.id)
         self._violation_flagged.discard(engagement.id)
+        self._ask_refusals.pop(engagement.id, None)
+        # F-EXPIRE: drop the operator-away suspend state on teardown.
+        self._operator_away.pop(engagement.id, None)
+        self._away_refusals.pop(engagement.id, None)
         # v0.79.0 (§2): drop the sequencer (its watcher task is cancelled above).
         self._sequencers.pop(engagement.id, None)
         # v0.79.0 (§5): drop the summary controller and cancel its elapsed tick
@@ -1032,6 +1066,8 @@ class ClaudeCodeDriver(DriverProtocol):
                 engagement.id),
             settle_anchor_on_delivery=lambda op_mid: self._settle_open_anchor(
                 engagement, op_mid),
+            on_operator_enqueued=lambda: self._clear_operator_away(
+                engagement.id),
         )
 
         tasks = [
@@ -1395,6 +1431,24 @@ class ClaudeCodeDriver(DriverProtocol):
                     "dropping this summary status transition (status=%s): %s",
                     engagement_id[:8], status, exc,
                 )
+        # F-EXPIRE (A2a) COERCION — the ONE funnel every lifecycle status source
+        # already goes through (Sol r1-2). While operator-away, a working/waiting
+        # submission is coerced to ⏸ paused so a compliant agent ending its turn
+        # (``result`` → ⏳) cannot overwrite the paused line. Terminal statuses
+        # bypass this funnel (finalize) and STATUS_PAUSED never routes here.
+        #
+        # PINNED INVARIANT (Sol r2-3): sample ``operator_away`` AFTER the revision
+        # allocation await returns. Sampling BEFORE it would let an inbound clear
+        # + recompute land a correct status, only for THIS older suspended
+        # coroutine to obtain a NEWER revision and write ⏸ back; sampling after
+        # allocation guarantees any later clear allocates a strictly-newer
+        # corrective revision that wins.
+        from drivers.summary_controller import (
+            STATUS_PAUSED, STATUS_WAITING_REPLY, STATUS_WORKING,
+        )
+        if (self._operator_away.get(engagement_id)
+                and status in (STATUS_WAITING_REPLY, STATUS_WORKING)):
+            status = STATUS_PAUSED
         await ctrl.submit_status(status, rev)
 
     async def note_ask_waiting(self, engagement_id: str) -> None:
@@ -1591,6 +1645,52 @@ class ClaudeCodeDriver(DriverProtocol):
                 engagement_id[:8], n,
             )
         return n
+
+    # -- F-EXPIRE (A2a) operator-away suspend state ------------------------
+
+    def note_operator_away(self, engagement_id: str, gen: int) -> bool:
+        """F-EXPIRE ENTER (generation-CAS, Sol r1-3/r2-2): mark the engagement
+        operator-away ONLY IF the inbound generation still equals ``gen`` — the
+        value sampled at the ask's entry and carried in the broker meta as
+        ``inbound_gen``. A racing inbound that already bumped the generation
+        FAILS the CAS, so a lost-response retry reattaching after an inbound
+        cleared the away state can never re-wedge it with a fresher generation.
+        Returns whether the flag was set. In-memory only (no persistence)."""
+        if self.inbound_generation(engagement_id) != gen:
+            return False
+        self._operator_away[engagement_id] = True
+        return True
+
+    def operator_away_active(self, engagement_id: str) -> bool:
+        """F-EXPIRE gate: True while the engagement is SUSPENDED waiting for the
+        operator (set on ask expiry, cleared on the next durable inbound)."""
+        return self._operator_away.get(engagement_id, False)
+
+    def record_away_refusal(self, engagement_id: str) -> int:
+        """F-EXPIRE backstop counter: bump + return the count of consecutive
+        operator-away ask refusals in the current away-episode. Task 5's
+        force-turn-boundary backstop CONSUMES this count; nothing here
+        force-ends. Reset when the away state clears (``_clear_operator_away``)."""
+        n = self._away_refusals.get(engagement_id, 0) + 1
+        self._away_refusals[engagement_id] = n
+        return n
+
+    async def _clear_operator_away(self, engagement_id: str) -> None:
+        """F-EXPIRE EXIT: a durably-enqueued operator message ends the away
+        episode. Clear the flag + the away-refusal counter, THEN recompute the
+        summary status so the ⏸ coercion window closes crisply — the recompute
+        allocates a strictly-newer revision that lands the correct ⚙️/⏳. A no-op
+        (no recompute) when the engagement was not away, so an ordinary operator
+        message never triggers a spurious summary edit."""
+        was_away = self._operator_away.pop(engagement_id, False)
+        self._away_refusals.pop(engagement_id, None)
+        if not was_away:
+            return
+        try:
+            await self.recompute_engagement_status(engagement_id)
+        except Exception:  # noqa: BLE001 — status recompute is advisory
+            logger.debug(
+                "recompute after operator-away clear failed", exc_info=True)
 
     async def reconcile_open_questions(
         self, engagement: EngagementRecord, snapshot: list[dict] | None = None,

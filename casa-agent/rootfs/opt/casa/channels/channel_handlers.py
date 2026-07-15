@@ -335,7 +335,11 @@ _ASK_DEFAULT_TIMEOUT_S = 300.0
 # v0.79.0 §4 — pinned settle copy (appended below the canonical question text
 # when the keyboard settles; the keyboard is cleared via clear_keyboard=True).
 _SETTLE_ANSWERED = "\n✅ {label}"
-_SETTLE_EXPIRED = "\n⌛ expired — answer by text below"
+# F-EXPIRE (v0.83.0, A2a): a live-ask keyboard that expires unanswered now
+# SUSPENDS the engagement (operator-away) rather than inviting an immediate
+# re-ask, so the settle copy tells the operator the engagement is paused and how
+# to resume it.
+_SETTLE_EXPIRED = "\n⌛ expired — engagement paused; reply here to continue"
 _SETTLE_CANCELLED = "\n🚫 cancelled"
 _SETTLE_SUPERSEDED = "\n🚫 superseded by your message below"
 # v0.79.0 §4 (Sol F6): the open-question ledger write failed AFTER the keyboard
@@ -361,6 +365,90 @@ _ASK_REFUSAL_STERN = (
     "question — END YOUR TURN NOW, read the operator's message, then decide."
 )
 _ASK_REFUSAL_ESCALATE_AT = 3
+
+# F-EXPIRE (v0.83.0, A2a) — operator-away copies.
+# The enriched ``no_answer`` response returned when a live ask expires: the
+# engagement is now PAUSED and the agent must end its turn silently rather than
+# re-ask (the live incident was a 21-ask loop).
+_ASK_PAUSED_MESSAGE = (
+    "The operator did not answer in time. The engagement is now PAUSED — end "
+    "your turn silently (no sign-off message). Do NOT re-ask: your question "
+    "stays on record and the operator's reply will start your next turn."
+)
+# The refusal returned to EVERY further ask while operator-away, with no broker
+# registration / keyboard / timeout burn.
+_ASK_AWAY_REFUSAL = (
+    "The operator is away — your last question expired unanswered. END YOUR "
+    "TURN NOW, silently. Do not ask again; the operator's return starts your "
+    "next turn."
+)
+
+
+def _operator_away_active(driver: Any, eng_id: str) -> bool:
+    """§A2.4 gate read — getattr-tolerant so a driver without operator-away
+    support (unit fakes / degraded boot) simply never gates."""
+    if driver is None:
+        return False
+    fn = getattr(driver, "operator_away_active", None)
+    if fn is None:
+        return False
+    try:
+        return bool(fn(eng_id))
+    except Exception:  # noqa: BLE001 — a gate read must never wedge the ask
+        logger.debug("operator_away_active read failed", exc_info=True)
+        return False
+
+
+def _away_refusal_response(driver: Any, eng_id: str) -> web.Response:
+    """§A2.4 refusal — bump the per-episode away-refusal counter (Task 5's
+    force-turn-boundary backstop reads it) and return the fixed refusal copy."""
+    bump = getattr(driver, "record_away_refusal", None) if driver is not None else None
+    if bump is not None:
+        try:
+            bump(eng_id)
+        except Exception:  # noqa: BLE001 — the refusal copy stands either way
+            logger.debug("record_away_refusal failed", exc_info=True)
+    return web.json_response({
+        "ok": False, "error": "operator_away", "message": _ASK_AWAY_REFUSAL,
+    })
+
+
+def _no_answer_response(driver: Any, eng_id: str, request_id: str) -> web.Response:
+    """§A2.1 expiry — ENTER operator-away (generation-CAS via the broker meta's
+    ``inbound_gen``, works for a live request AND a retired tombstone) and return
+    the enriched PAUSED response. Degrades to the plain ``no_answer`` response on
+    a driver without operator-away support (unit / eager fallback) so existing
+    no-driver callers are byte-unchanged."""
+    note = (
+        getattr(driver, "note_operator_away", None)
+        if driver is not None else None
+    )
+    if note is None:
+        return web.json_response({"ok": True, "outcome": "no_answer"})
+    from verdict_broker import BROKER
+    meta = BROKER.get_meta(
+        namespace="engagement_ask", scope=eng_id, request_id=request_id)
+    gen = meta.get("inbound_gen") if isinstance(meta, dict) else None
+    if gen is not None:  # tolerate a missing gen — just skip the away entry
+        try:
+            note(eng_id, gen=gen)
+        except Exception:  # noqa: BLE001 — away entry is best-effort
+            logger.debug("note_operator_away failed", exc_info=True)
+    return web.json_response({
+        "ok": True, "outcome": "no_answer", "engagement_paused": True,
+        "message": _ASK_PAUSED_MESSAGE,
+    })
+
+
+def _ask_final_response(
+    outcome: dict, options: list, driver: Any, eng_id: str, request_id: str,
+) -> web.Response:
+    """Map a broker ask outcome to the tool response, intercepting ``no_answer``
+    to enter operator-away + return the PAUSED response (F-EXPIRE). Every other
+    outcome delegates to ``_ask_outcome_response`` byte-identically."""
+    if outcome.get("outcome") == "no_answer":
+        return _no_answer_response(driver, eng_id, request_id)
+    return _ask_outcome_response(outcome, options)
 
 
 def _validate_ask_args(body: dict) -> tuple[str, list, float] | None:
@@ -670,6 +758,15 @@ def _make_ask(
                             "message_id": prior.get("message_id"),
                         })
 
+            # F-EXPIRE (§A2.4) GATE: while operator-away, refuse a genuinely-new
+            # anchor immediately — no number, no post, no broker. Placed AFTER the
+            # reattach check so a transport retry of an already-posted anchor
+            # still returns its recorded outcome above.
+            if _operator_away_active(driver, eng_id):
+                if created_intent:
+                    driver.cancel_send_intent(eng_id, request_id)  # tombstone
+                return _away_refusal_response(driver, eng_id)
+
             # First attempt (created intent) OR eager fallback: allocate the
             # durable number + build the poster.
             number = await _maybe_allocate_number(engagement_registry, eng_id)
@@ -737,23 +834,36 @@ def _make_ask(
         # RELAY-DEFERRED (§2, review C1): the relay posts the keyboard at the
         # ask's tool_use block, AFTER any preceding narration in the same frame.
 
+        # Reserve the operator-message generation for the post-then-recheck race
+        # AND the F-EXPIRE operator-away CAS. Sampled ONCE at entry, BEFORE any
+        # BROKER.register, and stamped into the ask's static meta as
+        # ``inbound_gen`` so both the main waiter and a same-request_id reattacher
+        # (live request OR retired tombstone — both retain meta) read the SAME
+        # generation for ``note_operator_away`` (Sol r2-2: a lost-response retry
+        # reusing the FIRST attempt's generation can never re-wedge a cleared
+        # away state with a fresher generation).
+        gen_at_entry = (
+            driver.inbound_generation(eng_id) if driver is not None else 0)
+
         def _ask_static_meta() -> dict:
             # F1 (Sol r3): the keyboard's STATIC metadata (options + topic_id +
-            # operator_id), seeded ATOMICALLY at broker creation. The old code
-            # seeded meta AFTER register (``if created: req.meta.update(...)``)
-            # ONLY on the main path, which lost the metadata whenever a
-            # concurrent same-request_id RETRY created the broker request first:
-            # the first attempt, suspended in number allocation, resumed to find
-            # ``created=False`` and skipped the init, leaving meta =
-            # {"message_id": ...} only ⇒ every tap rejected (topic_id/operator_id
-            # both absent). Now BOTH the reattach path and the main path pass
-            # ``meta=`` to ``register`` (a single synchronous op — register only
-            # seeds meta on creation, with no await between), so whichever call
-            # wins the create race installs the complete static metadata.
+            # operator_id + inbound_gen), seeded ATOMICALLY at broker creation.
+            # The old code seeded meta AFTER register (``if created:
+            # req.meta.update(...)``) ONLY on the main path, which lost the
+            # metadata whenever a concurrent same-request_id RETRY created the
+            # broker request first: the first attempt, suspended in number
+            # allocation, resumed to find ``created=False`` and skipped the init,
+            # leaving meta = {"message_id": ...} only ⇒ every tap rejected
+            # (topic_id/operator_id both absent). Now BOTH the reattach path and
+            # the main path pass ``meta=`` to ``register`` (a single synchronous
+            # op — register only seeds meta on creation, with no await between),
+            # so whichever call wins the create race installs the complete static
+            # metadata.
             return {
                 "options": options,
                 "topic_id": rec.topic_id,
                 "operator_id": rec.origin.get("user_id"),
+                "inbound_gen": gen_at_entry,
             }
 
         intent_registered = False
@@ -788,18 +898,24 @@ def _make_ask(
                         meta=_ask_static_meta(),
                     )
                     outcome = await BROKER.await_result(req)
-                    return _ask_outcome_response(outcome, options)
+                    return _ask_final_response(
+                        outcome, options, driver, eng_id, request_id)
                 intent_registered = True
+
+        # F-EXPIRE (§A2.4) GATE: while operator-away, refuse a genuinely-new ask
+        # immediately — no broker request, no keyboard, no timeout burn. Placed
+        # AFTER the reattach check so a transport retry of an already in-flight
+        # ask still reattaches to its live/tombstoned outcome above.
+        if _operator_away_active(driver, eng_id):
+            if intent_registered:
+                driver.cancel_send_intent(eng_id, request_id)  # tombstone
+            return _away_refusal_response(driver, eng_id)
 
         # INBOUND GATE (§4): an unseen operator message means "end your turn".
         if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
             if intent_registered:
                 driver.cancel_send_intent(eng_id, request_id)  # tombstone
             return _refusal_response()
-
-        # Reserve the operator-message generation for the post-then-recheck race.
-        gen_at_entry = (
-            driver.inbound_generation(eng_id) if driver is not None else 0)
 
         number = await _maybe_allocate_number(engagement_registry, eng_id)
         # W-R3 (Sol r1-5): the SINGLE canonical body — full options VERBATIM,
@@ -939,7 +1055,7 @@ def _make_ask(
         # future is decoupled from posting (resolved by the tap finish hook), so
         # nothing here needs the posted message id synchronously.
         outcome = await BROKER.await_result(req)
-        return _ask_outcome_response(outcome, options)
+        return _ask_final_response(outcome, options, driver, eng_id, request_id)
 
     return handler
 

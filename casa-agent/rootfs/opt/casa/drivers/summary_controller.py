@@ -42,6 +42,12 @@ logger = logging.getLogger(__name__)
 STATUS_WORKING = "⚙️ working"
 STATUS_WAITING_REPLY = "⏳ waiting for your reply"
 STATUS_WAITING_APPROVAL = "🔐 waiting for your approval"
+# F-EXPIRE (v0.83.0, A2a): the engagement is SUSPENDED — a question expired
+# unanswered and Casa is waiting for the operator to return (no further asks,
+# no live activity). NON-terminal (a returning operator clears it). Rendered
+# status-first like the others; because it is not ``STATUS_WORKING`` the
+# activity/elapsed merge in ``_render_locked`` never fires while paused.
+STATUS_PAUSED = "⏸ paused — waiting for the operator"
 STATUS_COMPLETED = "✅ completed"
 STATUS_CANCELLED = "🛑 cancelled"
 STATUS_ERROR = "⚠️ error"
