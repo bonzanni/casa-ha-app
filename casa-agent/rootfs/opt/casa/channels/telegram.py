@@ -985,7 +985,8 @@ class TelegramChannel(Channel):
                 # narration could append BELOW the operator's message.
                 if self._driver_advance_high_water is not None:
                     try:
-                        await self._driver_advance_high_water(rec, msg.message_id)
+                        await self._driver_advance_high_water(
+                            rec, getattr(msg, "message_id", None))
                     except Exception as exc:  # noqa: BLE001 — advisory sealing
                         logger.debug(
                             "advance_high_water failed for %s: %s",
@@ -1108,7 +1109,8 @@ class TelegramChannel(Channel):
                 if self._driver_send_user_turn is not None:
                     task = asyncio.create_task(
                         self._deliver_turn_bg(
-                            rec, text, tg_message_id=msg.message_id))
+                            rec, text,
+                            tg_message_id=getattr(msg, "message_id", None)))
                     self._turn_tasks.add(task)
                     task.add_done_callback(self._turn_tasks.discard)
                 return

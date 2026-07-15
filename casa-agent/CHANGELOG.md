@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.79.1] - 2026-07-15
+
+### Fixed
+
+- The end-to-end test harness (and any message object without an id) no
+  longer crashes the engagement inbound path — reply-threading and
+  ordering degrade gracefully instead; no change for real Telegram
+  traffic.
+
 ## [0.79.0] - 2026-07-15
 
 ### Added

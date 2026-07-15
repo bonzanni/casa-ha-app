@@ -843,3 +843,18 @@ class TestForeignChatGate:
         u = _mk_update(chat_id=100, text="hi Ellen")
         await ch.handle_update(u)
         ch._route_to_ellen.assert_awaited_once()
+
+
+def test_inbound_message_without_message_id_is_tolerated():
+    """v0.79.1: the e2e harness (and defensively, any malformed update) can
+    deliver a message object lacking ``message_id``; the engagement inbound
+    path must not AttributeError — threading and high-water advance are
+    best-effort and degrade to None (QA tier2 E-block regression,
+    telegram.py handle_update engagement-topic branch)."""
+    import inspect
+    import channels.telegram as tg
+    src = inspect.getsource(tg.TelegramChannel.handle_update)
+    assert 'getattr(msg, "message_id", None)' in src, (
+        "engagement inbound reads of msg.message_id must be getattr-guarded "
+        "(harness/e2e messages may omit it)")
+    assert "msg.message_id))" not in src
