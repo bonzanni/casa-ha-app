@@ -678,6 +678,16 @@ class ClaudeCodeDriver(DriverProtocol):
         # turn (reset at turn_start). From the 3rd the refusal copy escalates +
         # a WARN counter is logged (soft anti-livelock — no hard force-end).
         self._ask_refusals: dict[str, int] = {}
+        # v0.83.0 (§A3, Sol r6-4 + r7-2): in-memory ANSWERED overlay. When
+        # ``mark_question_answered``'s STRICT persist raises (the durable envelope
+        # is already spooled, so the agent WILL get the answer — the question must
+        # not keep gating), the caller records the number here so the live process
+        # treats the question answered immediately. It is UNIONED onto the
+        # persisted flag by ``_effective_open_question_numbers`` (gates/summary/
+        # re-anchor honor overlay ∪ persisted) and each later settle attempt
+        # RETRIES the strict persist; crash convergence is owned by boot
+        # reconciliation (the overlay is memory-only, dropped at teardown).
+        self._answered_overlay: dict[str, set[int]] = {}
         # F-EXPIRE (v0.83.0, A2a): operator-away suspend state. ``_operator_away``
         # is SET on ask expiry (generation-CAS, ``note_operator_away``) and
         # CLEARED on the next durable inbound operator envelope; while set, every
@@ -891,6 +901,9 @@ class ClaudeCodeDriver(DriverProtocol):
         self._violation_notified.discard(engagement.id)
         self._violation_flagged.discard(engagement.id)
         self._ask_refusals.pop(engagement.id, None)
+        # v0.83.0 (§A3): drop the in-memory answered overlay (memory-only;
+        # crash convergence is owned by boot reconciliation, not the overlay).
+        self._answered_overlay.pop(engagement.id, None)
         # F-EXPIRE: drop the operator-away suspend state on teardown.
         self._operator_away.pop(engagement.id, None)
         self._away_refusals.pop(engagement.id, None)
@@ -1400,12 +1413,9 @@ class ClaudeCodeDriver(DriverProtocol):
                 engagement_id=eid,
                 sequencer=self._ensure_sequencer(engagement),
                 goal_line=self._summary_goal_line(engagement),
-                open_question_numbers=(
-                    (lambda: reg.open_question_numbers(eid))
-                    if reg is not None
-                    and hasattr(reg, "open_question_numbers")
-                    else (lambda: [])
-                ),
+                # §A3: the pinned summary's ``Open questions:`` line reads the
+                # EFFECTIVE unanswered set (persisted ``answered`` flag ∪ overlay).
+                open_question_numbers=(lambda: self._effective_open_question_numbers(eid)),
                 pin_message=(
                     (lambda mid: self._pin_topic_message(engagement.topic_id, mid))
                     if self._pin_topic_message is not None
@@ -1474,6 +1484,125 @@ class ClaudeCodeDriver(DriverProtocol):
         from drivers.summary_controller import STATUS_WAITING_REPLY
         await self._summary_status_transition(engagement_id, STATUS_WAITING_REPLY)
 
+    # -- v0.83.0 (§A3) answered-overlay + effective open-question accessor ----
+    def mark_answered_overlay(self, engagement_id: str, number: int) -> None:
+        """Record an in-memory ANSWERED mark (§A3, Sol r6-4). Set by the answer
+        path when ``mark_question_answered``'s strict persist RAISES — the live
+        process then treats the question answered immediately (unioned onto the
+        persisted flag) while later settle attempts retry the durable write."""
+        self._answered_overlay.setdefault(engagement_id, set()).add(number)
+
+    def _overlay_answered(self, engagement_id: str, number: int | None) -> bool:
+        if number is None:
+            return False
+        return number in self._answered_overlay.get(engagement_id, set())
+
+    def _effective_open_question_numbers(self, engagement_id: str) -> list[int]:
+        """The A3 gates / pinned summary / recompute read UNANSWERED questions as
+        ``persisted-unanswered MINUS overlay-answered`` (overlay ∪ persisted flag,
+        Sol r6-4): a question whose ``answered`` write failed but is overlay-marked
+        stops gating immediately, before the durable retry converges."""
+        reg = self._registry
+        if reg is None or not hasattr(reg, "open_question_numbers"):
+            return []
+        try:
+            nums = reg.open_question_numbers(engagement_id)
+        except Exception:  # noqa: BLE001 — degrade to "no open questions"
+            return []
+        overlay = self._answered_overlay.get(engagement_id)
+        if not overlay:
+            return list(nums)
+        return [n for n in nums if n not in overlay]
+
+    async def _settle_ledger_entry(
+        self, rec: EngagementRecord, q: dict, *, answered_suffix: bool,
+    ) -> int | None:
+        """Settle ONE open-question entry's CURRENT copy plus every staged
+        ``stale_mids`` copy, honoring the entry-removal invariant (§A3, Sol r5-3):
+        the entry is REMOVED only when the current settle edit is CONFIRMED AND no
+        stale copy remains; otherwise it PERSISTS (its ``answered`` flag keeps it
+        invisible to the gates/summary) with each confirmed stale copy un-staged.
+
+        ``answered_suffix`` picks the terminal copy (``✅ answered below`` vs
+        ``⌛ expired``). Independently, when the entry is overlay-answered but its
+        durable ``answered`` flag never landed, the strict persist is RETRIED here
+        (Sol r6-4/r7-2 — convergence at each later settle attempt). Returns the
+        entry's current ``tg_message_id`` (for anchor reply-threading)."""
+        reg = self._registry
+        n = q.get("n")
+        # Converge the answered flag when an earlier strict persist failed
+        # (overlay covers the live process; retry before the visual settle).
+        if (reg is not None and n is not None
+                and not q.get("answered", False)
+                and self._overlay_answered(rec.id, n)):
+            mark = getattr(reg, "mark_question_answered", None)
+            if mark is not None:
+                try:
+                    await mark(rec.id, n)
+                except Exception:  # noqa: BLE001 — retry again at the next settle
+                    logger.debug(
+                        "mark_question_answered retry failed (n=%s)", n,
+                        exc_info=True)
+        suffix = (
+            _OPEN_Q_ANSWERED_SUFFIX if answered_suffix else _OPEN_Q_EXPIRED_SUFFIX
+        )
+        display = q.get("text") or (f"Q{n}:" if n is not None else "")
+        text = f"{display}{suffix}"
+        cur_mid = q.get("tg_message_id")
+        current_confirmed = await self._confirm_settle_mid(rec, cur_mid, text, n)
+        # Every staged stale copy is settled with the same confirmed-gate; a
+        # confirmed one is un-staged, an unconfirmed one keeps the entry present.
+        remaining_stale: list[int] = []
+        unstage = getattr(reg, "unstage_stale_mid", None) if reg is not None else None
+        for smid in list(q.get("stale_mids") or []):
+            if await self._confirm_settle_mid(rec, smid, text, n):
+                if unstage is not None and n is not None:
+                    try:
+                        await unstage(rec.id, n, smid)
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "unstage_stale_mid failed (n=%s mid=%s)", n, smid,
+                            exc_info=True)
+            else:
+                remaining_stale.append(smid)
+        # Entry-removal invariant: remove ONLY when the current copy is confirmed
+        # AND no stale copy remains; otherwise the entry persists.
+        if current_confirmed and not remaining_stale:
+            close = getattr(reg, "close_open_question", None) if reg is not None else None
+            if close is not None and n is not None:
+                try:
+                    await close(rec.id, n)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "engagement %s: close_open_question failed (n=%s)",
+                        rec.id[:8], n, exc_info=True)
+        return cur_mid
+
+    async def _confirm_settle_mid(
+        self, rec: EngagementRecord, mid: int | None, text: str, n: int | None,
+    ) -> bool:
+        """Confirmed-settle ONE message id (§A3). ``True`` when there is nothing to
+        settle (``mid`` is None) OR the edit is confirmed; ``False`` fail-closed
+        when a message-backed copy has no edit primitive, or the bounded retry
+        stays unconfirmed — leaving the ledger entry intact for a later pass."""
+        if mid is None:
+            return True
+        if self._edit_topic_message is None:
+            logger.warning(
+                "engagement %s: open-question settle has a message id but no edit "
+                "primitive (n=%s) — leaving ledger entry INTACT", rec.id[:8], n)
+            return False
+        settled = await confirmed_settle_edit(
+            lambda mid=mid, text=text: self._edit_topic_message(
+                rec.topic_id, mid, text, clear_keyboard=True),
+            sleep=self._sleep,
+        )
+        if not settled:
+            logger.warning(
+                "engagement %s: open-question settle UNCONFIRMED after retries "
+                "(n=%s) — leaving ledger entry INTACT", rec.id[:8], n)
+        return settled
+
     async def recompute_engagement_status(self, engagement_id: str) -> None:
         """W-R2: on ask/anchor SETTLEMENT, recompute the summary status from the
         REMAINING open questions — stay ⏳ waiting while any question is still
@@ -1487,13 +1616,9 @@ class ClaudeCodeDriver(DriverProtocol):
         from drivers.summary_controller import (
             STATUS_WAITING_REPLY, STATUS_WORKING,
         )
-        reg = self._registry
-        open_qs: list[int] = []
-        if reg is not None and hasattr(reg, "open_question_numbers"):
-            try:
-                open_qs = reg.open_question_numbers(engagement_id)
-            except Exception:  # noqa: BLE001 — degrade to "no open questions"
-                open_qs = []
+        # §A3: read the EFFECTIVE unanswered set (persisted flag ∪ overlay), so an
+        # answered-but-unconfirmed-settle question stops holding the summary ⏳.
+        open_qs = self._effective_open_question_numbers(engagement_id)
         if open_qs:
             await self._summary_status_transition(
                 engagement_id, STATUS_WAITING_REPLY)
@@ -1786,53 +1911,16 @@ class ClaudeCodeDriver(DriverProtocol):
         if not open_qs:
             return
 
-        close = getattr(self._registry, "close_open_question", None)
+        # §A3 (Sol r5-3): settle EVERY tracked copy (current + each ``stale_mids``
+        # copy) behind the confirmed-edit gate, removing the entry only when the
+        # current copy is confirmed AND no stale copy remains. The reconcile copy
+        # is chosen by the ``answered`` flag (∪ the live overlay): an answered
+        # entry reads ``✅ answered below`` — R1 recovery unchanged, an ordinary
+        # prior-process open question reads ``⌛ expired``.
         for q in open_qs:
-            n = q.get("n")
-            mid = q.get("tg_message_id")
-            # W-R1 (Sol r2-2): close the ledger entry ONLY after a CONFIRMED
-            # settle edit. An entry with a live keyboard/anchor (``mid``) whose
-            # edit stays unconfirmed after the bounded retry is LEFT INTACT so a
-            # later boot reconciliation retries it — never dropped on a transient
-            # failure. Entries with no message id (nothing to settle visually)
-            # close unconditionally.
-            settled = True
-            if mid is not None:
-                if self._edit_topic_message is None:
-                    # F3/R1 (Sol diff gate): a MESSAGE-BACKED entry with NO edit
-                    # primitive available cannot be confirmed-settled — treat it
-                    # as UNCONFIRMED (fail-CLOSED) so the ledger entry is
-                    # PRESERVED for a later reconciliation, never closed without
-                    # a confirmed edit. Only entries with no message id (nothing
-                    # to settle) may close unconditionally.
-                    settled = False
-                    logger.warning(
-                        "engagement %s: open-question boot settle has a message "
-                        "id but no edit primitive (n=%s) — leaving ledger entry "
-                        "INTACT", rec.id[:8], n,
-                    )
-                else:
-                    display = q.get("text") or (f"Q{n}:" if n is not None else "")
-                    text = f"{display}{_OPEN_Q_EXPIRED_SUFFIX}"
-                    settled = await confirmed_settle_edit(
-                        lambda mid=mid, text=text: self._edit_topic_message(
-                            rec.topic_id, mid, text, clear_keyboard=True),
-                        sleep=self._sleep,
-                    )
-                    if not settled:
-                        logger.warning(
-                            "engagement %s: open-question boot settle "
-                            "UNCONFIRMED after retries (n=%s) — leaving ledger "
-                            "entry INTACT", rec.id[:8], n,
-                        )
-            if settled and close is not None and n is not None:
-                try:
-                    await close(rec.id, n)
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "engagement %s: close_open_question failed (n=%s)",
-                        rec.id[:8], n, exc_info=True,
-                    )
+            answered = bool(q.get("answered", False)) or self._overlay_answered(
+                rec.id, q.get("n"))
+            await self._settle_ledger_entry(rec, q, answered_suffix=answered)
 
         # F1 (Sol diff gate): entries were closed above without touching the
         # pinned summary — refresh it so its open-questions line reflects the
@@ -1851,60 +1939,36 @@ class ClaudeCodeDriver(DriverProtocol):
         self, engagement: EngagementRecord, operator_msg_id: int | None,
     ) -> int | None:
         """§4: settle the oldest open free-text anchor when an operator message
-        is delivered — edit ``✅ answered below`` over the anchor, close its
-        ledger entry, and return the anchor's tg_message_id so the turn threads
-        to the QUESTION it answers. Returns ``None`` when no anchor is open."""
+        is delivered — edit ``✅ answered below`` over the anchor, remove its
+        ledger entry (per the §A3 entry-removal invariant — only when the current
+        settle is confirmed AND no ``stale_mids`` copy remains), and return the
+        anchor's tg_message_id so the turn threads to the QUESTION it answers.
+        Returns ``None`` when no anchor is open.
+
+        §A3: the anchor is selected from the RAW ledger (answered or not) — the
+        answer-lifecycle may already have flagged it answered (invisible to
+        ``oldest_open_anchor``), and visual settlement iterates raw entries. Every
+        staged stale copy is settled behind the same confirmed-gate."""
         reg = self._registry
         if reg is None:
             return None
-        getter = getattr(reg, "oldest_open_anchor", None)
-        if getter is None:
-            return None
-        anchor = getter(engagement.id)
+        anchor = None
+        entries_getter = getattr(reg, "open_question_entries", None)
+        if entries_getter is not None:
+            anchors = [
+                q for q in entries_getter(engagement.id)
+                if q.get("kind") == "anchor"
+            ]
+            if anchors:
+                anchor = min(anchors, key=lambda q: q.get("n", 0))
+        else:  # legacy registry without the raw accessor
+            getter = getattr(reg, "oldest_open_anchor", None)
+            if getter is not None:
+                anchor = getter(engagement.id)
         if anchor is None:
             return None
-        n = anchor.get("n")
-        amid = anchor.get("tg_message_id")
-        display = anchor.get("text") or (f"Q{n}:" if n is not None else "")
-        # W-R1 (Sol r2-2): confirmed-edit gate. Close the anchor's ledger entry
-        # ONLY after a CONFIRMED settle edit; an unconfirmed edit after the
-        # bounded retry leaves the entry INTACT for the next boot reconciliation.
-        # The anchor mid is STILL returned regardless so the operator's answer
-        # threads to the question it answers even when the cosmetic settle edit
-        # is transiently failing.
-        settled = True
-        if amid is not None:
-            if self._edit_topic_message is None:
-                # F3/R1 (Sol diff gate): a MESSAGE-BACKED anchor with NO edit
-                # primitive cannot be confirmed-settled — treat it as
-                # UNCONFIRMED (fail-CLOSED) so the ledger entry is PRESERVED,
-                # never closed without a confirmed edit. The anchor mid is STILL
-                # returned below so the operator's answer threads correctly.
-                settled = False
-                logger.warning(
-                    "engagement %s: anchor settle has a message id but no edit "
-                    "primitive (n=%s) — leaving ledger entry INTACT",
-                    engagement.id[:8], n,
-                )
-            else:
-                settled = await confirmed_settle_edit(
-                    lambda: self._edit_topic_message(
-                        engagement.topic_id, amid,
-                        f"{display}{_OPEN_Q_ANSWERED_SUFFIX}", clear_keyboard=True),
-                    sleep=self._sleep,
-                )
-                if not settled:
-                    logger.warning(
-                        "engagement %s: anchor settle UNCONFIRMED after retries "
-                        "(n=%s) — leaving ledger entry INTACT",
-                        engagement.id[:8], n,
-                    )
-        close = getattr(reg, "close_open_question", None)
-        if settled and close is not None and n is not None:
-            try:
-                await close(engagement.id, n)
-            except Exception:  # noqa: BLE001
-                logger.debug("close_open_question (anchor) failed", exc_info=True)
+        amid = await self._settle_ledger_entry(
+            engagement, anchor, answered_suffix=True)
         # W-R2: recompute the summary status from the remaining open questions
         # (still ⏳ waiting while another question is open; ⚙️ working once none
         # remain and the turn is running).
