@@ -1,0 +1,7 @@
+schema_version: 1
+max_sentences_confirmation: 2
+max_sentences_status: 3
+register: spoken
+format: plain
+rules:
+  - "Answer test tasks exactly as instructed. No preamble, no filler."
