@@ -43,6 +43,7 @@ import asyncio
 import inspect
 import logging
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -332,6 +333,14 @@ class OutputSequencer:
         self._hold_poll_s = hold_poll_s
 
         self._lock = asyncio.Lock()
+        # REENTRANT-PER-TASK ownership (Sol diff gate r2). The task currently
+        # inside the serialization lock, or None. A poster the sequencer awaits
+        # WHILE holding the lock (seal-narration + post is atomic) may call back
+        # into ``edit_summary`` — e.g. the ask poster's ``note_ask_waiting`` →
+        # SummaryController.submit_status → edit_summary — on this SAME task; a
+        # plain non-reentrant ``asyncio.Lock`` would deadlock it forever. Owner
+        # tracking lets that nested, already-serialized call proceed.
+        self._lock_owner: asyncio.Task | None = None
         self.registry = IntentRegistry(_now=_now)
         # F3 fail-closed posting: per-request resolution events. A deferred
         # ask/reply/anchor handler AWAITS the intent's outcome (posted ok, or
@@ -353,6 +362,45 @@ class OutputSequencer:
         # poster via ``consume_turn_reply_to``) threads to it, then clears it.
         self._turn_reply_to: int | None = None
 
+    # -- serialization (reentrant-per-task; §2 one serialized writer) -------
+
+    @asynccontextmanager
+    async def _serialized(self):
+        """Acquire the ONE serialization lock, REENTRANTLY for the task that
+        already holds it (owner-tracked).
+
+        INVARIANT (Sol diff gate r2): a locked section of the sequencer may,
+        via a poster it awaits, call back into :meth:`edit_summary` (the
+        NON-narration summary path). ``edit_summary`` must be reentrant-safe for
+        the lock-OWNING task and must never block on the lock it is nested
+        within. This is correct because the summary edit does NOT touch
+        narration / high-water / open-narration state (see :meth:`edit_summary`'s
+        docstring) — reentrant execution from within a narration-post critical
+        section cannot corrupt narration invariants.
+
+        Concretely: an ask poster runs while the writer lock is held (seal-
+        narration + post is atomic — see :meth:`_post_intent_locked`). That
+        poster calls ``driver.note_ask_waiting`` → SummaryController.submit_status
+        → ``edit_summary``, which re-enters here on the SAME task. A plain
+        non-reentrant ``asyncio.Lock`` would deadlock that task forever.
+
+        Reentrancy is safe because asyncio is single-threaded: the reentrant
+        body only runs when the SAME task already holds the lock, so no
+        concurrent mutation is possible. This keeps §2's single-writer
+        invariant (one lock, not a second summary lock) intact — a DIFFERENT
+        task still contends on ``self._lock`` and is fully serialized.
+        """
+        if self._lock_owner is asyncio.current_task():
+            # Already serialized by this very task — reenter without re-acquiring.
+            yield
+            return
+        async with self._lock:
+            self._lock_owner = asyncio.current_task()
+            try:
+                yield
+            finally:
+                self._lock_owner = None
+
     # -- narration ----------------------------------------------------------
 
     @property
@@ -366,7 +414,7 @@ class OutputSequencer:
     async def open_narration(self, text: str) -> int | None:
         """Post a NEW narration message; it becomes the open narration and the
         high-water mark."""
-        async with self._lock:
+        async with self._serialized():
             return await self._open_narration_locked(text)
 
     async def _open_narration_locked(self, text: str) -> int | None:
@@ -398,7 +446,7 @@ class OutputSequencer:
         edit is skipped (returns :data:`APPLIED`); a FAILED edit invalidates
         the cache entry so a retry is never suppressed.
         """
-        async with self._lock:
+        async with self._serialized():
             if msg_id != self._narration_msg_id or msg_id != self._high_water:
                 return SEALED
             tri = _markup_tristate(markup)
@@ -428,7 +476,7 @@ class OutputSequencer:
         F1 no-op edit gate: an identical edit skips (returns :data:`APPLIED`); a
         FAILED edit invalidates the cache entry so a retry is never suppressed.
         """
-        async with self._lock:
+        async with self._serialized():
             if self._edit_cache.get(msg_id) == (text, MARKUP_ABSENT):
                 return APPLIED
             ok = await _maybe_await(self.edit_message(self.topic_id, msg_id, text))
@@ -440,7 +488,7 @@ class OutputSequencer:
 
     async def seal_narration(self) -> None:
         """Explicitly SEAL the open narration (nothing edits it again)."""
-        async with self._lock:
+        async with self._serialized():
             self._seal_narration_locked()
 
     def _seal_narration_locked(self) -> None:
@@ -460,7 +508,7 @@ class OutputSequencer:
         (The inbound-spool call site is wired by T2; this is the machinery it
         invokes.)
         """
-        async with self._lock:
+        async with self._serialized():
             self._seal_narration_locked()
             if operator_msg_id is not None:
                 if self._high_water is None or operator_msg_id > self._high_water:
@@ -535,7 +583,7 @@ class OutputSequencer:
         at that position — instead of binding a later same-hash intent or
         emitting stray narration. Records the outcome (incl. ``message_id``) for
         response-loss-after-post retry reattachment (§2(1))."""
-        async with self._lock:
+        async with self._serialized():
             intent = self.registry.by_request_id(request_id)
             if intent is None:
                 return None
@@ -581,7 +629,7 @@ class OutputSequencer:
         is never missed."""
         if timeout is None:
             timeout = self.post_await_budget
-        async with self._lock:
+        async with self._serialized():
             intent = self.registry.by_request_id(request_id)
             if intent is None:
                 return None
@@ -614,7 +662,7 @@ class OutputSequencer:
         never missed."""
         if timeout is None:
             timeout = self._slot_hold_s
-        async with self._lock:
+        async with self._serialized():
             intent = self.registry.by_request_id(request_id)
             if intent is None or intent.consumed:
                 return True
@@ -644,7 +692,7 @@ class OutputSequencer:
         (the notice is a causal event below it), posts, and advances the
         high-water mark, all under the one serialization lock. Returns the posted
         message id, or ``None`` on send failure."""
-        async with self._lock:
+        async with self._serialized():
             self._seal_narration_locked()
             if reply_to is not None:
                 mid = await _maybe_await(
@@ -666,7 +714,7 @@ class OutputSequencer:
         late armed intent — a discrete send the agent believes is in flight
         would vanish and its awaiter would hang. Runs the same post path as the
         10s watcher; a failed post surfaces ok:false via F3."""
-        async with self._lock:
+        async with self._serialized():
             for intent in self.registry.armed_unposted():
                 await self._post_intent_locked(
                     intent, out_of_band=True, warn=True)
@@ -710,7 +758,7 @@ class OutputSequencer:
         fails closed via F3) first. There is NO await between the final
         empty-check and the synchronous prune, so a lock-free ``register_intent``
         /``arm_intent`` cannot slip an armed intent in between the two."""
-        async with self._lock:
+        async with self._serialized():
             while True:
                 pending = self.registry.armed_unposted()
                 if not pending:
@@ -744,12 +792,12 @@ class OutputSequencer:
         """
         deadline = self._now() + self._slot_hold_s
         while True:
-            async with self._lock:
+            async with self._serialized():
                 resolved = await self._resolve_block_locked(tool_name, block_hash)
                 if resolved is not None:
                     return resolved
             if self._now() >= deadline:
-                async with self._lock:
+                async with self._serialized():
                     # Last-look under the lock: an intent that armed exactly at
                     # the deadline still posts at THIS block; a still-pending one
                     # is marked slot_missed (its late post happens out-of-band).
@@ -863,7 +911,7 @@ class OutputSequencer:
         ``intent_timeout_s`` posts out-of-band with a WARN and leaves a
         one-block consumption debt so its late frame is consumed silently.
         """
-        async with self._lock:
+        async with self._serialized():
             self._arm_event.clear()
             now = self._now()
             for intent in self.registry.armed_unposted():
