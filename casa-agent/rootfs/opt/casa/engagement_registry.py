@@ -176,6 +176,14 @@ class EngagementRecord:
     # while an older/equal one never overrides.
     summary_message_id: int | None = None
     summary_revision: int = 0
+    # W-R6 (v0.81.0): the persisted SHORT topic title (2-3 words). Set once at
+    # engage_executor ingest (engager-supplied ``topic_title`` normalized, or a
+    # Casa-derived fallback from the brief/task), then read by BOTH the
+    # topic-name state edit (telegram.update_topic_state) and the live-summary
+    # title (claude_code_driver._summary_goal_line) — a single durable source.
+    # Additive + absent-tolerant on load (legacy rows have no key → "" → each
+    # reader falls back to the derived concise_task label, no crash).
+    topic_title: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +266,7 @@ class EngagementRegistry:
                     ),
                     summary_message_id=row.get("summary_message_id"),
                     summary_revision=int(row.get("summary_revision", 0) or 0),
+                    topic_title=row.get("topic_title", "") or "",
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed engagement row: %s", exc)
@@ -397,6 +406,7 @@ class EngagementRegistry:
                 "open_questions": [dict(q) for q in rec.open_questions],
                 "summary_message_id": rec.summary_message_id,
                 "summary_revision": rec.summary_revision,
+                "topic_title": rec.topic_title,
             })
         try:
             await asyncio.to_thread(self._write_tombstone, snapshot)
@@ -424,6 +434,7 @@ class EngagementRegistry:
         permission_mode: str = "acceptEdits",
         plugin_artifacts: tuple[dict, ...] | list[dict] = (),
         interaction_state: str = "",
+        topic_title: str = "",
     ) -> EngagementRecord:
         engagement_id = uuid.uuid4().hex
         now = time.time()
@@ -445,6 +456,7 @@ class EngagementRegistry:
             permission_mode=permission_mode or "acceptEdits",
             plugin_artifacts=tuple(dict(pa) for pa in plugin_artifacts),
             interaction_state=interaction_state,
+            topic_title=topic_title,
         )
         async with self._lock:
             self._records[engagement_id] = rec

@@ -501,10 +501,17 @@ async def ask_user(args: dict) -> dict:
                         "message": "channel not available"})
 
     from verdict_broker import BROKER
+    from channels.channel_handlers import render_ask_body
 
     rid = uuid.uuid4().hex
     target_role = origin.get("role")
     scope = f"dm:{chat_id}"
+    # v0.81.0 (W-R3b): the DM MESSAGE body carries the FULL options VERBATIM +
+    # 1-based numbered (the SAME single-source renderer the engagement asks use),
+    # while the buttons carry only short number-prefixed labels. Both the post
+    # and the settle edits derive from this one ``body`` so they can never
+    # disagree (mirrors the engagement single-source discipline).
+    body = render_ask_body(None, question, list(options))
     # Static meta BEFORE post (register() shallow-copies whatever dict we
     # pass, so the complete dict is supplied up front rather than mutated
     # after the fact). No `on_commit_sync` — plain asks record nothing at
@@ -524,7 +531,8 @@ async def ask_user(args: dict) -> dict:
 
     async def _post():
         return await channel.post_dm_keyboard(
-            chat_id=chat_id, request_id=rid, text=question, options=list(options),
+            chat_id=chat_id, request_id=rid, text=body, options=list(options),
+            short_labels=True,
         )
 
     def _finish_factory(message_id: int):
@@ -536,13 +544,13 @@ async def ask_user(args: dict) -> dict:
             if outcome.get("outcome") != "answered":
                 await channel.edit_dm_message(
                     chat_id, message_id,
-                    f"{question}\n\n(this question has expired)",
+                    f"{body}\n\n(this question has expired)",
                 )
                 return
             idx = outcome["option_index"]
             chosen = options[idx]
             await channel.edit_dm_message(
-                chat_id, message_id, f"{question}\n\nAnswered: {chosen}",
+                chat_id, message_id, f"{body}\n\nAnswered: {chosen}",
             )
             ok = await channel._dispatch_button_continuation(
                 chat_id=chat_id, user_id=operator_id, target_role=target_role,
@@ -2527,6 +2535,9 @@ async def _fetch_executor_archive(
             "executor_type": {"type": "string"},
             "task": {"type": "string"},
             "context": {"type": "string"},
+            # W-R6 (v0.81.0): OPTIONAL short 2-3 word topic title. Normalized +
+            # persisted at ingest; absent → a Casa-derived label from task/brief.
+            "topic_title": {"type": "string"},
             "brief": {
                 "type": "object",
                 "properties": {
@@ -2758,12 +2769,17 @@ async def engage_executor(args: dict) -> dict:
     # is delivered via the bubble (icon_custom_emoji_id from
     # channels.topic_icons.icon_id_for_role), not the title text.
     from channels.state_emoji import (
-        STATE_EMOJI, compose_topic_title, concise_task,
+        STATE_EMOJI, compose_topic_title, concise_task, normalize_topic_title,
     )
     first_line = (task_text or "").splitlines()[0]
     short_task = concise_task(first_line) or "engagement"
+    # W-R6 (v0.81.0): normalize ONCE at ingest — an engager-supplied topic_title
+    # (rejected + fell back if UNSAFE/blank), else the Casa-derived short label.
+    # The SAME persisted value feeds the topic-name state edits AND the live
+    # summary title (single source — see EngagementRecord.topic_title).
+    persisted_title = normalize_topic_title(args.get("topic_title")) or short_task
     topic_name = compose_topic_title(
-        state="active", short_task=short_task,
+        state="active", short_task=persisted_title,
     )
     try:
         topic_id = await channel.open_engagement_topic(
@@ -2826,6 +2842,7 @@ async def engage_executor(args: dict) -> dict:
             permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
             plugin_artifacts=plugin_artifacts,      # §3.8 recorded binding
             interaction_state="first_contact_required" if _two_phase else "",
+            topic_title=persisted_title,            # W-R6 durable short title
         )
 
     # Sol round-4: the manual-edit seam `casa_reload(scope="full")` bumps the

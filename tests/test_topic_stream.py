@@ -913,6 +913,136 @@ async def test_crash_interleave_after_checkpoint_no_edit_below(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# v0.81.0 (W-R4, Sol r1-3): finalize NEVER reposts the visible sealed narration
+# tail. The production bug: msg 1137 = "Option A locked in…"; msgs 1139/1141/1143
+# = that SAME text reposted at result finalization after a later discrete post.
+# ---------------------------------------------------------------------------
+
+
+async def test_finalize_no_repost_of_fully_visible_sealed_narration(tmp_path):
+    """R4 (a) NO-REPOST: narration is fully posted → a discrete SEALS it → the
+    result finalize must NOT repost the already-visible sealed tail. Exactly ONE
+    copy of the narration reaches the topic (pre-fix the finalize SEALED branch
+    reposted the whole ``_per_message_text`` as a new message)."""
+    rec, events = Recorder(), []
+    _write_current(tmp_path, [
+        _init(), _text("Option A locked in"), _reply_tool_frame("R"), _result(),
+    ])
+    cursor = tmp_path / ".stream_cursor.json"
+    relay = _make_relay(tmp_path, cursor, rec, events)
+    _arm_reply(relay, rec, "R")
+    await relay.run()
+
+    # Narration once, the discrete once, and finalize reposts NOTHING.
+    assert [t for _tp, t in rec.sends] == ["Option A locked in", "[reply]R"]
+    assert sum(t == "Option A locked in" for _tp, t in rec.sends) == 1
+
+
+async def test_finalize_posts_only_pending_suffix_of_sealed_narration(tmp_path):
+    """R4 (b) NO-LOSS: a visible PREFIX plus a PENDING throttled SUFFIX (the
+    relay held an unposted edit at :769) → a discrete SEALS the message →
+    finalize posts ONLY the genuinely-unposted suffix, exactly once — never the
+    whole tail (the R4 dup), never nothing (data loss).
+
+    Frozen clock + a wide throttle window: "AAA"→send, "AAABBB"→edit (posts,
+    arms the window at t=0), "AAABBBCCC"→edit THROTTLED (held, unposted). The
+    discrete then seals the narration; finalize must flush ONLY "CCC"."""
+    rec, events = Recorder(), []
+    _write_current(tmp_path, [
+        _init(), _text("AAA"), _text("BBB"), _text("CCC"),
+        _reply_tool_frame("R"), _result(),
+    ])
+    cursor = tmp_path / ".stream_cursor.json"
+    relay = _make_relay(
+        tmp_path, cursor, rec, events, edit_throttle=10.0, _now=lambda: 0.0,
+    )
+    _arm_reply(relay, rec, "R")
+    await relay.run()
+
+    # Prefix "AAABBB" was posted (send + edit); the discrete sealed it; only the
+    # held "CCC" is newly posted at finalize.
+    assert [t for _tp, t in rec.sends] == ["AAA", "[reply]R", "CCC"]
+    # The whole tail is NEVER reposted, and the suffix is NEVER lost.
+    assert all(t != "AAABBBCCC" for _tp, t in rec.sends)
+    assert sum(t == "CCC" for _tp, t in rec.sends) == 1
+
+
+async def test_seal_edit_branch_no_loss_via_posted_len(tmp_path):
+    """F2/R4 NO-LOSS (Sol diff gate): the SEALED-EDIT branch in ``_execute_ops``
+    (distinct from the finalize branch T4 fixed) must slice the fresh message
+    from ``_posted_len`` — the accurate wire-posted length — NOT ``len(prior)``,
+    which includes throttled never-posted text.
+
+    Repro: ``AAA`` sent → ``AAABBB`` edited (both reach the wire) → ``CCC``
+    THROTTLED (``_per_message_text`` advances to ``AAABBBCCC`` but it never
+    reaches the wire, so ``_posted_len`` stays at 6) → a discrete reply SEALS
+    the message → ``DDD`` arrives after the throttle window → the edit to
+    ``AAABBBCCCDDD`` hits the sealed message → SEALED → a fresh message opens.
+    That fresh message must carry the held ``CCC`` then ``DDD`` (``CCCDDD``);
+    pre-fix it sliced ``value[len(prior):]`` = ``DDD`` and lost ``CCC``."""
+    from channels.output_sequencer import OutputSequencer
+
+    rec, events = Recorder(), []
+    cursor = tmp_path / ".stream_cursor.json"
+    seq = OutputSequencer(
+        engagement_id="eng-1", topic_id=42,
+        send_message=rec.send, edit_message=rec.edit,
+    )
+    relay = _make_relay(tmp_path, cursor, rec, events, sequencer=seq)
+
+    # AAA posted (send), then AAABBB posted (edit) — both reach the wire.
+    await relay._execute_ops([("send", "AAA")])
+    await relay._execute_ops([("edit", "AAABBB")])
+    assert relay._posted_len == 6  # only "AAABBB" reached the wire
+
+    # CCC is THROTTLED: _per_message_text advances but _posted_len does NOT
+    # (mirrors _post_text's held-edit path at :794).
+    relay._per_message_text = "AAABBBCCC"
+
+    # A discrete reply SEALS the narration message.
+    await seq.seal_narration()
+
+    # DDD after the throttle window → edit hits the sealed message → SEALED →
+    # a fresh message opens for the genuinely-unposted increment.
+    await relay._execute_ops([("edit", "AAABBBCCCDDD")])
+
+    posted = [t for _tp, t in rec.sends]
+    # NO-LOSS: the fresh message carries the held CCC then DDD, never just DDD.
+    assert posted == ["AAA", "CCCDDD"]
+    # CCC is never permanently lost, and nothing is duplicated.
+    assert "".join(posted) == "AAACCCDDD"
+
+
+async def test_crash_recovery_reposts_full_sealed_tail_unchanged_by_r4(tmp_path):
+    """R4 (c): the crash-recovery CONSERVATIVE SEAL stays a SEPARATE,
+    distinguishable branch from finalize. A real post-restart recovery of an
+    OPEN turn whose narration was sealed by a discrete still reposts the FULL
+    narration as a NEW message (the accepted at-least-once duplicate). The R4
+    finalize suffix-only rule does NOT touch this reconcile path — this test
+    stays green before and after the fix, pinning the branch boundary."""
+    rec, events = Recorder(), []
+    offs = _write_current(tmp_path, [
+        _init(), _text("recovered tail"), _reply_tool_frame("R"),
+    ])
+    cur_path = tmp_path / ".stream_cursor.json"
+    seg = _ident(os.path.join(str(tmp_path), "current"))
+    # OPEN turn (no result): current is PAST the discrete frame — all replayed.
+    StreamCursor(
+        turn_start={"segment": seg, "offset": 0},
+        current={"segment": seg, "offset": offs[-1]},
+        message_ids=[7], last_posted_len=len("recovered tail"),
+    ).save(cur_path)
+
+    # FRESH relay + FRESH sequencer (models a process restart).
+    await _make_relay(tmp_path, cur_path, rec, events).run()
+
+    # Conservative seal reposts the WHOLE narration as a new message (accepted
+    # duplicate) and never edits the below-content id 7.
+    assert rec.sends == [(42, "recovered tail")]
+    assert all(mid != 7 for _t, mid, _x in rec.edits)
+
+
+# ---------------------------------------------------------------------------
 # v0.79.0 (T1 review): replay models discrete-rollover boundaries so a
 # same-process poll re-run never stale-prepends a rolled narration message.
 # ---------------------------------------------------------------------------

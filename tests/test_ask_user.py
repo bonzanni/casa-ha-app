@@ -64,7 +64,9 @@ class _FakeChannel:
         self._post_raises = post_raises
         self._dispatch_result = dispatch_result
 
-    async def post_dm_keyboard(self, *, chat_id, request_id, text, options):
+    async def post_dm_keyboard(
+        self, *, chat_id, request_id, text, options, short_labels=False,
+    ):
         self.calls.append(("post", chat_id, request_id, text, tuple(options)))
         if self._post_raises is not None:
             raise self._post_raises
@@ -516,6 +518,85 @@ async def _settle(pred, tries=2000):
             return
         await asyncio.sleep(0)
     raise AssertionError("condition never reached")
+
+
+# ---------------------------------------------------------------------------
+# 7b. R3b — readable DM buttons (full numbered options in the body, short
+#     number-prefixed button labels, full chosen option on settle)
+# ---------------------------------------------------------------------------
+
+
+class TestDmReadableButtons:
+    async def test_dm_body_has_full_numbered_options(
+        self, monkeypatch, _fresh_broker,
+    ):
+        """The DM MESSAGE body renders the FULL options verbatim + 1-based
+        numbered (render_ask_body), not just the raw question — so a long
+        option is readable even though the button label is short."""
+        channel = _FakeChannel()
+        _res, _payload_, ch = await _ask(
+            monkeypatch, channel=channel,
+            args={"question": "Which account?",
+                  "options": ["Personal Gmail", "Work Outlook"]},
+        )
+        post = next(c for c in ch.calls if c[0] == "post")
+        text = post[3]
+        assert text == "Which account?\n\n1. Personal Gmail\n2. Work Outlook"
+        assert "1. Personal Gmail" in text
+        assert "2. Work Outlook" in text
+
+    async def test_dm_buttons_short_labeled_with_index(self):
+        """The DM keyboard buttons carry the SHORT number-prefixed labels
+        (``_short_option_label``) while the body carries the full options; the
+        callback_data identity stays ``v1|resident_ask|<rid>|<i>`` (unchanged)."""
+        from channels import telegram as tg_mod
+
+        ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        bot = MagicMock()
+        bot.send_message = AsyncMock(
+            return_value=types.SimpleNamespace(message_id=9))
+        ch._bot = bot  # ``bot`` is a read-only property backed by ``_bot``
+
+        options = ["Personal Gmail", "Configure the enterprise SSO integration"]
+        body = ("Which account?\n\n1. Personal Gmail\n"
+                "2. Configure the enterprise SSO integration")
+        mid = await ch.post_dm_keyboard(
+            chat_id=500, request_id="rid", text=body, options=options,
+            short_labels=True,
+        )
+        assert mid == 9
+        kbd = bot.send_message.call_args.kwargs["reply_markup"]
+        rows = kbd.inline_keyboard
+        assert [r[0].text for r in rows] == [
+            "1 · Personal Gmail", "2 · Configure the"]
+        assert [r[0].callback_data for r in rows] == [
+            "v1|resident_ask|rid|0", "v1|resident_ask|rid|1"]
+        # The full body is posted verbatim (short labels never replace it).
+        assert bot.send_message.call_args.kwargs["text"] == body
+
+    async def test_dm_settle_shows_full_chosen_option(
+        self, monkeypatch, _fresh_broker,
+    ):
+        """On answer the DM settle edit shows the FULL chosen option (not the
+        short button label), appended below the full numbered body."""
+        channel = _FakeChannel(dispatch_result=True)
+        _res, payload, ch = await _ask(
+            monkeypatch, channel=channel,
+            args={"question": "Which account?",
+                  "options": ["Personal Gmail", "Work Outlook"]},
+        )
+        rid = payload["request_id"]
+        assert _fresh_broker.deliver(
+            namespace="resident_ask", scope="dm:500", request_id=rid,
+            option_index=0, actor_id=999,
+        ) == "delivered"
+        await _settle(lambda: len(ch.edits) >= 1 and any(
+            c[0] == "dispatch" for c in ch.calls))
+        settle_text = ch.edits[0][2]
+        assert settle_text.endswith("Answered: Personal Gmail")
+        # The full numbered body is preserved below the settle line.
+        assert "1. Personal Gmail" in settle_text
+        assert "2. Work Outlook" in settle_text
 
 
 # ---------------------------------------------------------------------------
