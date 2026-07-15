@@ -171,30 +171,40 @@ def render_summary(
     elapsed_str: str = "",
     open_qs: tuple[int, ...] = (),
 ) -> str:
-    """Render the EXACT summary layout (§5; no parse_mode, omit empty lines).
+    """Render the EXACT summary layout (W-R2; no parse_mode, omit empty lines).
+
+    STATUS FIRST, with activity + elapsed MERGED onto the status line; the short
+    title (W-R6 ``goal_line``) second; then Plan / Open-questions (each omitted
+    when empty). There is NO separate ``Now:`` line — activity/elapsed live on
+    the status line and are only supplied while working (the controller passes
+    ``activity=None`` when waiting/between turns).
 
     ::
 
-        <goal line>
-        <status line>
-        Plan: <done>/<total> — current: <subject>
-        Now: <activity> — <elapsed>
-        Open questions: Q<n>, Q<m>
+        ⚙️ working — planning · 1m 00s
+        Gmail plugin
+        Plan: 2/5 — current: OAuth setup
+        Open questions: Q11
 
-    The goal line (from the engagement's topic-name string source) is the stable
-    header; the status line follows; the Plan / Now / Open-questions lines are
-    each omitted when empty.
+    Waiting (no activity/elapsed on the status line)::
+
+        ⏳ waiting for your reply
+        Gmail plugin
+        Plan: 2/5 — current: OAuth setup
+        Open questions: Q11
     """
     lines: list[str] = []
+    status_line = status
+    if activity:
+        status_line += f" — {activity}"
+        if elapsed_str:
+            status_line += f" · {elapsed_str}"
+    lines.append(status_line)
     if goal_line:
         lines.append(goal_line)
-    lines.append(status)
     if plan_total:
         subj = f" — current: {plan_subject}" if plan_subject else ""
         lines.append(f"Plan: {plan_done or 0}/{plan_total}{subj}")
-    if activity:
-        tail = f" — {elapsed_str}" if elapsed_str else ""
-        lines.append(f"Now: {activity}{tail}")
     if open_qs:
         lines.append(
             "Open questions: " + ", ".join(f"Q{n}" for n in open_qs)

@@ -641,6 +641,14 @@ def _make_ask(
                     if add is not None:
                         await add(eng_id, number, mid, text=display,
                                   kind="anchor")
+                # W-R2: a posted anchor also hands the ball to the operator →
+                # ⏳ waiting for your reply (driven from the ask lifecycle). The
+                # next operator text settles it driver-side (_settle_open_anchor
+                # recomputes the status back to working when none remain).
+                if driver is not None:
+                    note = getattr(driver, "note_ask_waiting", None)
+                    if note is not None:
+                        await note(eng_id)
                 await _advance_first_contact()
                 return mid
 
@@ -752,12 +760,30 @@ def _make_ask(
             timeout_s=timeout_s, meta=_ask_static_meta(),
         )
 
+        # W-R2 linearization pin (Sol r2-1): the finish hook can become runnable
+        # (a FAST TAP) before ``_post_ask`` finishes registering the open
+        # question and setting ⏳ waiting. Gate the settlement recompute behind
+        # this event — set by ``_post_ask`` ONLY after durable registration + the
+        # waiting submission — so the recompute's revision is always allocated
+        # LAST and a fast tap can never leave the summary stuck-waiting. The
+        # event is ALWAYS set by ``_post_ask``'s finally (even on supersede /
+        # add failure), and the finish hook exists only once ``_post_ask``
+        # reached ``ensure_posted`` (which wires it), so this wait cannot hang.
+        _ask_registered = asyncio.Event()
+
         async def _close_question() -> None:
-            if number is None:
-                return
-            close = getattr(engagement_registry, "close_open_question", None)
-            if close is not None:
-                await close(eng_id, number)
+            await _ask_registered.wait()
+            if number is not None:
+                close = getattr(engagement_registry, "close_open_question", None)
+                if close is not None:
+                    await close(eng_id, number)
+            # Recompute the summary status from the remaining open questions
+            # (still ⏳ waiting while any question is open; ⚙️ working once none
+            # remain and the turn is running).
+            if driver is not None:
+                recompute = getattr(driver, "recompute_engagement_status", None)
+                if recompute is not None:
+                    await recompute(eng_id)
 
         # The DEFERRED poster (§2, review C1): the relay invokes this at the
         # ask's tool_use block (or the slot/intent-timeout watcher posts it
@@ -769,59 +795,75 @@ def _make_ask(
         # crash before the relay reaches the block leaves NO dangling ledger
         # entry — the broker TTL expires the ask instead.
         async def _post_ask() -> int | None:
-            await BROKER.ensure_posted(
-                req,
-                lambda: telegram_channel.post_options_keyboard(
-                    engagement_id=eng_id, request_id=request_id,
-                    question=display, options=options),
-                lambda mid: _ask_keyboard_finish(
-                    telegram_channel, rec.topic_id, mid, display, options,
-                    on_settle=_close_question),
-            )
-            mid = req.meta.get("message_id")
-            if not isinstance(mid, int):
-                # ensure_posted unregistered the request (post raised/None) →
-                # await_result below returns delivery_failed.
-                return None
-            # GENERATION RE-CHECK (§4, Sol r1-4 — reserve→post→re-check, now
-            # relay-mediated): an operator envelope that arrived between reserve
-            # and post supersedes this ask — settle it (broker cancel → finish
-            # hook renders the superseded copy + clears buttons), consuming no
-            # timeout budget.
-            superseded = (
-                driver is not None
-                and driver.inbound_generation(eng_id) != gen_at_entry
-            )
-            if superseded:
-                BROKER.cancel(
-                    namespace="engagement_ask", scope=eng_id,
-                    request_id=request_id, reason="superseded_by_text",
+            try:
+                await BROKER.ensure_posted(
+                    req,
+                    lambda: telegram_channel.post_options_keyboard(
+                        engagement_id=eng_id, request_id=request_id,
+                        question=display, options=options),
+                    lambda mid: _ask_keyboard_finish(
+                        telegram_channel, rec.topic_id, mid, display, options,
+                        on_settle=_close_question),
                 )
-            elif number is not None:
-                add = getattr(engagement_registry, "add_open_question", None)
-                if add is not None:
-                    try:
-                        await add(eng_id, number, mid, text=display)
-                    except Exception:  # noqa: BLE001 — F6 strict-persist raise
-                        # The ledger write failed AFTER the keyboard posted.
-                        # Fail closed: settle the keyboard (internal-error copy
-                        # via the finish hook) and refuse — a live-tappable
-                        # keyboard the boot reconciler can never see is worse
-                        # than a withdrawn question.
-                        logger.warning(
-                            "engagement %s: add_open_question failed — "
-                            "withdrawing ask Q%s", eng_id[:8], number,
-                            exc_info=True,
-                        )
-                        BROKER.cancel(
-                            namespace="engagement_ask", scope=eng_id,
-                            request_id=request_id, reason="internal_error",
-                        )
-                        return None
-            # W2/Sol B9 (Task 7): asking is an outbound agent action — advance
-            # only after the keyboard actually posted.
-            await _advance_first_contact()
-            return mid
+                mid = req.meta.get("message_id")
+                if not isinstance(mid, int):
+                    # ensure_posted unregistered the request (post raised/None) →
+                    # await_result below returns delivery_failed.
+                    return None
+                # GENERATION RE-CHECK (§4, Sol r1-4 — reserve→post→re-check, now
+                # relay-mediated): an operator envelope that arrived between
+                # reserve and post supersedes this ask — settle it (broker cancel
+                # → finish hook renders the superseded copy + clears buttons),
+                # consuming no timeout budget.
+                superseded = (
+                    driver is not None
+                    and driver.inbound_generation(eng_id) != gen_at_entry
+                )
+                if superseded:
+                    BROKER.cancel(
+                        namespace="engagement_ask", scope=eng_id,
+                        request_id=request_id, reason="superseded_by_text",
+                    )
+                else:
+                    if number is not None:
+                        add = getattr(
+                            engagement_registry, "add_open_question", None)
+                        if add is not None:
+                            try:
+                                await add(eng_id, number, mid, text=display)
+                            except Exception:  # noqa: BLE001 — F6 strict-persist
+                                # The ledger write failed AFTER the keyboard
+                                # posted. Fail closed: settle the keyboard
+                                # (internal-error copy via the finish hook) and
+                                # refuse — a live-tappable keyboard the boot
+                                # reconciler can never see is worse than a
+                                # withdrawn question.
+                                logger.warning(
+                                    "engagement %s: add_open_question failed — "
+                                    "withdrawing ask Q%s", eng_id[:8], number,
+                                    exc_info=True,
+                                )
+                                BROKER.cancel(
+                                    namespace="engagement_ask", scope=eng_id,
+                                    request_id=request_id, reason="internal_error",
+                                )
+                                return None
+                    # W-R2: a successful, non-superseded ask post → ⏳ waiting for
+                    # your reply, driven from the ask LIFECYCLE (not the turn
+                    # result). Ordered BEFORE any settlement recompute by the
+                    # ``_ask_registered`` pin (set in the finally below).
+                    if driver is not None:
+                        note = getattr(driver, "note_ask_waiting", None)
+                        if note is not None:
+                            await note(eng_id)
+                # W2/Sol B9 (Task 7): asking is an outbound agent action —
+                # advance only after the keyboard actually posted.
+                await _advance_first_contact()
+                return mid
+            finally:
+                # Unblock the (possibly already-runnable) settlement path: the
+                # registration + waiting submission above are now durable.
+                _ask_registered.set()
 
         if intent_registered:
             # Install the real poster and ARM — the point of no return

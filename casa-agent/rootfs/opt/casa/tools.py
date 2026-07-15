@@ -2527,6 +2527,9 @@ async def _fetch_executor_archive(
             "executor_type": {"type": "string"},
             "task": {"type": "string"},
             "context": {"type": "string"},
+            # W-R6 (v0.81.0): OPTIONAL short 2-3 word topic title. Normalized +
+            # persisted at ingest; absent → a Casa-derived label from task/brief.
+            "topic_title": {"type": "string"},
             "brief": {
                 "type": "object",
                 "properties": {
@@ -2758,12 +2761,17 @@ async def engage_executor(args: dict) -> dict:
     # is delivered via the bubble (icon_custom_emoji_id from
     # channels.topic_icons.icon_id_for_role), not the title text.
     from channels.state_emoji import (
-        STATE_EMOJI, compose_topic_title, concise_task,
+        STATE_EMOJI, compose_topic_title, concise_task, normalize_topic_title,
     )
     first_line = (task_text or "").splitlines()[0]
     short_task = concise_task(first_line) or "engagement"
+    # W-R6 (v0.81.0): normalize ONCE at ingest — an engager-supplied topic_title
+    # (rejected + fell back if UNSAFE/blank), else the Casa-derived short label.
+    # The SAME persisted value feeds the topic-name state edits AND the live
+    # summary title (single source — see EngagementRecord.topic_title).
+    persisted_title = normalize_topic_title(args.get("topic_title")) or short_task
     topic_name = compose_topic_title(
-        state="active", short_task=short_task,
+        state="active", short_task=persisted_title,
     )
     try:
         topic_id = await channel.open_engagement_topic(
@@ -2826,6 +2834,7 @@ async def engage_executor(args: dict) -> dict:
             permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
             plugin_artifacts=plugin_artifacts,      # §3.8 recorded binding
             interaction_state="first_contact_required" if _two_phase else "",
+            topic_title=persisted_title,            # W-R6 durable short title
         )
 
     # Sol round-4: the manual-edit seam `casa_reload(scope="full")` bumps the

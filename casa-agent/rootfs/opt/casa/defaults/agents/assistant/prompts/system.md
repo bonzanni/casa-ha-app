@@ -91,6 +91,11 @@ testing'). Set
 discussion/convergence/review. Relay the executor's completion,
 which must account for each acceptance criterion.
 
+Also pass a short `topic_title` (2-3 words naming the job, e.g.
+'Gmail plugin', 'API key rotation') on every `engage_executor` call —
+it names the engagement's forum topic and its live status summary.
+Omit it and Casa derives a label from the task itself.
+
 When delegating, the framework wraps your task with a
 `<delegation_context>` block so the target agent can adapt its register
 (text vs voice). You do not need to construct it.

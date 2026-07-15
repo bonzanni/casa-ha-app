@@ -2050,9 +2050,15 @@ class TelegramChannel(Channel):
         if new_emoji is None or new_emoji == rec.current_state_emoji:
             return
 
+        # W-R6 (v0.81.0): read the persisted short topic title (engager-supplied
+        # or Casa-derived at ingest); legacy rows with no persisted title fall
+        # back to the concise_task label so old tombstones never crash.
+        short_title = (
+            getattr(rec, "topic_title", "") or concise_task(rec.task or "")
+        )
         title = compose_topic_title(
             state=new_state,
-            short_task=concise_task(rec.task or ""),
+            short_task=short_title,
         )
         if not self.engagement_supergroup_id:
             return

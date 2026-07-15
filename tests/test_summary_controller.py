@@ -192,33 +192,52 @@ class TestLayoutExact:
         assert render_summary(goal_line="", status=STATUS_WORKING) == "⚙️ working"
 
     def test_goal_and_status(self):
+        # W-R2: STATUS FIRST, then the short title.
         assert render_summary(goal_line="fix bug", status=STATUS_WORKING) == (
-            "fix bug\n⚙️ working"
+            "⚙️ working\nfix bug"
         )
 
     def test_all_lines(self):
+        # W-R2 exact layout: status FIRST with activity + elapsed MERGED
+        # (` — <activity> · <elapsed>`), short title second, then Plan / Open.
         out = render_summary(
-            goal_line="fix bug",
+            goal_line="Gmail plugin",
             status=STATUS_WORKING,
-            plan_done=1,
-            plan_total=3,
-            plan_subject="wiring it up",
-            activity="running commands",
-            elapsed_str="2m 30s",
-            open_qs=(4, 6),
+            plan_done=2,
+            plan_total=5,
+            plan_subject="OAuth setup",
+            activity="planning",
+            elapsed_str="1m 00s",
+            open_qs=(11,),
         )
         assert out == (
-            "fix bug\n"
-            "⚙️ working\n"
-            "Plan: 1/3 — current: wiring it up\n"
-            "Now: running commands — 2m 30s\n"
-            "Open questions: Q4, Q6"
+            "⚙️ working — planning · 1m 00s\n"
+            "Gmail plugin\n"
+            "Plan: 2/5 — current: OAuth setup\n"
+            "Open questions: Q11"
+        )
+
+    def test_waiting_layout_exact(self):
+        # W-R2 waiting block: status line carries NO activity/elapsed.
+        out = render_summary(
+            goal_line="Gmail plugin",
+            status=STATUS_WAITING_REPLY,
+            plan_done=2,
+            plan_total=5,
+            plan_subject="OAuth setup",
+            open_qs=(11,),
+        )
+        assert out == (
+            "⏳ waiting for your reply\n"
+            "Gmail plugin\n"
+            "Plan: 2/5 — current: OAuth setup\n"
+            "Open questions: Q11"
         )
 
     def test_empty_lines_omitted(self):
-        # No plan, no activity, no open questions → only goal + status.
+        # No plan, no activity, no open questions → only status + title.
         out = render_summary(goal_line="fix bug", status=STATUS_WAITING_REPLY)
-        assert out == "fix bug\n⏳ waiting for your reply"
+        assert out == "⏳ waiting for your reply\nfix bug"
 
     def test_plan_without_subject_omits_current(self):
         out = render_summary(
@@ -226,11 +245,14 @@ class TestLayoutExact:
         )
         assert out == "⚙️ working\nPlan: 2/5"
 
-    def test_now_without_elapsed_omits_tail(self):
+    def test_activity_without_elapsed_merges_bare(self):
+        # W-R2: activity merges onto the status line even without elapsed; no
+        # ` · <elapsed>` tail and NO separate `Now:` line.
         out = render_summary(
             goal_line="", status=STATUS_WORKING, activity="reading files",
         )
-        assert out == "⚙️ working\nNow: reading files"
+        assert out == "⚙️ working — reading files"
+        assert "Now:" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +322,8 @@ class TestThrottleAndFlush:
         clock.t = 1.0  # only 1s later — inside the 10s throttle window
         await c.submit_status(STATUS_WAITING_REPLY, 5)  # status change → force
         assert len(seq.edits) == n + 1
-        assert seq.edits[-1][1].splitlines()[1] == "⏳ waiting for your reply"
+        # W-R2: status is now the FIRST line.
+        assert seq.edits[-1][1].splitlines()[0] == "⏳ waiting for your reply"
         c.shutdown()
 
     async def test_activity_coalesces_within_throttle_window(self):
@@ -387,11 +410,12 @@ class TestTickLifecycle:
         await c.note_turn_start()            # base = 0
         await c.submit_activity("running commands")  # edit @ elapsed 0s
         first = seq.edits[-1][1]
-        assert "Now: running commands — 0s" in first
+        # W-R2: activity + elapsed are MERGED onto the status line.
+        assert "⚙️ working — running commands · 0s" in first
         # One productive tick per 60s.
         clock.t = 60.0
         assert await c._tick_body() is True
-        assert "Now: running commands — 1m 00s" in seq.edits[-1][1]
+        assert "⚙️ working — running commands · 1m 00s" in seq.edits[-1][1]
         n = len(seq.edits)
         # A second tick at the SAME clock produces no new edit (elapsed
         # unchanged + throttle) — no edit spam.
@@ -400,7 +424,7 @@ class TestTickLifecycle:
         # Next minute → one more edit.
         clock.t = 120.0
         assert await c._tick_body() is True
-        assert "Now: running commands — 2m 00s" in seq.edits[-1][1]
+        assert "⚙️ working — running commands · 2m 00s" in seq.edits[-1][1]
         assert len(seq.edits) == n + 1
         c.shutdown()
 
@@ -509,7 +533,9 @@ async def test_waiting_for_approval_copy():
     seq = FakeSequencer()
     c = _make(seq)
     await c.submit_status(STATUS_WAITING_APPROVAL, 1)
-    assert seq.edits[-1][1].splitlines()[1] == "🔐 waiting for your approval"
+    # W-R2: status is the FIRST line. (The approval-status ask WIRING stays
+    # deferred in v0.81 — this only asserts the copy constant is renderable.)
+    assert seq.edits[-1][1].splitlines()[0] == "🔐 waiting for your approval"
     c.shutdown()
 
 

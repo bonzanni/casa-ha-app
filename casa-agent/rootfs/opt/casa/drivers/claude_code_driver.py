@@ -1237,8 +1237,13 @@ class ClaudeCodeDriver(DriverProtocol):
 
     @staticmethod
     def _summary_goal_line(engagement: EngagementRecord) -> str:
-        """The summary's stable header — the engagement's topic-name string
-        source (the concise task, minus the state emoji the status line owns)."""
+        """The summary's stable title — the persisted SHORT topic title (W-R6,
+        the SAME source the topic-name state edit reads). Legacy engagements
+        with no persisted title fall back to the derived concise_task label so
+        old records never crash."""
+        title = getattr(engagement, "topic_title", "") or ""
+        if title:
+            return title
         try:
             from channels.state_emoji import concise_task
             return concise_task(engagement.task or "")
@@ -1378,6 +1383,43 @@ class ClaudeCodeDriver(DriverProtocol):
                     engagement_id[:8], status, exc,
                 )
         await ctrl.submit_status(status, rev)
+
+    async def note_ask_waiting(self, engagement_id: str) -> None:
+        """W-R2: a successfully POSTED ask/anchor means the ball is now with the
+        operator → ⏳ waiting for your reply. Driven from the ask LIFECYCLE (not
+        the turn ``result``), because ``ask()`` blocks the subprocess for the
+        whole time the operator owns the turn — so without this the summary
+        would read ⚙️ working the entire wait. Acquires the next monotonic
+        revision so it totally-orders against the settlement recompute below."""
+        from drivers.summary_controller import STATUS_WAITING_REPLY
+        await self._summary_status_transition(engagement_id, STATUS_WAITING_REPLY)
+
+    async def recompute_engagement_status(self, engagement_id: str) -> None:
+        """W-R2: on ask/anchor SETTLEMENT, recompute the summary status from the
+        REMAINING open questions — stay ⏳ waiting while any question is still
+        open; return to ⚙️ working only when none remain AND the turn is still
+        running. A terminal status stays absolute (``submit_status`` rejects any
+        later transition). Each transition acquires a fresh revision, so the
+        linearization pin (registration → waiting → THEN settlement) guarantees
+        a fast tap during the post window can never leave the summary
+        stuck-waiting: the recompute's revision is always allocated after the
+        waiting submission's."""
+        from drivers.summary_controller import (
+            STATUS_WAITING_REPLY, STATUS_WORKING,
+        )
+        reg = self._registry
+        open_qs: list[int] = []
+        if reg is not None and hasattr(reg, "open_question_numbers"):
+            try:
+                open_qs = reg.open_question_numbers(engagement_id)
+            except Exception:  # noqa: BLE001 — degrade to "no open questions"
+                open_qs = []
+        if open_qs:
+            await self._summary_status_transition(
+                engagement_id, STATUS_WAITING_REPLY)
+        elif self._turn_running.get(engagement_id):
+            await self._summary_status_transition(
+                engagement_id, STATUS_WORKING)
 
     async def finalize_summary(
         self, engagement: EngagementRecord, outcome: str,
@@ -1602,6 +1644,13 @@ class ClaudeCodeDriver(DriverProtocol):
                 await close(engagement.id, n)
             except Exception:  # noqa: BLE001
                 logger.debug("close_open_question (anchor) failed", exc_info=True)
+        # W-R2: recompute the summary status from the remaining open questions
+        # (still ⏳ waiting while another question is open; ⚙️ working once none
+        # remain and the turn is running).
+        try:
+            await self.recompute_engagement_status(engagement.id)
+        except Exception:  # noqa: BLE001 — status recompute is advisory
+            logger.debug("recompute after anchor settle failed", exc_info=True)
         return amid
 
     def set_engagement_reply_anchor(

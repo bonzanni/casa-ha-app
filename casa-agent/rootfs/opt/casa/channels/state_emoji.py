@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 
-from text_util import truncate_for_topic
+from text_util import is_unsafe_text, truncate_for_topic
 
 # §6.3 state emoji.
 STATE_EMOJI: dict[str, str] = {
@@ -75,6 +75,37 @@ def concise_task(task: str) -> str:
     s = _ARTICLE_RE.sub("", s)
     s = _TRAILING_PUNCT_RE.sub("", s).rstrip()
     return truncate_for_topic(s, byte_budget=U3_TASK_BYTE_BUDGET)
+
+
+# W-R6 (v0.81.0): an engager may supply a short 2-3 word ``topic_title`` on
+# engage_executor. It is normalized ONCE at ingest, persisted on the
+# EngagementRecord, and shared by the topic-name state edit AND the live
+# summary title — a single source. ~24 chars / 3 words, word-boundary capped.
+TOPIC_TITLE_CHAR_CAP = 24
+TOPIC_TITLE_WORD_CAP = 3
+
+
+def normalize_topic_title(raw: object) -> str:
+    """Normalize an OPTIONAL engager-supplied ``topic_title`` (W-R6).
+
+    Rejects UNSAFE-TEXT (control/bidi codepoints incl. newlines — the v0.78
+    predicate) by returning ``""`` so the caller falls back to a Casa-derived
+    label. A safe title is capped to ~24 chars / 3 words at a WORD boundary.
+    Returns ``""`` for a non-str, blank, or unsafe value."""
+    if not isinstance(raw, str):
+        return ""
+    s = raw.strip()
+    if not s or is_unsafe_text(s):
+        return ""
+    words = s.split()
+    if len(words) > TOPIC_TITLE_WORD_CAP:
+        s = " ".join(words[:TOPIC_TITLE_WORD_CAP])
+    if len(s) > TOPIC_TITLE_CHAR_CAP:
+        head = s[:TOPIC_TITLE_CHAR_CAP]
+        if " " in head:
+            head = head.rsplit(" ", 1)[0]
+        s = head.rstrip()
+    return s
 
 
 def compose_topic_title(*, state: str, short_task: str) -> str:
