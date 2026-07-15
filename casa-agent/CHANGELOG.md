@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.80.0] - 2026-07-15
+
+Voice-fleet hardening: generic delegation, session, and ingress safety
+improvements that let a second voice agent run alongside the butler without
+crossing wires. No configuration change is required; three new options are
+available for tuning.
+
+### Security
+
+- Delegation is now authorized against the calling agent's declared delegates:
+  an agent can only hand off to the specialists it is configured to use, and
+  the check is keyed to the agent actually running (not a parent it was invoked
+  from). Undeclared hand-offs are refused.
+- Voice and webhook entry points now only serve agents that declare the
+  matching channel. An agent meant for private text channels can no longer be
+  reached from a voice satellite, even if a pipeline is misconfigured.
+- Conversation continuity is scoped per agent: two voice agents sharing one
+  device can no longer resume each other's conversations. (Existing voice
+  sessions reset once on upgrade.)
+
+### Added
+
+- Voice-originated hand-offs run under a turn budget: the agent speaks a brief
+  "one moment" and, if a specialist can't answer in time, gives a spoken
+  fallback instead of silently timing out.
+- Delegated agents can declare required plugins/tools; a missing dependency
+  refuses the hand-off instead of answering without its knowledge source.
+- Limits on concurrent specialist work per voice device and overall, with
+  per-agent usage/cost logging and a configurable cost alert.
+- New options: `voice_turn_budget_seconds` (default 27), `specialist_max_concurrency`
+  (default 2), `specialist_cost_alert_threshold` (default 5.0).
+
 ## [0.78.1] - 2026-07-14
 
 ### Fixed
