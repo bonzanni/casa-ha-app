@@ -49,6 +49,18 @@ _RECEIPT_COPY = "📥 Received — I'll get to this after the current step."
 _OPEN_Q_EXPIRED_SUFFIX = "\n⌛ expired — answer by text below"
 # §4 free-text anchor: appended when the next operator message answers it.
 _OPEN_Q_ANSWERED_SUFFIX = "\n✅ answered below"
+# §A3(b) terminal finalize: a live anchor stranded by /cancel or /complete is
+# settled (never left visually open forever) with an outcome-appropriate copy.
+_OPEN_Q_CANCELLED_SUFFIX = "\n🛑 engagement ended — this question is closed"
+# §A3(b) staged re-anchor markers (plain text, no keyboard): step-4 settles the
+# OLD copy pointing down to the re-posted question; the step-3 persist-failure
+# fallback settles the NEW copy pointing up to the still-live original.
+_OPEN_Q_REPOSTED_BELOW = "↪ question re-posted below ↓"
+_OPEN_Q_SEE_ABOVE = "↪ see the question above"
+# §A3(b) retry-owner bounded backoff (Sol r13-1): a FAILED latch-consuming pass
+# self-reschedules 5s → 30s → 300s (capped, repeated) indefinitely until the
+# latch clears via success / promotion / terminal settlement / a boundary win.
+_REANCHOR_BACKOFF: tuple[float, ...] = (5.0, 30.0, 300.0)
 _EVICTION_COPY = (
     "⚠️ Dropped in favor of your redirect — resend if still relevant."
 )
@@ -655,12 +667,17 @@ class ClaudeCodeDriver(DriverProtocol):
         pin_topic_message: Callable[[int, int], Awaitable[bool]] | None = None,
         registry: Any = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        reanchor_retry_sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self._engagements_root = engagements_root
         # W-R1 (v0.81.0): injectable clock for the confirmed-edit settle retry
         # (``confirmed_settle_edit``). Kept injectable so tests stay fast and
         # NEVER patch ``<module>.asyncio.sleep`` (the shared module attribute).
         self._sleep = sleep
+        # §A3(b) retry owner: a SEPARATE injectable clock for the re-anchor retry
+        # backoff, so a test can record its schedule without polluting the
+        # settle-gate's ``_sleep`` recorder. Defaults to ``sleep``.
+        self._reanchor_retry_sleep = reanchor_retry_sleep or sleep
         # ``send_to_topic`` doubles as the relay's ``send_message`` primitive:
         # casa_core wires it to return the posted Telegram message_id (the relay
         # needs it to edit the rolling message), while notice/warning callers
@@ -760,6 +777,24 @@ class ClaudeCodeDriver(DriverProtocol):
         # ingress; cleared SYNCHRONOUSLY (no lock) at durable ownership and on
         # every terminal failure path. Memory-only, dropped at teardown.
         self._ask_inflight: dict[str, str] = {}
+        # v0.83.0 (§A3(b), Sol r10-1/r11-1/r13-1): the per-engagement re-anchor-due
+        # LATCH — the standing OBLIGATION to keep the oldest unanswered anchor LAST.
+        # SET when a re-anchor pass fails/aborts or is suppressed by a reservation
+        # that then rolls back; CONSUMED (checked + cleared, only on a True pass)
+        # at EVERY turn boundary (result-after-on_turn_end, spawn-without-result,
+        # terminal finalize, and the rollback/non-delivery completion itself).
+        self._reanchor_due: set[str] = set()
+        # ONE retry task per engagement (Sol r13-1 note 1): a FAILED latch-consuming
+        # pass is its own retry owner — it self-reschedules with bounded backoff
+        # (injectable) until the latch clears (success / promotion / terminal
+        # settlement) or a boundary consumer beats it. Double-arm is a no-op;
+        # CancelledError terminates WITHOUT rescheduling; cancelled at teardown.
+        self._reanchor_retry_tasks: dict[str, asyncio.Task] = {}
+        # §A3(b) boot reconciliation owner (Sol r6-3): readiness-gated reconcile
+        # tasks for refused/terminal-with-questions records (attached records
+        # retain theirs in ``self._tasks``). Retained here so they are not GC'd
+        # before the Telegram-readiness barrier lifts; each self-removes on done.
+        self._boot_reconcile_tasks: list[asyncio.Task] = []
         # F-EXPIRE (v0.83.0, A2a): operator-away suspend state. ``_operator_away``
         # is SET on ask expiry (generation-CAS, ``note_operator_away``) and
         # CLEARED on the next durable inbound operator envelope; while set, every
@@ -1001,6 +1036,12 @@ class ClaudeCodeDriver(DriverProtocol):
         # §A3(c): drop the ask-maintenance lock + ingress marker on teardown.
         self._ask_maint_locks.pop(engagement.id, None)
         self._ask_inflight.pop(engagement.id, None)
+        # §A3(b): drop the re-anchor-due latch + cancel any retry-owner task
+        # (CancelledError terminates it without rescheduling).
+        self._reanchor_due.discard(engagement.id)
+        retry_task = self._reanchor_retry_tasks.pop(engagement.id, None)
+        if retry_task is not None and not retry_task.done():
+            retry_task.cancel()
         # F-EXPIRE: drop the operator-away suspend state on teardown.
         self._operator_away.pop(engagement.id, None)
         self._away_refusals.pop(engagement.id, None)
@@ -1160,7 +1201,12 @@ class ClaudeCodeDriver(DriverProtocol):
         self._last_turn_ts[engagement.id] = time.time()
         return True
 
-    def _spawn_background_tasks(self, engagement: EngagementRecord) -> None:
+    def _spawn_background_tasks(
+        self, engagement: EngagementRecord, *,
+        reconcile_snapshot: list[dict] | None = None,
+        reconcile_claimed: set[str] | None = None,
+        telegram_ready: "asyncio.Event | None" = None,
+    ) -> None:
         # Sol r2-B6: boot replay calls this DIRECTLY (not start), so the inbound
         # spool, reply-text set, epoch tracker AND the spool recovery all live
         # here — a resumed engagement gets the same wiring as a fresh one.
@@ -1261,12 +1307,77 @@ class ClaudeCodeDriver(DriverProtocol):
         # keeps a fresh same-process ask — which registers a NEW numbered entry
         # concurrently — out of the settle set (review I1: a live ask must not
         # suppress settling genuinely-stale prior-process keyboards).
-        attach_open_qs = list(getattr(engagement, "open_questions", ()) or ())
-        if attach_open_qs:
-            tasks.append(asyncio.create_task(
-                self.reconcile_open_questions(engagement, attach_open_qs)))
+        #
+        # §A3(b) boot reconciliation owner (Sol r6-3/r7-3/4/r10-3): when casa_core
+        # passes a PRE-SERVICE snapshot + shared claimed-set + the Telegram
+        # readiness event, this attached record CLAIMS itself (exactly one
+        # reconciler per record per boot) and its reconcile EXECUTION is gated on
+        # channel readiness — so its confirmed settle edits never fire against a
+        # ``None`` bot. Direct/legacy callers (driver unit tests, fresh start with
+        # no snapshot) keep the immediate attach-time read + ungated schedule.
+        if reconcile_snapshot is not None or reconcile_claimed is not None \
+                or telegram_ready is not None:
+            snap = (reconcile_snapshot if reconcile_snapshot is not None
+                    else list(getattr(engagement, "open_questions", ()) or ()))
+            rt = self.schedule_boot_reconcile(
+                engagement, snap, telegram_ready, claimed=reconcile_claimed)
+            if rt is not None:
+                tasks.append(rt)
+        else:
+            attach_open_qs = list(
+                getattr(engagement, "open_questions", ()) or ())
+            if attach_open_qs:
+                tasks.append(asyncio.create_task(
+                    self.reconcile_open_questions(engagement, attach_open_qs)))
 
         self._tasks[engagement.id] = tasks
+
+    def schedule_boot_reconcile(
+        self, engagement: EngagementRecord, snapshot: list[dict],
+        telegram_ready: "asyncio.Event | None", *,
+        claimed: set[str] | None = None,
+    ) -> "asyncio.Task | None":
+        """§A3(b) boot reconciliation owner: schedule a readiness-gated reconcile
+        of the record's PRE-SERVICE open-questions ``snapshot``. CLAIMS the record
+        via the shared ``claimed`` set (exactly one reconciler per record per
+        boot — a record already claimed returns ``None``). An empty snapshot
+        needs no reconcile (returns ``None``). Retains the task so it isn't GC'd
+        before the readiness barrier lifts; each self-removes on done. Used by
+        BOTH the attached path (``_spawn_background_tasks``) and the casa_core
+        refused/terminal-with-questions path."""
+        eng_id = engagement.id
+        if claimed is not None:
+            if eng_id in claimed:
+                return None
+            claimed.add(eng_id)
+        if not snapshot:
+            return None
+        task = asyncio.create_task(
+            self._reconcile_after_ready(engagement, list(snapshot), telegram_ready),
+            name=f"boot_reconcile:{eng_id[:8]}")
+        self._boot_reconcile_tasks.append(task)
+        task.add_done_callback(self._on_boot_reconcile_done)
+        return task
+
+    def _on_boot_reconcile_done(self, task: asyncio.Task) -> None:
+        try:
+            self._boot_reconcile_tasks.remove(task)
+        except ValueError:
+            pass
+
+    async def _reconcile_after_ready(
+        self, engagement: EngagementRecord, snapshot: list[dict],
+        telegram_ready: "asyncio.Event | None",
+    ) -> None:
+        """§A3(b) channel-readiness barrier (Sol r9-2/r10-3): wait for the
+        Telegram channel's first successful ``_rebuild`` before running the
+        reconcile's confirmed settle edits — otherwise every edit fails closed
+        against a ``None`` bot and the SAME ordering repeats next boot (settle
+        would never happen). The snapshot was taken PRE-SERVICE; execution is
+        deferred here, not in replay (which must not block on the channel)."""
+        if telegram_ready is not None:
+            await telegram_ready.wait()
+        await self.reconcile_open_questions(engagement, snapshot)
 
     async def _spool_send_notice(
         self, engagement: EngagementRecord, text: str, reply_to: int | None,
@@ -1788,13 +1899,23 @@ class ClaudeCodeDriver(DriverProtocol):
         return True
 
     async def _on_reservation_rolled_back(self, engagement_id: str) -> None:
-        """Task-9 SEAM (Sol r10-1/r12-1): a CAS rollback that cleared a still-
-        un-promoted reservation calls this. Task 9 replaces it with the
-        re-anchor-due latch handshake (a last-reservation-clearing rollback with
-        no running turn schedules a compensating, fully-revalidated re-anchor
-        pass). No-op for now — the reservation machinery is complete without it.
-        """
-        return None
+        """§A3(b) consumer (d) — the FOURTH turn boundary (Sol r10-1/r12-1): a CAS
+        rollback that cleared a still-un-promoted reservation lands here. An IDLE
+        engagement whose operator message did NOT become a delivered turn
+        (``/silent``, a rejected originator-only command, a handler cancellation,
+        a spool-rejected message) gets no later ``result``, abnormal spawn, or
+        terminal finalize — so the rollback path itself, AFTER any platform notice
+        it already posted (Sol r12-1 ordering), directly runs the same idempotent,
+        revalidated, maintenance-locked re-anchor pass so the anchor still ends up
+        LAST. SET the latch first (case b: a rollback CAS cleared the last
+        reservation) so a failed pass leaves the obligation armed for the retry
+        owner / a racing boundary consumer (harmlessly — one finds it consumed)."""
+        reg = self._registry
+        engagement = reg.get(engagement_id) if reg is not None else None
+        if engagement is None:
+            return
+        self.set_reanchor_due(engagement_id)
+        await self._consume_reanchor(engagement)
 
     async def _promote_answer_on_enqueue(
         self, engagement: EngagementRecord,
@@ -1812,6 +1933,11 @@ class ClaudeCodeDriver(DriverProtocol):
         # Consume the reservation regardless of whether an anchor was found —
         # promotion is the reservation's terminal state (Sol r9-1).
         self._answer_reservations.pop(eid, None)
+        # §A3(b) latch-clear discipline (Sol r13-1): PROMOTION (the question got
+        # answered) is one of the three latch-clearing events — discharge the
+        # re-anchor obligation and retire the retry owner.
+        self._reanchor_due.discard(eid)
+        self._retire_reanchor_retry(eid)
         if anchor is None:
             return None
         n = anchor.get("n")
@@ -1831,6 +1957,7 @@ class ClaudeCodeDriver(DriverProtocol):
 
     async def _settle_ledger_entry(
         self, rec: EngagementRecord, q: dict, *, answered_suffix: bool,
+        override_suffix: str | None = None,
     ) -> int | None:
         """Settle ONE open-question entry's CURRENT copy plus every staged
         ``stale_mids`` copy, honoring the entry-removal invariant (§A3, Sol r5-3):
@@ -1858,9 +1985,13 @@ class ClaudeCodeDriver(DriverProtocol):
                     logger.debug(
                         "mark_question_answered retry failed (n=%s)", n,
                         exc_info=True)
-        suffix = (
-            _OPEN_Q_ANSWERED_SUFFIX if answered_suffix else _OPEN_Q_EXPIRED_SUFFIX
-        )
+        if override_suffix is not None:
+            suffix = override_suffix
+        else:
+            suffix = (
+                _OPEN_Q_ANSWERED_SUFFIX if answered_suffix
+                else _OPEN_Q_EXPIRED_SUFFIX
+            )
         display = q.get("text") or (f"Q{n}:" if n is not None else "")
         text = f"{display}{suffix}"
         cur_mid = q.get("tg_message_id")
@@ -2392,6 +2523,249 @@ class ClaudeCodeDriver(DriverProtocol):
             logger.debug("recompute after anchor settle failed", exc_info=True)
         return amid
 
+    # -- v0.83.0 (§A3(b)) turn-end re-anchor: staged flow + latch + retry owner -
+    def set_reanchor_due(self, engagement_id: str) -> None:
+        """SET the re-anchor-due latch (idempotent). The standing OBLIGATION to
+        keep the oldest unanswered anchor LAST, consumed at every turn boundary
+        (§A3(b), Sol r10-1/r11-1). Set by the reservation-rollback consumer and
+        by any boundary pass that fails/aborts."""
+        self._reanchor_due.add(engagement_id)
+
+    async def _consume_reanchor(self, engagement: EngagementRecord) -> None:
+        """Run the re-anchor pass at a turn boundary and reconcile the latch +
+        retry owner (§A3(b), Sol r13-1). A True pass (obligation met — nothing
+        owed, already-last, or a successful staged re-anchor) CLEARS the latch and
+        RETIRES the retry owner; a False pass (persist failure, post/wire failure)
+        SETS the latch and ARMS the retry owner. The pass is idempotent and fully
+        revalidated, so a concurrent boundary consumer racing it is harmless —
+        one of them finds the obligation already discharged."""
+        eng_id = engagement.id
+        ok = await self._reanchor_pass(engagement)
+        if ok:
+            self._reanchor_due.discard(eng_id)
+            self._retire_reanchor_retry(eng_id)
+        else:
+            self._reanchor_due.add(eng_id)
+            self._arm_reanchor_retry(engagement)
+
+    async def _reanchor_pass(self, engagement: EngagementRecord) -> bool:
+        """§A3(b) staged turn-end re-anchor — ANCHORS ONLY. Keep the oldest
+        UNANSWERED anchor the LAST item in the topic. Returns ``True`` when the
+        latch MAY clear (nothing owed / obligation met), ``False`` when a retry is
+        owed. Runs under the per-engagement ask-maintenance lock (shared with
+        ``_settle_open_anchor`` and the ingress reservation; NEVER acquired while
+        holding the sequencer lock)."""
+        eng_id = engagement.id
+        async with self.ask_maintenance_lock(eng_id):
+            return await self._reanchor_pass_locked(engagement)
+
+    async def _reanchor_pass_locked(self, engagement: EngagementRecord) -> bool:
+        eng_id = engagement.id
+        reg = self._registry
+        # Select the oldest UNANSWERED, unreserved anchor (effective view: not
+        # answered ∪ overlay, not reserved). No such anchor ⇒ nothing owed.
+        anchor = self._oldest_unanswered_anchor(eng_id, exclude_reserved=True)
+        if anchor is None:
+            return True
+        n = anchor.get("n")
+        old_mid = anchor.get("tg_message_id")
+        seq = self._sequencers.get(eng_id)
+        if seq is None:
+            # No sequencer to measure high-water / post through — cannot
+            # re-anchor. Treat as nothing we can do (degraded); the boot
+            # reconciler is the eventual backstop.
+            return True
+        hw = seq.high_water
+        # Already LAST (nothing posted below it this turn) ⇒ nothing owed. A
+        # ``None`` high-water means the sequencer recorded no post at/after the
+        # anchor, so it is trivially last too.
+        if old_mid is not None and (hw is None or old_mid >= hw):
+            return True
+
+        body = anchor.get("text") or (f"Q{n}:" if n is not None else "")
+
+        # Step 1 — STAGE (strict): stale_mids += [old_mid]. A raise aborts with
+        # NOTHING on the wire (return False — retry owed).
+        if old_mid is not None and n is not None:
+            stage = getattr(reg, "stage_stale_mid", None) if reg is not None else None
+            if stage is not None:
+                try:
+                    await stage(eng_id, n, old_mid)
+                except Exception:  # noqa: BLE001 — strict stage failed
+                    logger.warning(
+                        "engagement %s: re-anchor stage_stale_mid failed (n=%s) "
+                        "— aborting, nothing on wire", eng_id[:8], n,
+                        exc_info=True)
+                    return False
+
+        # Step 2 — POST the new anchor copy through the sequencer with a
+        # ``revalidate`` hook that re-checks (under the sequencer lock,
+        # immediately before the send) that the anchor is STILL the oldest
+        # unanswered+unreserved one (Sol r8-2): an answer that landed during the
+        # awaited step-1 stage DECLINES the send.
+        declined = False
+
+        def _revalidate() -> bool:
+            nonlocal declined
+            cur = self._oldest_unanswered_anchor(eng_id, exclude_reserved=True)
+            still = cur is not None and cur.get("n") == n
+            if not still:
+                declined = True
+            return still
+
+        new_mid = await seq.post_discrete(body, revalidate=_revalidate)
+        if new_mid is None:
+            # Un-stage best-effort (a failed un-stage leaves an overlap-tolerant
+            # stale_mid — reconciliation tolerates the overlap).
+            await self._best_effort_unstage(eng_id, n, old_mid)
+            if declined:
+                # The answer won — nothing owed.
+                return True
+            # Wire failure — retry owed.
+            return False
+
+        # Step 3 — STRICT-PERSIST tg_message_id = new_mid. A raise settles the
+        # NEW copy to '↪ see the question above' (confirmed-gate, best-effort,
+        # plain text) and aborts; the original stays live and tracked.
+        update = (getattr(reg, "update_question_mid", None)
+                  if reg is not None else None)
+        if update is not None and n is not None:
+            try:
+                await update(eng_id, n, new_mid)
+            except Exception:  # noqa: BLE001 — strict persist failed
+                logger.warning(
+                    "engagement %s: re-anchor update_question_mid failed (n=%s) "
+                    "— settling the new copy 'see above'", eng_id[:8], n,
+                    exc_info=True)
+                await self._confirm_settle_mid(
+                    engagement, new_mid, f"{body}\n{_OPEN_Q_SEE_ABOVE}", n)
+                return False
+
+        # Step 4 — SETTLE-EDIT the OLD copy to '↪ question re-posted below ↓'
+        # (confirmed-gate). ONLY on a confirmed edit un-stage old_mid; an
+        # unconfirmed edit retains the stale_mid for boot reconciliation — the
+        # OBLIGATION is already met (the question is now LAST at new_mid).
+        if old_mid is not None:
+            old_confirmed = await self._confirm_settle_mid(
+                engagement, old_mid, f"{body}\n{_OPEN_Q_REPOSTED_BELOW}", n)
+            if old_confirmed and n is not None:
+                await self._best_effort_unstage(eng_id, n, old_mid)
+        return True
+
+    async def _best_effort_unstage(
+        self, engagement_id: str, n: int | None, mid: int | None,
+    ) -> None:
+        """Best-effort strict un-stage of a stale mid (§A3(b) overlap-tolerance):
+        a failure leaves a stale_mid pointing at a message that may ALSO still be
+        the live ``tg_message_id`` — reconciliation tolerates the overlap."""
+        reg = self._registry
+        if reg is None or n is None or mid is None:
+            return
+        unstage = getattr(reg, "unstage_stale_mid", None)
+        if unstage is None:
+            return
+        try:
+            await unstage(engagement_id, n, mid)
+        except Exception:  # noqa: BLE001 — overlap-tolerant
+            logger.debug(
+                "engagement %s: re-anchor un-stage failed (n=%s mid=%s)",
+                engagement_id[:8], n, mid, exc_info=True)
+
+    def _arm_reanchor_retry(self, engagement: EngagementRecord) -> None:
+        """Arm the ONE retry-owner task for this engagement (§A3(b), Sol r13-1).
+        A double-arm while a task already runs is a NO-OP. The task self-retires
+        (removing its dict entry) via a done-callback."""
+        eng_id = engagement.id
+        existing = self._reanchor_retry_tasks.get(eng_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._reanchor_retry_loop(engagement),
+            name=f"reanchor_retry:{eng_id[:8]}")
+        self._reanchor_retry_tasks[eng_id] = task
+        task.add_done_callback(
+            lambda t, eid=eng_id: self._on_reanchor_retry_done(eid, t))
+
+    def _on_reanchor_retry_done(
+        self, engagement_id: str, task: asyncio.Task,
+    ) -> None:
+        # Remove the dict entry only if it still points at THIS task (a fresh
+        # arm may have replaced it). A completed task leaves no reference.
+        if self._reanchor_retry_tasks.get(engagement_id) is task:
+            self._reanchor_retry_tasks.pop(engagement_id, None)
+
+    def _retire_reanchor_retry(self, engagement_id: str) -> None:
+        """Cancel + drop the retry owner (a boundary consumer / promotion /
+        terminal settle discharged the obligation)."""
+        task = self._reanchor_retry_tasks.pop(engagement_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _reanchor_retry_loop(self, engagement: EngagementRecord) -> None:
+        """Bounded-backoff self-rescheduling retry owner (§A3(b), Sol r13-1):
+        loop until a True pass clears the latch (success / the question got
+        answered elsewhere). ``CancelledError`` terminates WITHOUT rescheduling
+        (engagement teardown / a boundary consumer beat it). The pass is
+        idempotent + revalidated, so overlap with a boundary consumer is
+        harmless."""
+        eng_id = engagement.id
+        idx = 0
+        try:
+            while eng_id in self._reanchor_due:
+                delay = _REANCHOR_BACKOFF[min(idx, len(_REANCHOR_BACKOFF) - 1)]
+                idx += 1
+                await self._reanchor_retry_sleep(delay)
+                if eng_id not in self._reanchor_due:
+                    break
+                ok = await self._reanchor_pass(engagement)
+                if ok:
+                    self._reanchor_due.discard(eng_id)
+                    break
+        except asyncio.CancelledError:
+            raise
+
+    async def settle_all_open_questions(
+        self, engagement: EngagementRecord, outcome: str,
+    ) -> None:
+        """§A3(b) consumer (c) — terminal engagement finalize SETTLES every
+        remaining open-question entry (raw view) instead of re-anchoring, closing
+        the latent gap where ``/cancel``/``/complete`` left a live free-text
+        anchor visually open forever. Answered entries get the ✅ copy; unanswered
+        ones an outcome-appropriate copy (🛑 ended for cancelled/error, ⌛ expired
+        otherwise). The entry-removal invariant is honored. Clears the latch +
+        cancels the retry owner (the terminal settle IS the obligation's
+        discharge). Best-effort per entry — never raises into the finalize funnel.
+        Called getattr-tolerantly by ``tools._finalize_engagement``."""
+        eng_id = engagement.id
+        # Discharge the re-anchor obligation: nothing to keep last once terminal.
+        self._reanchor_due.discard(eng_id)
+        self._retire_reanchor_retry(eng_id)
+        reg = self._registry
+        entries_getter = (getattr(reg, "open_question_entries", None)
+                          if reg is not None else None)
+        if entries_getter is None:
+            return
+        cancelled = outcome in ("cancelled", "error", "failed")
+        async with self.ask_maintenance_lock(eng_id):
+            for q in list(entries_getter(eng_id)):
+                answered = bool(q.get("answered", False)) or self._overlay_answered(
+                    eng_id, q.get("n"))
+                try:
+                    if answered:
+                        await self._settle_ledger_entry(
+                            engagement, q, answered_suffix=True)
+                    else:
+                        await self._settle_ledger_entry(
+                            engagement, q, answered_suffix=False,
+                            override_suffix=(
+                                _OPEN_Q_CANCELLED_SUFFIX if cancelled
+                                else _OPEN_Q_EXPIRED_SUFFIX),
+                        )
+                except Exception:  # noqa: BLE001 — never abort finalize
+                    logger.warning(
+                        "engagement %s: terminal open-question settle failed "
+                        "(n=%s)", eng_id[:8], q.get("n"), exc_info=True)
+
     def set_engagement_reply_anchor(
         self, engagement_id: str, message_id: int,
     ) -> None:
@@ -2546,6 +2920,12 @@ class ClaudeCodeDriver(DriverProtocol):
             spool = self._inbound.get(eng_id)
             if spool is not None:
                 await spool.on_spawn()
+            if prev is not None:
+                # §A3(b) consumer (b): spawn-without-result — the prior turn died
+                # abnormally (an equally valid turn boundary). Consume the
+                # re-anchor latch AFTER on_spawn so a redelivered survivor never
+                # lands below the re-anchored question.
+                await self._consume_reanchor(engagement)
         elif kind == "turn_start":
             # Fresh turn — drop the prior turn's reply-text de-dup set, mark the
             # turn running (receipts are now due for new inbound), and consume
@@ -2640,6 +3020,11 @@ class ClaudeCodeDriver(DriverProtocol):
             spool = self._inbound.get(eng_id)
             if spool is not None:
                 await spool.on_turn_end()
+            # §A3(b) consumer (a) — the ordinary turn-end re-anchor pass, pinned
+            # to run AFTER ``spool.on_turn_end()`` (Sol r13-2): a notice the spool
+            # flushes at turn end must land BEFORE a just-re-anchored question, so
+            # the re-anchored anchor stays LAST.
+            await self._consume_reanchor(engagement)
             # §5: a finished turn ⇒ the ball is with the operator (⏳ waiting for
             # your reply). Stop the elapsed tick + mandatory turn-end flush.
             summary = self._summaries.get(eng_id)

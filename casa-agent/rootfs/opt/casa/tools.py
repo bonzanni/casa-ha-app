@@ -3294,6 +3294,21 @@ async def _finalize_engagement(
                 engagement.id[:8], exc,
             )
 
+    # v0.83.0 (§A3(b), consumer c): SETTLE every remaining open-question anchor
+    # while the topic is STILL OPEN — closing the latent gap where /cancel or
+    # /complete with a live free-text anchor left it visually open forever. Also
+    # clears the engagement's re-anchor latch + cancels its retry owner. Driver-
+    # methodized + getattr-tolerant (in_casa / legacy drivers simply don't
+    # engage). Never aborts the finalize funnel.
+    if driver is not None and hasattr(driver, "settle_all_open_questions"):
+        try:
+            await driver.settle_all_open_questions(engagement, outcome)
+        except Exception as exc:  # noqa: BLE001 — never abort finalize
+            logger.warning(
+                "finalize engagement %s: open-question settle failed: %s",
+                engagement.id[:8], exc,
+            )
+
     # [AR-4] Topic-retention ledger (2026-07-10 design): record the topic
     # for the retention sweep the moment the record flips terminal — both
     # drivers, all outcomes, regardless of whether close_topic below

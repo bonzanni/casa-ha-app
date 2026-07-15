@@ -300,6 +300,14 @@ class TelegramChannel(Channel):
         # capacity=0 also admits every message.
         self._rate_limiter = rate_limiter
         self._app: Application | None = None
+        # v0.83.0 (§A3(b), Sol r10-3): the CHANNEL-READINESS event the boot
+        # open-question reconcilers await. SET at the first successful ``_rebuild``
+        # (``self._app`` becomes usable) — NOT at ``start_all()`` return, since
+        # Telegram deliberately survives a transient bring-up failure and lets its
+        # supervisor retry. Boot replay snapshots pre-service but its confirmed
+        # settle edits must not fire against a ``None`` bot (they would fail closed
+        # and the ledger would never settle). Loop-agnostic since Py3.10.
+        self._ready_event: asyncio.Event = asyncio.Event()
         # r1-1/r1-2 (Sol): turn-owned typing leases. ``_typing_leases`` maps a
         # chat_id to ``{lease_id: monotonic_expiry}``; ``_typing_loops`` holds
         # ONE loop task per chat, running while that chat's lease dict is
@@ -548,6 +556,12 @@ class TelegramChannel(Channel):
 
         # Publish the rebuilt app atomically.
         self._app = app
+
+        # v0.83.0 (§A3(b), Sol r10-3): channel readiness. A successful rebuild
+        # means ``self._app``/``self.bot`` are usable, so the boot open-question
+        # reconcilers may now run their confirmed settle edits. Idempotent (a
+        # later rebuild re-sets an already-set event) — never cleared.
+        self._ready_event.set()
 
         # L6 (v0.52.0): a successful rebuild proves token+transport are
         # healthy (initialize() performs getMe and raises InvalidToken on a
@@ -2115,6 +2129,14 @@ class TelegramChannel(Channel):
         if self._bot is not None:
             return self._bot
         return self._app.bot if self._app is not None else None
+
+    @property
+    def ready_event(self) -> asyncio.Event:
+        """v0.83.0 (§A3(b), Sol r10-3): the channel-readiness event the boot
+        open-question reconcilers await — set at the first successful
+        ``_rebuild`` (transport up, ``bot`` usable). Exposed so casa_core can
+        gate reconcile EXECUTION on transport readiness without blocking replay."""
+        return self._ready_event
 
     # ------------------------------------------------------------------
     # Engagement topic helpers

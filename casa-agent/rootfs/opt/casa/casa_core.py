@@ -392,6 +392,7 @@ async def healthz(_request: web.Request) -> web.Response:
 async def replay_undergoing_engagements(
     *, registry, driver, executor_registry=None,
     engagements_root: str = "/data/engagements",
+    telegram_ready=None,
 ) -> None:
     """On Casa boot: reconstruct s6 services for UNDERGOING claude_code engagements.
 
@@ -415,6 +416,33 @@ async def replay_undergoing_engagements(
     # refused resume — and MUST be excluded from the start_service and
     # background-task loops below, not merely skipped during rendering.
     refused_ids: set[str] = set()
+
+    # v0.83.0 (§A3(b), Sol r6-3/r7-3/4): the BOOT open-question reconciliation
+    # owner. Take a PRE-SERVICE snapshot of every claude_code record that has
+    # outstanding raw open_questions AND a topic — REGARDLESS of terminal status
+    # (the ownership predicate; the summary-adoption-failure path mark_error's the
+    # record TERMINAL before refused_ids is even consulted, so a non-terminal
+    # filter would miss exactly the case that must still settle). Snapshotting
+    # HERE, before any service start / background-task spawn, preserves the
+    # invariant that a fresh same-process ask registered by a just-resumed CLI is
+    # never captured + expired. A shared claimed-set guarantees exactly one
+    # reconciler per record per boot (the attached driver pass OR the casa_core
+    # pass below — never both).
+    reconcile_snapshots: dict[str, list[dict]] = {}
+    reconcile_claimed: set[str] = set()
+    _seen_snapshot_ids: set[str] = set()
+    for _rec in (list(registry.active_and_idle())
+                 + list(registry.terminal_records())):
+        if _rec.id in _seen_snapshot_ids:
+            continue
+        _seen_snapshot_ids.add(_rec.id)
+        if getattr(_rec, "driver", None) != "claude_code":
+            continue
+        if getattr(_rec, "topic_id", None) is None:
+            continue
+        _oq = list(getattr(_rec, "open_questions", ()) or ())
+        if _oq:
+            reconcile_snapshots[_rec.id] = [dict(q) for q in _oq]
 
     async def _refuse_brief_resume(
         rec, reason: str, *, kind: str = "refuse_teardown_failed",
@@ -452,6 +480,28 @@ async def replay_undergoing_engagements(
         s6_rc.remove_service_dir(
             svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT, engagement_id=rec.id,
         )
+
+    # §A3(b) boot reconciliation owner — TERMINAL records (Sol r7-3): terminal
+    # records are DISJOINT from ``undergoing`` (they never attach), so schedule
+    # their readiness-gated reconcile HERE, BEFORE the compile lock — the lock's
+    # fast-path return (no undergoing + no orphans) would otherwise skip the tail
+    # of this function and a terminal summary-adoption-failure record with a live
+    # question would never settle. Claimed so the refused-undergoing pass below
+    # never double-settles.
+    _schedule_reconcile = getattr(driver, "schedule_boot_reconcile", None)
+    if _schedule_reconcile is not None:
+        for _trec in registry.terminal_records():
+            _tsnap = reconcile_snapshots.get(_trec.id)
+            if not _tsnap or _trec.id in reconcile_claimed:
+                continue
+            try:
+                _schedule_reconcile(
+                    _trec, _tsnap, telegram_ready, claimed=reconcile_claimed)
+            except Exception as exc:  # noqa: BLE001 — best-effort per record
+                logger.warning(
+                    "boot replay: terminal open-question reconcile for %s "
+                    "failed to schedule: %s", _trec.id[:8], exc,
+                )
 
     async with s6_rc._compile_lock:
         # 1. Orphan sweep — dirs for non-UNDERGOING engagements, remove them.
@@ -727,12 +777,42 @@ async def replay_undergoing_engagements(
         # — a summary-less running engagement is no longer possible. Background
         # tasks build the controller that adopts the (now-guaranteed) summary id.
         try:
-            driver._spawn_background_tasks(rec)
+            # §A3(b): thread the PRE-SERVICE snapshot + shared claimed-set + the
+            # Telegram-readiness event so the attached record's reconcile CLAIMS
+            # itself (one reconciler/boot) and runs only after channel readiness.
+            driver._spawn_background_tasks(
+                rec,
+                reconcile_snapshot=reconcile_snapshots.get(rec.id),
+                reconcile_claimed=reconcile_claimed,
+                telegram_ready=telegram_ready,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "boot replay: background tasks for %s failed: %s",
                 rec.id[:8], exc,
             )
+
+    # §A3(b) boot reconciliation owner — REFUSED-undergoing records (Sol r7-3):
+    # an undergoing record that REFUSED attachment (missing workspace/artifacts,
+    # refused brief resume, summary-adoption failure that mark_error'd it) never
+    # got the attached ``_spawn_background_tasks`` reconcile pass and would stay
+    # visibly live forever. casa_core owns whatever remains UNCLAIMED (terminal
+    # records were already claimed pre-lock; attached records claimed themselves).
+    if _schedule_reconcile is not None:
+        for _eid, _snap in reconcile_snapshots.items():
+            if _eid in reconcile_claimed:
+                continue
+            _rec = registry.get(_eid)
+            if _rec is None:
+                continue
+            try:
+                _schedule_reconcile(
+                    _rec, _snap, telegram_ready, claimed=reconcile_claimed)
+            except Exception as exc:  # noqa: BLE001 — best-effort per record
+                logger.warning(
+                    "boot replay: casa_core-owned open-question reconcile for "
+                    "%s failed to schedule: %s", _eid[:8], exc,
+                )
 
 
 async def reconcile_terminal_spools(*, registry, driver) -> None:
@@ -2114,11 +2194,21 @@ async def main() -> None:
     agent_mod.active_runtime = runtime
 
     # Plan 4a: boot replay for claude_code engagements.
+    # v0.83.0 (§A3(b), Sol r9-2/r10-3): the open-question reconcilers are
+    # scheduled here (pre-service snapshot) but their EXECUTION is gated on the
+    # Telegram channel's readiness event — replay runs long before the channel
+    # starts (start_all() below), and an ungated attach-time reconcile would fire
+    # its confirmed settle edits against a None bot and fail closed. The channel
+    # sets this at its first successful _rebuild; a None channel yields no event
+    # (reconciles then run ungated, matching the no-Telegram deploy).
+    _telegram_ready = (
+        telegram_channel.ready_event if telegram_channel is not None else None)
     try:
         await replay_undergoing_engagements(
             registry=engagement_registry,
             driver=claude_code_driver,
             executor_registry=executor_registry,
+            telegram_ready=_telegram_ready,
         )
     except Exception as exc:  # noqa: BLE001
         logger.error(

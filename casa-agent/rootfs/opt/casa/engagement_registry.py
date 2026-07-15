@@ -977,6 +977,32 @@ class EngagementRegistry:
             await self._commit_open_questions_strict(rec, prev)
             return True
 
+    async def update_question_mid(self, engagement_id: str, number: int,
+                                  new_mid: int) -> bool:
+        """§A3 staged re-anchor step 3: strict-persist an entry's live
+        ``tg_message_id`` to ``new_mid`` (the freshly-posted re-anchor copy).
+        STRICT-persisted (rollback + re-raise like the sibling mutators), so the
+        caller can settle the new copy fail-closed on a raise. Returns ``False``
+        for an unknown engagement/number."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return False
+            prev = rec.open_questions
+            found = False
+            entries: list[dict] = []
+            for q in rec.open_questions:
+                nq = dict(q)
+                if nq.get("n") == number:
+                    found = True
+                    nq["tg_message_id"] = new_mid
+                entries.append(nq)
+            if not found:
+                return False
+            rec.open_questions = tuple(entries)
+            await self._commit_open_questions_strict(rec, prev)
+            return True
+
     def open_question_entries(self, engagement_id: str) -> list[dict]:
         """RAW list copy of every open-question entry — answered or not (§A3).
         Used by the visual settle / boot reconciliation paths, which iterate the
