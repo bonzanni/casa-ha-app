@@ -686,6 +686,60 @@ async def test_anchor_away_retry_returns_recorded_outcome_not_unread(env):
     assert env["broker"].pending(namespace="engagement_ask", scope=eid) == []
 
 
+# ---------------------------------------------------------------------------
+# Sol A2 wave-3, Finding 3: an UNREAD-inbound-refused ask records a refusal
+# OUTCOME (refusal-count-free) on the intent — symmetric with the away-refusal
+# fix — so a same-request_id transport retry reattaches and returns
+# ``unread_inbound`` IMMEDIATELY, never awaiting the dead intent (→ the
+# deferred-post budget → ``delivery_failed``).
+# ---------------------------------------------------------------------------
+
+
+async def test_button_unread_refusal_retry_short_circuits_no_delivery_failed(env):
+    eid = env["rec"].id
+    driver = env["driver"]
+    # An unread operator message is pending → the inbound gate refuses.
+    await driver.spool.enqueue("operator message")
+    assert driver.inbound_unread_depth(eid) > 0
+
+    resp1 = await env["ask"](_FakeRequest(_payload(eid, request_id="u1")))
+    body1 = _body(resp1)
+    assert body1["error"] == "unread_inbound"
+    assert driver.ask_refusals == 1
+
+    # Same-request_id transport retry: reattaches to the RECORDED refusal and
+    # returns unread_inbound immediately — NOT delivery_failed.
+    resp2 = await env["ask"](_FakeRequest(_payload(eid, request_id="u1")))
+    body2 = _body(resp2)
+    assert body2["ok"] is False
+    assert body2["error"] == "unread_inbound"
+    # The recorded outcome is refusal-count-free (a reattach must not re-bump).
+    assert "refusal_count" not in body2
+    assert driver.ask_refusals == 1
+    assert env["broker"].pending(namespace="engagement_ask", scope=eid) == []
+    assert env["ch"].options_keyboards == []
+
+
+async def test_anchor_unread_refusal_retry_short_circuits_no_delivery_failed(env):
+    eid = env["rec"].id
+    driver = env["driver"]
+    await driver.spool.enqueue("operator message")
+    assert driver.inbound_unread_depth(eid) > 0
+
+    resp1 = await env["ask"](_FakeRequest(
+        _payload(eid, request_id="u2", options=[])))
+    assert _body(resp1)["error"] == "unread_inbound"
+
+    resp2 = await env["ask"](_FakeRequest(
+        _payload(eid, request_id="u2", options=[])))
+    body2 = _body(resp2)
+    assert body2["ok"] is False
+    assert body2["error"] == "unread_inbound"       # NOT delivery_failed
+    assert "refusal_count" not in body2
+    assert env["ch"].sent_texts == []
+    assert env["broker"].pending(namespace="engagement_ask", scope=eid) == []
+
+
 async def test_note_operator_away_drives_paused_summary_directly(tmp_path):
     from drivers.summary_controller import STATUS_PAUSED, STATUS_WAITING_REPLY
     drv, rec, ctrl, edits, reg = await _driver_with_summary(tmp_path)

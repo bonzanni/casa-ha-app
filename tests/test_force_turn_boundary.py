@@ -342,6 +342,132 @@ async def test_new_episode_can_fire_again_after_clear(tmp_path):
     assert fake.await_count == 2
 
 
+# ---------------------------------------------------------------------------
+# Sol A2 wave-3, Finding 1: the once-per-episode backstop RE-ARMS on an
+# unverified (False/unknown) outcome so a transient probe failure does not
+# permanently disable it; a VERIFIED (True) outcome latches (no re-fire).
+# ---------------------------------------------------------------------------
+
+
+async def test_unverified_outcome_rearms_backstop(tmp_path):
+    from unittest.mock import AsyncMock
+
+    eid = "eng0000000000000a"
+    drv = _driver(tmp_path)
+    # First force-end returns False (unknown probe); the second returns True.
+    fake = AsyncMock(side_effect=[False, True])
+    drv._force_turn_boundary = fake
+    drv._operator_away[eid] = True
+
+    drv.record_away_refusal(eid)          # 1 — below the threshold
+    drv.record_away_refusal(eid)          # 2 — fires; returns False → re-arm
+    await _drain()
+    assert fake.await_count == 1
+    assert eid not in drv._away_suspend_fired   # unverified → re-armed
+
+    drv.record_away_refusal(eid)          # 3 — re-fires; returns True → latch
+    await _drain()
+    assert fake.await_count == 2
+    assert eid in drv._away_suspend_fired       # verified True → latched
+
+    drv.record_away_refusal(eid)          # 4 — latched, NO re-fire
+    await _drain()
+    assert fake.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Sol A2 wave-3, Finding 2: the post-SIGTERM cleanup handoff is CANCEL-EXEMPT
+# and leak-free — tracked in a dedicated ``_force_cleanups`` set (never
+# ``_tasks[eng_id]``), retired on completion, never cancelled by teardown, and
+# recreating no stale ``_tasks`` entry after teardown popped it.
+# ---------------------------------------------------------------------------
+
+
+async def test_force_cleanup_tracked_in_dedicated_set_not_tasks(tmp_path):
+    import asyncio
+
+    eid = "eng0000000000000b"
+    drv = _driver(tmp_path)
+
+    done = asyncio.Event()
+
+    async def _cleanup():
+        await done.wait()
+        return True
+
+    t = asyncio.ensure_future(_cleanup())
+    drv._register_force_cleanup(eid, t)
+
+    # Tracked in the dedicated set, NOT under _tasks (which teardown cancels).
+    assert t in drv._force_cleanups
+    assert eid not in drv._tasks
+
+    done.set()
+    await asyncio.wait_for(t, timeout=1.0)
+    await _drain()
+    # Retired via add_done_callback — no reference lingers.
+    assert t not in drv._force_cleanups
+    assert not drv._force_cleanups
+
+
+async def test_handoff_after_teardown_leaves_no_stale_tasks_entry(tmp_path):
+    import asyncio
+
+    eid = "eng0000000000000c"
+    drv = _driver(tmp_path)
+    assert eid not in drv._tasks           # teardown already popped it
+
+    async def _cleanup():
+        return True
+
+    t = asyncio.ensure_future(_cleanup())
+    drv._register_force_cleanup(eid, t)
+    # The handoff must NOT recreate a stale _tasks[eng_id] entry (Finding 2c).
+    assert eid not in drv._tasks
+
+    await asyncio.wait_for(t, timeout=1.0)
+    await _drain()
+    assert not drv._force_cleanups
+
+
+async def test_teardown_does_not_cancel_handed_off_cleanup(tmp_path, monkeypatch):
+    import asyncio
+
+    from drivers import s6_rc as _s6
+
+    eid = "eng0000000000000d"
+    drv = _driver(tmp_path)
+
+    gate = asyncio.Event()
+    killed = {"done": False}
+
+    async def _cleanup():
+        await gate.wait()          # simulate the still-running SIGKILL escalation
+        killed["done"] = True
+        return True
+
+    t = asyncio.ensure_future(_cleanup())
+    drv._register_force_cleanup(eid, t)
+
+    # Neutralise the s6/service teardown so cancel() exercises only task handling.
+    async def _anoop(*a, **k):
+        return None
+
+    monkeypatch.setattr(_s6, "stop_service", _anoop)
+    monkeypatch.setattr(_s6, "stop_log_service", _anoop)
+    monkeypatch.setattr(_s6, "remove_service_dir", lambda *a, **k: None)
+    monkeypatch.setattr(_s6, "_compile_and_update_locked", _anoop)
+
+    await drv.cancel(types.SimpleNamespace(id=eid))
+    await _drain()
+
+    # Teardown must NOT cancel the handed-off cleanup — it must finish its kill.
+    assert not t.cancelled()
+    gate.set()
+    assert await asyncio.wait_for(t, timeout=1.0) is True
+    assert killed["done"] is True
+
+
 async def test_abnormal_exit_log_annotated_for_marked_epoch(tmp_path, caplog):
     eid = "eng00000000000003"
     drv = _driver(tmp_path)
@@ -620,14 +746,23 @@ class _FakeCompleted:
 
 
 @pytest.mark.parametrize("stdout,rc,expected", [
+    # Sol A2 wave-3, Finding 1: the REAL ``s6-svstat -o pid`` contract — an UP
+    # service publishes its live leader pid (> 0); a DOWN service publishes
+    # EXACTLY ``-1``. Only those two coherent shapes are trusted.
     ("true true 4242\n", 0, ("up", 4242)),      # up WITH a live pid → up
-    ("false false 0\n", 0, ("down", None)),      # down WITH no pid → down
-    ("false true 0\n", 0, ("unknown", None)),    # respawn-race: up-classified but
-                                                 #   no live pid → not a definite
-                                                 #   status the ladder acts on
+    ("true false 4242\n", 0, ("up", 4242)),     # up (wantedup irrelevant) → up
+    ("false false -1\n", 0, ("down", None)),     # down sentinel → down
+    ("false true -1\n", 0, ("down", None)),      # transitional: leader ALREADY
+                                                 #   gone (pid -1), wanted-up →
+                                                 #   down for turn-boundary
+    ("false false 0\n", 0, ("unknown", None)),   # pid 0 is NOT the down sentinel
+    ("false true 0\n", 0, ("unknown", None)),    # pid 0 → not a definite status
+    ("false false -2\n", 0, ("unknown", None)),  # negative but NOT -1
     ("false false 4242\n", 0, ("unknown", None)),   # down BUT pid present
+    ("true true 0\n", 0, ("unknown", None)),        # up BUT no live pid (<= 0)
+    ("true true -1\n", 0, ("unknown", None)),       # up BUT down-sentinel pid
     ("true garbage 4242\n", 0, ("unknown", None)),  # malformed wantedup
-    ("true true 0\n", 0, ("unknown", None)),        # up BUT no live pid
+    ("garbage true 4242\n", 0, ("unknown", None)),  # malformed up
     ("true true\n", 0, ("unknown", None)),          # missing pid field
     ("true true garbage\n", 0, ("unknown", None)),  # unparseable pid
     ("true true 4242 extra\n", 0, ("unknown", None)),  # too many fields
@@ -636,11 +771,12 @@ class _FakeCompleted:
 async def test_probe_status_and_pid_strict_shapes(
     monkeypatch, stdout, rc, expected,
 ):
-    # Only the two COHERENT shapes are trusted: an ``up`` service WITH a live pid,
-    # or a ``down`` service with none. Every contradictory / malformed / no-live-
-    # pid snapshot (including the ``false true`` respawn-race, which is up-
-    # classified but pidless) reads ("unknown", None) so force_turn_boundary never
-    # signals blind.
+    # Only the two COHERENT shapes are trusted: an ``up`` service WITH a live pid
+    # (> 0), or a ``down`` service publishing the exact ``-1`` sentinel. Every
+    # contradictory / malformed / non-sentinel-pid snapshot (including the
+    # ``false * 0`` pid-zero reads and the ``false true -1`` case, which reads
+    # DOWN because the leader is already gone) is validated against the REAL
+    # s6-svstat pid contract so force_turn_boundary never signals blind.
     monkeypatch.setattr(s6_rc.os.path, "isdir", lambda p: True)
 
     def _run(argv, capture_output=True, text=True):

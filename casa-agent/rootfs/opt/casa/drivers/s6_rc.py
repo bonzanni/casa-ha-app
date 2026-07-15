@@ -389,10 +389,29 @@ async def _probe_status_and_pid(scandir: str) -> tuple[str, int | None]:
     and RESPAWN between them and the ladder would kill the NEW spawn).
 
     Returns ``(status, pid)`` where ``status`` ∈ ``down`` / ``up`` / ``unknown``
-    (same truth table as :func:`_probe_service_down`) and ``pid`` is the live
-    supervised pid (``None`` when down / 0 / unparseable / query failed). The
-    caller uses BOTH fields from this single snapshot so status and pid can never
-    disagree across a respawn boundary."""
+    and ``pid`` is the live supervised pid (``None`` when down). The caller uses
+    BOTH fields from this single snapshot so status and pid can never disagree
+    across a respawn boundary.
+
+    PID CONTRACT (Sol A2 wave-3, Finding 1): pinned to the REAL ``s6-svstat -o
+    pid`` behaviour — an UP service publishes its live leader pid (a positive
+    integer); a DOWN service publishes EXACTLY ``-1`` ("If the service is
+    currently down, -1 is printed instead"). Only the two coherent shapes are
+    trusted:
+
+      - ``true <any> <pid > 0>``           → ``("up", pid)`` (wantedup irrelevant).
+      - ``false <any> -1``                 → ``("down", None)`` — INCLUDING the
+        transitional ``false true -1`` (down, wanted-up: s6 will respawn, but the
+        leader is ALREADY gone, so force_turn_boundary's "down → True" semantics
+        hold). This DIVERGES intentionally from :func:`_probe_service_down`, which
+        classifies ``false true`` as ``up`` (respawn-race): here the ``-1`` pid is
+        positive proof the leader process is extinct, which is exactly the turn
+        boundary the backstop wants.
+      - ANY other shape — pid ``0``, a negative pid other than ``-1``, a
+        non-integer / missing / extra field, a non-boolean up/wantedup, a
+        ``false * <pid > 0>`` (down but pid present) or a ``true * <pid <= 0>``
+        (up but no live pid) — → ``("unknown", None)``, never a definite status
+        the ladder may act on."""
     if not os.path.isdir(scandir):
         return "down", None
     result = await asyncio.to_thread(
@@ -406,29 +425,23 @@ async def _probe_status_and_pid(scandir: str) -> tuple[str, int | None]:
     if len(fields) != 3:
         return "unknown", None
     up, wantedup, pid_s = fields
-    # STRICT field validation (Sol A2 wave-2, Finding 1): a snapshot is trusted
-    # only when its shape is one of the two VALID s6 states — an ``up`` service
-    # with a live pid, or a ``down`` service with none. ``up``/``wantedup`` must
-    # each be the literal s6 boolean (``true``/``false``); anything else (e.g.
-    # ``true garbage N``) is a malformed read, NOT a status the ladder may act
-    # on. The pid must parse; a non-integer pid field also reads unknown.
+    # ``up``/``wantedup`` must each be the literal s6 boolean; anything else
+    # (e.g. ``true garbage N``) is a malformed read. The pid must parse.
     if up not in ("true", "false") or wantedup not in ("true", "false"):
         return "unknown", None
     try:
-        pid: int | None = int(pid_s)
+        pid = int(pid_s)
     except ValueError:
         return "unknown", None
-    if pid <= 0:
-        pid = None
-    status = _classify_updown(up, wantedup)
-    # CROSS-FIELD CONSISTENCY: reject contradictory snapshots. ``down`` WITH a
-    # live pid (``false false 4242``) must NOT read down; ``up`` with no live pid
-    # (``true true 0``) must NOT read up. Either contradiction → ``unknown``,
-    # never a definite status. Only the two coherent shapes pass through.
-    if status == "up":
-        return ("up", pid) if pid is not None else ("unknown", None)
-    if status == "down":
-        return ("down", None) if pid is None else ("unknown", None)
+    if up == "true":
+        # Up service: its live leader pid must be positive. A ``<= 0`` pid
+        # (0 / the -1 down-sentinel) contradicts ``up`` → unknown.
+        return ("up", pid) if pid > 0 else ("unknown", None)
+    # ``up == "false"``: the leader is gone. The ONLY valid down snapshot is the
+    # exact ``-1`` sentinel; any other pid (0, positive, other negatives) is a
+    # malformed / contradictory read.
+    if pid == -1:
+        return "down", None
     return "unknown", None
 
 

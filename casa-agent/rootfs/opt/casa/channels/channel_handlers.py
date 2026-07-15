@@ -573,10 +573,45 @@ def _record_intent_refusal(driver: Any, eng_id: str, request_id: str) -> None:
     driver.cancel_send_intent(eng_id, request_id)  # tombstone (pre-A2 behaviour)
 
 
+def _unread_refusal_payload(copy: str) -> dict:
+    """The refusal-count-FREE ``unread_inbound`` body recorded on the intent for a
+    transport retry (Sol A2 wave-3, Finding 3). The LIVE refusal response carries
+    ``refusal_count`` (a fresh bump); the recorded reattach copy omits it so a
+    retry never re-bumps the counter."""
+    return {"ok": False, "error": "unread_inbound", "message": copy}
+
+
+def _record_intent_unread_refusal(
+    driver: Any, eng_id: str, request_id: str, copy: str,
+) -> None:
+    """Sol A2 wave-3, Finding 3 (symmetric with :func:`_record_intent_refusal`):
+    record the ``unread_inbound`` refusal OUTCOME on the intent instead of a bare
+    cancel. A same-``request_id`` transport retry then hits the reattach path
+    FIRST, reads this recorded outcome, and short-circuits to the SAME refusal —
+    never awaiting the dead intent (→ the deferred-post budget → ``delivery_failed``,
+    anchor) nor re-registering. Degrades to the bare cancel on a driver predating
+    the seam."""
+    fn = getattr(driver, "record_send_intent_refusal", None)
+    if fn is not None:
+        try:
+            fn(eng_id, request_id, _unread_refusal_payload(copy))
+            return
+        except Exception:  # noqa: BLE001 — fall back to the bare tombstone
+            logger.debug("record_send_intent_refusal(unread) failed", exc_info=True)
+    cancel = getattr(driver, "cancel_send_intent", None)
+    if cancel is not None:
+        cancel(eng_id, request_id)
+
+
 def _refused_intent_outcome(prior: Any) -> bool:
-    """True iff a reattached intent's recorded outcome is an operator-away
-    refusal (Finding 1). The retry returns that outcome verbatim."""
-    return isinstance(prior, dict) and prior.get("error") == "operator_away"
+    """True iff a reattached intent's recorded outcome is a refusal the retry
+    returns verbatim — an operator-away refusal (Finding 1) OR an unread-inbound
+    refusal (Sol A2 wave-3, Finding 3). Both are terminal recorded outcomes; the
+    retry returns them as-is rather than awaiting the dead intent."""
+    return (
+        isinstance(prior, dict)
+        and prior.get("error") in ("operator_away", "unread_inbound")
+    )
 
 
 async def _no_answer_response(
@@ -875,12 +910,18 @@ def _make_ask(
         # INBOUND GATE (§4): an unseen operator message means "end your turn" —
         # applies to EVERY kind of ask (button and free-text anchor). Consumes
         # no timeout budget; escalates from the 3rd consecutive refusal.
-        def _refusal_response() -> web.Response:
+        def _refusal_response(record_intent: bool = False) -> web.Response:
             n = driver.record_ask_refusal(eng_id)
             copy = (
                 _ASK_REFUSAL_STERN if n >= _ASK_REFUSAL_ESCALATE_AT
                 else _ASK_REFUSAL
             )
+            if record_intent:
+                # Sol A2 wave-3, Finding 3: record the refusal-count-FREE outcome
+                # on the intent (not a bare cancel) so a same-request_id retry
+                # reattaches to it and returns unread_inbound IMMEDIATELY, never
+                # awaiting the dead intent (→ deferred-post budget → delivery_failed).
+                _record_intent_unread_refusal(driver, eng_id, request_id, copy)
             return web.json_response({
                 "ok": False, "error": "unread_inbound",
                 "message": copy, "refusal_count": n,
@@ -954,12 +995,10 @@ def _make_ask(
             # INBOUND GATE (§4): an unseen operator message means "end your turn".
             # Placed AFTER the reattach + away checks (Finding 4) — a genuinely-new
             # anchor is refused here; a same-id retry never reaches this point. A
-            # freshly-created intent is tombstoned so a retry reattaches (parity
-            # with the button path's unread gate).
+            # freshly-created intent records the unread_inbound OUTCOME (Sol A2
+            # wave-3, Finding 3 — NOT a bare cancel) so a retry reattaches to it.
             if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
-                if created_intent:
-                    driver.cancel_send_intent(eng_id, request_id)
-                return _refusal_response()
+                return _refusal_response(record_intent=bool(created_intent))
 
             # §A3(c) INGRESS RESERVATION (Sol r2-8/r3-6): under the ask-
             # maintenance lock, atomically CHECK the live-pending predicate and
@@ -1208,11 +1247,12 @@ def _make_ask(
                 _record_intent_refusal(driver, eng_id, request_id)
             return _away_refusal_response(driver, eng_id)
 
-        # INBOUND GATE (§4): an unseen operator message means "end your turn".
+        # INBOUND GATE (§4): an unseen operator message means "end your turn". A
+        # registered intent records the unread_inbound OUTCOME (Sol A2 wave-3,
+        # Finding 3 — NOT a bare cancel) so a same-request_id retry reattaches to
+        # it and returns unread_inbound immediately instead of delivery_failed.
         if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
-            if intent_registered:
-                driver.cancel_send_intent(eng_id, request_id)  # tombstone
-            return _refusal_response()
+            return _refusal_response(record_intent=intent_registered)
 
         # §A3(c) INGRESS RESERVATION (Sol r2-8/r3-6): atomically CHECK the live-
         # pending predicate + CLAIM the ``ask_inflight`` marker under the ask-

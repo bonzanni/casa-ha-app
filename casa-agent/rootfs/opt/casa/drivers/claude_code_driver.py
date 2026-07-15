@@ -785,6 +785,16 @@ class ClaudeCodeDriver(DriverProtocol):
         # backstop kill still verifying group extinction — the turn boundary the
         # operator's own message will now provide makes the forced one moot.
         self._force_tasks: dict[str, asyncio.Task] = {}
+        # A2b (Sol A2 wave-3, Finding 2): handed-off post-SIGTERM cleanup tasks.
+        # When a force-suspend task is cancelled after SIGTERM was delivered,
+        # ``force_turn_boundary`` hands its shielded extinction-poll + SIGKILL
+        # escalation to ``_register_force_cleanup``. Those tasks are bounded
+        # (≤ ~7 s) and MUST run to completion — teardown NEVER cancels this set
+        # (unlike ``_tasks``). Tracked in a DEDICATED set (not ``_tasks[eng_id]``,
+        # which teardown pops+cancels and which a post-teardown handoff would
+        # otherwise resurrect as a stale entry); each task self-retires via an
+        # ``add_done_callback`` so completion leaves no reference.
+        self._force_cleanups: set[asyncio.Task] = set()
 
     # -- DriverProtocol ---------------------------------------------------
 
@@ -1000,6 +1010,10 @@ class ClaudeCodeDriver(DriverProtocol):
         force_task = self._force_tasks.pop(engagement.id, None)
         if force_task is not None and not force_task.done():
             force_task.cancel()
+        # Sol A2 wave-3, Finding 2: ``_force_cleanups`` (handed-off post-SIGTERM
+        # kill sequences) is DELIBERATELY NOT cancelled here — those bounded tasks
+        # must complete their SIGKILL escalation + extinction verification. They
+        # self-retire via their own done-callback; teardown just leaves them.
         # v0.79.0 (§2): drop the sequencer (its watcher task is cancelled above).
         self._sequencers.pop(engagement.id, None)
         # v0.79.0 (§5): drop the summary controller and cancel its elapsed tick
@@ -2165,6 +2179,9 @@ class ClaudeCodeDriver(DriverProtocol):
             logger.debug(
                 "force_turn_boundary: no running loop; skipping force-end "
                 "for %s", engagement_id[:8])
+            # Sol A2 wave-3, Finding 1: nothing fired → RE-ARM so a later refusal
+            # (with a loop) can retry rather than staying permanently latched.
+            self._away_suspend_fired.discard(engagement_id)
             return
         # A2b (Sol A2 review): hold a DEDICATED per-engagement handle (replacing
         # the anonymous ``_tasks`` append) so ``_clear_operator_away`` can cancel
@@ -2179,13 +2196,25 @@ class ClaudeCodeDriver(DriverProtocol):
     def _register_force_cleanup(
         self, engagement_id: str, task: asyncio.Task,
     ) -> None:
-        """Sol A2 wave-2 Finding 3: adopt ``force_turn_boundary``'s shielded
-        post-signal cleanup task when the force-suspend task is cancelled mid-kill
-        (operator returned after SIGTERM was sent). Tracking it under
-        ``_tasks[eng_id]`` keeps the SIGKILL escalation running to completion —
-        never cancelled by the away-clear — while teardown still owns it (the
-        ordinary ``cancel()`` teardown is a legitimate terminal boundary)."""
-        self._tasks.setdefault(engagement_id, []).append(task)
+        """Adopt ``force_turn_boundary``'s shielded post-signal cleanup task when
+        the force-suspend task is cancelled mid-kill (operator returned after
+        SIGTERM was sent).
+
+        Sol A2 wave-3, Finding 2: the cleanup is CANCEL-EXEMPT — it must complete
+        its extinction poll + SIGKILL escalation (bounded ≤ ~7 s) even under
+        engagement teardown, or a SIGTERM-resistant MCP/tool child survives while
+        verification is skipped. It therefore goes in the DEDICATED
+        ``_force_cleanups`` set that ``cancel()`` NEVER cancels — NOT
+        ``_tasks[eng_id]`` (wave-2's bug): ``cancel()`` iterates+cancels
+        ``_tasks`` and, having already popped ``_tasks[eng_id]``, a handoff onto
+        it would (a) risk cancelling the kill and (b) resurrect a stale, never-
+        reaped ``_tasks`` entry after teardown. The ``add_done_callback`` retires
+        the task from the set on completion so no reference lingers.
+
+        There is no driver-level shutdown seam to bounded-await these at (each is
+        self-limiting), so at driver teardown they are simply left to finish."""
+        self._force_cleanups.add(task)
+        task.add_done_callback(self._force_cleanups.discard)
 
     async def _run_force_suspend(self, engagement_id: str) -> None:
         """A2b: await the injected verified group-kill and log the truthful
@@ -2214,8 +2243,14 @@ class ClaudeCodeDriver(DriverProtocol):
             logger.warning(
                 "engagement %s: force_turn_boundary raised", engagement_id[:8],
                 exc_info=True)
+            # Sol A2 wave-3, Finding 1: an unverified (raised) outcome RE-ARMS so
+            # the NEXT away-refusal retries — a transient failure must not
+            # permanently disable the once-per-episode backstop.
+            self._away_suspend_fired.discard(engagement_id)
             return
         if ok:
+            # Verified suspended → LATCH (leave the guard set) so the episode does
+            # not force-end again.
             logger.info(
                 "engagement %s: forced turn boundary (operator away, 2nd "
                 "refusal) — verified suspended", engagement_id[:8])
@@ -2223,6 +2258,10 @@ class ClaudeCodeDriver(DriverProtocol):
             logger.warning(
                 "engagement %s: forced turn boundary NOT verified — agent may "
                 "still be looping", engagement_id[:8])
+            # Sol A2 wave-3, Finding 1: an unverified (False) outcome RE-ARMS the
+            # once-per-episode guard so a subsequent away-refusal fires again
+            # (e.g. a transient ``unknown`` probe cleared on the next attempt).
+            self._away_suspend_fired.discard(engagement_id)
 
     async def _clear_operator_away(self, engagement_id: str) -> None:
         """F-EXPIRE EXIT: a durably-enqueued operator message ends the away
