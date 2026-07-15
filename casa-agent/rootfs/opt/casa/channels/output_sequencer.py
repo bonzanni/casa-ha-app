@@ -1096,6 +1096,14 @@ class OutputSequencer:
             )
             mid = None
         if mid is None:
+            # §A3(c): the poster may have SELF-ACCOUNTED a compensated physical
+            # write (initial-anchor add-failure): it posted the wire message,
+            # then called ``mark_intent_compensated`` (reentrant under this lock)
+            # which already resolved the intent ok:false+compensated and advanced
+            # high-water, and returned None. Do NOT re-resolve as a plain
+            # post-failure — that would clobber the mid + high-water accounting.
+            if intent.outcome is not None and intent.outcome.get("compensated"):
+                return
             # F3 fail-closed: the post did NOT land. Do NOT terminally consume
             # the intent as if it succeeded (no consumption debt claiming a
             # phantom post). Mark it post-failed (retired from matching so the

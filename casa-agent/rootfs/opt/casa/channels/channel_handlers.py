@@ -115,6 +115,21 @@ def _make_send_to_topic(
         projection_hash = body.get("projection_hash")
         driver = _resolve_active_driver()
 
+        # §A3(a) LIVE-PENDING REPLY GATE (Sol r1-9 + r5-2): refuse this reply
+        # while the engagement has a LIVE unresolved question. The check runs
+        # UNDER THE SAME per-engagement ask-maintenance lock as the ask ingress
+        # reservation (linearizing the reply against the reservation — closing the
+        # r5-2 race where parallel ask+reply both pass before the ask reaches
+        # durable ownership); the lock is held for the CHECK ONLY. Gating on
+        # actual pending state means reply-then-ask, a tap-answered ask (broker
+        # empty), an EXPIRED ask (no live request), and an answered-but-
+        # unconfirmed-settle anchor (the answered/reserved split) are all allowed.
+        _reply_gate_lock = _ask_maint_lock(driver, engagement_id)
+        if _reply_gate_lock is not None:
+            async with _reply_gate_lock:
+                if _ask_pending_predicate(driver, engagement_id):
+                    return _reply_pending_response(driver, engagement_id)
+
         # The actual post + post-side bookkeeping (advance first-contact, reply
         # de-dup hint). Invoked RELAY-SIDE (§2, review C1) at the reply's
         # tool_use block position — AFTER any preceding narration — or directly
@@ -383,6 +398,128 @@ _ASK_AWAY_REFUSAL = (
     "TURN NOW, silently. Do not ask again; the operator's return starts your "
     "next turn."
 )
+
+# v0.83.0 §A3 — F-ORDER structural gates. ``question_pending`` is returned by the
+# reply gate (a) and the ask-ingress stacking gate (c) when a question is already
+# LIVE for the engagement. ``{n}`` is filled from the pending question number
+# when known; the number-less variant is used when it cannot be resolved.
+_REPLY_PENDING_NUMBERED = (
+    "you have an open question (Q{n}) — end your turn and wait for the answer"
+)
+_REPLY_PENDING_GENERIC = (
+    "you have an open question — end your turn and wait for the answer"
+)
+_ASK_PENDING_NUMBERED = (
+    "Q{n} is still open — wait for the answer (end your turn) instead of asking "
+    "another question"
+)
+_ASK_PENDING_GENERIC = (
+    "a question is still open — wait for the answer (end your turn) instead of "
+    "asking another question"
+)
+# §A3(c): the withdrawn-anchor copy edited over an orphan whose ledger write
+# failed after posting (RAW-wire edit, never edit_discrete — see _post_anchor).
+_ANCHOR_WITHDRAWN = "⚠️ internal error — question withdrawn, please resend"
+# §A3(c): the compensated / withdrawn ask's tool response copy (add-failure).
+_ASK_INTERNAL_ERROR_MSG = (
+    "the question could not be recorded — it was withdrawn; end your turn and "
+    "re-ask"
+)
+
+
+def _ask_maint_lock(driver: Any, eng_id: str) -> Any:
+    """The per-engagement ask-maintenance lock, or ``None`` when the driver
+    predates the §A3 gate seam (unit fakes / degraded boot) — the reply /
+    stacking gates then simply don't engage. Getattr-tolerant."""
+    fn = getattr(driver, "ask_maintenance_lock", None) if driver is not None else None
+    return fn(eng_id) if fn is not None else None
+
+
+def _clear_ask_marker(driver: Any, eng_id: str, request_id: str) -> None:
+    """Clear the ingress marker (CAS on request_id), getattr-tolerant."""
+    fn = getattr(driver, "clear_ask_inflight", None) if driver is not None else None
+    if fn is not None:
+        fn(eng_id, request_id)
+
+
+def _ask_pending_predicate(
+    driver: Any, eng_id: str, *, exclude_request_id: str | None = None,
+) -> bool:
+    """§A3 live-pending predicate (shared by the reply gate + the ask stacking
+    gate). True iff the engagement has a LIVE unresolved question: a live broker
+    ask (``BROKER.pending`` non-empty) OR an unanswered free-text anchor (the
+    driver's EFFECTIVE view — Task 6 ``answered`` + Task 7 reserved excluded) OR
+    the ``ask_inflight`` ingress marker set to a DIFFERENT request_id (the
+    marker→durable-ownership gap). Evaluated UNDER the ask-maintenance lock."""
+    from verdict_broker import BROKER
+    if BROKER.pending(namespace="engagement_ask", scope=eng_id):
+        return True
+    if driver is None:
+        return False
+    anchor_fn = getattr(driver, "effective_open_anchor", None)
+    if anchor_fn is not None:
+        try:
+            if anchor_fn(eng_id) is not None:
+                return True
+        except Exception:  # noqa: BLE001 — degrade to "no anchor"
+            logger.debug("effective_open_anchor read failed", exc_info=True)
+    marker_fn = getattr(driver, "ask_inflight", None)
+    marker = marker_fn(eng_id) if marker_fn is not None else None
+    return marker is not None and marker != exclude_request_id
+
+
+def _pending_question_number(driver: Any, eng_id: str) -> int | None:
+    """The smallest EFFECTIVE-open question number for the refusal copy, or
+    ``None`` when unknown (e.g. a button ask reserved but not yet ledger-added,
+    or a degraded registry). Number-less copy is acceptable then."""
+    if driver is None:
+        return None
+    fn = getattr(driver, "_effective_open_question_numbers", None)
+    if fn is None:
+        return None
+    try:
+        nums = fn(eng_id)
+    except Exception:  # noqa: BLE001
+        return None
+    return min(nums) if nums else None
+
+
+def _reply_pending_response(driver: Any, eng_id: str) -> web.Response:
+    n = _pending_question_number(driver, eng_id)
+    msg = (
+        _REPLY_PENDING_NUMBERED.format(n=n) if n is not None
+        else _REPLY_PENDING_GENERIC
+    )
+    return web.json_response(
+        {"ok": False, "error": "question_pending", "message": msg})
+
+
+def _ask_pending_response(driver: Any, eng_id: str) -> web.Response:
+    n = _pending_question_number(driver, eng_id)
+    msg = (
+        _ASK_PENDING_NUMBERED.format(n=n) if n is not None
+        else _ASK_PENDING_GENERIC
+    )
+    return web.json_response(
+        {"ok": False, "error": "question_pending", "message": msg})
+
+
+def _record_intent_internal_error(
+    driver: Any, eng_id: str, request_id: str,
+) -> None:
+    """§A3(c) allocation-failure: tombstone the intent with an internal_error
+    OUTCOME so a same-request_id retry reattaches and short-circuits (no fresh
+    post). Degrades to a bare cancel on a driver without the seam."""
+    fn = getattr(driver, "record_send_intent_refusal", None)
+    if fn is not None:
+        try:
+            fn(eng_id, request_id, {"ok": False, "error": "internal_error"})
+            return
+        except Exception:  # noqa: BLE001 — fall back to a bare tombstone
+            logger.debug("record_send_intent_refusal(internal) failed", exc_info=True)
+    cancel = getattr(driver, "cancel_send_intent", None)
+    if cancel is not None:
+        cancel(eng_id, request_id)
 
 
 def _operator_away_active(driver: Any, eng_id: str) -> bool:
@@ -665,17 +802,16 @@ def _resolve_active_driver() -> Any:
 
 
 async def _maybe_allocate_number(engagement_registry: Any, eng_id: str) -> int | None:
-    """Allocate the next durable Q-number (getattr-tolerant — a fake registry
-    without the method leaves questions un-numbered)."""
+    """Allocate the next durable Q-number, distinguishing ABSENT from RAISING
+    (Sol r8-4). An ABSENT allocator (fake registry / degraded boot without the
+    method) returns ``None`` → the legacy un-numbered degraded path. An allocator
+    that RAISES PROPAGATES the exception so the caller can refuse the ask BEFORE
+    any wire post (a successful, operator-visible, UNTRACKED ask would defeat the
+    gap-free ``ask_inflight`` → durable-ownership handoff)."""
     alloc = getattr(engagement_registry, "allocate_question_number", None)
     if alloc is None:
         return None
-    try:
-        return await alloc(eng_id)
-    except Exception:  # noqa: BLE001 — numbering must never break the ask
-        logger.warning("allocate_question_number failed (eng=%s)", eng_id[:8],
-                       exc_info=True)
-        return None
+    return await alloc(eng_id)
 
 
 def _make_ask(
@@ -825,9 +961,40 @@ def _make_ask(
                     driver.cancel_send_intent(eng_id, request_id)
                 return _refusal_response()
 
+            # §A3(c) INGRESS RESERVATION (Sol r2-8/r3-6): under the ask-
+            # maintenance lock, atomically CHECK the live-pending predicate and
+            # CLAIM the ``ask_inflight`` marker. A second concurrent ask (any
+            # kind) then sees the marker/predicate and refuses ``question_pending``
+            # — making "one question at a time" structural. The lock is held for
+            # the CHECK + marker ONLY, never across the post/await below. Sample
+            # the operator-generation at this reserve point for the post-add
+            # re-check (a message that lands between reserve and add is the answer).
+            gen_at_entry = (
+                driver.inbound_generation(eng_id) if driver is not None else 0)
+            _anchor_lock = _ask_maint_lock(driver, eng_id)
+            if _anchor_lock is not None:
+                async with _anchor_lock:
+                    if _ask_pending_predicate(
+                            driver, eng_id, exclude_request_id=request_id):
+                        if created_intent:
+                            driver.cancel_send_intent(eng_id, request_id)
+                        return _ask_pending_response(driver, eng_id)
+                    driver.set_ask_inflight(eng_id, request_id)
+
             # First attempt (created intent) OR eager fallback: allocate the
-            # durable number + build the poster.
-            number = await _maybe_allocate_number(engagement_registry, eng_id)
+            # durable number. A RAISING allocator (Sol r8-4) is TERMINAL BEFORE
+            # any wire post — clear the marker, tombstone the intent with an
+            # internal_error outcome (retries short-circuit), refuse. An ABSENT
+            # allocator returns None → the un-numbered legacy degraded path.
+            try:
+                number = await _maybe_allocate_number(engagement_registry, eng_id)
+            except Exception:  # noqa: BLE001
+                logger.warning("anchor number allocation failed (eng=%s)",
+                               eng_id[:8], exc_info=True)
+                _clear_ask_marker(driver, eng_id, request_id)
+                if created_intent:
+                    _record_intent_internal_error(driver, eng_id, request_id)
+                return web.json_response({"ok": False, "error": "internal_error"})
             # W-R3: canonical body (anchor ⇒ options == [] ⇒ numbered question
             # ALONE, no option list — unchanged from the pre-W-R3 anchor copy).
             display = render_ask_body(number, question, options)
@@ -842,48 +1009,110 @@ def _make_ask(
                     return None
                 if not isinstance(mid, int):
                     return None
-                # open_questions registered ONLY after a successful post so a
-                # crash before the relay reaches the block leaves NO dangling
-                # ledger entry.
+                # DURABLE OWNERSHIP: register open_questions ONLY after a
+                # successful post (a crash before the relay reaches the block
+                # leaves NO dangling ledger entry). §A3(c) COMPENSATION (Sol
+                # r5-5/r6-1): an ``add_open_question`` failure AFTER the wire post
+                # leaves an orphan message — best-effort WITHDRAW-edit it via the
+                # RAW wire primitive (never edit_discrete — this poster runs under
+                # the sequencer lock on the relay task, no reacquisition) and
+                # account the COMPOUND outcome (``mark_send_intent_compensated``:
+                # high-water advances, intent resolves ok:false+compensated). The
+                # exception NEVER escapes the poster.
+                added = False
                 if number is not None:
                     add = getattr(engagement_registry, "add_open_question", None)
                     if add is not None:
-                        await add(eng_id, number, mid, text=display,
-                                  kind="anchor")
-                # W-R2: a posted anchor also hands the ball to the operator →
-                # ⏳ waiting for your reply (driven from the ask lifecycle). The
-                # next operator text settles it driver-side (_settle_open_anchor
-                # recomputes the status back to working when none remain).
-                if driver is not None:
-                    note = getattr(driver, "note_ask_waiting", None)
-                    if note is not None:
-                        await note(eng_id)
+                        try:
+                            await add(eng_id, number, mid, text=display,
+                                      kind="anchor")
+                            added = True
+                        except Exception:  # noqa: BLE001
+                            logger.warning(
+                                "anchor add_open_question failed — withdrawing "
+                                "(eng=%s Q%s)", eng_id[:8], number, exc_info=True)
+                            await _withdraw_anchor(
+                                telegram_channel, rec.topic_id, mid)
+                            if driver is not None:
+                                comp = getattr(
+                                    driver, "mark_send_intent_compensated", None)
+                                if comp is not None:
+                                    try:
+                                        await comp(eng_id, request_id, mid)
+                                    except Exception:  # noqa: BLE001
+                                        logger.debug(
+                                            "compensate seam failed", exc_info=True)
+                                _clear_ask_marker(driver, eng_id, request_id)
+                            return None
+                # Marker cleared SYNCHRONOUSLY at durable ownership (no
+                # maintenance lock — the unanswered-anchor clause takes over
+                # gap-free). In the ABSENT-allocator degraded mode (no number, no
+                # add) this is the poster's terminal path and the one-question
+                # invariant is UNAVAILABLE (Sol r9-4).
+                _clear_ask_marker(driver, eng_id, request_id)
+                # POST-ADD GENERATION RE-CHECK: an operator envelope that arrived
+                # between reserve and add IS this anchor's answer — mark it
+                # answered + settle instead of leaving it ⏳ waiting.
+                gen_bumped = (
+                    added and driver is not None
+                    and driver.inbound_generation(eng_id) != gen_at_entry
+                )
+                if gen_bumped:
+                    settle = getattr(driver, "settle_answered_anchor", None)
+                    if settle is not None:
+                        try:
+                            await settle(eng_id, number)
+                        except Exception:  # noqa: BLE001 — settle is best-effort
+                            logger.debug("gen-recheck settle failed", exc_info=True)
+                else:
+                    # W-R2: a posted, un-answered anchor hands the ball to the
+                    # operator → ⏳ waiting for your reply (driven from the ask
+                    # lifecycle; the next operator text settles it driver-side).
+                    if driver is not None:
+                        note = getattr(driver, "note_ask_waiting", None)
+                        if note is not None:
+                            await note(eng_id)
                 await _advance_first_contact()
                 return mid
 
-            if created_intent:
-                # DEFERRED (relay-mediated) created path: install the poster,
-                # ARM, and AWAIT the outcome fail-closed (F3/F5).
-                driver.set_send_intent_poster(eng_id, request_id, _post_anchor)
-                driver.arm_send_intent(eng_id, request_id)
-                outcome = await _await_deferred_post(driver, eng_id, request_id)
-                if outcome is None or not outcome.get("ok"):
+            try:
+                if created_intent:
+                    # DEFERRED (relay-mediated) created path: install the poster,
+                    # ARM, and AWAIT the outcome fail-closed (F3/F5).
+                    driver.set_send_intent_poster(eng_id, request_id, _post_anchor)
+                    driver.arm_send_intent(eng_id, request_id)
+                    outcome = await _await_deferred_post(driver, eng_id, request_id)
+                    # §A3(c): the compensated add-failure maps to ok:false
+                    # internal_error (the wire message exists but the question was
+                    # withdrawn) — distinct from a plain delivery_failed.
+                    if outcome is not None and outcome.get("compensated"):
+                        return web.json_response({
+                            "ok": False, "error": "internal_error",
+                            "message": _ASK_INTERNAL_ERROR_MSG,
+                        })
+                    if outcome is None or not outcome.get("ok"):
+                        return web.json_response(
+                            {"ok": False, "error": "delivery_failed"})
+                    return web.json_response({
+                        "ok": True, "outcome": "anchored",
+                        "question_number": number,
+                        "message_id": outcome.get("message_id"),
+                    })
+
+                # EAGER fallback (no live sequencer): post the anchor now.
+                mid = await _post_anchor()
+                if mid is None:
                     return web.json_response(
                         {"ok": False, "error": "delivery_failed"})
                 return web.json_response({
                     "ok": True, "outcome": "anchored",
-                    "question_number": number,
-                    "message_id": outcome.get("message_id"),
+                    "question_number": number, "message_id": mid,
                 })
-
-            # EAGER fallback (no live sequencer): post the anchor now.
-            mid = await _post_anchor()
-            if mid is None:
-                return web.json_response({"ok": False, "error": "delivery_failed"})
-            return web.json_response({
-                "ok": True, "outcome": "anchored",
-                "question_number": number, "message_id": mid,
-            })
+            finally:
+                # Terminal-failure BACKSTOP: clear the marker if this request
+                # still owns it (CAS — a no-op when the poster already cleared it
+                # at durable ownership, or a later ask claimed the marker).
+                _clear_ask_marker(driver, eng_id, request_id)
 
         # --- BUTTON ask ---------------------------------------------------
         # Register the discrete-send INTENT (pending) at the ingress boundary for
@@ -985,7 +1214,35 @@ def _make_ask(
                 driver.cancel_send_intent(eng_id, request_id)  # tombstone
             return _refusal_response()
 
-        number = await _maybe_allocate_number(engagement_registry, eng_id)
+        # §A3(c) INGRESS RESERVATION (Sol r2-8/r3-6): atomically CHECK the live-
+        # pending predicate + CLAIM the ``ask_inflight`` marker under the ask-
+        # maintenance lock (held for the check + marker ONLY). A second concurrent
+        # ask sees it and refuses ``question_pending``. The marker clears at
+        # BROKER.register below (durable ownership — the broker-pending clause
+        # takes over gap-free) and on the allocation-failure path.
+        _btn_lock = _ask_maint_lock(driver, eng_id)
+        if _btn_lock is not None:
+            async with _btn_lock:
+                if _ask_pending_predicate(
+                        driver, eng_id, exclude_request_id=request_id):
+                    if intent_registered:
+                        driver.cancel_send_intent(eng_id, request_id)
+                    return _ask_pending_response(driver, eng_id)
+                driver.set_ask_inflight(eng_id, request_id)
+
+        # A RAISING allocator (Sol r8-4) is TERMINAL BEFORE any wire post — clear
+        # the marker, tombstone the intent (internal_error outcome; retries
+        # short-circuit), refuse. An ABSENT allocator returns None (un-numbered
+        # legacy path).
+        try:
+            number = await _maybe_allocate_number(engagement_registry, eng_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("button number allocation failed (eng=%s)",
+                           eng_id[:8], exc_info=True)
+            _clear_ask_marker(driver, eng_id, request_id)
+            if intent_registered:
+                _record_intent_internal_error(driver, eng_id, request_id)
+            return web.json_response({"ok": False, "error": "internal_error"})
         # W-R3 (Sol r1-5): the SINGLE canonical body — full options VERBATIM,
         # numbered, below the question. This exact string feeds the keyboard
         # post, the persisted ``open_questions[].text``, the finish-hook settle
@@ -1001,6 +1258,11 @@ def _make_ask(
             namespace="engagement_ask", scope=eng_id, request_id=request_id,
             timeout_s=timeout_s, meta=_ask_static_meta(),
         )
+        # §A3(c): durable ownership reached — the request is live in the broker
+        # (BROKER.pending non-empty), so the ingress marker clears SYNCHRONOUSLY
+        # here (no maintenance lock) and the broker-pending clause of the gate
+        # predicate takes over gap-free.
+        _clear_ask_marker(driver, eng_id, request_id)
 
         # W-R2 linearization pin (Sol r2-1): the finish hook can become runnable
         # (a FAST TAP) before ``_post_ask`` finishes registering the open
@@ -1143,6 +1405,27 @@ async def _await_deferred_post(driver: Any, eng_id: str, request_id: str) -> dic
     except Exception:  # noqa: BLE001 — never wedge the handler on the await seam
         logger.debug("await_send_intent failed (eng=%s)", eng_id[:8], exc_info=True)
         return None
+
+
+async def _withdraw_anchor(
+    telegram_channel: Any, topic_id: int | None, mid: int,
+) -> None:
+    """§A3(c) compensation: best-effort confirmed WITHDRAW-edit of an orphan
+    anchor (posted, but its ledger write failed) via the RAW wire edit primitive
+    — NEVER ``edit_discrete`` (the initial-anchor poster runs under the sequencer
+    lock on the relay task; no reacquisition from poster context). An unconfirmed
+    edit leaves one stale plain-text line — the documented visual-orphan class."""
+    try:
+        confirmed = await confirmed_settle_edit(
+            lambda: telegram_channel.edit_topic_message(
+                topic_id, mid, _ANCHOR_WITHDRAWN, clear_keyboard=True),
+        )
+        if not confirmed:
+            logger.warning(
+                "anchor withdraw edit UNCONFIRMED (topic=%s mid=%s) — stale "
+                "plain-text orphan left", topic_id, mid)
+    except Exception:  # noqa: BLE001 — compensation edit is best-effort
+        logger.debug("anchor withdraw edit raised", exc_info=True)
 
 
 async def _noop_poster() -> int | None:

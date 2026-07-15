@@ -741,6 +741,25 @@ class ClaudeCodeDriver(DriverProtocol):
         # PROMOTION at durable enqueue is UNCONDITIONAL and CONSUMES it.
         # Memory-only (crash convergence is boot reconciliation's job).
         self._answer_reservations: dict[str, tuple[str, int]] = {}
+        # v0.83.0 (§A3(a)+(c), Sol r2-8/r3-6/r4-4/5): the per-engagement
+        # ASK-MAINTENANCE lock + the ingress-reservation ``ask_inflight`` marker.
+        #
+        # PINNED LOCK DISCIPLINE: ``ask_maintenance_lock`` is taken ONLY on
+        # driver/handler tasks with the sequencer lock NOT held — no
+        # sequencer→maintenance edge exists. The relay-invoked poster runs UNDER
+        # the sequencer lock and therefore NEVER acquires it (it clears the marker
+        # lock-free instead — asyncio run-to-completion makes the synchronous
+        # marker→durable-ownership handoff gap-free). The lock serializes the ask
+        # ingress reservation (check pending predicate + set marker) against the
+        # reply gate's check, so two concurrent asks can never both pass their
+        # gates before one reaches durable ownership.
+        self._ask_maint_locks: dict[str, asyncio.Lock] = {}
+        # ``engagement_id -> request_id`` of an ask that passed its gates but has
+        # not yet reached durable ownership (broker register for buttons /
+        # add_open_question for anchors). Set under the maintenance lock at
+        # ingress; cleared SYNCHRONOUSLY (no lock) at durable ownership and on
+        # every terminal failure path. Memory-only, dropped at teardown.
+        self._ask_inflight: dict[str, str] = {}
         # F-EXPIRE (v0.83.0, A2a): operator-away suspend state. ``_operator_away``
         # is SET on ask expiry (generation-CAS, ``note_operator_away``) and
         # CLEARED on the next durable inbound operator envelope; while set, every
@@ -969,6 +988,9 @@ class ClaudeCodeDriver(DriverProtocol):
         # reconciliation, not these).
         self._answered_overlay.pop(engagement.id, None)
         self._answer_reservations.pop(engagement.id, None)
+        # §A3(c): drop the ask-maintenance lock + ingress marker on teardown.
+        self._ask_maint_locks.pop(engagement.id, None)
+        self._ask_inflight.pop(engagement.id, None)
         # F-EXPIRE: drop the operator-away suspend state on teardown.
         self._operator_away.pop(engagement.id, None)
         self._away_refusals.pop(engagement.id, None)
@@ -1628,6 +1650,90 @@ class ClaudeCodeDriver(DriverProtocol):
         if not anchors:
             return None
         return min(anchors, key=lambda q: q.get("n", 0))
+
+    # -- v0.83.0 (§A3(a)+(c)) ask-maintenance lock + ingress marker ----------
+    def ask_maintenance_lock(self, engagement_id: str) -> asyncio.Lock:
+        """The per-engagement ASK-MAINTENANCE lock (create-on-demand). PINNED
+        DISCIPLINE: only ever taken on driver/handler tasks with the SEQUENCER
+        lock NOT held — the relay-invoked poster (which runs under the sequencer
+        lock) NEVER acquires it. It serializes the ask ingress reservation
+        (pending-predicate check + marker set) against the reply gate's check."""
+        lock = self._ask_maint_locks.get(engagement_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._ask_maint_locks[engagement_id] = lock
+        return lock
+
+    def ask_inflight(self, engagement_id: str) -> str | None:
+        """The request_id of an ask that passed its gates but is not yet durable
+        (broker-registered / add_open_question'd), or ``None``. Read under the
+        maintenance lock by the ingress reservation + reply gate predicates."""
+        return self._ask_inflight.get(engagement_id)
+
+    def set_ask_inflight(self, engagement_id: str, request_id: str) -> None:
+        """Claim the ingress marker for ``request_id`` (called under the
+        maintenance lock, right after the pending predicate passes)."""
+        self._ask_inflight[engagement_id] = request_id
+
+    def clear_ask_inflight(
+        self, engagement_id: str, request_id: str | None = None,
+    ) -> None:
+        """Clear the ingress marker — CAS on ``request_id`` (clear only when the
+        marker still belongs to this request, so a terminal-failure backstop can
+        never clobber a newer ask's marker). ``request_id=None`` clears
+        unconditionally. Cleared WITHOUT the maintenance lock (asyncio
+        run-to-completion makes the sync marker→durable handoff gap-free)."""
+        if request_id is None or self._ask_inflight.get(engagement_id) == request_id:
+            self._ask_inflight.pop(engagement_id, None)
+
+    def effective_open_anchor(self, engagement_id: str) -> dict | None:
+        """The oldest UNANSWERED free-text anchor (effective view — persisted
+        ``answered`` ∪ overlay ∪ reserved excluded), or ``None``. The A3 reply /
+        stacking gates' unanswered-anchor clause."""
+        return self._oldest_unanswered_anchor(engagement_id, exclude_reserved=True)
+
+    async def mark_send_intent_compensated(
+        self, engagement_id: str, request_id: str, message_id: int,
+    ) -> Any:
+        """§A3(c) (Sol r5-5/r6-1): the ``mark_send_intent_posted``-adjacent
+        COMPENSATED seam. The initial-anchor poster calls this on an
+        ``add_open_question`` failure AFTER the wire post: the sequencer advances
+        high-water to ``message_id`` and resolves the intent exactly once as
+        ``{"ok": False, "message_id": message_id, "compensated": True}`` — the
+        physical write is accounted, the logical result is failure."""
+        seq = self._sequencers.get(engagement_id)
+        if seq is None:
+            return None
+        return await seq.mark_intent_compensated(request_id, message_id)
+
+    async def settle_answered_anchor(
+        self, engagement_id: str, number: int,
+    ) -> int | None:
+        """§A3(c) post-add generation re-check: an operator envelope that arrived
+        between the ingress reservation and ``add_open_question`` IS this anchor's
+        answer. Mark it answered (strict; overlay on raise — Task-6 policy) and
+        run the shared visual settle. NOT maintenance-locked — the caller is the
+        relay poster under the sequencer lock (settle stays lock-free here)."""
+        reg = self._registry
+        if reg is None:
+            return None
+        engagement = reg.get(engagement_id)
+        if engagement is None:
+            return None
+        mark = getattr(reg, "mark_question_answered", None)
+        if mark is not None:
+            try:
+                await mark(engagement_id, number)
+            except Exception:  # noqa: BLE001 — overlay covers the live process
+                self.mark_answered_overlay(engagement_id, number)
+        anchor = None
+        entries = getattr(reg, "open_question_entries", None)
+        if entries is not None:
+            for q in entries(engagement_id):
+                if q.get("n") == number:
+                    anchor = q
+                    break
+        return await self._settle_open_anchor(engagement, anchor=anchor)
 
     def reserve_answer(self, engagement_id: str) -> str | None:
         """§A3 (Sol r7-1): reserve the oldest UNANSWERED anchor as answered by
