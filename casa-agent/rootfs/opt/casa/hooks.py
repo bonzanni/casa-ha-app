@@ -1316,7 +1316,7 @@ def make_engagement_permission_relay(
                 # sequencer / degraded boot ⇒ eager fallback (pre-v0.79 post).
                 _relay_posted = False
                 _drv = _active_claude_code_driver()
-                if _drv is not None and created:
+                if _drv is not None:
                     from channels.output_sequencer import (
                         projection_hash as _perm_projection_hash,
                     )
@@ -1329,9 +1329,18 @@ def make_engagement_permission_relay(
                     if _res is not None:
                         _intent, _created_intent = _res
                         if _created_intent:
+                            # First attempt: install the real poster + ARM — the
+                            # relay posts the keyboard at the gated tool's frame.
                             _drv.set_send_intent_poster(eng_id, rid, _post_keyboard)
                             _drv.arm_send_intent(eng_id, rid)
-                            _relay_posted = True
+                        # F1 (Sol r2): whether we just CREATED the intent or
+                        # REATTACHED to an existing one (a permission/transport
+                        # RETRY, created=False), the relay owns the post — NEVER
+                        # eager-post around the sequencer. A retry rides the first
+                        # attempt's keyboard and awaits the same broker verdict
+                        # below. Eager fallback ONLY when there is no live
+                        # sequencer (register returned None).
+                        _relay_posted = True
                 if not _relay_posted:
                     await _post_keyboard()
                 outcome = await BROKER.await_result(req)

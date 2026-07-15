@@ -598,6 +598,37 @@ class OutputSequencer:
         intent = self.registry.by_request_id(request_id)
         return intent.outcome if intent is not None else None
 
+    async def await_completion_drain(
+        self, request_id: str, timeout: float | None = None,
+    ) -> bool:
+        """F3: block until the relay CONSUMES the given consumption-debt intent
+        (the emit_completion debt) — i.e. reaches its content block, having
+        processed every PRIOR frame — so a completion post can never overtake
+        lagging prior-frame narration.
+
+        Bounded by *timeout* (default: the slot hold). Returns ``True`` when the
+        debt has been consumed (or the intent is unknown / already consumed),
+        ``False`` on timeout (the caller WARNs and proceeds — the ONE documented,
+        bounded weakening). Edge-triggered: consumption is checked under the lock
+        BEFORE waiting, so a consume that lands before the awaiter blocks is
+        never missed."""
+        if timeout is None:
+            timeout = self._slot_hold_s
+        async with self._lock:
+            intent = self.registry.by_request_id(request_id)
+            if intent is None or intent.consumed:
+                return True
+            ev = self._resolution_events.get(request_id)
+            if ev is None:
+                ev = asyncio.Event()
+                self._resolution_events[request_id] = ev
+        try:
+            await asyncio.wait_for(ev.wait(), timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+        intent = self.registry.by_request_id(request_id)
+        return intent is None or intent.consumed
+
     # -- F1(b) platform-origin discrete send -------------------------------
 
     async def post_platform_notice(
@@ -650,12 +681,50 @@ class OutputSequencer:
 
         F3/F4: signal every outstanding resolution event before dropping them so
         an awaiter blocked past turn end unblocks (reading a resolved ok:false /
-        ``None`` outcome) rather than hanging its transport budget out."""
+        ``None`` outcome) rather than hanging its transport budget out.
+
+        NOTE (F6): ``topic_stream._finalize`` no longer calls this directly —
+        it uses :meth:`drain_and_prune_turn`, which drains armed intents and
+        prunes under ONE lock hold so a late-armed intent can't be dropped
+        between a flush and this prune. This method stays for tests and any
+        caller that needs a bare synchronous prune."""
         for ev in self._resolution_events.values():
             ev.set()
         self._resolution_events.clear()
         self.registry.prune()
         self._turn_reply_to = None
+
+    async def drain_and_prune_turn(self) -> None:
+        """F4+F6: atomically drain every still-armed intent, then prune + seal —
+        under ONE lock hold.
+
+        Replaces the former ``flush_armed_intents`` → ``prune_turn`` →
+        ``seal_narration`` sequence in ``topic_stream._finalize``, which took and
+        RELEASED the lock between those three steps. That gap let a late ingress
+        register+arm an intent B during a flush poster-await AFTER the flush had
+        snapshotted the armed set; ``prune_turn`` then deleted B before it could
+        post (F6: intent B silently dropped, its awaiter left hanging / failing).
+
+        Here the armed set is RE-SNAPSHOTTED under the held lock until it is
+        empty, so every armed intent RESOLVES (posts out-of-band with a WARN, or
+        fails closed via F3) first. There is NO await between the final
+        empty-check and the synchronous prune, so a lock-free ``register_intent``
+        /``arm_intent`` cannot slip an armed intent in between the two."""
+        async with self._lock:
+            while True:
+                pending = self.registry.armed_unposted()
+                if not pending:
+                    break
+                for intent in pending:
+                    await self._post_intent_locked(
+                        intent, out_of_band=True, warn=True)
+            # Registry is now stable (no await below until the clear).
+            for ev in self._resolution_events.values():
+                ev.set()
+            self._resolution_events.clear()
+            self.registry.prune()
+            self._turn_reply_to = None
+            self._seal_narration_locked()
 
     # -- discrete posting driven by the relay at a content-block ------------
 
@@ -717,6 +786,10 @@ class OutputSequencer:
                 # edit/append to it below the discrete message.
                 self._seal_narration_locked()
                 item.consumed = True
+                # F3: unblock a completion drain waiting for this debt — the
+                # relay reaching the emit_completion block means every prior
+                # frame has been processed.
+                self._signal_resolution(item.request_id)
                 return "debt_consumed"
             return None  # pending → HOLD
         if tool_name not in HOLD_ELIGIBLE_TOOLS:

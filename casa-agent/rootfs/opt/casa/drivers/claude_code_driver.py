@@ -1138,6 +1138,21 @@ class ClaudeCodeDriver(DriverProtocol):
         seq = self._sequencers.get(engagement.id)
         if seq is None:
             return False
+        # F3: DRAIN the relay to the completion block FIRST — wait until the
+        # relay consumes the emit_completion consumption debt (⇒ every PRIOR
+        # frame has been processed) so lagging prior-frame narration can never
+        # post BELOW the completion message. Bounded (slot budget); on timeout
+        # WARN and proceed. ``register_completion_consumption`` uses this same
+        # request_id, so an emit_completion-driven finalize has a debt to await;
+        # a cancel/error finalize has none and this returns immediately.
+        rid = f"emit_completion:{engagement.id}"
+        drained = await seq.await_completion_drain(rid)
+        if not drained:
+            logger.warning(
+                "engagement %s: completion drain timed out — posting completion "
+                "without a full relay drain (prior narration may lag)",
+                engagement.id[:8],
+            )
         await seq.flush_armed_intents()
         await seq.seal_narration()
         await seq.post_platform_notice(summary_text)
@@ -1235,9 +1250,16 @@ class ClaudeCodeDriver(DriverProtocol):
                 f"summary post returned no message id for engagement "
                 f"{engagement.id[:8]}"
             )
-        # Persist on both the in-memory record (so _spawn_background_tasks'
-        # controller adopts it) and durably (so a restart resumes it).
-        engagement.summary_message_id = mid
+        # Persist durably FIRST (so a restart resumes it), THEN set the
+        # in-memory field. F7 (Sol r2): snapshot-BEFORE-mutate. The registry's
+        # strict setter snapshots the record's PRE-mutation summary_message_id to
+        # roll back on a persist failure. If we assigned ``engagement.summary_
+        # message_id = mid`` HERE first — and ``engagement`` IS the registry's
+        # own record object — the setter would snapshot the ALREADY-mutated new
+        # id, making its rollback a no-op (a forced persist failure would leave
+        # the new id in memory instead of the true prior value). So we let the
+        # setter own the mutation+snapshot and only touch the in-memory field
+        # AFTER a successful persist.
         setter = getattr(self._registry, "set_summary_message_id", None)
         if setter is not None:
             # §5 / F6: strict persistence — a summary posted but NOT persisted
@@ -1250,6 +1272,10 @@ class ClaudeCodeDriver(DriverProtocol):
                     f"summary_message_id persist failed for engagement "
                     f"{engagement.id[:8]}: {exc}"
                 ) from exc
+        # Set the in-memory record's field only after a durable persist (a no-op
+        # when ``engagement`` already IS the registry record the setter mutated;
+        # required when it is a distinct object or there is no registry setter).
+        engagement.summary_message_id = mid
         # T4 F-4 (review): the initial pin attempt is NOT made here — the
         # per-engagement SummaryController doesn't exist yet at this point in
         # ``start()`` (``_ensure_summary`` only runs later, from
@@ -1726,11 +1752,25 @@ class ClaudeCodeDriver(DriverProtocol):
                 # SUCCESSFUL notice + one flag-persist ever fire per engagement.
                 if eng_id not in self._violation_notified:
                     try:
-                        await self._send_to_topic(
-                            engagement.topic_id,
+                        # F2 (Sol r2): the violation notice is a PLATFORM notice
+                        # and MUST go through the single writer — a direct
+                        # send_to_topic posts it AROUND the sequencer, landing
+                        # below open narration while ``edit_narration_if_latest``
+                        # still returns APPLIED (the exact §2 ordering violation).
+                        # Route through ``post_platform_notice`` (seals narration
+                        # + advances high-water under the one lock); direct send
+                        # only when no live sequencer.
+                        notice = (
                             "The agent took an action while waiting for your "
-                            "reply — flagging this engagement for review.",
+                            "reply — flagging this engagement for review."
                         )
+                        seq = self._sequencers.get(eng_id)
+                        if seq is not None:
+                            posted = await seq.post_platform_notice(notice)
+                            if posted is None:
+                                raise RuntimeError("notice post returned no id")
+                        else:
+                            await self._send_to_topic(engagement.topic_id, notice)
                         self._violation_notified.add(eng_id)
                     except Exception:  # noqa: BLE001 — retry on the next frame
                         logger.warning(

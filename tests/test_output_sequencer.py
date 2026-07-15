@@ -8,9 +8,12 @@ we never patch ``asyncio.sleep`` (the global-patch OOM lesson).
 """
 from __future__ import annotations
 
+import asyncio
+
 from channels.output_sequencer import (
     APPLIED,
     ASK_TOOL,
+    EMIT_COMPLETION_TOOL,
     FAILED,
     MARKUP_EMPTY,
     REPLY_TOOL,
@@ -566,3 +569,110 @@ async def test_flush_armed_intents_posts_before_prune():
     # Prune signals resolution + clears the registry.
     seq.prune_turn()
     assert seq.registry.by_request_id("x1") is None
+
+
+# ---------------------------------------------------------------------------
+# F6 — drain_and_prune_turn: locked drain + prune (no stale-snapshot drop).
+# ---------------------------------------------------------------------------
+
+
+async def test_drain_and_prune_posts_intent_armed_during_drain():
+    """F6: an intent B registered+armed by a late ingress DURING the drain's
+    poster await must still POST — never be dropped from a stale armed snapshot
+    (the old flush→prune sequence pruned it before it posted)."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+
+    async def _a_poster():
+        # A late ingress lands mid-post (after any armed snapshot): register +
+        # arm intent B while the drain holds the lock.
+        seq.register_intent(
+            request_id="B", tool_name=REPLY_TOOL, projection_hash="hb",
+            poster=_poster(rec, "reply B"))
+        seq.arm_intent("B")
+        return await rec.send(42, "reply A")
+
+    seq.register_intent(
+        request_id="A", tool_name=REPLY_TOOL, projection_hash="ha",
+        poster=_a_poster)
+    seq.arm_intent("A")
+
+    await seq.drain_and_prune_turn()
+
+    # BOTH posted — B caught by the re-snapshot loop, not silently dropped.
+    assert (42, "reply A") in rec.sends
+    assert (42, "reply B") in rec.sends
+    # Registry fully pruned afterwards.
+    assert seq.registry.by_request_id("A") is None
+    assert seq.registry.by_request_id("B") is None
+
+
+async def test_drain_and_prune_seals_narration_and_signals_awaiters():
+    """drain_and_prune seals open narration and unblocks any awaiter."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    nar = await seq.open_narration("live narration")
+    assert seq.narration_msg_id == nar
+    # A pending (never-armed) intent with an awaiter waiting.
+    seq.register_intent(
+        request_id="p1", tool_name=REPLY_TOOL, projection_hash="h",
+        poster=_poster(rec, "x"))
+    waiter = asyncio.ensure_future(seq.await_intent_resolution("p1", timeout=5.0))
+    await asyncio.sleep(0)
+    await seq.drain_and_prune_turn()
+    # Narration sealed, registry pruned, awaiter released (None outcome).
+    assert seq.narration_msg_id is None
+    assert seq.registry.by_request_id("p1") is None
+    assert await asyncio.wait_for(waiter, timeout=1.0) is None
+
+
+# ---------------------------------------------------------------------------
+# F3 — await_completion_drain: block until the emit_completion debt is consumed.
+# ---------------------------------------------------------------------------
+
+
+def _register_completion_debt(seq, phash="hc"):
+    # A consumption debt is never POSTED (its block is consumed silently), so a
+    # placeholder poster is fine — it is never invoked.
+    intent, _ = seq.register_intent(
+        request_id="emit_completion:eng-1", tool_name=EMIT_COMPLETION_TOOL,
+        projection_hash=phash, poster="debt")
+    intent.state = "posted"
+    intent.timeout_posted = True
+    intent.consumed = False
+    return intent
+
+
+async def test_await_completion_drain_waits_for_debt_consumption():
+    """F3: the completion drain blocks until the relay CONSUMES the
+    emit_completion debt (reaches its block ⇒ all prior frames processed)."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    _register_completion_debt(seq)
+
+    drain = asyncio.ensure_future(
+        seq.await_completion_drain("emit_completion:eng-1", timeout=5.0))
+    await asyncio.sleep(0)
+    assert not drain.done()  # blocked: debt not yet consumed
+
+    res = await seq.post_for_block(EMIT_COMPLETION_TOOL, "hc")
+    assert res == "debt_consumed"
+    assert await asyncio.wait_for(drain, timeout=1.0) is True
+
+
+async def test_await_completion_drain_times_out_returns_false():
+    """F3: an un-consumed debt (no emit_completion block ever arrives) times out
+    → False (the caller WARNs and proceeds)."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    _register_completion_debt(seq)
+    assert await seq.await_completion_drain(
+        "emit_completion:eng-1", timeout=0.05) is False
+
+
+async def test_await_completion_drain_unknown_intent_returns_true():
+    """F3: no debt registered (a cancel/error finalize) ⇒ drain returns True
+    immediately."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    assert await seq.await_completion_drain("nope", timeout=0.05) is True

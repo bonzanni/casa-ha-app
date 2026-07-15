@@ -440,3 +440,116 @@ async def test_anchor_poster_failure_returns_ok_false(failing_env):
         engagement_id=eid, request_id="af-1",
         question="Which DB?", options=[])))
     assert _body(r)["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# F5 — deferred retry fail-closed + anchor no-double-number-allocation.
+# ---------------------------------------------------------------------------
+
+
+class _UnresolvedDriver:
+    """A driver whose deferred intent is ARMED but the relay never posts — so a
+    retry reattaches to an UNRESOLVED intent and ``await_send_intent`` times out
+    to None. Models the F5 fail-open probe: the handler must NOT return ok:true
+    on an unresolved intent."""
+
+    def __init__(self, created: bool = False) -> None:
+        self.depth = 0
+        self.gen = 0
+        self.refusals = 0
+        self._created = created
+
+    def inbound_unread_depth(self, eid) -> int:
+        return self.depth
+
+    def inbound_generation(self, eid) -> int:
+        return self.gen
+
+    def record_ask_refusal(self, eid) -> int:
+        self.refusals += 1
+        return self.refusals
+
+    def register_send_intent(self, *, engagement_id, request_id, tool_name,
+                             projection_hash, poster):
+        return (object(), self._created)
+
+    def set_send_intent_poster(self, eid, rid, poster):
+        return None
+
+    def arm_send_intent(self, eid, rid):
+        return None
+
+    def cancel_send_intent(self, eid, rid):
+        return None
+
+    def send_intent_outcome(self, eid, rid):
+        return None  # unresolved: no recorded outcome
+
+    async def await_send_intent(self, eid, rid, timeout=None):
+        return None  # bounded resolution timed out
+
+
+async def test_reply_retry_unresolved_awaits_and_fails_closed(env, monkeypatch):
+    """F5: a reply RETRY reattaching to an unresolved intent AWAITS the same
+    bounded resolution; a None/timeout maps to ok:false — never ok:true with no
+    post."""
+    driver = _UnresolvedDriver(created=False)
+    monkeypatch.setattr(agent_mod, "active_claude_code_driver", driver)
+    eid = env["rec"].id
+    r = await env["send"](_FakeRequest({
+        "engagement_id": eid, "text": "hi", "request_id": "rep-u",
+        "projection_hash": "rh"}))
+    b = _body(r)
+    assert b["ok"] is False and b["error"] == "send_failed"
+    assert env["ch"].sent_texts == []  # nothing posted
+
+
+async def test_reply_first_attempt_unresolved_fails_closed(env, monkeypatch):
+    """F5: even the FIRST attempt fails closed when the post never resolves
+    (outcome None) — the old code returned ok:true with message_id None."""
+    driver = _UnresolvedDriver(created=True)
+    monkeypatch.setattr(agent_mod, "active_claude_code_driver", driver)
+    eid = env["rec"].id
+    r = await env["send"](_FakeRequest({
+        "engagement_id": eid, "text": "hi", "request_id": "rep-f",
+        "projection_hash": "rh"}))
+    assert _body(r)["ok"] is False
+
+
+async def test_anchor_retry_unresolved_fails_closed_no_number(env, monkeypatch):
+    """F5: a free-text anchor RETRY reattaching to an unresolved intent fails
+    closed AND does not burn a fresh Q-number (reattach check precedes number
+    allocation)."""
+    driver = _UnresolvedDriver(created=False)
+    monkeypatch.setattr(agent_mod, "active_claude_code_driver", driver)
+    eid = env["rec"].id
+    before = env["reg"].get(eid).next_question_number
+    r = await env["ask"](_FakeRequest(_ask_payload(
+        engagement_id=eid, request_id="fu", question="DB?", options=[])))
+    b = _body(r)
+    assert b["ok"] is False and b["error"] == "delivery_failed"
+    assert env["reg"].get(eid).next_question_number == before  # no number burned
+    assert env["ch"].sent_texts == []
+
+
+async def test_anchor_retry_reattaches_without_new_qnumber(env):
+    """F5: a free-text anchor transport RETRY reattaches — NO new Q-number, NO
+    second anchor, single open-question entry (parity with the button reattach).
+    """
+    eid = env["rec"].id
+    p = _ask_payload(engagement_id=eid, request_id="ftr",
+                     question="DB?", options=[])
+    r1 = await env["ask"](_FakeRequest(p))
+    assert _body(r1)["question_number"] == 1
+    await asyncio.sleep(0.01)
+    assert env["reg"].get(eid).next_question_number == 2  # 1 allocated → next 2
+    sent_before = list(env["ch"].sent_texts)
+
+    r2 = await env["ask"](_FakeRequest(p))
+    b2 = _body(r2)
+    assert b2["ok"] is True and b2["outcome"] == "anchored"
+    # No fresh number allocated on the reattach (old code allocated at line 577
+    # BEFORE the reattach check → next would advance to 3):
+    assert env["reg"].get(eid).next_question_number == 2
+    assert env["ch"].sent_texts == sent_before          # no second anchor
+    assert env["reg"].open_question_numbers(eid) == [1]  # single open question

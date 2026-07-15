@@ -159,20 +159,30 @@ def _make_send_to_topic(
                         # posted — return its id, no second post (§2(1)).
                         return web.json_response(
                             {"ok": True, "message_id": prior["message_id"]})
-                    # Reattach before the relay posted → still armed, will post.
-                    return web.json_response({"ok": True})
-                driver.set_send_intent_poster(engagement_id, request_id, _do_post)
-                driver.arm_send_intent(engagement_id, request_id)
-                # F3 fail-closed: AWAIT the relay-mediated post's outcome (bounded
-                # by the sequencer's transport budget) — return ok:false if the
-                # send failed instead of a swallowed error under an ok:true.
-                outcome = await _await_deferred_post(
-                    driver, engagement_id, request_id)
-                if outcome is not None and not outcome.get("ok"):
+                    # F5 fail-closed: reattach BEFORE the relay posted — AWAIT the
+                    # same bounded resolution rather than returning ok:true on an
+                    # UNRESOLVED intent. A None/timeout/failed outcome maps to
+                    # ok:false (never a phantom ok:true with no post).
+                    outcome = await _await_deferred_post(
+                        driver, engagement_id, request_id)
+                    if outcome is not None and outcome.get("message_id") is not None:
+                        return web.json_response(
+                            {"ok": True, "message_id": outcome["message_id"]})
                     return web.json_response(
                         {"ok": False, "error": "send_failed"})
-                mid = outcome.get("message_id") if outcome else None
-                return web.json_response({"ok": True, "message_id": mid})
+                driver.set_send_intent_poster(engagement_id, request_id, _do_post)
+                driver.arm_send_intent(engagement_id, request_id)
+                # F3/F5 fail-closed: AWAIT the relay-mediated post's outcome
+                # (bounded by the sequencer's transport budget). An unresolved
+                # (None/timeout) or failed outcome is ok:false — never an ok:true
+                # with no post.
+                outcome = await _await_deferred_post(
+                    driver, engagement_id, request_id)
+                if outcome is None or not outcome.get("ok"):
+                    return web.json_response(
+                        {"ok": False, "error": "send_failed"})
+                return web.json_response(
+                    {"ok": True, "message_id": outcome.get("message_id")})
 
         # EAGER fallback (no live sequencer): post now and return the id.
         msg_id = await _do_post()
@@ -574,6 +584,42 @@ def _make_ask(
         if not options:
             if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
                 return _refusal_response()
+
+            # F5: register the discrete-send intent and check for a REATTACH
+            # BEFORE allocating a Q-number — parity with the button-ask reattach
+            # (a transport retry must NOT burn a fresh number or post a second
+            # anchor). ``created_intent`` is True only on the genuinely-first
+            # attempt; None when there is no live sequencer (eager fallback).
+            created_intent: bool | None = None
+            if driver is not None and projection_hash:
+                res = driver.register_send_intent(
+                    engagement_id=eng_id, request_id=request_id,
+                    tool_name=ASK_TOOL, projection_hash=projection_hash,
+                    poster=_noop_poster,
+                )
+                if res is not None:
+                    _intent, created_intent = res
+                    if not created_intent:
+                        # REATTACH: reuse the first attempt's outcome. If it
+                        # already posted, return its id; if still UNRESOLVED,
+                        # AWAIT the same bounded resolution and map None/timeout/
+                        # failed to ok:false (F5 fail-closed) — never ok:true on
+                        # an unresolved intent. No new number, no second anchor.
+                        prior = driver.send_intent_outcome(eng_id, request_id)
+                        if prior is None:
+                            prior = await _await_deferred_post(
+                                driver, eng_id, request_id)
+                        if prior is None or not prior.get("ok"):
+                            return web.json_response(
+                                {"ok": False, "error": "delivery_failed"})
+                        return web.json_response({
+                            "ok": True, "outcome": "anchored",
+                            "question_number": None,
+                            "message_id": prior.get("message_id"),
+                        })
+
+            # First attempt (created intent) OR eager fallback: allocate the
+            # durable number + build the poster.
             number = await _maybe_allocate_number(engagement_registry, eng_id)
             display = _canonical_question(question, number) if number else question
 
@@ -598,37 +644,20 @@ def _make_ask(
                 await _advance_first_contact()
                 return mid
 
-            if driver is not None and projection_hash:
-                res = driver.register_send_intent(
-                    engagement_id=eng_id, request_id=request_id,
-                    tool_name=ASK_TOOL, projection_hash=projection_hash,
-                    poster=_noop_poster,
-                )
-                if res is not None:
-                    _intent, created_intent = res
-                    if not created_intent:
-                        prior = driver.send_intent_outcome(eng_id, request_id)
-                        if prior is not None and not prior.get("ok"):
-                            return web.json_response(
-                                {"ok": False, "error": "delivery_failed"})
-                        return web.json_response({
-                            "ok": True, "outcome": "anchored",
-                            "question_number": number,
-                            "message_id": prior.get("message_id") if prior else None,
-                        })
-                    driver.set_send_intent_poster(eng_id, request_id, _post_anchor)
-                    driver.arm_send_intent(eng_id, request_id)
-                    # F3 fail-closed: await the anchor post's outcome.
-                    outcome = await _await_deferred_post(
-                        driver, eng_id, request_id)
-                    if outcome is not None and not outcome.get("ok"):
-                        return web.json_response(
-                            {"ok": False, "error": "delivery_failed"})
-                    return web.json_response({
-                        "ok": True, "outcome": "anchored",
-                        "question_number": number,
-                        "message_id": outcome.get("message_id") if outcome else None,
-                    })
+            if created_intent:
+                # DEFERRED (relay-mediated) created path: install the poster,
+                # ARM, and AWAIT the outcome fail-closed (F3/F5).
+                driver.set_send_intent_poster(eng_id, request_id, _post_anchor)
+                driver.arm_send_intent(eng_id, request_id)
+                outcome = await _await_deferred_post(driver, eng_id, request_id)
+                if outcome is None or not outcome.get("ok"):
+                    return web.json_response(
+                        {"ok": False, "error": "delivery_failed"})
+                return web.json_response({
+                    "ok": True, "outcome": "anchored",
+                    "question_number": number,
+                    "message_id": outcome.get("message_id"),
+                })
 
             # EAGER fallback (no live sequencer): post the anchor now.
             mid = await _post_anchor()

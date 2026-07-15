@@ -2185,3 +2185,147 @@ class TestF7AdoptSummaryOnAttach:
         await drv.adopt_summary_if_missing(rec)
         sender.assert_not_awaited()                      # already has one
         assert rec.summary_message_id == 900
+
+
+class TestF2ViolationNoticeThroughSequencer:
+    """F2 (Sol r2): the interaction-violation notice is a PLATFORM notice — with
+    a live sequencer it MUST route through post_platform_notice (seals open
+    narration + posts below it under the one lock), never a direct send_to_topic
+    around the writer."""
+
+    async def test_notice_routes_through_sequencer_and_seals(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from channels.output_sequencer import OutputSequencer, SEALED
+
+        sent_direct = AsyncMock()
+        reg = _FakeInteractionRegistry("awaiting_operator")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path), send_to_topic=sent_direct,
+            casa_framework_mcp_url="x", registry=reg)
+        rec = _make_record()
+
+        posts: list = []
+
+        async def _send(topic, text, reply_to=None):
+            posts.append((topic, text))
+            return 500 + len(posts)
+
+        async def _edit(topic, mid, text):
+            return True
+
+        seq = OutputSequencer(
+            engagement_id=rec.id, topic_id=rec.topic_id,
+            send_message=_send, edit_message=_edit)
+        drv._sequencers[rec.id] = seq
+        nar = await seq.open_narration("live narration")
+
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+
+        # Notice posted THROUGH the sequencer, which SEALED open narration.
+        assert any("waiting for your reply" in t for _, t in posts)
+        assert seq.narration_msg_id is None
+        assert await seq.edit_narration_if_latest(nar, "late") == SEALED
+        # NOT a direct send_to_topic around the writer.
+        sent_direct.assert_not_awaited()
+        assert reg.violated == [rec.id]
+        assert rec.id in drv._violation_notified
+
+    async def test_notice_falls_back_to_direct_send_without_sequencer(self, tmp_path):
+        """No live sequencer ⇒ the pre-v0.79 direct send is still used."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        sent_direct = AsyncMock()
+        reg = _FakeInteractionRegistry("awaiting_operator")
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path), send_to_topic=sent_direct,
+            casa_framework_mcp_url="x", registry=reg)
+        rec = _make_record()
+        await drv._on_stream_event(rec, "mutating_tool", {"tool": "Bash"})
+        sent_direct.assert_awaited_once()
+        assert rec.id in drv._violation_notified
+
+
+class TestF3FinalizeDrainsToCompletionBlock:
+    """F3 (Sol r2): finalize_completion_post must DRAIN the relay to the
+    emit_completion block (wait for its consumption debt) BEFORE posting the
+    completion text — so lagging prior-frame narration can't post below it."""
+
+    async def test_completion_waits_for_debt_consumption(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from channels.output_sequencer import (
+            OutputSequencer, EMIT_COMPLETION_TOOL, projection_hash,
+        )
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path), send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="x")
+        rec = _make_record()
+
+        posts: list = []
+
+        async def _send(topic, text, reply_to=None):
+            posts.append((topic, text))
+            return 700 + len(posts)
+
+        async def _edit(topic, mid, text):
+            return True
+
+        seq = OutputSequencer(
+            engagement_id=rec.id, topic_id=rec.topic_id,
+            send_message=_send, edit_message=_edit, slot_hold_s=5.0)
+        drv._sequencers[rec.id] = seq
+        # Register the emit_completion consumption debt (as tools.py does before
+        # calling _finalize_engagement).
+        drv.register_completion_consumption(rec.id, {"summary": "done"})
+
+        fin = asyncio.ensure_future(
+            drv.finalize_completion_post(rec, "Engagement completed."))
+        await asyncio.sleep(0.05)
+        # Blocked draining to the completion block; completion NOT posted yet.
+        assert not fin.done()
+        assert posts == []
+
+        # Relay reaches the emit_completion block → debt consumed → drain wakes.
+        phash = projection_hash(EMIT_COMPLETION_TOOL, {"summary": "done"})
+        assert await seq.post_for_block(
+            EMIT_COMPLETION_TOOL, phash) == "debt_consumed"
+        assert await asyncio.wait_for(fin, timeout=1.0) is True
+        assert any("completed" in t for _, t in posts)
+
+
+class TestF7StrictSetterRollback:
+    """F7 (Sol r2): _post_initial_summary must NOT pre-assign the in-memory
+    summary_message_id before the strict setter snapshots it — otherwise a
+    forced persist failure rolls back to the NEW id and leaves it in memory."""
+
+    async def test_persist_failure_rolls_back_in_memory_to_prior(
+        self, tmp_path, monkeypatch,
+    ):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            "executor", "configurator", "claude_code", "t", {}, topic_id=42)
+        assert rec.summary_message_id is None            # true prior value
+
+        async def _boom(*a, **k):
+            raise RuntimeError("disk full")
+        # Force the strict persist to fail AFTER the setter mutates in memory.
+        monkeypatch.setattr(reg, "_write_tombstone_locked", _boom)
+
+        async def _send(topic, text, **kw):
+            return 555
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path), send_to_topic=_send,
+            casa_framework_mcp_url="x", registry=reg)
+
+        with pytest.raises(RuntimeError):
+            await drv._post_initial_summary(rec)
+
+        # The in-memory record (SAME object the registry holds) rolled back to
+        # the TRUE prior value (None) — NOT the new 555 the old pre-assign left.
+        assert rec.summary_message_id is None
+        assert reg.get(rec.id).summary_message_id is None

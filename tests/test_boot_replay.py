@@ -1119,3 +1119,90 @@ class TestReconcileTerminalSpools:
 
         await reconcile_terminal_spools(registry=reg, driver=_Driver())
         assert drained == [r2.id]        # r2 still drained despite r1 failing
+
+
+async def test_replay_aborts_resume_when_summary_adopt_fails(monkeypatch, tmp_path):
+    """F7 (Sol r2): pinned-summary adoption failure ABORTS the resume — the
+    service is NOT started and the record is marked error (§5: never run a
+    summary-less engagement). Adoption runs BEFORE start."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+
+    svc_root = tmp_path / "svc"
+    svc_root.mkdir()
+    (svc_root / "engagement-keep1").mkdir()
+    (svc_root / "engagement-keep1" / "type").write_text("longrun\n")
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+    start_calls: list = []
+    down_calls: list = []
+
+    async def fake_cau():
+        pass
+
+    async def fake_start(*, engagement_id):
+        start_calls.append(engagement_id)
+
+    async def fake_down(*, engagement_id):
+        down_calls.append(engagement_id)
+        return True
+
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+    monkeypatch.setattr(s6_rc, "ensure_service_down", fake_down)
+
+    reg = await _make_registry([_rec("keep1")])
+
+    adopt_calls: list = []
+
+    async def _adopt_boom(rec):
+        adopt_calls.append(rec.id)
+        raise RuntimeError("telegram down")
+
+    driver = AsyncMock()
+    driver._spawn_background_tasks = lambda rec: None
+    driver.adopt_summary_if_missing = _adopt_boom
+
+    await replay_undergoing_engagements(registry=reg, driver=driver)
+
+    # Adoption was ATTEMPTED, and its failure aborted the resume:
+    assert adopt_calls == ["keep1"]
+    assert start_calls == []                       # NOT started summary-less
+    assert down_calls == ["keep1"]                 # confirmed down
+    assert reg.get("keep1").status == "error"      # marked error
+
+
+async def test_replay_adopts_summary_before_start(monkeypatch, tmp_path):
+    """F7: on the happy path, adoption runs BEFORE start_service (ordering)."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+
+    svc_root = tmp_path / "svc"
+    svc_root.mkdir()
+    (svc_root / "engagement-keep1").mkdir()
+    (svc_root / "engagement-keep1" / "type").write_text("longrun\n")
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+    order: list = []
+
+    async def fake_cau():
+        pass
+
+    async def fake_start(*, engagement_id):
+        order.append(("start", engagement_id))
+
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+
+    reg = await _make_registry([_rec("keep1")])
+
+    async def _adopt(rec):
+        order.append(("adopt", rec.id))
+
+    driver = AsyncMock()
+    driver._spawn_background_tasks = lambda rec: None
+    driver.adopt_summary_if_missing = _adopt
+
+    await replay_undergoing_engagements(registry=reg, driver=driver)
+
+    assert order == [("adopt", "keep1"), ("start", "keep1")]

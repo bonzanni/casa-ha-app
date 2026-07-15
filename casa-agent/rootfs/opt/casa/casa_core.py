@@ -667,10 +667,47 @@ async def replay_undergoing_engagements(
         # 3. Single compile + update pass.
         await s6_rc._compile_and_update_locked()
 
-        # 4. Start each (idempotent under s6-rc change).
+        # 4. v0.79.0 (§5/F7): adopt the pinned summary BEFORE starting each
+        # service, then start. §5 forbids a running engagement without a
+        # summary, so an adoption failure ABORTS that engagement (mark error +
+        # skip start) rather than starting it summary-less — fail-closed, not
+        # the old fail-open "log and continue after start". A fresh v0.79 record
+        # (summary already persisted) or a topic-less one adopts as a no-op.
+        adopt = getattr(driver, "adopt_summary_if_missing", None)
         for rec in undergoing:
             if rec.id in refused_ids:        # Sol F5: no service was written
                 continue
+            if adopt is not None:
+                try:
+                    await adopt(rec)
+                except Exception as exc:  # noqa: BLE001 — §5 abort rule
+                    logger.warning(
+                        "boot replay: summary adopt-on-attach failed for %s: "
+                        "%s — aborting resume (not starting summary-less)",
+                        rec.id[:8], exc,
+                    )
+                    refused_ids.add(rec.id)
+                    try:
+                        await registry.mark_error(
+                            rec.id, kind="summary_adopt_failed",
+                            message=(
+                                "resume aborted: pinned-summary adoption failed "
+                                f"({exc})"
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001 — best-effort terminal mark
+                        logger.warning(
+                            "boot replay: mark_error(summary_adopt_failed) "
+                            "failed for %s", rec.id[:8], exc_info=True,
+                        )
+                    try:
+                        await s6_rc.ensure_service_down(engagement_id=rec.id)
+                    except Exception:  # noqa: BLE001 — best-effort teardown
+                        logger.warning(
+                            "boot replay: ensure_service_down after adopt "
+                            "failure for %s failed", rec.id[:8], exc_info=True,
+                        )
+                    continue
             try:
                 await s6_rc.start_service(engagement_id=rec.id)
             except Exception as exc:  # noqa: BLE001
@@ -681,22 +718,12 @@ async def replay_undergoing_engagements(
 
     # 5. Background tasks OUTSIDE the lock (long-lived).
     for rec in undergoing:
-        if rec.id in refused_ids:            # Sol F5: refused resume
+        if rec.id in refused_ids:            # Sol F5: refused resume / F7 abort
             continue
-        # v0.79.0 (§5, F7): adopt-on-attach summary migration for LEGACY
-        # pre-v0.79 ACTIVE engagements (summary_message_id is None). Post +
-        # persist a summary before the controller/background tasks attach so
-        # §5's invariant (no running engagement without a summary) holds —
-        # best-effort per record (must not depend on N150 having none active).
-        adopt = getattr(driver, "adopt_summary_if_missing", None)
-        if adopt is not None:
-            try:
-                await adopt(rec)
-            except Exception as exc:  # noqa: BLE001 — per-record isolation
-                logger.warning(
-                    "boot replay: summary adopt-on-attach failed for %s: %s",
-                    rec.id[:8], exc,
-                )
+        # v0.79.0 (§5, F7): the pinned-summary adopt-on-attach now runs in the
+        # start loop ABOVE (BEFORE service start, aborting the resume on failure)
+        # — a summary-less running engagement is no longer possible. Background
+        # tasks build the controller that adopts the (now-guaranteed) summary id.
         try:
             driver._spawn_background_tasks(rec)
         except Exception as exc:  # noqa: BLE001
