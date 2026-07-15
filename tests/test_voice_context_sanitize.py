@@ -120,7 +120,10 @@ class TestVoiceWSSanitize:
                 if msg.type != WSMsgType.TEXT:
                     break
                 frame = json.loads(msg.data)
-                if frame["type"] == "done":
+                # S-1 (v0.82.0): a zero-speech turn ends with a typed
+                # `empty_turn` error frame instead of a bare `done` — this
+                # stub agent never speaks, so accept either terminal frame.
+                if frame["type"] in ("done", "error"):
                     break
 
         assert agent.captured, "agent must have received a dispatched turn"
