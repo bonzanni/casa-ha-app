@@ -151,7 +151,10 @@ assert tools._agent_registry is not None, \
 print("HARNESS: module-level wiring verified", file=sys.stderr)
 
 # ---------- 5. Monkey-patch _run_delegated_agent to bypass SDK ----------
-async def _fake_run(cfg, task_text, context_text):
+# v0.80.0 (spec A5): _run_delegated_agent gained a resolution= kwarg (the
+# requires-gate resolution threaded through _prelaunch). Accept it (and any
+# future kwargs) so this stub tracks the real signature.
+async def _fake_run(cfg, task_text, context_text, resolution=None, **kwargs):
     return "Lights are off."
 
 tools._run_delegated_agent = _fake_run
