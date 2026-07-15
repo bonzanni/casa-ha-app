@@ -2032,6 +2032,24 @@ async def main() -> None:
                 thread_id, message_id)
         return False
 
+    async def _send_topic_message_markup(
+        thread_id: int, text: str, markup, reply_to: int | None = None,
+    ) -> int | None:
+        # A9 (v0.83.0): markup-capable discrete send (OutputSequencer.post_discrete).
+        if telegram_channel is not None:
+            return await telegram_channel.send_topic_message_markup(
+                thread_id, text, markup, reply_to=reply_to)
+        return None
+
+    async def _edit_topic_message_markup(
+        thread_id: int, message_id: int, text, markup,
+    ) -> bool:
+        # A9 (v0.83.0): markup-capable discrete edit (OutputSequencer.edit_discrete).
+        if telegram_channel is not None:
+            return await telegram_channel.edit_topic_message_markup(
+                thread_id, message_id, text, markup)
+        return False
+
     async def _pin_topic_message(thread_id: int, message_id: int) -> bool:
         # v0.79.0 (§5): best-effort pin of the live summary message.
         if telegram_channel is not None:
@@ -2065,6 +2083,10 @@ async def main() -> None:
         # seam for Task 7's inbound one-turn queue).
         edit_topic_message=_edit_topic_message,
         delete_topic_message=_delete_topic_message,
+        # A9 (v0.83.0): markup-capable discrete send/edit for post_discrete /
+        # edit_discrete (keyboard-bearing writes through the single writer).
+        send_topic_message_markup=_send_topic_message_markup,
+        edit_topic_message_markup=_edit_topic_message_markup,
         # v0.79.0 (§5): best-effort pin primitive for the live summary.
         pin_topic_message=_pin_topic_message,
         registry=engagement_registry,

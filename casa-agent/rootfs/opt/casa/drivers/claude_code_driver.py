@@ -588,6 +588,8 @@ class ClaudeCodeDriver(DriverProtocol):
         persist_session_id: SessionIdPersister | None = None,
         edit_topic_message: Callable[[int, int, str], Awaitable[bool]] | None = None,
         delete_topic_message: Callable[[int, int], Awaitable[bool]] | None = None,
+        send_topic_message_markup: Callable[..., Awaitable[int | None]] | None = None,
+        edit_topic_message_markup: Callable[..., Awaitable[bool]] | None = None,
         pin_topic_message: Callable[[int, int], Awaitable[bool]] | None = None,
         registry: Any = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -604,6 +606,11 @@ class ClaudeCodeDriver(DriverProtocol):
         self._send_to_topic = send_to_topic
         self._edit_topic_message = edit_topic_message
         self._delete_topic_message = delete_topic_message
+        # A9 (v0.83.0): markup-capable topic send/edit primitives, injected into
+        # the per-engagement OutputSequencer so post_discrete/edit_discrete drive
+        # keyboard-bearing writes through the single writer.
+        self._send_topic_message_markup = send_topic_message_markup
+        self._edit_topic_message_markup = edit_topic_message_markup
         # v0.79.0 (§5): best-effort pin of the live summary message. Takes
         # ``(topic_id, message_id)`` and returns pin-ok. None (or an ungranted
         # can_pin_messages) leaves the summary unpinned but still live.
@@ -1469,6 +1476,9 @@ class ClaudeCodeDriver(DriverProtocol):
                 topic_id=engagement.topic_id,
                 send_message=self._relay_send_message,
                 edit_message=self._relay_edit_message,
+                # A9: markup-capable wire for post_discrete/edit_discrete.
+                send_message_markup=self._relay_send_message_markup,
+                edit_message_markup=self._relay_edit_message_markup,
             )
             self._sequencers[engagement.id] = seq
         return seq
@@ -1826,6 +1836,25 @@ class ClaudeCodeDriver(DriverProtocol):
         if self._delete_topic_message is None:
             return False
         return await self._delete_topic_message(topic_id, message_id)
+
+    async def _relay_send_message_markup(
+        self, topic_id: int, text: str, markup, reply_to: int | None = None,
+    ) -> int | None:
+        # A9: markup-capable discrete send (post_discrete). Returns None when the
+        # primitive is un-injected so the sequencer records a failed post.
+        if self._send_topic_message_markup is None:
+            return None
+        return await self._send_topic_message_markup(
+            topic_id, text, markup, reply_to=reply_to)
+
+    async def _relay_edit_message_markup(
+        self, topic_id: int, message_id: int, text, markup,
+    ) -> bool:
+        # A9: markup-capable discrete edit (edit_discrete).
+        if self._edit_topic_message_markup is None:
+            return False
+        return await self._edit_topic_message_markup(
+            topic_id, message_id, text, markup)
 
     # -- stream-event fan-out ---------------------------------------------
 

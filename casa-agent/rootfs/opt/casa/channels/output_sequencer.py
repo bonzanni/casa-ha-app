@@ -43,6 +43,7 @@ import asyncio
 import inspect
 import logging
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -59,6 +60,13 @@ _INTENT_TIMEOUT_S = 10.0  # §2(5): an armed intent unmatched by any block for
 #                           this long posts out-of-band with a WARN + a debt.
 _HOLD_POLL_S = 0.05       # slot-hold re-check cadence (the happy path arms well
 #                           inside one poll; MCP calls land in ms).
+_DISCRETE_CACHE_CAP = 64  # A9 (Sol r2-10b): bounded FIFO of discrete
+#                           post_discrete/edit_discrete no-op-cache keys, so
+#                           keyboard entries don't accumulate for the
+#                           engagement's lifetime. Eviction past the cap drops
+#                           the oldest DISCRETE _edit_cache entry (narration /
+#                           summary entries are never in this FIFO, so they are
+#                           untouched); the no-op gate then re-edits once.
 
 # Canonical channel-MCP tool names (the ask/reply ingresses — §2 pinned
 # ingress (a)). ``HOLD_ELIGIBLE_TOOLS`` is the set of tool kinds that ALWAYS
@@ -299,6 +307,13 @@ FAILED = "failed"
 
 SendMessage = Callable[[int, str], Awaitable[int | None]]
 EditMessage = Callable[[int, int, str], Awaitable[bool]]
+# A9 markup-capable wire primitives (injected by the driver's _relay_* wrappers;
+# production always supplies them, tests inject fakes). ``send_message_markup``
+# posts plain text + an inline keyboard and returns the message id;
+# ``edit_message_markup`` edits text and/or markup (``text=None`` ⇒ markup-only;
+# ``markup is _ABSENT`` ⇒ leave the keyboard untouched).
+SendMessageMarkup = Callable[..., Awaitable[int | None]]
+EditMessageMarkup = Callable[..., Awaitable[bool]]
 
 
 class OutputSequencer:
@@ -316,6 +331,8 @@ class OutputSequencer:
         topic_id: int,
         send_message: SendMessage,
         edit_message: EditMessage,
+        send_message_markup: SendMessageMarkup | None = None,
+        edit_message_markup: EditMessageMarkup | None = None,
         _now: Callable[[], float] = time.monotonic,
         _sleep: Callable[[float], Awaitable[None]] | None = None,
         slot_hold_s: float = _SLOT_HOLD_S,
@@ -326,6 +343,12 @@ class OutputSequencer:
         self.topic_id = topic_id
         self.send_message = send_message
         self.edit_message = edit_message
+        # A9: markup-capable wire primitives. Default None keeps the sequencer
+        # constructible without them; post_discrete/edit_discrete raise a clear
+        # RuntimeError if used un-injected (belt-and-suspenders — production
+        # always injects via the driver's _ensure_sequencer wiring).
+        self._send_message_markup = send_message_markup
+        self._edit_message_markup = edit_message_markup
         self._now = _now
         self._sleep = _sleep or _default_sleep
         self._slot_hold_s = slot_hold_s
@@ -354,7 +377,13 @@ class OutputSequencer:
         self._high_water: int | None = None
         self._narration_msg_id: int | None = None
         # F1 no-op edit gate: msg_id -> (text, markup_tristate).
-        self._edit_cache: dict[int, tuple[str, Any]] = {}
+        self._edit_cache: dict[int, tuple[Any, Any]] = {}
+        # A9 (Sol r2-10b): bounded FIFO of DISCRETE-write cache keys only. Narration
+        # entries retire on seal and summary entries live forever above the log;
+        # discrete keyboard entries would otherwise leak, so post_discrete/
+        # edit_discrete register their mids here and eviction past the cap drops
+        # the oldest discrete _edit_cache entry (never a narration/summary one).
+        self._discrete_cache_fifo: deque[int] = deque()
         self._arm_event = asyncio.Event()
         # v0.79.0 (§3, Primitive B): reply-threading. An inbound operator
         # envelope's delivery sets this to its Telegram message id; the turn's
@@ -623,6 +652,53 @@ class OutputSequencer:
             self._signal_resolution(request_id)
             return intent
 
+    async def mark_intent_compensated(
+        self, request_id: str, message_id: int,
+    ) -> Any:
+        """A3(c) COMPENSATED-INTENT path (Sol r5-5 + r6-1): account a physical
+        wire message whose logical result is FAILURE.
+
+        The A3 initial-anchor poster posts first, then strict-persists the
+        ledger entry; on an ``add_open_question`` failure the message EXISTS on
+        the wire but the ask must resolve ok:false. The poster best-effort
+        edits the orphan to a withdrawn-copy via the RAW wire primitive (never
+        ``edit_discrete`` — it runs under the sequencer lock on the relay task,
+        no reacquisition) and calls this to reconcile the sequencer's causal
+        accounting.
+
+        Pinned invariants (spec §A3(c)): ``_high_water`` advances to the
+        delivered *message_id* (so a later ask opens BELOW the orphan, never
+        beside it), the intent resolves EXACTLY ONCE with ``{"ok": False,
+        "message_id": message_id, "compensated": True}``, and ``post_failed`` is
+        NOT separately re-fired.
+
+        Divergence from :meth:`mark_intent_posted` (which records an ok success
+        with a one-block ``timeout_posted`` debt): here the outcome is ok:false
+        with a ``compensated`` marker, the intent is RETIRED from matching
+        (``consumed=True``, so no relay/watcher re-fire and no phantom debt),
+        and — unlike :meth:`_post_intent_locked`'s failure branch —
+        ``post_failed`` stays False (the post is not a fail-closed miss; the
+        message physically landed). Idempotent: a repeat call after
+        compensation is a no-op (no double resolution / high-water re-advance)."""
+        async with self._serialized():
+            intent = self.registry.by_request_id(request_id)
+            if intent is None:
+                return None
+            if intent.outcome is not None and intent.outcome.get("compensated"):
+                return intent  # already compensated — exactly-once
+            intent.state = "posted"
+            intent.consumed = True          # retired from matching
+            intent.timeout_posted = False   # no consumption debt (not a success)
+            intent.post_failed = False      # NOT a fail-closed re-fire
+            intent.message_id = message_id
+            intent.outcome = {
+                "ok": False, "message_id": message_id, "compensated": True,
+            }
+            if self._high_water is None or message_id > self._high_water:
+                self._high_water = message_id
+            self._signal_resolution(request_id)
+            return intent
+
     # -- F3 fail-closed resolution await -----------------------------------
 
     def _signal_resolution(self, request_id: str) -> None:
@@ -724,6 +800,109 @@ class OutputSequencer:
             ):
                 self._high_water = mid
             return mid
+
+    # -- A9 keyboard-bearing discrete writes (Sol r1-8) --------------------
+
+    def _register_discrete_cache(self, mid: int) -> None:
+        """Register *mid* in the bounded discrete-cache FIFO, evicting the
+        oldest discrete ``_edit_cache`` entry past the cap.
+
+        Re-registering an existing mid moves it to the tail (most-recent), so a
+        repeatedly-edited keyboard is not evicted ahead of a stale one. Only
+        entries created by :meth:`post_discrete`/:meth:`edit_discrete` are in
+        this FIFO — narration (retired on seal) and summary (append-above)
+        entries are never touched by eviction."""
+        if mid in self._discrete_cache_fifo:
+            self._discrete_cache_fifo.remove(mid)
+        self._discrete_cache_fifo.append(mid)
+        while len(self._discrete_cache_fifo) > _DISCRETE_CACHE_CAP:
+            evicted = self._discrete_cache_fifo.popleft()
+            self._edit_cache.pop(evicted, None)
+
+    def _forget_discrete_cache(self, mid: int) -> None:
+        """Drop *mid* from the discrete FIFO (a FAILED edit invalidated its
+        cache entry, so it must not linger as a phantom FIFO slot)."""
+        if mid in self._discrete_cache_fifo:
+            self._discrete_cache_fifo.remove(mid)
+
+    async def post_discrete(
+        self, text: str, *, markup: Any = None, reply_to: int | None = None,
+        revalidate: Any = None,
+    ) -> int | None:
+        """A9: post a keyboard-bearing DISCRETE message through the single writer
+        (A3 anchor re-anchor). Mirrors :meth:`post_platform_notice` but sends via
+        the markup-capable wire and maintains the F1 tri-state cache.
+
+        Under the writer lock: run *revalidate* (sync or async — the A3
+        answered/reserved final check) immediately before the send; a declined
+        revalidation returns ``None`` with NO send and NO state change. On a
+        successful send: SEAL open narration (the discrete message is a causal
+        event below it), advance ``_high_water`` to the returned mid, seed the
+        tri-state ``_edit_cache`` entry, and register the mid in the bounded
+        discrete-cache FIFO. *reply_to* threads like the other sends.
+
+        Deliberately NOT wrapped around ``ensure_posted`` posters (Sol r4-5): that
+        runs its poster in a NEW task, which would deadlock against the
+        relay-held, task-reentrant-only writer lock. Raises RuntimeError if the
+        markup wire was not injected."""
+        if self._send_message_markup is None:
+            raise RuntimeError(
+                "post_discrete requires an injected send_message_markup wire "
+                "primitive (driver _ensure_sequencer wiring)")
+        async with self._serialized():
+            if revalidate is not None and not await _maybe_await(revalidate()):
+                return None
+            self._seal_narration_locked()
+            mid = await _maybe_await(self._send_message_markup(
+                self.topic_id, text, markup, reply_to=reply_to))
+            if mid is None:
+                return None
+            if self._high_water is None or mid > self._high_water:
+                self._high_water = mid
+            self._edit_cache[mid] = (text, _markup_tristate(markup))
+            self._register_discrete_cache(mid)
+            return mid
+
+    async def edit_discrete(
+        self, msg_id: int, *, text: Any = None, markup: Any = _ABSENT,
+        revalidate: Any = None,
+    ) -> bool:
+        """A9: markup-capable edit of a discrete message through the F1 tri-state
+        no-op cache (A5 toggle redraw / multi settle edit).
+
+        Touches NEITHER narration NOR high-water — it edits HISTORY, like
+        :meth:`edit_summary`. ``text=None`` means a markup-only edit (a stable
+        cache representation distinct from a text edit). Under the writer lock:
+        run *revalidate* (the A5 terminal-race guard; declined → ``False``, no
+        edit); F1 no-op gate — an identical ``(text, markup-tristate)`` returns
+        ``True`` without any wire call; otherwise wire-edit and update the cache.
+
+        **Returns ``bool``, deliberately NOT the APPLIED/FAILED string codes
+        (Sol r2-10):** every settle path feeds ``confirmed_settle_edit``, whose
+        gate is ``bool(await do_edit())`` — the string ``"failed"`` is truthy and
+        would count a failed wire edit as CONFIRMED, deleting the recovery
+        record. ``True`` ⇔ applied or no-op-skip; ``False`` ⇔ failed or
+        revalidation-declined. Raises RuntimeError if the markup wire was not
+        injected."""
+        if self._edit_message_markup is None:
+            raise RuntimeError(
+                "edit_discrete requires an injected edit_message_markup wire "
+                "primitive (driver _ensure_sequencer wiring)")
+        async with self._serialized():
+            if revalidate is not None and not await _maybe_await(revalidate()):
+                return False
+            tri = _markup_tristate(markup)
+            if self._edit_cache.get(msg_id) == (text, tri):
+                return True  # no-op skip — no wire call
+            ok = await _maybe_await(self._edit_message_markup(
+                self.topic_id, msg_id, text, markup))
+            if not ok:
+                self._edit_cache.pop(msg_id, None)   # invalidate → retry allowed
+                self._forget_discrete_cache(msg_id)
+                return False
+            self._edit_cache[msg_id] = (text, tri)
+            self._register_discrete_cache(msg_id)
+            return True
 
     # -- F1(c) / F4 turn-boundary drain ------------------------------------
 

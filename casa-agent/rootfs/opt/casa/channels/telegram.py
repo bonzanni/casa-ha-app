@@ -1726,6 +1726,119 @@ class TelegramChannel(Channel):
             )
             return False
 
+    async def send_topic_message_markup(
+        self, topic_id: int | None, text: str, markup: Any = None,
+        *, reply_to: int | None = None,
+    ) -> int | None:
+        """A9 (v0.83.0): plain-text topic send carrying an inline keyboard,
+        returning the posted ``message_id`` (markup-capable companion to
+        ``send_to_topic`` for the OUTPUT SEQUENCER's ``post_discrete``).
+
+        ``markup`` is an ``InlineKeyboardMarkup`` (passed through), the
+        ``output_sequencer.MARKUP_EMPTY`` sentinel (⇒ explicit empty keyboard),
+        or ``None`` (⇒ no keyboard, plain send). ``reply_to`` reply-threads the
+        send. Best-effort: returns ``None`` on failure rather than raising."""
+        if not self.engagement_supergroup_id:
+            return None
+        kwargs: dict = {}
+        resolved = self._resolve_wire_keyboard(markup)
+        if resolved is not None:
+            kwargs["reply_markup"] = resolved
+        if reply_to is not None:
+            from telegram import ReplyParameters
+            kwargs["reply_parameters"] = ReplyParameters(
+                message_id=reply_to, allow_sending_without_reply=True,
+            )
+        try:
+            msg = await self.bot.send_message(
+                chat_id=self.engagement_supergroup_id,
+                text=text,
+                message_thread_id=topic_id,
+                **kwargs,
+            )
+            return msg.message_id
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+            logger.warning(
+                "send_topic_message_markup failed (topic=%s): %s", topic_id, exc,
+            )
+            return None
+
+    async def edit_topic_message_markup(
+        self, topic_id: int | None, message_id: int, text, markup,
+    ) -> bool:
+        """A9 (v0.83.0): markup-capable edit of a posted topic message (the
+        sequencer's ``edit_discrete`` wire).
+
+        * ``text`` non-None, ``markup is _ABSENT`` → text-only edit; the existing
+          keyboard is left UNTOUCHED (PTB drops the omitted ``reply_markup``).
+        * ``text`` non-None, ``markup`` given → edit text AND keyboard.
+        * ``text is None``, ``markup`` given → markup-only edit via
+          ``bot.edit_message_reply_markup``.
+        * ``text is None`` and ``markup is _ABSENT`` → nothing to do (no-op True).
+
+        ``markup`` values resolve like ``send_topic_message_markup``'s (a real
+        keyboard passes through; ``MARKUP_EMPTY``/``None`` ⇒ explicit empty
+        keyboard to CLEAR). "Message is not modified" is tolerated as success
+        (the desired end-state already holds), matching ``edit_topic_message``."""
+        from channels.output_sequencer import _ABSENT
+        if not self.engagement_supergroup_id:
+            return False
+        markup_touched = markup is not _ABSENT
+        if text is None and not markup_touched:
+            return True  # nothing to change
+        try:
+            if text is None:
+                await self.bot.edit_message_reply_markup(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id,
+                    reply_markup=self._resolve_wire_keyboard(markup, clear=True),
+                )
+            elif markup_touched:
+                await self.bot.edit_message_text(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=self._resolve_wire_keyboard(markup, clear=True),
+                )
+            else:
+                await self.bot.edit_message_text(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id,
+                    text=text,
+                )
+            return True
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            logger.warning(
+                "edit_topic_message_markup failed (topic=%s message_id=%s): %s",
+                topic_id, message_id, exc,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+            logger.warning(
+                "edit_topic_message_markup failed (topic=%s message_id=%s): %s",
+                topic_id, message_id, exc,
+            )
+            return False
+
+    @staticmethod
+    def _resolve_wire_keyboard(markup, *, clear: bool = False):
+        """Map a sequencer markup value to a concrete PTB ``reply_markup``.
+
+        A real ``InlineKeyboardMarkup`` passes through unchanged; the
+        ``output_sequencer.MARKUP_EMPTY`` sentinel resolves to an explicit empty
+        keyboard. ``None`` resolves to an explicit empty keyboard when *clear* is
+        set (an EDIT that must drop the old keyboard) or to ``None`` otherwise (a
+        fresh SEND has no keyboard to clear)."""
+        from telegram import InlineKeyboardMarkup
+        from channels.output_sequencer import MARKUP_EMPTY
+        if markup is None:
+            return InlineKeyboardMarkup([]) if clear else None
+        if isinstance(markup, str) and markup == MARKUP_EMPTY:
+            return InlineKeyboardMarkup([])
+        return markup
+
     async def delete_topic_message(
         self, topic_id: int | None, message_id: int,
     ) -> bool:
