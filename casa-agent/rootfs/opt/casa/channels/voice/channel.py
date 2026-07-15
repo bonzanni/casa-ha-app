@@ -49,6 +49,7 @@ _DEFAULT_ERROR_LINES = {
 # holds even if INTEGRATION_TIMEOUT_TOTAL is raised later.
 INTEGRATION_TIMEOUT_TOTAL: float = 30.0
 _VOICE_TURN_BUDGET_HARD_CAP_S: float = 27.0
+_VOICE_TURN_BUDGET_MIN_S: float = 10.0
 
 
 def _voice_turn_budget_s() -> float:
@@ -56,7 +57,10 @@ def _voice_turn_budget_s() -> float:
 
     ``min(voice_turn_budget_seconds, INTEGRATION_TIMEOUT_TOTAL - 3)``,
     configured via the ``VOICE_TURN_BUDGET_SECONDS`` env var (default 27),
-    hard-capped at 27s regardless of configuration.
+    clamped to the add-on schema's ``[10, 27]`` rail regardless of
+    configuration (defence in depth — HA schema-validates normal config, but
+    a direct env override or schema drift must not slip a sub-10s budget
+    past, which would starve every delegation).
 
     A non-finite configured value (``nan``/``inf``) is REJECTED and falls
     back to 27 — a NaN budget would propagate through ``min()`` and defeat
@@ -69,6 +73,8 @@ def _voice_turn_budget_s() -> float:
         configured = 27.0
     if not math.isfinite(configured):
         configured = 27.0
+    # Floor at the schema minimum, then apply the transport/hard-cap ceilings.
+    configured = max(configured, _VOICE_TURN_BUDGET_MIN_S)
     budget = min(configured, INTEGRATION_TIMEOUT_TOTAL - 3.0)
     return min(budget, _VOICE_TURN_BUDGET_HARD_CAP_S)
 

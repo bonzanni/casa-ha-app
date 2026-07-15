@@ -895,8 +895,13 @@ def _row(label: str, value: str, css: str = "") -> str:
 
 
 def _env_int_or(name: str, default: int, *, min_value: int = 0,
+                max_value: int | None = None,
                 env: dict[str, str] | None = None) -> int:
     """Read a non-negative int from env; fall back to *default* on bad input.
+
+    ``min_value``/``max_value`` clamp the parsed value to the same rails the
+    HA add-on schema validates (defence in depth — HA schema-validates normal
+    config, but a direct env override or a schema drift must not slip past).
 
     Extracted as a module-level helper so future items that need the same
     shape (spec 5.2 §9.3 has more env vars coming in item I) can reuse
@@ -918,6 +923,12 @@ def _env_int_or(name: str, default: int, *, min_value: int = 0,
             name, value, min_value, min_value,
         )
         return min_value
+    if max_value is not None and value > max_value:
+        logger.warning(
+            "%s=%d above maximum %d; using %d",
+            name, value, max_value, max_value,
+        )
+        return max_value
     return value
 
 
@@ -1711,8 +1722,10 @@ async def main() -> None:
     # delegation for that role also logs a WARNING. Both env vars are a
     # placeholder read pending Task 7's real HA-options wiring.
     from specialist_limits import SpecialistLimiter, SpecialistTelemetry
+    # Clamp to the add-on schema's [1, 20] rail (defence in depth — see
+    # _env_int_or). The per-scope cap (exactly 1) is not configurable.
     specialist_max_concurrency = _env_int_or(
-        "SPECIALIST_MAX_CONCURRENCY", 2, min_value=1)
+        "SPECIALIST_MAX_CONCURRENCY", 2, min_value=1, max_value=20)
     specialist_cost_alert_threshold = _env_float_or(
         "SPECIALIST_COST_ALERT_THRESHOLD", 5.0, min_value=0.0)
     specialist_limiter = SpecialistLimiter(max_global=specialist_max_concurrency)

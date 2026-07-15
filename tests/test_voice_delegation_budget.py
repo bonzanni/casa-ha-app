@@ -517,6 +517,16 @@ class TestVoiceTurnBudget:
         monkeypatch.setenv("VOICE_TURN_BUDGET_SECONDS", "inf")
         assert _voice_turn_budget_s() == 27.0
 
+    def test_below_schema_min_is_floored_to_10(self, monkeypatch):
+        """final-review MINOR 1: a sub-10s value (below the schema's min,
+        e.g. a direct env override) is floored to 10 defensively rather
+        than starving every delegation."""
+        from channels.voice.channel import _voice_turn_budget_s
+        monkeypatch.setenv("VOICE_TURN_BUDGET_SECONDS", "3")
+        assert _voice_turn_budget_s() == 10.0
+        monkeypatch.setenv("VOICE_TURN_BUDGET_SECONDS", "0")
+        assert _voice_turn_budget_s() == 10.0
+
 
 # ---------------------------------------------------------------------------
 # TestVoiceProgressSink — exactly-once, suppressed after real speech

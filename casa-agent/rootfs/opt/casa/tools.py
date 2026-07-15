@@ -1254,13 +1254,16 @@ def _record_launch_safe(agent_name: str) -> None:
 def _permit_release_callback(permit) -> "callable":
     """Return an asyncio task done-callback that releases *permit* (spec §4.6).
 
-    Attaching this to the delegated task is strictly more robust than a
-    ``finally`` inside the coroutine: a task cancelled BEFORE its coroutine
-    ever starts running has no coroutine-`finally` to run, but its done
-    callbacks still fire. The callback fires exactly once per task
-    (normal completion, exception, or cancellation) and ``Permit.release()``
-    is idempotent, so a redundant release elsewhere (registry terminal
-    transition, `_finalize_engagement`) is a safe no-op."""
+    This is the SOLE authoritative release for a launched sync/async task —
+    the ``SpecialistRegistry`` terminal transitions deliberately do not
+    release (that would race the voice teardown's ``cancel_delegation``
+    against a still-unwinding task). Attaching it to the task is strictly more
+    robust than a ``finally`` inside the coroutine: a task cancelled BEFORE
+    its coroutine ever starts running has no coroutine-`finally` to run, but
+    its done callbacks still fire. It fires exactly once per task (normal
+    completion, exception, or cancellation), and ``Permit.release()`` is
+    idempotent so an overlap with the pre-launch ``owned`` guard is a
+    safe no-op."""
     def _cb(_task: asyncio.Task) -> None:
         permit.release()
     return _cb
@@ -1365,6 +1368,7 @@ def _delegation_scope(origin: dict, agent_name: str) -> str:
 
 async def _prelaunch(
     agent_name: str, origin: dict, mode: str,
+    task_text: str = "", context_text: str = "",
 ) -> tuple[Any, Any, "specialist_limits.Permit | None", dict | None]:
     """The single unified prelaunch pipeline for delegate_to_agent (spec A4).
 
@@ -1372,10 +1376,16 @@ async def _prelaunch(
     another and no side effect (topic, engagement/delegation record, task,
     driver start, progress emission) can precede a clean return:
 
-        ACL (Task 1) -> not-initialized -> depth cap -> mode gate ->
-        target resolution -> resident-interactive-compat ->
-        requires (Task 5) -> concurrency (Task 6, spec §4.6) ->
-        progress -> launch
+        ACL (Task 1) -> not-initialized -> input-size bounds (Task 6) ->
+        depth cap -> mode gate -> target resolution ->
+        resident-interactive-compat -> requires (Task 5) ->
+        concurrency (Task 6, spec §4.6) -> progress -> launch
+
+    The input-size bounds run AFTER the ACL (so an unauthorized caller is
+    denied ``delegation_not_declared`` regardless of payload size, and no
+    telemetry is ever keyed on a caller-supplied target name pre-auth) but
+    BEFORE target resolution / concurrency / progress (so an oversized
+    payload never resolves plugins, acquires a slot, or speaks).
 
     The mode gate deliberately precedes both target resolution AND the
     resident-interactive-compat check: on voice, async/interactive must
@@ -1403,9 +1413,11 @@ async def _prelaunch(
       (``_build_specialist_options(cfg, resolution=resolution)`` and the
       interactive engagement-record binding) rather than re-resolving, so
       the gate's decision and what actually launches never drift. The
-      caller (``delegate_to_agent``) is responsible for the permit's
-      lifetime from here — see ``_run_delegated_agent_with_permit`` (sync/
-      async path) and the interactive branch's ``rec.permit`` handoff.
+      caller (``delegate_to_agent``) owns the permit's lifetime from here:
+      for the sync/async path the task's ``_permit_release_callback``
+      done-callback is the sole authoritative release; for interactive the
+      permit is handed to ``rec.permit`` and released by an
+      ``EngagementRegistry`` terminal transition (or ``_finalize_engagement``).
     """
     channel = str((origin or {}).get("channel", ""))
 
@@ -1438,6 +1450,38 @@ async def _prelaunch(
             "status": "error",
             "kind": "not_initialized",
             "message": "specialist registry not initialized",
+        })
+
+    # Task 6 input bounds (spec §4.6): reject an oversized task/context —
+    # AFTER the ACL (an unauthorized caller is already denied above, so we
+    # never leak `input_too_large` to an unknown caller, and any denial
+    # telemetry keyed on `agent_name` is now safe: the caller is authorized
+    # and `agent_name` is one of its DECLARED delegates) but BEFORE target
+    # resolution / concurrency / progress (an oversized payload never
+    # resolves plugins, acquires a slot, or speaks).
+    if len(task_text) > specialist_limits._MAX_TASK_CHARS:
+        if _specialist_telemetry is not None:
+            _specialist_telemetry.record_denial(agent_name, kind="input_too_large")
+        return None, None, None, _result({
+            "status": "error", "kind": "input_too_large", "field": "task",
+            "agent": agent_name, "length": len(task_text),
+            "limit": specialist_limits._MAX_TASK_CHARS,
+            "message": (
+                f"task ({len(task_text)} chars) exceeds the "
+                f"{specialist_limits._MAX_TASK_CHARS}-char limit."
+            ),
+        })
+    if len(context_text) > specialist_limits._MAX_CONTEXT_CHARS:
+        if _specialist_telemetry is not None:
+            _specialist_telemetry.record_denial(agent_name, kind="input_too_large")
+        return None, None, None, _result({
+            "status": "error", "kind": "input_too_large", "field": "context",
+            "agent": agent_name, "length": len(context_text),
+            "limit": specialist_limits._MAX_CONTEXT_CHARS,
+            "message": (
+                f"context ({len(context_text)} chars) exceeds the "
+                f"{specialist_limits._MAX_CONTEXT_CHARS}-char limit."
+            ),
         })
 
     # Depth cap: prevent delegation chains beyond depth=1.
@@ -1693,51 +1737,26 @@ async def delegate_to_agent(args: dict) -> dict:
     context_text = args.get("context", "") or ""
     mode = args.get("mode", "sync") or "sync"
 
-    # Task 6 input bounds (spec §4.6): checked at handler entry, BEFORE
-    # _prelaunch — an oversized task/context is rejected with ZERO side
-    # effects (no ACL/depth/mode gate run, no concurrency slot consumed).
-    if len(task_text) > specialist_limits._MAX_TASK_CHARS:
-        if _specialist_telemetry is not None:
-            _specialist_telemetry.record_denial(agent_name, kind="input_too_large")
-        return _result({
-            "status": "error", "kind": "input_too_large", "field": "task",
-            "agent": agent_name, "length": len(task_text),
-            "limit": specialist_limits._MAX_TASK_CHARS,
-            "message": (
-                f"task ({len(task_text)} chars) exceeds the "
-                f"{specialist_limits._MAX_TASK_CHARS}-char limit."
-            ),
-        })
-    if len(context_text) > specialist_limits._MAX_CONTEXT_CHARS:
-        if _specialist_telemetry is not None:
-            _specialist_telemetry.record_denial(agent_name, kind="input_too_large")
-        return _result({
-            "status": "error", "kind": "input_too_large", "field": "context",
-            "agent": agent_name, "length": len(context_text),
-            "limit": specialist_limits._MAX_CONTEXT_CHARS,
-            "message": (
-                f"context ({len(context_text)} chars) exceeds the "
-                f"{specialist_limits._MAX_CONTEXT_CHARS}-char limit."
-            ),
-        })
-
     # AR-2: snapshot at entry — this handler awaits (channel setup,
     # engagement/delegation dispatch) and must not read a holder that a
     # later turn has since rewritten in place.
     origin = _snapshot_origin()
 
     # A4: THE unified prelaunch pipeline — one call that runs EVERY
-    # pre-launch gate (ACL, depth, mode, target resolution, resident-compat,
-    # requires-seam, concurrency, progress) in a fixed order, so no gate is
-    # bypassable by another and NO side effect (topic, engagement/delegation
-    # record, task, driver start, progress emission) can precede a clean
-    # return. It dominates both the interactive branch and the sync/async
-    # path below. `permit` (Task 6, spec §4.6) is the concurrency slot this
-    # delegation now owns — the caller (this function) owns its lifetime
-    # from here: sync/async hands it to `_run_delegated_agent_with_permit`;
-    # interactive hands it to the just-created engagement record.
+    # pre-launch gate (ACL, not-initialized, input-size bounds, depth, mode,
+    # target resolution, resident-compat, requires-seam, concurrency,
+    # progress) in a fixed order, so no gate is bypassable by another and NO
+    # side effect (topic, engagement/delegation record, task, driver start,
+    # progress emission) can precede a clean return. It dominates both the
+    # interactive branch and the sync/async path below. The input-size bounds
+    # live INSIDE _prelaunch (after the ACL) so an unauthorized caller is
+    # denied `delegation_not_declared` regardless of payload size and no
+    # telemetry is ever keyed on a caller-supplied target pre-auth. `permit`
+    # (Task 6, spec §4.6) is the concurrency slot this delegation now owns —
+    # the caller owns its lifetime from here: sync/async releases via the
+    # task done-callback; interactive hands it to the engagement record.
     cfg, resolution, permit, prelaunch_error = await _prelaunch(
-        agent_name, origin, mode)
+        agent_name, origin, mode, task_text, context_text)
     if prelaunch_error is not None:
         return prelaunch_error
 
@@ -1746,10 +1765,12 @@ async def delegate_to_agent(args: dict) -> dict:
     # releases on ANY exit before transfer — including a CancelledError
     # raised at an await between here and launch (which `except Exception`
     # would miss), and every early error return. At each true ownership
-    # transfer (task done-callback attached / driver.start succeeded) the
-    # body sets `owned = None`. Every release is idempotent, so the
-    # registry terminal transitions and `_finalize_engagement` releasing
-    # the SAME permit are safe no-ops.
+    # transfer the body sets `owned = None`: for sync/async the moment the
+    # task's `_permit_release_callback` done-callback is attached (which then
+    # becomes the sole release); for interactive after `driver.start()`
+    # succeeds (the engagement record's permit is then released by an
+    # `EngagementRegistry` terminal transition). Every release is idempotent,
+    # so an overlapping release on the SAME permit is a safe no-op.
     owned = permit
     try:
         if mode == "interactive":
@@ -1939,11 +1960,13 @@ async def delegate_to_agent(args: dict) -> dict:
             id=delegation_id, agent=agent_name, started_at=started_at,
             origin=dict(origin),
         )
-        # Task 6 (spec §4.6): stash for observability + registry terminal-
-        # transition release (complete/fail/cancel_delegation). The PRIMARY
-        # release for the sync/async path is the `_permit_release_callback`
-        # done-callback attached to the task below (robust even if the task is
-        # cancelled before its coroutine starts). All releases are idempotent.
+        # Task 6 (spec §4.6): stash the permit on the record for
+        # observability only. The SOLE release for the sync/async path is the
+        # `_permit_release_callback` done-callback attached to the task below
+        # (robust even if the task is cancelled before its coroutine starts);
+        # `SpecialistRegistry` terminal transitions deliberately do NOT
+        # release (that would race the voice teardown's `cancel_delegation`
+        # against a still-unwinding task).
         record.permit = permit
         await _specialist_registry.register_delegation(record)
 

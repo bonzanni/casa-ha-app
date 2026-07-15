@@ -1130,3 +1130,54 @@ class TestInputBounds:
         )
         payload = json.loads(result["content"][0]["text"])
         assert payload.get("kind") != "input_too_large"
+
+    async def test_input_bounds_run_after_acl(self, tmp_path, monkeypatch):
+        """FINAL-REVIEW: the input-size check runs AFTER the ACL. An
+        unauthorized caller sending oversized input must be denied
+        `delegation_not_declared` (never `input_too_large` — which would both
+        leak the size gate to an unknown caller AND record target-keyed
+        telemetry on a caller-supplied `args["agent"]` BEFORE authorization).
+        No telemetry counter may move."""
+        import specialist_limits as sl
+
+        telem = SpecialistTelemetry()
+        # Caller "assistant" declares ONLY "finance"; it delegates to "ghost".
+        tm, reg, bus = _init_tools(tmp_path, telemetry=telem, agent_role_map={
+            "assistant": _caller_cfg(delegates=("finance",)),
+            "finance": _specialist_cfg("finance"),
+        })
+        monkeypatch.setattr(sl, "_MAX_TASK_CHARS", 10)
+
+        result = await _with_origin(
+            tm.delegate_to_agent.handler({
+                "agent": "ghost", "task": "x" * 500, "context": "",
+                "mode": "sync",
+            }),
+            _origin(),
+        )
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["kind"] == "delegation_not_declared"
+        # No telemetry keyed on the caller-supplied target pre-auth.
+        assert telem.snapshot("ghost").denials == 0
+        assert telem.snapshot("finance").denials == 0
+
+    async def test_missing_origin_oversized_input_is_not_declared(
+        self, tmp_path, monkeypatch,
+    ):
+        """A missing origin (called outside a turn) + oversized input →
+        `delegation_not_declared` (the ACL's unknown-caller denial), not
+        `input_too_large`, and no counter moves."""
+        import specialist_limits as sl
+
+        telem = SpecialistTelemetry()
+        tm, reg, bus = _init_tools(tmp_path, telemetry=telem)
+        monkeypatch.setattr(sl, "_MAX_TASK_CHARS", 10)
+
+        # NOT wrapped in _with_origin — origin_var stays None.
+        result = await tm.delegate_to_agent.handler({
+            "agent": "finance", "task": "x" * 500, "context": "",
+            "mode": "sync",
+        })
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["kind"] == "delegation_not_declared"
+        assert telem.snapshot("finance").denials == 0

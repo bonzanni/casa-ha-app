@@ -64,7 +64,7 @@ setting by hand:
 | `webhook_secret` | HMAC-SHA256 secret for authenticating webhook requests. Leave empty to skip verification. |
 | `engagement_reap_days` | Auto-close engagements after this many days without activity (daily sweep cancels them and closes their Telegram topic; the engaging agent is notified). Set `0` to disable. Default: `7`. |
 | `log_level` | Log verbosity: `debug`, `info`, `warning`, or `error`. Default: `info`. Flip to `debug` for verbose troubleshooting without rebuilding the image. |
-| `voice_turn_budget_seconds` | Max seconds a synchronous specialist delegation may run during one voice turn (see [Voice pipeline](#voice-pipeline)). Range 10-27; hard-capped at 27 regardless of this value. Default: `27`. |
+| `voice_turn_budget_seconds` | Wall-clock budget for one voice turn, from request ingress to the turn deadline (see [Voice pipeline](#voice-pipeline)). A synchronous specialist hand-off started mid-turn must finish within it, minus a ~5s reserve held back so Casa can still speak a fallback if the specialist runs long. Range 10-27; hard-capped at 27 regardless of this value. Default: `27`. |
 | `specialist_max_concurrency` | Max specialist delegations in flight fleet-wide at once (see [Delegation limits](#delegation-limits)). Range 1-20. Default: `2`. |
 | `specialist_cost_alert_threshold` | Cumulative per-specialist USD spend past which Casa logs a warning on further delegations (see [Delegation limits](#delegation-limits)). Default: `5.0`. |
 
@@ -114,8 +114,9 @@ Casa exposes two transports for Home Assistant voice / generic voice clients. Th
   (same scheme as `/invoke`).
 - `/api/converse/ws` — persistent WebSocket. Inbound frames:
   `stt_start`, `utterance`, `stage`, `cancel`. Outbound: `block`,
-  `done`, `error`. On `stt_start`, Casa prewarms the voice session's
-  memory cache so first-utterance latency is bounded.
+  `done`, `error`. `stt_start` and `stage` are advisory no-ops today;
+  the session pool is registered lazily on the first `utterance` frame
+  (which carries `agent_role`, so it keys the right resident's session).
 
 Toggle the transports via environment variables on the app:
 

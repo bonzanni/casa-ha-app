@@ -27,8 +27,10 @@ available for tuning.
   fallback instead of silently timing out.
 - Delegated agents can declare required plugins/tools; a missing dependency
   refuses the hand-off instead of answering without its knowledge source.
-- Limits on concurrent specialist work per voice device and overall, with
-  per-agent usage/cost logging and a configurable cost alert.
+- Limits on concurrent specialist work: at most one active delegation per
+  specialist per voice device (different specialists may still run
+  concurrently), plus an overall fleet-wide cap, with per-agent usage/cost
+  logging and a configurable cost alert.
 - New options: `voice_turn_budget_seconds` (default 27), `specialist_max_concurrency`
   (default 2), `specialist_cost_alert_threshold` (default 5.0).
 

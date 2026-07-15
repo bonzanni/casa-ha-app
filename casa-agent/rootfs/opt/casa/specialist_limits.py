@@ -29,23 +29,28 @@ Usage (see ``tools.py``'s ``_prelaunch``/``delegate_to_agent`` wiring):
     if permit is None:
         ...deny as typed "busy", no side effects yet...
 
-The permit must be released on EVERY terminal path of the delegated
-operation. Because ``Permit.release()`` is idempotent and cancellation-safe,
-the wiring layers several release hooks that all target the same permit —
-whichever fires first wins, the rest are no-ops:
+The permit must be released on EVERY terminal path, with exactly ONE
+authoritative release per path (``Permit.release()`` is idempotent and
+cancellation-safe, so the belt-and-suspenders below can never double-count):
 
-* a lexical ``owned`` try/finally in ``delegate_to_agent`` spanning the
-  acquire→launch region (catches CancelledError during any await BEFORE
-  ownership transfers to a task/record — the single most common leak class);
-* a ``_permit_release_callback`` done-callback on the sync/async task
-  (fires even for a task cancelled before its coroutine ever runs — which
-  has no coroutine ``finally``);
-* release inside EVERY registry terminal transition (``mark_error``,
-  ``mark_cancelled``, ``mark_completed``, ``try_transition_terminal``,
-  ``complete``/``fail``/``cancel_delegation``) — so direct terminal routes
-  that bypass ``_finalize_engagement`` (resume/orphan failures) still free
-  the slot;
-* ``_finalize_engagement`` as an idempotent fallback for interactive.
+* BEFORE launch (either path): a lexical ``owned`` try/finally in
+  ``delegate_to_agent`` spanning the acquire→launch region releases on any
+  exit — including a CancelledError raised at an await before ownership
+  transfers (the single most common leak class).
+* Sync/async, AFTER launch: the ``_permit_release_callback`` done-callback on
+  the task is the SOLE authoritative release. It fires only when the task
+  ACTUALLY ends (honouring cancellation) and even for a task cancelled before
+  its coroutine ever runs (which has no coroutine ``finally``). The
+  ``SpecialistRegistry`` terminal transitions deliberately do NOT release —
+  ``cancel_delegation`` is called by the voice teardown after a bounded wait
+  while the task may still be unwinding, so releasing there would free the
+  slot for a NEW delegation while the original still executes.
+* Interactive, AFTER launch: the ``EngagementRegistry`` terminal transitions
+  (``mark_error``/``mark_cancelled``/``mark_completed``/
+  ``try_transition_terminal``) release — interactive has no task done-callback,
+  and this covers the direct ``mark_error`` routes (resume/orphan failures)
+  that bypass ``_finalize_engagement``. ``_finalize_engagement`` also releases
+  as an idempotent fallback.
 
 Cost/usage telemetry is split from launch counting (see ``SpecialistTelemetry``):
 ``record_launch`` counts at ownership transfer (so setup failures still
