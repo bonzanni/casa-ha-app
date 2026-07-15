@@ -904,6 +904,10 @@ class TopicStreamRelay:
         self.cursor.message_text_lens = []
         self.cursor.last_posted_len = 0
         self._reset_turn_state()
+        # F4: resolve any still-armed, un-posted late intent BEFORE pruning drops
+        # it — an unmatched armed intent at prune time must still post (out-of-
+        # band WARN) or fail its awaiter (F3), never silently vanish.
+        await self.sequencer.flush_armed_intents()
         # §2(6): prune intents/tombstones/id→outcome + seal narration at turn end.
         self.sequencer.prune_turn()
         await self.sequencer.seal_narration()

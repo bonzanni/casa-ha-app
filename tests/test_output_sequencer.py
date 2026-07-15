@@ -521,3 +521,48 @@ async def test_edit_summary_noop_gate_and_failed_invalidation():
     assert await seq.edit_summary(500, "text-B") == FAILED
     assert await seq.edit_summary(500, "text-B") == APPLIED
     assert rec.edits[-1] == (42, 500, "text-B")
+
+
+# ---------------------------------------------------------------------------
+# F1(b) — platform-origin discrete send (receipt/notice) through the writer.
+# ---------------------------------------------------------------------------
+
+
+async def test_platform_notice_seals_narration_below_it():
+    """F1(b): a receipt/notice posted through the single writer SEALS open
+    narration — a direct receipt posting below narration while
+    ``edit_narration_if_latest`` still returns APPLIED is now impossible."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    nar = await seq.open_narration("working on it ")
+    assert await seq.edit_narration_if_latest(nar, "working on it more") == APPLIED
+    # A platform notice (receipt) posts through the writer → seals narration.
+    notice_mid = await seq.post_platform_notice("📥 Received")
+    assert notice_mid is not None and notice_mid > nar          # posted BELOW
+    # Narration is now SEALED: a further edit can NOT land as APPLIED (it would
+    # edit a message with the receipt below it).
+    assert await seq.edit_narration_if_latest(nar, "sneaky append") == SEALED
+
+
+# ---------------------------------------------------------------------------
+# F4 — turn-end flush of a late armed intent before prune.
+# ---------------------------------------------------------------------------
+
+
+async def test_flush_armed_intents_posts_before_prune():
+    """F4: an armed-but-unposted late intent (its block never arrived) must POST
+    out-of-band at turn end, before prune drops it — never silently vanish."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    seq.register_intent(
+        request_id="x1", tool_name=REPLY_TOOL, projection_hash="h",
+        poster=_poster(rec, "late reply"))
+    seq.arm_intent("x1")
+    # No post_for_block ever runs (the block never arrived). Turn end flushes it.
+    await seq.flush_armed_intents()
+    assert (42, "late reply") in rec.sends
+    outcome = seq.intent_outcome("x1")
+    assert outcome is not None and outcome["ok"] is True
+    # Prune signals resolution + clears the registry.
+    seq.prune_turn()
+    assert seq.registry.by_request_id("x1") is None

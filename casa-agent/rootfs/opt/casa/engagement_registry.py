@@ -766,18 +766,40 @@ class EngagementRegistry:
         reconciliation can re-render the settle copy over it (memory-only broker
         state does not survive a restart). ``kind`` is ``"button"`` (broker tap)
         or ``"anchor"`` (free-text — settled by the next operator message).
-        Idempotent on ``number``."""
+        Idempotent on ``number``.
+
+        v0.79.0 (§4, Sol F6): STRICT persistence — a tombstone-write failure
+        rolls ``open_questions`` back (full-field) and RE-RAISES rather than
+        silently leaving a keyboard that the ledger/summary/boot-reconciler
+        cannot see. The ask handler settles the keyboard fail-closed on the
+        raise. Uses the shield-and-await transactional pattern so cancellation
+        during ``to_thread`` cannot split memory from disk."""
         async with self._lock:
             rec = self._records.get(engagement_id)
             if rec is None:
                 return
+            prev = rec.open_questions
             entries = [q for q in rec.open_questions if q.get("n") != number]
             entry = {"n": number, "tg_message_id": tg_message_id, "kind": kind}
             if text is not None:
                 entry["text"] = text
             entries.append(entry)
             rec.open_questions = tuple(entries)
-            await self._write_tombstone_locked()
+
+            async def _mutate_and_persist() -> None:
+                try:
+                    await self._write_tombstone_locked(strict=True)
+                except Exception:
+                    rec.open_questions = prev
+                    raise
+
+            task = asyncio.ensure_future(_mutate_and_persist())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
+                raise
 
     def oldest_open_anchor(self, engagement_id: str) -> dict | None:
         """The oldest still-open FREE-TEXT anchor (``kind == "anchor"``), or
@@ -820,13 +842,35 @@ class EngagementRegistry:
         self, engagement_id: str, message_id: int | None,
     ) -> None:
         """Persist the pinned summary Telegram message id (posted at boot).
-        No-op for an unknown engagement."""
+        No-op for an unknown engagement.
+
+        v0.79.0 (§5, Sol F6): STRICT persistence — a tombstone-write failure
+        rolls ``summary_message_id`` back and RE-RAISES rather than leaving a
+        posted-but-unpersisted summary that a restart cannot resume; the boot
+        summary post ABORTS the launch on the raise (§5 post-failure-aborts).
+        Shield-and-await so cancellation during ``to_thread`` cannot split
+        memory from disk."""
         async with self._lock:
             rec = self._records.get(engagement_id)
             if rec is None:
                 return
+            prev = rec.summary_message_id
             rec.summary_message_id = message_id
-            await self._write_tombstone_locked()
+
+            async def _mutate_and_persist() -> None:
+                try:
+                    await self._write_tombstone_locked(strict=True)
+                except Exception:
+                    rec.summary_message_id = prev
+                    raise
+
+            task = asyncio.ensure_future(_mutate_and_persist())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
+                raise
 
     async def allocate_summary_revision(self, engagement_id: str) -> int | None:
         """Atomically allocate the next monotonic summary REVISION (§5).

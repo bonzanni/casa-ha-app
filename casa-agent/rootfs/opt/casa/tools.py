@@ -2596,10 +2596,29 @@ async def _finalize_engagement(
                         "\n\n⚠️ This engagement took an action before you "
                         "responded — please review."
                     )
-                await tch.send_to_topic(
-                    engagement.topic_id,
-                    summary_text,
-                )
+                # v0.79.0 (§2 F1(c)): for a claude_code engagement, DRAIN the
+                # sequencer (settle pending narration + parked/armed intents)
+                # BEFORE posting the completion text THROUGH the single writer —
+                # completion may not overtake its causal block. The driver hook
+                # returns True when it posted (skip the direct send); a
+                # non-claude_code driver / no live sequencer falls back to the
+                # pre-v0.79 direct send.
+                posted_via_sequencer = False
+                if driver is not None and hasattr(
+                        driver, "finalize_completion_post"):
+                    try:
+                        posted_via_sequencer = await driver.finalize_completion_post(
+                            engagement, summary_text)
+                    except Exception as exc:  # noqa: BLE001 — never abort finalize
+                        logger.warning(
+                            "finalize engagement %s: sequencer completion post "
+                            "failed: %s", engagement.id[:8], exc,
+                        )
+                if not posted_via_sequencer:
+                    await tch.send_to_topic(
+                        engagement.topic_id,
+                        summary_text,
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "finalize engagement %s: send_to_topic failed: %s",
@@ -3128,6 +3147,16 @@ async def emit_completion(args: dict) -> dict:
             )
         finally:
             _ENGAGEMENTS_PENDING_RELOAD.discard(engagement.id)
+
+    # v0.79.0 (§2 F1(c)): register the emit_completion CONSUMPTION DEBT (identity
+    # hash over the raw args) so the relay silently consumes the emit_completion
+    # tool_use block instead of emitting stray narration below the completion.
+    # Best-effort — no live sequencer ⇒ no-op.
+    if driver is not None and hasattr(driver, "register_completion_consumption"):
+        try:
+            driver.register_completion_consumption(engagement.id, args)
+        except Exception:  # noqa: BLE001 — defensive, never block completion
+            logger.debug("register_completion_consumption failed", exc_info=True)
 
     await _finalize_engagement(
         engagement,

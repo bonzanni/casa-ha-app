@@ -163,7 +163,16 @@ def _make_send_to_topic(
                     return web.json_response({"ok": True})
                 driver.set_send_intent_poster(engagement_id, request_id, _do_post)
                 driver.arm_send_intent(engagement_id, request_id)
-                return web.json_response({"ok": True})
+                # F3 fail-closed: AWAIT the relay-mediated post's outcome (bounded
+                # by the sequencer's transport budget) — return ok:false if the
+                # send failed instead of a swallowed error under an ok:true.
+                outcome = await _await_deferred_post(
+                    driver, engagement_id, request_id)
+                if outcome is not None and not outcome.get("ok"):
+                    return web.json_response(
+                        {"ok": False, "error": "send_failed"})
+                mid = outcome.get("message_id") if outcome else None
+                return web.json_response({"ok": True, "message_id": mid})
 
         # EAGER fallback (no live sequencer): post now and return the id.
         msg_id = await _do_post()
@@ -317,6 +326,10 @@ _SETTLE_ANSWERED = "\n✅ {label}"
 _SETTLE_EXPIRED = "\n⌛ expired — answer by text below"
 _SETTLE_CANCELLED = "\n🚫 cancelled"
 _SETTLE_SUPERSEDED = "\n🚫 superseded by your message below"
+# v0.79.0 §4 (Sol F6): the open-question ledger write failed AFTER the keyboard
+# posted — settle it fail-closed so no keyboard the boot reconciler can't see
+# stays live-tappable.
+_SETTLE_INTERNAL_ERROR = "\n⚠️ internal error — question withdrawn, please resend"
 
 # v0.79.0 §4 — free-text anchor: an ``options: []`` ask posts a numbered anchor
 # with NO keyboard; the next operator text settles it.
@@ -401,8 +414,11 @@ def _ask_settle_text(question: str, outcome: dict, options: list) -> str:
         )
         return question + _SETTLE_ANSWERED.format(label=label)
     if o == "cancelled":
-        if outcome.get("reason") == "superseded_by_text":
+        reason = outcome.get("reason")
+        if reason == "superseded_by_text":
             return question + _SETTLE_SUPERSEDED
+        if reason == "internal_error":
+            return question + _SETTLE_INTERNAL_ERROR
         return question + _SETTLE_CANCELLED
     # no_answer / timeout.
     return question + _SETTLE_EXPIRED
@@ -592,6 +608,9 @@ def _make_ask(
                     _intent, created_intent = res
                     if not created_intent:
                         prior = driver.send_intent_outcome(eng_id, request_id)
+                        if prior is not None and not prior.get("ok"):
+                            return web.json_response(
+                                {"ok": False, "error": "delivery_failed"})
                         return web.json_response({
                             "ok": True, "outcome": "anchored",
                             "question_number": number,
@@ -599,9 +618,16 @@ def _make_ask(
                         })
                     driver.set_send_intent_poster(eng_id, request_id, _post_anchor)
                     driver.arm_send_intent(eng_id, request_id)
+                    # F3 fail-closed: await the anchor post's outcome.
+                    outcome = await _await_deferred_post(
+                        driver, eng_id, request_id)
+                    if outcome is not None and not outcome.get("ok"):
+                        return web.json_response(
+                            {"ok": False, "error": "delivery_failed"})
                     return web.json_response({
                         "ok": True, "outcome": "anchored",
-                        "question_number": number, "message_id": None,
+                        "question_number": number,
+                        "message_id": outcome.get("message_id") if outcome else None,
                     })
 
             # EAGER fallback (no live sequencer): post the anchor now.
@@ -629,19 +655,24 @@ def _make_ask(
             if res is not None:
                 _intent, created_intent = res
                 if not created_intent:
-                    # Same request_id already posted → return recorded outcome
-                    # via the broker reattach below without a second keyboard.
-                    prior = driver.send_intent_outcome(eng_id, request_id)
-                    if prior is not None and prior.get("message_id") is not None:
-                        # Reattach to the live/retired broker request for the tap.
-                        req, _c = BROKER.register(
-                            namespace="engagement_ask", scope=eng_id,
-                            request_id=request_id, timeout_s=timeout_s,
-                        )
-                        outcome = await BROKER.await_result(req)
-                        return _ask_outcome_response(outcome, options)
-                else:
-                    intent_registered = True
+                    # F2 (was N1): a same-request_id retry REATTACHES (§2(1)) —
+                    # whether the relay has already posted (prior has a
+                    # message_id) OR the first attempt is still in flight and the
+                    # keyboard has not posted yet (not-yet-posted, armed). EITHER
+                    # WAY: NO new number allocation, NO second keyboard, NO eager
+                    # fallback. Reattach to the broker request (idempotent by
+                    # request_id) and await the same tap outcome. The old code
+                    # only took this path when a message_id was recorded and
+                    # otherwise fell through — allocating a fresh Q-number and
+                    # posting a SECOND keyboard eagerly (the probe: Q2 posting
+                    # before the relay's Q1, both ledger entries surviving).
+                    req, _c = BROKER.register(
+                        namespace="engagement_ask", scope=eng_id,
+                        request_id=request_id, timeout_s=timeout_s,
+                    )
+                    outcome = await BROKER.await_result(req)
+                    return _ask_outcome_response(outcome, options)
+                intent_registered = True
 
         # INBOUND GATE (§4): an unseen operator message means "end your turn".
         if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
@@ -718,7 +749,24 @@ def _make_ask(
             elif number is not None:
                 add = getattr(engagement_registry, "add_open_question", None)
                 if add is not None:
-                    await add(eng_id, number, mid, text=display)
+                    try:
+                        await add(eng_id, number, mid, text=display)
+                    except Exception:  # noqa: BLE001 — F6 strict-persist raise
+                        # The ledger write failed AFTER the keyboard posted.
+                        # Fail closed: settle the keyboard (internal-error copy
+                        # via the finish hook) and refuse — a live-tappable
+                        # keyboard the boot reconciler can never see is worse
+                        # than a withdrawn question.
+                        logger.warning(
+                            "engagement %s: add_open_question failed — "
+                            "withdrawing ask Q%s", eng_id[:8], number,
+                            exc_info=True,
+                        )
+                        BROKER.cancel(
+                            namespace="engagement_ask", scope=eng_id,
+                            request_id=request_id, reason="internal_error",
+                        )
+                        return None
             # W2/Sol B9 (Task 7): asking is an outbound agent action — advance
             # only after the keyboard actually posted.
             await _advance_first_contact()
@@ -743,6 +791,22 @@ def _make_ask(
         return _ask_outcome_response(outcome, options)
 
     return handler
+
+
+async def _await_deferred_post(driver: Any, eng_id: str, request_id: str) -> dict | None:
+    """F3 fail-closed: await a deferred ask/reply/anchor intent's resolution so
+    the handler returns ``ok`` ONLY when the post actually landed. Degrades to
+    ``None`` (old immediate-return behavior) when the driver predates the await
+    seam — an ``ok:true`` response with a failed post is then still impossible on
+    the live path (the real driver always exposes it)."""
+    awaiter = getattr(driver, "await_send_intent", None)
+    if awaiter is None:
+        return None
+    try:
+        return await awaiter(eng_id, request_id)
+    except Exception:  # noqa: BLE001 — never wedge the handler on the await seam
+        logger.debug("await_send_intent failed (eng=%s)", eng_id[:8], exc_info=True)
+        return None
 
 
 async def _noop_poster() -> int | None:
@@ -770,6 +834,12 @@ def _ask_outcome_response(outcome: dict, options: list) -> web.Response:
         if outcome.get("reason") == "superseded_by_text":
             return web.json_response({
                 "ok": False, "error": "superseded", "message": _ASK_REFUSAL,
+            })
+        if outcome.get("reason") == "internal_error":
+            return web.json_response({
+                "ok": False, "error": "internal_error",
+                "message": ("the question could not be recorded — it was "
+                            "withdrawn; end your turn and re-ask"),
             })
         return web.json_response({"ok": False, "error": "cancelled"})
     # delivery_failed (keyboard post raised or returned None, r10-B3).

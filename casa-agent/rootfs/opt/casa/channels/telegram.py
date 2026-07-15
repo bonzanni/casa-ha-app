@@ -1062,13 +1062,12 @@ class TelegramChannel(Channel):
                 # still ran under the lock, preserving the Bug-10 guarantee
                 # (a cancel that already finalised the driver blanks the turn
                 # here before any task is spawned).
-                if self._engagement_registry is not None:
-                    import time as _time
-                    await self._engagement_registry.update_user_turn(rec.id, _time.time())
-                # v0.79.0 (§3): an inbound operator message is a causal event —
-                # advance the topic high-water mark and SEAL open narration at
-                # handler entry (the T1 seam), so mid-turn narration can't
-                # append below the operator's message.
+                # v0.79.0 (§3, F5): an inbound operator message is a causal event
+                # and is visible on Telegram the moment it arrives — SEAL open
+                # narration + advance the topic high-water mark at TRUE handler
+                # entry, BEFORE update_user_turn()'s await. Sealing must precede
+                # any suspension, else mid-turn narration could append below the
+                # operator's message across the update_user_turn await.
                 if self._driver_advance_high_water is not None:
                     try:
                         await self._driver_advance_high_water(rec, msg.message_id)
@@ -1077,6 +1076,9 @@ class TelegramChannel(Channel):
                             "advance_high_water failed for %s: %s",
                             rec.id[:8], exc,
                         )
+                if self._engagement_registry is not None:
+                    import time as _time
+                    await self._engagement_registry.update_user_turn(rec.id, _time.time())
                 if self._driver_send_user_turn is not None:
                     task = asyncio.create_task(
                         self._deliver_turn_bg(

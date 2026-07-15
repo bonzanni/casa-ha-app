@@ -785,18 +785,36 @@ async def test_discrete_post_seals_narration_rollover_on_interleave(tmp_path):
                for _tp, _mid, text in rec.edits)  # no edit merged the two
 
 
-async def test_no_discrete_hold_when_registry_empty(tmp_path):
-    """T1-stubbed safety: an ask/reply tool_use frame with NO registered intent
-    resolves instantly (no 2s slot stall) — the machinery is dormant until an
-    ingress registers something."""
-    import time as _time
+async def test_hold_eligible_block_holds_slot_when_registry_empty(tmp_path):
+    """F4: an ask/reply tool_use frame with NO registered intent HOLDS the slot
+    (the intent may arm milliseconds later — the empty-registry no-hold guard
+    used to defeat this race). The block holds for the (tiny, injected) slot,
+    then proceeds on slot timeout posting nothing. A non-fenced tool keeps the
+    fast path (covered elsewhere)."""
+    from channels.output_sequencer import OutputSequencer
+
     rec, events = Recorder(), []
     _write_current(tmp_path, [_init(), _reply_tool_frame("R"), _result()])
     cursor = tmp_path / ".stream_cursor.json"
-    t0 = _time.monotonic()
-    await _make_relay(tmp_path, cursor, rec, events).run()
-    assert _time.monotonic() - t0 < 1.0  # never held for the 2s slot
-    assert rec.sends == []  # nothing to post (no intent)
+    hold_calls = {"n": 0}
+    clock = {"t": 0.0}
+
+    async def _counting_sleep(dt):
+        hold_calls["n"] += 1
+        clock["t"] += dt        # advance the fake clock so the slot deadline is
+
+    seq = OutputSequencer(
+        engagement_id="eng-1", topic_id=42,
+        send_message=rec.send, edit_message=rec.edit,
+        _now=lambda: clock["t"],  # reached after one poll (no real sleeping)
+        _sleep=_counting_sleep,
+        slot_hold_s=0.05, hold_poll_s=0.05,
+    )
+    await _make_relay(tmp_path, cursor, rec, events, sequencer=seq).run()
+    # It HELD (slept at least once) rather than proceeding instantly, then slot-
+    # timed-out and posted nothing (no intent ever arrived).
+    assert hold_calls["n"] >= 1
+    assert rec.sends == []
 
 
 # -- the four crash / seal tests (§2, Sol r1-2): no post-recovery edit ever

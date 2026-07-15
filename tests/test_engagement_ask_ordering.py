@@ -165,6 +165,45 @@ async def test_ask_keyboard_posts_after_preceding_narration(wired):
     assert chan.narrations[0][0] < chan.keyboards[0][0]
 
 
+async def test_button_ask_retry_reattaches_no_second_keyboard(wired):
+    """F2 (was N1): a same-request_id retry arriving while the first ask intent
+    is still armed-but-NOT-posted must REATTACH — NO new Q-number, NO second
+    keyboard, NO eager fallback. The probe showed Q2 posting before the relay's
+    Q1 with both ledger entries surviving; here exactly one keyboard + one open
+    question survive and both handlers resolve to the same answer."""
+    eid = wired["rec"].id
+    seq, reg = wired["seq"], wired["reg"]
+    h = projection_hash(
+        ASK_TOOL, {"question": "Proceed?", "options": ["A", "B"], "timeout_s": 60})
+    payload = {
+        "engagement_id": eid, "request_id": "dup", "question": "Proceed?",
+        "options": ["A", "B"], "timeout_s": 60, "projection_hash": h}
+
+    # First attempt: registers + arms the intent, then parks awaiting the tap
+    # WITHOUT the relay having reached the block yet (no post_for_block).
+    t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(dict(payload))))
+    await asyncio.sleep(0.02)
+    # Retry (same request_id) BEFORE the relay posted → must reattach.
+    t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(dict(payload))))
+    await asyncio.sleep(0.02)
+
+    # Now the relay reaches the ask block → the keyboard posts exactly ONCE.
+    await seq.post_for_block(ASK_TOOL, h)
+    assert wired["broker"].deliver(
+        namespace="engagement_ask", scope=eid, request_id="dup",
+        option_index=0, actor_id=555) == "delivered"
+    r1 = await asyncio.wait_for(t1, timeout=1.0)
+    r2 = await asyncio.wait_for(t2, timeout=1.0)
+    await wired["broker"].drain_hooks()
+
+    assert _body(r1)["outcome"] == "answered"
+    assert _body(r2)["outcome"] == "answered"
+    # Exactly ONE keyboard, ONE open question — no Q2, no second post.
+    assert len(wired["chan"].keyboards) == 1
+    assert reg.open_question_numbers(eid) in ([], [1])   # settled or single Q1
+    assert reg.get(eid).next_question_number == 2         # allocated once only
+
+
 async def test_reply_posts_after_preceding_narration(wired):
     """§2 reply-ingress variant: a reply within a frame posts at its tool_use
     block position, AFTER the preceding narration text."""

@@ -64,6 +64,12 @@ async def _never_deliver() -> bool:
     return False
 
 
+async def _completion_noop_poster() -> int | None:
+    """Poster for the emit_completion CONSUMPTION-DEBT intent (§2 F1(c)): never
+    invoked (a debt block is consumed silently, never posted)."""
+    return None
+
+
 def _is_redirect(text: str) -> bool:
     """§3 redirect detection: ``STOP`` as the (case-insensitive) first line, or
     a ``redirect:`` prefix."""
@@ -96,7 +102,7 @@ NoticeSender = Callable[[str, "int | None"], Awaitable[bool]]
 
 # Persisted envelope fields (§3 schema) + the impl-only fields the spool needs.
 _ENVELOPE_PERSIST_FIELDS = (
-    "text", "tg_message_id", "priority", "receipt", "notice",
+    "text", "tg_message_id", "priority", "receipt", "notice", "notice_text",
     "enqueued_at", "delivery_epoch", "state", "seq", "is_initial",
 )
 
@@ -126,6 +132,12 @@ class _Envelope:
     state: str
     seq: int
     is_initial: bool = False
+    # §3 / F8: the notice copy to send when ``notice == "pending"``. ``None``
+    # means the eviction copy (backward-compatible default); capacity-DROP
+    # notices (priority-full / ordinary-full) carry their own copy on a
+    # notice-only envelope so the drop notice is durable + retried, not
+    # fire-and-forget.
+    notice_text: str | None = None
 
     def to_line(self) -> str:
         return json.dumps(
@@ -147,6 +159,7 @@ class _Envelope:
             priority=bool(data.get("priority", False)),
             receipt=data.get("receipt", "not_required"),
             notice=data.get("notice", "none"),
+            notice_text=data.get("notice_text"),
             enqueued_at=float(data.get("enqueued_at", 0.0)),
             delivery_epoch=data.get("delivery_epoch"),
             state=data.get("state", "queued"),
@@ -328,7 +341,7 @@ class _InboundSpool:
         evicted = False
         if is_redirect:
             if self._priority_count() >= _PRIORITY_LANE_CAP:
-                await self._send_notice(_PRIORITY_CAP_COPY, tg_message_id)
+                await self._record_drop_notice(_PRIORITY_CAP_COPY, tg_message_id)
                 return "dropped_full"
             if self._ordinary_count() >= _ORDINARY_LANE_CAP:
                 victim = max(
@@ -340,7 +353,7 @@ class _InboundSpool:
                     evicted_tg = victim.tg_message_id
                     evicted = True
         elif self._ordinary_count() >= _ORDINARY_LANE_CAP:
-            await self._send_notice(_ORDINARY_FULL_COPY, tg_message_id)
+            await self._record_drop_notice(_ORDINARY_FULL_COPY, tg_message_id)
             return "dropped_full"
 
         receipt = (
@@ -391,6 +404,28 @@ class _InboundSpool:
 
     # -- receipt / notice at-least-once flush ------------------------------
 
+    async def _record_drop_notice(
+        self, copy: str, tg_message_id: int | None,
+    ) -> None:
+        """F8: record a DURABLE capacity-drop notice (priority-full / ordinary-
+        full). The dropped operator envelope itself is gone, but the notice must
+        NOT be fire-and-forget — a failed send has to survive and retry. A
+        notice-only envelope (``state=consumed``, ``notice=pending`` carrying its
+        own ``notice_text``) is appended + persisted; it rides the same
+        at-least-once retry lane as eviction notices (flushed here now, and again
+        at every touchpoint until it sends). ``has_pending()`` stays True while
+        the send has not succeeded."""
+        env = _Envelope(
+            text="", tg_message_id=tg_message_id, priority=False,
+            receipt="not_required", notice="pending", notice_text=copy,
+            enqueued_at=time.time(), delivery_epoch=None, state="consumed",
+            seq=self._next_seq, is_initial=False,
+        )
+        self._next_seq += 1
+        self._envelopes.append(env)
+        self._persist_quiet()
+        await self._flush_pending()
+
     async def _flush_pending(self) -> None:
         """Retry every pending receipt/notice (§3 touchpoint). Notice-first
         suppression: an envelope with BOTH pending sends ONLY the notice, then
@@ -399,7 +434,8 @@ class _InboundSpool:
         changed = False
         for env in self._envelopes:
             if env.notice == "pending":
-                ok = await self._send_notice(_EVICTION_COPY, env.tg_message_id)
+                ok = await self._send_notice(
+                    env.notice_text or _EVICTION_COPY, env.tg_message_id)
                 if ok:
                     env.notice = "sent"
                     if env.receipt == "pending":
@@ -1050,8 +1086,21 @@ class ClaudeCodeDriver(DriverProtocol):
     ) -> bool:
         """Send a spool receipt/notice into the topic, threaded to the operator
         message when given. Returns delivered-ok so a failed send stays pending
-        for at-least-once retry (§3)."""
+        for at-least-once retry (§3).
+
+        v0.79.0 (§2 F1(b)): a receipt/notice is a DISCRETE platform-origin send
+        and MUST go through the single writer — a receipt slipping in below open
+        narration while ``edit_narration_if_latest`` still returns APPLIED is the
+        exact ordering violation §2 forbids. It has no subprocess frame, so it
+        registers no intent; instead the sequencer's ``post_platform_notice``
+        seals open narration, posts, and advances the high-water mark under the
+        one serialization lock. Falls back to a direct send only when no live
+        sequencer exists (terminal boot reconciliation of a torn-down topic)."""
         try:
+            seq = self._sequencers.get(engagement.id)
+            if seq is not None:
+                mid = await seq.post_platform_notice(text, reply_to=reply_to)
+                return mid is not None
             if reply_to is not None:
                 await self._send_to_topic(
                     engagement.topic_id, text, reply_to_message_id=reply_to)
@@ -1072,6 +1121,53 @@ class ClaudeCodeDriver(DriverProtocol):
         spool = self._inbound.get(engagement.id)
         if spool is not None:
             await spool.drain()
+
+    async def finalize_completion_post(
+        self, engagement: EngagementRecord, summary_text: str,
+    ) -> bool:
+        """§2 F1(c): post the engagement COMPLETION text through the single
+        writer, but only AFTER draining the sequencer.
+
+        Completion may not overtake its causal block: first flush every pending
+        narration + parked/armed intent (``flush_armed_intents`` resolves late
+        armed intents; sealing closes open narration), THEN post the completion
+        text through ``post_platform_notice`` (single writer, seals + advances
+        high-water). Returns ``True`` if a live sequencer posted it (the caller
+        skips its own direct ``send_to_topic``), ``False`` if there is no live
+        sequencer (caller does the pre-v0.79 direct send)."""
+        seq = self._sequencers.get(engagement.id)
+        if seq is None:
+            return False
+        await seq.flush_armed_intents()
+        await seq.seal_narration()
+        await seq.post_platform_notice(summary_text)
+        return True
+
+    def register_completion_consumption(
+        self, engagement_id: str, args: dict,
+    ) -> None:
+        """§2 F1(c): register the emit_completion send INTENT (svc_casa_mcp
+        ingress, hash = identity over raw args) as a one-block CONSUMPTION DEBT
+        so the relay, reaching the emit_completion tool_use block, consumes it
+        silently instead of emitting stray narration or binding a later
+        same-hash intent. Best-effort — no live sequencer ⇒ no-op."""
+        seq = self._sequencers.get(engagement_id)
+        if seq is None:
+            return
+        from channels.output_sequencer import (
+            EMIT_COMPLETION_TOOL, projection_hash as _pj,
+        )
+        rid = f"emit_completion:{engagement_id}"
+        phash = _pj(EMIT_COMPLETION_TOOL, args if isinstance(args, dict) else {})
+        intent, _created = seq.register_intent(
+            request_id=rid, tool_name=EMIT_COMPLETION_TOOL,
+            projection_hash=phash, poster=_completion_noop_poster,
+        )
+        # Mark the debt directly (no lock needed — a plain dataclass toggle; the
+        # relay reads it under the lock at block-match time).
+        intent.state = "posted"
+        intent.timeout_posted = True
+        intent.consumed = False
 
     async def reconcile_terminal_spool(self, engagement: EngagementRecord) -> None:
         """§3 terminal boot-reconciliation: a TERMINAL engagement whose spool
@@ -1144,13 +1240,16 @@ class ClaudeCodeDriver(DriverProtocol):
         engagement.summary_message_id = mid
         setter = getattr(self._registry, "set_summary_message_id", None)
         if setter is not None:
+            # §5 / F6: strict persistence — a summary posted but NOT persisted
+            # cannot be resumed after a restart (§5's invariant would break), so
+            # a persist failure ABORTS the launch (post-failure-aborts rule).
             try:
                 await setter(engagement.id, mid)
-            except Exception as exc:  # noqa: BLE001 — id is in-memory regardless
-                logger.warning(
-                    "engagement %s: persisting summary_message_id failed: %s",
-                    engagement.id[:8], exc,
-                )
+            except Exception as exc:  # noqa: BLE001 — abort the launch
+                raise RuntimeError(
+                    f"summary_message_id persist failed for engagement "
+                    f"{engagement.id[:8]}: {exc}"
+                ) from exc
         # T4 F-4 (review): the initial pin attempt is NOT made here — the
         # per-engagement SummaryController doesn't exist yet at this point in
         # ``start()`` (``_ensure_summary`` only runs later, from
@@ -1161,6 +1260,19 @@ class ClaudeCodeDriver(DriverProtocol):
         # lifecycle flush) owns the pin attempt for both fresh and
         # resumed/replayed engagements alike.
         return mid
+
+    async def adopt_summary_if_missing(self, engagement: EngagementRecord) -> None:
+        """§5 / F7 adopt-on-attach migration: a LEGACY pre-v0.79 ACTIVE
+        engagement replayed at boot has ``summary_message_id is None`` (it
+        predates the pinned summary). Post + persist a summary NOW, on attach,
+        so §5's invariant — no running engagement without a summary — holds
+        before/immediately-at service start. Best-effort per record (boot replay
+        isolates failures); a fresh v0.79 engagement (id already persisted) or a
+        topic-less record is a no-op."""
+        if (getattr(engagement, "summary_message_id", None) is not None
+                or engagement.topic_id is None):
+            return
+        await self._post_initial_summary(engagement)
 
     def _ensure_summary(self, engagement: EngagementRecord) -> "SummaryController":
         """Build (or return) the per-engagement live-summary controller (§5)."""
@@ -1308,6 +1420,19 @@ class ClaudeCodeDriver(DriverProtocol):
         if seq is None:
             return None
         return await seq.mark_intent_posted(request_id, message_id)
+
+    async def await_send_intent(
+        self, engagement_id: str, request_id: str, timeout: float | None = None,
+    ) -> Any:
+        """F3 fail-closed: block until the deferred intent posts (ok) or fails
+        (ok:false), bounded by the sequencer's transport budget. Returns the
+        recorded outcome dict, or ``None`` if there is no live sequencer /
+        intent (the caller treats that as a non-post). See
+        ``OutputSequencer.await_intent_resolution``."""
+        seq = self._sequencers.get(engagement_id)
+        if seq is None:
+            return None
+        return await seq.await_intent_resolution(request_id, timeout)
 
     async def advance_topic_high_water_for_inbound(
         self, engagement_id: str, operator_msg_id: int | None = None,

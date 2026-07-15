@@ -67,7 +67,11 @@ _HOLD_POLL_S = 0.05       # slot-hold re-check cadence (the happy path arms well
 # (only when a matching intent/tombstone already exists), never held blindly.
 ASK_TOOL = "mcp__casa-engagement-channel__ask"
 REPLY_TOOL = "mcp__casa-engagement-channel__reply"
-HOLD_ELIGIBLE_TOOLS: frozenset[str] = frozenset({ASK_TOOL, REPLY_TOOL})
+# emit_completion is the svc_casa_mcp ingress (§2 pinned ingress (c)); its frame
+# is hold-eligible so the completion post never overtakes a still-pending block.
+EMIT_COMPLETION_TOOL = "mcp__casa-framework__emit_completion"
+HOLD_ELIGIBLE_TOOLS: frozenset[str] = frozenset(
+    {ASK_TOOL, REPLY_TOOL, EMIT_COMPLETION_TOOL})
 
 
 # ---------------------------------------------------------------------------
@@ -140,15 +144,18 @@ class SendIntent:
     slot_missed: bool = False       # relay slot timed out while this was pending
     timeout_posted: bool = False    # §2(5) one-block consumption debt
     consumed: bool = False          # retired from matching
+    post_failed: bool = False       # F3: poster failed — surfaced ok:false,
+    #                                 retired from matching (NOT a success debt)
 
     # -- matchability predicates -------------------------------------------
     def matchable(self) -> bool:
         """Still eligible to bind a content-block (§2(3)).
 
         Pending/armed intents, un-consumed cancelled tombstones, and the
-        one-block timeout-posted debt are matchable; a consumed item is not.
+        one-block timeout-posted debt are matchable; a consumed or
+        post-failed (F3) item is not.
         """
-        if self.consumed:
+        if self.consumed or self.post_failed:
             return False
         if self.state in ("pending", "armed", "cancelled"):
             return True
@@ -238,7 +245,8 @@ class IntentRegistry:
     def armed_unposted(self) -> list[SendIntent]:
         return [
             i for i in self._by_seq
-            if i.state == "armed" and not i.consumed and i.message_id is None
+            if i.state == "armed" and not i.consumed and not i.post_failed
+            and i.message_id is None
         ]
 
     def has_any_matchable(self) -> bool:
@@ -325,6 +333,12 @@ class OutputSequencer:
 
         self._lock = asyncio.Lock()
         self.registry = IntentRegistry(_now=_now)
+        # F3 fail-closed posting: per-request resolution events. A deferred
+        # ask/reply/anchor handler AWAITS the intent's outcome (posted ok, or
+        # poster-failure ok:false) bounded by ``post_await_budget`` and returns
+        # ok only when the post actually landed — an ``ok:true`` response with a
+        # failed post is structurally impossible.
+        self._resolution_events: dict[str, asyncio.Event] = {}
         # HIGH-WATER: newest sequencer-posted message id (the sequencer is the
         # only writer, so it is authoritative). ``_narration_msg_id`` is the
         # current OPEN narration message, or None when narration is SEALED.
@@ -538,7 +552,93 @@ class OutputSequencer:
                 self._high_water is None or message_id > self._high_water
             ):
                 self._high_water = message_id
+            self._signal_resolution(request_id)
             return intent
+
+    # -- F3 fail-closed resolution await -----------------------------------
+
+    def _signal_resolution(self, request_id: str) -> None:
+        ev = self._resolution_events.get(request_id)
+        if ev is not None:
+            ev.set()
+
+    @property
+    def post_await_budget(self) -> float:
+        """The bounded transport budget a deferred handler waits for a post to
+        resolve (§4/T3-fix, F3): the slot hold plus the intent timeout plus a
+        small margin so the 10s out-of-band watcher post is always covered."""
+        return self._slot_hold_s + self._intent_timeout_s + 2.0
+
+    async def await_intent_resolution(
+        self, request_id: str, timeout: float | None = None,
+    ) -> dict | None:
+        """F3: block until intent *request_id* posts (ok) or fails (ok:false),
+        bounded by *timeout* (defaults to :attr:`post_await_budget`). Returns the
+        recorded outcome dict, or ``None`` if the intent is unknown or still
+        unresolved at timeout (the caller treats a missing/failed outcome as
+        ok:false — never ok:true). Edge-triggered: the outcome is checked under
+        the lock BEFORE waiting, so a post that lands before the awaiter blocks
+        is never missed."""
+        if timeout is None:
+            timeout = self.post_await_budget
+        async with self._lock:
+            intent = self.registry.by_request_id(request_id)
+            if intent is None:
+                return None
+            if intent.outcome is not None:
+                return intent.outcome
+            ev = self._resolution_events.get(request_id)
+            if ev is None:
+                ev = asyncio.Event()
+                self._resolution_events[request_id] = ev
+        try:
+            await asyncio.wait_for(ev.wait(), timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+        intent = self.registry.by_request_id(request_id)
+        return intent.outcome if intent is not None else None
+
+    # -- F1(b) platform-origin discrete send -------------------------------
+
+    async def post_platform_notice(
+        self, text: str, *, reply_to: int | None = None,
+    ) -> int | None:
+        """F1(b): post a PLATFORM-ORIGIN discrete message (an inbound receipt /
+        eviction / capacity notice) through the single writer.
+
+        These have no subprocess frame, so they register no intent — but they
+        MUST NOT post around the sequencer: a receipt slipping in below open
+        narration while ``edit_narration_if_latest`` still returns APPLIED is
+        exactly the ordering violation §2 forbids. So this seals open narration
+        (the notice is a causal event below it), posts, and advances the
+        high-water mark, all under the one serialization lock. Returns the posted
+        message id, or ``None`` on send failure."""
+        async with self._lock:
+            self._seal_narration_locked()
+            if reply_to is not None:
+                mid = await _maybe_await(
+                    self.send_message(self.topic_id, text, reply_to=reply_to))
+            else:
+                mid = await _maybe_await(self.send_message(self.topic_id, text))
+            if mid is not None and (
+                self._high_water is None or mid > self._high_water
+            ):
+                self._high_water = mid
+            return mid
+
+    # -- F1(c) / F4 turn-boundary drain ------------------------------------
+
+    async def flush_armed_intents(self) -> None:
+        """F4: post every still-armed, un-posted intent out-of-band (WARN) so it
+        RESOLVES before its registry entry is pruned. Turn-end pruning
+        (topic_stream ``_finalize``) and finalize must never silently drop a
+        late armed intent — a discrete send the agent believes is in flight
+        would vanish and its awaiter would hang. Runs the same post path as the
+        10s watcher; a failed post surfaces ok:false via F3."""
+        async with self._lock:
+            for intent in self.registry.armed_unposted():
+                await self._post_intent_locked(
+                    intent, out_of_band=True, warn=True)
 
     def prune_turn(self) -> None:
         """§2(6): prune intents/tombstones/outcomes at turn end.
@@ -546,7 +646,14 @@ class OutputSequencer:
         Also CLEARS the causal-handoff one-shot reply anchor (§4): it "expires at
         turn end". A set-but-unconsumed anchor (a button answer that continued
         the turn but produced no output) must NOT leak into the next turn and
-        mis-thread its first message."""
+        mis-thread its first message.
+
+        F3/F4: signal every outstanding resolution event before dropping them so
+        an awaiter blocked past turn end unblocks (reading a resolved ok:false /
+        ``None`` outcome) rather than hanging its transport budget out."""
+        for ev in self._resolution_events.values():
+            ev.set()
+        self._resolution_events.clear()
         self.registry.prune()
         self._turn_reply_to = None
 
@@ -612,16 +719,17 @@ class OutputSequencer:
                 item.consumed = True
                 return "debt_consumed"
             return None  # pending → HOLD
-        if (
-            tool_name not in HOLD_ELIGIBLE_TOOLS
-            or not self.registry.has_any_matchable()
-        ):
-            # Not hold-eligible, OR hold-eligible but NO ingress is active
-            # (registry empty ⇒ nothing can arrive to bind this block): proceed
-            # immediately, never stall narration — the machinery stays dormant
-            # in the T1-stubbed state.
+        if tool_name not in HOLD_ELIGIBLE_TOOLS:
+            # Non-fenced tool: keep the fast path — never stall narration.
             return "no_match"
-        return None  # hold-eligible, ingress active, intent not here yet → HOLD
+        # F4: hold-eligible block (ask/reply/emit_completion) with NO matching
+        # intent yet. The empty-registry short-circuit that used to proceed here
+        # DEFEATED the designed relay-first race: the discrete ingress (an MCP
+        # call landing in milliseconds) may register its intent a beat AFTER the
+        # relay reads this block. HOLD the 2s slot regardless of registry
+        # emptiness; on slot timeout ``post_for_block`` proceeds and a genuinely
+        # absent intent costs only the bounded hold.
+        return None  # hold-eligible → HOLD for the slot
 
     async def _post_intent_locked(
         self, intent: SendIntent, *, out_of_band: bool, warn: bool = False,
@@ -650,14 +758,27 @@ class OutputSequencer:
                 intent.request_id, exc,
             )
             mid = None
+        if mid is None:
+            # F3 fail-closed: the post did NOT land. Do NOT terminally consume
+            # the intent as if it succeeded (no consumption debt claiming a
+            # phantom post). Mark it post-failed (retired from matching so the
+            # relay/watcher never silently re-fires it), record an ok:false
+            # outcome, and resolve so the awaiting handler returns ok:false —
+            # the agent learns the send failed instead of a swallowed error.
+            intent.post_failed = True
+            intent.outcome = {
+                "ok": False, "message_id": None, "out_of_band": out_of_band,
+            }
+            self._signal_resolution(intent.request_id)
+            return
         intent.state = "posted"
         intent.consumed = True
-        if mid is not None:
-            self._high_water = mid
-            intent.message_id = mid
+        self._high_water = mid
+        intent.message_id = mid
         intent.outcome = {
-            "ok": mid is not None, "message_id": mid, "out_of_band": out_of_band,
+            "ok": True, "message_id": mid, "out_of_band": out_of_band,
         }
+        self._signal_resolution(intent.request_id)
 
     async def process_intents_once(self) -> None:
         """One late/timeout intent pass (§2(4) late-arm, §2(5) timeout).

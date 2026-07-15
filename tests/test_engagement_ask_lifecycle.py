@@ -128,6 +128,15 @@ class _FakeDriver:
     async def mark_send_intent_posted(self, eid, rid, mid):
         return await self.seq.mark_intent_posted(rid, mid)
 
+    async def await_send_intent(self, eid, rid, timeout=None):
+        # F3: let the simulated relay tasks (scheduled on arm) run, then return
+        # the recorded outcome so the handler returns ok only when the post
+        # landed.
+        if self._relay_tasks:
+            await asyncio.gather(*self._relay_tasks, return_exceptions=True)
+            self._relay_tasks.clear()
+        return await self.seq.await_intent_resolution(rid, timeout)
+
     def intent_state(self, rid):
         intent = self.seq.registry.by_request_id(rid)
         return intent.state if intent is not None else None
@@ -374,3 +383,60 @@ async def test_reply_retry_reattaches_no_double_post(env):
     b2 = _body(r2)
     assert b2 == {"ok": True, "message_id": first_mid}
     assert env["ch"].sent_texts.count((42, "hello operator")) == 1
+
+
+# ---------------------------------------------------------------------------
+# F3 — fail-closed deferred posting (ok:true + outcome ok:false impossible)
+# ---------------------------------------------------------------------------
+
+
+class _FailingChannel(_FakeChannel):
+    """A channel whose topic send FAILS (returns None) — models a transient
+    Telegram failure of the relay-deferred reply/anchor post."""
+
+    async def send_response_to_topic(self, topic_id, text) -> int | None:
+        self.sent_texts.append((topic_id, text))
+        return None
+
+
+@pytest.fixture
+async def failing_env(tmp_path, fresh_broker, monkeypatch):
+    from engagement_registry import EngagementRegistry
+    from channels.channel_handlers import _make_channel_handlers
+
+    reg = EngagementRegistry(
+        tombstone_path=str(tmp_path / "engagements.json"), bus=None)
+    rec = await reg.create(
+        "executor", "configurator", "claude_code", "t",
+        {"user_id": 555}, topic_id=42)
+    ch = _FailingChannel()
+    driver = _FakeDriver()
+    monkeypatch.setattr(agent_mod, "active_claude_code_driver", driver)
+    handlers = _make_channel_handlers(telegram_channel=ch, engagement_registry=reg)
+    return {
+        "reg": reg, "rec": rec, "ch": ch, "driver": driver,
+        "broker": fresh_broker, "ask": handlers["/internal/channel/ask"],
+        "send": handlers["/internal/channel/send_to_topic"],
+    }
+
+
+async def test_reply_poster_failure_returns_ok_false(failing_env):
+    """F3: the deferred reply poster fails → the handler AWAITS the outcome and
+    returns ok:false. An ok:true response with a failed post is impossible."""
+    eid = failing_env["rec"].id
+    r = await failing_env["send"](_FakeRequest({
+        "engagement_id": eid, "text": "shipped it",
+        "request_id": "rf-1", "projection_hash": "rh"}))
+    assert _body(r)["ok"] is False
+    # The intent recorded an ok:false outcome (surfaced, not swallowed).
+    outcome = failing_env["driver"].send_intent_outcome(eid, "rf-1")
+    assert outcome is not None and outcome["ok"] is False
+
+
+async def test_anchor_poster_failure_returns_ok_false(failing_env):
+    """F3: the free-text anchor poster fails → ok:false, never ok:true."""
+    eid = failing_env["rec"].id
+    r = await failing_env["ask"](_FakeRequest(_ask_payload(
+        engagement_id=eid, request_id="af-1",
+        question="Which DB?", options=[])))
+    assert _body(r)["ok"] is False

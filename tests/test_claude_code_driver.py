@@ -1131,6 +1131,34 @@ class TestRedirectLane:
         assert (_PRIORITY_CAP_COPY, 77) in notices.calls
         assert s._priority_count() == 3
 
+    async def test_dropped_full_notice_is_durable_and_retries(self, tmp_path):
+        """F8: a capacity-DROP notice (priority-full / ordinary-full) with a
+        FAILED send must NOT be fire-and-forget — it survives as a durable
+        pending notice so ``has_pending()`` stays True and it retries at the next
+        touchpoint (the eviction-notice lane, now extended to drops)."""
+        from drivers.claude_code_driver import (
+            _ORDINARY_FULL_COPY, _PRIORITY_CAP_COPY,
+        )
+        notices = _RecordNotice(ok=False)               # every send fails
+        s = _make_spool(tmp_path, notices=notices)
+        # Ordinary lane full → drop with a failed send.
+        for i in range(10):
+            await s.enqueue(f"m{i}", tg_message_id=100 + i)
+        assert await s.enqueue("overflow", tg_message_id=99) == "dropped_full"
+        # The drop notice is durable + pending (send failed) → retries.
+        assert s.has_pending() is True
+        assert (_ORDINARY_FULL_COPY, 99) in notices.calls
+        # Priority lane full → drop with a failed send, also durable.
+        for i in range(3):
+            await s.enqueue(f"redirect: r{i}")
+        assert await s.enqueue("STOP\nextra", tg_message_id=77) == "dropped_full"
+        assert s.has_pending() is True
+        # Retry at a touchpoint once the transport recovers → both notices send.
+        notices.ok = True
+        await s.on_turn_end()
+        assert (_PRIORITY_CAP_COPY, 77) in notices.calls
+        assert s.has_pending() is False
+
     async def test_notice_first_suppression(self, tmp_path):
         # An evicted envelope holding BOTH pending receipt and pending notice
         # sends ONLY the notice; its receipt flips to not_required.
@@ -2109,3 +2137,51 @@ class TestSummaryStreamWiring:
         await drv._on_stream_event(rec, "turn_start", {})
         assert ctrl._status == STATUS_COMPLETED
         assert ctrl._tick_task is None  # tick cancelled at finalize
+
+
+class TestF7AdoptSummaryOnAttach:
+    """v0.79.0 (§5, F7): a LEGACY pre-v0.79 ACTIVE engagement replayed at boot
+    (summary_message_id is None) gets a summary posted + persisted on attach —
+    §5's invariant (no running engagement without a summary) must hold without
+    depending on N150 currently having none active."""
+
+    async def test_adopts_summary_for_legacy_record(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            "executor", "configurator", "claude_code", "t", {}, topic_id=42)
+        assert rec.summary_message_id is None            # legacy: no summary yet
+
+        sender = AsyncMock(return_value=555)
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x", registry=reg)
+
+        await drv.adopt_summary_if_missing(rec)
+
+        # Posted + persisted (both in-memory and durably in the registry).
+        sender.assert_awaited()
+        assert rec.summary_message_id == 555
+        assert reg.get(rec.id).summary_message_id == 555
+
+    async def test_noop_when_summary_already_present(self, tmp_path):
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            "executor", "configurator", "claude_code", "t", {}, topic_id=42)
+        await reg.set_summary_message_id(rec.id, 900)
+        rec.summary_message_id = 900
+
+        sender = AsyncMock(return_value=555)
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=sender, casa_framework_mcp_url="x", registry=reg)
+        await drv.adopt_summary_if_missing(rec)
+        sender.assert_not_awaited()                      # already has one
+        assert rec.summary_message_id == 900

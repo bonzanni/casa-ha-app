@@ -461,6 +461,17 @@ HookCallback = Callable[
 # decision purposes) but type-compliant.
 
 
+def _active_claude_code_driver() -> Any:
+    """Resolve the live ``claude_code`` driver for the §2 F1(a) permission-
+    keyboard discrete-send seam. Returns ``None`` (⇒ eager fallback) when no
+    driver is attached (unit tests / degraded boot)."""
+    try:
+        import agent as _agent_mod
+        return getattr(_agent_mod, "active_claude_code_driver", None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _deny(reason: str) -> dict[str, Any]:
     """Return a PreToolUse payload that denies the tool call.
 
@@ -1275,13 +1286,13 @@ def make_engagement_permission_relay(
                     "topic_id": rec.topic_id,
                     "operator_id": rec.origin.get("user_id"),
                 })
-            try:
-                # r8-B3: the post runs in a broker-owned SHIELDED setup task
-                # — cancelling THIS hook never interrupts an in-flight
-                # Telegram post (which may already be accepted server-side),
-                # so a same-id retry can never produce a second keyboard.
-                # Post FAILURE inside the task unregisters (waiters get
-                # delivery_failed).
+
+            # The keyboard post — a broker-owned SHIELDED setup task (r8-B3):
+            # cancelling THIS hook never interrupts an in-flight Telegram post
+            # (which may already be accepted server-side), so a same-id retry
+            # never produces a second keyboard. Post FAILURE inside the task
+            # unregisters (waiters get delivery_failed).
+            async def _post_keyboard() -> int | None:
                 await BROKER.ensure_posted(
                     req,
                     lambda: telegram_channel.post_perm_keyboard(
@@ -1290,6 +1301,39 @@ def make_engagement_permission_relay(
                     lambda mid: _perm_keyboard_finish(
                         telegram_channel, rec.topic_id, mid),
                 )
+                return req.meta.get("message_id")
+
+            try:
+                # v0.79.0 (§2 F1(a)): the permission keyboard is a DISCRETE send
+                # and MUST go through the single writer — never eager-post around
+                # the sequencer. Register+arm a send INTENT fenced on the GATED
+                # tool's own frame (hash = identity over the raw tool_input), and
+                # the relay posts the keyboard at that block (sealing preceding
+                # narration first); a late intent posts out-of-band through the
+                # sequencer's watcher. Only the CREATED (first-attempt) intent
+                # installs the poster + arms; a retry rides the first attempt's
+                # post and just awaits the same broker verdict below. No live
+                # sequencer / degraded boot ⇒ eager fallback (pre-v0.79 post).
+                _relay_posted = False
+                _drv = _active_claude_code_driver()
+                if _drv is not None and created:
+                    from channels.output_sequencer import (
+                        projection_hash as _perm_projection_hash,
+                    )
+                    _phash = _perm_projection_hash(tool_name, tool_input)
+                    _res = _drv.register_send_intent(
+                        engagement_id=eng_id, request_id=rid,
+                        tool_name=tool_name, projection_hash=_phash,
+                        poster=_post_keyboard,
+                    )
+                    if _res is not None:
+                        _intent, _created_intent = _res
+                        if _created_intent:
+                            _drv.set_send_intent_poster(eng_id, rid, _post_keyboard)
+                            _drv.arm_send_intent(eng_id, rid)
+                            _relay_posted = True
+                if not _relay_posted:
+                    await _post_keyboard()
                 outcome = await BROKER.await_result(req)
                 if outcome.get("outcome") == "delivery_failed":
                     return _deny("keyboard post failed")

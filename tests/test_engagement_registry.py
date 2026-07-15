@@ -1027,3 +1027,38 @@ class TestSummaryState:
         reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
         assert await reg.allocate_summary_revision("nope") is None
         await reg.set_summary_message_id("nope", 1)  # no-op, no raise
+
+
+class TestF6StrictLedgerPersistence:
+    """v0.79.0 (§4/§5, Sol F6): ``add_open_question`` and
+    ``set_summary_message_id`` are STRICT — a tombstone-write failure rolls the
+    mutated field back (full-field) and RE-RAISES so a caller can fail closed."""
+
+    async def test_add_open_question_strict_rolls_back_and_raises(self, tmp_path):
+        import unittest.mock as _mock
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("executor", "configurator", "claude_code", "t", {}, 1)
+        assert rec.open_questions == ()
+        with _mock.patch.object(
+            reg, "_write_tombstone", side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError):
+                await reg.add_open_question(rec.id, 1, 500, text="Q1: hi")
+        # Rolled back — no phantom open question the ledger/summary can't back.
+        assert rec.open_questions == ()
+
+    async def test_set_summary_message_id_strict_rolls_back_and_raises(self, tmp_path):
+        import unittest.mock as _mock
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("executor", "configurator", "claude_code", "t", {}, 1)
+        assert rec.summary_message_id is None
+        with _mock.patch.object(
+            reg, "_write_tombstone", side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError):
+                await reg.set_summary_message_id(rec.id, 777)
+        assert rec.summary_message_id is None

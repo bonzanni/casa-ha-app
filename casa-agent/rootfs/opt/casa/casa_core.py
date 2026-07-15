@@ -683,6 +683,20 @@ async def replay_undergoing_engagements(
     for rec in undergoing:
         if rec.id in refused_ids:            # Sol F5: refused resume
             continue
+        # v0.79.0 (§5, F7): adopt-on-attach summary migration for LEGACY
+        # pre-v0.79 ACTIVE engagements (summary_message_id is None). Post +
+        # persist a summary before the controller/background tasks attach so
+        # §5's invariant (no running engagement without a summary) holds —
+        # best-effort per record (must not depend on N150 having none active).
+        adopt = getattr(driver, "adopt_summary_if_missing", None)
+        if adopt is not None:
+            try:
+                await adopt(rec)
+            except Exception as exc:  # noqa: BLE001 — per-record isolation
+                logger.warning(
+                    "boot replay: summary adopt-on-attach failed for %s: %s",
+                    rec.id[:8], exc,
+                )
         try:
             driver._spawn_background_tasks(rec)
         except Exception as exc:  # noqa: BLE001
