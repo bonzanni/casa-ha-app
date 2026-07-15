@@ -174,10 +174,13 @@ When `enable_terminal` is enabled, a web terminal is available at the `/terminal
 Ellen (and the specialists she delegates to) can pause a turn to ask you a
 quick multiple-choice question, posted as inline buttons right in your 1:1
 Telegram DM — the same tap-to-answer pattern engagements use, without
-opening a topic. Tap an option and the agent picks up from there; a
-plain-text reply in the same DM answers it too. An unanswered question
-expires after a few minutes, and starting a fresh session (`/new`)
-cancels any question still pending.
+opening a topic. The full answer choices are spelled out (numbered) in the
+message itself, with short labels on the buttons underneath, so long options
+are always readable and never truncated to the point of being unpickable
+(v0.81.0). Tap an option and the agent picks up from there; a plain-text
+reply in the same DM answers it too. An unanswered question expires after a
+few minutes, and starting a fresh session (`/new`) cancels any question
+still pending.
 
 ## Engagements (v0.11.0)
 
@@ -333,23 +336,30 @@ If you accidentally post in the main feed, the bot will reply once
 per boot with a redirect hint, then silently ignore further main-feed
 messages.
 
-### While the engagement runs (v0.79.0)
+### While the engagement runs (v0.81.0)
 
 A pinned summary message sits at the top of the topic for the whole
-engagement: current status, plan progress, what the agent is doing right
-now (with elapsed time), and any questions still waiting on you. Everything
-else — the agent's narration and your exchange with it — reads below it in
-strict chat order: as the agent works, its running narration streams live
-and rolls to a new message rather than editing above anything newer, so the
-topic always reads top-to-bottom in the order things actually happened.
+engagement, leading with the current status — `⚙️ working` (with what it's
+doing right now and elapsed time) or `⏳ waiting for your reply` while it's
+your turn — followed by a short 2-3 word title, plan progress, and any
+questions still waiting on you. The topic itself is named after that same
+short title, so the topic list and the pinned summary always agree. Everything
+else — the agent's narration and your exchange with it — reads below the
+summary in strict chat order: as the agent works, its running narration
+streams live and rolls to a new message rather than editing above anything
+newer, so the topic always reads top-to-bottom in the order things actually
+happened.
 
 Every message you send gets an instant receipt, and the agent's reply is
 quoted back to yours so it's always clear what it's responding to. If it
 needs a decision from you, it asks one question at a time — via tappable
 inline buttons when the options are enumerable, or a numbered free-text
 question otherwise — and won't ask another while your last message is still
-waiting to be read. Once you answer, the question visibly settles (its
-buttons disappear) instead of just showing a toast.
+waiting to be read. The full answer choices are always spelled out in the
+message itself (numbered), with short labels on the buttons underneath, so
+long options are never truncated to the point of being unpickable. Once you
+answer, the question visibly settles (its buttons disappear) instead of just
+showing a toast.
 
 Need to interrupt? Send `STOP` as the first line of a message to make the
 agent drop what it's doing and check in with you, or prefix a message with

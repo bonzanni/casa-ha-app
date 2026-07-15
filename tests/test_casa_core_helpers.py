@@ -288,7 +288,9 @@ class TestBrokerShutdownOrdering:
         order: list[str] = []
 
         class _FakeAskChannel:
-            async def post_dm_keyboard(self, *, chat_id, request_id, text, options):
+            async def post_dm_keyboard(
+                self, *, chat_id, request_id, text, options, short_labels=False,
+            ):
                 return 77
 
             async def edit_dm_message(self, chat_id, message_id, text):

@@ -217,10 +217,11 @@ async def test_answered_settles_with_check_and_clears_keyboard(env):
 
     assert _body(resp) == {
         "ok": True, "outcome": "answered", "option": "B", "option_index": 1}
-    # Settle edit: PRESENT clear_keyboard, ✅ + label, canonical Q1 prefix.
+    # Settle edit: PRESENT clear_keyboard, ✅ + FULL chosen option appended
+    # BELOW the canonical body (W-R3: body carries every option verbatim).
     edit = env["ch"].edits[-1]
     assert edit["clear_keyboard"] is True
-    assert edit["text"] == "Q1: Proceed?\n✅ B"
+    assert edit["text"] == "Q1: Proceed?\n\n1. A\n2. B\n✅ B"
 
 
 async def test_expired_settles_with_hourglass_and_clears_keyboard(env, monkeypatch):
@@ -237,7 +238,8 @@ async def test_expired_settles_with_hourglass_and_clears_keyboard(env, monkeypat
     assert _body(resp) == {"ok": True, "outcome": "no_answer"}
     edit = env["ch"].edits[-1]
     assert edit["clear_keyboard"] is True
-    assert edit["text"] == "Q1: Proceed?\n⌛ expired — answer by text below"
+    assert edit["text"] == (
+        "Q1: Proceed?\n\n1. A\n2. B\n⌛ expired — answer by text below")
 
 
 async def test_canonical_qnumber_strips_agent_authored_prefix(env):
@@ -248,7 +250,7 @@ async def test_canonical_qnumber_strips_agent_authored_prefix(env):
         engagement_id=eid, request_id="c1", question="Q7: Which DB?"))))
     await asyncio.sleep(0.02)
     posted_q = env["ch"].options_keyboards[-1]["question"]
-    assert posted_q == "Q1: Which DB?"
+    assert posted_q == "Q1: Which DB?\n\n1. A\n2. B"
     # open_questions ledger + summary accessor agree with the message.
     assert env["reg"].open_question_numbers(eid) == [1]
     env["broker"].deliver(
@@ -357,7 +359,8 @@ async def test_generation_recheck_supersedes(env):
     # Keyboard settled with the superseded copy + cleared.
     edit = ch.edits[-1]
     assert edit["clear_keyboard"] is True
-    assert edit["text"] == "Q1: Proceed?\n🚫 superseded by your message below"
+    assert edit["text"] == (
+        "Q1: Proceed?\n\n1. A\n2. B\n🚫 superseded by your message below")
 
 
 # ---------------------------------------------------------------------------
@@ -618,3 +621,79 @@ async def test_button_ask_reattach_race_preserves_static_metadata(env, monkeypat
     assert _body(resp)["outcome"] == "answered"
     await asyncio.gather(second, return_exceptions=True)
     await env["broker"].drain_hooks()
+
+
+# ---------------------------------------------------------------------------
+# W-R1 (Sol r2-2): confirmed-edit settle gating on the finish hook
+# ---------------------------------------------------------------------------
+
+
+class _FailEditChannel:
+    """Channel whose settle edit is transiently failing (returns False, as
+    ``edit_topic_message`` does on a timeout / non-'not-modified' BadRequest)."""
+
+    def __init__(self, succeed_on: int | None = None) -> None:
+        self.attempts = 0
+        self.succeed_on = succeed_on  # 1-based attempt that starts succeeding
+        self.edits: list[dict] = []
+
+    async def edit_topic_message(
+        self, topic_id, message_id, text, *, clear_keyboard=False,
+    ) -> bool:
+        self.attempts += 1
+        ok = self.succeed_on is not None and self.attempts >= self.succeed_on
+        self.edits.append(
+            {"message_id": message_id, "text": text,
+             "clear_keyboard": clear_keyboard, "ok": ok})
+        return ok
+
+
+async def test_finish_hook_preserves_ledger_on_unconfirmed_edit():
+    """R1: an all-failing settle edit → the finish hook retries EXACTLY 3× with
+    0.5s→1s→2s backoff (injected clock) and DOES NOT close the ledger entry."""
+    from channels.channel_handlers import _ask_keyboard_finish
+
+    ch = _FailEditChannel(succeed_on=None)  # never succeeds
+    sleeps: list[float] = []
+
+    async def _sleep(d):
+        sleeps.append(d)
+
+    closed = {"n": 0}
+
+    async def _on_settle():
+        closed["n"] += 1
+
+    hook = _ask_keyboard_finish(
+        ch, 42, 101, "Q1: Proceed?\n\n1. A\n2. B", ["A", "B"],
+        on_settle=_on_settle, sleep=_sleep)
+    await hook({"outcome": "answered", "option_index": 0})
+
+    assert ch.attempts == 3           # exactly 3 bounded attempts
+    assert sleeps == [0.5, 1.0, 2.0]  # 0.5→1→2 backoff via injected clock
+    assert closed["n"] == 0           # ledger entry PRESERVED (no premature close)
+
+
+async def test_finish_hook_closes_once_when_edit_confirmed_on_retry_two():
+    """R1: edit succeeds on the SECOND attempt → ledger closed exactly once."""
+    from channels.channel_handlers import _ask_keyboard_finish
+
+    ch = _FailEditChannel(succeed_on=2)  # fail 1, confirm on 2
+    sleeps: list[float] = []
+
+    async def _sleep(d):
+        sleeps.append(d)
+
+    closed = {"n": 0}
+
+    async def _on_settle():
+        closed["n"] += 1
+
+    hook = _ask_keyboard_finish(
+        ch, 42, 101, "Q1: Proceed?\n\n1. A\n2. B", ["A", "B"],
+        on_settle=_on_settle, sleep=_sleep)
+    await hook({"outcome": "answered", "option_index": 1})
+
+    assert ch.attempts == 2
+    assert sleeps == [0.5]   # slept once after the first failure, then confirmed
+    assert closed["n"] == 1  # ledger closed exactly once

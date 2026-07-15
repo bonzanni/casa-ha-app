@@ -79,3 +79,44 @@ def test_compose_topic_title_unknown_state_falls_back_to_active():
     title = compose_topic_title(state="banana", short_task="x")
     assert title.startswith("🟢")
     assert title == "🟢 x"
+
+
+# ---------------------------------------------------------------------------
+# W-R6 (v0.81.0): normalize_topic_title — engager-supplied short topic title.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_topic_title_passes_short_clean_title():
+    from channels.state_emoji import normalize_topic_title
+    assert normalize_topic_title("Gmail plugin") == "Gmail plugin"
+
+
+def test_normalize_topic_title_caps_to_three_words_at_word_boundary():
+    from channels.state_emoji import normalize_topic_title
+    assert normalize_topic_title("one two three four five") == "one two three"
+
+
+def test_normalize_topic_title_caps_to_char_budget_at_word_boundary():
+    from channels.state_emoji import normalize_topic_title, TOPIC_TITLE_CHAR_CAP
+    # Three long words exceed the char cap → dropped at a WORD boundary.
+    out = normalize_topic_title("configuration deployment orchestration")
+    assert len(out) <= TOPIC_TITLE_CHAR_CAP
+    # Never a mid-word cut: the result is a whitespace-joined prefix.
+    assert out in "configuration deployment orchestration"
+    assert not out.endswith(" ")
+
+
+def test_normalize_topic_title_unsafe_text_falls_back_to_empty():
+    from channels.state_emoji import normalize_topic_title
+    # A newline (C0 control) is UNSAFE-TEXT → rejected → "" (caller derives).
+    assert normalize_topic_title("Gmail\nplugin") == ""
+    # A bidi override is also UNSAFE.
+    assert normalize_topic_title("safe‮title") == ""
+
+
+def test_normalize_topic_title_blank_and_non_str_fall_back_to_empty():
+    from channels.state_emoji import normalize_topic_title
+    assert normalize_topic_title("") == ""
+    assert normalize_topic_title("   ") == ""
+    assert normalize_topic_title(None) == ""
+    assert normalize_topic_title(123) == ""

@@ -211,6 +211,45 @@ def _parse_callback_data(data: str) -> tuple[str | None, str | None, int | None]
     return None, None, None
 
 
+# v0.81.0 (W-R3, Sol r1-5): button labels are DERIVED channel-side from the
+# full option so they stay readable — Telegram truncates long labels to a few
+# words, which made most choices unpickable. The full option text lives VERBATIM
+# in the message body (``channel_handlers.render_ask_body``); the button carries
+# only a short summary. The button's IDENTITY stays the option INDEX in
+# ``callback_data`` — the label is display-only, so nothing is lost by shortening.
+_ASK_BUTTON_LABEL_CAP = 24
+_ASK_BUTTON_SUMMARY_WORDS = 3
+
+
+def _short_option_label(number: int, option: str) -> str:
+    """Derive a short, number-prefixed button label from a full option string.
+
+    ``<number> · <≤3 words>``, the whole label capped at ~``_ASK_BUTTON_LABEL_CAP``
+    chars on a WORD boundary (e.g. ``1 · Personal Gmail``). No ellipsis: the full
+    option text is carried verbatim in the message body, so a shortened label
+    never changes the choice. ``number`` is the option's 1-based position, which
+    also lets the operator match the label to the numbered body line.
+    """
+    prefix = f"{number} · "
+    words = option.split()[:_ASK_BUTTON_SUMMARY_WORDS]
+    chosen: list[str] = []
+    for w in words:
+        candidate = prefix + " ".join(chosen + [w])
+        # The cap applies to EVERY word — including the FIRST (R3 label bug: the
+        # first word used to be appended unconditionally, so a long single/first
+        # word blew past the cap, e.g. ``1 · <47-char token>`` = 51 chars).
+        if len(candidate) > _ASK_BUTTON_LABEL_CAP:
+            break
+        chosen.append(w)
+    if not chosen:
+        # Degenerate: the first word alone exceeds the cap (or a whitespace-only
+        # option). Hard-slice to the cap on a codepoint boundary — no ellipsis;
+        # the full text still lives in the body and the callback identity is the
+        # index, so nothing is lost by the slice.
+        return (prefix + (words[0] if words else ""))[:_ASK_BUTTON_LABEL_CAP]
+    return prefix + " ".join(chosen)
+
+
 # Reconnect supervisor backoff schedule (spec 5.2 §4.2): 1s, 2s, 4s, 8s,
 # 16s, cap 60s, unbounded. Reuses retry.compute_backoff_ms via
 # ReconnectSupervisor. Module-level so tests can monkey-patch short
@@ -1617,9 +1656,14 @@ class TelegramChannel(Channel):
 
         # v0.75.0 (W5): v1 broker callback_data, one button (its own row)
         # per option — option_index is this option's position in `options`.
+        # v0.81.0 (W-R3): the button LABEL is a short, number-prefixed summary
+        # (``_short_option_label``) so it stays readable — Telegram truncates
+        # long labels. ``question`` is already the canonical body
+        # (``render_ask_body``): the FULL options are numbered VERBATIM in it,
+        # and ``callback_data`` still carries the option INDEX as the identity.
         kbd = InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                text=label,
+                text=_short_option_label(i + 1, label),
                 callback_data=f"v1|engagement_ask|{request_id}|{i}",
             )]
             for i, label in enumerate(options)
@@ -1715,6 +1759,7 @@ class TelegramChannel(Channel):
 
     async def post_dm_keyboard(
         self, *, chat_id: int, request_id: str, text: str, options: list[str],
+        short_labels: bool = False,
     ) -> int | None:
         """Post a plain-text question to a DM chat with one tappable button
         per option (resident_ask).
@@ -1725,12 +1770,20 @@ class TelegramChannel(Channel):
         where ``i`` is the option's position. Returns the Telegram
         ``message_id``, or ``None`` on send failure — the broker's
         ``ensure_posted`` treats ``None`` as a delivery failure (r10-B3).
+
+        ``short_labels`` (v0.81.0, W-R3b): when True, derive short, number-
+        prefixed button labels via ``_short_option_label`` — Telegram truncates
+        long labels, which made ``ask_user`` options unpickable. The FULL options
+        must already live VERBATIM in ``text`` (the caller renders them with
+        ``render_ask_body``). Default False keeps the authz-challenge DM path
+        (``authz_grants`` — short ``Approve``/``Deny`` options) untouched.
         """
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
         kbd = InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                text=label,
+                text=(_short_option_label(i + 1, label)
+                      if short_labels else label),
                 callback_data=f"v1|resident_ask|{request_id}|{i}",
             )]
             for i, label in enumerate(options)
@@ -2050,9 +2103,15 @@ class TelegramChannel(Channel):
         if new_emoji is None or new_emoji == rec.current_state_emoji:
             return
 
+        # W-R6 (v0.81.0): read the persisted short topic title (engager-supplied
+        # or Casa-derived at ingest); legacy rows with no persisted title fall
+        # back to the concise_task label so old tombstones never crash.
+        short_title = (
+            getattr(rec, "topic_title", "") or concise_task(rec.task or "")
+        )
         title = compose_topic_title(
             state=new_state,
-            short_task=concise_task(rec.task or ""),
+            short_task=short_title,
         )
         if not self.engagement_supergroup_id:
             return

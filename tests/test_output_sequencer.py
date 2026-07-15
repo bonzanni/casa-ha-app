@@ -23,6 +23,11 @@ from channels.output_sequencer import (
     project_args,
     projection_hash,
 )
+from drivers.summary_controller import (
+    STATUS_WAITING_REPLY,
+    STATUS_WORKING,
+    SummaryController,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -676,3 +681,323 @@ async def test_await_completion_drain_unknown_intent_returns_true():
     rec, clock = Recorder(), Clock()
     seq = _make_seq(rec, clock)
     assert await seq.await_completion_drain("nope", timeout=0.05) is True
+
+
+# ---------------------------------------------------------------------------
+# W-R5 repro-gate (Sol r2-1/r1-7): no edit of a message AFTER a newer causal
+# event exists. The recommendation→ask→result regression, on the REAL sequencer.
+# ---------------------------------------------------------------------------
+
+
+async def test_r5_recommendation_not_edited_after_ask_posts_below_it():
+    """W-R5 PROPERTY TEST (repro-first, Sol r2-1): a turn streams a
+    recommendation (narration), posts an ask BELOW it, then finalizes the
+    result. The recommendation, the ask, and the result each land as a NEW
+    message in strict causal order, and once the ask sits below the
+    recommendation NO further edit targets the recommendation — the seal-and-
+    open-new mechanism (``edit_narration_if_latest`` returns SEALED past a newer
+    high-water) enforces the invariant. If this passes, R5 needs no new code."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+
+    # 1. Stream the recommendation as latest-message narration (open + grow).
+    rec_mid = await seq.open_narration("Recommendation: Option A —")
+    assert rec_mid is not None
+    assert (
+        await seq.edit_narration_if_latest(
+            rec_mid, "Recommendation: Option A — locked in")
+        == APPLIED
+    )  # streaming the latest narration STAYS allowed
+
+    # 2. Post the ask BELOW the recommendation (a discrete relay-mediated intent).
+    seq.register_intent(
+        request_id="ask-1", tool_name=ASK_TOOL, projection_hash="h",
+        poster=_poster(rec, "Q1: Proceed?"))
+    seq.arm_intent("ask-1")
+    assert await seq.post_for_block(ASK_TOOL, "h") == "posted"
+    ask_mid = seq.intent_outcome("ask-1")["message_id"]
+    assert ask_mid > rec_mid  # the ask is a NEW message, causally AFTER the rec
+
+    # 3. A late narration token / finalize tries to edit the recommendation now
+    #    that the ask sits below it → SEALED (the caller must open a NEW message,
+    #    NOT edit the recommendation).
+    assert (
+        await seq.edit_narration_if_latest(
+            rec_mid, "Recommendation: Option A — locked in (late token)")
+        == SEALED
+    )
+
+    # 4. Finalize the result as a NEW message below the ask.
+    res_mid = await seq.open_narration("Result: done")
+    assert res_mid is not None
+
+    # PROPERTY 1: three DISTINCT messages in strict causal order.
+    assert rec_mid < ask_mid < res_mid
+    # PROPERTY 2: the recommendation message is NEVER an edit target after the
+    # ask posts — the only edit that ever touched it was the pre-ask streaming
+    # grow; no edit-after-newer-event bypassed edit_narration_if_latest.
+    edits_of_rec = [e for e in rec.edits if e[1] == rec_mid]
+    assert edits_of_rec == [
+        (42, rec_mid, "Recommendation: Option A — locked in")]
+
+
+# ---------------------------------------------------------------------------
+# Sol diff gate r2 — REENTRANT-LOCK DEADLOCK on the ask-poster → summary-edit
+# path. The ask poster runs WHILE the sequencer's single writer lock is held
+# (seal-narration + post is atomic). It calls back into the NON-narration
+# summary path (note_ask_waiting → SummaryController.submit_status →
+# edit_summary), which re-enters the SAME lock. A plain non-reentrant lock
+# deadlocks the holding task forever. These use the REAL SummaryController wired
+# to the REAL sequencer — a fake sequencer HIDES this bug (that is why it
+# shipped).
+# ---------------------------------------------------------------------------
+
+
+async def _park_forever(_dt: float) -> None:
+    """A ``_sleep`` that parks so a controller tick loop never spins (we never
+    reach the working+turn-running predicate here anyway)."""
+    await asyncio.Event().wait()
+
+
+def _wire_controller(seq, *, open_qs, goal="Gmail plugin", message_id=500):
+    """Real SummaryController wired to the real *seq* — a fake sequencer would
+    hide the reentrant-lock deadlock this suite reproduces."""
+    return SummaryController(
+        engagement_id="eng-1",
+        sequencer=seq,
+        goal_line=goal,
+        open_question_numbers=lambda: list(open_qs),
+        message_id=message_id,
+        _now=lambda: 0.0,
+        _sleep=_park_forever,
+    )
+
+
+async def test_ask_poster_summary_edit_does_not_deadlock_held_writer_lock():
+    """Sol's exact repro: status=WAITING, open=[Q11]; an armed DEFERRED ask
+    poster adds Q12 and submits WAITING at a NEWER revision (the F1 same-status
+    revision-bump path). ``post_for_block`` posts the ask while HOLDING the
+    writer lock and awaits the poster; the poster's submit_status → edit_summary
+    re-enters that same lock. Before the reentrant-per-task fix this DEADLOCKS —
+    the bounded ``asyncio.wait_for(..., 0.2)`` TIMES OUT (RED). With the fix the
+    post completes and the summary reflects the added question."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    open_qs = [11]
+    controller = _wire_controller(seq, open_qs=open_qs)
+    # Seed the current status WAITING at revision 0 (the ask already waiting).
+    await controller.submit_status(STATUS_WAITING_REPLY, 0)
+    rec.edits.clear()
+
+    async def _ask_poster():
+        # Runs UNDER the held writer lock. Adding Q12 and re-submitting WAITING
+        # at a newer revision drives edit_summary — which re-enters the lock.
+        open_qs.append(12)
+        await controller.submit_status(STATUS_WAITING_REPLY, 1)
+        return await rec.send(42, "Q12: Proceed?")
+
+    seq.register_intent(
+        request_id="ask-2", tool_name=ASK_TOOL, projection_hash="h",
+        poster=_ask_poster)
+    seq.arm_intent("ask-2")
+
+    # RED-VERIFIED ASSERTION: this call DEADLOCKS before the fix (wait_for times
+    # out); after the fix it returns "posted".
+    res = await asyncio.wait_for(seq.post_for_block(ASK_TOOL, "h"), 0.2)
+    assert res == "posted"
+    # The nested summary edit landed and reflects the grown open-questions set.
+    assert any("Q11, Q12" in text for _, _, text in rec.edits)
+
+
+async def test_first_ask_working_to_waiting_class_change_does_not_deadlock():
+    """The FIRST ask is a working→waiting status-CLASS change — latent since T1
+    (commit 2670794 put note_ask_waiting in the poster), BEFORE the F1 fix. The
+    armed ask poster submits WAITING (rev 0) from the default WORKING status and
+    adds Q11; the class-change flush drives edit_summary → re-enters the held
+    lock. Before the fix ``post_for_block`` DEADLOCKS (wait_for times out)."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    open_qs: list[int] = []
+    controller = _wire_controller(seq, open_qs=open_qs)
+    assert controller._status == STATUS_WORKING  # default, first-ask precondition
+
+    async def _ask_poster():
+        open_qs.append(11)
+        await controller.submit_status(STATUS_WAITING_REPLY, 0)  # working→waiting
+        return await rec.send(42, "Q11: Proceed?")
+
+    seq.register_intent(
+        request_id="ask-1", tool_name=ASK_TOOL, projection_hash="h",
+        poster=_ask_poster)
+    seq.arm_intent("ask-1")
+
+    res = await asyncio.wait_for(seq.post_for_block(ASK_TOOL, "h"), 0.2)
+    assert res == "posted"
+    assert controller._status == STATUS_WAITING_REPLY
+    assert any(
+        STATUS_WAITING_REPLY in text and "Q11" in text
+        for _, _, text in rec.edits)
+
+
+async def test_serialized_still_mutually_exclusive_across_tasks():
+    """Owner-tracking must NOT relax exclusion for a DIFFERENT task: while one
+    task holds the writer lock (inside a poster await), another task's locked
+    op BLOCKS until release. Guards against the reentrant conversion turning the
+    single-writer lock into a no-op for concurrent tasks."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    order: list[str] = []
+
+    async def _holder_poster():
+        order.append("A-in")
+        entered.set()
+        await release.wait()          # hold the writer lock open
+        order.append("A-out")
+        return await rec.send(42, "A")
+
+    seq.register_intent(
+        request_id="A", tool_name=REPLY_TOOL, projection_hash="h",
+        poster=_holder_poster)
+    seq.arm_intent("A")
+    task_a = asyncio.ensure_future(seq.post_for_block(REPLY_TOOL, "h"))
+    await asyncio.wait_for(entered.wait(), 1.0)
+
+    # A DIFFERENT task attempts a locked summary edit — must BLOCK while A holds.
+    task_b = asyncio.ensure_future(seq.edit_summary(500, "B"))
+    await asyncio.sleep(0)
+    assert not task_b.done()          # exclusion preserved for the other task
+    order.append("B-blocked")
+
+    release.set()
+    assert await asyncio.wait_for(task_a, 1.0) == "posted"
+    assert await asyncio.wait_for(task_b, 1.0) == APPLIED
+    # B's edit only ran AFTER A released the lock.
+    assert order == ["A-in", "B-blocked", "A-out"]
+
+
+# ---------------------------------------------------------------------------
+# Sol diff gate r3 — CROSS-TASK AB-BA lock inversion between the sequencer
+# writer lock and the summary lock. Per-task reentrancy (r2) fixes a poster
+# re-entering on its OWN task; it CANNOT fix a DIFFERENT-task cycle:
+#   * Task A (ask poster): holds sequencer lock, then wants summary lock;
+#   * Task B (submit_status / tick): holds summary lock, then wants sequencer.
+# The fix imposes ONE order (sequencer OUTER, summary INNER via _writing), so
+# holding the summary lock REQUIRES first holding the sequencer lock — no cycle.
+# REAL sequencer + REAL SummaryController (a fake sequencer hides this).
+# ---------------------------------------------------------------------------
+
+
+async def test_cross_task_ask_poster_vs_summary_flush_no_deadlock():
+    """Sol's cross-task repro. Task A runs an armed ask poster that, WHILE holding
+    the sequencer writer lock, calls ``submit_status`` (wants the summary lock).
+    Task B concurrently runs ``submit_status`` on a DIFFERENT task — a text-changing
+    transition that acquires the summary lock and then reaches ``edit_summary``
+    (wants the sequencer lock). Interleaved so B grabs the summary lock before A's
+    poster asks for it.
+
+    On 88beebe (summary→sequencer order still present) this is a classic AB-BA
+    deadlock: A holds sequencer + waits summary; B holds summary + waits sequencer
+    — the bounded ``asyncio.wait_for`` TIMES OUT and this asserts the deadlock
+    (RED). With the global sequencer-OUTER/summary-INNER order, B can never hold
+    the summary lock while A holds the sequencer (it blocks on the sequencer FIRST),
+    so both tasks complete and the intent is marked posted (GREEN)."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    open_qs = [11]
+
+    controller = SummaryController(
+        engagement_id="eng-1", sequencer=seq, goal_line="Gmail plugin",
+        open_question_numbers=lambda: list(open_qs), message_id=500,
+        _now=lambda: 0.0, _sleep=_park_forever,
+    )
+
+    poster_holds_seq = asyncio.Event()
+    b_released = asyncio.Event()
+
+    async def _ask_poster():
+        # Runs UNDER the held sequencer writer lock (post_for_block posts armed
+        # intents from inside _serialized). Signal ownership, wait until B has had
+        # its chance to grab the summary lock, THEN cross into the summary lock.
+        poster_holds_seq.set()
+        await b_released.wait()
+        await controller.submit_status(STATUS_WAITING_REPLY, 10)  # wants summary
+        return await rec.send(42, "Q11: Proceed?")
+
+    seq.register_intent(
+        request_id="ask-A", tool_name=ASK_TOOL, projection_hash="h",
+        poster=_ask_poster)
+    seq.arm_intent("ask-A")
+
+    task_a = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, "h"))
+    await asyncio.wait_for(poster_holds_seq.wait(), 1.0)  # A holds the sequencer
+
+    # Task B: a WORKING(-1 default) → WAITING transition — text changes, so
+    # _flush_locked actually reaches edit_summary (and thus the sequencer lock).
+    task_b = asyncio.ensure_future(
+        controller.submit_status(STATUS_WAITING_REPLY, 5))
+    # Advance B to its blocking point. This cannot be a single event-gate because
+    # the two code paths block in DIFFERENT places: on 88beebe B acquires the
+    # summary lock and then blocks on the sequencer lock (it renders); on the fix
+    # B blocks on the sequencer lock FIRST and never holds the summary lock (so it
+    # never renders). A bounded run of scheduler turns reaches whichever blocking
+    # point applies before we release A.
+    for _ in range(6):
+        await asyncio.sleep(0)
+    b_released.set()  # release A's poster into the summary lock
+
+    try:
+        res_a, _ = await asyncio.wait_for(
+            asyncio.gather(task_a, task_b), timeout=0.5)
+    except asyncio.TimeoutError:
+        task_a.cancel()
+        task_b.cancel()
+        await asyncio.gather(task_a, task_b, return_exceptions=True)
+        raise AssertionError(
+            "CROSS-TASK DEADLOCK: ask poster holds the sequencer lock and waits "
+            "for the summary lock while submit_status holds the summary lock and "
+            "waits for the sequencer lock (AB-BA inversion)")
+    assert res_a == "posted"
+    intent = seq.registry.by_request_id("ask-A")
+    assert intent.state == "posted" and intent.outcome["ok"] is True
+    # Both status submissions applied; the summary reflects the waiting status.
+    assert controller._status == STATUS_WAITING_REPLY
+    assert any(STATUS_WAITING_REPLY in text for _, _, text in rec.edits)
+
+
+async def test_global_lock_order_completes_regardless_of_start_order():
+    """The single global order (sequencer OUTER, summary INNER) is symmetric: a
+    summary flush and an ask poster running concurrently both complete no matter
+    which task starts first — there is no ordering-dependent hang."""
+    for summary_first in (True, False):
+        rec, clock = Recorder(), Clock()
+        seq = _make_seq(rec, clock)
+        open_qs = [11]
+        controller = SummaryController(
+            engagement_id="eng-1", sequencer=seq, goal_line="Gmail plugin",
+            open_question_numbers=lambda: list(open_qs), message_id=500,
+            _now=lambda: 0.0, _sleep=_park_forever,
+        )
+
+        async def _ask_poster():
+            await controller.submit_status(STATUS_WAITING_REPLY, 7)
+            return await rec.send(42, "Q11?")
+
+        seq.register_intent(
+            request_id="ask-X", tool_name=ASK_TOOL, projection_hash="h",
+            poster=_ask_poster)
+        seq.arm_intent("ask-X")
+
+        # Vary the ACTUAL scheduling order: whichever is created first is the
+        # first coroutine the loop steps. (Swapping references after both are
+        # scheduled would not change scheduling at all.)
+        if summary_first:
+            flush = asyncio.ensure_future(controller.submit_activity("reading files"))
+            poster = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, "h"))
+        else:
+            poster = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, "h"))
+            flush = asyncio.ensure_future(controller.submit_activity("reading files"))
+        res = await asyncio.wait_for(
+            asyncio.gather(poster, flush), timeout=0.5)
+        assert "posted" in res  # the poster resolved
