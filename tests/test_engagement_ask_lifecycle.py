@@ -621,3 +621,79 @@ async def test_button_ask_reattach_race_preserves_static_metadata(env, monkeypat
     assert _body(resp)["outcome"] == "answered"
     await asyncio.gather(second, return_exceptions=True)
     await env["broker"].drain_hooks()
+
+
+# ---------------------------------------------------------------------------
+# W-R1 (Sol r2-2): confirmed-edit settle gating on the finish hook
+# ---------------------------------------------------------------------------
+
+
+class _FailEditChannel:
+    """Channel whose settle edit is transiently failing (returns False, as
+    ``edit_topic_message`` does on a timeout / non-'not-modified' BadRequest)."""
+
+    def __init__(self, succeed_on: int | None = None) -> None:
+        self.attempts = 0
+        self.succeed_on = succeed_on  # 1-based attempt that starts succeeding
+        self.edits: list[dict] = []
+
+    async def edit_topic_message(
+        self, topic_id, message_id, text, *, clear_keyboard=False,
+    ) -> bool:
+        self.attempts += 1
+        ok = self.succeed_on is not None and self.attempts >= self.succeed_on
+        self.edits.append(
+            {"message_id": message_id, "text": text,
+             "clear_keyboard": clear_keyboard, "ok": ok})
+        return ok
+
+
+async def test_finish_hook_preserves_ledger_on_unconfirmed_edit():
+    """R1: an all-failing settle edit → the finish hook retries EXACTLY 3× with
+    0.5s→1s→2s backoff (injected clock) and DOES NOT close the ledger entry."""
+    from channels.channel_handlers import _ask_keyboard_finish
+
+    ch = _FailEditChannel(succeed_on=None)  # never succeeds
+    sleeps: list[float] = []
+
+    async def _sleep(d):
+        sleeps.append(d)
+
+    closed = {"n": 0}
+
+    async def _on_settle():
+        closed["n"] += 1
+
+    hook = _ask_keyboard_finish(
+        ch, 42, 101, "Q1: Proceed?\n\n1. A\n2. B", ["A", "B"],
+        on_settle=_on_settle, sleep=_sleep)
+    await hook({"outcome": "answered", "option_index": 0})
+
+    assert ch.attempts == 3           # exactly 3 bounded attempts
+    assert sleeps == [0.5, 1.0, 2.0]  # 0.5→1→2 backoff via injected clock
+    assert closed["n"] == 0           # ledger entry PRESERVED (no premature close)
+
+
+async def test_finish_hook_closes_once_when_edit_confirmed_on_retry_two():
+    """R1: edit succeeds on the SECOND attempt → ledger closed exactly once."""
+    from channels.channel_handlers import _ask_keyboard_finish
+
+    ch = _FailEditChannel(succeed_on=2)  # fail 1, confirm on 2
+    sleeps: list[float] = []
+
+    async def _sleep(d):
+        sleeps.append(d)
+
+    closed = {"n": 0}
+
+    async def _on_settle():
+        closed["n"] += 1
+
+    hook = _ask_keyboard_finish(
+        ch, 42, 101, "Q1: Proceed?\n\n1. A\n2. B", ["A", "B"],
+        on_settle=_on_settle, sleep=_sleep)
+    await hook({"outcome": "answered", "option_index": 1})
+
+    assert ch.attempts == 2
+    assert sleeps == [0.5]   # slept once after the first failure, then confirmed
+    assert closed["n"] == 1  # ledger closed exactly once

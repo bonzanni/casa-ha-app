@@ -676,3 +676,61 @@ async def test_await_completion_drain_unknown_intent_returns_true():
     rec, clock = Recorder(), Clock()
     seq = _make_seq(rec, clock)
     assert await seq.await_completion_drain("nope", timeout=0.05) is True
+
+
+# ---------------------------------------------------------------------------
+# W-R5 repro-gate (Sol r2-1/r1-7): no edit of a message AFTER a newer causal
+# event exists. The recommendation→ask→result regression, on the REAL sequencer.
+# ---------------------------------------------------------------------------
+
+
+async def test_r5_recommendation_not_edited_after_ask_posts_below_it():
+    """W-R5 PROPERTY TEST (repro-first, Sol r2-1): a turn streams a
+    recommendation (narration), posts an ask BELOW it, then finalizes the
+    result. The recommendation, the ask, and the result each land as a NEW
+    message in strict causal order, and once the ask sits below the
+    recommendation NO further edit targets the recommendation — the seal-and-
+    open-new mechanism (``edit_narration_if_latest`` returns SEALED past a newer
+    high-water) enforces the invariant. If this passes, R5 needs no new code."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+
+    # 1. Stream the recommendation as latest-message narration (open + grow).
+    rec_mid = await seq.open_narration("Recommendation: Option A —")
+    assert rec_mid is not None
+    assert (
+        await seq.edit_narration_if_latest(
+            rec_mid, "Recommendation: Option A — locked in")
+        == APPLIED
+    )  # streaming the latest narration STAYS allowed
+
+    # 2. Post the ask BELOW the recommendation (a discrete relay-mediated intent).
+    seq.register_intent(
+        request_id="ask-1", tool_name=ASK_TOOL, projection_hash="h",
+        poster=_poster(rec, "Q1: Proceed?"))
+    seq.arm_intent("ask-1")
+    assert await seq.post_for_block(ASK_TOOL, "h") == "posted"
+    ask_mid = seq.intent_outcome("ask-1")["message_id"]
+    assert ask_mid > rec_mid  # the ask is a NEW message, causally AFTER the rec
+
+    # 3. A late narration token / finalize tries to edit the recommendation now
+    #    that the ask sits below it → SEALED (the caller must open a NEW message,
+    #    NOT edit the recommendation).
+    assert (
+        await seq.edit_narration_if_latest(
+            rec_mid, "Recommendation: Option A — locked in (late token)")
+        == SEALED
+    )
+
+    # 4. Finalize the result as a NEW message below the ask.
+    res_mid = await seq.open_narration("Result: done")
+    assert res_mid is not None
+
+    # PROPERTY 1: three DISTINCT messages in strict causal order.
+    assert rec_mid < ask_mid < res_mid
+    # PROPERTY 2: the recommendation message is NEVER an edit target after the
+    # ask posts — the only edit that ever touched it was the pre-ask streaming
+    # grow; no edit-after-newer-event bypassed edit_narration_if_latest.
+    edits_of_rec = [e for e in rec.edits if e[1] == rec_mid]
+    assert edits_of_rec == [
+        (42, rec_mid, "Recommendation: Option A — locked in")]

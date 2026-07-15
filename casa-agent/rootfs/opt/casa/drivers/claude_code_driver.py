@@ -24,6 +24,7 @@ from drivers.workspace import (
     render_run_script, write_casa_meta,
 )
 from engagement_registry import EngagementRecord
+from settle_gate import confirmed_settle_edit
 
 logger = logging.getLogger(__name__)
 
@@ -589,8 +590,13 @@ class ClaudeCodeDriver(DriverProtocol):
         delete_topic_message: Callable[[int, int], Awaitable[bool]] | None = None,
         pin_topic_message: Callable[[int, int], Awaitable[bool]] | None = None,
         registry: Any = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._engagements_root = engagements_root
+        # W-R1 (v0.81.0): injectable clock for the confirmed-edit settle retry
+        # (``confirmed_settle_edit``). Kept injectable so tests stay fast and
+        # NEVER patch ``<module>.asyncio.sleep`` (the shared module attribute).
+        self._sleep = sleep
         # ``send_to_topic`` doubles as the relay's ``send_message`` primitive:
         # casa_core wires it to return the posted Telegram message_id (the relay
         # needs it to edit the rolling message), while notice/warning callers
@@ -1592,18 +1598,28 @@ class ClaudeCodeDriver(DriverProtocol):
         for q in open_qs:
             n = q.get("n")
             mid = q.get("tg_message_id")
+            # W-R1 (Sol r2-2): close the ledger entry ONLY after a CONFIRMED
+            # settle edit. An entry with a live keyboard/anchor (``mid``) whose
+            # edit stays unconfirmed after the bounded retry is LEFT INTACT so a
+            # later boot reconciliation retries it — never dropped on a transient
+            # failure. Entries with no message id (nothing to settle visually)
+            # close unconditionally.
+            settled = True
             if mid is not None and self._edit_topic_message is not None:
                 display = q.get("text") or (f"Q{n}:" if n is not None else "")
                 text = f"{display}{_OPEN_Q_EXPIRED_SUFFIX}"
-                try:
-                    await self._edit_topic_message(
-                        rec.topic_id, mid, text, clear_keyboard=True)
-                except Exception:  # noqa: BLE001 — best-effort settle
+                settled = await confirmed_settle_edit(
+                    lambda mid=mid, text=text: self._edit_topic_message(
+                        rec.topic_id, mid, text, clear_keyboard=True),
+                    sleep=self._sleep,
+                )
+                if not settled:
                     logger.warning(
-                        "engagement %s: open-question boot settle failed (n=%s)",
-                        rec.id[:8], n, exc_info=True,
+                        "engagement %s: open-question boot settle UNCONFIRMED "
+                        "after retries (n=%s) — leaving ledger entry INTACT",
+                        rec.id[:8], n,
                     )
-            if close is not None and n is not None:
+            if settled and close is not None and n is not None:
                 try:
                     await close(rec.id, n)
                 except Exception:  # noqa: BLE001
@@ -1631,15 +1647,27 @@ class ClaudeCodeDriver(DriverProtocol):
         n = anchor.get("n")
         amid = anchor.get("tg_message_id")
         display = anchor.get("text") or (f"Q{n}:" if n is not None else "")
+        # W-R1 (Sol r2-2): confirmed-edit gate. Close the anchor's ledger entry
+        # ONLY after a CONFIRMED settle edit; an unconfirmed edit after the
+        # bounded retry leaves the entry INTACT for the next boot reconciliation.
+        # The anchor mid is STILL returned regardless so the operator's answer
+        # threads to the question it answers even when the cosmetic settle edit
+        # is transiently failing.
+        settled = True
         if amid is not None and self._edit_topic_message is not None:
-            try:
-                await self._edit_topic_message(
+            settled = await confirmed_settle_edit(
+                lambda: self._edit_topic_message(
                     engagement.topic_id, amid,
-                    f"{display}{_OPEN_Q_ANSWERED_SUFFIX}", clear_keyboard=True)
-            except Exception:  # noqa: BLE001 — settle is advisory
-                logger.debug("anchor settle edit failed", exc_info=True)
+                    f"{display}{_OPEN_Q_ANSWERED_SUFFIX}", clear_keyboard=True),
+                sleep=self._sleep,
+            )
+            if not settled:
+                logger.warning(
+                    "engagement %s: anchor settle UNCONFIRMED after retries "
+                    "(n=%s) — leaving ledger entry INTACT", engagement.id[:8], n,
+                )
         close = getattr(reg, "close_open_question", None)
-        if close is not None and n is not None:
+        if settled and close is not None and n is not None:
             try:
                 await close(engagement.id, n)
             except Exception:  # noqa: BLE001

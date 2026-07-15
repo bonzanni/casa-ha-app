@@ -25,6 +25,8 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
+from settle_gate import confirmed_settle_edit
+
 logger = logging.getLogger(__name__)
 
 Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
@@ -473,6 +475,7 @@ def _ask_keyboard_finish(
     telegram_channel: Any, topic_id: int | None, message_id: int,
     question: str, options: list,
     *, on_settle: "Callable[[], Awaitable[None]] | None" = None,
+    sleep: "Callable[[float], Awaitable[None]]" = asyncio.sleep,
 ) -> Callable[[dict], "Awaitable[None]"]:
     """Broker finish-hook (r3-B3 shape, mirrors ``hooks._perm_keyboard_finish``)
     -- the engagement_ask namespace's ONLY keyboard-message writer. Fires
@@ -485,19 +488,33 @@ def _ask_keyboard_finish(
 
     ``on_settle`` (§4): a callback run once on any terminal outcome to close the
     question's entry in the registry ``open_questions`` ledger.
+
+    W-R1 (v0.81.0, Sol r2-2) — CONFIRMED-EDIT GATING: the settle edit can fail
+    transiently (``edit_topic_message`` returns ``False`` on a timeout /
+    non-'not-modified' BadRequest). Because the broker fires this hook exactly
+    ONCE, a later tap cannot re-drive settlement. So bounds-retry the edit
+    (``confirmed_settle_edit``: 3 attempts, 0.5→1→2 backoff, injected ``sleep``)
+    and run ``on_settle`` (which closes the ledger entry) ONLY on a CONFIRMED
+    edit. An unconfirmed edit leaves the keyboard live AND the ledger entry
+    INTACT so the NEXT boot reconciliation (itself confirmed-edit gated) settles
+    it — there is deliberately no later-tap re-drive.
     """
 
     async def _finish(outcome: dict) -> None:
         text = _ask_settle_text(question, outcome, options)
-        try:
-            await telegram_channel.edit_topic_message(
-                topic_id, message_id, text, clear_keyboard=True,
-            )
-        except Exception:  # noqa: BLE001 — finish hooks must never raise
+        confirmed = await confirmed_settle_edit(
+            lambda: telegram_channel.edit_topic_message(
+                topic_id, message_id, text, clear_keyboard=True),
+            sleep=sleep,
+        )
+        if not confirmed:
             logger.warning(
-                "ask keyboard finish-hook edit failed "
-                "(topic=%s message_id=%s)", topic_id, message_id, exc_info=True,
+                "ask keyboard finish-hook settle edit UNCONFIRMED after retries "
+                "(topic=%s message_id=%s) — leaving keyboard live and the "
+                "open-question ledger entry INTACT for boot reconciliation",
+                topic_id, message_id,
             )
+            return
         if on_settle is not None:
             try:
                 await on_settle()

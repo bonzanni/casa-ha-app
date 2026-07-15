@@ -1908,6 +1908,127 @@ class TestAskLifecycleSeams:
         drv.set_engagement_reply_anchor("eng", 5555)
         assert seq.reply_targets == [5555]
 
+    async def test_reconcile_preserves_ledger_on_unconfirmed_edit(
+        self, tmp_path,
+    ):
+        """W-R1 (Sol r2-2): a transiently-failing settle edit (returns False)
+        during boot reconciliation must retry EXACTLY 3× (0.5→1→2 backoff via an
+        injected clock) and leave the ledger entry INTACT for the next boot."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            "executor", "configurator", "claude_code", "t", {}, topic_id=999)
+        n1 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n1, 7001, text="Q1: Proceed?",
+                                    kind="button")
+
+        attempts = {"n": 0}
+
+        async def _edit(topic_id, message_id, text, *, clear_keyboard=False):
+            attempts["n"] += 1
+            return False  # transient failure every attempt
+
+        sleeps: list[float] = []
+
+        async def _sleep(d):
+            sleeps.append(d)
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="http://x",
+            edit_topic_message=_edit, registry=reg,
+        )
+        drv._sleep = _sleep
+        await drv.reconcile_open_questions(rec)
+
+        assert attempts["n"] == 3            # exactly 3 bounded attempts
+        assert sleeps == [0.5, 1.0, 2.0]     # 0.5→1→2 backoff
+        # Ledger entry PRESERVED (NOT closed on a failed edit).
+        assert reg.open_question_numbers(rec.id) == [n1]
+
+    async def test_reconcile_closes_when_edit_confirmed_on_retry_two(
+        self, tmp_path,
+    ):
+        """W-R1: edit confirmed on the SECOND attempt → ledger closed once."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            "executor", "configurator", "claude_code", "t", {}, topic_id=999)
+        n1 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n1, 7001, text="Q1: Proceed?",
+                                    kind="button")
+
+        attempts = {"n": 0}
+
+        async def _edit(topic_id, message_id, text, *, clear_keyboard=False):
+            attempts["n"] += 1
+            return attempts["n"] >= 2  # fail 1, confirm on 2
+
+        sleeps: list[float] = []
+
+        async def _sleep(d):
+            sleeps.append(d)
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="http://x",
+            edit_topic_message=_edit, registry=reg,
+        )
+        drv._sleep = _sleep
+        await drv.reconcile_open_questions(rec)
+
+        assert attempts["n"] == 2
+        assert sleeps == [0.5]
+        assert reg.open_question_numbers(rec.id) == []  # closed once
+
+    async def test_anchor_settle_preserves_ledger_on_unconfirmed_edit(
+        self, tmp_path,
+    ):
+        """W-R1: a transiently-failing anchor settle edit must retry 3× and
+        leave the anchor's ledger entry INTACT (still recoverable at next boot),
+        while STILL returning the anchor mid so the turn threads correctly."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            "executor", "configurator", "claude_code", "t", {}, topic_id=999)
+        n1 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n1, 8001, text="Q1: DB name?",
+                                    kind="anchor")
+
+        attempts = {"n": 0}
+
+        async def _edit(topic_id, message_id, text, *, clear_keyboard=False):
+            attempts["n"] += 1
+            return False  # transient failure every attempt
+
+        sleeps: list[float] = []
+
+        async def _sleep(d):
+            sleeps.append(d)
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="http://x",
+            edit_topic_message=_edit, registry=reg,
+        )
+        drv._sleep = _sleep
+        amid = await drv._settle_open_anchor(rec, operator_msg_id=42)
+
+        assert amid == 8001                  # still threads to the anchor
+        assert attempts["n"] == 3            # exactly 3 bounded attempts
+        assert sleeps == [0.5, 1.0, 2.0]
+        # Ledger entry PRESERVED (NOT closed on a failed edit).
+        assert reg.open_question_numbers(rec.id) == [n1]
+
 
 class TestBootSummary:
     """v0.79.0 (§5): the pinned live summary is posted + persisted BEFORE the
