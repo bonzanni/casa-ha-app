@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.79.2] - 2026-07-15
+
+### Fixed
+
+- In-Casa engagements (configurator, specialist topics) crashed on operator
+  topic messages after 0.79.0 — the new reply-threading argument was not
+  accepted by their driver. Caught by the end-to-end suite before any
+  deployment; claude_code engagements were unaffected.
+
 ## [0.79.1] - 2026-07-15
 
 ### Fixed
