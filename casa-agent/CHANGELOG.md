@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.81.0] - 2026-07-15
+
+Engagement-topic UX round 2: the pinned summary, topic titles, and question
+buttons all get more readable. No configuration change is required.
+
+### Changed
+
+- Engagement topic summaries now lead with the current status (working/waiting)
+  and use a short 2-3 word title, so the topic header reads clearly at a
+  glance.
+- Questions asked in the topic — and in Ellen's DM — now show the full answer
+  choices in the message itself, with short button labels underneath, so
+  options are always readable even when Telegram would otherwise truncate a
+  long button.
+
+### Fixed
+
+- The pinned summary correctly shows "waiting for your reply" while it's your
+  turn (previously it could get stuck showing "working").
+- Answered questions reliably settle (their buttons disappear) even if a
+  Telegram edit transiently fails.
+- The engagement no longer occasionally re-posts a duplicate of a message it
+  already sent.
+
 ## [0.80.0] - 2026-07-15
 
 Voice-fleet hardening: generic delegation, session, and ingress safety
