@@ -509,6 +509,123 @@ async def ensure_service_down(*, engagement_id: str, attempts: int = 3) -> bool:
     return False
 
 
+# --- A2b: verified group-wide force-turn-boundary (operator-away backstop) ---
+
+# Poll cadence + bounds for the group-extinction verification. Module-level so
+# tests drive the ladder with an injected sleep (NEVER a patch of the shared
+# ``<module>.asyncio.sleep`` — memory-cage rule).
+_FORCE_POLL_INTERVAL_S = 0.25
+_FORCE_TERM_ATTEMPTS = 20      # after SIGTERM
+_FORCE_KILL_ATTEMPTS = 8       # after the SIGKILL escalation
+
+
+def _killpg(pgid: int, sig: int) -> None:
+    """Thin injectable seam over ``os.killpg`` (tests monkeypatch this to record
+    the exact signal sequence without touching a real process group). ``sig == 0``
+    is the liveness/emptiness probe: it raises ``ProcessLookupError`` iff the
+    group is extinct."""
+    os.killpg(pgid, sig)
+
+
+async def _poll_group_extinct(
+    pgid: int, *, attempts: int, interval: float,
+    sleep,
+) -> bool:
+    """Poll ``os.killpg(pgid, 0)`` up to ``attempts`` times (``interval`` apart)
+    until it raises ``ProcessLookupError`` — i.e. the recorded process GROUP is
+    empty. Returns True on extinction, False if the group is still alive after
+    the last attempt. A kernel-refused probe (EPERM etc.) reads as still-alive
+    (not proof of extinction)."""
+    for _ in range(attempts):
+        try:
+            _killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            pass  # e.g. EPERM — group exists, just not signalable; still alive
+        await sleep(interval)
+    return False
+
+
+async def force_turn_boundary(
+    *, engagement_id: str, sleep=asyncio.sleep,
+) -> bool:
+    """Force-end the engagement's CLI turn by killing its whole process GROUP,
+    then VERIFY the group is extinct — the A2b operator-away hard backstop.
+
+    s6's wanted-state is never touched, so the supervisor auto-respawns the run
+    script; the fresh spawn blocks on its stdin FIFO with an empty spool — the
+    architecture's natural zero-cost suspended state between turns. Ladder
+    (spec §A2.6):
+
+      1. STRICT tri-state entry probe (reuse ``_probe_service_down``):
+         ``down`` → already suspended → True; ``unknown`` → WARN + return False
+         truthfully ("not suspending blind" — a query failure is NOT proof);
+         ``up`` → read the live pid and proceed.
+      2. Record the pre-signal pgid (= pid; the run script is the session/group
+         leader) and ``os.killpg(pid, SIGTERM)`` the whole group
+         (``ProcessLookupError`` → already gone → True).
+      3. Bounded verification of GROUP EXTINCTION (not leader turnover): poll
+         ``os.killpg(recorded_pgid, 0)`` until ``ProcessLookupError``.
+      4. Timeout → ``os.killpg(recorded_pgid, SIGKILL)`` (never a re-read pid — a
+         respawn may already own it) → re-poll the same emptiness probe.
+
+    Returns True IFF the old group is verifiably empty; a False is WARN-logged as
+    "forced suspend NOT verified" and never falsely reported as suspended."""
+    scandir = _service_scandir(engagement_id)
+
+    status = await _probe_service_down(scandir)
+    if status == "down":
+        return True
+    if status != "up":
+        logger.warning(
+            "force_turn_boundary %s: cannot verify service state — not "
+            "suspending blind", engagement_id,
+        )
+        return False
+
+    pid = await service_pid(engagement_id=engagement_id)
+    if pid is None:
+        logger.warning(
+            "force_turn_boundary %s: probed up but pid unavailable — not "
+            "suspending blind", engagement_id,
+        )
+        return False
+
+    # The fresh run-script spawn is its own session/group leader, so the pgid is
+    # the pid — recorded here, BEFORE the signal, and used for every subsequent
+    # probe (a respawn may reuse the pid but never this whole group).
+    pgid = pid
+    try:
+        _killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True  # group already extinct between probe and signal
+
+    if await _poll_group_extinct(
+        pgid, attempts=_FORCE_TERM_ATTEMPTS,
+        interval=_FORCE_POLL_INTERVAL_S, sleep=sleep,
+    ):
+        return True
+
+    # SIGTERM-ignoring children survive → escalate to a group SIGKILL on the
+    # RECORDED pgid, then re-verify emptiness.
+    try:
+        _killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    if await _poll_group_extinct(
+        pgid, attempts=_FORCE_KILL_ATTEMPTS,
+        interval=_FORCE_POLL_INTERVAL_S, sleep=sleep,
+    ):
+        return True
+
+    logger.warning(
+        "force_turn_boundary %s: forced suspend NOT verified (group %s still "
+        "alive after SIGKILL)", engagement_id, pgid,
+    )
+    return False
+
+
 def sweep_orphan_compiled_dbs(*, tmp_root: str = "/tmp") -> list[str]:
     """Remove stale /tmp/s6-casa-db-* dirs left by previous container runs.
 

@@ -688,6 +688,16 @@ class ClaudeCodeDriver(DriverProtocol):
         # FIFO-blocked suspended state anyway, so nothing is persisted.
         self._operator_away: dict[str, bool] = {}
         self._away_refusals: dict[str, int] = {}
+        # F-EXPIRE (v0.83.0, A2b): the HARD backstop. On the 2nd away-refusal in
+        # an episode the driver force-ends the CLI turn ONCE (``_away_suspend_fired``
+        # gates re-firing; reset when away clears). Before signalling, the current
+        # spawn epoch is stamped into ``_forced_suspend_epochs`` so the ensuing
+        # respawn's abnormal-exit log reads "forced suspend (operator away)" at
+        # INFO instead of the scary WARN. ``_force_turn_boundary`` is the injected
+        # kill callable (defaults to the verified group-kill in s6_rc).
+        self._forced_suspend_epochs: dict[str, int | None] = {}
+        self._away_suspend_fired: set[str] = set()
+        self._force_turn_boundary = s6_rc.force_turn_boundary
 
     # -- DriverProtocol ---------------------------------------------------
 
@@ -884,6 +894,9 @@ class ClaudeCodeDriver(DriverProtocol):
         # F-EXPIRE: drop the operator-away suspend state on teardown.
         self._operator_away.pop(engagement.id, None)
         self._away_refusals.pop(engagement.id, None)
+        # A2b: drop the force-end backstop state on teardown.
+        self._forced_suspend_epochs.pop(engagement.id, None)
+        self._away_suspend_fired.discard(engagement.id)
         # v0.79.0 (§2): drop the sequencer (its watcher task is cancelled above).
         self._sequencers.pop(engagement.id, None)
         # v0.79.0 (§5): drop the summary controller and cancel its elapsed tick
@@ -1670,10 +1683,60 @@ class ClaudeCodeDriver(DriverProtocol):
         """F-EXPIRE backstop counter: bump + return the count of consecutive
         operator-away ask refusals in the current away-episode. Task 5's
         force-turn-boundary backstop CONSUMES this count; nothing here
-        force-ends. Reset when the away state clears (``_clear_operator_away``)."""
+        force-ends. Reset when the away state clears (``_clear_operator_away``).
+
+        A2b HARD BACKSTOP: refusals are instant, so a doctrine-defying agent
+        could loop ask→refusal at token speed. On the 2nd refusal in an episode
+        (``_away_suspend_fired`` gates re-firing) the driver force-ends the CLI
+        turn ONCE via the verified group-kill. The trigger lives here — the
+        handler-side gate already routes every refusal through this method, so
+        channel_handlers needs no further change."""
         n = self._away_refusals.get(engagement_id, 0) + 1
         self._away_refusals[engagement_id] = n
+        if n >= 2 and engagement_id not in self._away_suspend_fired:
+            self._away_suspend_fired.add(engagement_id)
+            self._trigger_force_suspend(engagement_id)
         return n
+
+    def _trigger_force_suspend(self, engagement_id: str) -> None:
+        """A2b: mark the current epoch expected-terminated BEFORE signalling (so
+        ``_log_abnormal_exit`` annotates the ensuing respawn), then spawn the
+        verified group-kill as a tracked background task. Degrades to a no-op if
+        no event loop is running (a sync fake context)."""
+        # Stamp the epoch first — the kill races the respawn's spawn event.
+        self._forced_suspend_epochs[engagement_id] = self._epoch_pending.get(
+            engagement_id)
+        try:
+            task = asyncio.create_task(
+                self._run_force_suspend(engagement_id),
+                name=f"force_suspend:{engagement_id[:8]}")
+        except RuntimeError:  # no running loop — cannot schedule the kill
+            logger.debug(
+                "force_turn_boundary: no running loop; skipping force-end "
+                "for %s", engagement_id[:8])
+            return
+        self._tasks.setdefault(engagement_id, []).append(task)
+
+    async def _run_force_suspend(self, engagement_id: str) -> None:
+        """A2b: await the injected verified group-kill and log the truthful
+        outcome. A False (unverified) is WARN-logged; the kill helper never
+        touches s6 wanted-state, so s6 auto-respawns the run script into the
+        FIFO-blocked suspended state either way."""
+        try:
+            ok = await self._force_turn_boundary(engagement_id=engagement_id)
+        except Exception:  # noqa: BLE001 — the backstop must never wedge the driver
+            logger.warning(
+                "engagement %s: force_turn_boundary raised", engagement_id[:8],
+                exc_info=True)
+            return
+        if ok:
+            logger.info(
+                "engagement %s: forced turn boundary (operator away, 2nd "
+                "refusal) — verified suspended", engagement_id[:8])
+        else:
+            logger.warning(
+                "engagement %s: forced turn boundary NOT verified — agent may "
+                "still be looping", engagement_id[:8])
 
     async def _clear_operator_away(self, engagement_id: str) -> None:
         """F-EXPIRE EXIT: a durably-enqueued operator message ends the away
@@ -1684,6 +1747,11 @@ class ClaudeCodeDriver(DriverProtocol):
         message never triggers a spurious summary edit."""
         was_away = self._operator_away.pop(engagement_id, False)
         self._away_refusals.pop(engagement_id, None)
+        # A2b: reset the once-per-episode force-end guard so a fresh away-episode
+        # can fire again. The epoch mark self-clears when _log_abnormal_exit
+        # consumes it, so it is NOT dropped here (the respawn's spawn event may
+        # arrive after this clear).
+        self._away_suspend_fired.discard(engagement_id)
         if not was_away:
             return
         try:
@@ -2106,8 +2174,19 @@ class ClaudeCodeDriver(DriverProtocol):
     def _log_abnormal_exit(
         self, engagement: EngagementRecord, epoch: int | None,
     ) -> None:
-        tail = self._read_epoch_stderr_tail(engagement, epoch)
         short = engagement.id[:8]
+        # A2b: an epoch we force-ended as the operator-away backstop is NOT a
+        # scary abnormal exit — log the expected forced suspend at INFO and
+        # consume the mark (a later, genuinely-abnormal exit still WARNs).
+        if (epoch is not None
+                and self._forced_suspend_epochs.get(engagement.id) == epoch):
+            self._forced_suspend_epochs.pop(engagement.id, None)
+            logger.info(
+                "engagement %s: epoch %s ended by forced suspend "
+                "(operator away)", short, epoch,
+            )
+            return
+        tail = self._read_epoch_stderr_tail(engagement, epoch)
         if tail is None:
             logger.warning(
                 "engagement %s: epoch %s exited without a result frame "
