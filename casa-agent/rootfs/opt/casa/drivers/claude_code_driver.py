@@ -2070,6 +2070,17 @@ class ClaudeCodeDriver(DriverProtocol):
                 self._force_tasks.pop(eid, None)
                 if self._force_tasks.get(eid) is t else None))
 
+    def _register_force_cleanup(
+        self, engagement_id: str, task: asyncio.Task,
+    ) -> None:
+        """Sol A2 wave-2 Finding 3: adopt ``force_turn_boundary``'s shielded
+        post-signal cleanup task when the force-suspend task is cancelled mid-kill
+        (operator returned after SIGTERM was sent). Tracking it under
+        ``_tasks[eng_id]`` keeps the SIGKILL escalation running to completion —
+        never cancelled by the away-clear — while teardown still owns it (the
+        ordinary ``cancel()`` teardown is a legitimate terminal boundary)."""
+        self._tasks.setdefault(engagement_id, []).append(task)
+
     async def _run_force_suspend(self, engagement_id: str) -> None:
         """A2b: await the injected verified group-kill and log the truthful
         outcome. A False (unverified) is WARN-logged; the kill helper never
@@ -2080,11 +2091,18 @@ class ClaudeCodeDriver(DriverProtocol):
                 engagement_id=engagement_id,
                 workspace_dir=str(Path(self._engagements_root) / engagement_id),
                 expected_epoch=self._forced_suspend_epochs.get(engagement_id),
+                track_task=(
+                    lambda t, eid=engagement_id:
+                    self._register_force_cleanup(eid, t)),
             )
         except asyncio.CancelledError:
             # A2b: operator returned mid-kill (``_clear_operator_away`` cancelled
-            # this task). The operator's own message provides the turn boundary —
-            # nothing to log, propagate the cancellation.
+            # this task). Sol A2 wave-2 Finding 3: if SIGTERM was already sent,
+            # ``force_turn_boundary`` has already handed its shielded post-signal
+            # cleanup to ``_register_force_cleanup`` so the SIGKILL escalation
+            # still completes under teardown ownership; a pre-signal cancel left
+            # nothing running. Either way the operator's own message provides the
+            # turn boundary — nothing to log, propagate the cancellation.
             raise
         except Exception:  # noqa: BLE001 — the backstop must never wedge the driver
             logger.warning(

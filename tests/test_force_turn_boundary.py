@@ -461,30 +461,197 @@ async def test_clear_operator_away_cancels_inflight_force_task(tmp_path):
     assert eid not in drv._force_tasks
 
 
-async def test_force_turn_boundary_tolerates_cancellation_mid_poll(monkeypatch):
+async def test_cancellation_before_sigterm_sends_nothing(monkeypatch):
+    """Finding 3: a PRE-signal cancel (during the entry probe / epoch guard /
+    re-probe) aborts cleanly — asyncio delivers CancelledError only at an await,
+    and nothing has been signalled yet."""
     import asyncio
-    import signal as _sig
 
     seq: list[tuple] = []
-    block = asyncio.Event()
 
     def killpg(pgid, sig):
         seq.append((pgid, sig))
-        # emptiness probes always report alive (never raise) → poll would spin.
 
-    async def _sleep(_d):
-        await block.wait()        # wedge the poll between probes
+    started = asyncio.Event()
+    release = asyncio.Event()
 
-    _install(monkeypatch, probe="up", pid=444, killpg=killpg)
-    task = asyncio.ensure_future(
-        s6_rc.force_turn_boundary(engagement_id="e1", sleep=_sleep))
-    for _ in range(6):            # let it send SIGTERM + one probe + enter sleep
-        await asyncio.sleep(0)
+    async def _probe(scandir):
+        started.set()
+        await release.wait()          # wedge the ENTRY probe (pre-signal)
+        return ("up", 100)
 
+    monkeypatch.setattr(s6_rc, "_probe_status_and_pid", _probe)
+    monkeypatch.setattr(s6_rc, "_getpgid", lambda p: p)
+    monkeypatch.setattr(s6_rc, "_killpg", killpg)
+
+    task = asyncio.ensure_future(s6_rc.force_turn_boundary(engagement_id="e1"))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    # SIGTERM was delivered; cancellation stopped the poll BEFORE any SIGKILL.
-    assert (444, _sig.SIGTERM) in seq
-    assert _sig.SIGKILL not in [s for _, s in seq]
+    assert seq == []                  # cancelled pre-signal → ZERO signals
+
+
+async def test_cancellation_after_sigterm_completes_cleanup_via_track_task(
+    monkeypatch,
+):
+    """Finding 3 (the RED): once SIGTERM is sent, a cancel of the caller must NOT
+    suppress the extinction poll + SIGKILL escalation. force_turn_boundary hands
+    the shielded post-signal cleanup to ``track_task``; the caller re-raises
+    CancelledError but the cleanup runs to completion (SIGKILL + verified)."""
+    import asyncio
+
+    seq: list[tuple] = []
+    state = {"killed": False}
+
+    def killpg(pgid, sig):
+        seq.append((pgid, sig))
+        if sig == signal.SIGKILL:
+            state["killed"] = True
+            return
+        if sig == 0 and state["killed"]:
+            raise ProcessLookupError      # extinct only AFTER the SIGKILL
+        # SIGTERM + every pre-kill emptiness probe → still alive.
+
+    started = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def _sleep(_d):
+        started.set()
+        await gate.wait()                 # Event-gated fake sleep wedges the poll
+
+    captured: list = []
+
+    _install(monkeypatch, probe="up", pid=444, killpg=killpg)
+    task = asyncio.ensure_future(s6_rc.force_turn_boundary(
+        engagement_id="e1", sleep=_sleep, track_task=captured.append))
+
+    # SIGTERM delivered + first emptiness probe + the poll wedged on the sleep.
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    assert (444, signal.SIGTERM) in seq
+
+    # Operator returned → the caller task is cancelled mid-poll.
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The cleanup was HANDED OFF (not cancelled) and is still running.
+    assert len(captured) == 1
+    cleanup = captured[0]
+    assert not cleanup.done()
+
+    # Release the wedge → the cleanup escalates to SIGKILL and completes truthful.
+    gate.set()
+    result = await asyncio.wait_for(cleanup, timeout=1.0)
+    assert result is True
+    assert (444, signal.SIGKILL) in seq   # escalation still ran after the cancel
+
+
+# ---------------------------------------------------------------------------
+# Finding 2: pid-stability re-probe closes the epoch TOCTOU. A respawn can be
+# supervisor-visible before .spawn_epoch republishes, so the epoch guard can
+# pass against a FRESH group. The re-probe requires the pid UNCHANGED; a changed
+# pid → abort False, ZERO signals.
+# ---------------------------------------------------------------------------
+
+
+async def test_pid_change_on_reprobe_aborts_no_signals(monkeypatch, caplog):
+    seq: list[tuple] = []
+
+    def killpg(pgid, sig):
+        seq.append((pgid, sig))
+
+    calls = {"n": 0}
+
+    async def _probe(scandir):
+        calls["n"] += 1
+        # entry probe: up pid 100; re-probe: a FRESH spawn already owns pid 200.
+        return ("up", 100 if calls["n"] == 1 else 200)
+
+    monkeypatch.setattr(s6_rc, "_probe_status_and_pid", _probe)
+    monkeypatch.setattr(s6_rc, "_getpgid", lambda p: p)
+    monkeypatch.setattr(s6_rc, "_killpg", killpg)
+    calls_sleep, sleep = await _no_sleep_recorder()
+
+    with caplog.at_level(logging.INFO, logger="drivers.s6_rc"):
+        result = await s6_rc.force_turn_boundary(engagement_id="e1", sleep=sleep)
+
+    assert result is False
+    assert seq == []                       # pid changed → never signal the group
+    assert any("turn already ended" in r.message for r in caplog.records)
+
+
+async def test_reprobe_unknown_aborts_no_signals(monkeypatch):
+    """A re-probe that reads unknown (query failure / malformed) also aborts — we
+    do not signal blind once the second read is not a clean ``up`` at the same
+    pid."""
+    seq: list[tuple] = []
+
+    def killpg(pgid, sig):
+        seq.append((pgid, sig))
+
+    calls = {"n": 0}
+
+    async def _probe(scandir):
+        calls["n"] += 1
+        return ("up", 100) if calls["n"] == 1 else ("unknown", None)
+
+    monkeypatch.setattr(s6_rc, "_probe_status_and_pid", _probe)
+    monkeypatch.setattr(s6_rc, "_getpgid", lambda p: p)
+    monkeypatch.setattr(s6_rc, "_killpg", killpg)
+
+    result = await s6_rc.force_turn_boundary(engagement_id="e1")
+    assert result is False
+    assert seq == []
+
+
+# ---------------------------------------------------------------------------
+# Finding 1: _probe_status_and_pid returns a strict tri-state — only the two
+# coherent shapes (up+live-pid, down+no-pid) are trusted; every contradictory or
+# malformed snapshot reads ("unknown", None), never a definite status.
+# ---------------------------------------------------------------------------
+
+
+class _FakeCompleted:
+    def __init__(self, returncode, stdout):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+@pytest.mark.parametrize("stdout,rc,expected", [
+    ("true true 4242\n", 0, ("up", 4242)),      # up WITH a live pid → up
+    ("false false 0\n", 0, ("down", None)),      # down WITH no pid → down
+    ("false true 0\n", 0, ("unknown", None)),    # respawn-race: up-classified but
+                                                 #   no live pid → not a definite
+                                                 #   status the ladder acts on
+    ("false false 4242\n", 0, ("unknown", None)),   # down BUT pid present
+    ("true garbage 4242\n", 0, ("unknown", None)),  # malformed wantedup
+    ("true true 0\n", 0, ("unknown", None)),        # up BUT no live pid
+    ("true true\n", 0, ("unknown", None)),          # missing pid field
+    ("true true garbage\n", 0, ("unknown", None)),  # unparseable pid
+    ("true true 4242 extra\n", 0, ("unknown", None)),  # too many fields
+    ("", 1, ("unknown", None)),                      # query failure (rc != 0)
+])
+async def test_probe_status_and_pid_strict_shapes(
+    monkeypatch, stdout, rc, expected,
+):
+    # Only the two COHERENT shapes are trusted: an ``up`` service WITH a live pid,
+    # or a ``down`` service with none. Every contradictory / malformed / no-live-
+    # pid snapshot (including the ``false true`` respawn-race, which is up-
+    # classified but pidless) reads ("unknown", None) so force_turn_boundary never
+    # signals blind.
+    monkeypatch.setattr(s6_rc.os.path, "isdir", lambda p: True)
+
+    def _run(argv, capture_output=True, text=True):
+        return _FakeCompleted(rc, stdout)
+
+    monkeypatch.setattr(s6_rc.subprocess, "run", _run)
+    result = await s6_rc._probe_status_and_pid(
+        "/run/service/engagement-e1")
+    assert result == expected
+
+
+async def test_probe_status_and_pid_scandir_absent_is_down(monkeypatch):
+    monkeypatch.setattr(s6_rc.os.path, "isdir", lambda p: False)
+    assert await s6_rc._probe_status_and_pid("/nope") == ("down", None)

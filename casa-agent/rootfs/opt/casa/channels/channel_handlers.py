@@ -758,14 +758,19 @@ def _make_ask(
         # relay posts it at the ask tool_use block (AFTER any preceding
         # narration). No driver/hash ⇒ eager fallback (pre-v0.79 behavior). ---
         if not options:
-            if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
-                return _refusal_response()
-
             # F5: register the discrete-send intent and check for a REATTACH
             # BEFORE allocating a Q-number — parity with the button-ask reattach
             # (a transport retry must NOT burn a fresh number or post a second
             # anchor). ``created_intent`` is True only on the genuinely-first
             # attempt; None when there is no live sequencer (eager fallback).
+            #
+            # GATE ORDERING (Sol A2 wave-2, Finding 4): the reattach-outcome
+            # check runs FIRST — BEFORE the unread and away gates — exactly like
+            # the button path. Previously the unread-inbound gate ran first, so a
+            # same-request_id retry whose original was refused ``operator_away``
+            # could get ``unread_inbound`` (an inbound cleared away but is still
+            # unread) instead of its RECORDED outcome. Order now mirrors the
+            # button path: reattach → away gate → unread gate.
             created_intent: bool | None = None
             if driver is not None and projection_hash:
                 res = driver.register_send_intent(
@@ -809,6 +814,16 @@ def _make_ask(
                     # so a same-id retry reattaches to it above.
                     _record_intent_refusal(driver, eng_id, request_id)
                 return _away_refusal_response(driver, eng_id)
+
+            # INBOUND GATE (§4): an unseen operator message means "end your turn".
+            # Placed AFTER the reattach + away checks (Finding 4) — a genuinely-new
+            # anchor is refused here; a same-id retry never reaches this point. A
+            # freshly-created intent is tombstoned so a retry reattaches (parity
+            # with the button path's unread gate).
+            if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
+                if created_intent:
+                    driver.cancel_send_intent(eng_id, request_id)
+                return _refusal_response()
 
             # First attempt (created intent) OR eager fallback: allocate the
             # durable number + build the poster.

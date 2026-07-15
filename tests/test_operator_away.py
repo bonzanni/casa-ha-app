@@ -650,6 +650,42 @@ async def test_no_answer_reads_waiter_req_meta_not_broker_key(env, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+async def test_anchor_away_retry_returns_recorded_outcome_not_unread(env):
+    """Sol A2 wave-2, Finding 4: the anchor path now runs the reattach-outcome
+    check BEFORE the unread-inbound gate (parity with the button path). An
+    away-refused anchor whose operator then returns (inbound lands, away cleared
+    but the message still UNREAD) must, on a same-request_id retry, return its
+    RECORDED ``operator_away`` outcome — not ``unread_inbound``."""
+    eid = env["rec"].id
+    driver = env["driver"]
+    driver._operator_away[eid] = True
+
+    # First anchor ask is refused operator_away and records the outcome on the
+    # intent (created_intent True → _record_intent_refusal).
+    resp1 = await env["ask"](_FakeRequest(
+        _payload(eid, request_id="a4", options=[])))
+    assert _body(resp1)["error"] == "operator_away"
+
+    # The operator returns: an inbound lands (clears away) but is still UNREAD
+    # until the next turn-start consumes it.
+    await driver.spool.enqueue("operator is back")
+    driver._operator_away.pop(eid, None)
+    assert driver.inbound_unread_depth(eid) > 0
+    assert driver.operator_away_active(eid) is False
+
+    # Same-request_id transport retry: reattach-first returns the RECORDED
+    # operator_away outcome, NOT unread_inbound (the pre-fix ordering bug).
+    resp2 = await env["ask"](_FakeRequest(
+        _payload(eid, request_id="a4", options=[])))
+    body2 = _body(resp2)
+    assert body2["ok"] is False
+    assert body2["error"] == "operator_away"
+    assert body2["error"] != "unread_inbound"
+    # Still no anchor posted, no broker request across both attempts.
+    assert env["ch"].sent_texts == []
+    assert env["broker"].pending(namespace="engagement_ask", scope=eid) == []
+
+
 async def test_note_operator_away_drives_paused_summary_directly(tmp_path):
     from drivers.summary_controller import STATUS_PAUSED, STATUS_WAITING_REPLY
     drv, rec, ctrl, edits, reg = await _driver_with_summary(tmp_path)
