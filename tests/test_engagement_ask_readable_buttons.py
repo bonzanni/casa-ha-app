@@ -127,6 +127,30 @@ class TestShortOptionLabel:
             assert label.startswith(f"{i + 1} · ")
             assert f"{i + 1}. {opt}" in body
 
+    def test_caps_long_single_word_option(self) -> None:
+        # R3 label bug: a single long token (47 chars, within the _ASK_MAX_LABEL
+        # _LEN=48 validation cap) must STILL yield a label ≤ the button cap. The
+        # old loop appended the first word unconditionally (the cap check only
+        # ran once `chosen` was non-empty), so this produced "1 · <47 chars>" =
+        # 51 chars — over the 24 cap and unreadable.
+        from channels.telegram import _ASK_BUTTON_LABEL_CAP
+
+        opt = "Supercalifragilisticexpialidociousandmore12345"
+        assert " " not in opt and len(opt) > _ASK_BUTTON_LABEL_CAP  # single long token
+        label = _short_option_label(1, opt)
+        assert len(label) <= _ASK_BUTTON_LABEL_CAP
+        assert label.startswith("1 · ")
+
+    def test_caps_long_first_word_then_more(self) -> None:
+        # A long FIRST word followed by more words: the cap must bite on the
+        # first word (hard slice), not append it whole and blow past the cap.
+        from channels.telegram import _ASK_BUTTON_LABEL_CAP
+
+        label = _short_option_label(
+            2, "Supercalifragilisticexpialidocious mango")
+        assert len(label) <= _ASK_BUTTON_LABEL_CAP
+        assert label.startswith("2 · ")
+
 
 # ---------------------------------------------------------------------------
 # post_options_keyboard — body verbatim, short labels, index identity

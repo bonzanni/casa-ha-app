@@ -235,13 +235,17 @@ def _short_option_label(number: int, option: str) -> str:
     chosen: list[str] = []
     for w in words:
         candidate = prefix + " ".join(chosen + [w])
-        if chosen and len(candidate) > _ASK_BUTTON_LABEL_CAP:
+        # The cap applies to EVERY word — including the FIRST (R3 label bug: the
+        # first word used to be appended unconditionally, so a long single/first
+        # word blew past the cap, e.g. ``1 · <47-char token>`` = 51 chars).
+        if len(candidate) > _ASK_BUTTON_LABEL_CAP:
             break
         chosen.append(w)
     if not chosen:
         # Degenerate: the first word alone exceeds the cap (or a whitespace-only
-        # option). Hard-slice the single word to the cap — no ellipsis; the full
-        # text still lives in the body and the callback identity is the index.
+        # option). Hard-slice to the cap on a codepoint boundary — no ellipsis;
+        # the full text still lives in the body and the callback identity is the
+        # index, so nothing is lost by the slice.
         return (prefix + (words[0] if words else ""))[:_ASK_BUTTON_LABEL_CAP]
     return prefix + " ".join(chosen)
 
@@ -1755,6 +1759,7 @@ class TelegramChannel(Channel):
 
     async def post_dm_keyboard(
         self, *, chat_id: int, request_id: str, text: str, options: list[str],
+        short_labels: bool = False,
     ) -> int | None:
         """Post a plain-text question to a DM chat with one tappable button
         per option (resident_ask).
@@ -1765,12 +1770,20 @@ class TelegramChannel(Channel):
         where ``i`` is the option's position. Returns the Telegram
         ``message_id``, or ``None`` on send failure — the broker's
         ``ensure_posted`` treats ``None`` as a delivery failure (r10-B3).
+
+        ``short_labels`` (v0.81.0, W-R3b): when True, derive short, number-
+        prefixed button labels via ``_short_option_label`` — Telegram truncates
+        long labels, which made ``ask_user`` options unpickable. The FULL options
+        must already live VERBATIM in ``text`` (the caller renders them with
+        ``render_ask_body``). Default False keeps the authz-challenge DM path
+        (``authz_grants`` — short ``Approve``/``Deny`` options) untouched.
         """
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
         kbd = InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                text=label,
+                text=(_short_option_label(i + 1, label)
+                      if short_labels else label),
                 callback_data=f"v1|resident_ask|{request_id}|{i}",
             )]
             for i, label in enumerate(options)

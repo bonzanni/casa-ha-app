@@ -501,10 +501,17 @@ async def ask_user(args: dict) -> dict:
                         "message": "channel not available"})
 
     from verdict_broker import BROKER
+    from channels.channel_handlers import render_ask_body
 
     rid = uuid.uuid4().hex
     target_role = origin.get("role")
     scope = f"dm:{chat_id}"
+    # v0.81.0 (W-R3b): the DM MESSAGE body carries the FULL options VERBATIM +
+    # 1-based numbered (the SAME single-source renderer the engagement asks use),
+    # while the buttons carry only short number-prefixed labels. Both the post
+    # and the settle edits derive from this one ``body`` so they can never
+    # disagree (mirrors the engagement single-source discipline).
+    body = render_ask_body(None, question, list(options))
     # Static meta BEFORE post (register() shallow-copies whatever dict we
     # pass, so the complete dict is supplied up front rather than mutated
     # after the fact). No `on_commit_sync` — plain asks record nothing at
@@ -524,7 +531,8 @@ async def ask_user(args: dict) -> dict:
 
     async def _post():
         return await channel.post_dm_keyboard(
-            chat_id=chat_id, request_id=rid, text=question, options=list(options),
+            chat_id=chat_id, request_id=rid, text=body, options=list(options),
+            short_labels=True,
         )
 
     def _finish_factory(message_id: int):
@@ -536,13 +544,13 @@ async def ask_user(args: dict) -> dict:
             if outcome.get("outcome") != "answered":
                 await channel.edit_dm_message(
                     chat_id, message_id,
-                    f"{question}\n\n(this question has expired)",
+                    f"{body}\n\n(this question has expired)",
                 )
                 return
             idx = outcome["option_index"]
             chosen = options[idx]
             await channel.edit_dm_message(
-                chat_id, message_id, f"{question}\n\nAnswered: {chosen}",
+                chat_id, message_id, f"{body}\n\nAnswered: {chosen}",
             )
             ok = await channel._dispatch_button_continuation(
                 chat_id=chat_id, user_id=operator_id, target_role=target_role,
