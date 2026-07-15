@@ -427,11 +427,15 @@ class TopicStreamRelay:
         self.cursor_path = cursor_path
         self.send_message = send_message
         self.edit_message = edit_message
-        # T3-intended seams: ``delete_message`` (de-dup delete) and
-        # ``reply_texts`` (reply-set lookup) are injected but currently UNUSED —
-        # §2(d) removed the finalize de-dup delete, and de-dup-before-post moves
-        # inside the sequencer when the reply ingress is wired (T3). Retained so
-        # the driver wiring is stable across the T2/T3 activation.
+        # ``delete_message`` and ``reply_texts`` are injected by the driver but
+        # currently UNUSED here: §2(d) removed the finalize de-dup DELETE (a
+        # duplicate is preferred over erasing history), and there is NO
+        # content-based de-dup-before-post inside the sequencer — that seam was
+        # never wired (a prior comment here claimed it was; it is not). Duplicate
+        # NARRATION is prevented STRUCTURALLY instead: ``_finalize`` reposts only
+        # genuinely-unposted trailing text (W-R4, tracked via ``_posted_len``),
+        # and the sequencer's SEAL / high-water invariant keeps ordering. These
+        # two seams are retained only so the driver wiring stays stable.
         self.delete_message = delete_message
         self.on_turn_event = on_turn_event
         self.reply_texts = reply_texts
@@ -457,6 +461,15 @@ class TopicStreamRelay:
         # Per-turn in-memory state (never persisted — rebuilt on recovery).
         self._turn_text = ""
         self._per_message_text = ""
+        # W-R4 (Sol r1-3): length of the CURRENT narration message's text that
+        # has actually reached the wire (a send/edit that landed). It tracks
+        # ``_per_message_text`` EXCEPT while a throttled edit is held unposted
+        # (:769) — then ``_per_message_text`` grows but this does not, so the
+        # held suffix is ``_per_message_text[_posted_len:]``. ``_finalize`` uses
+        # it to repost ONLY genuinely-unposted trailing text when the narration
+        # was sealed (never the visible prefix). Unlike the write-only cursor
+        # ``last_posted_len``, an invisible tool-only frame never bumps this.
+        self._posted_len = 0
         self._replay_msg_count = 0
         self._fail_count = 0
         self._dropped = False
@@ -611,6 +624,10 @@ class TopicStreamRelay:
             else:
                 self._sync_last_len()
             self.cursor.last_posted_len = len(self._per_message_text)
+            # The reconciled message now carries the FULL narration on the wire
+            # (conservative repost or in-place edit), so nothing is pending — a
+            # subsequent live ``_finalize`` reposts nothing (W-R4).
+            self._posted_len = len(self._per_message_text)
             self._save()
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -729,6 +746,7 @@ class TopicStreamRelay:
                     return
                 self.cursor.message_ids.append(mid)
                 self._per_message_text = value
+                self._posted_len = len(value)
             else:  # edit
                 prior = self._per_message_text
                 res = await self._apply_seq_edit(
@@ -747,8 +765,10 @@ class TopicStreamRelay:
                         return
                     self.cursor.message_ids.append(mid)
                     self._per_message_text = increment
+                    self._posted_len = len(increment)
                 else:  # applied
                     self._per_message_text = value
+                    self._posted_len = len(value)
                 self._last_edit_ts = self._now()
             # Record this op's per-message narration boundary (send appended a
             # new message; edit grew the current or rolled to a fresh one).
@@ -859,6 +879,7 @@ class TopicStreamRelay:
     def _reset_turn_state(self) -> None:
         self._turn_text = ""
         self._per_message_text = ""
+        self._posted_len = 0
         self._replay_msg_count = 0
         self._fail_count = 0
         self._dropped = False
@@ -888,11 +909,24 @@ class TopicStreamRelay:
                 self.cursor.message_ids[-1], self._per_message_text,
             )
             if res == "sealed":
-                applied, mid = await self._apply_op(
-                    lambda: self.sequencer.open_narration(self._per_message_text)
-                )
-                if applied:
-                    self.cursor.message_ids = [mid]
+                # §2(c) / W-R4 (Sol r1-3): the narration message was SEALED (a
+                # discrete posted below it), so it can no longer be edited. Post
+                # ONLY the GENUINELY-UNPOSTED trailing text — the already-visible
+                # prefix (``_posted_len`` chars, what actually reached the wire)
+                # must NOT be reposted. A fully-posted sealed tail (pending == "")
+                # reposts NOTHING (the production dup: msgs 1139/1141/1143 were
+                # this branch reposting the whole visible tail); a throttled,
+                # never-posted suffix (:769 held it without advancing
+                # ``_posted_len``) posts EXACTLY that suffix, once. This is the
+                # NORMAL in-process finalize; the conservative crash-recovery
+                # seal in ``_reconcile`` is a SEPARATE branch that may duplicate.
+                pending = self._per_message_text[self._posted_len:]
+                if pending:
+                    applied, mid = await self._apply_op(
+                        lambda p=pending: self.sequencer.open_narration(p)
+                    )
+                    if applied:
+                        self.cursor.message_ids = [mid]
 
         if self._dropped:
             # The turn ended in drop mode: ``dropped_through`` reaches the
