@@ -708,6 +708,11 @@ class ClaudeCodeDriver(DriverProtocol):
         self._forced_suspend_epochs: dict[str, int | None] = {}
         self._away_suspend_fired: set[str] = set()
         self._force_turn_boundary = s6_rc.force_turn_boundary
+        # A2b (Sol A2 review): the in-flight force-suspend task, held per
+        # engagement so ``_clear_operator_away`` (operator returned) can CANCEL a
+        # backstop kill still verifying group extinction — the turn boundary the
+        # operator's own message will now provide makes the forced one moot.
+        self._force_tasks: dict[str, asyncio.Task] = {}
 
     # -- DriverProtocol ---------------------------------------------------
 
@@ -910,6 +915,9 @@ class ClaudeCodeDriver(DriverProtocol):
         # A2b: drop the force-end backstop state on teardown.
         self._forced_suspend_epochs.pop(engagement.id, None)
         self._away_suspend_fired.discard(engagement.id)
+        force_task = self._force_tasks.pop(engagement.id, None)
+        if force_task is not None and not force_task.done():
+            force_task.cancel()
         # v0.79.0 (§2): drop the sequencer (its watcher task is cancelled above).
         self._sequencers.pop(engagement.id, None)
         # v0.79.0 (§5): drop the summary controller and cancel its elapsed tick
@@ -1458,7 +1466,9 @@ class ClaudeCodeDriver(DriverProtocol):
         # already goes through (Sol r1-2). While operator-away, a working/waiting
         # submission is coerced to ⏸ paused so a compliant agent ending its turn
         # (``result`` → ⏳) cannot overwrite the paused line. Terminal statuses
-        # bypass this funnel (finalize) and STATUS_PAUSED never routes here.
+        # bypass this funnel (finalize). A DIRECT STATUS_PAUSED submission
+        # (``note_operator_away`` entry, Finding 3) passes through untouched —
+        # the coercion only rewrites WAITING/WORKING.
         #
         # PINNED INVARIANT (Sol r2-3): sample ``operator_away`` AFTER the revision
         # allocation await returns. Sampling BEFORE it would let an inbound clear
@@ -1717,6 +1727,15 @@ class ClaudeCodeDriver(DriverProtocol):
         seq = self._sequencers.get(engagement_id)
         return seq.cancel_intent(request_id) if seq is not None else None
 
+    def record_send_intent_refusal(
+        self, engagement_id: str, request_id: str, outcome: dict,
+    ) -> Any:
+        """A2 (Finding 1): tombstone the intent AND record a refusal outcome so a
+        same-request_id retry reattaches to the SAME refusal. See
+        ``OutputSequencer.record_intent_refusal``."""
+        seq = self._sequencers.get(engagement_id)
+        return seq.record_intent_refusal(request_id, outcome) if seq is not None else None
+
     def send_intent_outcome(self, engagement_id: str, request_id: str) -> Any:
         """Recorded outcome (incl. posted message id) for a reattaching retry."""
         seq = self._sequencers.get(engagement_id)
@@ -1786,17 +1805,33 @@ class ClaudeCodeDriver(DriverProtocol):
 
     # -- F-EXPIRE (A2a) operator-away suspend state ------------------------
 
-    def note_operator_away(self, engagement_id: str, gen: int) -> bool:
+    async def note_operator_away(self, engagement_id: str, gen: int) -> bool:
         """F-EXPIRE ENTER (generation-CAS, Sol r1-3/r2-2): mark the engagement
         operator-away ONLY IF the inbound generation still equals ``gen`` — the
         value sampled at the ask's entry and carried in the broker meta as
         ``inbound_gen``. A racing inbound that already bumped the generation
         FAILS the CAS, so a lost-response retry reattaching after an inbound
         cleared the away state can never re-wedge it with a fresher generation.
-        Returns whether the flag was set. In-memory only (no persistence)."""
+        Returns whether the flag was set. In-memory only (no persistence).
+
+        Sol A2 review (Finding 3): on a SUCCESSFUL CAS, DRIVE the paused summary
+        DIRECTLY — the timeout settle edit that would otherwise recompute the
+        status may be unconfirmed (``_close_question``'s recompute never runs),
+        leaving the engagement showing ⏳ forever while suspended. Submitting
+        STATUS_PAUSED through the ONE ``_summary_status_transition`` funnel (a
+        fresh monotonic revision) makes ⏸ appear regardless; the funnel's
+        away-coercion + monotonic revision make a redundant/racing submit
+        idempotent."""
         if self.inbound_generation(engagement_id) != gen:
             return False
         self._operator_away[engagement_id] = True
+        from drivers.summary_controller import STATUS_PAUSED
+        try:
+            await self._summary_status_transition(engagement_id, STATUS_PAUSED)
+        except Exception:  # noqa: BLE001 — the away flag stands regardless
+            logger.debug(
+                "paused-status submit after operator-away entry failed",
+                exc_info=True)
         return True
 
     def operator_away_active(self, engagement_id: str) -> bool:
@@ -1840,7 +1875,15 @@ class ClaudeCodeDriver(DriverProtocol):
                 "force_turn_boundary: no running loop; skipping force-end "
                 "for %s", engagement_id[:8])
             return
-        self._tasks.setdefault(engagement_id, []).append(task)
+        # A2b (Sol A2 review): hold a DEDICATED per-engagement handle (replacing
+        # the anonymous ``_tasks`` append) so ``_clear_operator_away`` can cancel
+        # this specific kill on operator re-engagement. Retire the handle when
+        # the task completes so a stale/cancelled reference is never re-cancelled.
+        self._force_tasks[engagement_id] = task
+        task.add_done_callback(
+            lambda t, eid=engagement_id: (
+                self._force_tasks.pop(eid, None)
+                if self._force_tasks.get(eid) is t else None))
 
     async def _run_force_suspend(self, engagement_id: str) -> None:
         """A2b: await the injected verified group-kill and log the truthful
@@ -1848,7 +1891,16 @@ class ClaudeCodeDriver(DriverProtocol):
         touches s6 wanted-state, so s6 auto-respawns the run script into the
         FIFO-blocked suspended state either way."""
         try:
-            ok = await self._force_turn_boundary(engagement_id=engagement_id)
+            ok = await self._force_turn_boundary(
+                engagement_id=engagement_id,
+                workspace_dir=str(Path(self._engagements_root) / engagement_id),
+                expected_epoch=self._forced_suspend_epochs.get(engagement_id),
+            )
+        except asyncio.CancelledError:
+            # A2b: operator returned mid-kill (``_clear_operator_away`` cancelled
+            # this task). The operator's own message provides the turn boundary —
+            # nothing to log, propagate the cancellation.
+            raise
         except Exception:  # noqa: BLE001 — the backstop must never wedge the driver
             logger.warning(
                 "engagement %s: force_turn_boundary raised", engagement_id[:8],
@@ -1877,6 +1929,14 @@ class ClaudeCodeDriver(DriverProtocol):
         # consumes it, so it is NOT dropped here (the respawn's spawn event may
         # arrive after this clear).
         self._away_suspend_fired.discard(engagement_id)
+        # A2b (Sol A2 review): cancel an in-flight force-suspend kill — the
+        # operator's own inbound is now the turn boundary, so a still-verifying
+        # SIGTERM/SIGKILL ladder against a possibly-already-respawned generation
+        # is both moot and racy. force_turn_boundary tolerates cancellation at
+        # any await (nothing half-signalled).
+        force_task = self._force_tasks.pop(engagement_id, None)
+        if force_task is not None and not force_task.done():
+            force_task.cancel()
         if not was_away:
             return
         try:

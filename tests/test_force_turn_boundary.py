@@ -39,18 +39,16 @@ pytestmark = pytest.mark.asyncio
 
 def _install(monkeypatch, *, probe, pid=4242, killpg, getpgid=None):
     async def _fake_probe(scandir):
-        return probe() if callable(probe) else probe
-
-    async def _fake_pid(*, engagement_id):
-        return pid
+        # ONE atomic snapshot: status + pid together (Sol A2 review).
+        status = probe() if callable(probe) else probe
+        return status, pid
 
     def _fake_getpgid(p):
         # Default: the leader IS its own group leader (pgid == pid). Cases that
         # need a divergent group or a vanished leader pass an explicit callable.
         return p if getpgid is None else getpgid(p)
 
-    monkeypatch.setattr(s6_rc, "_probe_service_down", _fake_probe)
-    monkeypatch.setattr(s6_rc, "service_pid", _fake_pid)
+    monkeypatch.setattr(s6_rc, "_probe_status_and_pid", _fake_probe)
     monkeypatch.setattr(s6_rc, "_getpgid", _fake_getpgid)
     monkeypatch.setattr(s6_rc, "_killpg", killpg)
 
@@ -304,8 +302,13 @@ async def test_second_away_refusal_fires_force_end_once(tmp_path):
 
     assert drv.record_away_refusal(eid) == 2
     await _drain()
-    fake.assert_awaited_once_with(engagement_id=eid)
-    # the current epoch was marked expected-terminated BEFORE signalling.
+    fake.assert_awaited_once()
+    # the current epoch was marked expected-terminated BEFORE signalling AND is
+    # passed to the kill as the expected-epoch guard, with the workspace dir.
+    kwargs = fake.await_args.kwargs
+    assert kwargs["engagement_id"] == eid
+    assert kwargs["expected_epoch"] == 7
+    assert kwargs["workspace_dir"].endswith(eid)
     assert drv._forced_suspend_epochs[eid] == 7
 
     # 3rd refusal in the SAME episode does NOT re-fire.
@@ -368,3 +371,120 @@ async def test_abnormal_exit_unmarked_epoch_keeps_warn(tmp_path, caplog):
     assert not any(
         "forced suspend" in r.message for r in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# Finding 4a: expected-epoch guard. The atomic status+pid probe closes the
+# turn-ended/respawn race; if .spawn_epoch no longer equals the armed epoch the
+# ladder aborts with False and ZERO signals (never kills the fresh spawn).
+# ---------------------------------------------------------------------------
+
+
+async def test_epoch_mismatch_aborts_with_no_signals(monkeypatch, tmp_path, caplog):
+    import signal as _sig
+
+    seq: list[tuple] = []
+
+    def killpg(pgid, sig):
+        seq.append((pgid, sig))
+
+    _install(monkeypatch, probe="up", pid=333, killpg=killpg)
+    # The workspace epoch advanced past what the driver armed → turn respawned.
+    (tmp_path / ".spawn_epoch").write_text("9\n")
+    calls, sleep = await _no_sleep_recorder()
+
+    with caplog.at_level(logging.INFO, logger="drivers.s6_rc"):
+        result = await s6_rc.force_turn_boundary(
+            engagement_id="e1", workspace_dir=str(tmp_path),
+            expected_epoch=7, sleep=sleep)
+
+    assert result is False
+    assert seq == []              # ZERO signals — the fresh spawn is never killed
+    assert _sig.SIGKILL not in [s for _, s in seq]
+    assert any("turn already ended" in r.message for r in caplog.records)
+
+
+async def test_epoch_match_proceeds_to_signal(monkeypatch, tmp_path):
+    import signal as _sig
+
+    seq: list[tuple] = []
+
+    def killpg(pgid, sig):
+        seq.append((pgid, sig))
+        if sig == _sig.SIGTERM:
+            raise ProcessLookupError   # group already empty on the group signal
+
+    _install(monkeypatch, probe="up", pid=333, killpg=killpg)
+    (tmp_path / ".spawn_epoch").write_text("7\n")   # still the armed epoch
+
+    result = await s6_rc.force_turn_boundary(
+        engagement_id="e1", workspace_dir=str(tmp_path), expected_epoch=7)
+
+    assert result is True
+    assert seq == [(333, _sig.SIGTERM)]   # guard passed → signalled the group
+
+
+# ---------------------------------------------------------------------------
+# Finding 4b: away-clear cancels an in-flight force task; force_turn_boundary
+# tolerates mid-poll cancellation cleanly (no SIGKILL after the cancel).
+# ---------------------------------------------------------------------------
+
+
+async def test_clear_operator_away_cancels_inflight_force_task(tmp_path):
+    import asyncio
+
+    eid = "eng00000000000005"
+    drv = _driver(tmp_path)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _blocking(**kwargs):
+        started.set()
+        await release.wait()      # simulate a long group-extinction verify
+        return True
+
+    drv._force_turn_boundary = _blocking
+    drv._operator_away[eid] = True
+
+    drv.record_away_refusal(eid)
+    drv.record_away_refusal(eid)      # 2nd refusal fires the force task
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    task = drv._force_tasks[eid]
+    assert not task.done()
+
+    # Operator returns → away clears → the in-flight kill is cancelled.
+    await drv._clear_operator_away(eid)
+    await _drain()
+
+    assert task.cancelled()
+    assert eid not in drv._force_tasks
+
+
+async def test_force_turn_boundary_tolerates_cancellation_mid_poll(monkeypatch):
+    import asyncio
+    import signal as _sig
+
+    seq: list[tuple] = []
+    block = asyncio.Event()
+
+    def killpg(pgid, sig):
+        seq.append((pgid, sig))
+        # emptiness probes always report alive (never raise) → poll would spin.
+
+    async def _sleep(_d):
+        await block.wait()        # wedge the poll between probes
+
+    _install(monkeypatch, probe="up", pid=444, killpg=killpg)
+    task = asyncio.ensure_future(
+        s6_rc.force_turn_boundary(engagement_id="e1", sleep=_sleep))
+    for _ in range(6):            # let it send SIGTERM + one probe + enter sleep
+        await asyncio.sleep(0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # SIGTERM was delivered; cancellation stopped the poll BEFORE any SIGKILL.
+    assert (444, _sig.SIGTERM) in seq
+    assert _sig.SIGKILL not in [s for _, s in seq]

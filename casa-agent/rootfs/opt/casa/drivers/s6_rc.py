@@ -366,7 +366,13 @@ async def _probe_service_down(scandir: str) -> str:
     fields = result.stdout.split()
     if len(fields) != 2:
         return "unknown"
-    up, wantedup = fields[0], fields[1]
+    return _classify_updown(fields[0], fields[1])
+
+
+def _classify_updown(up: str, wantedup: str) -> str:
+    """Map the ``s6-svstat -o up,wantedup`` field pair to the strict tri-state
+    (shared by the status-only probe and the atomic status+pid probe so both
+    read the SAME truth table)."""
     if up == "false" and wantedup == "false":
         return "down"
     if up == "false" and wantedup == "true":
@@ -374,6 +380,53 @@ async def _probe_service_down(scandir: str) -> str:
     if up == "true":
         return "up"
     return "unknown"
+
+
+async def _probe_status_and_pid(scandir: str) -> tuple[str, int | None]:
+    """ONE atomic ``s6-svstat`` invocation yielding the strict tri-state status
+    AND the supervised pid together (Sol A2 review — force_turn_boundary's entry
+    probe + pid capture were TWO separate s6-svstat calls, so a turn could END
+    and RESPAWN between them and the ladder would kill the NEW spawn).
+
+    Returns ``(status, pid)`` where ``status`` ∈ ``down`` / ``up`` / ``unknown``
+    (same truth table as :func:`_probe_service_down`) and ``pid`` is the live
+    supervised pid (``None`` when down / 0 / unparseable / query failed). The
+    caller uses BOTH fields from this single snapshot so status and pid can never
+    disagree across a respawn boundary."""
+    if not os.path.isdir(scandir):
+        return "down", None
+    result = await asyncio.to_thread(
+        subprocess.run,
+        ["s6-svstat", "-o", "up,wantedup,pid", scandir],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return "unknown", None
+    fields = result.stdout.split()
+    if len(fields) != 3:
+        return "unknown", None
+    up, wantedup, pid_s = fields
+    try:
+        pid: int | None = int(pid_s)
+    except ValueError:
+        pid = None
+    if pid is not None and pid <= 0:
+        pid = None
+    return _classify_updown(up, wantedup), pid
+
+
+def _read_spawn_epoch(workspace_dir: str) -> int | None:
+    """Read the current ``.spawn_epoch`` integer the engagement run template
+    atomically publishes each spawn (``engagement_run_template.sh`` line 22).
+    Returns the epoch, or ``None`` when the file is absent / unreadable /
+    unparseable. Used by force_turn_boundary's expected-epoch guard: if the file
+    no longer holds the epoch the driver recorded when arming the trigger, the
+    turn already ended and respawned — signalling would kill the fresh spawn."""
+    try:
+        with open(os.path.join(workspace_dir, ".spawn_epoch")) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
 
 
 async def _direct_killpg(scandir: str) -> bool:
@@ -560,7 +613,8 @@ async def _poll_group_extinct(
 
 
 async def force_turn_boundary(
-    *, engagement_id: str, sleep=asyncio.sleep,
+    *, engagement_id: str, workspace_dir: str | None = None,
+    expected_epoch: int | None = None, sleep=asyncio.sleep,
 ) -> bool:
     """Force-end the engagement's CLI turn by killing its whole process GROUP,
     then VERIFY the group is extinct — the A2b operator-away hard backstop.
@@ -570,10 +624,13 @@ async def force_turn_boundary(
     architecture's natural zero-cost suspended state between turns. Ladder
     (spec §A2.6):
 
-      1. STRICT tri-state entry probe (reuse ``_probe_service_down``):
-         ``down`` → already suspended → True; ``unknown`` → WARN + return False
-         truthfully ("not suspending blind" — a query failure is NOT proof);
-         ``up`` → read the live pid and proceed.
+      1. STRICT tri-state entry probe + pid capture in ONE atomic ``s6-svstat``
+         invocation (``_probe_status_and_pid`` — Sol A2 review): a separate
+         status probe and pid read let a turn END and RESPAWN between them, and
+         the ladder would then kill the NEW spawn. ``down`` → already suspended →
+         True; ``unknown`` → WARN + return False truthfully ("not suspending
+         blind" — a query failure is NOT proof); ``up`` with no pid → WARN +
+         False; ``up`` with a pid → proceed.
       2. Record the pre-signal pgid via ``os.getpgid(pid)`` — READ, never
          assumed to equal the pid (the run template never calls setsid, so the
          leader may not be its own group leader; a hardcoded ``pgid = pid``
@@ -581,18 +638,33 @@ async def force_turn_boundary(
          "already extinct" → a FALSE verified-suspended). If ``os.getpgid``
          raises ``ProcessLookupError`` (leader vanished in the probe→getpgid
          window) the group cannot be identified → WARN + return False (never
-         guess a pgid). Then ``os.killpg(recorded_pgid, SIGTERM)`` the whole
-         group (``ProcessLookupError`` → group genuinely empty → True).
-      3. Bounded verification of GROUP EXTINCTION (not leader turnover): poll
+         guess a pgid).
+      2b. EXPECTED-EPOCH GUARD (Sol A2 review): after the pgid is recorded,
+         re-read the workspace ``.spawn_epoch``. If it no longer equals
+         ``expected_epoch`` (the epoch the driver stamped when arming the
+         trigger) the turn already ended and s6 respawned a fresh generation —
+         abort with False, ZERO signals ("turn already ended — not signalling").
+         Skipped when ``workspace_dir``/``expected_epoch`` are not supplied
+         (legacy / direct-probe callers).
+      3. ``os.killpg(recorded_pgid, SIGTERM)`` the whole group
+         (``ProcessLookupError`` → group genuinely empty → True), then bounded
+         verification of GROUP EXTINCTION (not leader turnover): poll
          ``os.killpg(recorded_pgid, 0)`` until ``ProcessLookupError``.
       4. Timeout → ``os.killpg(recorded_pgid, SIGKILL)`` (never a re-read pid — a
          respawn may already own it) → re-poll the same emptiness probe.
+
+    CANCELLATION (Sol A2 review): the driver holds the spawned task in
+    ``_force_tasks[eng_id]`` and cancels it on operator-away clear. This
+    coroutine tolerates cancellation cleanly — asyncio delivers ``CancelledError``
+    only at an ``await`` point, so cancellation BEFORE the SIGTERM sends nothing,
+    and cancellation while polling simply stops the poll (no partial-signal
+    weirdness: a signal already delivered is complete; none is half-sent).
 
     Returns True IFF the old group is verifiably empty; a False is WARN-logged as
     "forced suspend NOT verified" and never falsely reported as suspended."""
     scandir = _service_scandir(engagement_id)
 
-    status = await _probe_service_down(scandir)
+    status, pid = await _probe_status_and_pid(scandir)
     if status == "down":
         return True
     if status != "up":
@@ -602,7 +674,6 @@ async def force_turn_boundary(
         )
         return False
 
-    pid = await service_pid(engagement_id=engagement_id)
     if pid is None:
         logger.warning(
             "force_turn_boundary %s: probed up but pid unavailable — not "
@@ -625,6 +696,20 @@ async def force_turn_boundary(
             "could be recorded — cannot verify suspension", engagement_id,
         )
         return False
+
+    # EXPECTED-EPOCH GUARD: the probe→pgid window is a race — the turn may have
+    # ended and respawned. Re-read the atomically-published .spawn_epoch; a
+    # mismatch means the pid/pgid we captured belongs to a DEAD generation (or a
+    # fresh spawn already reused the pid), so signalling would kill the new turn.
+    if workspace_dir is not None and expected_epoch is not None:
+        current_epoch = _read_spawn_epoch(workspace_dir)
+        if current_epoch != expected_epoch:
+            logger.info(
+                "force_turn_boundary %s: turn already ended — not signalling "
+                "(spawn epoch %s != expected %s)",
+                engagement_id, current_epoch, expected_epoch,
+            )
+            return False
     try:
         _killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:

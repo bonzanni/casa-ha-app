@@ -19,6 +19,7 @@ Error codes (Phase 1):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections import defaultdict
 from typing import Any, Awaitable, Callable
@@ -399,6 +400,13 @@ def _operator_away_active(driver: Any, eng_id: str) -> bool:
         return False
 
 
+def _away_refusal_payload() -> dict:
+    """The canonical operator-away refusal body. Shared by the live refusal
+    response AND the intent-refusal outcome recorded for a transport retry
+    (Finding 1) so a reattaching retry returns byte-identical JSON."""
+    return {"ok": False, "error": "operator_away", "message": _ASK_AWAY_REFUSAL}
+
+
 def _away_refusal_response(driver: Any, eng_id: str) -> web.Response:
     """§A2.4 refusal — bump the per-episode away-refusal counter (Task 5's
     force-turn-boundary backstop reads it) and return the fixed refusal copy."""
@@ -408,30 +416,57 @@ def _away_refusal_response(driver: Any, eng_id: str) -> web.Response:
             bump(eng_id)
         except Exception:  # noqa: BLE001 — the refusal copy stands either way
             logger.debug("record_away_refusal failed", exc_info=True)
-    return web.json_response({
-        "ok": False, "error": "operator_away", "message": _ASK_AWAY_REFUSAL,
-    })
+    return web.json_response(_away_refusal_payload())
 
 
-def _no_answer_response(driver: Any, eng_id: str, request_id: str) -> web.Response:
-    """§A2.1 expiry — ENTER operator-away (generation-CAS via the broker meta's
-    ``inbound_gen``, works for a live request AND a retired tombstone) and return
-    the enriched PAUSED response. Degrades to the plain ``no_answer`` response on
-    a driver without operator-away support (unit / eager fallback) so existing
-    no-driver callers are byte-unchanged."""
+def _record_intent_refusal(driver: Any, eng_id: str, request_id: str) -> None:
+    """§A2.4 (Finding 1): record the operator-away refusal OUTCOME on the intent
+    instead of a bare cancel. A same-``request_id`` transport retry then hits the
+    reattach path FIRST, reads this recorded outcome, and short-circuits to the
+    SAME refusal — never awaiting the dead intent (→ ``delivery_failed``, anchor)
+    nor re-registering a fresh broker request (→ timeout burn, no keyboard,
+    button). Degrades to the bare cancel on a driver predating the seam."""
+    fn = getattr(driver, "record_send_intent_refusal", None)
+    if fn is not None:
+        try:
+            fn(eng_id, request_id, _away_refusal_payload())
+            return
+        except Exception:  # noqa: BLE001 — fall back to the bare tombstone
+            logger.debug("record_send_intent_refusal failed", exc_info=True)
+    driver.cancel_send_intent(eng_id, request_id)  # tombstone (pre-A2 behaviour)
+
+
+def _refused_intent_outcome(prior: Any) -> bool:
+    """True iff a reattached intent's recorded outcome is an operator-away
+    refusal (Finding 1). The retry returns that outcome verbatim."""
+    return isinstance(prior, dict) and prior.get("error") == "operator_away"
+
+
+async def _no_answer_response(
+    driver: Any, eng_id: str, request_id: str, req: Any,
+) -> web.Response:
+    """§A2.1 expiry — ENTER operator-away (generation-CAS via THIS waiter's own
+    ``req.meta`` ``inbound_gen`` — Finding 2: never re-query the broker by key
+    after the await, where a retired/reused tombstone could hand back a NEWER
+    generation and re-wedge) and return the enriched PAUSED response. Degrades to
+    the plain ``no_answer`` response on a driver without operator-away support
+    (unit / eager fallback) so existing no-driver callers are byte-unchanged."""
     note = (
         getattr(driver, "note_operator_away", None)
         if driver is not None else None
     )
     if note is None:
         return web.json_response({"ok": True, "outcome": "no_answer"})
-    from verdict_broker import BROKER
-    meta = BROKER.get_meta(
-        namespace="engagement_ask", scope=eng_id, request_id=request_id)
+    # Finding 2: use the waiter's OWN req.meta (the handler holds ``req`` in both
+    # the main and reattach paths; register returns the tombstone-backed req for
+    # a retired key), never ``BROKER.get_meta`` by key after the await.
+    meta = getattr(req, "meta", None)
     gen = meta.get("inbound_gen") if isinstance(meta, dict) else None
     if gen is not None:  # tolerate a missing gen — just skip the away entry
         try:
-            note(eng_id, gen=gen)
+            res = note(eng_id, gen=gen)
+            if inspect.isawaitable(res):
+                await res
         except Exception:  # noqa: BLE001 — away entry is best-effort
             logger.debug("note_operator_away failed", exc_info=True)
     return web.json_response({
@@ -440,14 +475,15 @@ def _no_answer_response(driver: Any, eng_id: str, request_id: str) -> web.Respon
     })
 
 
-def _ask_final_response(
+async def _ask_final_response(
     outcome: dict, options: list, driver: Any, eng_id: str, request_id: str,
+    req: Any,
 ) -> web.Response:
     """Map a broker ask outcome to the tool response, intercepting ``no_answer``
     to enter operator-away + return the PAUSED response (F-EXPIRE). Every other
     outcome delegates to ``_ask_outcome_response`` byte-identically."""
     if outcome.get("outcome") == "no_answer":
-        return _no_answer_response(driver, eng_id, request_id)
+        return await _no_answer_response(driver, eng_id, request_id, req)
     return _ask_outcome_response(outcome, options)
 
 
@@ -746,6 +782,11 @@ def _make_ask(
                         # failed to ok:false (F5 fail-closed) — never ok:true on
                         # an unresolved intent. No new number, no second anchor.
                         prior = driver.send_intent_outcome(eng_id, request_id)
+                        # Finding 1: a prior operator-away refusal recorded an
+                        # ``operator_away`` outcome — return it verbatim instead
+                        # of awaiting the dead intent (→ delivery_failed).
+                        if _refused_intent_outcome(prior):
+                            return web.json_response(prior)
                         if prior is None:
                             prior = await _await_deferred_post(
                                 driver, eng_id, request_id)
@@ -764,7 +805,9 @@ def _make_ask(
             # still returns its recorded outcome above.
             if _operator_away_active(driver, eng_id):
                 if created_intent:
-                    driver.cancel_send_intent(eng_id, request_id)  # tombstone
+                    # Finding 1: record the refusal OUTCOME (not a bare cancel)
+                    # so a same-id retry reattaches to it above.
+                    _record_intent_refusal(driver, eng_id, request_id)
                 return _away_refusal_response(driver, eng_id)
 
             # First attempt (created intent) OR eager fallback: allocate the
@@ -876,6 +919,14 @@ def _make_ask(
             if res is not None:
                 _intent, created_intent = res
                 if not created_intent:
+                    # Finding 1: a prior operator-away refusal recorded an
+                    # ``operator_away`` outcome on the intent → return it verbatim
+                    # BEFORE touching the broker (reattach-outcome check → away
+                    # gate → broker). Without this, the retry re-registers a fresh
+                    # broker request and burns the full timeout with no keyboard.
+                    prior = driver.send_intent_outcome(eng_id, request_id)
+                    if _refused_intent_outcome(prior):
+                        return web.json_response(prior)
                     # F2 (was N1): a same-request_id retry REATTACHES (§2(1)) —
                     # whether the relay has already posted (prior has a
                     # message_id) OR the first attempt is still in flight and the
@@ -898,8 +949,8 @@ def _make_ask(
                         meta=_ask_static_meta(),
                     )
                     outcome = await BROKER.await_result(req)
-                    return _ask_final_response(
-                        outcome, options, driver, eng_id, request_id)
+                    return await _ask_final_response(
+                        outcome, options, driver, eng_id, request_id, req)
                 intent_registered = True
 
         # F-EXPIRE (§A2.4) GATE: while operator-away, refuse a genuinely-new ask
@@ -908,7 +959,9 @@ def _make_ask(
         # ask still reattaches to its live/tombstoned outcome above.
         if _operator_away_active(driver, eng_id):
             if intent_registered:
-                driver.cancel_send_intent(eng_id, request_id)  # tombstone
+                # Finding 1: record the refusal OUTCOME (not a bare cancel) so a
+                # same-id retry reattaches to it above.
+                _record_intent_refusal(driver, eng_id, request_id)
             return _away_refusal_response(driver, eng_id)
 
         # INBOUND GATE (§4): an unseen operator message means "end your turn".
@@ -1055,7 +1108,8 @@ def _make_ask(
         # future is decoupled from posting (resolved by the tap finish hook), so
         # nothing here needs the posted message id synchronously.
         outcome = await BROKER.await_result(req)
-        return _ask_final_response(outcome, options, driver, eng_id, request_id)
+        return await _ask_final_response(
+            outcome, options, driver, eng_id, request_id, req)
 
     return handler
 

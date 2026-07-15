@@ -621,6 +621,23 @@ class OutputSequencer:
         intent = self.registry.by_request_id(request_id)
         return intent.outcome if intent is not None else None
 
+    def record_intent_refusal(self, request_id: str, outcome: dict) -> SendIntent | None:
+        """A2 (F-EXPIRE, Sol review Finding 1): the operator-away gate REFUSED
+        this ask. Tombstone the intent (like :meth:`cancel_intent`) AND record a
+        refusal OUTCOME so a same-``request_id`` transport retry REATTACHES to the
+        SAME refusal rather than: awaiting a dead intent (→ ``delivery_failed``)
+        or re-registering a fresh broker request (→ full timeout burn, no
+        keyboard). Signals any fail-closed awaiter so a blocked
+        :meth:`await_intent_resolution` unblocks with the refusal (never ok:true
+        on a never-posted intent). No-op if the intent is unknown."""
+        intent = self.registry.cancel(request_id)
+        if intent is None:
+            return None
+        intent.outcome = dict(outcome)
+        self._arm_event.set()
+        self._signal_resolution(request_id)
+        return intent
+
     async def mark_intent_posted(
         self, request_id: str, message_id: int | None,
     ) -> Any:

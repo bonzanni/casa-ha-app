@@ -166,6 +166,9 @@ class _AwayDriver:
     def cancel_send_intent(self, eid, rid):
         return self.seq.cancel_intent(rid)
 
+    def record_send_intent_refusal(self, eid, rid, outcome):
+        return self.seq.record_intent_refusal(rid, outcome)
+
     def send_intent_outcome(self, eid, rid):
         return self.seq.intent_outcome(rid)
 
@@ -426,16 +429,16 @@ async def test_note_operator_away_cas_with_real_spool(tmp_path):
     drv._inbound[eid] = spool
 
     assert spool.generation() == 0
-    assert drv.note_operator_away(eid, 0) is True
+    assert await drv.note_operator_away(eid, 0) is True
     assert drv.operator_away_active(eid) is True
 
     drv._operator_away.clear()
     await spool.enqueue("inbound")          # generation 0 → 1
     # A stale generation fails the CAS...
-    assert drv.note_operator_away(eid, 0) is False
+    assert await drv.note_operator_away(eid, 0) is False
     assert drv.operator_away_active(eid) is False
     # ...the current generation passes.
-    assert drv.note_operator_away(eid, 1) is True
+    assert await drv.note_operator_away(eid, 1) is True
 
 
 # ---------------------------------------------------------------------------
@@ -559,3 +562,107 @@ async def test_refusal_and_paused_copies_wording():
     assert "silently" in _ASK_AWAY_REFUSAL
     assert "PAUSED" in _ASK_PAUSED_MESSAGE
     assert "silently" in _ASK_PAUSED_MESSAGE
+
+
+# ---------------------------------------------------------------------------
+# Finding 1: an away-refused ask records a refusal OUTCOME, so a same-request_id
+# transport retry short-circuits to the SAME refusal — never awaiting the dead
+# intent (delivery_failed) nor re-registering a fresh broker request (timeout).
+# ---------------------------------------------------------------------------
+
+
+async def test_button_away_refusal_retry_short_circuits_no_broker(env):
+    eid = env["rec"].id
+    driver = env["driver"]
+    driver._operator_away[eid] = True
+
+    # First away-refused button ask records the refusal outcome on the intent.
+    resp1 = await env["ask"](_FakeRequest(_payload(eid, request_id="b1")))
+    assert _body(resp1)["error"] == "operator_away"
+    assert driver._away_refusals.get(eid) == 1
+
+    # Same-request_id transport retry: reattaches to the recorded refusal
+    # WITHOUT touching the broker and WITHOUT re-bumping the away counter.
+    resp2 = await env["ask"](_FakeRequest(_payload(eid, request_id="b1")))
+    body2 = _body(resp2)
+    assert body2["ok"] is False
+    assert body2["error"] == "operator_away"
+    assert "END YOUR TURN" in body2["message"]
+    # Zero broker registrations across BOTH attempts; no delivery_failed.
+    assert env["broker"].pending(namespace="engagement_ask", scope=eid) == []
+    assert env["ch"].options_keyboards == []
+    assert driver._away_refusals.get(eid) == 1   # retry did NOT re-bump
+
+
+async def test_anchor_away_refusal_retry_short_circuits_no_delivery_failed(env):
+    eid = env["rec"].id
+    driver = env["driver"]
+    driver._operator_away[eid] = True
+
+    resp1 = await env["ask"](_FakeRequest(
+        _payload(eid, request_id="a1", options=[])))
+    assert _body(resp1)["error"] == "operator_away"
+
+    # Retry reattaches to the recorded operator_away refusal — NOT delivery_failed.
+    resp2 = await env["ask"](_FakeRequest(
+        _payload(eid, request_id="a1", options=[])))
+    body2 = _body(resp2)
+    assert body2["ok"] is False
+    assert body2["error"] == "operator_away"
+    assert env["ch"].sent_texts == []
+    assert env["broker"].pending(namespace="engagement_ask", scope=eid) == []
+
+
+# ---------------------------------------------------------------------------
+# Finding 2: the waiter uses ITS OWN req.meta gen, never BROKER.get_meta by key
+# (a retired/reused tombstone key could hand back None or a NEWER generation).
+# ---------------------------------------------------------------------------
+
+
+async def test_no_answer_reads_waiter_req_meta_not_broker_key(env, monkeypatch):
+    import types as _types
+    from channels.channel_handlers import _no_answer_response
+    from verdict_broker import BROKER
+
+    driver = env["driver"]
+    eid = env["rec"].id
+
+    # The broker key is GONE (retired + popped near tombstone retirement) — the
+    # waiter MUST NOT consult BROKER.get_meta. Blow up if it does.
+    def _boom(*a, **k):
+        raise AssertionError("get_meta must not be called after the await (F2)")
+
+    monkeypatch.setattr(BROKER, "get_meta", _boom)
+
+    # The waiter holds its OWN req with the ORIGINAL inbound_gen (0).
+    req = _types.SimpleNamespace(meta={"inbound_gen": 0})
+    resp = await _no_answer_response(driver, eid, "rid-gone", req)
+
+    body = _body(resp)
+    assert body["engagement_paused"] is True
+    # Away entry fired from req.meta gen 0 (== current spool gen 0).
+    assert driver.operator_away_active(eid) is True
+
+
+# ---------------------------------------------------------------------------
+# Finding 3: a successful note_operator_away CAS drives the paused summary
+# DIRECTLY (the timeout settle edit may be unconfirmed → recompute never runs).
+# ---------------------------------------------------------------------------
+
+
+async def test_note_operator_away_drives_paused_summary_directly(tmp_path):
+    from drivers.summary_controller import STATUS_PAUSED, STATUS_WAITING_REPLY
+    drv, rec, ctrl, edits, reg = await _driver_with_summary(tmp_path)
+    eid = rec.id
+
+    # Establish a non-paused baseline (the ⏳ waiting an ordinary ask would set).
+    await drv._summary_status_transition(eid, STATUS_WAITING_REPLY)
+    assert ctrl._status == STATUS_WAITING_REPLY
+
+    # No inbound spool ⇒ inbound_generation == 0; the CAS at gen 0 succeeds and
+    # the entry submits STATUS_PAUSED through the funnel — regardless of whether
+    # the keyboard settle edit ever confirmed.
+    assert await drv.note_operator_away(eid, 0) is True
+    assert ctrl._status == STATUS_PAUSED
+    assert edits[-1][1].startswith(STATUS_PAUSED)
+    ctrl.shutdown()
