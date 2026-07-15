@@ -13,7 +13,10 @@ import pytest
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
-from config import AgentConfig, CharacterConfig, MemoryConfig, SessionConfig, ToolsConfig
+from config import (
+    AgentConfig, CharacterConfig, DelegateEntry, MemoryConfig, SessionConfig,
+    ToolsConfig,
+)
 from plugin_registry import ResolutionResult
 from specialist_registry import (
     DelegationComplete,
@@ -164,6 +167,18 @@ def _origin(role="assistant", channel="telegram", chat_id="x"):
     }
 
 
+def _caller_cfg(role: str = "assistant", delegates: tuple[str, ...] = ("finance",)) -> AgentConfig:
+    """Minimal caller AgentConfig declaring *delegates* (spec A1 ACL fixture).
+
+    The delegation ACL denies any target the caller's `origin["role"]`
+    doesn't declare, so every fixture that drives `delegate_to_agent`
+    must seed the caller into `agent_role_map` with the target declared.
+    """
+    cfg = AgentConfig(role=role)
+    cfg.delegates = [DelegateEntry(agent=d, purpose="p", when="w") for d in delegates]
+    return cfg
+
+
 # ---------------------------------------------------------------------------
 # TestUnknownAgent / TestDisabledAgent
 # ---------------------------------------------------------------------------
@@ -177,7 +192,7 @@ class TestUnknownAgent:
                                  tombstone_path=str(tmp_path / "del.json"))
         bus = MessageBus()
         cm = ChannelManager()
-        init_tools(cm, bus, reg)
+        init_tools(cm, bus, reg, agent_role_map={"assistant": _caller_cfg(delegates=("ghost",))})
 
         result = await _with_origin(
             delegate_to_agent.handler({
@@ -207,7 +222,7 @@ class TestDisabledAgent:
         reg.load()
         bus = MessageBus()
         cm = ChannelManager()
-        init_tools(cm, bus, reg)
+        init_tools(cm, bus, reg, agent_role_map={"assistant": _caller_cfg(delegates=("finance",))})
 
         result = await _with_origin(
             delegate_to_agent.handler({
@@ -237,7 +252,7 @@ class TestSyncOk:
         reg.load()
         bus = MessageBus()
         cm = ChannelManager()
-        init_tools(cm, bus, reg)
+        init_tools(cm, bus, reg, agent_role_map={"assistant": _caller_cfg(delegates=("finance",))})
 
         _FakeSpecialistClient.reset(response="invoice drafted", delay=0)
         with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
@@ -271,7 +286,7 @@ class TestSyncError:
         reg.load()
         bus = MessageBus()
         cm = ChannelManager()
-        init_tools(cm, bus, reg)
+        init_tools(cm, bus, reg, agent_role_map={"assistant": _caller_cfg(delegates=("finance",))})
 
         _FakeSpecialistClient.reset(raise_exc=RuntimeError("boom"))
         with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
@@ -298,7 +313,10 @@ class TestSyncError:
 class TestOriginMissing:
     async def test_no_origin_returns_error(self, tmp_path):
         """Called outside a turn (origin_var unset) — shouldn't happen
-        in prod but must not crash. Return error, do not dispatch."""
+        in prod but must not crash. With the A1 ACL enforced first, a
+        missing origin means an empty/unknown caller role, which the ACL
+        denies as delegation_not_declared (the caller-identity check
+        subsumes the old no_origin branch)."""
         from tools import delegate_to_agent, init_tools
 
         reg = SpecialistRegistry(str(tmp_path / "ex"),
@@ -313,7 +331,7 @@ class TestOriginMissing:
         })
         payload = json.loads(result["content"][0]["text"])
         assert payload["status"] == "error"
-        assert payload["kind"] == "no_origin"
+        assert payload["kind"] == "delegation_not_declared"
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +358,7 @@ class TestTimeoutDegrades:
         bus = MessageBus()
         bus.register("assistant", None)  # queue to receive the late NOTIFICATION
         cm = ChannelManager()
-        init_tools(cm, bus, reg)
+        init_tools(cm, bus, reg, agent_role_map={"assistant": _caller_cfg(delegates=("finance",))})
 
         # Make the specialist body take "longer" than we wait.
         _FakeSpecialistClient.reset(response="eventual", delay=0.2)
@@ -379,7 +397,7 @@ class TestTimeoutDegrades:
         bus = MessageBus()
         bus.register("assistant", None)  # Ellen's queue
         cm = ChannelManager()
-        init_tools(cm, bus, reg)
+        init_tools(cm, bus, reg, agent_role_map={"assistant": _caller_cfg(delegates=("finance",))})
 
         _FakeSpecialistClient.reset(response="late result", delay=0.1)
         monkeypatch.setattr(tools_mod, "_SYNC_WAIT_TIMEOUT_S", 0.02)
@@ -434,7 +452,7 @@ class TestAsyncMode:
         bus = MessageBus()
         bus.register("assistant", None)
         cm = ChannelManager()
-        init_tools(cm, bus, reg)
+        init_tools(cm, bus, reg, agent_role_map={"assistant": _caller_cfg(delegates=("finance",))})
 
         _FakeSpecialistClient.reset(response="async reply", delay=0.05)
         with patch("tools.ClaudeSDKClient", _FakeSpecialistClient), \
@@ -483,7 +501,7 @@ class TestCancellation:
         bus = MessageBus()
         bus.register("assistant", None)
         cm = ChannelManager()
-        init_tools(cm, bus, reg)
+        init_tools(cm, bus, reg, agent_role_map={"assistant": _caller_cfg(delegates=("finance",))})
 
         _FakeSpecialistClient.reset(response="slow", delay=1.0)
 
@@ -605,7 +623,10 @@ class TestMergedRoleMap:
             bus=None,
             specialist_registry=reg,
             mcp_registry=None,
-            agent_role_map={"butler": resident_cfg},
+            agent_role_map={
+                "butler": resident_cfg,
+                "assistant": _caller_cfg(delegates=("butler",)),
+            },
         )
 
         import agent as agent_mod
@@ -614,7 +635,7 @@ class TestMergedRoleMap:
             "user_id": 1, "cid": "abc", "user_text": "x",
         })
         try:
-            async def _fake_run(cfg, task_text, context_text):
+            async def _fake_run(cfg, task_text, context_text, resolution=None):
                 return f"Tina says ok: {task_text}"
             monkeypatch.setattr(tools, "_run_delegated_agent", _fake_run)
 
@@ -645,7 +666,7 @@ class TestMergedRoleMap:
             bus=None,
             specialist_registry=reg,
             mcp_registry=None,
-            agent_role_map={},
+            agent_role_map={"assistant": _caller_cfg(delegates=("ghost",))},
         )
 
         import agent as agent_mod
@@ -684,7 +705,10 @@ class TestMergedRoleMap:
             bus=None,
             specialist_registry=spec_reg,
             mcp_registry=None,
-            agent_role_map={"butler": resident_cfg},
+            agent_role_map={
+                "butler": resident_cfg,
+                "assistant": _caller_cfg(delegates=("butler",)),
+            },
         )
         token = agent_mod.origin_var.set({
             "role": "assistant", "channel": "telegram", "chat_id": "1",
@@ -710,6 +734,9 @@ class TestMergedRoleMap:
         resident_cfg = _specialist_cfg(role="butler")
         resident_cfg.character.name = "Tina"
         resident_cfg.channels = ["voice"]
+        # Declare the target so the A1 ACL passes and the depth-cap branch
+        # (which runs AFTER the ACL) is the one that fires.
+        resident_cfg.delegates = [DelegateEntry(agent="butler", purpose="p", when="w")]
 
         from specialist_registry import SpecialistRegistry
         spec_reg = SpecialistRegistry(

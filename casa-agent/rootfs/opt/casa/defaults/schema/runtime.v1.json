@@ -45,6 +45,14 @@
       }
     },
     "voice_errors": {"type": "object", "additionalProperties": {"type": "string"}, "default": {}},
-    "cwd":          {"type": "string", "default": ""}
+    "cwd":          {"type": "string", "default": ""},
+    "requires": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "plugins": {"type": "array", "items": {"type": "string"}, "default": []},
+        "tools":   {"type": "array", "items": {"type": "string"}, "default": []}
+      }
+    }
   }
 }

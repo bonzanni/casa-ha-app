@@ -48,6 +48,7 @@ class _FakeAgentConfig:
     memory = type("M", (), {"token_budget": 800})()
     role = "butler"
     voice_errors: dict[str, str] = {}
+    channels: list[str] = ["ha_voice"]
 
 
 class _DummyMemory:
@@ -143,6 +144,7 @@ async def agent_error_voice_app(tmp_path):
         tts=TTSConfig(tag_dialect="square_brackets"),
         # RuntimeError classifies as UNKNOWN → this key is used.
         voice_errors={"unknown": "[apologetic] Natural-path Tina voice failure."},
+        channels=["ha_voice"],
     )
 
     channel_manager = ChannelManager()

@@ -334,3 +334,29 @@ class TestBrokerShutdownOrdering:
         assert "expired" in edits[0][2].lower()
         # The edit landed BEFORE stop_all — drain_hooks() is awaited first.
         assert order == ["edit", "stop_all"]
+
+
+# ---------------------------------------------------------------------------
+# _env_int_or clamps (final-review MINOR 1: mirror the add-on schema rails)
+# ---------------------------------------------------------------------------
+
+
+class TestEnvIntClamp:
+    def test_max_value_clamps_above(self):
+        from casa_core import _env_int_or
+        assert _env_int_or(
+            "X", 2, min_value=1, max_value=20, env={"X": "999"}) == 20
+
+    def test_min_value_clamps_below(self):
+        from casa_core import _env_int_or
+        assert _env_int_or(
+            "X", 2, min_value=1, max_value=20, env={"X": "0"}) == 1
+
+    def test_in_range_passes_through(self):
+        from casa_core import _env_int_or
+        assert _env_int_or(
+            "X", 2, min_value=1, max_value=20, env={"X": "5"}) == 5
+
+    def test_absent_uses_default(self):
+        from casa_core import _env_int_or
+        assert _env_int_or("X", 2, min_value=1, max_value=20, env={}) == 2

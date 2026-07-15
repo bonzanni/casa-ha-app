@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.79.2"
+version: "0.80.0"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 image: "ghcr.io/bonzanni/casa-agent"
@@ -56,6 +56,11 @@ options:
   casa_tz: "Europe/Amsterdam"
   engagement_reap_days: 7
 
+  # Voice & delegation limits (spec A4/§4.6)
+  voice_turn_budget_seconds: 27
+  specialist_max_concurrency: 2
+  specialist_cost_alert_threshold: 5.0
+
 # NOTE: when you REMOVE an option below, also add its key to
 # DEPRECATED_OPTION_KEYS in rootfs/etc/s6-overlay/scripts/setup-configs.sh
 # (deprecated-options-prune block) so the stale stored value is deleted on
@@ -84,3 +89,6 @@ schema:
   casa_tz: str?
   engagement_reap_days: int?
   log_level: "list(debug|info|warning|error)?"
+  voice_turn_budget_seconds: "int(10,27)?"
+  specialist_max_concurrency: "int(1,20)?"
+  specialist_cost_alert_threshold: "float(0,)?"

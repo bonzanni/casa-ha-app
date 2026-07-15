@@ -7,12 +7,13 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import signal
 import sys
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 # Ensure the Casa package root is on sys.path regardless of cwd
 _CASA_ROOT = str(Path(__file__).resolve().parent)
@@ -25,6 +26,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from agent_loader import load_all_agents
 from authz_grants import CHALLENGES, GRANTS
 from bus import BusMessage, MessageBus, MessageType
+from channel_authz import agent_allowed_on
 from channels import ChannelManager
 from config import AgentConfig
 from config_git import init_repo, snapshot_manual_edits
@@ -959,8 +961,13 @@ def _row(label: str, value: str, css: str = "") -> str:
 
 
 def _env_int_or(name: str, default: int, *, min_value: int = 0,
+                max_value: int | None = None,
                 env: dict[str, str] | None = None) -> int:
     """Read a non-negative int from env; fall back to *default* on bad input.
+
+    ``min_value``/``max_value`` clamp the parsed value to the same rails the
+    HA add-on schema validates (defence in depth — HA schema-validates normal
+    config, but a direct env override or a schema drift must not slip past).
 
     Extracted as a module-level helper so future items that need the same
     shape (spec 5.2 §9.3 has more env vars coming in item I) can reuse
@@ -979,6 +986,38 @@ def _env_int_or(name: str, default: int, *, min_value: int = 0,
     if value < min_value:
         logger.warning(
             "%s=%d below minimum %d; using %d",
+            name, value, min_value, min_value,
+        )
+        return min_value
+    if max_value is not None and value > max_value:
+        logger.warning(
+            "%s=%d above maximum %d; using %d",
+            name, value, max_value, max_value,
+        )
+        return max_value
+    return value
+
+
+def _env_float_or(name: str, default: float, *, min_value: float = 0.0,
+                   env: dict[str, str] | None = None) -> float:
+    """Read a non-negative float from env; fall back to *default* on bad
+    input. Float counterpart to :func:`_env_int_or` — Task 6 (spec §4.6)
+    needs one for ``SPECIALIST_COST_ALERT_THRESHOLD`` (a USD figure)."""
+    env = env if env is not None else os.environ
+    raw = env.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+    if not math.isfinite(value):
+        logger.warning("Non-finite %s=%r; using default %s", name, raw, default)
+        return default
+    if value < min_value:
+        logger.warning(
+            "%s=%s below minimum %s; using %s",
             name, value, min_value, min_value,
         )
         return min_value
@@ -1129,6 +1168,7 @@ def _make_invoke_handler(
     webhook_secret: str,
     bus: Any,
     assistant_role: str,
+    role_configs: Mapping[str, Any],
 ):
     """Build the ``POST /invoke/{agent}`` direct-invocation handler.
 
@@ -1138,6 +1178,9 @@ def _make_invoke_handler(
     rejected with the same 400 the handler already uses for malformed
     JSON, and an explicit ``"context": null`` is normalized to ``{}``
     instead of raising ``TypeError`` at item-assignment.
+
+    Fail-closed channel-capability gate (spec A3): only a resident that
+    declares ``webhook`` in its ``channels:`` list is invoke-reachable.
     """
 
     def _verify(request: web.Request, body: bytes) -> bool:
@@ -1159,6 +1202,10 @@ def _make_invoke_handler(
             return web.json_response({"error": "invalid signature"}, status=401)
 
         agent_role = request.match_info.get("agent", assistant_role)
+        cfg = role_configs.get(agent_role)
+        if cfg is None or not agent_allowed_on("webhook", cfg):
+            return web.json_response({"error": "unknown agent"}, status=404)
+
         try:
             payload = await request.json()
         except Exception:
@@ -1603,6 +1650,16 @@ async def main() -> None:
     # 4. Session registry + TTL sweeper (spec 5.2 §6)
     sessions_path = os.path.join(DATA_DIR, "sessions.json")
     session_registry = SessionRegistry(sessions_path)
+    # A2: one-shot boot migration off the v1 {channel}-{scope} key schema —
+    # idempotent (already-v2 entries are left alone), so safe to run on
+    # every boot. Only persists when something actually changed.
+    _migration_stats = session_registry.migrate_to_v2()
+    if _migration_stats["migrated"] or _migration_stats["dropped"]:
+        logger.info(
+            "session_registry v2 migration: migrated=%d dropped=%d",
+            _migration_stats["migrated"], _migration_stats["dropped"],
+        )
+        await session_registry.save()
     session_sweeper = SessionSweeper(
         registry=session_registry,
         session_ttl_days=_env_int_or("SESSION_TTL_DAYS", 30, min_value=1),
@@ -1723,6 +1780,24 @@ async def main() -> None:
         defaults_root="/opt/casa",
         semantic_memory=semantic_memory,
     )
+    # Task 6 (spec §4.6): specialist concurrency cap + per-role cost
+    # telemetry. `specialist_max_concurrency` bounds delegations in flight
+    # fleet-wide; the per-scope cap (exactly 1) is hard-coded inside
+    # SpecialistLimiter, not an option. `specialist_cost_alert_threshold`
+    # is the cumulative per-role USD figure past which every further
+    # delegation for that role also logs a WARNING. Both env vars are a
+    # placeholder read pending Task 7's real HA-options wiring.
+    from specialist_limits import SpecialistLimiter, SpecialistTelemetry
+    # Clamp to the add-on schema's [1, 20] rail (defence in depth — see
+    # _env_int_or). The per-scope cap (exactly 1) is not configurable.
+    specialist_max_concurrency = _env_int_or(
+        "SPECIALIST_MAX_CONCURRENCY", 2, min_value=1, max_value=20)
+    specialist_cost_alert_threshold = _env_float_or(
+        "SPECIALIST_COST_ALERT_THRESHOLD", 5.0, min_value=0.0)
+    specialist_limiter = SpecialistLimiter(max_global=specialist_max_concurrency)
+    specialist_telemetry = SpecialistTelemetry(
+        cost_alert_threshold=specialist_cost_alert_threshold)
+
     init_tools(
         channel_manager, bus, specialist_registry, mcp_registry,
         agent_role_map=_build_role_registry(
@@ -1733,6 +1808,8 @@ async def main() -> None:
         engagement_registry=engagement_registry,
         executor_registry=executor_registry,
         runtime=runtime,
+        specialist_limiter=specialist_limiter,
+        specialist_telemetry=specialist_telemetry,
     )
     casa_tools_config = create_casa_tools()
     mcp_registry.register_sdk("casa-framework", casa_tools_config)
@@ -1899,9 +1976,25 @@ async def main() -> None:
         )
         return telegram_channel.create_topic_stream(topic_id)
 
+    # Task 6 (spec §4.6): observe interactive specialist ResultMessages so
+    # their cost/usage reaches SpecialistTelemetry too (ephemeral sync/async
+    # delegations are captured in tools._run_delegated_agent). Only
+    # kind="specialist" engagements feed specialist telemetry; executor
+    # engagements are out of scope for this counter.
+    def _specialist_result_observer(engagement, result_msg) -> None:
+        if getattr(engagement, "kind", "") != "specialist":
+            return
+        from tokens import extract_usage
+        specialist_telemetry.record_cost(
+            engagement.role_or_type,
+            cost_usd=float(getattr(result_msg, "total_cost_usd", 0.0) or 0.0),
+            usage=extract_usage(result_msg),
+        )
+
     engagement_driver = InCasaDriver(
         topic_stream_factory=_topic_stream_factory,
         persist_session_id=engagement_registry.persist_session_id,
+        result_observer=_specialist_result_observer,
     )
 
     # claude_code driver: send_to_topic doubles as the live TopicStreamRelay's
@@ -2149,6 +2242,7 @@ async def main() -> None:
         webhook_secret=webhook_secret,
         bus=bus,
         assistant_role=assistant_role,
+        role_configs=role_configs,
     )
 
     # 11. Telegram webhook route (only used when webhook_url is set).

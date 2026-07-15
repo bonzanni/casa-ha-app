@@ -842,9 +842,11 @@ class TelegramChannel(Channel):
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("/new ack send to chat_id=%s failed: %s", chat_id, exc)
             if self._session_registry is not None and self._semantic_memory is not None:
-                from session_registry import build_session_key
+                from session_registry import build_scoped_session_key
                 from session_saver import reset_channel
-                channel_key = build_session_key("telegram", chat_id)
+                channel_key = build_scoped_session_key(
+                    "telegram", self.default_agent, chat_id,
+                )
                 await reset_channel(
                     channel_key, self._session_registry, self._semantic_memory,
                     channel="telegram",

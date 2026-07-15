@@ -17,7 +17,7 @@ from channels import ChannelManager
 from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
 from mcp_registry import McpServerRegistry
 from semantic_memory import SemanticMemory
-from session_registry import SessionRegistry
+from session_registry import SessionRegistry, build_scoped_session_key
 
 from claude_agent_sdk import (
     AssistantMessage as _SDKAssistantMessage,
@@ -202,7 +202,9 @@ async def test_session_id_is_channel_plus_role(tmp_path):
     # Fresh telegram session → one bank recall keyed to the shared casa bank.
     assert len(sem.recall_calls) == 1
     assert sem.recall_calls[0]["bank"] == "casa"
-    entry = agent._session_registry.get("telegram-123")
+    entry = agent._session_registry.get(
+        build_scoped_session_key("telegram", "assistant", "123"),
+    )
     assert entry is not None
 
 
@@ -292,7 +294,9 @@ async def test_voice_channel_uses_voice_speaker_peer(tmp_path):
 
     assert len(sem.profile_calls) == 0   # voice clearance < private → overlay blocked
     assert sem.recall_calls == []        # voice never auto-recalls
-    entry = agent._session_registry.get("voice-lr")
+    entry = agent._session_registry.get(
+        build_scoped_session_key("voice", "butler", "lr"),
+    )
     assert entry is not None
 
 
@@ -847,7 +851,8 @@ class TestTokenBudgetMonitoring:
         expected = estimate_tokens(
             f"<memory_context>\n{facts}\n</memory_context>"
         )
-        assert observed == [("telegram-123-assistant", expected, 1000)]
+        expected_channel_key = build_scoped_session_key("telegram", "assistant", "123")
+        assert observed == [(f"{expected_channel_key}-assistant", expected, 1000)]
 
     async def test_three_consecutive_overruns_emit_one_warning(
         self, tmp_path, caplog,
@@ -876,9 +881,10 @@ class TestTokenBudgetMonitoring:
             for _ in range(5):
                 await agent._process(_msg("telegram", "123", "hi"))
 
+        expected_channel_key = build_scoped_session_key("telegram", "assistant", "123")
         rows = [
             r for r in caplog.records
-            if r.name == "tokens" and "telegram-123-assistant" in r.getMessage()
+            if r.name == "tokens" and f"{expected_channel_key}-assistant" in r.getMessage()
         ]
         assert len(rows) == 1, [r.getMessage() for r in rows]
 
@@ -1007,7 +1013,10 @@ class TestResumeResilience:
         ]
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
-        await reg.register("voice-probe-scope", "butler", "stale-sid-abc")
+        await reg.register(
+            build_scoped_session_key("voice", "butler", "probe-scope"),
+            "butler", "stale-sid-abc",
+        )
 
         agent = _make_agent_with_registry(reg, role="butler")
 
@@ -1037,7 +1046,10 @@ class TestResumeResilience:
         FakeClient.response_text = "ok after retry"
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
-        await reg.register("telegram-202", "butler", "STALE-SID-1")
+        await reg.register(
+            build_scoped_session_key("telegram", "butler", "202"),
+            "butler", "STALE-SID-1",
+        )
 
         agent = _make_agent_with_registry(reg, role="butler")
 
@@ -1078,7 +1090,10 @@ class TestResumeResilience:
         ]
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
-        await reg.register("voice-probe-scope", "butler", "stale-sid-abc")
+        await reg.register(
+            build_scoped_session_key("voice", "butler", "probe-scope"),
+            "butler", "stale-sid-abc",
+        )
 
         agent = _make_agent_with_registry(reg, role="butler")
 
@@ -1108,7 +1123,9 @@ class TestResumeResilience:
                 await agent._process(_msg("voice", "fresh-scope", "hi"))
 
         assert FakeClient.attempts == 1
-        assert reg.get("voice-fresh-scope") is None
+        assert reg.get(
+            build_scoped_session_key("voice", "butler", "fresh-scope"),
+        ) is None
 
     async def test_fallback_second_process_error_reraises(self, tmp_path):
         """Both attempts ProcessError -> second propagates; stale id cleared."""
@@ -1121,7 +1138,10 @@ class TestResumeResilience:
         ]
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
-        await reg.register("voice-probe-scope", "butler", "stale-sid-xyz")
+        await reg.register(
+            build_scoped_session_key("voice", "butler", "probe-scope"),
+            "butler", "stale-sid-xyz",
+        )
 
         agent = _make_agent_with_registry(reg, role="butler")
 
@@ -1131,7 +1151,7 @@ class TestResumeResilience:
                 await agent._process(_msg("voice", "probe-scope", "hi"))
 
         assert FakeClient.attempts == 2
-        entry = reg.get("voice-probe-scope")
+        entry = reg.get(build_scoped_session_key("voice", "butler", "probe-scope"))
         assert entry is not None
         assert "sdk_session_id" not in entry
 
@@ -1147,7 +1167,8 @@ class TestResumeResilience:
         ]
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
-        await reg.register("voice-probe-scope", "butler", "stale-sid-xyz")
+        expected_channel_key = build_scoped_session_key("voice", "butler", "probe-scope")
+        await reg.register(expected_channel_key, "butler", "stale-sid-xyz")
 
         agent = _make_agent_with_registry(reg, role="butler")
 
@@ -1163,7 +1184,7 @@ class TestResumeResilience:
         ]
         assert len(warning_records) == 1
         msg = warning_records[0].getMessage()
-        assert "voice-probe-scope" in msg
+        assert expected_channel_key in msg
         assert "stale-sid-xyz" in msg
 
 
@@ -1581,7 +1602,7 @@ class TestSaveBeforeOverwrite:
         stale_ts = (
             datetime.now(timezone.utc) - timedelta(hours=13)
         ).isoformat()
-        reg._data["telegram-123"] = {
+        reg._data[build_scoped_session_key("telegram", "assistant", "123")] = {
             "agent": "assistant",
             "sdk_session_id": "old-stale-sid",
             "last_active": stale_ts,
@@ -1632,7 +1653,7 @@ class TestSaveBeforeOverwrite:
         fresh_ts = (
             datetime.now(timezone.utc) - timedelta(minutes=5)
         ).isoformat()
-        reg._data["telegram-456"] = {
+        reg._data[build_scoped_session_key("telegram", "assistant", "456")] = {
             "agent": "assistant",
             "sdk_session_id": "fresh-live-sid",
             "last_active": fresh_ts,
@@ -1668,7 +1689,7 @@ class TestSaveBeforeOverwrite:
         fresh_ts = (
             datetime.now(timezone.utc) - timedelta(minutes=5)
         ).isoformat()
-        reg._data["telegram-789"] = {
+        reg._data[build_scoped_session_key("telegram", "assistant", "789")] = {
             "agent": "assistant",
             "sdk_session_id": "live-sid-resume",
             "last_active": fresh_ts,

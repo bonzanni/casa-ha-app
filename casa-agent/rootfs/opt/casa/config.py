@@ -170,6 +170,22 @@ class HooksConfig:
 
 
 @dataclass
+class RequiresConfig:
+    """A delegated agent's declared launch dependencies (spec A5).
+
+    ``plugins`` names must be a subset of the plugins actually resolved
+    for the agent's tier:role target; ``tools`` are full MCP tool names
+    (``mcp__plugin_<plugin>_<server>__<tool>``) that must be BOTH
+    manifest-declared (``casa.provides_tools``) AND have their SERVER
+    grant actually attached (``grants_for_resolution``). Empty on both
+    fields (the default) skips the requires gate entirely — a delegated
+    agent with no ``requires:`` block launches from model memory exactly
+    as before."""
+    plugins: list[str] = field(default_factory=list)
+    tools: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AgentConfig:
     role: str = ""
     model: str = ""
@@ -192,6 +208,7 @@ class AgentConfig:
     triggers: list[TriggerSpec] = field(default_factory=list)
     hooks: HooksConfig = field(default_factory=HooksConfig)
     system_prompt: str = ""
+    requires: RequiresConfig = field(default_factory=RequiresConfig)
 
 
 @dataclass

@@ -29,7 +29,7 @@ from channels import ChannelManager
 from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
 from mcp_registry import McpServerRegistry
 from semantic_memory import SemanticMemory
-from session_registry import SessionRegistry
+from session_registry import SessionRegistry, build_scoped_session_key
 
 from claude_agent_sdk import (
     AssistantMessage as _AM,
@@ -146,7 +146,7 @@ CELLS = [
 @pytest.mark.parametrize("role,channel,is_fresh", CELLS)
 async def test_memory_reachable_in_every_cell(tmp_path, role, channel, is_fresh):
     chat_id = f"{channel}-{is_fresh}"
-    key = None if is_fresh else f"{channel}-{chat_id}"
+    key = None if is_fresh else build_scoped_session_key(channel, role, chat_id)
     agent, sem = _agent(tmp_path, role, seed_resumed=key)
     with patch("sdk_client_pool._default_make_client", _CaptureClient):
         await agent._process(_msg(channel, chat_id))
@@ -167,7 +167,7 @@ async def test_options_allowed_tools_superset_of_config(tmp_path, role, channel,
     """The assembled options must carry every granted tool (handler must not
     silently drop grants) — the captured contract ⊇ the config."""
     chat_id = f"sup-{channel}-{is_fresh}"
-    key = None if is_fresh else f"{channel}-{chat_id}"
+    key = None if is_fresh else build_scoped_session_key(channel, role, chat_id)
     agent, _ = _agent(tmp_path, role, seed_resumed=key)
     with patch("sdk_client_pool._default_make_client", _CaptureClient):
         await agent._process(_msg(channel, chat_id))

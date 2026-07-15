@@ -25,7 +25,7 @@ from channels import ChannelManager
 from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
 from mcp_registry import McpServerRegistry
 from semantic_memory import SemanticMemory
-from session_registry import SessionRegistry
+from session_registry import SessionRegistry, build_scoped_session_key
 
 
 # --------------------------------------------------------------------------
@@ -206,7 +206,9 @@ async def test_new_reset_listener_closes_warm_entry(agent_fixture,
     agent, send_turn = agent_fixture
     await send_turn("hello")
     assert agent._pool.stats()["entries"] == 1
-    await agent._session_registry.notify_reset("telegram-42")
+    await agent._session_registry.notify_reset(
+        build_scoped_session_key("telegram", "assistant", "42"),
+    )
     assert agent._pool.stats()["entries"] == 0
     assert scripted_factory.clients[0].disconnected
 
@@ -269,7 +271,7 @@ async def test_warm_reuse_process_error_clears_sid_and_retries_fresh(
 
     reply1 = await send_turn("hello")
     assert reply1 is not None and reply1.content.endswith("hello")
-    channel_key = "telegram-42"
+    channel_key = build_scoped_session_key("telegram", "assistant", "42")
     assert agent._session_registry.get(channel_key)["sdk_session_id"] == (
         "sid-attempt-1"
     )

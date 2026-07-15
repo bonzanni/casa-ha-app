@@ -36,6 +36,7 @@ class _FakeCfg:
     memory = type("M", (), {"token_budget": 800})()
     role = "butler"
     voice_errors: dict = {}
+    channels: list[str] = ["ha_voice"]
 
 
 @pytest.fixture
@@ -92,9 +93,13 @@ class TestWSTurn:
             # pushed at 'friends' clearance; the overlay prewarm was removed.
             assert memory.profile.await_count == 0
 
-    async def test_stt_start_ensures_session(self, ws_app):
-        """stt_start ensures a VoiceSession is created in the pool; sending
-        it twice is idempotent (same session, no duplicate tasks).  The
+    async def test_stt_start_is_pool_noop(self, ws_app):
+        """v0.80.0 (spec A2): stt_start no longer touches the pool at all —
+        the frame carries no agent_role, and VoiceSessionPool.ensure() now
+        requires one (role-scoped keying, so two residents on one device
+        can't collide on a session_key). Pool registration happens lazily
+        on the utterance frame instead, which DOES carry agent_role.
+        Sending stt_start twice remains a harmless no-op either way. The
         obsolete overlay prewarm has been removed — no profile() is called."""
         client, _, memory, channel = ws_app
 
@@ -102,10 +107,7 @@ class TestWSTurn:
             await ws.send_json({"type": "stt_start", "scope_id": "s"})
             await ws.send_json({"type": "stt_start", "scope_id": "s"})
             await asyncio.sleep(0.05)
-            sess = channel.pool.get("s")
-            assert sess is not None
-            # No prewarm task — schedule_prewarm is no longer called.
-            assert sess.prewarm_task is None
+            assert channel.pool.get("s", role="butler") is None
             # No profile() call — overlay not used for voice.
             assert memory.profile.await_count == 0
 
@@ -181,7 +183,7 @@ class TestWSTurn:
         client, _, _, channel = ws_app
         task_refs: list[weakref.ref] = []
 
-        async def stub_ok(ws, frame, uid):
+        async def stub_ok(ws, frame, uid, voice_deadline):
             task_refs.append(weakref.ref(asyncio.current_task()))
             await ws.send_json({"type": "done", "utterance_id": uid})
 
@@ -203,7 +205,7 @@ class TestWSTurn:
 
             # Exception arm: a failing utterance task must be reaped +
             # logged, never left as an unretrieved-exception task.
-            async def stub_fail(ws_, frame, uid):
+            async def stub_fail(ws_, frame, uid, voice_deadline):
                 raise ConnectionResetError("Cannot write to closing transport")
             monkeypatch.setattr(channel, "_run_ws_utterance", stub_fail)
             with caplog.at_level("WARNING"):

@@ -73,6 +73,18 @@ if [ "$_reap_days" != "null" ] && [ -n "$_reap_days" ]; then
     export ENGAGEMENT_REAP_DAYS="$_reap_days"
 fi
 
+# Task 7 (spec A4/§4.6): voice turn budget + specialist concurrency/cost-alert
+# options. All three ship with a default in the options block above, so
+# bashio never returns "null" here (unlike the optional str?/int? options
+# above) — export unconditionally, matching TELEGRAM_ENGAGEMENT_SUPERGROUP_ID.
+# _voice_turn_budget_s() in channels/voice/channel.py and the
+# specialist_max_concurrency/specialist_cost_alert_threshold reads in
+# casa_core.py still clamp/validate on top of this (e.g. the 27s hard cap) —
+# this export only feeds the env var, it does not itself enforce the cap.
+export VOICE_TURN_BUDGET_SECONDS="$(bashio::config 'voice_turn_budget_seconds')"
+export SPECIALIST_MAX_CONCURRENCY="$(bashio::config 'specialist_max_concurrency')"
+export SPECIALIST_COST_ALERT_THRESHOLD="$(bashio::config 'specialist_cost_alert_threshold')"
+
 # SUPERVISOR_TOKEN is injected automatically by the HA Supervisor.
 
 exec /opt/casa/venv/bin/python3 /opt/casa/casa_core.py

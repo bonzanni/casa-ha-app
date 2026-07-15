@@ -113,3 +113,22 @@ configuration:
     description: >-
       Log verbosity for the Casa services (debug, info, warning, error).
       Defaults to info.
+  voice_turn_budget_seconds:
+    name: "Voice Turn Budget (seconds)"
+    description: >-
+      Maximum seconds a synchronous specialist delegation may run during a
+      voice turn before Casa gives up and returns early, leaving room for
+      the voice transport's own timeout. Hard-capped at 27 regardless of
+      this value. Defaults to 27.
+  specialist_max_concurrency:
+    name: "Specialist Max Concurrency"
+    description: >-
+      Maximum number of specialist delegations allowed in flight at once
+      across the whole fleet. A given voice/chat scope may still only have
+      one active delegation to the same specialist (not configurable).
+      Defaults to 2.
+  specialist_cost_alert_threshold:
+    name: "Specialist Cost Alert Threshold (USD)"
+    description: >-
+      Cumulative per-specialist USD spend past which Casa logs a warning
+      on every further delegation to that specialist. Defaults to 5.0.
