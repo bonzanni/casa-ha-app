@@ -1426,6 +1426,20 @@ class ClaudeCodeDriver(DriverProtocol):
         elif self._turn_running.get(engagement_id):
             await self._summary_status_transition(
                 engagement_id, STATUS_WORKING)
+        # F1 (Sol diff gate): the open-questions SET may have changed with NO
+        # status-class transition — one of several questions settled while the
+        # summary stays ⏳ waiting, or none remain but the turn already ended
+        # (neither branch above fires). Force a summary refresh so the pinned
+        # open-questions line reflects the remaining set; the no-op gate elides
+        # a redundant edit when a transition above already reflowed it.
+        ctrl = self._summaries.get(engagement_id)
+        if ctrl is not None:
+            try:
+                await ctrl.refresh()
+            except Exception:  # noqa: BLE001 — summary refresh is advisory
+                logger.debug(
+                    "summary refresh after status recompute failed",
+                    exc_info=True)
 
     async def finalize_summary(
         self, engagement: EngagementRecord, outcome: str,
@@ -1605,20 +1619,34 @@ class ClaudeCodeDriver(DriverProtocol):
             # failure. Entries with no message id (nothing to settle visually)
             # close unconditionally.
             settled = True
-            if mid is not None and self._edit_topic_message is not None:
-                display = q.get("text") or (f"Q{n}:" if n is not None else "")
-                text = f"{display}{_OPEN_Q_EXPIRED_SUFFIX}"
-                settled = await confirmed_settle_edit(
-                    lambda mid=mid, text=text: self._edit_topic_message(
-                        rec.topic_id, mid, text, clear_keyboard=True),
-                    sleep=self._sleep,
-                )
-                if not settled:
+            if mid is not None:
+                if self._edit_topic_message is None:
+                    # F3/R1 (Sol diff gate): a MESSAGE-BACKED entry with NO edit
+                    # primitive available cannot be confirmed-settled — treat it
+                    # as UNCONFIRMED (fail-CLOSED) so the ledger entry is
+                    # PRESERVED for a later reconciliation, never closed without
+                    # a confirmed edit. Only entries with no message id (nothing
+                    # to settle) may close unconditionally.
+                    settled = False
                     logger.warning(
-                        "engagement %s: open-question boot settle UNCONFIRMED "
-                        "after retries (n=%s) — leaving ledger entry INTACT",
-                        rec.id[:8], n,
+                        "engagement %s: open-question boot settle has a message "
+                        "id but no edit primitive (n=%s) — leaving ledger entry "
+                        "INTACT", rec.id[:8], n,
                     )
+                else:
+                    display = q.get("text") or (f"Q{n}:" if n is not None else "")
+                    text = f"{display}{_OPEN_Q_EXPIRED_SUFFIX}"
+                    settled = await confirmed_settle_edit(
+                        lambda mid=mid, text=text: self._edit_topic_message(
+                            rec.topic_id, mid, text, clear_keyboard=True),
+                        sleep=self._sleep,
+                    )
+                    if not settled:
+                        logger.warning(
+                            "engagement %s: open-question boot settle "
+                            "UNCONFIRMED after retries (n=%s) — leaving ledger "
+                            "entry INTACT", rec.id[:8], n,
+                        )
             if settled and close is not None and n is not None:
                 try:
                     await close(rec.id, n)
@@ -1627,6 +1655,19 @@ class ClaudeCodeDriver(DriverProtocol):
                         "engagement %s: close_open_question failed (n=%s)",
                         rec.id[:8], n, exc_info=True,
                     )
+
+        # F1 (Sol diff gate): entries were closed above without touching the
+        # pinned summary — refresh it so its open-questions line reflects the
+        # post-reconcile set (the open-question accessor reads live, so refresh
+        # picks up exactly the entries that closed).
+        ctrl = self._summaries.get(rec.id)
+        if ctrl is not None:
+            try:
+                await ctrl.refresh()
+            except Exception:  # noqa: BLE001 — summary refresh is advisory
+                logger.debug(
+                    "summary refresh after open-question reconcile failed",
+                    exc_info=True)
 
     async def _settle_open_anchor(
         self, engagement: EngagementRecord, operator_msg_id: int | None,
@@ -1654,18 +1695,32 @@ class ClaudeCodeDriver(DriverProtocol):
         # threads to the question it answers even when the cosmetic settle edit
         # is transiently failing.
         settled = True
-        if amid is not None and self._edit_topic_message is not None:
-            settled = await confirmed_settle_edit(
-                lambda: self._edit_topic_message(
-                    engagement.topic_id, amid,
-                    f"{display}{_OPEN_Q_ANSWERED_SUFFIX}", clear_keyboard=True),
-                sleep=self._sleep,
-            )
-            if not settled:
+        if amid is not None:
+            if self._edit_topic_message is None:
+                # F3/R1 (Sol diff gate): a MESSAGE-BACKED anchor with NO edit
+                # primitive cannot be confirmed-settled — treat it as
+                # UNCONFIRMED (fail-CLOSED) so the ledger entry is PRESERVED,
+                # never closed without a confirmed edit. The anchor mid is STILL
+                # returned below so the operator's answer threads correctly.
+                settled = False
                 logger.warning(
-                    "engagement %s: anchor settle UNCONFIRMED after retries "
-                    "(n=%s) — leaving ledger entry INTACT", engagement.id[:8], n,
+                    "engagement %s: anchor settle has a message id but no edit "
+                    "primitive (n=%s) — leaving ledger entry INTACT",
+                    engagement.id[:8], n,
                 )
+            else:
+                settled = await confirmed_settle_edit(
+                    lambda: self._edit_topic_message(
+                        engagement.topic_id, amid,
+                        f"{display}{_OPEN_Q_ANSWERED_SUFFIX}", clear_keyboard=True),
+                    sleep=self._sleep,
+                )
+                if not settled:
+                    logger.warning(
+                        "engagement %s: anchor settle UNCONFIRMED after retries "
+                        "(n=%s) — leaving ledger entry INTACT",
+                        engagement.id[:8], n,
+                    )
         close = getattr(reg, "close_open_question", None)
         if settled and close is not None and n is not None:
             try:

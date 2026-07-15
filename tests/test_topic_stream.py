@@ -967,6 +967,52 @@ async def test_finalize_posts_only_pending_suffix_of_sealed_narration(tmp_path):
     assert sum(t == "CCC" for _tp, t in rec.sends) == 1
 
 
+async def test_seal_edit_branch_no_loss_via_posted_len(tmp_path):
+    """F2/R4 NO-LOSS (Sol diff gate): the SEALED-EDIT branch in ``_execute_ops``
+    (distinct from the finalize branch T4 fixed) must slice the fresh message
+    from ``_posted_len`` — the accurate wire-posted length — NOT ``len(prior)``,
+    which includes throttled never-posted text.
+
+    Repro: ``AAA`` sent → ``AAABBB`` edited (both reach the wire) → ``CCC``
+    THROTTLED (``_per_message_text`` advances to ``AAABBBCCC`` but it never
+    reaches the wire, so ``_posted_len`` stays at 6) → a discrete reply SEALS
+    the message → ``DDD`` arrives after the throttle window → the edit to
+    ``AAABBBCCCDDD`` hits the sealed message → SEALED → a fresh message opens.
+    That fresh message must carry the held ``CCC`` then ``DDD`` (``CCCDDD``);
+    pre-fix it sliced ``value[len(prior):]`` = ``DDD`` and lost ``CCC``."""
+    from channels.output_sequencer import OutputSequencer
+
+    rec, events = Recorder(), []
+    cursor = tmp_path / ".stream_cursor.json"
+    seq = OutputSequencer(
+        engagement_id="eng-1", topic_id=42,
+        send_message=rec.send, edit_message=rec.edit,
+    )
+    relay = _make_relay(tmp_path, cursor, rec, events, sequencer=seq)
+
+    # AAA posted (send), then AAABBB posted (edit) — both reach the wire.
+    await relay._execute_ops([("send", "AAA")])
+    await relay._execute_ops([("edit", "AAABBB")])
+    assert relay._posted_len == 6  # only "AAABBB" reached the wire
+
+    # CCC is THROTTLED: _per_message_text advances but _posted_len does NOT
+    # (mirrors _post_text's held-edit path at :794).
+    relay._per_message_text = "AAABBBCCC"
+
+    # A discrete reply SEALS the narration message.
+    await seq.seal_narration()
+
+    # DDD after the throttle window → edit hits the sealed message → SEALED →
+    # a fresh message opens for the genuinely-unposted increment.
+    await relay._execute_ops([("edit", "AAABBBCCCDDD")])
+
+    posted = [t for _tp, t in rec.sends]
+    # NO-LOSS: the fresh message carries the held CCC then DDD, never just DDD.
+    assert posted == ["AAA", "CCCDDD"]
+    # CCC is never permanently lost, and nothing is duplicated.
+    assert "".join(posted) == "AAACCCDDD"
+
+
 async def test_crash_recovery_reposts_full_sealed_tail_unchanged_by_r4(tmp_path):
     """R4 (c): the crash-recovery CONSERVATIVE SEAL stays a SEPARATE,
     distinguishable branch from finalize. A real post-restart recovery of an

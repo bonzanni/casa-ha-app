@@ -755,8 +755,18 @@ class TopicStreamRelay:
                 if res == "dropped":
                     return
                 if res == "sealed":
+                    # F2/R4 NO-LOSS (Sol diff gate): slice from ``_posted_len``
+                    # — what actually reached the wire for THIS message — NOT
+                    # ``len(prior)``. ``prior`` (``_per_message_text``) can
+                    # include a throttled, never-posted suffix (a held ``CCC``);
+                    # slicing at ``len(prior)`` would drop it behind the seal
+                    # forever. The posted prefix is ``prior[:_posted_len]``;
+                    # everything past it (held suffix + this frame's new text)
+                    # rides into the fresh message exactly once.
+                    posted_prefix = prior[: self._posted_len]
                     increment = (
-                        value[len(prior):] if value.startswith(prior) else value
+                        value[self._posted_len:]
+                        if value.startswith(posted_prefix) else value
                     )
                     applied, mid = await self._apply_op(
                         lambda v=increment: self.sequencer.open_narration(v)

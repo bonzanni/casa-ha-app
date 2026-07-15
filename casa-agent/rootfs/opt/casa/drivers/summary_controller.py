@@ -287,23 +287,23 @@ class SummaryController:
         """Submit a lifecycle STATUS at *revision* (§5 authority model).
 
         Accepted iff the current status is not terminal AND *revision* is
-        strictly greater than the revision the current status was set at. A
-        status-class CHANGE flushes immediately; a same-status revision bump is
-        a silent no-op.
+        strictly greater than the revision the current status was set at. The
+        flush is FORCED (F1, Sol diff gate): a status-class change obviously
+        re-renders, but a SAME-status revision bump can still change the
+        rendered text — most commonly the open-questions set shrinking or
+        growing while the status stays ⏳ waiting — and that change must reach
+        the pinned summary. The rendered-text no-op gate in ``_flush_locked``
+        suppresses a redundant wire edit when nothing actually moved.
         """
         async with self._lock:
             if self._status in _TERMINAL_STATUSES:
                 return  # terminal absolute
             if revision is None or revision <= self._status_rev:
                 return  # older/equal never overrides
-            changed = status != self._status
             self._status = status
             self._status_rev = revision
             self._reconcile_tick_locked()
-            # §5: status-class changes flush immediately; a same-status bump
-            # touches nothing visible, so no flush is needed.
-            if changed:
-                await self._flush_locked(force=True)
+            await self._flush_locked(force=True)
 
     async def finalize(self, status: str) -> None:
         """Set the TERMINAL status (§5 — terminal absolute), cancel the tick and
@@ -314,6 +314,18 @@ class SummaryController:
             self._status = status
             self._turn_running = False
             self._cancel_tick_locked()
+            await self._flush_locked(force=True)
+
+    # -- open-questions / pulled-input refresh (never status) ---------------
+    async def refresh(self) -> None:
+        """Force a re-render + flush so a change in a PULLED input that carries
+        NO status transition still reaches the pinned summary (F1, Sol diff
+        gate). The open-questions set is read live from ``_open_question_numbers``
+        at render time, so when it shrinks/grows during ask settlement or boot
+        reconciliation — without a status-class change — the driver calls this
+        to reflow the open-questions line. The rendered-text no-op gate in
+        ``_flush_locked`` suppresses a redundant wire edit when nothing moved."""
+        async with self._lock:
             await self._flush_locked(force=True)
 
     # -- activity / plan (never status) -------------------------------------

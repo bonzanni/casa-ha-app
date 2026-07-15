@@ -1987,6 +1987,123 @@ class TestAskLifecycleSeams:
         assert sleeps == [0.5]
         assert reg.open_question_numbers(rec.id) == []  # closed once
 
+    async def test_boot_reconcile_refreshes_summary_open_questions(
+        self, tmp_path,
+    ):
+        """F1 (Sol diff gate): boot reconciliation closes open-question ledger
+        entries; the pinned summary's open-questions line must be REFRESHED to
+        reflect the post-reconcile set (pre-fix the summary went stale — the
+        close path never touched it)."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers.summary_controller import (
+            STATUS_WAITING_REPLY, SummaryController,
+        )
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            "executor", "configurator", "claude_code", "t", {}, topic_id=999)
+        n1 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n1, 7001, text="Q1: A?",
+                                    kind="button")
+        n2 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n2, 7002, text="Q2: B?",
+                                    kind="button")
+        # Reconcile ONLY Q1 (attach-time snapshot); Q2 stays open.
+        snapshot = [q for q in rec.open_questions if q.get("n") == n1]
+
+        async def _edit(topic_id, message_id, text, *, clear_keyboard=False):
+            return True
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="http://x",
+            edit_topic_message=_edit, registry=reg,
+        )
+
+        class _SumSeq:
+            def __init__(self):
+                self.edits: list = []
+
+            async def edit_summary(self, mid, text):
+                self.edits.append((mid, text))
+                return "applied"
+
+        sseq = _SumSeq()
+        ctrl = SummaryController(
+            engagement_id=rec.id, sequencer=sseq, goal_line="do X",
+            open_question_numbers=lambda: reg.open_question_numbers(rec.id),
+            message_id=8888,
+        )
+        ctrl._status = STATUS_WAITING_REPLY
+        # As if the summary currently shows BOTH questions.
+        ctrl._last_rendered = "stale text showing Q1 and Q2"
+        drv._summaries[rec.id] = ctrl
+
+        await drv.reconcile_open_questions(rec, snapshot)
+
+        assert reg.open_question_numbers(rec.id) == [n2]
+        assert sseq.edits, "summary was not refreshed after reconcile"
+        last = sseq.edits[-1][1]
+        assert f"Q{n2}" in last and f"Q{n1}" not in last
+
+    async def test_reconcile_preserves_ledger_when_edit_primitive_absent(
+        self, tmp_path,
+    ):
+        """F3/R1 (Sol diff gate): a MESSAGE-BACKED open-question entry must NOT
+        be closed when NO edit primitive exists (``edit_topic_message is None``)
+        — the settle cannot be confirmed, so the entry is PRESERVED for a later
+        reconciliation (fail-CLOSED, not fail-open)."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            "executor", "configurator", "claude_code", "t", {}, topic_id=999)
+        n1 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n1, 7001, text="Q1: Proceed?",
+                                    kind="button")
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="http://x",
+            edit_topic_message=None, registry=reg,
+        )
+        await drv.reconcile_open_questions(rec)
+
+        # Message-backed entry + no edit primitive → UNCONFIRMED → PRESERVED.
+        assert reg.open_question_numbers(rec.id) == [n1]
+
+    async def test_anchor_settle_preserves_ledger_when_edit_primitive_absent(
+        self, tmp_path,
+    ):
+        """F3/R1 (Sol diff gate): the anchor settle path likewise must NOT close
+        a message-backed anchor when ``edit_topic_message is None`` — preserved
+        (fail-closed), while STILL returning the anchor mid so the operator's
+        answer threads correctly."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            "executor", "configurator", "claude_code", "t", {}, topic_id=999)
+        n1 = await reg.allocate_question_number(rec.id)
+        await reg.add_open_question(rec.id, n1, 8001, text="Q1: DB name?",
+                                    kind="anchor")
+
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="http://x",
+            edit_topic_message=None, registry=reg,
+        )
+        amid = await drv._settle_open_anchor(rec, operator_msg_id=42)
+
+        assert amid == 8001                              # still threads
+        assert reg.open_question_numbers(rec.id) == [n1]  # PRESERVED
+
     async def test_anchor_settle_preserves_ledger_on_unconfirmed_edit(
         self, tmp_path,
     ):

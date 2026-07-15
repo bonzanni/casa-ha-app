@@ -524,6 +524,52 @@ class TestOpenQuestions:
         c.shutdown()
 
 
+class TestF1SameStatusOpenQuestionRefresh:
+    """F1 (Sol diff gate): a SAME-status revision bump whose OPEN-QUESTIONS set
+    changed must still re-render + flush the pinned summary — the no-op gate is
+    keyed on the RENDERED TEXT, not the status enum."""
+
+    async def test_settle_one_of_two_reflows_open_questions(self):
+        seq = FakeSequencer()
+        nums = [11, 12]
+        c = _make(seq, message_id=500)
+        c._open_question_numbers = lambda: list(nums)
+        await c.submit_status(STATUS_WAITING_REPLY, 1)
+        assert "Open questions: Q11, Q12" in seq.edits[-1][1]
+        # Q11 settles; still ⏳ waiting on Q12 (same status, higher revision).
+        nums[:] = [12]
+        await c.submit_status(STATUS_WAITING_REPLY, 2)
+        assert "Open questions: Q12" in seq.edits[-1][1]
+        assert "Q11" not in seq.edits[-1][1]
+        c.shutdown()
+
+    async def test_add_question_while_waiting_reflows(self):
+        seq = FakeSequencer()
+        nums = [11]
+        c = _make(seq, message_id=500)
+        c._open_question_numbers = lambda: list(nums)
+        await c.submit_status(STATUS_WAITING_REPLY, 1)
+        assert "Open questions: Q11" in seq.edits[-1][1]
+        # A new question is registered while already ⏳ waiting.
+        nums[:] = [11, 12]
+        await c.submit_status(STATUS_WAITING_REPLY, 2)
+        assert "Open questions: Q11, Q12" in seq.edits[-1][1]
+        c.shutdown()
+
+    async def test_refresh_reflows_without_status_transition(self):
+        # The explicit refresh path (driver recompute / boot reconcile) reflows
+        # the open-questions line with NO status change at all.
+        seq = FakeSequencer()
+        nums = [11, 12]
+        c = _make(seq, message_id=500)
+        c._open_question_numbers = lambda: list(nums)
+        await c.submit_status(STATUS_WAITING_REPLY, 1)
+        nums[:] = []  # all settled
+        await c.refresh()
+        assert "Open questions:" not in seq.edits[-1][1]
+        c.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # Waiting-for-approval status copy is available (ask-registry source).
 # ---------------------------------------------------------------------------
