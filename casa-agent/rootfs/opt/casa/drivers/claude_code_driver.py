@@ -2872,6 +2872,37 @@ class ClaudeCodeDriver(DriverProtocol):
         if seq is not None:
             seq.set_turn_reply_to(message_id)
 
+    async def edit_ask_keyboard(
+        self, engagement_id: str, message_id: int, markup: Any,
+        *, revalidate: Any = None,
+    ) -> bool:
+        """A5 · F-MULTI: markup-only redraw of a live multi-select keyboard
+        through the sequencer's ``edit_discrete`` (§A9) so it serializes on the
+        same single-writer lock as the settle edit. ``revalidate`` (the toggle
+        terminal-race guard) runs under the lock immediately before the wire
+        edit. Returns False (no edit) when the engagement has no live sequencer."""
+        seq = self._sequencers.get(engagement_id)
+        if seq is None:
+            return False
+        return await seq.edit_discrete(
+            message_id, markup=markup, revalidate=revalidate)
+
+    async def settle_ask_keyboard(
+        self, engagement_id: str, message_id: int, text: str,
+    ) -> bool:
+        """A5 · F-MULTI: the multi ask's terminal settle edit — set the settle
+        text AND clear the keyboard, routed through the SAME ``edit_discrete``
+        primitive as the toggle redraw so a stale redraw can never land after
+        (and resurrect) a settled keyboard. Returns False when the engagement
+        has no live sequencer (the finish hook then leaves the ledger intact for
+        boot reconciliation)."""
+        seq = self._sequencers.get(engagement_id)
+        if seq is None:
+            return False
+        from channels.output_sequencer import MARKUP_EMPTY
+        return await seq.edit_discrete(
+            message_id, text=text, markup=MARKUP_EMPTY)
+
     async def _supersede_pending_asks(self, engagement_id: str) -> None:
         """§4 live-ask supersession: a fresh operator message resolves any
         PENDING engagement_ask keyboard as ``superseded_by_text`` (broker cancel

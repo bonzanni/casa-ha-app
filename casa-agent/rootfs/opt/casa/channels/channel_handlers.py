@@ -696,6 +696,11 @@ def _validate_ask_args(
         return None
     if len(options) != 0 and not (_ASK_MIN_OPTIONS <= len(options) <= _ASK_MAX_OPTIONS):
         return None
+    # A5 · F-MULTI: a multi-select ask REQUIRES ≥2 options — a multi anchor
+    # (``options: []``) or a degenerate single-option multi is refused
+    # ``invalid_args``. Non-multi anchors (``multi`` absent/False) are unaffected.
+    if body.get("multi") and len(options) < _ASK_MIN_OPTIONS:
+        return None
     labels: list[str] = []
     shorts: list[str | None] = []
     for o in options:
@@ -786,6 +791,16 @@ def _ask_settle_text(question: str, outcome: dict, options: list) -> str:
     """
     o = outcome.get("outcome")
     if o == "answered":
+        # A5 · F-MULTI: a multi submit carries ``option_indices`` → settle copy
+        # is ``✅ label1 + label2 + …`` (single-select stays ``✅ label``).
+        indices = outcome.get("option_indices")
+        if indices:
+            picked = [
+                options[i] for i in indices
+                if isinstance(i, int) and 0 <= i < len(options)
+            ]
+            label = " + ".join(picked) if picked else "?"
+            return question + _SETTLE_ANSWERED.format(label=label)
         idx = outcome.get("option_index")
         label = (
             options[idx]
@@ -809,6 +824,7 @@ def _ask_keyboard_finish(
     question: str, options: list,
     *, on_settle: "Callable[[], Awaitable[None]] | None" = None,
     sleep: "Callable[[float], Awaitable[None]]" = asyncio.sleep,
+    settle_edit: "Callable[[str], Awaitable[bool]] | None" = None,
 ) -> Callable[[dict], "Awaitable[None]"]:
     """Broker finish-hook (r3-B3 shape, mirrors ``hooks._perm_keyboard_finish``)
     -- the engagement_ask namespace's ONLY keyboard-message writer. Fires
@@ -835,11 +851,18 @@ def _ask_keyboard_finish(
 
     async def _finish(outcome: dict) -> None:
         text = _ask_settle_text(question, outcome, options)
-        confirmed = await confirmed_settle_edit(
-            lambda: telegram_channel.edit_topic_message(
-                topic_id, message_id, text, clear_keyboard=True),
-            sleep=sleep,
-        )
+        # A5 · F-MULTI: a multi ask's settle edit routes through the SAME
+        # sequencer markup primitive (``edit_discrete``) that the toggle redraw
+        # uses, so the two writers serialize on ONE lock — a stale toggle redraw
+        # can never land after (and resurrect) a settled keyboard. The finish
+        # hook stays the sole TERMINAL writer. Single-select keeps today's direct
+        # ``edit_topic_message`` (``settle_edit`` is None).
+        if settle_edit is not None:
+            do_edit = lambda: settle_edit(text)  # noqa: E731
+        else:
+            do_edit = lambda: telegram_channel.edit_topic_message(  # noqa: E731
+                topic_id, message_id, text, clear_keyboard=True)
+        confirmed = await confirmed_settle_edit(do_edit, sleep=sleep)
         if not confirmed:
             logger.warning(
                 "ask keyboard finish-hook settle edit UNCONFIRMED after retries "
@@ -930,6 +953,10 @@ def _make_ask(
         # ``options`` = FULL labels (body/meta/settle/response see these);
         # ``shorts`` = parallel agent-supplied shorts (keyboard-only, A4 rule 3).
         question, options, timeout_s, shorts = validated
+        # A5 · F-MULTI: a toggle-many keyboard + ✅ Submit. Read AFTER validation
+        # (which already refused multi + <2 options / anchor). Only the BUTTON
+        # ask path can be multi — the anchor path below is never reached.
+        multi = bool(body.get("multi", False))
 
         rec = engagement_registry.get(eng_id)
         if rec is None:
@@ -1239,6 +1266,11 @@ def _make_ask(
                 "topic_id": rec.topic_id,
                 "operator_id": rec.origin.get("user_id"),
                 "inbound_gen": gen_at_entry,
+                # A5 · F-MULTI: the tap dispatcher reads ``multi`` to branch and
+                # ``shorts`` to rebuild the toggle keyboard on every redraw
+                # (``selected`` is created lazily by ``toggle_selection``).
+                "multi": multi,
+                "shorts": shorts,
             }
 
         intent_registered = False
@@ -1406,8 +1438,29 @@ def _make_ask(
         # entry — the broker TTL expires the ask instead.
         # Pass ``shorts`` to the keyboard ONLY when at least one option carried an
         # agent short — str-only asks keep today's call shape (backward-compatible
-        # with existing keyboard fakes that don't accept the kwarg).
-        _kbd_kwargs = {"shorts": shorts} if any(shorts) else {}
+        # with existing keyboard fakes that don't accept the kwarg). A5 · F-MULTI:
+        # a multi ask always passes ``multi=True`` (and ``shorts`` so the toggle
+        # rows carry the agent shorts / heuristic labels).
+        _kbd_kwargs: dict[str, Any] = {}
+        if any(shorts):
+            _kbd_kwargs["shorts"] = shorts
+        if multi:
+            _kbd_kwargs["multi"] = True
+            _kbd_kwargs["shorts"] = shorts
+
+        # A5 · F-MULTI: the multi settle edit routes through the sequencer's
+        # ``edit_discrete`` (via the driver seam) so it serializes on the same
+        # lock as the toggle redraw. Degrades to the direct ``edit_topic_message``
+        # path when there is no live driver/sequencer (eager fallback / fakes).
+        def _make_settle_edit(mid: int):
+            if not multi or driver is None:
+                return None
+            settle = getattr(driver, "settle_ask_keyboard", None)
+            if settle is None:
+                return None
+            async def _settle(text: str) -> bool:
+                return await settle(eng_id, mid, text)
+            return _settle
 
         async def _post_ask() -> int | None:
             try:
@@ -1418,7 +1471,8 @@ def _make_ask(
                         question=display, options=options, **_kbd_kwargs),
                     lambda mid: _ask_keyboard_finish(
                         telegram_channel, rec.topic_id, mid, display, options,
-                        on_settle=_close_question),
+                        on_settle=_close_question,
+                        settle_edit=_make_settle_edit(mid)),
                 )
                 mid = req.meta.get("message_id")
                 if not isinstance(mid, int):
@@ -1553,6 +1607,22 @@ def _ask_outcome_response(outcome: dict, options: list) -> web.Response:
     """Map a broker ask outcome to the tool's JSON response."""
     o = outcome.get("outcome")
     if o == "answered":
+        # A5 · F-MULTI: a multi submit resolves with ``option_indices`` → the
+        # response lists ALL selected labels + indices, KEEPING the single
+        # ``option``/``option_index`` fields (the FIRST selection) for
+        # downstream compat.
+        indices = outcome.get("option_indices")
+        if indices:
+            labels = [
+                options[i] for i in indices
+                if isinstance(i, int) and 0 <= i < len(options)
+            ]
+            return web.json_response({
+                "ok": True, "outcome": "answered",
+                "options": labels, "option_indices": list(indices),
+                "option": labels[0] if labels else None,
+                "option_index": indices[0],
+            })
         idx = outcome["option_index"]
         return web.json_response({
             "ok": True, "outcome": "answered",

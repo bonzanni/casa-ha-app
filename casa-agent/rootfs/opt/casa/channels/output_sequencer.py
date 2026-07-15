@@ -94,10 +94,14 @@ HOLD_ELIGIBLE_TOOLS: frozenset[str] = frozenset(
 def project_args(tool_name: str, raw_args: dict) -> dict:
     """Apply the pinned projection for *tool_name* to *raw_args*.
 
-    * ``ask`` → ``{question, options, timeout_s-as-given}``.
+    * ``ask`` → ``{question, options, timeout_s-as-given, multi-as-given}``.
     * ``reply`` → ``{text}`` (drops the SDK-compat ``chat_id``).
     * everything else (a permission-gated tool's own frame, ``emit_completion``)
       → identity over the raw args.
+
+    A5 · F-MULTI (v0.83.0): ``multi`` joins the ask projection — this MUST stay
+    byte-identical to ``casa_engagement_channel._ask_projection_hash`` (the
+    client side), or a multi ask's relay intent would never match its block.
     """
     if not isinstance(raw_args, dict):
         raw_args = {}
@@ -106,6 +110,7 @@ def project_args(tool_name: str, raw_args: dict) -> dict:
             "question": raw_args.get("question"),
             "options": raw_args.get("options"),
             "timeout_s": raw_args.get("timeout_s"),
+            "multi": raw_args.get("multi", False),
         }
     if tool_name == REPLY_TOOL:
         return {"text": raw_args.get("text")}

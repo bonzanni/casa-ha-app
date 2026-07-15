@@ -176,13 +176,22 @@ async def _safe_answer(cq: Any, text: str) -> None:
         logger.warning("callback_query.answer failed: %s", exc)
 
 
-def _parse_callback_data(data: str) -> tuple[str | None, str | None, int | None]:
+def _parse_callback_data(
+    data: str,
+) -> tuple[str | None, str | None, int | None, str | None]:
     """Parse inline-keyboard ``callback_data`` into ``(namespace, request_id,
-    option_index)``, or ``(None, None, None)`` on any malformed shape.
+    option_index, kind)``, or ``(None, None, None, None)`` on any malformed
+    shape.
 
-    Two accepted shapes:
+    Accepted shapes:
     - v1 (current): ``v1|<ns>|<request_id>|<option_index>``, ``ns`` one of
-      the broker's three namespaces, ``option_index`` an int.
+      the broker's three namespaces, ``option_index`` an int. ``kind`` is
+      ``None`` (a single-select / permission tap).
+    - A5 · F-MULTI: ``v1|ask_multi|<request_id>|<idx>`` (a checkbox TOGGLE,
+      ``kind="toggle"``) and ``v1|ask_multi|<request_id>|s`` (SUBMIT,
+      ``kind="submit"``, ``option_index`` is ``None``). The ``ask_multi``
+      namespace maps to the ``engagement_ask`` broker namespace — only the
+      callback grammar is new.
     - legacy (back-compat): ``perm:<allow|deny>:<request_id>`` — pre-v0.75.0
       keyboards still in flight across an upgrade must keep routing.
 
@@ -191,24 +200,35 @@ def _parse_callback_data(data: str) -> tuple[str | None, str | None, int | None]
     generate one.
     """
     if len(data.encode("utf-8")) > _CALLBACK_DATA_MAX_BYTES:
-        return None, None, None
+        return None, None, None, None
     if data.startswith("v1|"):
         parts = data.split("|", 3)
         if len(parts) != 4:
-            return None, None, None
+            return None, None, None, None
         _, ns, request_id, idx_s = parts
-        if ns not in _CALLBACK_NAMESPACES or not request_id:
-            return None, None, None
+        if not request_id:
+            return None, None, None, None
+        if ns == "ask_multi":
+            # A5 · F-MULTI: routes onto the engagement_ask broker namespace.
+            if idx_s == "s":
+                return "engagement_ask", request_id, None, "submit"
+            try:
+                idx = int(idx_s)
+            except ValueError:
+                return None, None, None, None
+            return "engagement_ask", request_id, idx, "toggle"
+        if ns not in _CALLBACK_NAMESPACES:
+            return None, None, None, None
         try:
             idx = int(idx_s)
         except ValueError:
-            return None, None, None
-        return ns, request_id, idx
+            return None, None, None, None
+        return ns, request_id, idx, None
     parts = data.split(":", 2)
     if (len(parts) == 3 and parts[0] == "perm"
             and parts[1] in ("allow", "deny") and parts[2]):
-        return "permission", parts[2], (0 if parts[1] == "allow" else 1)
-    return None, None, None
+        return "permission", parts[2], (0 if parts[1] == "allow" else 1), None
+    return None, None, None, None
 
 
 # v0.81.0 (W-R3, Sol r1-5): button labels are DERIVED channel-side from the
@@ -374,6 +394,51 @@ def _short_option_label(number: int, option: str) -> str:
     set-level ``short_option_labels`` so distinctness can be verified.
     """
     return _elide_one(f"{number} · ", option, [])
+
+
+# A5 · F-MULTI checkbox glyphs.
+_MULTI_BOX_ON = "☑"
+_MULTI_BOX_OFF = "☐"
+_MULTI_SUBMIT_TEXT = "✅ Submit"
+
+
+def _multi_button_caption(
+    i: int, options: list, shorts: "list | None", heuristic: list, selected: set,
+) -> str:
+    """A5 · F-MULTI: one toggle-row caption ``☐/☑ <n> · <short-or-heuristic>``.
+
+    ``shorts[i]`` (agent-supplied) wins VERBATIM (``n · <short>``); otherwise the
+    distinguishing-tail heuristic label (already ``n · …``) is used. The leading
+    checkbox reflects membership in ``selected``."""
+    box = _MULTI_BOX_ON if i in selected else _MULTI_BOX_OFF
+    if shorts is not None and i < len(shorts) and shorts[i]:
+        return f"{box} {i + 1} · {shorts[i]}"
+    return f"{box} {heuristic[i]}"
+
+
+def _build_multi_keyboard(
+    request_id: str, options: list, shorts: "list | None", selected,
+):
+    """A5 · F-MULTI: the toggle-many keyboard — one ``☐/☑ n · <label>`` row per
+    option (callback ``v1|ask_multi|<rid>|<idx>``) plus a final ``✅ Submit`` row
+    (``v1|ask_multi|<rid>|s``). Shared by the initial post and every redraw so
+    the two can never disagree."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    heuristic = short_option_labels(options)
+    sel = set(selected or ())
+    rows = [
+        [InlineKeyboardButton(
+            text=_multi_button_caption(i, options, shorts, heuristic, sel),
+            callback_data=f"v1|ask_multi|{request_id}|{i}",
+        )]
+        for i in range(len(options))
+    ]
+    rows.append([InlineKeyboardButton(
+        text=_MULTI_SUBMIT_TEXT,
+        callback_data=f"v1|ask_multi|{request_id}|s",
+    )])
+    return InlineKeyboardMarkup(rows)
 
 
 # Reconnect supervisor backoff schedule (spec 5.2 §4.2): 1s, 2s, 4s, 8s,
@@ -1480,7 +1545,7 @@ class TelegramChannel(Channel):
         """
         cq = update.callback_query
         data = cq.data or ""
-        ns, request_id, idx = _parse_callback_data(data)
+        ns, request_id, idx, kind = _parse_callback_data(data)
         if ns is None:
             await _safe_answer(cq, "expired")
             return
@@ -1524,7 +1589,9 @@ class TelegramChannel(Channel):
             await _safe_answer(cq, "expired")
             return
         options = meta.get("options") or []
-        if idx not in range(len(options)):
+        # A5 · F-MULTI: a SUBMIT tap carries no option index (``idx is None``);
+        # the range check applies only to single-select + toggle taps.
+        if kind != "submit" and idx not in range(len(options)):
             await _safe_answer(cq, "invalid")
             return
 
@@ -1536,9 +1603,38 @@ class TelegramChannel(Channel):
             await _safe_answer(cq, "not for you")
             return
 
+        # A5 · F-MULTI TOGGLE: broker-owned atomic flip on a LIVE, UNCLAIMED
+        # request, then a revalidated markup-only keyboard redraw through the
+        # sequencer's ``edit_discrete`` (§A9). This handler NEVER resolves the
+        # request — only the finish hook (submit / timeout / supersede) settles.
+        if kind == "toggle":
+            selected = BROKER.toggle_selection(
+                namespace=ns, scope=rec.id, request_id=request_id, idx=idx)
+            if selected is None:
+                await _safe_answer(cq, "expired")
+                return
+            await self._redraw_multi_keyboard(
+                rec.id, request_id, meta, options, selected)
+            await _safe_answer(
+                cq, "added" if idx in selected else "removed")
+            return
+
+        # A5 · F-MULTI SUBMIT: require ≥1 selection, then claim carrying the full
+        # selection (``option_index`` = the FIRST selected index for compat).
+        option_indices: "list[int] | None" = None
+        claim_index = idx
+        if kind == "submit":
+            selected = sorted(set(meta.get("selected") or ()))
+            if not selected:
+                await _safe_answer(cq, "pick at least one")
+                return
+            option_indices = selected
+            claim_index = selected[0]
+
         claim = BROKER.claim(
             namespace=ns, scope=rec.id, request_id=request_id,
-            option_index=idx, actor_id=cq.from_user.id,
+            option_index=claim_index, actor_id=cq.from_user.id,
+            option_indices=option_indices,
         )
         if isinstance(claim, str):
             # Non-winning: a late tap on an already-retired keyboard never
@@ -1606,6 +1702,50 @@ class TelegramChannel(Channel):
                 else:
                     BROKER.abort_claim(claim)
         await _safe_answer(cq, "✔" if committed else "expired")
+
+    async def _redraw_multi_keyboard(
+        self, engagement_id: str, request_id: str, meta: dict,
+        options: list, selected: list,
+    ) -> bool:
+        """A5 · F-MULTI: redraw the toggle keyboard after a flip, via the
+        sequencer's markup-only ``edit_discrete`` (§A9).
+
+        The redraw REVALIDATES live-and-unclaimed under the serialized CM
+        immediately before the wire edit (``BROKER.is_live_unclaimed``) — a
+        terminal outcome that resolved in between skips the edit, so a stale
+        redraw can never resurrect a settled keyboard. Degrades to a no-op
+        (returns False) when the driver/sequencer seam is absent (eager
+        fallback / unit fakes). The message id + agent ``shorts`` live in the
+        broker-owned meta seeded at post time."""
+        mid = meta.get("message_id")
+        if not isinstance(mid, int):
+            return False
+        try:
+            import agent as _agent_mod
+            drv = getattr(_agent_mod, "active_claude_code_driver", None)
+        except Exception:  # noqa: BLE001
+            drv = None
+        if drv is None:
+            return False
+        editor = getattr(drv, "edit_ask_keyboard", None)
+        if editor is None:
+            return False
+        from verdict_broker import BROKER
+
+        markup = _build_multi_keyboard(
+            request_id, options, meta.get("shorts"), selected)
+
+        def _still_live() -> bool:
+            return BROKER.is_live_unclaimed(
+                namespace="engagement_ask", scope=engagement_id,
+                request_id=request_id)
+
+        try:
+            return await editor(
+                engagement_id, mid, markup, revalidate=_still_live)
+        except Exception:  # noqa: BLE001 — a redraw failure never breaks the tap
+            logger.debug("multi keyboard redraw failed", exc_info=True)
+            return False
 
     def _commit_ask_with_anchor(
         self, claim: Any, ns: str, rec: Any, meta: dict,
@@ -1857,6 +1997,7 @@ class TelegramChannel(Channel):
         question: str,
         options: list,
         shorts: "list | None" = None,
+        multi: bool = False,
     ) -> int | None:
         """Post a plain-text multiple-choice question with one tappable
         button per option (W5 `ask`).
@@ -1888,6 +2029,14 @@ class TelegramChannel(Channel):
         # ``shorts`` (A4 rule 3): an agent-supplied short per option (or None) —
         # used VERBATIM (``n · <short>``, no elision) when given, else the
         # heuristic label. The full ``label`` is what the body/meta/settle see.
+        # A5 · F-MULTI: a multi ask renders the toggle-many keyboard (checkboxes
+        # + ✅ Submit) via the shared builder; single-select keeps one tappable
+        # button per option (``v1|engagement_ask|<rid>|<idx>``).
+        if multi:
+            kbd = _build_multi_keyboard(request_id, options, shorts, selected=())
+            return await self.send_to_topic(
+                rec.topic_id, question, reply_markup=kbd)
+
         heuristic = short_option_labels(options)
 
         def _button_text(i: int) -> str:

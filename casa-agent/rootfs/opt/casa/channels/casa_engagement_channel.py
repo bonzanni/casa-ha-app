@@ -86,10 +86,18 @@ def _canonical_hash(payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
-def _ask_projection_hash(question: Any, options: Any, timeout_s: Any) -> str:
-    """ask → ``{question, options, timeout_s-as-given}``."""
+def _ask_projection_hash(
+    question: Any, options: Any, timeout_s: Any, multi: Any = False,
+) -> str:
+    """ask → ``{question, options, timeout_s-as-given, multi-as-given}``.
+
+    A5 · F-MULTI (v0.83.0): ``multi`` joins the pinned projection. The relay's
+    ``output_sequencer.project_args`` mirrors this EXACTLY (same four keys), so
+    an intent's transmitted hash and the ask block's computed hash agree — the
+    pinned hash-identity contract."""
     return _canonical_hash(
-        {"question": question, "options": options, "timeout_s": timeout_s},
+        {"question": question, "options": options,
+         "timeout_s": timeout_s, "multi": multi},
     )
 
 
@@ -196,7 +204,7 @@ async def reply(chat_id: str, text: str) -> dict[str, Any]:
 
 @server.tool()
 async def ask(
-    question: str, options: list, timeout_s: Any = None,
+    question: str, options: list, timeout_s: Any = None, multi: bool = False,
 ) -> dict[str, Any]:
     """Ask the operator a question. With 2-8 ``options`` it renders tappable
     buttons; with ``options: []`` it posts a numbered free-text question anchor.
@@ -206,6 +214,11 @@ async def ask(
     VERBATIM in the message body and returned on selection; ``short`` (≤ 25
     chars) is the compact button caption. Plain-string options get an
     auto-shortened button caption. Returns the selected FULL label.
+
+    A5 · F-MULTI: pass ``multi: true`` (requires ≥2 ``options``) when SEVERAL
+    choices may apply — the keyboard becomes toggle checkboxes plus a ``✅
+    Submit`` row, and the response carries ``options``/``option_indices`` (the
+    full selection) alongside the first-selection ``option``/``option_index``.
 
     Returns the selected label, or outcome=no_answer on timeout. NOT an
     authorization mechanism.
@@ -230,10 +243,12 @@ async def ask(
     request_id = uuid.uuid4().hex
     payload: dict[str, Any] = {
         "request_id": request_id,
-        "projection_hash": _ask_projection_hash(question, options, timeout_s),
+        "projection_hash": _ask_projection_hash(
+            question, options, timeout_s, multi),
         "question": question,
         "options": options,
         "timeout_s": clamped_timeout,
+        "multi": multi,
     }
     if ENGAGEMENT_ID is not None:
         payload["engagement_id"] = ENGAGEMENT_ID
