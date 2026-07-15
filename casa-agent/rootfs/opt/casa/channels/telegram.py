@@ -217,37 +217,163 @@ def _parse_callback_data(data: str) -> tuple[str | None, str | None, int | None]
 # in the message body (``channel_handlers.render_ask_body``); the button carries
 # only a short summary. The button's IDENTITY stays the option INDEX in
 # ``callback_data`` — the label is display-only, so nothing is lost by shortening.
-_ASK_BUTTON_LABEL_CAP = 24
-_ASK_BUTTON_SUMMARY_WORDS = 3
+#
+# v0.83.0 (A4 · F-BTN, Sol r2-9/r3-7): the fixed 3-word cap dropped distinguishing
+# TAILS ("Single account with aliases" → "1 · Single account with" — the live
+# regression). Replaced by an ELISION LADDER computed over the WHOLE option set
+# (so distinctness can be verified pairwise). Cap raised to 30 INCLUDING the
+# ``n · `` number prefix.
+_ASK_BUTTON_LABEL_CAP = 30
+_ASK_LABEL_ELLIPSIS = "…"
+
+
+def _render_kept(tokens: list[str], kept: set[int]) -> str:
+    """Render a summary from a subset of KEPT token indices.
+
+    Kept tokens are space-joined; each INTERIOR run of dropped tokens collapses
+    to a single ``…`` attached to its neighbours without surrounding spaces
+    (``Single…aliases``); a LEADING or TRAILING dropped run is omitted entirely
+    (no edge ellipsis), so a left-drop reads ``account with aliases`` — not
+    ``…account with aliases``.
+    """
+    n = len(tokens)
+    out = ""
+    i = 0
+    while i < n:
+        if i in kept:
+            if out and not out.endswith(_ASK_LABEL_ELLIPSIS):
+                out += " "
+            out += tokens[i]
+            i += 1
+        else:
+            j = i
+            while j < n and j not in kept:
+                j += 1
+            if i != 0 and j != n:  # interior run only → single ellipsis
+                out += _ASK_LABEL_ELLIPSIS
+            i = j
+    return out
+
+
+def _elide_one(prefix: str, option: str, others_tokens: "list[set[str]]") -> str:
+    """Pinned per-option elision ladder (A4 rule 2). ``others_tokens`` is the
+    casefolded token set of every OTHER option in the same ask (a token is
+    *shared* iff its casefold appears in at least one of them).
+
+    Resolution order: (1) full fit → verbatim; (2) shared-token elision (drop
+    shared tokens longest-first, each dropped RUN → ``…``); (3) interior elision
+    (keep head + tail); (4) left-drop of leading tokens; (5) hard slice.
+    """
+    budget = _ASK_BUTTON_LABEL_CAP - len(prefix)
+    tokens = option.split()
+    if not tokens:
+        # Whitespace-only option: nothing to summarise — hard-slice the prefix.
+        return (prefix)[:_ASK_BUTTON_LABEL_CAP]
+    full = " ".join(tokens)
+    # (1) full fit — verbatim, no ellipsis.
+    if len(full) <= budget:
+        return prefix + full
+    n = len(tokens)
+    # (2) shared-token elision: drop SHARED tokens, longest-first (leftmost tie),
+    #     keeping discriminative ones; the operator scans the tail differentiator.
+    kept = set(range(n))
+    shared = [
+        p for p in range(n)
+        if any(tokens[p].casefold() in s for s in others_tokens)
+    ]
+    for p in sorted(shared, key=lambda q: (-len(tokens[q]), q)):
+        kept.discard(p)
+        cand = _render_kept(tokens, kept)
+        if cand and len(cand) <= budget:
+            return prefix + cand
+    # (3) interior elision: keep head + tail (``Single…aliases``).
+    if n >= 2:
+        cand = _render_kept(tokens, {0, n - 1})
+        if cand and len(cand) <= budget:
+            return prefix + cand
+    # (4) left-drop: drop leading tokens (tail differentiator survives).
+    for k in range(1, n):
+        cand = _render_kept(tokens, set(range(k, n)))
+        if cand and len(cand) <= budget:
+            return prefix + cand
+    # (5) hard slice on a codepoint boundary — degenerate long single token.
+    return (prefix + full)[:_ASK_BUTTON_LABEL_CAP]
+
+
+def _resolve_label_collisions(
+    options: list[str], prefixes: list[str], summaries: list[str],
+) -> None:
+    """Pairwise-distinctness validation (Sol r3-7). Any two produced summaries
+    that collide (casefolded, ignoring the number prefix) while their full
+    options differ are re-elided IN PLACE — keeping, for each, the token
+    positions where it differs from a colliding sibling (earliest first, as the
+    budget allows). The unique number prefixes make the FINAL button labels
+    pairwise-distinct regardless; this step surfaces a differentiating token
+    whenever one fits.
+    """
+    from collections import defaultdict
+
+    groups: "defaultdict[str, list[int]]" = defaultdict(list)
+    for i, s in enumerate(summaries):
+        groups[s.casefold()].append(i)
+    for idxs in groups.values():
+        if len(idxs) < 2:
+            continue
+        if len({options[i].casefold() for i in idxs}) < 2:
+            continue  # the full options are themselves identical — nothing to do
+        for i in idxs:
+            budget = _ASK_BUTTON_LABEL_CAP - len(prefixes[i])
+            tokens = options[i].split()
+            sib_tokens = [options[j].split() for j in idxs if j != i]
+            diff = [
+                p for p in range(len(tokens))
+                if any(
+                    p >= len(sib) or sib[p].casefold() != tokens[p].casefold()
+                    for sib in sib_tokens
+                )
+            ]
+            if not diff:
+                continue
+            kept: set[int] = set()
+            for p in diff:
+                if len(_render_kept(tokens, kept | {p})) <= budget:
+                    kept.add(p)
+            if kept:
+                cand = _render_kept(tokens, kept)
+                if cand and len(cand) <= budget:
+                    summaries[i] = cand
+
+
+def short_option_labels(options: list) -> list[str]:
+    """Derive short, number-prefixed button labels for a WHOLE option set.
+
+    Each label is ``<n> · <summary>`` (1-based ``n``), the whole string ≤
+    ``_ASK_BUTTON_LABEL_CAP`` including the prefix, produced by the elision
+    ladder (``_elide_one``) and then validated pairwise-distinct
+    (``_resolve_label_collisions``). The full option text is carried VERBATIM in
+    the message body, so a shortened label never changes the choice; the
+    ``callback_data`` identity stays the option INDEX.
+    """
+    opts = [str(o) for o in options]
+    token_sets = [{t.casefold() for t in o.split()} for o in opts]
+    prefixes = [f"{i + 1} · " for i in range(len(opts))]
+    summaries: list[str] = []
+    for i, o in enumerate(opts):
+        others = [token_sets[j] for j in range(len(opts)) if j != i]
+        lab = _elide_one(prefixes[i], o, others)
+        summaries.append(lab[len(prefixes[i]):])
+    _resolve_label_collisions(opts, prefixes, summaries)
+    return [prefixes[i] + summaries[i] for i in range(len(opts))]
 
 
 def _short_option_label(number: int, option: str) -> str:
-    """Derive a short, number-prefixed button label from a full option string.
+    """Single-option fallback of the elision ladder (no siblings ⇒ no shared
+    tokens, no pairwise check). ``number`` is the option's 1-based position.
 
-    ``<number> · <≤3 words>``, the whole label capped at ~``_ASK_BUTTON_LABEL_CAP``
-    chars on a WORD boundary (e.g. ``1 · Personal Gmail``). No ellipsis: the full
-    option text is carried verbatim in the message body, so a shortened label
-    never changes the choice. ``number`` is the option's 1-based position, which
-    also lets the operator match the label to the numbered body line.
+    Kept for callers that shorten ONE option in isolation; the keyboards use the
+    set-level ``short_option_labels`` so distinctness can be verified.
     """
-    prefix = f"{number} · "
-    words = option.split()[:_ASK_BUTTON_SUMMARY_WORDS]
-    chosen: list[str] = []
-    for w in words:
-        candidate = prefix + " ".join(chosen + [w])
-        # The cap applies to EVERY word — including the FIRST (R3 label bug: the
-        # first word used to be appended unconditionally, so a long single/first
-        # word blew past the cap, e.g. ``1 · <47-char token>`` = 51 chars).
-        if len(candidate) > _ASK_BUTTON_LABEL_CAP:
-            break
-        chosen.append(w)
-    if not chosen:
-        # Degenerate: the first word alone exceeds the cap (or a whitespace-only
-        # option). Hard-slice to the cap on a codepoint boundary — no ellipsis;
-        # the full text still lives in the body and the callback identity is the
-        # index, so nothing is lost by the slice.
-        return (prefix + (words[0] if words else ""))[:_ASK_BUTTON_LABEL_CAP]
-    return prefix + " ".join(chosen)
+    return _elide_one(f"{number} · ", option, [])
 
 
 # Reconnect supervisor backoff schedule (spec 5.2 §4.2): 1s, 2s, 4s, 8s,
@@ -1726,6 +1852,7 @@ class TelegramChannel(Channel):
         request_id: str,
         question: str,
         options: list,
+        shorts: "list | None" = None,
     ) -> int | None:
         """Post a plain-text multiple-choice question with one tappable
         button per option (W5 `ask`).
@@ -1748,17 +1875,28 @@ class TelegramChannel(Channel):
 
         # v0.75.0 (W5): v1 broker callback_data, one button (its own row)
         # per option — option_index is this option's position in `options`.
-        # v0.81.0 (W-R3): the button LABEL is a short, number-prefixed summary
-        # (``_short_option_label``) so it stays readable — Telegram truncates
-        # long labels. ``question`` is already the canonical body
+        # v0.81.0 (W-R3) / v0.83.0 (A4 · F-BTN): the button LABEL is a short,
+        # number-prefixed summary derived over the WHOLE option set
+        # (``short_option_labels`` — distinguishing tails preserved) so it stays
+        # readable AND pickable. ``question`` is already the canonical body
         # (``render_ask_body``): the FULL options are numbered VERBATIM in it,
         # and ``callback_data`` still carries the option INDEX as the identity.
+        # ``shorts`` (A4 rule 3): an agent-supplied short per option (or None) —
+        # used VERBATIM (``n · <short>``, no elision) when given, else the
+        # heuristic label. The full ``label`` is what the body/meta/settle see.
+        heuristic = short_option_labels(options)
+
+        def _button_text(i: int) -> str:
+            if shorts is not None and i < len(shorts) and shorts[i]:
+                return f"{i + 1} · {shorts[i]}"
+            return heuristic[i]
+
         kbd = InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                text=_short_option_label(i + 1, label),
+                text=_button_text(i),
                 callback_data=f"v1|engagement_ask|{request_id}|{i}",
             )]
-            for i, label in enumerate(options)
+            for i in range(len(options))
         ])
 
         return await self.send_to_topic(rec.topic_id, question, reply_markup=kbd)
@@ -1976,22 +2114,23 @@ class TelegramChannel(Channel):
         ``message_id``, or ``None`` on send failure — the broker's
         ``ensure_posted`` treats ``None`` as a delivery failure (r10-B3).
 
-        ``short_labels`` (v0.81.0, W-R3b): when True, derive short, number-
-        prefixed button labels via ``_short_option_label`` — Telegram truncates
-        long labels, which made ``ask_user`` options unpickable. The FULL options
-        must already live VERBATIM in ``text`` (the caller renders them with
-        ``render_ask_body``). Default False keeps the authz-challenge DM path
-        (``authz_grants`` — short ``Approve``/``Deny`` options) untouched.
+        ``short_labels`` (v0.81.0, W-R3b; v0.83.0 A4 · F-BTN): when True, derive
+        short, number-prefixed button labels via the set-level
+        ``short_option_labels`` (distinguishing-tail elision ladder) — Telegram
+        truncates long labels, which made ``ask_user`` options unpickable. The
+        FULL options must already live VERBATIM in ``text`` (the caller renders
+        them with ``render_ask_body``). Default False keeps the authz-challenge
+        DM path (``authz_grants`` — short ``Approve``/``Deny`` options) untouched.
         """
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+        heuristic = short_option_labels(options) if short_labels else None
         kbd = InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                text=(_short_option_label(i + 1, label)
-                      if short_labels else label),
+                text=(heuristic[i] if heuristic is not None else options[i]),
                 callback_data=f"v1|resident_ask|{request_id}|{i}",
             )]
-            for i, label in enumerate(options)
+            for i in range(len(options))
         ])
         try:
             msg = await self.bot.send_message(

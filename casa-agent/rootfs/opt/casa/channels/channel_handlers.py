@@ -343,6 +343,9 @@ def _make_permission_verdict(engagement_registry: Any) -> Handler:
 _ASK_MIN_OPTIONS = 2
 _ASK_MAX_OPTIONS = 8
 _ASK_MAX_LABEL_LEN = 48
+# A4 · F-BTN (Sol r3-7b): an agent-supplied ``short`` ≤ 25 so ``"n · <short>"``
+# (prefix ≤ 5 chars) keeps the rendered button within the 30-char button cap.
+_ASK_MAX_SHORT_LEN = 25
 _ASK_MAX_QUESTION_LEN = 1024
 _ASK_MIN_TIMEOUT_S = 30.0
 _ASK_MAX_TIMEOUT_S = 570.0
@@ -659,16 +662,30 @@ async def _ask_final_response(
     return _ask_outcome_response(outcome, options)
 
 
-def _validate_ask_args(body: dict) -> tuple[str, list, float] | None:
+def _validate_ask_args(
+    body: dict,
+) -> tuple[str, list, float, list] | None:
     """Validate + clamp the `ask` request body.
 
-    Returns ``(question, options, clamped_timeout_s)`` on success, or
+    Returns ``(question, options, clamped_timeout_s, shorts)`` on success, or
     ``None`` on any validation failure (caller maps to ``invalid_args``).
+    ``options`` is the list of FULL labels (downstream sees these everywhere —
+    body VERBATIM, broker meta, settle ✅, ``_ask_outcome_response``); ``shorts``
+    is a PARALLEL list, one entry per option: the agent-supplied short label
+    (str) or ``None``. The ONLY consumer of ``shorts`` is the keyboard.
 
-    v0.79.0 §4: ``options: []`` is now ACCEPTED (a free-text numbered anchor);
-    a non-empty list still requires ``_ASK_MIN_OPTIONS..MAX``, unique, non-empty
-    labels within the length cap. All validation lives here server-side (the
-    channel subprocess transmits raw args and lets this gate refuse — r8-1).
+    v0.79.0 §4: ``options: []`` is ACCEPTED (a free-text numbered anchor); a
+    non-empty list still requires ``_ASK_MIN_OPTIONS..MAX``, unique, non-empty
+    labels within the length cap.
+
+    v0.83.0 (A4 · F-BTN): each option may be a plain ``str`` (unchanged) OR a
+    ``{"label": str, "short": str}`` dict — ``label`` under the 48 cap and
+    ``label.strip()`` non-empty; ``short`` ≤ 25 and ``short.strip()`` non-empty.
+    Mixed str+dict lists are allowed. Duplicate FULL labels OR duplicate
+    provided shorts are refused. The projection hash is computed client-side
+    over the RAW args, so this server-side normalization does not affect relay
+    matching. All validation lives here server-side (the channel subprocess
+    transmits raw args and lets this gate refuse — r8-1).
     """
     question = body.get("question")
     if (not isinstance(question, str) or not question
@@ -679,19 +696,39 @@ def _validate_ask_args(body: dict) -> tuple[str, list, float] | None:
         return None
     if len(options) != 0 and not (_ASK_MIN_OPTIONS <= len(options) <= _ASK_MAX_OPTIONS):
         return None
-    if any(
-        not isinstance(o, str) or not o or len(o) > _ASK_MAX_LABEL_LEN
-        for o in options
-    ):
+    labels: list[str] = []
+    shorts: list[str | None] = []
+    for o in options:
+        if isinstance(o, str):
+            # str path UNCHANGED (enumerator/strip normalization is A6/Task 12).
+            if not o or len(o) > _ASK_MAX_LABEL_LEN:
+                return None
+            labels.append(o)
+            shorts.append(None)
+        elif isinstance(o, dict):
+            label = o.get("label")
+            short = o.get("short")
+            if (not isinstance(label, str) or not label.strip()
+                    or len(label) > _ASK_MAX_LABEL_LEN):
+                return None
+            if (not isinstance(short, str) or not short.strip()
+                    or len(short) > _ASK_MAX_SHORT_LEN):
+                return None
+            labels.append(label)
+            shorts.append(short)
+        else:
+            return None
+    if len(set(labels)) != len(labels):
         return None
-    if len(set(options)) != len(options):
+    provided_shorts = [s for s in shorts if s is not None]
+    if len(set(provided_shorts)) != len(provided_shorts):
         return None
     try:
         timeout_s = float(body.get("timeout_s", _ASK_DEFAULT_TIMEOUT_S))
     except (TypeError, ValueError):
         return None
     timeout_s = min(max(timeout_s, _ASK_MIN_TIMEOUT_S), _ASK_MAX_TIMEOUT_S)
-    return question, options, timeout_s
+    return question, labels, timeout_s, shorts
 
 
 def _canonical_question(question: str, number: int) -> str:
@@ -890,7 +927,9 @@ def _make_ask(
         validated = _validate_ask_args(body)
         if validated is None:
             return web.json_response({"ok": False, "error": "invalid_args"})
-        question, options, timeout_s = validated
+        # ``options`` = FULL labels (body/meta/settle/response see these);
+        # ``shorts`` = parallel agent-supplied shorts (keyboard-only, A4 rule 3).
+        question, options, timeout_s, shorts = validated
 
         rec = engagement_registry.get(eng_id)
         if rec is None:
@@ -1338,13 +1377,18 @@ def _make_ask(
         # open question only AFTER a successful, non-superseded post means a
         # crash before the relay reaches the block leaves NO dangling ledger
         # entry — the broker TTL expires the ask instead.
+        # Pass ``shorts`` to the keyboard ONLY when at least one option carried an
+        # agent short — str-only asks keep today's call shape (backward-compatible
+        # with existing keyboard fakes that don't accept the kwarg).
+        _kbd_kwargs = {"shorts": shorts} if any(shorts) else {}
+
         async def _post_ask() -> int | None:
             try:
                 await BROKER.ensure_posted(
                     req,
                     lambda: telegram_channel.post_options_keyboard(
                         engagement_id=eng_id, request_id=request_id,
-                        question=display, options=options),
+                        question=display, options=options, **_kbd_kwargs),
                     lambda mid: _ask_keyboard_finish(
                         telegram_channel, rec.topic_id, mid, display, options,
                         on_settle=_close_question),

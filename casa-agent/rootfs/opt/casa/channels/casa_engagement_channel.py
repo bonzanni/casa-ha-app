@@ -201,6 +201,12 @@ async def ask(
     """Ask the operator a question. With 2-8 ``options`` it renders tappable
     buttons; with ``options: []`` it posts a numbered free-text question anchor.
 
+    Each ``options`` entry is either a plain string OR a ``{"label": str,
+    "short": str}`` dict (A4 · F-BTN): ``label`` is the full choice shown
+    VERBATIM in the message body and returned on selection; ``short`` (≤ 25
+    chars) is the compact button caption. Plain-string options get an
+    auto-shortened button caption. Returns the selected FULL label.
+
     Returns the selected label, or outcome=no_answer on timeout. NOT an
     authorization mechanism.
 

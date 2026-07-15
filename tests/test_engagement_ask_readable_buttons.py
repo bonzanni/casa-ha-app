@@ -101,21 +101,25 @@ class TestShortOptionLabel:
     def test_short_option_number_prefixed(self) -> None:
         assert _short_option_label(1, "Personal Gmail") == "1 · Personal Gmail"
 
-    def test_caps_long_option_at_word_boundary(self) -> None:
-        # A >3-word / >24-char option → capped on a WORD boundary (no ellipsis,
-        # no mid-word cut). The FULL text is carried by the body, not the button.
+    def test_caps_long_option_via_interior_elision(self) -> None:
+        # v0.83.0 (A4): a lone long option that overflows the 30-char cap is
+        # elided keeping the HEAD + TAIL tokens (interior ellipsis) so the
+        # distinguishing tail survives. The FULL text is carried by the body.
+        from channels.telegram import _ASK_BUTTON_LABEL_CAP
+
         label = _short_option_label(
             1, "Configure the enterprise SSO integration")
-        assert label == "1 · Configure the"
-        assert len(label) <= 24
-        # No dangling partial word / ellipsis.
-        assert not label.endswith(("…", " ", "-"))
+        assert label == "1 · Configure…integration"
+        assert len(label) <= _ASK_BUTTON_LABEL_CAP
 
-    def test_at_most_three_summary_words(self) -> None:
+    def test_fills_words_up_to_cap_no_three_word_ceiling(self) -> None:
+        # v0.83.0 (A4): the old 3-word ceiling is gone — a short option that
+        # fully fits the 30-char cap renders VERBATIM with no truncation.
+        from channels.telegram import _ASK_BUTTON_LABEL_CAP
+
         label = _short_option_label(2, "one two three four five")
-        # ≤3 words after the "<n> · " prefix.
-        summary = label.split(" · ", 1)[1]
-        assert len(summary.split()) <= 3
+        assert label == "2 · one two three four five"
+        assert len(label) <= _ASK_BUTTON_LABEL_CAP
 
     def test_number_matches_body_line(self) -> None:
         # The label number is the 1-based option position, matching the numbered
@@ -183,9 +187,10 @@ class TestPostOptionsKeyboardReadable:
         assert "Configure the enterprise SSO integration" in args[1]
 
         rows = ch.send_to_topic.call_args.kwargs["reply_markup"].inline_keyboard
-        # Labels are the short derived summaries, number-prefixed.
+        # Labels are the short derived summaries, number-prefixed (v0.83.0 A4:
+        # the long option is interior-elided keeping head + tail).
         assert [r[0].text for r in rows] == [
-            "1 · Personal Gmail", "2 · Configure the"]
+            "1 · Personal Gmail", "2 · Configure…integration"]
         # callback_data identity is the option INDEX (unchanged schema).
         assert [r[0].callback_data for r in rows] == [
             "v1|engagement_ask|rid|0", "v1|engagement_ask|rid|1"]
