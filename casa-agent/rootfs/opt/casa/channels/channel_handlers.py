@@ -406,6 +406,41 @@ def _canonical_question(question: str, number: int) -> str:
     return f"Q{number}: {stripped}"
 
 
+def render_ask_body(number: "int | None", question: str, options: list) -> str:
+    """v0.81.0 (W-R3, Sol r1-5) — the SINGLE canonical rendered ask body.
+
+    Used IDENTICALLY by all four ask consumers so they can never disagree:
+    the initial keyboard post, the finish-hook settlement base, the persisted
+    ``open_questions[].text``, and boot reconciliation. If the displayed
+    message and the persisted text ever diverged, a tap/reconcile would drop
+    the option list — this one source prevents that bug.
+
+    Format::
+
+        Q<n>: <question>
+
+        1. <opt0>
+        2. <opt1>
+        …
+
+    EVERY option is rendered VERBATIM (no truncation, no ellipsis), 1-based
+    numbered. A free-text anchor (``options == []``) renders the numbered
+    question ALONE — no option list. ``number`` may be ``None`` (no durable
+    number allocated / degraded boot), in which case the bare question is used
+    without the ``Q<n>:`` prefix.
+
+    No overflow path (Sol r1-5): the ``_validate_ask_args`` caps (question
+    ≤1024, ≤8 options ≤48 each) keep this body well under Telegram's 4096-char
+    limit (worst case ≈1.5 KB). A cap change that could exceed 4096 must REJECT
+    in ``_validate_ask_args`` — never silently truncate here.
+    """
+    base = _canonical_question(question, number) if number else question
+    if not options:
+        return base
+    numbered = "\n".join(f"{i + 1}. {opt}" for i, opt in enumerate(options))
+    return f"{base}\n\n{numbered}"
+
+
 def _ask_settle_text(question: str, outcome: dict, options: list) -> str:
     """v0.79.0 §4 — render the pinned settle copy below the canonical question.
 
@@ -621,7 +656,9 @@ def _make_ask(
             # First attempt (created intent) OR eager fallback: allocate the
             # durable number + build the poster.
             number = await _maybe_allocate_number(engagement_registry, eng_id)
-            display = _canonical_question(question, number) if number else question
+            # W-R3: canonical body (anchor ⇒ options == [] ⇒ numbered question
+            # ALONE, no option list — unchanged from the pre-W-R3 anchor copy).
+            display = render_ask_body(number, question, options)
 
             async def _post_anchor() -> int | None:
                 try:
@@ -748,7 +785,11 @@ def _make_ask(
             driver.inbound_generation(eng_id) if driver is not None else 0)
 
         number = await _maybe_allocate_number(engagement_registry, eng_id)
-        display = _canonical_question(question, number) if number else question
+        # W-R3 (Sol r1-5): the SINGLE canonical body — full options VERBATIM,
+        # numbered, below the question. This exact string feeds the keyboard
+        # post, the persisted ``open_questions[].text``, the finish-hook settle
+        # base, and (via the persisted text) boot reconciliation.
+        display = render_ask_body(number, question, options)
 
         # F1: create-with-metadata atomically (STATIC meta seeded at creation so
         # a fast tap never sees incomplete metadata — r3-B3 fast-tap — AND a

@@ -639,7 +639,9 @@ class TestPostOptionsKeyboard:
         kbd = kwargs["reply_markup"]
         rows = kbd.inline_keyboard
         assert len(rows) == 3
-        assert [r[0].text for r in rows] == ["Yes", "No", "Maybe"]
+        # v0.81.0 (W-R3): labels are short + number-prefixed (the FULL option is
+        # carried verbatim in the message body, not the button).
+        assert [r[0].text for r in rows] == ["1 · Yes", "2 · No", "3 · Maybe"]
         assert [r[0].callback_data for r in rows] == [
             "v1|engagement_ask|rid_ask|0",
             "v1|engagement_ask|rid_ask|1",

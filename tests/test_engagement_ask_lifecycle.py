@@ -217,10 +217,11 @@ async def test_answered_settles_with_check_and_clears_keyboard(env):
 
     assert _body(resp) == {
         "ok": True, "outcome": "answered", "option": "B", "option_index": 1}
-    # Settle edit: PRESENT clear_keyboard, ✅ + label, canonical Q1 prefix.
+    # Settle edit: PRESENT clear_keyboard, ✅ + FULL chosen option appended
+    # BELOW the canonical body (W-R3: body carries every option verbatim).
     edit = env["ch"].edits[-1]
     assert edit["clear_keyboard"] is True
-    assert edit["text"] == "Q1: Proceed?\n✅ B"
+    assert edit["text"] == "Q1: Proceed?\n\n1. A\n2. B\n✅ B"
 
 
 async def test_expired_settles_with_hourglass_and_clears_keyboard(env, monkeypatch):
@@ -237,7 +238,8 @@ async def test_expired_settles_with_hourglass_and_clears_keyboard(env, monkeypat
     assert _body(resp) == {"ok": True, "outcome": "no_answer"}
     edit = env["ch"].edits[-1]
     assert edit["clear_keyboard"] is True
-    assert edit["text"] == "Q1: Proceed?\n⌛ expired — answer by text below"
+    assert edit["text"] == (
+        "Q1: Proceed?\n\n1. A\n2. B\n⌛ expired — answer by text below")
 
 
 async def test_canonical_qnumber_strips_agent_authored_prefix(env):
@@ -248,7 +250,7 @@ async def test_canonical_qnumber_strips_agent_authored_prefix(env):
         engagement_id=eid, request_id="c1", question="Q7: Which DB?"))))
     await asyncio.sleep(0.02)
     posted_q = env["ch"].options_keyboards[-1]["question"]
-    assert posted_q == "Q1: Which DB?"
+    assert posted_q == "Q1: Which DB?\n\n1. A\n2. B"
     # open_questions ledger + summary accessor agree with the message.
     assert env["reg"].open_question_numbers(eid) == [1]
     env["broker"].deliver(
@@ -357,7 +359,8 @@ async def test_generation_recheck_supersedes(env):
     # Keyboard settled with the superseded copy + cleared.
     edit = ch.edits[-1]
     assert edit["clear_keyboard"] is True
-    assert edit["text"] == "Q1: Proceed?\n🚫 superseded by your message below"
+    assert edit["text"] == (
+        "Q1: Proceed?\n\n1. A\n2. B\n🚫 superseded by your message below")
 
 
 # ---------------------------------------------------------------------------

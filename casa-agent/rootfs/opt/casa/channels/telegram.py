@@ -211,6 +211,41 @@ def _parse_callback_data(data: str) -> tuple[str | None, str | None, int | None]
     return None, None, None
 
 
+# v0.81.0 (W-R3, Sol r1-5): button labels are DERIVED channel-side from the
+# full option so they stay readable — Telegram truncates long labels to a few
+# words, which made most choices unpickable. The full option text lives VERBATIM
+# in the message body (``channel_handlers.render_ask_body``); the button carries
+# only a short summary. The button's IDENTITY stays the option INDEX in
+# ``callback_data`` — the label is display-only, so nothing is lost by shortening.
+_ASK_BUTTON_LABEL_CAP = 24
+_ASK_BUTTON_SUMMARY_WORDS = 3
+
+
+def _short_option_label(number: int, option: str) -> str:
+    """Derive a short, number-prefixed button label from a full option string.
+
+    ``<number> · <≤3 words>``, the whole label capped at ~``_ASK_BUTTON_LABEL_CAP``
+    chars on a WORD boundary (e.g. ``1 · Personal Gmail``). No ellipsis: the full
+    option text is carried verbatim in the message body, so a shortened label
+    never changes the choice. ``number`` is the option's 1-based position, which
+    also lets the operator match the label to the numbered body line.
+    """
+    prefix = f"{number} · "
+    words = option.split()[:_ASK_BUTTON_SUMMARY_WORDS]
+    chosen: list[str] = []
+    for w in words:
+        candidate = prefix + " ".join(chosen + [w])
+        if chosen and len(candidate) > _ASK_BUTTON_LABEL_CAP:
+            break
+        chosen.append(w)
+    if not chosen:
+        # Degenerate: the first word alone exceeds the cap (or a whitespace-only
+        # option). Hard-slice the single word to the cap — no ellipsis; the full
+        # text still lives in the body and the callback identity is the index.
+        return (prefix + (words[0] if words else ""))[:_ASK_BUTTON_LABEL_CAP]
+    return prefix + " ".join(chosen)
+
+
 # Reconnect supervisor backoff schedule (spec 5.2 §4.2): 1s, 2s, 4s, 8s,
 # 16s, cap 60s, unbounded. Reuses retry.compute_backoff_ms via
 # ReconnectSupervisor. Module-level so tests can monkey-patch short
@@ -1617,9 +1652,14 @@ class TelegramChannel(Channel):
 
         # v0.75.0 (W5): v1 broker callback_data, one button (its own row)
         # per option — option_index is this option's position in `options`.
+        # v0.81.0 (W-R3): the button LABEL is a short, number-prefixed summary
+        # (``_short_option_label``) so it stays readable — Telegram truncates
+        # long labels. ``question`` is already the canonical body
+        # (``render_ask_body``): the FULL options are numbered VERBATIM in it,
+        # and ``callback_data`` still carries the option INDEX as the identity.
         kbd = InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                text=label,
+                text=_short_option_label(i + 1, label),
                 callback_data=f"v1|engagement_ask|{request_id}|{i}",
             )]
             for i, label in enumerate(options)
