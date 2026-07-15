@@ -613,21 +613,46 @@ class TopicStreamRelay:
                 self.cursor.message_ids[-1], self._per_message_text,
             )
             if res == "sealed":
-                applied, mid = await self._apply_op(
-                    lambda: self.sequencer.open_narration(self._per_message_text)
-                )
-                if applied:
-                    # Reposted as a single new closing message — collapse the
-                    # boundary record to it.
-                    self.cursor.message_ids = [mid]
-                    self.cursor.message_text_lens = [len(self._per_message_text)]
+                # §A1(2) delta-aware cold reconcile: on a fresh post-recovery
+                # sequencer the checkpoint-named message is CONSERVATIVELY
+                # SEALED. Repost ONLY the genuinely-unposted tail past the
+                # PERSISTED wire high-water — never the already-visible prefix
+                # (the production F-DUP reposted the WHOLE tail here). Empty
+                # pending (a fully-posted sealed tail) reposts NOTHING. A legacy
+                # checkpoint (``last_posted_len`` 0) degrades to today's full
+                # repost; a lost-cursor-persist window degrades to a small
+                # suffix duplicate — both at-least-once, both cold-path-only.
+                pending = self._per_message_text[self.cursor.last_posted_len:]
+                if pending:
+                    applied, mid = await self._apply_op(
+                        lambda p=pending: self.sequencer.open_narration(p)
+                    )
+                    if applied:
+                        # Adopt the delta message exactly like ``_execute_ops``'
+                        # sealed branch: the new message carries ONLY ``pending``;
+                        # the visible prefix stays in the now-sealed prior message.
+                        self.cursor.message_ids = [mid]
+                        self.cursor.message_text_lens = [len(pending)]
+                        self._per_message_text = pending
+                        self._posted_len = len(pending)
+                        self.cursor.last_posted_len = len(pending)
+                    else:
+                        # Dropped mid-reconcile: the tail never reached the wire,
+                        # so the persisted wire high-water is still the truth.
+                        self._posted_len = self.cursor.last_posted_len
+                else:
+                    # Fully-posted sealed tail — the wire already carries the
+                    # full narration on ``message_ids[-1]``; record it as the
+                    # wire high-water so a subsequent live edit computes the
+                    # correct increment (W-R4).
+                    self._posted_len = len(self._per_message_text)
+                    self.cursor.last_posted_len = len(self._per_message_text)
             else:
+                # APPLIED in-place edit: the editable message now carries the
+                # FULL narration on the wire.
                 self._sync_last_len()
-            self.cursor.last_posted_len = len(self._per_message_text)
-            # The reconciled message now carries the FULL narration on the wire
-            # (conservative repost or in-place edit), so nothing is pending — a
-            # subsequent live ``_finalize`` reposts nothing (W-R4).
-            self._posted_len = len(self._per_message_text)
+                self._posted_len = len(self._per_message_text)
+                self.cursor.last_posted_len = len(self._per_message_text)
             self._save()
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -810,7 +835,11 @@ class TopicStreamRelay:
             return
 
         self.cursor.current = {"segment": list(seg), "offset": off_after}
-        self.cursor.last_posted_len = len(self._per_message_text)
+        # §A1 (Sol r2-1a): persist the WIRE high-water (``_posted_len``), NOT
+        # ``len(self._per_message_text)`` — the two are equal on this happy path,
+        # but diverge under a throttled hold; the delta reconcile slices at this
+        # value, so an inflated length would LOSE the held suffix on recovery.
+        self.cursor.last_posted_len = self._posted_len
         self._save()
 
     async def _append_narration(self, text: str) -> None:
@@ -883,7 +912,12 @@ class TopicStreamRelay:
                 await self._match_discrete_block(name, tool_input)
 
         self.cursor.current = {"segment": list(seg), "offset": off_after}
-        self.cursor.last_posted_len = len(self._per_message_text)
+        # §A1 (Sol r2-1a): a tool-only frame can checkpoint WHILE a throttled
+        # narration edit is held unposted (``_per_message_text`` grew, the wire
+        # did not). Persist the WIRE high-water (``_posted_len``), never the
+        # inflated in-memory length, so the delta reconcile keeps the held
+        # suffix instead of slicing it behind the seal forever.
+        self.cursor.last_posted_len = self._posted_len
         self._save()
 
     def _reset_turn_state(self) -> None:
