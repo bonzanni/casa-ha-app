@@ -283,6 +283,7 @@ class SdkClientPool:
     async def turn(self, *, channel_key: str, channel: str, prompt: str,
                    origin: dict, cid: str, build_options, on_stale_old,
                    on_message,
+                   on_success: Callable[[str], Awaitable[None]] | None = None,
                    on_decision: Callable[[str | None, bool], None] | None = None,
                    ) -> PoolTurnResult:
         self._ensure_sweeper()
@@ -356,12 +357,23 @@ class SdkClientPool:
                     entry = fresh_client
                 if decision == "resume":
                     await self._registry.touch(channel_key)
+                publishing = False
                 try:
                     sid = await entry.run_turn_locked(
                         prompt, origin=origin, cid=cid, on_message=on_message,
                     )
+                    if sid is not None and on_success is not None:
+                        # Publish the result before the entry lock can hand off
+                        # to another turn or an invalidation generation.
+                        publishing = True
+                        await on_success(sid)
+                        publishing = False
                 except asyncio.CancelledError:
-                    if entry.state != "warm":
+                    if publishing or entry.state != "warm":
+                        # A warm client whose sid was not successfully
+                        # published is unsafe to reuse. Cancellation inside
+                        # run_turn_locked retains its existing warm-reuse
+                        # behavior when the SDK interrupt/drain succeeds.
                         await self._drop(channel_key, entry)
                     raise
                 except BaseException:

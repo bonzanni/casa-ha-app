@@ -609,6 +609,7 @@ class Agent:
             last_resume: dict[str, str | None] = {"sid": None}
 
             async def _attempt_pooled_turn():
+                session_published = False
                 turn_guard = (
                     VoiceTurnGuard.ha_direct()
                     if msg.channel == "voice"
@@ -633,6 +634,18 @@ class Agent:
                         user_text=user_text,
                     )
 
+                async def _publish(sid):
+                    nonlocal session_published
+                    await self._session_registry.register(
+                        channel_key=channel_key,
+                        agent=self.config.role,
+                        sdk_session_id=sid,
+                        scope_class=(
+                            "webhook_oneshot" if is_webhook_oneshot else None
+                        ),
+                    )
+                    session_published = True
+
                 result = await self._pool.turn(
                     channel_key=channel_key, channel=msg.channel,
                     prompt=prompt_text, origin=origin_snapshot,
@@ -641,6 +654,7 @@ class Agent:
                         old_sid, agent_home, user_peer, msg.channel,
                     ),
                     on_message=on_message,
+                    on_success=_publish,
                     # Finding 2 (final-review): fires for EVERY turn (warm
                     # reuse included), unlike _build above which the pool
                     # skips on warm reuse — so a non-retryable failure on a
@@ -653,7 +667,7 @@ class Agent:
                 last_resume["sid"] = result.resume_sid
                 return (
                     state["text"], result.sid, state["usage"],
-                    result.resume_sid,
+                    result.resume_sid, session_published,
                 )
 
             async def _attempt_bypass_turn():
@@ -708,7 +722,7 @@ class Agent:
                         )
                 finally:
                     await client.aclose()
-                return state["text"], sid, state["usage"], resume_sid
+                return state["text"], sid, state["usage"], resume_sid, False
 
             # Retry transient faults (spec 5.2 §3). The pooled path may raise
             # PoolUnavailable (pool closing / entry unstable) — fall to the
@@ -717,10 +731,12 @@ class Agent:
             # a FRESH decision from the cleared registry).
             attempt = _attempt_pooled_turn if use_pool else _attempt_bypass_turn
             try:
-                response_text, sdk_session_id, usage, used_resume = \
+                response_text, sdk_session_id, usage, used_resume, \
+                    session_published = \
                     await retry_sdk_call(attempt, on_retry=self._log_retry)
             except PoolUnavailable:
-                response_text, sdk_session_id, usage, used_resume = \
+                response_text, sdk_session_id, usage, used_resume, \
+                    session_published = \
                     await retry_sdk_call(
                         _attempt_bypass_turn, on_retry=self._log_retry,
                     )
@@ -741,7 +757,8 @@ class Agent:
                     "fresh", channel_key, last_resume["sid"],
                 )
                 await self._session_registry.clear_sdk_session(channel_key)
-                response_text, sdk_session_id, usage, used_resume = \
+                response_text, sdk_session_id, usage, used_resume, \
+                    session_published = \
                     await retry_sdk_call(attempt, on_retry=self._log_retry)
 
             # Per-turn telemetry (spec 5.2 §5.2). Microsecond cost — string
@@ -768,7 +785,7 @@ class Agent:
             # nothing to compute or record per-turn here.
 
             # 9. SessionRegistry — record the SDK session id for resume + save.
-            if sdk_session_id:
+            if sdk_session_id and not session_published:
                 await self._session_registry.register(
                     channel_key=channel_key,
                     agent=self.config.role,
