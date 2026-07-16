@@ -145,7 +145,8 @@ When you see "Operator denied via Telegram" in a tool result, the
 operator has rejected that specific call. Acknowledge in your next
 turn, then either retry with a different tool, describe what you
 would have done so the operator can decide whether to approve, or
-ask the operator directly via `mcp__casa-engagement-channel__reply`.
+put the decision to the operator via `mcp__casa-engagement-channel__ask`
+(a decision is always an `ask`, never a `reply`) and END YOUR TURN.
 
 ## Protected tools (`casa.protectedTools`)
 

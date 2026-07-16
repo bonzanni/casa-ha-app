@@ -387,12 +387,13 @@ _SETTLE_ANSWERED_BELOW = "\n✅ answered below"
 # force-end primitive exists — this is soft anti-livelock).
 _ASK_REFUSAL = (
     "the operator sent a message you have not seen — it will arrive next "
-    "turn; end your turn now and re-ask after reading it"
+    "turn; end your turn now, silently (no sign-off), and re-ask after reading it"
 )
 _ASK_REFUSAL_STERN = (
     "STOP ASKING. The operator has a message waiting that you have NOT read. "
     "It is delivered to you the moment you end this turn. Do not ask another "
-    "question — END YOUR TURN NOW, read the operator's message, then decide."
+    "question — END YOUR TURN NOW, silently, read the operator's message, then "
+    "decide."
 )
 _ASK_REFUSAL_ESCALATE_AT = 3
 

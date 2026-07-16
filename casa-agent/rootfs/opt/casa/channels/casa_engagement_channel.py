@@ -225,8 +225,18 @@ async def ask(
     A7 · F-ANCHOR: an anchor (``options: []``) whose question embeds ≥2
     numbered/lettered choice lines is refused — pass the choices as ``options``.
 
-    Returns the selected label, or outcome=no_answer on timeout. NOT an
-    authorization mechanism.
+    THE CONTRACT: `ask` is the ONLY channel for an operator decision — never
+    embed a question in a `reply`. After it posts (button OR anchor), END YOUR
+    TURN and wait; the operator's answer starts your next turn. Ask ONE question
+    at a time (a second while one is live is refused `question_pending`).
+
+    Returns the selected FULL label. On timeout it returns
+    ``{"outcome": "no_answer", "engagement_paused": true}`` — the operator is
+    away and the engagement is now PAUSED: END YOUR TURN silently (no sign-off)
+    and wait. Do NOT re-ask; your question stays on record. A further `ask`
+    while paused is refused `operator_away` — that too means end your turn.
+    (A7 anchors that embed enumerated choices are refused `embedded_options`.)
+    NOT an authorization mechanism.
 
     v0.79.0 (§2, r8-1): RAW-DICT ingress — no client-side validation. The raw
     args, the per-logical-call ``request_id`` (minted BEFORE attempt 1, reused
