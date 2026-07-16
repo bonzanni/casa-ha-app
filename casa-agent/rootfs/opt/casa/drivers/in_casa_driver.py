@@ -320,7 +320,11 @@ class InCasaDriver(DriverProtocol):
                                     tool_names_by_id[
                                         getattr(block, "id", "")
                                     ] = getattr(block, "name", "?")
-                                    sdk_logging.log_tool_use(block, idx=idx)
+                                    sdk_logging.log_tool_use(
+                                        block,
+                                        idx=idx,
+                                        started_ms=started_ms,
+                                    )
                         elif isinstance(sdk_msg, UserMessage):
                             for block in getattr(sdk_msg, "content", []) or []:
                                 if isinstance(block, ToolResultBlock):

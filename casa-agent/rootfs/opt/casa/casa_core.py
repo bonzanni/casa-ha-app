@@ -28,6 +28,11 @@ from authz_grants import CHALLENGES, GRANTS
 from bus import BusMessage, MessageBus, MessageType
 from channel_authz import agent_allowed_on
 from channels import ChannelManager
+from claude_runtime import (
+    CLAUDE_CLI_PATH,
+    CLAUDE_CLI_VERSION,
+    verify_effective_cli,
+)
 from config import AgentConfig
 from config_git import init_repo, snapshot_manual_edits
 from freshness_reaper import FreshnessReaper
@@ -1749,6 +1754,15 @@ async def main() -> None:
     from sdk_logging import install_sdk_task_noise_filter
     install_sdk_task_noise_filter(asyncio.get_running_loop())
     logger.info("Casa core starting up")
+
+    observed_cli = await asyncio.to_thread(verify_effective_cli)
+    observed_version = observed_cli.split(maxsplit=1)[0]
+    logger.info(
+        "Claude CLI verified path=%s expected=%s observed=%s",
+        CLAUDE_CLI_PATH,
+        CLAUDE_CLI_VERSION,
+        observed_version,
+    )
 
     # 1a. §8: universal op:// resolution for password-typed addon options.
     # OP_SERVICE_ACCOUNT_TOKEN is already in env (exported by svc-casa/run from

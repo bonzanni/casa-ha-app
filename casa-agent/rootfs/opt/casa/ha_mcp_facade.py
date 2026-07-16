@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import time
 from contextlib import AsyncExitStack
 from typing import Any, AsyncContextManager, Callable, Protocol
 
@@ -65,11 +66,13 @@ class HomeAssistantFacade:
         headers: dict[str, str],
         on_schema_change: Callable[[], Any] | None = None,
         session_factory: SessionFactory | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._url = url
         self._headers = dict(headers)
         self._on_schema_change = on_schema_change
         self._session_factory = session_factory
+        self._monotonic = monotonic
         self._lock = asyncio.Lock()
         self._stack: AsyncExitStack | None = None
         self._session: _UpstreamSession | None = None
@@ -229,9 +232,16 @@ class HomeAssistantFacade:
             return _unavailable_result()
 
         upstream_arguments = {} if name == LIVE_CONTEXT_TOOL else arguments
+        started_ms = self._monotonic() * 1000
         try:
             result = await session.call_tool(name, upstream_arguments)
         except Exception:
+            elapsed = int(self._monotonic() * 1000 - started_ms)
+            logger.info(
+                "ha_facade_call tool=%s ok=False ms=%d",
+                name,
+                elapsed,
+            )
             invalidated = await self._disconnect_failed(
                 session,
                 session_generation,
@@ -242,6 +252,13 @@ class HomeAssistantFacade:
                 "Home Assistant tool transport failed; detail suppressed",
             )
             return _unavailable_result()
+        elapsed = int(self._monotonic() * 1000 - started_ms)
+        logger.info(
+            "ha_facade_call tool=%s ok=%s ms=%d",
+            name,
+            not bool(getattr(result, "isError", False)),
+            elapsed,
+        )
         payload = _sdk_result(result)
         if name != LIVE_CONTEXT_TOOL or not arguments.get("domain"):
             return payload

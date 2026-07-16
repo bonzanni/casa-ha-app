@@ -133,6 +133,49 @@ async def test_cold_hit_connects_with_resume_and_touches():
     assert made[0].options == {"resume": "sid-0"}
 
 
+async def test_cold_connect_logs_monotonic_elapsed_ms(caplog):
+    import logging
+
+    now = [10.0]
+    reg = FakeRegistry()
+    pool = _mk_pool(reg, monotonic=lambda: now[0])
+
+    class TimedConnectClient(ScriptedClient):
+        async def connect(self):
+            await super().connect()
+            now[0] = 10.125
+
+    pool._make_client = TimedConnectClient
+
+    async def build_options(is_fresh, resume_sid):
+        return {}
+
+    async def on_message(_message):
+        return None
+
+    with caplog.at_level(logging.INFO, logger="sdk_client_pool"):
+        await pool.turn(
+            channel_key="voice-latency",
+            channel="voice",
+            prompt="secret prompt",
+            origin={},
+            cid="c",
+            build_options=build_options,
+            on_stale_old=lambda _sid: None,
+            on_message=on_message,
+        )
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "sdk_client_pool" and "pool cold connect" in record.getMessage()
+    ]
+    assert messages == [
+        "pool cold connect key=voice-latency resume=False ms=125"
+    ]
+    assert "secret prompt" not in caplog.text
+
+
 async def test_warm_reuse_skips_connect_and_build_options():
     reg = FakeRegistry()
     reg.data["voice-s1"] = {"sdk_session_id": "sid-0", "last_active": "x"}

@@ -29,6 +29,7 @@ from plugin_grants import grants_for_resolution, make_fail_closed_can_use_tool
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
+from claude_runtime import CLAUDE_CLI_PATH
 from config import AgentConfig
 from specialist_registry import DelegationComplete
 from hooks import resolve_hooks
@@ -59,7 +60,12 @@ from tokens import (
     extract_usage,
     format_turn_summary,
 )
-from error_kinds import ErrorKind, _classify_error, _USER_MESSAGES  # noqa: F401 — re-exported
+from error_kinds import (  # noqa: F401 — selected names are re-exported
+    ErrorKind,
+    VoiceToolLoopError,
+    _classify_error,
+    _USER_MESSAGES,
+)
 from voice_turn_guard import VoiceTurnGuard
 
 logger = logging.getLogger(__name__)
@@ -934,6 +940,7 @@ class Agent:
 
         options = ClaudeAgentOptions(
             model=self.config.model,
+            cli_path=CLAUDE_CLI_PATH,
             system_prompt=system_prompt,
             allowed_tools=allowed_tools,
             disallowed_tools=self.config.tools.disallowed,
@@ -1032,7 +1039,17 @@ class Agent:
                 return
 
             if turn_guard is not None:
-                turn_guard.observe(sdk_msg)
+                try:
+                    turn_guard.observe(sdk_msg)
+                except VoiceToolLoopError as exc:
+                    logger.info(
+                        "voice_tool_loop_stop reason=%s "
+                        "live_context_successes=%d validation_failures=%d",
+                        str(exc),
+                        turn_guard.live_context_successes,
+                        turn_guard.validation_failures,
+                    )
+                    raise
 
             # Phase 4b dispatch — wrapped so a malformed block cannot abort the
             # turn (logged + continued).
@@ -1047,7 +1064,11 @@ class Agent:
                             state["tool_names_by_id"][
                                 getattr(block, "id", "")
                             ] = getattr(block, "name", "?")
-                            sdk_logging.log_tool_use(block, idx=state["idx"])
+                            sdk_logging.log_tool_use(
+                                block,
+                                idx=state["idx"],
+                                started_ms=state["started_ms"],
+                            )
                 elif isinstance(sdk_msg, UserMessage):
                     for block in getattr(sdk_msg, "content", []) or []:
                         if isinstance(block, ToolResultBlock):

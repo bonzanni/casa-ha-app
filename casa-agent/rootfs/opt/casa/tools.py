@@ -48,6 +48,7 @@ from claude_agent_sdk import (
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
+from claude_runtime import CLAUDE_CLI_PATH
 from media_policies import MEDIA_POLICIES
 import plugin_outbox
 from error_kinds import _classify_error
@@ -902,6 +903,7 @@ def _build_specialist_options(
 
     return ClaudeAgentOptions(
         model=cfg.model,
+        cli_path=CLAUDE_CLI_PATH,
         system_prompt=cfg.system_prompt,
         allowed_tools=allowed_tools,
         disallowed_tools=_with_subagent_spawn_disallowed(cfg.tools.disallowed),
@@ -993,6 +995,7 @@ def _build_executor_options(
     # plugin-env.conf, etc.).
     return ClaudeAgentOptions(
         model=defn.model,
+        cli_path=CLAUDE_CLI_PATH,
         system_prompt="",
         allowed_tools=allowed_tools,
         disallowed_tools=list(defn.tools_disallowed),

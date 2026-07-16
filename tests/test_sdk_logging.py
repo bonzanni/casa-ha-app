@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from unittest.mock import MagicMock
 
+import pytest
+
 
 def _mk_tool_use(name: str, input_: dict):
     """Build a synthetic ToolUseBlock-shaped object."""
@@ -93,33 +95,46 @@ class TestLogAssistantMessage:
 
 
 class TestLogToolUse:
-    def test_emits_debug_with_name_and_target(self, caplog):
+    def test_emits_debug_with_name_and_elapsed_ms_without_arguments(self, caplog):
         from sdk_logging import log_tool_use
-        block = _mk_tool_use("Edit", {"file_path": "/x.py", "old_string": "a"})
+        secret = "SECRET_TOOL_ARGUMENT"
+        block = _mk_tool_use(
+            "mcp__homeassistant__HassTurnOff",
+            {"name": secret},
+        )
 
         with caplog.at_level(logging.DEBUG, logger="sdk"):
-            log_tool_use(block, idx=2)
+            log_tool_use(
+                block,
+                idx=1,
+                started_ms=1000.0,
+                monotonic=lambda: 1.125,
+            )
 
         recs = [r for r in caplog.records if r.name == "sdk"]
         assert len(recs) == 1
         assert recs[0].levelno == logging.DEBUG
         msg = recs[0].getMessage()
         assert "tool_use" in msg
-        assert "idx=2" in msg
-        assert "name=Edit" in msg
-        assert "target=/x.py" in msg
+        assert msg == (
+            "tool_use idx=1 name=mcp__homeassistant__HassTurnOff ms=125"
+        )
+        assert secret not in caplog.text
 
 
 class TestLogToolResult:
     def test_emits_debug_with_ok_and_ms(self, caplog):
-        import re
-        import time
         from sdk_logging import log_tool_result
-        started_ms = (time.monotonic() * 1000) - 100
         block = _mk_tool_result(is_error=False, content="42 lines read")
 
         with caplog.at_level(logging.DEBUG, logger="sdk"):
-            log_tool_result(block, idx=2, started_ms=started_ms, name="Read")
+            log_tool_result(
+                block,
+                idx=2,
+                started_ms=1000.0,
+                name="Read",
+                monotonic=lambda: 1.125,
+            )
 
         recs = [r for r in caplog.records if r.name == "sdk"]
         assert len(recs) == 1
@@ -128,23 +143,22 @@ class TestLogToolResult:
         assert "idx=2" in msg
         assert "name=Read" in msg
         assert "ok=True" in msg
-        m = re.search(r"ms=(\d+)", msg)
-        assert m, msg
-        assert int(m.group(1)) >= 99  # allow 1 ms slop
+        assert "ms=125" in msg
 
 
 class TestLogTurnDone:
     def test_emits_info_with_cost_and_tokens(self, caplog):
-        import time
         from sdk_logging import log_turn_done
         sdk_msg = MagicMock()
         sdk_msg.num_turns = 3
         sdk_msg.total_cost_usd = 0.0042
         sdk_msg.usage = {"input_tokens": 1234, "output_tokens": 567}
-        started_ms = (time.monotonic() * 1000) - 250
-
         with caplog.at_level(logging.INFO, logger="sdk"):
-            log_turn_done(sdk_msg, started_ms=started_ms)
+            log_turn_done(
+                sdk_msg,
+                started_ms=1000.0,
+                monotonic=lambda: 1.250,
+            )
 
         recs = [r for r in caplog.records if r.name == "sdk"]
         assert len(recs) == 1
@@ -157,11 +171,11 @@ class TestLogTurnDone:
         # E2: cache fields default to 0 when the usage dict omits them.
         assert "cache_read=0" in msg
         assert "cache_write=0" in msg
+        assert "ms=250" in msg
 
     def test_emits_cache_token_fields(self, caplog):
         """E2: cache_read/cache_write come from the Anthropic usage keys so a
         cached prompt's low in_tok with real cost is explainable."""
-        import time
         from sdk_logging import log_turn_done
         sdk_msg = MagicMock()
         sdk_msg.num_turns = 1
@@ -171,15 +185,73 @@ class TestLogTurnDone:
             "cache_read_input_tokens": 18500,
             "cache_creation_input_tokens": 1200,
         }
-        started_ms = (time.monotonic() * 1000) - 100
-
         with caplog.at_level(logging.INFO, logger="sdk"):
-            log_turn_done(sdk_msg, started_ms=started_ms)
+            log_turn_done(
+                sdk_msg,
+                started_ms=1000.0,
+                monotonic=lambda: 1.100,
+            )
 
         msg = [r for r in caplog.records if r.name == "sdk"][0].getMessage()
         assert "in_tok=3" in msg
         assert "cache_read=18500" in msg
         assert "cache_write=1200" in msg
+
+
+class TestVoiceToolLoopStop:
+    @pytest.mark.asyncio
+    async def test_logs_reason_and_counts_without_tool_payload(self, caplog):
+        from agent import Agent
+        from claude_agent_sdk import (
+            AssistantMessage,
+            ToolResultBlock,
+            ToolUseBlock,
+            UserMessage,
+        )
+        from error_kinds import VoiceToolLoopError
+        from voice_turn_guard import VoiceTurnGuard
+
+        secret = "SECRET_VALIDATION_RESULT"
+        agent = Agent.__new__(Agent)
+        on_message, _state = agent._make_on_message(
+            None,
+            VoiceTurnGuard.ha_direct(),
+        )
+
+        async def tool_round(tool_id: str) -> None:
+            await on_message(AssistantMessage(
+                content=[ToolUseBlock(
+                    id=tool_id,
+                    name="mcp__homeassistant__GetLiveContext",
+                    input={"domain": "light"},
+                )],
+                model="claude-haiku-4-5",
+            ))
+            await on_message(UserMessage(content=[ToolResultBlock(
+                tool_use_id=tool_id,
+                content=f"InputValidationError {secret}",
+                is_error=True,
+            )]))
+
+        await tool_round("tool-1")
+        with caplog.at_level(logging.INFO, logger="agent"):
+            with pytest.raises(
+                VoiceToolLoopError,
+                match="validation_correction_exhausted",
+            ):
+                await tool_round("tool-2")
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "agent" and "voice_tool_loop_stop" in record.getMessage()
+        ]
+        assert messages == [
+            "voice_tool_loop_stop "
+            "reason=validation_correction_exhausted "
+            "live_context_successes=0 validation_failures=2"
+        ]
+        assert secret not in caplog.text
 
 
 class TestLogSystemInit:

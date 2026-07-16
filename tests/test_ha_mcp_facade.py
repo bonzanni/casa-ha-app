@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import asynccontextmanager
 from typing import Any, Callable
 
@@ -187,16 +188,19 @@ def make_facade(
     session: FakeHaSession | SessionSequence,
     *,
     on_schema_change: SchemaChangeRecorder | None = None,
+    monotonic=None,
 ) -> HomeAssistantFacade:
     session_factory = (
         session if isinstance(session, SessionSequence)
         else lambda: fake_connection(session)
     )
+    kwargs = {"monotonic": monotonic} if monotonic is not None else {}
     return HomeAssistantFacade(
         "http://ha/mcp",
         {"Authorization": "Bearer secret"},
         on_schema_change=on_schema_change,
         session_factory=session_factory,
+        **kwargs,
     )
 
 
@@ -409,6 +413,40 @@ async def test_action_proxy_preserves_arguments_exactly():
 
 
 @pytest.mark.asyncio
+async def test_facade_call_logs_only_tool_status_and_monotonic_ms(caplog):
+    secret_argument = "SECRET_HA_ARGUMENT"
+    secret_response = "SECRET_HA_RESPONSE"
+    clock = iter((10.0, 10.125))
+    upstream = FakeHaSession(
+        tools=[action_tool("HassTurnOff")],
+        results={"HassTurnOff": text_result(secret_response)},
+    )
+    facade = make_facade(upstream, monotonic=lambda: next(clock))
+
+    await facade.start()
+    try:
+        with caplog.at_level(logging.INFO, logger="ha_mcp_facade"):
+            await invoke_sdk_tool(
+                facade.server_config,
+                "HassTurnOff",
+                {"name": secret_argument},
+            )
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "ha_mcp_facade"
+            and "ha_facade_call" in record.getMessage()
+        ]
+        assert messages == [
+            "ha_facade_call tool=HassTurnOff ok=True ms=125"
+        ]
+        assert secret_argument not in caplog.text
+        assert secret_response not in caplog.text
+    finally:
+        await facade.aclose()
+
+
+@pytest.mark.asyncio
 async def test_transport_failure_returns_fixed_error_and_refreshes_once(caplog):
     failed = FakeHaSession(
         tools=[action_tool("HassTurnOn")],
@@ -421,16 +459,22 @@ async def test_transport_failure_returns_fixed_error_and_refreshes_once(caplog):
     healthy = FakeHaSession(tools=[action_tool("HassTurnOn")])
     sessions = SessionSequence(failed, healthy)
     changed = SchemaChangeRecorder()
-    facade = make_facade(sessions, on_schema_change=changed)
+    clock = iter((20.0, 20.250))
+    facade = make_facade(
+        sessions,
+        on_schema_change=changed,
+        monotonic=lambda: next(clock),
+    )
 
     await facade.start()
     try:
         original_config = facade.server_config
-        result = await invoke_sdk_tool(
-            original_config,
-            "HassTurnOn",
-            {"name": "private office"},
-        )
+        with caplog.at_level(logging.INFO, logger="ha_mcp_facade"):
+            result = await invoke_sdk_tool(
+                original_config,
+                "HassTurnOn",
+                {"name": "private office"},
+            )
         assert result == {
             "content": [{
                 "type": "text",
@@ -451,6 +495,12 @@ async def test_transport_failure_returns_fixed_error_and_refreshes_once(caplog):
         assert "Bearer secret" not in caplog.text
         assert "secret-bearing transport detail" not in caplog.text
         assert "private office" not in caplog.text
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "ha_mcp_facade"
+            and "ha_facade_call" in record.getMessage()
+        ] == ["ha_facade_call tool=HassTurnOn ok=False ms=250"]
     finally:
         await facade.aclose()
 

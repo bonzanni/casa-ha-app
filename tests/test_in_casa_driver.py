@@ -388,7 +388,11 @@ class TestInCasaStart:
         msgs = [r.getMessage() for r in caplog.records if r.name == "sdk"]
         assert any("system_init" in m and "model=sonnet" in m for m in msgs), msgs
         assert any("assistant_message idx=1" in m and "tool_uses=1" in m for m in msgs), msgs
-        assert any("tool_use idx=1" in m and "name=Read" in m and "target=/x.yaml" in m for m in msgs), msgs
+        assert any(
+            "tool_use idx=1" in m and "name=Read" in m and "ms=" in m
+            for m in msgs
+        ), msgs
+        assert "/x.yaml" not in caplog.text
         assert any("tool_result idx=1" in m and "ok=True" in m for m in msgs), msgs
         assert any("turn_done" in m and "turns=1" in m for m in msgs), msgs
 

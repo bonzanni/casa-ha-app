@@ -327,12 +327,6 @@ class SdkClientPool:
                         if stale:
                             on_stale_old(stale)
                     options = await build_options(is_fresh, resume_sid)
-                    # Finding 4 (final-review): one INFO per cold connect;
-                    # warm reuse stays silent (hot path).
-                    logger.info(
-                        "pool cold connect key=%s resume=%s",
-                        channel_key, bool(resume_sid),
-                    )
                     fresh_client = ManagedSdkClient(
                         options,
                         origin_ctxvar=self._origin_ctxvar,
@@ -343,7 +337,16 @@ class SdkClientPool:
                     )
                     fresh_client.lock = entry.lock    # keep the held lock
                     fresh_client.sid = resume_sid
+                    connect_started_ms = self._monotonic() * 1000
                     await fresh_client.open()
+                    # Finding 4 (final-review): one INFO per successful cold
+                    # connect; warm reuse stays silent (hot path).
+                    logger.info(
+                        "pool cold connect key=%s resume=%s ms=%d",
+                        channel_key,
+                        bool(resume_sid),
+                        int(self._monotonic() * 1000 - connect_started_ms),
+                    )
                     async with self._pool_lock:
                         self._entries[channel_key] = fresh_client
                     entry = fresh_client

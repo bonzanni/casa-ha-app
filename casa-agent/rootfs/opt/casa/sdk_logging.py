@@ -110,16 +110,22 @@ def log_assistant_message(sdk_msg: AssistantMessage, *, idx: int) -> None:
     )
 
 
-def log_tool_use(block: ToolUseBlock, *, idx: int) -> None:
-    """DEBUG ``tool_use idx=N name=<name> target=<target>``."""
+def log_tool_use(
+    block: ToolUseBlock,
+    *,
+    idx: int,
+    started_ms: float,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    """DEBUG ``tool_use idx=N name=<name> ms=N`` from the turn anchor."""
     name = getattr(block, "name", "?")
-    target = extract_tool_target(block)
-    logger.debug("tool_use idx=%d name=%s target=%s", idx, name, target)
+    elapsed = int(monotonic() * 1000 - started_ms)
+    logger.debug("tool_use idx=%d name=%s ms=%d", idx, name, elapsed)
 
 
 def log_tool_result(
     block: ToolResultBlock, *, idx: int, started_ms: float,
-    name: str = "",
+    name: str = "", monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
     """DEBUG ``tool_result idx=N name=<name> ok=<bool> ms=N``.
 
@@ -127,7 +133,7 @@ def log_tool_result(
     the per-turn anchor captured by the caller).
     """
     is_error = bool(getattr(block, "is_error", False))
-    now_ms = time.monotonic() * 1000
+    now_ms = monotonic() * 1000
     elapsed = int(now_ms - started_ms)
     logger.debug(
         "tool_result idx=%d name=%s ok=%s ms=%d",
@@ -135,7 +141,12 @@ def log_tool_result(
     )
 
 
-def log_turn_done(sdk_msg: ResultMessage, *, started_ms: float) -> None:
+def log_turn_done(
+    sdk_msg: ResultMessage,
+    *,
+    started_ms: float,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
     """INFO ``turn_done turns=N cost_usd=N.NNNN in_tok=N out_tok=N
     cache_read=N cache_write=N ms=N``.
 
@@ -151,7 +162,7 @@ def log_turn_done(sdk_msg: ResultMessage, *, started_ms: float) -> None:
     out_tok = int(usage.get("output_tokens", 0) or 0)
     cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
     cache_write = int(usage.get("cache_creation_input_tokens", 0) or 0)
-    now_ms = time.monotonic() * 1000
+    now_ms = monotonic() * 1000
     elapsed = int(now_ms - started_ms)
     logger.info(
         "turn_done turns=%d cost_usd=%.4f in_tok=%d out_tok=%d "

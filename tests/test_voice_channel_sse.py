@@ -67,6 +67,7 @@ class _DummyMemory:
 
 @pytest.fixture
 async def voice_app():
+    telemetry_clock = iter((10.0, 10.125))
     bus = MessageBus()
     agent = StubAgent(bus, "butler")
     bus.register("butler", agent.handle_message)
@@ -81,6 +82,7 @@ async def voice_app():
         agent_configs={"butler": _FakeAgentConfig()},
         memory=_DummyMemory(),
         idle_timeout=300,
+        monotonic=lambda: next(telemetry_clock),
     )
 
     app = web.Application(middlewares=[cid_middleware])
@@ -218,6 +220,33 @@ class TestSSE:
         events = [f["event"] for f in frames]
         assert "block" in events
         assert events[-1] == "done"
+
+    async def test_first_real_block_logs_once_from_ingress_with_fake_clock(
+        self, voice_app, caplog,
+    ):
+        client, _ = voice_app
+        secret = "SECRET_SSE_PROMPT"
+        with caplog.at_level(logging.INFO, logger="channels.voice.channel"):
+            resp = await client.post(
+                "/api/converse",
+                json={
+                    "prompt": secret,
+                    "agent_role": "butler",
+                    "scope_id": "latency-sse",
+                },
+            )
+            await resp.read()
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "channels.voice.channel"
+            and "voice_first_block" in record.getMessage()
+        ]
+        assert messages == [
+            "voice_first_block role=butler transport=sse ms=125"
+        ]
+        assert secret not in caplog.text
 
     async def test_unknown_agent_role_404(self, voice_app):
         client, _ = voice_app
