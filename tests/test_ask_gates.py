@@ -553,6 +553,112 @@ class TestMarkerCancellationWedge:
         await wired["broker"].drain_hooks()
 
 
+class TestCancelledIntentTombstone:
+    """§A3 wave 2 — B1/B2: a transport CANCELLATION between arming/registering an
+    ask intent and its post must tombstone the intent AND record a ``cancelled``
+    outcome, so (B1) the armed intent is no longer matchable (the relay
+    consume-cancels it — nothing posts) and a DIFFERENT ask can post exactly
+    once, and (B2) a SAME-request_id retry short-circuits to the recorded
+    outcome instead of hanging on the transport budget (anchor) / registering a
+    fresh broker request (button)."""
+
+    async def test_cancel_after_arm_before_post_tombstones_anchor_intent(
+        self, wired,
+    ):
+        # B1: the anchor is ARMED and awaiting the relay-deferred post (the relay
+        # has NOT reached the block — ``post_for_block`` not called yet).
+        eid, drv = wired["rec"].id, wired["drv"]
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "a1"            # marker armed
+        assert wired["chan"].anchors == []              # nothing posted yet
+        t1.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t1
+        # Marker cleared AND the armed intent tombstoned with a cancelled outcome.
+        assert drv.ask_inflight(eid) is None
+        assert drv.send_intent_outcome(eid, "a1") == {
+            "ok": False, "error": "cancelled"}
+        # The relay reaching the (now-tombstoned) block posts NOTHING.
+        await wired["seq"].post_for_block(ASK_TOOL, _ANCHOR_HASH)
+        assert wired["chan"].anchors == []
+        # A second, DIFFERENT ask posts EXACTLY once.
+        t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
+        resp2 = await _drive_anchor(wired, t2, hash="anchor-hash-2")
+        assert _body(resp2)["outcome"] == "anchored"
+        assert len(wired["chan"].anchors) == 1
+        # A same-id retry gets the recorded cancelled outcome verbatim (no hang).
+        resp_retry = await asyncio.wait_for(
+            wired["ask"](_FakeRequest(_anchor_payload(eid, "a1"))), timeout=1.0)
+        assert _body(resp_retry) == {"ok": False, "error": "cancelled"}
+
+    async def test_cancel_mid_allocation_same_id_retry_short_circuits_anchor(
+        self, wired, monkeypatch,
+    ):
+        # B2 (anchor): cancel WHILE the number allocation is in flight — the
+        # PENDING intent must be tombstoned so a SAME-request_id retry does not
+        # hang on the transport budget waiting for a never-armed intent.
+        eid, drv = wired["rec"].id, wired["drv"]
+        gate = asyncio.Event()
+
+        async def _slow(_eid):
+            await gate.wait()
+            return 1
+
+        monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "cx"))))
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "cx"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert drv.ask_inflight(eid) is None
+        assert drv.send_intent_outcome(eid, "cx") == {
+            "ok": False, "error": "cancelled"}
+        # SAME request_id retry short-circuits to the recorded outcome — no hang,
+        # no fresh post.
+        gate.set()
+        resp = await asyncio.wait_for(
+            wired["ask"](_FakeRequest(_anchor_payload(eid, "cx"))), timeout=1.0)
+        assert _body(resp) == {"ok": False, "error": "cancelled"}
+        assert wired["chan"].anchors == []
+
+    async def test_cancel_mid_allocation_same_id_retry_short_circuits_button(
+        self, wired, monkeypatch,
+    ):
+        # B2 (button): a same-request_id retry must NOT register a fresh broker
+        # request (which would burn the full timeout with no keyboard).
+        eid, drv = wired["rec"].id, wired["drv"]
+        gate = asyncio.Event()
+
+        async def _slow(_eid):
+            await gate.wait()
+            return 1
+
+        monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(eid, "cx"))))
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "cx"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert drv.ask_inflight(eid) is None
+        assert drv.send_intent_outcome(eid, "cx") == {
+            "ok": False, "error": "cancelled"}
+        gate.set()
+        resp = await asyncio.wait_for(
+            wired["ask"](_FakeRequest(_btn_payload(eid, "cx"))), timeout=1.0)
+        assert _body(resp) == {"ok": False, "error": "cancelled"}
+        # No broker request was created — no timeout burn, no keyboard.
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=eid) == []
+        assert wired["chan"].keyboards == []
+
+
 class TestPostAddGenRecheck:
     async def test_gen_bump_between_reserve_and_add_marks_answered(
         self, wired, monkeypatch,

@@ -606,14 +606,60 @@ def _record_intent_unread_refusal(
         cancel(eng_id, request_id)
 
 
+def _record_intent_cancelled(driver: Any, eng_id: str, request_id: str) -> None:
+    """B1/B2 (§A3 wave 2): a transport CANCELLATION between arming/registering an
+    ask intent and its post TOMBSTONES the intent AND records a terminal
+    ``cancelled`` outcome. Two failures are closed at once:
+
+    * the armed/pending intent stays MATCHABLE as a tombstone, so the relay
+      consume-cancels its block (NOTHING posts) — a marker cleared without this
+      would let a DIFFERENT ask pass the gate while the armed original still
+      posts (the one-question invariant broken, B1);
+    * a same-``request_id`` retry reads this recorded outcome via the reattach
+      path (``_refused_intent_outcome`` recognises ``cancelled``) and
+      short-circuits — never awaiting a never-armed intent to the transport
+      budget (anchor hang, B2) nor registering a fresh broker request (button
+      timeout burn, B2).
+
+    NO-OP once the intent already RESOLVED (a concurrent relay post won the
+    race) — never clobber a posted/compensated outcome. Getattr-tolerant and
+    swallows its own errors: an intent-cleanup failure must never mask the
+    original cancellation being re-raised."""
+    if driver is None:
+        return
+    outcome_fn = getattr(driver, "send_intent_outcome", None)
+    if outcome_fn is not None:
+        try:
+            if outcome_fn(eng_id, request_id) is not None:
+                return  # already resolved (posted / compensated) — don't clobber
+        except Exception:  # noqa: BLE001 — degrade to attempting the tombstone
+            logger.debug("send_intent_outcome read failed", exc_info=True)
+    rec = getattr(driver, "record_send_intent_refusal", None)
+    if rec is not None:
+        try:
+            rec(eng_id, request_id, {"ok": False, "error": "cancelled"})
+            return
+        except Exception:  # noqa: BLE001 — fall back to a bare tombstone
+            logger.debug("record_send_intent_refusal(cancelled) failed",
+                         exc_info=True)
+    cancel = getattr(driver, "cancel_send_intent", None)
+    if cancel is not None:
+        try:
+            cancel(eng_id, request_id)
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            logger.debug("cancel_send_intent failed", exc_info=True)
+
+
 def _refused_intent_outcome(prior: Any) -> bool:
     """True iff a reattached intent's recorded outcome is a refusal the retry
-    returns verbatim — an operator-away refusal (Finding 1) OR an unread-inbound
-    refusal (Sol A2 wave-3, Finding 3). Both are terminal recorded outcomes; the
-    retry returns them as-is rather than awaiting the dead intent."""
+    returns verbatim — an operator-away refusal (Finding 1), an unread-inbound
+    refusal (Sol A2 wave-3, Finding 3), OR a CANCELLED tombstone (§A3 wave 2,
+    B1/B2: a transport cancellation between arm/register and post). All are
+    terminal recorded outcomes; the retry returns them as-is rather than
+    awaiting the dead intent or re-registering a fresh broker request."""
     return (
         isinstance(prior, dict)
-        and prior.get("error") in ("operator_away", "unread_inbound")
+        and prior.get("error") in ("operator_away", "unread_inbound", "cancelled")
     )
 
 
@@ -1109,6 +1155,13 @@ def _make_ask(
                 # clear is a no-op once durable ownership took over (add_open_question
                 # clears it synchronously), so it is safe on every path.
                 _clear_ask_marker(driver, eng_id, request_id)
+                # B2 (wave 2): the PENDING intent (registered, not yet armed) is
+                # still matchable — a same-request_id retry would hang on the
+                # transport budget waiting for a never-armed intent (→
+                # delivery_failed). Tombstone it + record a cancelled outcome so
+                # the retry short-circuits to the recorded outcome.
+                if created_intent:
+                    _record_intent_cancelled(driver, eng_id, request_id)
                 raise
             # W-R3: canonical body (anchor ⇒ options == [] ⇒ numbered question
             # ALONE, no option list — unchanged from the pre-W-R3 anchor copy).
@@ -1196,7 +1249,21 @@ def _make_ask(
                     # ARM, and AWAIT the outcome fail-closed (F3/F5).
                     driver.set_send_intent_poster(eng_id, request_id, _post_anchor)
                     driver.arm_send_intent(eng_id, request_id)
-                    outcome = await _await_deferred_post(driver, eng_id, request_id)
+                    try:
+                        outcome = await _await_deferred_post(
+                            driver, eng_id, request_id)
+                    except BaseException:
+                        # B1 (wave 2): a transport CANCELLATION after ARM but
+                        # BEFORE the relay posts would leave the armed intent
+                        # live+matchable while the finally clears the ingress
+                        # marker — a DIFFERENT ask then passes the gate and BOTH
+                        # could post (one-question invariant broken). Tombstone the
+                        # armed intent + record a cancelled outcome so the relay
+                        # consume-cancels the block (nothing posts) and a same-id
+                        # retry reads the recorded outcome (no-op once the relay
+                        # already resolved it). Marker cleared by the finally.
+                        _record_intent_cancelled(driver, eng_id, request_id)
+                        raise
                     # §A3(c): the compensated add-failure maps to ok:false
                     # internal_error (the wire message exists but the question was
                     # withdrawn) — distinct from a plain delivery_failed.
@@ -1371,6 +1438,13 @@ def _make_ask(
             # before re-raising. Durable ownership disarms this by clearing the
             # marker itself synchronously at register.
             _clear_ask_marker(driver, eng_id, request_id)
+            # B2 (wave 2): the PENDING intent stays matchable — a same-request_id
+            # button retry would reattach, find no recorded outcome, and register a
+            # FRESH broker request that never posts (full timeout burn, no
+            # keyboard). Tombstone it + record a cancelled outcome so the retry
+            # short-circuits before touching the broker.
+            if intent_registered:
+                _record_intent_cancelled(driver, eng_id, request_id)
             raise
         # W-R3 (Sol r1-5): the SINGLE canonical body — full options VERBATIM,
         # numbered, below the question. This exact string feeds the keyboard

@@ -460,6 +460,55 @@ class TestCrashResidual:
 
 
 # ===========================================================================
+# 5b. B3 (wave 2) — an ABSENT fresh re-read is ALREADY RESOLVED: SKIP, never
+#     fall back to the captured snapshot (its answered=False would ⌛-overwrite
+#     a ✅ settle on a message that is already done).
+# ===========================================================================
+
+
+class TestB3FreshReadOnlyReconcile:
+    async def test_reconcile_skips_entry_settled_after_snapshot(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire)
+        drv._ensure_sequencer(rec)
+
+        # Snapshot captured while the entry is live (answered=False).
+        snapshot = reg.open_question_entries(rec.id)
+        assert snapshot and snapshot[0]["n"] == n
+
+        # The question is ANSWERED + settled + CLOSED (removed) between the
+        # snapshot capture and this readiness-gated reconcile.
+        await reg.mark_question_answered(rec.id, n)
+        await reg.close_open_question(rec.id, n)
+        assert reg.open_question_entries(rec.id) == []
+
+        # B3: reconcile must make ZERO edits — the fresh re-read is absent (already
+        # resolved), so it SKIPS rather than settling the stale snapshot copy.
+        await drv.reconcile_open_questions(rec, snapshot)
+        assert wire.edits == []
+
+    async def test_settle_open_anchor_skips_absent_numbered_entry(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire)
+        drv._ensure_sequencer(rec)
+
+        # A captured anchor snapshot whose NUMBERED entry is NOT in the ledger
+        # (already settled + removed). The in-lock fresh re-read finds nothing.
+        stale = {
+            "n": 7, "tg_message_id": 500, "stale_mids": [], "kind": "anchor",
+            "answered": False, "text": "Q7: name?",
+        }
+        # B3: the settle path skips (returns None) rather than re-editing mid 500
+        # from the captured fallback dict.
+        amid = await drv._settle_open_anchor(rec, anchor=stale)
+        assert amid is None
+        assert wire.edits == []
+
+
+# ===========================================================================
 # 6. boundary consumers
 # ===========================================================================
 

@@ -2498,6 +2498,18 @@ class ClaudeCodeDriver(DriverProtocol):
                 n = q.get("n")
                 fresh = (self._reread_open_question(rec.id, n)
                          if n is not None else None)
+                if fresh is None and n is not None:
+                    # B3 (wave 2): a NUMBERED snapshot entry ABSENT on the in-lock
+                    # fresh re-read was ALREADY resolved (settled + removed) between
+                    # snapshot capture and this readiness-gated pass. SKIP — never
+                    # fall back to the stale snapshot, whose ``answered=False`` would
+                    # ⌛-overwrite a ✅ settle on a message that is already done.
+                    logger.debug(
+                        "boot reconcile: Q%s absent on fresh re-read (already "
+                        "resolved) — skipping (eng=%s)", n, rec.id[:8])
+                    continue
+                # A legacy no-number snapshot entry (``n is None``) cannot be
+                # re-read; settle it from the snapshot as before.
                 entry = fresh if fresh is not None else q
                 answered = bool(entry.get("answered", False)) or \
                     self._overlay_answered(rec.id, n)
@@ -2565,6 +2577,16 @@ class ClaudeCodeDriver(DriverProtocol):
         legacy no-number entry (``n is None``) settles the ``fallback`` dict."""
         entry = self._reread_open_question(engagement.id, n) if n is not None else None
         if entry is None:
+            if n is not None:
+                # B3 (wave 2): a NUMBERED entry ABSENT on the fresh re-read was
+                # ALREADY resolved (settled + removed) — SKIP, never re-edit from
+                # the captured ``fallback`` snapshot (its ``answered=False`` would
+                # ⌛-overwrite a ✅ settle). The ``fallback`` is ONLY for a legacy
+                # no-number entry (``n is None``), which cannot be re-read.
+                logger.debug(
+                    "settle: anchor Q%s absent on fresh re-read (already "
+                    "resolved) — skipping (eng=%s)", n, engagement.id[:8])
+                return None
             entry = fallback
         if entry is None:
             return None

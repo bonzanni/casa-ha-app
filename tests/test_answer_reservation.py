@@ -830,6 +830,43 @@ class TestFourthConsumerReanchorMatrix:
         assert reg.open_question_entries(rec.id) == []
 
 
+class TestM4NoticeAwaitCancellation:
+    """§A3 wave 2 — M4: a CancelledError while AWAITING the ``Turn failed``
+    notice must NOT leak the answered reservation. The rollback is guaranteed by
+    a try/finally around the notice (the CancelledError still propagates)."""
+
+    async def test_cancel_during_failure_notice_rolls_back_reservation(
+        self, tmp_path, fake_telegram_bot,
+    ):
+        ch, reg, rec, drv, seq, wire, n = await _handler_ctx_seq(
+            tmp_path, fake_telegram_bot)
+        # Reserve the answer (as the handler does synchronously at entry).
+        token = drv.reserve_answer(rec.id)
+        assert token is not None
+        assert drv._answer_reservations.get(rec.id) is not None
+
+        # Delivery raises a NON-terminal Exception → reach the failure-notice
+        # block; the notice await BLOCKS so we can cancel mid-await.
+        ch._driver_send_user_turn = AsyncMock(side_effect=RuntimeError("boom"))
+        entered = asyncio.Event()
+
+        async def _blocking_notice(_rec, _text):
+            entered.set()
+            await asyncio.Event().wait()      # block until cancelled
+
+        ch._driver_post_notice = _blocking_notice
+
+        task = asyncio.ensure_future(ch._deliver_turn_bg(
+            rec, "answer", tg_message_id=999, answer_token=token))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # M4: the reservation was rolled back despite the cancellation.
+        assert drv._answer_reservations.get(rec.id) is None
+
+
 class TestHandlerDelivery:
     async def test_accepted_delivery_keeps_reservation_for_bg_owner(
         self, tmp_path, fake_telegram_bot,

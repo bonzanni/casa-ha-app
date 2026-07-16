@@ -1489,10 +1489,16 @@ class TelegramChannel(Channel):
                 await self._post_engagement_notice(rec, f"Turn failed: {exc}")
             except Exception:  # noqa: BLE001 — best-effort user notice
                 pass
-            # Sol r12-1: rollback AFTER the platform notice — the rollback
-            # consumer re-anchors the question, and the re-posted question must
-            # land BELOW the notice (last item), never above it.
-            await self._rollback_answer(rec, answer_token)
+            finally:
+                # M4 (§A3 wave 2): a CancelledError while AWAITING the notice
+                # bypasses ``except Exception`` — without a finally the rollback
+                # below never runs and the answered reservation LEAKS (the anchor
+                # stays invisibly 'answered'). Guarantee the rollback here so it
+                # runs on both the normal and the cancelled paths; a CancelledError
+                # still propagates after. Sol r12-1 ordering preserved: rollback
+                # runs AFTER the notice attempt, so a rollback consumer's re-posted
+                # question lands BELOW the notice.
+                await self._rollback_answer(rec, answer_token)
             return
         # §A3: a durable-enqueue REJECTION (capacity drop / spool-write error)
         # rolls the reservation back; an accepted enqueue already promoted it.
