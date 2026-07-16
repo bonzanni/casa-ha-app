@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,32 @@ import pytest
 import yaml
 
 pytestmark = pytest.mark.unit
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+HA_E2E_SCRIPT = REPO_ROOT / "test-local/e2e/test_ha_delegation.sh"
+E2E_PYTHON_RESOLVER = REPO_ROOT / "test-local/e2e/resolve_python.sh"
+
+
+def _write_fake_python(path: Path, body: str = "exit 0") -> None:
+    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _run_python_resolver(
+    shared_root: Path,
+    *,
+    env: dict[str, str],
+    timeout: float = 3,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(E2E_PYTHON_RESOLVER), str(shared_root)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
 
 
 def test_tina_facade_option_defaults_on_with_optional_bool_schema_and_copy():
@@ -39,16 +66,111 @@ def test_tina_facade_option_defaults_on_with_optional_bool_schema_and_copy():
 
 
 def test_ha_mock_e2e_pins_eager_facade_contract():
-    root = Path(__file__).resolve().parents[1]
-    script = (
-        root / "test-local/e2e/test_ha_delegation.sh"
-    ).read_text(encoding="utf-8")
+    script = HA_E2E_SCRIPT.read_text(encoding="utf-8")
 
     assert "MOCK_HA_MALFORMED_TOOL=1" in script
     assert "HomeAssistantFacade" in script
     assert "tools/list after resident connect" in script
     assert '"name": "GetLiveContext", "arguments": {}' in script
     assert "guard bound exceeded" in script
+
+
+def test_e2e_python_resolver_prefers_explicit_override(tmp_path):
+    shared_root = tmp_path / "shared"
+    shared_python = shared_root / "venv_test/bin/python3"
+    shared_python.parent.mkdir(parents=True)
+    _write_fake_python(shared_python)
+    override = tmp_path / "override-python"
+    _write_fake_python(override)
+    env = {**os.environ, "E2E_PYTHON": str(override)}
+
+    result = _run_python_resolver(shared_root, env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(override)
+    assert result.stderr == ""
+
+
+def test_e2e_python_resolver_falls_back_to_path_without_shared_venv(tmp_path):
+    shared_root = tmp_path / "shared-without-venv"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    path_python = fake_bin / "python3"
+    _write_fake_python(path_python)
+    env = dict(os.environ)
+    env.pop("E2E_PYTHON", None)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = _run_python_resolver(shared_root, env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(path_python)
+    assert result.stderr == ""
+
+
+def test_e2e_python_resolver_rejects_nonexecutable_override(tmp_path):
+    override = tmp_path / "not-executable"
+    override.write_text("not executable\n", encoding="utf-8")
+    env = {**os.environ, "E2E_PYTHON": str(override)}
+
+    result = _run_python_resolver(tmp_path / "shared", env=env)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "not executable" in result.stderr
+
+
+def test_e2e_python_resolver_reports_aiohttp_dependency_without_detail(
+    tmp_path,
+):
+    override = tmp_path / "python-without-aiohttp"
+    _write_fake_python(
+        override,
+        'printf "SECRET_DEPENDENCY_DETAIL" >&2; exit 7',
+    )
+    env = {**os.environ, "E2E_PYTHON": str(override)}
+
+    result = _run_python_resolver(tmp_path / "shared", env=env)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "cannot import aiohttp" in result.stderr
+    assert "SECRET_DEPENDENCY_DETAIL" not in result.stderr
+
+
+def test_e2e_python_resolver_bounds_aiohttp_import_check(tmp_path):
+    override = tmp_path / "hanging-python"
+    _write_fake_python(override, "sleep 10")
+    env = {
+        **os.environ,
+        "E2E_PYTHON": str(override),
+        "E2E_PYTHON_CHECK_TIMEOUT": "0.1",
+    }
+
+    result = _run_python_resolver(
+        tmp_path / "shared",
+        env=env,
+        timeout=2,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "aiohttp check timed out after 0.1" in result.stderr
+
+
+def test_ha_mock_e2e_bounds_every_mock_reset_and_history_curl():
+    normalized = " ".join(HA_E2E_SCRIPT.read_text(encoding="utf-8").split())
+
+    history = (
+        'curl -sf --max-time 2 '
+        '"http://localhost:${MOCK_HA_PORT}/_calls"'
+    )
+    reset = (
+        'curl -sf --max-time 2 -X POST '
+        '"http://localhost:${MOCK_HA_PORT}/_reset"'
+    )
+    assert normalized.count(history) == 4
+    assert normalized.count(reset) == 2
 
 
 @pytest.fixture

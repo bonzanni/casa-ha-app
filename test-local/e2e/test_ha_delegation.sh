@@ -33,9 +33,9 @@ case "$GIT_COMMON_DIR" in
     *) GIT_COMMON_DIR="$REPO_ROOT/$GIT_COMMON_DIR" ;;
 esac
 SHARED_REPO_ROOT="$(cd "$(dirname "$GIT_COMMON_DIR")" && pwd)"
-E2E_PYTHON="${E2E_PYTHON:-$SHARED_REPO_ROOT/venv_test/bin/python3}"
-[ -x "$E2E_PYTHON" ] \
-    || fail "shared test interpreter missing: $E2E_PYTHON (run make setup)"
+if ! E2E_PYTHON="$(bash "$HERE/resolve_python.sh" "$SHARED_REPO_ROOT")"; then
+    exit 1
+fi
 MOCK_HA_PORT="${MOCK_HA_PORT:-8200}"
 MOCK_HA_PID=""
 NAME="casa-ha-deleg-$$"
@@ -87,7 +87,8 @@ pass "H-1: CASA_HA_MCP_URL override threaded to register_http"
 # H-2: resident facade → direct actions/state → mock HA call history
 # ============================================================
 log "H-2: eager facade actions/state stay within discovery + loop bounds"
-curl -sf -X POST "http://localhost:${MOCK_HA_PORT}/_reset" >/dev/null
+curl -sf --max-time 2 -X POST "http://localhost:${MOCK_HA_PORT}/_reset" \
+    >/dev/null
 
 if ! out=$(MSYS_NO_PATHCONV=1 docker exec -i \
         -e PYTHONPATH=/opt/casa \
@@ -228,7 +229,7 @@ fi
 printf '%s\n' "$out" | tail -1 | grep -qF '"status": "OK"' \
     || { printf '%s\n' "$out" | tail -10 >&2; fail "H-2: facade probe did not report OK"; }
 
-curl -sf "http://localhost:$MOCK_HA_PORT/_calls" \
+curl -sf --max-time 2 "http://localhost:${MOCK_HA_PORT}/_calls" \
     | "$E2E_PYTHON" -c '
 import json, sys
 actual = json.load(sys.stdin)
@@ -245,7 +246,8 @@ pass "H-2: direct off/on + normalized state query used one call each"
 # H-3: raw fallback agent_loader → SDK options → mock HA
 # ============================================================
 log "H-3: raw fallback still resolves butler grant + reaches mock HA"
-curl -sf -X POST "http://localhost:${MOCK_HA_PORT}/_reset" >/dev/null
+curl -sf --max-time 2 -X POST "http://localhost:${MOCK_HA_PORT}/_reset" \
+    >/dev/null
 
 MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c \
     "echo '"'[{"server":"homeassistant","tool":"HassTurnOn","args":{"name":"bedroom"}}]'"' > /data/mock_sdk_tool_invoke.json"
@@ -268,7 +270,7 @@ fi
 printf '%s\n' "$out" | tail -1 | grep -qF OK \
     || { printf '%s\n' "$out" | tail -10 >&2; fail "H-3: harness did not print OK"; }
 
-calls=$(curl -sf "http://localhost:${MOCK_HA_PORT}/_calls" \
+calls=$(curl -sf --max-time 2 "http://localhost:${MOCK_HA_PORT}/_calls" \
     | "$E2E_PYTHON" -c "import sys, json; print(len(json.load(sys.stdin)))")
 [ "$calls" -ge 1 ] \
     || fail "H-3: raw agent_loader→SDK chain did not reach mock HA (calls=$calls)"
