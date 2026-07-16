@@ -869,6 +869,153 @@ class TestDoubleCancelWave4:
         assert len(wired["chan"].anchors) == 1
 
 
+class TestPosterOwnsClearWave5:
+    """Sol A3 wave 5 — the poster OWNS the ``ask_inflight`` clear on EVERY
+    non-durable exit.
+
+    Wave 4 gated the handler's outer ``finally`` off when a transport cancel LOST
+    to an in-flight post (``_post_wins``): ownership of the marker transfers to
+    the winning poster, which clears it at durable ownership. But if the poster
+    then FAILS *before* durable ownership (the wire send raises / returns None →
+    the intent resolves ok:false), NOTHING cleared the marker: it wedged, and
+    every later ask/reply was refused ``question_pending`` until restart.
+
+    The fix wraps each poster body in try/finally so the poster itself clears the
+    marker (CAS) on every exit that did not reach durable ownership."""
+
+    async def test_post_wins_then_send_raises_clears_marker_anchor(
+        self, wired, monkeypatch,
+    ):
+        # Sol's exact interleaving: a1 arms and parks awaiting the relay post; the
+        # relay reaches the block and the poster blocks INSIDE the gated wire send
+        # (posting=True, writer lock held); the handler is cancelled ONCE (the sync
+        # cancel reads posting=True → NO-OPS → the post wins, _post_wins=True, the
+        # handler's finally is gated OFF); the gate releases with the wire send
+        # RAISING → the poster returns None BEFORE durable ownership.
+        eid, drv, seq, chan = (
+            wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
+        gate = asyncio.Event()
+        real_send = chan.send_response_to_topic
+
+        async def _gated_raising_send(topic_id, text):
+            await gate.wait()               # park the poster mid-post, lock held
+            raise RuntimeError("wire send failed after the cancel lost")
+
+        monkeypatch.setattr(chan, "send_response_to_topic", _gated_raising_send)
+
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "a1"
+
+        relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
+        await asyncio.sleep(0.02)
+        intent = seq.registry.by_request_id("a1")
+        assert intent.state == "armed" and intent.posting is True
+
+        # Cancel ONCE — the cancel loses (posting=True), the post wins.
+        t1.cancel()
+        await asyncio.sleep(0.02)
+        # The cancel is stalled behind the post → the marker still stands.
+        assert drv.ask_inflight(eid) == "a1"
+
+        # Release → the wire send RAISES → the poster returns None BEFORE durable
+        # ownership. Pre-fix: NOTHING clears the marker (handler finally gated off,
+        # poster raised out before its durable clear) → wedged. Post-fix: the
+        # poster's own finally clears it (CAS).
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await t1
+        await asyncio.wait_for(relay, timeout=1.0)
+
+        # Marker cleared; nothing posted; no live question; intent resolved ok:false.
+        assert drv.ask_inflight(eid) is None
+        assert chan.anchors == []
+        assert drv._effective_open_question_numbers(eid) == []
+        outcome = drv.send_intent_outcome(eid, "a1")
+        assert outcome is not None and outcome["ok"] is False
+
+        # A next, DIFFERENT ask is NOT wedged question_pending — it posts cleanly.
+        monkeypatch.setattr(chan, "send_response_to_topic", real_send)
+        t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
+        resp2 = await _drive_anchor(wired, t2, hash="anchor-hash-2")
+        assert _body(resp2)["outcome"] == "anchored"
+
+        # The cancelled handler's same-request_id retry short-circuits to the
+        # recorded failure outcome — no second post, no hang.
+        resp_retry = await asyncio.wait_for(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))), timeout=1.0)
+        assert _body(resp_retry)["ok"] is False
+        assert len(chan.anchors) == 1      # only a2 posted
+
+    async def test_post_wins_then_send_returns_none_clears_marker_anchor(
+        self, wired, monkeypatch,
+    ):
+        # Same race, but the wire send RETURNS None (not int) mid-post rather than
+        # raising — another non-durable poster exit that must clear the marker.
+        eid, drv, seq, chan = (
+            wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
+        gate = asyncio.Event()
+
+        async def _gated_none_send(topic_id, text):
+            await gate.wait()
+            return None
+
+        monkeypatch.setattr(chan, "send_response_to_topic", _gated_none_send)
+
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
+        await asyncio.sleep(0.02)
+        assert seq.registry.by_request_id("a1").posting is True
+
+        t1.cancel()
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "a1"        # the cancel lost
+
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await t1
+        await asyncio.wait_for(relay, timeout=1.0)
+
+        assert drv.ask_inflight(eid) is None        # poster owns the clear
+        assert drv.send_intent_outcome(eid, "a1")["ok"] is False
+
+    async def test_button_poster_failure_leaves_marker_clear(
+        self, wired, monkeypatch,
+    ):
+        # Button parity: durable ownership for a button ask is the BROKER.register-
+        # side marker clear, which runs BEFORE the poster. A poster failure (the
+        # keyboard post RAISES) therefore never wedges ask_inflight — and the
+        # poster's own finally is a belt-and-suspenders CAS no-op. A next ask is
+        # admitted (never refused question_pending).
+        eid, drv, chan = wired["rec"].id, wired["drv"], wired["chan"]
+        real_kbd = chan.post_options_keyboard
+
+        async def _boom(*, engagement_id, request_id, question, options, **k):
+            raise RuntimeError("keyboard post failed")
+
+        monkeypatch.setattr(chan, "post_options_keyboard", _boom)
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(eid, "b1"))))
+        await asyncio.sleep(0.02)
+        await wired["seq"].post_for_block(ASK_TOOL, _BTN_HASH)
+        resp1 = await asyncio.wait_for(t1, timeout=1.0)
+        assert _body(resp1)["ok"] is False
+        # The marker never wedged (cleared at register, before the poster ran).
+        assert drv.ask_inflight(eid) is None
+
+        # A next, DIFFERENT button ask is NOT refused question_pending — it drives
+        # to an answered resolution.
+        monkeypatch.setattr(chan, "post_options_keyboard", real_kbd)
+        t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(eid, "b2", hash="btn-hash-2"))))
+        resp2 = await _drive_button(wired, t2, "b2", hash="btn-hash-2")
+        assert _body(resp2)["outcome"] == "answered"
+
+
 class TestPostAddGenRecheck:
     async def test_gen_bump_between_reserve_and_add_marks_answered(
         self, wired, monkeypatch,

@@ -1325,80 +1325,107 @@ def _make_ask(
             display = render_ask_body(number, question, options)
 
             async def _post_anchor() -> int | None:
+                # A3 · F-ORDER (Sol A3 wave 5): once the post WINS a transport-
+                # cancel race (``_post_wins``), the handler's outer ``finally`` is
+                # gated OFF and the poster OWNS the ``ask_inflight`` clear. The
+                # ``finally`` below guarantees it on EVERY exit that did NOT reach
+                # durable ownership — the wire send raising / returning None, the
+                # add-failure compensation, a never-durable escape — so the marker
+                # can never wedge (a wedged marker refuses every later ask/reply
+                # ``question_pending`` until restart). ``_durable`` gates the clear
+                # off once durable ownership was reached in THIS invocation (the
+                # sync clear at that point already ran, and the ``finally`` would
+                # CAS-no-op anyway — but a running turn's later ⏳/settle awaits
+                # must not have the live anchor's marker stripped from under them).
+                _durable = False
                 try:
-                    mid = await telegram_channel.send_response_to_topic(
-                        rec.topic_id, display)
-                except Exception:  # noqa: BLE001
-                    logger.warning("free-text anchor post failed (eng=%s)",
-                                   eng_id[:8], exc_info=True)
-                    return None
-                if not isinstance(mid, int):
-                    return None
-                # DURABLE OWNERSHIP: register open_questions ONLY after a
-                # successful post (a crash before the relay reaches the block
-                # leaves NO dangling ledger entry). §A3(c) COMPENSATION (Sol
-                # r5-5/r6-1): an ``add_open_question`` failure AFTER the wire post
-                # leaves an orphan message — best-effort WITHDRAW-edit it via the
-                # RAW wire primitive (never edit_discrete — this poster runs under
-                # the sequencer lock on the relay task, no reacquisition) and
-                # account the COMPOUND outcome (``mark_send_intent_compensated``:
-                # high-water advances, intent resolves ok:false+compensated). The
-                # exception NEVER escapes the poster.
-                added = False
-                if number is not None:
-                    add = getattr(engagement_registry, "add_open_question", None)
-                    if add is not None:
-                        try:
-                            await add(eng_id, number, mid, text=display,
-                                      kind="anchor")
-                            added = True
-                        except Exception:  # noqa: BLE001
-                            logger.warning(
-                                "anchor add_open_question failed — withdrawing "
-                                "(eng=%s Q%s)", eng_id[:8], number, exc_info=True)
-                            await _withdraw_anchor(
-                                telegram_channel, rec.topic_id, mid)
-                            if driver is not None:
-                                comp = getattr(
-                                    driver, "mark_send_intent_compensated", None)
-                                if comp is not None:
-                                    try:
-                                        await comp(eng_id, request_id, mid)
-                                    except Exception:  # noqa: BLE001
-                                        logger.debug(
-                                            "compensate seam failed", exc_info=True)
-                                _clear_ask_marker(driver, eng_id, request_id)
-                            return None
-                # Marker cleared SYNCHRONOUSLY at durable ownership (no
-                # maintenance lock — the unanswered-anchor clause takes over
-                # gap-free). In the ABSENT-allocator degraded mode (no number, no
-                # add) this is the poster's terminal path and the one-question
-                # invariant is UNAVAILABLE (Sol r9-4).
-                _clear_ask_marker(driver, eng_id, request_id)
-                # POST-ADD GENERATION RE-CHECK: an operator envelope that arrived
-                # between reserve and add IS this anchor's answer — mark it
-                # answered + settle instead of leaving it ⏳ waiting.
-                gen_bumped = (
-                    added and driver is not None
-                    and driver.inbound_generation(eng_id) != gen_at_entry
-                )
-                if gen_bumped:
-                    settle = getattr(driver, "settle_answered_anchor", None)
-                    if settle is not None:
-                        try:
-                            await settle(eng_id, number)
-                        except Exception:  # noqa: BLE001 — settle is best-effort
-                            logger.debug("gen-recheck settle failed", exc_info=True)
-                else:
-                    # W-R2: a posted, un-answered anchor hands the ball to the
-                    # operator → ⏳ waiting for your reply (driven from the ask
-                    # lifecycle; the next operator text settles it driver-side).
-                    if driver is not None:
-                        note = getattr(driver, "note_ask_waiting", None)
-                        if note is not None:
-                            await note(eng_id)
-                await _advance_first_contact()
-                return mid
+                    try:
+                        mid = await telegram_channel.send_response_to_topic(
+                            rec.topic_id, display)
+                    except Exception:  # noqa: BLE001
+                        logger.warning("free-text anchor post failed (eng=%s)",
+                                       eng_id[:8], exc_info=True)
+                        return None
+                    if not isinstance(mid, int):
+                        return None
+                    # DURABLE OWNERSHIP: register open_questions ONLY after a
+                    # successful post (a crash before the relay reaches the block
+                    # leaves NO dangling ledger entry). §A3(c) COMPENSATION (Sol
+                    # r5-5/r6-1): an ``add_open_question`` failure AFTER the wire
+                    # post leaves an orphan message — best-effort WITHDRAW-edit it
+                    # via the RAW wire primitive (never edit_discrete — this poster
+                    # runs under the sequencer lock on the relay task, no
+                    # reacquisition) and account the COMPOUND outcome
+                    # (``mark_send_intent_compensated``: high-water advances, intent
+                    # resolves ok:false+compensated). The exception NEVER escapes
+                    # the poster; the compensation is a NON-durable exit, so the
+                    # ``finally`` (CAS) still clears the marker.
+                    added = False
+                    if number is not None:
+                        add = getattr(
+                            engagement_registry, "add_open_question", None)
+                        if add is not None:
+                            try:
+                                await add(eng_id, number, mid, text=display,
+                                          kind="anchor")
+                                added = True
+                            except Exception:  # noqa: BLE001
+                                logger.warning(
+                                    "anchor add_open_question failed — withdrawing "
+                                    "(eng=%s Q%s)", eng_id[:8], number,
+                                    exc_info=True)
+                                await _withdraw_anchor(
+                                    telegram_channel, rec.topic_id, mid)
+                                if driver is not None:
+                                    comp = getattr(
+                                        driver, "mark_send_intent_compensated",
+                                        None)
+                                    if comp is not None:
+                                        try:
+                                            await comp(eng_id, request_id, mid)
+                                        except Exception:  # noqa: BLE001
+                                            logger.debug(
+                                                "compensate seam failed",
+                                                exc_info=True)
+                                return None
+                    # Marker cleared SYNCHRONOUSLY at durable ownership (no
+                    # maintenance lock — the unanswered-anchor clause takes over
+                    # gap-free). In the ABSENT-allocator degraded mode (no number,
+                    # no add) this is the poster's terminal path and the
+                    # one-question invariant is UNAVAILABLE (Sol r9-4).
+                    _clear_ask_marker(driver, eng_id, request_id)
+                    _durable = True
+                    # POST-ADD GENERATION RE-CHECK: an operator envelope that
+                    # arrived between reserve and add IS this anchor's answer —
+                    # mark it answered + settle instead of leaving it ⏳ waiting.
+                    gen_bumped = (
+                        added and driver is not None
+                        and driver.inbound_generation(eng_id) != gen_at_entry
+                    )
+                    if gen_bumped:
+                        settle = getattr(driver, "settle_answered_anchor", None)
+                        if settle is not None:
+                            try:
+                                await settle(eng_id, number)
+                            except Exception:  # noqa: BLE001 — best-effort
+                                logger.debug(
+                                    "gen-recheck settle failed", exc_info=True)
+                    else:
+                        # W-R2: a posted, un-answered anchor hands the ball to the
+                        # operator → ⏳ waiting for your reply (driven from the ask
+                        # lifecycle; the next operator text settles it driver-side).
+                        if driver is not None:
+                            note = getattr(driver, "note_ask_waiting", None)
+                            if note is not None:
+                                await note(eng_id)
+                    await _advance_first_contact()
+                    return mid
+                finally:
+                    # Sol A3 wave 5: the poster owns the marker clear on every
+                    # non-durable exit (CAS — a no-op once ``_durable`` cleared it
+                    # or a later ask re-claimed the marker).
+                    if not _durable:
+                        _clear_ask_marker(driver, eng_id, request_id)
 
             # A3 · F-ORDER (Sol A3 wave 4): when a transport cancel LOSES to an
             # in-flight relay post, the poster owns the marker (it clears it at
@@ -1783,6 +1810,13 @@ def _make_ask(
                 # Unblock the (possibly already-runnable) settlement path: the
                 # registration + waiting submission above are now durable.
                 _ask_registered.set()
+                # Sol A3 wave 5: parity with the anchor poster — the poster owns
+                # the ``ask_inflight`` clear on every exit. Durable ownership for a
+                # button ask is the BROKER.register-side clear that ran BEFORE this
+                # poster, so this CAS is a belt-and-suspenders no-op in the normal
+                # case (marker already cleared, or a later ask re-claimed it); it
+                # guarantees no poster-failure path can ever leave the marker set.
+                _clear_ask_marker(driver, eng_id, request_id)
 
         if intent_registered:
             # Install the real poster and ARM — the point of no return
