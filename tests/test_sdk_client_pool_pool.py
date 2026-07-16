@@ -50,6 +50,10 @@ def _mk_result(sid, usage=None, *, is_error=False, result=""):
     return m
 
 
+async def _async_result(value):
+    return value
+
+
 class ScriptedClient:
     def __init__(self, options):
         self.options = options
@@ -174,6 +178,176 @@ async def test_cold_connect_logs_monotonic_elapsed_ms(caplog):
         "pool cold connect key=voice-latency resume=False ms=125"
     ]
     assert "secret prompt" not in caplog.text
+
+
+async def test_session_publish_logs_monotonic_elapsed_ms(caplog):
+    import logging
+
+    now = [10.0]
+    pool = _mk_pool(FakeRegistry(), monotonic=lambda: now[0])
+    made = []
+
+    def make_client(options):
+        client = ScriptedClient(options)
+        client.script = [[_mk_result("secret-session-id")]]
+        made.append(client)
+        return client
+
+    pool._make_client = make_client
+    published = []
+
+    async def on_success(sid):
+        published.append(sid)
+        now[0] = 10.125
+
+    try:
+        with caplog.at_level(logging.INFO, logger="sdk_client_pool"):
+            await pool.turn(
+                channel_key="voice-publish-latency",
+                channel="voice",
+                prompt="secret publish prompt",
+                origin={},
+                cid="c",
+                build_options=lambda _fresh, _resume: _async_result({}),
+                on_stale_old=lambda _sid: None,
+                on_message=lambda _message: _async_result(None),
+                on_success=on_success,
+            )
+    finally:
+        await pool.aclose()
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "sdk_client_pool"
+        and "pool session publish" in record.getMessage()
+    ]
+    assert messages == ["pool session publish ok=True ms=125"]
+    assert published == ["secret-session-id"]
+    assert made[0].disconnected
+    assert "secret-session-id" not in caplog.text
+    assert "secret publish prompt" not in caplog.text
+
+
+async def test_session_publish_failure_logs_sanitized_elapsed_and_drops(caplog):
+    import logging
+
+    class PublishFailure(Exception):
+        pass
+
+    now = [20.0]
+    pool = _mk_pool(FakeRegistry(), monotonic=lambda: now[0])
+    made = []
+
+    def make_client(options):
+        client = ScriptedClient(options)
+        client.script = [[_mk_result("secret-failed-session-id")]]
+        made.append(client)
+        return client
+
+    pool._make_client = make_client
+    callbacks = 0
+
+    async def on_success(_sid):
+        nonlocal callbacks
+        callbacks += 1
+        now[0] = 20.25
+        raise PublishFailure("secret publication failure")
+
+    try:
+        with caplog.at_level(logging.INFO, logger="sdk_client_pool"):
+            with pytest.raises(PublishFailure, match="secret publication failure"):
+                await pool.turn(
+                    channel_key="voice-publish-failure",
+                    channel="voice",
+                    prompt="secret failure prompt",
+                    origin={},
+                    cid="c",
+                    build_options=lambda _fresh, _resume: _async_result({}),
+                    on_stale_old=lambda _sid: None,
+                    on_message=lambda _message: _async_result(None),
+                    on_success=on_success,
+                )
+        assert pool.stats()["entries"] == 0
+        assert made[0].disconnected
+    finally:
+        await pool.aclose()
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "sdk_client_pool"
+        and "pool session publish" in record.getMessage()
+    ]
+    assert messages == ["pool session publish ok=False ms=250"]
+    assert callbacks == 1
+    assert "secret-failed-session-id" not in caplog.text
+    assert "secret failure prompt" not in caplog.text
+    assert "secret publication failure" not in caplog.text
+
+
+async def test_cancelled_session_publish_logs_elapsed_and_drops(caplog):
+    import logging
+
+    now = [30.0]
+    pool = _mk_pool(FakeRegistry(), monotonic=lambda: now[0])
+    made = []
+
+    def make_client(options):
+        client = ScriptedClient(options)
+        client.script = [[_mk_result("secret-cancelled-session-id")]]
+        made.append(client)
+        return client
+
+    pool._make_client = make_client
+    publish_started = asyncio.Event()
+    never_publish = asyncio.Event()
+    callbacks = 0
+
+    async def on_success(_sid):
+        nonlocal callbacks
+        callbacks += 1
+        publish_started.set()
+        await never_publish.wait()
+
+    task = None
+    try:
+        with caplog.at_level(logging.INFO, logger="sdk_client_pool"):
+            task = asyncio.create_task(pool.turn(
+                channel_key="voice-publish-cancelled",
+                channel="voice",
+                prompt="secret cancelled prompt",
+                origin={},
+                cid="c",
+                build_options=lambda _fresh, _resume: _async_result({}),
+                on_stale_old=lambda _sid: None,
+                on_message=lambda _message: _async_result(None),
+                on_success=on_success,
+            ))
+            await asyncio.wait_for(publish_started.wait(), timeout=1)
+            now[0] = 30.5
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert pool.stats()["entries"] == 0
+        assert made[0].disconnected
+    finally:
+        never_publish.set()
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await pool.aclose()
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "sdk_client_pool"
+        and "pool session publish" in record.getMessage()
+    ]
+    assert messages == ["pool session publish ok=False ms=500"]
+    assert callbacks == 1
+    assert "secret-cancelled-session-id" not in caplog.text
+    assert "secret cancelled prompt" not in caplog.text
 
 
 async def test_warm_reuse_skips_connect_and_build_options():

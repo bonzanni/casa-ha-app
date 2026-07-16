@@ -280,6 +280,15 @@ class HomeAssistantFacade:
         name: str,
         arguments: dict[str, Any],
     ) -> Any:
+        # MCP Python >=1.28.1,<2 ClientSession.call_tool() performs a hidden
+        # strict tools/list rediscovery that can reject the whole HA surface
+        # when one dynamic schema is malformed. The typed raw send_request
+        # path is intentional because facade discovery already filtered those
+        # schemas. On every MCP bump rerun these regressions:
+        # test_raw_discovery_calls_healthy_tool_without_strict_rediscovery,
+        # TestMockHaMcp.test_live_context_domain_flows_through_facade_as_empty_arguments
+        # (real transport), and test_ha_mock_e2e_pins_eager_facade_contract
+        # (mock-e2e guard).
         send_request = getattr(session, "send_request", None)
         if send_request is None:
             return await session.call_tool(name, arguments)

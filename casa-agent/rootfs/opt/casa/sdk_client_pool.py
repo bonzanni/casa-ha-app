@@ -286,6 +286,16 @@ class SdkClientPool:
                    on_success: Callable[[str], Awaitable[None]] | None = None,
                    on_decision: Callable[[str | None, bool], None] | None = None,
                    ) -> PoolTurnResult:
+        """Run one serialized turn and publish its returned session id.
+
+        When provided, ``on_success`` is awaited exactly once when the SDK
+        turn returns a non-None session id. It runs while the
+        per-key entry lock is still held so publication completes before
+        turn/invalidation handoff. The callback must therefore be fast and
+        non-reentrant into this pool (a same-key turn would deadlock).
+        Callback exceptions and cancellation propagate and drop the
+        unpublished client generation.
+        """
         self._ensure_sweeper()
         for _attempt in (1, 2):                      # AR-7: one silent retry
             if self._closing:
@@ -366,7 +376,20 @@ class SdkClientPool:
                         # Publish the result before the entry lock can hand off
                         # to another turn or an invalidation generation.
                         publishing = True
-                        await on_success(sid)
+                        publish_started_ms = self._monotonic() * 1000
+                        publish_ok = False
+                        try:
+                            await on_success(sid)
+                            publish_ok = True
+                        finally:
+                            logger.info(
+                                "pool session publish ok=%s ms=%d",
+                                publish_ok,
+                                int(
+                                    self._monotonic() * 1000
+                                    - publish_started_ms
+                                ),
+                            )
                         publishing = False
                 except asyncio.CancelledError:
                     if publishing or entry.state != "warm":
