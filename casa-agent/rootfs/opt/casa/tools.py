@@ -4018,6 +4018,7 @@ async def _synthesize_answer(
     # environment for this one CLI subprocess only).
     options = ClaudeAgentOptions(
         model=model,
+        cli_path=CLAUDE_CLI_PATH,
         system_prompt=_QUERY_ENGAGER_SYSTEM,
         max_turns=1,
         mcp_servers={},

@@ -3,6 +3,7 @@ claude-agent-sdk pin must be exact + match the intended version (spec §6).
 Pure-unit static parse — no docker, no network."""
 from __future__ import annotations
 
+import ast
 import re
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ import pytest
 pytestmark = [pytest.mark.unit]
 
 REPO = Path(__file__).resolve().parents[1]
+APP_ROOT = REPO / "casa-agent" / "rootfs" / "opt" / "casa"
 DOCKERFILE = REPO / "casa-agent" / "Dockerfile"
 TEST_DOCKERFILE = REPO / "test-local" / "Dockerfile.test"
 REQUIREMENTS = REPO / "casa-agent" / "requirements.txt"
@@ -50,6 +52,45 @@ def test_sdk_pin_is_exact_and_current() -> None:
     assert sdk_lines, "claude-agent-sdk not pinned in requirements.txt"
     assert sdk_lines[0].strip() == f"claude-agent-sdk=={SDK_VERSION}", (
         f"expected claude-agent-sdk=={SDK_VERSION}, got {sdk_lines[0].strip()!r}"
+    )
+
+
+def test_every_production_claude_options_uses_shared_cli_path() -> None:
+    """Every in-process SDK client must launch the boot-verified CLI."""
+    observed: dict[str, str | None] = {}
+    for path in sorted(APP_ROOT.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            constructor = node.func
+            is_options = (
+                isinstance(constructor, ast.Name)
+                and constructor.id == "ClaudeAgentOptions"
+            ) or (
+                isinstance(constructor, ast.Attribute)
+                and constructor.attr == "ClaudeAgentOptions"
+            )
+            if not is_options:
+                continue
+            cli_kwarg = next(
+                (kw for kw in node.keywords if kw.arg == "cli_path"),
+                None,
+            )
+            location = f"{path.relative_to(APP_ROOT)}:{node.lineno}"
+            observed[location] = (
+                ast.unparse(cli_kwarg.value) if cli_kwarg is not None else None
+            )
+
+    assert observed, "no production ClaudeAgentOptions constructions found"
+    unpinned = {
+        location: value
+        for location, value in observed.items()
+        if value != "CLAUDE_CLI_PATH"
+    }
+    assert not unpinned, (
+        "every production ClaudeAgentOptions construction must pass the "
+        f"shared CLAUDE_CLI_PATH; unpinned={unpinned}"
     )
 
 

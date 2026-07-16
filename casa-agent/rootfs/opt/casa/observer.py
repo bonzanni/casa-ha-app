@@ -15,6 +15,8 @@ import json
 import logging
 from typing import Any, Literal
 
+from claude_runtime import CLAUDE_CLI_PATH
+
 logger = logging.getLogger(__name__)
 
 
@@ -196,6 +198,7 @@ class Observer:
         })
         options = ClaudeAgentOptions(
             model=self._model,
+            cli_path=CLAUDE_CLI_PATH,
             system_prompt=system,
             max_turns=1,
             mcp_servers={},

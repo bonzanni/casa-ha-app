@@ -133,6 +133,40 @@ class TestSynthesizeAnswerMaxTokens:
         assert captured["options"].env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") == "123"
         assert "123" in captured["prompt"]  # prompt carries the budget instruction
 
+    async def test_synthesize_answer_uses_verified_cli_path(self, monkeypatch):
+        import tools
+        from claude_runtime import CLAUDE_CLI_PATH
+
+        captured = {}
+
+        class FakeClient:
+            def __init__(self, options):
+                captured["options"] = options
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def query(self, prompt):
+                pass
+
+            async def receive_response(self):
+                if False:
+                    yield None
+
+        monkeypatch.setattr(tools, "ClaudeSDKClient", FakeClient)
+        monkeypatch.setattr(
+            tools.sdk_logging,
+            "with_stderr_callback",
+            lambda options, engagement_id=None: options,
+        )
+
+        await tools._synthesize_answer("q?", "some ctx", max_tokens=123)
+
+        assert captured["options"].cli_path == CLAUDE_CLI_PATH
+
     async def test_synthesize_answer_hard_truncates_overshoot(self, monkeypatch):
         import tools
 
