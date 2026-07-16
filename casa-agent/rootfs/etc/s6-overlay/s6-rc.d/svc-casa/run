@@ -49,6 +49,9 @@ export ENABLE_TERMINAL="$(bashio::config 'enable_terminal')"
 # off/0/false as disabled and anything else as enabled, so exporting
 # bashio's raw "true"/"false" string works the same way as ENABLE_TERMINAL.
 export SDK_CLIENT_POOL="$(bashio::config 'sdk_client_pool')"
+# Tina's eager Home Assistant facade is default-on with an operator-reachable
+# raw-MCP fallback for diagnosis.
+export TINA_HA_FACADE_ENABLED="$(bashio::config 'tina_ha_facade_enabled')"
 export CASA_VERSION="$(bashio::addon.version)"
 
 # 3.3: scheduler timezone — optional; timekeeping.resolve_tz() falls back

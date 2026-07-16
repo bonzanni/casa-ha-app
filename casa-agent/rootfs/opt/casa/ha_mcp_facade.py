@@ -13,7 +13,13 @@ from typing import Any, AsyncContextManager, Callable, Protocol
 from claude_agent_sdk import SdkMcpTool, create_sdk_mcp_server, tool
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
-from mcp.types import ClientRequest, ListToolsRequest
+from mcp.types import (
+    CallToolRequest,
+    CallToolRequestParams,
+    CallToolResult,
+    ClientRequest,
+    ListToolsRequest,
+)
 from pydantic import BaseModel, ConfigDict
 
 
@@ -234,7 +240,11 @@ class HomeAssistantFacade:
         upstream_arguments = {} if name == LIVE_CONTEXT_TOOL else arguments
         started_ms = self._monotonic() * 1000
         try:
-            result = await session.call_tool(name, upstream_arguments)
+            result = await self._call_upstream(
+                session,
+                name,
+                upstream_arguments,
+            )
         except Exception:
             elapsed = int(self._monotonic() * 1000 - started_ms)
             logger.info(
@@ -263,6 +273,25 @@ class HomeAssistantFacade:
         if name != LIVE_CONTEXT_TOOL or not arguments.get("domain"):
             return payload
         return _filter_live_context(payload, arguments["domain"])
+
+    async def _call_upstream(
+        self,
+        session: _UpstreamSession,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> Any:
+        send_request = getattr(session, "send_request", None)
+        if send_request is None:
+            return await session.call_tool(name, arguments)
+        return await send_request(
+            ClientRequest(CallToolRequest(
+                params=CallToolRequestParams(
+                    name=name,
+                    arguments=arguments,
+                ),
+            )),
+            CallToolResult,
+        )
 
     async def _disconnect_failed(
         self,

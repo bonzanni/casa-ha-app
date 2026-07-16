@@ -16,6 +16,7 @@ pytestmark = [pytest.mark.unit]
 
 REPO = Path(__file__).resolve().parents[1]
 DOCKERFILE = REPO / "casa-agent" / "Dockerfile"
+TEST_DOCKERFILE = REPO / "test-local" / "Dockerfile.test"
 REQUIREMENTS = REPO / "casa-agent" / "requirements.txt"
 
 SDK_VERSION = "0.2.114"
@@ -31,6 +32,15 @@ def test_global_claude_cli_is_pinned() -> None:
     assert f"@anthropic-ai/claude-code@{CLAUDE_CLI_VERSION}" in text, (
         "Dockerfile must pin "
         f"@anthropic-ai/claude-code@{CLAUDE_CLI_VERSION}"
+    )
+
+
+def test_e2e_image_claude_cli_pin_matches_production() -> None:
+    from claude_runtime import CLAUDE_CLI_VERSION
+
+    text = TEST_DOCKERFILE.read_text(encoding="utf-8")
+    assert f"@anthropic-ai/claude-code@{CLAUDE_CLI_VERSION}" in text, (
+        "Dockerfile.test must use the production Claude CLI pin"
     )
 
 

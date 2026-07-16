@@ -12,11 +12,43 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 pytestmark = pytest.mark.unit
+
+
+def test_tina_facade_option_defaults_on_with_optional_bool_schema_and_copy():
+    root = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load(
+        (root / "casa-agent/config.yaml").read_text(encoding="utf-8"),
+    )
+    translation = yaml.safe_load(
+        (root / "casa-agent/translations/en.yaml").read_text(encoding="utf-8"),
+    )
+
+    assert config["version"] == "0.84.0"
+    assert config["options"]["tina_ha_facade_enabled"] is True
+    assert config["schema"]["tina_ha_facade_enabled"] == "bool?"
+    copy = translation["configuration"]["tina_ha_facade_enabled"]
+    assert copy["name"]
+    assert "fallback" in copy["description"].lower()
+
+
+def test_ha_mock_e2e_pins_eager_facade_contract():
+    root = Path(__file__).resolve().parents[1]
+    script = (
+        root / "test-local/e2e/test_ha_delegation.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "MOCK_HA_MALFORMED_TOOL=1" in script
+    assert "HomeAssistantFacade" in script
+    assert "tools/list after resident connect" in script
+    assert '"name": "GetLiveContext", "arguments": {}' in script
+    assert "guard bound exceeded" in script
 
 
 @pytest.fixture
@@ -192,6 +224,8 @@ async def test_tina_facade_false_kill_switch_logs_once_without_secrets(
     ] == ["ha_facade_disabled"]
     assert "private-token" not in caplog.text
     assert "private-ha" not in caplog.text
+    assert "authorization" not in caplog.text.lower()
+    assert "headers" not in caplog.text.lower()
     assert registry.resolve(
         ["homeassistant"], role="butler",
     )["homeassistant"]["url"] == "http://private-ha"

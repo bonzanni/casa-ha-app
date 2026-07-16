@@ -87,6 +87,16 @@ def test_run_script_exports_sdk_client_pool():
     )
 
 
+def test_run_script_exports_tina_ha_facade_kill_switch_exactly():
+    script = _read_run_script()
+    export = (
+        'export TINA_HA_FACADE_ENABLED="$(bashio::config '
+        "'tina_ha_facade_enabled')\""
+    )
+    assert export in script
+    assert script.count(export) == 1
+
+
 def test_run_script_gates_webhook_secret_on_auth_enabled():
     """webhook_auth_enabled=false must actually disable webhook auth, even
     when webhook_secret still holds a configured value. Prior to the fix,

@@ -21,6 +21,14 @@ def _butler_md_path() -> Path:
     )
 
 
+def _resident_ha_doctrine_path() -> Path:
+    root = Path(__file__).resolve().parent.parent
+    return root / (
+        "casa-agent/rootfs/opt/casa/defaults/agents/executors/"
+        "configurator/doctrine/recipes/resident/grant_ha_tools.md"
+    )
+
+
 @pytest.fixture(scope="module")
 def butler_md_text() -> str:
     # Collapse whitespace so anchor phrases match regardless of markdown
@@ -28,6 +36,21 @@ def butler_md_text() -> str:
     import re
     raw = _butler_md_path().read_text(encoding="utf-8")
     return re.sub(r"\s+", " ", raw)
+
+
+def test_butler_prompt_describes_normalized_state_filter(butler_md_text):
+    text = butler_md_text.lower()
+    assert "optional domain filter" in text
+    assert "forwarded to home assistant" not in text
+    assert "at most once per turn" in text
+
+
+def test_resident_ha_doctrine_matches_normalized_state_filter_contract():
+    text = _resident_ha_doctrine_path().read_text(encoding="utf-8").lower()
+    assert "optional domain filter" in text
+    assert "local" in text
+    assert "upstream" in text and "{}" in text
+    assert "at most once per turn" in text
 
 
 def test_butler_prompt_has_getlivecontext_anti_loop_rule(butler_md_text):

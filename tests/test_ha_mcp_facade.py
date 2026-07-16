@@ -79,6 +79,28 @@ class RawDiscoverySession(FakeHaSession):
         return result_type.model_validate({"tools": self._raw_tools})
 
 
+class RawCallSession(RawDiscoverySession):
+    """Expose raw request support while rejecting strict call_tool()."""
+
+    def __init__(self, raw_tools: list[dict[str, Any]]) -> None:
+        super().__init__(raw_tools)
+        self.raw_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def send_request(self, request: Any, result_type: Any) -> Any:
+        if isinstance(request.root, CallToolRequest):
+            params = request.root.params
+            self.raw_calls.append((params.name, params.arguments or {}))
+            return text_result('{"success":true}')
+        return await super().send_request(request, result_type)
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> CallToolResult:
+        raise AssertionError("strict call_tool path must not rediscover tools")
+
+
 @asynccontextmanager
 async def fake_connection(session: FakeHaSession):
     yield session
@@ -314,6 +336,37 @@ async def test_raw_discovery_omits_bad_schema_without_losing_healthy_tool():
     await facade.start()
     try:
         assert facade.tool_names == ("HassTurnOn",)
+    finally:
+        await facade.aclose()
+
+
+@pytest.mark.asyncio
+async def test_raw_discovery_calls_healthy_tool_without_strict_rediscovery():
+    upstream = RawCallSession([
+        {
+            "name": "Broken",
+            "description": "Bad schema",
+            "inputSchema": "not-an-object",
+        },
+        {
+            "name": "HassTurnOn",
+            "description": "Turn on",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+    ])
+    facade = make_facade(upstream)
+
+    await facade.start()
+    try:
+        result = await invoke_sdk_tool(
+            facade.server_config,
+            "HassTurnOn",
+            {"name": "office light"},
+        )
+        assert "is_error" not in result
+        assert upstream.raw_calls == [
+            ("HassTurnOn", {"name": "office light"}),
+        ]
     finally:
         await facade.aclose()
 

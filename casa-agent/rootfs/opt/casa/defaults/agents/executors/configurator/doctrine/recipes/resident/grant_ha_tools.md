@@ -47,7 +47,9 @@ Without this, the allow-list grant points at nothing. casa_core only registers t
 
 ## Step 3 — Teach the resident HOW in `prompts/system.md`
 
-Append a `## Home Assistant tools` section that names the conventional intents (`HassTurnOn`, `HassTurnOff`, `HassLightSet`, `HassClimateSetTemperature`, `GetLiveContext`, …) and points the model at `GetLiveContext` first when it doesn't know what's exposed. See butler's `prompts/system.md` for the reference shape.
+Append a `## Home Assistant tools` section that names the conventional intents (`HassTurnOn`, `HassTurnOff`, `HassLightSet`, `HassClimateSetTemperature`, `GetLiveContext`, …). Tell the resident to call action tools directly without surveying first, and to use `GetLiveContext` only for state questions or one disambiguation after an action fails.
+
+Keep the normalized state-query contract explicit: `GetLiveContext` accepts an optional domain filter, but that filter is local to Casa. Casa sends `{}` upstream and filters the returned snapshot afterward. Bound `GetLiveContext` to at most once per turn, then require the resident to act or answer. See butler's `prompts/system.md` for the reference shape.
 
 ## Verify
 

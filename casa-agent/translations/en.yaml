@@ -80,6 +80,12 @@ configuration:
       Reuse a warm Claude SDK client across resident turns instead of
       reconnecting every turn (faster replies). Disable only to fall back to
       per-turn sessions when diagnosing issues.
+  tina_ha_facade_enabled:
+    name: Use Tina's Fast Home Assistant Tools
+    description: >-
+      Keep Tina's Home Assistant tools connected and ready for lower voice
+      latency. Disable to use the raw Home Assistant MCP fallback while
+      diagnosing compatibility issues.
   telegram_engagement_supergroup_id:
     name: "Telegram engagement supergroup chat ID"
     description: |
