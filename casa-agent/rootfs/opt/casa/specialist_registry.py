@@ -278,21 +278,13 @@ class SpecialistRegistry:
     # callback, DO release in EngagementRegistry terminal transitions.)
     async def complete_delegation(self, delegation_id: str) -> None:
         await self._job_registry.load()
-        job = self._job_registry.get(delegation_id)
-        if job is not None and job.execution_state in {
-            ExecutionState.ACCEPTED, ExecutionState.RUNNING,
-        }:
-            await self._job_registry.finish(delegation_id, "")
+        await self._job_registry.finish_compat(delegation_id, "")
 
     async def fail_delegation(
         self, delegation_id: str, exc: Exception,
     ) -> None:
         await self._job_registry.load()
-        job = self._job_registry.get(delegation_id)
-        if job is not None and job.execution_state in {
-            ExecutionState.ACCEPTED, ExecutionState.RUNNING,
-        }:
-            await self._job_registry.fail(delegation_id, exc)
+        await self._job_registry.fail_compat(delegation_id, exc)
 
     async def cancel_delegation(self, delegation_id: str) -> None:
         await self._job_registry.load()

@@ -200,6 +200,76 @@ async def test_authorized_cancel_waits_for_preplay_outcome(tmp_path):
     assert job.cancel_pending is False
 
 
+async def test_cancel_during_persist_still_signals_and_reaps_owned_task(
+    tmp_path, monkeypatch,
+):
+    import job_registry as job_registry_module
+
+    registry = await loaded_registry(tmp_path, make_job())
+    registry.CANCEL_GRACE_SECONDS = 0.01
+    worker_cancelled = asyncio.Event()
+
+    class PermitProbe:
+        def __init__(self):
+            self.releases = 0
+
+        def release(self):
+            self.releases += 1
+
+    async def work():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            worker_cancelled.set()
+            raise
+
+    permit = PermitProbe()
+    worker = asyncio.create_task(work())
+    cancel_event = await registry.bind_task("job-1", worker, permit=permit)
+
+    replaced = threading.Event()
+    release_writer = threading.Event()
+    real_write = job_registry_module.atomic_write_json
+
+    def blocked_after_replace(*args, **kwargs):
+        real_write(*args, **kwargs)
+        replaced.set()
+        assert release_writer.wait(timeout=5)
+
+    monkeypatch.setattr(job_registry_module, "atomic_write_json", blocked_after_replace)
+    request = asyncio.create_task(
+        registry.request_cancel("job-1", actor=actor_for_job()),
+    )
+    try:
+        assert await asyncio.to_thread(replaced.wait, 5)
+        request.cancel()
+        release_writer.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert registry.get("job-1").cancel_pending is True
+        assert cancel_event.is_set()
+
+        reloaded = JobRegistry(
+            tmp_path / "jobs.json", tmp_path / "delegations.json",
+        )
+        await reloaded.load()
+        assert reloaded.get("job-1").cancel_pending is True
+
+        await asyncio.wait_for(worker_cancelled.wait(), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+        await asyncio.sleep(0)
+        assert permit.releases == 1
+    finally:
+        release_writer.set()
+        if not request.done():
+            request.cancel()
+        if not worker.done():
+            worker.cancel()
+        await asyncio.gather(request, worker, return_exceptions=True)
+
+
 async def test_cancel_pending_authorized_job_rejects_playback_start(tmp_path):
     registry = await ready_claimed_authorized_registry(tmp_path)
     await registry.request_cancel("job-1", actor=actor_for_job())
@@ -578,45 +648,96 @@ async def test_snapshot_without_orphan_ack_field_decodes_as_not_pending(tmp_path
     assert reloaded.get("job-1").orphan_notification_pending is False
 
 
-async def test_recovered_telegram_orphan_is_acked_only_after_notify_succeeds():
+@pytest.mark.parametrize("failure_phase", ["notify", "ack"])
+async def test_recovered_orphan_failure_isolated_before_later_success(
+    tmp_path, caplog, failure_phase,
+):
+    import logging
+
     from casa_core import _notify_recovered_delegations
 
-    job = make_job(
+    registry = await loaded_registry(tmp_path)
+    failed_job = make_job(
+        id="job-fail",
         creator_peer="telegram",
         scope_id="chat-1",
         origin_device_id=None,
         execution_state=ExecutionState.ORPHANED,
         failure=JobFailure("restart_orphan", "Lost on restart"),
         orphan_notification_pending=True,
+        delivery_sequence=1,
     )
+    next_job = replace(
+        failed_job, id="job-next", scope_id="chat-2", delivery_sequence=2,
+    )
+    await registry.create(failed_job)
+    await registry.create(next_job)
     events = []
+    secret = "SECRET-notification-detail"
 
     class RegistryProbe:
         async def ack_orphan_notification(self, job_id):
             events.append(("ack", job_id))
+            if failure_phase == "ack" and job_id == "job-fail":
+                raise RuntimeError(secret)
+            await registry.ack_orphan_notification(job_id)
 
-    class FailingBus:
+    class BusProbe:
         queues = {"concierge": object()}
 
         async def notify(self, message):
-            events.append(("notify", message.content.text))
-            raise RuntimeError("queue unavailable")
+            assert message.content.text == ""
+            events.append(("notify", message.content.delegation_id))
+            if (failure_phase == "notify"
+                    and message.content.delegation_id == "job-fail"):
+                raise RuntimeError(secret)
 
-    with pytest.raises(RuntimeError, match="queue unavailable"):
+    with caplog.at_level(logging.ERROR, logger="casa_core"):
         await _notify_recovered_delegations(
-            [job], RegistryProbe(), FailingBus(), assistant_role="concierge",
+            registry.all(), RegistryProbe(), BusProbe(),
+            assistant_role="concierge",
         )
-    assert events == [("notify", "")]
+    expected = [("notify", "job-fail")]
+    if failure_phase == "ack":
+        expected.append(("ack", "job-fail"))
+    expected.extend([("notify", "job-next"), ("ack", "job-next")])
+    assert events == expected
+    assert registry.get("job-fail").orphan_notification_pending is True
+    assert registry.get("job-next").orphan_notification_pending is False
+    assert secret not in caplog.text
 
-    class SuccessfulBus(FailingBus):
-        async def notify(self, message):
-            events.append(("notify", message.content.text))
-
-    events.clear()
-    await _notify_recovered_delegations(
-        [job], RegistryProbe(), SuccessfulBus(), assistant_role="concierge",
+    reloaded = JobRegistry(
+        tmp_path / "jobs.json", tmp_path / "delegations.json",
     )
-    assert events == [("notify", ""), ("ack", "job-1")]
+    await reloaded.load()
+    assert reloaded.get("job-fail").orphan_notification_pending is True
+    assert reloaded.get("job-next").orphan_notification_pending is False
+
+
+async def test_recovered_orphan_notification_does_not_swallow_cancellation():
+    from casa_core import _notify_recovered_delegations
+
+    job = make_job(
+        creator_peer="telegram",
+        execution_state=ExecutionState.ORPHANED,
+        failure=JobFailure("restart_orphan", "Lost on restart"),
+        orphan_notification_pending=True,
+    )
+
+    class RegistryProbe:
+        async def ack_orphan_notification(self, _job_id):
+            raise AssertionError("ack must not run")
+
+    class CancelledBus:
+        queues = {"concierge": object()}
+
+        async def notify(self, _message):
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await _notify_recovered_delegations(
+            [job], RegistryProbe(), CancelledBus(), assistant_role="concierge",
+        )
 
 
 async def test_restart_retains_delivery_attempt_for_one_full_lease(tmp_path):

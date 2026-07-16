@@ -290,39 +290,7 @@ class JobRegistry:
         async with self._lock:
             current = self._require_job(job_id)
             self._require_live_execution(current, "finish")
-            now = self._now()
-            if current.cancel_pending:
-                updated = replace(
-                    current,
-                    execution_state=ExecutionState.CANCELLED,
-                    terminal_at=now,
-                    expires_at=now + self.RESULT_TTL_SECONDS,
-                    failure=JobFailure("cancelled", "Cancelled by creator"),
-                    delivery_state=(
-                        DeliveryState.CANCELLED
-                        if current.delivery_state is not DeliveryState.NONE
-                        else DeliveryState.NONE
-                    ),
-                    delivery_attempt_id=None,
-                    lease_until=None,
-                    cancel_pending=False,
-                )
-            else:
-                delivery, sequence = self._terminal_delivery(current)
-                updated = replace(
-                    current,
-                    execution_state=ExecutionState.SUCCEEDED,
-                    terminal_at=now,
-                    expires_at=now + self.RESULT_TTL_SECONDS,
-                    result=str(result),
-                    failure=None,
-                    delivery_state=delivery,
-                    delivery_sequence=sequence,
-                    delivery_attempt_id=None,
-                    lease_until=None,
-                    cancel_pending=False,
-                )
-            return await self._persist_job_locked(updated)
+            return await self._finish_current_locked(current, result)
 
     async def fail(
         self,
@@ -333,41 +301,38 @@ class JobRegistry:
         async with self._lock:
             current = self._require_job(job_id)
             self._require_live_execution(current, "fail")
-            now = self._now()
-            envelope = self._failure_envelope(failure)
-            cancelled = (
-                isinstance(failure, asyncio.CancelledError)
-                or envelope.kind == "cancelled"
-            )
-            if cancelled or current.cancel_pending:
-                state = ExecutionState.CANCELLED
-                delivery = (
-                    DeliveryState.CANCELLED
-                    if current.delivery_state is not DeliveryState.NONE
-                    else DeliveryState.NONE
-                )
-                sequence = current.delivery_sequence
-            else:
-                state = ExecutionState.FAILED
-                delivery, sequence = self._terminal_delivery(current)
-            updated = replace(
-                current,
-                execution_state=state,
-                terminal_at=now,
-                expires_at=now + self.RESULT_TTL_SECONDS,
-                failure=envelope,
-                delivery_state=delivery,
-                delivery_sequence=sequence,
-                delivery_attempt_id=None,
-                lease_until=None,
-                cancel_pending=False,
-            )
-            return await self._persist_job_locked(updated)
+            return await self._fail_current_locked(current, failure)
+
+    async def finish_compat(
+        self, job_id: str, result: str = "",
+    ) -> VoiceJob | None:
+        """Idempotently finish a live job for legacy delegation callbacks."""
+        async with self._lock:
+            self._require_loaded()
+            current = self._jobs.get(job_id)
+            if (current is None
+                    or current.execution_state not in {
+                        ExecutionState.ACCEPTED, ExecutionState.RUNNING,
+                    }):
+                return current
+            return await self._finish_current_locked(current, result)
+
+    async def fail_compat(
+        self, job_id: str, failure: JobFailure | BaseException,
+    ) -> VoiceJob | None:
+        """Idempotently fail a live job for legacy delegation callbacks."""
+        async with self._lock:
+            self._require_loaded()
+            current = self._jobs.get(job_id)
+            if (current is None
+                    or current.execution_state not in {
+                        ExecutionState.ACCEPTED, ExecutionState.RUNNING,
+                    }):
+                return current
+            return await self._fail_current_locked(current, failure)
 
     async def request_cancel(self, job_id: str, *, actor: Any) -> CancelResult:
         """Authorize creator cancellation without racing playback start."""
-        event: asyncio.Event | None = None
-        task: asyncio.Task | None = None
         async with self._lock:
             current = self._require_job(job_id)
             self._authorize_actor(current, actor)
@@ -403,15 +368,19 @@ class JobRegistry:
             else:
                 return CancelResult("too_late")
 
-            await self._persist_job_locked(updated)
             event = self._cancel_events.get(job_id)
             task = self._tasks.get(job_id)
 
-        if event is not None:
-            event.set()
-        if task is not None and not task.done():
-            self._arm_force_cancel(job_id, task)
-        return CancelResult(status)
+            def publish_cancel_signal() -> None:
+                if event is not None:
+                    event.set()
+                if task is not None and not task.done():
+                    self._arm_force_cancel(job_id, task)
+
+            await self._persist_job_locked(
+                updated, after_publish=publish_cancel_signal,
+            )
+            return CancelResult(status)
 
     async def cancel(self, job_id: str) -> VoiceJob | None:
         """Compatibility terminal transition used by legacy delegation code."""
@@ -947,9 +916,89 @@ class JobRegistry:
 
     # -- transition helpers --------------------------------------------
 
-    async def _persist_job_locked(self, updated: VoiceJob) -> VoiceJob:
+    async def _finish_current_locked(
+        self, current: VoiceJob, result: str,
+    ) -> VoiceJob:
+        now = self._now()
+        if current.cancel_pending:
+            updated = replace(
+                current,
+                execution_state=ExecutionState.CANCELLED,
+                terminal_at=now,
+                expires_at=now + self.RESULT_TTL_SECONDS,
+                failure=JobFailure("cancelled", "Cancelled by creator"),
+                delivery_state=(
+                    DeliveryState.CANCELLED
+                    if current.delivery_state is not DeliveryState.NONE
+                    else DeliveryState.NONE
+                ),
+                delivery_attempt_id=None,
+                lease_until=None,
+                cancel_pending=False,
+            )
+        else:
+            delivery, sequence = self._terminal_delivery(current)
+            updated = replace(
+                current,
+                execution_state=ExecutionState.SUCCEEDED,
+                terminal_at=now,
+                expires_at=now + self.RESULT_TTL_SECONDS,
+                result=str(result),
+                failure=None,
+                delivery_state=delivery,
+                delivery_sequence=sequence,
+                delivery_attempt_id=None,
+                lease_until=None,
+                cancel_pending=False,
+            )
+        return await self._persist_job_locked(updated)
+
+    async def _fail_current_locked(
+        self,
+        current: VoiceJob,
+        failure: JobFailure | BaseException,
+    ) -> VoiceJob:
+        now = self._now()
+        envelope = self._failure_envelope(failure)
+        cancelled = (
+            isinstance(failure, asyncio.CancelledError)
+            or envelope.kind == "cancelled"
+        )
+        if cancelled or current.cancel_pending:
+            state = ExecutionState.CANCELLED
+            delivery = (
+                DeliveryState.CANCELLED
+                if current.delivery_state is not DeliveryState.NONE
+                else DeliveryState.NONE
+            )
+            sequence = current.delivery_sequence
+        else:
+            state = ExecutionState.FAILED
+            delivery, sequence = self._terminal_delivery(current)
+        updated = replace(
+            current,
+            execution_state=state,
+            terminal_at=now,
+            expires_at=now + self.RESULT_TTL_SECONDS,
+            failure=envelope,
+            delivery_state=delivery,
+            delivery_sequence=sequence,
+            delivery_attempt_id=None,
+            lease_until=None,
+            cancel_pending=False,
+        )
+        return await self._persist_job_locked(updated)
+
+    async def _persist_job_locked(
+        self,
+        updated: VoiceJob,
+        *,
+        after_publish: Callable[[], None] | None = None,
+    ) -> VoiceJob:
         candidate = self._with_job(updated)
-        await self._commit_snapshot_locked(candidate)
+        await self._commit_snapshot_locked(
+            candidate, after_publish=after_publish,
+        )
         return updated
 
     def _with_job(self, updated: VoiceJob) -> dict[str, VoiceJob]:

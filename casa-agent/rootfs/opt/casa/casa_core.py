@@ -1780,19 +1780,41 @@ async def _notify_recovered_delegations(
             },
             elapsed_s=0.0,
         )
-        await bus.notify(BusMessage(
-            type=MessageType.NOTIFICATION,
-            source=job.specialist_role,
-            target=target_role,
-            content=synthetic,
-            channel=job.creator_peer,
-            context={
-                "cid": job.origin_route_id or "-",
-                "chat_id": job.scope_id,
-                "delegation_id": job.id,
-            },
-        ))
-        await job_registry.ack_orphan_notification(job.id)
+        try:
+            await bus.notify(BusMessage(
+                type=MessageType.NOTIFICATION,
+                source=job.specialist_role,
+                target=target_role,
+                content=synthetic,
+                channel=job.creator_peer,
+                context={
+                    "cid": job.origin_route_id or "-",
+                    "chat_id": job.scope_id,
+                    "delegation_id": job.id,
+                },
+            ))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — one bad recovery must not block later jobs
+            # Do not log exception text/tracebacks: connector failures can
+            # include payload or credential material. The durable pending bit
+            # retains enough state for the next boot to retry.
+            logger.error(
+                "Orphan notification failed: id=%s phase=notify — retained",
+                job.id[:8],
+            )
+            continue
+
+        try:
+            await job_registry.ack_orphan_notification(job.id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — notification was at-least-once
+            logger.error(
+                "Orphan notification failed: id=%s phase=ack — retained",
+                job.id[:8],
+            )
+            continue
         logger.warning(
             "Orphan delegation recovered: id=%s agent=%s — NOTIFICATION posted",
             job.id[:8], job.specialist_role,

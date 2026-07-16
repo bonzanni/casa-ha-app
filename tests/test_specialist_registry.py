@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import textwrap
 from pathlib import Path
 
@@ -348,6 +349,49 @@ class TestDelegationLifecycle:
         await reg.complete_delegation("d-repeat")
         await reg.fail_delegation("d-repeat", RuntimeError("late callback"))
         await reg.cancel_delegation("d-repeat")
+
+    async def test_competing_terminal_facade_calls_are_registry_atomic(
+        self, tmp_path,
+    ):
+        from job_registry import ExecutionState, JobRegistry
+        from specialist_registry import DelegationRecord, SpecialistRegistry
+
+        jobs_path = tmp_path / "jobs.json"
+        legacy_path = tmp_path / "delegations.json"
+        jobs = JobRegistry(jobs_path, legacy_path)
+        await jobs.load()
+        reg = SpecialistRegistry(
+            str(tmp_path / "specialists"), job_registry=jobs,
+        )
+        await reg.register_delegation(DelegationRecord(
+            id="d-race", agent="finance", started_at=1.0, origin={},
+        ))
+
+        await jobs._lock.acquire()
+        complete = asyncio.create_task(reg.complete_delegation("d-race"))
+        fail = asyncio.create_task(
+            reg.fail_delegation("d-race", RuntimeError("late failure")),
+        )
+        try:
+            await asyncio.sleep(0)
+            assert len(jobs._lock._waiters) == 2
+        finally:
+            jobs._lock.release()
+
+        assert await asyncio.gather(complete, fail, return_exceptions=True) == [
+            None, None,
+        ]
+        terminal = jobs.get("d-race")
+        assert terminal.execution_state in {
+            ExecutionState.SUCCEEDED, ExecutionState.FAILED,
+        }
+
+        reloaded = JobRegistry(jobs_path, legacy_path)
+        await reloaded.load()
+        persisted = reloaded.get("d-race")
+        assert persisted.execution_state is terminal.execution_state
+        assert persisted.result == terminal.result
+        assert persisted.failure == terminal.failure
 
 
 # ---------------------------------------------------------------------------
