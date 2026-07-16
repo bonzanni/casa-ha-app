@@ -1871,6 +1871,11 @@ async def _run_delegated_agent_bounded(
     try:
         done, pending = await asyncio.wait({inner}, timeout=ceiling)
     except asyncio.CancelledError:
+        # The bounded runner may be abandoned by a voice deadline or caller
+        # while the delegated coroutine turns cancellation into an exception.
+        # Retrieve that exception without rendering it so private task/result
+        # content cannot reach the event loop's exception handler.
+        inner.add_done_callback(_retrieve_late_task_exception)
         inner.cancel()
         # Await the actual unwind so the permit (released by the OUTER
         # task's done-callback) never frees while the delegated work is

@@ -177,6 +177,46 @@ async def test_finish_voice_result_answer_has_ttl_without_continuation(tmp_path)
     assert finished.continuable_until is None
 
 
+async def test_finish_voice_result_cancel_pending_wins(tmp_path):
+    registry = await loaded_registry(tmp_path, make_job(), now=300.0)
+    result = await registry.request_cancel("job-1", actor=actor_for_job())
+    assert result.status == "stopping"
+
+    finished = await registry.finish_voice_result(
+        "job-1", '{"status":"answered"}',
+        awaiting_input=True, delivery_ttl_s=900,
+    )
+
+    assert finished.execution_state is ExecutionState.CANCELLED
+    assert finished.result is None
+    assert finished.awaiting_input is False
+    assert finished.continuable_until is None
+    assert finished.failure == JobFailure("cancelled", "Cancelled by creator")
+
+
+async def test_finish_voice_result_write_failure_is_atomic(tmp_path, monkeypatch):
+    registry = await loaded_registry(tmp_path, make_job(), now=300.0)
+    before = registry.get("job-1")
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("voice result disk full")
+
+    monkeypatch.setattr("job_registry.atomic_write_json", fail_write)
+    with pytest.raises(OSError, match="voice result disk full"):
+        await registry.finish_voice_result(
+            "job-1", '{"status":"answered"}',
+            awaiting_input=False, delivery_ttl_s=900,
+        )
+
+    assert registry.get("job-1") == before
+    reloaded = JobRegistry(
+        tmp_path / "jobs.json", tmp_path / "delegations.json",
+        clock=lambda: 300.0,
+    )
+    await reloaded.load()
+    assert reloaded.get("job-1") == before
+
+
 @pytest.mark.parametrize("ttl", [True, 29, 3601])
 async def test_finish_voice_result_rejects_invalid_ttl_without_mutation(
     tmp_path, ttl,

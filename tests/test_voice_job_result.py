@@ -34,6 +34,13 @@ def valid_result(**overrides):
     return parse_voice_job_result(payload)
 
 
+def nested_provenance(depth: int, leaf):
+    value = leaf
+    for _ in range(depth):
+        value = {"layer": value}
+    return value
+
+
 def test_output_format_is_the_exact_closed_voice_job_schema():
     assert VOICE_JOB_OUTPUT_FORMAT == {
         "type": "json_schema",
@@ -121,6 +128,19 @@ def test_parser_rejects_non_json_provenance_values():
         valid_result(provenance={"unsafe": object()})
 
 
+def test_parser_rejects_excessive_provenance_depth_without_payload_echo():
+    private_key = "PRIVATE-DEEP-PROVENANCE-KEY-83f2"
+    private_value = "PRIVATE-DEEP-PROVENANCE-VALUE-4ca1"
+    provenance = nested_provenance(1000, {private_key: private_value})
+
+    with pytest.raises(VoiceJobResultError, match="provenance") as caught:
+        valid_result(provenance=provenance)
+
+    rendered = str(caught.value)
+    assert private_key not in rendered
+    assert private_value not in rendered
+
+
 def test_parser_never_echoes_unexpected_private_field_names():
     private_canary = "PRIVATE-UNEXPECTED-FIELD-CANARY"
     payload = {**_VALID_RESULT, private_canary: "value"}
@@ -176,6 +196,32 @@ def test_household_result_is_spoken_on_origin_household_route():
     assert spoken_text_for(
         result, prompted=False, identity_clearance="household",
     ) == "The ruling is no."
+
+
+def test_needs_clarification_speaks_validated_question_not_summary():
+    result = valid_result(
+        status="needs_clarification",
+        spoken_summary="I need one more detail.",
+        answer="",
+        clarification="Which card do you mean?",
+        sensitivity="household",
+    )
+    assert spoken_text_for(
+        result, prompted=False, identity_clearance="household",
+    ) == "Which card do you mean?"
+
+
+def test_private_clarification_is_withheld_before_question_selection():
+    result = valid_result(
+        status="needs_clarification",
+        spoken_summary="I need one private detail.",
+        answer="",
+        clarification="Which private account do you mean?",
+        sensitivity="private",
+    )
+    assert spoken_text_for(
+        result, prompted=False, identity_clearance="household",
+    ) == "Your result is ready; ask me for the details."
 
 
 def test_private_prompt_still_requires_private_identity_clearance():

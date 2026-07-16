@@ -84,14 +84,29 @@ def _string_list_field(payload: dict[str, Any], name: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _freeze_json(value: Any) -> Any:
-    """Return an immutable snapshot of a JSON-shaped provenance value."""
+_MAX_PROVENANCE_DEPTH = 32
+
+
+def _freeze_json(value: Any, *, _depth: int = 0) -> Any:
+    """Return an immutable snapshot of a JSON-shaped provenance value.
+
+    Provenance permits at most 32 nested collection levels.  That is ample
+    for useful source metadata while keeping recursive validation far below
+    Python's interpreter recursion limit, even for hostile model output.
+    """
     if isinstance(value, dict):
+        if _depth >= _MAX_PROVENANCE_DEPTH:
+            raise VoiceJobResultError("provenance exceeds maximum nesting depth")
         if any(not isinstance(key, str) for key in value):
             raise VoiceJobResultError("provenance must contain only JSON values")
-        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+        return MappingProxyType({
+            key: _freeze_json(item, _depth=_depth + 1)
+            for key, item in value.items()
+        })
     if isinstance(value, list):
-        return tuple(_freeze_json(item) for item in value)
+        if _depth >= _MAX_PROVENANCE_DEPTH:
+            raise VoiceJobResultError("provenance exceeds maximum nesting depth")
+        return tuple(_freeze_json(item, _depth=_depth + 1) for item in value)
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float) and math.isfinite(value):
@@ -174,11 +189,13 @@ def spoken_text_for(
     identity_clearance: Literal["household", "private"],
 ) -> str:
     """Resolve disclosure before any result text reaches the voice wire."""
-    if result.sensitivity != "private" or identity_clearance == "private":
-        return result.spoken_summary
-    if prompted:
-        return "Your result is ready; I can't read private details on this voice route."
-    return "Your result is ready; ask me for the details."
+    if result.sensitivity == "private" and identity_clearance != "private":
+        if prompted:
+            return "Your result is ready; I can't read private details on this voice route."
+        return "Your result is ready; ask me for the details."
+    if result.status == "needs_clarification":
+        return result.clarification
+    return result.spoken_summary
 
 
 def voice_identity_clearance(
