@@ -1741,6 +1741,64 @@ def _rich_text_enabled_from_env(env: dict) -> bool:
     )
 
 
+async def _notify_recovered_delegations(
+    recovered_jobs,
+    job_registry,
+    bus,
+    *,
+    assistant_role: str,
+) -> None:
+    """Notify restart-orphaned Telegram jobs, then durably acknowledge."""
+    from specialist_registry import DelegationComplete
+
+    for job in recovered_jobs:
+        if job.creator_peer != "telegram" or job.failure is None:
+            continue
+        target_role = job.creating_role or assistant_role
+        if target_role not in bus.queues:
+            logger.error(
+                "Orphan delegation %s targets unknown role %r — retained for retry",
+                job.id[:8], target_role,
+            )
+            continue
+
+        # This compatibility signal carries only the stable failure envelope
+        # and origin metadata. No specialist output is reintroduced into the
+        # resident's context during restart recovery.
+        synthetic = DelegationComplete(
+            delegation_id=job.id,
+            agent=job.specialist_role,
+            status="error",
+            kind=job.failure.kind,
+            message=job.failure.message,
+            origin={
+                "role": job.creating_role,
+                "channel": job.creator_peer,
+                "chat_id": job.scope_id,
+                "cid": job.origin_route_id or "-",
+                "user_text": job.task,
+            },
+            elapsed_s=0.0,
+        )
+        await bus.notify(BusMessage(
+            type=MessageType.NOTIFICATION,
+            source=job.specialist_role,
+            target=target_role,
+            content=synthetic,
+            channel=job.creator_peer,
+            context={
+                "cid": job.origin_route_id or "-",
+                "chat_id": job.scope_id,
+                "delegation_id": job.id,
+            },
+        ))
+        await job_registry.ack_orphan_notification(job.id)
+        logger.warning(
+            "Orphan delegation recovered: id=%s agent=%s — NOTIFICATION posted",
+            job.id[:8], job.specialist_role,
+        )
+
+
 async def main() -> None:
     """Async entry point for the Casa add-on."""
 
@@ -1884,7 +1942,7 @@ async def main() -> None:
 
     # 7. Framework tools
     from tools import create_casa_tools, init_tools
-    from specialist_registry import DelegationComplete, SpecialistRegistry
+    from specialist_registry import SpecialistRegistry
     from job_registry import JobRegistry
 
     # One durable owner for both delegated execution and voice-delivery state.
@@ -2717,47 +2775,9 @@ async def main() -> None:
     # 13b. Restart-orphan notifications come from the recovered durable job
     # failures. Voice jobs remain READY for their delivery coordinator; the
     # compatibility notification below is only for the legacy Telegram route.
-    for job in recovered_jobs:
-        if job.creator_peer != "telegram" or job.failure is None:
-            continue
-        target_role = job.creating_role or assistant_role
-        if target_role in bus.queues:
-            synthetic = DelegationComplete(
-                delegation_id=job.id,
-                agent=job.specialist_role,
-                status="error",
-                kind=job.failure.kind,
-                message=job.failure.message,
-                origin={
-                    "role": job.creating_role,
-                    "channel": job.creator_peer,
-                    "chat_id": job.scope_id,
-                    "cid": job.origin_route_id or "-",
-                    "user_text": job.task,
-                },
-                elapsed_s=0.0,
-            )
-            await bus.notify(BusMessage(
-                type=MessageType.NOTIFICATION,
-                source=job.specialist_role,
-                target=target_role,
-                content=synthetic,
-                channel=job.creator_peer,
-                context={
-                    "cid": job.origin_route_id or "-",
-                    "chat_id": job.scope_id,
-                    "delegation_id": job.id,
-                },
-            ))
-            logger.warning(
-                "Orphan delegation recovered: id=%s agent=%s — NOTIFICATION posted",
-                job.id[:8], job.specialist_role,
-            )
-        else:
-            logger.error(
-                "Orphan delegation %s targets unknown role %r — dropped",
-                job.id[:8], target_role,
-            )
+    await _notify_recovered_delegations(
+        recovered_jobs, job_registry, bus, assistant_role=assistant_role,
+    )
 
     # 13c. Surface any default-sync overwrites to the operator (direct
     # telegram outbound — see notify_config_sync).

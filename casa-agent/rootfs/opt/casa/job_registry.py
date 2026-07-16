@@ -14,7 +14,7 @@ import os
 import time
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import Any, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping
 
 from atomic_io import atomic_write_json
 
@@ -80,6 +80,7 @@ class VoiceJob:
     delivery_attempt_id: str | None
     lease_until: float | None
     cancel_pending: bool
+    orphan_notification_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -168,34 +169,52 @@ class JobRegistry:
 
             migrated: dict[str, VoiceJob] = {}
             migrated_ids: list[str] = []
+            consume_legacy = False
             legacy_exists = os.path.exists(self._legacy_tombstone_path)
             if legacy_exists:
-                migrated, migrated_ids = await asyncio.to_thread(
+                migrated, migrated_ids, consume_legacy = await asyncio.to_thread(
                     self._read_legacy_jobs,
                     max((job.delivery_sequence for job in jobs.values()), default=0),
                     jobs,
                 )
                 jobs.update(migrated)
 
-            if not snapshot_exists or migrated:
-                # Persist converted rows after any existing jobs and before
-                # touching the legacy file. A failed write therefore cannot
-                # lose the only restart-recovery copy.
-                await self._write_snapshot_locked(jobs)
-            if legacy_exists:
-                await asyncio.to_thread(
-                    atomic_write_json,
-                    self._legacy_tombstone_path,
-                    [],
-                    indent=2,
-                )
+            write_snapshot = not snapshot_exists or bool(migrated)
 
-            self._jobs = jobs
-            self._delivery_sequence = max(
-                (job.delivery_sequence for job in jobs.values()), default=0,
-            )
-            self._migrated_on_load = migrated_ids
-            self._loaded = True
+            def publish_load() -> None:
+                self._jobs = jobs
+                self._delivery_sequence = max(
+                    (job.delivery_sequence for job in jobs.values()), default=0,
+                )
+                # Telegram recovery is driven exclusively by the durable
+                # pending bit. This process-local bridge remains only for
+                # migrated voice rows, whose READY delivery is authoritative.
+                self._migrated_on_load = [
+                    job_id for job_id in migrated_ids
+                    if (job_id in jobs
+                        and not jobs[job_id].orphan_notification_pending)
+                ]
+                self._loaded = True
+
+            if write_snapshot or consume_legacy:
+                async def commit_load() -> None:
+                    if write_snapshot:
+                        # Persist converted rows after any existing jobs and
+                        # before touching the legacy file. A failed write
+                        # therefore cannot lose the only recovery copy.
+                        await self._write_snapshot_locked(jobs)
+                    if consume_legacy:
+                        await asyncio.to_thread(
+                            atomic_write_json,
+                            self._legacy_tombstone_path,
+                            [],
+                            indent=2,
+                        )
+                    publish_load()
+
+                await self._finish_atomic_commit(commit_load())
+            else:
+                publish_load()
 
     def get(self, job_id: str) -> VoiceJob | None:
         return self._jobs.get(job_id)
@@ -216,11 +235,7 @@ class JobRegistry:
                 raise JobTransitionError(f"job {job.id!r} already exists")
             candidate = dict(self._jobs)
             candidate[job.id] = job
-            await self._write_snapshot_locked(candidate)
-            self._jobs = candidate
-            self._delivery_sequence = max(
-                self._delivery_sequence, job.delivery_sequence,
-            )
+            await self._commit_snapshot_locked(candidate)
             return job
 
     async def bind_task(
@@ -253,16 +268,20 @@ class JobRegistry:
                             if current.started_at is not None else self._now()),
             )
             candidate = self._with_job(updated)
-            await self._write_snapshot_locked(candidate)
-            self._jobs = candidate
 
             event = cancel_event or asyncio.Event()
-            self._tasks[job_id] = task
-            self._cancel_events[job_id] = event
-            if permit is not None:
-                self._permits[job_id] = permit
-            task.add_done_callback(
-                lambda done, jid=job_id: self._task_done(jid, done),
+
+            def publish_runtime_ownership() -> None:
+                self._tasks[job_id] = task
+                self._cancel_events[job_id] = event
+                if permit is not None:
+                    self._permits[job_id] = permit
+                task.add_done_callback(
+                    lambda done, jid=job_id: self._task_done(jid, done),
+                )
+
+            await self._commit_snapshot_locked(
+                candidate, after_publish=publish_runtime_ownership,
             )
             return event
 
@@ -548,8 +567,7 @@ class JobRegistry:
                 candidate[job_id] = updated
                 changed.append(updated)
             if changed:
-                await self._write_snapshot_locked(candidate)
-                self._jobs = candidate
+                await self._commit_snapshot_locked(candidate)
             return changed
 
     async def expire_leases(self) -> list[VoiceJob]:
@@ -580,8 +598,7 @@ class JobRegistry:
                 candidate[job_id] = updated
                 changed.append(updated)
             if changed:
-                await self._write_snapshot_locked(candidate)
-                self._jobs = candidate
+                await self._commit_snapshot_locked(candidate)
             return changed
 
     async def recover_after_restart(self) -> list[VoiceJob]:
@@ -589,7 +606,11 @@ class JobRegistry:
         async with self._lock:
             self._require_loaded()
             now = self._now()
-            recovered_ids = list(self._migrated_on_load)
+            recovered_ids = [
+                job.id for job in self.all()
+                if job.orphan_notification_pending
+            ]
+            recovered_ids.extend(self._migrated_on_load)
             candidate = dict(self._jobs)
             changed = False
             next_sequence = self._delivery_sequence
@@ -617,6 +638,9 @@ class JobRegistry:
                         delivery_attempt_id=None,
                         lease_until=None,
                         cancel_pending=False,
+                        orphan_notification_pending=(
+                            current.creator_peer == "telegram"
+                        ),
                     )
                     recovered_ids.append(job_id)
                 elif current.delivery_state in self._LEASED_DELIVERY:
@@ -630,11 +654,11 @@ class JobRegistry:
                     changed = True
 
             if changed:
-                await self._write_snapshot_locked(candidate)
-                self._jobs = candidate
-                self._delivery_sequence = next_sequence
-
-            self._migrated_on_load.clear()
+                await self._commit_snapshot_locked(
+                    candidate, after_publish=self._migrated_on_load.clear,
+                )
+            else:
+                self._migrated_on_load.clear()
 
             seen: set[str] = set()
             return [
@@ -642,6 +666,16 @@ class JobRegistry:
                 for job_id in recovered_ids
                 if job_id in self._jobs and not (job_id in seen or seen.add(job_id))
             ]
+
+    async def ack_orphan_notification(self, job_id: str) -> VoiceJob:
+        """Durably acknowledge a restart-orphan Telegram notification."""
+        async with self._lock:
+            current = self._require_job(job_id)
+            if not current.orphan_notification_pending:
+                return current
+            return await self._persist_job_locked(replace(
+                current, orphan_notification_pending=False,
+            ))
 
     async def close(self) -> None:
         """Cancel process-owned resources and wait for task callbacks to run."""
@@ -671,7 +705,7 @@ class JobRegistry:
         self,
         starting_sequence: int,
         existing: Mapping[str, VoiceJob],
-    ) -> tuple[dict[str, VoiceJob], list[str]]:
+    ) -> tuple[dict[str, VoiceJob], list[str], bool]:
         try:
             raw = self._read_json(self._legacy_tombstone_path)
         except (OSError, json.JSONDecodeError) as exc:
@@ -679,13 +713,13 @@ class JobRegistry:
                 "Legacy delegation tombstone corrupt or unreadable (%s): %s",
                 self._legacy_tombstone_path, exc,
             )
-            return {}, []
+            return {}, [], True
         if not isinstance(raw, list):
             logger.error(
                 "Legacy delegation tombstone %s is not a JSON array",
                 self._legacy_tombstone_path,
             )
-            return {}, []
+            return {}, [], True
 
         jobs: dict[str, VoiceJob] = {}
         migrated_ids: list[str] = []
@@ -709,6 +743,13 @@ class JobRegistry:
                     # Handles a crash after jobs.json replace but before legacy
                     # truncation: do not duplicate the record, but do surface
                     # the recovered failure during this successful boot.
+                    if (prior.creator_peer == "telegram"
+                            and not prior.orphan_notification_pending):
+                        # Backfills a pre-field snapshot caught in that crash
+                        # window before consuming its remaining tombstone.
+                        jobs[job_id] = replace(
+                            prior, orphan_notification_pending=True,
+                        )
                     migrated_ids.append(job_id)
                 else:
                     logger.warning(
@@ -748,10 +789,13 @@ class JobRegistry:
                 delivery_attempt_id=None,
                 lease_until=None,
                 cancel_pending=False,
+                orphan_notification_pending=(
+                    str(origin.get("channel") or "") == "telegram"
+                ),
             )
             jobs[job_id] = job
             migrated_ids.append(job_id)
-        return jobs, migrated_ids
+        return jobs, migrated_ids, bool(raw)
 
     def _decode_snapshot(self, raw: Any) -> dict[str, VoiceJob]:
         if not isinstance(raw, list):
@@ -807,6 +851,9 @@ class JobRegistry:
                     row.get("delivery_attempt_id")),
                 lease_until=JobRegistry._optional_float(row.get("lease_until")),
                 cancel_pending=bool(row["cancel_pending"]),
+                orphan_notification_pending=bool(
+                    row.get("orphan_notification_pending", False)
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise JobRegistryError(f"invalid job snapshot row: {exc}") from exc
@@ -845,6 +892,7 @@ class JobRegistry:
             "delivery_attempt_id": job.delivery_attempt_id,
             "lease_until": job.lease_until,
             "cancel_pending": job.cancel_pending,
+            "orphan_notification_pending": job.orphan_notification_pending,
         }
 
     async def _write_snapshot_locked(
@@ -861,15 +909,47 @@ class JobRegistry:
             atomic_write_json, self._path, snapshot, indent=2,
         )
 
+    async def _commit_snapshot_locked(
+        self,
+        jobs: dict[str, VoiceJob],
+        *,
+        after_publish: Callable[[], None] | None = None,
+    ) -> None:
+        """Persist and publish one candidate without a cancellation gap."""
+        async def commit() -> None:
+            await self._write_snapshot_locked(jobs)
+            self._jobs = jobs
+            self._delivery_sequence = max(
+                (job.delivery_sequence for job in jobs.values()), default=0,
+            )
+            if after_publish is not None:
+                after_publish()
+
+        await self._finish_atomic_commit(commit())
+
+    @staticmethod
+    async def _finish_atomic_commit(operation: Awaitable[None]) -> None:
+        """Defer caller cancellation until a disk/publication commit finishes."""
+        task = asyncio.ensure_future(operation)
+        cancelled: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+
+        # A persistence error wins over a simultaneous cancellation and is
+        # always retrieved from the inner task. Publication only happens after
+        # the blocking writer returned successfully.
+        task.result()
+        if cancelled is not None:
+            raise cancelled
+
     # -- transition helpers --------------------------------------------
 
     async def _persist_job_locked(self, updated: VoiceJob) -> VoiceJob:
         candidate = self._with_job(updated)
-        await self._write_snapshot_locked(candidate)
-        self._jobs = candidate
-        self._delivery_sequence = max(
-            self._delivery_sequence, updated.delivery_sequence,
-        )
+        await self._commit_snapshot_locked(candidate)
         return updated
 
     def _with_job(self, updated: VoiceJob) -> dict[str, VoiceJob]:
