@@ -342,3 +342,60 @@ async def test_discrete_primitives_require_markup_wire():
 
 def test_markup_tristate_absent_sentinel():
     assert _markup_tristate(_ABSENT) == MARKUP_ABSENT
+
+
+# ---------------------------------------------------------------------------
+# F4 (whole-branch gate): the DISCRETE tri-state distinguishes None (CLEAR the
+# keyboard) from _ABSENT (leave untouched), so a keyboard CLEAR after an
+# identical text-only edit is not no-op-suppressed.
+# ---------------------------------------------------------------------------
+
+
+def test_discrete_markup_tristate_splits_none_from_absent():
+    from channels.output_sequencer import (
+        MARKUP_EMPTY,
+        _discrete_markup_tristate,
+    )
+    # _ABSENT stays ABSENT; None becomes EMPTY (a clear); MARKUP_EMPTY passes
+    # through; a real keyboard serializes distinctly.
+    assert _discrete_markup_tristate(_ABSENT) == MARKUP_ABSENT
+    assert _discrete_markup_tristate(None) == MARKUP_EMPTY
+    assert _discrete_markup_tristate(MARKUP_EMPTY) == MARKUP_EMPTY
+    assert _discrete_markup_tristate(KBD1) != MARKUP_ABSENT
+    assert _discrete_markup_tristate(KBD1) != MARKUP_EMPTY
+    # The non-discrete helper still conflates None with _ABSENT (its other
+    # consumers rely on that) — the split is DISCRETE-only.
+    assert _markup_tristate(None) == MARKUP_ABSENT
+
+
+async def test_edit_discrete_markup_none_clear_not_suppressed_after_text_edit():
+    """A CLEAR (markup=None) after an identical text-only edit (markup=_ABSENT)
+    must reach the wire; a repeated identical clear IS suppressed."""
+    seq, _plain, markup, _clock, _ids = _make_seq()
+    mid = await seq.post_discrete("body", markup=KBD1)
+    # A text-only edit leaves the keyboard untouched (_ABSENT), seeding
+    # (text, MARKUP_ABSENT).
+    assert await seq.edit_discrete(mid, text="body2") is True
+    n_after_text = len(markup.edits)
+    assert n_after_text == 1  # the text edit reached the wire
+
+    # The CLEAR with the SAME text must NOT be no-op-suppressed — pre-fix None
+    # mapped to MARKUP_ABSENT (== the text edit's key) and was dropped.
+    assert await seq.edit_discrete(mid, text="body2", markup=None) is True
+    assert len(markup.edits) == n_after_text + 1        # clear reached the wire
+    assert markup.edits[-1][3] is None                   # markup=None on the wire
+
+    # A repeated identical clear IS suppressed (cache now holds MARKUP_EMPTY).
+    assert await seq.edit_discrete(mid, text="body2", markup=None) is True
+    assert len(markup.edits) == n_after_text + 1         # no new wire edit
+
+
+async def test_post_discrete_none_markup_seeds_empty_not_absent():
+    """post_discrete(markup=None) seeds MARKUP_EMPTY, so a subsequent identical
+    clear is a genuine no-op — but a text-only touch that leaves the keyboard
+    untouched is NOT conflated with it."""
+    seq, _plain, markup, _clock, _ids = _make_seq()
+    mid = await seq.post_discrete("plain", markup=None)   # posted with no keyboard
+    # An identical clear is a genuine no-op (the message already has no keyboard).
+    assert await seq.edit_discrete(mid, text="plain", markup=None) is True
+    assert markup.edits == []

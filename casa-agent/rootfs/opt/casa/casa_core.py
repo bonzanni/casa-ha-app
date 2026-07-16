@@ -2270,10 +2270,11 @@ async def main() -> None:
             return None
         telegram_channel._driver_reserve_answer = _driver_reserve_answer
 
-        async def _driver_rollback_answer_reservation(rec, token):
+        async def _driver_rollback_answer_reservation(
+                rec, token, *, suppress_reanchor=False):
             if rec.driver == "claude_code" and token is not None:
                 return await claude_code_driver.rollback_answer_reservation(
-                    rec.id, token)
+                    rec.id, token, suppress_reanchor=suppress_reanchor)
             return False
         telegram_channel._driver_rollback_answer_reservation = (
             _driver_rollback_answer_reservation)
@@ -2768,6 +2769,22 @@ async def main() -> None:
     for task in all_loop_tasks:
         task.cancel()
     await asyncio.gather(*all_loop_tasks, return_exceptions=True)
+
+    # F1 (v0.83.0 whole-branch gate): bounded drain of the claude_code driver's
+    # CANCEL-EXEMPT post-SIGTERM force-suspend cleanups (extinction poll + SIGKILL
+    # escalation). Placed AFTER the engagement-loop/agent teardown and BEFORE the
+    # broker/channel teardown (mirroring _drain_broker_before_channel_shutdown's
+    # "resolve in-flight work before tearing the transport down" ordering) so a
+    # SIGTERM-resistant engagement subprocess is verified extinct rather than
+    # orphaned by a premature process exit. Bounded + truthful — never wedges
+    # shutdown (getattr-guarded so a driver without the seam is a no-op).
+    _cc_driver = getattr(runtime, "claude_code_driver", None)
+    _drain_force = getattr(_cc_driver, "drain_force_cleanups", None)
+    if _drain_force is not None:
+        try:
+            await _drain_force()
+        except Exception:  # noqa: BLE001 — shutdown must complete
+            logger.warning("force-cleanup drain failed", exc_info=True)
 
     await _drain_broker_before_channel_shutdown(channel_manager)
     # Close the shared Hindsight client session (L32) so aiohttp does not

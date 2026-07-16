@@ -557,8 +557,11 @@ async def _handler_ctx(tmp_path, fake_telegram_bot):
     ch._driver_advance_high_water = AsyncMock()
     ch._driver_reserve_answer = lambda r: drv.reserve_answer(r.id)
 
-    async def _rb(r, tok):
-        return await drv.rollback_answer_reservation(r.id, tok)
+    async def _rb(r, tok, *, suppress_reanchor=False):
+        # Mirrors casa_core's real _driver_rollback_answer_reservation seam,
+        # which forwards F2's suppress_reanchor to the driver.
+        return await drv.rollback_answer_reservation(
+            r.id, tok, suppress_reanchor=suppress_reanchor)
 
     ch._driver_rollback_answer_reservation = _rb
     ch._post_engagement_notice = AsyncMock()
@@ -702,8 +705,11 @@ async def _handler_ctx_seq(tmp_path, fake_telegram_bot):
     ch._driver_advance_high_water = AsyncMock()
     ch._driver_reserve_answer = lambda r: drv.reserve_answer(r.id)
 
-    async def _rb(r, tok):
-        return await drv.rollback_answer_reservation(r.id, tok)
+    async def _rb(r, tok, *, suppress_reanchor=False):
+        # Mirrors casa_core's real _driver_rollback_answer_reservation seam,
+        # which forwards F2's suppress_reanchor to the driver.
+        return await drv.rollback_answer_reservation(
+            r.id, tok, suppress_reanchor=suppress_reanchor)
 
     ch._driver_rollback_answer_reservation = _rb
     # Route platform notices through the REAL sequencer onto the shared wire.

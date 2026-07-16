@@ -656,6 +656,67 @@ class TestTerminalFinalizeSettle:
 
 
 # ===========================================================================
+# F2 (whole-branch gate): a TERMINAL command (/cancel, /complete) rolls back
+# the answer reservation with suppress_reanchor=True — the imminent terminal
+# finalize owns the open anchors, so the fourth-consumer re-anchor must NOT
+# fire (no redundant copy) and the latch must stay UNSET. The REAL driver
+# finalizer settle (settle_all_open_questions) then settles the entry once.
+# ===========================================================================
+
+
+class TestF2TerminalCommandSuppressesReanchor:
+    async def test_suppress_reanchor_skips_pass_then_terminal_settles_once(
+        self, tmp_path,
+    ):
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire)
+        seq = drv._ensure_sequencer(rec)
+        # A command notice posted BELOW the anchor this turn (high-water > 500),
+        # so a NON-suppressed rollback WOULD re-anchor.
+        await seq.post_platform_notice("Engagement cancelled by originator.")
+        assert seq.high_water > 500
+        token = drv.reserve_answer(rec.id)
+        assert token is not None
+
+        # /cancel path: rollback with suppress_reanchor=True (finalize follows).
+        rolled = await drv.rollback_answer_reservation(
+            rec.id, token, suppress_reanchor=True)
+        assert rolled is True
+        # NO re-anchor post — the terminal settle owns the entries.
+        assert all(k != "markup" for k, _, _ in wire.posts)
+        # Latch NEITHER set NOR consumed.
+        assert rec.id not in drv._reanchor_due
+
+        # REAL terminal finalizer settle — settles the (unanswered) entry ONCE.
+        await drv.settle_all_open_questions(rec, "cancelled")
+        settles = [
+            (mid, text) for _, mid, text in wire.edits if mid == 500
+        ]
+        assert len(settles) == 1
+        assert "engagement ended" in settles[0][1]
+        assert reg.open_question_entries(rec.id) == []
+
+    async def test_non_suppressed_rollback_still_reanchors(self, tmp_path):
+        """Contrast: a NON-terminal rollback (default) DOES re-anchor — proving
+        the suppress flag, not the setup, is what silences the pass."""
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire)
+        seq = drv._ensure_sequencer(rec)
+        await seq.post_platform_notice("Observer quieted.")
+        token = drv.reserve_answer(rec.id)
+
+        rolled = await drv.rollback_answer_reservation(rec.id, token)
+        assert rolled is True
+        assert any(k == "markup" for k, _, _ in wire.posts)   # re-anchored
+        assert _entry(reg, rec, n)["tg_message_id"] == (
+            [mid for k, mid, _ in wire.posts if k == "markup"][-1])
+
+
+# ===========================================================================
 # 8. retry owner (Sol §6n note 1)
 # ===========================================================================
 

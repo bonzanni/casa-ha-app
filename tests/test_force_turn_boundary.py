@@ -269,14 +269,15 @@ async def test_getpgid_vanished_returns_false_no_signals(monkeypatch, caplog):
 # ---------------------------------------------------------------------------
 
 
-def _driver(tmp_path):
+def _driver(tmp_path, *, monotonic=None):
     from unittest.mock import AsyncMock
 
     from drivers.claude_code_driver import ClaudeCodeDriver
 
+    kw = {} if monotonic is None else {"monotonic": monotonic}
     return ClaudeCodeDriver(
         engagements_root=str(tmp_path), send_to_topic=AsyncMock(),
-        casa_framework_mcp_url="x")
+        casa_framework_mcp_url="x", **kw)
 
 
 async def _drain():
@@ -343,34 +344,46 @@ async def test_new_episode_can_fire_again_after_clear(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Sol A2 wave-3, Finding 1: the once-per-episode backstop RE-ARMS on an
-# unverified (False/unknown) outcome so a transient probe failure does not
-# permanently disable it; a VERIFIED (True) outcome latches (no re-fire).
+# Sol A2 wave-3, Finding 1 + F3 (whole-branch gate): the once-per-episode
+# backstop RE-ARMS on an unverified (False/unknown) outcome so a transient probe
+# failure does not permanently disable it — but a monotonic COOLDOWN must elapse
+# before it re-fires (F3), so a doctrine-defying ask→refusal loop cannot churn
+# probes/subprocesses at token speed. A VERIFIED (True) outcome latches.
 # ---------------------------------------------------------------------------
 
 
-async def test_unverified_outcome_rearms_backstop(tmp_path):
+async def test_unverified_outcome_rearms_after_cooldown(tmp_path):
     from unittest.mock import AsyncMock
 
     eid = "eng0000000000000a"
-    drv = _driver(tmp_path)
+    clock = {"t": 1000.0}
+    drv = _driver(tmp_path, monotonic=lambda: clock["t"])
     # First force-end returns False (unknown probe); the second returns True.
     fake = AsyncMock(side_effect=[False, True])
     drv._force_turn_boundary = fake
     drv._operator_away[eid] = True
 
     drv.record_away_refusal(eid)          # 1 — below the threshold
-    drv.record_away_refusal(eid)          # 2 — fires; returns False → re-arm
+    drv.record_away_refusal(eid)          # 2 — fires; returns False → re-arm+cooldown
     await _drain()
     assert fake.await_count == 1
-    assert eid not in drv._away_suspend_fired   # unverified → re-armed
+    assert eid not in drv._away_suspend_fired          # unverified → re-armed
+    # A cooldown deadline in the future was recorded.
+    assert drv._away_force_cooldown_until[eid] > clock["t"]
 
-    drv.record_away_refusal(eid)          # 3 — re-fires; returns True → latch
+    # 3 — still WITHIN the cooldown window → does NOT re-fire (F3 pacing).
+    drv.record_away_refusal(eid)
+    await _drain()
+    assert fake.await_count == 1
+
+    # Advance the injected clock past the cooldown → the next refusal re-fires.
+    clock["t"] += 61.0
+    drv.record_away_refusal(eid)          # 4 — re-fires; returns True → latch
     await _drain()
     assert fake.await_count == 2
-    assert eid in drv._away_suspend_fired       # verified True → latched
+    assert eid in drv._away_suspend_fired               # verified True → latched
 
-    drv.record_away_refusal(eid)          # 4 — latched, NO re-fire
+    drv.record_away_refusal(eid)          # 5 — latched, NO re-fire
     await _drain()
     assert fake.await_count == 2
 
@@ -791,3 +804,77 @@ async def test_probe_status_and_pid_strict_shapes(
 async def test_probe_status_and_pid_scandir_absent_is_down(monkeypatch):
     monkeypatch.setattr(s6_rc.os.path, "isdir", lambda p: False)
     assert await s6_rc._probe_status_and_pid("/nope") == ("down", None)
+
+
+# ---------------------------------------------------------------------------
+# F1 (whole-branch gate): bounded shutdown drain of the cancel-exempt
+# post-SIGTERM force-suspend cleanups (``drain_force_cleanups``). A gated
+# in-flight cleanup is AWAITED before the drain returns True; a cleanup that
+# outruns the timeout returns a truthful False (and is NOT cancelled — it is
+# cancel-exempt) so shutdown proceeds.
+# ---------------------------------------------------------------------------
+
+
+async def test_drain_force_cleanups_no_pending_returns_true(tmp_path):
+    drv = _driver(tmp_path)
+    assert await drv.drain_force_cleanups() is True
+
+
+async def test_drain_force_cleanups_awaits_inflight_then_true(tmp_path):
+    import asyncio
+
+    eid = "eng0000000000000d"
+    drv = _driver(tmp_path)
+    gate = asyncio.Event()
+    finished = []
+
+    async def _cleanup():
+        await gate.wait()
+        finished.append(True)
+        return True
+
+    t = asyncio.ensure_future(_cleanup())
+    drv._register_force_cleanup(eid, t)
+
+    # Release the cleanup, then drain: the drain must AWAIT it to completion
+    # before returning True (it is not yet done when the drain starts).
+    async def _release() -> None:
+        await asyncio.sleep(0)
+        gate.set()
+
+    releaser = asyncio.ensure_future(_release())
+    drained = await asyncio.wait_for(drv.drain_force_cleanups(timeout=1.0), 1.5)
+    await releaser
+    assert drained is True
+    assert finished == [True]          # the cleanup actually completed
+    assert t.done()
+
+
+async def test_drain_force_cleanups_timeout_returns_false_and_does_not_cancel(
+    tmp_path, caplog,
+):
+    import asyncio
+    import logging
+
+    eid = "eng0000000000000e"
+    drv = _driver(tmp_path)
+    gate = asyncio.Event()
+
+    async def _slow_cleanup():
+        await gate.wait()          # never released within the timeout
+        return True
+
+    t = asyncio.ensure_future(_slow_cleanup())
+    drv._register_force_cleanup(eid, t)
+
+    with caplog.at_level(logging.WARNING):
+        drained = await drv.drain_force_cleanups(timeout=0.05)
+
+    # Truthful False on timeout; the cleanup is cancel-exempt (still running).
+    assert drained is False
+    assert not t.done()
+    assert any("did not finish" in r.message for r in caplog.records)
+
+    # Cleanup after the drain so the test leaves no pending task.
+    gate.set()
+    await asyncio.wait_for(t, timeout=1.0)

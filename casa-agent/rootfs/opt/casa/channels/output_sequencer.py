@@ -304,6 +304,31 @@ def _markup_tristate(markup: Any) -> Any:
     return f"markup:{markup!r}"
 
 
+def _discrete_markup_tristate(markup: Any) -> Any:
+    """Map a DISCRETE-write markup argument to its cache key (F4).
+
+    Unlike :func:`_markup_tristate` (which conflates them so a text-only
+    narration edit never accidentally reads as a keyboard change),
+    ``post_discrete``/``edit_discrete`` distinguish the two keyboard operations:
+
+    * ``_ABSENT`` — "leave the keyboard untouched" → ``MARKUP_ABSENT``;
+    * ``None`` — "CLEAR the keyboard" → ``MARKUP_EMPTY`` (a clear IS the
+      explicit-empty operation; matches ``edit_topic_message_markup``'s
+      ``None``/``MARKUP_EMPTY`` → explicit-empty-keyboard wire semantics).
+
+    Without this split a keyboard CLEAR (``markup=None``) after an identical
+    text-only edit is no-op-suppressed, because ``_markup_tristate(None)``
+    equals ``_markup_tristate(_ABSENT)`` and the ``(text, tri)`` cache matches.
+    """
+    if markup is _ABSENT:
+        return MARKUP_ABSENT
+    if markup is None:
+        return MARKUP_EMPTY
+    if isinstance(markup, str) and markup == MARKUP_EMPTY:
+        return MARKUP_EMPTY
+    return f"markup:{markup!r}"
+
+
 # Result codes from edit_narration_if_latest / post_for_block.
 APPLIED = "applied"
 SEALED = "sealed"
@@ -929,7 +954,7 @@ class OutputSequencer:
                 return None
             if self._high_water is None or mid > self._high_water:
                 self._high_water = mid
-            self._edit_cache[mid] = (text, _markup_tristate(markup))
+            self._edit_cache[mid] = (text, _discrete_markup_tristate(markup))
             self._register_discrete_cache(mid)
             return mid
 
@@ -961,7 +986,7 @@ class OutputSequencer:
         async with self._serialized():
             if revalidate is not None and not await _maybe_await(revalidate()):
                 return False
-            tri = _markup_tristate(markup)
+            tri = _discrete_markup_tristate(markup)  # F4: None ⇒ CLEAR, not ABSENT
             if self._edit_cache.get(msg_id) == (text, tri):
                 return True  # no-op skip — no wire call
             ok = await _maybe_await(self._edit_message_markup(

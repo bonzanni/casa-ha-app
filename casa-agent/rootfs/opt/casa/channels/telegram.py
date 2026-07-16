@@ -1303,7 +1303,14 @@ class TelegramChannel(Channel):
                                 )
                                 await self._rollback_answer(rec, answer_token)
                                 return
-                            await self._rollback_answer(rec, answer_token)
+                            # F2: TERMINAL path — finalize follows and its
+                            # settle_all_open_questions owns the open anchors, so
+                            # suppress the fourth-consumer re-anchor (it would post
+                            # a redundant copy that terminal settle instantly
+                            # settles). The originator-rejected + /silent rollbacks
+                            # above are NON-terminal and keep re-anchoring.
+                            await self._rollback_answer(
+                                rec, answer_token, suppress_reanchor=True)
                             if command == "/cancel":
                                 return await self._finalize_cancel(rec, reason="user")
                             return await self._finalize_complete_user(rec)
@@ -1425,14 +1432,23 @@ class TelegramChannel(Channel):
             return
         return await self._route_to_ellen(update)
 
-    async def _rollback_answer(self, rec, token) -> None:
+    async def _rollback_answer(
+        self, rec, token, *, suppress_reanchor: bool = False,
+    ) -> None:
         """§A3: best-effort CAS rollback of an answered reservation (a no-op when
         unwired, the token is None, or the CAS loses ownership). Swallows its own
-        errors so no non-delivery path is aborted by a rollback failure."""
+        errors so no non-delivery path is aborted by a rollback failure.
+
+        F2 (whole-branch gate): TERMINAL command paths (``/cancel``/``/complete``)
+        pass ``suppress_reanchor=True`` because engagement finalize follows and
+        its ``settle_all_open_questions`` owns the open anchors — re-anchoring
+        here would post a redundant copy that terminal settlement instantly
+        settles."""
         if token is None or self._driver_rollback_answer_reservation is None:
             return
         try:
-            await self._driver_rollback_answer_reservation(rec, token)
+            await self._driver_rollback_answer_reservation(
+                rec, token, suppress_reanchor=suppress_reanchor)
         except Exception:  # noqa: BLE001 — rollback is advisory
             logger.debug("rollback_answer_reservation failed for %s",
                          rec.id[:8], exc_info=True)

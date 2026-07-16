@@ -11,6 +11,21 @@ import pytest
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
+def _boot_driver():
+    """A driver fake for boot-replay tests.
+
+    F6 (whole-branch gate): ``casa_core.replay_undergoing_engagements`` calls
+    ``schedule_boot_reconcile`` SYNCHRONOUSLY (it is sync by design — it schedules
+    a task and returns it, or None). An unconstrained ``AsyncMock`` fabricates it
+    as async, returning a coroutine casa_core never awaits → an
+    unawaited-coroutine RuntimeWarning per call. Pin it to a plain sync no-op so
+    the gate stays warning-clean. (``_spawn_background_tasks`` is likewise
+    overridden by each caller.)"""
+    driver = AsyncMock()
+    driver.schedule_boot_reconcile = lambda *a, **k: None
+    return driver
+
+
 async def _make_registry(records):
     from engagement_registry import EngagementRegistry
     reg = EngagementRegistry(tombstone_path="/tmp/x-nope.json", bus=None)
@@ -52,7 +67,7 @@ async def test_replay_sweeps_orphans_and_replants_missing(monkeypatch, tmp_path)
 
     reg = await _make_registry([_rec("keep1"), _rec("done1", status="completed")])
 
-    driver = AsyncMock()
+    driver = _boot_driver()
     driver._spawn_background_tasks = lambda rec: None
 
     await replay_undergoing_engagements(
@@ -116,7 +131,7 @@ async def test_replay_heals_missing_service_dir_with_known_executor(
     })
 
     reg = await _make_registry([_rec("keep1")])
-    driver = AsyncMock()
+    driver = _boot_driver()
     driver._spawn_background_tasks = lambda rec: None
 
     # M7: heal only happens when the workspace dir still exists.
@@ -188,7 +203,7 @@ async def test_replay_rerenders_stale_prev75_run_script(monkeypatch, tmp_path):
     })
 
     reg = await _make_registry([_rec("keep1")])
-    driver = AsyncMock()
+    driver = _boot_driver()
     driver._spawn_background_tasks = lambda rec: None
 
     ws_root = tmp_path / "eng"
@@ -230,7 +245,7 @@ async def test_replay_leaves_alone_unknown_executor(monkeypatch, tmp_path):
         def get(self, _t): return None
 
     reg = await _make_registry([_rec("keep1")])
-    driver = AsyncMock()
+    driver = _boot_driver()
     driver._spawn_background_tasks = lambda rec: None
 
     # Workspace present so we exercise the unknown-executor branch (not the
@@ -295,7 +310,7 @@ async def test_replay_replants_incomplete_pair(monkeypatch, tmp_path):
             )
 
     reg = await _make_registry([_rec("keep1")])
-    driver = AsyncMock()
+    driver = _boot_driver()
     driver._spawn_background_tasks = lambda rec: None
 
     ws_root = tmp_path / "eng"
@@ -347,7 +362,7 @@ async def test_replay_heals_when_only_log_sibling_survives(
             )
 
     reg = await _make_registry([_rec("keep1")])
-    driver = AsyncMock()
+    driver = _boot_driver()
     driver._spawn_background_tasks = lambda rec: None
 
     ws_root = tmp_path / "eng"
@@ -406,7 +421,7 @@ async def test_replay_one_bad_heal_does_not_abort_others(
             )
 
     reg = await _make_registry([_rec("bad1"), _rec("good1")])
-    driver = AsyncMock()
+    driver = _boot_driver()
     driver._spawn_background_tasks = lambda rec: None
 
     ws_root = tmp_path / "eng"
@@ -459,7 +474,7 @@ async def test_replay_warn_and_skips_heal_when_workspace_missing(
             )
 
     reg = await _make_registry([_rec("keep1")])
-    driver = AsyncMock()
+    driver = _boot_driver()
     driver._spawn_background_tasks = lambda rec: None
 
     ws_root = tmp_path / "eng"   # exists, but keep1/ subdir deliberately absent
@@ -527,7 +542,7 @@ async def test_replay_renders_plugin_dir_flags_from_record(monkeypatch, tmp_path
     rec = _rec_pa("keep1", [{"name": "superpowers", "artifact_id": "a" * 64,
                              "path": str(art_dir)}])
     reg = await _make_registry([rec])
-    driver = AsyncMock(); driver._spawn_background_tasks = lambda r: None
+    driver = _boot_driver(); driver._spawn_background_tasks = lambda r: None
     ws_root = tmp_path / "eng"; (ws_root / "keep1").mkdir(parents=True)
 
     await replay_undergoing_engagements(
@@ -567,7 +582,7 @@ async def test_replay_refuses_when_recorded_artifact_missing(monkeypatch, tmp_pa
                         "path": str(good_dir)}], topic_id=6)
     reg = await _make_registry([refused, healthy])
 
-    driver = AsyncMock()
+    driver = _boot_driver()
     bg = MagicMock()
     driver._spawn_background_tasks = bg
     ws_root = tmp_path / "eng"
@@ -665,7 +680,7 @@ async def test_replay_a_re_renders_claude_md_on_complete_pair(monkeypatch, tmp_p
     (ws_root / "keep1" / "CLAUDE.md").write_text("")   # blanked
 
     reg = await _make_registry([_brief_rec("keep1", _BRIEF)])
-    driver = AsyncMock(); driver._spawn_background_tasks = lambda r: None
+    driver = _boot_driver(); driver._spawn_background_tasks = lambda r: None
 
     await replay_undergoing_engagements(
         registry=reg, driver=driver, executor_registry=_exec_reg_any(defn),
@@ -716,7 +731,7 @@ async def test_replay_b_refresh_failure_refuses_with_checked_teardown(
     defn = _brief_defn(tmp_path)
     ws_root = tmp_path / "eng"; (ws_root / "keep1").mkdir(parents=True)
     reg = await _make_registry([_brief_rec("keep1", _BRIEF)])
-    driver = AsyncMock(); bg = MagicMock(); driver._spawn_background_tasks = bg
+    driver = _boot_driver(); bg = MagicMock(); driver._spawn_background_tasks = bg
 
     await replay_undergoing_engagements(
         registry=reg, driver=driver, executor_registry=_exec_reg_any(defn),
@@ -762,7 +777,7 @@ async def test_replay_b2_removal_and_compile_failures_after_confirmed_stop(
     defn = _brief_defn(tmp_path)
     ws_root = tmp_path / "eng"; (ws_root / "keep1").mkdir(parents=True)
     reg = await _make_registry([_brief_rec("keep1", _BRIEF)])
-    driver = AsyncMock(); driver._spawn_background_tasks = lambda r: None
+    driver = _boot_driver(); driver._spawn_background_tasks = lambda r: None
 
     with pytest.raises(RuntimeError, match="compile failed"):
         await replay_undergoing_engagements(
@@ -796,7 +811,7 @@ async def test_replay_c_missing_registry_refuses_brief(monkeypatch, tmp_path):
 
     ws_root = tmp_path / "eng"; (ws_root / "keep1").mkdir(parents=True)
     reg = await _make_registry([_brief_rec("keep1", _BRIEF)])
-    driver = AsyncMock(); bg = MagicMock(); driver._spawn_background_tasks = bg
+    driver = _boot_driver(); bg = MagicMock(); driver._spawn_background_tasks = bg
 
     await replay_undergoing_engagements(
         registry=reg, driver=driver, executor_registry=None,
@@ -833,7 +848,7 @@ async def test_replay_d_definition_any_none_refuses_brief(monkeypatch, tmp_path)
 
     ws_root = tmp_path / "eng"; (ws_root / "keep1").mkdir(parents=True)
     reg = await _make_registry([_brief_rec("keep1", _BRIEF)])
-    driver = AsyncMock(); bg = MagicMock(); driver._spawn_background_tasks = bg
+    driver = _boot_driver(); bg = MagicMock(); driver._spawn_background_tasks = bg
 
     await replay_undergoing_engagements(
         registry=reg, driver=driver, executor_registry=NoneReg(),
@@ -870,7 +885,7 @@ async def test_replay_e_disabled_defn_incomplete_pair_heals(monkeypatch, tmp_pat
     (ws_root / "keep1" / "CLAUDE.md").write_text("")
 
     reg = await _make_registry([_brief_rec("keep1", _BRIEF)])
-    driver = AsyncMock(); bg = MagicMock(); driver._spawn_background_tasks = bg
+    driver = _boot_driver(); bg = MagicMock(); driver._spawn_background_tasks = bg
 
     # get() returns None (disabled), definition_any returns the defn.
     await replay_undergoing_engagements(
@@ -913,7 +928,7 @@ async def test_replay_true_exhaustion_marks_error_via_real_registry(
 
     reg = EngagementRegistry(tombstone_path=str(tmp_path / "tomb.json"), bus=None)
     reg._records["keep1"] = _brief_rec("keep1", _BRIEF)
-    driver = AsyncMock(); driver._spawn_background_tasks = lambda r: None
+    driver = _boot_driver(); driver._spawn_background_tasks = lambda r: None
 
     await replay_undergoing_engagements(
         registry=reg, driver=driver, executor_registry=_exec_reg_any(defn),
@@ -985,7 +1000,7 @@ async def test_replay_b2_stale_migration_removal_fails_refuses_closed(
 
     reg = EngagementRegistry(tombstone_path=str(tmp_path / "tomb.json"), bus=None)
     reg._records["keep1"] = _brief_rec("keep1", _BRIEF)
-    driver = AsyncMock(); bg = MagicMock(); driver._spawn_background_tasks = bg
+    driver = _boot_driver(); bg = MagicMock(); driver._spawn_background_tasks = bg
 
     await replay_undergoing_engagements(
         registry=reg, driver=driver, executor_registry=exec_reg,
@@ -1036,7 +1051,7 @@ async def test_replay_b2_partial_removal_main_survives_refuses_closed(
     from engagement_registry import EngagementRegistry
     reg = EngagementRegistry(tombstone_path=str(tmp_path / "tomb.json"), bus=None)
     reg._records["keep1"] = _brief_rec("keep1", _BRIEF)
-    driver = AsyncMock(); bg = MagicMock(); driver._spawn_background_tasks = bg
+    driver = _boot_driver(); bg = MagicMock(); driver._spawn_background_tasks = bg
 
     await replay_undergoing_engagements(
         registry=reg, driver=driver, executor_registry=exec_reg,
@@ -1070,7 +1085,7 @@ async def test_replay_b2_migration_succeeds_when_removal_confirmed(
     ws_root = tmp_path / "eng"; (ws_root / "keep1").mkdir(parents=True)
 
     reg = await _make_registry([_brief_rec("keep1", _BRIEF)])
-    driver = AsyncMock(); driver._spawn_background_tasks = lambda r: None
+    driver = _boot_driver(); driver._spawn_background_tasks = lambda r: None
 
     await replay_undergoing_engagements(
         registry=reg, driver=driver, executor_registry=exec_reg,
@@ -1159,7 +1174,7 @@ async def test_replay_aborts_resume_when_summary_adopt_fails(monkeypatch, tmp_pa
         adopt_calls.append(rec.id)
         raise RuntimeError("telegram down")
 
-    driver = AsyncMock()
+    driver = _boot_driver()
     driver._spawn_background_tasks = lambda rec: None
     driver.adopt_summary_if_missing = _adopt_boom
 
@@ -1199,7 +1214,7 @@ async def test_replay_adopts_summary_before_start(monkeypatch, tmp_path):
     async def _adopt(rec):
         order.append(("adopt", rec.id))
 
-    driver = AsyncMock()
+    driver = _boot_driver()
     driver._spawn_background_tasks = lambda rec: None
     driver.adopt_summary_if_missing = _adopt
 

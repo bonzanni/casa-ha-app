@@ -1016,6 +1016,80 @@ class TestPosterOwnsClearWave5:
         assert _body(resp2)["outcome"] == "answered"
 
 
+class TestCompensationCancelInterleaving:
+    """F5 (whole-branch gate): a transport cancel LOSES to an in-flight anchor
+    post (``posting`` True → the sync cancel no-ops, ``_post_wins``), and THEN
+    ``add_open_question`` fails after the wire message landed. The compensation
+    path must run (withdraw edit + ``mark_intent_compensated`` ok:false), the
+    poster must OWN the ``ask_inflight`` clear (it never reached durable
+    ownership), and a next ask must pass. Composes the wave-5 cancel-loses
+    harness with the add-failure compensation injection."""
+
+    async def test_cancel_loses_then_add_failure_compensates_and_clears_marker(
+        self, wired, monkeypatch,
+    ):
+        eid, drv, seq, chan = (
+            wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
+        gate = asyncio.Event()
+        orig_add = wired["reg"].add_open_question
+
+        async def _gated_boom_add(*a, **k):
+            # Park the poster mid-post (wire message already landed, writer lock
+            # held, posting=True), then FAIL the ledger add.
+            await gate.wait()
+            raise RuntimeError("ledger down")
+
+        monkeypatch.setattr(wired["reg"], "add_open_question", _gated_boom_add)
+
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "a1"
+
+        relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
+        await asyncio.sleep(0.02)
+        intent = seq.registry.by_request_id("a1")
+        assert intent.state == "armed" and intent.posting is True
+        assert len(chan.anchors) == 1          # orphan wire message landed
+        orphan_mid = chan.anchors[0][0]
+
+        # Cancel ONCE — posting=True → the cancel loses, the post wins, the
+        # handler's outer finally is gated off (poster owns the marker clear).
+        t1.cancel()
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "a1"   # cancel stalled behind the post
+
+        # Release → add_open_question RAISES → compensation runs.
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await t1
+        await asyncio.wait_for(relay, timeout=1.0)
+
+        # Compensation: withdraw edit over the orphan (RAW wire edit).
+        withdraws = [e for e in chan.edits
+                     if e["message_id"] == orphan_mid and "withdrawn" in e["text"]]
+        assert withdraws, "no withdraw edit for the compensated orphan"
+        # Compensated intent outcome recorded ok:false, once.
+        outcome = drv.send_intent_outcome(eid, "a1")
+        assert outcome is not None
+        assert outcome["ok"] is False and outcome.get("compensated") is True
+        assert outcome.get("message_id") == orphan_mid
+        # High-water advanced to the orphan; no ledger entry survived.
+        assert seq._high_water == orphan_mid
+        assert wired["reg"].open_question_numbers(eid) == []
+        # Marker cleared — poster-owned (never reached durable ownership).
+        assert drv.ask_inflight(eid) is None
+
+        # A next, DIFFERENT ask is NOT wedged question_pending — it posts BELOW
+        # the compensated orphan (higher id) and resolves cleanly.
+        monkeypatch.setattr(wired["reg"], "add_open_question", orig_add)
+        t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
+        resp2 = await _drive_anchor(wired, t2, hash="anchor-hash-2")
+        assert _body(resp2)["outcome"] == "anchored"
+        assert chan.anchors[1][0] > orphan_mid
+
+
 class TestPostAddGenRecheck:
     async def test_gen_bump_between_reserve_and_add_marks_answered(
         self, wired, monkeypatch,

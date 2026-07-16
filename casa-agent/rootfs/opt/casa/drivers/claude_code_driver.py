@@ -61,6 +61,11 @@ _OPEN_Q_SEE_ABOVE = "↪ see the question above"
 # self-reschedules 5s → 30s → 300s (capped, repeated) indefinitely until the
 # latch clears via success / promotion / terminal settlement / a boundary win.
 _REANCHOR_BACKOFF: tuple[float, ...] = (5.0, 30.0, 300.0)
+# F3 (whole-branch gate): after an UNVERIFIED (False/raised) force-suspend
+# outcome the once-per-episode backstop re-arms, but must PACE before it may
+# fire again — an immediate re-arm lets a doctrine-defying ask→refusal loop
+# churn probes/subprocesses at token speed. A monotonic cooldown gates re-firing.
+_AWAY_FORCE_COOLDOWN_S = 60.0
 _EVICTION_COPY = (
     "⚠️ Dropped in favor of your redirect — resend if still relevant."
 )
@@ -668,8 +673,13 @@ class ClaudeCodeDriver(DriverProtocol):
         registry: Any = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         reanchor_retry_sleep: Callable[[float], Awaitable[None]] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._engagements_root = engagements_root
+        # F3 (whole-branch gate): injectable monotonic clock for the force-suspend
+        # re-arm cooldown (tests advance it deterministically; never patch a
+        # shared module attribute).
+        self._monotonic = monotonic
         # W-R1 (v0.81.0): injectable clock for the confirmed-edit settle retry
         # (``confirmed_settle_edit``). Kept injectable so tests stay fast and
         # NEVER patch ``<module>.asyncio.sleep`` (the shared module attribute).
@@ -814,6 +824,10 @@ class ClaudeCodeDriver(DriverProtocol):
         # kill callable (defaults to the verified group-kill in s6_rc).
         self._forced_suspend_epochs: dict[str, int | None] = {}
         self._away_suspend_fired: set[str] = set()
+        # F3 (whole-branch gate): monotonic deadline BEFORE which a re-armed
+        # backstop may NOT re-fire (set after an unverified False/raised outcome;
+        # cleared when the away episode ends). Paces probe/subprocess churn.
+        self._away_force_cooldown_until: dict[str, float] = {}
         self._force_turn_boundary = s6_rc.force_turn_boundary
         # A2b (Sol A2 review): the in-flight force-suspend task, held per
         # engagement so ``_clear_operator_away`` (operator returned) can CANCEL a
@@ -1048,6 +1062,7 @@ class ClaudeCodeDriver(DriverProtocol):
         # A2b: drop the force-end backstop state on teardown.
         self._forced_suspend_epochs.pop(engagement.id, None)
         self._away_suspend_fired.discard(engagement.id)
+        self._away_force_cooldown_until.pop(engagement.id, None)  # F3
         force_task = self._force_tasks.pop(engagement.id, None)
         if force_task is not None and not force_task.done():
             force_task.cancel()
@@ -1902,6 +1917,7 @@ class ClaudeCodeDriver(DriverProtocol):
 
     async def rollback_answer_reservation(
         self, engagement_id: str, token: str | None,
+        *, suppress_reanchor: bool = False,
     ) -> bool:
         """§A3 (Sol r7-1/r9-1): CAS-roll-back a reservation — clear it ONLY when
         the CURRENT reservation still carries ``token`` (never clobber a later
@@ -1909,14 +1925,23 @@ class ClaudeCodeDriver(DriverProtocol):
         the entry, so a consumed reservation is simply absent → CAS fails).
         Returns ``True`` on a successful clear. On success calls the Task-9 seam
         ``_on_reservation_rolled_back`` (a last-reservation-clearing rollback
-        schedules a compensating re-anchor pass there — a no-op today)."""
+        schedules a compensating re-anchor pass there).
+
+        F2 (whole-branch gate): a TERMINAL command (``/cancel``/``/complete``)
+        rolls back the reservation and then FINALIZES the engagement, whose
+        ``settle_all_open_questions`` owns every open anchor. Firing the
+        fourth-consumer re-anchor pass here would post a redundant anchor copy
+        that terminal settlement immediately settles. When ``suppress_reanchor``
+        is set, the CAS clear still happens but the re-anchor latch is NEITHER
+        set NOR consumed — the imminent terminal settle owns the entries."""
         if token is None:
             return False
         res = self._answer_reservations.get(engagement_id)
         if res is None or res[0] != token:
             return False
         del self._answer_reservations[engagement_id]
-        await self._on_reservation_rolled_back(engagement_id)
+        if not suppress_reanchor:
+            await self._on_reservation_rolled_back(engagement_id)
         return True
 
     async def _on_reservation_rolled_back(self, engagement_id: str) -> None:
@@ -2346,7 +2371,15 @@ class ClaudeCodeDriver(DriverProtocol):
         channel_handlers needs no further change."""
         n = self._away_refusals.get(engagement_id, 0) + 1
         self._away_refusals[engagement_id] = n
-        if n >= 2 and engagement_id not in self._away_suspend_fired:
+        # F3: after an unverified outcome the guard re-arms but a monotonic
+        # cooldown must elapse before it may re-fire — else an ask→refusal loop
+        # churns probes/subprocesses at token speed.
+        cooldown_until = self._away_force_cooldown_until.get(engagement_id, 0.0)
+        if (
+            n >= 2
+            and engagement_id not in self._away_suspend_fired
+            and self._monotonic() >= cooldown_until
+        ):
             self._away_suspend_fired.add(engagement_id)
             self._trigger_force_suspend(engagement_id)
         return n
@@ -2399,10 +2432,46 @@ class ClaudeCodeDriver(DriverProtocol):
         reaped ``_tasks`` entry after teardown. The ``add_done_callback`` retires
         the task from the set on completion so no reference lingers.
 
-        There is no driver-level shutdown seam to bounded-await these at (each is
-        self-limiting), so at driver teardown they are simply left to finish."""
+        Process shutdown bounded-awaits these via :meth:`drain_force_cleanups`
+        (F1 whole-branch gate) so a resistant engagement subprocess is verified
+        extinct before the process exits; each is otherwise self-limiting."""
         self._force_cleanups.add(task)
         task.add_done_callback(self._force_cleanups.discard)
+
+    async def drain_force_cleanups(self, timeout: float = 10.0) -> bool:
+        """F1 (whole-branch gate): bounded shutdown drain of the CANCEL-EXEMPT
+        post-SIGTERM force-suspend cleanup tasks (``_force_cleanups`` — the
+        shielded extinction-poll + SIGKILL escalation handed off by
+        ``force_turn_boundary``, ≤ ~7 s each).
+
+        Post-SIGTERM cleanups are exempt from ``cancel()`` precisely so a
+        SIGTERM-resistant MCP/tool child is verified gone (or SIGKILL-escalated)
+        rather than orphaned — but process shutdown must actually WAIT for that
+        verification, or teardown races the SIGKILL and the resistant subprocess
+        outlives the container. casa_core's shutdown sequence calls this AFTER the
+        engagement-loop/agent teardown and BEFORE the broker/channel teardown
+        (analogous to ``_drain_broker_before_channel_shutdown``'s "resolve
+        in-flight work before tearing the transport down" ordering).
+
+        Returns ``True`` when every cleanup drained within ``timeout``; ``False``
+        on timeout (WARN with the still-pending count) so shutdown proceeds
+        truthfully rather than blocking forever. NEVER raises — a drain failure
+        must not wedge shutdown."""
+        pending = [t for t in self._force_cleanups if not t.done()]
+        if not pending:
+            return True
+        try:
+            _done, still = await asyncio.wait(pending, timeout=timeout)
+        except Exception:  # noqa: BLE001 — shutdown must complete regardless
+            logger.warning("drain_force_cleanups: wait raised", exc_info=True)
+            return False
+        if still:
+            logger.warning(
+                "drain_force_cleanups: %d force-suspend cleanup task(s) did not "
+                "finish within %.1fs — proceeding with shutdown",
+                len(still), timeout)
+            return False
+        return True
 
     async def _run_force_suspend(self, engagement_id: str) -> None:
         """A2b: await the injected verified group-kill and log the truthful
@@ -2433,7 +2502,10 @@ class ClaudeCodeDriver(DriverProtocol):
                 exc_info=True)
             # Sol A2 wave-3, Finding 1: an unverified (raised) outcome RE-ARMS so
             # the NEXT away-refusal retries — a transient failure must not
-            # permanently disable the once-per-episode backstop.
+            # permanently disable the once-per-episode backstop. F3: pace the
+            # retry behind a monotonic cooldown so the loop cannot churn.
+            self._away_force_cooldown_until[engagement_id] = (
+                self._monotonic() + _AWAY_FORCE_COOLDOWN_S)
             self._away_suspend_fired.discard(engagement_id)
             return
         if ok:
@@ -2449,6 +2521,9 @@ class ClaudeCodeDriver(DriverProtocol):
             # Sol A2 wave-3, Finding 1: an unverified (False) outcome RE-ARMS the
             # once-per-episode guard so a subsequent away-refusal fires again
             # (e.g. a transient ``unknown`` probe cleared on the next attempt).
+            # F3: pace the re-fire behind a monotonic cooldown to bound churn.
+            self._away_force_cooldown_until[engagement_id] = (
+                self._monotonic() + _AWAY_FORCE_COOLDOWN_S)
             self._away_suspend_fired.discard(engagement_id)
 
     async def _clear_operator_away(self, engagement_id: str) -> None:
@@ -2460,6 +2535,9 @@ class ClaudeCodeDriver(DriverProtocol):
         message never triggers a spurious summary edit."""
         was_away = self._operator_away.pop(engagement_id, False)
         self._away_refusals.pop(engagement_id, None)
+        # F3: a fresh away-episode starts with no cooldown so its first backstop
+        # fires immediately.
+        self._away_force_cooldown_until.pop(engagement_id, None)
         # A2b: reset the once-per-episode force-end guard so a fresh away-episode
         # can fire again. The epoch mark self-clears when _log_abnormal_exit
         # consumes it, so it is NOT dropped here (the respawn's spawn event may
