@@ -2439,39 +2439,60 @@ class ClaudeCodeDriver(DriverProtocol):
         task.add_done_callback(self._force_cleanups.discard)
 
     async def drain_force_cleanups(self, timeout: float = 10.0) -> bool:
-        """F1 (whole-branch gate): bounded shutdown drain of the CANCEL-EXEMPT
-        post-SIGTERM force-suspend cleanup tasks (``_force_cleanups`` — the
-        shielded extinction-poll + SIGKILL escalation handed off by
-        ``force_turn_boundary``, ≤ ~7 s each).
+        """F1 (whole-branch gate): bounded, LOOP-until-stable shutdown drain of
+        the driver's force-suspend machinery across BOTH surfaces:
 
-        Post-SIGTERM cleanups are exempt from ``cancel()`` precisely so a
-        SIGTERM-resistant MCP/tool child is verified gone (or SIGKILL-escalated)
-        rather than orphaned — but process shutdown must actually WAIT for that
+          * ``_force_tasks`` — the still-running ``_run_force_suspend`` OWNERS. A
+            post-SIGTERM cleanup normally lives INSIDE its owner (shield-awaited
+            there); it only MIGRATES to ``_force_cleanups`` when the owner is
+            cancelled (operator returned mid-kill). So an in-flight owner is
+            itself an un-drained cleanup and must be awaited here.
+          * ``_force_cleanups`` — the CANCEL-EXEMPT shielded extinction-poll +
+            SIGKILL escalation handed off by ``force_turn_boundary`` (≤ ~7 s each).
+
+        These cleanups are exempt from ``cancel()`` precisely so a SIGTERM-
+        resistant MCP/tool child is verified gone (or SIGKILL-escalated) rather
+        than orphaned — but process shutdown must actually WAIT for that
         verification, or teardown races the SIGKILL and the resistant subprocess
-        outlives the container. casa_core's shutdown sequence calls this AFTER the
-        engagement-loop/agent teardown and BEFORE the broker/channel teardown
-        (analogous to ``_drain_broker_before_channel_shutdown``'s "resolve
-        in-flight work before tearing the transport down" ordering).
+        outlives the container.
 
-        Returns ``True`` when every cleanup drained within ``timeout``; ``False``
-        on timeout (WARN with the still-pending count) so shutdown proceeds
-        truthfully rather than blocking forever. NEVER raises — a drain failure
-        must not wedge shutdown."""
-        pending = [t for t in self._force_cleanups if not t.done()]
-        if not pending:
-            return True
-        try:
-            _done, still = await asyncio.wait(pending, timeout=timeout)
-        except Exception:  # noqa: BLE001 — shutdown must complete regardless
-            logger.warning("drain_force_cleanups: wait raised", exc_info=True)
-            return False
-        if still:
-            logger.warning(
-                "drain_force_cleanups: %d force-suspend cleanup task(s) did not "
-                "finish within %.1fs — proceeding with shutdown",
-                len(still), timeout)
-            return False
-        return True
+        The drain LOOPS within a single ``timeout`` budget: each iteration
+        RE-SNAPSHOTS both surfaces and awaits whatever is pending. Re-snapshotting
+        is what makes it stable — an owner cancelled mid-drain hands a fresh
+        cleanup off AFTER an earlier snapshot, and the loop's next iteration
+        catches it instead of letting it slip past. It settles when both surfaces
+        are empty (``True``) or the budget is exhausted (``False``).
+
+        casa_core's shutdown sequence calls this AFTER channel + HTTP ingress
+        teardown so the drain point is INGRESS-QUIESCENT — no inbound can spawn a
+        fresh force-suspend or fire an operator-away clear that hands a new
+        cleanup off once the loop has settled.
+
+        Returns ``True`` when both surfaces drained within ``timeout``; ``False``
+        on budget exhaustion (WARN with the still-pending owner + cleanup counts)
+        so shutdown proceeds truthfully rather than blocking forever. NEVER
+        raises — a drain failure must not wedge shutdown."""
+        deadline = self._monotonic() + timeout
+        while True:
+            owners = [t for t in self._force_tasks.values() if not t.done()]
+            cleanups = [t for t in self._force_cleanups if not t.done()]
+            pending = owners + cleanups
+            if not pending:
+                return True
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "drain_force_cleanups: %d force-suspend owner(s) + %d "
+                    "cleanup(s) did not finish within %.1fs — proceeding with "
+                    "shutdown", len(owners), len(cleanups), timeout)
+                return False
+            try:
+                await asyncio.wait(pending, timeout=remaining)
+            except Exception:  # noqa: BLE001 — shutdown must complete regardless
+                logger.warning(
+                    "drain_force_cleanups: wait raised", exc_info=True)
+                return False
+            # Loop: re-snapshot to catch a handoff that landed during this wait.
 
     async def _run_force_suspend(self, engagement_id: str) -> None:
         """A2b: await the injected verified group-kill and log the truthful

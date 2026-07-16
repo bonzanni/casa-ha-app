@@ -2299,10 +2299,13 @@ async def main() -> None:
         telegram_channel._driver_post_notice = _driver_post_notice
 
         async def _finalize_cancel(rec, reason="user"):
+            # F2 (whole-branch r2): PROPAGATE _finalize_engagement's bool so the
+            # terminal command path can gate the answered-reservation re-anchor
+            # suppression on a successful strict terminal transition.
             from tools import _finalize_engagement
             driver = (claude_code_driver if rec.driver == "claude_code"
                       else engagement_driver)
-            await _finalize_engagement(
+            return await _finalize_engagement(
                 rec, outcome="cancelled", text=f"Cancelled by {reason}.",
                 artifacts=[], next_steps=[],
                 driver=driver,
@@ -2310,10 +2313,11 @@ async def main() -> None:
         telegram_channel._finalize_cancel = _finalize_cancel
 
         async def _finalize_complete_user(rec):
+            # F2 (whole-branch r2): PROPAGATE the finalize bool (see above).
             from tools import _finalize_engagement
             driver = (claude_code_driver if rec.driver == "claude_code"
                       else engagement_driver)
-            await _finalize_engagement(
+            return await _finalize_engagement(
                 rec, outcome="completed", text="User-marked complete.",
                 artifacts=[], next_steps=[],
                 driver=driver,
@@ -2770,13 +2774,32 @@ async def main() -> None:
         task.cancel()
     await asyncio.gather(*all_loop_tasks, return_exceptions=True)
 
-    # F1 (v0.83.0 whole-branch gate): bounded drain of the claude_code driver's
-    # CANCEL-EXEMPT post-SIGTERM force-suspend cleanups (extinction poll + SIGKILL
-    # escalation). Placed AFTER the engagement-loop/agent teardown and BEFORE the
-    # broker/channel teardown (mirroring _drain_broker_before_channel_shutdown's
-    # "resolve in-flight work before tearing the transport down" ordering) so a
-    # SIGTERM-resistant engagement subprocess is verified extinct rather than
-    # orphaned by a premature process exit. Bounded + truthful — never wedges
+    # Channel teardown (Telegram bot, voice, etc.) — resolve in-flight broker
+    # work first, then stop the channels.
+    await _drain_broker_before_channel_shutdown(channel_manager)
+
+    # HTTP ingress teardown: close BOTH AppRunners (public 8099 + the internal
+    # unix socket) BEFORE draining the force cleanups below. runner.cleanup()
+    # drains in-flight requests then closes the listener, so once it returns no
+    # webhook/voice/internal inbound can reach an agent. Moved AHEAD of the
+    # force-cleanup drain (and of semantic_memory.close) to make the drain point
+    # INGRESS-QUIESCENT — see the F1 rationale below.
+    for _r in runners:
+        await _r.cleanup()
+
+    # F1 (v0.83.0 whole-branch gate, wave 2): bounded LOOP-drain of the
+    # claude_code driver's force-suspend OWNERS (`_force_tasks`) + CANCEL-EXEMPT
+    # post-SIGTERM cleanups (`_force_cleanups` — extinction poll + SIGKILL
+    # escalation) so a SIGTERM-resistant engagement subprocess is verified
+    # extinct rather than orphaned by a premature process exit.
+    #
+    # Placed AFTER every ingress surface is quiesced — the agent loops are
+    # cancelled (above), the channels stopped, and now the HTTP/socket listeners
+    # closed — so nothing can spawn a fresh force-suspend or fire an operator-
+    # away clear that hands a new cleanup off after the loop-drain settles. The
+    # drain itself re-snapshots both surfaces each iteration to catch a handoff
+    # that lands mid-drain. Kept BEFORE semantic_memory.close so the memory
+    # client outlives any in-flight cleanup. Bounded + truthful — never wedges
     # shutdown (getattr-guarded so a driver without the seam is a no-op).
     _cc_driver = getattr(runtime, "claude_code_driver", None)
     _drain_force = getattr(_cc_driver, "drain_force_cleanups", None)
@@ -2786,15 +2809,12 @@ async def main() -> None:
         except Exception:  # noqa: BLE001 — shutdown must complete
             logger.warning("force-cleanup drain failed", exc_info=True)
 
-    await _drain_broker_before_channel_shutdown(channel_manager)
     # Close the shared Hindsight client session (L32) so aiohttp does not
     # warn about an unclosed session; no-op for NoOp/other backends.
     try:
         await semantic_memory.close()
     except Exception:  # noqa: BLE001
         logger.warning("semantic memory close failed", exc_info=True)
-    for _r in runners:
-        await _r.cleanup()
     logger.info("Casa core shutdown complete")
 
 

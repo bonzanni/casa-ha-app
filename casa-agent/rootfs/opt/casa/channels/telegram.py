@@ -1303,17 +1303,30 @@ class TelegramChannel(Channel):
                                 )
                                 await self._rollback_answer(rec, answer_token)
                                 return
-                            # F2: TERMINAL path — finalize follows and its
-                            # settle_all_open_questions owns the open anchors, so
-                            # suppress the fourth-consumer re-anchor (it would post
-                            # a redundant copy that terminal settle instantly
-                            # settles). The originator-rejected + /silent rollbacks
-                            # above are NON-terminal and keep re-anchoring.
-                            await self._rollback_answer(
-                                rec, answer_token, suppress_reanchor=True)
+                            # F2 (whole-branch r2): TERMINAL path — run the
+                            # finalizer FIRST, then gate the re-anchor SUPPRESSION
+                            # on finalize SUCCESS. On success, finalize's
+                            # settle_all_open_questions already owns + settles
+                            # every open anchor (it never reads the reservation,
+                            # so a still-held reservation during finalize is
+                            # inert), and the suppressed rollback just clears the
+                            # reservation — no redundant re-anchor copy. On a
+                            # FAILED strict terminal transition (finalize returns
+                            # False → engagement stays live, nothing settled), the
+                            # rollback runs WITHOUT suppression so the fourth-
+                            # consumer re-anchor moves the stranded live anchor
+                            # below the command instead of orphaning it above.
+                            # The originator-rejected + /silent rollbacks above are
+                            # NON-terminal and keep re-anchoring unconditionally.
                             if command == "/cancel":
-                                return await self._finalize_cancel(rec, reason="user")
-                            return await self._finalize_complete_user(rec)
+                                finalized = await self._finalize_cancel(
+                                    rec, reason="user")
+                            else:
+                                finalized = await self._finalize_complete_user(rec)
+                            await self._rollback_answer(
+                                rec, answer_token,
+                                suppress_reanchor=bool(finalized))
+                            return
                         if command == "/silent":
                             if self._observer is not None:
                                 self._observer.silence(rec.id)

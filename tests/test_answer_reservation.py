@@ -835,6 +835,59 @@ class TestFourthConsumerReanchorMatrix:
                    for _, mid, text in wire.edits)
         assert reg.open_question_entries(rec.id) == []
 
+    async def test_terminal_finalize_failure_reanchors_anchor_last(
+        self, tmp_path, fake_telegram_bot,
+    ):
+        """F2 (whole-branch r2): a /cancel whose STRICT terminal transition
+        FAILS (finalize returns False → engagement stays live, nothing settled)
+        must NOT strand the live anchor above the command. The suppression is
+        gated on finalize success, so the rollback runs WITHOUT suppression and
+        the fourth-consumer re-anchor moves the anchor below the command."""
+        ch, reg, rec, drv, seq, wire, n = await _handler_ctx_seq(
+            tmp_path, fake_telegram_bot)
+
+        async def _failing_finalize(_rec, reason="user"):
+            # Strict terminal transition lost / rolled back → engagement live.
+            return False
+
+        ch._finalize_cancel = _failing_finalize
+        u = _mk_update(chat_id=-1001, text="/cancel", thread_id=555, user_id=77)
+        await ch.handle_update(u)
+
+        # Re-anchored (NOT suppressed) → the markup copy is the LAST wire post.
+        assert wire.posts and wire.posts[-1][0] == "markup"
+        reanchor_mid = wire.posts[-1][1]
+        assert seq.high_water == reanchor_mid
+        assert _entry(reg, rec, n)["tg_message_id"] == reanchor_mid
+        assert _entry(reg, rec, n).get("answered") is False
+        assert drv._answer_reservations.get(rec.id) is None
+
+    async def test_terminal_finalize_success_settles_no_reanchor(
+        self, tmp_path, fake_telegram_bot,
+    ):
+        """F2: a /cancel whose finalize SUCCEEDS lets its own
+        ``settle_all_open_questions`` own the open anchor (settled once); the
+        terminal rollback is then suppressed so no redundant re-anchor copy is
+        posted. Finalize runs FIRST — a still-held reservation is inert to
+        settle, which never reads the reservation state."""
+        ch, reg, rec, drv, seq, wire, n = await _handler_ctx_seq(
+            tmp_path, fake_telegram_bot)
+
+        async def _ok_finalize(_rec, reason="user"):
+            # Mirror production: a winning finalize settles the open anchors
+            # while the answered reservation is still held.
+            assert drv._answer_reservations.get(rec.id) is not None
+            await drv.settle_all_open_questions(_rec, "cancelled")
+            return True
+
+        ch._finalize_cancel = _ok_finalize
+        u = _mk_update(chat_id=-1001, text="/cancel", thread_id=555, user_id=77)
+        await ch.handle_update(u)
+
+        assert not any(k == "markup" for k, _, _ in wire.posts)   # no re-anchor
+        assert reg.open_question_entries(rec.id) == []            # settled once
+        assert drv._answer_reservations.get(rec.id) is None
+
 
 class TestM4NoticeAwaitCancellation:
     """§A3 wave 2 — M4: a CancelledError while AWAITING the ``Turn failed``

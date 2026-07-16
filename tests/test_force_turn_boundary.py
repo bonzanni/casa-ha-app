@@ -878,3 +878,108 @@ async def test_drain_force_cleanups_timeout_returns_false_and_does_not_cancel(
     # Cleanup after the drain so the test leaves no pending task.
     gate.set()
     await asyncio.wait_for(t, timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# F1 (whole-branch gate WAVE 2): the drain must LOOP until STABLE and cover
+# BOTH surfaces — an ACTIVE ``_force_tasks`` entry (a post-SIGTERM cleanup
+# normally lives INSIDE a still-running force-suspend task, shield-awaited
+# there; it only migrates to ``_force_cleanups`` when the owner is cancelled)
+# AND a handoff that occurs DURING the drain (caught by the loop's re-snapshot).
+# ---------------------------------------------------------------------------
+
+
+async def test_drain_awaits_active_force_task(tmp_path):
+    """An in-flight ``_force_tasks`` entry (the shield-awaiting owner) is drained
+    even though nothing has migrated to ``_force_cleanups`` yet."""
+    import asyncio
+
+    eid = "engactive00000001"
+    drv = _driver(tmp_path)
+    gate = asyncio.Event()
+    finished: list[bool] = []
+
+    async def _force_task():
+        await gate.wait()
+        finished.append(True)
+        return None
+
+    ft = asyncio.ensure_future(_force_task())
+    drv._force_tasks[eid] = ft
+
+    async def _release() -> None:
+        await asyncio.sleep(0)
+        gate.set()
+
+    releaser = asyncio.ensure_future(_release())
+    drained = await asyncio.wait_for(drv.drain_force_cleanups(timeout=1.0), 1.5)
+    await releaser
+    assert drained is True
+    assert finished == [True]          # the active force task actually completed
+    assert ft.done()
+
+
+async def test_drain_loops_until_stable_catches_handoff(tmp_path):
+    """A handoff (owner cancelled → cleanup registered) that lands AFTER the
+    drain's first snapshot is caught by the loop's re-snapshot, not orphaned."""
+    import asyncio
+
+    eid = "enghandoff0000001"
+    drv = _driver(tmp_path)
+    gate = asyncio.Event()
+    cleanup_done: list[bool] = []
+
+    async def _late_cleanup():
+        cleanup_done.append(True)
+        return True
+
+    async def _force_task():
+        await gate.wait()
+        # Simulate the cancel→handoff: a NEW cleanup is registered as the force
+        # task unwinds, AFTER the drain already snapshotted _force_cleanups.
+        drv._register_force_cleanup(eid, asyncio.ensure_future(_late_cleanup()))
+        return None
+
+    ft = asyncio.ensure_future(_force_task())
+    drv._force_tasks[eid] = ft
+
+    async def _release() -> None:
+        await asyncio.sleep(0)
+        gate.set()
+
+    releaser = asyncio.ensure_future(_release())
+    drained = await asyncio.wait_for(drv.drain_force_cleanups(timeout=1.0), 1.5)
+    await releaser
+    assert drained is True
+    assert cleanup_done == [True]      # the late-handoff cleanup was drained
+    assert not drv._force_cleanups
+
+
+async def test_drain_budget_exhaustion_false_with_counts(tmp_path, caplog):
+    """Budget exhausted while BOTH a force task and a cleanup are pending →
+    truthful False, neither is cancelled, and the WARN carries both counts."""
+    import asyncio
+    import logging
+
+    eid = "engbudget00000001"
+    drv = _driver(tmp_path)
+    gate = asyncio.Event()
+
+    async def _slow():
+        await gate.wait()
+        return True
+
+    ft = asyncio.ensure_future(_slow())
+    ct = asyncio.ensure_future(_slow())
+    drv._force_tasks[eid] = ft
+    drv._register_force_cleanup(eid, ct)
+
+    with caplog.at_level(logging.WARNING):
+        drained = await drv.drain_force_cleanups(timeout=0.05)
+
+    assert drained is False
+    assert not ft.done() and not ct.done()      # cancel-exempt — still running
+    assert any("did not finish" in r.message for r in caplog.records)
+
+    gate.set()
+    await asyncio.gather(ft, ct)
