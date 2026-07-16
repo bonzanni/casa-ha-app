@@ -176,13 +176,22 @@ async def _safe_answer(cq: Any, text: str) -> None:
         logger.warning("callback_query.answer failed: %s", exc)
 
 
-def _parse_callback_data(data: str) -> tuple[str | None, str | None, int | None]:
+def _parse_callback_data(
+    data: str,
+) -> tuple[str | None, str | None, int | None, str | None]:
     """Parse inline-keyboard ``callback_data`` into ``(namespace, request_id,
-    option_index)``, or ``(None, None, None)`` on any malformed shape.
+    option_index, kind)``, or ``(None, None, None, None)`` on any malformed
+    shape.
 
-    Two accepted shapes:
+    Accepted shapes:
     - v1 (current): ``v1|<ns>|<request_id>|<option_index>``, ``ns`` one of
-      the broker's three namespaces, ``option_index`` an int.
+      the broker's three namespaces, ``option_index`` an int. ``kind`` is
+      ``None`` (a single-select / permission tap).
+    - A5 · F-MULTI: ``v1|ask_multi|<request_id>|<idx>`` (a checkbox TOGGLE,
+      ``kind="toggle"``) and ``v1|ask_multi|<request_id>|s`` (SUBMIT,
+      ``kind="submit"``, ``option_index`` is ``None``). The ``ask_multi``
+      namespace maps to the ``engagement_ask`` broker namespace — only the
+      callback grammar is new.
     - legacy (back-compat): ``perm:<allow|deny>:<request_id>`` — pre-v0.75.0
       keyboards still in flight across an upgrade must keep routing.
 
@@ -191,24 +200,35 @@ def _parse_callback_data(data: str) -> tuple[str | None, str | None, int | None]
     generate one.
     """
     if len(data.encode("utf-8")) > _CALLBACK_DATA_MAX_BYTES:
-        return None, None, None
+        return None, None, None, None
     if data.startswith("v1|"):
         parts = data.split("|", 3)
         if len(parts) != 4:
-            return None, None, None
+            return None, None, None, None
         _, ns, request_id, idx_s = parts
-        if ns not in _CALLBACK_NAMESPACES or not request_id:
-            return None, None, None
+        if not request_id:
+            return None, None, None, None
+        if ns == "ask_multi":
+            # A5 · F-MULTI: routes onto the engagement_ask broker namespace.
+            if idx_s == "s":
+                return "engagement_ask", request_id, None, "submit"
+            try:
+                idx = int(idx_s)
+            except ValueError:
+                return None, None, None, None
+            return "engagement_ask", request_id, idx, "toggle"
+        if ns not in _CALLBACK_NAMESPACES:
+            return None, None, None, None
         try:
             idx = int(idx_s)
         except ValueError:
-            return None, None, None
-        return ns, request_id, idx
+            return None, None, None, None
+        return ns, request_id, idx, None
     parts = data.split(":", 2)
     if (len(parts) == 3 and parts[0] == "perm"
             and parts[1] in ("allow", "deny") and parts[2]):
-        return "permission", parts[2], (0 if parts[1] == "allow" else 1)
-    return None, None, None
+        return "permission", parts[2], (0 if parts[1] == "allow" else 1), None
+    return None, None, None, None
 
 
 # v0.81.0 (W-R3, Sol r1-5): button labels are DERIVED channel-side from the
@@ -217,37 +237,208 @@ def _parse_callback_data(data: str) -> tuple[str | None, str | None, int | None]
 # in the message body (``channel_handlers.render_ask_body``); the button carries
 # only a short summary. The button's IDENTITY stays the option INDEX in
 # ``callback_data`` — the label is display-only, so nothing is lost by shortening.
-_ASK_BUTTON_LABEL_CAP = 24
-_ASK_BUTTON_SUMMARY_WORDS = 3
+#
+# v0.83.0 (A4 · F-BTN, Sol r2-9/r3-7): the fixed 3-word cap dropped distinguishing
+# TAILS ("Single account with aliases" → "1 · Single account with" — the live
+# regression). Replaced by an ELISION LADDER computed over the WHOLE option set
+# (so distinctness can be verified pairwise). Cap raised to 30 INCLUDING the
+# ``n · `` number prefix.
+_ASK_BUTTON_LABEL_CAP = 30
+_ASK_LABEL_ELLIPSIS = "…"
+
+
+def _render_kept(tokens: list[str], kept: set[int]) -> str:
+    """Render a summary from a subset of KEPT token indices.
+
+    Kept tokens are space-joined; each INTERIOR run of dropped tokens collapses
+    to a single ``…`` attached to its neighbours without surrounding spaces
+    (``Single…aliases``); a LEADING or TRAILING dropped run is omitted entirely
+    (no edge ellipsis), so a left-drop reads ``account with aliases`` — not
+    ``…account with aliases``.
+    """
+    n = len(tokens)
+    out = ""
+    i = 0
+    while i < n:
+        if i in kept:
+            if out and not out.endswith(_ASK_LABEL_ELLIPSIS):
+                out += " "
+            out += tokens[i]
+            i += 1
+        else:
+            j = i
+            while j < n and j not in kept:
+                j += 1
+            if i != 0 and j != n:  # interior run only → single ellipsis
+                out += _ASK_LABEL_ELLIPSIS
+            i = j
+    return out
+
+
+def _elide_one(prefix: str, option: str, others_tokens: "list[set[str]]") -> str:
+    """Pinned per-option elision ladder (A4 rule 2). ``others_tokens`` is the
+    casefolded token set of every OTHER option in the same ask (a token is
+    *shared* iff its casefold appears in at least one of them).
+
+    Resolution order: (1) full fit → verbatim; (2) shared-token elision (drop
+    shared tokens longest-first, each dropped RUN → ``…``); (3) interior elision
+    (keep head + tail); (4) left-drop of leading tokens; (5) hard slice.
+    """
+    budget = _ASK_BUTTON_LABEL_CAP - len(prefix)
+    tokens = option.split()
+    if not tokens:
+        # Whitespace-only option: nothing to summarise — hard-slice the prefix.
+        return (prefix)[:_ASK_BUTTON_LABEL_CAP]
+    full = " ".join(tokens)
+    # (1) full fit — verbatim, no ellipsis.
+    if len(full) <= budget:
+        return prefix + full
+    n = len(tokens)
+    # (2) shared-token elision: drop SHARED tokens, longest-first (leftmost tie),
+    #     keeping discriminative ones; the operator scans the tail differentiator.
+    kept = set(range(n))
+    shared = [
+        p for p in range(n)
+        if any(tokens[p].casefold() in s for s in others_tokens)
+    ]
+    for p in sorted(shared, key=lambda q: (-len(tokens[q]), q)):
+        kept.discard(p)
+        cand = _render_kept(tokens, kept)
+        if cand and len(cand) <= budget:
+            return prefix + cand
+    # (3) interior elision: keep head + tail (``Single…aliases``).
+    if n >= 2:
+        cand = _render_kept(tokens, {0, n - 1})
+        if cand and len(cand) <= budget:
+            return prefix + cand
+    # (4) left-drop: drop leading tokens (tail differentiator survives).
+    for k in range(1, n):
+        cand = _render_kept(tokens, set(range(k, n)))
+        if cand and len(cand) <= budget:
+            return prefix + cand
+    # (5) hard slice on a codepoint boundary — degenerate long single token.
+    return (prefix + full)[:_ASK_BUTTON_LABEL_CAP]
+
+
+def _resolve_label_collisions(
+    options: list[str], prefixes: list[str], summaries: list[str],
+) -> None:
+    """Pairwise-distinctness validation (Sol r3-7). Any two produced summaries
+    that collide (casefolded, ignoring the number prefix) while their full
+    options differ are re-elided IN PLACE — keeping, for each, the token
+    positions where it differs from a colliding sibling (earliest first, as the
+    budget allows). The unique number prefixes make the FINAL button labels
+    pairwise-distinct regardless; this step surfaces a differentiating token
+    whenever one fits.
+    """
+    from collections import defaultdict
+
+    groups: "defaultdict[str, list[int]]" = defaultdict(list)
+    for i, s in enumerate(summaries):
+        groups[s.casefold()].append(i)
+    for idxs in groups.values():
+        if len(idxs) < 2:
+            continue
+        if len({options[i].casefold() for i in idxs}) < 2:
+            continue  # the full options are themselves identical — nothing to do
+        for i in idxs:
+            budget = _ASK_BUTTON_LABEL_CAP - len(prefixes[i])
+            tokens = options[i].split()
+            sib_tokens = [options[j].split() for j in idxs if j != i]
+            diff = [
+                p for p in range(len(tokens))
+                if any(
+                    p >= len(sib) or sib[p].casefold() != tokens[p].casefold()
+                    for sib in sib_tokens
+                )
+            ]
+            if not diff:
+                continue
+            kept: set[int] = set()
+            for p in diff:
+                if len(_render_kept(tokens, kept | {p})) <= budget:
+                    kept.add(p)
+            if kept:
+                cand = _render_kept(tokens, kept)
+                if cand and len(cand) <= budget:
+                    summaries[i] = cand
+
+
+def short_option_labels(options: list) -> list[str]:
+    """Derive short, number-prefixed button labels for a WHOLE option set.
+
+    Each label is ``<n> · <summary>`` (1-based ``n``), the whole string ≤
+    ``_ASK_BUTTON_LABEL_CAP`` including the prefix, produced by the elision
+    ladder (``_elide_one``) and then validated pairwise-distinct
+    (``_resolve_label_collisions``). The full option text is carried VERBATIM in
+    the message body, so a shortened label never changes the choice; the
+    ``callback_data`` identity stays the option INDEX.
+    """
+    opts = [str(o) for o in options]
+    token_sets = [{t.casefold() for t in o.split()} for o in opts]
+    prefixes = [f"{i + 1} · " for i in range(len(opts))]
+    summaries: list[str] = []
+    for i, o in enumerate(opts):
+        others = [token_sets[j] for j in range(len(opts)) if j != i]
+        lab = _elide_one(prefixes[i], o, others)
+        summaries.append(lab[len(prefixes[i]):])
+    _resolve_label_collisions(opts, prefixes, summaries)
+    return [prefixes[i] + summaries[i] for i in range(len(opts))]
 
 
 def _short_option_label(number: int, option: str) -> str:
-    """Derive a short, number-prefixed button label from a full option string.
+    """Single-option fallback of the elision ladder (no siblings ⇒ no shared
+    tokens, no pairwise check). ``number`` is the option's 1-based position.
 
-    ``<number> · <≤3 words>``, the whole label capped at ~``_ASK_BUTTON_LABEL_CAP``
-    chars on a WORD boundary (e.g. ``1 · Personal Gmail``). No ellipsis: the full
-    option text is carried verbatim in the message body, so a shortened label
-    never changes the choice. ``number`` is the option's 1-based position, which
-    also lets the operator match the label to the numbered body line.
+    Kept for callers that shorten ONE option in isolation; the keyboards use the
+    set-level ``short_option_labels`` so distinctness can be verified.
     """
-    prefix = f"{number} · "
-    words = option.split()[:_ASK_BUTTON_SUMMARY_WORDS]
-    chosen: list[str] = []
-    for w in words:
-        candidate = prefix + " ".join(chosen + [w])
-        # The cap applies to EVERY word — including the FIRST (R3 label bug: the
-        # first word used to be appended unconditionally, so a long single/first
-        # word blew past the cap, e.g. ``1 · <47-char token>`` = 51 chars).
-        if len(candidate) > _ASK_BUTTON_LABEL_CAP:
-            break
-        chosen.append(w)
-    if not chosen:
-        # Degenerate: the first word alone exceeds the cap (or a whitespace-only
-        # option). Hard-slice to the cap on a codepoint boundary — no ellipsis;
-        # the full text still lives in the body and the callback identity is the
-        # index, so nothing is lost by the slice.
-        return (prefix + (words[0] if words else ""))[:_ASK_BUTTON_LABEL_CAP]
-    return prefix + " ".join(chosen)
+    return _elide_one(f"{number} · ", option, [])
+
+
+# A5 · F-MULTI checkbox glyphs.
+_MULTI_BOX_ON = "☑"
+_MULTI_BOX_OFF = "☐"
+_MULTI_SUBMIT_TEXT = "✅ Submit"
+
+
+def _multi_button_caption(
+    i: int, options: list, shorts: "list | None", heuristic: list, selected: set,
+) -> str:
+    """A5 · F-MULTI: one toggle-row caption ``☐/☑ <n> · <short-or-heuristic>``.
+
+    ``shorts[i]`` (agent-supplied) wins VERBATIM (``n · <short>``); otherwise the
+    distinguishing-tail heuristic label (already ``n · …``) is used. The leading
+    checkbox reflects membership in ``selected``."""
+    box = _MULTI_BOX_ON if i in selected else _MULTI_BOX_OFF
+    if shorts is not None and i < len(shorts) and shorts[i]:
+        return f"{box} {i + 1} · {shorts[i]}"
+    return f"{box} {heuristic[i]}"
+
+
+def _build_multi_keyboard(
+    request_id: str, options: list, shorts: "list | None", selected,
+):
+    """A5 · F-MULTI: the toggle-many keyboard — one ``☐/☑ n · <label>`` row per
+    option (callback ``v1|ask_multi|<rid>|<idx>``) plus a final ``✅ Submit`` row
+    (``v1|ask_multi|<rid>|s``). Shared by the initial post and every redraw so
+    the two can never disagree."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    heuristic = short_option_labels(options)
+    sel = set(selected or ())
+    rows = [
+        [InlineKeyboardButton(
+            text=_multi_button_caption(i, options, shorts, heuristic, sel),
+            callback_data=f"v1|ask_multi|{request_id}|{i}",
+        )]
+        for i in range(len(options))
+    ]
+    rows.append([InlineKeyboardButton(
+        text=_MULTI_SUBMIT_TEXT,
+        callback_data=f"v1|ask_multi|{request_id}|s",
+    )])
+    return InlineKeyboardMarkup(rows)
 
 
 # Reconnect supervisor backoff schedule (spec 5.2 §4.2): 1s, 2s, 4s, 8s,
@@ -300,6 +491,14 @@ class TelegramChannel(Channel):
         # capacity=0 also admits every message.
         self._rate_limiter = rate_limiter
         self._app: Application | None = None
+        # v0.83.0 (§A3(b), Sol r10-3): the CHANNEL-READINESS event the boot
+        # open-question reconcilers await. SET at the first successful ``_rebuild``
+        # (``self._app`` becomes usable) — NOT at ``start_all()`` return, since
+        # Telegram deliberately survives a transient bring-up failure and lets its
+        # supervisor retry. Boot replay snapshots pre-service but its confirmed
+        # settle edits must not fire against a ``None`` bot (they would fail closed
+        # and the ledger would never settle). Loop-agnostic since Py3.10.
+        self._ready_event: asyncio.Event = asyncio.Event()
         # r1-1/r1-2 (Sol): turn-owned typing leases. ``_typing_leases`` maps a
         # chat_id to ``{lease_id: monotonic_expiry}``; ``_typing_loops`` holds
         # ONE loop task per chat, running while that chat's lease dict is
@@ -344,6 +543,14 @@ class TelegramChannel(Channel):
         # v0.79.0 (§3): seal open narration on inbound (claude_code engagements);
         # wired by casa_core, None-safe for tests.
         self._driver_advance_high_water = None
+        # v0.83.0 (§A3, Sol r7-1/r8-1): the answered-RESERVATION seam. SYNCHRONOUS
+        # ``reserve_answer(rec) -> token|None`` set in the SAME section as the
+        # high-water advance (no await between); ``rollback_answer_reservation(
+        # rec, token) -> bool`` (CAS) fires on every non-delivery path (command
+        # classification, handler cancellation, spool enqueue rejection). Wired by
+        # casa_core, None-safe for tests.
+        self._driver_reserve_answer = None
+        self._driver_rollback_answer_reservation = None
         # v0.79.0 (§3, F2): route a platform-origin topic notice (command
         # replies, resume errors) through the engagement's OUTPUT SEQUENCER so
         # it seals open narration + advances the high-water under the single
@@ -540,6 +747,12 @@ class TelegramChannel(Channel):
 
         # Publish the rebuilt app atomically.
         self._app = app
+
+        # v0.83.0 (§A3(b), Sol r10-3): channel readiness. A successful rebuild
+        # means ``self._app``/``self.bot`` are usable, so the boot open-question
+        # reconcilers may now run their confirmed settle edits. Idempotent (a
+        # later rebuild re-sets an already-set event) — never cleared.
+        self._ready_event.set()
 
         # L6 (v0.52.0): a successful rebuild proves token+transport are
         # healthy (initialize() performs getMe and raises InvalidToken on a
@@ -1034,127 +1247,187 @@ class TelegramChannel(Channel):
                             rec.id[:8], exc,
                         )
 
-                if text.startswith("/"):
-                    # M10 (v0.52.0): group command menus send "/cancel@botname"
-                    # (Telegram appends @botusername to menu-selected commands
-                    # in groups). Strip the mention so the command matches. A
-                    # command explicitly addressed to a DIFFERENT bot is
-                    # blanked (falls through to the user-turn path, matching
-                    # PTB's CommandHandler semantics). When our username isn't
-                    # cached yet, strip unconditionally — safe inside Casa's
-                    # own supergroup.
-                    token = text.split()[0].lower()
-                    command, _, mention = token.partition("@")
-                    if mention and self._bot_username and mention != self._bot_username:
-                        command = ""  # addressed to another bot — not ours
-                    # Bug 8 (v0.14.6): /cancel and /complete are originator-only.
-                    # Pre-fix any user in the supergroup could terminate any
-                    # engagement; user_id wasn't even checked. /silent stays
-                    # open since it's local to the engagement (anyone reading
-                    # along can quiet the observer in their topic).
-                    if command in ("/cancel", "/complete"):
-                        owner_id = rec.origin.get("user_id")
-                        if (
-                            owner_id is not None
-                            and user_id is not None
-                            and int(owner_id) != int(user_id)
-                        ):
-                            # F2: route through the sequencer so this reply
-                            # cannot land below open narration.
-                            await self._post_engagement_notice(
-                                rec,
-                                f"Only the engagement originator can {command}. "
-                                "Ask them, or start your own engagement.",
-                            )
-                            return
-                        if command == "/cancel":
-                            return await self._finalize_cancel(rec, reason="user")
-                        return await self._finalize_complete_user(rec)
-                    if command == "/silent":
-                        if self._observer is not None:
-                            self._observer.silence(rec.id)
-                        # F2: route through the sequencer (single writer).
-                        await self._post_engagement_notice(
-                            rec, "Observer quieted for this engagement.",
-                        )
-                        return
-
-                # Resume suspended client if needed (in_casa driver only — the
-                # claude_code driver has s6 keeping the subprocess alive across
-                # Casa restarts, and its engagements never have sdk_session_id).
-                if rec.driver != "claude_code" and self._engagement_driver is not None:
-                    drv = self._engagement_driver
-                    if not drv.is_alive(rec) and rec.sdk_session_id:
-                        fail_count = rec.origin.get("_resume_fail_count", 0)
-                        try:
-                            await drv.resume(rec, rec.sdk_session_id)
-                            rec.origin["_resume_fail_count"] = 0
-                        except Exception as exc:  # noqa: BLE001
-                            fail_count += 1
-                            rec.origin["_resume_fail_count"] = fail_count
-                            logger.warning(
-                                "resume failed (%d/2) for engagement %s: %s",
-                                fail_count, rec.id[:8], exc,
-                            )
-                            if fail_count >= 2:
-                                await self._engagement_registry.mark_error(
-                                    rec.id, kind="resume_failed", message=str(exc),
+                # v0.83.0 (§A3, Sol r7-1): set the answered RESERVATION in the
+                # SAME synchronous section as the high-water advance — NO await
+                # between the advance above and this reserve — so a concurrent
+                # result-finalize that observed the answer's high-water also
+                # observes the reservation. ``reserve_answer`` is SYNCHRONOUS.
+                # The reservation counts the oldest unanswered anchor as ANSWERED
+                # (gates/summary/re-anchor) until the message either PROMOTES it
+                # (durable enqueue) or ROLLS it back (every non-delivery path
+                # below: command classification, resume failure, handler
+                # cancellation, spool enqueue rejection). ``handed_off`` transfers
+                # ownership to ``_deliver_turn_bg`` on the delivery path.
+                answer_token = None
+                if self._driver_reserve_answer is not None:
+                    try:
+                        answer_token = self._driver_reserve_answer(rec)
+                    except Exception:  # noqa: BLE001 — reservation is advisory
+                        answer_token = None
+                handed_off = False
+                try:
+                    if text.startswith("/"):
+                        # M10 (v0.52.0): group command menus send "/cancel@botname"
+                        # (Telegram appends @botusername to menu-selected commands
+                        # in groups). Strip the mention so the command matches. A
+                        # command explicitly addressed to a DIFFERENT bot is
+                        # blanked (falls through to the user-turn path, matching
+                        # PTB's CommandHandler semantics). When our username isn't
+                        # cached yet, strip unconditionally — safe inside Casa's
+                        # own supergroup.
+                        token = text.split()[0].lower()
+                        command, _, mention = token.partition("@")
+                        if mention and self._bot_username and mention != self._bot_username:
+                            command = ""  # addressed to another bot — not ours
+                        # Bug 8 (v0.14.6): /cancel and /complete are originator-only.
+                        # Pre-fix any user in the supergroup could terminate any
+                        # engagement; user_id wasn't even checked. /silent stays
+                        # open since it's local to the engagement (anyone reading
+                        # along can quiet the observer in their topic). §A3: a
+                        # command NEVER becomes a delivered user turn — CAS-roll
+                        # back the reservation (Sol r8-1). Ordered AFTER the notice
+                        # so the Task-9 seam's re-anchor lands below it (Sol r12-1).
+                        if command in ("/cancel", "/complete"):
+                            owner_id = rec.origin.get("user_id")
+                            if (
+                                owner_id is not None
+                                and user_id is not None
+                                and int(owner_id) != int(user_id)
+                            ):
+                                # F2: route through the sequencer so this reply
+                                # cannot land below open narration.
+                                await self._post_engagement_notice(
+                                    rec,
+                                    f"Only the engagement originator can {command}. "
+                                    "Ask them, or start your own engagement.",
                                 )
-                            await self.send_to_topic(
-                                thread_id,
-                                f"Could not resume this engagement: {exc}. "
-                                f"Start a fresh one if needed.",
-                            )
-                            if fail_count >= 2:
-                                # [AR-1] (v0.65.0): this terminal path
-                                # bypasses finalize — title-mark, close +
-                                # ledger the topic here (best-effort,
-                                # never raises). After the notice: posting
-                                # into a just-closed topic works only
-                                # while the bot keeps can_manage_topics —
-                                # mirror the funnel's send-then-close
-                                # order.
-                                await self._cleanup_error_topic(rec)
+                                await self._rollback_answer(rec, answer_token)
+                                return
+                            # F2 (whole-branch r2): TERMINAL path — run the
+                            # finalizer FIRST, then gate the re-anchor SUPPRESSION
+                            # on finalize SUCCESS. On success, finalize's
+                            # settle_all_open_questions already owns + settles
+                            # every open anchor (it never reads the reservation,
+                            # so a still-held reservation during finalize is
+                            # inert), and the suppressed rollback just clears the
+                            # reservation — no redundant re-anchor copy. On a
+                            # FAILED strict terminal transition (finalize returns
+                            # False → engagement stays live, nothing settled), the
+                            # rollback runs WITHOUT suppression so the fourth-
+                            # consumer re-anchor moves the stranded live anchor
+                            # below the command instead of orphaning it above.
+                            # The originator-rejected + /silent rollbacks above are
+                            # NON-terminal and keep re-anchoring unconditionally.
+                            if command == "/cancel":
+                                finalized = await self._finalize_cancel(
+                                    rec, reason="user")
+                            else:
+                                finalized = await self._finalize_complete_user(rec)
+                            await self._rollback_answer(
+                                rec, answer_token,
+                                suppress_reanchor=bool(finalized))
                             return
-                    elif not drv.is_alive(rec):
-                        # No session to resume — orphan
-                        await self._engagement_registry.mark_error(
-                            rec.id, kind="orphan_no_session",
-                            message="no sdk_session_id to resume with",
-                        )
-                        await self.send_to_topic(
-                            thread_id, "This engagement can't be resumed.",
-                        )
-                        # [AR-1] (v0.65.0): this terminal path bypasses
-                        # finalize — title-mark, close + ledger the topic
-                        # here (best-effort, never raises). After the
-                        # notice — the funnel's send-then-close order.
-                        await self._cleanup_error_topic(rec)
-                        return
+                        if command == "/silent":
+                            if self._observer is not None:
+                                self._observer.silence(rec.id)
+                            # F2: route through the sequencer (single writer).
+                            await self._post_engagement_notice(
+                                rec, "Observer quieted for this engagement.",
+                            )
+                            await self._rollback_answer(rec, answer_token)
+                            return
 
-                # M9 (v0.52.0): deliver the user turn in a tracked background
-                # task so the per-topic lock (and, in polling mode, PTB's
-                # update fetcher) is NOT held across the whole multi-minute
-                # SDK turn — a subsequent /cancel can then acquire the lock
-                # and interrupt the in-flight turn. The status re-check above
-                # still ran under the lock, preserving the Bug-10 guarantee
-                # (a cancel that already finalised the driver blanks the turn
-                # here before any task is spawned).
-                # v0.79.0 (§3, F2/F5): the high-water advance + narration seal
-                # now happens at TRUE handler entry above (before command
-                # handling and any suspension) — see the block after the
-                # active-status check.
-                if self._engagement_registry is not None:
-                    import time as _time
-                    await self._engagement_registry.update_user_turn(rec.id, _time.time())
-                if self._driver_send_user_turn is not None:
-                    task = asyncio.create_task(
-                        self._deliver_turn_bg(
-                            rec, text,
-                            tg_message_id=getattr(msg, "message_id", None)))
-                    self._turn_tasks.add(task)
-                    task.add_done_callback(self._turn_tasks.discard)
-                return
+                    # Resume suspended client if needed (in_casa driver only — the
+                    # claude_code driver has s6 keeping the subprocess alive across
+                    # Casa restarts, and its engagements never have sdk_session_id).
+                    if rec.driver != "claude_code" and self._engagement_driver is not None:
+                        drv = self._engagement_driver
+                        if not drv.is_alive(rec) and rec.sdk_session_id:
+                            fail_count = rec.origin.get("_resume_fail_count", 0)
+                            try:
+                                await drv.resume(rec, rec.sdk_session_id)
+                                rec.origin["_resume_fail_count"] = 0
+                            except Exception as exc:  # noqa: BLE001
+                                fail_count += 1
+                                rec.origin["_resume_fail_count"] = fail_count
+                                logger.warning(
+                                    "resume failed (%d/2) for engagement %s: %s",
+                                    fail_count, rec.id[:8], exc,
+                                )
+                                if fail_count >= 2:
+                                    await self._engagement_registry.mark_error(
+                                        rec.id, kind="resume_failed", message=str(exc),
+                                    )
+                                await self.send_to_topic(
+                                    thread_id,
+                                    f"Could not resume this engagement: {exc}. "
+                                    f"Start a fresh one if needed.",
+                                )
+                                if fail_count >= 2:
+                                    # [AR-1] (v0.65.0): this terminal path
+                                    # bypasses finalize — title-mark, close +
+                                    # ledger the topic here (best-effort,
+                                    # never raises). After the notice: posting
+                                    # into a just-closed topic works only
+                                    # while the bot keeps can_manage_topics —
+                                    # mirror the funnel's send-then-close
+                                    # order.
+                                    await self._cleanup_error_topic(rec)
+                                return
+                        elif not drv.is_alive(rec):
+                            # No session to resume — orphan
+                            await self._engagement_registry.mark_error(
+                                rec.id, kind="orphan_no_session",
+                                message="no sdk_session_id to resume with",
+                            )
+                            await self.send_to_topic(
+                                thread_id, "This engagement can't be resumed.",
+                            )
+                            # [AR-1] (v0.65.0): this terminal path bypasses
+                            # finalize — title-mark, close + ledger the topic
+                            # here (best-effort, never raises). After the
+                            # notice — the funnel's send-then-close order.
+                            await self._cleanup_error_topic(rec)
+                            return
+
+                    # M9 (v0.52.0): deliver the user turn in a tracked background
+                    # task so the per-topic lock (and, in polling mode, PTB's
+                    # update fetcher) is NOT held across the whole multi-minute
+                    # SDK turn — a subsequent /cancel can then acquire the lock
+                    # and interrupt the in-flight turn. The status re-check above
+                    # still ran under the lock, preserving the Bug-10 guarantee
+                    # (a cancel that already finalised the driver blanks the turn
+                    # here before any task is spawned).
+                    # v0.79.0 (§3, F2/F5): the high-water advance + narration seal
+                    # now happens at TRUE handler entry above (before command
+                    # handling and any suspension) — see the block after the
+                    # active-status check.
+                    if self._engagement_registry is not None:
+                        import time as _time
+                        await self._engagement_registry.update_user_turn(rec.id, _time.time())
+                    if self._driver_send_user_turn is not None:
+                        # §A3: the message becomes a delivered user turn — TRANSFER
+                        # reservation ownership to the background task, which
+                        # promotes (accepted) or CAS-rolls-back (rejected) per the
+                        # enqueue disposition. ``handed_off`` stops the finally
+                        # below from clobbering the in-flight reservation.
+                        handed_off = True
+                        task = asyncio.create_task(
+                            self._deliver_turn_bg(
+                                rec, text,
+                                tg_message_id=getattr(msg, "message_id", None),
+                                answer_token=answer_token))
+                        self._turn_tasks.add(task)
+                        task.add_done_callback(self._turn_tasks.discard)
+                    return
+                finally:
+                    # §A3 (Sol r8-1): every path that did NOT hand the reservation
+                    # to the delivery task — command classification, resume
+                    # failure/orphan, handler CANCELLATION — CAS-rolls it back.
+                    # The CAS no-ops if a command branch already rolled it back,
+                    # if promotion consumed it, or if a later message re-reserved.
+                    if not handed_off:
+                        await self._rollback_answer(rec, answer_token)
 
         # 3) Other chats. When telegram_chat_id is configured it is an
         #    allowlist (DOCS.md: "Telegram chat ID to restrict messages
@@ -1172,8 +1445,30 @@ class TelegramChannel(Channel):
             return
         return await self._route_to_ellen(update)
 
+    async def _rollback_answer(
+        self, rec, token, *, suppress_reanchor: bool = False,
+    ) -> None:
+        """§A3: best-effort CAS rollback of an answered reservation (a no-op when
+        unwired, the token is None, or the CAS loses ownership). Swallows its own
+        errors so no non-delivery path is aborted by a rollback failure.
+
+        F2 (whole-branch gate): TERMINAL command paths (``/cancel``/``/complete``)
+        pass ``suppress_reanchor=True`` because engagement finalize follows and
+        its ``settle_all_open_questions`` owns the open anchors — re-anchoring
+        here would post a redundant copy that terminal settlement instantly
+        settles."""
+        if token is None or self._driver_rollback_answer_reservation is None:
+            return
+        try:
+            await self._driver_rollback_answer_reservation(
+                rec, token, suppress_reanchor=suppress_reanchor)
+        except Exception:  # noqa: BLE001 — rollback is advisory
+            logger.debug("rollback_answer_reservation failed for %s",
+                         rec.id[:8], exc_info=True)
+
     async def _deliver_turn_bg(
         self, rec, text: str, *, tg_message_id: int | None = None,
+        answer_token: str | None = None,
     ) -> None:
         """M9 (v0.52.0): run one engagement user-turn to completion.
 
@@ -1185,13 +1480,24 @@ class TelegramChannel(Channel):
 
         v0.79.0 (§3): ``tg_message_id`` threads the durable inbound envelope to
         the operator's Telegram message (reply-quoting / receipts).
+
+        v0.83.0 (§A3, Sol r9-1/r10-2): this task OWNS the answered reservation
+        after hand-off. The enqueue DISPOSITION drives its fate — an ACCEPTED
+        enqueue (``queued``/``evicted_other``) already PROMOTED (consumed) the
+        reservation inside ``enqueue``; a REJECTED enqueue (``dropped_full`` /
+        ``error``) or a raised/cancelled delivery CAS-rolls it back so the
+        question stops being treated as answered.
         """
         try:
-            await self._driver_send_user_turn(
+            disposition = await self._driver_send_user_turn(
                 rec, text, tg_message_id=tg_message_id)
         except asyncio.CancelledError:
+            # Cancelled before a durable enqueue could promote — roll back.
+            await self._rollback_answer(rec, answer_token)
             raise
         except Exception as exc:  # noqa: BLE001
+            # The enqueue raised (never durably spooled) — the reservation must
+            # roll back so the answer-lifecycle isn't left falsely promoted.
             latest = (
                 self._engagement_registry.get(rec.id)
                 if self._engagement_registry is not None else None
@@ -1199,6 +1505,7 @@ class TelegramChannel(Channel):
             if latest is not None and latest.status in (
                 "completed", "cancelled", "error",
             ):
+                await self._rollback_answer(rec, answer_token)
                 logger.info(
                     "turn delivery ended by finalize for %s: %s",
                     rec.id[:8], exc,
@@ -1211,6 +1518,21 @@ class TelegramChannel(Channel):
                 await self._post_engagement_notice(rec, f"Turn failed: {exc}")
             except Exception:  # noqa: BLE001 — best-effort user notice
                 pass
+            finally:
+                # M4 (§A3 wave 2): a CancelledError while AWAITING the notice
+                # bypasses ``except Exception`` — without a finally the rollback
+                # below never runs and the answered reservation LEAKS (the anchor
+                # stays invisibly 'answered'). Guarantee the rollback here so it
+                # runs on both the normal and the cancelled paths; a CancelledError
+                # still propagates after. Sol r12-1 ordering preserved: rollback
+                # runs AFTER the notice attempt, so a rollback consumer's re-posted
+                # question lands BELOW the notice.
+                await self._rollback_answer(rec, answer_token)
+            return
+        # §A3: a durable-enqueue REJECTION (capacity drop / spool-write error)
+        # rolls the reservation back; an accepted enqueue already promoted it.
+        if disposition in ("dropped_full", "error"):
+            await self._rollback_answer(rec, answer_token)
 
     async def _maybe_redirect_main_feed(self, user_id: int | None) -> None:
         if user_id is None:
@@ -1258,7 +1580,7 @@ class TelegramChannel(Channel):
         """
         cq = update.callback_query
         data = cq.data or ""
-        ns, request_id, idx = _parse_callback_data(data)
+        ns, request_id, idx, kind = _parse_callback_data(data)
         if ns is None:
             await _safe_answer(cq, "expired")
             return
@@ -1302,7 +1624,9 @@ class TelegramChannel(Channel):
             await _safe_answer(cq, "expired")
             return
         options = meta.get("options") or []
-        if idx not in range(len(options)):
+        # A5 · F-MULTI: a SUBMIT tap carries no option index (``idx is None``);
+        # the range check applies only to single-select + toggle taps.
+        if kind != "submit" and idx not in range(len(options)):
             await _safe_answer(cq, "invalid")
             return
 
@@ -1314,9 +1638,38 @@ class TelegramChannel(Channel):
             await _safe_answer(cq, "not for you")
             return
 
+        # A5 · F-MULTI TOGGLE: broker-owned atomic flip on a LIVE, UNCLAIMED
+        # request, then a revalidated markup-only keyboard redraw through the
+        # sequencer's ``edit_discrete`` (§A9). This handler NEVER resolves the
+        # request — only the finish hook (submit / timeout / supersede) settles.
+        if kind == "toggle":
+            selected = BROKER.toggle_selection(
+                namespace=ns, scope=rec.id, request_id=request_id, idx=idx)
+            if selected is None:
+                await _safe_answer(cq, "expired")
+                return
+            await self._redraw_multi_keyboard(
+                rec.id, request_id, meta, options, selected)
+            await _safe_answer(
+                cq, "added" if idx in selected else "removed")
+            return
+
+        # A5 · F-MULTI SUBMIT: require ≥1 selection, then claim carrying the full
+        # selection (``option_index`` = the FIRST selected index for compat).
+        option_indices: "list[int] | None" = None
+        claim_index = idx
+        if kind == "submit":
+            selected = sorted(set(meta.get("selected") or ()))
+            if not selected:
+                await _safe_answer(cq, "pick at least one")
+                return
+            option_indices = selected
+            claim_index = selected[0]
+
         claim = BROKER.claim(
             namespace=ns, scope=rec.id, request_id=request_id,
-            option_index=idx, actor_id=cq.from_user.id,
+            option_index=claim_index, actor_id=cq.from_user.id,
+            option_indices=option_indices,
         )
         if isinstance(claim, str):
             # Non-winning: a late tap on an already-retired keyboard never
@@ -1384,6 +1737,50 @@ class TelegramChannel(Channel):
                 else:
                     BROKER.abort_claim(claim)
         await _safe_answer(cq, "✔" if committed else "expired")
+
+    async def _redraw_multi_keyboard(
+        self, engagement_id: str, request_id: str, meta: dict,
+        options: list, selected: list,
+    ) -> bool:
+        """A5 · F-MULTI: redraw the toggle keyboard after a flip, via the
+        sequencer's markup-only ``edit_discrete`` (§A9).
+
+        The redraw REVALIDATES live-and-unclaimed under the serialized CM
+        immediately before the wire edit (``BROKER.is_live_unclaimed``) — a
+        terminal outcome that resolved in between skips the edit, so a stale
+        redraw can never resurrect a settled keyboard. Degrades to a no-op
+        (returns False) when the driver/sequencer seam is absent (eager
+        fallback / unit fakes). The message id + agent ``shorts`` live in the
+        broker-owned meta seeded at post time."""
+        mid = meta.get("message_id")
+        if not isinstance(mid, int):
+            return False
+        try:
+            import agent as _agent_mod
+            drv = getattr(_agent_mod, "active_claude_code_driver", None)
+        except Exception:  # noqa: BLE001
+            drv = None
+        if drv is None:
+            return False
+        editor = getattr(drv, "edit_ask_keyboard", None)
+        if editor is None:
+            return False
+        from verdict_broker import BROKER
+
+        markup = _build_multi_keyboard(
+            request_id, options, meta.get("shorts"), selected)
+
+        def _still_live() -> bool:
+            return BROKER.is_live_unclaimed(
+                namespace="engagement_ask", scope=engagement_id,
+                request_id=request_id)
+
+        try:
+            return await editor(
+                engagement_id, mid, markup, revalidate=_still_live)
+        except Exception:  # noqa: BLE001 — a redraw failure never breaks the tap
+            logger.debug("multi keyboard redraw failed", exc_info=True)
+            return False
 
     def _commit_ask_with_anchor(
         self, claim: Any, ns: str, rec: Any, meta: dict,
@@ -1634,6 +2031,8 @@ class TelegramChannel(Channel):
         request_id: str,
         question: str,
         options: list,
+        shorts: "list | None" = None,
+        multi: bool = False,
     ) -> int | None:
         """Post a plain-text multiple-choice question with one tappable
         button per option (W5 `ask`).
@@ -1656,17 +2055,36 @@ class TelegramChannel(Channel):
 
         # v0.75.0 (W5): v1 broker callback_data, one button (its own row)
         # per option — option_index is this option's position in `options`.
-        # v0.81.0 (W-R3): the button LABEL is a short, number-prefixed summary
-        # (``_short_option_label``) so it stays readable — Telegram truncates
-        # long labels. ``question`` is already the canonical body
+        # v0.81.0 (W-R3) / v0.83.0 (A4 · F-BTN): the button LABEL is a short,
+        # number-prefixed summary derived over the WHOLE option set
+        # (``short_option_labels`` — distinguishing tails preserved) so it stays
+        # readable AND pickable. ``question`` is already the canonical body
         # (``render_ask_body``): the FULL options are numbered VERBATIM in it,
         # and ``callback_data`` still carries the option INDEX as the identity.
+        # ``shorts`` (A4 rule 3): an agent-supplied short per option (or None) —
+        # used VERBATIM (``n · <short>``, no elision) when given, else the
+        # heuristic label. The full ``label`` is what the body/meta/settle see.
+        # A5 · F-MULTI: a multi ask renders the toggle-many keyboard (checkboxes
+        # + ✅ Submit) via the shared builder; single-select keeps one tappable
+        # button per option (``v1|engagement_ask|<rid>|<idx>``).
+        if multi:
+            kbd = _build_multi_keyboard(request_id, options, shorts, selected=())
+            return await self.send_to_topic(
+                rec.topic_id, question, reply_markup=kbd)
+
+        heuristic = short_option_labels(options)
+
+        def _button_text(i: int) -> str:
+            if shorts is not None and i < len(shorts) and shorts[i]:
+                return f"{i + 1} · {shorts[i]}"
+            return heuristic[i]
+
         kbd = InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                text=_short_option_label(i + 1, label),
+                text=_button_text(i),
                 callback_data=f"v1|engagement_ask|{request_id}|{i}",
             )]
-            for i, label in enumerate(options)
+            for i in range(len(options))
         ])
 
         return await self.send_to_topic(rec.topic_id, question, reply_markup=kbd)
@@ -1726,6 +2144,119 @@ class TelegramChannel(Channel):
             )
             return False
 
+    async def send_topic_message_markup(
+        self, topic_id: int | None, text: str, markup: Any = None,
+        *, reply_to: int | None = None,
+    ) -> int | None:
+        """A9 (v0.83.0): plain-text topic send carrying an inline keyboard,
+        returning the posted ``message_id`` (markup-capable companion to
+        ``send_to_topic`` for the OUTPUT SEQUENCER's ``post_discrete``).
+
+        ``markup`` is an ``InlineKeyboardMarkup`` (passed through), the
+        ``output_sequencer.MARKUP_EMPTY`` sentinel (⇒ explicit empty keyboard),
+        or ``None`` (⇒ no keyboard, plain send). ``reply_to`` reply-threads the
+        send. Best-effort: returns ``None`` on failure rather than raising."""
+        if not self.engagement_supergroup_id:
+            return None
+        kwargs: dict = {}
+        resolved = self._resolve_wire_keyboard(markup)
+        if resolved is not None:
+            kwargs["reply_markup"] = resolved
+        if reply_to is not None:
+            from telegram import ReplyParameters
+            kwargs["reply_parameters"] = ReplyParameters(
+                message_id=reply_to, allow_sending_without_reply=True,
+            )
+        try:
+            msg = await self.bot.send_message(
+                chat_id=self.engagement_supergroup_id,
+                text=text,
+                message_thread_id=topic_id,
+                **kwargs,
+            )
+            return msg.message_id
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+            logger.warning(
+                "send_topic_message_markup failed (topic=%s): %s", topic_id, exc,
+            )
+            return None
+
+    async def edit_topic_message_markup(
+        self, topic_id: int | None, message_id: int, text, markup,
+    ) -> bool:
+        """A9 (v0.83.0): markup-capable edit of a posted topic message (the
+        sequencer's ``edit_discrete`` wire).
+
+        * ``text`` non-None, ``markup is _ABSENT`` → text-only edit; the existing
+          keyboard is left UNTOUCHED (PTB drops the omitted ``reply_markup``).
+        * ``text`` non-None, ``markup`` given → edit text AND keyboard.
+        * ``text is None``, ``markup`` given → markup-only edit via
+          ``bot.edit_message_reply_markup``.
+        * ``text is None`` and ``markup is _ABSENT`` → nothing to do (no-op True).
+
+        ``markup`` values resolve like ``send_topic_message_markup``'s (a real
+        keyboard passes through; ``MARKUP_EMPTY``/``None`` ⇒ explicit empty
+        keyboard to CLEAR). "Message is not modified" is tolerated as success
+        (the desired end-state already holds), matching ``edit_topic_message``."""
+        from channels.output_sequencer import _ABSENT
+        if not self.engagement_supergroup_id:
+            return False
+        markup_touched = markup is not _ABSENT
+        if text is None and not markup_touched:
+            return True  # nothing to change
+        try:
+            if text is None:
+                await self.bot.edit_message_reply_markup(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id,
+                    reply_markup=self._resolve_wire_keyboard(markup, clear=True),
+                )
+            elif markup_touched:
+                await self.bot.edit_message_text(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=self._resolve_wire_keyboard(markup, clear=True),
+                )
+            else:
+                await self.bot.edit_message_text(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id,
+                    text=text,
+                )
+            return True
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            logger.warning(
+                "edit_topic_message_markup failed (topic=%s message_id=%s): %s",
+                topic_id, message_id, exc,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+            logger.warning(
+                "edit_topic_message_markup failed (topic=%s message_id=%s): %s",
+                topic_id, message_id, exc,
+            )
+            return False
+
+    @staticmethod
+    def _resolve_wire_keyboard(markup, *, clear: bool = False):
+        """Map a sequencer markup value to a concrete PTB ``reply_markup``.
+
+        A real ``InlineKeyboardMarkup`` passes through unchanged; the
+        ``output_sequencer.MARKUP_EMPTY`` sentinel resolves to an explicit empty
+        keyboard. ``None`` resolves to an explicit empty keyboard when *clear* is
+        set (an EDIT that must drop the old keyboard) or to ``None`` otherwise (a
+        fresh SEND has no keyboard to clear)."""
+        from telegram import InlineKeyboardMarkup
+        from channels.output_sequencer import MARKUP_EMPTY
+        if markup is None:
+            return InlineKeyboardMarkup([]) if clear else None
+        if isinstance(markup, str) and markup == MARKUP_EMPTY:
+            return InlineKeyboardMarkup([])
+        return markup
+
     async def delete_topic_message(
         self, topic_id: int | None, message_id: int,
     ) -> bool:
@@ -1771,22 +2302,23 @@ class TelegramChannel(Channel):
         ``message_id``, or ``None`` on send failure — the broker's
         ``ensure_posted`` treats ``None`` as a delivery failure (r10-B3).
 
-        ``short_labels`` (v0.81.0, W-R3b): when True, derive short, number-
-        prefixed button labels via ``_short_option_label`` — Telegram truncates
-        long labels, which made ``ask_user`` options unpickable. The FULL options
-        must already live VERBATIM in ``text`` (the caller renders them with
-        ``render_ask_body``). Default False keeps the authz-challenge DM path
-        (``authz_grants`` — short ``Approve``/``Deny`` options) untouched.
+        ``short_labels`` (v0.81.0, W-R3b; v0.83.0 A4 · F-BTN): when True, derive
+        short, number-prefixed button labels via the set-level
+        ``short_option_labels`` (distinguishing-tail elision ladder) — Telegram
+        truncates long labels, which made ``ask_user`` options unpickable. The
+        FULL options must already live VERBATIM in ``text`` (the caller renders
+        them with ``render_ask_body``). Default False keeps the authz-challenge
+        DM path (``authz_grants`` — short ``Approve``/``Deny`` options) untouched.
         """
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+        heuristic = short_option_labels(options) if short_labels else None
         kbd = InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                text=(_short_option_label(i + 1, label)
-                      if short_labels else label),
+                text=(heuristic[i] if heuristic is not None else options[i]),
                 callback_data=f"v1|resident_ask|{request_id}|{i}",
             )]
-            for i, label in enumerate(options)
+            for i in range(len(options))
         ])
         try:
             msg = await self.bot.send_message(
@@ -1924,6 +2456,14 @@ class TelegramChannel(Channel):
         if self._bot is not None:
             return self._bot
         return self._app.bot if self._app is not None else None
+
+    @property
+    def ready_event(self) -> asyncio.Event:
+        """v0.83.0 (§A3(b), Sol r10-3): the channel-readiness event the boot
+        open-question reconcilers await — set at the first successful
+        ``_rebuild`` (transport up, ``bot`` usable). Exposed so casa_core can
+        gate reconcile EXECUTION on transport readiness without blocking replay."""
+        return self._ready_event
 
     # ------------------------------------------------------------------
     # Engagement topic helpers

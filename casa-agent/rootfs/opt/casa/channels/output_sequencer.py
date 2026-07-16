@@ -43,6 +43,7 @@ import asyncio
 import inspect
 import logging
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -59,6 +60,13 @@ _INTENT_TIMEOUT_S = 10.0  # §2(5): an armed intent unmatched by any block for
 #                           this long posts out-of-band with a WARN + a debt.
 _HOLD_POLL_S = 0.05       # slot-hold re-check cadence (the happy path arms well
 #                           inside one poll; MCP calls land in ms).
+_DISCRETE_CACHE_CAP = 64  # A9 (Sol r2-10b): bounded FIFO of discrete
+#                           post_discrete/edit_discrete no-op-cache keys, so
+#                           keyboard entries don't accumulate for the
+#                           engagement's lifetime. Eviction past the cap drops
+#                           the oldest DISCRETE _edit_cache entry (narration /
+#                           summary entries are never in this FIFO, so they are
+#                           untouched); the no-op gate then re-edits once.
 
 # Canonical channel-MCP tool names (the ask/reply ingresses — §2 pinned
 # ingress (a)). ``HOLD_ELIGIBLE_TOOLS`` is the set of tool kinds that ALWAYS
@@ -86,10 +94,14 @@ HOLD_ELIGIBLE_TOOLS: frozenset[str] = frozenset(
 def project_args(tool_name: str, raw_args: dict) -> dict:
     """Apply the pinned projection for *tool_name* to *raw_args*.
 
-    * ``ask`` → ``{question, options, timeout_s-as-given}``.
+    * ``ask`` → ``{question, options, timeout_s-as-given, multi-as-given}``.
     * ``reply`` → ``{text}`` (drops the SDK-compat ``chat_id``).
     * everything else (a permission-gated tool's own frame, ``emit_completion``)
       → identity over the raw args.
+
+    A5 · F-MULTI (v0.83.0): ``multi`` joins the ask projection — this MUST stay
+    byte-identical to ``casa_engagement_channel._ask_projection_hash`` (the
+    client side), or a multi ask's relay intent would never match its block.
     """
     if not isinstance(raw_args, dict):
         raw_args = {}
@@ -98,6 +110,7 @@ def project_args(tool_name: str, raw_args: dict) -> dict:
             "question": raw_args.get("question"),
             "options": raw_args.get("options"),
             "timeout_s": raw_args.get("timeout_s"),
+            "multi": raw_args.get("multi", False),
         }
     if tool_name == REPLY_TOOL:
         return {"text": raw_args.get("text")}
@@ -142,6 +155,10 @@ class SendIntent:
     state: str = "pending"          # pending | armed | posted | cancelled
     message_id: int | None = None
     outcome: dict | None = None
+    posting: bool = False           # A3 · F-ORDER (Sol A3 wave 3): the writer is
+    #                                 CURRENTLY awaiting this intent's poster under
+    #                                 the lock. A serialized cancel that observes
+    #                                 this NO-OPS — the in-flight post wins.
     slot_missed: bool = False       # relay slot timed out while this was pending
     timeout_posted: bool = False    # §2(5) one-block consumption debt
     consumed: bool = False          # retired from matching
@@ -287,6 +304,31 @@ def _markup_tristate(markup: Any) -> Any:
     return f"markup:{markup!r}"
 
 
+def _discrete_markup_tristate(markup: Any) -> Any:
+    """Map a DISCRETE-write markup argument to its cache key (F4).
+
+    Unlike :func:`_markup_tristate` (which conflates them so a text-only
+    narration edit never accidentally reads as a keyboard change),
+    ``post_discrete``/``edit_discrete`` distinguish the two keyboard operations:
+
+    * ``_ABSENT`` — "leave the keyboard untouched" → ``MARKUP_ABSENT``;
+    * ``None`` — "CLEAR the keyboard" → ``MARKUP_EMPTY`` (a clear IS the
+      explicit-empty operation; matches ``edit_topic_message_markup``'s
+      ``None``/``MARKUP_EMPTY`` → explicit-empty-keyboard wire semantics).
+
+    Without this split a keyboard CLEAR (``markup=None``) after an identical
+    text-only edit is no-op-suppressed, because ``_markup_tristate(None)``
+    equals ``_markup_tristate(_ABSENT)`` and the ``(text, tri)`` cache matches.
+    """
+    if markup is _ABSENT:
+        return MARKUP_ABSENT
+    if markup is None:
+        return MARKUP_EMPTY
+    if isinstance(markup, str) and markup == MARKUP_EMPTY:
+        return MARKUP_EMPTY
+    return f"markup:{markup!r}"
+
+
 # Result codes from edit_narration_if_latest / post_for_block.
 APPLIED = "applied"
 SEALED = "sealed"
@@ -299,6 +341,13 @@ FAILED = "failed"
 
 SendMessage = Callable[[int, str], Awaitable[int | None]]
 EditMessage = Callable[[int, int, str], Awaitable[bool]]
+# A9 markup-capable wire primitives (injected by the driver's _relay_* wrappers;
+# production always supplies them, tests inject fakes). ``send_message_markup``
+# posts plain text + an inline keyboard and returns the message id;
+# ``edit_message_markup`` edits text and/or markup (``text=None`` ⇒ markup-only;
+# ``markup is _ABSENT`` ⇒ leave the keyboard untouched).
+SendMessageMarkup = Callable[..., Awaitable[int | None]]
+EditMessageMarkup = Callable[..., Awaitable[bool]]
 
 
 class OutputSequencer:
@@ -316,6 +365,8 @@ class OutputSequencer:
         topic_id: int,
         send_message: SendMessage,
         edit_message: EditMessage,
+        send_message_markup: SendMessageMarkup | None = None,
+        edit_message_markup: EditMessageMarkup | None = None,
         _now: Callable[[], float] = time.monotonic,
         _sleep: Callable[[float], Awaitable[None]] | None = None,
         slot_hold_s: float = _SLOT_HOLD_S,
@@ -326,6 +377,12 @@ class OutputSequencer:
         self.topic_id = topic_id
         self.send_message = send_message
         self.edit_message = edit_message
+        # A9: markup-capable wire primitives. Default None keeps the sequencer
+        # constructible without them; post_discrete/edit_discrete raise a clear
+        # RuntimeError if used un-injected (belt-and-suspenders — production
+        # always injects via the driver's _ensure_sequencer wiring).
+        self._send_message_markup = send_message_markup
+        self._edit_message_markup = edit_message_markup
         self._now = _now
         self._sleep = _sleep or _default_sleep
         self._slot_hold_s = slot_hold_s
@@ -354,7 +411,13 @@ class OutputSequencer:
         self._high_water: int | None = None
         self._narration_msg_id: int | None = None
         # F1 no-op edit gate: msg_id -> (text, markup_tristate).
-        self._edit_cache: dict[int, tuple[str, Any]] = {}
+        self._edit_cache: dict[int, tuple[Any, Any]] = {}
+        # A9 (Sol r2-10b): bounded FIFO of DISCRETE-write cache keys only. Narration
+        # entries retire on seal and summary entries live forever above the log;
+        # discrete keyboard entries would otherwise leak, so post_discrete/
+        # edit_discrete register their mids here and eviction past the cap drops
+        # the oldest discrete _edit_cache entry (never a narration/summary one).
+        self._discrete_cache_fifo: deque[int] = deque()
         self._arm_event = asyncio.Event()
         # v0.79.0 (§3, Primitive B): reply-threading. An inbound operator
         # envelope's delivery sets this to its Telegram message id; the turn's
@@ -592,6 +655,67 @@ class OutputSequencer:
         intent = self.registry.by_request_id(request_id)
         return intent.outcome if intent is not None else None
 
+    def record_intent_refusal(self, request_id: str, outcome: dict) -> SendIntent | None:
+        """A2 (F-EXPIRE, Sol review Finding 1): the operator-away gate REFUSED
+        this ask. Tombstone the intent (like :meth:`cancel_intent`) AND record a
+        refusal OUTCOME so a same-``request_id`` transport retry REATTACHES to the
+        SAME refusal rather than: awaiting a dead intent (→ ``delivery_failed``)
+        or re-registering a fresh broker request (→ full timeout burn, no
+        keyboard). Signals any fail-closed awaiter so a blocked
+        :meth:`await_intent_resolution` unblocks with the refusal (never ok:true
+        on a never-posted intent). No-op if the intent is unknown."""
+        intent = self.registry.cancel(request_id)
+        if intent is None:
+            return None
+        intent.outcome = dict(outcome)
+        self._arm_event.set()
+        self._signal_resolution(request_id)
+        return intent
+
+    def record_intent_cancelled_nowait(
+        self, request_id: str, outcome: dict,
+    ) -> bool:
+        """A3 · F-ORDER (Sol A3 wave 4): FULLY SYNCHRONOUS transport-cancellation
+        cleanup against an in-flight relay post — "the post wins" — with NO awaits.
+
+        The wave-3 predecessor acquired the writer lock (awaited), which left a
+        DOUBLE-cancel window: a second ``Task.cancel()`` during that await
+        interrupted the cleanup, dropping control into the handler's outer
+        ``finally`` while a bound poster was mid-post. Being awaitless, this
+        method can never be interrupted part-way, so no such window exists.
+
+        Correctness (asyncio is single-threaded): ``posting`` is set/cleared under
+        the writer lock in :meth:`_post_intent_locked`, and the attribute write
+        COMMITS before any await — so a plain sync read here can never observe a
+        torn / mid-mutation flag. If ``posting`` is True (or ``state == "posted"``,
+        or a terminal outcome is recorded) the post has won and owns both the
+        marker and the outcome — return ``False``, never clobber. Otherwise the
+        relay has NOT bound this intent (a still-pending, or armed-and-unposted
+        intent): synchronously TOMBSTONE it via the registry's sync
+        :meth:`IntentRegistry.cancel`, record the ``cancelled`` outcome (so a
+        same-``request_id`` retry reattaches), signal resolution, and return
+        ``True``. A later relay bind then sees the tombstone and consume-cancels
+        the block — it can never post.
+
+        Returns ``True`` iff the cancel TOOK EFFECT (the caller then clears the
+        ingress marker). No-op ``False`` if the intent is unknown."""
+        intent = self.registry.by_request_id(request_id)
+        if intent is None:
+            return False
+        if (
+            intent.posting
+            or intent.state == "posted"
+            or intent.outcome is not None
+        ):
+            return False  # the in-flight / resolved post wins — never clobber
+        if intent.state not in ("pending", "armed"):
+            return False
+        self.registry.cancel(request_id)  # sync tombstone (pending/armed → cancelled)
+        intent.outcome = dict(outcome)
+        self._arm_event.set()
+        self._signal_resolution(request_id)
+        return True
+
     async def mark_intent_posted(
         self, request_id: str, message_id: int | None,
     ) -> Any:
@@ -619,6 +743,53 @@ class OutputSequencer:
             if message_id is not None and (
                 self._high_water is None or message_id > self._high_water
             ):
+                self._high_water = message_id
+            self._signal_resolution(request_id)
+            return intent
+
+    async def mark_intent_compensated(
+        self, request_id: str, message_id: int,
+    ) -> Any:
+        """A3(c) COMPENSATED-INTENT path (Sol r5-5 + r6-1): account a physical
+        wire message whose logical result is FAILURE.
+
+        The A3 initial-anchor poster posts first, then strict-persists the
+        ledger entry; on an ``add_open_question`` failure the message EXISTS on
+        the wire but the ask must resolve ok:false. The poster best-effort
+        edits the orphan to a withdrawn-copy via the RAW wire primitive (never
+        ``edit_discrete`` — it runs under the sequencer lock on the relay task,
+        no reacquisition) and calls this to reconcile the sequencer's causal
+        accounting.
+
+        Pinned invariants (spec §A3(c)): ``_high_water`` advances to the
+        delivered *message_id* (so a later ask opens BELOW the orphan, never
+        beside it), the intent resolves EXACTLY ONCE with ``{"ok": False,
+        "message_id": message_id, "compensated": True}``, and ``post_failed`` is
+        NOT separately re-fired.
+
+        Divergence from :meth:`mark_intent_posted` (which records an ok success
+        with a one-block ``timeout_posted`` debt): here the outcome is ok:false
+        with a ``compensated`` marker, the intent is RETIRED from matching
+        (``consumed=True``, so no relay/watcher re-fire and no phantom debt),
+        and — unlike :meth:`_post_intent_locked`'s failure branch —
+        ``post_failed`` stays False (the post is not a fail-closed miss; the
+        message physically landed). Idempotent: a repeat call after
+        compensation is a no-op (no double resolution / high-water re-advance)."""
+        async with self._serialized():
+            intent = self.registry.by_request_id(request_id)
+            if intent is None:
+                return None
+            if intent.outcome is not None and intent.outcome.get("compensated"):
+                return intent  # already compensated — exactly-once
+            intent.state = "posted"
+            intent.consumed = True          # retired from matching
+            intent.timeout_posted = False   # no consumption debt (not a success)
+            intent.post_failed = False      # NOT a fail-closed re-fire
+            intent.message_id = message_id
+            intent.outcome = {
+                "ok": False, "message_id": message_id, "compensated": True,
+            }
+            if self._high_water is None or message_id > self._high_water:
                 self._high_water = message_id
             self._signal_resolution(request_id)
             return intent
@@ -724,6 +895,109 @@ class OutputSequencer:
             ):
                 self._high_water = mid
             return mid
+
+    # -- A9 keyboard-bearing discrete writes (Sol r1-8) --------------------
+
+    def _register_discrete_cache(self, mid: int) -> None:
+        """Register *mid* in the bounded discrete-cache FIFO, evicting the
+        oldest discrete ``_edit_cache`` entry past the cap.
+
+        Re-registering an existing mid moves it to the tail (most-recent), so a
+        repeatedly-edited keyboard is not evicted ahead of a stale one. Only
+        entries created by :meth:`post_discrete`/:meth:`edit_discrete` are in
+        this FIFO — narration (retired on seal) and summary (append-above)
+        entries are never touched by eviction."""
+        if mid in self._discrete_cache_fifo:
+            self._discrete_cache_fifo.remove(mid)
+        self._discrete_cache_fifo.append(mid)
+        while len(self._discrete_cache_fifo) > _DISCRETE_CACHE_CAP:
+            evicted = self._discrete_cache_fifo.popleft()
+            self._edit_cache.pop(evicted, None)
+
+    def _forget_discrete_cache(self, mid: int) -> None:
+        """Drop *mid* from the discrete FIFO (a FAILED edit invalidated its
+        cache entry, so it must not linger as a phantom FIFO slot)."""
+        if mid in self._discrete_cache_fifo:
+            self._discrete_cache_fifo.remove(mid)
+
+    async def post_discrete(
+        self, text: str, *, markup: Any = None, reply_to: int | None = None,
+        revalidate: Any = None,
+    ) -> int | None:
+        """A9: post a keyboard-bearing DISCRETE message through the single writer
+        (A3 anchor re-anchor). Mirrors :meth:`post_platform_notice` but sends via
+        the markup-capable wire and maintains the F1 tri-state cache.
+
+        Under the writer lock: run *revalidate* (sync or async — the A3
+        answered/reserved final check) immediately before the send; a declined
+        revalidation returns ``None`` with NO send and NO state change. On a
+        successful send: SEAL open narration (the discrete message is a causal
+        event below it), advance ``_high_water`` to the returned mid, seed the
+        tri-state ``_edit_cache`` entry, and register the mid in the bounded
+        discrete-cache FIFO. *reply_to* threads like the other sends.
+
+        Deliberately NOT wrapped around ``ensure_posted`` posters (Sol r4-5): that
+        runs its poster in a NEW task, which would deadlock against the
+        relay-held, task-reentrant-only writer lock. Raises RuntimeError if the
+        markup wire was not injected."""
+        if self._send_message_markup is None:
+            raise RuntimeError(
+                "post_discrete requires an injected send_message_markup wire "
+                "primitive (driver _ensure_sequencer wiring)")
+        async with self._serialized():
+            if revalidate is not None and not await _maybe_await(revalidate()):
+                return None
+            self._seal_narration_locked()
+            mid = await _maybe_await(self._send_message_markup(
+                self.topic_id, text, markup, reply_to=reply_to))
+            if mid is None:
+                return None
+            if self._high_water is None or mid > self._high_water:
+                self._high_water = mid
+            self._edit_cache[mid] = (text, _discrete_markup_tristate(markup))
+            self._register_discrete_cache(mid)
+            return mid
+
+    async def edit_discrete(
+        self, msg_id: int, *, text: Any = None, markup: Any = _ABSENT,
+        revalidate: Any = None,
+    ) -> bool:
+        """A9: markup-capable edit of a discrete message through the F1 tri-state
+        no-op cache (A5 toggle redraw / multi settle edit).
+
+        Touches NEITHER narration NOR high-water — it edits HISTORY, like
+        :meth:`edit_summary`. ``text=None`` means a markup-only edit (a stable
+        cache representation distinct from a text edit). Under the writer lock:
+        run *revalidate* (the A5 terminal-race guard; declined → ``False``, no
+        edit); F1 no-op gate — an identical ``(text, markup-tristate)`` returns
+        ``True`` without any wire call; otherwise wire-edit and update the cache.
+
+        **Returns ``bool``, deliberately NOT the APPLIED/FAILED string codes
+        (Sol r2-10):** every settle path feeds ``confirmed_settle_edit``, whose
+        gate is ``bool(await do_edit())`` — the string ``"failed"`` is truthy and
+        would count a failed wire edit as CONFIRMED, deleting the recovery
+        record. ``True`` ⇔ applied or no-op-skip; ``False`` ⇔ failed or
+        revalidation-declined. Raises RuntimeError if the markup wire was not
+        injected."""
+        if self._edit_message_markup is None:
+            raise RuntimeError(
+                "edit_discrete requires an injected edit_message_markup wire "
+                "primitive (driver _ensure_sequencer wiring)")
+        async with self._serialized():
+            if revalidate is not None and not await _maybe_await(revalidate()):
+                return False
+            tri = _discrete_markup_tristate(markup)  # F4: None ⇒ CLEAR, not ABSENT
+            if self._edit_cache.get(msg_id) == (text, tri):
+                return True  # no-op skip — no wire call
+            ok = await _maybe_await(self._edit_message_markup(
+                self.topic_id, msg_id, text, markup))
+            if not ok:
+                self._edit_cache.pop(msg_id, None)   # invalidate → retry allowed
+                self._forget_discrete_cache(msg_id)
+                return False
+            self._edit_cache[msg_id] = (text, tri)
+            self._register_discrete_cache(msg_id)
+            return True
 
     # -- F1(c) / F4 turn-boundary drain ------------------------------------
 
@@ -886,6 +1160,14 @@ class OutputSequencer:
                 intent.request_id, intent.tool_name, self._intent_timeout_s,
                 self.engagement_id,
             )
+        # A3 · F-ORDER (Sol A3 wave 3/4): mark the intent as being-posted for the
+        # WHOLE poster await, under the lock. A synchronous
+        # ``record_intent_cancelled_nowait`` that observes ``posting`` NO-OPS — the
+        # in-flight post wins. ``posting`` is written before the first await below,
+        # so a sync read from another task never sees a torn flag. Cleared in
+        # ``finally`` so a poster failure still re-opens the intent for its
+        # fail-closed resolution below.
+        intent.posting = True
         try:
             if callable(intent.poster):
                 mid = await _maybe_await(intent.poster())
@@ -899,7 +1181,17 @@ class OutputSequencer:
                 intent.request_id, exc,
             )
             mid = None
+        finally:
+            intent.posting = False
         if mid is None:
+            # §A3(c): the poster may have SELF-ACCOUNTED a compensated physical
+            # write (initial-anchor add-failure): it posted the wire message,
+            # then called ``mark_intent_compensated`` (reentrant under this lock)
+            # which already resolved the intent ok:false+compensated and advanced
+            # high-water, and returned None. Do NOT re-resolve as a plain
+            # post-failure — that would clobber the mid + high-water accounting.
+            if intent.outcome is not None and intent.outcome.get("compensated"):
+                return
             # F3 fail-closed: the post did NOT land. Do NOT terminally consume
             # the intent as if it succeeded (no consumption debt claiming a
             # phantom post). Mark it post-failed (retired from matching so the
@@ -911,6 +1203,20 @@ class OutputSequencer:
                 "ok": False, "message_id": None, "out_of_band": out_of_band,
             }
             self._signal_resolution(intent.request_id)
+            return
+        # A3 · F-ORDER (Sol A3 wave 3/4) defensive no-double-resolve: with the
+        # synchronous ``record_intent_cancelled_nowait`` (which NO-OPS while
+        # ``posting`` is set) a terminal outcome can NEVER already be recorded when
+        # a successful post resolves here. If one somehow is, the recorded terminal
+        # outcome WINS — log and do not overwrite it (this branch should be
+        # unreachable).
+        if intent.outcome is not None:
+            logger.warning(
+                "output sequencer: intent %s post resolved (mid=%s) but a "
+                "terminal outcome %r is already recorded — NOT double-resolving "
+                "(A3 · F-ORDER; engagement %s)",
+                intent.request_id, mid, intent.outcome, self.engagement_id,
+            )
             return
         intent.state = "posted"
         intent.consumed = True

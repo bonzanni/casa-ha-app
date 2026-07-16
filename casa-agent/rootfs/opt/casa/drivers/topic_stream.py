@@ -479,6 +479,17 @@ class TopicStreamRelay:
         self._live = True
         self._reconciled = False
         self._passed_cur_seg = False
+        # §A1(1) WARM re-entry (F-DUP): the relay object survives the driver's
+        # 0.5s poll; a CLEAN re-entry resumes IN PLACE instead of reloading the
+        # cursor, resetting turn state, replaying, and reconciling (which sealed
+        # + reposted the open narration on EVERY poll — the every-turn dup).
+        # ``_warm`` latches at clean exhaustion; ``_read_coord`` is a MEMORY-ONLY
+        # resume coordinate ({"segment": [dev, ino], "offset": N}) set for EVERY
+        # frame consumed (replay AND live) — NOT ``cursor.current`` (which sits
+        # behind a throttle-held text frame that returned without checkpointing;
+        # resuming there would re-read and duplicate the held suffix, Sol r1-1).
+        self._warm = False
+        self._read_coord: dict | None = None
 
     # -- persistence helpers ------------------------------------------------
 
@@ -524,6 +535,19 @@ class TopicStreamRelay:
         st = tuple(seg)
         if st == tseg:
             return off_after <= toff
+        # §A1(3) comparison-level absence rule (Sol A1 review): when the target's
+        # segment is NOT the frame's segment AND the target segment is absent from
+        # disk (``_seg_rank`` == the sentinel), its data is gone — no readable
+        # frame can be ``<=`` it, so never mute. This replaces the racy cold-start
+        # ``dropped_through`` clear: it fixes the WARM path too (a live marker
+        # whose segment rotates out mid-run no longer rank-infinity-mutes every
+        # frame) and never mutates persisted state from a scan. Accepted rare
+        # residual: during a rotation race a transient ``_ordered_segments`` miss
+        # lets at most the frames read in that window through (one stray message
+        # class) — preferred over permanently muting the relay or clearing a live
+        # marker.
+        if self._seg_rank(tseg) == (1 << 30):
+            return False
         return self._seg_rank(st) < self._seg_rank(tseg)
 
     def _update_live(self, seg, off_after: int) -> None:
@@ -613,21 +637,68 @@ class TopicStreamRelay:
                 self.cursor.message_ids[-1], self._per_message_text,
             )
             if res == "sealed":
-                applied, mid = await self._apply_op(
-                    lambda: self.sequencer.open_narration(self._per_message_text)
-                )
-                if applied:
-                    # Reposted as a single new closing message — collapse the
-                    # boundary record to it.
-                    self.cursor.message_ids = [mid]
-                    self.cursor.message_text_lens = [len(self._per_message_text)]
+                # §A1(2) delta-aware cold reconcile: on a fresh post-recovery
+                # sequencer the checkpoint-named message is CONSERVATIVELY
+                # SEALED. Repost ONLY the genuinely-unposted tail past the
+                # PERSISTED wire high-water — never the already-visible prefix
+                # (the production F-DUP reposted the WHOLE tail here). Empty
+                # pending (a fully-posted sealed tail) reposts NOTHING. A legacy
+                # checkpoint (``last_posted_len`` 0) degrades to today's full
+                # repost; a lost-cursor-persist window degrades to a small
+                # suffix duplicate — both at-least-once, both cold-path-only.
+                pending = self._per_message_text[self.cursor.last_posted_len:]
+                if pending:
+                    applied, mid = await self._apply_op(
+                        lambda p=pending: self.sequencer.open_narration(p)
+                    )
+                    if applied:
+                        # Adopt the delta message exactly like ``_execute_ops``'
+                        # sealed branch, which APPENDS — the state must stay
+                        # REPLAY-CONVERGENT because ``turn_start`` still covers the
+                        # FULL turn (a cold restart re-reads and reconstructs the
+                        # WHOLE narration, then re-splits it at ``message_text_lens``
+                        # boundaries). FREEZE the old current message's boundary at
+                        # the WIRE truth (its visible prefix == ``last_posted_len``)
+                        # and APPEND the delta message carrying ONLY ``pending``.
+                        # On the next restart the trailing slice re-derives EXACTLY
+                        # ``pending`` and the persisted ``last_posted_len ==
+                        # len(pending)`` makes that restart's pending empty (posts
+                        # NOTHING) — so successive restarts converge instead of
+                        # re-posting overlapping fragments forever. (Replacing the
+                        # boundaries here, as the pre-fix code did, left
+                        # ``turn_start`` covering the full turn but the boundaries
+                        # sized to the delta, so replay mis-split the reconstructed
+                        # text and the next reconcile re-posted a shifted overlap.)
+                        lens = self.cursor.message_text_lens
+                        ids = self.cursor.message_ids
+                        if len(lens) > len(ids):
+                            del lens[len(ids):]
+                        while len(lens) < len(ids):
+                            lens.append(0)
+                        if ids:
+                            lens[-1] = self.cursor.last_posted_len
+                        self.cursor.message_ids.append(mid)
+                        self.cursor.message_text_lens.append(len(pending))
+                        self._per_message_text = pending
+                        self._posted_len = len(pending)
+                        self.cursor.last_posted_len = len(pending)
+                    else:
+                        # Dropped mid-reconcile: the tail never reached the wire,
+                        # so the persisted wire high-water is still the truth.
+                        self._posted_len = self.cursor.last_posted_len
+                else:
+                    # Fully-posted sealed tail — the wire already carries the
+                    # full narration on ``message_ids[-1]``; record it as the
+                    # wire high-water so a subsequent live edit computes the
+                    # correct increment (W-R4).
+                    self._posted_len = len(self._per_message_text)
+                    self.cursor.last_posted_len = len(self._per_message_text)
             else:
+                # APPLIED in-place edit: the editable message now carries the
+                # FULL narration on the wire.
                 self._sync_last_len()
-            self.cursor.last_posted_len = len(self._per_message_text)
-            # The reconciled message now carries the FULL narration on the wire
-            # (conservative repost or in-place edit), so nothing is pending — a
-            # subsequent live ``_finalize`` reposts nothing (W-R4).
-            self._posted_len = len(self._per_message_text)
+                self._posted_len = len(self._per_message_text)
+                self.cursor.last_posted_len = len(self._per_message_text)
             self._save()
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -810,7 +881,11 @@ class TopicStreamRelay:
             return
 
         self.cursor.current = {"segment": list(seg), "offset": off_after}
-        self.cursor.last_posted_len = len(self._per_message_text)
+        # §A1 (Sol r2-1a): persist the WIRE high-water (``_posted_len``), NOT
+        # ``len(self._per_message_text)`` — the two are equal on this happy path,
+        # but diverge under a throttled hold; the delta reconcile slices at this
+        # value, so an inflated length would LOSE the held suffix on recovery.
+        self.cursor.last_posted_len = self._posted_len
         self._save()
 
     async def _append_narration(self, text: str) -> None:
@@ -883,7 +958,12 @@ class TopicStreamRelay:
                 await self._match_discrete_block(name, tool_input)
 
         self.cursor.current = {"segment": list(seg), "offset": off_after}
-        self.cursor.last_posted_len = len(self._per_message_text)
+        # §A1 (Sol r2-1a): a tool-only frame can checkpoint WHILE a throttled
+        # narration edit is held unposted (``_per_message_text`` grew, the wire
+        # did not). Persist the WIRE high-water (``_posted_len``), never the
+        # inflated in-memory length, so the delta reconcile keeps the held
+        # suffix instead of slicing it behind the seal forever.
+        self.cursor.last_posted_len = self._posted_len
         self._save()
 
     def _reset_turn_state(self) -> None:
@@ -961,7 +1041,28 @@ class TopicStreamRelay:
     # -- main loop ----------------------------------------------------------
 
     async def run(self) -> None:
+        """Relay the log to the topic. COLD on the first call / after any error
+        (reload the cursor, compute ``recovering``, replay from ``turn_start``,
+        reconcile on going live); WARM on a clean re-entry (resume from
+        ``_read_coord`` live — no reload, no state reset, no replay, no
+        reconcile). ``_reconcile`` is thereby confined to genuine restarts."""
+        if self._warm and self._read_coord is not None:
+            await self._run_warm()
+        else:
+            await self._run_cold()
+
+    async def _run_cold(self) -> None:
         self.cursor = StreamCursor.load(self.cursor_path)
+        # §A1(3) (Sol A1 review): a STALE ``dropped_through`` whose segment has
+        # rotated off disk is NO LONGER cleared here. The prior cold-start clear
+        # (a) never helped the WARM path (a live marker whose segment rotated out
+        # while warm still rank-infinity-muted everything) and (b) had a TOCTOU —
+        # ``_ordered_segments`` can transiently miss a segment mid-rotation, so the
+        # clear could erase a LIVE marker and let deliberately-dropped bytes
+        # reconcile back onto the wire. The permanent-mute bug is instead handled
+        # at comparison level in ``_coord_le`` (an absent target segment is never
+        # ``>=`` a readable frame), which fixes both paths without mutating
+        # persisted state from a racy scan.
         cur_seg = tuple(self.cursor.current.get("segment", (0, 0)))
         recovering = (
             cur_seg != _ZERO_SEG
@@ -972,40 +1073,110 @@ class TopicStreamRelay:
         self._reconciled = False
         self._passed_cur_seg = False
         self._reset_turn_state()
+        self._read_coord = None
+        gap_seen = False
 
-        async for seg, off_after, raw in iter_log_segments(
-            self.log_dir, self.cursor.turn_start
-        ):
-            if seg == SEGMENT_GAP:
-                logger.warning(
-                    "topic stream retention gap for engagement %s: turn_start "
-                    "segment %s absent on disk; resuming at current offset 0",
-                    self.engagement_id, self.cursor.turn_start.get("segment"),
-                )
-                # The turn's history is unrecoverable — resume fresh and live.
-                self._live = True
-                self._reconciled = True
-                self.cursor.message_ids = []
-                self.cursor.message_text_lens = []
-                self._reset_turn_state()
-                continue
-
-            # Drop-mode tail from a prior run: skip entirely (no side effects).
-            if self.cursor.dropped_through is not None and self._coord_le(
-                seg, off_after, self.cursor.dropped_through
+        try:
+            async for seg, off_after, raw in iter_log_segments(
+                self.log_dir, self.cursor.turn_start
             ):
-                continue
+                if seg == SEGMENT_GAP:
+                    logger.warning(
+                        "topic stream retention gap for engagement %s: "
+                        "turn_start segment %s absent on disk; resuming at "
+                        "current offset 0",
+                        self.engagement_id,
+                        self.cursor.turn_start.get("segment"),
+                    )
+                    # The turn's history is unrecoverable — resume fresh and
+                    # live. The sentinel NEVER becomes a coordinate: after a gap,
+                    # ``_read_coord`` is seeded only by the first REAL frame
+                    # consumed post-gap (and a gap-only run stays cold).
+                    self._live = True
+                    self._reconciled = True
+                    self.cursor.message_ids = []
+                    self.cursor.message_text_lens = []
+                    self._reset_turn_state()
+                    gap_seen = True
+                    continue
 
-            was_live = self._live
-            self._update_live(seg, off_after)
-            if self._live and not was_live and not self._reconciled:
+                # The warm resume coordinate: set for EVERY real frame consumed
+                # (replay AND live) BEFORE dispatch (Sol r1-1 / r2-1b).
+                self._read_coord = {"segment": list(seg), "offset": off_after}
+
+                # Drop-mode tail from a prior run: skip entirely (no side
+                # effects) but still advance ``_read_coord`` past it.
+                if self.cursor.dropped_through is not None and self._coord_le(
+                    seg, off_after, self.cursor.dropped_through
+                ):
+                    continue
+
+                was_live = self._live
+                self._update_live(seg, off_after)
+                if self._live and not was_live and not self._reconciled:
+                    await self._reconcile()
+
+                await self._handle_frame(seg, off_after, raw)
+
+            # Stream ended while still replaying an open turn — reconcile now.
+            if recovering and not self._reconciled:
                 await self._reconcile()
+        except BaseException:
+            # Any error escaping the loop invalidates the warm latch so the
+            # driver's retry does a full cold recovery (reconcile stays
+            # restart-only).
+            self._warm = False
+            raise
 
-            await self._handle_frame(seg, off_after, raw)
+        self._latch_warm(gap_seen)
 
-        # Stream ended while still replaying an open turn — reconcile now.
-        if recovering and not self._reconciled:
-            await self._reconcile()
+    def _latch_warm(self, gap_seen: bool) -> None:
+        """Latch WARM re-entry at clean exhaustion when the resume coordinate is
+        valid (§A1(1), Sol r3-3). ``_read_coord`` is non-``None`` iff at least
+        one real frame was consumed; when ZERO frames were consumed it may be
+        seeded from ``cursor.current`` ONLY at a closed-turn boundary
+        (``message_ids == []`` — memory-empty matches disk) and only when no
+        retention gap intervened. A zero-frame run over an OPEN turn — or any
+        gap-only run — does NOT latch; the next poll runs cold again."""
+        if self._read_coord is not None:
+            self._warm = True
+            return
+        if not gap_seen and not self.cursor.message_ids:
+            self._read_coord = dict(self.cursor.current)
+            self._warm = True
+
+    async def _run_warm(self) -> None:
+        """Resume IN PLACE from ``_read_coord``: no cursor reload, no turn-state
+        reset, live from the first frame, no replay, no reconcile (§A1(1))."""
+        self._reconciled = True  # warm never reconciles
+        self._live = True
+        try:
+            async for seg, off_after, raw in iter_log_segments(
+                self.log_dir, self._read_coord
+            ):
+                if seg == SEGMENT_GAP:
+                    # The resume segment rotated off disk between polls (rare):
+                    # drop the warm latch and let the next poll cold-recover
+                    # from ``turn_start`` (the sentinel never becomes a coord).
+                    logger.warning(
+                        "topic stream for engagement %s: retention gap on warm "
+                        "resume; falling back to cold recovery",
+                        self.engagement_id,
+                    )
+                    self._warm = False
+                    return
+
+                self._read_coord = {"segment": list(seg), "offset": off_after}
+
+                if self.cursor.dropped_through is not None and self._coord_le(
+                    seg, off_after, self.cursor.dropped_through
+                ):
+                    continue
+
+                await self._handle_frame(seg, off_after, raw)
+        except BaseException:
+            self._warm = False
+            raise
 
     async def _handle_frame(self, seg, off_after: int, raw: bytes) -> None:
         frame = parse_frame(raw)

@@ -19,7 +19,9 @@ Error codes (Phase 1):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+import re
 from collections import defaultdict
 from typing import Any, Awaitable, Callable
 
@@ -113,6 +115,21 @@ def _make_send_to_topic(
         request_id = body.get("request_id")
         projection_hash = body.get("projection_hash")
         driver = _resolve_active_driver()
+
+        # §A3(a) LIVE-PENDING REPLY GATE (Sol r1-9 + r5-2): refuse this reply
+        # while the engagement has a LIVE unresolved question. The check runs
+        # UNDER THE SAME per-engagement ask-maintenance lock as the ask ingress
+        # reservation (linearizing the reply against the reservation — closing the
+        # r5-2 race where parallel ask+reply both pass before the ask reaches
+        # durable ownership); the lock is held for the CHECK ONLY. Gating on
+        # actual pending state means reply-then-ask, a tap-answered ask (broker
+        # empty), an EXPIRED ask (no live request), and an answered-but-
+        # unconfirmed-settle anchor (the answered/reserved split) are all allowed.
+        _reply_gate_lock = _ask_maint_lock(driver, engagement_id)
+        if _reply_gate_lock is not None:
+            async with _reply_gate_lock:
+                if _ask_pending_predicate(driver, engagement_id):
+                    return _reply_pending_response(driver, engagement_id)
 
         # The actual post + post-side bookkeeping (advance first-contact, reply
         # de-dup hint). Invoked RELAY-SIDE (§2, review C1) at the reply's
@@ -324,9 +341,22 @@ def _make_permission_verdict(engagement_registry: Any) -> Handler:
 # Telegram callback_data v1|engagement_ask|<rid>|<idx> caps request_id at the
 # same headroom the permission namespace uses (_RID_MAX_LEN in hooks.py); the
 # ask tool's request_id is always a full uuid4().hex (32 chars), well under.
+# v0.83.0 (A6 · F-LABEL / A7 · F-ANCHOR, Sol r1-11): the SINGLE shared
+# enumerator grammar. A6 strips ONE leading enumerator off each option label
+# (``A — ``, ``b) ``, ``1. ``, ``2 · ``); A7 counts anchor-question lines that
+# match it (with non-whitespace content after) to refuse embedded-options
+# anchors. One constant so the two halves can never diverge. The trailing
+# ``\s+`` means a separator-adjacent, space-followed marker matches (``A— x``,
+# ``A — x``) but ``A la carte`` / ``Be right back`` do NOT (no separator char
+# from the class after the leading letter).
+_ENUMERATOR_RE = re.compile(r"^\s*(?:[A-Za-z]|\d{1,2})\s*[—–\-·.):]\s+")
+
 _ASK_MIN_OPTIONS = 2
 _ASK_MAX_OPTIONS = 8
 _ASK_MAX_LABEL_LEN = 48
+# A4 · F-BTN (Sol r3-7b): an agent-supplied ``short`` ≤ 25 so ``"n · <short>"``
+# (prefix ≤ 5 chars) keeps the rendered button within the 30-char button cap.
+_ASK_MAX_SHORT_LEN = 25
 _ASK_MAX_QUESTION_LEN = 1024
 _ASK_MIN_TIMEOUT_S = 30.0
 _ASK_MAX_TIMEOUT_S = 570.0
@@ -335,7 +365,11 @@ _ASK_DEFAULT_TIMEOUT_S = 300.0
 # v0.79.0 §4 — pinned settle copy (appended below the canonical question text
 # when the keyboard settles; the keyboard is cleared via clear_keyboard=True).
 _SETTLE_ANSWERED = "\n✅ {label}"
-_SETTLE_EXPIRED = "\n⌛ expired — answer by text below"
+# F-EXPIRE (v0.83.0, A2a): a live-ask keyboard that expires unanswered now
+# SUSPENDS the engagement (operator-away) rather than inviting an immediate
+# re-ask, so the settle copy tells the operator the engagement is paused and how
+# to resume it.
+_SETTLE_EXPIRED = "\n⌛ expired — engagement paused; reply here to continue"
 _SETTLE_CANCELLED = "\n🚫 cancelled"
 _SETTLE_SUPERSEDED = "\n🚫 superseded by your message below"
 # v0.79.0 §4 (Sol F6): the open-question ledger write failed AFTER the keyboard
@@ -353,26 +387,461 @@ _SETTLE_ANSWERED_BELOW = "\n✅ answered below"
 # force-end primitive exists — this is soft anti-livelock).
 _ASK_REFUSAL = (
     "the operator sent a message you have not seen — it will arrive next "
-    "turn; end your turn now and re-ask after reading it"
+    "turn; end your turn now, silently (no sign-off), and re-ask after reading it"
 )
 _ASK_REFUSAL_STERN = (
     "STOP ASKING. The operator has a message waiting that you have NOT read. "
     "It is delivered to you the moment you end this turn. Do not ask another "
-    "question — END YOUR TURN NOW, read the operator's message, then decide."
+    "question — END YOUR TURN NOW, silently, read the operator's message, then "
+    "decide."
 )
 _ASK_REFUSAL_ESCALATE_AT = 3
 
+# F-EXPIRE (v0.83.0, A2a) — operator-away copies.
+# The enriched ``no_answer`` response returned when a live ask expires: the
+# engagement is now PAUSED and the agent must end its turn silently rather than
+# re-ask (the live incident was a 21-ask loop).
+_ASK_PAUSED_MESSAGE = (
+    "The operator did not answer in time. The engagement is now PAUSED — end "
+    "your turn silently (no sign-off message). Do NOT re-ask: your question "
+    "stays on record and the operator's reply will start your next turn."
+)
+# The refusal returned to EVERY further ask while operator-away, with no broker
+# registration / keyboard / timeout burn.
+_ASK_AWAY_REFUSAL = (
+    "The operator is away — your last question expired unanswered. END YOUR "
+    "TURN NOW, silently. Do not ask again; the operator's return starts your "
+    "next turn."
+)
 
-def _validate_ask_args(body: dict) -> tuple[str, list, float] | None:
+# v0.83.0 §A3 — F-ORDER structural gates. ``question_pending`` is returned by the
+# reply gate (a) and the ask-ingress stacking gate (c) when a question is already
+# LIVE for the engagement. ``{n}`` is filled from the pending question number
+# when known; the number-less variant is used when it cannot be resolved.
+_REPLY_PENDING_NUMBERED = (
+    "you have an open question (Q{n}) — end your turn silently and wait for "
+    "the answer"
+)
+_REPLY_PENDING_GENERIC = (
+    "you have an open question — end your turn silently and wait for the answer"
+)
+_ASK_PENDING_NUMBERED = (
+    "Q{n} is still open — wait for the answer (end your turn silently) instead "
+    "of asking another question"
+)
+_ASK_PENDING_GENERIC = (
+    "a question is still open — wait for the answer (end your turn silently) "
+    "instead of asking another question"
+)
+# A7 · F-ANCHOR (v0.83.0): the refusal returned for an anchor (``options: []``)
+# whose question embeds ≥2 enumerated option lines — the live free-text
+# multiple-choice anti-pattern. Consumes no timeout, registers no broker
+# request; records the refusal OUTCOME on the intent so a retry short-circuits.
+_ASK_EMBEDDED_OPTIONS = (
+    "this looks like a multiple-choice question — call ask again passing the "
+    "choices as options (the operator gets buttons), or multi: true if several "
+    "can apply"
+)
+
+# §A3(c): the withdrawn-anchor copy edited over an orphan whose ledger write
+# failed after posting (RAW-wire edit, never edit_discrete — see _post_anchor).
+_ANCHOR_WITHDRAWN = "⚠️ internal error — question withdrawn, please resend"
+# §A3(c): the compensated / withdrawn ask's tool response copy (add-failure).
+_ASK_INTERNAL_ERROR_MSG = (
+    "the question could not be recorded — it was withdrawn; end your turn and "
+    "re-ask"
+)
+
+
+def _ask_maint_lock(driver: Any, eng_id: str) -> Any:
+    """The per-engagement ask-maintenance lock, or ``None`` when the driver
+    predates the §A3 gate seam (unit fakes / degraded boot) — the reply /
+    stacking gates then simply don't engage. Getattr-tolerant."""
+    fn = getattr(driver, "ask_maintenance_lock", None) if driver is not None else None
+    return fn(eng_id) if fn is not None else None
+
+
+def _clear_ask_marker(driver: Any, eng_id: str, request_id: str) -> None:
+    """Clear the ingress marker (CAS on request_id), getattr-tolerant."""
+    fn = getattr(driver, "clear_ask_inflight", None) if driver is not None else None
+    if fn is not None:
+        fn(eng_id, request_id)
+
+
+def _ask_pending_predicate(
+    driver: Any, eng_id: str, *, exclude_request_id: str | None = None,
+) -> bool:
+    """§A3 live-pending predicate (shared by the reply gate + the ask stacking
+    gate). True iff the engagement has a LIVE unresolved question: a live broker
+    ask (``BROKER.pending`` non-empty) OR an unanswered free-text anchor (the
+    driver's EFFECTIVE view — Task 6 ``answered`` + Task 7 reserved excluded) OR
+    the ``ask_inflight`` ingress marker set to a DIFFERENT request_id (the
+    marker→durable-ownership gap). Evaluated UNDER the ask-maintenance lock."""
+    from verdict_broker import BROKER
+    if BROKER.pending(namespace="engagement_ask", scope=eng_id):
+        return True
+    if driver is None:
+        return False
+    anchor_fn = getattr(driver, "effective_open_anchor", None)
+    if anchor_fn is not None:
+        try:
+            if anchor_fn(eng_id) is not None:
+                return True
+        except Exception:  # noqa: BLE001 — degrade to "no anchor"
+            logger.debug("effective_open_anchor read failed", exc_info=True)
+    marker_fn = getattr(driver, "ask_inflight", None)
+    marker = marker_fn(eng_id) if marker_fn is not None else None
+    return marker is not None and marker != exclude_request_id
+
+
+def _pending_question_number(driver: Any, eng_id: str) -> int | None:
+    """The smallest EFFECTIVE-open question number for the refusal copy, or
+    ``None`` when unknown (e.g. a button ask reserved but not yet ledger-added,
+    or a degraded registry). Number-less copy is acceptable then."""
+    if driver is None:
+        return None
+    fn = getattr(driver, "_effective_open_question_numbers", None)
+    if fn is None:
+        return None
+    try:
+        nums = fn(eng_id)
+    except Exception:  # noqa: BLE001
+        return None
+    return min(nums) if nums else None
+
+
+def _reply_pending_response(driver: Any, eng_id: str) -> web.Response:
+    n = _pending_question_number(driver, eng_id)
+    msg = (
+        _REPLY_PENDING_NUMBERED.format(n=n) if n is not None
+        else _REPLY_PENDING_GENERIC
+    )
+    return web.json_response(
+        {"ok": False, "error": "question_pending", "message": msg})
+
+
+def _ask_pending_response(driver: Any, eng_id: str) -> web.Response:
+    n = _pending_question_number(driver, eng_id)
+    msg = (
+        _ASK_PENDING_NUMBERED.format(n=n) if n is not None
+        else _ASK_PENDING_GENERIC
+    )
+    return web.json_response(
+        {"ok": False, "error": "question_pending", "message": msg})
+
+
+def _record_intent_internal_error(
+    driver: Any, eng_id: str, request_id: str,
+) -> None:
+    """§A3(c) allocation-failure: tombstone the intent with an internal_error
+    OUTCOME so a same-request_id retry reattaches and short-circuits (no fresh
+    post). Degrades to a bare cancel on a driver without the seam."""
+    fn = getattr(driver, "record_send_intent_refusal", None)
+    if fn is not None:
+        try:
+            fn(eng_id, request_id, {"ok": False, "error": "internal_error"})
+            return
+        except Exception:  # noqa: BLE001 — fall back to a bare tombstone
+            logger.debug("record_send_intent_refusal(internal) failed", exc_info=True)
+    cancel = getattr(driver, "cancel_send_intent", None)
+    if cancel is not None:
+        cancel(eng_id, request_id)
+
+
+def _operator_away_active(driver: Any, eng_id: str) -> bool:
+    """§A2.4 gate read — getattr-tolerant so a driver without operator-away
+    support (unit fakes / degraded boot) simply never gates."""
+    if driver is None:
+        return False
+    fn = getattr(driver, "operator_away_active", None)
+    if fn is None:
+        return False
+    try:
+        return bool(fn(eng_id))
+    except Exception:  # noqa: BLE001 — a gate read must never wedge the ask
+        logger.debug("operator_away_active read failed", exc_info=True)
+        return False
+
+
+def _away_refusal_payload() -> dict:
+    """The canonical operator-away refusal body. Shared by the live refusal
+    response AND the intent-refusal outcome recorded for a transport retry
+    (Finding 1) so a reattaching retry returns byte-identical JSON."""
+    return {"ok": False, "error": "operator_away", "message": _ASK_AWAY_REFUSAL}
+
+
+def _away_refusal_response(driver: Any, eng_id: str) -> web.Response:
+    """§A2.4 refusal — bump the per-episode away-refusal counter (Task 5's
+    force-turn-boundary backstop reads it) and return the fixed refusal copy."""
+    bump = getattr(driver, "record_away_refusal", None) if driver is not None else None
+    if bump is not None:
+        try:
+            bump(eng_id)
+        except Exception:  # noqa: BLE001 — the refusal copy stands either way
+            logger.debug("record_away_refusal failed", exc_info=True)
+    return web.json_response(_away_refusal_payload())
+
+
+def _record_intent_refusal(driver: Any, eng_id: str, request_id: str) -> None:
+    """§A2.4 (Finding 1): record the operator-away refusal OUTCOME on the intent
+    instead of a bare cancel. A same-``request_id`` transport retry then hits the
+    reattach path FIRST, reads this recorded outcome, and short-circuits to the
+    SAME refusal — never awaiting the dead intent (→ ``delivery_failed``, anchor)
+    nor re-registering a fresh broker request (→ timeout burn, no keyboard,
+    button). Degrades to the bare cancel on a driver predating the seam."""
+    fn = getattr(driver, "record_send_intent_refusal", None)
+    if fn is not None:
+        try:
+            fn(eng_id, request_id, _away_refusal_payload())
+            return
+        except Exception:  # noqa: BLE001 — fall back to the bare tombstone
+            logger.debug("record_send_intent_refusal failed", exc_info=True)
+    driver.cancel_send_intent(eng_id, request_id)  # tombstone (pre-A2 behaviour)
+
+
+def _unread_refusal_payload(copy: str) -> dict:
+    """The refusal-count-FREE ``unread_inbound`` body recorded on the intent for a
+    transport retry (Sol A2 wave-3, Finding 3). The LIVE refusal response carries
+    ``refusal_count`` (a fresh bump); the recorded reattach copy omits it so a
+    retry never re-bumps the counter."""
+    return {"ok": False, "error": "unread_inbound", "message": copy}
+
+
+def _record_intent_unread_refusal(
+    driver: Any, eng_id: str, request_id: str, copy: str,
+) -> None:
+    """Sol A2 wave-3, Finding 3 (symmetric with :func:`_record_intent_refusal`):
+    record the ``unread_inbound`` refusal OUTCOME on the intent instead of a bare
+    cancel. A same-``request_id`` transport retry then hits the reattach path
+    FIRST, reads this recorded outcome, and short-circuits to the SAME refusal —
+    never awaiting the dead intent (→ the deferred-post budget → ``delivery_failed``,
+    anchor) nor re-registering. Degrades to the bare cancel on a driver predating
+    the seam."""
+    fn = getattr(driver, "record_send_intent_refusal", None)
+    if fn is not None:
+        try:
+            fn(eng_id, request_id, _unread_refusal_payload(copy))
+            return
+        except Exception:  # noqa: BLE001 — fall back to the bare tombstone
+            logger.debug("record_send_intent_refusal(unread) failed", exc_info=True)
+    cancel = getattr(driver, "cancel_send_intent", None)
+    if cancel is not None:
+        cancel(eng_id, request_id)
+
+
+def _embedded_options_payload() -> dict:
+    """A7 · F-ANCHOR: the canonical ``embedded_options`` refusal body. Shared by
+    the live refusal response AND the intent-refusal outcome recorded for a
+    transport retry so a reattaching retry returns byte-identical JSON."""
+    return {"ok": False, "error": "embedded_options", "message": _ASK_EMBEDDED_OPTIONS}
+
+
+def _record_intent_embedded_refusal(
+    driver: Any, eng_id: str, request_id: str,
+) -> None:
+    """A7 · F-ANCHOR (symmetric with :func:`_record_intent_refusal`): record the
+    ``embedded_options`` refusal OUTCOME on the freshly-created intent instead of
+    a bare cancel. A same-``request_id`` transport retry then hits the reattach
+    path FIRST, reads this recorded outcome, and short-circuits to the SAME
+    refusal — never awaiting the dead intent nor re-registering. Degrades to the
+    bare cancel on a driver predating the seam."""
+    fn = getattr(driver, "record_send_intent_refusal", None)
+    if fn is not None:
+        try:
+            fn(eng_id, request_id, _embedded_options_payload())
+            return
+        except Exception:  # noqa: BLE001 — fall back to the bare tombstone
+            logger.debug("record_send_intent_refusal(embedded) failed", exc_info=True)
+    cancel = getattr(driver, "cancel_send_intent", None)
+    if cancel is not None:
+        cancel(eng_id, request_id)
+
+
+def _record_intent_cancelled(
+    driver: Any, eng_id: str, request_id: str,
+) -> bool:
+    """B1/B2 (§A3 wave 2) + A3 · F-ORDER (Sol A3 wave 3/4): a transport
+    CANCELLATION between arming/registering an ask intent and its post TOMBSTONES
+    the intent AND records a terminal ``cancelled`` outcome — but "the post wins"
+    when a relay post is already in flight. Closes:
+
+    * the armed/pending intent stays MATCHABLE as a tombstone, so the relay
+      consume-cancels its block (NOTHING posts) — a marker cleared without this
+      would let a DIFFERENT ask pass the gate while the armed original still
+      posts (the one-question invariant broken, B1);
+    * a same-``request_id`` retry reads this recorded outcome via the reattach
+      path (``_refused_intent_outcome`` recognises ``cancelled``) and
+      short-circuits — never awaiting a never-armed intent to the transport
+      budget (anchor hang, B2) nor registering a fresh broker request (button
+      timeout burn, B2).
+
+    A3 · F-ORDER wave 4: FULLY SYNCHRONOUS — no awaits. It routes through the
+    driver's ``record_send_intent_cancelled_nowait`` seam, which reads the
+    intent's ``posting`` flag synchronously and takes effect ONLY while the intent
+    is still cancellable (not currently being posted / posted / already resolved).
+    Being awaitless it can never be interrupted mid-flight by a SECOND
+    ``Task.cancel()`` — the double-cancel window the awaited wave-3 seam left open
+    (a second cancel dropping control into the caller's outer ``finally`` while a
+    poster was mid-post) is closed. Returns ``True`` iff the cancel TOOK EFFECT —
+    the caller then clears the ingress marker. Returns ``False`` when a concurrent
+    relay post WON the race (never clobbers the posted/compensated outcome; the
+    poster's own paths own the marker).
+
+    Getattr-tolerant and swallows its own errors: an intent-cleanup failure must
+    never mask the original cancellation being re-raised. Degrades to the
+    pre-seam synchronous tombstone (best-effort) on a driver without the wave-4
+    seam."""
+    if driver is None:
+        return False
+    rec_nowait = getattr(driver, "record_send_intent_cancelled_nowait", None)
+    if rec_nowait is not None:
+        try:
+            return bool(rec_nowait(
+                eng_id, request_id, {"ok": False, "error": "cancelled"}))
+        except Exception:  # noqa: BLE001 — fall back to the pre-seam path
+            logger.debug("record_send_intent_cancelled_nowait failed", exc_info=True)
+    # --- pre-seam fallback (no nowait guard available) ----------------------
+    outcome_fn = getattr(driver, "send_intent_outcome", None)
+    if outcome_fn is not None:
+        try:
+            if outcome_fn(eng_id, request_id) is not None:
+                return False  # already resolved (posted / compensated) — no clobber
+        except Exception:  # noqa: BLE001 — degrade to attempting the tombstone
+            logger.debug("send_intent_outcome read failed", exc_info=True)
+    rec = getattr(driver, "record_send_intent_refusal", None)
+    if rec is not None:
+        try:
+            rec(eng_id, request_id, {"ok": False, "error": "cancelled"})
+            return True
+        except Exception:  # noqa: BLE001 — fall back to a bare tombstone
+            logger.debug("record_send_intent_refusal(cancelled) failed",
+                         exc_info=True)
+    cancel = getattr(driver, "cancel_send_intent", None)
+    if cancel is not None:
+        try:
+            cancel(eng_id, request_id)
+            return True
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            logger.debug("cancel_send_intent failed", exc_info=True)
+    return False
+
+
+def _refused_intent_outcome(prior: Any) -> bool:
+    """True iff a reattached intent's recorded outcome is a refusal the retry
+    returns verbatim — an operator-away refusal (Finding 1), an unread-inbound
+    refusal (Sol A2 wave-3, Finding 3), an ``embedded_options`` anchor refusal
+    (A7 · F-ANCHOR), OR a CANCELLED tombstone (§A3 wave 2, B1/B2: a transport
+    cancellation between arm/register and post). All are terminal recorded
+    outcomes; the retry returns them as-is rather than awaiting the dead intent
+    or re-registering a fresh broker request."""
+    return (
+        isinstance(prior, dict)
+        and prior.get("error") in (
+            "operator_away", "unread_inbound", "embedded_options", "cancelled")
+    )
+
+
+async def _no_answer_response(
+    driver: Any, eng_id: str, request_id: str, req: Any,
+) -> web.Response:
+    """§A2.1 expiry — ENTER operator-away (generation-CAS via THIS waiter's own
+    ``req.meta`` ``inbound_gen`` — Finding 2: never re-query the broker by key
+    after the await, where a retired/reused tombstone could hand back a NEWER
+    generation and re-wedge) and return the enriched PAUSED response. Degrades to
+    the plain ``no_answer`` response on a driver without operator-away support
+    (unit / eager fallback) so existing no-driver callers are byte-unchanged."""
+    note = (
+        getattr(driver, "note_operator_away", None)
+        if driver is not None else None
+    )
+    if note is None:
+        return web.json_response({"ok": True, "outcome": "no_answer"})
+    # Finding 2: use the waiter's OWN req.meta (the handler holds ``req`` in both
+    # the main and reattach paths; register returns the tombstone-backed req for
+    # a retired key), never ``BROKER.get_meta`` by key after the await.
+    meta = getattr(req, "meta", None)
+    gen = meta.get("inbound_gen") if isinstance(meta, dict) else None
+    if gen is not None:  # tolerate a missing gen — just skip the away entry
+        try:
+            res = note(eng_id, gen=gen)
+            if inspect.isawaitable(res):
+                await res
+        except Exception:  # noqa: BLE001 — away entry is best-effort
+            logger.debug("note_operator_away failed", exc_info=True)
+    return web.json_response({
+        "ok": True, "outcome": "no_answer", "engagement_paused": True,
+        "message": _ASK_PAUSED_MESSAGE,
+    })
+
+
+async def _ask_final_response(
+    outcome: dict, options: list, driver: Any, eng_id: str, request_id: str,
+    req: Any,
+) -> web.Response:
+    """Map a broker ask outcome to the tool response, intercepting ``no_answer``
+    to enter operator-away + return the PAUSED response (F-EXPIRE). Every other
+    outcome delegates to ``_ask_outcome_response`` byte-identically."""
+    if outcome.get("outcome") == "no_answer":
+        return await _no_answer_response(driver, eng_id, request_id, req)
+    return _ask_outcome_response(outcome, options)
+
+
+def _strip_enumerator(label: str) -> str:
+    """A6 · F-LABEL: strip ONE leading agent-authored enumerator off an option
+    label (or dict ``short``) and re-strip surrounding whitespace, so Casa's own
+    numbering is not double-labelled (``1. A — Python`` → ``1. Python``). ``A la
+    carte`` / ``Be right back`` survive unstripped (no separator char after the
+    leading letter). At most ONE enumerator is removed (anchored ``^``)."""
+    return _ENUMERATOR_RE.sub("", label, count=1).strip()
+
+
+def _count_enumerated_lines(question: str) -> int:
+    """A7 · F-ANCHOR: count lines in an anchor question that match the SHARED
+    enumerator grammar AND carry non-whitespace content after the enumerator
+    (the ``\\S`` requirement — a bare marker line does not count). ≥2 such lines
+    is the embedded-options anti-pattern the ask handler refuses."""
+    n = 0
+    for line in question.splitlines():
+        m = _ENUMERATOR_RE.match(line)
+        if m and line[m.end():].strip():
+            n += 1
+    return n
+
+
+def _validate_ask_args(
+    body: dict,
+) -> tuple[str, list, float, list] | None:
     """Validate + clamp the `ask` request body.
 
-    Returns ``(question, options, clamped_timeout_s)`` on success, or
+    Returns ``(question, options, clamped_timeout_s, shorts)`` on success, or
     ``None`` on any validation failure (caller maps to ``invalid_args``).
+    ``options`` is the list of FULL labels (downstream sees these everywhere —
+    body VERBATIM, broker meta, settle ✅, ``_ask_outcome_response``); ``shorts``
+    is a PARALLEL list, one entry per option: the agent-supplied short label
+    (str) or ``None``. The ONLY consumer of ``shorts`` is the keyboard.
 
-    v0.79.0 §4: ``options: []`` is now ACCEPTED (a free-text numbered anchor);
-    a non-empty list still requires ``_ASK_MIN_OPTIONS..MAX``, unique, non-empty
-    labels within the length cap. All validation lives here server-side (the
-    channel subprocess transmits raw args and lets this gate refuse — r8-1).
+    v0.79.0 §4: ``options: []`` is ACCEPTED (a free-text numbered anchor); a
+    non-empty list still requires ``_ASK_MIN_OPTIONS..MAX``, unique, non-empty
+    labels within the length cap.
+
+    v0.83.0 (A4 · F-BTN): each option may be a plain ``str`` (unchanged) OR a
+    ``{"label": str, "short": str}`` dict — ``label`` under the 48 cap and
+    ``label.strip()`` non-empty; ``short`` ≤ 25 and ``short.strip()`` non-empty.
+    Mixed str+dict lists are allowed. Duplicate FULL labels OR duplicate
+    provided shorts are refused. The projection hash is computed client-side
+    over the RAW args, so this server-side normalization does not affect relay
+    matching. All validation lives here server-side (the channel subprocess
+    transmits raw args and lets this gate refuse — r8-1).
+
+    v0.83.0 (A6 · F-LABEL): each FULL label (and dict ``short``) is normalized by
+    stripping ONE leading agent-authored enumerator (``A — ``, ``b) ``, ``1. ``)
+    so Casa's own numbering is not double-labelled — "verbatim" now means
+    "verbatim after enumerator normalization". Normalization runs BEFORE
+    render/meta and AFTER hashing (hash is client-side over the raw args). The
+    uniqueness + non-emptiness checks below run POST-normalization (Sol r6-5,
+    r7-5): raw-unique labels that collide after stripping (``A — Same`` /
+    ``1. Same``), a marker-only option that normalizes empty, and any label /
+    short that is whitespace-only after stripping all refuse ``invalid_args``.
     """
     question = body.get("question")
     if (not isinstance(question, str) or not question
@@ -383,19 +852,57 @@ def _validate_ask_args(body: dict) -> tuple[str, list, float] | None:
         return None
     if len(options) != 0 and not (_ASK_MIN_OPTIONS <= len(options) <= _ASK_MAX_OPTIONS):
         return None
-    if any(
-        not isinstance(o, str) or not o or len(o) > _ASK_MAX_LABEL_LEN
-        for o in options
-    ):
+    # A5 · F-MULTI: a multi-select ask REQUIRES ≥2 options — a multi anchor
+    # (``options: []``) or a degenerate single-option multi is refused
+    # ``invalid_args``. Non-multi anchors (``multi`` absent/False) are unaffected.
+    if body.get("multi") and len(options) < _ASK_MIN_OPTIONS:
         return None
-    if len(set(options)) != len(options):
+    labels: list[str] = []
+    shorts: list[str | None] = []
+    for o in options:
+        if isinstance(o, str):
+            # Length cap is enforced on the RAW label; A6 strips the enumerator
+            # AFTER, then the post-normalization non-emptiness check below refuses
+            # a marker-only / whitespace-only label.
+            if not o or len(o) > _ASK_MAX_LABEL_LEN:
+                return None
+            labels.append(_strip_enumerator(o))
+            shorts.append(None)
+        elif isinstance(o, dict):
+            label = o.get("label")
+            short = o.get("short")
+            if (not isinstance(label, str) or not label.strip()
+                    or len(label) > _ASK_MAX_LABEL_LEN):
+                return None
+            if (not isinstance(short, str) or not short.strip()
+                    or len(short) > _ASK_MAX_SHORT_LEN):
+                return None
+            labels.append(_strip_enumerator(label))
+            shorts.append(_strip_enumerator(short))
+        else:
+            return None
+    # A6 POST-normalization re-validation (Sol r6-5 + r7-5): a marker-only or
+    # whitespace-only label / short is refused via ``.strip() != ""`` (bare
+    # truthiness would accept whitespace-only), and uniqueness is re-checked so
+    # raw-unique labels colliding after the strip (``A — Same`` / ``1. Same``)
+    # refuse instead of rendering duplicate choices.
+    for lab in labels:
+        if not lab.strip():
+            return None
+    for s in shorts:
+        if s is not None and not s.strip():
+            return None
+    if len(set(labels)) != len(labels):
+        return None
+    provided_shorts = [s for s in shorts if s is not None]
+    if len(set(provided_shorts)) != len(provided_shorts):
         return None
     try:
         timeout_s = float(body.get("timeout_s", _ASK_DEFAULT_TIMEOUT_S))
     except (TypeError, ValueError):
         return None
     timeout_s = min(max(timeout_s, _ASK_MIN_TIMEOUT_S), _ASK_MAX_TIMEOUT_S)
-    return question, options, timeout_s
+    return question, labels, timeout_s, shorts
 
 
 def _canonical_question(question: str, number: int) -> str:
@@ -453,6 +960,16 @@ def _ask_settle_text(question: str, outcome: dict, options: list) -> str:
     """
     o = outcome.get("outcome")
     if o == "answered":
+        # A5 · F-MULTI: a multi submit carries ``option_indices`` → settle copy
+        # is ``✅ label1 + label2 + …`` (single-select stays ``✅ label``).
+        indices = outcome.get("option_indices")
+        if indices:
+            picked = [
+                options[i] for i in indices
+                if isinstance(i, int) and 0 <= i < len(options)
+            ]
+            label = " + ".join(picked) if picked else "?"
+            return question + _SETTLE_ANSWERED.format(label=label)
         idx = outcome.get("option_index")
         label = (
             options[idx]
@@ -476,6 +993,8 @@ def _ask_keyboard_finish(
     question: str, options: list,
     *, on_settle: "Callable[[], Awaitable[None]] | None" = None,
     sleep: "Callable[[float], Awaitable[None]]" = asyncio.sleep,
+    settle_edit: "Callable[[str], Awaitable[bool]] | None" = None,
+    eng_id: str | None = None, number: int | None = None,
 ) -> Callable[[dict], "Awaitable[None]"]:
     """Broker finish-hook (r3-B3 shape, mirrors ``hooks._perm_keyboard_finish``)
     -- the engagement_ask namespace's ONLY keyboard-message writer. Fires
@@ -502,11 +1021,18 @@ def _ask_keyboard_finish(
 
     async def _finish(outcome: dict) -> None:
         text = _ask_settle_text(question, outcome, options)
-        confirmed = await confirmed_settle_edit(
-            lambda: telegram_channel.edit_topic_message(
-                topic_id, message_id, text, clear_keyboard=True),
-            sleep=sleep,
-        )
+        # A5 · F-MULTI: a multi ask's settle edit routes through the SAME
+        # sequencer markup primitive (``edit_discrete``) that the toggle redraw
+        # uses, so the two writers serialize on ONE lock — a stale toggle redraw
+        # can never land after (and resurrect) a settled keyboard. The finish
+        # hook stays the sole TERMINAL writer. Single-select keeps today's direct
+        # ``edit_topic_message`` (``settle_edit`` is None).
+        if settle_edit is not None:
+            do_edit = lambda: settle_edit(text)  # noqa: E731
+        else:
+            do_edit = lambda: telegram_channel.edit_topic_message(  # noqa: E731
+                topic_id, message_id, text, clear_keyboard=True)
+        confirmed = await confirmed_settle_edit(do_edit, sleep=sleep)
         if not confirmed:
             logger.warning(
                 "ask keyboard finish-hook settle edit UNCONFIRMED after retries "
@@ -515,6 +1041,24 @@ def _ask_keyboard_finish(
                 topic_id, message_id,
             )
             return
+        # A8 · Q1-settle observability: one INFO line per CONFIRMED settle (the
+        # keyboard cleared on screen). Outcome mirrors the settle copy chosen by
+        # ``_ask_settle_text`` — answered / no_answer→expired / cancelled (with
+        # superseded + internal-error→withdrawn sub-reasons).
+        _o = outcome.get("outcome")
+        if _o == "answered":
+            _outcome = "answered"
+        elif _o == "cancelled":
+            _outcome = {
+                "superseded_by_text": "superseded",
+                "internal_error": "withdrawn",
+            }.get(outcome.get("reason"), "cancelled")
+        else:
+            _outcome = "expired"
+        logger.info(
+            "ask settle CONFIRMED (eng=%s q=%s mid=%s outcome=%s)",
+            eng_id[:8] if eng_id else "-",
+            number if number is not None else "-", message_id, _outcome)
         if on_settle is not None:
             try:
                 await on_settle()
@@ -541,17 +1085,16 @@ def _resolve_active_driver() -> Any:
 
 
 async def _maybe_allocate_number(engagement_registry: Any, eng_id: str) -> int | None:
-    """Allocate the next durable Q-number (getattr-tolerant — a fake registry
-    without the method leaves questions un-numbered)."""
+    """Allocate the next durable Q-number, distinguishing ABSENT from RAISING
+    (Sol r8-4). An ABSENT allocator (fake registry / degraded boot without the
+    method) returns ``None`` → the legacy un-numbered degraded path. An allocator
+    that RAISES PROPAGATES the exception so the caller can refuse the ask BEFORE
+    any wire post (a successful, operator-visible, UNTRACKED ask would defeat the
+    gap-free ``ask_inflight`` → durable-ownership handoff)."""
     alloc = getattr(engagement_registry, "allocate_question_number", None)
     if alloc is None:
         return None
-    try:
-        return await alloc(eng_id)
-    except Exception:  # noqa: BLE001 — numbering must never break the ask
-        logger.warning("allocate_question_number failed (eng=%s)", eng_id[:8],
-                       exc_info=True)
-        return None
+    return await alloc(eng_id)
 
 
 def _make_ask(
@@ -595,7 +1138,13 @@ def _make_ask(
         validated = _validate_ask_args(body)
         if validated is None:
             return web.json_response({"ok": False, "error": "invalid_args"})
-        question, options, timeout_s = validated
+        # ``options`` = FULL labels (body/meta/settle/response see these);
+        # ``shorts`` = parallel agent-supplied shorts (keyboard-only, A4 rule 3).
+        question, options, timeout_s, shorts = validated
+        # A5 · F-MULTI: a toggle-many keyboard + ✅ Submit. Read AFTER validation
+        # (which already refused multi + <2 options / anchor). Only the BUTTON
+        # ask path can be multi — the anchor path below is never reached.
+        multi = bool(body.get("multi", False))
 
         rec = engagement_registry.get(eng_id)
         if rec is None:
@@ -615,12 +1164,18 @@ def _make_ask(
         # INBOUND GATE (§4): an unseen operator message means "end your turn" —
         # applies to EVERY kind of ask (button and free-text anchor). Consumes
         # no timeout budget; escalates from the 3rd consecutive refusal.
-        def _refusal_response() -> web.Response:
+        def _refusal_response(record_intent: bool = False) -> web.Response:
             n = driver.record_ask_refusal(eng_id)
             copy = (
                 _ASK_REFUSAL_STERN if n >= _ASK_REFUSAL_ESCALATE_AT
                 else _ASK_REFUSAL
             )
+            if record_intent:
+                # Sol A2 wave-3, Finding 3: record the refusal-count-FREE outcome
+                # on the intent (not a bare cancel) so a same-request_id retry
+                # reattaches to it and returns unread_inbound IMMEDIATELY, never
+                # awaiting the dead intent (→ deferred-post budget → delivery_failed).
+                _record_intent_unread_refusal(driver, eng_id, request_id, copy)
             return web.json_response({
                 "ok": False, "error": "unread_inbound",
                 "message": copy, "refusal_count": n,
@@ -634,14 +1189,19 @@ def _make_ask(
         # relay posts it at the ask tool_use block (AFTER any preceding
         # narration). No driver/hash ⇒ eager fallback (pre-v0.79 behavior). ---
         if not options:
-            if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
-                return _refusal_response()
-
             # F5: register the discrete-send intent and check for a REATTACH
             # BEFORE allocating a Q-number — parity with the button-ask reattach
             # (a transport retry must NOT burn a fresh number or post a second
             # anchor). ``created_intent`` is True only on the genuinely-first
             # attempt; None when there is no live sequencer (eager fallback).
+            #
+            # GATE ORDERING (Sol A2 wave-2, Finding 4): the reattach-outcome
+            # check runs FIRST — BEFORE the unread and away gates — exactly like
+            # the button path. Previously the unread-inbound gate ran first, so a
+            # same-request_id retry whose original was refused ``operator_away``
+            # could get ``unread_inbound`` (an inbound cleared away but is still
+            # unread) instead of its RECORDED outcome. Order now mirrors the
+            # button path: reattach → away gate → unread gate.
             created_intent: bool | None = None
             if driver is not None and projection_hash:
                 res = driver.register_send_intent(
@@ -658,6 +1218,11 @@ def _make_ask(
                         # failed to ok:false (F5 fail-closed) — never ok:true on
                         # an unresolved intent. No new number, no second anchor.
                         prior = driver.send_intent_outcome(eng_id, request_id)
+                        # Finding 1: a prior operator-away refusal recorded an
+                        # ``operator_away`` outcome — return it verbatim instead
+                        # of awaiting the dead intent (→ delivery_failed).
+                        if _refused_intent_outcome(prior):
+                            return web.json_response(prior)
                         if prior is None:
                             prior = await _await_deferred_post(
                                 driver, eng_id, request_id)
@@ -670,65 +1235,267 @@ def _make_ask(
                             "message_id": prior.get("message_id"),
                         })
 
+            # F-EXPIRE (§A2.4) GATE: while operator-away, refuse a genuinely-new
+            # anchor immediately — no number, no post, no broker. Placed AFTER the
+            # reattach check so a transport retry of an already-posted anchor
+            # still returns its recorded outcome above.
+            if _operator_away_active(driver, eng_id):
+                if created_intent:
+                    # Finding 1: record the refusal OUTCOME (not a bare cancel)
+                    # so a same-id retry reattaches to it above.
+                    _record_intent_refusal(driver, eng_id, request_id)
+                return _away_refusal_response(driver, eng_id)
+
+            # INBOUND GATE (§4): an unseen operator message means "end your turn".
+            # Placed AFTER the reattach + away checks (Finding 4) — a genuinely-new
+            # anchor is refused here; a same-id retry never reaches this point. A
+            # freshly-created intent records the unread_inbound OUTCOME (Sol A2
+            # wave-3, Finding 3 — NOT a bare cancel) so a retry reattaches to it.
+            if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
+                return _refusal_response(record_intent=bool(created_intent))
+
+            # A7 · F-ANCHOR: refuse an anchor whose question EMBEDS ≥2 enumerated
+            # option lines (the live free-text multiple-choice anti-pattern — the
+            # agent should pass the choices as ``options`` so the operator gets
+            # buttons). Placed AFTER reattach/away/unread and BEFORE the ingress
+            # reservation — the refusal consumes no timeout, registers no broker
+            # request, and records the refusal OUTCOME on a freshly-created intent
+            # so a same-request_id retry reattaches above and short-circuits to
+            # the SAME ``embedded_options``. Heuristic is deliberately narrow
+            # (two-plus enumerated lines); plain prose anchors pass untouched.
+            if _count_enumerated_lines(question) >= 2:
+                if created_intent:
+                    _record_intent_embedded_refusal(driver, eng_id, request_id)
+                return web.json_response(_embedded_options_payload())
+
+            # §A3(c) INGRESS RESERVATION (Sol r2-8/r3-6): under the ask-
+            # maintenance lock, atomically CHECK the live-pending predicate and
+            # CLAIM the ``ask_inflight`` marker. A second concurrent ask (any
+            # kind) then sees the marker/predicate and refuses ``question_pending``
+            # — making "one question at a time" structural. The lock is held for
+            # the CHECK + marker ONLY, never across the post/await below. Sample
+            # the operator-generation at this reserve point for the post-add
+            # re-check (a message that lands between reserve and add is the answer).
+            gen_at_entry = (
+                driver.inbound_generation(eng_id) if driver is not None else 0)
+            _anchor_lock = _ask_maint_lock(driver, eng_id)
+            if _anchor_lock is not None:
+                async with _anchor_lock:
+                    if _ask_pending_predicate(
+                            driver, eng_id, exclude_request_id=request_id):
+                        if created_intent:
+                            driver.cancel_send_intent(eng_id, request_id)
+                        return _ask_pending_response(driver, eng_id)
+                    driver.set_ask_inflight(eng_id, request_id)
+
             # First attempt (created intent) OR eager fallback: allocate the
-            # durable number + build the poster.
-            number = await _maybe_allocate_number(engagement_registry, eng_id)
+            # durable number. A RAISING allocator (Sol r8-4) is TERMINAL BEFORE
+            # any wire post — clear the marker, tombstone the intent with an
+            # internal_error outcome (retries short-circuit), refuse. An ABSENT
+            # allocator returns None → the un-numbered legacy degraded path.
+            try:
+                number = await _maybe_allocate_number(engagement_registry, eng_id)
+            except Exception:  # noqa: BLE001
+                logger.warning("anchor number allocation failed (eng=%s)",
+                               eng_id[:8], exc_info=True)
+                _clear_ask_marker(driver, eng_id, request_id)
+                if created_intent:
+                    _record_intent_internal_error(driver, eng_id, request_id)
+                return web.json_response({"ok": False, "error": "internal_error"})
+            except BaseException:
+                # B1: from the moment ``set_ask_inflight`` claimed the marker, ANY
+                # non-durable-ownership exit MUST clear it. Transport CANCELLATION
+                # (CancelledError) during this awaited allocation bypasses ``except
+                # Exception``; without this the marker wedges and every later
+                # ask/reply is refused ``question_pending`` until restart. The CAS
+                # clear is a no-op once durable ownership took over (add_open_question
+                # clears it synchronously), so it is safe on every path.
+                _clear_ask_marker(driver, eng_id, request_id)
+                # B2 (wave 2): the PENDING intent (registered, not yet armed) is
+                # still matchable — a same-request_id retry would hang on the
+                # transport budget waiting for a never-armed intent (→
+                # delivery_failed). Tombstone it + record a cancelled outcome so
+                # the retry short-circuits to the recorded outcome. Synchronous —
+                # a still-pending intent has no in-flight post, so the cancel
+                # takes effect; the marker was already cleared above.
+                if created_intent:
+                    _record_intent_cancelled(driver, eng_id, request_id)
+                raise
             # W-R3: canonical body (anchor ⇒ options == [] ⇒ numbered question
             # ALONE, no option list — unchanged from the pre-W-R3 anchor copy).
             display = render_ask_body(number, question, options)
 
             async def _post_anchor() -> int | None:
+                # A3 · F-ORDER (Sol A3 wave 5): once the post WINS a transport-
+                # cancel race (``_post_wins``), the handler's outer ``finally`` is
+                # gated OFF and the poster OWNS the ``ask_inflight`` clear. The
+                # ``finally`` below guarantees it on EVERY exit that did NOT reach
+                # durable ownership — the wire send raising / returning None, the
+                # add-failure compensation, a never-durable escape — so the marker
+                # can never wedge (a wedged marker refuses every later ask/reply
+                # ``question_pending`` until restart). ``_durable`` gates the clear
+                # off once durable ownership was reached in THIS invocation (the
+                # sync clear at that point already ran, and the ``finally`` would
+                # CAS-no-op anyway — but a running turn's later ⏳/settle awaits
+                # must not have the live anchor's marker stripped from under them).
+                _durable = False
                 try:
-                    mid = await telegram_channel.send_response_to_topic(
-                        rec.topic_id, display)
-                except Exception:  # noqa: BLE001
-                    logger.warning("free-text anchor post failed (eng=%s)",
-                                   eng_id[:8], exc_info=True)
-                    return None
-                if not isinstance(mid, int):
-                    return None
-                # open_questions registered ONLY after a successful post so a
-                # crash before the relay reaches the block leaves NO dangling
-                # ledger entry.
-                if number is not None:
-                    add = getattr(engagement_registry, "add_open_question", None)
-                    if add is not None:
-                        await add(eng_id, number, mid, text=display,
-                                  kind="anchor")
-                # W-R2: a posted anchor also hands the ball to the operator →
-                # ⏳ waiting for your reply (driven from the ask lifecycle). The
-                # next operator text settles it driver-side (_settle_open_anchor
-                # recomputes the status back to working when none remain).
-                if driver is not None:
-                    note = getattr(driver, "note_ask_waiting", None)
-                    if note is not None:
-                        await note(eng_id)
-                await _advance_first_contact()
-                return mid
+                    try:
+                        mid = await telegram_channel.send_response_to_topic(
+                            rec.topic_id, display)
+                    except Exception:  # noqa: BLE001
+                        logger.warning("free-text anchor post failed (eng=%s)",
+                                       eng_id[:8], exc_info=True)
+                        return None
+                    if not isinstance(mid, int):
+                        return None
+                    # DURABLE OWNERSHIP: register open_questions ONLY after a
+                    # successful post (a crash before the relay reaches the block
+                    # leaves NO dangling ledger entry). §A3(c) COMPENSATION (Sol
+                    # r5-5/r6-1): an ``add_open_question`` failure AFTER the wire
+                    # post leaves an orphan message — best-effort WITHDRAW-edit it
+                    # via the RAW wire primitive (never edit_discrete — this poster
+                    # runs under the sequencer lock on the relay task, no
+                    # reacquisition) and account the COMPOUND outcome
+                    # (``mark_send_intent_compensated``: high-water advances, intent
+                    # resolves ok:false+compensated). The exception NEVER escapes
+                    # the poster; the compensation is a NON-durable exit, so the
+                    # ``finally`` (CAS) still clears the marker.
+                    added = False
+                    if number is not None:
+                        add = getattr(
+                            engagement_registry, "add_open_question", None)
+                        if add is not None:
+                            try:
+                                await add(eng_id, number, mid, text=display,
+                                          kind="anchor")
+                                added = True
+                            except Exception:  # noqa: BLE001
+                                logger.warning(
+                                    "anchor add_open_question failed — withdrawing "
+                                    "(eng=%s Q%s)", eng_id[:8], number,
+                                    exc_info=True)
+                                await _withdraw_anchor(
+                                    telegram_channel, rec.topic_id, mid)
+                                if driver is not None:
+                                    comp = getattr(
+                                        driver, "mark_send_intent_compensated",
+                                        None)
+                                    if comp is not None:
+                                        try:
+                                            await comp(eng_id, request_id, mid)
+                                        except Exception:  # noqa: BLE001
+                                            logger.debug(
+                                                "compensate seam failed",
+                                                exc_info=True)
+                                return None
+                    # Marker cleared SYNCHRONOUSLY at durable ownership (no
+                    # maintenance lock — the unanswered-anchor clause takes over
+                    # gap-free). In the ABSENT-allocator degraded mode (no number,
+                    # no add) this is the poster's terminal path and the
+                    # one-question invariant is UNAVAILABLE (Sol r9-4).
+                    _clear_ask_marker(driver, eng_id, request_id)
+                    _durable = True
+                    # POST-ADD GENERATION RE-CHECK: an operator envelope that
+                    # arrived between reserve and add IS this anchor's answer —
+                    # mark it answered + settle instead of leaving it ⏳ waiting.
+                    gen_bumped = (
+                        added and driver is not None
+                        and driver.inbound_generation(eng_id) != gen_at_entry
+                    )
+                    if gen_bumped:
+                        settle = getattr(driver, "settle_answered_anchor", None)
+                        if settle is not None:
+                            try:
+                                await settle(eng_id, number)
+                            except Exception:  # noqa: BLE001 — best-effort
+                                logger.debug(
+                                    "gen-recheck settle failed", exc_info=True)
+                    else:
+                        # W-R2: a posted, un-answered anchor hands the ball to the
+                        # operator → ⏳ waiting for your reply (driven from the ask
+                        # lifecycle; the next operator text settles it driver-side).
+                        if driver is not None:
+                            note = getattr(driver, "note_ask_waiting", None)
+                            if note is not None:
+                                await note(eng_id)
+                    await _advance_first_contact()
+                    return mid
+                finally:
+                    # Sol A3 wave 5: the poster owns the marker clear on every
+                    # non-durable exit (CAS — a no-op once ``_durable`` cleared it
+                    # or a later ask re-claimed the marker).
+                    if not _durable:
+                        _clear_ask_marker(driver, eng_id, request_id)
 
-            if created_intent:
-                # DEFERRED (relay-mediated) created path: install the poster,
-                # ARM, and AWAIT the outcome fail-closed (F3/F5).
-                driver.set_send_intent_poster(eng_id, request_id, _post_anchor)
-                driver.arm_send_intent(eng_id, request_id)
-                outcome = await _await_deferred_post(driver, eng_id, request_id)
-                if outcome is None or not outcome.get("ok"):
+            # A3 · F-ORDER (Sol A3 wave 4): when a transport cancel LOSES to an
+            # in-flight relay post, the poster owns the marker (it clears it at
+            # durable ownership) — the outer ``finally`` must NOT clear it, or a
+            # SECOND cancel that lands mid-post would strip the marker while a
+            # question is still being posted, admitting a second live question.
+            _post_wins = False
+            try:
+                if created_intent:
+                    # DEFERRED (relay-mediated) created path: install the poster,
+                    # ARM, and AWAIT the outcome fail-closed (F3/F5).
+                    driver.set_send_intent_poster(eng_id, request_id, _post_anchor)
+                    driver.arm_send_intent(eng_id, request_id)
+                    try:
+                        outcome = await _await_deferred_post(
+                            driver, eng_id, request_id)
+                    except BaseException:
+                        # B1 (wave 2) + A3 · F-ORDER (Sol A3 wave 3/4): a transport
+                        # CANCELLATION after ARM. The cleanup is FULLY SYNCHRONOUS
+                        # (no await ⇒ immune to a second Task.cancel()). If the relay
+                        # has NOT started the post, the cancel takes effect: the
+                        # armed intent tombstones so the relay consume-cancels the
+                        # block (nothing posts) and a same-id retry reads the
+                        # recorded cancelled outcome — the finally then clears the
+                        # marker. If the relay IS mid-post (``posting`` set, holding
+                        # the writer lock inside the poster), the sync cancel reads
+                        # ``posting`` and NO-OPS (returns False) — the cancel is LOST
+                        # ("the post wins"), the intent keeps its SUCCESS outcome,
+                        # and the marker is left to the poster (which clears it at
+                        # durable ownership). Gate the finally on that decision.
+                        if not _record_intent_cancelled(driver, eng_id, request_id):
+                            _post_wins = True
+                        raise
+                    # §A3(c): the compensated add-failure maps to ok:false
+                    # internal_error (the wire message exists but the question was
+                    # withdrawn) — distinct from a plain delivery_failed.
+                    if outcome is not None and outcome.get("compensated"):
+                        return web.json_response({
+                            "ok": False, "error": "internal_error",
+                            "message": _ASK_INTERNAL_ERROR_MSG,
+                        })
+                    if outcome is None or not outcome.get("ok"):
+                        return web.json_response(
+                            {"ok": False, "error": "delivery_failed"})
+                    return web.json_response({
+                        "ok": True, "outcome": "anchored",
+                        "question_number": number,
+                        "message_id": outcome.get("message_id"),
+                    })
+
+                # EAGER fallback (no live sequencer): post the anchor now.
+                mid = await _post_anchor()
+                if mid is None:
                     return web.json_response(
                         {"ok": False, "error": "delivery_failed"})
                 return web.json_response({
                     "ok": True, "outcome": "anchored",
-                    "question_number": number,
-                    "message_id": outcome.get("message_id"),
+                    "question_number": number, "message_id": mid,
                 })
-
-            # EAGER fallback (no live sequencer): post the anchor now.
-            mid = await _post_anchor()
-            if mid is None:
-                return web.json_response({"ok": False, "error": "delivery_failed"})
-            return web.json_response({
-                "ok": True, "outcome": "anchored",
-                "question_number": number, "message_id": mid,
-            })
+            finally:
+                # Terminal-failure BACKSTOP: clear the marker if this request
+                # still owns it (CAS — a no-op when the poster already cleared it
+                # at durable ownership, or a later ask claimed the marker). SKIP
+                # the clear when a transport cancel LOST to an in-flight post
+                # (``_post_wins``): the winning poster owns the marker and clears
+                # it at durable ownership — clearing here would strip it mid-post
+                # and admit a second live question (Sol A3 wave 4 double-cancel).
+                if not _post_wins:
+                    _clear_ask_marker(driver, eng_id, request_id)
 
         # --- BUTTON ask ---------------------------------------------------
         # Register the discrete-send INTENT (pending) at the ingress boundary for
@@ -737,23 +1504,41 @@ def _make_ask(
         # RELAY-DEFERRED (§2, review C1): the relay posts the keyboard at the
         # ask's tool_use block, AFTER any preceding narration in the same frame.
 
+        # Reserve the operator-message generation for the post-then-recheck race
+        # AND the F-EXPIRE operator-away CAS. Sampled ONCE at entry, BEFORE any
+        # BROKER.register, and stamped into the ask's static meta as
+        # ``inbound_gen`` so both the main waiter and a same-request_id reattacher
+        # (live request OR retired tombstone — both retain meta) read the SAME
+        # generation for ``note_operator_away`` (Sol r2-2: a lost-response retry
+        # reusing the FIRST attempt's generation can never re-wedge a cleared
+        # away state with a fresher generation).
+        gen_at_entry = (
+            driver.inbound_generation(eng_id) if driver is not None else 0)
+
         def _ask_static_meta() -> dict:
             # F1 (Sol r3): the keyboard's STATIC metadata (options + topic_id +
-            # operator_id), seeded ATOMICALLY at broker creation. The old code
-            # seeded meta AFTER register (``if created: req.meta.update(...)``)
-            # ONLY on the main path, which lost the metadata whenever a
-            # concurrent same-request_id RETRY created the broker request first:
-            # the first attempt, suspended in number allocation, resumed to find
-            # ``created=False`` and skipped the init, leaving meta =
-            # {"message_id": ...} only ⇒ every tap rejected (topic_id/operator_id
-            # both absent). Now BOTH the reattach path and the main path pass
-            # ``meta=`` to ``register`` (a single synchronous op — register only
-            # seeds meta on creation, with no await between), so whichever call
-            # wins the create race installs the complete static metadata.
+            # operator_id + inbound_gen), seeded ATOMICALLY at broker creation.
+            # The old code seeded meta AFTER register (``if created:
+            # req.meta.update(...)``) ONLY on the main path, which lost the
+            # metadata whenever a concurrent same-request_id RETRY created the
+            # broker request first: the first attempt, suspended in number
+            # allocation, resumed to find ``created=False`` and skipped the init,
+            # leaving meta = {"message_id": ...} only ⇒ every tap rejected
+            # (topic_id/operator_id both absent). Now BOTH the reattach path and
+            # the main path pass ``meta=`` to ``register`` (a single synchronous
+            # op — register only seeds meta on creation, with no await between),
+            # so whichever call wins the create race installs the complete static
+            # metadata.
             return {
                 "options": options,
                 "topic_id": rec.topic_id,
                 "operator_id": rec.origin.get("user_id"),
+                "inbound_gen": gen_at_entry,
+                # A5 · F-MULTI: the tap dispatcher reads ``multi`` to branch and
+                # ``shorts`` to rebuild the toggle keyboard on every redraw
+                # (``selected`` is created lazily by ``toggle_selection``).
+                "multi": multi,
+                "shorts": shorts,
             }
 
         intent_registered = False
@@ -766,6 +1551,14 @@ def _make_ask(
             if res is not None:
                 _intent, created_intent = res
                 if not created_intent:
+                    # Finding 1: a prior operator-away refusal recorded an
+                    # ``operator_away`` outcome on the intent → return it verbatim
+                    # BEFORE touching the broker (reattach-outcome check → away
+                    # gate → broker). Without this, the retry re-registers a fresh
+                    # broker request and burns the full timeout with no keyboard.
+                    prior = driver.send_intent_outcome(eng_id, request_id)
+                    if _refused_intent_outcome(prior):
+                        return web.json_response(prior)
                     # F2 (was N1): a same-request_id retry REATTACHES (§2(1)) —
                     # whether the relay has already posted (prior has a
                     # message_id) OR the first attempt is still in flight and the
@@ -788,20 +1581,74 @@ def _make_ask(
                         meta=_ask_static_meta(),
                     )
                     outcome = await BROKER.await_result(req)
-                    return _ask_outcome_response(outcome, options)
+                    return await _ask_final_response(
+                        outcome, options, driver, eng_id, request_id, req)
                 intent_registered = True
 
-        # INBOUND GATE (§4): an unseen operator message means "end your turn".
-        if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
+        # F-EXPIRE (§A2.4) GATE: while operator-away, refuse a genuinely-new ask
+        # immediately — no broker request, no keyboard, no timeout burn. Placed
+        # AFTER the reattach check so a transport retry of an already in-flight
+        # ask still reattaches to its live/tombstoned outcome above.
+        if _operator_away_active(driver, eng_id):
             if intent_registered:
-                driver.cancel_send_intent(eng_id, request_id)  # tombstone
-            return _refusal_response()
+                # Finding 1: record the refusal OUTCOME (not a bare cancel) so a
+                # same-id retry reattaches to it above.
+                _record_intent_refusal(driver, eng_id, request_id)
+            return _away_refusal_response(driver, eng_id)
 
-        # Reserve the operator-message generation for the post-then-recheck race.
-        gen_at_entry = (
-            driver.inbound_generation(eng_id) if driver is not None else 0)
+        # INBOUND GATE (§4): an unseen operator message means "end your turn". A
+        # registered intent records the unread_inbound OUTCOME (Sol A2 wave-3,
+        # Finding 3 — NOT a bare cancel) so a same-request_id retry reattaches to
+        # it and returns unread_inbound immediately instead of delivery_failed.
+        if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
+            return _refusal_response(record_intent=intent_registered)
 
-        number = await _maybe_allocate_number(engagement_registry, eng_id)
+        # §A3(c) INGRESS RESERVATION (Sol r2-8/r3-6): atomically CHECK the live-
+        # pending predicate + CLAIM the ``ask_inflight`` marker under the ask-
+        # maintenance lock (held for the check + marker ONLY). A second concurrent
+        # ask sees it and refuses ``question_pending``. The marker clears at
+        # BROKER.register below (durable ownership — the broker-pending clause
+        # takes over gap-free) and on the allocation-failure path.
+        _btn_lock = _ask_maint_lock(driver, eng_id)
+        if _btn_lock is not None:
+            async with _btn_lock:
+                if _ask_pending_predicate(
+                        driver, eng_id, exclude_request_id=request_id):
+                    if intent_registered:
+                        driver.cancel_send_intent(eng_id, request_id)
+                    return _ask_pending_response(driver, eng_id)
+                driver.set_ask_inflight(eng_id, request_id)
+
+        # A RAISING allocator (Sol r8-4) is TERMINAL BEFORE any wire post — clear
+        # the marker, tombstone the intent (internal_error outcome; retries
+        # short-circuit), refuse. An ABSENT allocator returns None (un-numbered
+        # legacy path).
+        try:
+            number = await _maybe_allocate_number(engagement_registry, eng_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("button number allocation failed (eng=%s)",
+                           eng_id[:8], exc_info=True)
+            _clear_ask_marker(driver, eng_id, request_id)
+            if intent_registered:
+                _record_intent_internal_error(driver, eng_id, request_id)
+            return web.json_response({"ok": False, "error": "internal_error"})
+        except BaseException:
+            # B1: transport CANCELLATION during the awaited allocation (the only
+            # await between ``set_ask_inflight`` and the durable ``BROKER.register``
+            # handoff below) must NOT wedge the ingress marker — clear it (CAS)
+            # before re-raising. Durable ownership disarms this by clearing the
+            # marker itself synchronously at register.
+            _clear_ask_marker(driver, eng_id, request_id)
+            # B2 (wave 2): the PENDING intent stays matchable — a same-request_id
+            # button retry would reattach, find no recorded outcome, and register a
+            # FRESH broker request that never posts (full timeout burn, no
+            # keyboard). Tombstone it + record a cancelled outcome so the retry
+            # short-circuits before touching the broker. Synchronous — a
+            # still-pending intent has no in-flight post, so the cancel takes
+            # effect; the marker was already cleared above.
+            if intent_registered:
+                _record_intent_cancelled(driver, eng_id, request_id)
+            raise
         # W-R3 (Sol r1-5): the SINGLE canonical body — full options VERBATIM,
         # numbered, below the question. This exact string feeds the keyboard
         # post, the persisted ``open_questions[].text``, the finish-hook settle
@@ -817,6 +1664,11 @@ def _make_ask(
             namespace="engagement_ask", scope=eng_id, request_id=request_id,
             timeout_s=timeout_s, meta=_ask_static_meta(),
         )
+        # §A3(c): durable ownership reached — the request is live in the broker
+        # (BROKER.pending non-empty), so the ingress marker clears SYNCHRONOUSLY
+        # here (no maintenance lock) and the broker-pending clause of the gate
+        # predicate takes over gap-free.
+        _clear_ask_marker(driver, eng_id, request_id)
 
         # W-R2 linearization pin (Sol r2-1): the finish hook can become runnable
         # (a FAST TAP) before ``_post_ask`` finishes registering the open
@@ -834,7 +1686,16 @@ def _make_ask(
             if number is not None:
                 close = getattr(engagement_registry, "close_open_question", None)
                 if close is not None:
-                    await close(eng_id, number)
+                    try:
+                        await close(eng_id, number)
+                    except Exception:  # noqa: BLE001
+                        # M4: close_open_question is now STRICT (rollback + raise).
+                        # Treat a raise as RETAINED — the entry stays for a later
+                        # settle / boot-reconcile; still recompute the summary.
+                        logger.warning(
+                            "engagement %s: close_open_question failed on settle "
+                            "(Q%s) — entry retained", eng_id[:8], number,
+                            exc_info=True)
             # Recompute the summary status from the remaining open questions
             # (still ⏳ waiting while any question is open; ⚙️ working once none
             # remain and the turn is running).
@@ -852,16 +1713,44 @@ def _make_ask(
         # open question only AFTER a successful, non-superseded post means a
         # crash before the relay reaches the block leaves NO dangling ledger
         # entry — the broker TTL expires the ask instead.
+        # Pass ``shorts`` to the keyboard ONLY when at least one option carried an
+        # agent short — str-only asks keep today's call shape (backward-compatible
+        # with existing keyboard fakes that don't accept the kwarg). A5 · F-MULTI:
+        # a multi ask always passes ``multi=True`` (and ``shorts`` so the toggle
+        # rows carry the agent shorts / heuristic labels).
+        _kbd_kwargs: dict[str, Any] = {}
+        if any(shorts):
+            _kbd_kwargs["shorts"] = shorts
+        if multi:
+            _kbd_kwargs["multi"] = True
+            _kbd_kwargs["shorts"] = shorts
+
+        # A5 · F-MULTI: the multi settle edit routes through the sequencer's
+        # ``edit_discrete`` (via the driver seam) so it serializes on the same
+        # lock as the toggle redraw. Degrades to the direct ``edit_topic_message``
+        # path when there is no live driver/sequencer (eager fallback / fakes).
+        def _make_settle_edit(mid: int):
+            if not multi or driver is None:
+                return None
+            settle = getattr(driver, "settle_ask_keyboard", None)
+            if settle is None:
+                return None
+            async def _settle(text: str) -> bool:
+                return await settle(eng_id, mid, text)
+            return _settle
+
         async def _post_ask() -> int | None:
             try:
                 await BROKER.ensure_posted(
                     req,
                     lambda: telegram_channel.post_options_keyboard(
                         engagement_id=eng_id, request_id=request_id,
-                        question=display, options=options),
+                        question=display, options=options, **_kbd_kwargs),
                     lambda mid: _ask_keyboard_finish(
                         telegram_channel, rec.topic_id, mid, display, options,
-                        on_settle=_close_question),
+                        on_settle=_close_question,
+                        settle_edit=_make_settle_edit(mid),
+                        eng_id=eng_id, number=number),
                 )
                 mid = req.meta.get("message_id")
                 if not isinstance(mid, int):
@@ -922,6 +1811,13 @@ def _make_ask(
                 # Unblock the (possibly already-runnable) settlement path: the
                 # registration + waiting submission above are now durable.
                 _ask_registered.set()
+                # Sol A3 wave 5: parity with the anchor poster — the poster owns
+                # the ``ask_inflight`` clear on every exit. Durable ownership for a
+                # button ask is the BROKER.register-side clear that ran BEFORE this
+                # poster, so this CAS is a belt-and-suspenders no-op in the normal
+                # case (marker already cleared, or a later ask re-claimed it); it
+                # guarantees no poster-failure path can ever leave the marker set.
+                _clear_ask_marker(driver, eng_id, request_id)
 
         if intent_registered:
             # Install the real poster and ARM — the point of no return
@@ -939,7 +1835,8 @@ def _make_ask(
         # future is decoupled from posting (resolved by the tap finish hook), so
         # nothing here needs the posted message id synchronously.
         outcome = await BROKER.await_result(req)
-        return _ask_outcome_response(outcome, options)
+        return await _ask_final_response(
+            outcome, options, driver, eng_id, request_id, req)
 
     return handler
 
@@ -960,6 +1857,27 @@ async def _await_deferred_post(driver: Any, eng_id: str, request_id: str) -> dic
         return None
 
 
+async def _withdraw_anchor(
+    telegram_channel: Any, topic_id: int | None, mid: int,
+) -> None:
+    """§A3(c) compensation: best-effort confirmed WITHDRAW-edit of an orphan
+    anchor (posted, but its ledger write failed) via the RAW wire edit primitive
+    — NEVER ``edit_discrete`` (the initial-anchor poster runs under the sequencer
+    lock on the relay task; no reacquisition from poster context). An unconfirmed
+    edit leaves one stale plain-text line — the documented visual-orphan class."""
+    try:
+        confirmed = await confirmed_settle_edit(
+            lambda: telegram_channel.edit_topic_message(
+                topic_id, mid, _ANCHOR_WITHDRAWN, clear_keyboard=True),
+        )
+        if not confirmed:
+            logger.warning(
+                "anchor withdraw edit UNCONFIRMED (topic=%s mid=%s) — stale "
+                "plain-text orphan left", topic_id, mid)
+    except Exception:  # noqa: BLE001 — compensation edit is best-effort
+        logger.debug("anchor withdraw edit raised", exc_info=True)
+
+
 async def _noop_poster() -> int | None:
     """Placeholder poster used ONLY between an intent's early registration (for
     idempotent transport-retry reattach detection) and the point where the ask/
@@ -974,6 +1892,22 @@ def _ask_outcome_response(outcome: dict, options: list) -> web.Response:
     """Map a broker ask outcome to the tool's JSON response."""
     o = outcome.get("outcome")
     if o == "answered":
+        # A5 · F-MULTI: a multi submit resolves with ``option_indices`` → the
+        # response lists ALL selected labels + indices, KEEPING the single
+        # ``option``/``option_index`` fields (the FIRST selection) for
+        # downstream compat.
+        indices = outcome.get("option_indices")
+        if indices:
+            labels = [
+                options[i] for i in indices
+                if isinstance(i, int) and 0 <= i < len(options)
+            ]
+            return web.json_response({
+                "ok": True, "outcome": "answered",
+                "options": labels, "option_indices": list(indices),
+                "option": labels[0] if labels else None,
+                "option_index": indices[0],
+            })
         idx = outcome["option_index"]
         return web.json_response({
             "ok": True, "outcome": "answered",

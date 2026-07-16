@@ -165,6 +165,15 @@ class EngagementRecord:
     # ``open_questions`` is the set of still-open (unsettled) questions, each a
     # ``{"n": int, "tg_message_id": int|None}`` dict — boot reconciliation
     # settles any entry whose broker record did not survive the restart.
+    # v0.83.0 (§A3, Sol r2-7/r3-5/r5-3): entries gain ``answered: bool`` (the
+    # answer-lifecycle decision, split from visual settlement — an answered entry
+    # is INVISIBLE to ``open_question_numbers``/``oldest_open_anchor`` and the A3
+    # gates/summary, yet stays present for raw reconcile/settle iteration) and
+    # ``stale_mids: list[int]`` (re-anchor OLD copies awaiting a confirmed
+    # settle). BOTH are absent-tolerated on load (pre-v0.83 rows have neither key
+    # → each accessor ``.get``-defaults). Entry-removal invariant: an entry is
+    # REMOVED only when its CURRENT copy's settle edit is confirmed AND
+    # ``stale_mids`` is empty.
     next_question_number: int = 1
     open_questions: tuple[dict, ...] = ()
     # v0.79.0 (§5): the pinned live-summary controller state. ``summary_message_id``
@@ -837,7 +846,12 @@ class EngagementRegistry:
                 return
             prev = rec.open_questions
             entries = [q for q in rec.open_questions if q.get("n") != number]
-            entry = {"n": number, "tg_message_id": tg_message_id, "kind": kind}
+            entry = {
+                "n": number, "tg_message_id": tg_message_id, "kind": kind,
+                # v0.83.0 (§A3): the answer-lifecycle flag + re-anchor stale-copy
+                # list. New rows carry them explicitly; old rows are .get-tolerant.
+                "answered": False, "stale_mids": [],
+            }
             if text is not None:
                 entry["text"] = text
             entries.append(entry)
@@ -858,13 +872,158 @@ class EngagementRegistry:
                     await asyncio.gather(task, return_exceptions=True)
                 raise
 
+    async def _commit_open_questions_strict(self, rec: EngagementRecord,
+                                            prev: tuple[dict, ...]) -> None:
+        """Shared strict-persist transaction for the ``open_questions`` mutators
+        (§A3): shield-and-await the tombstone write; on failure ROLL BACK the
+        whole tuple (``prev``) and RE-RAISE, so a caller can fail closed and a
+        cancelled ``to_thread`` never splits memory from disk. Caller MUST hold
+        ``self._lock`` and have already assigned the new ``rec.open_questions``."""
+        async def _mutate_and_persist() -> None:
+            try:
+                await self._write_tombstone_locked(strict=True)
+            except Exception:
+                rec.open_questions = prev
+                raise
+
+        task = asyncio.ensure_future(_mutate_and_persist())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done():
+                await asyncio.gather(task, return_exceptions=True)
+            raise
+
+    async def mark_question_answered(self, engagement_id: str, number: int) -> bool:
+        """§A3 (Sol r2-7): mark an open-question entry ANSWERED — the
+        answer-lifecycle decision, split from visual settlement. STRICT-persisted
+        (rollback + re-raise like ``add_open_question``). The entry stays in the
+        ledger (removed only after a confirmed settle edit) but becomes INVISIBLE
+        to ``open_question_numbers``/``oldest_open_anchor`` so the A3 gates and the
+        pinned summary stop treating an already-answered question as live.
+
+        Returns ``True`` when an entry with ``number`` was flagged, ``False`` for
+        an unknown engagement or number (idempotent on an already-answered entry).
+        """
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return False
+            prev = rec.open_questions
+            found = False
+            entries: list[dict] = []
+            for q in rec.open_questions:
+                nq = dict(q)
+                if nq.get("n") == number:
+                    found = True
+                    nq["answered"] = True
+                entries.append(nq)
+            if not found:
+                return False
+            rec.open_questions = tuple(entries)
+            await self._commit_open_questions_strict(rec, prev)
+            return True
+
+    async def stage_stale_mid(self, engagement_id: str, number: int,
+                              mid: int) -> bool:
+        """§A3 staged re-anchor: append ``mid`` to an entry's ``stale_mids`` (the
+        OLD copy awaiting a confirmed settle). STRICT-persisted, idempotent on
+        ``mid``. Returns ``False`` for an unknown engagement/number."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return False
+            prev = rec.open_questions
+            found = False
+            entries: list[dict] = []
+            for q in rec.open_questions:
+                nq = dict(q)
+                if nq.get("n") == number:
+                    found = True
+                    stale = list(nq.get("stale_mids") or [])
+                    if mid not in stale:
+                        stale.append(mid)
+                    nq["stale_mids"] = stale
+                entries.append(nq)
+            if not found:
+                return False
+            rec.open_questions = tuple(entries)
+            await self._commit_open_questions_strict(rec, prev)
+            return True
+
+    async def unstage_stale_mid(self, engagement_id: str, number: int,
+                                mid: int) -> bool:
+        """§A3: remove ``mid`` from an entry's ``stale_mids`` once its OLD copy is
+        confirmed-settled. STRICT-persisted, no-op-tolerant when the mid is absent.
+        Returns ``False`` for an unknown engagement/number."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return False
+            prev = rec.open_questions
+            found = False
+            entries: list[dict] = []
+            for q in rec.open_questions:
+                nq = dict(q)
+                if nq.get("n") == number:
+                    found = True
+                    nq["stale_mids"] = [
+                        m for m in (nq.get("stale_mids") or []) if m != mid
+                    ]
+                entries.append(nq)
+            if not found:
+                return False
+            rec.open_questions = tuple(entries)
+            await self._commit_open_questions_strict(rec, prev)
+            return True
+
+    async def update_question_mid(self, engagement_id: str, number: int,
+                                  new_mid: int) -> bool:
+        """§A3 staged re-anchor step 3: strict-persist an entry's live
+        ``tg_message_id`` to ``new_mid`` (the freshly-posted re-anchor copy).
+        STRICT-persisted (rollback + re-raise like the sibling mutators), so the
+        caller can settle the new copy fail-closed on a raise. Returns ``False``
+        for an unknown engagement/number."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return False
+            prev = rec.open_questions
+            found = False
+            entries: list[dict] = []
+            for q in rec.open_questions:
+                nq = dict(q)
+                if nq.get("n") == number:
+                    found = True
+                    nq["tg_message_id"] = new_mid
+                entries.append(nq)
+            if not found:
+                return False
+            rec.open_questions = tuple(entries)
+            await self._commit_open_questions_strict(rec, prev)
+            return True
+
+    def open_question_entries(self, engagement_id: str) -> list[dict]:
+        """RAW list copy of every open-question entry — answered or not (§A3).
+        Used by the visual settle / boot reconciliation paths, which iterate the
+        WHOLE ledger; the gates/summary use the answered-filtered accessors."""
+        rec = self._records.get(engagement_id)
+        if rec is None:
+            return []
+        return [dict(q) for q in rec.open_questions]
+
     def oldest_open_anchor(self, engagement_id: str) -> dict | None:
-        """The oldest still-open FREE-TEXT anchor (``kind == "anchor"``), or
-        ``None``. The next operator message settles it (§4)."""
+        """The oldest still-open, UNANSWERED free-text anchor (``kind ==
+        "anchor"``), or ``None``. The next operator message settles it (§4).
+        v0.83.0 (§A3): answered anchors are excluded — an answered-but-unsettled
+        anchor must not gate replies or be re-posted as unresolved."""
         rec = self._records.get(engagement_id)
         if rec is None:
             return None
-        anchors = [q for q in rec.open_questions if q.get("kind") == "anchor"]
+        anchors = [
+            q for q in rec.open_questions
+            if q.get("kind") == "anchor" and not q.get("answered", False)
+        ]
         if not anchors:
             return None
         return min(anchors, key=lambda q: q.get("n", 0))
@@ -872,26 +1031,39 @@ class EngagementRegistry:
     async def close_open_question(self, engagement_id: str, number: int) -> None:
         """Remove a settled question from the open-question ledger (persisted).
         ``next_question_number`` is NEVER rewound. Unknown engagement/number is
-        a no-op."""
+        a no-op.
+
+        v0.83.0 (§A3, M4): the closing removal is now STRICT — a tombstone-write
+        failure ROLLS BACK ``open_questions`` (full-tuple) and RE-RAISES, like the
+        sibling mutators, so the entry can never vanish from memory while surviving
+        on disk. Callers (``_settle_ledger_entry``) treat a raise as RETAINED — the
+        entry stays present for a later settle / boot-reconcile pass."""
         async with self._lock:
             rec = self._records.get(engagement_id)
             if rec is None:
                 return
+            prev = rec.open_questions
             remaining = tuple(
                 q for q in rec.open_questions if q.get("n") != number
             )
             if len(remaining) == len(rec.open_questions):
                 return
             rec.open_questions = remaining
-            await self._write_tombstone_locked()
+            await self._commit_open_questions_strict(rec, prev)
 
     def open_question_numbers(self, engagement_id: str) -> list[int]:
-        """Accessor for summary consumers (T4): the sorted list of still-open
-        question numbers (``Open questions: Q4, Q6``)."""
+        """Accessor for summary consumers (T4): the sorted list of still-open,
+        UNANSWERED question numbers (``Open questions: Q4, Q6``). v0.83.0 (§A3,
+        Sol r3-5): answered entries are excluded — this feeds the pinned summary's
+        ``Open questions:`` line and ``recompute_engagement_status``, so an
+        answered-but-unconfirmed-settle entry must stop showing/gating."""
         rec = self._records.get(engagement_id)
         if rec is None:
             return []
-        return sorted(q["n"] for q in rec.open_questions if "n" in q)
+        return sorted(
+            q["n"] for q in rec.open_questions
+            if "n" in q and not q.get("answered", False)
+        )
 
     # -- v0.79.0 (§5) live-summary state ------------------------------------
 

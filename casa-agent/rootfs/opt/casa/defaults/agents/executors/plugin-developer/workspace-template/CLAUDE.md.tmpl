@@ -11,18 +11,20 @@ themselves: `gh repo edit <repo> --visibility public`.
 
 ## First contact
 
-Your FIRST action, before any repository work: `reply` restating the brief in one paragraph, your intended approach, and open questions (use `mcp__casa-engagement-channel__ask` for choice questions). If the brief is marked interaction-required, END YOUR TURN after first contact and wait for the engager.
+Your FIRST action, before any repository work: ONE `reply` that restates the brief and your intended approach — STATEMENTS ONLY, no embedded questions. THEN post your first open question via `mcp__casa-engagement-channel__ask` (buttons for a choice, `options: []` for free text) and END YOUR TURN. If the brief is marked interaction-required, wait for the engager after that first question.
 
-## Turn discipline (v0.79.0 — every turn)
+## Turn discipline (v0.83.0 — every turn)
 
 The engagement topic is a live, ordered conversation, not a batch log. Full detail in `doctrine/engagement-conduct.md`; the binding rules:
 
-- **One question at a time**, via `mcp__casa-engagement-channel__ask` — pass `options` (2-8 choices) for tappable buttons, or `options: []` for a numbered free-text question anchor when the answer isn't enumerable.
-- **One message per beat** — don't fragment one thought across several `reply` calls.
+- **Ask, then stop.** Every operator decision goes through the blocking `mcp__casa-engagement-channel__ask` — NEVER a `reply` (if a `reply` would end in `?`, it should have been an `ask`). After asking, END YOUR TURN and wait; never answer your own question. One question at a time — a second while one is live is refused `question_pending`.
+- **Buttons for choices.** Enumerable answer → pass the choices in `options` (numbered choices embedded in an anchor body are refused `embedded_options`); several may apply → add `multi: true`; open-ended → `options: []` (a numbered free-text anchor).
+- **Never pre-number/letter options** — Casa numbers them (a leading `A — `/`1. ` is stripped). For a long choice pass `{"label", "short"}` so the button stays readable.
+- **End turns silently** — no "ending my turn"/"I'll wait" sign-off; the platform narrates state (summary + receipts). Applies after asking and on every refusal.
+- **Expiry = pause.** `ask` returning `outcome: no_answer` (`engagement_paused: true`) means the operator is away and the engagement is PAUSED: end your turn silently and wait — NEVER re-ask. A further ask while paused refuses `operator_away`.
 - If your turn was triggered by an operator message, **address it first** — the platform threads your reply to it.
-- An `ask` call that refuses with `unread_inbound` means an operator message is waiting unread: **end your turn now**, don't retry the ask.
-- A message prefixed `[OPERATOR REDIRECT — …]` means **drop your current agenda and re-plan from that message**.
-- A bare `STOP` as the first line of a message is the operator's barge-in — treat it exactly like a redirect. Text after `STOP` on the SAME line is NOT a redirect (that's an ordinary message); an operator combining both uses `redirect: <text>`.
+- An `ask` call that refuses with `unread_inbound` means an operator message is waiting unread: **end your turn now** (silently), don't retry the ask.
+- A message prefixed `[OPERATOR REDIRECT — …]`, or a bare `STOP` as the first line, means **drop your current agenda and re-plan from that message**. Text after `STOP` on the SAME line is NOT a redirect (that's an ordinary message); an operator combining both uses `redirect: <text>`.
 
 ## Task
 

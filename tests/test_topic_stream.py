@@ -450,7 +450,10 @@ async def test_recovery_replays_turn_edits_last_id(tmp_path):
         turn_start={"segment": seg, "offset": 0},
         current={"segment": seg, "offset": offs[1]},
         message_ids=[7],
-        last_posted_len=len("hello world"),
+        # A1a: last_posted_len is now load-bearing (delta reconcile). 0 pins the
+        # LEGACY full-repost / conservative-seal path this test covers; the delta
+        # (partial-tail) path is exercised in test_topic_stream_round3.py.
+        last_posted_len=0,
     ).save(cur_path)
 
     await _make_relay(tmp_path, cur_path, rec, events).run()
@@ -515,7 +518,7 @@ async def test_recovery_replays_turn_edits_last_id_after_more_live_text(tmp_path
         turn_start={"segment": seg, "offset": 0},
         current={"segment": seg, "offset": offs[1]},  # through "hello"
         message_ids=[7],
-        last_posted_len=len("hello"),
+        last_posted_len=0,  # A1a: legacy full-repost path (see round3 for delta)
     ).save(cur_path)
 
     await _make_relay(tmp_path, cur_path, rec, events).run()
@@ -591,7 +594,7 @@ async def test_rollover_plus_restart_recovers_editing_final_id(tmp_path):
         turn_start={"segment": seg, "offset": 0},
         current={"segment": seg, "offset": offs[1]},  # through the text frame
         message_ids=[7, 9],
-        last_posted_len=len(big) - 3900,
+        last_posted_len=0,  # A1a: legacy full-repost path (see round3 for delta)
     ).save(cur_path)
 
     await _make_relay(tmp_path, cur_path, rec, events).run()
@@ -639,7 +642,7 @@ async def test_recovery_suppresses_inturn_checkpointed_spawn_side_effect(tmp_pat
         turn_start={"segment": seg, "offset": 0},
         current={"segment": seg, "offset": offs[-1]},  # everything <= current
         message_ids=[5],
-        last_posted_len=len("alpha"),
+        last_posted_len=0,  # A1a: legacy full-repost path (see round3 for delta)
     ).save(cur_path)
 
     await _make_relay(tmp_path, cur_path, rec, events).run()
@@ -832,7 +835,7 @@ async def test_crash_recovery_reconcile_seals_never_edits_prior(tmp_path):
     StreamCursor(
         turn_start={"segment": seg, "offset": 0},
         current={"segment": seg, "offset": offs[1]},
-        message_ids=[7], last_posted_len=len("hello world"),
+        message_ids=[7], last_posted_len=0,  # A1a: legacy full-repost path
     ).save(cur_path)
 
     await _make_relay(tmp_path, cur_path, rec, events).run()
@@ -852,7 +855,7 @@ async def test_crash_result_finalize_seals_never_edits_prior(tmp_path):
     StreamCursor(
         turn_start={"segment": seg, "offset": 0},
         current={"segment": seg, "offset": offs[1]},  # through the text frame
-        message_ids=[7], last_posted_len=len("done text"),
+        message_ids=[7], last_posted_len=0,  # A1a: legacy full-repost path
     ).save(cur_path)
 
     await _make_relay(tmp_path, cur_path, rec, events).run()
@@ -877,7 +880,7 @@ async def test_crash_interleave_before_checkpoint_no_edit_below(tmp_path):
     StreamCursor(
         turn_start={"segment": seg, "offset": 0},
         current={"segment": seg, "offset": offs[-1]},
-        message_ids=[7], last_posted_len=len("narr"),
+        message_ids=[7], last_posted_len=0,  # A1a: legacy full-repost path
     ).save(cur_path)
 
     await _make_relay(tmp_path, cur_path, rec, events).run()
@@ -901,7 +904,7 @@ async def test_crash_interleave_after_checkpoint_no_edit_below(tmp_path):
     StreamCursor(
         turn_start={"segment": seg, "offset": 0},
         current={"segment": seg, "offset": offs[1]},
-        message_ids=[7], last_posted_len=len("narr"),
+        message_ids=[7], last_posted_len=0,  # A1a: legacy full-repost path
     ).save(cur_path)
 
     await _make_relay(tmp_path, cur_path, rec, events).run()
@@ -1019,7 +1022,11 @@ async def test_crash_recovery_reposts_full_sealed_tail_unchanged_by_r4(tmp_path)
     OPEN turn whose narration was sealed by a discrete still reposts the FULL
     narration as a NEW message (the accepted at-least-once duplicate). The R4
     finalize suffix-only rule does NOT touch this reconcile path — this test
-    stays green before and after the fix, pinning the branch boundary."""
+    stays green before and after the fix, pinning the branch boundary.
+
+    A1a note: ``last_posted_len`` became load-bearing, so this scenario is pinned
+    to the LEGACY (``last_posted_len == 0``) full-repost path; the delta-aware
+    partial-tail reconcile is covered in test_topic_stream_round3.py."""
     rec, events = Recorder(), []
     offs = _write_current(tmp_path, [
         _init(), _text("recovered tail"), _reply_tool_frame("R"),
@@ -1030,7 +1037,7 @@ async def test_crash_recovery_reposts_full_sealed_tail_unchanged_by_r4(tmp_path)
     StreamCursor(
         turn_start={"segment": seg, "offset": 0},
         current={"segment": seg, "offset": offs[-1]},
-        message_ids=[7], last_posted_len=len("recovered tail"),
+        message_ids=[7], last_posted_len=0,  # A1a: legacy full-repost path
     ).save(cur_path)
 
     # FRESH relay + FRESH sequencer (models a process restart).
@@ -1105,7 +1112,7 @@ async def test_legacy_checkpoint_absent_lens_falls_back_and_seals(tmp_path):
         turn_start={"segment": seg, "offset": 0},
         current={"segment": seg, "offset": offs[-1]},
         message_ids=[7, 9],
-        last_posted_len=len("def"),
+        last_posted_len=0,  # A1a: legacy full-repost path (see round3 for delta)
     ).save(cur_path)
 
     # FRESH relay + FRESH sequencer (models a process restart).

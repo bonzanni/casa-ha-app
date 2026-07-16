@@ -97,10 +97,14 @@ def _poster(rec, text):
 
 def test_project_args_pins_reply_to_text_only():
     assert project_args(REPLY_TOOL, {"chat_id": "x", "text": "hi"}) == {"text": "hi"}
+    # A5 · F-MULTI: ``multi`` joins the ask projection (defaults False when the
+    # frame omits it) — mirrors ``casa_engagement_channel._ask_projection_hash``.
     assert project_args(ASK_TOOL, {"question": "q", "options": ["a", "b"],
                                    "timeout_s": 300, "extra": 1}) == {
-        "question": "q", "options": ["a", "b"], "timeout_s": 300,
+        "question": "q", "options": ["a", "b"], "timeout_s": 300, "multi": False,
     }
+    assert project_args(ASK_TOOL, {"question": "q", "options": ["a", "b"],
+                                   "multi": True})["multi"] is True
     # identity for a gated tool / emit_completion.
     assert project_args("Bash", {"command": "ls"}) == {"command": "ls"}
 

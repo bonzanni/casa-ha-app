@@ -567,8 +567,10 @@ class TestDmReadableButtons:
         assert mid == 9
         kbd = bot.send_message.call_args.kwargs["reply_markup"]
         rows = kbd.inline_keyboard
+        # v0.83.0 (A4 · F-BTN): the long option is interior-elided keeping
+        # head + tail (cap 30) rather than the old 3-word cut.
         assert [r[0].text for r in rows] == [
-            "1 · Personal Gmail", "2 · Configure the"]
+            "1 · Personal Gmail", "2 · Configure…integration"]
         assert [r[0].callback_data for r in rows] == [
             "v1|resident_ask|rid|0", "v1|resident_ask|rid|1"]
         # The full body is posted verbatim (short labels never replace it).
