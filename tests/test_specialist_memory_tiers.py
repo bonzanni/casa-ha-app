@@ -172,10 +172,10 @@ async def test_token_budget_zero_no_sem_calls(monkeypatch):
     _FakeSDKClient.reset(response="ok")
 
     with patch.object(tools, "ClaudeSDKClient", _FakeSDKClient):
-        text = await tools._run_delegated_agent(cfg, task_text="hi", context_text="")
+        output = await tools._run_delegated_agent(cfg, task_text="hi", context_text="")
 
     await _drain_bg()
-    assert text == "ok"
+    assert output.text == "ok"
     assert fake_sem.recall_calls == []
     assert fake_sem.retain_calls == []
 
@@ -294,7 +294,7 @@ async def test_sem_none_no_crash(monkeypatch):
     _FakeSDKClient.reset(response="ok")
 
     with patch.object(tools, "ClaudeSDKClient", _FakeSDKClient):
-        text = await tools._run_delegated_agent(cfg, task_text="hi", context_text="")
+        output = await tools._run_delegated_agent(cfg, task_text="hi", context_text="")
 
-    assert text == "ok"
+    assert output.text == "ok"
     assert "<memory_context" not in _FakeSDKClient.captured_prompt

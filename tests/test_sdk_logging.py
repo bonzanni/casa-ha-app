@@ -336,6 +336,33 @@ class TestWithStderrCallback:
         assert out.stderr is sentinel
 
 
+class TestStructuredVoiceSdkLogGuard:
+    @pytest.mark.parametrize("logger_name", [
+        "claude_agent_sdk._internal.query",
+        "claude_agent_sdk._internal.transport.subprocess_cli",
+        "claude_agent_sdk._internal._task_compat",
+    ])
+    def test_suppresses_sdk_payload_logs_only_inside_guard(
+        self, caplog, logger_name,
+    ):
+        from sdk_logging import suppress_structured_voice_sdk_payload_logs
+
+        private_canary = "PRIVATE-MALFORMED-SDK-FRAME-CANARY"
+        logger = logging.getLogger(logger_name)
+        with caplog.at_level(logging.DEBUG):
+            logger.error("visible before guard")
+            with suppress_structured_voice_sdk_payload_logs():
+                logger.error("malformed frame: %s", private_canary)
+            logger.error("visible after guard")
+
+        messages = [
+            record.getMessage() for record in caplog.records
+            if record.name == logger_name
+        ]
+        assert messages == ["visible before guard", "visible after guard"]
+        assert private_canary not in caplog.text
+
+
 class TestSdkTaskNoiseFilter:
     """P-4: the SDK spawns control-request handlers as DETACHED tasks; at
     engagement teardown their transport.write raises CLIConnectionError and

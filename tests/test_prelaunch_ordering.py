@@ -47,6 +47,7 @@ class TestPrelaunchOrdering:
         reg.cancel_delegation = AsyncMock()
         reg.fail_delegation = AsyncMock()
         reg.complete_delegation = AsyncMock()
+        reg.job_registry.finish_voice_result = AsyncMock()
 
         tm.init_tools(
             channel_manager=MagicMock(), bus=MagicMock(),
@@ -58,9 +59,17 @@ class TestPrelaunchOrdering:
             },
         )
 
-        async def _fake_run(cfg, task_text, context_text, resolution=None):
+        async def _fake_run(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
             trace.append("task")
-            return "ok"
+            assert output_format is tm.VOICE_JOB_OUTPUT_FORMAT
+            return tm.DelegatedOutput(text="ok", structured_output={
+                "status": "answered", "spoken_summary": "ok", "answer": "ok",
+                "clarification": "", "citations": [], "assumptions": [],
+                "provenance": {}, "sensitivity": "household",
+                "delivery_ttl_s": 900,
+            })
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _fake_run)
 

@@ -12,7 +12,9 @@ import shutil
 import subprocess
 import time
 import uuid
+from contextlib import nullcontext
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -62,6 +64,13 @@ from specialist_registry import (
     DelegationComplete,
     DelegationRecord,
     SpecialistRegistry,
+)
+from voice_job_result import (
+    VOICE_JOB_OUTPUT_FORMAT,
+    VoiceJobResultError,
+    parse_voice_job_result,
+    spoken_text_for,
+    voice_identity_clearance,
 )
 
 logger = logging.getLogger(__name__)
@@ -798,6 +807,7 @@ def _build_specialist_options(
     *,
     resolution=None,
     extra_casa_tools: tuple[str, ...] = (),
+    output_format=None,
 ) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for a Tier 2 specialist invocation.
 
@@ -916,6 +926,8 @@ def _build_specialist_options(
         setting_sources=["project"],
         skills=skills,
         plugins=sdk_plugins,
+        output_format=output_format,
+        stderr=(_discard_structured_stderr if output_format is not None else None),
         # P-5b: no relay exists on this path — deny ungranted tools fast
         # instead of hanging on an unanswerable CC prompt.
         can_use_tool=make_fail_closed_can_use_tool(
@@ -1146,10 +1158,23 @@ def _build_world_state_summary() -> str:
 _specialist_bg_tasks: set[asyncio.Task[Any]] = set()
 
 
+@dataclass(frozen=True)
+class DelegatedOutput:
+    """Raw text plus the SDK's optional structured result envelope."""
+
+    text: str
+    structured_output: Any = None
+
+
+def _discard_structured_stderr(_line: str) -> None:
+    """Drain structured-job stderr without placing model content in logs."""
+
+
 async def _run_delegated_agent(
     cfg, task_text: str, context_text: str, resolution=None,
-) -> str:
-    """Run one ephemeral delegated turn and return the concatenated text.
+    output_format=None,
+) -> DelegatedOutput:
+    """Run one ephemeral delegated turn and return text plus structured output.
 
     ``resolution`` (spec A5): when the caller's requires gate already
     resolved this agent's plugins, that SAME ``ResolutionResult`` is
@@ -1228,25 +1253,33 @@ async def _run_delegated_agent(
     # artifact); the PERSISTENT stale-binding incident is fully closed. Tracked
     # for a future live-binding registry (docs/ROADMAP-backlog.md).
     options = await asyncio.to_thread(
-        _build_specialist_options, cfg, resolution=resolution)
+        _build_specialist_options, cfg, resolution=resolution,
+        output_format=output_format)
     text = ""
     result_msg: ResultMessage | None = None
     token = agent_mod.origin_var.set(child_origin)
     try:
-        async with ClaudeSDKClient(
-            sdk_logging.with_stderr_callback(options, engagement_id=None),
-        ) as client:
-            await client.query(prompt)
-            async for sdk_msg in client.receive_response():
-                if isinstance(sdk_msg, AssistantMessage):
-                    for block in getattr(sdk_msg, "content", []):
-                        if isinstance(block, TextBlock):
-                            text += block.text
-                elif isinstance(sdk_msg, ResultMessage):
-                    # Task 6 (spec §4.6): previously discarded — captured
-                    # below (in `finally`, so it's recorded even when the
-                    # client raises before the loop reaches a ResultMessage).
-                    result_msg = sdk_msg
+        client_options = (
+            options if output_format is not None
+            else sdk_logging.with_stderr_callback(options, engagement_id=None)
+        )
+        sdk_log_guard = (
+            sdk_logging.suppress_structured_voice_sdk_payload_logs()
+            if output_format is not None else nullcontext()
+        )
+        with sdk_log_guard:
+            async with ClaudeSDKClient(client_options) as client:
+                await client.query(prompt)
+                async for sdk_msg in client.receive_response():
+                    if isinstance(sdk_msg, AssistantMessage):
+                        for block in getattr(sdk_msg, "content", []):
+                            if isinstance(block, TextBlock):
+                                text += block.text
+                    elif isinstance(sdk_msg, ResultMessage):
+                        # Task 6 (spec §4.6): previously discarded — captured
+                        # below (in `finally`, so it's recorded even when the
+                        # client raises before the loop reaches a ResultMessage).
+                        result_msg = sdk_msg
     finally:
         agent_mod.origin_var.reset(token)
         # Task 6 (spec §4.6): aggregate cost/usage from the captured
@@ -1285,7 +1318,13 @@ async def _run_delegated_agent(
             _specialist_bg_tasks.add(bg)
             bg.add_done_callback(_specialist_bg_tasks.discard)
 
-    return text
+    return DelegatedOutput(
+        text=text,
+        structured_output=(
+            getattr(result_msg, "structured_output", None)
+            if result_msg is not None else None
+        ),
+    )
 
 
 def _record_launch_safe(agent_name: str) -> None:
@@ -1348,7 +1387,7 @@ def _attach_completion_callback(
             return
         complete: DelegationComplete | None = None
         try:
-            text = t.result()
+            text = t.result().text
             bounded, output_truncated = specialist_limits.truncate_output(text)
             if output_truncated:
                 logger.warning(
@@ -1764,7 +1803,7 @@ def _retrieve_late_task_exception(t: asyncio.Task) -> None:
     if exc is not None:
         logger.warning(
             "voice deadline teardown: specialist task raised after "
-            "cancellation had already been requested: %s", exc,
+            "cancellation had already been requested",
         )
 
 
@@ -1805,7 +1844,8 @@ class DelegationCeilingExceeded(asyncio.TimeoutError):
 
 async def _run_delegated_agent_bounded(
     cfg, task_text: str, context_text: str, resolution=None,
-) -> str:
+    output_format=None,
+) -> DelegatedOutput:
     """Run ``_run_delegated_agent`` under ``_DELEGATION_CEILING_S``.
 
     Transparent wrapper on the happy path (result and exceptions propagate
@@ -1823,7 +1863,8 @@ async def _run_delegated_agent_bounded(
     monkeypatch them."""
     inner = asyncio.create_task(
         _run_delegated_agent(cfg, task_text, context_text,
-                             resolution=resolution))
+                             resolution=resolution,
+                             output_format=output_format))
     ceiling = _DELEGATION_CEILING_S
     if not math.isfinite(ceiling) or ceiling <= 0:
         ceiling = 600.0  # fail closed to the shipped default, never hang
@@ -2176,7 +2217,8 @@ async def delegate_to_agent(args: dict) -> dict:
         # the non-raising wrapper).
         task = asyncio.create_task(
             _run_delegated_agent_bounded(
-                cfg, task_text, context_text, resolution=resolution))
+                cfg, task_text, context_text, resolution=resolution,
+                output_format=(VOICE_JOB_OUTPUT_FORMAT if is_voice else None)))
         if permit is not None:
             task.add_done_callback(_permit_release_callback(permit))
         owned = None  # __TRANSFER_SYNC__
@@ -2241,8 +2283,29 @@ async def delegate_to_agent(args: dict) -> dict:
         if finished.exception() is not None:
             exc = finished.exception()
             kind = _classify_error(exc).value
-            await _specialist_registry.fail_delegation(delegation_id, exc)
             elapsed = time.time() - started_at
+            if is_voice:
+                from job_registry import JobFailure
+                failure = JobFailure(
+                    kind=kind,
+                    message="Specialist could not complete the voice job.",
+                )
+                await _specialist_registry.job_registry.fail_compat(
+                    delegation_id, failure)
+                logger.info(
+                    "Delegation %s → %s failed status=failed kind=%s (%.2fs)",
+                    delegation_id[:8], agent_name, kind, elapsed,
+                )
+                return _result({
+                    "status": "error",
+                    "delegation_id": delegation_id,
+                    "agent": agent_name,
+                    "kind": kind,
+                    "message": failure.message,
+                    "elapsed_s": elapsed,
+                })
+
+            await _specialist_registry.fail_delegation(delegation_id, exc)
             logger.info(
                 "Delegation %s → %s failed: %s (%s)",
                 delegation_id[:8], agent_name, kind, exc,
@@ -2256,16 +2319,61 @@ async def delegate_to_agent(args: dict) -> dict:
                 "elapsed_s": elapsed,
             })
 
-        text = finished.result()
+        delegated_output = finished.result()
+        if is_voice:
+            try:
+                voice_result = parse_voice_job_result(
+                    delegated_output.structured_output)
+            except VoiceJobResultError:
+                from job_registry import JobFailure
+                failure = JobFailure(
+                    kind="invalid_specialist_result",
+                    message="Specialist returned an invalid structured result.",
+                )
+                await _specialist_registry.job_registry.fail_compat(
+                    delegation_id, failure)
+                elapsed = time.time() - started_at
+                logger.warning(
+                    "Delegation %s → %s returned an invalid voice result "
+                    "status=failed (%.2fs)",
+                    delegation_id[:8], agent_name, elapsed,
+                )
+                return _result({
+                    "status": "error",
+                    "delegation_id": delegation_id,
+                    "agent": agent_name,
+                    "kind": failure.kind,
+                    "message": failure.message,
+                    "elapsed_s": elapsed,
+                })
+
+            # The validated structured envelope is durable job data, not Gary
+            # context. Persist it once, then resolve the only text allowed onto
+            # the voice tool wire from sensitivity + server-bound identity.
+            await _specialist_registry.job_registry.finish_voice_result(
+                delegation_id,
+                json.dumps(delegated_output.structured_output),
+                awaiting_input=voice_result.awaiting_input,
+                delivery_ttl_s=voice_result.delivery_ttl_s,
+            )
+            text = spoken_text_for(
+                voice_result,
+                prompted=False,
+                identity_clearance=voice_identity_clearance(origin),
+            )
+        else:
+            text = delegated_output.text
         # Task 6 (spec §4.6): bound the synchronous result + expose the flag on
         # the wire so the narrating resident can disclose a clipped answer.
+        original_text_length = len(text)
         text, output_truncated = specialist_limits.truncate_output(text)
         if output_truncated:
             logger.warning(
                 "delegated agent %s output truncated: %d > %d chars (spec §4.6)",
-                agent_name, len(finished.result()), specialist_limits._MAX_OUTPUT_CHARS,
+                agent_name, original_text_length, specialist_limits._MAX_OUTPUT_CHARS,
             )
-        await _specialist_registry.complete_delegation(delegation_id)
+        if not is_voice:
+            await _specialist_registry.complete_delegation(delegation_id)
         elapsed = time.time() - started_at
         logger.info(
             "Delegation %s → %s ok (%.2fs)",

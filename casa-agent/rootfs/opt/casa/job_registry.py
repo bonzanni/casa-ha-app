@@ -292,6 +292,32 @@ class JobRegistry:
             self._require_live_execution(current, "finish")
             return await self._finish_current_locked(current, result)
 
+    async def finish_voice_result(
+        self,
+        job_id: str,
+        result: str,
+        *,
+        awaiting_input: bool,
+        delivery_ttl_s: int,
+    ) -> VoiceJob:
+        """Atomically persist a validated structured voice-job result."""
+        if not isinstance(awaiting_input, bool):
+            raise ValueError("awaiting_input must be a boolean")
+        if (isinstance(delivery_ttl_s, bool)
+                or not isinstance(delivery_ttl_s, int)
+                or not 30 <= delivery_ttl_s <= 3600):
+            raise ValueError("delivery_ttl_s must be an integer from 30 to 3600")
+
+        async with self._lock:
+            current = self._require_job(job_id)
+            self._require_live_execution(current, "finish_voice_result")
+            return await self._finish_voice_result_current_locked(
+                current,
+                result,
+                awaiting_input=awaiting_input,
+                delivery_ttl_s=delivery_ttl_s,
+            )
+
     async def fail(
         self,
         job_id: str,
@@ -945,6 +971,53 @@ class JobRegistry:
                 expires_at=now + self.RESULT_TTL_SECONDS,
                 result=str(result),
                 failure=None,
+                delivery_state=delivery,
+                delivery_sequence=sequence,
+                delivery_attempt_id=None,
+                lease_until=None,
+                cancel_pending=False,
+            )
+        return await self._persist_job_locked(updated)
+
+    async def _finish_voice_result_current_locked(
+        self,
+        current: VoiceJob,
+        result: str,
+        *,
+        awaiting_input: bool,
+        delivery_ttl_s: int,
+    ) -> VoiceJob:
+        now = self._now()
+        if current.cancel_pending:
+            updated = replace(
+                current,
+                execution_state=ExecutionState.CANCELLED,
+                terminal_at=now,
+                expires_at=now + self.RESULT_TTL_SECONDS,
+                failure=JobFailure("cancelled", "Cancelled by creator"),
+                awaiting_input=False,
+                continuable_until=None,
+                delivery_state=(
+                    DeliveryState.CANCELLED
+                    if current.delivery_state is not DeliveryState.NONE
+                    else DeliveryState.NONE
+                ),
+                delivery_attempt_id=None,
+                lease_until=None,
+                cancel_pending=False,
+            )
+        else:
+            expires_at = now + float(delivery_ttl_s)
+            delivery, sequence = self._terminal_delivery(current)
+            updated = replace(
+                current,
+                execution_state=ExecutionState.SUCCEEDED,
+                terminal_at=now,
+                expires_at=expires_at,
+                result=str(result),
+                failure=None,
+                awaiting_input=awaiting_input,
+                continuable_until=(expires_at if awaiting_input else None),
                 delivery_state=delivery,
                 delivery_sequence=sequence,
                 delivery_attempt_id=None,

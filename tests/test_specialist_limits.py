@@ -306,8 +306,8 @@ class TestRunDelegatedAgentTelemetry:
         )
         monkeypatch.setattr(tm, "ClaudeSDKClient", _FakeSpecialistClient)
         cfg = _specialist_cfg("finance")
-        text = await tm._run_delegated_agent(cfg, "do x", "", resolution=None)
-        assert text == "ok"
+        output = await tm._run_delegated_agent(cfg, "do x", "", resolution=None)
+        assert output.text == "ok"
 
         snap = telem.snapshot("finance")
         assert snap.delegations == 0  # counting is the caller's job
@@ -342,7 +342,7 @@ class TestRunDelegatedAgentTelemetry:
         assert snap.total_cost_usd == pytest.approx(0.05)
 
     async def test_sync_output_truncated_wire_flag(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, caplog,
     ):
         """The output cap is enforced at the caller and the truncation is
         exposed as a WIRE-LEVEL `output_truncated` flag on the sync result
@@ -366,6 +366,7 @@ class TestRunDelegatedAgentTelemetry:
         assert payload["status"] == "ok"
         assert payload["output_truncated"] is True
         assert len(payload["text"]) == 10
+        assert "50 > 10 chars" in caplog.text
 
     async def test_sync_output_not_truncated_flag_false(
         self, tmp_path, monkeypatch,
@@ -492,9 +493,11 @@ class TestConcurrencyWiring:
         limiter = SpecialistLimiter(max_global=1)
         tm, reg, bus = _init_tools(tmp_path, limiter=limiter)
 
-        async def _slow(cfg, task_text, context_text, resolution=None):
+        async def _slow(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
             await asyncio.sleep(10)  # cooperatively cancellable
-            return "too late"
+            return tm.DelegatedOutput(text="too late")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _slow)
 

@@ -135,6 +135,71 @@ async def test_multiple_terminal_jobs_survive_reload_in_delivery_order(tmp_path)
     )
 
 
+async def test_finish_voice_result_persists_clarification_contract_and_ttl(
+    tmp_path,
+):
+    registry = await loaded_registry(tmp_path, make_job(), now=200.0)
+    envelope = json.dumps({
+        "status": "needs_clarification",
+        "spoken_summary": "Which card do you mean?",
+        "clarification": "Which card do you mean?",
+        "delivery_ttl_s": 600,
+    })
+
+    finished = await registry.finish_voice_result(
+        "job-1", envelope, awaiting_input=True, delivery_ttl_s=600,
+    )
+
+    assert finished.execution_state is ExecutionState.SUCCEEDED
+    assert finished.delivery_state is DeliveryState.READY
+    assert finished.result == envelope
+    assert finished.awaiting_input is True
+    assert finished.terminal_at == 200.0
+    assert finished.expires_at == 800.0
+    assert finished.continuable_until == 800.0
+
+    reloaded = JobRegistry(
+        tmp_path / "jobs.json", tmp_path / "delegations.json",
+        clock=lambda: 200.0,
+    )
+    await reloaded.load()
+    assert reloaded.get("job-1") == finished
+
+
+async def test_finish_voice_result_answer_has_ttl_without_continuation(tmp_path):
+    registry = await loaded_registry(tmp_path, make_job(), now=300.0)
+    finished = await registry.finish_voice_result(
+        "job-1", '{"status":"answered"}',
+        awaiting_input=False, delivery_ttl_s=900,
+    )
+    assert finished.expires_at == 1200.0
+    assert finished.awaiting_input is False
+    assert finished.continuable_until is None
+
+
+@pytest.mark.parametrize("ttl", [True, 29, 3601])
+async def test_finish_voice_result_rejects_invalid_ttl_without_mutation(
+    tmp_path, ttl,
+):
+    registry = await loaded_registry(tmp_path, make_job(), now=300.0)
+    with pytest.raises(ValueError, match="delivery_ttl_s"):
+        await registry.finish_voice_result(
+            "job-1", "{}", awaiting_input=False, delivery_ttl_s=ttl,
+        )
+    assert registry.get("job-1") == make_job()
+
+
+async def test_finish_voice_result_rejects_non_boolean_awaiting_without_mutation(
+    tmp_path,
+):
+    registry = await loaded_registry(tmp_path, make_job(), now=300.0)
+    with pytest.raises(ValueError, match="awaiting_input"):
+        await registry.finish_voice_result(
+            "job-1", "{}", awaiting_input="yes", delivery_ttl_s=900,
+        )
+    assert registry.get("job-1") == make_job()
+
+
 async def test_cancel_after_replace_waits_for_memory_publication_under_lock(
     tmp_path, monkeypatch,
 ):
