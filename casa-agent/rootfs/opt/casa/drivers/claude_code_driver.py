@@ -2017,6 +2017,18 @@ class ClaudeCodeDriver(DriverProtocol):
         text = f"{display}{suffix}"
         cur_mid = q.get("tg_message_id")
         current_confirmed = await self._confirm_settle_mid(rec, cur_mid, text, n)
+        # A8 · Q1-settle observability: one INFO line per CONFIRMED settle (a real
+        # keyboard-clearing edit landed). The outcome mirrors the settle copy.
+        if current_confirmed and cur_mid is not None:
+            if override_suffix == _OPEN_Q_CANCELLED_SUFFIX:
+                _outcome = "cancelled"
+            elif answered_suffix:
+                _outcome = "answered"
+            else:
+                _outcome = "expired"
+            logger.info(
+                "ask settle CONFIRMED (eng=%s q=%s mid=%s outcome=%s)",
+                rec.id[:8], n if n is not None else "-", cur_mid, _outcome)
         # Every staged stale copy is settled with the same confirmed-gate; a
         # confirmed one is un-staged, an unconfirmed one keeps the entry present.
         remaining_stale: list[int] = []

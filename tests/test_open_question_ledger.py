@@ -443,3 +443,63 @@ class TestSingleCrashResidual:
         assert reg2.open_question_entries(eid) == []
         # The spool is UNTOUCHED — the envelope remains deliverable.
         assert spool.read_bytes() == spool_before
+
+
+# ---------------------------------------------------------------------------
+# 9. A8 · Q1-settle observability — one INFO line per CONFIRMED settle
+# ---------------------------------------------------------------------------
+
+
+class TestSettleObservability:
+    async def test_anchor_answer_logs_confirmed_answered(self, tmp_path, caplog):
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_q(reg, rec, kind="anchor", mid=8001, text="Q1: A?")
+
+        async def _edit(topic_id, mid, text, *, clear_keyboard=False):
+            return True
+
+        drv = _make_driver(tmp_path, reg, edit_topic_message=_edit)
+        drv._sleep = AsyncMock()
+
+        with caplog.at_level("INFO"):
+            await drv._settle_open_anchor(rec, operator_msg_id=42)
+
+        line = next(m for m in caplog.messages if "ask settle CONFIRMED" in m)
+        assert f"eng={rec.id[:8]}" in line
+        assert f"q={n1}" in line
+        assert "mid=8001" in line
+        assert "outcome=answered" in line
+
+    async def test_reconcile_expired_logs_confirmed_expired(self, tmp_path, caplog):
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_q(reg, rec, kind="button", mid=7001, text="Q1: A?")
+
+        async def _edit(topic_id, mid, text, *, clear_keyboard=False):
+            return True
+
+        drv = _make_driver(tmp_path, reg, edit_topic_message=_edit)
+        drv._sleep = AsyncMock()
+
+        with caplog.at_level("INFO"):
+            await drv.reconcile_open_questions(rec)
+
+        line = next(m for m in caplog.messages if "ask settle CONFIRMED" in m)
+        assert f"eng={rec.id[:8]}" in line
+        assert f"q={n1}" in line
+        assert "mid=7001" in line
+        assert "outcome=expired" in line
+
+    async def test_unconfirmed_settle_logs_nothing(self, tmp_path, caplog):
+        reg, rec = await _make_registry(tmp_path)
+        await _add_q(reg, rec, kind="anchor", mid=8001, text="Q1: A?")
+
+        async def _edit(topic_id, mid, text, *, clear_keyboard=False):
+            return False  # never confirmed
+
+        drv = _make_driver(tmp_path, reg, edit_topic_message=_edit)
+        drv._sleep = AsyncMock()
+
+        with caplog.at_level("INFO"):
+            await drv._settle_open_anchor(rec, operator_msg_id=42)
+
+        assert not any("ask settle CONFIRMED" in m for m in caplog.messages)

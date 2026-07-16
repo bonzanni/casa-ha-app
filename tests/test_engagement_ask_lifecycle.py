@@ -698,3 +698,55 @@ async def test_finish_hook_closes_once_when_edit_confirmed_on_retry_two():
     assert ch.attempts == 2
     assert sleeps == [0.5]   # slept once after the first failure, then confirmed
     assert closed["n"] == 1  # ledger closed exactly once
+
+
+# ---------------------------------------------------------------------------
+# A8 · Q1-settle observability — one INFO line per CONFIRMED button settle
+# ---------------------------------------------------------------------------
+
+
+async def test_finish_hook_logs_confirmed_settle(caplog):
+    """A8: a confirmed button-ask settle emits one INFO
+    ``ask settle CONFIRMED (eng=… q=… mid=… outcome=…)`` line, with the outcome
+    derived from the broker outcome dict (answered / no_answer→expired /
+    cancelled+reason→superseded/withdrawn/cancelled)."""
+    from channels.channel_handlers import _ask_keyboard_finish
+
+    async def _sleep(_d):
+        pass
+
+    cases = [
+        ({"outcome": "answered", "option_index": 0}, "answered"),
+        ({"outcome": "no_answer"}, "expired"),
+        ({"outcome": "cancelled", "reason": "superseded_by_text"}, "superseded"),
+        ({"outcome": "cancelled", "reason": "internal_error"}, "withdrawn"),
+        ({"outcome": "cancelled"}, "cancelled"),
+    ]
+    for outcome, expected in cases:
+        ch = _FailEditChannel(succeed_on=1)  # confirm on first attempt
+        hook = _ask_keyboard_finish(
+            ch, 42, 101, "Q3: Proceed?\n\n1. A\n2. B", ["A", "B"],
+            sleep=_sleep, eng_id="abcdef1234567890", number=3)
+        with caplog.at_level("INFO"):
+            caplog.clear()
+            await hook(outcome)
+        line = next(m for m in caplog.messages if "ask settle CONFIRMED" in m)
+        assert "eng=abcdef12" in line
+        assert "q=3" in line
+        assert "mid=101" in line
+        assert f"outcome={expected}" in line
+
+
+async def test_finish_hook_unconfirmed_settle_logs_nothing(caplog):
+    from channels.channel_handlers import _ask_keyboard_finish
+
+    async def _sleep(_d):
+        pass
+
+    ch = _FailEditChannel(succeed_on=None)  # never confirms
+    hook = _ask_keyboard_finish(
+        ch, 42, 101, "Q1: Proceed?\n\n1. A\n2. B", ["A", "B"],
+        sleep=_sleep, eng_id="abcdef1234567890", number=1)
+    with caplog.at_level("INFO"):
+        await hook({"outcome": "answered", "option_index": 0})
+    assert not any("ask settle CONFIRMED" in m for m in caplog.messages)

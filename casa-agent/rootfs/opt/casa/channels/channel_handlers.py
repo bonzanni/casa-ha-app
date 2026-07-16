@@ -988,6 +988,7 @@ def _ask_keyboard_finish(
     *, on_settle: "Callable[[], Awaitable[None]] | None" = None,
     sleep: "Callable[[float], Awaitable[None]]" = asyncio.sleep,
     settle_edit: "Callable[[str], Awaitable[bool]] | None" = None,
+    eng_id: str | None = None, number: int | None = None,
 ) -> Callable[[dict], "Awaitable[None]"]:
     """Broker finish-hook (r3-B3 shape, mirrors ``hooks._perm_keyboard_finish``)
     -- the engagement_ask namespace's ONLY keyboard-message writer. Fires
@@ -1034,6 +1035,24 @@ def _ask_keyboard_finish(
                 topic_id, message_id,
             )
             return
+        # A8 · Q1-settle observability: one INFO line per CONFIRMED settle (the
+        # keyboard cleared on screen). Outcome mirrors the settle copy chosen by
+        # ``_ask_settle_text`` — answered / no_answer→expired / cancelled (with
+        # superseded + internal-error→withdrawn sub-reasons).
+        _o = outcome.get("outcome")
+        if _o == "answered":
+            _outcome = "answered"
+        elif _o == "cancelled":
+            _outcome = {
+                "superseded_by_text": "superseded",
+                "internal_error": "withdrawn",
+            }.get(outcome.get("reason"), "cancelled")
+        else:
+            _outcome = "expired"
+        logger.info(
+            "ask settle CONFIRMED (eng=%s q=%s mid=%s outcome=%s)",
+            eng_id[:8] if eng_id else "-",
+            number if number is not None else "-", message_id, _outcome)
         if on_settle is not None:
             try:
                 await on_settle()
@@ -1685,7 +1704,8 @@ def _make_ask(
                     lambda mid: _ask_keyboard_finish(
                         telegram_channel, rec.topic_id, mid, display, options,
                         on_settle=_close_question,
-                        settle_edit=_make_settle_edit(mid)),
+                        settle_edit=_make_settle_edit(mid),
+                        eng_id=eng_id, number=number),
                 )
                 mid = req.meta.get("message_id")
                 if not isinstance(mid, int):
