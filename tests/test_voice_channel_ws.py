@@ -13,6 +13,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from bus import BusMessage, MessageBus, MessageType
 from channels.voice.channel import VoiceChannel
+from error_kinds import VoiceToolLoopError
 
 pytestmark = pytest.mark.unit
 
@@ -35,7 +36,12 @@ class _FakeCfg:
     class tts: tag_dialect = "square_brackets"
     memory = type("M", (), {"token_budget": 800})()
     role = "butler"
-    voice_errors: dict = {}
+    voice_errors: dict = {
+        "voice_tool_loop": (
+            "[apologetic] I couldn't resolve that cleanly. "
+            "Try naming the device again?"
+        ),
+    }
     channels: list[str] = ["ha_voice"]
 
 
@@ -217,6 +223,43 @@ class TestWSTurn:
             gc.collect()
             assert any("utterance task failed" in r.message for r in caplog.records)
             assert not any("never retrieved" in r.message for r in caplog.records)
+
+    async def test_voice_tool_loop_emits_one_typed_error_without_payload_log(
+        self, ws_app, caplog,
+    ):
+        client, bus, _, _ = ws_app
+        secret = "SECRET_VOICE_TOOL_INPUT_WS"
+
+        async def raise_voice_tool_loop(_msg, timeout=300):
+            raise VoiceToolLoopError("validation_correction_exhausted")
+
+        bus.request = raise_voice_tool_loop
+        with caplog.at_level(logging.DEBUG):
+            async with client.ws_connect("/api/converse/ws") as ws:
+                await ws.send_json({
+                    "type": "utterance",
+                    "utterance_id": "guarded-ws",
+                    "text": secret,
+                    "agent_role": "butler",
+                    "scope_id": "guarded-ws",
+                })
+                frames = [await ws.receive_json(timeout=2.0)]
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(ws.receive_json(), timeout=0.05)
+
+        errors = [frame for frame in frames if frame["type"] == "error"]
+        assert len(errors) == 1
+        assert errors[0] == {
+            "type": "error",
+            "utterance_id": "guarded-ws",
+            "kind": "voice_tool_loop",
+            "spoken": (
+                "[apologetic] I couldn't resolve that cleanly. "
+                "Try naming the device again?"
+            ),
+        }
+        assert not any(frame["type"] == "done" for frame in frames)
+        assert secret not in caplog.text
 
 
 # ---------------------------------------------------------------------------

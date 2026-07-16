@@ -33,5 +33,6 @@ voice_errors:
   sdk_error:     "[apologetic] I couldn't reach my brain. Try again?"
   memory_error:  ""
   channel_error: "[flat] Something went wrong sending that."
+  voice_tool_loop: "[apologetic] I couldn't resolve that cleanly. Try naming the device again?"
   unknown:       "[flat] Sorry, something went wrong."
 cwd: ""

@@ -60,6 +60,7 @@ from tokens import (
     format_turn_summary,
 )
 from error_kinds import ErrorKind, _classify_error, _USER_MESSAGES  # noqa: F401 — re-exported
+from voice_turn_guard import VoiceTurnGuard
 
 logger = logging.getLogger(__name__)
 
@@ -602,7 +603,15 @@ class Agent:
             last_resume: dict[str, str | None] = {"sid": None}
 
             async def _attempt_pooled_turn():
-                on_message, state = self._make_on_message(on_token)
+                turn_guard = (
+                    VoiceTurnGuard.ha_direct()
+                    if msg.channel == "voice"
+                    and self.config.tools.voice_guard == "ha_direct"
+                    else None
+                )
+                on_message, state = self._make_on_message(
+                    on_token, turn_guard,
+                )
 
                 async def _build(is_fresh, resume_sid):
                     # Recorded HERE too (not just via on_decision below) so a
@@ -644,6 +653,12 @@ class Agent:
             async def _attempt_bypass_turn():
                 # Per-turn path (today's semantics): decision here, one-shot
                 # ManagedSdkClient reusing the same turn body.
+                turn_guard = (
+                    VoiceTurnGuard.ha_direct()
+                    if msg.channel == "voice"
+                    and self.config.tools.voice_guard == "ha_direct"
+                    else None
+                )
                 existing = self._session_registry.get(channel_key)
                 decision, save_old = _resume_decision(
                     msg.channel, existing, datetime.now(timezone.utc),
@@ -675,7 +690,9 @@ class Agent:
                     options, origin_ctxvar=origin_var,
                     cid_ctxvar=cid_var, engagement_ctxvar=self._engagement_var,
                 )
-                on_message, state = self._make_on_message(on_token)
+                on_message, state = self._make_on_message(
+                    on_token, turn_guard,
+                )
                 try:
                     await client.open()
                     async with client.lock:
@@ -943,7 +960,11 @@ class Agent:
         )
         return sdk_logging.with_stderr_callback(options, engagement_id=None)
 
-    def _make_on_message(self, on_token: OnTokenCallback | None):
+    def _make_on_message(
+        self,
+        on_token: OnTokenCallback | None,
+        turn_guard: VoiceTurnGuard | None = None,
+    ):
         """Build the per-turn ``on_message(sdk_msg)`` handler + its ``state``.
 
         Reproduces today's per-message body VERBATIM (Phase 4b sdk_logging
@@ -1009,6 +1030,9 @@ class Agent:
                         exc_info=True,
                     )
                 return
+
+            if turn_guard is not None:
+                turn_guard.observe(sdk_msg)
 
             # Phase 4b dispatch — wrapped so a malformed block cannot abort the
             # turn (logged + continued).
