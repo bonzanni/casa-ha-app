@@ -265,6 +265,10 @@ class SdkClientPool:
         self._monotonic = monotonic
         self._wall_now = wall_now or (lambda: datetime.now(timezone.utc))
         self._entries: dict[str, ManagedSdkClient] = {}
+        self._invalidation_barriers: dict[
+            str, asyncio.Future[None]
+        ] = {}
+        self._invalidation_groups: set[asyncio.Future[Any]] = set()
         self._pool_lock = asyncio.Lock()
         self._closing = False
         self._sweeper: asyncio.Task | None = None
@@ -373,19 +377,45 @@ class SdkClientPool:
         raise PoolUnavailable("entry unstable after retry")
 
     async def _entry_stub(self, channel_key: str) -> ManagedSdkClient:
+        while True:
+            async with self._pool_lock:
+                if self._closing:
+                    raise PoolUnavailable("pool closing")
+                barrier = self._invalidation_barriers.get(channel_key)
+                if barrier is None:
+                    entry = self._entries.get(channel_key)
+                    if entry is None:
+                        entry = ManagedSdkClient(
+                            None,
+                            origin_ctxvar=self._origin_ctxvar,
+                            cid_ctxvar=self._cid_ctxvar,
+                            engagement_ctxvar=self._engagement_ctxvar,
+                            make_client=(
+                                self._make_client or _default_make_client
+                            ),
+                            monotonic=self._monotonic,
+                        )
+                        self._entries[channel_key] = entry
+                    return entry
+            # Never hold the global pool lock while an old same-key turn
+            # drains. Other keys remain free to construct/reuse entries. The
+            # Future is shared, so one cancelled waiter must not cancel the
+            # handoff signal for every other waiter.
+            await asyncio.shield(barrier)
+
+    async def _release_invalidation_barrier(
+        self,
+        channel_key: str,
+        barrier: asyncio.Future[None],
+    ) -> None:
+        """Resolve only the invalidation generation that owns ``barrier``."""
+        release = False
         async with self._pool_lock:
-            entry = self._entries.get(channel_key)
-            if entry is None:
-                entry = ManagedSdkClient(
-                    None,
-                    origin_ctxvar=self._origin_ctxvar,
-                    cid_ctxvar=self._cid_ctxvar,
-                    engagement_ctxvar=self._engagement_ctxvar,
-                    make_client=self._make_client or _default_make_client,
-                    monotonic=self._monotonic,
-                )
-                self._entries[channel_key] = entry
-            return entry
+            if self._invalidation_barriers.get(channel_key) is barrier:
+                del self._invalidation_barriers[channel_key]
+                release = True
+        if release and not barrier.done():
+            barrier.set_result(None)
 
     async def _drop(self, channel_key: str, entry: ManagedSdkClient) -> None:
         """Generation-checked invalidate: only removes THIS entry object.
@@ -427,19 +457,54 @@ class SdkClientPool:
                 await entry.aclose()
 
     async def invalidate_all(self) -> None:
-        """Drop the current entry generation without shutting down the pool."""
+        """Drop the current entry generation without shutting down the pool.
+
+        A per-key handoff barrier prevents a replacement client from starting
+        while the removed generation still owns its turn lock. The barrier is
+        released as soon as that lock transfers to this invalidation, before
+        transport close, so a slow disconnect stays off the new turn's path.
+        """
         async with self._pool_lock:
-            entries = list(self._entries.values())
+            entries = dict(self._entries)
             self._entries.clear()
+            loop = asyncio.get_running_loop()
+            barriers = {}
+            for key in entries:
+                barrier = loop.create_future()
+                self._invalidation_barriers[key] = barrier
+                barriers[key] = barrier
 
-        async def _close(entry: ManagedSdkClient) -> None:
-            async with entry.lock:
-                await entry.aclose()
+        async def _close(
+            key: str,
+            entry: ManagedSdkClient,
+            barrier: asyncio.Future[None],
+        ) -> None:
+            try:
+                async with entry.lock:
+                    # The prior turn has ended. Allow the replacement to
+                    # connect now; it need not wait for a slow disconnect.
+                    await self._release_invalidation_barrier(key, barrier)
+                    await entry.aclose()
+            finally:
+                # Cancellation/close races must never strand future turns.
+                await asyncio.shield(
+                    self._release_invalidation_barrier(key, barrier)
+                )
 
-        await asyncio.gather(
-            *(_close(entry) for entry in entries),
+        close_group = asyncio.gather(
+            *(
+                _close(key, entry, barriers[key])
+                for key, entry in entries.items()
+            ),
             return_exceptions=True,
         )
+        # Caller cancellation must not cancel the lock-handoff workers: doing
+        # so would either strand the barrier or release it while the old turn
+        # still owns the lock. Keep the shielded group strongly referenced
+        # until every old generation has transferred ownership and closed.
+        self._invalidation_groups.add(close_group)
+        close_group.add_done_callback(self._invalidation_groups.discard)
+        await asyncio.shield(close_group)
 
     async def aclose(self, *, drain_timeout: float = 120.0) -> None:
         self._closing = True
@@ -449,6 +514,15 @@ class SdkClientPool:
         async with self._pool_lock:
             entries = dict(self._entries)
             self._entries.clear()
+            barriers = list(self._invalidation_barriers.values())
+            self._invalidation_barriers.clear()
+            invalidation_groups = tuple(self._invalidation_groups)
+        # Wake same-key waiters only after closing is visible. Their next
+        # _entry_stub loop raises PoolUnavailable instead of constructing a
+        # post-shutdown generation.
+        for barrier in barriers:
+            if not barrier.done():
+                barrier.set_result(None)
         for key, entry in entries.items():
             try:
                 await asyncio.wait_for(entry.lock.acquire(), timeout=drain_timeout)
@@ -459,6 +533,14 @@ class SdkClientPool:
             except (asyncio.TimeoutError, TimeoutError):
                 logger.warning("pool aclose: drain timeout on %s; force close", key)
                 await entry.aclose()
+        if invalidation_groups:
+            # These workers own entries already removed from _entries, so
+            # normal shutdown must drain them too. Shield preserves their
+            # lock-handoff invariant if an outer shutdown timeout cancels us.
+            await asyncio.shield(asyncio.gather(
+                *invalidation_groups,
+                return_exceptions=True,
+            ))
         if self in SdkClientPool._instances:
             SdkClientPool._instances.remove(self)
 
