@@ -419,18 +419,19 @@ _ASK_AWAY_REFUSAL = (
 # LIVE for the engagement. ``{n}`` is filled from the pending question number
 # when known; the number-less variant is used when it cannot be resolved.
 _REPLY_PENDING_NUMBERED = (
-    "you have an open question (Q{n}) — end your turn and wait for the answer"
+    "you have an open question (Q{n}) — end your turn silently and wait for "
+    "the answer"
 )
 _REPLY_PENDING_GENERIC = (
-    "you have an open question — end your turn and wait for the answer"
+    "you have an open question — end your turn silently and wait for the answer"
 )
 _ASK_PENDING_NUMBERED = (
-    "Q{n} is still open — wait for the answer (end your turn) instead of asking "
-    "another question"
+    "Q{n} is still open — wait for the answer (end your turn silently) instead "
+    "of asking another question"
 )
 _ASK_PENDING_GENERIC = (
-    "a question is still open — wait for the answer (end your turn) instead of "
-    "asking another question"
+    "a question is still open — wait for the answer (end your turn silently) "
+    "instead of asking another question"
 )
 # A7 · F-ANCHOR (v0.83.0): the refusal returned for an anchor (``options: []``)
 # whose question embeds ≥2 enumerated option lines — the live free-text

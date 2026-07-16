@@ -313,6 +313,9 @@ async def test_warm_reentry_inbound_seal_no_repost(tmp_path):
     _append_current(tmp_path, [_text(" tail")])
     await relay.run()
 
+    # Final-review pin: discriminate the WARM path — a delta-aware cold poll
+    # would pass the wire assertions below identically.
+    assert relay._warm is True
     assert [t for _tp, t in rec.sends] == ["narr body", " tail"]
     assert sum("narr body" in t for _tp, t in rec.sends) == 1
     assert all("narr body" not in text for _tp, _mid, text in rec.edits)
