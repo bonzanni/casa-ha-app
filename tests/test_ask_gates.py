@@ -677,3 +677,79 @@ class TestPostAddGenRecheck:
         assert drv._effective_open_question_numbers(eid) == []
         # A settle edit ran over the anchor.
         assert wired["chan"].edits, "no settle edit for the gen-bumped anchor"
+
+
+# ===========================================================================
+# A7 · F-ANCHOR — embedded-options anchor refusal (Task 12)
+# ===========================================================================
+
+
+class TestEmbeddedOptionsAnchor:
+    async def test_spaced_embedded_lines_refused(self, wired):
+        """The LIVE ``A — opt`` free-text form: ≥2 enumerated lines in an anchor
+        question → embedded_options with the spec copy, no post, no broker."""
+        eid = wired["rec"].id
+        q = "Which stack?\nA — Python MCP + MCPB\nB — Rust bridge"
+        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, "e1", question=q)))
+        body = _body(resp)
+        assert body["ok"] is False
+        assert body["error"] == "embedded_options"
+        assert "multiple-choice" in body["message"]
+        # No wire post, no broker request, no ingress marker held.
+        assert wired["chan"].anchors == []
+        assert wired["broker"].pending(namespace="engagement_ask", scope=eid) == []
+        assert wired["drv"].ask_inflight(eid) is None
+
+    async def test_digit_embedded_lines_refused(self, wired):
+        eid = wired["rec"].id
+        q = "Pick:\n1. one\n2. two"
+        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, "e2", question=q)))
+        assert _body(resp)["error"] == "embedded_options"
+
+    async def test_embedded_refusal_records_intent_and_retry_short_circuits(
+        self, wired,
+    ):
+        """The refusal records the intent OUTCOME so a same-request_id transport
+        retry reattaches and short-circuits to the SAME embedded_options."""
+        eid, drv = wired["rec"].id, wired["drv"]
+        q = "Which?\nA — Python MCP\nB — Rust bridge"
+        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, "er", question=q)))
+        assert _body(resp)["error"] == "embedded_options"
+        # Recorded on the intent (byte-identical to the live refusal payload).
+        assert drv.send_intent_outcome(eid, "er") == {
+            "ok": False, "error": "embedded_options",
+            "message": _body(resp)["message"],
+        }
+        # A same-id retry reattaches and returns the recorded outcome verbatim.
+        resp2 = await wired["ask"](_FakeRequest(_anchor_payload(eid, "er", question=q)))
+        assert _body(resp2) == _body(resp)
+        # Still nothing posted.
+        assert wired["chan"].anchors == []
+
+    async def test_one_enumerated_line_allowed(self, wired):
+        """A single enumerated line is below the ≥2 threshold — a normal anchor."""
+        eid = wired["rec"].id
+        q = "Which?\nA — Python MCP\njust prose, no second option"
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "ok1", question=q))))
+        resp = await _drive_anchor(wired, task)
+        assert _body(resp)["ok"] is True
+        assert _body(resp)["outcome"] == "anchored"
+
+    async def test_plain_prose_anchor_allowed(self, wired):
+        eid = wired["rec"].id
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "ok2", question="What DB name do you want?"))))
+        resp = await _drive_anchor(wired, task)
+        assert _body(resp)["ok"] is True
+
+    async def test_button_ask_with_enumerated_question_untouched(self, wired):
+        """A7 is ANCHORS ONLY — a button ask whose QUESTION looks enumerated
+        still posts its keyboard (never refused embedded_options)."""
+        eid = wired["rec"].id
+        q = "Which?\n1. one\n2. two"
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(eid, "b7", question=q))))
+        resp = await _drive_button(wired, task, "b7")
+        assert _body(resp)["outcome"] == "answered"
+        assert len(wired["chan"].keyboards) == 1

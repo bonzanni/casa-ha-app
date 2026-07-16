@@ -220,6 +220,11 @@ async def ask(
     Submit`` row, and the response carries ``options``/``option_indices`` (the
     full selection) alongside the first-selection ``option``/``option_index``.
 
+    A6 · F-LABEL: options are auto-de-enumerated — never pre-number or
+    pre-letter them (``A — …``, ``1. …``); Casa numbers them for you.
+    A7 · F-ANCHOR: an anchor (``options: []``) whose question embeds ≥2
+    numbered/lettered choice lines is refused — pass the choices as ``options``.
+
     Returns the selected label, or outcome=no_answer on timeout. NOT an
     authorization mechanism.
 

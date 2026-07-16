@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 from collections import defaultdict
 from typing import Any, Awaitable, Callable
 
@@ -340,6 +341,16 @@ def _make_permission_verdict(engagement_registry: Any) -> Handler:
 # Telegram callback_data v1|engagement_ask|<rid>|<idx> caps request_id at the
 # same headroom the permission namespace uses (_RID_MAX_LEN in hooks.py); the
 # ask tool's request_id is always a full uuid4().hex (32 chars), well under.
+# v0.83.0 (A6 · F-LABEL / A7 · F-ANCHOR, Sol r1-11): the SINGLE shared
+# enumerator grammar. A6 strips ONE leading enumerator off each option label
+# (``A — ``, ``b) ``, ``1. ``, ``2 · ``); A7 counts anchor-question lines that
+# match it (with non-whitespace content after) to refuse embedded-options
+# anchors. One constant so the two halves can never diverge. The trailing
+# ``\s+`` means a separator-adjacent, space-followed marker matches (``A— x``,
+# ``A — x``) but ``A la carte`` / ``Be right back`` do NOT (no separator char
+# from the class after the leading letter).
+_ENUMERATOR_RE = re.compile(r"^\s*(?:[A-Za-z]|\d{1,2})\s*[—–\-·.):]\s+")
+
 _ASK_MIN_OPTIONS = 2
 _ASK_MAX_OPTIONS = 8
 _ASK_MAX_LABEL_LEN = 48
@@ -420,6 +431,16 @@ _ASK_PENDING_GENERIC = (
     "a question is still open — wait for the answer (end your turn) instead of "
     "asking another question"
 )
+# A7 · F-ANCHOR (v0.83.0): the refusal returned for an anchor (``options: []``)
+# whose question embeds ≥2 enumerated option lines — the live free-text
+# multiple-choice anti-pattern. Consumes no timeout, registers no broker
+# request; records the refusal OUTCOME on the intent so a retry short-circuits.
+_ASK_EMBEDDED_OPTIONS = (
+    "this looks like a multiple-choice question — call ask again passing the "
+    "choices as options (the operator gets buttons), or multi: true if several "
+    "can apply"
+)
+
 # §A3(c): the withdrawn-anchor copy edited over an orphan whose ledger write
 # failed after posting (RAW-wire edit, never edit_discrete — see _post_anchor).
 _ANCHOR_WITHDRAWN = "⚠️ internal error — question withdrawn, please resend"
@@ -606,6 +627,34 @@ def _record_intent_unread_refusal(
         cancel(eng_id, request_id)
 
 
+def _embedded_options_payload() -> dict:
+    """A7 · F-ANCHOR: the canonical ``embedded_options`` refusal body. Shared by
+    the live refusal response AND the intent-refusal outcome recorded for a
+    transport retry so a reattaching retry returns byte-identical JSON."""
+    return {"ok": False, "error": "embedded_options", "message": _ASK_EMBEDDED_OPTIONS}
+
+
+def _record_intent_embedded_refusal(
+    driver: Any, eng_id: str, request_id: str,
+) -> None:
+    """A7 · F-ANCHOR (symmetric with :func:`_record_intent_refusal`): record the
+    ``embedded_options`` refusal OUTCOME on the freshly-created intent instead of
+    a bare cancel. A same-``request_id`` transport retry then hits the reattach
+    path FIRST, reads this recorded outcome, and short-circuits to the SAME
+    refusal — never awaiting the dead intent nor re-registering. Degrades to the
+    bare cancel on a driver predating the seam."""
+    fn = getattr(driver, "record_send_intent_refusal", None)
+    if fn is not None:
+        try:
+            fn(eng_id, request_id, _embedded_options_payload())
+            return
+        except Exception:  # noqa: BLE001 — fall back to the bare tombstone
+            logger.debug("record_send_intent_refusal(embedded) failed", exc_info=True)
+    cancel = getattr(driver, "cancel_send_intent", None)
+    if cancel is not None:
+        cancel(eng_id, request_id)
+
+
 def _record_intent_cancelled(driver: Any, eng_id: str, request_id: str) -> None:
     """B1/B2 (§A3 wave 2): a transport CANCELLATION between arming/registering an
     ask intent and its post TOMBSTONES the intent AND records a terminal
@@ -653,13 +702,15 @@ def _record_intent_cancelled(driver: Any, eng_id: str, request_id: str) -> None:
 def _refused_intent_outcome(prior: Any) -> bool:
     """True iff a reattached intent's recorded outcome is a refusal the retry
     returns verbatim — an operator-away refusal (Finding 1), an unread-inbound
-    refusal (Sol A2 wave-3, Finding 3), OR a CANCELLED tombstone (§A3 wave 2,
-    B1/B2: a transport cancellation between arm/register and post). All are
-    terminal recorded outcomes; the retry returns them as-is rather than
-    awaiting the dead intent or re-registering a fresh broker request."""
+    refusal (Sol A2 wave-3, Finding 3), an ``embedded_options`` anchor refusal
+    (A7 · F-ANCHOR), OR a CANCELLED tombstone (§A3 wave 2, B1/B2: a transport
+    cancellation between arm/register and post). All are terminal recorded
+    outcomes; the retry returns them as-is rather than awaiting the dead intent
+    or re-registering a fresh broker request."""
     return (
         isinstance(prior, dict)
-        and prior.get("error") in ("operator_away", "unread_inbound", "cancelled")
+        and prior.get("error") in (
+            "operator_away", "unread_inbound", "embedded_options", "cancelled")
     )
 
 
@@ -708,6 +759,28 @@ async def _ask_final_response(
     return _ask_outcome_response(outcome, options)
 
 
+def _strip_enumerator(label: str) -> str:
+    """A6 · F-LABEL: strip ONE leading agent-authored enumerator off an option
+    label (or dict ``short``) and re-strip surrounding whitespace, so Casa's own
+    numbering is not double-labelled (``1. A — Python`` → ``1. Python``). ``A la
+    carte`` / ``Be right back`` survive unstripped (no separator char after the
+    leading letter). At most ONE enumerator is removed (anchored ``^``)."""
+    return _ENUMERATOR_RE.sub("", label, count=1).strip()
+
+
+def _count_enumerated_lines(question: str) -> int:
+    """A7 · F-ANCHOR: count lines in an anchor question that match the SHARED
+    enumerator grammar AND carry non-whitespace content after the enumerator
+    (the ``\\S`` requirement — a bare marker line does not count). ≥2 such lines
+    is the embedded-options anti-pattern the ask handler refuses."""
+    n = 0
+    for line in question.splitlines():
+        m = _ENUMERATOR_RE.match(line)
+        if m and line[m.end():].strip():
+            n += 1
+    return n
+
+
 def _validate_ask_args(
     body: dict,
 ) -> tuple[str, list, float, list] | None:
@@ -732,6 +805,16 @@ def _validate_ask_args(
     over the RAW args, so this server-side normalization does not affect relay
     matching. All validation lives here server-side (the channel subprocess
     transmits raw args and lets this gate refuse — r8-1).
+
+    v0.83.0 (A6 · F-LABEL): each FULL label (and dict ``short``) is normalized by
+    stripping ONE leading agent-authored enumerator (``A — ``, ``b) ``, ``1. ``)
+    so Casa's own numbering is not double-labelled — "verbatim" now means
+    "verbatim after enumerator normalization". Normalization runs BEFORE
+    render/meta and AFTER hashing (hash is client-side over the raw args). The
+    uniqueness + non-emptiness checks below run POST-normalization (Sol r6-5,
+    r7-5): raw-unique labels that collide after stripping (``A — Same`` /
+    ``1. Same``), a marker-only option that normalizes empty, and any label /
+    short that is whitespace-only after stripping all refuse ``invalid_args``.
     """
     question = body.get("question")
     if (not isinstance(question, str) or not question
@@ -751,10 +834,12 @@ def _validate_ask_args(
     shorts: list[str | None] = []
     for o in options:
         if isinstance(o, str):
-            # str path UNCHANGED (enumerator/strip normalization is A6/Task 12).
+            # Length cap is enforced on the RAW label; A6 strips the enumerator
+            # AFTER, then the post-normalization non-emptiness check below refuses
+            # a marker-only / whitespace-only label.
             if not o or len(o) > _ASK_MAX_LABEL_LEN:
                 return None
-            labels.append(o)
+            labels.append(_strip_enumerator(o))
             shorts.append(None)
         elif isinstance(o, dict):
             label = o.get("label")
@@ -765,9 +850,20 @@ def _validate_ask_args(
             if (not isinstance(short, str) or not short.strip()
                     or len(short) > _ASK_MAX_SHORT_LEN):
                 return None
-            labels.append(label)
-            shorts.append(short)
+            labels.append(_strip_enumerator(label))
+            shorts.append(_strip_enumerator(short))
         else:
+            return None
+    # A6 POST-normalization re-validation (Sol r6-5 + r7-5): a marker-only or
+    # whitespace-only label / short is refused via ``.strip() != ""`` (bare
+    # truthiness would accept whitespace-only), and uniqueness is re-checked so
+    # raw-unique labels colliding after the strip (``A — Same`` / ``1. Same``)
+    # refuse instead of rendering duplicate choices.
+    for lab in labels:
+        if not lab.strip():
+            return None
+    for s in shorts:
+        if s is not None and not s.strip():
             return None
     if len(set(labels)) != len(labels):
         return None
@@ -1111,6 +1207,20 @@ def _make_ask(
             # wave-3, Finding 3 — NOT a bare cancel) so a retry reattaches to it.
             if driver is not None and driver.inbound_unread_depth(eng_id) > 0:
                 return _refusal_response(record_intent=bool(created_intent))
+
+            # A7 · F-ANCHOR: refuse an anchor whose question EMBEDS ≥2 enumerated
+            # option lines (the live free-text multiple-choice anti-pattern — the
+            # agent should pass the choices as ``options`` so the operator gets
+            # buttons). Placed AFTER reattach/away/unread and BEFORE the ingress
+            # reservation — the refusal consumes no timeout, registers no broker
+            # request, and records the refusal OUTCOME on a freshly-created intent
+            # so a same-request_id retry reattaches above and short-circuits to
+            # the SAME ``embedded_options``. Heuristic is deliberately narrow
+            # (two-plus enumerated lines); plain prose anchors pass untouched.
+            if _count_enumerated_lines(question) >= 2:
+                if created_intent:
+                    _record_intent_embedded_refusal(driver, eng_id, request_id)
+                return web.json_response(_embedded_options_payload())
 
             # §A3(c) INGRESS RESERVATION (Sol r2-8/r3-6): under the ask-
             # maintenance lock, atomically CHECK the live-pending predicate and
