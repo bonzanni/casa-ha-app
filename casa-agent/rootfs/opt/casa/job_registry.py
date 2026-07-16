@@ -1,0 +1,1015 @@
+"""Durable specialist voice-job state machine.
+
+The registry is the single owner of execution and voice-delivery lifecycle
+state.  Runtime-only task, cooperative-cancellation, and concurrency-permit
+objects are deliberately kept out of the JSON snapshot.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, replace
+from enum import StrEnum
+from typing import Any, Callable, Mapping
+
+from atomic_io import atomic_write_json
+
+
+logger = logging.getLogger(__name__)
+
+
+class ExecutionState(StrEnum):
+    ACCEPTED = "ACCEPTED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    ORPHANED = "ORPHANED"
+
+
+class DeliveryState(StrEnum):
+    NONE = "NONE"
+    READY = "READY"
+    CLAIMED = "CLAIMED"
+    AUTHORIZED = "AUTHORIZED"
+    PLAYING = "PLAYING"
+    DELIVERED = "DELIVERED"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+
+
+@dataclass(frozen=True)
+class JobFailure:
+    """Stable failure envelope safe to persist and deliver after restart."""
+
+    kind: str
+    message: str
+
+
+@dataclass(frozen=True)
+class VoiceJob:
+    """One durable delegated job and its delivery compare-and-set state."""
+
+    id: str
+    parent_job_id: str | None
+    creating_role: str
+    specialist_role: str
+    specialist_display_name: str
+    creator_peer: str
+    creator_user_id: str | None
+    scope_id: str
+    origin_route_id: str | None
+    origin_device_id: str | None
+    task: str
+    context: str
+    created_at: float
+    started_at: float | None
+    terminal_at: float | None
+    expires_at: float | None
+    execution_state: ExecutionState
+    delivery_state: DeliveryState
+    result: str | None
+    failure: JobFailure | None
+    awaiting_input: bool
+    continuable_until: float | None
+    delivery_sequence: int
+    delivery_attempt_id: str | None
+    lease_until: float | None
+    cancel_pending: bool
+
+
+@dataclass(frozen=True)
+class CancelResult:
+    status: str
+
+
+class JobRegistryError(RuntimeError):
+    """Base class for durable job registry failures."""
+
+
+class JobTransitionError(JobRegistryError):
+    """A compare-and-set transition did not match the persisted state."""
+
+
+class JobAuthorizationError(JobRegistryError):
+    """The cancellation actor does not own the job's creation scope."""
+
+
+class JobRegistry:
+    """Crash-safe registry for delegated execution and voice delivery.
+
+    A mutation is published to memory only after the complete candidate
+    snapshot has been atomically replaced on disk while ``_lock`` is held.
+    """
+
+    LEASE_SECONDS = 15.0
+    RESULT_TTL_SECONDS = 24 * 60 * 60.0
+    CANCEL_GRACE_SECONDS = 2.0
+
+    _TERMINAL_EXECUTION = frozenset({
+        ExecutionState.SUCCEEDED,
+        ExecutionState.FAILED,
+        ExecutionState.CANCELLED,
+        ExecutionState.ORPHANED,
+    })
+    _LEASED_DELIVERY = frozenset({
+        DeliveryState.CLAIMED,
+        DeliveryState.AUTHORIZED,
+        DeliveryState.PLAYING,
+    })
+
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        legacy_tombstone_path: str | os.PathLike[str],
+        *,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._path = os.fspath(path)
+        self._legacy_tombstone_path = os.fspath(legacy_tombstone_path)
+        self._clock = clock
+        self._jobs: dict[str, VoiceJob] = {}
+        self._delivery_sequence = 0
+        self._lock = asyncio.Lock()
+        self._loaded = False
+
+        # Process-local ownership.  None of these values is JSON-serializable
+        # or meaningful after a restart.
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._cancel_events: dict[str, asyncio.Event] = {}
+        self._permits: dict[str, Any] = {}
+        self._cancel_timers: dict[str, asyncio.Task] = {}
+
+        # IDs migrated from the old tombstone during this process's first
+        # load.  recover_after_restart consumes this list for Telegram's
+        # compatibility notification path; it is never a second lifecycle.
+        self._migrated_on_load: list[str] = []
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    async def load(self) -> None:
+        """Load the durable snapshot, migrating legacy tombstones once."""
+        async with self._lock:
+            if self._loaded:
+                return
+
+            snapshot_exists = os.path.exists(self._path)
+            if snapshot_exists:
+                raw = await asyncio.to_thread(self._read_json, self._path)
+                jobs = self._decode_snapshot(raw)
+            else:
+                jobs = {}
+
+            migrated: dict[str, VoiceJob] = {}
+            migrated_ids: list[str] = []
+            legacy_exists = os.path.exists(self._legacy_tombstone_path)
+            if legacy_exists:
+                migrated, migrated_ids = await asyncio.to_thread(
+                    self._read_legacy_jobs,
+                    max((job.delivery_sequence for job in jobs.values()), default=0),
+                    jobs,
+                )
+                jobs.update(migrated)
+
+            if not snapshot_exists or migrated:
+                # Persist converted rows after any existing jobs and before
+                # touching the legacy file. A failed write therefore cannot
+                # lose the only restart-recovery copy.
+                await self._write_snapshot_locked(jobs)
+            if legacy_exists:
+                await asyncio.to_thread(
+                    atomic_write_json,
+                    self._legacy_tombstone_path,
+                    [],
+                    indent=2,
+                )
+
+            self._jobs = jobs
+            self._delivery_sequence = max(
+                (job.delivery_sequence for job in jobs.values()), default=0,
+            )
+            self._migrated_on_load = migrated_ids
+            self._loaded = True
+
+    def get(self, job_id: str) -> VoiceJob | None:
+        return self._jobs.get(job_id)
+
+    def all(self) -> list[VoiceJob]:
+        """Return a stable delivery-order snapshot."""
+        return sorted(
+            self._jobs.values(),
+            key=lambda job: (job.delivery_sequence, job.created_at, job.id),
+        )
+
+    async def create(self, job: VoiceJob) -> VoiceJob:
+        async with self._lock:
+            self._require_loaded()
+            if not job.id:
+                raise ValueError("job id must not be empty")
+            if job.id in self._jobs:
+                raise JobTransitionError(f"job {job.id!r} already exists")
+            candidate = dict(self._jobs)
+            candidate[job.id] = job
+            await self._write_snapshot_locked(candidate)
+            self._jobs = candidate
+            self._delivery_sequence = max(
+                self._delivery_sequence, job.delivery_sequence,
+            )
+            return job
+
+    async def bind_task(
+        self,
+        job_id: str,
+        task: asyncio.Task,
+        permit: Any = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> asyncio.Event:
+        """Transition ACCEPTED→RUNNING and bind runtime task ownership.
+
+        The installed done callback is the sole release authority for the
+        bound permit.  Terminal record transitions intentionally never touch
+        it because cancellation can be persisted before the task has actually
+        finished unwinding.
+        """
+        async with self._lock:
+            self._require_loaded()
+            current = self._require_job(job_id)
+            if current.execution_state is not ExecutionState.ACCEPTED:
+                raise self._transition_error(
+                    current, "bind_task", expected="execution=ACCEPTED",
+                )
+            if job_id in self._tasks:
+                raise JobTransitionError(f"job {job_id!r} already has a task")
+            updated = replace(
+                current,
+                execution_state=ExecutionState.RUNNING,
+                started_at=(current.started_at
+                            if current.started_at is not None else self._now()),
+            )
+            candidate = self._with_job(updated)
+            await self._write_snapshot_locked(candidate)
+            self._jobs = candidate
+
+            event = cancel_event or asyncio.Event()
+            self._tasks[job_id] = task
+            self._cancel_events[job_id] = event
+            if permit is not None:
+                self._permits[job_id] = permit
+            task.add_done_callback(
+                lambda done, jid=job_id: self._task_done(jid, done),
+            )
+            return event
+
+    async def finish(self, job_id: str, result: str) -> VoiceJob:
+        """Persist a successful terminal execution and queue voice delivery."""
+        async with self._lock:
+            current = self._require_job(job_id)
+            self._require_live_execution(current, "finish")
+            now = self._now()
+            if current.cancel_pending:
+                updated = replace(
+                    current,
+                    execution_state=ExecutionState.CANCELLED,
+                    terminal_at=now,
+                    expires_at=now + self.RESULT_TTL_SECONDS,
+                    failure=JobFailure("cancelled", "Cancelled by creator"),
+                    delivery_state=(
+                        DeliveryState.CANCELLED
+                        if current.delivery_state is not DeliveryState.NONE
+                        else DeliveryState.NONE
+                    ),
+                    delivery_attempt_id=None,
+                    lease_until=None,
+                    cancel_pending=False,
+                )
+            else:
+                delivery, sequence = self._terminal_delivery(current)
+                updated = replace(
+                    current,
+                    execution_state=ExecutionState.SUCCEEDED,
+                    terminal_at=now,
+                    expires_at=now + self.RESULT_TTL_SECONDS,
+                    result=str(result),
+                    failure=None,
+                    delivery_state=delivery,
+                    delivery_sequence=sequence,
+                    delivery_attempt_id=None,
+                    lease_until=None,
+                    cancel_pending=False,
+                )
+            return await self._persist_job_locked(updated)
+
+    async def fail(
+        self,
+        job_id: str,
+        failure: JobFailure | BaseException,
+    ) -> VoiceJob:
+        """Persist a failed/cancelled terminal execution."""
+        async with self._lock:
+            current = self._require_job(job_id)
+            self._require_live_execution(current, "fail")
+            now = self._now()
+            envelope = self._failure_envelope(failure)
+            cancelled = (
+                isinstance(failure, asyncio.CancelledError)
+                or envelope.kind == "cancelled"
+            )
+            if cancelled or current.cancel_pending:
+                state = ExecutionState.CANCELLED
+                delivery = (
+                    DeliveryState.CANCELLED
+                    if current.delivery_state is not DeliveryState.NONE
+                    else DeliveryState.NONE
+                )
+                sequence = current.delivery_sequence
+            else:
+                state = ExecutionState.FAILED
+                delivery, sequence = self._terminal_delivery(current)
+            updated = replace(
+                current,
+                execution_state=state,
+                terminal_at=now,
+                expires_at=now + self.RESULT_TTL_SECONDS,
+                failure=envelope,
+                delivery_state=delivery,
+                delivery_sequence=sequence,
+                delivery_attempt_id=None,
+                lease_until=None,
+                cancel_pending=False,
+            )
+            return await self._persist_job_locked(updated)
+
+    async def request_cancel(self, job_id: str, *, actor: Any) -> CancelResult:
+        """Authorize creator cancellation without racing playback start."""
+        event: asyncio.Event | None = None
+        task: asyncio.Task | None = None
+        async with self._lock:
+            current = self._require_job(job_id)
+            self._authorize_actor(current, actor)
+
+            if current.delivery_state in {
+                DeliveryState.PLAYING, DeliveryState.DELIVERED,
+            }:
+                return CancelResult("too_late")
+            if current.delivery_state in {
+                DeliveryState.CANCELLED, DeliveryState.EXPIRED,
+            } or current.execution_state is ExecutionState.CANCELLED:
+                return CancelResult("cancelled")
+
+            if current.delivery_state is DeliveryState.AUTHORIZED:
+                updated = replace(current, cancel_pending=True)
+                status = "stopping"
+            elif current.delivery_state in {
+                DeliveryState.READY, DeliveryState.CLAIMED,
+            }:
+                updated = replace(
+                    current,
+                    delivery_state=DeliveryState.CANCELLED,
+                    delivery_attempt_id=None,
+                    lease_until=None,
+                    cancel_pending=False,
+                )
+                status = "cancelled"
+            elif current.execution_state in {
+                ExecutionState.ACCEPTED, ExecutionState.RUNNING,
+            }:
+                updated = replace(current, cancel_pending=True)
+                status = "stopping"
+            else:
+                return CancelResult("too_late")
+
+            await self._persist_job_locked(updated)
+            event = self._cancel_events.get(job_id)
+            task = self._tasks.get(job_id)
+
+        if event is not None:
+            event.set()
+        if task is not None and not task.done():
+            self._arm_force_cancel(job_id, task)
+        return CancelResult(status)
+
+    async def cancel(self, job_id: str) -> VoiceJob | None:
+        """Compatibility terminal transition used by legacy delegation code."""
+        async with self._lock:
+            current = self._jobs.get(job_id)
+            if current is None:
+                return None
+            if current.execution_state in self._TERMINAL_EXECUTION:
+                return current
+            now = self._now()
+            updated = replace(
+                current,
+                execution_state=ExecutionState.CANCELLED,
+                terminal_at=now,
+                expires_at=now + self.RESULT_TTL_SECONDS,
+                failure=JobFailure("cancelled", "Delegation cancelled"),
+                delivery_state=(
+                    DeliveryState.CANCELLED
+                    if current.delivery_state is not DeliveryState.NONE
+                    else DeliveryState.NONE
+                ),
+                delivery_attempt_id=None,
+                lease_until=None,
+                cancel_pending=False,
+            )
+            return await self._persist_job_locked(updated)
+
+    async def claim(self, job_id: str, delivery_attempt_id: str) -> VoiceJob:
+        if not delivery_attempt_id:
+            raise ValueError("delivery_attempt_id must not be empty")
+        async with self._lock:
+            current = self._require_delivery_cas(
+                job_id, "claim", DeliveryState.READY, attempt_id=None,
+            )
+            updated = replace(
+                current,
+                delivery_state=DeliveryState.CLAIMED,
+                delivery_attempt_id=delivery_attempt_id,
+                lease_until=self._now() + self.LEASE_SECONDS,
+            )
+            return await self._persist_job_locked(updated)
+
+    async def renew(self, job_id: str, delivery_attempt_id: str) -> VoiceJob:
+        async with self._lock:
+            current = self._require_job(job_id)
+            if (current.delivery_state not in self._LEASED_DELIVERY
+                    or current.delivery_attempt_id != delivery_attempt_id):
+                raise self._transition_error(
+                    current, "renew",
+                    expected="matching attempt in CLAIMED/AUTHORIZED/PLAYING",
+                )
+            updated = replace(
+                current, lease_until=self._now() + self.LEASE_SECONDS,
+            )
+            return await self._persist_job_locked(updated)
+
+    async def authorize(self, job_id: str, delivery_attempt_id: str) -> VoiceJob:
+        async with self._lock:
+            current = self._require_delivery_cas(
+                job_id, "authorize", DeliveryState.CLAIMED,
+                attempt_id=delivery_attempt_id,
+            )
+            updated = replace(current, delivery_state=DeliveryState.AUTHORIZED)
+            return await self._persist_job_locked(updated)
+
+    async def mark_playing(
+        self, job_id: str, delivery_attempt_id: str,
+    ) -> VoiceJob:
+        async with self._lock:
+            current = self._require_delivery_cas(
+                job_id, "mark_playing", DeliveryState.AUTHORIZED,
+                attempt_id=delivery_attempt_id,
+            )
+            if current.cancel_pending:
+                raise self._transition_error(
+                    current,
+                    "mark_playing",
+                    expected="AUTHORIZED without cancel_pending",
+                )
+            updated = replace(current, delivery_state=DeliveryState.PLAYING)
+            return await self._persist_job_locked(updated)
+
+    async def mark_delivered(
+        self, job_id: str, delivery_attempt_id: str,
+    ) -> VoiceJob:
+        async with self._lock:
+            current = self._require_delivery_cas(
+                job_id, "mark_delivered", DeliveryState.PLAYING,
+                attempt_id=delivery_attempt_id,
+            )
+            updated = replace(
+                current,
+                delivery_state=DeliveryState.DELIVERED,
+                delivery_attempt_id=None,
+                lease_until=None,
+                cancel_pending=False,
+            )
+            return await self._persist_job_locked(updated)
+
+    async def nack(
+        self,
+        job_id: str,
+        delivery_attempt_id: str,
+        reason: str,
+    ) -> VoiceJob:
+        async with self._lock:
+            current = self._require_job(job_id)
+            if (current.delivery_state not in {
+                    DeliveryState.CLAIMED, DeliveryState.AUTHORIZED,
+                } or current.delivery_attempt_id != delivery_attempt_id):
+                raise self._transition_error(
+                    current, "nack",
+                    expected="matching attempt in CLAIMED/AUTHORIZED",
+                )
+            cancelled = (
+                current.delivery_state is DeliveryState.AUTHORIZED
+                and current.cancel_pending
+                and reason == "preempted_before_playback"
+            )
+            updated = replace(
+                current,
+                delivery_state=(
+                    DeliveryState.CANCELLED if cancelled else DeliveryState.READY
+                ),
+                delivery_attempt_id=None,
+                lease_until=None,
+                cancel_pending=False,
+            )
+            return await self._persist_job_locked(updated)
+
+    async def expire_due(self) -> list[VoiceJob]:
+        """Apply terminal result/delivery TTL without deleting audit records."""
+        async with self._lock:
+            now = self._now()
+            changed: list[VoiceJob] = []
+            candidate = dict(self._jobs)
+            for job_id, current in self._jobs.items():
+                if current.expires_at is None or current.expires_at > now:
+                    continue
+                if current.delivery_state in {
+                    DeliveryState.DELIVERED,
+                    DeliveryState.CANCELLED,
+                    DeliveryState.EXPIRED,
+                }:
+                    continue
+                updated = replace(
+                    current,
+                    delivery_state=DeliveryState.EXPIRED,
+                    delivery_attempt_id=None,
+                    lease_until=None,
+                    cancel_pending=False,
+                )
+                candidate[job_id] = updated
+                changed.append(updated)
+            if changed:
+                await self._write_snapshot_locked(candidate)
+                self._jobs = candidate
+            return changed
+
+    async def expire_leases(self) -> list[VoiceJob]:
+        """Recover lapsed delivery attempts independently from result TTL."""
+        async with self._lock:
+            now = self._now()
+            changed: list[VoiceJob] = []
+            candidate = dict(self._jobs)
+            for job_id, current in self._jobs.items():
+                if (current.delivery_state not in self._LEASED_DELIVERY
+                        or current.lease_until is None
+                        or current.lease_until > now):
+                    continue
+                cancelled = (
+                    current.delivery_state is DeliveryState.AUTHORIZED
+                    and current.cancel_pending
+                )
+                updated = replace(
+                    current,
+                    delivery_state=(
+                        DeliveryState.CANCELLED
+                        if cancelled else DeliveryState.READY
+                    ),
+                    delivery_attempt_id=None,
+                    lease_until=None,
+                    cancel_pending=False,
+                )
+                candidate[job_id] = updated
+                changed.append(updated)
+            if changed:
+                await self._write_snapshot_locked(candidate)
+                self._jobs = candidate
+            return changed
+
+    async def recover_after_restart(self) -> list[VoiceJob]:
+        """Recover execution and retain delivery attempts for one full lease."""
+        async with self._lock:
+            self._require_loaded()
+            now = self._now()
+            recovered_ids = list(self._migrated_on_load)
+            candidate = dict(self._jobs)
+            changed = False
+            next_sequence = self._delivery_sequence
+
+            for job_id, current in self._jobs.items():
+                updated = current
+                if current.execution_state is ExecutionState.RUNNING:
+                    if current.origin_route_id and current.origin_device_id:
+                        next_sequence += 1
+                        delivery = DeliveryState.READY
+                        sequence = next_sequence
+                    else:
+                        delivery = DeliveryState.NONE
+                        sequence = current.delivery_sequence
+                    updated = replace(
+                        current,
+                        execution_state=ExecutionState.ORPHANED,
+                        terminal_at=now,
+                        expires_at=now + self.RESULT_TTL_SECONDS,
+                        failure=JobFailure(
+                            "restart_orphan", "Lost on restart",
+                        ),
+                        delivery_state=delivery,
+                        delivery_sequence=sequence,
+                        delivery_attempt_id=None,
+                        lease_until=None,
+                        cancel_pending=False,
+                    )
+                    recovered_ids.append(job_id)
+                elif current.delivery_state in self._LEASED_DELIVERY:
+                    # A restarted coordinator must not immediately steal an
+                    # attempt that may still be speaking through the device.
+                    updated = replace(
+                        current, lease_until=now + self.LEASE_SECONDS,
+                    )
+                if updated != current:
+                    candidate[job_id] = updated
+                    changed = True
+
+            if changed:
+                await self._write_snapshot_locked(candidate)
+                self._jobs = candidate
+                self._delivery_sequence = next_sequence
+
+            self._migrated_on_load.clear()
+
+            seen: set[str] = set()
+            return [
+                self._jobs[job_id]
+                for job_id in recovered_ids
+                if job_id in self._jobs and not (job_id in seen or seen.add(job_id))
+            ]
+
+    async def close(self) -> None:
+        """Cancel process-owned resources and wait for task callbacks to run."""
+        timers = list(self._cancel_timers.values())
+        self._cancel_timers.clear()
+        for timer in timers:
+            timer.cancel()
+        if timers:
+            await asyncio.gather(*timers, return_exceptions=True)
+
+        tasks = list(self._tasks.values())
+        for event in self._cancel_events.values():
+            event.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    # -- persistence -----------------------------------------------------
+
+    def _read_json(self, path: str) -> Any:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def _read_legacy_jobs(
+        self,
+        starting_sequence: int,
+        existing: Mapping[str, VoiceJob],
+    ) -> tuple[dict[str, VoiceJob], list[str]]:
+        try:
+            raw = self._read_json(self._legacy_tombstone_path)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.error(
+                "Legacy delegation tombstone corrupt or unreadable (%s): %s",
+                self._legacy_tombstone_path, exc,
+            )
+            return {}, []
+        if not isinstance(raw, list):
+            logger.error(
+                "Legacy delegation tombstone %s is not a JSON array",
+                self._legacy_tombstone_path,
+            )
+            return {}, []
+
+        jobs: dict[str, VoiceJob] = {}
+        migrated_ids: list[str] = []
+        sequence = starting_sequence
+        now = self._now()
+        for row in raw:
+            try:
+                job_id = str(row["id"])
+                agent = str(row["agent"])
+                started_at = float(row.get("started_at", 0.0))
+                origin = dict(row.get("origin") or {})
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("Skipping malformed legacy delegation: %s", exc)
+                continue
+            if job_id in existing or job_id in jobs:
+                prior = existing.get(job_id)
+                if (prior is not None
+                        and prior.execution_state is ExecutionState.ORPHANED
+                        and prior.failure is not None
+                        and prior.failure.kind == "restart_orphan"):
+                    # Handles a crash after jobs.json replace but before legacy
+                    # truncation: do not duplicate the record, but do surface
+                    # the recovered failure during this successful boot.
+                    migrated_ids.append(job_id)
+                else:
+                    logger.warning(
+                        "Skipping legacy delegation with duplicate id %s", job_id,
+                    )
+                continue
+            sequence += 1
+            route_id = origin.get("cid") or origin.get("route_id")
+            device_id = origin.get("device_id") or origin.get("origin_device_id")
+            has_voice_route = bool(route_id and device_id)
+            job = VoiceJob(
+                id=job_id,
+                parent_job_id=None,
+                creating_role=str(origin.get("role") or "assistant"),
+                specialist_role=agent,
+                specialist_display_name=agent,
+                creator_peer=str(origin.get("channel") or ""),
+                creator_user_id=self._optional_str(origin.get("user_id")),
+                scope_id=str(origin.get("chat_id") or origin.get("scope_id") or ""),
+                origin_route_id=self._optional_str(route_id),
+                origin_device_id=self._optional_str(device_id),
+                task=str(origin.get("user_text") or ""),
+                context="",
+                created_at=started_at,
+                started_at=started_at,
+                terminal_at=now,
+                expires_at=now + self.RESULT_TTL_SECONDS,
+                execution_state=ExecutionState.ORPHANED,
+                delivery_state=(
+                    DeliveryState.READY if has_voice_route else DeliveryState.NONE
+                ),
+                result=None,
+                failure=JobFailure("restart_orphan", "Lost on restart"),
+                awaiting_input=False,
+                continuable_until=None,
+                delivery_sequence=sequence,
+                delivery_attempt_id=None,
+                lease_until=None,
+                cancel_pending=False,
+            )
+            jobs[job_id] = job
+            migrated_ids.append(job_id)
+        return jobs, migrated_ids
+
+    def _decode_snapshot(self, raw: Any) -> dict[str, VoiceJob]:
+        if not isinstance(raw, list):
+            raise JobRegistryError(f"job snapshot {self._path!r} is not a JSON array")
+        jobs: dict[str, VoiceJob] = {}
+        for row in raw:
+            job = self._decode_job(row)
+            if job.id in jobs:
+                raise JobRegistryError(f"duplicate job id {job.id!r} in snapshot")
+            jobs[job.id] = job
+        return jobs
+
+    @staticmethod
+    def _decode_job(row: Any) -> VoiceJob:
+        if not isinstance(row, dict):
+            raise JobRegistryError("job snapshot row is not an object")
+        failure_raw = row.get("failure")
+        failure = None
+        if failure_raw is not None:
+            if not isinstance(failure_raw, dict):
+                raise JobRegistryError("job failure is not an object")
+            failure = JobFailure(
+                kind=str(failure_raw["kind"]),
+                message=str(failure_raw["message"]),
+            )
+        try:
+            return VoiceJob(
+                id=str(row["id"]),
+                parent_job_id=JobRegistry._optional_str(row.get("parent_job_id")),
+                creating_role=str(row["creating_role"]),
+                specialist_role=str(row["specialist_role"]),
+                specialist_display_name=str(row["specialist_display_name"]),
+                creator_peer=str(row["creator_peer"]),
+                creator_user_id=JobRegistry._optional_str(row.get("creator_user_id")),
+                scope_id=str(row["scope_id"]),
+                origin_route_id=JobRegistry._optional_str(row.get("origin_route_id")),
+                origin_device_id=JobRegistry._optional_str(row.get("origin_device_id")),
+                task=str(row["task"]),
+                context=str(row["context"]),
+                created_at=float(row["created_at"]),
+                started_at=JobRegistry._optional_float(row.get("started_at")),
+                terminal_at=JobRegistry._optional_float(row.get("terminal_at")),
+                expires_at=JobRegistry._optional_float(row.get("expires_at")),
+                execution_state=ExecutionState(row["execution_state"]),
+                delivery_state=DeliveryState(row["delivery_state"]),
+                result=(None if row.get("result") is None else str(row["result"])),
+                failure=failure,
+                awaiting_input=bool(row["awaiting_input"]),
+                continuable_until=JobRegistry._optional_float(
+                    row.get("continuable_until")),
+                delivery_sequence=int(row["delivery_sequence"]),
+                delivery_attempt_id=JobRegistry._optional_str(
+                    row.get("delivery_attempt_id")),
+                lease_until=JobRegistry._optional_float(row.get("lease_until")),
+                cancel_pending=bool(row["cancel_pending"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise JobRegistryError(f"invalid job snapshot row: {exc}") from exc
+
+    @staticmethod
+    def _encode_job(job: VoiceJob) -> dict[str, Any]:
+        return {
+            "id": job.id,
+            "parent_job_id": job.parent_job_id,
+            "creating_role": job.creating_role,
+            "specialist_role": job.specialist_role,
+            "specialist_display_name": job.specialist_display_name,
+            "creator_peer": job.creator_peer,
+            "creator_user_id": job.creator_user_id,
+            "scope_id": job.scope_id,
+            "origin_route_id": job.origin_route_id,
+            "origin_device_id": job.origin_device_id,
+            "task": job.task,
+            "context": job.context,
+            "created_at": job.created_at,
+            "started_at": job.started_at,
+            "terminal_at": job.terminal_at,
+            "expires_at": job.expires_at,
+            "execution_state": job.execution_state.value,
+            "delivery_state": job.delivery_state.value,
+            "result": job.result,
+            "failure": (
+                None if job.failure is None else {
+                    "kind": job.failure.kind,
+                    "message": job.failure.message,
+                }
+            ),
+            "awaiting_input": job.awaiting_input,
+            "continuable_until": job.continuable_until,
+            "delivery_sequence": job.delivery_sequence,
+            "delivery_attempt_id": job.delivery_attempt_id,
+            "lease_until": job.lease_until,
+            "cancel_pending": job.cancel_pending,
+        }
+
+    async def _write_snapshot_locked(
+        self, jobs: Mapping[str, VoiceJob],
+    ) -> None:
+        snapshot = [
+            self._encode_job(job)
+            for job in sorted(
+                jobs.values(),
+                key=lambda item: (item.delivery_sequence, item.created_at, item.id),
+            )
+        ]
+        await asyncio.to_thread(
+            atomic_write_json, self._path, snapshot, indent=2,
+        )
+
+    # -- transition helpers --------------------------------------------
+
+    async def _persist_job_locked(self, updated: VoiceJob) -> VoiceJob:
+        candidate = self._with_job(updated)
+        await self._write_snapshot_locked(candidate)
+        self._jobs = candidate
+        self._delivery_sequence = max(
+            self._delivery_sequence, updated.delivery_sequence,
+        )
+        return updated
+
+    def _with_job(self, updated: VoiceJob) -> dict[str, VoiceJob]:
+        candidate = dict(self._jobs)
+        candidate[updated.id] = updated
+        return candidate
+
+    def _require_job(self, job_id: str) -> VoiceJob:
+        self._require_loaded()
+        try:
+            return self._jobs[job_id]
+        except KeyError as exc:
+            raise JobTransitionError(f"unknown job {job_id!r}") from exc
+
+    def _require_loaded(self) -> None:
+        if not self._loaded:
+            raise JobRegistryError("JobRegistry.load() must be awaited first")
+
+    def _require_live_execution(self, job: VoiceJob, action: str) -> None:
+        if job.execution_state not in {
+            ExecutionState.ACCEPTED, ExecutionState.RUNNING,
+        }:
+            raise self._transition_error(
+                job, action, expected="execution=ACCEPTED/RUNNING",
+            )
+
+    def _require_delivery_cas(
+        self,
+        job_id: str,
+        action: str,
+        state: DeliveryState,
+        *,
+        attempt_id: str | None,
+    ) -> VoiceJob:
+        current = self._require_job(job_id)
+        if current.delivery_state is not state:
+            raise self._transition_error(
+                current, action, expected=f"delivery={state.value}",
+            )
+        if attempt_id is None:
+            if current.delivery_attempt_id is not None:
+                raise self._transition_error(
+                    current, action, expected="no persisted delivery attempt",
+                )
+        elif current.delivery_attempt_id != attempt_id:
+            raise self._transition_error(
+                current, action, expected=f"attempt={attempt_id!r}",
+            )
+        return current
+
+    @staticmethod
+    def _transition_error(
+        job: VoiceJob, action: str, *, expected: str,
+    ) -> JobTransitionError:
+        return JobTransitionError(
+            f"{action} rejected for {job.id!r}: expected {expected}; "
+            f"found execution={job.execution_state.value}, "
+            f"delivery={job.delivery_state.value}, "
+            f"attempt={job.delivery_attempt_id!r}",
+        )
+
+    def _terminal_delivery(
+        self, job: VoiceJob,
+    ) -> tuple[DeliveryState, int]:
+        if not (job.origin_route_id and job.origin_device_id):
+            return DeliveryState.NONE, job.delivery_sequence
+        return DeliveryState.READY, self._delivery_sequence + 1
+
+    def _task_done(self, job_id: str, task: asyncio.Task) -> None:
+        if self._tasks.get(job_id) is not task:
+            return
+        self._tasks.pop(job_id, None)
+        self._cancel_events.pop(job_id, None)
+        timer = self._cancel_timers.pop(job_id, None)
+        if timer is not None and timer is not asyncio.current_task():
+            timer.cancel()
+        permit = self._permits.pop(job_id, None)
+        if permit is not None:
+            try:
+                permit.release()
+            except Exception:  # noqa: BLE001 — task cleanup must finish
+                logger.warning("job %s permit release failed", job_id, exc_info=True)
+
+    def _arm_force_cancel(self, job_id: str, task: asyncio.Task) -> None:
+        existing = self._cancel_timers.get(job_id)
+        if existing is not None and not existing.done():
+            return
+
+        async def _cancel_after_grace() -> None:
+            await asyncio.sleep(self.CANCEL_GRACE_SECONDS)
+            if not task.done():
+                task.cancel()
+
+        timer = asyncio.create_task(_cancel_after_grace())
+        self._cancel_timers[job_id] = timer
+
+    def _authorize_actor(self, job: VoiceJob, actor: Any) -> None:
+        peer = self._actor_value(actor, "creator_peer", "peer")
+        scope = self._actor_value(actor, "scope_id", "scope")
+        user_id = self._actor_value(actor, "creator_user_id", "user_id")
+        if peer != job.creator_peer or scope != job.scope_id:
+            raise JobAuthorizationError(f"actor does not own job {job.id!r}")
+        if job.creator_user_id is not None and user_id != job.creator_user_id:
+            raise JobAuthorizationError(f"actor does not own job {job.id!r}")
+
+    @staticmethod
+    def _actor_value(actor: Any, primary: str, fallback: str) -> Any:
+        if isinstance(actor, Mapping):
+            return actor.get(primary, actor.get(fallback))
+        return getattr(actor, primary, getattr(actor, fallback, None))
+
+    @staticmethod
+    def _failure_envelope(failure: JobFailure | BaseException) -> JobFailure:
+        if isinstance(failure, JobFailure):
+            return failure
+        if isinstance(failure, asyncio.CancelledError):
+            return JobFailure("cancelled", "Delegation cancelled")
+        kind = type(failure).__name__
+        return JobFailure(kind=kind, message=str(failure))
+
+    def _now(self) -> float:
+        return float(self._clock())
+
+    @staticmethod
+    def _optional_str(value: Any) -> str | None:
+        return None if value is None else str(value)
+
+    @staticmethod
+    def _optional_float(value: Any) -> float | None:
+        return None if value is None else float(value)
+
+
+__all__ = [
+    "CancelResult",
+    "DeliveryState",
+    "ExecutionState",
+    "JobAuthorizationError",
+    "JobFailure",
+    "JobRegistry",
+    "JobRegistryError",
+    "JobTransitionError",
+    "VoiceJob",
+]

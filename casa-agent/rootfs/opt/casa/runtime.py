@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from config import AgentConfig
     from engagement_registry import EngagementRegistry
     from executor_registry import ExecutorRegistry
+    from job_registry import JobRegistry
     from mcp_registry import McpServerRegistry
     from policies import PolicyLibrary
     from semantic_memory import SemanticMemory
@@ -78,3 +79,7 @@ class CasaRuntime:
     # Defaulted, so it MUST stay the LAST field (dataclass rule); test
     # stand-ins that skip it get None → Agent maps None to NoOp.
     semantic_memory: "SemanticMemory | None" = None
+
+    # Durable delegated execution + delivery state. Defaulted for existing
+    # narrow test stand-ins; production always injects the boot-loaded owner.
+    job_registry: "JobRegistry | None" = None
