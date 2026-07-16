@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.83.0] - 2026-07-16
+
+Engagement-topic UX round 3: no more duplicated narration, questions that
+pause politely when you're away, and buttons you can actually read and
+multi-select. No new options; no configuration change required.
+
+### Fixed
+
+- Agent narration is no longer re-posted below a question or after your
+  message — the live-editing duplicate copies are gone (the root cause was
+  the topic relay treating every poll as a crash recovery).
+- An unanswered question no longer re-asks itself in a loop while you're
+  away. When a question expires the engagement now PAUSES (`⏸ paused —
+  waiting for the operator` in the pinned summary) and resumes the moment
+  you reply; a runaway agent that keeps asking anyway is forcibly suspended.
+- A free-text question left behind by output posted after it is re-posted
+  at the bottom of the topic, so the open question is always the last item.
+- Answered questions reliably clear their buttons on screen, and every
+  confirmed settle is now visible in the logs.
+
+### Changed
+
+- Questions with several valid answers can now be MULTI-SELECT: tap to
+  toggle ☐/☑ options, then ✅ Submit.
+- Button labels keep the words that distinguish the options ("Single
+  account…aliases", not "Single account with"), and agents can supply their
+  own short labels for long options.
+- Agents can no longer double-label options ("1. A — …") — leading
+  letters/numbers are stripped and numbered once by Casa — and a
+  multiple-choice question posted as free text is refused with guidance to
+  use buttons.
+- Agents are instructed to ask ONE question, stop, and wait — silently: no
+  more "ending my turn…" narration, no working past their own questions.
+
 ## [0.82.0] - 2026-07-15
 
 Fixes for the three findings of the 2026-07-15 live verification round
