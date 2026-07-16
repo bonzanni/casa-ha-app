@@ -26,6 +26,8 @@ LIVE_CONTEXT_SCHEMA: dict[str, Any] = {
 }
 UNAVAILABLE_TEXT = "Home Assistant is temporarily unavailable."
 
+SurfaceDescriptor = tuple[tuple[str, str, str], ...]
+
 
 class _UpstreamSession(Protocol):
     async def initialize(self) -> Any: ...
@@ -71,8 +73,10 @@ class HomeAssistantFacade:
         self._lock = asyncio.Lock()
         self._stack: AsyncExitStack | None = None
         self._session: _UpstreamSession | None = None
+        self._session_generation = 0
         self._tools: tuple[SdkMcpTool[Any], ...] = ()
         self._server_config: dict[str, Any] | None = None
+        self._surface_descriptor: SurfaceDescriptor = ()
         self._refresh_task: asyncio.Task[None] | None = None
         self._closed = False
 
@@ -103,8 +107,8 @@ class HomeAssistantFacade:
         async with self._lock:
             if self._closed:
                 raise RuntimeError("Home Assistant facade is closed")
-            await self._refresh_locked()
-        if self._on_schema_change is not None:
+            surface_changed = await self._refresh_locked()
+        if surface_changed and self._on_schema_change is not None:
             callback_result = self._on_schema_change()
             if inspect.isawaitable(callback_result):
                 await callback_result
@@ -122,7 +126,7 @@ class HomeAssistantFacade:
             self._closed = True
             await self._close_upstream_locked()
 
-    async def _refresh_locked(self) -> None:
+    async def _refresh_locked(self) -> bool:
         await self._close_upstream_locked()
         stack, session = await self._open_upstream()
         try:
@@ -141,10 +145,15 @@ class HomeAssistantFacade:
             tools=list(proxies),
         )
         config["alwaysLoad"] = True
+        descriptor = _surface_descriptor_for(proxies)
+        surface_changed = descriptor != self._surface_descriptor
         self._stack = stack
         self._session = session
+        self._session_generation += 1
         self._tools = proxies
         self._server_config = config
+        self._surface_descriptor = descriptor
+        return surface_changed
 
     async def _discover_tools(
         self,
@@ -212,6 +221,7 @@ class HomeAssistantFacade:
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
         session = self._session
+        session_generation = self._session_generation
         if session is None:
             self._schedule_refresh()
             return _unavailable_result()
@@ -220,8 +230,12 @@ class HomeAssistantFacade:
         try:
             result = await session.call_tool(name, upstream_arguments)
         except Exception:
-            await self._disconnect_failed(session)
-            self._schedule_refresh()
+            invalidated = await self._disconnect_failed(
+                session,
+                session_generation,
+            )
+            if invalidated:
+                self._schedule_refresh()
             logger.warning(
                 "Home Assistant tool transport failed; detail suppressed",
             )
@@ -231,10 +245,19 @@ class HomeAssistantFacade:
             return payload
         return _filter_live_context(payload, arguments["domain"])
 
-    async def _disconnect_failed(self, failed_session: _UpstreamSession) -> None:
+    async def _disconnect_failed(
+        self,
+        failed_session: _UpstreamSession,
+        failed_generation: int,
+    ) -> bool:
         async with self._lock:
-            if self._session is failed_session:
-                await self._close_upstream_locked()
+            if (
+                self._session is not failed_session
+                or self._session_generation != failed_generation
+            ):
+                return False
+            await self._close_upstream_locked()
+            return True
 
     def _schedule_refresh(self) -> None:
         if self._closed:
@@ -275,6 +298,24 @@ def _schema_for(tool_spec: Any) -> dict[str, Any]:
         raise ValueError("inputSchema properties must be object")
     normalized["properties"] = dict(normalized["properties"])
     return normalized
+
+
+def _surface_descriptor_for(
+    proxies: tuple[SdkMcpTool[Any], ...],
+) -> SurfaceDescriptor:
+    return tuple(
+        (
+            proxy.name,
+            proxy.description,
+            json.dumps(
+                proxy.input_schema,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
+        )
+        for proxy in proxies
+    )
 
 
 def _unavailable_result() -> dict[str, Any]:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 from mcp.types import (
@@ -119,14 +119,40 @@ class CoordinatedFailingSession(FakeHaSession):
         raise ConnectionError("secret-bearing transport detail")
 
 
+class StaggeredFailingSession(FakeHaSession):
+    """Let one old-generation failure arrive after recovery completes."""
+
+    def __init__(self, *, tools: list[Tool]) -> None:
+        super().__init__(tools=tools)
+        self.slow_started = asyncio.Event()
+        self.release_slow = asyncio.Event()
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> CallToolResult:
+        self.calls.append((name, arguments))
+        if arguments["name"] == "slow":
+            self.slow_started.set()
+            await self.release_slow.wait()
+        else:
+            await self.slow_started.wait()
+        raise ConnectionError("secret-bearing staggered detail")
+
+
 class SchemaChangeRecorder:
     def __init__(self) -> None:
         self.count = 0
-        self.changed = asyncio.Event()
 
     async def __call__(self) -> None:
         self.count += 1
-        self.changed.set()
+
+
+async def wait_until(predicate: Callable[[], bool]) -> None:
+    async with asyncio.timeout(1):
+        while not predicate():
+            await asyncio.sleep(0)
 
 
 def make_facade(
@@ -311,6 +337,28 @@ async def test_unparseable_live_context_is_returned_unchanged():
 
 
 @pytest.mark.asyncio
+async def test_parseable_non_object_live_context_is_returned_unchanged():
+    raw = "[]"
+    upstream = FakeHaSession(
+        tools=[live_context_tool()],
+        results={"GetLiveContext": text_result(raw)},
+    )
+    facade = make_facade(upstream)
+
+    await facade.start()
+    try:
+        result = await invoke_sdk_tool(
+            facade.server_config,
+            "GetLiveContext",
+            {"domain": "light"},
+        )
+        assert upstream.calls == [("GetLiveContext", {})]
+        assert result["content"][0]["text"] == raw
+    finally:
+        await facade.aclose()
+
+
+@pytest.mark.asyncio
 async def test_action_proxy_preserves_arguments_exactly():
     upstream = FakeHaSession(
         tools=[action_tool("HassTurnOff")],
@@ -349,8 +397,9 @@ async def test_transport_failure_returns_fixed_error_and_refreshes_once(caplog):
 
     await facade.start()
     try:
+        original_config = facade.server_config
         result = await invoke_sdk_tool(
-            facade.server_config,
+            original_config,
             "HassTurnOn",
             {"name": "private office"},
         )
@@ -361,8 +410,11 @@ async def test_transport_failure_returns_fixed_error_and_refreshes_once(caplog):
             }],
             "is_error": True,
         }
-        await asyncio.wait_for(changed.changed.wait(), timeout=1)
-        assert changed.count == 1
+        await wait_until(
+            lambda: sessions.open_count == 2
+            and facade.server_config is not original_config,
+        )
+        assert changed.count == 0
         assert sessions.open_count == 2
         assert failed.calls == [
             ("HassTurnOn", {"name": "private office"}),
@@ -393,9 +445,11 @@ async def test_concurrent_transport_failures_share_one_reconnect():
             invoke_sdk_tool(original_config, "HassTurnOn", {"name": "two"}),
         )
         assert all(result["is_error"] is True for result in results)
-        await asyncio.wait_for(changed.changed.wait(), timeout=1)
-        await asyncio.sleep(0)
-        assert changed.count == 1
+        await wait_until(
+            lambda: sessions.open_count == 2
+            and facade.server_config is not original_config,
+        )
+        assert changed.count == 0
         assert sessions.open_count == 2
         assert len(failed.calls) == 2
         assert healthy.calls == []
@@ -412,12 +466,96 @@ async def test_new_tool_appears_after_refresh_without_losing_healthy_tools():
             action_tool("HassLightSet"),
         ]),
     )
-    facade = make_facade(sessions)
+    changed = SchemaChangeRecorder()
+    facade = make_facade(sessions, on_schema_change=changed)
 
     await facade.start()
     try:
         await facade.refresh()
         assert facade.tool_names == ("HassTurnOn", "HassLightSet")
         assert sessions.open_count == 2
+        assert changed.count == 1
     finally:
+        await facade.aclose()
+
+
+@pytest.mark.asyncio
+async def test_identical_normalized_surface_does_not_notify_schema_change():
+    initial = Tool(
+        name="HassTurnOn",
+        description="Turn on",
+        inputSchema={},
+    )
+    equivalent = Tool(
+        name="HassTurnOn",
+        description="Turn on",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    sessions = SessionSequence(
+        FakeHaSession(tools=[initial]),
+        FakeHaSession(tools=[equivalent]),
+    )
+    changed = SchemaChangeRecorder()
+    facade = make_facade(sessions, on_schema_change=changed)
+
+    await facade.start()
+    try:
+        original_config = facade.server_config
+        await facade.refresh()
+        assert facade.server_config is not original_config
+        assert changed.count == 0
+    finally:
+        await facade.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stale_generation_failure_does_not_replace_recovered_session():
+    failed = StaggeredFailingSession(
+        tools=[action_tool("HassTurnOn")],
+    )
+    healthy = FakeHaSession(tools=[action_tool("HassTurnOn")])
+    replacement = FakeHaSession(tools=[action_tool("HassTurnOn")])
+    sessions = SessionSequence(failed, healthy, replacement)
+    facade = make_facade(sessions)
+
+    await facade.start()
+    try:
+        original_config = facade.server_config
+        slow_call = asyncio.create_task(
+            invoke_sdk_tool(
+                original_config,
+                "HassTurnOn",
+                {"name": "slow"},
+            ),
+        )
+        await asyncio.wait_for(failed.slow_started.wait(), timeout=1)
+
+        fast_result = await invoke_sdk_tool(
+            original_config,
+            "HassTurnOn",
+            {"name": "fast"},
+        )
+        assert fast_result["is_error"] is True
+        await wait_until(
+            lambda: sessions.open_count == 2
+            and facade.server_config is not original_config,
+        )
+        recovered_config = facade.server_config
+
+        failed.release_slow.set()
+        slow_result = await slow_call
+        assert slow_result["is_error"] is True
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert sessions.open_count == 2
+        await invoke_sdk_tool(
+            recovered_config,
+            "HassTurnOn",
+            {"name": "healthy"},
+        )
+        assert healthy.calls == [("HassTurnOn", {"name": "healthy"})]
+        assert replacement.calls == []
+    finally:
+        failed.release_slow.set()
         await facade.aclose()

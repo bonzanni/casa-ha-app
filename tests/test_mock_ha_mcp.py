@@ -1,6 +1,7 @@
 """Smoke tests for the mock HA MCP server used by test_ha_delegation.sh."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -8,6 +9,9 @@ from unittest.mock import patch
 
 import pytest
 from aiohttp.test_utils import AioHTTPTestCase
+from mcp.types import CallToolRequest, CallToolRequestParams
+
+from ha_mcp_facade import HomeAssistantFacade
 
 pytestmark = pytest.mark.unit
 
@@ -17,6 +21,21 @@ if str(_E2E_ROOT) not in sys.path:
     sys.path.insert(0, str(_E2E_ROOT))
 
 from mock_ha_mcp.server import build_app  # noqa: E402
+
+
+async def invoke_sdk_tool(
+    server_config,
+    name: str,
+    arguments: dict,
+):
+    request = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(name=name, arguments=arguments),
+    )
+    wrapped = await server_config["instance"].request_handlers[CallToolRequest](
+        request,
+    )
+    return wrapped.root
 
 
 class TestMockHaMcp(AioHTTPTestCase):
@@ -90,18 +109,29 @@ class TestMockHaMcp(AioHTTPTestCase):
         calls = await calls_resp.json()
         assert calls == []
 
-    async def test_live_context_records_facade_stripped_arguments(self):
+    @pytest.mark.filterwarnings(
+        "ignore:Use `streamable_http_client` instead.:DeprecationWarning",
+    )
+    async def test_live_context_domain_flows_through_facade_as_empty_arguments(self):
         await self.client.post("/_reset")
+        facade = HomeAssistantFacade(str(self.server.make_url("/")), {})
 
-        response = await self.client.post("/", json={
-            "jsonrpc": "2.0", "id": 5,
-            "method": "tools/call",
-            "params": {"name": "GetLiveContext", "arguments": {}},
-        })
-        assert "result" in await response.json()
+        await facade.start()
+        try:
+            result = await invoke_sdk_tool(
+                facade.server_config,
+                "GetLiveContext",
+                {"domain": "lights"},
+            )
 
-        calls_response = await self.client.get("/_calls")
-        assert await calls_response.json() == [{
-            "name": "GetLiveContext",
-            "arguments": {},
-        }]
+            calls_response = await self.client.get("/_calls")
+            assert await calls_response.json() == [{
+                "name": "GetLiveContext",
+                "arguments": {},
+            }]
+            assert json.loads(result.content[0].text) == {
+                "lights.kitchen": "on",
+                "lights.bedroom": "off",
+            }
+        finally:
+            await facade.aclose()
