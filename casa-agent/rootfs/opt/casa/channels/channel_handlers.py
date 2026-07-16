@@ -656,13 +656,13 @@ def _record_intent_embedded_refusal(
         cancel(eng_id, request_id)
 
 
-async def _record_intent_cancelled(
+def _record_intent_cancelled(
     driver: Any, eng_id: str, request_id: str,
 ) -> bool:
-    """B1/B2 (§A3 wave 2) + A3 · F-ORDER (Sol A3 wave 3): a transport
+    """B1/B2 (§A3 wave 2) + A3 · F-ORDER (Sol A3 wave 3/4): a transport
     CANCELLATION between arming/registering an ask intent and its post TOMBSTONES
-    the intent AND records a terminal ``cancelled`` outcome — but SERIALIZED
-    against an in-flight relay post so "the post wins". Closes:
+    the intent AND records a terminal ``cancelled`` outcome — but "the post wins"
+    when a relay post is already in flight. Closes:
 
     * the armed/pending intent stays MATCHABLE as a tombstone, so the relay
       consume-cancels its block (NOTHING posts) — a marker cleared without this
@@ -674,28 +674,32 @@ async def _record_intent_cancelled(
       budget (anchor hang, B2) nor registering a fresh broker request (button
       timeout burn, B2).
 
-    A3 · F-ORDER: routes through the driver's SERIALIZED
-    ``record_send_intent_cancelled`` seam, which waits on the sequencer writer
-    lock and takes effect ONLY while the intent is still cancellable (not
-    currently being posted / posted / already resolved). Returns ``True`` iff the
-    cancel TOOK EFFECT — the caller then clears the ingress marker. Returns
-    ``False`` when a concurrent relay post WON the race (never clobbers the
-    posted/compensated outcome; the poster's own paths own the marker).
+    A3 · F-ORDER wave 4: FULLY SYNCHRONOUS — no awaits. It routes through the
+    driver's ``record_send_intent_cancelled_nowait`` seam, which reads the
+    intent's ``posting`` flag synchronously and takes effect ONLY while the intent
+    is still cancellable (not currently being posted / posted / already resolved).
+    Being awaitless it can never be interrupted mid-flight by a SECOND
+    ``Task.cancel()`` — the double-cancel window the awaited wave-3 seam left open
+    (a second cancel dropping control into the caller's outer ``finally`` while a
+    poster was mid-post) is closed. Returns ``True`` iff the cancel TOOK EFFECT —
+    the caller then clears the ingress marker. Returns ``False`` when a concurrent
+    relay post WON the race (never clobbers the posted/compensated outcome; the
+    poster's own paths own the marker).
 
     Getattr-tolerant and swallows its own errors: an intent-cleanup failure must
     never mask the original cancellation being re-raised. Degrades to the
-    pre-seam synchronous tombstone (best-effort, no serialization) on a driver
-    without the wave-3 seam."""
+    pre-seam synchronous tombstone (best-effort) on a driver without the wave-4
+    seam."""
     if driver is None:
         return False
-    rec_serialized = getattr(driver, "record_send_intent_cancelled", None)
-    if rec_serialized is not None:
+    rec_nowait = getattr(driver, "record_send_intent_cancelled_nowait", None)
+    if rec_nowait is not None:
         try:
-            return bool(await rec_serialized(
+            return bool(rec_nowait(
                 eng_id, request_id, {"ok": False, "error": "cancelled"}))
         except Exception:  # noqa: BLE001 — fall back to the pre-seam path
-            logger.debug("record_send_intent_cancelled failed", exc_info=True)
-    # --- pre-seam fallback (no serialized guard available) ------------------
+            logger.debug("record_send_intent_cancelled_nowait failed", exc_info=True)
+    # --- pre-seam fallback (no nowait guard available) ----------------------
     outcome_fn = getattr(driver, "send_intent_outcome", None)
     if outcome_fn is not None:
         try:
@@ -1310,11 +1314,11 @@ def _make_ask(
                 # still matchable — a same-request_id retry would hang on the
                 # transport budget waiting for a never-armed intent (→
                 # delivery_failed). Tombstone it + record a cancelled outcome so
-                # the retry short-circuits to the recorded outcome. Serialized —
+                # the retry short-circuits to the recorded outcome. Synchronous —
                 # a still-pending intent has no in-flight post, so the cancel
                 # takes effect; the marker was already cleared above.
                 if created_intent:
-                    await _record_intent_cancelled(driver, eng_id, request_id)
+                    _record_intent_cancelled(driver, eng_id, request_id)
                 raise
             # W-R3: canonical body (anchor ⇒ options == [] ⇒ numbered question
             # ALONE, no option list — unchanged from the pre-W-R3 anchor copy).
@@ -1396,6 +1400,12 @@ def _make_ask(
                 await _advance_first_contact()
                 return mid
 
+            # A3 · F-ORDER (Sol A3 wave 4): when a transport cancel LOSES to an
+            # in-flight relay post, the poster owns the marker (it clears it at
+            # durable ownership) — the outer ``finally`` must NOT clear it, or a
+            # SECOND cancel that lands mid-post would strip the marker while a
+            # question is still being posted, admitting a second live question.
+            _post_wins = False
             try:
                 if created_intent:
                     # DEFERRED (relay-mediated) created path: install the poster,
@@ -1406,20 +1416,21 @@ def _make_ask(
                         outcome = await _await_deferred_post(
                             driver, eng_id, request_id)
                     except BaseException:
-                        # B1 (wave 2) + A3 · F-ORDER (Sol A3 wave 3): a transport
-                        # CANCELLATION after ARM. If the relay has NOT started the
-                        # post, the SERIALIZED cancel takes effect: the armed
-                        # intent tombstones so the relay consume-cancels the block
-                        # (nothing posts) and a same-id retry reads the recorded
-                        # cancelled outcome. If the relay IS mid-post (holding the
-                        # writer lock inside the poster), this AWAITS that lock and
-                        # then sees the resolved post — the cancel is LOST ("the
-                        # post wins"), the intent keeps its SUCCESS outcome, and
-                        # nothing is clobbered. Either way the marker is owned by
-                        # the winner: on a post-win the poster cleared it at
-                        # durable ownership (the CAS finally below is a no-op); on
-                        # a cancel-win the CAS finally clears it.
-                        await _record_intent_cancelled(driver, eng_id, request_id)
+                        # B1 (wave 2) + A3 · F-ORDER (Sol A3 wave 3/4): a transport
+                        # CANCELLATION after ARM. The cleanup is FULLY SYNCHRONOUS
+                        # (no await ⇒ immune to a second Task.cancel()). If the relay
+                        # has NOT started the post, the cancel takes effect: the
+                        # armed intent tombstones so the relay consume-cancels the
+                        # block (nothing posts) and a same-id retry reads the
+                        # recorded cancelled outcome — the finally then clears the
+                        # marker. If the relay IS mid-post (``posting`` set, holding
+                        # the writer lock inside the poster), the sync cancel reads
+                        # ``posting`` and NO-OPS (returns False) — the cancel is LOST
+                        # ("the post wins"), the intent keeps its SUCCESS outcome,
+                        # and the marker is left to the poster (which clears it at
+                        # durable ownership). Gate the finally on that decision.
+                        if not _record_intent_cancelled(driver, eng_id, request_id):
+                            _post_wins = True
                         raise
                     # §A3(c): the compensated add-failure maps to ok:false
                     # internal_error (the wire message exists but the question was
@@ -1450,8 +1461,13 @@ def _make_ask(
             finally:
                 # Terminal-failure BACKSTOP: clear the marker if this request
                 # still owns it (CAS — a no-op when the poster already cleared it
-                # at durable ownership, or a later ask claimed the marker).
-                _clear_ask_marker(driver, eng_id, request_id)
+                # at durable ownership, or a later ask claimed the marker). SKIP
+                # the clear when a transport cancel LOST to an in-flight post
+                # (``_post_wins``): the winning poster owns the marker and clears
+                # it at durable ownership — clearing here would strip it mid-post
+                # and admit a second live question (Sol A3 wave 4 double-cancel).
+                if not _post_wins:
+                    _clear_ask_marker(driver, eng_id, request_id)
 
         # --- BUTTON ask ---------------------------------------------------
         # Register the discrete-send INTENT (pending) at the ingress boundary for
@@ -1599,11 +1615,11 @@ def _make_ask(
             # button retry would reattach, find no recorded outcome, and register a
             # FRESH broker request that never posts (full timeout burn, no
             # keyboard). Tombstone it + record a cancelled outcome so the retry
-            # short-circuits before touching the broker. Serialized — a
+            # short-circuits before touching the broker. Synchronous — a
             # still-pending intent has no in-flight post, so the cancel takes
             # effect; the marker was already cleared above.
             if intent_registered:
-                await _record_intent_cancelled(driver, eng_id, request_id)
+                _record_intent_cancelled(driver, eng_id, request_id)
             raise
         # W-R3 (Sol r1-5): the SINGLE canonical body — full options VERBATIM,
         # numbered, below the question. This exact string feeds the keyboard

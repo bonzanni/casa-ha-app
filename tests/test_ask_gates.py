@@ -639,8 +639,10 @@ class TestCancelledIntentTombstone:
         assert len(chan.anchors) == 1      # wire message landed; ledger NOT yet
         assert drv._effective_open_question_numbers(eid) == []
 
-        # Cancel the handler. Its cleanup routes through the SERIALIZED cancel,
-        # which now BLOCKS on the writer lock the relay holds.
+        # Cancel the handler. Its cleanup routes through the SYNCHRONOUS cancel
+        # (wave 4), which reads the intent's ``posting`` flag (set while the relay
+        # holds the writer lock mid-post) and NO-OPS — the post wins, the marker
+        # stands, and the finally is gated so it does not clear it.
         t1.cancel()
         await asyncio.sleep(0.02)
 
@@ -738,6 +740,133 @@ class TestCancelledIntentTombstone:
         assert wired["broker"].pending(
             namespace="engagement_ask", scope=eid) == []
         assert wired["chan"].keyboards == []
+
+
+class TestDoubleCancelWave4:
+    """Sol A3 wave 4 — the DOUBLE-cancel variant of the intent-cancellation race.
+
+    The wave-3 fix serialized the cancel cleanup by AWAITING the sequencer writer
+    lock. A SECOND ``Task.cancel()`` during that await INTERRUPTS the cleanup;
+    control then lands in the outer ``finally`` which cleared ``ask_inflight``
+    UNCONDITIONALLY — while the bound poster was past wire-send but pre-ledger-add
+    (``posting`` True). A second ask was then admitted → two live questions.
+
+    The fix makes the cancel cleanup FULLY SYNCHRONOUS (no awaits ⇒ no
+    double-cancel window) and gates the outer ``finally``'s clear on the cancel
+    decision: the marker is left to the poster when the post wins."""
+
+    async def test_double_cancel_during_inflight_post_marker_stands_anchor(
+        self, wired, monkeypatch,
+    ):
+        # Poster event-gated AFTER wire-send / BEFORE ledger-add: the intent is
+        # ``posting`` (armed, wire message landed, add_open_question parked, writer
+        # lock held). A DOUBLE cancel must NOT clear the marker out from under it.
+        eid, drv, seq, chan = (
+            wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
+        gate = asyncio.Event()
+        real_add = wired["reg"].add_open_question
+
+        async def _gated_add(*a, **k):
+            await gate.wait()               # park the poster mid-post, lock held
+            return await real_add(*a, **k)
+
+        monkeypatch.setattr(wired["reg"], "add_open_question", _gated_add)
+
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "a1"
+
+        # The relay reaches the block: the poster posts the wire message, then
+        # blocks in the gated add_open_question — STILL holding the writer lock,
+        # with ``posting`` set.
+        relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
+        await asyncio.sleep(0.02)
+        intent = seq.registry.by_request_id("a1")
+        assert intent.state == "armed" and intent.posting is True
+        assert len(chan.anchors) == 1     # wire message landed; ledger NOT yet
+        assert drv._effective_open_question_numbers(eid) == []
+
+        # DOUBLE cancel: the first lands in the handler's cleanup; the second
+        # lands WHILE the (pre-fix) serialized cleanup AWAITS the writer lock the
+        # relay holds — the window that let the outer finally clear the marker
+        # mid-post. The synchronous cleanup has no await to interrupt.
+        t1.cancel()
+        await asyncio.sleep(0.02)
+        t1.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t1
+
+        # The marker STILL stands (the post is winning) — a second, DIFFERENT ask
+        # is refused question_pending (pre-fix the marker was cleared → this ask
+        # would be admitted, giving two live questions).
+        assert drv.ask_inflight(eid) == "a1"
+        resp2 = await asyncio.wait_for(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a2", hash="anchor-hash-2"))), timeout=1.0)
+        assert _body(resp2)["error"] == "question_pending"
+
+        # Release the poster → durable ownership clears the marker, the post
+        # resolves ok; exactly ONE live question remains.
+        gate.set()
+        await asyncio.wait_for(relay, timeout=1.0)
+        assert len(chan.anchors) == 1
+        assert drv.ask_inflight(eid) is None
+        outcome = drv.send_intent_outcome(eid, "a1")
+        assert outcome["ok"] is True and outcome.get("message_id") is not None
+        assert drv._effective_open_question_numbers(eid) == [1]
+
+        # The cancelled handler's same-request_id retry reattaches to the POSTED
+        # outcome — no second post, no hang.
+        resp_retry = await asyncio.wait_for(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))), timeout=1.0)
+        body_retry = _body(resp_retry)
+        assert body_retry["outcome"] == "anchored"
+        assert body_retry["message_id"] == outcome["message_id"]
+        assert len(chan.anchors) == 1
+
+    async def test_double_cancel_mid_allocation_pending_intent_anchor(
+        self, wired, monkeypatch,
+    ):
+        # A pending-intent double-cancel: the cancel-wins path is fully synchronous
+        # now (no window). The marker is cleared once, the pending intent is
+        # tombstoned with a cancelled outcome, and a second DIFFERENT ask is
+        # admitted cleanly (exactly one post).
+        eid, drv = wired["rec"].id, wired["drv"]
+        gate = asyncio.Event()
+
+        async def _slow(_eid):
+            await gate.wait()
+            return 1
+
+        monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "a1"
+        intent = wired["seq"].registry.by_request_id("a1")
+        assert intent.state == "pending" and intent.posting is False
+
+        # DOUBLE cancel while parked in the number allocation (pending intent, no
+        # in-flight post) — the sync cleanup tombstones exactly once.
+        t1.cancel()
+        await asyncio.sleep(0.02)
+        t1.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t1
+        assert drv.ask_inflight(eid) is None
+        assert drv.send_intent_outcome(eid, "a1") == {
+            "ok": False, "error": "cancelled"}
+
+        # The relay reaching the tombstoned block posts NOTHING; a second, DIFFERENT
+        # ask is admitted cleanly and posts exactly once.
+        gate.set()
+        await wired["seq"].post_for_block(ASK_TOOL, _ANCHOR_HASH)
+        assert wired["chan"].anchors == []
+        t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
+        resp2 = await _drive_anchor(wired, t2, hash="anchor-hash-2")
+        assert _body(resp2)["outcome"] == "anchored"
+        assert len(wired["chan"].anchors) == 1
 
 
 class TestPostAddGenRecheck:
