@@ -983,3 +983,86 @@ async def test_drain_budget_exhaustion_false_with_counts(tmp_path, caplog):
 
     gate.set()
     await asyncio.gather(ft, ct)
+
+
+# ---------------------------------------------------------------------------
+# Whole-branch gate r3: cancel-in-place visibility + single-flight trigger.
+# The Sol repro: pop-then-cancel made a cancelled-but-not-yet-done owner
+# invisible to BOTH drain surfaces (its shielded cleanup only registers when
+# the cancellation runs, one loop turn later), so the drain returned True with
+# SIGKILL/extinction work still pending.
+# ---------------------------------------------------------------------------
+
+
+async def test_cancelled_owner_stays_visible_until_done(tmp_path):
+    """``_clear_operator_away`` cancels IN PLACE: the owner stays in
+    ``_force_tasks`` (drain-visible) until its done callback retires it, and
+    the drain awaits it through the cancellation-time handoff."""
+    import asyncio
+
+    eid = "engr3visible00001"
+    drv = _driver(tmp_path)
+    handed_off: list[bool] = []
+    started = asyncio.Event()
+
+    async def _cleanup():
+        handed_off.append(True)
+        return True
+
+    async def _parked_force_suspend(engagement_id):
+        started.set()
+        try:
+            await asyncio.Event().wait()  # park until cancelled
+        except asyncio.CancelledError:
+            # Mirror the real path: the shielded post-SIGTERM cleanup is handed
+            # off exactly when the owner's cancellation runs.
+            drv._register_force_cleanup(
+                eid, asyncio.ensure_future(_cleanup()))
+            raise
+
+    drv._run_force_suspend = _parked_force_suspend
+    drv._trigger_force_suspend(eid)  # installs task + done-callback retirement
+    await started.wait()
+    ft = drv._force_tasks.get(eid)
+    assert ft is not None and not ft.done()
+
+    drv._operator_away[eid] = True
+    await drv._clear_operator_away(eid)
+
+    # THE r3 PIN (pre-fix this fails: the owner was popped before cancel).
+    assert drv._force_tasks.get(eid) is ft
+    drained = await asyncio.wait_for(drv.drain_force_cleanups(timeout=1.0), 1.5)
+    assert drained is True
+    assert handed_off == [True]
+    await asyncio.sleep(0)  # let the done callback retire the handle
+    assert drv._force_tasks.get(eid) is None
+
+
+async def test_trigger_single_flight_defers_to_inflight_kill(tmp_path):
+    """A second trigger while an owner is live (e.g. cancelled-but-not-done)
+    never overwrites the visible handle — it defers to the in-flight kill."""
+    import asyncio
+
+    eid = "engr3single000001"
+    drv = _driver(tmp_path)
+    started = asyncio.Event()
+    calls: list[int] = []
+
+    async def _parked_force_suspend(engagement_id):
+        calls.append(1)
+        started.set()
+        await asyncio.Event().wait()
+
+    drv._run_force_suspend = _parked_force_suspend
+    drv._trigger_force_suspend(eid)
+    await started.wait()
+    first = drv._force_tasks.get(eid)
+
+    drv._trigger_force_suspend(eid)  # single-flight: must defer, not replace
+    assert drv._force_tasks.get(eid) is first
+    await asyncio.sleep(0)
+    assert calls == [1]  # no second coroutine ever started
+
+    first.cancel()
+    with __import__("contextlib").suppress(asyncio.CancelledError):
+        await first

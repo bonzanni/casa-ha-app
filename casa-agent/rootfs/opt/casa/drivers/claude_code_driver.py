@@ -1063,7 +1063,13 @@ class ClaudeCodeDriver(DriverProtocol):
         self._forced_suspend_epochs.pop(engagement.id, None)
         self._away_suspend_fired.discard(engagement.id)
         self._away_force_cooldown_until.pop(engagement.id, None)  # F3
-        force_task = self._force_tasks.pop(engagement.id, None)
+        # Whole-branch gate r3: cancel IN PLACE — never pop-then-cancel. The
+        # owner must stay VISIBLE in ``_force_tasks`` until its done callback
+        # retires it, because its shielded post-SIGTERM cleanup only registers
+        # in ``_force_cleanups`` when the cancellation actually runs; a
+        # popped-but-not-yet-done owner would be invisible to
+        # ``drain_force_cleanups``'s snapshot on BOTH surfaces.
+        force_task = self._force_tasks.get(engagement.id)
         if force_task is not None and not force_task.done():
             force_task.cancel()
         # Sol A2 wave-3, Finding 2: ``_force_cleanups`` (handed-off post-SIGTERM
@@ -2389,6 +2395,17 @@ class ClaudeCodeDriver(DriverProtocol):
         ``_log_abnormal_exit`` annotates the ensuing respawn), then spawn the
         verified group-kill as a tracked background task. Degrades to a no-op if
         no event loop is running (a sync fake context)."""
+        # Whole-branch gate r3: SINGLE-FLIGHT — never overwrite a live owner
+        # (a cancelled-but-not-yet-done predecessor must stay visible to the
+        # drain until its done callback retires it; overwriting would hide it
+        # from both drain surfaces for one loop turn). Checked BEFORE creating
+        # a duplicate task so no side-effecting coroutine ever starts.
+        existing = self._force_tasks.get(engagement_id)
+        if existing is not None and not existing.done():
+            logger.debug(
+                "force_turn_boundary: kill already in flight for %s — "
+                "deferring to it", engagement_id[:8])
+            return
         # Stamp the epoch first — the kill races the respawn's spawn event.
         self._forced_suspend_epochs[engagement_id] = self._epoch_pending.get(
             engagement_id)
@@ -2568,8 +2585,11 @@ class ClaudeCodeDriver(DriverProtocol):
         # operator's own inbound is now the turn boundary, so a still-verifying
         # SIGTERM/SIGKILL ladder against a possibly-already-respawned generation
         # is both moot and racy. force_turn_boundary tolerates cancellation at
-        # any await (nothing half-signalled).
-        force_task = self._force_tasks.pop(engagement_id, None)
+        # any await (nothing half-signalled). Whole-branch gate r3: cancel IN
+        # PLACE (no pop) — the done callback retires the handle, keeping the
+        # owner visible to ``drain_force_cleanups`` until its shielded cleanup
+        # has been handed off or finished.
+        force_task = self._force_tasks.get(engagement_id)
         if force_task is not None and not force_task.done():
             force_task.cancel()
         if not was_away:
