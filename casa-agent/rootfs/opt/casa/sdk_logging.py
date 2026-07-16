@@ -129,8 +129,8 @@ def log_tool_result(
 ) -> None:
     """DEBUG ``tool_result idx=N name=<name> ok=<bool> ms=N``.
 
-    ``ms`` is wall-clock duration since the turn started (started_ms is
-    the per-turn anchor captured by the caller).
+    ``ms`` is the monotonic elapsed duration since the turn started
+    (started_ms is the per-turn monotonic anchor captured by the caller).
     """
     is_error = bool(getattr(block, "is_error", False))
     now_ms = monotonic() * 1000
