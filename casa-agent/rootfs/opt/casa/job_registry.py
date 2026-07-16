@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, replace
@@ -129,7 +130,11 @@ class JobRegistry:
         legacy_tombstone_path: str | os.PathLike[str],
         *,
         clock: Callable[[], float] = time.time,
+        reconciliation_retry_interval: float = 5.0,
     ) -> None:
+        retry_interval = float(reconciliation_retry_interval)
+        if not math.isfinite(retry_interval) or retry_interval <= 0:
+            raise ValueError("reconciliation_retry_interval must be positive")
         self._path = os.fspath(path)
         self._legacy_tombstone_path = os.fspath(legacy_tombstone_path)
         self._clock = clock
@@ -144,6 +149,17 @@ class JobRegistry:
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._permits: dict[str, Any] = {}
         self._cancel_timers: dict[str, asyncio.Task] = {}
+        self._reconciliation_retry_interval = retry_interval
+        self._reconciliation_tasks: dict[str, asyncio.Task] = {}
+        self._reconciliation_waiters: dict[
+            str, set[asyncio.Future[None]]
+        ] = {}
+        self._terminal_waiters: dict[
+            str, set[asyncio.Future[VoiceJob]]
+        ] = {}
+        self._runtime_release_waiters: dict[
+            str, set[asyncio.Future[None]]
+        ] = {}
 
         # IDs migrated from the old tombstone during this process's first
         # load.  recover_after_restart consumes this list for Telegram's
@@ -291,13 +307,167 @@ class JobRegistry:
             consumed_parent = replace(
                 parent,
                 awaiting_input=False,
-                continuable_until=None,
             )
             candidate = dict(self._jobs)
             candidate[parent_job_id] = consumed_parent
             candidate[child.id] = child
             await self._commit_snapshot_locked(candidate)
             return child
+
+    async def compensate_unbound_continuation(
+        self,
+        parent_job_id: str,
+        child_job_id: str,
+        *,
+        actor: Any,
+    ) -> bool:
+        """Remove an unbound child and restore its still-fresh parent."""
+        async with self._lock:
+            self._require_loaded()
+            parent = self._require_job(parent_job_id)
+            self._authorize_actor(parent, actor)
+            child = self._jobs.get(child_job_id)
+            if child is None:
+                return False
+            self._authorize_actor(child, actor)
+            if child.parent_job_id != parent_job_id:
+                raise JobTransitionError(
+                    f"job {child_job_id!r} is not a child of {parent_job_id!r}"
+                )
+            if (child.execution_state is not ExecutionState.ACCEPTED
+                    or child_job_id in self._tasks):
+                return False
+
+            now = self._now()
+            restore_parent = (
+                parent.execution_state is ExecutionState.SUCCEEDED
+                and not parent.awaiting_input
+                and parent.continuable_until is not None
+                and parent.continuable_until > now
+                and (parent.expires_at is None or parent.expires_at > now)
+                and parent.delivery_state not in {
+                    DeliveryState.CANCELLED,
+                    DeliveryState.EXPIRED,
+                }
+                and not parent.cancel_pending
+                and parent.result is not None
+            )
+            candidate = dict(self._jobs)
+            candidate.pop(child_job_id)
+            if restore_parent:
+                candidate[parent_job_id] = replace(parent, awaiting_input=True)
+            await self._commit_snapshot_locked(candidate)
+            return restore_parent
+
+    def owns_task(self, job_id: str, task: asyncio.Task) -> bool:
+        """Return whether runtime ownership was published for exactly task."""
+        return self._tasks.get(job_id) is task
+
+    async def wait_for_terminal(self, job_id: str) -> VoiceJob:
+        """Wait for a concrete durable terminal transition for one job."""
+        async with self._lock:
+            current = self._require_job(job_id)
+            if current.execution_state in self._TERMINAL_EXECUTION:
+                return current
+            future = asyncio.get_running_loop().create_future()
+            self._terminal_waiters.setdefault(job_id, set()).add(future)
+        try:
+            return await future
+        finally:
+            waiters = self._terminal_waiters.get(job_id)
+            if waiters is not None:
+                waiters.discard(future)
+                if not waiters:
+                    self._terminal_waiters.pop(job_id, None)
+
+    async def wait_for_runtime_release(self, job_id: str) -> None:
+        """Wait until the bound task has released its runtime ownership."""
+        if job_id not in self._tasks:
+            return
+        future = asyncio.get_running_loop().create_future()
+        self._runtime_release_waiters.setdefault(job_id, set()).add(future)
+        if job_id not in self._tasks and not future.done():
+            future.set_result(None)
+        try:
+            await future
+        finally:
+            waiters = self._runtime_release_waiters.get(job_id)
+            if waiters is not None:
+                waiters.discard(future)
+                if not waiters:
+                    self._runtime_release_waiters.pop(job_id, None)
+
+    @property
+    def reconciliation_count(self) -> int:
+        return len(self._reconciliation_tasks)
+
+    async def wait_for_reconciliation(self, job_id: str) -> None:
+        """Wait until registry-owned terminal reconciliation is drained."""
+        task = self._reconciliation_tasks.get(job_id)
+        if task is None or task.done():
+            return
+        future = asyncio.get_running_loop().create_future()
+        self._reconciliation_waiters.setdefault(job_id, set()).add(future)
+        current = self._reconciliation_tasks.get(job_id)
+        if (current is not task or task.done()) and not future.done():
+            future.set_result(None)
+        try:
+            await future
+        finally:
+            waiters = self._reconciliation_waiters.get(job_id)
+            if waiters is not None:
+                waiters.discard(future)
+                if not waiters:
+                    self._reconciliation_waiters.pop(job_id, None)
+
+    def schedule_failure_reconciliation(self, job_id: str) -> None:
+        """Strongly own a metadata-only retry for a still-live failed write."""
+        existing = self._reconciliation_tasks.get(job_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._reconcile_failure(job_id))
+        self._reconciliation_tasks[job_id] = task
+        task.add_done_callback(
+            lambda done, jid=job_id: self._reconciliation_done(jid, done),
+        )
+
+    async def _reconcile_failure(self, job_id: str) -> None:
+        while True:
+            await asyncio.sleep(self._reconciliation_retry_interval)
+            try:
+                current = await self.fail_compat(
+                    job_id,
+                    JobFailure(
+                        "persistence_failed",
+                        "Specialist result could not be saved.",
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — never render persistence content
+                logger.warning(
+                    "job %s terminal reconciliation retry failed",
+                    job_id[:8],
+                )
+                continue
+            if (current is None
+                    or current.execution_state in self._TERMINAL_EXECUTION):
+                return
+
+    def _reconciliation_done(self, job_id: str, task: asyncio.Task) -> None:
+        if self._reconciliation_tasks.get(job_id) is task:
+            self._reconciliation_tasks.pop(job_id, None)
+        for waiter in self._reconciliation_waiters.pop(job_id, set()):
+            if not waiter.done():
+                waiter.set_result(None)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logger.error("job %s terminal reconciliation stopped", job_id[:8])
 
     async def bind_task(
         self,
@@ -737,7 +907,7 @@ class JobRegistry:
             ))
 
     async def close(self) -> None:
-        """Cancel process-owned resources and wait for task callbacks to run."""
+        """Cancel and drain execution, cancellation, and retry ownership."""
         timers = list(self._cancel_timers.values())
         self._cancel_timers.clear()
         for timer in timers:
@@ -753,6 +923,13 @@ class JobRegistry:
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+        reconciliations = list(self._reconciliation_tasks.values())
+        for task in reconciliations:
+            if not task.done():
+                task.cancel()
+        if reconciliations:
+            await asyncio.gather(*reconciliations, return_exceptions=True)
 
     # -- persistence -----------------------------------------------------
 
@@ -983,6 +1160,7 @@ class JobRegistry:
             )
             if after_publish is not None:
                 after_publish()
+            self._signal_terminal_waiters()
 
         await self._finish_atomic_commit(commit())
 
@@ -1218,6 +1396,21 @@ class JobRegistry:
                 permit.release()
             except Exception:  # noqa: BLE001 — task cleanup must finish
                 logger.warning("job %s permit release failed", job_id, exc_info=True)
+        waiters = self._runtime_release_waiters.pop(job_id, set())
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    def _signal_terminal_waiters(self) -> None:
+        for job_id, waiters in list(self._terminal_waiters.items()):
+            job = self._jobs.get(job_id)
+            if (job is None
+                    or job.execution_state not in self._TERMINAL_EXECUTION):
+                continue
+            self._terminal_waiters.pop(job_id, None)
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_result(job)
 
     def _arm_force_cancel(self, job_id: str, task: asyncio.Task) -> None:
         existing = self._cancel_timers.get(job_id)

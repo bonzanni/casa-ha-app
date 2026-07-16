@@ -759,7 +759,7 @@ async def test_continuation_create_atomically_consumes_parent(tmp_path):
     ) == child
     parent = registry.get("job-1")
     assert parent.awaiting_input is False
-    assert parent.continuable_until is None
+    assert parent.continuable_until == 200.0
     assert registry.get("job-child") == child
 
     with pytest.raises(JobTransitionError):
@@ -769,6 +769,116 @@ async def test_continuation_create_atomically_consumes_parent(tmp_path):
             actor=actor_for_job(),
         )
     assert registry.get("job-duplicate") is None
+
+
+async def test_compensate_unbound_continuation_restores_fresh_parent(tmp_path):
+    registry = await loaded_registry(
+        tmp_path,
+        make_job(
+            terminal_at=100.0,
+            expires_at=200.0,
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.DELIVERED,
+            result='{"status":"needs_clarification"}',
+            awaiting_input=True,
+            continuable_until=200.0,
+        ),
+        now=120.0,
+    )
+    child = replace(
+        make_job(), id="job-child", parent_job_id="job-1", created_at=120.0,
+    )
+    await registry.create_continuation(
+        "job-1", child, actor=actor_for_job(),
+    )
+
+    restored = await registry.compensate_unbound_continuation(
+        "job-1", "job-child", actor=actor_for_job(),
+    )
+
+    assert restored is True
+    assert registry.get("job-child") is None
+    parent = registry.get("job-1")
+    assert parent.awaiting_input is True
+    assert parent.continuable_until == 200.0
+
+
+async def test_compensate_unbound_continuation_does_not_restore_expired_parent(
+    tmp_path,
+):
+    now = [120.0]
+    registry = JobRegistry(
+        tmp_path / "jobs.json",
+        tmp_path / "delegations.json",
+        clock=lambda: now[0],
+    )
+    await registry.load()
+    await registry.create(make_job(
+        terminal_at=100.0,
+        expires_at=121.0,
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.DELIVERED,
+        result='{"status":"needs_clarification"}',
+        awaiting_input=True,
+        continuable_until=121.0,
+    ))
+    child = replace(
+        make_job(), id="job-child", parent_job_id="job-1", created_at=120.0,
+    )
+    await registry.create_continuation(
+        "job-1", child, actor=actor_for_job(),
+    )
+    now[0] = 122.0
+
+    restored = await registry.compensate_unbound_continuation(
+        "job-1", "job-child", actor=actor_for_job(),
+    )
+
+    assert restored is False
+    assert registry.get("job-child") is None
+    parent = registry.get("job-1")
+    assert parent.awaiting_input is False
+    assert parent.continuable_until == 121.0
+
+
+async def test_compensation_never_rewinds_a_bound_running_child(tmp_path):
+    registry = await loaded_registry(
+        tmp_path,
+        make_job(
+            terminal_at=100.0,
+            expires_at=200.0,
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.DELIVERED,
+            result='{"status":"needs_clarification"}',
+            awaiting_input=True,
+            continuable_until=200.0,
+        ),
+        now=120.0,
+    )
+    child = replace(
+        make_job(), id="job-child", parent_job_id="job-1", created_at=120.0,
+    )
+    await registry.create_continuation(
+        "job-1", child, actor=actor_for_job(),
+    )
+    release = asyncio.Event()
+
+    async def work():
+        await release.wait()
+
+    worker = asyncio.create_task(work())
+    await registry.bind_task("job-child", worker)
+    try:
+        restored = await registry.compensate_unbound_continuation(
+            "job-1", "job-child", actor=actor_for_job(),
+        )
+        assert restored is False
+        assert registry.get("job-child").execution_state is ExecutionState.RUNNING
+        assert registry.get("job-1").awaiting_input is False
+        assert registry.owns_task("job-child", worker) is True
+    finally:
+        release.set()
+        await worker
 
 
 async def test_continuation_create_rejects_parent_that_expired_before_commit(tmp_path):
@@ -794,6 +904,117 @@ async def test_continuation_create_rejects_parent_that_expired_before_commit(tmp
             "job-1", child, actor=actor_for_job(),
         )
     assert registry.get("job-child") is None
+
+
+async def test_terminal_waiter_observes_durable_terminal_transition(tmp_path):
+    registry = await loaded_registry(tmp_path, make_job())
+    waiter = asyncio.create_task(registry.wait_for_terminal("job-1"))
+
+    await registry.fail("job-1", JobFailure("safe", "safe failure"))
+
+    terminal = await asyncio.wait_for(waiter, timeout=1)
+    assert terminal.execution_state is ExecutionState.FAILED
+
+
+async def test_failure_reconciliation_eventually_terminalizes_live_job(
+    tmp_path, caplog,
+):
+    registry = JobRegistry(
+        tmp_path / "jobs.json",
+        tmp_path / "delegations.json",
+        clock=lambda: 120.0,
+        reconciliation_retry_interval=0.01,
+    )
+    await registry.load()
+    await registry.create(make_job(
+        started_at=110.0,
+        execution_state=ExecutionState.RUNNING,
+    ))
+    real_fail = registry.fail_compat
+    attempts = 0
+
+    async def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("PRIVATE_RECONCILE_CANARY")
+        return await real_fail(*args, **kwargs)
+
+    registry.fail_compat = fail_once
+    registry.schedule_failure_reconciliation("job-1")
+
+    terminal = await asyncio.wait_for(
+        registry.wait_for_terminal("job-1"), timeout=1,
+    )
+    await asyncio.wait_for(
+        registry.wait_for_reconciliation("job-1"), timeout=1,
+    )
+    assert attempts == 2
+    assert terminal.execution_state is ExecutionState.FAILED
+    assert terminal.failure == JobFailure(
+        "persistence_failed", "Specialist result could not be saved.",
+    )
+    assert registry.reconciliation_count == 0
+    assert "PRIVATE_RECONCILE_CANARY" not in caplog.text
+
+
+async def test_close_cancels_and_drains_sleeping_reconciliation(tmp_path):
+    registry = JobRegistry(
+        tmp_path / "jobs.json",
+        tmp_path / "delegations.json",
+        reconciliation_retry_interval=3600.0,
+    )
+    await registry.load()
+    await registry.create(make_job(
+        started_at=110.0,
+        execution_state=ExecutionState.RUNNING,
+    ))
+    registry.schedule_failure_reconciliation("job-1")
+    assert registry.reconciliation_count == 1
+
+    await asyncio.wait_for(registry.close(), timeout=1)
+
+    assert registry.reconciliation_count == 0
+    assert registry.get("job-1").execution_state is ExecutionState.RUNNING
+
+
+async def test_persistent_reconciliation_failure_stays_restart_recoverable(
+    tmp_path, caplog,
+):
+    attempted = asyncio.Event()
+    registry = JobRegistry(
+        tmp_path / "jobs.json",
+        tmp_path / "delegations.json",
+        clock=lambda: 120.0,
+        reconciliation_retry_interval=0.01,
+    )
+    await registry.load()
+    await registry.create(make_job(
+        started_at=110.0,
+        execution_state=ExecutionState.RUNNING,
+    ))
+
+    async def fail_forever(*_args, **_kwargs):
+        attempted.set()
+        raise OSError("PRIVATE_RECONCILE_CANARY")
+
+    registry.fail_compat = fail_forever
+    registry.schedule_failure_reconciliation("job-1")
+    await asyncio.wait_for(attempted.wait(), timeout=1)
+    await registry.close()
+    assert registry.reconciliation_count == 0
+    assert registry.get("job-1").execution_state is ExecutionState.RUNNING
+    assert "PRIVATE_RECONCILE_CANARY" not in caplog.text
+
+    restarted = JobRegistry(
+        tmp_path / "jobs.json",
+        tmp_path / "delegations.json",
+        clock=lambda: 121.0,
+    )
+    await restarted.load()
+    recovered = await restarted.recover_after_restart()
+    assert [job.id for job in recovered] == ["job-1"]
+    assert restarted.get("job-1").execution_state is ExecutionState.ORPHANED
 
 
 async def test_telegram_orphan_notification_retries_until_durable_ack(tmp_path):

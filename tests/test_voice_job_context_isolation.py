@@ -123,17 +123,12 @@ async def test_voice_job_completion_never_reenters_gary(
 
     release.set()
     job_id = accepted_payload["job_id"]
-    for _ in range(200):
-        job = registry.get(job_id)
-        if job is not None and job.execution_state is ExecutionState.SUCCEEDED:
-            break
-        await asyncio.sleep(0)
-    else:
-        pytest.fail("voice job did not reach SUCCEEDED")
-
-    # Give an accidentally scheduled bus notification/model turn time to run.
-    for _ in range(10):
-        await asyncio.sleep(0)
+    job = await asyncio.wait_for(
+        registry.wait_for_terminal(job_id), timeout=1,
+    )
+    await asyncio.wait_for(
+        registry.wait_for_runtime_release(job_id), timeout=1,
+    )
 
     after = gary._pool.stats().copy()
     assert [m for m in bus.get_log() if m.type is MessageType.NOTIFICATION] == []
@@ -141,7 +136,7 @@ async def test_voice_job_completion_never_reenters_gary(
     assert after == before
     assert private_canary not in caplog.text
     assert private_canary not in json.dumps(accepted_payload)
-    assert private_canary in (registry.get(job_id).result or "")
+    assert private_canary in (job.result or "")
 
     loop_task.cancel()
     await asyncio.gather(loop_task, return_exceptions=True)

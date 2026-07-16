@@ -11,6 +11,7 @@ import asyncio
 import json
 import time
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -242,14 +243,12 @@ async def test_voice_async_failure_persists_only_a_safe_ready_envelope(tool_env)
     accepted = tool_payload(await tool_env.invoke_delegate())
     job_id = accepted["job_id"]
     await tool_env.runner.fail(RuntimeError("PRIVATE_FAILURE_CANARY"))
-
-    for _ in range(100):
-        job = tool_env.job_registry.get(job_id)
-        if job is not None and job.execution_state is ExecutionState.FAILED:
-            break
-        await asyncio.sleep(0)
-
-    job = tool_env.job_registry.get(job_id)
+    job = await asyncio.wait_for(
+        tool_env.job_registry.wait_for_terminal(job_id), timeout=1,
+    )
+    await asyncio.wait_for(
+        tool_env.job_registry.wait_for_runtime_release(job_id), timeout=1,
+    )
     assert job.execution_state is ExecutionState.FAILED
     assert job.delivery_state is DeliveryState.READY
     assert job.result is None
@@ -305,20 +304,72 @@ async def test_terminal_write_failure_uses_safe_fallback_without_private_log(
         tool_env.job_registry, "finish_voice_result", fail_finish,
     )
     accepted = tool_payload(await tool_env.invoke_delegate())
+    job_id = accepted["job_id"]
     await tool_env.runner.finish()
-    for _ in range(100):
-        job = tool_env.job_registry.get(accepted["job_id"])
-        if job is not None and job.execution_state is ExecutionState.FAILED:
-            break
-        await asyncio.sleep(0)
-
-    job = tool_env.job_registry.get(accepted["job_id"])
+    job = await asyncio.wait_for(
+        tool_env.job_registry.wait_for_terminal(job_id), timeout=1,
+    )
+    await asyncio.wait_for(
+        tool_env.job_registry.wait_for_runtime_release(job_id), timeout=1,
+    )
     assert job.execution_state is ExecutionState.FAILED
     assert job.delivery_state is DeliveryState.READY
     assert job.failure == JobFailure(
         "persistence_failed", "Specialist result could not be saved.",
     )
     assert "PRIVATE_PERSISTENCE_CANARY" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_double_terminal_write_failure_reconciles_without_holding_permit(
+    tool_env, monkeypatch, caplog,
+):
+    allow_reconciliation = False
+    fallback_attempted = asyncio.Event()
+    real_fail = tool_env.job_registry.fail_compat
+    tool_env.job_registry._reconciliation_retry_interval = 0.01
+
+    async def fail_primary(*_args, **_kwargs):
+        raise OSError("PRIVATE_PRIMARY_WRITE_CANARY")
+
+    async def controlled_fallback(*args, **kwargs):
+        fallback_attempted.set()
+        if not allow_reconciliation:
+            raise OSError("PRIVATE_FALLBACK_WRITE_CANARY")
+        return await real_fail(*args, **kwargs)
+
+    monkeypatch.setattr(
+        tool_env.job_registry, "finish_voice_result", fail_primary,
+    )
+    monkeypatch.setattr(
+        tool_env.job_registry, "fail_compat", controlled_fallback,
+    )
+    accepted = tool_payload(await tool_env.invoke_delegate())
+    job_id = accepted["job_id"]
+    await tool_env.runner.finish()
+    await asyncio.wait_for(fallback_attempted.wait(), timeout=1)
+    await asyncio.wait_for(
+        tool_env.job_registry.wait_for_runtime_release(job_id), timeout=1,
+    )
+
+    assert tool_env.limiter.in_flight == 0
+    assert tool_env.job_registry.get(job_id).execution_state is ExecutionState.RUNNING
+    assert tool_env.job_registry.reconciliation_count == 1
+
+    allow_reconciliation = True
+    terminal = await asyncio.wait_for(
+        tool_env.job_registry.wait_for_terminal(job_id), timeout=1,
+    )
+    await asyncio.wait_for(
+        tool_env.job_registry.wait_for_reconciliation(job_id), timeout=1,
+    )
+    assert terminal.execution_state is ExecutionState.FAILED
+    assert terminal.failure == JobFailure(
+        "persistence_failed", "Specialist result could not be saved.",
+    )
+    assert tool_env.job_registry.reconciliation_count == 0
+    assert "PRIVATE_PRIMARY_WRITE_CANARY" not in caplog.text
+    assert "PRIVATE_FALLBACK_WRITE_CANARY" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -502,21 +553,15 @@ async def test_cancel_completion_race_has_one_honest_terminal_winner(
         tools.cancel_voice_job, voice_origin(), {"job_id": job_id},
     ))
     payload = tool_payload(await cancel_task)
-    for _ in range(100):
-        job = tool_env.job_registry.get(job_id)
-        if job is not None and job.execution_state in {
-            ExecutionState.SUCCEEDED, ExecutionState.CANCELLED,
-        }:
-            break
-        await asyncio.sleep(0)
-    job = tool_env.job_registry.get(job_id)
+    job = await asyncio.wait_for(
+        tool_env.job_registry.wait_for_terminal(job_id), timeout=1,
+    )
     assert payload["status"] in {"stopping", "cancelled", "too_late"}
     assert job.execution_state in {ExecutionState.SUCCEEDED, ExecutionState.CANCELLED}
     assert not (job.execution_state is ExecutionState.SUCCEEDED and job.cancel_pending)
-    for _ in range(100):
-        if tool_env.limiter.in_flight == 0:
-            break
-        await asyncio.sleep(0)
+    await asyncio.wait_for(
+        tool_env.job_registry.wait_for_runtime_release(job_id), timeout=1,
+    )
     assert tool_env.limiter.in_flight == 0
 
 
@@ -553,7 +598,7 @@ async def test_continue_job_copies_private_backend_context_without_returning_it(
     child = tool_env.job_registry.get(payload["job_id"])
     consumed_parent = tool_env.job_registry.get(parent.id)
     assert consumed_parent.awaiting_input is False
-    assert consumed_parent.continuable_until is None
+    assert consumed_parent.continuable_until == parent.continuable_until
     assert child.parent_job_id == parent.id
     assert child.origin_route_id == "entry-2"
     assert child.origin_device_id == "device-office"
@@ -561,6 +606,184 @@ async def test_continue_job_copies_private_backend_context_without_returning_it(
     assert canary in child.context
     await tool_env.runner.started.wait()
     assert canary in tool_env.runner.calls[-1]["context"]
+
+
+@pytest.mark.asyncio
+async def test_continuation_task_create_failure_restores_parent_without_child(
+    tool_env, monkeypatch, caplog,
+):
+    child_canary = "PRIVATE_UNBOUND_CHILD_TASK_CANARY"
+    continuable_until = time.time() + 900
+    await tool_env.add_job(
+        "job-parent",
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.DELIVERED,
+        terminal_at=time.time(),
+        expires_at=continuable_until,
+        result=json.dumps(_structured_result(
+            status="needs_clarification",
+            spoken_summary="Which one?",
+            clarification="Which one?",
+        )),
+        awaiting_input=True,
+        continuable_until=continuable_until,
+    )
+    real_factory = getattr(tools, "_create_voice_lifecycle_task", None)
+
+    def fail_task_create(**_kwargs):
+        raise RuntimeError("synthetic task creation failure")
+
+    monkeypatch.setattr(
+        tools, "_create_voice_lifecycle_task", fail_task_create, raising=False,
+    )
+    with pytest.raises(RuntimeError, match="task creation failure"):
+        await _call(
+            tools.continue_voice_job,
+            voice_origin(),
+            {"input": child_canary, "job_id": "job-parent"},
+        )
+
+    parent = tool_env.job_registry.get("job-parent")
+    assert parent.awaiting_input is True
+    assert parent.continuable_until == continuable_until
+    assert [job.id for job in tool_env.job_registry.all()] == ["job-parent"]
+    assert child_canary not in Path(tool_env.job_registry.path).read_text()
+    assert child_canary not in caplog.text
+    assert tool_env.limiter.in_flight == 0
+    assert tool_env.runner.calls == []
+
+    assert real_factory is not None
+    monkeypatch.setattr(tools, "_create_voice_lifecycle_task", real_factory)
+    retry = tool_payload(await _call(
+        tools.continue_voice_job,
+        voice_origin(),
+        {"input": "safe retry", "job_id": "job-parent"},
+    ))
+    assert retry["status"] == "pending"
+    children = [
+        job for job in tool_env.job_registry.all()
+        if job.parent_job_id == "job-parent"
+    ]
+    assert [job.id for job in children] == [retry["job_id"]]
+    assert children[0].execution_state is ExecutionState.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_continuation_bind_write_failure_restores_parent_without_child(
+    tool_env, monkeypatch, caplog,
+):
+    child_canary = "PRIVATE_UNBOUND_CHILD_BIND_CANARY"
+    continuable_until = time.time() + 900
+    await tool_env.add_job(
+        "job-parent",
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.DELIVERED,
+        terminal_at=time.time(),
+        expires_at=continuable_until,
+        result=json.dumps(_structured_result(
+            status="needs_clarification",
+            spoken_summary="Which one?",
+            clarification="Which one?",
+        )),
+        awaiting_input=True,
+        continuable_until=continuable_until,
+    )
+    real_write = tool_env.job_registry._write_snapshot_locked
+
+    async def fail_running_child(jobs):
+        if any(
+            job.parent_job_id == "job-parent"
+            and job.execution_state is ExecutionState.RUNNING
+            for job in jobs.values()
+        ):
+            raise OSError("synthetic bind write failure")
+        await real_write(jobs)
+
+    monkeypatch.setattr(
+        tool_env.job_registry, "_write_snapshot_locked", fail_running_child,
+    )
+    with pytest.raises(OSError, match="bind write failure"):
+        await _call(
+            tools.continue_voice_job,
+            voice_origin(),
+            {"input": child_canary, "job_id": "job-parent"},
+        )
+
+    parent = tool_env.job_registry.get("job-parent")
+    assert parent.awaiting_input is True
+    assert parent.continuable_until == continuable_until
+    assert [job.id for job in tool_env.job_registry.all()] == ["job-parent"]
+    assert child_canary not in Path(tool_env.job_registry.path).read_text()
+    assert child_canary not in caplog.text
+    assert tool_env.limiter.in_flight == 0
+    assert tool_env.runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_bind_published_before_caller_cancel_keeps_running_child_owned(
+    tool_env, monkeypatch,
+):
+    continuable_until = time.time() + 900
+    await tool_env.add_job(
+        "job-parent",
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.DELIVERED,
+        terminal_at=time.time(),
+        expires_at=continuable_until,
+        result=json.dumps(_structured_result(
+            status="needs_clarification",
+            spoken_summary="Which one?",
+            clarification="Which one?",
+        )),
+        awaiting_input=True,
+        continuable_until=continuable_until,
+    )
+    running_written = asyncio.Event()
+    release_write = asyncio.Event()
+    real_write = tool_env.job_registry._write_snapshot_locked
+
+    async def block_after_running_write(jobs):
+        await real_write(jobs)
+        if any(
+            job.parent_job_id == "job-parent"
+            and job.execution_state is ExecutionState.RUNNING
+            for job in jobs.values()
+        ):
+            running_written.set()
+            await release_write.wait()
+
+    monkeypatch.setattr(
+        tool_env.job_registry, "_write_snapshot_locked", block_after_running_write,
+    )
+    continuation = asyncio.create_task(_call(
+        tools.continue_voice_job,
+        voice_origin(),
+        {"input": "continue after caller cancel", "job_id": "job-parent"},
+    ))
+    await asyncio.wait_for(running_written.wait(), timeout=1)
+    continuation.cancel()
+    release_write.set()
+    with pytest.raises(asyncio.CancelledError):
+        await continuation
+
+    children = [
+        job for job in tool_env.job_registry.all()
+        if job.parent_job_id == "job-parent"
+    ]
+    assert len(children) == 1
+    child = children[0]
+    assert child.execution_state is ExecutionState.RUNNING
+    assert tool_env.job_registry.get("job-parent").awaiting_input is False
+    assert tool_env.job_registry.get("job-parent").continuable_until == continuable_until
+    await asyncio.wait_for(tool_env.runner.started.wait(), timeout=1)
+    await tool_env.runner.finish()
+    await asyncio.wait_for(
+        tool_env.job_registry.wait_for_terminal(child.id), timeout=1,
+    )
+    await asyncio.wait_for(
+        tool_env.job_registry.wait_for_runtime_release(child.id), timeout=1,
+    )
+    assert tool_env.limiter.in_flight == 0
 
 
 @pytest.mark.asyncio
@@ -586,10 +809,13 @@ async def test_continuation_parent_can_be_consumed_only_once(tool_env):
     ))
     assert first["status"] == "pending"
     await tool_env.runner.finish()
-    for _ in range(100):
-        if tool_env.limiter.in_flight == 0:
-            break
-        await asyncio.sleep(0)
+    child_id = first["job_id"]
+    await asyncio.wait_for(
+        tool_env.job_registry.wait_for_terminal(child_id), timeout=1,
+    )
+    await asyncio.wait_for(
+        tool_env.job_registry.wait_for_runtime_release(child_id), timeout=1,
+    )
 
     second = tool_payload(await _call(
         tools.continue_voice_job,

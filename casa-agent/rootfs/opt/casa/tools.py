@@ -1183,6 +1183,13 @@ class JobActor:
     scope_id: str
 
 
+@dataclass
+class _PermitHandoff:
+    """Shared marker for lexical-to-registry permit ownership transfer."""
+
+    transferred: bool = False
+
+
 _BACKGROUND_ROUTE_CAPABILITIES = frozenset({
     "background_jobs", "satellite_announce",
 })
@@ -2117,9 +2124,17 @@ async def _persist_voice_terminal(
     except Exception:  # noqa: BLE001 — restart recovery remains authoritative
         logger.error(
             "Voice job %s role=%s safe terminal fallback failed; "
-            "restart recovery required",
+            "scheduling reconciliation",
             job_id[:8], specialist_role,
         )
+        try:
+            registry.schedule_failure_reconciliation(job_id)
+        except Exception:  # noqa: BLE001 — restart recovery remains authoritative
+            logger.error(
+                "Voice job %s role=%s reconciliation scheduling failed; "
+                "restart recovery required",
+                job_id[:8], specialist_role,
+            )
         return "unpersisted"
 
 
@@ -2237,6 +2252,33 @@ async def _run_voice_job_lifecycle(
         raise
 
 
+async def _run_voice_job_after_bind(
+    *,
+    start_gate: asyncio.Event,
+    lifecycle_kwargs: dict[str, Any],
+) -> None:
+    """Prevent specialist work from starting before RUNNING is durable."""
+    await start_gate.wait()
+    await _run_voice_job_lifecycle(**lifecycle_kwargs)
+
+
+def _create_voice_lifecycle_task(
+    *,
+    start_gate: asyncio.Event,
+    lifecycle_kwargs: dict[str, Any],
+) -> asyncio.Task:
+    """Create the bind-gated lifecycle task without leaking a coroutine."""
+    coroutine = _run_voice_job_after_bind(
+        start_gate=start_gate,
+        lifecycle_kwargs=lifecycle_kwargs,
+    )
+    try:
+        return asyncio.create_task(coroutine)
+    except BaseException:
+        coroutine.close()
+        raise
+
+
 async def _start_voice_async_job(
     *,
     cfg: Any,
@@ -2246,6 +2288,7 @@ async def _start_voice_async_job(
     origin: dict,
     resolution: Any,
     permit: Any,
+    handoff: _PermitHandoff,
     parent_job_id: str | None = None,
 ) -> dict:
     """Persist ACCEPTED, bind RUNNING task/permit ownership, return metadata."""
@@ -2261,38 +2304,68 @@ async def _start_voice_async_job(
         task_text=task_text,
         context_text=context_text,
     )
-    if parent_job_id is None:
-        await registry.create(job)
-    else:
-        actor = _job_actor_from_origin(origin)
-        if actor is None:
-            raise JobAuthorizationError("voice continuation has no actor")
-        await registry.create_continuation(
-            parent_job_id,
-            job,
-            actor=actor,
-        )
-
+    actor = _job_actor_from_origin(origin)
+    if parent_job_id is not None and actor is None:
+        raise JobAuthorizationError("voice continuation has no actor")
+    created = False
     task: asyncio.Task | None = None
+    start_gate = asyncio.Event()
     try:
+        try:
+            if parent_job_id is None:
+                await registry.create(job)
+            else:
+                await registry.create_continuation(
+                    parent_job_id,
+                    job,
+                    actor=actor,
+                )
+            created = True
+        except BaseException:
+            # Atomic persistence can publish and then re-raise cancellation.
+            created = registry.get(job_id) is not None
+            raise
+
         started_at = time.time()
-        task = asyncio.create_task(_run_voice_job_lifecycle(
-            registry=registry,
-            job_id=job_id,
-            cfg=cfg,
-            specialist_role=specialist_role,
-            task_text=task_text,
-            context_text=context_text,
-            origin=dict(origin),
-            resolution=resolution,
-            started_at=started_at,
-        ))
-        await registry.bind_task(job_id, task, permit=permit)
+        task = _create_voice_lifecycle_task(
+            start_gate=start_gate,
+            lifecycle_kwargs={
+                "registry": registry,
+                "job_id": job_id,
+                "cfg": cfg,
+                "specialist_role": specialist_role,
+                "task_text": task_text,
+                "context_text": context_text,
+                "origin": dict(origin),
+                "resolution": resolution,
+                "started_at": started_at,
+            },
+        )
+        try:
+            await registry.bind_task(job_id, task, permit=permit)
+        except BaseException:
+            if registry.owns_task(job_id, task):
+                handoff.transferred = True
+                start_gate.set()
+                _record_launch_safe(specialist_role)
+            raise
+        handoff.transferred = True
+        start_gate.set()
     except BaseException:
+        if handoff.transferred:
+            raise
         if task is not None and not task.done():
             task.cancel()
             await _await_task_teardown(task, _CEILING_TEARDOWN_BOUND_S)
-        await registry.cancel(job_id)
+        if created:
+            if parent_job_id is None:
+                await registry.cancel(job_id)
+            else:
+                await registry.compensate_unbound_continuation(
+                    parent_job_id,
+                    job_id,
+                    actor=actor,
+                )
         raise
 
     _record_launch_safe(specialist_role)
@@ -2525,18 +2598,21 @@ async def delegate_to_agent(args: dict) -> dict:
 
         is_voice = str(origin.get("channel", "")) == "voice"
         if is_voice and mode == "async":
-            result = await _start_voice_async_job(
-                cfg=cfg,
-                specialist_role=agent_name,
-                task_text=task_text,
-                context_text=context_text,
-                origin=origin,
-                resolution=resolution,
-                permit=permit,
-            )
-            # JobRegistry.bind_task is now the sole task/permit owner. No await
-            # may occur between the successful bind above and this transfer.
-            owned = None  # __TRANSFER_VOICE_JOB__
+            handoff = _PermitHandoff()
+            try:
+                result = await _start_voice_async_job(
+                    cfg=cfg,
+                    specialist_role=agent_name,
+                    task_text=task_text,
+                    context_text=context_text,
+                    origin=origin,
+                    resolution=resolution,
+                    permit=permit,
+                    handoff=handoff,
+                )
+            finally:
+                if handoff.transferred:
+                    owned = None  # __TRANSFER_VOICE_JOB__
             return result
 
         delegation_id = str(uuid.uuid4())
@@ -3054,17 +3130,23 @@ async def continue_voice_job(args: dict) -> dict:
 
     owned = permit
     try:
+        handoff = _PermitHandoff()
         try:
-            result = await _start_voice_async_job(
-                cfg=cfg,
-                specialist_role=parent.specialist_role,
-                task_text=continuation_input,
-                context_text=private_context,
-                origin=origin,
-                resolution=resolution,
-                permit=permit,
-                parent_job_id=parent.id,
-            )
+            try:
+                result = await _start_voice_async_job(
+                    cfg=cfg,
+                    specialist_role=parent.specialist_role,
+                    task_text=continuation_input,
+                    context_text=private_context,
+                    origin=origin,
+                    resolution=resolution,
+                    permit=permit,
+                    handoff=handoff,
+                    parent_job_id=parent.id,
+                )
+            finally:
+                if handoff.transferred:
+                    owned = None
         except JobAuthorizationError:
             return _job_not_found_result()
         except JobTransitionError:
@@ -3073,8 +3155,6 @@ async def continue_voice_job(args: dict) -> dict:
                 "kind": "job_not_continuable",
                 "message": "That specialist job cannot be continued.",
             })
-        # Registry.bind_task owns task + permit from this exact point.
-        owned = None
         return result
     finally:
         if owned is not None:
