@@ -141,6 +141,20 @@ class StaggeredFailingSession(FakeHaSession):
         raise ConnectionError("secret-bearing staggered detail")
 
 
+class BlockingInitializeSession(FakeHaSession):
+    """Keep a reconnect in flight while the facade has no session."""
+
+    def __init__(self, *, tools: list[Tool]) -> None:
+        super().__init__(tools=tools)
+        self.initialize_started = asyncio.Event()
+        self.release_initialize = asyncio.Event()
+
+    async def initialize(self) -> InitializeResult:
+        self.initialize_started.set()
+        await self.release_initialize.wait()
+        return await super().initialize()
+
+
 class SchemaChangeRecorder:
     def __init__(self) -> None:
         self.count = 0
@@ -468,6 +482,82 @@ async def test_concurrent_transport_failures_share_one_reconnect():
         assert len(failed.calls) == 2
         assert healthy.calls == []
     finally:
+        await facade.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_calls_do_not_queue_redundant_reconnect():
+    failed = FakeHaSession(
+        tools=[action_tool("HassTurnOn")],
+        results={"HassTurnOn": ConnectionError("initial failure")},
+    )
+    replacement = BlockingInitializeSession(
+        tools=[action_tool("HassTurnOn")],
+    )
+    redundant_reconnect_sentinel = FakeHaSession(
+        tools=[action_tool("HassTurnOn")],
+    )
+    sessions = SessionSequence(
+        failed,
+        replacement,
+        redundant_reconnect_sentinel,
+    )
+    facade = make_facade(sessions)
+    unavailable = {
+        "content": [{
+            "type": "text",
+            "text": "Home Assistant is temporarily unavailable.",
+        }],
+        "is_error": True,
+    }
+
+    await facade.start()
+    try:
+        original_config = facade.server_config
+        failed_result = await invoke_sdk_tool(
+            original_config,
+            "HassTurnOn",
+            {"name": "failed"},
+        )
+        assert failed_result == unavailable
+
+        await asyncio.wait_for(replacement.initialize_started.wait(), timeout=1)
+        assert sessions.open_count == 2
+
+        unavailable_results = await asyncio.wait_for(
+            asyncio.gather(*(
+                invoke_sdk_tool(
+                    original_config,
+                    "HassTurnOn",
+                    {"name": f"waiting-{index}"},
+                )
+                for index in range(16)
+            )),
+            timeout=1,
+        )
+        assert unavailable_results == [unavailable] * 16
+        assert sessions.open_count == 2
+        assert replacement.calls == []
+
+        replacement.release_initialize.set()
+        await wait_until(
+            lambda: facade.server_config is not original_config,
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert sessions.open_count == 2
+        healthy_result = await invoke_sdk_tool(
+            facade.server_config,
+            "HassTurnOn",
+            {"name": "healthy"},
+        )
+        assert "is_error" not in healthy_result
+        assert failed.calls == [("HassTurnOn", {"name": "failed"})]
+        assert replacement.calls == [("HassTurnOn", {"name": "healthy"})]
+        assert redundant_reconnect_sentinel.calls == []
+    finally:
+        replacement.release_initialize.set()
         await facade.aclose()
 
 

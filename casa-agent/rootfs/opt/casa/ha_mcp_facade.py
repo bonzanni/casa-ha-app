@@ -225,7 +225,7 @@ class HomeAssistantFacade:
         session = self._session
         session_generation = self._session_generation
         if session is None:
-            self._schedule_refresh()
+            self._ensure_refresh_worker()
             return _unavailable_result()
 
         upstream_arguments = {} if name == LIVE_CONTEXT_TOOL else arguments
@@ -237,7 +237,7 @@ class HomeAssistantFacade:
                 session_generation,
             )
             if invalidated:
-                self._schedule_refresh()
+                self._request_follow_up_refresh()
             logger.warning(
                 "Home Assistant tool transport failed; detail suppressed",
             )
@@ -261,15 +261,22 @@ class HomeAssistantFacade:
             await self._close_upstream_locked()
             return True
 
-    def _schedule_refresh(self) -> None:
+    def _ensure_refresh_worker(self) -> None:
+        """Start recovery unless an existing worker already owns it."""
         if self._closed:
             return
-        self._refresh_pending = True
         if self._refresh_task is None or self._refresh_task.done():
             self._refresh_task = asyncio.create_task(
                 self._run_scheduled_refresh(),
                 name="ha-mcp-facade-refresh",
             )
+
+    def _request_follow_up_refresh(self) -> None:
+        """Retain recovery requested while the worker is already in flight."""
+        if self._closed:
+            return
+        self._refresh_pending = True
+        self._ensure_refresh_worker()
 
     async def _run_scheduled_refresh(self) -> None:
         while True:
