@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 pytestmark = pytest.mark.unit
@@ -19,6 +21,48 @@ def test_role_sdk_override_wins_only_for_target_role():
     assert registry.resolve(
         ["homeassistant"], role="butler",
     )["homeassistant"]["type"] == "sdk"
+    assert registry.resolve(
+        ["homeassistant"], role="assistant",
+    )["homeassistant"]["url"] == "http://raw"
+
+
+async def test_wire_ha_facade_publishes_before_invalidating_only_butler():
+    from casa_core import wire_tina_ha_facade
+    from mcp_registry import McpServerRegistry
+
+    registry = McpServerRegistry()
+    registry.register_http("homeassistant", "http://raw")
+    old_config = {"type": "sdk", "instance": object()}
+    registry.register_role_sdk("homeassistant", "butler", old_config)
+    new_config = {"type": "sdk", "instance": object()}
+
+    class ObservingAgent:
+        def __init__(self, role):
+            self.role = role
+            self.seen = []
+
+        async def invalidate_tool_surface(self):
+            self.seen.append(
+                registry.resolve(["homeassistant"], role=self.role)[
+                    "homeassistant"
+                ]
+            )
+
+    butler = ObservingAgent("butler")
+    assistant = ObservingAgent("assistant")
+
+    await wire_tina_ha_facade(
+        registry,
+        type("Facade", (), {"server_config": new_config})(),
+        {"butler": butler, "assistant": assistant},
+        tina_role="butler",
+    )
+
+    assert butler.seen == [new_config]
+    assert assistant.seen == []
+    assert registry.resolve(
+        ["homeassistant"], role="butler",
+    )["homeassistant"] is new_config
     assert registry.resolve(
         ["homeassistant"], role="assistant",
     )["homeassistant"]["url"] == "http://raw"
@@ -74,3 +118,17 @@ def test_server_level_framework_grant_keeps_full_surface():
         tool.name for tool in CASA_TOOLS
     }
     assert cfg["alwaysLoad"] is True
+
+
+def test_ha_grant_doctrine_forbids_duplicate_raw_and_facade_names():
+    path = (
+        Path(__file__).parents[1]
+        / "casa-agent/rootfs/opt/casa/defaults/agents/executors/configurator"
+        / "doctrine/recipes/resident/grant_ha_tools.md"
+    )
+    text = path.read_text(encoding="utf-8")
+
+    assert "role-specific eager facade" in text
+    assert "same logical server name, `homeassistant`" in text
+    assert "Never grant raw `homeassistant` alongside a second facade" in text
+    assert "duplicate tools" in text

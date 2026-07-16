@@ -33,6 +33,7 @@ from config_git import init_repo, snapshot_manual_edits
 from freshness_reaper import FreshnessReaper
 from log_cid import install_logging, new_cid
 from casa_core_middleware import cid_middleware, CasaAccessLogger
+from ha_mcp_facade import HomeAssistantFacade
 from mcp_registry import McpServerRegistry
 from semantic_memory import SemanticMemory
 from policies import load_policies
@@ -1138,6 +1139,82 @@ def _maybe_register_n8n(
     return mcp_registry.resolve(["n8n-workflows"]).get("n8n-workflows")
 
 
+async def wire_tina_ha_facade(
+    mcp_registry: "McpServerRegistry",
+    facade: Any,
+    agents: Mapping[str, Any],
+    *,
+    tina_role: str = "butler",
+) -> None:
+    """Publish Tina's eager HA schema and retire her stale SDK clients."""
+    mcp_registry.register_role_sdk(
+        "homeassistant", tina_role, facade.server_config,
+    )
+    agent = agents.get(tina_role)
+    if agent is not None:
+        await agent.invalidate_tool_surface()
+
+
+async def _start_tina_ha_facade(
+    mcp_registry: "McpServerRegistry",
+    role_configs: Mapping[str, Any],
+    agents: Mapping[str, Any],
+    *,
+    ha_mcp_url: str,
+    supervisor_token: str,
+    env: Mapping[str, str] | None = None,
+    tina_role: str = "butler",
+) -> HomeAssistantFacade | None:
+    """Start and publish Tina's eager Home Assistant facade."""
+    env = env if env is not None else os.environ
+    if env.get("TINA_HA_FACADE_ENABLED", "true").strip().lower() == "false":
+        logger.info("ha_facade_disabled")
+        return None
+    tina_config = role_configs.get(tina_role)
+    if (
+        not supervisor_token
+        or tina_config is None
+        or "ha_voice" not in (getattr(tina_config, "channels", ()) or ())
+    ):
+        return None
+
+    facade: HomeAssistantFacade
+
+    async def _schema_changed() -> None:
+        await wire_tina_ha_facade(
+            mcp_registry, facade, agents, tina_role=tina_role,
+        )
+
+    facade = HomeAssistantFacade(
+        ha_mcp_url,
+        {"Authorization": f"Bearer {supervisor_token}"},
+        on_schema_change=_schema_changed,
+    )
+    try:
+        await facade.start()
+    except Exception:  # noqa: BLE001 — raw upstream details may hold secrets
+        try:
+            await facade.aclose()
+        except Exception:  # noqa: BLE001 — degraded boot remains available
+            pass
+        logger.warning("ha_facade_initialization_failed status=degraded")
+        return None
+    await wire_tina_ha_facade(
+        mcp_registry, facade, agents, tina_role=tina_role,
+    )
+    return facade
+
+
+async def _close_tina_ha_facade(facade: Any | None) -> None:
+    """Close the optional eager HA facade during Casa shutdown."""
+    if facade is None:
+        return
+    try:
+        await facade.aclose()
+    except Exception:  # noqa: BLE001 — shutdown must remain available
+        logger.warning("ha_facade_close_failed")
+
+
 def _make_webhook_handler(
     *,
     webhook_rate_limiter: Any,
@@ -1762,11 +1839,11 @@ async def main() -> None:
     mcp_registry = McpServerRegistry()
 
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
+    ha_mcp_url = os.environ.get(
+        "CASA_HA_MCP_URL",
+        "http://supervisor/core/api/mcp",
+    )
     if supervisor_token:
-        ha_mcp_url = os.environ.get(
-            "CASA_HA_MCP_URL",
-            "http://supervisor/core/api/mcp",
-        )
         mcp_registry.register_http(
             name="homeassistant",
             url=ha_mcp_url,
@@ -1959,6 +2036,13 @@ async def main() -> None:
             cfg.memory.read_strategy,
         )
 
+    ha_facade = await _start_tina_ha_facade(
+        mcp_registry,
+        role_configs,
+        agents,
+        ha_mcp_url=ha_mcp_url,
+        supervisor_token=supervisor_token,
+    )
     runtime.agents = agents  # share the dict reference; reload handlers mutate this directly.
 
     assistant_role = "assistant"
@@ -2767,6 +2851,7 @@ async def main() -> None:
                 await asyncio.wait_for(aclose(), timeout=15)
             except Exception:  # noqa: BLE001 — shutdown must complete
                 logger.warning("agent %s aclose failed/timed out", _role)
+    await _close_tina_ha_facade(ha_facade)
 
     # H10 (v0.49.0): include consumers spawned after boot by reload
     # (bus.start_agent_loop) — the local loop_tasks list only has the

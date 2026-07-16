@@ -9,6 +9,7 @@ bypasses, the reset-listener flush, options fresh-vs-resumed, and ``aclose``.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 
 import pytest
@@ -211,6 +212,187 @@ async def test_new_reset_listener_closes_warm_entry(agent_fixture,
     )
     assert agent._pool.stats()["entries"] == 0
     assert scripted_factory.clients[0].disconnected
+
+
+async def test_invalidate_all_closes_entries_but_pool_remains_usable(
+    agent_fixture, scripted_factory,
+):
+    agent, send_turn = agent_fixture
+    await send_turn("hello")
+    key = build_scoped_session_key("telegram", "assistant", "42")
+    old = agent._pool._entries[key]
+    sweeper = agent._pool._sweeper
+
+    await agent._pool.invalidate_all()
+
+    assert old.state == "closed"
+    assert scripted_factory.clients[0].disconnected
+    assert agent._pool.stats() == {"entries": 0, "closing": False}
+    assert agent._pool._sweeper is sweeper
+    assert sweeper is not None and not sweeper.done()
+
+    await send_turn("again")
+    assert agent._pool.stats() == {"entries": 1, "closing": False}
+    assert agent._pool._entries[key] is not old
+    assert scripted_factory.constructed == 2
+
+
+async def test_invalidate_all_does_not_close_a_concurrent_new_generation(
+    agent_fixture, scripted_factory,
+):
+    agent, send_turn = agent_fixture
+    await send_turn("hello")
+    key = build_scoped_session_key("telegram", "assistant", "42")
+    old = agent._pool._entries[key]
+    old_client = scripted_factory.clients[0]
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def gated_disconnect():
+        old_client.disconnected = True
+        close_started.set()
+        await release_close.wait()
+
+    old_client.disconnect = gated_disconnect
+    invalidation = asyncio.create_task(agent._pool.invalidate_all())
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+
+    await send_turn("again")
+    current = agent._pool._entries[key]
+    assert current is not old
+    assert current.state == "warm"
+    assert not invalidation.done()
+
+    release_close.set()
+    await invalidation
+    assert agent._pool._entries[key] is current
+    assert current.state == "warm"
+
+
+async def test_invalidate_all_waits_for_an_in_flight_entry_lock(
+    agent_fixture, scripted_factory,
+):
+    agent, send_turn = agent_fixture
+    await send_turn("hello")
+    key = build_scoped_session_key("telegram", "assistant", "42")
+    old = agent._pool._entries[key]
+    await old.lock.acquire()
+
+    invalidation = asyncio.create_task(agent._pool.invalidate_all())
+    await asyncio.sleep(0)
+
+    assert key not in agent._pool._entries
+    assert old.state == "warm"
+    assert not scripted_factory.clients[0].disconnected
+
+    old.lock.release()
+    await invalidation
+    assert old.state == "closed"
+    assert scripted_factory.clients[0].disconnected
+
+
+async def test_agent_invalidate_tool_surface_closes_current_pool_generation(
+    agent_fixture, scripted_factory,
+):
+    agent, send_turn = agent_fixture
+    await send_turn("hello")
+    old = next(iter(agent._pool._entries.values()))
+
+    await agent.invalidate_tool_surface()
+
+    assert old.state == "closed"
+    assert scripted_factory.clients[0].disconnected
+    assert agent._pool.stats() == {"entries": 0, "closing": False}
+
+
+async def test_facade_schema_refresh_reconnects_only_butler_with_new_config(
+    tmp_path, scripted_factory,
+):
+    from casa_core import wire_tina_ha_facade
+
+    registry = McpServerRegistry()
+    raw_config = {
+        "type": "http",
+        "url": "http://raw",
+        "headers": None,
+    }
+    old_facade_config = {"type": "sdk", "instance": object()}
+    new_facade_config = {"type": "sdk", "instance": object()}
+    registry.register_http("homeassistant", "http://raw")
+    registry.register_role_sdk(
+        "homeassistant", "butler", old_facade_config,
+    )
+    sessions = SessionRegistry(str(tmp_path / "sessions.json"))
+
+    def make_agent(role):
+        return Agent(
+            config=AgentConfig(
+                role=role,
+                model="claude-sonnet-4-6",
+                system_prompt="You are helpful.",
+                character=CharacterConfig(name=role.title()),
+                tools=ToolsConfig(
+                    allowed=["Read", "mcp__homeassistant"],
+                    permission_mode="acceptEdits",
+                ),
+                mcp_server_names=["homeassistant"],
+                memory=MemoryConfig(
+                    token_budget=1000, read_strategy="per_turn",
+                ),
+            ),
+            session_registry=sessions,
+            mcp_registry=registry,
+            channel_manager=ChannelManager(),
+            semantic_memory=FakeSemanticMemory(),
+        )
+
+    butler = make_agent("butler")
+    assistant = make_agent("assistant")
+
+    async def send(agent, role, text):
+        return await agent.handle_message(BusMessage(
+            type=MessageType.REQUEST,
+            source="user",
+            target=role,
+            content=text,
+            channel="telegram",
+            context={"chat_id": "42"},
+        ))
+
+    try:
+        await send(butler, "butler", "before")
+        await send(assistant, "assistant", "before")
+        old_butler_client, assistant_client = scripted_factory.clients
+        assert (
+            old_butler_client.options.mcp_servers["homeassistant"]
+            is old_facade_config
+        )
+        assert assistant_client.options.mcp_servers["homeassistant"] == raw_config
+
+        facade = type(
+            "Facade", (), {"server_config": new_facade_config},
+        )()
+        await wire_tina_ha_facade(
+            registry,
+            facade,
+            {"butler": butler, "assistant": assistant},
+        )
+
+        assert old_butler_client.disconnected
+        assert butler._pool.stats()["entries"] == 0
+        assert not assistant_client.disconnected
+        assert assistant._pool.stats()["entries"] == 1
+
+        await send(butler, "butler", "after")
+        await send(assistant, "assistant", "after")
+        assert scripted_factory.constructed == 3
+        assert (
+            scripted_factory.clients[2].options.mcp_servers["homeassistant"]
+            is new_facade_config
+        )
+        assert not assistant_client.disconnected
+    finally:
+        await asyncio.gather(butler.aclose(), assistant.aclose())
 
 
 async def test_options_fresh_vs_resumed_memory_blocks(agent_fixture,

@@ -4,6 +4,12 @@ When a resident agent needs to control HA devices (lights, climate, locks, media
 
 The default Casa setup wires this for `butler` (Tina). Use this recipe to add it to any other resident.
 
+Keep the same logical server name, `homeassistant`, for every role with direct
+HA grants. Casa may transparently substitute a role-specific eager facade under
+that name. Never grant raw `homeassistant` alongside a second facade server
+name: that exposes duplicate tools to the model and makes tool selection
+ambiguous.
+
 ## Prerequisite — HA-side configuration
 
 The user must, in Home Assistant:

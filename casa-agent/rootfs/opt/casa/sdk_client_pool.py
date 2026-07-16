@@ -423,6 +423,21 @@ class SdkClientPool:
             async with entry.lock:
                 await entry.aclose()
 
+    async def invalidate_all(self) -> None:
+        """Drop the current entry generation without shutting down the pool."""
+        async with self._pool_lock:
+            entries = list(self._entries.values())
+            self._entries.clear()
+
+        async def _close(entry: ManagedSdkClient) -> None:
+            async with entry.lock:
+                await entry.aclose()
+
+        await asyncio.gather(
+            *(_close(entry) for entry in entries),
+            return_exceptions=True,
+        )
+
     async def aclose(self, *, drain_timeout: float = 120.0) -> None:
         self._closing = True
         if self._sweeper is not None:

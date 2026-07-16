@@ -1071,6 +1071,10 @@ class Agent:
 
         return on_message, state
 
+    async def invalidate_tool_surface(self) -> None:
+        """Reconnect pooled SDK clients against the current MCP schemas."""
+        await self._pool.invalidate_all()
+
     async def aclose(self) -> None:
         """Release pooled SDK clients + reset hook. Safe to call twice; called
         by reload (old instance) and casa_core shutdown."""

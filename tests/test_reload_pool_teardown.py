@@ -4,6 +4,7 @@ subprocess per warm conversation per reload."""
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -52,6 +53,39 @@ async def test_schedule_agent_close_awaits_aclose():
 async def test_schedule_agent_close_tolerates_missing_aclose():
     reload_mod._schedule_agent_close(object())      # must not raise
     reload_mod._schedule_agent_close(None)
+
+
+async def test_close_tina_facade_awaits_aclose():
+    from casa_core import _close_tina_ha_facade
+
+    class Facade:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    facade = Facade()
+    await _close_tina_ha_facade(facade)
+    assert facade.closed
+
+
+async def test_close_tina_facade_failure_is_sanitized(caplog):
+    from casa_core import _close_tina_ha_facade
+
+    class Facade:
+        async def aclose(self):
+            raise RuntimeError("private-token at http://private-ha")
+
+    with caplog.at_level(logging.WARNING):
+        await _close_tina_ha_facade(Facade())
+
+    assert [
+        record.getMessage() for record in caplog.records
+        if "ha_facade" in record.getMessage()
+    ] == ["ha_facade_close_failed"]
+    assert "private-token" not in caplog.text
+    assert "private-ha" not in caplog.text
 
 
 async def test_reload_agent_closes_replaced_instance(monkeypatch, tmp_path):
