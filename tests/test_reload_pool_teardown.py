@@ -88,6 +88,35 @@ async def test_close_tina_facade_failure_is_sanitized(caplog):
     assert "private-ha" not in caplog.text
 
 
+async def test_close_tina_facade_hanging_close_is_bounded(caplog):
+    from casa_core import _close_tina_ha_facade
+
+    close_started = asyncio.Event()
+    close_cancelled = asyncio.Event()
+    never_close = asyncio.Event()
+
+    class Facade:
+        async def aclose(self):
+            close_started.set()
+            try:
+                await never_close.wait()
+            finally:
+                close_cancelled.set()
+
+    with caplog.at_level(logging.WARNING):
+        await asyncio.wait_for(
+            _close_tina_ha_facade(Facade(), timeout=0.01),
+            timeout=1.0,
+        )
+
+    assert close_started.is_set()
+    assert close_cancelled.is_set()
+    assert [
+        record.getMessage() for record in caplog.records
+        if "ha_facade" in record.getMessage()
+    ] == ["ha_facade_close_failed"]
+
+
 async def test_reload_agent_closes_replaced_instance(monkeypatch, tmp_path):
     """Run reload_agent against the stub runtime (mirrors the end-to-end
     pattern in tests/test_reload.py::TestReloadAgent.test_resident_atomic_swap,

@@ -1205,12 +1205,16 @@ async def _start_tina_ha_facade(
     return facade
 
 
-async def _close_tina_ha_facade(facade: Any | None) -> None:
-    """Close the optional eager HA facade during Casa shutdown."""
+async def _close_tina_ha_facade(
+    facade: Any | None,
+    *,
+    timeout: float = 15.0,
+) -> None:
+    """Close the optional eager HA facade without wedging Casa shutdown."""
     if facade is None:
         return
     try:
-        await facade.aclose()
+        await asyncio.wait_for(facade.aclose(), timeout=timeout)
     except Exception:  # noqa: BLE001 — shutdown must remain available
         logger.warning("ha_facade_close_failed")
 
