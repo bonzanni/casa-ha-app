@@ -1895,8 +1895,10 @@ async def main() -> None:
         specialist_limiter=specialist_limiter,
         specialist_telemetry=specialist_telemetry,
     )
-    casa_tools_config = create_casa_tools()
-    mcp_registry.register_sdk("casa-framework", casa_tools_config)
+    mcp_registry.register_sdk_factory(
+        "casa-framework",
+        lambda _role, grants: create_casa_tools(grants),
+    )
     logger.info("Registered casa-framework MCP tools")
 
     # Plugin media outbox (v0.73.0 §3.4): init FDs + boot-reap + register the

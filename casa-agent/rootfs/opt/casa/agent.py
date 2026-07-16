@@ -838,10 +838,7 @@ class Agent:
         # rides on the per-turn query text (built in _process).
         system_prompt = "\n".join(system_parts)
 
-        # 4. MCP servers.
-        mcp_servers = self._mcp_registry.resolve(self.config.mcp_server_names)
-
-        # 5. Hooks — resolved from hooks.yaml at load time by agent_loader.
+        # 4. Hooks — resolved from hooks.yaml at load time by agent_loader.
         #    I-2 (v0.69.8): always inject the agent-home settings.json
         #    self-grant guard — a code-side security invariant that config
         #    cannot remove. Build a fresh dict so the shared _resolved_hooks
@@ -906,6 +903,18 @@ class Agent:
             if grant not in allowed_tools:
                 allowed_tools.append(grant)
 
+        # Resolve role-aware MCP servers only after every config/plugin grant
+        # is known so SDK factories can expose the exact authorized schemas.
+        mcp_servers = self._mcp_registry.resolve(
+            self.config.mcp_server_names,
+            role=self.config.role,
+            allowed_tools=allowed_tools,
+        )
+        skills = (
+            "all" if getattr(self.config.tools, "skills", "all") == "all"
+            else None
+        )
+
         options = ClaudeAgentOptions(
             model=self.config.model,
             system_prompt=system_prompt,
@@ -918,7 +927,7 @@ class Agent:
             cwd=agent_home,
             resume=resume_sid,
             setting_sources=["project"],
-            skills="all",  # (f) v0.69.9: replaces the deprecated bare "Skill"
+            skills=skills,
             plugins=[{"type": "local", "path": rp.path}
                      for rp in resolution.plugins],
             # P-5b: in-casa agents have no permission relay — fail closed on

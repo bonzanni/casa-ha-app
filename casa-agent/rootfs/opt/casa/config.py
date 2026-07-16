@@ -75,6 +75,8 @@ class ToolsConfig:
     disallowed: list[str] = field(default_factory=list)
     permission_mode: str = ""
     max_turns: int = 10
+    skills: str = "all"
+    voice_guard: str = "none"
 
 
 _VALID_READ_STRATEGIES = ("per_turn", "cached")

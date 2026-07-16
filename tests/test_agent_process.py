@@ -191,6 +191,45 @@ def _msg(channel: str, chat_id: str, text: str = "ping") -> BusMessage:
     )
 
 
+async def test_resident_options_resolve_mcp_with_role_grants_and_skill_policy(
+    tmp_path,
+):
+    agent = _make_agent(tmp_path, role="butler")
+    agent.config.tools = ToolsConfig(
+        allowed=["Skill", "mcp__casa-framework__get_schedule"],
+        permission_mode="acceptEdits",
+        skills="none",
+    )
+    agent.config.mcp_server_names = ["casa-framework"]
+    agent._mcp_registry.register_sdk_factory(
+        "casa-framework",
+        lambda role, grants: {
+            "type": "sdk",
+            "instance": object(),
+            "resolved_role": role,
+            "resolved_grants": grants,
+        },
+    )
+
+    options = await agent._build_options(
+        channel="voice",
+        channel_key="voice-butler-house",
+        is_fresh=True,
+        resume_sid=None,
+        user_text="what is next?",
+    )
+
+    server = options.mcp_servers["casa-framework"]
+    assert server["resolved_role"] == "butler"
+    assert server["resolved_grants"] == frozenset({
+        "mcp__casa-framework__get_schedule",
+    })
+    assert options.allowed_tools == [
+        "mcp__casa-framework__get_schedule",
+    ]
+    assert options.skills is None
+
+
 async def test_session_id_is_channel_plus_role(tmp_path):
     # §4.3: the read path no longer fans out per-scope Honcho sessions; it
     # recalls once against the role's bank.

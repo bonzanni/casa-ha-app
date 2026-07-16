@@ -599,6 +599,58 @@ class TestMcpRegistryWiring:
         options = _build_specialist_options(cfg)
         assert options.mcp_servers == {}
 
+    async def test_specialist_resolves_after_interactive_grants_are_added(
+        self, tmp_path,
+    ):
+        from mcp_registry import McpServerRegistry
+        from tools import _build_specialist_options, init_tools
+
+        mcp = McpServerRegistry()
+        mcp.register_sdk_factory(
+            "casa-framework",
+            lambda role, grants: {
+                "type": "sdk",
+                "instance": object(),
+                "resolved_role": role,
+                "resolved_grants": grants,
+            },
+        )
+        reg = SpecialistRegistry(
+            str(tmp_path / "ex"),
+            tombstone_path=str(tmp_path / "del.json"),
+        )
+        init_tools(ChannelManager(), MessageBus(), reg, mcp)
+        cfg = _specialist_cfg(role="finance")
+        cfg.tools = ToolsConfig(
+            allowed=["Skill", "mcp__casa-framework__recall_memory"],
+            permission_mode="acceptEdits",
+            skills="none",
+        )
+        cfg.mcp_server_names = ["casa-framework"]
+
+        options = _build_specialist_options(
+            cfg,
+            resolution=ResolutionResult(registry_valid=True),
+            extra_casa_tools=(
+                "mcp__casa-framework__query_engager",
+                "mcp__casa-framework__emit_completion",
+            ),
+        )
+
+        server = options.mcp_servers["casa-framework"]
+        assert server["resolved_role"] == "finance"
+        assert server["resolved_grants"] == frozenset({
+            "mcp__casa-framework__recall_memory",
+            "mcp__casa-framework__query_engager",
+            "mcp__casa-framework__emit_completion",
+        })
+        assert options.allowed_tools == [
+            "mcp__casa-framework__recall_memory",
+            "mcp__casa-framework__query_engager",
+            "mcp__casa-framework__emit_completion",
+        ]
+        assert options.skills is None
+
 
 # ---------------------------------------------------------------------------
 # TestMergedRoleMap — Task 7: delegate_to_agent resolves resident configs

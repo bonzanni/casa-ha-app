@@ -559,8 +559,11 @@ class TestInteractiveRequiresDenial:
         )
         captured: dict = {}
 
-        def _spy_builder(cfg, *, resolution=None):
+        def _spy_builder(
+            cfg, *, resolution=None, extra_casa_tools: tuple[str, ...] = (),
+        ):
             captured["resolution"] = resolution
+            captured["extra_casa_tools"] = extra_casa_tools
             opts = MagicMock()
             opts.allowed_tools = []
             return opts
@@ -594,5 +597,9 @@ class TestInteractiveRequiresDenial:
         )
         # The builder received the SAME object (identity, not equality).
         assert captured["resolution"] is resolution
+        assert captured["extra_casa_tools"] == (
+            "mcp__casa-framework__query_engager",
+            "mcp__casa-framework__emit_completion",
+        )
         # Exactly one resolve across the whole interactive path.
         assert resolve_calls == ["specialist:finance"]

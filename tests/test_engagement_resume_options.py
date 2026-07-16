@@ -16,7 +16,9 @@ import pytest
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
-def _wire(monkeypatch, *, specialist_cfg=None, executor_defn=None):
+def _wire(
+    monkeypatch, *, specialist_cfg=None, executor_defn=None, mcp_registry=None,
+):
     import tools as tools_mod
     import plugin_registry
     monkeypatch.setattr(
@@ -29,11 +31,28 @@ def _wire(monkeypatch, *, specialist_cfg=None, executor_defn=None):
     exec_reg.get = MagicMock(return_value=executor_defn)
     tools_mod.init_tools(
         channel_manager=MagicMock(), bus=MagicMock(),
-        specialist_registry=spec_reg, mcp_registry=MagicMock(),
+        specialist_registry=spec_reg,
+        mcp_registry=mcp_registry if mcp_registry is not None else MagicMock(),
         trigger_registry=MagicMock(), engagement_registry=MagicMock(),
         executor_registry=exec_reg,
     )
     return tools_mod
+
+
+def _role_aware_mcp_registry():
+    from mcp_registry import McpServerRegistry
+
+    registry = McpServerRegistry()
+    registry.register_sdk_factory(
+        "casa-framework",
+        lambda role, grants: {
+            "type": "sdk",
+            "instance": object(),
+            "resolved_role": role,
+            "resolved_grants": grants,
+        },
+    )
+    return registry
 
 
 def _specialist_cfg(tmp_home):
@@ -47,7 +66,12 @@ def _specialist_cfg(tmp_home):
 
 
 async def test_resume_options_rebuild_specialist_keeps_restrictions(tmp_path, monkeypatch):
-    tools_mod = _wire(monkeypatch, specialist_cfg=_specialist_cfg(str(tmp_path)))
+    cfg = _specialist_cfg(str(tmp_path))
+    cfg.mcp_server_names = ["casa-framework"]
+    mcp = _role_aware_mcp_registry()
+    tools_mod = _wire(
+        monkeypatch, specialist_cfg=cfg, mcp_registry=mcp,
+    )
     eng = SimpleNamespace(kind="specialist", role_or_type="finance")
     opts = tools_mod.build_engagement_resume_options(eng, "sess-xyz")
     assert opts.resume == "sess-xyz"
@@ -55,19 +79,42 @@ async def test_resume_options_rebuild_specialist_keeps_restrictions(tmp_path, mo
     assert opts.skills == "all"
     assert opts.can_use_tool is not None          # fail-closed callback restored
     assert "Skill" not in opts.allowed_tools
+    assert {
+        "mcp__casa-framework__query_engager",
+        "mcp__casa-framework__emit_completion",
+    } <= set(opts.allowed_tools)
+    server = opts.mcp_servers["casa-framework"]
+    assert server["resolved_role"] == "finance"
+    assert {
+        "mcp__casa-framework__query_engager",
+        "mcp__casa-framework__emit_completion",
+    } <= server["resolved_grants"]
 
 
 async def test_resume_options_rebuild_executor(monkeypatch):
     defn = SimpleNamespace(
-        hooks_path=None, mcp_server_names=[], tools_allowed=["Read"],
+        hooks_path=None, mcp_server_names=["casa-framework"], tools_allowed=["Read"],
         model="claude-sonnet-4-6", permission_mode="auto", max_turns=None,
         tools_disallowed=[], driver="in_casa",
     )
-    tools_mod = _wire(monkeypatch, executor_defn=defn)
+    mcp = _role_aware_mcp_registry()
+    tools_mod = _wire(
+        monkeypatch, executor_defn=defn, mcp_registry=mcp,
+    )
     eng = SimpleNamespace(kind="executor", role_or_type="configurator")
     opts = tools_mod.build_engagement_resume_options(eng, "sess-abc")
     assert opts.resume == "sess-abc"
     assert opts.skills == "all"
+    assert {
+        "mcp__casa-framework__query_engager",
+        "mcp__casa-framework__emit_completion",
+    } <= set(opts.allowed_tools)
+    server = opts.mcp_servers["casa-framework"]
+    assert server["resolved_role"] == "configurator"
+    assert {
+        "mcp__casa-framework__query_engager",
+        "mcp__casa-framework__emit_completion",
+    } <= server["resolved_grants"]
 
 
 async def test_resume_options_missing_config_fails_closed(monkeypatch):

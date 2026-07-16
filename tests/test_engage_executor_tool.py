@@ -389,6 +389,75 @@ class TestEngageExecutorReal:
         assert payload["executor_type"] == "configurator"
         assert payload["topic_id"] == 42
 
+    async def test_in_casa_factory_sees_final_interactive_grants(
+        self, tmp_path, monkeypatch,
+    ):
+        from mcp_registry import McpServerRegistry
+        from tools import engage_executor, init_tools
+        import agent as agent_mod
+
+        defn = _mock_executor_def(tools_allowed=[
+            "Read",
+            "mcp__casa-framework__config_git_commit",
+        ])
+        reg = MagicMock()
+        reg.get = MagicMock(return_value=defn)
+        reg.list_types = MagicMock(return_value=["configurator"])
+        er = MagicMock()
+        rec = MagicMock(id="abcd1234" + "0" * 24, topic_id=42)
+        er.create = AsyncMock(return_value=rec)
+        er.mark_error = AsyncMock()
+        er.set_channel_state = AsyncMock()
+        channel = await _setup(reg, tmp_path=tmp_path)
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+
+        mcp = McpServerRegistry()
+        mcp.register_sdk_factory(
+            "casa-framework",
+            lambda role, grants: {
+                "type": "sdk",
+                "instance": object(),
+                "resolved_role": role,
+                "resolved_grants": grants,
+            },
+        )
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=mcp,
+            trigger_registry=MagicMock(), engagement_registry=er,
+            executor_registry=reg,
+        )
+        driver = MagicMock(start=AsyncMock())
+        monkeypatch.setattr(
+            agent_mod, "active_engagement_driver", driver, raising=False,
+        )
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+        })
+        try:
+            result = await engage_executor.handler({
+                "executor_type": "configurator",
+                "task": "make a thing",
+                "context": "none",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["status"] == "pending"
+        options = driver.start.await_args.kwargs["options"]
+        server = options.mcp_servers["casa-framework"]
+        assert server["resolved_role"] == "configurator"
+        assert server["resolved_grants"] == frozenset({
+            "Read",
+            "mcp__casa-framework__config_git_commit",
+            "mcp__casa-framework__query_engager",
+            "mcp__casa-framework__emit_completion",
+        })
+
     async def test_requires_origin(self):
         from tools import engage_executor, init_tools
         reg = MagicMock()

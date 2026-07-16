@@ -141,6 +141,41 @@ class TestHappyPath:
         assert "### Delegation" not in cfg.system_prompt
 
 
+def test_runtime_loads_context_surface_policy(tmp_path):
+    from agent_loader import load_agent_from_dir
+    from policies import load_policies
+
+    agent_dir = _seed_resident(tmp_path / "agents", "butler")
+    _w(agent_dir / "runtime.yaml", """\
+        schema_version: 1
+        model: sonnet
+        tools:
+          allowed: [mcp__casa-framework__get_schedule]
+          skills: none
+          voice_guard: ha_direct
+        channels: [ha_voice]
+    """)
+    policies = load_policies(str(_policies_file(tmp_path / "policies")))
+
+    cfg = load_agent_from_dir(str(agent_dir), policies=policies)
+
+    assert cfg.tools.skills == "none"
+    assert cfg.tools.voice_guard == "ha_direct"
+
+
+def test_runtime_context_policy_defaults_preserve_existing_agents(tmp_path):
+    from agent_loader import load_agent_from_dir
+    from policies import load_policies
+
+    agent_dir = _seed_resident(tmp_path / "agents", "assistant")
+    policies = load_policies(str(_policies_file(tmp_path / "policies")))
+
+    cfg = load_agent_from_dir(str(agent_dir), policies=policies)
+
+    assert cfg.tools.skills == "all"
+    assert cfg.tools.voice_guard == "none"
+
+
 # ---------------------------------------------------------------------------
 # TestStrictMode — unknown field / file / schema_version
 # ---------------------------------------------------------------------------
@@ -480,6 +515,36 @@ def test_butler_runtime_grants_homeassistant_server_level():
     assert "mcp__homeassistant" in allowed, (
         f"butler.tools.allowed missing mcp__homeassistant; got {allowed}"
     )
+
+
+def test_butler_runtime_sets_minimal_context_surface_policy():
+    import yaml
+    from pathlib import Path
+
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "casa-agent/rootfs/opt/casa/defaults/agents/butler/runtime.yaml"
+    )
+    data = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
+
+    assert data["tools"]["skills"] == "none"
+    assert data["tools"]["voice_guard"] == "ha_direct"
+    assert "Skill" not in data["tools"]["allowed"]
+    assert data["mcp_server_names"] == ["homeassistant", "casa-framework"]
+
+
+def test_assistant_runtime_omits_unused_homeassistant_attachment():
+    import yaml
+    from pathlib import Path
+
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "casa-agent/rootfs/opt/casa/defaults/agents/assistant/runtime.yaml"
+    )
+    data = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
+
+    assert "mcp__homeassistant" not in data["tools"]["allowed"]
+    assert "homeassistant" not in data["mcp_server_names"]
 
 
 def test_assistant_delegates_include_butler():

@@ -4,7 +4,6 @@ enabled: true
 tools:
   allowed:
     - Read
-    - Skill
     - mcp__casa-framework__get_schedule
     - mcp__casa-framework__recall_memory
     - mcp__homeassistant
@@ -13,6 +12,8 @@ tools:
   disallowed: [Bash, Write, Edit, Agent, Task]
   permission_mode: acceptEdits
   max_turns: 10
+  skills: none
+  voice_guard: ha_direct
 mcp_server_names:
   - homeassistant
   - casa-framework

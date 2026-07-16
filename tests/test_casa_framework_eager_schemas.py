@@ -24,7 +24,7 @@ pytestmark = pytest.mark.unit
 
 
 def test_casa_framework_server_config_carries_alwaysload():
-    from tools import create_casa_tools
+    from tools import CASA_TOOLS, create_casa_tools, select_casa_tools
 
     cfg = create_casa_tools()
     assert cfg.get("type") == "sdk"
@@ -33,3 +33,4 @@ def test_casa_framework_server_config_carries_alwaysload():
         "casa-framework must opt out of ToolSearch deferral (S-1): "
         f"config keys = {sorted(cfg.keys())!r}"
     )
+    assert select_casa_tools() == CASA_TOOLS

@@ -15,7 +15,9 @@
         "allowed":         {"type": "array", "items": {"type": "string"}, "default": []},
         "disallowed":      {"type": "array", "items": {"type": "string"}, "default": []},
         "permission_mode": {"type": "string", "default": "acceptEdits"},
-        "max_turns":       {"type": "integer", "minimum": 1, "default": 10}
+        "max_turns":       {"type": "integer", "minimum": 1, "default": 10},
+        "skills":          {"type": "string", "enum": ["all", "none"], "default": "all"},
+        "voice_guard":     {"type": "string", "enum": ["none", "ha_direct"], "default": "none"}
       }
     },
     "mcp_server_names": {"type": "array", "items": {"type": "string"}, "default": []},
