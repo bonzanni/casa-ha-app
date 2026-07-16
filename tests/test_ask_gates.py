@@ -594,6 +594,87 @@ class TestCancelledIntentTombstone:
             wired["ask"](_FakeRequest(_anchor_payload(eid, "a1"))), timeout=1.0)
         assert _body(resp_retry) == {"ok": False, "error": "cancelled"}
 
+    async def test_cancel_during_inflight_post_loses_the_post_wins_anchor(
+        self, wired, monkeypatch,
+    ):
+        """A3 · F-ORDER (Sol A3 wave 3 — the final blocker): a transport
+        CANCELLATION that lands WHILE the relay is mid-post (holding the writer
+        lock inside the poster) must be SERIALIZED behind that post — the cancel
+        LOSES, the post WINS, and the ledger ends with exactly ONE live question
+        (Sol's [1, 2] two-live-questions repro is closed).
+
+        Interleaving: the relay reaches ``_post_intent_locked`` and blocks INSIDE
+        the poster (gated on an Event, holding the writer lock) → the handler task
+        is cancelled (its cleanup runs) → a SECOND ask must now be REFUSED
+        ``question_pending`` (the cancel lost, so the marker still stands) →
+        release the poster (post completes, ledger entry tracked, marker cleared
+        at durable ownership) → exactly ONE live question, the intent keeps its
+        SUCCESS outcome, and the cancelled handler's same-request_id retry
+        reattaches to the POSTED outcome."""
+        eid, drv, seq, chan = (
+            wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
+        gate = asyncio.Event()
+        real_add = wired["reg"].add_open_question
+
+        async def _gated_add(*a, **k):
+            await gate.wait()               # park the poster mid-post, lock held
+            return await real_add(*a, **k)
+
+        monkeypatch.setattr(wired["reg"], "add_open_question", _gated_add)
+
+        # a1 registers, arms, and parks awaiting the relay-deferred post.
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "a1"
+
+        # The relay reaches the block: the poster posts the wire message, then
+        # blocks in the gated add_open_question — STILL holding the writer lock.
+        relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
+        await asyncio.sleep(0.02)
+        # The poster's wire message has landed but the ledger write (add_open_
+        # question) is parked, so the intent is still armed and unresolved.
+        intent = seq.registry.by_request_id("a1")
+        assert intent.state == "armed"
+        assert len(chan.anchors) == 1      # wire message landed; ledger NOT yet
+        assert drv._effective_open_question_numbers(eid) == []
+
+        # Cancel the handler. Its cleanup routes through the SERIALIZED cancel,
+        # which now BLOCKS on the writer lock the relay holds.
+        t1.cancel()
+        await asyncio.sleep(0.02)
+
+        # The cancel is stalled behind the post — the marker STILL stands, so a
+        # SECOND, different ask is refused question_pending (one-question intact).
+        assert drv.ask_inflight(eid) == "a1"
+        resp2 = await asyncio.wait_for(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a2", hash="anchor-hash-2"))), timeout=1.0)
+        assert _body(resp2)["error"] == "question_pending"
+
+        # Release the poster → it finishes durable ownership (clears the marker)
+        # and the post resolves ok; the writer lock frees; the cancel LOSES.
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await t1
+        await asyncio.wait_for(relay, timeout=1.0)
+
+        # Exactly ONE live question; the intent keeps its SUCCESS outcome; the
+        # marker cleared at durable ownership (the cancel never clobbered it).
+        assert len(chan.anchors) == 1
+        assert drv.ask_inflight(eid) is None
+        outcome = drv.send_intent_outcome(eid, "a1")
+        assert outcome["ok"] is True and outcome.get("message_id") is not None
+        assert drv._effective_open_question_numbers(eid) == [1]
+
+        # The cancelled handler's same-request_id retry reattaches to the POSTED
+        # outcome — no second post, no hang.
+        resp_retry = await asyncio.wait_for(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))), timeout=1.0)
+        body_retry = _body(resp_retry)
+        assert body_retry["outcome"] == "anchored"
+        assert body_retry["message_id"] == outcome["message_id"]
+        assert len(chan.anchors) == 1
+
     async def test_cancel_mid_allocation_same_id_retry_short_circuits_anchor(
         self, wired, monkeypatch,
     ):

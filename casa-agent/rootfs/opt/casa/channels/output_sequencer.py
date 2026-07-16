@@ -155,6 +155,10 @@ class SendIntent:
     state: str = "pending"          # pending | armed | posted | cancelled
     message_id: int | None = None
     outcome: dict | None = None
+    posting: bool = False           # A3 · F-ORDER (Sol A3 wave 3): the writer is
+    #                                 CURRENTLY awaiting this intent's poster under
+    #                                 the lock. A serialized cancel that observes
+    #                                 this NO-OPS — the in-flight post wins.
     slot_missed: bool = False       # relay slot timed out while this was pending
     timeout_posted: bool = False    # §2(5) one-block consumption debt
     consumed: bool = False          # retired from matching
@@ -643,6 +647,46 @@ class OutputSequencer:
         self._signal_resolution(request_id)
         return intent
 
+    async def record_intent_cancelled(
+        self, request_id: str, outcome: dict,
+    ) -> bool:
+        """A3 · F-ORDER (Sol A3 wave 3): SERIALIZE a transport-cancellation
+        cleanup against an in-flight relay post — "the post wins".
+
+        Unlike the synchronous :meth:`record_intent_refusal` (used by the
+        pre-arm operator-away / unread / embedded gates, where no relay post can
+        be racing), this acquires the writer lock, so it runs ONLY after any
+        concurrent :meth:`_post_intent_locked` for this intent has RESOLVED and
+        released the lock. It then takes effect — tombstone + record the
+        ``cancelled`` outcome (so the relay consume-cancels the block and a
+        same-``request_id`` retry reattaches) — ONLY while the intent is still
+        cancellable: ``pending``, or ``armed`` AND NOT currently being posted AND
+        with no terminal outcome yet.
+
+        Returns ``True`` iff the cancel TOOK EFFECT (the caller then clears the
+        ingress marker). Returns ``False`` — "cancel lost, the post wins" — when
+        the intent is currently being posted (``posting``), already ``posted``,
+        or already carries a terminal outcome; the poster's own paths then own
+        the marker and the recorded (success / compensated) outcome, and this
+        NEVER clobbers it. No-op ``False`` if the intent is unknown."""
+        async with self._serialized():
+            intent = self.registry.by_request_id(request_id)
+            if intent is None:
+                return False
+            if (
+                intent.posting
+                or intent.state == "posted"
+                or intent.outcome is not None
+            ):
+                return False  # the in-flight / resolved post wins — never clobber
+            if intent.state not in ("pending", "armed"):
+                return False
+            intent.state = "cancelled"
+            intent.outcome = dict(outcome)
+            self._arm_event.set()
+            self._signal_resolution(request_id)
+            return True
+
     async def mark_intent_posted(
         self, request_id: str, message_id: int | None,
     ) -> Any:
@@ -1087,6 +1131,12 @@ class OutputSequencer:
                 intent.request_id, intent.tool_name, self._intent_timeout_s,
                 self.engagement_id,
             )
+        # A3 · F-ORDER (Sol A3 wave 3): mark the intent as being-posted for the
+        # WHOLE poster await, under the lock. A serialized ``record_intent_cancelled``
+        # (which waits on this same writer lock) that observes ``posting`` NO-OPS —
+        # the in-flight post wins. Cleared in ``finally`` so a poster failure still
+        # re-opens the intent for its fail-closed resolution below.
+        intent.posting = True
         try:
             if callable(intent.poster):
                 mid = await _maybe_await(intent.poster())
@@ -1100,6 +1150,8 @@ class OutputSequencer:
                 intent.request_id, exc,
             )
             mid = None
+        finally:
+            intent.posting = False
         if mid is None:
             # §A3(c): the poster may have SELF-ACCOUNTED a compensated physical
             # write (initial-anchor add-failure): it posted the wire message,
@@ -1120,6 +1172,20 @@ class OutputSequencer:
                 "ok": False, "message_id": None, "out_of_band": out_of_band,
             }
             self._signal_resolution(intent.request_id)
+            return
+        # A3 · F-ORDER (Sol A3 wave 3) defensive no-double-resolve: with the
+        # serialized ``record_intent_cancelled`` (which cannot run while
+        # ``posting`` is set, and waits on this writer lock) a terminal outcome
+        # can NEVER already be recorded when a successful post resolves here. If
+        # one somehow is, the recorded terminal outcome WINS — log and do not
+        # overwrite it (this branch should be unreachable).
+        if intent.outcome is not None:
+            logger.warning(
+                "output sequencer: intent %s post resolved (mid=%s) but a "
+                "terminal outcome %r is already recorded — NOT double-resolving "
+                "(A3 · F-ORDER; engagement %s)",
+                intent.request_id, mid, intent.outcome, self.engagement_id,
+            )
             return
         intent.state = "posted"
         intent.consumed = True

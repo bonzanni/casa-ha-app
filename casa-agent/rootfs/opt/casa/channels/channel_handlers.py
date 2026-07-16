@@ -655,10 +655,13 @@ def _record_intent_embedded_refusal(
         cancel(eng_id, request_id)
 
 
-def _record_intent_cancelled(driver: Any, eng_id: str, request_id: str) -> None:
-    """B1/B2 (§A3 wave 2): a transport CANCELLATION between arming/registering an
-    ask intent and its post TOMBSTONES the intent AND records a terminal
-    ``cancelled`` outcome. Two failures are closed at once:
+async def _record_intent_cancelled(
+    driver: Any, eng_id: str, request_id: str,
+) -> bool:
+    """B1/B2 (§A3 wave 2) + A3 · F-ORDER (Sol A3 wave 3): a transport
+    CANCELLATION between arming/registering an ask intent and its post TOMBSTONES
+    the intent AND records a terminal ``cancelled`` outcome — but SERIALIZED
+    against an in-flight relay post so "the post wins". Closes:
 
     * the armed/pending intent stays MATCHABLE as a tombstone, so the relay
       consume-cancels its block (NOTHING posts) — a marker cleared without this
@@ -670,24 +673,40 @@ def _record_intent_cancelled(driver: Any, eng_id: str, request_id: str) -> None:
       budget (anchor hang, B2) nor registering a fresh broker request (button
       timeout burn, B2).
 
-    NO-OP once the intent already RESOLVED (a concurrent relay post won the
-    race) — never clobber a posted/compensated outcome. Getattr-tolerant and
-    swallows its own errors: an intent-cleanup failure must never mask the
-    original cancellation being re-raised."""
+    A3 · F-ORDER: routes through the driver's SERIALIZED
+    ``record_send_intent_cancelled`` seam, which waits on the sequencer writer
+    lock and takes effect ONLY while the intent is still cancellable (not
+    currently being posted / posted / already resolved). Returns ``True`` iff the
+    cancel TOOK EFFECT — the caller then clears the ingress marker. Returns
+    ``False`` when a concurrent relay post WON the race (never clobbers the
+    posted/compensated outcome; the poster's own paths own the marker).
+
+    Getattr-tolerant and swallows its own errors: an intent-cleanup failure must
+    never mask the original cancellation being re-raised. Degrades to the
+    pre-seam synchronous tombstone (best-effort, no serialization) on a driver
+    without the wave-3 seam."""
     if driver is None:
-        return
+        return False
+    rec_serialized = getattr(driver, "record_send_intent_cancelled", None)
+    if rec_serialized is not None:
+        try:
+            return bool(await rec_serialized(
+                eng_id, request_id, {"ok": False, "error": "cancelled"}))
+        except Exception:  # noqa: BLE001 — fall back to the pre-seam path
+            logger.debug("record_send_intent_cancelled failed", exc_info=True)
+    # --- pre-seam fallback (no serialized guard available) ------------------
     outcome_fn = getattr(driver, "send_intent_outcome", None)
     if outcome_fn is not None:
         try:
             if outcome_fn(eng_id, request_id) is not None:
-                return  # already resolved (posted / compensated) — don't clobber
+                return False  # already resolved (posted / compensated) — no clobber
         except Exception:  # noqa: BLE001 — degrade to attempting the tombstone
             logger.debug("send_intent_outcome read failed", exc_info=True)
     rec = getattr(driver, "record_send_intent_refusal", None)
     if rec is not None:
         try:
             rec(eng_id, request_id, {"ok": False, "error": "cancelled"})
-            return
+            return True
         except Exception:  # noqa: BLE001 — fall back to a bare tombstone
             logger.debug("record_send_intent_refusal(cancelled) failed",
                          exc_info=True)
@@ -695,8 +714,10 @@ def _record_intent_cancelled(driver: Any, eng_id: str, request_id: str) -> None:
     if cancel is not None:
         try:
             cancel(eng_id, request_id)
+            return True
         except Exception:  # noqa: BLE001 — best-effort cleanup
             logger.debug("cancel_send_intent failed", exc_info=True)
+    return False
 
 
 def _refused_intent_outcome(prior: Any) -> bool:
@@ -1269,9 +1290,11 @@ def _make_ask(
                 # still matchable — a same-request_id retry would hang on the
                 # transport budget waiting for a never-armed intent (→
                 # delivery_failed). Tombstone it + record a cancelled outcome so
-                # the retry short-circuits to the recorded outcome.
+                # the retry short-circuits to the recorded outcome. Serialized —
+                # a still-pending intent has no in-flight post, so the cancel
+                # takes effect; the marker was already cleared above.
                 if created_intent:
-                    _record_intent_cancelled(driver, eng_id, request_id)
+                    await _record_intent_cancelled(driver, eng_id, request_id)
                 raise
             # W-R3: canonical body (anchor ⇒ options == [] ⇒ numbered question
             # ALONE, no option list — unchanged from the pre-W-R3 anchor copy).
@@ -1363,16 +1386,20 @@ def _make_ask(
                         outcome = await _await_deferred_post(
                             driver, eng_id, request_id)
                     except BaseException:
-                        # B1 (wave 2): a transport CANCELLATION after ARM but
-                        # BEFORE the relay posts would leave the armed intent
-                        # live+matchable while the finally clears the ingress
-                        # marker — a DIFFERENT ask then passes the gate and BOTH
-                        # could post (one-question invariant broken). Tombstone the
-                        # armed intent + record a cancelled outcome so the relay
-                        # consume-cancels the block (nothing posts) and a same-id
-                        # retry reads the recorded outcome (no-op once the relay
-                        # already resolved it). Marker cleared by the finally.
-                        _record_intent_cancelled(driver, eng_id, request_id)
+                        # B1 (wave 2) + A3 · F-ORDER (Sol A3 wave 3): a transport
+                        # CANCELLATION after ARM. If the relay has NOT started the
+                        # post, the SERIALIZED cancel takes effect: the armed
+                        # intent tombstones so the relay consume-cancels the block
+                        # (nothing posts) and a same-id retry reads the recorded
+                        # cancelled outcome. If the relay IS mid-post (holding the
+                        # writer lock inside the poster), this AWAITS that lock and
+                        # then sees the resolved post — the cancel is LOST ("the
+                        # post wins"), the intent keeps its SUCCESS outcome, and
+                        # nothing is clobbered. Either way the marker is owned by
+                        # the winner: on a post-win the poster cleared it at
+                        # durable ownership (the CAS finally below is a no-op); on
+                        # a cancel-win the CAS finally clears it.
+                        await _record_intent_cancelled(driver, eng_id, request_id)
                         raise
                     # §A3(c): the compensated add-failure maps to ok:false
                     # internal_error (the wire message exists but the question was
@@ -1552,9 +1579,11 @@ def _make_ask(
             # button retry would reattach, find no recorded outcome, and register a
             # FRESH broker request that never posts (full timeout burn, no
             # keyboard). Tombstone it + record a cancelled outcome so the retry
-            # short-circuits before touching the broker.
+            # short-circuits before touching the broker. Serialized — a
+            # still-pending intent has no in-flight post, so the cancel takes
+            # effect; the marker was already cleared above.
             if intent_registered:
-                _record_intent_cancelled(driver, eng_id, request_id)
+                await _record_intent_cancelled(driver, eng_id, request_id)
             raise
         # W-R3 (Sol r1-5): the SINGLE canonical body — full options VERBATIM,
         # numbered, below the question. This exact string feeds the keyboard

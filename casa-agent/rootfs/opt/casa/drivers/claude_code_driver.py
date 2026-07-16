@@ -2200,6 +2200,22 @@ class ClaudeCodeDriver(DriverProtocol):
         seq = self._sequencers.get(engagement_id)
         return seq.record_intent_refusal(request_id, outcome) if seq is not None else None
 
+    async def record_send_intent_cancelled(
+        self, engagement_id: str, request_id: str, outcome: dict,
+    ) -> bool:
+        """A3 · F-ORDER (Sol A3 wave 3): SERIALIZE a transport-cancellation
+        cleanup against an in-flight relay post. Awaits the sequencer writer lock
+        so it runs only once any concurrent ``_post_intent_locked`` for this
+        intent has resolved, then tombstones + records the ``cancelled`` outcome
+        ONLY while the intent is still cancellable. Returns ``True`` iff the
+        cancel TOOK EFFECT (the caller then clears the ingress marker); ``False``
+        when the post WON the race (the poster owns the marker + outcome — never
+        clobbered). See ``OutputSequencer.record_intent_cancelled``."""
+        seq = self._sequencers.get(engagement_id)
+        if seq is None:
+            return False
+        return await seq.record_intent_cancelled(request_id, outcome)
+
     def send_intent_outcome(self, engagement_id: str, request_id: str) -> Any:
         """Recorded outcome (incl. posted message id) for a reattaching retry."""
         seq = self._sequencers.get(engagement_id)
