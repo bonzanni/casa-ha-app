@@ -1,8 +1,8 @@
-"""Voice turn budget, sync-only modes, and deterministic progress (spec A4).
+"""Voice turn budget, async route gates, and deterministic progress (spec A4).
 
 Covers:
-- TestVoiceModes: async/interactive delegation is rejected outright on the
-  voice channel (never coerced to sync, never `pending`).
+- TestVoiceModes: interactive delegation remains unsupported; async requires
+  a trusted background-delivery-capable WebSocket route.
 - TestVoiceDeadline: an expired/missing voice deadline degrades to a typed
   `deadline_exceeded` FAST (never the 60s general sync ceiling).
 - TestVoiceTurnBudget: channels/voice/channel.py's `_voice_turn_budget_s()`
@@ -85,7 +85,7 @@ def _init_tools_for_voice():
 
 @pytest.mark.asyncio
 class TestVoiceModes:
-    async def test_async_mode_rejected_on_voice(self):
+    async def test_async_mode_without_route_rejected_on_voice(self):
         import agent as agent_mod
 
         tm, reg = _init_tools_for_voice()
@@ -101,7 +101,7 @@ class TestVoiceModes:
 
         payload = json.loads(res["content"][0]["text"])
         assert payload["status"] == "error"
-        assert payload["kind"] == "mode_unsupported_on_voice"
+        assert payload["kind"] == "background_delivery_unavailable"
         # No side effect happened — the specialist never launched.
         reg.register_delegation.assert_not_awaited()
 
@@ -846,6 +846,12 @@ class TestVoiceDeadlineOriginPropagation:
             context={
                 "chat_id": "s1", "_voice_deadline": 12345.0,
                 "_progress_sink": _sink,
+                "_voice_transport": "ws",
+                "_voice_route_id": "entry-1",
+                "_voice_route_capabilities": frozenset({
+                    "background_jobs", "satellite_announce",
+                }),
+                "_origin_device_id": "device-kitchen",
             },
         )
         with patch("sdk_client_pool._default_make_client", CapturingClient):
@@ -854,6 +860,12 @@ class TestVoiceDeadlineOriginPropagation:
         origin = captured["origin"]
         assert origin["voice_deadline"] == 12345.0
         assert origin["_progress_sink"] is _sink
+        assert origin["voice_transport"] == "ws"
+        assert origin["voice_route_id"] == "entry-1"
+        assert origin["voice_route_capabilities"] == frozenset({
+            "background_jobs", "satellite_announce",
+        })
+        assert origin["origin_device_id"] == "device-kitchen"
 
     async def test_non_voice_channel_does_not_propagate_deadline(self, tmp_path):
         """Defensive: even if a non-voice message somehow carried these
@@ -880,6 +892,10 @@ class TestVoiceDeadlineOriginPropagation:
             context={
                 "chat_id": "s1", "_voice_deadline": 12345.0,
                 "_progress_sink": _sink,
+                "_voice_transport": "ws",
+                "_voice_route_id": "spoofed-entry",
+                "_voice_route_capabilities": frozenset({"background_jobs"}),
+                "_origin_device_id": "spoofed-device",
             },
         )
         with patch("sdk_client_pool._default_make_client", CapturingClient):
@@ -888,3 +904,7 @@ class TestVoiceDeadlineOriginPropagation:
         origin = captured["origin"]
         assert "voice_deadline" not in origin
         assert "_progress_sink" not in origin
+        assert "voice_transport" not in origin
+        assert "voice_route_id" not in origin
+        assert "voice_route_capabilities" not in origin
+        assert "origin_device_id" not in origin

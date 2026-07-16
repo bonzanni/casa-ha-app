@@ -16,7 +16,7 @@ from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable
 
 if TYPE_CHECKING:
     from trigger_registry import TriggerRegistry
@@ -64,6 +64,14 @@ from specialist_registry import (
     DelegationComplete,
     DelegationRecord,
     SpecialistRegistry,
+)
+from job_registry import (
+    DeliveryState,
+    ExecutionState,
+    JobAuthorizationError,
+    JobFailure,
+    JobTransitionError,
+    VoiceJob,
 )
 from voice_job_result import (
     VOICE_JOB_OUTPUT_FORMAT,
@@ -1166,6 +1174,81 @@ class DelegatedOutput:
     structured_output: Any = None
 
 
+@dataclass(frozen=True)
+class JobActor:
+    """Trusted creator identity used for every voice-job lookup/mutation."""
+
+    creator_peer: str
+    creator_user_id: str | None
+    scope_id: str
+
+
+_BACKGROUND_ROUTE_CAPABILITIES = frozenset({
+    "background_jobs", "satellite_announce",
+})
+
+
+def background_route_available(origin: dict | None) -> bool:
+    """Return whether the trusted turn origin can accept background audio."""
+    if not isinstance(origin, dict):
+        return False
+    if origin.get("channel") != "voice" or origin.get("voice_transport") != "ws":
+        return False
+    route_id = origin.get("voice_route_id")
+    device_id = origin.get("origin_device_id")
+    capabilities = origin.get("voice_route_capabilities")
+    if not isinstance(route_id, str) or not route_id.strip():
+        return False
+    if not isinstance(device_id, str) or not device_id.strip():
+        return False
+    if not isinstance(capabilities, (set, frozenset, list, tuple)):
+        return False
+    return _BACKGROUND_ROUTE_CAPABILITIES <= frozenset(
+        item for item in capabilities if isinstance(item, str)
+    )
+
+
+def _background_delivery_unavailable_result() -> dict:
+    return _result({
+        "status": "error",
+        "kind": "background_delivery_unavailable",
+        "message": (
+            "Background specialist delivery requires a current, "
+            "acknowledged voice WebSocket route."
+        ),
+    })
+
+
+def _specialist_display_name(cfg: Any, role: str) -> str:
+    character = getattr(cfg, "character", None)
+    display_name = getattr(character, "name", None)
+    if isinstance(display_name, str) and display_name.strip():
+        return display_name.strip()
+    return role
+
+
+def _job_actor_from_origin(origin: dict | None) -> JobActor | None:
+    if not isinstance(origin, dict) or origin.get("channel") != "voice":
+        return None
+    scope_id = origin.get("chat_id") or origin.get("scope_id")
+    if not isinstance(scope_id, (str, int)) or not str(scope_id):
+        return None
+    raw_user_id = origin.get("user_id")
+    user_id = None if raw_user_id is None else str(raw_user_id)
+    return JobActor(
+        creator_peer="voice",
+        creator_user_id=user_id,
+        scope_id=str(scope_id),
+    )
+
+
+def _actor_owns_job(actor: JobActor, job: VoiceJob) -> bool:
+    if (actor.creator_peer != job.creator_peer
+            or actor.scope_id != job.scope_id):
+        return False
+    return actor.creator_user_id == job.creator_user_id
+
+
 def _discard_structured_stderr(_line: str) -> None:
     """Drain structured-job stderr without placing model content in logs."""
 
@@ -1482,11 +1565,10 @@ async def _prelaunch(
     payload never resolves plugins, acquires a slot, or speaks).
 
     The mode gate deliberately precedes both target resolution AND the
-    resident-interactive-compat check: on voice, async/interactive must
-    be denied as ``mode_unsupported_on_voice`` regardless of what (or
-    whether) the target resolves to — an earlier ``interactive_not_
-    supported`` (or ``unknown_agent``) would be an observable ordering
-    bypass of the voice mode gate.
+    resident-interactive-compat check. On voice, interactive is always
+    denied as ``mode_unsupported_on_voice``; async without a trusted capable
+    route is denied as ``background_delivery_unavailable``. Those denials
+    stay independent of what (or whether) the target resolves to.
 
     Returns ``(cfg, resolution, permit, error)``:
     - ``error`` is a terminal tool-result dict the caller returns
@@ -1507,11 +1589,12 @@ async def _prelaunch(
       (``_build_specialist_options(cfg, resolution=resolution)`` and the
       interactive engagement-record binding) rather than re-resolving, so
       the gate's decision and what actually launches never drift. The
-      caller (``delegate_to_agent``) owns the permit's lifetime from here:
-      for the sync/async path the task's ``_permit_release_callback``
-      done-callback is the sole authoritative release; for interactive the
-      permit is handed to ``rec.permit`` and released by an
-      ``EngagementRegistry`` terminal transition (or ``_finalize_engagement``).
+      caller (``delegate_to_agent``) owns the permit's lifetime from here.
+      Legacy sync/non-voice async tasks use ``_permit_release_callback``;
+      accepted async voice jobs transfer the permit to ``JobRegistry`` at
+      ``bind_task``; interactive hands it to ``rec.permit`` for release by an
+      ``EngagementRegistry`` terminal transition (or
+      ``_finalize_engagement``).
     """
     channel = str((origin or {}).get("channel", ""))
 
@@ -1590,21 +1673,23 @@ async def _prelaunch(
             ),
         })
 
-    # A4 mode gate — BEFORE target resolution and resident-compat. The
-    # voice channel has no follow-up surface to deliver a LATER completion
-    # notification on, so async/interactive (both of which can degrade to
-    # a `pending` marker) are rejected outright rather than silently
-    # coerced to sync. `pending` must never be returned on voice.
-    if channel == "voice" and mode != "sync":
+    # A4 mode gate — BEFORE target resolution and resident-compat. Voice
+    # interactive remains unsupported. Async is accepted only when ingress
+    # bound a current acknowledged delivery route on the server-owned WS
+    # connection; SSE and route-shaped tool/context spoofing fail here before
+    # requires/concurrency/progress or any launch side effect.
+    if channel == "voice" and mode == "interactive":
         return None, None, None, _result({
             "status": "error",
             "kind": "mode_unsupported_on_voice",
             "message": (
                 f"mode={mode!r} is not supported on the voice channel — "
-                "only synchronous delegation can complete within a "
-                "spoken turn."
+                "interactive engagements require a text channel."
             ),
         })
+    if (channel == "voice" and mode == "async"
+            and not background_route_available(origin)):
+        return None, None, None, _background_delivery_unavailable_result()
 
     # Resolve target. Look in the merged role map (residents + specialists)
     # first; fall back to the specialist registry for back-compat with any
@@ -1937,6 +2022,291 @@ async def _await_task_teardown(inner: asyncio.Task, bound_s: float) -> bool:
     return inner.done()
 
 
+def _new_voice_job(
+    *,
+    job_id: str,
+    parent_job_id: str | None,
+    cfg: Any,
+    specialist_role: str,
+    origin: dict,
+    task_text: str,
+    context_text: str,
+) -> VoiceJob:
+    """Build the durable ACCEPTED row from trusted turn provenance."""
+    raw_user_id = origin.get("user_id")
+    return VoiceJob(
+        id=job_id,
+        parent_job_id=parent_job_id,
+        creating_role=str(
+            origin.get("execution_role") or origin.get("role") or "assistant"
+        ),
+        specialist_role=specialist_role,
+        specialist_display_name=_specialist_display_name(cfg, specialist_role),
+        creator_peer="voice",
+        creator_user_id=(None if raw_user_id is None else str(raw_user_id)),
+        scope_id=str(origin.get("chat_id") or origin.get("scope_id") or ""),
+        origin_route_id=str(origin["voice_route_id"]),
+        origin_device_id=str(origin["origin_device_id"]),
+        task=task_text,
+        context=context_text,
+        created_at=time.time(),
+        started_at=None,
+        terminal_at=None,
+        expires_at=None,
+        execution_state=ExecutionState.ACCEPTED,
+        delivery_state=DeliveryState.NONE,
+        result=None,
+        failure=None,
+        awaiting_input=False,
+        continuable_until=None,
+        delivery_sequence=0,
+        delivery_attempt_id=None,
+        lease_until=None,
+        cancel_pending=False,
+    )
+
+
+async def _await_voice_persistence(operation: Awaitable[Any]) -> Any:
+    """Finish one terminal write even if lifecycle cancellation arrives."""
+    task = asyncio.create_task(operation)
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except Exception:
+            break
+    result = task.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+async def _persist_voice_terminal(
+    operation: Awaitable[Any],
+    *,
+    registry,
+    job_id: str,
+    specialist_role: str,
+) -> str:
+    """Persist a terminal state, then try one metadata-only safe fallback."""
+    try:
+        await _await_voice_persistence(operation)
+        return "primary"
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — never render a persistence exception
+        logger.error(
+            "Voice job %s role=%s terminal persistence failed; "
+            "attempting safe fallback",
+            job_id[:8], specialist_role,
+        )
+
+    try:
+        await _await_voice_persistence(registry.fail_compat(
+            job_id,
+            JobFailure(
+                "persistence_failed",
+                "Specialist result could not be saved.",
+            ),
+        ))
+        return "fallback"
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — restart recovery remains authoritative
+        logger.error(
+            "Voice job %s role=%s safe terminal fallback failed; "
+            "restart recovery required",
+            job_id[:8], specialist_role,
+        )
+        return "unpersisted"
+
+
+async def _run_voice_job_lifecycle(
+    *,
+    registry,
+    job_id: str,
+    cfg: Any,
+    specialist_role: str,
+    task_text: str,
+    context_text: str,
+    origin: dict,
+    resolution: Any,
+    started_at: float,
+) -> None:
+    """Run and persist one job inside the registry-owned task lifetime."""
+    try:
+        try:
+            output = await _run_delegated_agent_bounded(
+                cfg,
+                task_text,
+                context_text,
+                resolution=resolution,
+                output_format=VOICE_JOB_OUTPUT_FORMAT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — model text stays private
+            kind = _classify_error(exc).value
+            await _persist_voice_terminal(
+                registry.fail_compat(
+                    job_id,
+                    JobFailure(
+                        kind=kind,
+                        message="Specialist could not complete the voice job.",
+                    ),
+                ),
+                registry=registry,
+                job_id=job_id,
+                specialist_role=specialist_role,
+            )
+            logger.info(
+                "Voice job %s role=%s terminal=failed kind=%s elapsed_s=%.2f",
+                job_id[:8], specialist_role, kind, time.time() - started_at,
+            )
+            return
+
+        try:
+            voice_result = parse_voice_job_result(output.structured_output)
+        except VoiceJobResultError:
+            await _persist_voice_terminal(
+                registry.fail_compat(
+                    job_id,
+                    JobFailure(
+                        "invalid_specialist_result",
+                        "Specialist returned an invalid structured result.",
+                    ),
+                ),
+                registry=registry,
+                job_id=job_id,
+                specialist_role=specialist_role,
+            )
+            logger.warning(
+                "Voice job %s role=%s terminal=failed "
+                "kind=invalid_specialist_result elapsed_s=%.2f",
+                job_id[:8], specialist_role, time.time() - started_at,
+            )
+            return
+
+        # Resolve disclosure without placing either full result or approved
+        # spoken text on a Gary-facing surface. Task 4 re-evaluates this
+        # durable envelope immediately before delivery.
+        spoken = spoken_text_for(
+            voice_result,
+            prompted=False,
+            identity_clearance=voice_identity_clearance(origin),
+        )
+        durable_result = json.dumps(
+            output.structured_output,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        persistence = await _persist_voice_terminal(
+            registry.finish_voice_result(
+                job_id,
+                durable_result,
+                awaiting_input=voice_result.awaiting_input,
+                delivery_ttl_s=voice_result.delivery_ttl_s,
+            ),
+            registry=registry,
+            job_id=job_id,
+            specialist_role=specialist_role,
+        )
+        logger.info(
+            "Voice job %s role=%s terminal=%s status=%s sensitivity=%s "
+            "result_chars=%d spoken_chars=%d elapsed_s=%.2f",
+            job_id[:8], specialist_role,
+            "succeeded" if persistence == "primary" else persistence,
+            voice_result.status, voice_result.sensitivity,
+            len(durable_result), len(spoken), time.time() - started_at,
+        )
+    except asyncio.CancelledError:
+        # This is also safe after a cancellation arrived during a successful
+        # shielded terminal write: fail_compat then observes a terminal row
+        # and is an idempotent no-op.
+        await _persist_voice_terminal(
+            registry.fail_compat(
+                job_id,
+                JobFailure("cancelled", "Specialist job was cancelled."),
+            ),
+            registry=registry,
+            job_id=job_id,
+            specialist_role=specialist_role,
+        )
+        raise
+
+
+async def _start_voice_async_job(
+    *,
+    cfg: Any,
+    specialist_role: str,
+    task_text: str,
+    context_text: str,
+    origin: dict,
+    resolution: Any,
+    permit: Any,
+    parent_job_id: str | None = None,
+) -> dict:
+    """Persist ACCEPTED, bind RUNNING task/permit ownership, return metadata."""
+    registry = _specialist_registry.job_registry
+    await registry.load()
+    job_id = str(uuid.uuid4())
+    job = _new_voice_job(
+        job_id=job_id,
+        parent_job_id=parent_job_id,
+        cfg=cfg,
+        specialist_role=specialist_role,
+        origin=origin,
+        task_text=task_text,
+        context_text=context_text,
+    )
+    if parent_job_id is None:
+        await registry.create(job)
+    else:
+        actor = _job_actor_from_origin(origin)
+        if actor is None:
+            raise JobAuthorizationError("voice continuation has no actor")
+        await registry.create_continuation(
+            parent_job_id,
+            job,
+            actor=actor,
+        )
+
+    task: asyncio.Task | None = None
+    try:
+        started_at = time.time()
+        task = asyncio.create_task(_run_voice_job_lifecycle(
+            registry=registry,
+            job_id=job_id,
+            cfg=cfg,
+            specialist_role=specialist_role,
+            task_text=task_text,
+            context_text=context_text,
+            origin=dict(origin),
+            resolution=resolution,
+            started_at=started_at,
+        ))
+        await registry.bind_task(job_id, task, permit=permit)
+    except BaseException:
+        if task is not None and not task.done():
+            task.cancel()
+            await _await_task_teardown(task, _CEILING_TEARDOWN_BOUND_S)
+        await registry.cancel(job_id)
+        raise
+
+    _record_launch_safe(specialist_role)
+    logger.info(
+        "Voice job %s role=%s accepted route_bound=true",
+        job_id[:8], specialist_role,
+    )
+    return _result({
+        "status": "pending",
+        "job_id": job_id,
+        "specialist_display_name": job.specialist_display_name,
+    })
+
+
 @tool(
     "delegate_to_agent",
     "Delegate a task to another agent (resident or specialist) and return its result.",
@@ -2153,16 +2523,29 @@ async def delegate_to_agent(args: dict) -> dict:
                 "topic_id": topic_id,
             })
 
+        is_voice = str(origin.get("channel", "")) == "voice"
+        if is_voice and mode == "async":
+            result = await _start_voice_async_job(
+                cfg=cfg,
+                specialist_role=agent_name,
+                task_text=task_text,
+                context_text=context_text,
+                origin=origin,
+                resolution=resolution,
+                permit=permit,
+            )
+            # JobRegistry.bind_task is now the sole task/permit owner. No await
+            # may occur between the successful bind above and this transfer.
+            owned = None  # __TRANSFER_VOICE_JOB__
+            return result
+
         delegation_id = str(uuid.uuid4())
 
-        # A4: voice turn budget. The deadline is ABSOLUTE (origin["voice_deadline"],
-        # a monotonic loop.time() value); the remaining wait is recomputed at
-        # every decision point because loop.time() advances as this handler
-        # awaits. `voice_wait_s` stays None for non-voice turns (they use the
-        # general 60s ceiling below). A None from _voice_wait_from_deadline means
-        # the budget is exhausted, missing, or non-finite → fail closed with
-        # deadline_exceeded rather than launch or (worse, on NaN) hang.
-        is_voice = str(origin.get("channel", "")) == "voice"
+        # A4: synchronous voice turn budget. The deadline is ABSOLUTE
+        # (origin["voice_deadline"], a monotonic loop.time() value); remaining
+        # wait is recomputed because loop.time() advances across awaits. Async
+        # voice returned above and is deliberately not subject to this gate.
+        # Non-voice turns use the general 60s ceiling below.
         loop = asyncio.get_running_loop() if is_voice else None
         raw_deadline = origin.get("voice_deadline") if is_voice else None
 
@@ -2185,7 +2568,7 @@ async def delegate_to_agent(args: dict) -> dict:
             origin=dict(origin),
         )
         # Task 6 (spec §4.6): stash the permit on the record for
-        # observability only. The SOLE release for the sync/async path is the
+        # observability only. The SOLE release for this legacy path is the
         # `_permit_release_callback` done-callback attached to the task below
         # (robust even if the task is cancelled before its coroutine starts);
         # `SpecialistRegistry` terminal transitions deliberately do NOT
@@ -2392,6 +2775,307 @@ async def delegate_to_agent(args: dict) -> dict:
             "text": text,
             "output_truncated": output_truncated,
         })
+    finally:
+        if owned is not None:
+            owned.release()
+
+
+# ---------------------------------------------------------------------------
+# Metadata-only voice job control. Full case/result data never crosses these
+# tool envelopes; continuation injects it directly into the specialist child.
+# ---------------------------------------------------------------------------
+
+
+def _job_not_found_result() -> dict:
+    return _result({
+        "status": "error",
+        "kind": "job_not_found",
+        "message": "No matching specialist job is available.",
+    })
+
+
+def _no_matching_job_result() -> dict:
+    return _result({
+        "status": "error",
+        "kind": "no_matching_job",
+        "message": "No eligible specialist job is available.",
+    })
+
+
+def _ambiguous_job_result(jobs: list[VoiceJob]) -> dict:
+    return _result({
+        "status": "error",
+        "kind": "ambiguous_job",
+        "message": "More than one specialist job matches; choose a job ID.",
+        "choices": [
+            {
+                "job_id": job.id,
+                "specialist_display_name": job.specialist_display_name,
+            }
+            for job in jobs
+        ],
+    })
+
+
+def _requested_job_id(args: dict) -> str | None:
+    raw = args.get("job_id")
+    if not isinstance(raw, str):
+        return None
+    normalized = raw.strip()
+    return normalized or None
+
+
+def _authorized_jobs(registry, actor: JobActor) -> list[VoiceJob]:
+    return [job for job in registry.all() if _actor_owns_job(actor, job)]
+
+
+def _resolve_authorized_job(
+    registry,
+    actor: JobActor,
+    requested_id: str | None,
+    *,
+    predicate,
+    explicit_mismatch_kind: str = "job_not_found",
+) -> tuple[VoiceJob | None, dict | None]:
+    if requested_id is not None:
+        job = registry.get(requested_id)
+        if job is None or not _actor_owns_job(actor, job):
+            return None, _job_not_found_result()
+        if not predicate(job):
+            if explicit_mismatch_kind == "job_not_continuable":
+                return None, _result({
+                    "status": "error",
+                    "kind": "job_not_continuable",
+                    "message": "That specialist job cannot be continued.",
+                })
+            return None, _job_not_found_result()
+        return job, None
+
+    matches = [
+        job for job in _authorized_jobs(registry, actor)
+        if predicate(job)
+    ]
+    if not matches:
+        return None, _no_matching_job_result()
+    if len(matches) != 1:
+        return None, _ambiguous_job_result(matches)
+    return matches[0], None
+
+
+def _job_status_value(job: VoiceJob) -> str:
+    if job.execution_state is ExecutionState.ACCEPTED:
+        return "pending"
+    if job.execution_state is ExecutionState.ORPHANED:
+        return "failed"
+    return job.execution_state.value.lower()
+
+
+def _job_metadata(job: VoiceJob) -> dict:
+    return {
+        "status": _job_status_value(job),
+        "job_id": job.id,
+        "specialist_display_name": job.specialist_display_name,
+        "awaiting_input": bool(job.awaiting_input),
+        "delivery_status": job.delivery_state.value.lower(),
+    }
+
+
+def _status_candidate(job: VoiceJob) -> bool:
+    return (
+        job.delivery_state not in {
+            DeliveryState.DELIVERED,
+            DeliveryState.CANCELLED,
+            DeliveryState.EXPIRED,
+        }
+        or job.execution_state in {
+            ExecutionState.ACCEPTED,
+            ExecutionState.RUNNING,
+        }
+    )
+
+
+def _cancellable_job(job: VoiceJob) -> bool:
+    return (
+        job.execution_state in {
+            ExecutionState.ACCEPTED,
+            ExecutionState.RUNNING,
+        }
+        or job.delivery_state in {
+            DeliveryState.READY,
+            DeliveryState.CLAIMED,
+            DeliveryState.AUTHORIZED,
+        }
+    )
+
+
+def _continuable_job(job: VoiceJob, *, now: float) -> bool:
+    return (
+        job.execution_state is ExecutionState.SUCCEEDED
+        and job.awaiting_input
+        and job.continuable_until is not None
+        and job.continuable_until > now
+        and (job.expires_at is None or job.expires_at > now)
+        and job.delivery_state not in {
+            DeliveryState.CANCELLED,
+            DeliveryState.EXPIRED,
+        }
+        and not job.cancel_pending
+        and job.result is not None
+    )
+
+
+@tool(
+    "voice_job_status",
+    "Check specialist job status.",
+    {"job_id": str},
+)
+async def voice_job_status(args: dict) -> dict:
+    origin = _snapshot_origin()
+    actor = _job_actor_from_origin(origin)
+    if actor is None or _specialist_registry is None:
+        return _job_not_found_result()
+    registry = _specialist_registry.job_registry
+    await registry.load()
+    await registry.expire_due()
+    requested_id = _requested_job_id(args)
+    if requested_id is not None:
+        job = registry.get(requested_id)
+        if job is None or not _actor_owns_job(actor, job):
+            return _job_not_found_result()
+    else:
+        job, error = _resolve_authorized_job(
+            registry,
+            actor,
+            None,
+            predicate=_status_candidate,
+        )
+        if error is not None:
+            return error
+    return _result(_job_metadata(job))
+
+
+@tool(
+    "cancel_voice_job",
+    "Cancel a specialist job.",
+    {"job_id": str},
+)
+async def cancel_voice_job(args: dict) -> dict:
+    origin = _snapshot_origin()
+    actor = _job_actor_from_origin(origin)
+    if actor is None or _specialist_registry is None:
+        return _job_not_found_result()
+    registry = _specialist_registry.job_registry
+    await registry.load()
+    await registry.expire_due()
+    requested_id = _requested_job_id(args)
+    if requested_id is not None:
+        job = registry.get(requested_id)
+        if job is None or not _actor_owns_job(actor, job):
+            return _job_not_found_result()
+    else:
+        job, error = _resolve_authorized_job(
+            registry,
+            actor,
+            None,
+            predicate=_cancellable_job,
+        )
+        if error is not None:
+            return error
+
+    if job.delivery_state is DeliveryState.DELIVERED:
+        cancel_status = "already_delivered"
+    else:
+        try:
+            cancel_status = (
+                await registry.request_cancel(job.id, actor=actor)
+            ).status
+        except JobAuthorizationError:
+            return _job_not_found_result()
+    return _result({
+        "status": cancel_status,
+        "job_id": job.id,
+        "specialist_display_name": job.specialist_display_name,
+    })
+
+
+@tool(
+    "continue_voice_job",
+    "Continue a specialist job with new input.",
+    {"job_id": str, "input": str},
+)
+async def continue_voice_job(args: dict) -> dict:
+    origin = _snapshot_origin()
+    actor = _job_actor_from_origin(origin)
+    if actor is None or _specialist_registry is None:
+        return _job_not_found_result()
+    continuation_input = args.get("input")
+    if not isinstance(continuation_input, str) or not continuation_input.strip():
+        return _result({
+            "status": "error",
+            "kind": "invalid_arguments",
+            "message": "input must be a non-empty string.",
+        })
+    continuation_input = continuation_input.strip()
+    if not background_route_available(origin):
+        return _background_delivery_unavailable_result()
+
+    registry = _specialist_registry.job_registry
+    await registry.load()
+    await registry.expire_due()
+    now = time.time()
+    parent, error = _resolve_authorized_job(
+        registry,
+        actor,
+        _requested_job_id(args),
+        predicate=lambda job: _continuable_job(job, now=now),
+        explicit_mismatch_kind="job_not_continuable",
+    )
+    if error is not None:
+        return error
+
+    # The complete prior case/result travels backend-to-specialist only. The
+    # tool result below contains opaque metadata, never this private envelope.
+    private_context = json.dumps({
+        "parent_job_id": parent.id,
+        "original_task": parent.task,
+        "original_context": parent.context,
+        "previous_result": parent.result,
+    }, ensure_ascii=False, separators=(",", ":"))
+
+    cfg, resolution, permit, prelaunch_error = await _prelaunch(
+        parent.specialist_role,
+        origin,
+        "async",
+        continuation_input,
+        private_context,
+    )
+    if prelaunch_error is not None:
+        return prelaunch_error
+
+    owned = permit
+    try:
+        try:
+            result = await _start_voice_async_job(
+                cfg=cfg,
+                specialist_role=parent.specialist_role,
+                task_text=continuation_input,
+                context_text=private_context,
+                origin=origin,
+                resolution=resolution,
+                permit=permit,
+                parent_job_id=parent.id,
+            )
+        except JobAuthorizationError:
+            return _job_not_found_result()
+        except JobTransitionError:
+            return _result({
+                "status": "error",
+                "kind": "job_not_continuable",
+                "message": "That specialist job cannot be continued.",
+            })
+        # Registry.bind_task owns task + permit from this exact point.
+        owned = None
+        return result
     finally:
         if owned is not None:
             owned.release()
@@ -5815,6 +6499,9 @@ CASA_TOOLS: tuple = (
     send_media,
     ask_user,
     delegate_to_agent,
+    voice_job_status,
+    cancel_voice_job,
+    continue_voice_job,
     recall_memory,                 # §4.3 — shared-bank semantic recall (tier-clearance filtered)
     get_schedule,
     engage_executor,

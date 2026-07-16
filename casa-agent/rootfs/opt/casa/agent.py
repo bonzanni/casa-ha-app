@@ -558,6 +558,25 @@ class Agent:
                 origin_snapshot["voice_deadline"] = msg.context["_voice_deadline"]
             if "_progress_sink" in msg.context:
                 origin_snapshot["_progress_sink"] = msg.context["_progress_sink"]
+            transport = msg.context.get("_voice_transport")
+            if transport in {"sse", "ws"}:
+                origin_snapshot["voice_transport"] = transport
+            route_id = msg.context.get("_voice_route_id")
+            if isinstance(route_id, str) and route_id.strip():
+                origin_snapshot["voice_route_id"] = route_id.strip()
+            capabilities = msg.context.get("_voice_route_capabilities")
+            if isinstance(capabilities, (set, frozenset, list, tuple)):
+                normalized_capabilities = frozenset(
+                    item for item in capabilities
+                    if isinstance(item, str) and item
+                )
+                if normalized_capabilities:
+                    origin_snapshot["voice_route_capabilities"] = (
+                        normalized_capabilities
+                    )
+            device_id = msg.context.get("_origin_device_id")
+            if isinstance(device_id, str) and device_id.strip():
+                origin_snapshot["origin_device_id"] = device_id.strip()
         origin_token = origin_var.set(origin_snapshot)
         try:
             # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at

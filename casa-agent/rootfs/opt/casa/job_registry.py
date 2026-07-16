@@ -238,6 +238,67 @@ class JobRegistry:
             await self._commit_snapshot_locked(candidate)
             return job
 
+    async def create_continuation(
+        self,
+        parent_job_id: str,
+        child: VoiceJob,
+        *,
+        actor: Any,
+    ) -> VoiceJob:
+        """Consume one live clarification and create its child atomically."""
+        async with self._lock:
+            self._require_loaded()
+            parent = self._require_job(parent_job_id)
+            self._authorize_actor(parent, actor)
+            self._authorize_actor(child, actor)
+            if not child.id:
+                raise ValueError("job id must not be empty")
+            if child.id in self._jobs:
+                raise JobTransitionError(f"job {child.id!r} already exists")
+            if child.parent_job_id != parent_job_id:
+                raise ValueError("continuation child has the wrong parent")
+            if child.specialist_role != parent.specialist_role:
+                raise ValueError("continuation child has the wrong specialist")
+            if (child.execution_state is not ExecutionState.ACCEPTED
+                    or child.delivery_state is not DeliveryState.NONE
+                    or child.result is not None
+                    or child.failure is not None
+                    or child.awaiting_input
+                    or child.continuable_until is not None):
+                raise ValueError("continuation child must be newly accepted")
+
+            now = self._now()
+            continuable = (
+                parent.execution_state is ExecutionState.SUCCEEDED
+                and parent.awaiting_input
+                and parent.continuable_until is not None
+                and parent.continuable_until > now
+                and (parent.expires_at is None or parent.expires_at > now)
+                and parent.delivery_state not in {
+                    DeliveryState.CANCELLED,
+                    DeliveryState.EXPIRED,
+                }
+                and not parent.cancel_pending
+                and parent.result is not None
+            )
+            if not continuable:
+                raise self._transition_error(
+                    parent,
+                    "create_continuation",
+                    expected="live awaiting-input parent",
+                )
+
+            consumed_parent = replace(
+                parent,
+                awaiting_input=False,
+                continuable_until=None,
+            )
+            candidate = dict(self._jobs)
+            candidate[parent_job_id] = consumed_parent
+            candidate[child.id] = child
+            await self._commit_snapshot_locked(candidate)
+            return child
+
     async def bind_task(
         self,
         job_id: str,
@@ -612,7 +673,10 @@ class JobRegistry:
 
             for job_id, current in self._jobs.items():
                 updated = current
-                if current.execution_state is ExecutionState.RUNNING:
+                if current.execution_state in {
+                    ExecutionState.ACCEPTED,
+                    ExecutionState.RUNNING,
+                }:
                     if current.origin_route_id and current.origin_device_id:
                         next_sequence += 1
                         delivery = DeliveryState.READY
@@ -1174,7 +1238,7 @@ class JobRegistry:
         user_id = self._actor_value(actor, "creator_user_id", "user_id")
         if peer != job.creator_peer or scope != job.scope_id:
             raise JobAuthorizationError(f"actor does not own job {job.id!r}")
-        if job.creator_user_id is not None and user_id != job.creator_user_id:
+        if user_id != job.creator_user_id:
             raise JobAuthorizationError(f"actor does not own job {job.id!r}")
 
     @staticmethod

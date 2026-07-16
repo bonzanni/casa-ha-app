@@ -12,6 +12,7 @@ import pytest
 from job_registry import (
     DeliveryState,
     ExecutionState,
+    JobAuthorizationError,
     JobFailure,
     JobRegistry,
     JobTransitionError,
@@ -303,6 +304,17 @@ async def test_authorized_cancel_waits_for_preplay_outcome(tmp_path):
     job = registry.get("job-1")
     assert job.delivery_state is DeliveryState.CANCELLED
     assert job.cancel_pending is False
+
+
+async def test_anonymous_creator_identity_is_exact_not_a_wildcard(tmp_path):
+    registry = await loaded_registry(tmp_path, make_job())
+    with pytest.raises(JobAuthorizationError):
+        await registry.request_cancel("job-1", actor={
+            "creator_peer": "voice_speaker",
+            "creator_user_id": "different-user",
+            "scope_id": "scope-1",
+        })
+    assert registry.get("job-1").cancel_pending is False
 
 
 async def test_cancel_during_persist_still_signals_and_reaps_owned_task(
@@ -709,6 +721,79 @@ async def test_restart_orphans_running_job_and_queues_voice_failure(tmp_path):
     assert job.failure.kind == "restart_orphan"
     assert job.delivery_sequence == 1
     assert job.orphan_notification_pending is False
+
+
+async def test_restart_orphans_accepted_job_left_before_task_binding(tmp_path):
+    registry = await loaded_registry(tmp_path, make_job(), now=120.0)
+    recovered = await registry.recover_after_restart()
+    job = registry.get("job-1")
+    assert recovered == [job]
+    assert job.execution_state is ExecutionState.ORPHANED
+    assert job.delivery_state is DeliveryState.READY
+    assert job.failure == JobFailure("restart_orphan", "Lost on restart")
+
+
+async def test_continuation_create_atomically_consumes_parent(tmp_path):
+    registry = await loaded_registry(
+        tmp_path,
+        make_job(
+            terminal_at=100.0,
+            expires_at=200.0,
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.DELIVERED,
+            result='{"status":"needs_clarification"}',
+            awaiting_input=True,
+            continuable_until=200.0,
+        ),
+        now=120.0,
+    )
+    child = replace(
+        make_job(),
+        id="job-child",
+        parent_job_id="job-1",
+        created_at=120.0,
+    )
+
+    assert await registry.create_continuation(
+        "job-1", child, actor=actor_for_job(),
+    ) == child
+    parent = registry.get("job-1")
+    assert parent.awaiting_input is False
+    assert parent.continuable_until is None
+    assert registry.get("job-child") == child
+
+    with pytest.raises(JobTransitionError):
+        await registry.create_continuation(
+            "job-1",
+            replace(child, id="job-duplicate"),
+            actor=actor_for_job(),
+        )
+    assert registry.get("job-duplicate") is None
+
+
+async def test_continuation_create_rejects_parent_that_expired_before_commit(tmp_path):
+    registry = await loaded_registry(
+        tmp_path,
+        make_job(
+            terminal_at=100.0,
+            expires_at=119.0,
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.READY,
+            result='{"status":"needs_clarification"}',
+            awaiting_input=True,
+            continuable_until=119.0,
+        ),
+        now=120.0,
+    )
+    child = replace(
+        make_job(), id="job-child", parent_job_id="job-1", created_at=120.0,
+    )
+
+    with pytest.raises(JobTransitionError):
+        await registry.create_continuation(
+            "job-1", child, actor=actor_for_job(),
+        )
+    assert registry.get("job-child") is None
 
 
 async def test_telegram_orphan_notification_retries_until_durable_ack(tmp_path):

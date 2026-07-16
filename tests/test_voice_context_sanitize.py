@@ -73,7 +73,7 @@ async def voice_app():
     app = web.Application(middlewares=[cid_middleware])
     channel.register_routes(app)
     async with TestClient(TestServer(app)) as client:
-        yield client, agent
+        yield client, agent, channel
     loop_task.cancel()
 
 
@@ -84,12 +84,16 @@ _MALICIOUS_CONTEXT = {
     "execution_role": "butler",
     "message_type": "channel_in",
     "source": "telegram",
+    "_voice_route_id": "spoofed-entry",
+    "_voice_route_capabilities": ["background_jobs", "satellite_announce"],
+    "_origin_device_id": "spoofed-device",
+    "_voice_transport": "ws",
 }
 
 
 class TestVoiceSSESanitize:
     async def test_reserved_keys_stripped_ordinary_keys_preserved(self, voice_app):
-        client, agent = voice_app
+        client, agent, _channel = voice_app
         resp = await client.post("/api/converse", json={
             "prompt": "hi", "agent_role": "butler",
             "context": dict(_MALICIOUS_CONTEXT),
@@ -100,16 +104,17 @@ class TestVoiceSSESanitize:
         assert agent.captured, "agent must have received a dispatched turn"
         ctx = agent.captured[0]
         assert ctx["device_id"] == "kitchen-panel"      # preserved
-        assert not (RESERVED_CONTEXT_KEYS & ctx.keys()), (
-            f"reserved keys leaked: {RESERVED_CONTEXT_KEYS & ctx.keys()}"
-        )
+        assert ctx["_voice_transport"] == "sse"
+        assert "_voice_route_id" not in ctx
+        assert "_voice_route_capabilities" not in ctx
+        assert "_origin_device_id" not in ctx
         # Casa-owned keys still present.
         assert "chat_id" in ctx and "utterance_id" in ctx and "cid" in ctx
 
 
 class TestVoiceWSSanitize:
     async def test_reserved_keys_stripped_ordinary_keys_preserved(self, voice_app):
-        client, agent = voice_app
+        client, agent, _channel = voice_app
         async with client.ws_connect("/api/converse/ws") as ws:
             await ws.send_json({
                 "type": "utterance", "utterance_id": "u1", "text": "hi",
@@ -129,7 +134,45 @@ class TestVoiceWSSanitize:
         assert agent.captured, "agent must have received a dispatched turn"
         ctx = agent.captured[0]
         assert ctx["device_id"] == "kitchen-panel"      # preserved
-        assert not (RESERVED_CONTEXT_KEYS & ctx.keys()), (
-            f"reserved keys leaked: {RESERVED_CONTEXT_KEYS & ctx.keys()}"
-        )
+        assert ctx["_voice_transport"] == "ws"
+        assert "_origin_device_id" not in ctx
+        assert "_voice_route_id" not in ctx
+        assert "_voice_route_capabilities" not in ctx
         assert "chat_id" in ctx and "utterance_id" in ctx and "cid" in ctx
+
+    async def test_route_capability_comes_only_from_server_connection(
+        self, voice_app,
+    ):
+        _client, agent, channel = voice_app
+
+        class BoundConnection:
+            voice_route_id = "entry-trusted"
+            voice_route_capabilities = frozenset({
+                "background_jobs", "satellite_announce",
+            })
+
+            def __init__(self):
+                self.sent = []
+
+            async def send_json(self, frame):
+                self.sent.append(frame)
+
+        connection = BoundConnection()
+        await channel._run_ws_utterance(
+            connection,
+            {
+                "text": "hi", "agent_role": "butler", "scope_id": "s",
+                "device_id": "device-trusted",
+                "context": dict(_MALICIOUS_CONTEXT),
+            },
+            "u-bound",
+            asyncio.get_running_loop().time() + 20.0,
+        )
+
+        ctx = agent.captured[-1]
+        assert ctx["_voice_route_id"] == "entry-trusted"
+        assert ctx["_voice_route_capabilities"] == frozenset({
+            "background_jobs", "satellite_announce",
+        })
+        assert ctx["_origin_device_id"] == "device-trusted"
+        assert ctx["_voice_transport"] == "ws"

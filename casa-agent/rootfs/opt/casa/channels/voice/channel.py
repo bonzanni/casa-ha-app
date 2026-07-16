@@ -34,6 +34,45 @@ from semantic_memory import SemanticMemory
 
 logger = logging.getLogger(__name__)
 
+
+def _nonempty_identifier(value: Any) -> str | None:
+    """Normalize one trusted voice identifier without logging its value."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > 512:
+        return None
+    return normalized
+
+
+def _connection_voice_route(connection: Any) -> tuple[str | None, frozenset[str]]:
+    """Read route identity only from the server-owned WS connection object.
+
+    Task 4 replaces the raw aiohttp socket with ``VoiceWsConnection``.  The
+    two accepted attribute spellings keep this trust seam compatible with
+    that wrapper while direct Task-3 tests can use a minimal connection
+    double.  Utterance/context fields are intentionally never consulted.
+    """
+    route_id = _nonempty_identifier(
+        getattr(connection, "voice_route_id", None)
+    ) or _nonempty_identifier(getattr(connection, "route_id", None))
+    raw_capabilities = getattr(
+        connection,
+        "voice_route_capabilities",
+        getattr(
+            connection,
+            "accepted_capabilities",
+            getattr(connection, "capabilities", ()),
+        ),
+    )
+    if not isinstance(raw_capabilities, (set, frozenset, list, tuple)):
+        return route_id, frozenset()
+    capabilities = frozenset(
+        item for item in raw_capabilities
+        if isinstance(item, str) and item
+    )
+    return route_id, capabilities
+
 _DEFAULT_ERROR_LINES = {
     "timeout":       "[flat] That took too long.",
     "rate_limit":    "[flat] I'm busy — try again shortly.",
@@ -331,6 +370,7 @@ class VoiceChannel(Channel):
             })
             error_emitted = True
 
+        external_context = sanitize_external_context(payload.get("context"))
         msg = BusMessage(
             type=MessageType.REQUEST,
             source="voice",
@@ -341,7 +381,7 @@ class VoiceChannel(Channel):
                 # Sanitize-and-preserve (A:§3.5): payload["context"] is
                 # caller-supplied (the SSE POST body) — strip Casa-reserved
                 # provenance keys before Casa's own keys are merged in below.
-                **sanitize_external_context(payload.get("context")),
+                **external_context,
                 "chat_id": scope_id,
                 "utterance_id": utterance_id,
                 "cid": request["cid"],
@@ -349,6 +389,10 @@ class VoiceChannel(Channel):
                 "_error_sink": _error_sink,
                 "_voice_deadline": voice_deadline,
                 "_progress_sink": _progress_sink,
+                # SSE can complete only the live request. It never advertises
+                # an out-of-band delivery route, even when its external
+                # context contains route-shaped spoof fields.
+                "_voice_transport": "sse",
             },
         )
 
@@ -635,6 +679,24 @@ class VoiceChannel(Channel):
             })
             error_emitted = True
 
+        external_context = sanitize_external_context(frame.get("context"))
+        route_id, route_capabilities = _connection_voice_route(ws)
+        # The integration frame is authenticated by the WS route.  Ordinary
+        # external context remains available to the agent but must never be
+        # promoted into trusted job-delivery provenance.
+        origin_device_id = _nonempty_identifier(frame.get("device_id"))
+        trusted_route_context: dict[str, Any] = {
+            "_voice_transport": "ws",
+        }
+        if route_id is not None:
+            trusted_route_context["_voice_route_id"] = route_id
+        if route_capabilities:
+            trusted_route_context["_voice_route_capabilities"] = (
+                route_capabilities
+            )
+        if origin_device_id is not None:
+            trusted_route_context["_origin_device_id"] = origin_device_id
+
         bus_msg = BusMessage(
             type=MessageType.REQUEST, source="voice", target=agent_role,
             content=frame.get("text", ""),
@@ -644,13 +706,14 @@ class VoiceChannel(Channel):
                 # caller-supplied (the WS utterance frame) — strip
                 # Casa-reserved provenance keys before Casa's own keys are
                 # merged in below.
-                **sanitize_external_context(frame.get("context")),
+                **external_context,
                 "chat_id": scope_id, "utterance_id": uid,
                 "cid": new_cid(),
                 "_on_token": on_token,
                 "_error_sink": _error_sink,
                 "_voice_deadline": voice_deadline,
                 "_progress_sink": _progress_sink,
+                **trusted_route_context,
             },
         )
 

@@ -28,6 +28,8 @@ def test_reserved_context_keys_are_exactly_the_spec_set():
     assert RESERVED_CONTEXT_KEYS == frozenset({
         "synthetic", "button_answer", "execution_role",
         "message_type", "source",
+        "_voice_route_id", "_voice_route_capabilities",
+        "_origin_device_id", "_voice_transport",
     })
 
 
@@ -49,6 +51,10 @@ class TestSanitizeExternalContext:
             "synthetic": "button", "button_answer": "yes",
             "execution_role": "butler", "message_type": "channel_in",
             "source": "telegram",
+            "_voice_route_id": "spoofed-entry",
+            "_voice_route_capabilities": ["background_jobs"],
+            "_origin_device_id": "spoofed-device",
+            "_voice_transport": "ws",
         }
         out = sanitize_external_context(ctx)
         assert out == {"chat_id": "1", "cid": "abc"}
