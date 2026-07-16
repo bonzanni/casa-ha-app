@@ -78,6 +78,7 @@ class HomeAssistantFacade:
         self._server_config: dict[str, Any] | None = None
         self._surface_descriptor: SurfaceDescriptor = ()
         self._refresh_task: asyncio.Task[None] | None = None
+        self._refresh_pending = False
         self._closed = False
 
     @property
@@ -114,6 +115,8 @@ class HomeAssistantFacade:
                 await callback_result
 
     async def aclose(self) -> None:
+        self._closed = True
+        self._refresh_pending = False
         refresh_task = self._refresh_task
         self._refresh_task = None
         if refresh_task is not None and refresh_task is not asyncio.current_task():
@@ -123,7 +126,6 @@ class HomeAssistantFacade:
             except asyncio.CancelledError:
                 pass
         async with self._lock:
-            self._closed = True
             await self._close_upstream_locked()
 
     async def _refresh_locked(self) -> bool:
@@ -262,6 +264,7 @@ class HomeAssistantFacade:
     def _schedule_refresh(self) -> None:
         if self._closed:
             return
+        self._refresh_pending = True
         if self._refresh_task is None or self._refresh_task.done():
             self._refresh_task = asyncio.create_task(
                 self._run_scheduled_refresh(),
@@ -269,14 +272,18 @@ class HomeAssistantFacade:
             )
 
     async def _run_scheduled_refresh(self) -> None:
-        try:
-            await self.refresh()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning(
-                "Home Assistant schema refresh failed; detail suppressed",
-            )
+        while True:
+            self._refresh_pending = False
+            try:
+                await self.refresh()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Home Assistant schema refresh failed; detail suppressed",
+                )
+            if not self._refresh_pending:
+                return
 
 
 def _schema_for(tool_spec: Any) -> dict[str, Any]:

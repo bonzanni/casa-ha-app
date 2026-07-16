@@ -149,6 +149,20 @@ class SchemaChangeRecorder:
         self.count += 1
 
 
+class BlockingSchemaChangeRecorder(SchemaChangeRecorder):
+    """Expose a published changed surface while its callback remains blocked."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self) -> None:
+        self.count += 1
+        self.entered.set()
+        await self.release.wait()
+
+
 async def wait_until(predicate: Callable[[], bool]) -> None:
     async with asyncio.timeout(1):
         while not predicate():
@@ -454,6 +468,87 @@ async def test_concurrent_transport_failures_share_one_reconnect():
         assert len(failed.calls) == 2
         assert healthy.calls == []
     finally:
+        await facade.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failure_during_blocked_schema_callback_preserves_refresh():
+    initial = FakeHaSession(
+        tools=[action_tool("HassTurnOn")],
+        results={"HassTurnOn": ConnectionError("initial failure")},
+    )
+    recovered = FakeHaSession(
+        tools=[
+            action_tool("HassTurnOn"),
+            action_tool("HassLightSet"),
+        ],
+        results={"HassTurnOn": ConnectionError("recovered failure")},
+    )
+    healthy = FakeHaSession(tools=[
+        action_tool("HassTurnOn"),
+        action_tool("HassLightSet"),
+    ])
+    reconnect_storm_sentinel = FakeHaSession(tools=[
+        action_tool("HassTurnOn"),
+        action_tool("HassLightSet"),
+    ])
+    sessions = SessionSequence(
+        initial,
+        recovered,
+        healthy,
+        reconnect_storm_sentinel,
+    )
+    changed = BlockingSchemaChangeRecorder()
+    facade = make_facade(sessions, on_schema_change=changed)
+
+    await facade.start()
+    try:
+        original_config = facade.server_config
+        initial_result = await invoke_sdk_tool(
+            original_config,
+            "HassTurnOn",
+            {"name": "initial"},
+        )
+        assert initial_result["is_error"] is True
+
+        await asyncio.wait_for(changed.entered.wait(), timeout=1)
+        recovered_config = facade.server_config
+        assert recovered_config is not original_config
+        assert facade.tool_names == ("HassTurnOn", "HassLightSet")
+        assert sessions.open_count == 2
+        assert changed.count == 1
+
+        recovered_result = await invoke_sdk_tool(
+            recovered_config,
+            "HassTurnOn",
+            {"name": "recovered"},
+        )
+        assert recovered_result["is_error"] is True
+        assert sessions.open_count == 2
+
+        changed.release.set()
+        await wait_until(
+            lambda: sessions.open_count == 3
+            and facade.server_config is not recovered_config,
+        )
+        healthy_config = facade.server_config
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert sessions.open_count == 3
+        assert changed.count == 1
+        healthy_result = await invoke_sdk_tool(
+            healthy_config,
+            "HassTurnOn",
+            {"name": "healthy"},
+        )
+        assert "is_error" not in healthy_result
+        assert initial.calls == [("HassTurnOn", {"name": "initial"})]
+        assert recovered.calls == [("HassTurnOn", {"name": "recovered"})]
+        assert healthy.calls == [("HassTurnOn", {"name": "healthy"})]
+        assert reconnect_storm_sentinel.calls == []
+    finally:
+        changed.release.set()
         await facade.aclose()
 
 
