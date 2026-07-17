@@ -242,8 +242,9 @@ class TestStagedFlowPerStepFailures:
         new_mid = wire.posts[0][1]
         e = _entry(reg, rec, n)
         assert e["tg_message_id"] == new_mid      # step-3 persisted
-        # step-4 unconfirmed → retained, staged "plain" (D2 owns the flip).
-        assert e["stale_mids"] == [{"mid": 500, "kind": "plain"}]
+        # step-4 unconfirmed → retained; D2's atomic flip in
+        # update_question_mid already marked it "reanchored" at step 3.
+        assert e["stale_mids"] == [{"mid": 500, "kind": "reanchored"}]
 
 
 # ===========================================================================
@@ -261,7 +262,7 @@ class TestUnconfirmedStep4Reconcile:
         seq._high_water = 600
         await drv._reanchor_pass(rec)             # step-4 unconfirmed
         new_mid = wire.posts[0][1]
-        assert _entry(reg, rec, n)["stale_mids"] == [{"mid": 500, "kind": "plain"}]
+        assert _entry(reg, rec, n)["stale_mids"] == [{"mid": 500, "kind": "reanchored"}]
 
         # "Boot": the transport recovers, reconcile settles every tracked copy.
         wire.edit_ok = True
