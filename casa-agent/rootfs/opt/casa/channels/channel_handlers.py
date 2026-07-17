@@ -22,6 +22,7 @@ import asyncio
 import inspect
 import logging
 import re
+import time
 from collections import defaultdict
 from typing import Any, Awaitable, Callable
 
@@ -51,6 +52,202 @@ _PERMISSION_QUEUES: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
 # v0.37.2 (C-1): public alias for consumers outside this module (deprecated
 # alongside _PERMISSION_QUEUES above).
 PERMISSION_QUEUES = _PERMISSION_QUEUES
+
+
+# ---------------------------------------------------------------------------
+# Module-level state — ask validation gate (D1, round 4, Task A4)
+# ---------------------------------------------------------------------------
+#
+# Sol r9-1/r10-1/r10-2 protocol (design ref: docs/superpowers/specs/2026-07-16-
+# engagement-ask-labels-round4-design.md §D1 "Validator placement"). A
+# concurrent reattacher can win broker creation before the owner finishes
+# post-allocation size validation; without a handshake, a refusal by the
+# owner would leave the reattacher burning its full timeout against a broker
+# nobody will ever commit (Sol r3-1). The fix is a per-request_id validation
+# gate: NO path — owner or reattacher — registers a broker request / arms a
+# send-intent poster until the gate resolves PASSED. This module supplies
+# the self-consistent gate primitive only; wiring it into the ask/ask_cancel/
+# reattach handlers is Task A5.
+#
+# Gate state = TWO components (r9-1 BLOCKER — a single once-only slot cannot
+# express PASSED -> CANCELLED):
+#   (a) an IMMUTABLE completion slot (PASSED / FAILED(payload)), set exactly
+#       once, owner-only (the single validation owner — the original ask
+#       call, never a reattacher);
+#   (b) a MONOTONIC cancellation latch, settable by ANYONE at ANY time —
+#       before the gate even has a completion (the get-or-create tombstone,
+#       r5-1), during validation, or AFTER PASSED (r9-1: ``ask_cancel``
+#       fires whenever the original call exits without a response,
+#       regardless of what the owner already decided).
+# ONE ``asyncio.Event`` is set by whichever of cancellation or completion
+# happens FIRST (and stays set), so a reattacher already blocked in
+# ``await gate.event.wait()`` wakes on latch-only cancellation, not just
+# completion (r10-1). Every reader snapshots latch-first-then-completion via
+# :meth:`AskValidationGate.effective` — CANCELLED always wins over a
+# completed PASSED/FAILED, which in turn wins over PENDING.
+
+
+class AskValidationGate:
+    """Per-request_id validation gate (spec §D1). ``completion`` is
+    owner-only and immutable once set; ``cancelled`` is a monotonic latch
+    anyone may set at any time (including after ``PASSED``); one ``event``
+    wakes waiters on whichever terminal arrives first. See the module
+    docstring above for the executable protocol (Sol r9-1/r10-1)."""
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self.completion: tuple[str, dict | None] | None = None
+        self.cancelled: bool = False
+        self.event = asyncio.Event()
+        self._clock = clock
+        self._refcount = 0
+        self._resolved_at: float | None = None
+
+    # -- completion: owner-only, immutable once set -------------------------
+
+    def set_passed(self) -> None:
+        """Validation PASSED. Owner-only; no-op if ``completion`` is already
+        set — a second call (or a call after a FAILED/cancelled gate) never
+        clobbers the first resolution."""
+        if self.completion is not None:
+            return
+        self.completion = ("PASSED", None)
+        self._resolve()
+
+    def set_failed(self, payload: dict) -> None:
+        """Validation FAILED with *payload* — the EXACT response body every
+        current and future reattacher gets back byte-identical (r10-1/
+        r10-2). Owner-only; no-op if ``completion`` is already set."""
+        if self.completion is not None:
+            return
+        self.completion = ("FAILED", payload)
+        self._resolve()
+
+    # -- cancellation: monotonic latch, settable by anyone, any time --------
+
+    def set_cancelled(self) -> None:
+        """Set the cancellation latch. Monotonic (idempotent) and NEVER
+        gated by ``completion`` — ``ask_cancel`` may call this before the
+        gate has any completion, during validation, or after ``PASSED``
+        (r9-1/r10-1: cancellation is orthogonal to, and always overrides,
+        the completion slot)."""
+        self.cancelled = True
+        self._resolve()
+
+    # -- shared terminal bookkeeping -----------------------------------------
+
+    def _resolve(self) -> None:
+        """Record the FIRST terminal-resolution timestamp (retention reads
+        it) and wake every current/future waiter. Idempotent: a SECOND
+        terminal event (e.g. a cancel arriving after ``PASSED``) re-sets an
+        already-set event harmlessly and never moves ``_resolved_at``."""
+        if self._resolved_at is None:
+            self._resolved_at = self._clock()
+        self.event.set()
+
+    def effective(self) -> tuple[str, dict | None]:
+        """Latch-first snapshot (r9-1/r10-1): CANCELLED beats ``completion``,
+        which beats PENDING. Every consumer — owner, reattacher, poster —
+        reads this instead of the raw fields."""
+        if self.cancelled:
+            return ("CANCELLED", None)
+        if self.completion is not None:
+            return self.completion
+        return ("PENDING", None)
+
+    # -- retention refcount (A5 pins gates it still references) -------------
+
+    def acquire(self) -> None:
+        """Pin the gate — an owner/reattacher/send-intent holds a live
+        reference. Pair with :meth:`release`; :func:`maybe_retire_gate`
+        never drops a gate while :attr:`refcount` is above zero."""
+        self._refcount += 1
+
+    def release(self) -> None:
+        """Drop a pin taken by :meth:`acquire`. Never goes negative — a
+        stray extra release is a no-op, not a crash: retention is a hygiene
+        optimization (bounding ``ASK_GATES``' size), never a correctness
+        mechanism (a leaked gate is merely never cleaned up)."""
+        if self._refcount > 0:
+            self._refcount -= 1
+
+    @property
+    def refcount(self) -> int:
+        return self._refcount
+
+    def retirable(self, *, bound: float | None = None) -> bool:
+        """True iff no active reference remains AND the reattach retention
+        bound has elapsed since the FIRST terminal resolution (spec §D1
+        "Tombstone retention, stated precisely"). A gate that never resolved
+        (still PENDING) is never retirable — there is no terminal outcome to
+        retain, so retiring it would just re-litigate the get-or-create race
+        it exists to settle. ``bound`` defaults to the existing reattach
+        refusal-outcome retention window (see :func:`_reattach_retention_
+        bound`) — round 4 REUSES it rather than inventing a new TTL."""
+        if self._refcount > 0:
+            return False
+        if self._resolved_at is None:
+            return False
+        if bound is None:
+            bound = _reattach_retention_bound()
+        return (self._clock() - self._resolved_at) >= bound
+
+
+def _reattach_retention_bound() -> float:
+    """The EXISTING reattach refusal-outcome retention bound (round 3):
+    ``verdict_broker``'s retired-tombstone window. A retired broker request
+    stays reattachable for exactly this long — the same guarantee this gate
+    now offers a validation reattacher — so round 4 reuses the SAME window
+    instead of inventing a new TTL constant (spec §D1). Imported lazily and
+    read as a module attribute (never bound at import time) so a test that
+    monkeypatches ``verdict_broker._RETIRE_S`` is honoured, mirroring that
+    module's own docstring warning about capturing a default at
+    registration."""
+    import verdict_broker
+    return verdict_broker._RETIRE_S
+
+
+ASK_GATES: dict[str, AskValidationGate] = {}
+
+
+def get_or_create_gate(
+    request_id: str, *, clock: Callable[[], float] | None = None,
+) -> AskValidationGate:
+    """Idempotent per-request_id gate lookup (r10-1). The FIRST caller for a
+    given *request_id* — the validation owner's ask path OR a racing
+    ``ask_cancel``/reattacher — creates the gate; every LATER caller for the
+    SAME *request_id* gets the identical instance. This is what makes
+    cancel-first ordering safe (spec §D1 r5-1/r10-1): an ``ask_cancel`` that
+    lands before the original ``/ask`` call creates the gate and sets its
+    cancellation latch immediately; the ask path's later
+    ``get_or_create_gate`` call for the same request_id finds that SAME
+    gate, latch already set, and never registers a broker request.
+
+    ``clock`` is test-only (never patch module-level ``asyncio.sleep`` — or
+    ``time.monotonic`` — inject the clock instead); production callers never
+    pass it. This function does NOT bump :attr:`AskValidationGate.refcount`
+    — callers that need retention protection call
+    :meth:`AskValidationGate.acquire` explicitly."""
+    gate = ASK_GATES.get(request_id)
+    if gate is None:
+        gate = AskValidationGate() if clock is None else AskValidationGate(clock=clock)
+        ASK_GATES[request_id] = gate
+    return gate
+
+
+def maybe_retire_gate(request_id: str) -> bool:
+    """Drop the gate for *request_id* from :data:`ASK_GATES` iff it is
+    :meth:`AskValidationGate.retirable` — piggybacking on the SAME
+    reattach-bound cleanup shape round 3 already uses for send-intent
+    refusal outcomes (release-then-maybe-retire), not a new sweep/TTL
+    mechanism (spec §D1). Returns ``True`` iff a gate was actually retired.
+    Safe to call speculatively (e.g. after every
+    :meth:`AskValidationGate.release`) — a non-retirable or already-gone
+    gate is a no-op."""
+    gate = ASK_GATES.get(request_id)
+    if gate is None or not gate.retirable():
+        return False
+    del ASK_GATES[request_id]
+    return True
 
 
 # ---------------------------------------------------------------------------

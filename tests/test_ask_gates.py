@@ -1244,3 +1244,364 @@ class TestCapsRemovedEndToEnd:
         resp = await _drive_button(wired, task, "cap5")
         assert _body(resp)["ok"] is True
         assert len(wired["chan"].keyboards) == 1
+
+
+# ===========================================================================
+# D1 (round 4, Task A4) — AskValidationGate: completion slot, cancellation
+# latch, wake event, get_or_create_gate, refcounted retention.
+#
+# Design ref: docs/superpowers/specs/2026-07-16-engagement-ask-labels-
+# round4-design.md §D1 "Validator placement + failure hygiene" (Sol
+# r9-1/r10-1/r10-2). Pure unit tests against the gate primitive itself —
+# NOT wired into the ask/ask_cancel/reattach handlers yet (Task A5). Real
+# asyncio throughout; retention tests inject a fake monotonic clock rather
+# than patching ``time.monotonic``/``asyncio.sleep``.
+# ===========================================================================
+
+
+import verdict_broker as _verdict_broker_mod
+from channels.channel_handlers import (
+    ASK_GATES,
+    AskValidationGate,
+    get_or_create_gate,
+    maybe_retire_gate,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_ask_gates():
+    """D1 tests own ``ASK_GATES`` — never leak a gate into another test."""
+    ASK_GATES.clear()
+    yield
+    ASK_GATES.clear()
+
+
+class _FakeClock:
+    """Deterministic monotonic clock the retention tests advance by hand —
+    never patches ``time.monotonic`` (the memory-cage rule bars patching
+    shared module attributes; this is dependency-injected instead)."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, delta: float) -> None:
+        self.now += delta
+
+
+class TestCompletionSlot:
+    """Completion is owner-only and immutable once set (spec §D1 r10-1)."""
+
+    async def test_pending_before_any_terminal(self):
+        gate = AskValidationGate()
+        assert gate.completion is None
+        assert gate.cancelled is False
+        assert gate.effective() == ("PENDING", None)
+        assert not gate.event.is_set()
+
+    async def test_set_passed_then_effective_passed(self):
+        gate = AskValidationGate()
+        gate.set_passed()
+        assert gate.completion == ("PASSED", None)
+        assert gate.effective() == ("PASSED", None)
+        assert gate.event.is_set()
+
+    async def test_set_failed_then_effective_failed_with_payload(self):
+        gate = AskValidationGate()
+        payload = {"ok": False, "error": "invalid_args", "detail": "too long"}
+        gate.set_failed(payload)
+        assert gate.effective() == ("FAILED", payload)
+        assert gate.event.is_set()
+
+    async def test_set_passed_twice_is_a_noop(self):
+        gate = AskValidationGate()
+        gate.set_passed()
+        gate.set_passed()
+        assert gate.completion == ("PASSED", None)
+
+    async def test_set_failed_after_passed_does_not_clobber(self):
+        """Owner-only immutability: a second (buggy) owner call never
+        overwrites the first resolution, regardless of which terminal it
+        tries to set."""
+        gate = AskValidationGate()
+        gate.set_passed()
+        gate.set_failed({"ok": False, "error": "invalid_args"})
+        assert gate.completion == ("PASSED", None)
+
+    async def test_set_passed_after_failed_does_not_clobber(self):
+        gate = AskValidationGate()
+        payload = {"ok": False, "error": "invalid_args"}
+        gate.set_failed(payload)
+        gate.set_passed()
+        assert gate.completion == ("FAILED", payload)
+
+
+class TestCancellationLatch:
+    """Cancellation is monotonic and settable by ANYONE at ANY time —
+    including after PASSED (the r9-1 transition a single once-only slot
+    cannot express)."""
+
+    async def test_cancel_before_any_completion(self):
+        gate = AskValidationGate()
+        gate.set_cancelled()
+        assert gate.effective() == ("CANCELLED", None)
+        assert gate.event.is_set()
+
+    async def test_passed_then_cancelled_effective_is_cancelled(self):
+        """The r9-1 transition: PASSED -> CANCELLED. CANCELLED wins over a
+        completion that already landed."""
+        gate = AskValidationGate()
+        gate.set_passed()
+        gate.set_cancelled()
+        assert gate.completion == ("PASSED", None)  # completion untouched
+        assert gate.cancelled is True
+        assert gate.effective() == ("CANCELLED", None)
+
+    async def test_failed_then_cancelled_effective_is_cancelled(self):
+        gate = AskValidationGate()
+        gate.set_failed({"ok": False, "error": "invalid_args"})
+        gate.set_cancelled()
+        assert gate.effective() == ("CANCELLED", None)
+
+    async def test_cancel_is_idempotent(self):
+        gate = AskValidationGate()
+        gate.set_cancelled()
+        gate.set_cancelled()
+        assert gate.cancelled is True
+        assert gate.effective() == ("CANCELLED", None)
+
+    async def test_cancel_then_set_passed_still_reads_cancelled(self):
+        """Cancellation is never gated by completion order: even a
+        (belated) owner PASSED after the latch is set does not un-cancel
+        the effective outcome."""
+        gate = AskValidationGate()
+        gate.set_cancelled()
+        gate.set_passed()
+        assert gate.completion == ("PASSED", None)
+        assert gate.effective() == ("CANCELLED", None)
+
+
+class TestWakeEvent:
+    """ONE asyncio.Event, set by whichever terminal arrives first, wakes a
+    waiter regardless of which terminal it was (r10-1)."""
+
+    async def test_latch_only_cancellation_wakes_a_pending_waiter(self):
+        gate = AskValidationGate()
+        waiter = asyncio.ensure_future(gate.event.wait())
+        await asyncio.sleep(0.01)
+        assert not waiter.done()
+        gate.set_cancelled()
+        await asyncio.wait_for(waiter, timeout=1.0)
+        assert waiter.result() is True
+        assert gate.effective() == ("CANCELLED", None)
+
+    async def test_set_passed_wakes_a_pending_waiter(self):
+        gate = AskValidationGate()
+        waiter = asyncio.ensure_future(gate.event.wait())
+        await asyncio.sleep(0.01)
+        gate.set_passed()
+        await asyncio.wait_for(waiter, timeout=1.0)
+        assert gate.effective() == ("PASSED", None)
+
+    async def test_failed_payload_delivered_byte_identical_to_two_concurrent_waiters(
+        self,
+    ):
+        gate = AskValidationGate()
+        payload = {
+            "ok": False, "error": "invalid_args",
+            "detail": "rendered question+options would exceed Telegram's "
+                       "4096-char message limit",
+        }
+
+        async def _wait_and_read():
+            await gate.event.wait()
+            return gate.effective()
+
+        w1 = asyncio.ensure_future(_wait_and_read())
+        w2 = asyncio.ensure_future(_wait_and_read())
+        await asyncio.sleep(0.01)
+        gate.set_failed(payload)
+        outcome1 = await asyncio.wait_for(w1, timeout=1.0)
+        outcome2 = await asyncio.wait_for(w2, timeout=1.0)
+        assert outcome1 == ("FAILED", payload)
+        assert outcome2 == ("FAILED", payload)
+        # Byte-identical — the SAME dict object, never a re-serialized copy.
+        assert outcome1[1] is payload
+        assert outcome2[1] is payload
+
+    async def test_a_late_waiter_after_resolution_never_blocks(self):
+        """A reattacher that arrives AFTER the gate resolved finds the
+        latch already set — ``event.wait()`` returns immediately."""
+        gate = AskValidationGate()
+        gate.set_failed({"ok": False, "error": "invalid_args"})
+        await asyncio.wait_for(gate.event.wait(), timeout=0.05)
+        assert gate.effective() == ("FAILED", {"ok": False, "error": "invalid_args"})
+
+
+class TestGetOrCreateGate:
+    """Idempotent per-request_id lookup — the cancel-first ordering the
+    r5-1/r10-1 handshake depends on."""
+
+    async def test_first_call_creates_a_gate(self):
+        assert "rid-1" not in ASK_GATES
+        gate = get_or_create_gate("rid-1")
+        assert ASK_GATES["rid-1"] is gate
+        assert gate.effective() == ("PENDING", None)
+
+    async def test_second_call_returns_the_same_instance(self):
+        g1 = get_or_create_gate("rid-2")
+        g2 = get_or_create_gate("rid-2")
+        assert g1 is g2
+
+    async def test_different_request_ids_get_different_gates(self):
+        g1 = get_or_create_gate("rid-3a")
+        g2 = get_or_create_gate("rid-3b")
+        assert g1 is not g2
+
+    async def test_cancel_first_then_ask_path_finds_latch_already_set(self):
+        """The r5-1 scenario: ``ask_cancel`` is a SEPARATE HTTP request from
+        the caller's ``finally`` and can land BEFORE the original ``/ask``
+        creates anything. ``ask_cancel`` calls ``get_or_create_gate`` and
+        sets the cancellation latch; when the ask path LATER calls
+        ``get_or_create_gate`` for the same request_id, it must find the
+        SAME gate with the latch already set — never a fresh PENDING gate
+        that lets the ask proceed to register a broker request for a
+        caller who already abandoned it."""
+        rid = "rid-cancel-first"
+        cancel_gate = get_or_create_gate(rid)
+        cancel_gate.set_cancelled()
+
+        # ... time passes; the original /ask handler now runs for the
+        # first time and looks up the gate for the same request_id.
+        ask_gate = get_or_create_gate(rid)
+
+        assert ask_gate is cancel_gate
+        assert ask_gate.effective() == ("CANCELLED", None)
+        # The owner's later PASSED must not resurrect a stale ordering —
+        # cancellation still wins.
+        ask_gate.set_passed()
+        assert ask_gate.effective() == ("CANCELLED", None)
+
+
+class TestRefcountedRetention:
+    """Retention: a gate retires only when (a) no active reference remains
+    AND (b) the reattach retention bound has elapsed since terminal
+    resolution — reusing ``verdict_broker``'s existing tombstone window
+    rather than a new TTL constant (spec §D1 "Tombstone retention, stated
+    precisely")."""
+
+    async def test_pending_gate_is_never_retirable(self):
+        gate = AskValidationGate()
+        assert gate.retirable() is False
+
+    async def test_unresolved_but_referenced_gate_is_never_retirable(self, monkeypatch):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 0.0)
+        gate = AskValidationGate()
+        gate.acquire()
+        assert gate.retirable() is False
+
+    async def test_not_retirable_while_referenced_even_after_terminal(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 0.0)
+        clock = _FakeClock()
+        gate = AskValidationGate(clock=clock)
+        gate.acquire()
+        gate.set_passed()
+        clock.advance(1000.0)  # WAY past any bound
+        assert gate.refcount == 1
+        assert gate.retirable() is False  # still referenced
+
+    async def test_retirable_immediately_after_release_when_bound_is_zero(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 0.0)
+        clock = _FakeClock()
+        gate = AskValidationGate(clock=clock)
+        gate.acquire()
+        gate.set_passed()
+        assert gate.retirable() is False
+        gate.release()
+        assert gate.refcount == 0
+        assert gate.retirable() is True
+
+    async def test_not_retirable_before_the_bound_elapses(self, monkeypatch):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 60.0)
+        clock = _FakeClock()
+        gate = AskValidationGate(clock=clock)
+        gate.set_failed({"ok": False, "error": "invalid_args"})
+        clock.advance(59.9)
+        assert gate.retirable() is False
+
+    async def test_retirable_once_the_bound_elapses(self, monkeypatch):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 60.0)
+        clock = _FakeClock()
+        gate = AskValidationGate(clock=clock)
+        gate.set_failed({"ok": False, "error": "invalid_args"})
+        clock.advance(60.0)
+        assert gate.retirable() is True
+
+    async def test_release_never_goes_negative(self):
+        gate = AskValidationGate()
+        gate.release()
+        gate.release()
+        assert gate.refcount == 0
+
+    async def test_explicit_bound_overrides_the_reused_default(self):
+        """``retirable(bound=...)`` lets a caller override the reused
+        window directly — used by :func:`maybe_retire_gate`'s callers in
+        tests without touching ``verdict_broker`` at all."""
+        clock = _FakeClock()
+        gate = AskValidationGate(clock=clock)
+        gate.set_passed()
+        assert gate.retirable(bound=10.0) is False
+        clock.advance(10.0)
+        assert gate.retirable(bound=10.0) is True
+
+    async def test_maybe_retire_gate_noop_while_referenced(self, monkeypatch):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 0.0)
+        clock = _FakeClock()
+        gate = get_or_create_gate("rid-retain", clock=clock)
+        gate.acquire()
+        gate.set_passed()
+        assert maybe_retire_gate("rid-retain") is False
+        assert "rid-retain" in ASK_GATES
+
+    async def test_maybe_retire_gate_removes_from_ask_gates_after_release_and_bound(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 5.0)
+        clock = _FakeClock()
+        gate = get_or_create_gate("rid-retire", clock=clock)
+        gate.acquire()
+        gate.set_passed()
+        assert maybe_retire_gate("rid-retire") is False  # still referenced
+
+        gate.release()
+        assert maybe_retire_gate("rid-retire") is False  # bound not elapsed
+
+        clock.advance(5.0)
+        assert maybe_retire_gate("rid-retire") is True
+        assert "rid-retire" not in ASK_GATES
+
+    async def test_maybe_retire_gate_unknown_request_id_is_a_noop(self):
+        assert maybe_retire_gate("no-such-request-id") is False
+
+    async def test_reuses_verdict_broker_retire_window_not_a_new_constant(
+        self, monkeypatch,
+    ):
+        """Direct check that the gate's DEFAULT bound tracks
+        ``verdict_broker._RETIRE_S`` dynamically (read at call time, not
+        captured at import) — the same guarantee that module documents for
+        its own tombstone retirement."""
+        clock = _FakeClock()
+        gate = AskValidationGate(clock=clock)
+        gate.set_passed()
+
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 42.0)
+        clock.advance(41.9)
+        assert gate.retirable() is False
+        clock.advance(0.2)
+        assert gate.retirable() is True
