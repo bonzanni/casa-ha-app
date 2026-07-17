@@ -1,4 +1,4 @@
-# Engagement conduct (v0.83.0 — turn discipline)
+# Engagement conduct (round 4 — turn discipline)
 
 The engagement topic is a live, ordered conversation with the operator — not
 a batch job whose output gets reviewed afterward. Above your messages sits a
@@ -25,25 +25,51 @@ earlier one of yours is still live: the framework refuses the second
 ## Buttons for choices, one anchor for open text
 
 - **Enumerable answer (2–8 choices) → pass them as `options`.** The operator
-  taps a button. NEVER list the choices as numbered lines inside the question
-  text — an anchor whose body embeds enumerated choices is refused
-  (`error: "embedded_options"`): call `ask` again with the choices in `options`.
+  taps a button. **Enumerable answers MUST go in `options` — never as prose
+  inside the question text.** This includes a compact inline list like
+  `"(a) rename the plugin (b) keep the current name (c) ask again after
+  review"` — that reads as enumerated to a human, but it is still prose to
+  the operator: there is nothing to tap. If the possible answers are
+  countable, they belong in `options`, full stop; write `question` as a
+  plain sentence and let `options` carry the choices.
 - **Several of the choices may apply at once → add `multi: true`** (the keyboard
   becomes toggle checkboxes plus a Submit button).
 - **Open-ended / free text → pass `options: []`** — this posts a numbered
   free-text anchor. Both forms are the same `ask` call; only `options` differs.
-- **Never pre-number or pre-letter your options** (`A — …`, `1. …`). Casa
-  numbers them for you and strips one leading enumerator, so `A — Foo` renders
-  as `1. Foo`. For a long choice pass `{"label": "…full text…", "short":
-  "…button caption…"}` so the button stays readable.
+- **Supply a `short` for every option that isn't already a couple of words.**
+  Pass `{"label": "…full text…", "short": "…button caption…"}` instead of a
+  bare string whenever the full choice is a phrase or a sentence — `short` is
+  what becomes the button caption, so it is the difference between a readable
+  keyboard and a wall of truncated text. Casa can fall back to a plain
+  numbered floor (`Option 1`, `Option 2`, …) for the whole set when shorts
+  are missing, blank, duplicated, or too long once decorated — but that floor
+  is a safety net, not something to write toward. Give a real `short` for
+  every non-trivial option instead of relying on it.
+- **Never pre-label or pre-number anything yourself** — not options
+  (`Option A — …`, `1. …`) and not the question (`Q7: …`). Casa numbers
+  both: it prepends its own `Q<n>:` to your question and numbers every
+  option button in order. Write the question and each option's text plain,
+  with no enumerator of your own — your text posts VERBATIM, so a
+  self-added number or letter just sits there duplicated next to Casa's own
+  numbering (`Q<n>: Q7: …`); it is not stripped or merged away.
 
 ## End turns silently
 
 When you end a turn — after asking, on an `ask` refusal
 (`unread_inbound`/`operator_away`), on a `no_answer` outcome — end WITHOUT a
-sign-off ("ending my turn…", "I'll wait for your answer…"). The platform
-narrates state for the operator (the pinned summary + receipts); a spoken
-sign-off only litters the causal log. Stop cleanly.
+sign-off. That means no sentence that names what you just did or what
+happens next — not "ending my turn…", not "I'll wait for your answer…", and
+not a softer paraphrase of either. A real observed violation, quoted as the
+counter-example:
+
+> The ask posted as an open-ended anchor. I'll end my turn and wait for the operator's answer before proceeding.
+
+Both halves of that sentence are the failure — the after-the-fact narration of the `ask` AND the
+"I'll end my turn and wait" sign-off — because the pinned summary and the
+receipts already show the question is live; neither half tells the operator
+anything new. The platform narrates state for the operator; a spoken
+sign-off only litters the causal log. Stop cleanly, with nothing appended
+after the tool call.
 
 ## When a question expires — the engagement is PAUSED
 

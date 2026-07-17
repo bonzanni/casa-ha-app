@@ -210,20 +210,33 @@ async def ask(
     buttons; with ``options: []`` it posts a numbered free-text question anchor.
 
     Each ``options`` entry is either a plain string OR a ``{"label": str,
-    "short": str}`` dict (A4 · F-BTN): ``label`` is the full choice shown
-    VERBATIM in the message body and returned on selection; ``short`` (≤ 25
-    chars) is the compact button caption. Plain-string options get an
-    auto-shortened button caption. Returns the selected FULL label.
+    "short": str}`` dict: ``label`` is the full choice shown VERBATIM in the
+    message body and returned on selection. **Supply ``short`` for every
+    option that isn't already a couple of words** — it is the button
+    caption, so it is the difference between a readable keyboard and a wall
+    of truncated text. Without a usable ``short`` (missing, blank, duplicated
+    across options, or too long once decorated), Casa falls back to a plain
+    numbered floor (``"Option 1"``, ``"Option 2"``, …) for the WHOLE set —
+    that floor is a safety net, not something to write toward. Returns the
+    selected FULL label.
 
-    A5 · F-MULTI: pass ``multi: true`` (requires ≥2 ``options``) when SEVERAL
-    choices may apply — the keyboard becomes toggle checkboxes plus a ``✅
-    Submit`` row, and the response carries ``options``/``option_indices`` (the
-    full selection) alongside the first-selection ``option``/``option_index``.
+    Enumerable answers MUST go in ``options`` — never as prose inside
+    ``question``, not even a compact inline list like ``"(a) rename the repo
+    (b) keep the current name (c) ask again later"``. That reads as
+    enumerated to a human, but the operator still can't tap it. If the
+    possible answers are countable, put them in ``options`` and keep
+    ``question`` a plain sentence.
 
-    A6 · F-LABEL: options are auto-de-enumerated — never pre-number or
-    pre-letter them (``A — …``, ``1. …``); Casa numbers them for you.
-    A7 · F-ANCHOR: an anchor (``options: []``) whose question embeds ≥2
-    numbered/lettered choice lines is refused — pass the choices as ``options``.
+    Pass ``multi: true`` (requires ≥2 ``options``) when SEVERAL choices may
+    apply — the keyboard becomes toggle checkboxes plus a ``✅ Submit`` row,
+    and the response carries ``options``/``option_indices`` (the full
+    selection) alongside the first-selection ``option``/``option_index``.
+
+    Never pre-number or pre-letter your own options (``A — …``, ``1. …``) or
+    your own question (``Q7: …``) — Casa numbers both, prepending its own
+    ``Q<n>:`` to the question and numbering every option button. Your text
+    posts VERBATIM, so a self-added number or letter just sits there
+    duplicated next to Casa's own numbering; it is not stripped or merged.
 
     THE CONTRACT: `ask` is the ONLY channel for an operator decision — never
     embed a question in a `reply`. After it posts (button OR anchor), END YOUR
@@ -235,7 +248,6 @@ async def ask(
     away and the engagement is now PAUSED: END YOUR TURN silently (no sign-off)
     and wait. Do NOT re-ask; your question stays on record. A further `ask`
     while paused is refused `operator_away` — that too means end your turn.
-    (A7 anchors that embed enumerated choices are refused `embedded_options`.)
     NOT an authorization mechanism.
 
     v0.79.0 (§2, r8-1): RAW-DICT ingress — no client-side validation. The raw
