@@ -239,10 +239,8 @@ def _parse_callback_data(
 # only a short summary. The button's IDENTITY stays the option INDEX in
 # ``callback_data`` — the label is display-only, so nothing is lost by shortening.
 #
-# v0.84.0 (round 4, spec D2, Sol r1-3/r2-3/r2-7/r3-5): the v0.83.0 per-option
-# ELISION LADDER (the ``_elide_one``/``_resolve_label_collisions`` pair and the
-# single-option elision fallback) is GONE — it garbled labels
-# ("1 · A —…MCP…MCPB"). Button labels are now MODEL-generated: the agent
+# Round 4 (spec D2, Sol r1-3/r2-3/r2-7/r3-5): the v0.83.0 per-option elision
+# ladder is GONE — it garbled labels ("1 · A —…MCP…MCPB"). Button labels are now MODEL-generated: the agent
 # supplies an optional ``short`` per option, resolved with WHOLE-SET semantics by
 # ``resolve_button_labels`` below. Either EVERY option has a usable short and
 # the whole set renders ``n · <short>`` verbatim, or the WHOLE set floors to
