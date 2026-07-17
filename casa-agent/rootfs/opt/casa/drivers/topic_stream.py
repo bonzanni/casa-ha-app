@@ -509,6 +509,16 @@ class TopicStreamRelay:
         # boundary (``_reset_turn_state``).
         self._anchor_candidate: tuple[str, str] | None = None
         self._suppressing_for: tuple[int, int] | None = None
+        # D5 Task C2: the anchor-scoped NARRATION BUFFER. While suppression is
+        # armed, trailing prose is HELD here (never posted) as
+        # ``(text, segment, offset_after)`` tuples — the frame coordinates travel
+        # with the held text so Task C3 can add the persisted ``hold_pending``
+        # marker + checkpoint-hold exemption on top WITHOUT restructuring. The
+        # buffer FLUSHES (posts normally) on a later tool_use (which also DISARMS)
+        # or an answer before ``result``; it is DISCARDED at ``result`` if the
+        # anchor is still open-and-unanswered. In-memory only, reset every turn
+        # boundary (``_reset_turn_state``).
+        self._anchor_buffer: list[tuple[str, list[int], int]] = []
 
     # -- persistence helpers ------------------------------------------------
 
@@ -877,25 +887,42 @@ class TopicStreamRelay:
     async def _post_text(self, text: str, seg, off_after: int) -> None:
         """Text-only streaming path: throttle + single frame-end checkpoint."""
         await self._maybe_arm_suppression()
+        # §D5: armed (anchor open) — trailing prose is BUFFERED, never posted
+        # here. Flushed on a later tool_use / an answer before ``result``, or
+        # DISCARDED at ``result`` if the anchor is still open. A held frame does
+        # NOT checkpoint (mirrors the throttle-hold below) so a crash can never
+        # strand the held prose past an advanced cursor; Task C3 persists the
+        # ``hold_pending`` marker + cold-replay exemption on top of this.
+        if self._suppressing_for is not None:
+            self._anchor_buffer.append((text, list(seg), off_after))
+            return
         self._turn_text += text
         if self._dropped:
             self._advance_dropped(seg, off_after)
             return
 
-        ops = self._plan_ops(text)
-        if not ops:
-            self._checkpoint(seg, off_after)
-            return
-
-        # Throttle only the rapid single-edit streaming case: skip the live
-        # edit within the window (text is retained in memory and flushed by the
-        # next edit or at finalize), and do NOT advance the cursor.
-        if len(ops) == 1 and ops[0][0] == "edit":
-            if self._now() - self._last_edit_ts < self._edit_throttle:
-                self._per_message_text = ops[0][1]
+        # §D5 r4-2: a pending, not-yet-armed anchor-candidate — the anchor may be
+        # posting LATE (out-of-band). Route the post through the sequencer's
+        # ATOMIC read-decide-write so the seam re-read + narration post share the
+        # ONE lock the late poster uses; a hold buffers + arms (no checkpoint).
+        if self._anchor_candidate is not None and self.open_anchor_state is not None:
+            if await self._atomic_post_or_hold(text, seg, off_after):
+                return
+        else:
+            ops = self._plan_ops(text)
+            if not ops:
+                self._checkpoint(seg, off_after)
                 return
 
-        await self._execute_ops(ops)
+            # Throttle only the rapid single-edit streaming case: skip the live
+            # edit within the window (text is retained in memory and flushed by
+            # the next edit or at finalize), and do NOT advance the cursor.
+            if len(ops) == 1 and ops[0][0] == "edit":
+                if self._now() - self._last_edit_ts < self._edit_throttle:
+                    self._per_message_text = ops[0][1]
+                    return
+
+            await self._execute_ops(ops)
         if self._dropped:
             self._advance_dropped(seg, off_after)
             return
@@ -908,12 +935,21 @@ class TopicStreamRelay:
         self.cursor.last_posted_len = self._posted_len
         self._save()
 
-    async def _append_narration(self, text: str) -> None:
+    async def _append_narration(self, text: str, seg, off_after: int) -> None:
         """Append narration text WITHOUT throttle or checkpoint (used by the
         block-ordered mixed-frame path, which checkpoints once at frame end)."""
         await self._maybe_arm_suppression()
+        # §D5: armed — BUFFER (see ``_post_text``). The frame-end checkpoint in
+        # ``_handle_assistant_blocks`` is EXEMPTED while the buffer is non-empty.
+        if self._suppressing_for is not None:
+            self._anchor_buffer.append((text, list(seg), off_after))
+            return
         self._turn_text += text
         if self._dropped:
+            return
+        # §D5 r4-2 atomic hold-or-post for a pending, not-yet-armed candidate.
+        if self._anchor_candidate is not None and self.open_anchor_state is not None:
+            await self._atomic_post_or_hold(text, seg, off_after)
             return
         ops = self._plan_ops(text)
         await self._execute_ops(ops)
@@ -978,6 +1014,60 @@ class TopicStreamRelay:
         if state is not None:
             self._suppressing_for = (state[0], state[1])
 
+    async def _atomic_post_or_hold(self, text: str, seg, off_after: int) -> bool:
+        """§D5 r4-2: route a not-yet-armed prose post through the sequencer's
+        ATOMIC read-decide-write, so the seam re-read and the narration post
+        share the ONE lock the late anchor poster uses. Returns ``True`` if the
+        text was HELD (buffered + armed — the caller must NOT post/checkpoint
+        it); ``False`` if the anchor was closed/absent and the poster already
+        posted the text normally.
+
+        Reached only when a candidate is pending and NOT yet armed (the seam was
+        closed at the ``_maybe_arm_suppression`` check just above the caller) —
+        the r4-2 race window where the anchor may be surfacing LATE. Once armed,
+        callers buffer directly without a seam read (no post ⇒ no race)."""
+        status = await self.sequencer.post_unless_anchor_open(
+            text,
+            self.open_anchor_state,
+            poster=lambda t=text: self._execute_ops(self._plan_ops(t)),
+        )
+        if status != "held":
+            return False
+        # The op surfaced the anchor under the lock ⇒ ARM + buffer. Re-read the
+        # seam for the arm identity; this is post-DECISION (we will NOT post
+        # regardless), so it is not the r4-2 race — a value that raced to
+        # answered only means the buffer flushes at ``result`` instead of
+        # discarding. Keep the prior identity (or a sentinel) if it raced away,
+        # so the armed buffering discipline still holds.
+        state = await _maybe_await(self.open_anchor_state())
+        if state is not None:
+            self._suppressing_for = (state[0], state[1])
+        elif self._suppressing_for is None:
+            self._suppressing_for = (0, 0)
+        self._anchor_buffer.append((text, list(seg), off_after))
+        return True
+
+    async def _flush_anchor_buffer(self) -> None:
+        """Post all buffered anchor-scoped prose as ORDINARY narration (§D5
+        flush), through the normal rollover/seal-aware path so the cursor
+        bookkeeping stays consistent. No-op on an empty buffer."""
+        if not self._anchor_buffer:
+            return
+        buffered = "".join(text for (text, _seg, _off) in self._anchor_buffer)
+        self._anchor_buffer = []
+        if buffered:
+            await self._execute_ops(self._plan_ops(buffered))
+
+    async def _flush_and_disarm(self) -> None:
+        """§D5 r23-2: a tool_use proves the agent is still working, so buffered
+        post-anchor prose is legitimate — FLUSH it and DISARM for the rest of the
+        turn. The spent candidate is dropped too, so the CURRENT anchor never
+        re-arms on the next prose frame; re-arming happens ONLY when a NEW anchor
+        surfaces (a fresh ``_match_discrete_block`` candidate)."""
+        await self._flush_anchor_buffer()
+        self._suppressing_for = None
+        self._anchor_candidate = None
+
     async def _handle_assistant_blocks(
         self, blocks: list[tuple], seg, off_after: int,
     ) -> None:
@@ -993,12 +1083,22 @@ class TopicStreamRelay:
         fired_mutating = False
         for block in blocks:
             if block[0] == "text":
-                await self._append_narration(block[1])
+                await self._append_narration(block[1], seg, off_after)
                 if self._dropped:
                     self._advance_dropped(seg, off_after)
                     return
             else:  # tool_use
                 _kind, name, tool_input = block
+                # §D5 r23-2: a tool_use proves the agent is still working — FLUSH
+                # any buffered post-anchor prose (above this block's discrete
+                # post) and DISARM. The flush drops the spent candidate, so if
+                # this block is itself a NEW anchor ask, ``_match_discrete_block``
+                # below re-records the candidate and the next prose re-arms.
+                if self._suppressing_for is not None:
+                    await self._flush_and_disarm()
+                    if self._dropped:
+                        self._advance_dropped(seg, off_after)
+                        return
                 if not fired_mutating and name not in _NON_MUTATING_TOOLS:
                     fired_mutating = True
                     await _maybe_await(
@@ -1015,6 +1115,14 @@ class TopicStreamRelay:
                 )
                 await self._match_discrete_block(name, tool_input)
 
+        # §D5: a frame that still holds UNFLUSHED buffered prose is EXEMPT from
+        # checkpoint advancement (mirrors the throttled-text hold at :894) so a
+        # crash can never strand the held prose behind an advanced cursor. Task
+        # C3 persists the ``hold_pending`` marker so cold replay re-renders the
+        # held prose as ordinary narration; here the in-memory buffer alone
+        # relies on a later flush / the ``result`` discard to advance the cursor.
+        if self._anchor_buffer:
+            return
         self.cursor.current = {"segment": list(seg), "offset": off_after}
         # §A1 (Sol r2-1a): a tool-only frame can checkpoint WHILE a throttled
         # narration edit is held unposted (``_per_message_text`` grew, the wire
@@ -1033,9 +1141,13 @@ class TopicStreamRelay:
         self._dropped = False
         self._drop_warned = False
         self._last_edit_ts = float("-inf")
-        # §D5: turn boundaries reset candidate/arming state.
+        # §D5: turn boundaries reset candidate/arming state AND the buffer.
+        # (A non-empty buffer at an ABNORMAL boundary — spawn-without-result — is
+        # Task C3's flush-before-checkpoint concern; the normal ``result`` path
+        # flushes/discards before reaching here.)
         self._anchor_candidate = None
         self._suppressing_for = None
+        self._anchor_buffer = []
 
     async def _finalize(self, seg, off_after: int) -> None:
         """Route the closing edit through ``edit_narration_if_latest`` (§2:612),
@@ -1052,6 +1164,21 @@ class TopicStreamRelay:
         # §D5: re-consult the seam AGAIN at result (an answer that arrived
         # during the turn, or a late anchor post, may only now resolve).
         await self._maybe_arm_suppression()
+        # §D5 FLUSH-vs-DISCARD: an answer that arrived during the turn (the seam
+        # now reports the anchor closed/answered) FLUSHES the held prose as
+        # ordinary narration; an anchor still open-and-unanswered at ``result``
+        # DISCARDS it — the F-LEAK2 kill (the trailing sign-off never posts).
+        # The seam re-read here is not the r4-2 race: a reported answer means the
+        # anchor already resolved, so no late anchor post can still race us.
+        if self._anchor_buffer:
+            state = (
+                await _maybe_await(self.open_anchor_state())
+                if self.open_anchor_state is not None else None
+            )
+            if state is None:
+                await self._flush_anchor_buffer()
+            else:
+                self._anchor_buffer = []
         coord = {"segment": list(seg), "offset": off_after}
         if not self._dropped and self.cursor.message_ids and self._per_message_text:
             # B2 (Sol r1): the closing edit carries this turn's FINAL fragment,

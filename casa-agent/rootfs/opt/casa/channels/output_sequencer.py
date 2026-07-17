@@ -542,6 +542,42 @@ class OutputSequencer:
             self._edit_cache[msg_id] = (text, tri)
             return APPLIED
 
+    async def post_unless_anchor_open(
+        self, text: str, seam: Any, *, poster: Any = None,
+    ) -> str:
+        """§D5 (Sol r4-2 BLOCKER): the ATOMIC read-decide-write for anchor-scoped
+        narration suppression.
+
+        Under the ONE serialization lock, re-read *seam* (the driver-injected
+        ``open_anchor_state`` — ``() -> (n, mid) | None``, sync or async): if it
+        reports a genuinely open, unanswered free-text anchor, return
+        :data:`"held"` and post NOTHING; otherwise run *poster* (the relay's
+        normal narration post — reentrant under THIS same lock) and return
+        :data:`"posted"`. When no *poster* is given, *text* is posted as a fresh
+        narration message (belt-and-suspenders default; the relay always injects
+        its rollover-aware poster).
+
+        This is the ONLY way armed/arming narration reaches the wire. Making the
+        seam read and the narration post ATOMIC forecloses the r4-2 interleave: a
+        bare re-read races the late anchor poster — relay reads "no open anchor"
+        → the intent watcher takes THIS lock and posts the late anchor
+        (:meth:`process_intents_once`) → relay takes the lock and posts narration
+        BELOW it, recreating F-LEAK2. Because the late poster and this op contend
+        on the SAME lock (reentrant-per-task, so it also nests inside the relay's
+        own writer paths), the anchor can never slip in between this op's seam
+        read and its post: either the anchor posts first and the seam reports it
+        open (⇒ held), or the narration posts first and the anchor lands below it
+        (correct order). Returns :data:`"held"` or :data:`"posted"`."""
+        async with self._serialized():
+            state = await _maybe_await(seam()) if seam is not None else None
+            if state is not None:
+                return "held"
+            if poster is not None:
+                await _maybe_await(poster())
+            else:
+                await self._open_narration_locked(text)
+            return "posted"
+
     async def edit_summary(self, msg_id: int, text: str) -> str:
         """Edit the pinned live SUMMARY message (§5 — the R1 exception).
 
