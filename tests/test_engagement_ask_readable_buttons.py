@@ -79,11 +79,12 @@ class TestRenderAskBody:
         assert body.splitlines()[2:] == [
             "1. " + options[0], "2. " + options[1], "3. " + options[2]]
 
-    def test_strips_agent_authored_qprefix(self) -> None:
-        # Agent-authored "Q7:" is stripped and re-prefixed with the allocated
-        # durable number (parity with _canonical_question).
+    def test_prepends_qnumber_verbatim(self) -> None:
+        # v0.85.0 (round 4, D4): the agent-authored "Q7:" prefix is preserved
+        # VERBATIM; Casa only PREPENDS the allocated durable number (parity
+        # with _canonical_question).
         body = render_ask_body(1, "Q7: Which DB?", ["A", "B"])
-        assert body == "Q1: Which DB?\n\n1. A\n2. B"
+        assert body == "Q1: Q7: Which DB?\n\n1. A\n2. B"
 
     def test_anchor_no_option_list(self) -> None:
         # Free-text anchor (options == []) renders the numbered question ALONE.

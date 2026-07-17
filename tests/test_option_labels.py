@@ -345,11 +345,13 @@ class TestShortIsAdvisoryNeverRejects:
         assert shorts == ["x" * 26, None]
 
     def test_short_whitespace_only_accepted_advisory(self):
+        # v0.85.0 (round 4, D4): shorts flow through VERBATIM — no
+        # enumerator-strip's incidental ``.strip()`` collapsing this to "".
         out = self._validated([{"label": "Full", "short": "   "}, "B"])
         assert out is not None
         _q, labels, _t, shorts = out
         assert labels == ["Full", "B"]
-        assert shorts == ["", None]
+        assert shorts == ["   ", None]
 
     def test_short_non_string_treated_as_absent(self):
         out = self._validated([{"label": "Full", "short": 7}, "B"])

@@ -251,15 +251,16 @@ async def test_expired_settles_with_hourglass_and_clears_keyboard(env, monkeypat
         "⌛ expired — engagement paused; reply here to continue")
 
 
-async def test_canonical_qnumber_strips_agent_authored_prefix(env):
+async def test_canonical_qnumber_prepends_verbatim(env):
     eid = env["rec"].id
-    # Agent authored its own "Q7:" — must be stripped and re-prefixed with the
-    # ALLOCATED durable number so message == registry == summary accessor.
+    # v0.85.0 (round 4, D4): the agent's own "Q7:" prefix is preserved
+    # VERBATIM — Casa only PREPENDS the allocated durable number, it no
+    # longer strips an agent-authored leading "Q<digits>:".
     task = asyncio.ensure_future(env["ask"](_FakeRequest(_ask_payload(
         engagement_id=eid, request_id="c1", question="Q7: Which DB?"))))
     await asyncio.sleep(0.02)
     posted_q = env["ch"].options_keyboards[-1]["question"]
-    assert posted_q == "Q1: Which DB?\n\n1. A\n2. B"
+    assert posted_q == "Q1: Q7: Which DB?\n\n1. A\n2. B"
     # open_questions ledger + summary accessor agree with the message.
     assert env["reg"].open_question_numbers(eid) == [1]
     env["broker"].deliver(

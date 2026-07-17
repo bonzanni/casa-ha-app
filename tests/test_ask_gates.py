@@ -69,6 +69,7 @@ class _Chan:
 
     async def post_options_keyboard(
         self, *, engagement_id, request_id, question, options,
+        shorts=None, multi=False,
     ) -> int:
         m = self._id()
         self.keyboards.append((m, question))
@@ -1251,54 +1252,51 @@ class TestAnchorLatchedSend:
 
 
 # ===========================================================================
-# A7 · F-ANCHOR — embedded-options anchor refusal (Task 12)
+# D3 (round 4) — the A7 embedded-options regex gate is DELETED: inline
+# enumerated-looking anchor questions are ACCEPTED, no refusal, verbatim text.
 # ===========================================================================
 
 
-class TestEmbeddedOptionsAnchor:
-    async def test_spaced_embedded_lines_refused(self, wired):
-        """The LIVE ``A — opt`` free-text form: ≥2 enumerated lines in an anchor
-        question → embedded_options with the spec copy, no post, no broker."""
+class TestInlineEnumeratedAnchorsAccepted:
+    async def test_spaced_embedded_lines_accepted(self, wired):
+        """The LIVE ``A — opt`` free-text form used to be refused
+        ``embedded_options``; D3 deletes the gate — it now posts a normal
+        anchor, question preserved verbatim."""
         eid = wired["rec"].id
         q = "Which stack?\nA — Python MCP + MCPB\nB — Rust bridge"
-        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, "e1", question=q)))
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "e1", question=q))))
+        resp = await _drive_anchor(wired, task)
         body = _body(resp)
-        assert body["ok"] is False
-        assert body["error"] == "embedded_options"
-        assert "multiple-choice" in body["message"]
-        # No wire post, no broker request, no ingress marker held.
-        assert wired["chan"].anchors == []
-        assert wired["broker"].pending(namespace="engagement_ask", scope=eid) == []
-        assert wired["drv"].ask_inflight(eid) is None
+        assert body["ok"] is True
+        assert body["outcome"] == "anchored"
+        assert len(wired["chan"].anchors) == 1
+        assert q in wired["chan"].anchors[0][1]
 
-    async def test_digit_embedded_lines_refused(self, wired):
+    async def test_digit_embedded_lines_accepted(self, wired):
         eid = wired["rec"].id
         q = "Pick:\n1. one\n2. two"
-        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, "e2", question=q)))
-        assert _body(resp)["error"] == "embedded_options"
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "e2", question=q))))
+        resp = await _drive_anchor(wired, task)
+        assert _body(resp)["ok"] is True
+        assert _body(resp)["outcome"] == "anchored"
 
-    async def test_embedded_refusal_records_intent_and_retry_short_circuits(
-        self, wired,
-    ):
-        """The refusal records the intent OUTCOME so a same-request_id transport
-        retry reattaches and short-circuits to the SAME embedded_options."""
-        eid, drv = wired["rec"].id, wired["drv"]
-        q = "Which?\nA — Python MCP\nB — Rust bridge"
-        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, "er", question=q)))
-        assert _body(resp)["error"] == "embedded_options"
-        # Recorded on the intent (byte-identical to the live refusal payload).
-        assert drv.send_intent_outcome(eid, "er") == {
-            "ok": False, "error": "embedded_options",
-            "message": _body(resp)["message"],
-        }
-        # A same-id retry reattaches and returns the recorded outcome verbatim.
-        resp2 = await wired["ask"](_FakeRequest(_anchor_payload(eid, "er", question=q)))
-        assert _body(resp2) == _body(resp)
-        # Still nothing posted.
-        assert wired["chan"].anchors == []
+    async def test_inline_parenthetical_options_accepted(self, wired):
+        """Task B1 brief: an inline "(a) … (b) …" anchor is ACCEPTED — no
+        line-start regex, so a parenthetical inline form was never caught by
+        the old gate either, but this pins the doctrine-only behaviour."""
+        eid = wired["rec"].id
+        q = "Which do you want: (a) the fast path or (b) the safe path?"
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "e3", question=q))))
+        resp = await _drive_anchor(wired, task)
+        body = _body(resp)
+        assert body["ok"] is True
+        assert body["outcome"] == "anchored"
+        assert q in wired["chan"].anchors[0][1]
 
     async def test_one_enumerated_line_allowed(self, wired):
-        """A single enumerated line is below the ≥2 threshold — a normal anchor."""
         eid = wired["rec"].id
         q = "Which?\nA — Python MCP\njust prose, no second option"
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
@@ -1315,8 +1313,8 @@ class TestEmbeddedOptionsAnchor:
         assert _body(resp)["ok"] is True
 
     async def test_button_ask_with_enumerated_question_untouched(self, wired):
-        """A7 is ANCHORS ONLY — a button ask whose QUESTION looks enumerated
-        still posts its keyboard (never refused embedded_options)."""
+        """A button ask whose QUESTION looks enumerated still posts its
+        keyboard as before (never touched by the anchor gate)."""
         eid = wired["rec"].id
         q = "Which?\n1. one\n2. two"
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
@@ -1346,9 +1344,9 @@ class TestCapsRemovedEndToEnd:
         body = _body(resp)
         assert body["ok"] is True
         assert body["outcome"] == "answered"
-        # The strip_enumerator normalization removes the leading "Option A — ".
-        assert "a genuinely long, readable choice description" in (
-            wired["chan"].keyboards[-1][1])
+        # D4 (round 4): no enumerator stripping — the label, including its
+        # leading "Option A — ", is rendered VERBATIM.
+        assert long_label in wired["chan"].keyboards[-1][1]
 
     async def test_2000_char_question_accepted(self, wired):
         long_question = "x" * 2000
