@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.84.0] - 2026-07-16
+
+Tina's Home Assistant path is now ready before a voice turn starts, with
+strict loop bounds and a documented raw-MCP rollback switch.
+
+### Added
+
+- Tina gets an eager, role-scoped Home Assistant tool facade: Assist tools are
+  discovered at boot and kept connected for her without changing the raw Home
+  Assistant surface used by other agents.
+- New `tina_ha_facade_enabled` option (default `true`). Disable it to fall back
+  to raw Home Assistant MCP while diagnosing compatibility issues; an initial
+  facade-discovery failure also degrades to that raw path instead of blocking
+  Casa startup.
+
+### Changed
+
+- Tina's voice turns carry less tool context and no longer need an on-demand
+  tool-search round before direct Home Assistant actions. State lookups accept
+  a local domain filter while Casa always sends `{}` to Home Assistant.
+- Home Assistant tool loops are bounded: at most one successful live-context
+  lookup and one validation correction can be consumed in a voice turn.
+- Casa pins every in-process agent to the verified Claude CLI executable and
+  fails startup unless `/usr/local/bin/claude --version` reports exactly
+  `2.1.150`.
+
 ## [0.83.0] - 2026-07-16
 
 Engagement-topic UX round 3: no more duplicated narration, questions that

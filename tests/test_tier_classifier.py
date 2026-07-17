@@ -87,6 +87,16 @@ async def test_classify_uses_root_safe_permission_mode(monkeypatch):
     assert captured.get("permission_mode") == "acceptEdits"
 
 
+async def test_classify_uses_verified_cli_path(monkeypatch):
+    from claude_runtime import CLAUDE_CLI_PATH
+
+    captured: dict = {}
+    _install_fake_sdk(monkeypatch, reply="family", capture=captured)
+
+    assert await tier_classifier.classify_tier("dinner is at seven") == "family"
+    assert captured.get("cli_path") == CLAUDE_CLI_PATH
+
+
 def _install_flaky_sdk(monkeypatch, *, fail_times: int, reply: str,
                        exc: Exception | None = None):
     """Fake SDK whose query() raises on the first ``fail_times`` calls, then

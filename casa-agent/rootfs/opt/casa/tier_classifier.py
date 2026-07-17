@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from claude_runtime import CLAUDE_CLI_PATH
 from sensitivity import DEFAULT_TIER, SENSITIVITY_PROMPT, parse_tier
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ async def classify_tier(content: str) -> str:
     import claude_agent_sdk as sdk
 
     opts = sdk.ClaudeAgentOptions(
+        cli_path=CLAUDE_CLI_PATH,
         system_prompt=SENSITIVITY_PROMPT, max_turns=1, allowed_tools=[],
         # NOT bypassPermissions: that makes the SDK pass
         # ``--dangerously-skip-permissions`` to the bundled ``claude`` CLI, which

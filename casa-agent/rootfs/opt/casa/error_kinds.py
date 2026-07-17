@@ -10,12 +10,17 @@ import asyncio
 from enum import Enum
 
 
+class VoiceToolLoopError(RuntimeError):
+    """A direct voice turn exhausted its bounded HA correction loop."""
+
+
 class ErrorKind(Enum):
     TIMEOUT = "timeout"
     RATE_LIMIT = "rate_limit"
     SDK_ERROR = "sdk_error"
     MEMORY_ERROR = "memory_error"
     CHANNEL_ERROR = "channel_error"
+    VOICE_TOOL_LOOP = "voice_tool_loop"
     UNKNOWN = "unknown"
 
 
@@ -25,12 +30,15 @@ _USER_MESSAGES: dict[ErrorKind, str] = {
     ErrorKind.SDK_ERROR: "There was an issue communicating with Claude. Please try again.",
     ErrorKind.MEMORY_ERROR: "Memory service is unavailable, but I can still respond without context.",
     ErrorKind.CHANNEL_ERROR: "There was an issue sending the response.",
+    ErrorKind.VOICE_TOOL_LOOP: "I couldn't resolve that cleanly. Try naming the device again.",
     ErrorKind.UNKNOWN: "Sorry, something went wrong while processing your request.",
 }
 
 
 def _classify_error(exc: Exception) -> ErrorKind:
     """Classify an exception into an ErrorKind for routing recovery."""
+    if isinstance(exc, VoiceToolLoopError):
+        return ErrorKind.VOICE_TOOL_LOOP
     if isinstance(exc, asyncio.TimeoutError):
         return ErrorKind.TIMEOUT
 

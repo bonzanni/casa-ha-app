@@ -61,6 +61,7 @@ setting by hand:
 |--------|-------------|
 | `enable_terminal` | Enable a web terminal accessible via the ingress panel. Default: `false`. |
 | `sdk_client_pool` | Reuse a warm Claude SDK client across resident turns for faster replies. Default: `true`. Disable to fall back to a fresh per-turn session (e.g. while diagnosing an issue). |
+| `tina_ha_facade_enabled` | Keep Tina's role-scoped Home Assistant tools connected and ready instead of rediscovering them during a voice turn. Default: `true`. Disable to use the raw Home Assistant MCP connection while diagnosing compatibility issues. |
 | `webhook_secret` | HMAC-SHA256 secret for authenticating webhook requests. Leave empty to skip verification. |
 | `engagement_reap_days` | Auto-close engagements after this many days without activity (daily sweep cancels them and closes their Telegram topic; the engaging agent is notified). Set `0` to disable. Default: `7`. |
 | `log_level` | Log verbosity: `debug`, `info`, `warning`, or `error`. Default: `info`. Flip to `debug` for verbose troubleshooting without rebuilding the image. |
@@ -133,6 +134,15 @@ from the voice butler) is bounded by the `voice_turn_budget_seconds` app
 option (default 27) so it always leaves room for the voice transport's own
 30s timeout — the effective budget is hard-capped at 27 seconds no matter
 how high the option is set.
+
+Tina normally uses an eager, role-scoped Home Assistant facade: Casa discovers
+the Assist tools at boot, keeps that upstream connection resident, and gives
+only Tina the ready-to-call proxy surface. Set `tina_ha_facade_enabled: false`
+to use the raw Home Assistant MCP server instead. If the eager facade cannot
+initialize, Casa still boots in the same degraded raw-fallback mode; other
+agents' raw Home Assistant access is unchanged. This switch is intended for
+diagnosis and rollback, so direct raw mode may reintroduce per-session tool
+discovery and higher voice latency.
 
 Per-agent voice config (`butler.yaml`):
 

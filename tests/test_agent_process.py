@@ -23,7 +23,13 @@ from claude_agent_sdk import (
     AssistantMessage as _SDKAssistantMessage,
     ResultMessage as _SDKResultMessage,
     TextBlock as _SDKTextBlock,
+    ToolResultBlock as _SDKToolResultBlock,
+    ToolUseBlock as _SDKToolUseBlock,
+    UserMessage as _SDKUserMessage,
 )
+
+from error_kinds import VoiceToolLoopError
+from voice_turn_guard import VoiceTurnGuard
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
@@ -61,6 +67,36 @@ def _mk_assistant(text: str) -> _SDKAssistantMessage:
         return _SDKAssistantMessage(content=[block])
     except TypeError:
         m = _SDKAssistantMessage.__new__(_SDKAssistantMessage)
+        m.content = [block]  # type: ignore[attr-defined]
+        return m
+
+
+def _mk_tool_use(
+    tool_id: str, name: str, tool_input: dict | None = None,
+) -> _SDKAssistantMessage:
+    block = _SDKToolUseBlock(
+        id=tool_id, name=name, input=tool_input or {},
+    )
+    try:
+        return _SDKAssistantMessage(
+            content=[block], model="claude-haiku-4-5",
+        )
+    except TypeError:
+        m = _SDKAssistantMessage.__new__(_SDKAssistantMessage)
+        m.content = [block]  # type: ignore[attr-defined]
+        return m
+
+
+def _mk_tool_result(
+    tool_id: str, *, is_error: bool, text: str,
+) -> _SDKUserMessage:
+    block = _SDKToolResultBlock(
+        tool_use_id=tool_id, content=text, is_error=is_error,
+    )
+    try:
+        return _SDKUserMessage(content=[block])
+    except TypeError:
+        m = _SDKUserMessage.__new__(_SDKUserMessage)
         m.content = [block]  # type: ignore[attr-defined]
         return m
 
@@ -155,6 +191,38 @@ class FakeClient:
         yield _mk_result("sdk-sid-1", usage=FakeClient.usage)
 
 
+class ScriptedToolClient:
+    """SDK client double that consumes one SDK-message script per attempt."""
+
+    scripts: list[list[Any]] = []
+    instances: list["ScriptedToolClient"] = []
+
+    @classmethod
+    def reset(cls, *scripts: list[Any]) -> None:
+        cls.scripts = [list(script) for script in scripts]
+        cls.instances = []
+
+    def __init__(self, _options):
+        self._script = self.scripts.pop(0)
+        self.disconnected = False
+        self.instances.append(self)
+
+    async def connect(self):
+        return None
+
+    async def disconnect(self):
+        self.disconnected = True
+
+    async def query(self, _text):
+        return None
+
+    async def receive_response(self):
+        for item in self._script:
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+
 def _make_agent(
     tmp_path,
     role: str = "assistant",
@@ -189,6 +257,45 @@ def _msg(channel: str, chat_id: str, text: str = "ping") -> BusMessage:
         channel=channel,
         context={"chat_id": chat_id},
     )
+
+
+async def test_resident_options_resolve_mcp_with_role_grants_and_skill_policy(
+    tmp_path,
+):
+    agent = _make_agent(tmp_path, role="butler")
+    agent.config.tools = ToolsConfig(
+        allowed=["Skill", "mcp__casa-framework__get_schedule"],
+        permission_mode="acceptEdits",
+        skills="none",
+    )
+    agent.config.mcp_server_names = ["casa-framework"]
+    agent._mcp_registry.register_sdk_factory(
+        "casa-framework",
+        lambda role, grants: {
+            "type": "sdk",
+            "instance": object(),
+            "resolved_role": role,
+            "resolved_grants": grants,
+        },
+    )
+
+    options = await agent._build_options(
+        channel="voice",
+        channel_key="voice-butler-house",
+        is_fresh=True,
+        resume_sid=None,
+        user_text="what is next?",
+    )
+
+    server = options.mcp_servers["casa-framework"]
+    assert server["resolved_role"] == "butler"
+    assert server["resolved_grants"] == frozenset({
+        "mcp__casa-framework__get_schedule",
+    })
+    assert options.allowed_tools == [
+        "mcp__casa-framework__get_schedule",
+    ]
+    assert options.skills is None
 
 
 async def test_session_id_is_channel_plus_role(tmp_path):
@@ -668,6 +775,125 @@ class TestPhase4bDispatch:
             "Phase 4b Bug 4: ClaudeAgentOptions.stderr must be set "
             "to make_stderr_logger's callback before ClaudeSDKClient is built"
         )
+
+    async def test_on_message_guard_stops_second_validation_result(
+        self, tmp_path,
+    ):
+        agent = _make_agent(tmp_path, role="butler")
+        on_message, _state = agent._make_on_message(
+            None, VoiceTurnGuard.ha_direct(),
+        )
+
+        await on_message(_mk_tool_use(
+            "tool-1", "mcp__homeassistant__GetLiveContext",
+            {"domain": "light"},
+        ))
+        await on_message(_mk_tool_result(
+            "tool-1", is_error=True, text="InputValidationError",
+        ))
+        await on_message(_mk_tool_use(
+            "tool-2", "mcp__homeassistant__GetLiveContext",
+        ))
+        with pytest.raises(
+            VoiceToolLoopError, match="validation_correction_exhausted",
+        ):
+            await on_message(_mk_tool_result(
+                "tool-2", is_error=True, text="invalid tool input",
+            ))
+
+
+class TestVoiceTurnGuardWiring:
+    @pytest.mark.parametrize(
+        ("channel", "policy", "should_raise"),
+        [
+            ("voice", "ha_direct", True),
+            ("voice", "none", False),
+            ("telegram", "ha_direct", False),
+        ],
+    )
+    async def test_guard_is_enabled_only_for_ha_direct_voice_turns(
+        self, tmp_path, channel, policy, should_raise,
+    ):
+        agent = _make_agent(tmp_path, role="butler")
+        agent.config.tools.voice_guard = policy
+        ScriptedToolClient.reset([
+            _mk_tool_use(
+                "tool-1", "mcp__homeassistant__GetLiveContext",
+                {"domain": "light"},
+            ),
+            _mk_tool_result(
+                "tool-1", is_error=True, text="InputValidationError",
+            ),
+            _mk_tool_use(
+                "tool-2", "mcp__homeassistant__GetLiveContext",
+            ),
+            _mk_tool_result(
+                "tool-2", is_error=True, text="schema validation failed",
+            ),
+            _mk_result("guard-sid"),
+        ])
+
+        with patch(
+            "sdk_client_pool._default_make_client", ScriptedToolClient,
+        ):
+            if should_raise:
+                with pytest.raises(
+                    VoiceToolLoopError,
+                    match="validation_correction_exhausted",
+                ):
+                    await agent._process(_msg(channel, "guard-scope"))
+                assert all(
+                    client.disconnected
+                    for client in ScriptedToolClient.instances
+                )
+                assert agent._pool.stats()["entries"] == 0
+            else:
+                await agent._process(_msg(channel, "guard-scope"))
+
+    @pytest.mark.parametrize("pool_mode", ["on", "off"])
+    async def test_voice_guard_is_fresh_for_each_retry_attempt(
+        self, tmp_path, monkeypatch, pool_mode,
+    ):
+        monkeypatch.setenv("SDK_CLIENT_POOL", pool_mode)
+        agent = _make_agent(tmp_path, role="butler")
+        agent.config.tools.voice_guard = "ha_direct"
+        RetryableError = type("CLIConnectionError", (RuntimeError,), {})
+        ScriptedToolClient.reset(
+            [
+                _mk_tool_use(
+                    "attempt-1-tool",
+                    "mcp__homeassistant__HassTurnOff",
+                    {"name": "office"},
+                ),
+                _mk_tool_result(
+                    "attempt-1-tool", is_error=True,
+                    text="input validation failed",
+                ),
+                RetryableError("upstream reset"),
+            ],
+            [
+                _mk_tool_use(
+                    "attempt-2-tool",
+                    "mcp__homeassistant__HassTurnOff",
+                    {"name": "office lamp"},
+                ),
+                _mk_tool_result(
+                    "attempt-2-tool", is_error=True,
+                    text="invalid tool input",
+                ),
+                _mk_assistant("Recovered cleanly."),
+                _mk_result("retry-guard-sid"),
+            ],
+        )
+
+        with patch(
+            "sdk_client_pool._default_make_client", ScriptedToolClient,
+        ), patch_retry_sleep():
+            text = await agent._process(_msg(
+                "voice", f"retry-guard-{pool_mode}",
+            ))
+
+        assert text == "Recovered cleanly."
 
 
 # ---------------------------------------------------------------------------

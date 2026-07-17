@@ -84,6 +84,10 @@ cause of a stuck turn.
 STATE ("is the office light on?", "what's the temperature?"), or ONCE to
 disambiguate after an action tool returned "entity not found". 
 
+`GetLiveContext` accepts an optional domain filter. The filter is local to
+Casa: Casa calls Home Assistant upstream with `{}` and filters the returned
+snapshot afterward. It is not part of the raw upstream tool schema.
+
 **Anti-loop rule — this is absolute.** Call `GetLiveContext` **at most
 once per turn**. After it returns, you MUST either act (call an action
 tool) or answer — never call `GetLiveContext` a second time in the same

@@ -679,6 +679,8 @@ def _build_runtime_fields(
         disallowed=list(tools.get("disallowed") or []),
         permission_mode=tools.get("permission_mode", "acceptEdits"),
         max_turns=int(tools.get("max_turns", 10)),
+        skills=tools.get("skills", "all"),
+        voice_guard=tools.get("voice_guard", "none"),
     )
 
     cfg.mcp_server_names = list(runtime.get("mcp_server_names") or [])

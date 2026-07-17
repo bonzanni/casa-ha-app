@@ -230,6 +230,9 @@ class ClaudeAgentOptions:
     # a can_use_tool callback for residents/specialists. The mock accepts
     # and ignores it; offline permission decisions are pre-made by options.
     can_use_tool: Any = None
+    # v0.84.0 effective CLI pin: every Casa option builder selects the
+    # boot-verified absolute executable. The mock accepts and ignores it.
+    cli_path: str | None = None
 
 
 class ClaudeSDKClient:

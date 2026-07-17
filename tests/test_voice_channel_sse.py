@@ -6,6 +6,7 @@ turn end-to-end over HTTP without touching the SDK.
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -15,6 +16,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from bus import BusMessage, MessageBus, MessageType
 from casa_core_middleware import cid_middleware
 from channels.voice.channel import VoiceChannel
+from error_kinds import VoiceToolLoopError
 
 pytestmark = pytest.mark.unit
 
@@ -47,7 +49,12 @@ class _FakeAgentConfig:
         tag_dialect = "square_brackets"
     memory = type("M", (), {"token_budget": 800})()
     role = "butler"
-    voice_errors: dict[str, str] = {}
+    voice_errors: dict[str, str] = {
+        "voice_tool_loop": (
+            "[apologetic] I couldn't resolve that cleanly. "
+            "Try naming the device again?"
+        ),
+    }
     channels: list[str] = ["ha_voice"]
 
 
@@ -60,6 +67,7 @@ class _DummyMemory:
 
 @pytest.fixture
 async def voice_app():
+    telemetry_clock = iter((10.0, 10.125))
     bus = MessageBus()
     agent = StubAgent(bus, "butler")
     bus.register("butler", agent.handle_message)
@@ -74,6 +82,7 @@ async def voice_app():
         agent_configs={"butler": _FakeAgentConfig()},
         memory=_DummyMemory(),
         idle_timeout=300,
+        monotonic=lambda: next(telemetry_clock),
     )
 
     app = web.Application(middlewares=[cid_middleware])
@@ -212,6 +221,33 @@ class TestSSE:
         assert "block" in events
         assert events[-1] == "done"
 
+    async def test_first_real_block_logs_once_from_ingress_with_fake_clock(
+        self, voice_app, caplog,
+    ):
+        client, _ = voice_app
+        secret = "SECRET_SSE_PROMPT"
+        with caplog.at_level(logging.INFO, logger="channels.voice.channel"):
+            resp = await client.post(
+                "/api/converse",
+                json={
+                    "prompt": secret,
+                    "agent_role": "butler",
+                    "scope_id": "latency-sse",
+                },
+            )
+            await resp.read()
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "channels.voice.channel"
+            and "voice_first_block" in record.getMessage()
+        ]
+        assert messages == [
+            "voice_first_block role=butler transport=sse ms=125"
+        ]
+        assert secret not in caplog.text
+
     async def test_unknown_agent_role_404(self, voice_app):
         client, _ = voice_app
         resp = await client.post(
@@ -253,6 +289,39 @@ class TestSSE:
         assert "Natural-path Tina voice failure" in body
         # Crucially: done MUST NOT be emitted after error.
         assert "event: done" not in body
+
+    async def test_voice_tool_loop_emits_one_typed_error_without_payload_log(
+        self, voice_app, caplog,
+    ):
+        client, bus = voice_app
+        secret = "SECRET_VOICE_TOOL_INPUT_SSE"
+
+        async def raise_voice_tool_loop(_msg, timeout=300):
+            raise VoiceToolLoopError("validation_correction_exhausted")
+
+        bus.request = raise_voice_tool_loop
+        with caplog.at_level(logging.DEBUG):
+            resp = await client.post(
+                "/api/converse",
+                json={
+                    "prompt": secret,
+                    "agent_role": "butler",
+                    "scope_id": "guarded-sse",
+                },
+            )
+            frames = await _parse_sse_events(resp)
+
+        errors = [frame for frame in frames if frame["event"] == "error"]
+        assert len(errors) == 1
+        assert errors[0]["data"] == {
+            "kind": "voice_tool_loop",
+            "spoken": (
+                "[apologetic] I couldn't resolve that cleanly. "
+                "Try naming the device again?"
+            ),
+        }
+        assert not any(frame["event"] == "done" for frame in frames)
+        assert secret not in caplog.text
 
     async def test_client_context_cannot_clobber_computed_keys(self, voice_app):
         """L59/L8: a client-supplied context dict must not override the

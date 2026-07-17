@@ -50,6 +50,10 @@ def _mk_result(sid, usage=None, *, is_error=False, result=""):
     return m
 
 
+async def _async_result(value):
+    return value
+
+
 class ScriptedClient:
     def __init__(self, options):
         self.options = options
@@ -131,6 +135,219 @@ async def test_cold_hit_connects_with_resume_and_touches():
     assert res.resume_sid == "sid-0" and res.is_fresh is False
     assert reg.touched == ["voice-s1"]
     assert made[0].options == {"resume": "sid-0"}
+
+
+async def test_cold_connect_logs_monotonic_elapsed_ms(caplog):
+    import logging
+
+    now = [10.0]
+    reg = FakeRegistry()
+    pool = _mk_pool(reg, monotonic=lambda: now[0])
+
+    class TimedConnectClient(ScriptedClient):
+        async def connect(self):
+            await super().connect()
+            now[0] = 10.125
+
+    pool._make_client = TimedConnectClient
+
+    async def build_options(is_fresh, resume_sid):
+        return {}
+
+    async def on_message(_message):
+        return None
+
+    with caplog.at_level(logging.INFO, logger="sdk_client_pool"):
+        await pool.turn(
+            channel_key="voice-latency",
+            channel="voice",
+            prompt="secret prompt",
+            origin={},
+            cid="c",
+            build_options=build_options,
+            on_stale_old=lambda _sid: None,
+            on_message=on_message,
+        )
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "sdk_client_pool" and "pool cold connect" in record.getMessage()
+    ]
+    assert messages == [
+        "pool cold connect key=voice-latency resume=False ms=125"
+    ]
+    assert "secret prompt" not in caplog.text
+
+
+async def test_session_publish_logs_monotonic_elapsed_ms(caplog):
+    import logging
+
+    now = [10.0]
+    pool = _mk_pool(FakeRegistry(), monotonic=lambda: now[0])
+    made = []
+
+    def make_client(options):
+        client = ScriptedClient(options)
+        client.script = [[_mk_result("secret-session-id")]]
+        made.append(client)
+        return client
+
+    pool._make_client = make_client
+    published = []
+
+    async def on_success(sid):
+        published.append(sid)
+        now[0] = 10.125
+
+    try:
+        with caplog.at_level(logging.INFO, logger="sdk_client_pool"):
+            await pool.turn(
+                channel_key="voice-publish-latency",
+                channel="voice",
+                prompt="secret publish prompt",
+                origin={},
+                cid="c",
+                build_options=lambda _fresh, _resume: _async_result({}),
+                on_stale_old=lambda _sid: None,
+                on_message=lambda _message: _async_result(None),
+                on_success=on_success,
+            )
+    finally:
+        await pool.aclose()
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "sdk_client_pool"
+        and "pool session publish" in record.getMessage()
+    ]
+    assert messages == ["pool session publish ok=True ms=125"]
+    assert published == ["secret-session-id"]
+    assert made[0].disconnected
+    assert "secret-session-id" not in caplog.text
+    assert "secret publish prompt" not in caplog.text
+
+
+async def test_session_publish_failure_logs_sanitized_elapsed_and_drops(caplog):
+    import logging
+
+    class PublishFailure(Exception):
+        pass
+
+    now = [20.0]
+    pool = _mk_pool(FakeRegistry(), monotonic=lambda: now[0])
+    made = []
+
+    def make_client(options):
+        client = ScriptedClient(options)
+        client.script = [[_mk_result("secret-failed-session-id")]]
+        made.append(client)
+        return client
+
+    pool._make_client = make_client
+    callbacks = 0
+
+    async def on_success(_sid):
+        nonlocal callbacks
+        callbacks += 1
+        now[0] = 20.25
+        raise PublishFailure("secret publication failure")
+
+    try:
+        with caplog.at_level(logging.INFO, logger="sdk_client_pool"):
+            with pytest.raises(PublishFailure, match="secret publication failure"):
+                await pool.turn(
+                    channel_key="voice-publish-failure",
+                    channel="voice",
+                    prompt="secret failure prompt",
+                    origin={},
+                    cid="c",
+                    build_options=lambda _fresh, _resume: _async_result({}),
+                    on_stale_old=lambda _sid: None,
+                    on_message=lambda _message: _async_result(None),
+                    on_success=on_success,
+                )
+        assert pool.stats()["entries"] == 0
+        assert made[0].disconnected
+    finally:
+        await pool.aclose()
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "sdk_client_pool"
+        and "pool session publish" in record.getMessage()
+    ]
+    assert messages == ["pool session publish ok=False ms=250"]
+    assert callbacks == 1
+    assert "secret-failed-session-id" not in caplog.text
+    assert "secret failure prompt" not in caplog.text
+    assert "secret publication failure" not in caplog.text
+
+
+async def test_cancelled_session_publish_logs_elapsed_and_drops(caplog):
+    import logging
+
+    now = [30.0]
+    pool = _mk_pool(FakeRegistry(), monotonic=lambda: now[0])
+    made = []
+
+    def make_client(options):
+        client = ScriptedClient(options)
+        client.script = [[_mk_result("secret-cancelled-session-id")]]
+        made.append(client)
+        return client
+
+    pool._make_client = make_client
+    publish_started = asyncio.Event()
+    never_publish = asyncio.Event()
+    callbacks = 0
+
+    async def on_success(_sid):
+        nonlocal callbacks
+        callbacks += 1
+        publish_started.set()
+        await never_publish.wait()
+
+    task = None
+    try:
+        with caplog.at_level(logging.INFO, logger="sdk_client_pool"):
+            task = asyncio.create_task(pool.turn(
+                channel_key="voice-publish-cancelled",
+                channel="voice",
+                prompt="secret cancelled prompt",
+                origin={},
+                cid="c",
+                build_options=lambda _fresh, _resume: _async_result({}),
+                on_stale_old=lambda _sid: None,
+                on_message=lambda _message: _async_result(None),
+                on_success=on_success,
+            ))
+            await asyncio.wait_for(publish_started.wait(), timeout=1)
+            now[0] = 30.5
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert pool.stats()["entries"] == 0
+        assert made[0].disconnected
+    finally:
+        never_publish.set()
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await pool.aclose()
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "sdk_client_pool"
+        and "pool session publish" in record.getMessage()
+    ]
+    assert messages == ["pool session publish ok=False ms=500"]
+    assert callbacks == 1
+    assert "secret-cancelled-session-id" not in caplog.text
+    assert "secret cancelled prompt" not in caplog.text
 
 
 async def test_warm_reuse_skips_connect_and_build_options():
@@ -325,6 +542,252 @@ async def test_concurrent_first_turns_single_connect():
     made[0].script = [[_mk_result("sid-0")], [_mk_result("sid-0")]]
     await asyncio.gather(t1, t2)
     assert len(made) == 1                    # one client served both, serialized
+
+
+async def test_invalidation_serializes_same_key_until_active_turn_releases():
+    """A cleared generation remains a same-key handoff barrier until its
+    active turn releases the entry lock, but neither unrelated keys nor the
+    replacement generation wait for the old transport to finish closing.
+    """
+    reg = FakeRegistry()
+    reg.data["voice-same"] = {
+        "sdk_session_id": "sid-same", "last_active": "x",
+    }
+    reg.data["voice-other"] = {
+        "sdk_session_id": "sid-other", "last_active": "x",
+    }
+    pool = _mk_pool(reg)
+    first_turn_started = asyncio.Event()
+    release_first_turn = asyncio.Event()
+    old_disconnect_started = asyncio.Event()
+    release_old_disconnect = asyncio.Event()
+    made = []
+    same_key_generations = 0
+
+    class GatedClient(ScriptedClient):
+        def __init__(self, options, *, same_generation):
+            super().__init__(options)
+            self.same_generation = same_generation
+
+        async def query(self, prompt, session_id="default"):
+            self.queries.append(prompt)
+            if prompt == "first":
+                first_turn_started.set()
+
+        async def receive_response(self):
+            prompt = self.queries[-1]
+            if prompt == "first":
+                await release_first_turn.wait()
+            sid = (
+                "sid-other"
+                if self.options["key"] == "voice-other"
+                else "sid-same"
+            )
+            yield _mk_result(sid)
+
+        async def disconnect(self):
+            self.disconnected = True
+            if self.same_generation == 1:
+                old_disconnect_started.set()
+                await release_old_disconnect.wait()
+
+    def make_client(options):
+        nonlocal same_key_generations
+        generation = None
+        if options["key"] == "voice-same":
+            same_key_generations += 1
+            generation = same_key_generations
+        client = GatedClient(options, same_generation=generation)
+        made.append(client)
+        return client
+
+    pool._make_client = make_client
+
+    async def go(key, prompt):
+        async def build_options(is_fresh, resume_sid):
+            return {"key": key, "resume": resume_sid}
+
+        async def on_message(_message):
+            return None
+
+        return await pool.turn(
+            channel_key=key,
+            channel="voice",
+            prompt=prompt,
+            origin={},
+            cid="c",
+            build_options=build_options,
+            on_stale_old=lambda _sid: None,
+            on_message=on_message,
+        )
+
+    first = asyncio.create_task(go("voice-same", "first"))
+    invalidation = None
+    replacement = None
+    try:
+        await asyncio.wait_for(first_turn_started.wait(), timeout=1)
+        invalidation = asyncio.create_task(pool.invalidate_all())
+        replacement = asyncio.create_task(go("voice-same", "second"))
+
+        # Let invalidation remove the first generation and block on its
+        # actual in-turn lock. The replacement must not even construct yet.
+        await asyncio.sleep(0)
+        assert same_key_generations == 1
+
+        # The barrier is per key, not global.
+        other = await asyncio.wait_for(
+            go("voice-other", "other"), timeout=1,
+        )
+        assert other.sid == "sid-other"
+
+        # Ending the old turn transfers ownership to invalidation. It drops
+        # the handoff barrier before awaiting the old transport close.
+        release_first_turn.set()
+        assert (await asyncio.wait_for(first, timeout=1)).sid == "sid-same"
+        await asyncio.wait_for(old_disconnect_started.wait(), timeout=1)
+        assert not invalidation.done()
+
+        result = await asyncio.wait_for(replacement, timeout=1)
+        assert result.sid == "sid-same"
+        assert same_key_generations == 2
+        assert not invalidation.done()
+
+        release_old_disconnect.set()
+        await asyncio.wait_for(invalidation, timeout=1)
+    finally:
+        release_first_turn.set()
+        release_old_disconnect.set()
+        tasks = [
+            task for task in (first, invalidation, replacement)
+            if task is not None
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await pool.aclose()
+
+
+async def test_cancelled_invalidation_keeps_active_generation_barrier():
+    """Caller cancellation and a repeated invalidation cannot release the
+    active generation's barrier before its entry lock actually drains.
+    """
+    pool = _mk_pool(FakeRegistry())
+    old = await pool._entry_stub("voice-same")
+    await old.lock.acquire()
+    invalidation = asyncio.create_task(pool.invalidate_all())
+    replacement = None
+    try:
+        # The first invalidation snapshots the entry and owns its barrier.
+        while "voice-same" in pool._entries:
+            await asyncio.sleep(0)
+
+        # A concurrent/repeated invalidation sees no current generation. It
+        # must neither replace nor release the first invalidation's barrier.
+        await pool.invalidate_all()
+        replacement = asyncio.create_task(pool._entry_stub("voice-same"))
+        await asyncio.sleep(0)
+        assert not replacement.done()
+
+        # Cancelling the caller may stop its wait, but the lock-handoff close
+        # must continue in the background so a new client cannot overlap the
+        # still-active old generation.
+        invalidation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await invalidation
+        await asyncio.sleep(0)
+        assert not replacement.done()
+
+        old.lock.release()
+        current = await asyncio.wait_for(replacement, timeout=1)
+        assert current is not old
+        for _ in range(10):
+            if old.state == "closed":
+                break
+            await asyncio.sleep(0)
+        assert old.state == "closed"
+    finally:
+        if old.lock.locked():
+            old.lock.release()
+        if replacement is not None and not replacement.done():
+            replacement.cancel()
+        await asyncio.gather(
+            *(task for task in (invalidation, replacement) if task is not None),
+            return_exceptions=True,
+        )
+        await pool.aclose()
+
+
+async def test_cancelled_waiter_does_not_cancel_shared_invalidation_barrier():
+    pool = _mk_pool(FakeRegistry())
+    old = await pool._entry_stub("voice-same")
+    await old.lock.acquire()
+    invalidation = asyncio.create_task(pool.invalidate_all())
+    first_waiter = None
+    second_waiter = None
+    try:
+        while "voice-same" in pool._entries:
+            await asyncio.sleep(0)
+        first_waiter = asyncio.create_task(pool._entry_stub("voice-same"))
+        second_waiter = asyncio.create_task(pool._entry_stub("voice-same"))
+        await asyncio.sleep(0)
+
+        first_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_waiter
+        await asyncio.sleep(0)
+        assert not second_waiter.done()
+
+        old.lock.release()
+        current = await asyncio.wait_for(second_waiter, timeout=1)
+        assert current is not old
+        await asyncio.wait_for(invalidation, timeout=1)
+    finally:
+        if old.lock.locked():
+            old.lock.release()
+        tasks = [
+            task for task in (invalidation, first_waiter, second_waiter)
+            if task is not None
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await pool.aclose()
+
+
+async def test_pool_close_wakes_barrier_waiters_without_reopening_generation():
+    from sdk_client_pool import PoolUnavailable
+
+    pool = _mk_pool(FakeRegistry())
+    old = await pool._entry_stub("voice-same")
+    await old.lock.acquire()
+    invalidation = asyncio.create_task(pool.invalidate_all())
+    replacement = None
+    closing = None
+    try:
+        while "voice-same" in pool._entries:
+            await asyncio.sleep(0)
+        replacement = asyncio.create_task(pool._entry_stub("voice-same"))
+        await asyncio.sleep(0)
+        assert not replacement.done()
+
+        closing = asyncio.create_task(pool.aclose(drain_timeout=0.01))
+        with pytest.raises(PoolUnavailable, match="pool closing"):
+            await asyncio.wait_for(replacement, timeout=1)
+        assert "voice-same" not in pool._entries
+        assert not closing.done()
+
+        old.lock.release()
+        await asyncio.wait_for(invalidation, timeout=1)
+        await asyncio.wait_for(closing, timeout=1)
+        assert not pool._invalidation_groups
+    finally:
+        if old.lock.locked():
+            old.lock.release()
+        await asyncio.gather(
+            *(task for task in (invalidation, closing) if task is not None),
+            return_exceptions=True,
+        )
+        if replacement is not None and not replacement.done():
+            replacement.cancel()
+            await asyncio.gather(replacement, return_exceptions=True)
 
 
 async def test_turn_on_closing_pool_raises_poolunavailable():

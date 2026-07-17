@@ -9,6 +9,7 @@ bypasses, the reset-listener flush, options fresh-vs-resumed, and ``aclose``.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 
 import pytest
@@ -163,6 +164,98 @@ async def agent_fixture(tmp_path, scripted_factory):
     await agent.aclose()
 
 
+async def _exercise_blocked_session_publish(
+    agent, send_turn, monkeypatch, *, invalidate: bool,
+):
+    """Hold the real SessionRegistry lock after the SDK result is complete."""
+    sdk_turn_finished = asyncio.Event()
+
+    class PublishAwareClient(ScriptedClient):
+        def __init__(self, options, *, sid, signal_finish):
+            super().__init__(options, sid=sid)
+            self._signal_finish = signal_finish
+
+        async def receive_response(self):
+            async for message in super().receive_response():
+                yield message
+            if self._signal_finish:
+                sdk_turn_finished.set()
+
+    class PublishAwareFactory:
+        def __init__(self):
+            self.clients = []
+
+        @property
+        def constructed(self):
+            return len(self.clients)
+
+        def __call__(self, options):
+            generation = len(self.clients) + 1
+            client = PublishAwareClient(
+                options,
+                sid=f"sid-{generation}",
+                signal_finish=generation == 1,
+            )
+            self.clients.append(client)
+            return client
+
+    factory = PublishAwareFactory()
+    monkeypatch.setattr("sdk_client_pool._default_make_client", factory)
+    registry = agent._session_registry
+    key = build_scoped_session_key("telegram", "assistant", "42")
+    await registry._lock.acquire()
+    gate_held = True
+    first = asyncio.create_task(send_turn("first"))
+    invalidation = None
+    replacement = None
+    try:
+        await asyncio.wait_for(sdk_turn_finished.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not first.done()
+
+        if invalidate:
+            invalidation = asyncio.create_task(agent._pool.invalidate_all())
+        replacement = asyncio.create_task(send_turn("second"))
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if factory.constructed > 1:
+                break
+
+        # The first SDK turn has a sid, but its durable registry publication
+        # is still blocked. Neither ordinary same-key serialization nor an
+        # invalidation handoff may let a second generation decide/build yet.
+        assert factory.constructed == 1
+        assert not replacement.done()
+        if invalidation is not None:
+            assert not invalidation.done()
+
+        registry._lock.release()
+        gate_held = False
+        await asyncio.wait_for(first, timeout=1)
+        pending = [replacement]
+        if invalidation is not None:
+            pending.append(invalidation)
+        await asyncio.wait_for(asyncio.gather(*pending), timeout=1)
+
+        if invalidate:
+            assert factory.constructed == 2
+            assert factory.clients[1].options.resume == "sid-1"
+            assert registry.get(key)["sdk_session_id"] == "sid-2"
+        else:
+            assert factory.constructed == 1
+            assert factory.clients[0].queries[-1].endswith("second")
+            assert registry.get(key)["sdk_session_id"] == "sid-1"
+    finally:
+        if gate_held:
+            registry._lock.release()
+        tasks = [
+            task for task in (first, invalidation, replacement)
+            if task is not None
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
 # --------------------------------------------------------------------------
 # Tests
 # --------------------------------------------------------------------------
@@ -175,6 +268,94 @@ async def test_second_turn_reuses_warm_client(agent_fixture, scripted_factory):
     await send_turn("again")
     assert scripted_factory.constructed == 1
     assert scripted_factory.clients[0].queries[-1].endswith("again")
+
+
+async def test_invalidation_waits_for_pooled_session_publication(
+    agent_fixture, monkeypatch,
+):
+    agent, send_turn = agent_fixture
+    await _exercise_blocked_session_publish(
+        agent, send_turn, monkeypatch, invalidate=True,
+    )
+
+
+async def test_concurrent_turn_waits_for_pooled_session_publication(
+    agent_fixture, monkeypatch,
+):
+    agent, send_turn = agent_fixture
+    await _exercise_blocked_session_publish(
+        agent, send_turn, monkeypatch, invalidate=False,
+    )
+
+
+async def test_pooled_session_publish_failure_drops_unpublished_generation(
+    agent_fixture, scripted_factory, monkeypatch,
+):
+    agent, send_turn = agent_fixture
+
+    class PublishFailure(RuntimeError):
+        pass
+
+    async def fail_register(*args, **kwargs):
+        raise PublishFailure("disk unavailable")
+
+    monkeypatch.setattr(agent._session_registry, "register", fail_register)
+
+    # handle_message converts processing failures into an error response; the
+    # pool invariant is that the unpublished generation is no longer warm.
+    await send_turn("hello")
+
+    assert agent._pool.stats()["entries"] == 0
+    assert scripted_factory.clients[0].disconnected
+
+
+async def test_cancelled_pooled_session_publish_drops_unpublished_generation(
+    agent_fixture, scripted_factory,
+):
+    agent, send_turn = agent_fixture
+    registry = agent._session_registry
+    await registry._lock.acquire()
+    task = asyncio.create_task(send_turn("hello"))
+    try:
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if (
+                scripted_factory.clients
+                and next(iter(agent._pool._entries.values())).state == "warm"
+            ):
+                break
+        assert not task.done()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert agent._pool.stats()["entries"] == 0
+        assert scripted_factory.clients[0].disconnected
+    finally:
+        registry._lock.release()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_successful_pooled_turn_registers_once_per_turn(
+    agent_fixture, monkeypatch,
+):
+    agent, send_turn = agent_fixture
+    real_register = agent._session_registry.register
+    registrations = []
+
+    async def counted_register(*args, **kwargs):
+        registrations.append((args, kwargs))
+        await real_register(*args, **kwargs)
+
+    monkeypatch.setattr(
+        agent._session_registry, "register", counted_register,
+    )
+
+    await send_turn("hello")
+    await send_turn("again")
+
+    assert len(registrations) == 2
 
 
 async def test_scheduled_turn_bypasses_pool(agent_fixture, scripted_factory):
@@ -211,6 +392,187 @@ async def test_new_reset_listener_closes_warm_entry(agent_fixture,
     )
     assert agent._pool.stats()["entries"] == 0
     assert scripted_factory.clients[0].disconnected
+
+
+async def test_invalidate_all_closes_entries_but_pool_remains_usable(
+    agent_fixture, scripted_factory,
+):
+    agent, send_turn = agent_fixture
+    await send_turn("hello")
+    key = build_scoped_session_key("telegram", "assistant", "42")
+    old = agent._pool._entries[key]
+    sweeper = agent._pool._sweeper
+
+    await agent._pool.invalidate_all()
+
+    assert old.state == "closed"
+    assert scripted_factory.clients[0].disconnected
+    assert agent._pool.stats() == {"entries": 0, "closing": False}
+    assert agent._pool._sweeper is sweeper
+    assert sweeper is not None and not sweeper.done()
+
+    await send_turn("again")
+    assert agent._pool.stats() == {"entries": 1, "closing": False}
+    assert agent._pool._entries[key] is not old
+    assert scripted_factory.constructed == 2
+
+
+async def test_invalidate_all_does_not_close_a_concurrent_new_generation(
+    agent_fixture, scripted_factory,
+):
+    agent, send_turn = agent_fixture
+    await send_turn("hello")
+    key = build_scoped_session_key("telegram", "assistant", "42")
+    old = agent._pool._entries[key]
+    old_client = scripted_factory.clients[0]
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def gated_disconnect():
+        old_client.disconnected = True
+        close_started.set()
+        await release_close.wait()
+
+    old_client.disconnect = gated_disconnect
+    invalidation = asyncio.create_task(agent._pool.invalidate_all())
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+
+    await send_turn("again")
+    current = agent._pool._entries[key]
+    assert current is not old
+    assert current.state == "warm"
+    assert not invalidation.done()
+
+    release_close.set()
+    await invalidation
+    assert agent._pool._entries[key] is current
+    assert current.state == "warm"
+
+
+async def test_invalidate_all_waits_for_an_in_flight_entry_lock(
+    agent_fixture, scripted_factory,
+):
+    agent, send_turn = agent_fixture
+    await send_turn("hello")
+    key = build_scoped_session_key("telegram", "assistant", "42")
+    old = agent._pool._entries[key]
+    await old.lock.acquire()
+
+    invalidation = asyncio.create_task(agent._pool.invalidate_all())
+    await asyncio.sleep(0)
+
+    assert key not in agent._pool._entries
+    assert old.state == "warm"
+    assert not scripted_factory.clients[0].disconnected
+
+    old.lock.release()
+    await invalidation
+    assert old.state == "closed"
+    assert scripted_factory.clients[0].disconnected
+
+
+async def test_agent_invalidate_tool_surface_closes_current_pool_generation(
+    agent_fixture, scripted_factory,
+):
+    agent, send_turn = agent_fixture
+    await send_turn("hello")
+    old = next(iter(agent._pool._entries.values()))
+
+    await agent.invalidate_tool_surface()
+
+    assert old.state == "closed"
+    assert scripted_factory.clients[0].disconnected
+    assert agent._pool.stats() == {"entries": 0, "closing": False}
+
+
+async def test_facade_schema_refresh_reconnects_only_butler_with_new_config(
+    tmp_path, scripted_factory,
+):
+    from casa_core import wire_tina_ha_facade
+
+    registry = McpServerRegistry()
+    raw_config = {
+        "type": "http",
+        "url": "http://raw",
+        "headers": None,
+    }
+    old_facade_config = {"type": "sdk", "instance": object()}
+    new_facade_config = {"type": "sdk", "instance": object()}
+    registry.register_http("homeassistant", "http://raw")
+    registry.register_role_sdk(
+        "homeassistant", "butler", old_facade_config,
+    )
+    sessions = SessionRegistry(str(tmp_path / "sessions.json"))
+
+    def make_agent(role):
+        return Agent(
+            config=AgentConfig(
+                role=role,
+                model="claude-sonnet-4-6",
+                system_prompt="You are helpful.",
+                character=CharacterConfig(name=role.title()),
+                tools=ToolsConfig(
+                    allowed=["Read", "mcp__homeassistant"],
+                    permission_mode="acceptEdits",
+                ),
+                mcp_server_names=["homeassistant"],
+                memory=MemoryConfig(
+                    token_budget=1000, read_strategy="per_turn",
+                ),
+            ),
+            session_registry=sessions,
+            mcp_registry=registry,
+            channel_manager=ChannelManager(),
+            semantic_memory=FakeSemanticMemory(),
+        )
+
+    butler = make_agent("butler")
+    assistant = make_agent("assistant")
+
+    async def send(agent, role, text):
+        return await agent.handle_message(BusMessage(
+            type=MessageType.REQUEST,
+            source="user",
+            target=role,
+            content=text,
+            channel="telegram",
+            context={"chat_id": "42"},
+        ))
+
+    try:
+        await send(butler, "butler", "before")
+        await send(assistant, "assistant", "before")
+        old_butler_client, assistant_client = scripted_factory.clients
+        assert (
+            old_butler_client.options.mcp_servers["homeassistant"]
+            is old_facade_config
+        )
+        assert assistant_client.options.mcp_servers["homeassistant"] == raw_config
+
+        facade = type(
+            "Facade", (), {"server_config": new_facade_config},
+        )()
+        await wire_tina_ha_facade(
+            registry,
+            facade,
+            {"butler": butler, "assistant": assistant},
+        )
+
+        assert old_butler_client.disconnected
+        assert butler._pool.stats()["entries"] == 0
+        assert not assistant_client.disconnected
+        assert assistant._pool.stats()["entries"] == 1
+
+        await send(butler, "butler", "after")
+        await send(assistant, "assistant", "after")
+        assert scripted_factory.constructed == 3
+        assert (
+            scripted_factory.clients[2].options.mcp_servers["homeassistant"]
+            is new_facade_config
+        )
+        assert not assistant_client.disconnected
+    finally:
+        await asyncio.gather(butler.aclose(), assistant.aclose())
 
 
 async def test_options_fresh_vs_resumed_memory_blocks(agent_fixture,

@@ -51,6 +51,12 @@ TOOLS = [
     },
 ]
 
+MALFORMED_TOOL = {
+    "name": "MalformedSchema",
+    "description": "Test-only malformed discovery entry.",
+    "inputSchema": "not-an-object",
+}
+
 # In-memory state. Cleared via POST /_reset.
 STATE: dict[str, Any] = {"calls": []}
 
@@ -65,6 +71,13 @@ def _error(req_id: Any, code: int, message: str) -> web.Response:
         "id": req_id,
         "error": {"code": code, "message": message},
     })
+
+
+def _discovery_tools() -> list[dict[str, Any]]:
+    tools = list(TOOLS)
+    if os.environ.get("MOCK_HA_MALFORMED_TOOL") == "1":
+        tools.append(MALFORMED_TOOL)
+    return tools
 
 
 async def handle_jsonrpc(request: web.Request) -> web.Response:
@@ -84,7 +97,7 @@ async def handle_jsonrpc(request: web.Request) -> web.Response:
         })
 
     if method == "tools/list":
-        return _ok(req_id, {"tools": TOOLS})
+        return _ok(req_id, {"tools": _discovery_tools()})
 
     if method == "tools/call":
         params = payload.get("params") or {}

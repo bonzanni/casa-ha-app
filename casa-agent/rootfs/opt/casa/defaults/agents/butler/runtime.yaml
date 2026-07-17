@@ -4,7 +4,6 @@ enabled: true
 tools:
   allowed:
     - Read
-    - Skill
     - mcp__casa-framework__get_schedule
     - mcp__casa-framework__recall_memory
     - mcp__homeassistant
@@ -13,6 +12,8 @@ tools:
   disallowed: [Bash, Write, Edit, Agent, Task]
   permission_mode: acceptEdits
   max_turns: 10
+  skills: none
+  voice_guard: ha_direct
 mcp_server_names:
   - homeassistant
   - casa-framework
@@ -32,5 +33,6 @@ voice_errors:
   sdk_error:     "[apologetic] I couldn't reach my brain. Try again?"
   memory_error:  ""
   channel_error: "[flat] Something went wrong sending that."
+  voice_tool_loop: "[apologetic] I couldn't resolve that cleanly. Try naming the device again?"
   unknown:       "[flat] Sorry, something went wrong."
 cwd: ""

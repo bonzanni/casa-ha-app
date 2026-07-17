@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import time
 import uuid
 from typing import Any, Awaitable, Callable, Mapping
 
@@ -100,6 +101,7 @@ class VoiceChannel(Channel):
         sse_enabled: bool = True,
         ws_enabled: bool = True,
         rate_limiter: RateLimiter | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._bus = bus
         self.default_agent = default_agent
@@ -114,6 +116,7 @@ class VoiceChannel(Channel):
         self._sweeper: asyncio.Task | None = None
         # Per-scope_id rate limit (spec 5.2 §8). None = unlimited.
         self._rate_limiter = rate_limiter
+        self._monotonic = monotonic
 
     # --- Channel ABC --------------------------------------------------
 
@@ -176,6 +179,7 @@ class VoiceChannel(Channel):
     # --- SSE ----------------------------------------------------------
 
     async def _sse_handler(self, request: web.Request) -> web.StreamResponse:
+        ingress_started_ms = self._monotonic() * 1000
         # A4: capture the deadline at TRUE ingress — the first line of the
         # handler, BEFORE body-read/HMAC/JSON validation — so those (I/O-
         # bound, potentially slow) steps are counted against the 27s window
@@ -258,6 +262,18 @@ class VoiceChannel(Channel):
         write_lock = asyncio.Lock()
         speech_block_sent = False
         progress_sent = False
+        first_block_logged = False
+
+        def _log_first_block() -> None:
+            nonlocal first_block_logged
+            if first_block_logged:
+                return
+            logger.info(
+                "voice_first_block role=%s transport=sse ms=%d",
+                agent_role,
+                int(self._monotonic() * 1000 - ingress_started_ms),
+            )
+            first_block_logged = True
 
         async def on_token(accumulated: str) -> None:
             nonlocal last_text, splitter, speech_block_sent
@@ -285,6 +301,7 @@ class VoiceChannel(Channel):
                         "text": adapter.render(block),
                         "final": False,
                     })
+                    _log_first_block()
                     speech_block_sent = True
 
         async def _progress_sink(text: str) -> None:
@@ -345,6 +362,7 @@ class VoiceChannel(Channel):
                     "text": adapter.render(tail),
                     "final": True,
                 })
+                _log_first_block()
             elif not speech_block_sent:
                 # S-1: zero spoken output for the whole turn — emit a typed
                 # empty_turn error line instead of a silent bare `done`
@@ -456,6 +474,9 @@ class VoiceChannel(Channel):
 
             if t == "utterance":
                 uid = frame.get("utterance_id") or str(uuid.uuid4())
+                # Server-owned anchor: overwrite any identically named client
+                # field before handing the frame to the scheduled task.
+                frame["_casa_ingress_started_ms"] = self._monotonic() * 1000
                 # A4: capture the deadline at TRUE ingress — the moment the
                 # utterance frame is RECEIVED here, not inside the separately-
                 # scheduled _run_ws_utterance task (which may not run for an
@@ -552,6 +573,22 @@ class VoiceChannel(Channel):
         write_lock = asyncio.Lock()
         speech_block_sent = False
         progress_sent = False
+        first_block_logged = False
+        ingress_started_ms = frame.get("_casa_ingress_started_ms")
+        if ingress_started_ms is None:
+            # Direct internal callers (tests/helpers) bypass _ws_handler.
+            ingress_started_ms = self._monotonic() * 1000
+
+        def _log_first_block() -> None:
+            nonlocal first_block_logged
+            if first_block_logged:
+                return
+            logger.info(
+                "voice_first_block role=%s transport=ws ms=%d",
+                agent_role,
+                int(self._monotonic() * 1000 - ingress_started_ms),
+            )
+            first_block_logged = True
 
         async def on_token(accumulated: str) -> None:
             nonlocal last_text, splitter, speech_block_sent
@@ -573,6 +610,7 @@ class VoiceChannel(Channel):
                         "type": "block", "utterance_id": uid,
                         "text": adapter.render(block), "final": False,
                     })
+                    _log_first_block()
                     speech_block_sent = True
 
         async def _progress_sink(text: str) -> None:
@@ -626,6 +664,7 @@ class VoiceChannel(Channel):
                     "type": "block", "utterance_id": uid,
                     "text": adapter.render(tail), "final": True,
                 })
+                _log_first_block()
             elif not speech_block_sent:
                 # S-1: zero spoken output — typed empty_turn error, never a
                 # silent bare `done`. See the SSE handler for rationale.

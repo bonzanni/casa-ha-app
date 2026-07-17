@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -112,6 +114,74 @@ class TestInterject:
                             AsyncMock(return_value={"interject": False, "text": ""}))
         await obs._interject("e1", "warn", {})
         bus.notify.assert_not_called()
+
+
+class TestObserverSdkOptions:
+    async def test_decider_uses_verified_cli_path(self, monkeypatch):
+        import sdk_logging
+        from claude_runtime import CLAUDE_CLI_PATH
+        from observer import Observer
+
+        captured = {}
+        fake_sdk = types.ModuleType("claude_agent_sdk")
+
+        class ClaudeAgentOptions:  # noqa: N801 — mirrors SDK name
+            def __init__(self, **kwargs):
+                captured["options"] = self
+                for key, value in kwargs.items():
+                    setattr(self, key, value)
+
+        class TextBlock:  # noqa: N801 — mirrors SDK name
+            def __init__(self, text):
+                self.text = text
+
+        class AssistantMessage:  # noqa: N801 — mirrors SDK name
+            def __init__(self, text):
+                self.content = [TextBlock(text)]
+
+        class ClaudeSDKClient:  # noqa: N801 — mirrors SDK name
+            def __init__(self, options):
+                captured["client_options"] = options
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def query(self, prompt):
+                captured["prompt"] = prompt
+
+            async def receive_response(self):
+                yield AssistantMessage('{"interject": false, "text": ""}')
+
+        fake_sdk.ClaudeAgentOptions = ClaudeAgentOptions
+        fake_sdk.TextBlock = TextBlock
+        fake_sdk.AssistantMessage = AssistantMessage
+        fake_sdk.ClaudeSDKClient = ClaudeSDKClient
+        monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake_sdk)
+        monkeypatch.setattr(
+            sdk_logging,
+            "with_stderr_callback",
+            lambda options, engagement_id=None: options,
+        )
+
+        observer = Observer(
+            bus=MagicMock(),
+            engagement_registry=MagicMock(),
+            model_name="haiku",
+        )
+        record = MagicMock(
+            id="engagement-1",
+            task="check the kitchen",
+            role_or_type="configurator",
+        )
+
+        result = await observer._decide_interjection("warn", {}, record)
+
+        assert result == {"interject": False, "text": ""}
+        assert getattr(captured["options"], "cli_path", None) == CLAUDE_CLI_PATH
+        assert captured["client_options"] is captured["options"]
 
 
 class TestBudgetCountsOnlyPostedInterjections:

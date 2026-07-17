@@ -265,6 +265,10 @@ class SdkClientPool:
         self._monotonic = monotonic
         self._wall_now = wall_now or (lambda: datetime.now(timezone.utc))
         self._entries: dict[str, ManagedSdkClient] = {}
+        self._invalidation_barriers: dict[
+            str, asyncio.Future[None]
+        ] = {}
+        self._invalidation_groups: set[asyncio.Future[Any]] = set()
         self._pool_lock = asyncio.Lock()
         self._closing = False
         self._sweeper: asyncio.Task | None = None
@@ -279,8 +283,19 @@ class SdkClientPool:
     async def turn(self, *, channel_key: str, channel: str, prompt: str,
                    origin: dict, cid: str, build_options, on_stale_old,
                    on_message,
+                   on_success: Callable[[str], Awaitable[None]] | None = None,
                    on_decision: Callable[[str | None, bool], None] | None = None,
                    ) -> PoolTurnResult:
+        """Run one serialized turn and publish its returned session id.
+
+        When provided, ``on_success`` is awaited exactly once when the SDK
+        turn returns a non-None session id. It runs while the
+        per-key entry lock is still held so publication completes before
+        turn/invalidation handoff. The callback must therefore be fast and
+        non-reentrant into this pool (a same-key turn would deadlock).
+        Callback exceptions and cancellation propagate and drop the
+        unpublished client generation.
+        """
         self._ensure_sweeper()
         for _attempt in (1, 2):                      # AR-7: one silent retry
             if self._closing:
@@ -327,12 +342,6 @@ class SdkClientPool:
                         if stale:
                             on_stale_old(stale)
                     options = await build_options(is_fresh, resume_sid)
-                    # Finding 4 (final-review): one INFO per cold connect;
-                    # warm reuse stays silent (hot path).
-                    logger.info(
-                        "pool cold connect key=%s resume=%s",
-                        channel_key, bool(resume_sid),
-                    )
                     fresh_client = ManagedSdkClient(
                         options,
                         origin_ctxvar=self._origin_ctxvar,
@@ -343,18 +352,51 @@ class SdkClientPool:
                     )
                     fresh_client.lock = entry.lock    # keep the held lock
                     fresh_client.sid = resume_sid
+                    connect_started_ms = self._monotonic() * 1000
                     await fresh_client.open()
+                    # Finding 4 (final-review): one INFO per successful cold
+                    # connect; warm reuse stays silent (hot path).
+                    logger.info(
+                        "pool cold connect key=%s resume=%s ms=%d",
+                        channel_key,
+                        bool(resume_sid),
+                        int(self._monotonic() * 1000 - connect_started_ms),
+                    )
                     async with self._pool_lock:
                         self._entries[channel_key] = fresh_client
                     entry = fresh_client
                 if decision == "resume":
                     await self._registry.touch(channel_key)
+                publishing = False
                 try:
                     sid = await entry.run_turn_locked(
                         prompt, origin=origin, cid=cid, on_message=on_message,
                     )
+                    if sid is not None and on_success is not None:
+                        # Publish the result before the entry lock can hand off
+                        # to another turn or an invalidation generation.
+                        publishing = True
+                        publish_started_ms = self._monotonic() * 1000
+                        publish_ok = False
+                        try:
+                            await on_success(sid)
+                            publish_ok = True
+                        finally:
+                            logger.info(
+                                "pool session publish ok=%s ms=%d",
+                                publish_ok,
+                                int(
+                                    self._monotonic() * 1000
+                                    - publish_started_ms
+                                ),
+                            )
+                        publishing = False
                 except asyncio.CancelledError:
-                    if entry.state != "warm":
+                    if publishing or entry.state != "warm":
+                        # A warm client whose sid was not successfully
+                        # published is unsafe to reuse. Cancellation inside
+                        # run_turn_locked retains its existing warm-reuse
+                        # behavior when the SDK interrupt/drain succeeds.
                         await self._drop(channel_key, entry)
                     raise
                 except BaseException:
@@ -370,19 +412,45 @@ class SdkClientPool:
         raise PoolUnavailable("entry unstable after retry")
 
     async def _entry_stub(self, channel_key: str) -> ManagedSdkClient:
+        while True:
+            async with self._pool_lock:
+                if self._closing:
+                    raise PoolUnavailable("pool closing")
+                barrier = self._invalidation_barriers.get(channel_key)
+                if barrier is None:
+                    entry = self._entries.get(channel_key)
+                    if entry is None:
+                        entry = ManagedSdkClient(
+                            None,
+                            origin_ctxvar=self._origin_ctxvar,
+                            cid_ctxvar=self._cid_ctxvar,
+                            engagement_ctxvar=self._engagement_ctxvar,
+                            make_client=(
+                                self._make_client or _default_make_client
+                            ),
+                            monotonic=self._monotonic,
+                        )
+                        self._entries[channel_key] = entry
+                    return entry
+            # Never hold the global pool lock while an old same-key turn
+            # drains. Other keys remain free to construct/reuse entries. The
+            # Future is shared, so one cancelled waiter must not cancel the
+            # handoff signal for every other waiter.
+            await asyncio.shield(barrier)
+
+    async def _release_invalidation_barrier(
+        self,
+        channel_key: str,
+        barrier: asyncio.Future[None],
+    ) -> None:
+        """Resolve only the invalidation generation that owns ``barrier``."""
+        release = False
         async with self._pool_lock:
-            entry = self._entries.get(channel_key)
-            if entry is None:
-                entry = ManagedSdkClient(
-                    None,
-                    origin_ctxvar=self._origin_ctxvar,
-                    cid_ctxvar=self._cid_ctxvar,
-                    engagement_ctxvar=self._engagement_ctxvar,
-                    make_client=self._make_client or _default_make_client,
-                    monotonic=self._monotonic,
-                )
-                self._entries[channel_key] = entry
-            return entry
+            if self._invalidation_barriers.get(channel_key) is barrier:
+                del self._invalidation_barriers[channel_key]
+                release = True
+        if release and not barrier.done():
+            barrier.set_result(None)
 
     async def _drop(self, channel_key: str, entry: ManagedSdkClient) -> None:
         """Generation-checked invalidate: only removes THIS entry object.
@@ -423,6 +491,56 @@ class SdkClientPool:
             async with entry.lock:
                 await entry.aclose()
 
+    async def invalidate_all(self) -> None:
+        """Drop the current entry generation without shutting down the pool.
+
+        A per-key handoff barrier prevents a replacement client from starting
+        while the removed generation still owns its turn lock. The barrier is
+        released as soon as that lock transfers to this invalidation, before
+        transport close, so a slow disconnect stays off the new turn's path.
+        """
+        async with self._pool_lock:
+            entries = dict(self._entries)
+            self._entries.clear()
+            loop = asyncio.get_running_loop()
+            barriers = {}
+            for key in entries:
+                barrier = loop.create_future()
+                self._invalidation_barriers[key] = barrier
+                barriers[key] = barrier
+
+        async def _close(
+            key: str,
+            entry: ManagedSdkClient,
+            barrier: asyncio.Future[None],
+        ) -> None:
+            try:
+                async with entry.lock:
+                    # The prior turn has ended. Allow the replacement to
+                    # connect now; it need not wait for a slow disconnect.
+                    await self._release_invalidation_barrier(key, barrier)
+                    await entry.aclose()
+            finally:
+                # Cancellation/close races must never strand future turns.
+                await asyncio.shield(
+                    self._release_invalidation_barrier(key, barrier)
+                )
+
+        close_group = asyncio.gather(
+            *(
+                _close(key, entry, barriers[key])
+                for key, entry in entries.items()
+            ),
+            return_exceptions=True,
+        )
+        # Caller cancellation must not cancel the lock-handoff workers: doing
+        # so would either strand the barrier or release it while the old turn
+        # still owns the lock. Keep the shielded group strongly referenced
+        # until every old generation has transferred ownership and closed.
+        self._invalidation_groups.add(close_group)
+        close_group.add_done_callback(self._invalidation_groups.discard)
+        await asyncio.shield(close_group)
+
     async def aclose(self, *, drain_timeout: float = 120.0) -> None:
         self._closing = True
         if self._sweeper is not None:
@@ -431,6 +549,15 @@ class SdkClientPool:
         async with self._pool_lock:
             entries = dict(self._entries)
             self._entries.clear()
+            barriers = list(self._invalidation_barriers.values())
+            self._invalidation_barriers.clear()
+            invalidation_groups = tuple(self._invalidation_groups)
+        # Wake same-key waiters only after closing is visible. Their next
+        # _entry_stub loop raises PoolUnavailable instead of constructing a
+        # post-shutdown generation.
+        for barrier in barriers:
+            if not barrier.done():
+                barrier.set_result(None)
         for key, entry in entries.items():
             try:
                 await asyncio.wait_for(entry.lock.acquire(), timeout=drain_timeout)
@@ -441,6 +568,14 @@ class SdkClientPool:
             except (asyncio.TimeoutError, TimeoutError):
                 logger.warning("pool aclose: drain timeout on %s; force close", key)
                 await entry.aclose()
+        if invalidation_groups:
+            # These workers own entries already removed from _entries, so
+            # normal shutdown must drain them too. Shield preserves their
+            # lock-handoff invariant if an outer shutdown timeout cancels us.
+            await asyncio.shield(asyncio.gather(
+                *invalidation_groups,
+                return_exceptions=True,
+            ))
         if self in SdkClientPool._instances:
             SdkClientPool._instances.remove(self)
 

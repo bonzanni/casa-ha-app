@@ -29,6 +29,7 @@ from plugin_grants import grants_for_resolution, make_fail_closed_can_use_tool
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
+from claude_runtime import CLAUDE_CLI_PATH
 from config import AgentConfig
 from specialist_registry import DelegationComplete
 from hooks import resolve_hooks
@@ -59,7 +60,13 @@ from tokens import (
     extract_usage,
     format_turn_summary,
 )
-from error_kinds import ErrorKind, _classify_error, _USER_MESSAGES  # noqa: F401 — re-exported
+from error_kinds import (  # noqa: F401 — selected names are re-exported
+    ErrorKind,
+    VoiceToolLoopError,
+    _classify_error,
+    _USER_MESSAGES,
+)
+from voice_turn_guard import VoiceTurnGuard
 
 logger = logging.getLogger(__name__)
 
@@ -602,7 +609,16 @@ class Agent:
             last_resume: dict[str, str | None] = {"sid": None}
 
             async def _attempt_pooled_turn():
-                on_message, state = self._make_on_message(on_token)
+                session_published = False
+                turn_guard = (
+                    VoiceTurnGuard.ha_direct()
+                    if msg.channel == "voice"
+                    and self.config.tools.voice_guard == "ha_direct"
+                    else None
+                )
+                on_message, state = self._make_on_message(
+                    on_token, turn_guard,
+                )
 
                 async def _build(is_fresh, resume_sid):
                     # Recorded HERE too (not just via on_decision below) so a
@@ -618,6 +634,18 @@ class Agent:
                         user_text=user_text,
                     )
 
+                async def _publish(sid):
+                    nonlocal session_published
+                    await self._session_registry.register(
+                        channel_key=channel_key,
+                        agent=self.config.role,
+                        sdk_session_id=sid,
+                        scope_class=(
+                            "webhook_oneshot" if is_webhook_oneshot else None
+                        ),
+                    )
+                    session_published = True
+
                 result = await self._pool.turn(
                     channel_key=channel_key, channel=msg.channel,
                     prompt=prompt_text, origin=origin_snapshot,
@@ -626,6 +654,7 @@ class Agent:
                         old_sid, agent_home, user_peer, msg.channel,
                     ),
                     on_message=on_message,
+                    on_success=_publish,
                     # Finding 2 (final-review): fires for EVERY turn (warm
                     # reuse included), unlike _build above which the pool
                     # skips on warm reuse — so a non-retryable failure on a
@@ -638,12 +667,18 @@ class Agent:
                 last_resume["sid"] = result.resume_sid
                 return (
                     state["text"], result.sid, state["usage"],
-                    result.resume_sid,
+                    result.resume_sid, session_published,
                 )
 
             async def _attempt_bypass_turn():
                 # Per-turn path (today's semantics): decision here, one-shot
                 # ManagedSdkClient reusing the same turn body.
+                turn_guard = (
+                    VoiceTurnGuard.ha_direct()
+                    if msg.channel == "voice"
+                    and self.config.tools.voice_guard == "ha_direct"
+                    else None
+                )
                 existing = self._session_registry.get(channel_key)
                 decision, save_old = _resume_decision(
                     msg.channel, existing, datetime.now(timezone.utc),
@@ -675,7 +710,9 @@ class Agent:
                     options, origin_ctxvar=origin_var,
                     cid_ctxvar=cid_var, engagement_ctxvar=self._engagement_var,
                 )
-                on_message, state = self._make_on_message(on_token)
+                on_message, state = self._make_on_message(
+                    on_token, turn_guard,
+                )
                 try:
                     await client.open()
                     async with client.lock:
@@ -685,7 +722,7 @@ class Agent:
                         )
                 finally:
                     await client.aclose()
-                return state["text"], sid, state["usage"], resume_sid
+                return state["text"], sid, state["usage"], resume_sid, False
 
             # Retry transient faults (spec 5.2 §3). The pooled path may raise
             # PoolUnavailable (pool closing / entry unstable) — fall to the
@@ -694,10 +731,12 @@ class Agent:
             # a FRESH decision from the cleared registry).
             attempt = _attempt_pooled_turn if use_pool else _attempt_bypass_turn
             try:
-                response_text, sdk_session_id, usage, used_resume = \
+                response_text, sdk_session_id, usage, used_resume, \
+                    session_published = \
                     await retry_sdk_call(attempt, on_retry=self._log_retry)
             except PoolUnavailable:
-                response_text, sdk_session_id, usage, used_resume = \
+                response_text, sdk_session_id, usage, used_resume, \
+                    session_published = \
                     await retry_sdk_call(
                         _attempt_bypass_turn, on_retry=self._log_retry,
                     )
@@ -718,7 +757,8 @@ class Agent:
                     "fresh", channel_key, last_resume["sid"],
                 )
                 await self._session_registry.clear_sdk_session(channel_key)
-                response_text, sdk_session_id, usage, used_resume = \
+                response_text, sdk_session_id, usage, used_resume, \
+                    session_published = \
                     await retry_sdk_call(attempt, on_retry=self._log_retry)
 
             # Per-turn telemetry (spec 5.2 §5.2). Microsecond cost — string
@@ -745,7 +785,7 @@ class Agent:
             # nothing to compute or record per-turn here.
 
             # 9. SessionRegistry — record the SDK session id for resume + save.
-            if sdk_session_id:
+            if sdk_session_id and not session_published:
                 await self._session_registry.register(
                     channel_key=channel_key,
                     agent=self.config.role,
@@ -838,10 +878,7 @@ class Agent:
         # rides on the per-turn query text (built in _process).
         system_prompt = "\n".join(system_parts)
 
-        # 4. MCP servers.
-        mcp_servers = self._mcp_registry.resolve(self.config.mcp_server_names)
-
-        # 5. Hooks — resolved from hooks.yaml at load time by agent_loader.
+        # 4. Hooks — resolved from hooks.yaml at load time by agent_loader.
         #    I-2 (v0.69.8): always inject the agent-home settings.json
         #    self-grant guard — a code-side security invariant that config
         #    cannot remove. Build a fresh dict so the shared _resolved_hooks
@@ -906,8 +943,21 @@ class Agent:
             if grant not in allowed_tools:
                 allowed_tools.append(grant)
 
+        # Resolve role-aware MCP servers only after every config/plugin grant
+        # is known so SDK factories can expose the exact authorized schemas.
+        mcp_servers = self._mcp_registry.resolve(
+            self.config.mcp_server_names,
+            role=self.config.role,
+            allowed_tools=allowed_tools,
+        )
+        skills = (
+            "all" if getattr(self.config.tools, "skills", "all") == "all"
+            else None
+        )
+
         options = ClaudeAgentOptions(
             model=self.config.model,
+            cli_path=CLAUDE_CLI_PATH,
             system_prompt=system_prompt,
             allowed_tools=allowed_tools,
             disallowed_tools=self.config.tools.disallowed,
@@ -918,7 +968,7 @@ class Agent:
             cwd=agent_home,
             resume=resume_sid,
             setting_sources=["project"],
-            skills="all",  # (f) v0.69.9: replaces the deprecated bare "Skill"
+            skills=skills,
             plugins=[{"type": "local", "path": rp.path}
                      for rp in resolution.plugins],
             # P-5b: in-casa agents have no permission relay — fail closed on
@@ -934,7 +984,11 @@ class Agent:
         )
         return sdk_logging.with_stderr_callback(options, engagement_id=None)
 
-    def _make_on_message(self, on_token: OnTokenCallback | None):
+    def _make_on_message(
+        self,
+        on_token: OnTokenCallback | None,
+        turn_guard: VoiceTurnGuard | None = None,
+    ):
         """Build the per-turn ``on_message(sdk_msg)`` handler + its ``state``.
 
         Reproduces today's per-message body VERBATIM (Phase 4b sdk_logging
@@ -1001,6 +1055,19 @@ class Agent:
                     )
                 return
 
+            if turn_guard is not None:
+                try:
+                    turn_guard.observe(sdk_msg)
+                except VoiceToolLoopError as exc:
+                    logger.info(
+                        "voice_tool_loop_stop reason=%s "
+                        "live_context_successes=%d validation_failures=%d",
+                        str(exc),
+                        turn_guard.live_context_successes,
+                        turn_guard.validation_failures,
+                    )
+                    raise
+
             # Phase 4b dispatch — wrapped so a malformed block cannot abort the
             # turn (logged + continued).
             try:
@@ -1014,7 +1081,11 @@ class Agent:
                             state["tool_names_by_id"][
                                 getattr(block, "id", "")
                             ] = getattr(block, "name", "?")
-                            sdk_logging.log_tool_use(block, idx=state["idx"])
+                            sdk_logging.log_tool_use(
+                                block,
+                                idx=state["idx"],
+                                started_ms=state["started_ms"],
+                            )
                 elif isinstance(sdk_msg, UserMessage):
                     for block in getattr(sdk_msg, "content", []) or []:
                         if isinstance(block, ToolResultBlock):
@@ -1061,6 +1132,10 @@ class Agent:
                     state["last_emitted"] = cum
 
         return on_message, state
+
+    async def invalidate_tool_surface(self) -> None:
+        """Reconnect pooled SDK clients against the current MCP schemas."""
+        await self._pool.invalidate_all()
 
     async def aclose(self) -> None:
         """Release pooled SDK clients + reset hook. Safe to call twice; called

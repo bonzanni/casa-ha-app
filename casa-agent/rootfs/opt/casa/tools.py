@@ -40,6 +40,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage,
+    SdkMcpTool,
     TextBlock,
     create_sdk_mcp_server,
     tool,
@@ -47,6 +48,7 @@ from claude_agent_sdk import (
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
+from claude_runtime import CLAUDE_CLI_PATH
 from media_policies import MEDIA_POLICIES
 import plugin_outbox
 from error_kinds import _classify_error
@@ -791,7 +793,12 @@ def _resolution_from_recorded(plugin_artifacts) -> "plugin_registry.ResolutionRe
     return ResolutionResult(registry_valid=True, plugins=plugins, issues=issues)
 
 
-def _build_specialist_options(cfg, *, resolution=None) -> ClaudeAgentOptions:
+def _build_specialist_options(
+    cfg,
+    *,
+    resolution=None,
+    extra_casa_tools: tuple[str, ...] = (),
+) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for a Tier 2 specialist invocation.
 
     Specialist memory is injected via prompt in :func:`_run_delegated_agent`
@@ -803,11 +810,6 @@ def _build_specialist_options(cfg, *, resolution=None) -> ClaudeAgentOptions:
     :meth:`Agent._process` (agent.py step 4). Degrades to empty-dict
     when the registry is not bound (legacy callers / test harnesses)."""
     from hooks import resolve_hooks
-
-    if _mcp_registry is not None:
-        mcp_servers = _mcp_registry.resolve(cfg.mcp_server_names)
-    else:
-        mcp_servers = {}
 
     resolved_hooks = resolve_hooks(cfg.hooks, default_cwd=cfg.cwd)
     # Sol #5: inject the /config/plugins + settings.json guard code-side (like
@@ -885,9 +887,23 @@ def _build_specialist_options(cfg, *, resolution=None) -> ClaudeAgentOptions:
     for grant in grants_for_resolution(resolution):
         if grant not in allowed_tools:
             allowed_tools.append(grant)
+    for grant in extra_casa_tools:
+        if grant not in allowed_tools:
+            allowed_tools.append(grant)
+
+    if _mcp_registry is not None:
+        mcp_servers = _mcp_registry.resolve(
+            cfg.mcp_server_names,
+            role=getattr(cfg, "role", ""),
+            allowed_tools=allowed_tools,
+        )
+    else:
+        mcp_servers = {}
+    skills = "all" if getattr(cfg.tools, "skills", "all") == "all" else None
 
     return ClaudeAgentOptions(
         model=cfg.model,
+        cli_path=CLAUDE_CLI_PATH,
         system_prompt=cfg.system_prompt,
         allowed_tools=allowed_tools,
         disallowed_tools=_with_subagent_spawn_disallowed(cfg.tools.disallowed),
@@ -898,7 +914,7 @@ def _build_specialist_options(cfg, *, resolution=None) -> ClaudeAgentOptions:
         cwd=agent_home,
         resume=None,
         setting_sources=["project"],
-        skills="all",  # (f) v0.69.9
+        skills=skills,
         plugins=sdk_plugins,
         # P-5b: no relay exists on this path — deny ungranted tools fast
         # instead of hanging on an unanswerable CC prompt.
@@ -907,10 +923,14 @@ def _build_specialist_options(cfg, *, resolution=None) -> ClaudeAgentOptions:
     )
 
 
-def _build_executor_options(defn, *, executor_type: str,
-                            resolution=None,
-                            plugin_paths: "list[str] | None" = None,
-                            ) -> ClaudeAgentOptions:
+def _build_executor_options(
+    defn,
+    *,
+    executor_type: str,
+    resolution=None,
+    plugin_paths: "list[str] | None" = None,
+    extra_casa_tools: tuple[str, ...] = (),
+) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for a Tier 3 Executor invocation.
 
     Unlike specialists, executors DO have MCP servers and structured hooks
@@ -944,11 +964,6 @@ def _build_executor_options(defn, *, executor_type: str,
         agent_home_settings_guard_matcher(),
     ]
 
-    if _mcp_registry is not None:
-        mcp_servers = _mcp_registry.resolve(defn.mcp_server_names)
-    else:
-        mcp_servers = {}
-
     if plugin_paths is not None:
         sdk_plugins = [{"type": "local", "path": p} for p in plugin_paths]
     else:
@@ -961,6 +976,18 @@ def _build_executor_options(defn, *, executor_type: str,
     # Skills via skills="all" below; strip any config-supplied "Skill"
     # (deprecated) — (f) v0.69.9.
     allowed_tools = [t for t in defn.tools_allowed if t != "Skill"]
+    for grant in extra_casa_tools:
+        if grant not in allowed_tools:
+            allowed_tools.append(grant)
+
+    if _mcp_registry is not None:
+        mcp_servers = _mcp_registry.resolve(
+            defn.mcp_server_names,
+            role=executor_type,
+            allowed_tools=allowed_tools,
+        )
+    else:
+        mcp_servers = {}
 
     # Executors (in_casa driver — Configurator, future Tier-3) operate on
     # the addon-config root rather than an agent-home, because their
@@ -968,6 +995,7 @@ def _build_executor_options(defn, *, executor_type: str,
     # plugin-env.conf, etc.).
     return ClaudeAgentOptions(
         model=defn.model,
+        cli_path=CLAUDE_CLI_PATH,
         system_prompt="",
         allowed_tools=allowed_tools,
         disallowed_tools=list(defn.tools_disallowed),
@@ -1019,8 +1047,15 @@ def build_engagement_resume_options(engagement, session_id: str) -> ClaudeAgentO
                         f"recorded plugin artifact missing "
                         f"(plugin_artifact_missing): {pa!r}")
                 plugin_paths.append(path)
-            opts = _build_executor_options(defn, executor_type=role,
-                                           plugin_paths=plugin_paths)
+            opts = _build_executor_options(
+                defn,
+                executor_type=role,
+                plugin_paths=plugin_paths,
+                extra_casa_tools=(
+                    "mcp__casa-framework__query_engager",
+                    "mcp__casa-framework__emit_completion",
+                ),
+            )
     else:
         cfg = _specialist_registry.get(role) if _specialist_registry is not None else None
         if cfg is not None:
@@ -1032,9 +1067,21 @@ def build_engagement_resume_options(engagement, session_id: str) -> ClaudeAgentO
             recorded = getattr(engagement, "plugin_artifacts", None)
             if recorded is not None:
                 opts = _build_specialist_options(
-                    cfg, resolution=_resolution_from_recorded(recorded))
+                    cfg,
+                    resolution=_resolution_from_recorded(recorded),
+                    extra_casa_tools=(
+                        "mcp__casa-framework__query_engager",
+                        "mcp__casa-framework__emit_completion",
+                    ),
+                )
             else:
-                opts = _build_specialist_options(cfg)
+                opts = _build_specialist_options(
+                    cfg,
+                    extra_casa_tools=(
+                        "mcp__casa-framework__query_engager",
+                        "mcp__casa-framework__emit_completion",
+                    ),
+                )
     if opts is None:
         raise RuntimeError(
             f"cannot rebuild options to resume {kind or 'specialist'} engagement "
@@ -2007,14 +2054,14 @@ async def delegate_to_agent(args: dict) -> dict:
 
             # Build options + start driver (off-loop: registry resolve is file IO).
             options = await asyncio.to_thread(
-                _build_specialist_options, cfg, resolution=_spec_res)
-            # Augment allowed tools (additive) with query_engager + emit_completion
-            injected = list(options.allowed_tools or [])
-            for t in ("mcp__casa-framework__query_engager",
-                      "mcp__casa-framework__emit_completion"):
-                if t not in injected:
-                    injected.append(t)
-            options.allowed_tools = injected
+                _build_specialist_options,
+                cfg,
+                resolution=_spec_res,
+                extra_casa_tools=(
+                    "mcp__casa-framework__query_engager",
+                    "mcp__casa-framework__emit_completion",
+                ),
+            )
 
             prompt = (
                 f"You are engaged with the user in a Telegram forum topic.\n"
@@ -3071,13 +3118,12 @@ async def engage_executor(args: dict) -> dict:
         # SAME resolution gated + recorded above (one resolve, one binding).
         options = await asyncio.to_thread(
             _build_executor_options, defn, executor_type=executor_type,
-            resolution=plugin_resolution)
-        injected = list(options.allowed_tools or [])
-        for t in ("mcp__casa-framework__query_engager",
-                  "mcp__casa-framework__emit_completion"):
-            if t not in injected:
-                injected.append(t)
-        options.allowed_tools = injected
+            resolution=plugin_resolution,
+            extra_casa_tools=(
+                "mcp__casa-framework__query_engager",
+                "mcp__casa-framework__emit_completion",
+            ),
+        )
         options.system_prompt = prompt
 
         driver = getattr(agent_mod, "active_engagement_driver", None)
@@ -3972,6 +4018,7 @@ async def _synthesize_answer(
     # environment for this one CLI subprocess only).
     options = ClaudeAgentOptions(
         model=model,
+        cli_path=CLAUDE_CLI_PATH,
         system_prompt=_QUERY_ENGAGER_SYSTEM,
         max_turns=1,
         mcp_servers={},
@@ -5684,11 +5731,27 @@ CASA_TOOLS: tuple = (
 )
 
 
-def create_casa_tools() -> dict[str, Any]:
+def select_casa_tools(
+    allowed_tools: frozenset[str] | None = None,
+) -> tuple[SdkMcpTool, ...]:
+    """Return the Casa tools granted to one resolved MCP server."""
+    selected = list(CASA_TOOLS)
+    if allowed_tools is not None and "mcp__casa-framework" not in allowed_tools:
+        selected = [
+            candidate for candidate in CASA_TOOLS
+            if f"mcp__casa-framework__{candidate.name}" in allowed_tools
+        ]
+    return tuple(selected)
+
+
+def create_casa_tools(
+    allowed_tools: frozenset[str] | None = None,
+) -> dict[str, Any]:
     """Create and return the casa-framework MCP server config."""
+    selected = select_casa_tools(allowed_tools)
     server = create_sdk_mcp_server(
         name="casa-framework",
-        tools=list(CASA_TOOLS),
+        tools=list(selected),
     )
     # S-1 (block-S live finding 2026-07-15): opt the framework server out of
     # Claude Code's ToolSearch deferral. Since CLI ~2.1.69 ALL MCP tool

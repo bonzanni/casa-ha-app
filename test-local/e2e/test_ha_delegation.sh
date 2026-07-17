@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# test_ha_delegation.sh — verify v0.15.1 wiring: CASA_HA_MCP_URL env override
-# threads through to MCP registration, butler.runtime.yaml's HA grant resolves
-# through to a real HTTP call against mock HA MCP, and the voice-direct path
-# triggers butler→HA without needing live model reasoning.
+# test_ha_delegation.sh — verify Tina's eager Home Assistant facade over the
+# real HTTP MCP transport without requiring live model reasoning.
 #
 # Tier: 2 (functional). Runs on every push and PR.
 #
 # H-0  Boot mock HA MCP + Casa addon container with CASA_HA_MCP_URL override.
 # H-1  Assert addon log shows `Registered Home Assistant MCP server (url=<mock>)`.
-# H-2  Voice-direct: pre-write mock-SDK tool-invoke file, POST /api/converse
-#      with agent_role=butler; assert mock HA /_calls gained 1 entry.
-# H-3  Resident-options harness: docker exec a Python script that loads
+# H-2  Start the shipped facade once, then assert direct off/on need exactly
+#      one action each and no post-connect tools/list; state needs one
+#      GetLiveContext with upstream {}; malformed discovery keeps actions.
+# H-3  Raw-fallback harness: docker exec a Python script that loads
 #      butler via agent_loader and constructs SDK options like casa_core does;
 #      run a query; assert mock HA /_calls gained another entry. Validates
-#      the runtime.yaml→registry→options chain end-to-end.
+#      the documented degraded raw registry→options path end-to-end.
 #
 # Coverage scope (per spec §4.2 / plan F.1.0):
 # - This test does NOT exercise Ellen→delegate_to_agent→butler reasoning.
@@ -22,14 +21,21 @@
 #   coverage lives in J.5 manual smoke (live SDK + Anthropic key on N150).
 
 set -euo pipefail
+export BOOT_TIMEOUT="${BOOT_TIMEOUT:-180}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=common.sh
 . "$HERE/common.sh"
 
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
-# Cold-boot provisioning (agent-homes, plugin seed) can exceed the default
-# 30s locally. Override only if caller didn't already set BOOT_TIMEOUT.
-export BOOT_TIMEOUT="${BOOT_TIMEOUT:-180}"
+GIT_COMMON_DIR="$(git -C "$REPO_ROOT" rev-parse --git-common-dir)"
+case "$GIT_COMMON_DIR" in
+    /*) ;;
+    *) GIT_COMMON_DIR="$REPO_ROOT/$GIT_COMMON_DIR" ;;
+esac
+SHARED_REPO_ROOT="$(cd "$(dirname "$GIT_COMMON_DIR")" && pwd)"
+if ! E2E_PYTHON="$(bash "$HERE/resolve_python.sh" "$SHARED_REPO_ROOT")"; then
+    exit 1
+fi
 MOCK_HA_PORT="${MOCK_HA_PORT:-8200}"
 MOCK_HA_PID=""
 NAME="casa-ha-deleg-$$"
@@ -46,14 +52,16 @@ build_image
 # H-0: boot mock HA MCP + Casa addon
 # ============================================================
 log "H-0: start mock HA MCP + Casa addon"
-python3 "$REPO_ROOT/test-local/e2e/mock_ha_mcp/server.py" --port "$MOCK_HA_PORT" \
+MOCK_HA_MALFORMED_TOOL=1 "$E2E_PYTHON" \
+    "$REPO_ROOT/test-local/e2e/mock_ha_mcp/server.py" --port "$MOCK_HA_PORT" \
     >/tmp/mock_ha_mcp.log 2>&1 &
 MOCK_HA_PID=$!
 for _ in $(seq 1 10); do
-    curl -sf "http://localhost:${MOCK_HA_PORT}/_calls" >/dev/null 2>&1 && break
+    curl -sf --max-time 2 "http://localhost:${MOCK_HA_PORT}/_calls" \
+        >/dev/null 2>&1 && break
     sleep 0.5
 done
-curl -sf "http://localhost:${MOCK_HA_PORT}/_calls" >/dev/null \
+curl -sf --max-time 2 "http://localhost:${MOCK_HA_PORT}/_calls" >/dev/null \
     || fail "H-0: mock HA MCP not responding on port $MOCK_HA_PORT"
 
 MSYS_NO_PATHCONV=1 docker run -d --rm --name "$NAME" \
@@ -71,48 +79,175 @@ pass "H-0: mock HA MCP + addon up"
 log "H-1: addon log mentions mock HA URL"
 assert_log_contains "$NAME" \
     "Registered Home Assistant MCP server (url=http://host.docker.internal:${MOCK_HA_PORT}/)"
+assert_log_contains "$NAME" \
+    "Skipping Home Assistant tool MalformedSchema: invalid input schema"
 pass "H-1: CASA_HA_MCP_URL override threaded to register_http"
 
 # ============================================================
-# H-2: voice-direct path → butler → mock HA tool call
+# H-2: resident facade → direct actions/state → mock HA call history
 # ============================================================
-log "H-2: voice/sse → butler → mock HA tool call"
-curl -sf -X POST "http://localhost:${MOCK_HA_PORT}/_reset" >/dev/null
+log "H-2: eager facade actions/state stay within discovery + loop bounds"
+curl -sf --max-time 2 -X POST "http://localhost:${MOCK_HA_PORT}/_reset" \
+    >/dev/null
 
-# Pre-seed the tool-invoke file so butler's mock-SDK call fires the HA tool.
-MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c \
-    "echo '"'[{"server":"homeassistant","tool":"HassTurnOff","args":{"name":"kitchen"}}]'"' > /data/mock_sdk_tool_invoke.json"
+if ! out=$(MSYS_NO_PATHCONV=1 docker exec -i \
+        -e PYTHONPATH=/opt/casa \
+        "$NAME" /opt/casa/venv/bin/python - \
+        "http://host.docker.internal:$MOCK_HA_PORT/" <<'PY'
+from __future__ import annotations
 
-curl -sf -N -X POST \
-    "http://localhost:${HOST_PORT}/api/converse" \
-    -H 'content-type: application/json' \
-    -d '{"prompt":"turn off the kitchen lights","agent_role":"butler","scope_id":"v0151-h2"}' \
-    --max-time 15 >/dev/null || true
+import asyncio
+import json
+import sys
+from contextlib import asynccontextmanager
 
-# Wait until mock HA recorded the call (up to 15s).
-deadline=$(( $(date +%s) + 15 ))
-calls_count=0
-while [ "$(date +%s)" -lt "$deadline" ]; do
-    calls_count=$(curl -sf "http://localhost:${MOCK_HA_PORT}/_calls" \
-        | python3 -c "import sys, json; print(len(json.load(sys.stdin)))")
-    [ "$calls_count" -ge 1 ] && break
-    sleep 0.5
-done
+from ha_mcp_facade import HomeAssistantFacade
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 
-if [ "$calls_count" -lt 1 ]; then
-    docker logs "$NAME" 2>&1 | tail -40 >&2
-    fail "H-2: voice → butler did not hit mock HA (calls=$calls_count)"
+
+async def main(url: str) -> None:
+    history: list[dict] = []
+
+    class TrackingSession:
+        def __init__(self, session: ClientSession) -> None:
+            self.session = session
+
+        async def initialize(self):
+            history.append({"method": "initialize"})
+            return await self.session.initialize()
+
+        async def list_tools(self):
+            result = await self.session.list_tools()
+            history.append({
+                "method": "tools/list",
+                "tools": [candidate.name for candidate in result.tools],
+            })
+            return result
+
+        async def send_request(self, request, result_type):
+            if request.root.method == "tools/call":
+                params = request.root.params
+                event = {
+                    "method": "tools/call",
+                    "name": params.name,
+                    "arguments": dict(params.arguments or {}),
+                }
+                history.append(event)
+                try:
+                    return await self.session.send_request(request, result_type)
+                except Exception as exc:
+                    event["error_type"] = type(exc).__name__
+                    event["error"] = str(exc)
+                    raise
+
+            result = await self.session.send_request(request, result_type)
+            history.append({
+                "method": "tools/list",
+                "tools": [candidate.name for candidate in result.tools],
+            })
+            return result
+
+        async def call_tool(self, name: str, arguments: dict):
+            event = {
+                "method": "tools/call",
+                "name": name,
+                "arguments": dict(arguments),
+            }
+            history.append(event)
+            try:
+                return await self.session.call_tool(name, arguments)
+            except Exception as exc:
+                event["error_type"] = type(exc).__name__
+                event["error"] = str(exc)
+                raise
+
+    @asynccontextmanager
+    async def session_factory():
+        async with streamablehttp_client(url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                yield TrackingSession(session)
+
+    facade = HomeAssistantFacade(url, {}, session_factory=session_factory)
+    await facade.start()
+    try:
+        assert history[0] == {"method": "initialize"}
+        assert history[1]["method"] == "tools/list"
+        assert "MalformedSchema" in history[1]["tools"]
+
+        tools = {candidate.name: candidate for candidate in facade.tools}
+        assert {"HassTurnOn", "HassTurnOff", "GetLiveContext"} <= set(tools)
+        assert "MalformedSchema" not in tools
+        resident_connected = len(history)
+
+        turns = [
+            ("HassTurnOff", {"name": "office light"}),
+            ("HassTurnOn", {"name": "office light"}),
+            ("GetLiveContext", {"domain": "lights"}),
+        ]
+        deltas = []
+        for name, arguments in turns:
+            before = len(history)
+            result = await tools[name].handler(arguments)
+            delta = history[before:]
+            if len(delta) > 1:
+                raise AssertionError(
+                    f"guard bound exceeded for {name}: {delta!r}",
+                )
+            deltas.append(delta)
+            assert result.get("is_error") is not True, (result, delta)
+
+        assert deltas[0] == [{
+            "method": "tools/call",
+            "name": "HassTurnOff",
+            "arguments": {"name": "office light"},
+        }]
+        assert deltas[1] == [{
+            "method": "tools/call",
+            "name": "HassTurnOn",
+            "arguments": {"name": "office light"},
+        }]
+        assert deltas[2] == [{
+            "method": "tools/call",
+            "name": "GetLiveContext", "arguments": {},
+        }]
+        assert not any(
+            event["method"] == "tools/list"
+            for event in history[resident_connected:]
+        ), "tools/list after resident connect"
+        print(json.dumps({"status": "OK", "history": history}))
+    finally:
+        await facade.aclose()
+
+
+asyncio.run(main(sys.argv[1]))
+PY
+); then
+    printf '%s\n' "$out" | tail -30 >&2
+    fail "H-2: eager facade probe exited non-zero"
 fi
+printf '%s\n' "$out" | tail -1 | grep -qF '"status": "OK"' \
+    || { printf '%s\n' "$out" | tail -10 >&2; fail "H-2: facade probe did not report OK"; }
 
-curl -s "http://localhost:${MOCK_HA_PORT}/_calls" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('called:', [c['name'] for c in d])"
-pass "H-2: voice/sse → butler reached mock HA ($calls_count call(s))"
+curl -sf --max-time 2 "http://localhost:${MOCK_HA_PORT}/_calls" \
+    | "$E2E_PYTHON" -c '
+import json, sys
+actual = json.load(sys.stdin)
+expected = [
+    {"name": "HassTurnOff", "arguments": {"name": "office light"}},
+    {"name": "HassTurnOn", "arguments": {"name": "office light"}},
+    {"name": "GetLiveContext", "arguments": {}},
+]
+assert actual == expected, (actual, expected)
+'
+pass "H-2: direct off/on + normalized state query used one call each"
 
 # ============================================================
-# H-3: agent_loader → SDK options chain validates butler.runtime.yaml grant
+# H-3: raw fallback agent_loader → SDK options → mock HA
 # ============================================================
-log "H-3: agent_loader resolves butler grant + SDK options reach mock HA"
-curl -sf -X POST "http://localhost:${MOCK_HA_PORT}/_reset" >/dev/null
+log "H-3: raw fallback still resolves butler grant + reaches mock HA"
+curl -sf --max-time 2 -X POST "http://localhost:${MOCK_HA_PORT}/_reset" \
+    >/dev/null
 
 MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c \
     "echo '"'[{"server":"homeassistant","tool":"HassTurnOn","args":{"name":"bedroom"}}]'"' > /data/mock_sdk_tool_invoke.json"
@@ -135,11 +270,11 @@ fi
 printf '%s\n' "$out" | tail -1 | grep -qF OK \
     || { printf '%s\n' "$out" | tail -10 >&2; fail "H-3: harness did not print OK"; }
 
-calls=$(curl -sf "http://localhost:${MOCK_HA_PORT}/_calls" \
-    | python3 -c "import sys, json; print(len(json.load(sys.stdin)))")
+calls=$(curl -sf --max-time 2 "http://localhost:${MOCK_HA_PORT}/_calls" \
+    | "$E2E_PYTHON" -c "import sys, json; print(len(json.load(sys.stdin)))")
 [ "$calls" -ge 1 ] \
-    || fail "H-3: agent_loader→SDK chain did not reach mock HA (calls=$calls)"
-pass "H-3: agent_loader → registry → SDK options → mock HA chain works ($calls call(s))"
+    || fail "H-3: raw agent_loader→SDK chain did not reach mock HA (calls=$calls)"
+pass "H-3: raw fallback registry → SDK options → mock HA works ($calls call(s))"
 
 stop_container "$NAME"
 log "All H-* checkpoints green."
