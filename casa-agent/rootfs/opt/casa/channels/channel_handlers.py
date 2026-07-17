@@ -180,9 +180,9 @@ class AskValidationGate:
         "Tombstone retention, stated precisely"). A gate that never resolved
         (still PENDING) is never retirable — there is no terminal outcome to
         retain, so retiring it would just re-litigate the get-or-create race
-        it exists to settle. ``bound`` defaults to the existing reattach
-        refusal-outcome retention window (see :func:`_reattach_retention_
-        bound`) — round 4 REUSES it rather than inventing a new TTL."""
+        it exists to settle. ``bound`` defaults to
+        :func:`_reattach_retention_bound` — see that docstring for what the
+        default actually is (and is not)."""
         if self._refcount > 0:
             return False
         if self._resolved_at is None:
@@ -193,15 +193,19 @@ class AskValidationGate:
 
 
 def _reattach_retention_bound() -> float:
-    """The EXISTING reattach refusal-outcome retention bound (round 3):
-    ``verdict_broker``'s retired-tombstone window. A retired broker request
-    stays reattachable for exactly this long — the same guarantee this gate
-    now offers a validation reattacher — so round 4 reuses the SAME window
-    instead of inventing a new TTL constant (spec §D1). Imported lazily and
-    read as a module attribute (never bound at import time) so a test that
-    monkeypatches ``verdict_broker._RETIRE_S`` is honoured, mirroring that
-    module's own docstring warning about capturing a default at
-    registration."""
+    """Gate-retention window: reuses ``verdict_broker._RETIRE_S`` as the
+    CLOSEST AVAILABLE numeric analogue — NOT because it is "the" reattach
+    refusal-outcome bound. The round-3 refusal-outcome machinery
+    (``_record_intent_*`` → send-intent registry) is retained STRUCTURALLY
+    at turn end (``OutputSequencer.prune_turn``), not by any TTL; no
+    numeric refusal-retention constant exists to reuse. ``_RETIRE_S`` is the
+    broker's retired-tombstone window — the nearest guarantee of the same
+    shape (a resolved request staying observable to late reattachers) —
+    and retention here is pure map hygiene, never correctness: ``retirable``
+    is refcount-gated first, so a referenced gate is immortal regardless of
+    this value. A5's wiring may pass an explicit ``bound=`` if its window
+    differs. Read lazily as a module attribute (never captured at import)
+    so monkeypatched ``verdict_broker._RETIRE_S`` is honoured."""
     import verdict_broker
     return verdict_broker._RETIRE_S
 
