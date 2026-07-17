@@ -1,24 +1,33 @@
-"""v0.81.0 (W-R3, Sol r1-5) — readable ask buttons.
+"""v0.81.0 (W-R3, Sol r1-5) — readable ask buttons; v0.84.0 (round 4, spec D2)
+— the button-label half moved to whole-set floor/verbatim semantics.
 
-The bug: ``post_options_keyboard`` used each FULL option string as the button
-label, which Telegram truncates to a few words → most choices were unpickable,
-and the full option texts appeared NOWHERE. The fix:
+The original bug: ``post_options_keyboard`` used each FULL option string as the
+button label, which Telegram truncates to a few words → most choices were
+unpickable, and the full option texts appeared NOWHERE. The fix (still
+current):
 
   1. ONE canonical ``render_ask_body(number, question, options)`` renders the
      full options VERBATIM + numbered in the MESSAGE body. This single helper
      feeds all four ask consumers (initial post, finish-hook settle base,
      persisted ``open_questions[].text``, boot reconciliation) so they can
      never disagree.
-  2. Buttons carry a short, number-prefixed summary label derived channel-side
-     (``_short_option_label``); ``callback_data`` identity stays the option
-     INDEX.
+  2. Buttons carry a resolved caption; ``callback_data`` identity stays the
+     option INDEX.
+
+v0.83.0's per-option ELISION LADDER (``_short_option_label``, deriving a
+summary from the full option text) is GONE (D2: "Drop the
+``_short_option_label`` elision ladder entirely"). Button labels are now
+MODEL-generated: the agent supplies an optional ``short`` per option, resolved
+with WHOLE-SET semantics by ``resolve_button_labels`` (see
+``tests/test_ask_button_labels.py`` for its exhaustive coverage) — no agent
+shorts anywhere (as in the plain-``str``-option calls below) always floors to
+the numbered placeholder.
 
 These tests assert: the four consumers render a byte-identical body; every full
-option appears verbatim + numbered; button labels are short + number-prefixed +
-map to the correct index; settle appends the FULL chosen option below the
-canonical body; a long option yields a word-boundary-capped label but the full
-text survives in the body; free-text anchors render without an option list; and
-the SEPARATE authz-challenge renderer is untouched.
+option appears verbatim + numbered; a floored keyboard maps to the correct
+index; settle appends the FULL chosen option below the canonical body; free-text
+anchors render without an option list; and the SEPARATE authz-challenge
+renderer is untouched.
 """
 
 from __future__ import annotations
@@ -37,7 +46,6 @@ from channels.channel_handlers import (
     _ask_settle_text,
     render_ask_body,
 )
-from channels.telegram import _short_option_label
 
 # ``asyncio_mode = auto`` (pytest.ini) auto-detects the async tests here; no
 # module-level asyncio mark (this file mixes sync helper tests + async ones).
@@ -93,71 +101,55 @@ class TestRenderAskBody:
 
 
 # ---------------------------------------------------------------------------
-# _short_option_label — derived button labels
+# short_option_labels / resolve_button_labels — resolved button labels
 # ---------------------------------------------------------------------------
 
 
 class TestShortOptionLabel:
-    def test_short_option_number_prefixed(self) -> None:
-        assert _short_option_label(1, "Personal Gmail") == "1 · Personal Gmail"
+    """v0.84.0 (round 4, D2): the per-option elision ladder is gone; these pin
+    ``short_option_labels``'s whole-set floor/verbatim behaviour for the
+    exact shapes this file used to probe with the deleted
+    ``_short_option_label``. See ``tests/test_ask_button_labels.py`` for the
+    resolver's own exhaustive coverage."""
 
-    def test_caps_long_option_via_interior_elision(self) -> None:
-        # v0.83.0 (A4): a lone long option that overflows the 30-char cap is
-        # elided keeping the HEAD + TAIL tokens (interior ellipsis) so the
-        # distinguishing tail survives. The FULL text is carried by the body.
-        from channels.telegram import _ASK_BUTTON_LABEL_CAP
+    def test_short_option_verbatim_when_short_given(self) -> None:
+        from channels.telegram import short_option_labels
 
-        label = _short_option_label(
-            1, "Configure the enterprise SSO integration")
-        assert label == "1 · Configure…integration"
-        assert len(label) <= _ASK_BUTTON_LABEL_CAP
+        assert short_option_labels(["Personal Gmail"], ["Gmail"]) == [
+            "1 · Gmail"]
 
-    def test_fills_words_up_to_cap_no_three_word_ceiling(self) -> None:
-        # v0.83.0 (A4): the old 3-word ceiling is gone — a short option that
-        # fully fits the 30-char cap renders VERBATIM with no truncation.
-        from channels.telegram import _ASK_BUTTON_LABEL_CAP
+    def test_no_short_floors_to_numbered_placeholder(self) -> None:
+        # v0.84.0 (D2): no agent-supplied short → the WHOLE set floors; it
+        # never elides the full option text into a garbled summary.
+        from channels.telegram import short_option_labels
 
-        label = _short_option_label(2, "one two three four five")
-        assert label == "2 · one two three four five"
-        assert len(label) <= _ASK_BUTTON_LABEL_CAP
+        label = short_option_labels(
+            ["Configure the enterprise SSO integration"])[0]
+        assert label == "Option 1"
 
     def test_number_matches_body_line(self) -> None:
-        # The label number is the 1-based option position, matching the numbered
-        # line in render_ask_body so the operator can cross-reference.
+        # The floor's number is the 1-based option position, matching the
+        # numbered line in render_ask_body so the operator can
+        # cross-reference even without an agent-supplied short.
+        from channels.telegram import short_option_labels
+
         options = ["Personal Gmail", "Work Outlook"]
         body = render_ask_body(1, "Which?", options)
+        labels = short_option_labels(options)
         for i, opt in enumerate(options):
-            label = _short_option_label(i + 1, opt)
-            assert label.startswith(f"{i + 1} · ")
+            assert labels[i] == f"Option {i + 1}"
             assert f"{i + 1}. {opt}" in body
 
-    def test_caps_long_single_word_option(self) -> None:
-        # R3 label bug: a single long token (47 chars, within the _ASK_MAX_LABEL
-        # _LEN=48 validation cap) must STILL yield a label ≤ the button cap. The
-        # old loop appended the first word unconditionally (the cap check only
-        # ran once `chosen` was non-empty), so this produced "1 · <47 chars>" =
-        # 51 chars — over the 24 cap and unreadable.
-        from channels.telegram import _ASK_BUTTON_LABEL_CAP
+    def test_caption_within_64_char_cap_when_short_given(self) -> None:
+        from channels.telegram import _ASK_BUTTON_CAPTION_CAP, short_option_labels
 
-        opt = "Supercalifragilisticexpialidociousandmore12345"
-        assert " " not in opt and len(opt) > _ASK_BUTTON_LABEL_CAP  # single long token
-        label = _short_option_label(1, opt)
-        assert len(label) <= _ASK_BUTTON_LABEL_CAP
-        assert label.startswith("1 · ")
-
-    def test_caps_long_first_word_then_more(self) -> None:
-        # A long FIRST word followed by more words: the cap must bite on the
-        # first word (hard slice), not append it whole and blow past the cap.
-        from channels.telegram import _ASK_BUTTON_LABEL_CAP
-
-        label = _short_option_label(
-            2, "Supercalifragilisticexpialidocious mango")
-        assert len(label) <= _ASK_BUTTON_LABEL_CAP
-        assert label.startswith("2 · ")
+        label = short_option_labels(["Full option text"], ["SSO"])[0]
+        assert label == "1 · SSO"
+        assert len(label) <= _ASK_BUTTON_CAPTION_CAP
 
 
 # ---------------------------------------------------------------------------
-# post_options_keyboard — body verbatim, short labels, index identity
+# post_options_keyboard — body verbatim, resolved labels, index identity
 # ---------------------------------------------------------------------------
 
 
@@ -171,7 +163,9 @@ class TestPostOptionsKeyboardReadable:
         ch.send_to_topic = AsyncMock(return_value=101)
         return ch
 
-    async def test_body_posted_verbatim_short_labels_index_identity(self) -> None:
+    async def test_body_posted_verbatim_floors_without_shorts_index_identity(
+        self,
+    ) -> None:
         ch = self._channel()
         options = ["Personal Gmail", "Configure the enterprise SSO integration"]
         body = render_ask_body(1, "Which account?", options)
@@ -187,13 +181,27 @@ class TestPostOptionsKeyboardReadable:
         assert "Configure the enterprise SSO integration" in args[1]
 
         rows = ch.send_to_topic.call_args.kwargs["reply_markup"].inline_keyboard
-        # Labels are the short derived summaries, number-prefixed (v0.83.0 A4:
-        # the long option is interior-elided keeping head + tail).
-        assert [r[0].text for r in rows] == [
-            "1 · Personal Gmail", "2 · Configure…integration"]
+        # v0.84.0 (D2): no agent-supplied ``short`` per option → the WHOLE set
+        # floors to the numbered placeholder (never a garbled elision).
+        assert [r[0].text for r in rows] == ["Option 1", "Option 2"]
         # callback_data identity is the option INDEX (unchanged schema).
         assert [r[0].callback_data for r in rows] == [
             "v1|engagement_ask|rid|0", "v1|engagement_ask|rid|1"]
+
+    async def test_agent_shorts_render_verbatim_when_whole_set_usable(
+        self,
+    ) -> None:
+        ch = self._channel()
+        options = ["Personal Gmail", "Configure the enterprise SSO integration"]
+        shorts = ["Gmail", "SSO"]
+        body = render_ask_body(1, "Which account?", options)
+
+        await ch.post_options_keyboard(
+            engagement_id="x" * 32, request_id="rid",
+            question=body, options=options, shorts=shorts)
+
+        rows = ch.send_to_topic.call_args.kwargs["reply_markup"].inline_keyboard
+        assert [r[0].text for r in rows] == ["1 · Gmail", "2 · SSO"]
 
 
 # ---------------------------------------------------------------------------
