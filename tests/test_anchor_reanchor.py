@@ -1043,6 +1043,44 @@ class TestConfirmedPairScheduler:
         await task
         assert drv._confirmed_pair_mid(rec.id, n) is None    # committed once freed
 
+    # -- (j) D4 review: promotion must NOT retire the pump owner while a
+    #        confirmed pair remains owned — mirrors the ``_consume_reanchor``
+    #        guard. DOUBLE FAILURE: persist exhausts (confirmed pair recorded)
+    #        AND the in-call settlement orphan marker-edit ALSO fails (record
+    #        retained) — the retry owner must stay armed so the standing pump
+    #        keeps retrying, instead of depending on the next unrelated
+    #        output boundary.
+
+    async def test_j_promote_keeps_owner_armed_while_pair_retained(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path, edit_ok=False)
+        self._fail_persist(reg)
+
+        # Boundary 1: send #1, persist exhausts → confirmed pair recorded.
+        assert await drv._reanchor_pass(rec) is True
+        new_mid = wire.posts[0][1]
+        assert drv._confirmed_pair_mid(rec.id, n) == new_mid
+
+        # A prior boundary armed the standing pump owner (as _consume_reanchor
+        # does) — simulate that here.
+        drv._arm_reanchor_retry(rec)
+        assert rec.id in drv._reanchor_retry_tasks
+        owner = drv._reanchor_retry_tasks[rec.id]
+
+        # The operator answers → promotion marks the question answered and
+        # settles it; the in-call orphan marker-edit ALSO fails (edit_ok=False)
+        # so the confirmed-pair record is retained — historical work remains.
+        await drv._promote_answer_on_enqueue(rec)
+
+        assert drv._confirmed_pair_mid(rec.id, n) == new_mid  # KEPT (edit failed)
+        assert drv._historical_items(rec.id) != []
+        # §D6 r29-2 PUMP: the retry owner must stay armed while historical
+        # items remain — it must NOT depend on the next unrelated boundary.
+        assert rec.id in drv._reanchor_retry_tasks
+        assert drv._reanchor_retry_tasks[rec.id] is owner
+        assert not owner.done()
+
+        drv._retire_reanchor_retry(rec.id)   # cleanup parked owner
+
 
 # ===========================================================================
 # 5b. B3 (wave 2) — an ABSENT fresh re-read is ALREADY RESOLVED: SKIP, never

@@ -2124,9 +2124,16 @@ class ClaudeCodeDriver(DriverProtocol):
         self._answer_reservations.pop(eid, None)
         # §A3(b) latch-clear discipline (Sol r13-1): PROMOTION (the question got
         # answered) is one of the three latch-clearing events — discharge the
-        # re-anchor obligation and retire the retry owner.
+        # re-anchor obligation. §D6 r29-2 PUMP (D4 review): retire the retry
+        # owner ONLY when no historical items remain — mirrors the guard in
+        # ``_consume_reanchor``. A confirmed-pair memory record surviving
+        # persist exhaustion (or a durable ``reanchored`` stale entry) still
+        # needs the standing pump's marker-edit cleanup; retiring
+        # unconditionally here would strand that cleanup on the next
+        # unrelated output boundary instead.
         self._reanchor_due.discard(eid)
-        self._retire_reanchor_retry(eid)
+        if not self._historical_items(eid):
+            self._retire_reanchor_retry(eid)
         if anchor is None:
             return None
         n = anchor.get("n")
