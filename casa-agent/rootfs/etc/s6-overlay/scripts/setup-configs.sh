@@ -221,11 +221,19 @@ fi
 
 # Auto-generate webhook secret if auth is enabled and no secret is set.
 SECRET_FILE="$DATA_DIR/webhook_secret"
+DISCOVERY_AUTH_ENABLED=false
 if bashio::config.true 'webhook_auth_enabled'; then
+    DISCOVERY_AUTH_ENABLED=true
     USER_SECRET=$(bashio::config 'webhook_secret')
+    # bashio returns the literal string "null" for an unset optional value.
+    # Treat it exactly like an empty override so auth gets a random secret.
+    if [ "$USER_SECRET" = "null" ]; then
+        USER_SECRET=""
+    fi
     if [ -n "$USER_SECRET" ]; then
         printf '%s' "$USER_SECRET" > "$SECRET_FILE"
-    elif [ ! -f "$SECRET_FILE" ]; then
+    elif [ ! -f "$SECRET_FILE" ] || \
+         [ "$(cat "$SECRET_FILE" 2>/dev/null)" = "null" ]; then
         head -c 32 /dev/urandom | base64 | tr -d '=/+' | head -c 48 > "$SECRET_FILE"
         bashio::log.info "Auto-generated webhook secret (see /data/webhook_secret)"
     fi
@@ -237,7 +245,8 @@ fi
 # Publish Casa's authenticated endpoint to the companion integration through
 # Supervisor discovery. The publisher owns only the returned UUID in /data;
 # it reads the selected secret above and never logs or persists that secret.
-python3 /opt/casa/supervisor_discovery.py || \
+CASA_DISCOVERY_AUTH_ENABLED="$DISCOVERY_AUTH_ENABLED" \
+    python3 /opt/casa/supervisor_discovery.py || \
     bashio::log.warning "Supervisor discovery publisher exited non-zero"
 
 # --- cc-home HOME setup -----------------------------------------------------

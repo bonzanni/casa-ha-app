@@ -83,6 +83,7 @@ async def test_publishes_exact_schema_one_record_with_runtime_hostname(paths):
     ])
 
     await publish_or_remove_discovery(
+        auth_enabled=True,
         secret_file=secret, state_file=state,
         session_factory=_session_factory(session), sleep=AsyncMock(),
     )
@@ -120,6 +121,7 @@ async def test_retries_transient_failure_a_bounded_number_of_times(paths):
     sleep = AsyncMock()
 
     await publish_or_remove_discovery(
+        auth_enabled=True,
         secret_file=secret, state_file=state,
         session_factory=_session_factory(session), sleep=sleep,
     )
@@ -147,6 +149,7 @@ async def test_retries_a_timed_out_supervisor_request(paths):
     sleep = AsyncMock()
 
     await publish_or_remove_discovery(
+        auth_enabled=True,
         secret_file=secret, state_file=state,
         session_factory=_session_factory(session), sleep=sleep,
     )
@@ -172,6 +175,7 @@ async def test_republishes_matching_record_in_place_with_the_same_uuid(paths):
     ])
 
     await publish_or_remove_discovery(
+        auth_enabled=True,
         secret_file=secret, state_file=state,
         session_factory=_session_factory(session), sleep=AsyncMock(),
     )
@@ -196,6 +200,7 @@ async def test_secret_rotation_posts_in_place_without_delete(paths):
     ])
 
     await publish_or_remove_discovery(
+        auth_enabled=True,
         secret_file=secret, state_file=state,
         session_factory=_session_factory(session), sleep=AsyncMock(),
     )
@@ -216,6 +221,7 @@ async def test_disabled_auth_deletes_existing_discovery_and_clears_state(paths):
     session = _Session([_Response(200)])
 
     await publish_or_remove_discovery(
+        auth_enabled=False,
         secret_file=secret, state_file=state,
         session_factory=_session_factory(session), sleep=AsyncMock(),
     )
@@ -235,6 +241,7 @@ async def test_disabled_auth_clears_state_when_the_remote_uuid_is_already_stale(
     session = _Session([_Response(404)])
 
     await publish_or_remove_discovery(
+        auth_enabled=False,
         secret_file=secret, state_file=state,
         session_factory=_session_factory(session), sleep=AsyncMock(),
     )
@@ -255,6 +262,7 @@ async def test_malformed_or_stale_local_uuid_is_overwritten_after_publish(paths)
     ])
 
     await publish_or_remove_discovery(
+        auth_enabled=True,
         secret_file=secret, state_file=state,
         session_factory=_session_factory(session), sleep=AsyncMock(),
     )
@@ -279,6 +287,7 @@ async def test_secret_never_appears_in_logs_or_persisted_state(paths, caplog):
 
     with caplog.at_level(logging.WARNING):
         await publish_or_remove_discovery(
+            auth_enabled=True,
             secret_file=secret, state_file=state,
             session_factory=_session_factory(session), sleep=AsyncMock(),
         )
@@ -287,11 +296,43 @@ async def test_secret_never_appears_in_logs_or_persisted_state(paths, caplog):
     assert not state.exists()
 
 
+@pytest.mark.asyncio
+async def test_enabled_auth_with_unreadable_secret_retains_discovery_state(paths, caplog):
+    from supervisor_discovery import publish_or_remove_discovery
+
+    secret, state = paths
+    state.write_text('{"uuid":"existing-uuid"}')
+    session = _Session([])
+
+    with caplog.at_level(logging.WARNING):
+        await publish_or_remove_discovery(
+            auth_enabled=True,
+            secret_file=secret, state_file=state,
+            session_factory=_session_factory(session), sleep=AsyncMock(),
+        )
+
+    assert session.calls == []
+    assert json.loads(state.read_text()) == {"uuid": "existing-uuid"}
+    assert "existing-uuid" not in caplog.text
+
+
 def test_setup_wires_discovery_after_webhook_secret_selection():
     script = Path("casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh").read_text()
     secret_block = script.index('SECRET_FILE="$DATA_DIR/webhook_secret"')
     publisher = script.index("supervisor_discovery.py")
     assert publisher > secret_block
+
+
+def test_setup_normalizes_blank_bashio_webhook_secret_before_generation():
+    script = Path("casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh").read_text()
+    start = script.index('SECRET_FILE="$DATA_DIR/webhook_secret"')
+    end = script.index("# Publish Casa's authenticated endpoint", start)
+    secret_block = script[start:end]
+
+    assert 'if [ "$USER_SECRET" = "null" ]; then' in secret_block
+    assert 'USER_SECRET=""' in secret_block
+    assert '[ "$(cat "$SECRET_FILE" 2>/dev/null)" = "null" ]' in secret_block
+    assert 'CASA_DISCOVERY_AUTH_ENABLED="$DISCOVERY_AUTH_ENABLED"' in script
 
 
 def test_manifest_and_docs_declare_discovery_contract():

@@ -101,18 +101,40 @@ async def _request(
 
 async def publish_or_remove_discovery(
     *,
+    auth_enabled: bool,
     secret_file: Path = _SECRET_FILE,
     state_file: Path = _STATE_FILE,
     session_factory: Callable[..., Any] = aiohttp.ClientSession,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> None:
     """Publish the authenticated Casa endpoint, or remove it when disabled."""
+    uuid = _read_uuid(state_file)
+    if not auth_enabled:
+        if uuid is None:
+            _clear_state(state_file)
+            return
+        token = os.environ.get("SUPERVISOR_TOKEN")
+        if not token:
+            _LOGGER.warning("Supervisor discovery unavailable: no Supervisor token")
+            return
+        async with session_factory(
+            headers={"Authorization": f"Bearer {token}"}, timeout=_REQUEST_TIMEOUT,
+        ) as session:
+            status, _ = await _request(
+                session, "DELETE", f"/discovery/{uuid}", sleep=sleep,
+            )
+            if status == 404 or (status is not None and 200 <= status < 300):
+                _clear_state(state_file)
+        return
+
     try:
         secret = secret_file.read_text().strip()
     except OSError:
         secret = ""
+    if not secret:
+        _LOGGER.warning("Supervisor discovery unavailable: webhook secret missing")
+        return
 
-    uuid = _read_uuid(state_file)
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token:
         _LOGGER.warning("Supervisor discovery unavailable: no Supervisor token")
@@ -121,16 +143,6 @@ async def publish_or_remove_discovery(
     async with session_factory(
         headers={"Authorization": f"Bearer {token}"}, timeout=_REQUEST_TIMEOUT,
     ) as session:
-        if not secret:
-            if uuid is None:
-                _clear_state(state_file)
-                return
-            status, _ = await _request(
-                session, "DELETE", f"/discovery/{uuid}", sleep=sleep,
-            )
-            if status == 404 or (status is not None and 200 <= status < 300):
-                _clear_state(state_file)
-            return
 
         status, addon_info = await _request(
             session, "GET", "/addons/self/info", sleep=sleep,
@@ -158,7 +170,9 @@ async def publish_or_remove_discovery(
 
 
 async def _main() -> None:
-    await publish_or_remove_discovery()
+    await publish_or_remove_discovery(
+        auth_enabled=os.environ.get("CASA_DISCOVERY_AUTH_ENABLED") == "true",
+    )
 
 
 if __name__ == "__main__":
