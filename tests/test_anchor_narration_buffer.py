@@ -999,6 +999,113 @@ async def test_answered_flush_failure_retains_for_resurface(tmp_path):
 
 
 # ===========================================================================
+# wb7-1 (whole-branch gate wave 7): the SHARED tool-use flush path
+# (``_flush_and_disarm`` at a subsequent ``tool_use``) must obey the same
+# wave-6 resurface-never-lose contract. When the held-prose flush hits drop
+# mode the flush reports failure; the tool-use path must NOT swallow it and
+# ``_advance_dropped`` past the held frame (which set ``dropped_through`` and
+# made cold recovery SKIP the held frames despite ``hold_pending=True``).
+# Instead it defers (``_FlushDeferred``) BEFORE disarming or advancing the
+# cursor/``dropped_through``, so a cold restart resurfaces the prose. Both the
+# cold-first-run and warm-re-entry tool-use flush-failure shapes, mirroring the
+# wb6-1 spawn/answered tests.
+# ===========================================================================
+
+
+async def test_tool_use_failed_flush_retains_for_resurface(tmp_path):
+    """(wb7-1, tool_use-flush path, COLD) A ``tool_use`` FLUSHES the held buffer
+    (post-tool prose is legitimate) and every flush send FAILS (drop mode). The
+    flush must NOT disarm suppression or advance ``current``/``dropped_through``
+    past the held frame: the buffer + ``hold_pending`` marker + UNADVANCED
+    boundary are RETAINED and a brand-new relay (Telegram healthy) resurfaces the
+    prose. Before the fix ``_flush_and_disarm`` swallowed the failure and
+    ``_handle_assistant_blocks`` ``_advance_dropped`` set ``dropped_through`` past
+    the held frame, so cold recovery skipped it (held prose lost)."""
+    offs = _write_current(tmp_path, [
+        _init(), _anchor_ask("Q?"), _text("held"),
+        _tool_in("Bash", {"command": "ls"}), _result(),
+    ])
+    cursor = tmp_path / ".stream_cursor.json"
+
+    # First relay: "held" is buffered (anchor open); the flush at the tool_use
+    # fails persistently → drop. Nothing reaches the wire; nothing checkpoints away.
+    rec1, events1 = Recorder(), []
+    rec1.send_fails = 10_000                       # every send fails forever → drop
+    seq1, _c1 = _fast_sequencer(rec1)
+    relay1 = _make_relay(
+        tmp_path, cursor, rec1, events1, sequencer=seq1,
+        open_anchor_state=lambda: (5, 500, _ah()),
+    )
+    await relay1.run()
+
+    assert rec1.sends == []                         # never delivered (all failed)
+    assert relay1._warm is False                    # deferred → next poll cold
+    saved = StreamCursor.load(cursor)
+    assert saved.hold_pending is True               # marker RETAINED
+    assert saved.dropped_through is None            # NOT diverted past the held frame
+    assert saved.current["offset"] == offs[1]       # checkpoint HELD behind "held"
+    assert saved.current["offset"] < offs[2]
+
+    # Brand-new relay, Telegram healthy — cold recovery resurfaces the prose.
+    rec2, events2 = Recorder(), []
+    seq2, _c2 = _fast_sequencer(rec2)
+    relay2 = _make_relay(
+        tmp_path, cursor, rec2, events2, sequencer=seq2,
+        open_anchor_state=lambda: (5, 500, _ah()),
+    )
+    await relay2.run()
+
+    assert _narration_sends(rec2) == ["held"]        # RESURFACED
+    assert StreamCursor.load(cursor).hold_pending is False
+
+
+async def test_tool_use_failed_flush_warm_retains_for_resurface(tmp_path):
+    """(wb7-1, tool_use-flush path, WARM re-entry) The buffer is held on the first
+    poll (warm-latched); a later ``tool_use`` arrives and the SAME relay resumes
+    WARM. Its flush FAILS (drop). The warm path must RETAIN the buffer + marker,
+    leave the checkpoint behind the held frame, keep ``dropped_through`` unset, and
+    drop the warm latch so a cold restart resurfaces the prose."""
+    _write_current(tmp_path, [_init(), _anchor_ask("Q?"), _text("held")])
+    cursor = tmp_path / ".stream_cursor.json"
+
+    rec, events = Recorder(), []
+    seq, _clock = _fast_sequencer(rec)
+    relay = _make_relay(
+        tmp_path, cursor, rec, events, sequencer=seq,
+        open_anchor_state=lambda: (5, 500, _ah()),
+    )
+    await relay.run()                       # buffers "held", marker set, warm-latched
+    assert rec.sends == []
+    assert relay._suppressing_for == (5, 500)
+    assert StreamCursor.load(cursor).hold_pending is True
+    held_current = StreamCursor.load(cursor).current["offset"]
+
+    # A tool_use arrives; the SAME relay resumes WARM. The flush FAILS.
+    rec.send_fails = 10_000
+    _append_current(tmp_path, [_tool_in("Bash", {"command": "ls"}), _result()])
+    await relay.run()                       # WARM re-entry; flush fails → defer
+
+    assert rec.sends == []                  # nothing delivered
+    assert relay._warm is False             # deferred → next poll cold
+    saved = StreamCursor.load(cursor)
+    assert saved.hold_pending is True       # marker RETAINED
+    assert saved.dropped_through is None    # NOT diverted past the held frame
+    assert saved.current["offset"] == held_current   # checkpoint NOT advanced
+
+    # Brand-new relay, Telegram healthy — cold recovery resurfaces "held".
+    rec2, events2 = Recorder(), []
+    seq2, _c2 = _fast_sequencer(rec2)
+    relay2 = _make_relay(
+        tmp_path, cursor, rec2, events2, sequencer=seq2,
+        open_anchor_state=lambda: (5, 500, _ah()),
+    )
+    await relay2.run()
+
+    assert _narration_sends(rec2) == ["held"]        # RESURFACED
+    assert StreamCursor.load(cursor).hold_pending is False
+
+
+# ===========================================================================
 # wb3-2 (whole-branch gate wave 3): terminal narration DISCARD is revalidated
 # INSIDE the sequencer writer lock (one truth source = the terminal latch), so
 # neither a write blocked on the lock at the instant of terminalization nor a

@@ -1277,7 +1277,25 @@ class TopicStreamRelay:
         turn. The spent candidate is dropped too, so the CURRENT anchor never
         re-arms on the next prose frame; re-arming happens ONLY when a NEW anchor
         surfaces (a fresh ``_match_discrete_block`` candidate)."""
-        await self._flush_anchor_buffer()
+        # wb7-1: the tool_use flush obeys the SAME wave-6 resurface-never-lose
+        # contract as the spawn/finalize flushes. If delivery FAILED (drop mode)
+        # the buffer is RETAINED — do NOT disarm suppression, and (critically) do
+        # NOT let ``_handle_assistant_blocks`` fall through to ``_advance_dropped``,
+        # which would set ``dropped_through`` past the still-held frames and make a
+        # cold restart SKIP them despite ``hold_pending=True`` (held prose lost).
+        # Defer INSTEAD: raise ``_FlushDeferred`` BEFORE disarming/advancing, so
+        # ``current``/``dropped_through`` stay behind the held frames, the marker
+        # stays set, and the run-loop catch cold-recovers to resurface the prose
+        # (the C3 cold-disarm machinery renders it as ordinary narration).
+        if not await self._flush_anchor_buffer():
+            logger.warning(
+                "topic stream for engagement %s: held-prose flush failed at a "
+                "tool_use boundary; deferring to a cold restart so the held "
+                "narration resurfaces (marker kept, checkpoint held behind the "
+                "held frames)",
+                self.engagement_id,
+            )
+            raise _FlushDeferred
         # wb2-1: dropping the spent candidate is what enforces "re-arm only when a
         # NEW anchor surfaces" — the next prose has no candidate to bind, and a
         # later candidate only arms on ITS OWN anchor (positive source-hash bind),
@@ -1315,10 +1333,14 @@ class TopicStreamRelay:
                 # below re-records the candidate and the next prose re-arms.
                 if self._suppressing_for is not None:
                     flushed_buffer = True
+                    # wb7-1: a flush that hits drop mode raises ``_FlushDeferred``
+                    # INSIDE ``_flush_and_disarm`` (buffer + marker retained,
+                    # boundary left behind the held frames) so it never reaches an
+                    # ``_advance_dropped`` divert here — that would set
+                    # ``dropped_through`` past the still-held frames and lose them
+                    # on a cold restart. Only a SUCCESSFUL flush returns; the loop
+                    # then continues with an empty buffer, disarmed.
                     await self._flush_and_disarm()
-                    if self._dropped:
-                        self._advance_dropped(seg, off_after)
-                        return
                 if not fired_mutating and name not in _NON_MUTATING_TOOLS:
                     fired_mutating = True
                     await _maybe_await(

@@ -1515,9 +1515,19 @@ def _make_ask(
                 return web.json_response({"ok": False, "error": "cancelled"})
             rec = engagement_registry.get(eng_id)
             if rec is None:
-                return web.json_response({"ok": False, "error": "unknown_engagement"})
+                # wb7-2 (D1): a pre-PASSED terminal exit PUBLISHES its EXACT
+                # refusal payload through the gate (``set_failed``) and returns the
+                # SAME dict, so a same-request retry reads the RETAINED resolved
+                # outcome (byte-identical) under the normal resolved-gate retention
+                # — instead of the finally's never-owned-PENDING delete, which
+                # dropped the gate and forced every retry to re-derive.
+                payload = {"ok": False, "error": "unknown_engagement"}
+                gate.set_failed(payload)
+                return web.json_response(payload)
             if getattr(rec, "status", None) not in ("active", "idle"):
-                return web.json_response({"ok": False, "error": "engagement_terminal"})
+                payload = {"ok": False, "error": "engagement_terminal"}
+                gate.set_failed(payload)
+                return web.json_response(payload)
 
             driver = _resolve_active_driver()
             projection_hash = body.get("projection_hash")
@@ -1588,8 +1598,11 @@ def _make_ask(
                     # wb4-1: engagement terminalized mid-ingress — refuse rather
                     # than posting an anchor below the terminal completion.
                     if res is TERMINAL_REGISTRATION:
-                        return web.json_response(
-                            {"ok": False, "error": "engagement_terminal"})
+                        # wb7-2 (D1): publish the refusal through the gate + retain
+                        # (see the rec-is-None exit); a retry reads it back.
+                        payload = {"ok": False, "error": "engagement_terminal"}
+                        gate.set_failed(payload)
+                        return web.json_response(payload)
                     if res is not None:
                         _intent, created_intent = res
                         if created_intent:
@@ -2035,8 +2048,11 @@ def _make_ask(
                 # wb4-1: engagement terminalized mid-ingress — refuse rather than
                 # posting a keyboard below the terminal completion.
                 if res is TERMINAL_REGISTRATION:
-                    return web.json_response(
-                        {"ok": False, "error": "engagement_terminal"})
+                    # wb7-2 (D1): publish the refusal through the gate + retain
+                    # (see the rec-is-None exit); a retry reads it back.
+                    payload = {"ok": False, "error": "engagement_terminal"}
+                    gate.set_failed(payload)
+                    return web.json_response(payload)
                 if res is not None:
                     _intent, created_intent = res
                     if created_intent:
@@ -2432,20 +2448,24 @@ def _make_ask(
             # dropped, so a late reattacher can still find the resolved gate).
             gate.release()
             if not _validation_owner and gate.effective()[0] == "PENDING":
-                # A5 review, Finding 1 (second half): this call exited
-                # WITHOUT ever becoming the validation owner (e.g.
-                # ``unknown_engagement`` / ``engagement_terminal``, checked
-                # before ownership is ever claimed) AND without publishing
+                # A5 review, Finding 1 (second half): this call exited WITHOUT
+                # ever becoming the validation owner AND without publishing
                 # anything to the gate — it is still PENDING. ``retirable()``
                 # would never fire for it: ``_resolved_at`` stays ``None``
-                # forever, so the bound-based sweep can never catch it
-                # either. But since no owner was ever registered in
-                # ``_ASK_VALIDATION_OWNERS`` for this request_id, no
-                # reattacher can possibly be blocked on this gate's event —
-                # it carries no terminal outcome worth retaining (a retry
-                # just re-derives ``unknown_engagement``/``engagement_terminal``
-                # deterministically from the registry). Drop it outright,
-                # once unreferenced, instead of leaking it forever.
+                # forever, so the bound-based sweep can never catch it either.
+                # But since no owner was ever registered in
+                # ``_ASK_VALIDATION_OWNERS`` for this request_id, no reattacher
+                # can possibly be blocked on this gate's event — it carries no
+                # terminal outcome worth retaining. Drop it outright, once
+                # unreferenced, instead of leaking it forever.
+                # wb7-2: the pre-PASSED TERMINAL exits (``unknown_engagement`` /
+                # ``engagement_terminal`` / ``TERMINAL_REGISTRATION``) no longer
+                # reach here — they now ``set_failed`` their exact payload, so the
+                # gate is RESOLVED and takes the normal resolved-gate retention
+                # branch below. What remains for this delete is the genuinely
+                # unpublishable case: a reattacher (never the owner) that found a
+                # PENDING gate with no local owner to resolve it and fell through
+                # the fail-closed path.
                 if gate.refcount == 0 and ASK_GATES.get(request_id) is gate:
                     del ASK_GATES[request_id]
             else:

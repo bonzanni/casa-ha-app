@@ -2154,29 +2154,14 @@ class TestAskEntrySweepsPriorLeakedGates:
         assert "leak3" in ASK_GATES  # its own gate is untouched
 
 
-class TestNeverOwnedPendingGateCleanup:
-    """A5 review, Finding 1 (second half): a gate created for a request that
-    exits BEFORE ever becoming the validation owner and BEFORE publishing
-    anything to the gate (``unknown_engagement`` / ``engagement_terminal``)
-    stays PENDING forever — ``retirable()`` never fires for it (``_resolved_at``
-    stays ``None``), so the bound-based sweep can never catch it either. No
-    owner was ever registered in ``_ASK_VALIDATION_OWNERS`` for these
-    request_ids, so no reattacher can possibly be blocked on the gate's
-    event — it is released and dropped immediately instead of leaking
-    forever."""
-
-    async def test_unknown_engagement_does_not_leak_a_pending_gate(self, wired):
-        resp = await wired["ask"](_FakeRequest(
-            _btn_payload("no-such-engagement", "unk1")))
-        assert _body(resp) == {"ok": False, "error": "unknown_engagement"}
-        assert "unk1" not in ASK_GATES
-
-    async def test_engagement_terminal_does_not_leak_a_pending_gate(self, wired):
-        wired["rec"].status = "completed"
-        resp = await wired["ask"](_FakeRequest(
-            _btn_payload(wired["rec"].id, "term1")))
-        assert _body(resp) == {"ok": False, "error": "engagement_terminal"}
-        assert "term1" not in ASK_GATES
+# wb7-2 (whole-branch gate wave 7) SUPERSEDES A5 review, Finding 1 (second
+# half): the ``unknown_engagement`` / ``engagement_terminal`` /
+# ``TERMINAL_REGISTRATION`` exits NO LONGER leave the gate PENDING for the
+# finally to drop — they now PUBLISH their exact payload (``set_failed``) and
+# the gate is RETAINED under the normal resolved-gate retention. That contract
+# is exercised by ``TestTerminalExitsPublishGate`` above. The finally's
+# never-owned-PENDING delete now only covers the genuinely-unpublishable case
+# (a reattacher that found a PENDING gate with no local owner to resolve it).
 
 
 # ===========================================================================
@@ -2434,3 +2419,77 @@ class TestLateReplyAfterTerminalize:
         # NOTHING posted below the terminal completion.
         assert chan.replies == []
         assert seq.registry.by_request_id("lr1") is None
+
+
+# ===========================================================================
+# wb7-2 (whole-branch gate wave 7): D1 requires EVERY pre-PASSED terminal exit
+# to PUBLISH its EXACT refusal payload through the gate (``set_failed``) and
+# RETAIN the gate under the normal resolved-gate retention — so a same-request
+# retry reads the byte-identical resolved outcome instead of hitting the
+# finally's never-owned-PENDING delete (which dropped the gate and forced every
+# retry to re-derive). Covers the four exits: ``unknown_engagement``,
+# ``engagement_terminal`` (status), and both ``TERMINAL_REGISTRATION`` refusals
+# (anchor + button). Before the fix each of these left the gate PENDING and the
+# finally deleted it (``ASK_GATES.get(rid) is None``).
+# ===========================================================================
+
+
+class TestTerminalExitsPublishGate:
+    async def test_unknown_engagement_publishes_and_retains_gate(self, wired):
+        from channels.channel_handlers import ASK_GATES
+
+        payload = {"ok": False, "error": "unknown_engagement"}
+        resp = await wired["ask"](_FakeRequest(
+            _anchor_payload("no-such-engagement", rid="wb7-unknown")))
+        assert _body(resp) == payload
+        gate = ASK_GATES.get("wb7-unknown")
+        assert gate is not None                       # RETAINED (not PENDING-deleted)
+        assert gate.effective() == ("FAILED", payload)  # RESOLVED with exact payload
+        # Same-request retry reads the byte-identical outcome.
+        resp2 = await wired["ask"](_FakeRequest(
+            _anchor_payload("no-such-engagement", rid="wb7-unknown")))
+        assert _body(resp2) == payload
+
+    async def test_engagement_terminal_status_publishes_and_retains_gate(self, wired):
+        import time
+
+        from channels.channel_handlers import ASK_GATES
+
+        eid = wired["rec"].id
+        await wired["reg"].mark_completed(eid, time.time())   # status → terminal
+        payload = {"ok": False, "error": "engagement_terminal"}
+        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, rid="wb7-term")))
+        assert _body(resp) == payload
+        gate = ASK_GATES.get("wb7-term")
+        assert gate is not None
+        assert gate.effective() == ("FAILED", payload)
+        resp2 = await wired["ask"](_FakeRequest(_anchor_payload(eid, rid="wb7-term")))
+        assert _body(resp2) == payload
+
+    async def test_anchor_terminal_registration_publishes_and_retains_gate(self, wired):
+        from channels.channel_handlers import ASK_GATES
+
+        eid, seq = wired["rec"].id, wired["seq"]
+        await seq.terminalize()   # rec status stays active; register_intent REFUSES
+        payload = {"ok": False, "error": "engagement_terminal"}
+        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, rid="wb7-areg")))
+        assert _body(resp) == payload
+        gate = ASK_GATES.get("wb7-areg")
+        assert gate is not None
+        assert gate.effective() == ("FAILED", payload)
+        resp2 = await wired["ask"](_FakeRequest(_anchor_payload(eid, rid="wb7-areg")))
+        assert _body(resp2) == payload
+
+    async def test_button_terminal_registration_publishes_and_retains_gate(self, wired):
+        from channels.channel_handlers import ASK_GATES
+
+        eid, seq = wired["rec"].id, wired["seq"]
+        await seq.terminalize()
+        payload = {"ok": False, "error": "engagement_terminal"}
+        resp = await wired["ask"](_FakeRequest(_btn_payload(eid, rid="wb7-breg")))
+        assert _body(resp) == payload
+        gate = ASK_GATES.get("wb7-breg")
+        assert gate is not None
+        assert gate.effective() == ("FAILED", payload)
+        resp2 = await wired["ask"](_FakeRequest(_btn_payload(eid, rid="wb7-breg")))
+        assert _body(resp2) == payload
