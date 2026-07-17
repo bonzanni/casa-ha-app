@@ -331,14 +331,17 @@ def _mk_update(*, data, thread_id, chat_id=-1001, user_id=999):
 
 
 def _seed_multi(broker, *, scope, rid, topic_id, operator_id, options,
-                message_id=7000, selected=None, shorts=None):
+                message_id=7000, selected=None, shorts=None, button_labels=None):
+    meta = {
+        "options": list(options), "topic_id": topic_id,
+        "operator_id": operator_id, "multi": True,
+        "shorts": shorts, "message_id": message_id,
+    }
+    if button_labels is not None:
+        meta["button_labels"] = list(button_labels)
     req, created = broker.register(
         namespace="engagement_ask", scope=scope, request_id=rid, timeout_s=60.0,
-        meta={
-            "options": list(options), "topic_id": topic_id,
-            "operator_id": operator_id, "multi": True,
-            "shorts": shorts, "message_id": message_id,
-        })
+        meta=meta)
     assert created
     if selected is not None:
         req.meta["selected"] = list(selected)
@@ -388,6 +391,35 @@ class TestToggleDispatch:
         await ch._on_inline_callback(update2, context=None)
         assert req.meta["selected"] == []
         update2.callback_query.answer.assert_awaited_once_with("removed")
+
+    async def test_redraw_consumes_persisted_button_labels_byte_identical(
+        self, fake_telegram_bot, engagement_fixture, _fresh_broker, monkeypatch,
+    ):
+        """D2 item 3 (Task A5): the multi redraw prepends only the mutable ☐/☑
+        glyph to the PERSISTED ``button_labels`` — it NEVER re-resolves from
+        ``shorts``. Seed captions that DIFFER from what re-deriving ``shorts``
+        (here: ``None`` ⇒ the numbered floor) would produce, so a re-deriving
+        redraw would render ``☑ Option 2`` while the correct persisted-caption
+        redraw renders ``☑ 2 · Beta`` byte-identically."""
+        rec = engagement_fixture.active_record
+        drv = _SeqDriver(rec.id, topic_id=rec.topic_id)
+        monkeypatch.setattr(agent_mod, "active_claude_code_driver", drv)
+        ch = _mk_channel(fake_telegram_bot, engagement_fixture.registry)
+        persisted = ["1 · Alpha", "2 · Beta", "3 · Gamma"]
+        _seed_multi(
+            _fresh_broker, scope=rec.id, rid="bl1", topic_id=rec.topic_id,
+            operator_id=999, options=["Alpha", "Beta", "Gamma"],
+            shorts=None, button_labels=persisted)
+
+        update = _mk_update(data="v1|ask_multi|bl1|1", thread_id=rec.topic_id)
+        await ch._on_inline_callback(update, context=None)
+
+        assert len(drv.wire.edits) == 1
+        _topic, _mid, _text, markup = drv.wire.edits[0]
+        captions = [row[0].text for row in markup.inline_keyboard]
+        assert captions == [
+            "☐ 1 · Alpha", "☑ 2 · Beta", "☐ 3 · Gamma", "✅ Submit",
+        ]
 
     async def test_toggle_on_claimed_returns_expired_no_edit(
         self, fake_telegram_bot, engagement_fixture, _fresh_broker, monkeypatch,

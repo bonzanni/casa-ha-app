@@ -26,13 +26,15 @@ Two changes ship together:
       the true worst case with no arbitrary margin — a drift test below fails
       if a new suffix constant is added without joining the enumeration.
 
-Placement (documented, not the final architecture): this task wires the
-check PRE-Q-ALLOCATION using the WORST-CASE Q-number width
-(``_ASK_WORST_CASE_NUMBER = 9999``) as a conservative approximation — no
-Q-number/intent/broker record exists yet at this point in the handler, so a
-refusal here needs no tombstone/marker cleanup machinery. The real
-post-allocation gate (with reattach-handshake cancellation semantics) is
-Task A4/A5's job.
+Placement (v0.84.0 round 4, Task A5): the check runs AT ITS SPEC-LITERAL
+PLACEMENT — AFTER Q-number allocation (with the REAL allocated number) and
+BEFORE broker registration/posting. On refusal the validation gate owns the
+cleanup (clear the ingress marker, tombstone the intent with the detailed
+``invalid_args`` outcome, publish FAILED through the gate). The old
+pre-allocation ``_WC`` approximation is gone; the pure
+measurement machinery (``ask_lifecycle_suffixes``) is number-independent, so
+these unit tests pass any placeholder number to it, while the handler-level
+tests assert the detail against the REAL first-allocated number (``1``).
 """
 
 from __future__ import annotations
@@ -47,10 +49,15 @@ import verdict_broker
 from verdict_broker import VerdictBroker
 from channels.channel_handlers import (
     _ASK_BODY_LIMIT,
-    _ASK_WORST_CASE_NUMBER,
     render_ask_body,
 )
 from drivers.claude_code_driver import ask_lifecycle_suffixes
+
+# ``ask_lifecycle_suffixes`` never interpolates the number (D1 — no suffix form
+# uses it), so the pure-measurement tests pass an arbitrary placeholder. The
+# handler-level tests use the REAL first-allocated number (1).
+_WC = 9999
+_FIRST_N = 1
 
 # ``asyncio_mode = auto`` (pytest.ini) auto-detects the async tests here; this
 # file mixes sync unit tests (suffix/drift) with async handler-level tests, so
@@ -64,17 +71,17 @@ from drivers.claude_code_driver import ask_lifecycle_suffixes
 
 class TestAskLifecycleSuffixes:
     def test_anchor_includes_answered_below(self) -> None:
-        suffixes = ask_lifecycle_suffixes(_ASK_WORST_CASE_NUMBER, [], False)
+        suffixes = ask_lifecycle_suffixes(_WC, [], False)
         assert "\n✅ answered below" in suffixes
 
     def test_single_select_worst_case_is_last_option_position(self) -> None:
         suffixes = ask_lifecycle_suffixes(
-            _ASK_WORST_CASE_NUMBER, ["A", "B", "C"], False)
+            _WC, ["A", "B", "C"], False)
         assert "\n✅ Option 3" in suffixes
 
     def test_multi_worst_case_is_every_option_selected_exactly(self) -> None:
         suffixes = ask_lifecycle_suffixes(
-            _ASK_WORST_CASE_NUMBER, ["A", "B", "C", "D"], True)
+            _WC, ["A", "B", "C", "D"], True)
         assert "\n✅ Options 1, 2, 3, 4" in suffixes
 
     def test_fixed_lifecycle_forms_always_present(self) -> None:
@@ -82,7 +89,7 @@ class TestAskLifecycleSuffixes:
         # answered+expired / terminal cancellation never depend on
         # options/multi.
         suffixes = ask_lifecycle_suffixes(
-            _ASK_WORST_CASE_NUMBER, ["A", "B"], False)
+            _WC, ["A", "B"], False)
         assert "\n⌛ expired — engagement paused; reply here to continue" in suffixes
         assert "\n🚫 cancelled" in suffixes
         assert "\n🚫 superseded by your message below" in suffixes
@@ -104,7 +111,7 @@ class TestAskLifecycleSuffixes:
         # directly (see the handler-level tests below for the byte-exact
         # boundary construction through the real 8-option-capped endpoint).
         options = [chr(ord("A") + i % 26) for i in range(40)]
-        suffixes = ask_lifecycle_suffixes(_ASK_WORST_CASE_NUMBER, options, True)
+        suffixes = ask_lifecycle_suffixes(_WC, options, True)
         worst = max(len(s) for s in suffixes)
         all_selected = "\n✅ Options " + ", ".join(str(i + 1) for i in range(40))
         assert all_selected in suffixes
@@ -135,11 +142,11 @@ class TestNoOrphanedSuffixConstant:
 
         enumerated: set[str] = set()
         enumerated.update(
-            ask_lifecycle_suffixes(_ASK_WORST_CASE_NUMBER, [], False))
+            ask_lifecycle_suffixes(_WC, [], False))
         enumerated.update(
-            ask_lifecycle_suffixes(_ASK_WORST_CASE_NUMBER, ["A", "B"], False))
+            ask_lifecycle_suffixes(_WC, ["A", "B"], False))
         enumerated.update(ask_lifecycle_suffixes(
-            _ASK_WORST_CASE_NUMBER, ["A", "B", "C"], True))
+            _WC, ["A", "B", "C"], True))
 
         missing: list[str] = []
         for mod, prefix in ((ch, "_SETTLE_"), (ccd, "_OPEN_Q_")):
@@ -206,16 +213,19 @@ def _make_ask_handler(tmp_path, monkeypatch):
     return handlers["/internal/channel/ask"], reg, ch, fresh
 
 
-def _oversized_question(options: list, *, multi: bool, over_by: int) -> str:
+def _oversized_question(
+    options: list, *, multi: bool, over_by: int, number: int = _FIRST_N,
+) -> str:
     """Build a question whose rendered body ALONE is just under budget, but
     whose worst-case lifecycle suffix pushes the total ``over_by`` chars past
     Telegram's 4096-char limit — isolating that it is the SUFFIX (not the raw
-    body) causing the refusal, per spec §D1 bullet 3."""
+    body) causing the refusal, per spec §D1 bullet 3. Rendered with the REAL
+    allocated ``number`` (the validator now runs post-allocation, Task A5)."""
     worst_suffix_len = max(
         len(s) for s in
-        ask_lifecycle_suffixes(_ASK_WORST_CASE_NUMBER, options, multi))
+        ask_lifecycle_suffixes(number, options, multi))
     target_body_len = (_ASK_BODY_LIMIT - worst_suffix_len) + over_by
-    skeleton = render_ask_body(_ASK_WORST_CASE_NUMBER, "", options)
+    skeleton = render_ask_body(number, "", options)
     question_len = target_body_len - len(skeleton)
     assert question_len > 0
     return "Q" * question_len
@@ -225,17 +235,21 @@ async def test_oversized_ask_refused_with_self_explaining_detail(
     tmp_path, monkeypatch,
 ) -> None:
     options = ["Alpha", "Beta"]
+    # The refusal now fires POST-allocation with the REAL first number (1).
     question = _oversized_question(options, multi=False, over_by=5)
-    expected_body = render_ask_body(_ASK_WORST_CASE_NUMBER, question, options)
+    expected_body = render_ask_body(_FIRST_N, question, options)
     expected_suffix = max(
         len(s) for s in
-        ask_lifecycle_suffixes(_ASK_WORST_CASE_NUMBER, options, False))
+        ask_lifecycle_suffixes(_FIRST_N, options, False))
     expected_n = len(expected_body) + expected_suffix
     assert expected_n == _ASK_BODY_LIMIT + 5
 
-    ask, _reg, ch, _broker = _make_ask_handler(tmp_path, monkeypatch)
+    ask, reg, ch, _broker = _make_ask_handler(tmp_path, monkeypatch)
+    rec = await reg.create(
+        "executor", "configurator", "claude_code", "t",
+        {"user_id": 555}, topic_id=42)
     payload = {
-        "engagement_id": "eng-oversized", "request_id": "r1",
+        "engagement_id": rec.id, "request_id": "r1",
         "question": question, "options": options, "timeout_s": 60,
     }
     resp = await ask(_FakeRequest(payload))
@@ -251,7 +265,7 @@ async def test_oversized_ask_refused_with_self_explaining_detail(
         f"limit (was {expected_n} incl. lifecycle suffix); shorten the "
         "question or reduce options"
     )
-    # PRE-allocation refusal: no keyboard ever posted, no engagement touched.
+    # Post-allocation refusal: the gate owns cleanup — NO keyboard ever posted.
     assert ch.options_keyboards == []
 
 
@@ -261,9 +275,12 @@ async def test_oversized_multi_ask_all_selected_worst_case_refused(
     options = ["A", "B", "C", "D", "E", "F", "G", "H"]  # the 8-option cap
     question = _oversized_question(options, multi=True, over_by=1)
 
-    ask, _reg, ch, _broker = _make_ask_handler(tmp_path, monkeypatch)
+    ask, reg, ch, _broker = _make_ask_handler(tmp_path, monkeypatch)
+    rec = await reg.create(
+        "executor", "configurator", "claude_code", "t",
+        {"user_id": 555}, topic_id=42)
     payload = {
-        "engagement_id": "eng-oversized-multi", "request_id": "r2",
+        "engagement_id": rec.id, "request_id": "r2",
         "question": question, "options": options, "multi": True,
         "timeout_s": 60,
     }

@@ -143,6 +143,8 @@ async def wired(tmp_path, fresh_broker, monkeypatch):
         "reg": reg, "rec": rec, "chan": chan, "seq": seq, "drv": drv,
         "broker": fresh_broker, "ask": handlers["/internal/channel/ask"],
         "send": handlers["/internal/channel/send_to_topic"],
+        "ask_cancel": handlers["/internal/channel/ask_cancel"],
+        "handlers": handlers,
     }
 
 
@@ -1247,6 +1249,152 @@ class TestCapsRemovedEndToEnd:
 
 
 # ===========================================================================
+# D1 (round 4, Task A5) — validation-gate WIRING into the ask handler:
+# single-owner validation, terminal-exit publication, cancel-awareness.
+# REAL handler + REAL VerdictBroker + REAL OutputSequencer; asyncio.Event
+# barriers inside a monkeypatched allocator force the owner/reattacher
+# orderings. Never patches ``<module>.asyncio.sleep``.
+# ===========================================================================
+
+
+class TestGateWiring:
+    def _barrier_alloc(self, wired, *, raises=False):
+        """Patch the registry allocator with a controllable barrier so the
+        OWNER blocks mid-validation (after registering the intent + claiming
+        the ingress marker, before the post) while a same-request_id
+        reattacher blocks on the gate. Returns (entered, release)."""
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        orig = wired["reg"].allocate_question_number
+
+        async def _alloc(eid):
+            entered.set()
+            await release.wait()
+            if raises:
+                raise RuntimeError("boom")
+            return await orig(eid)
+
+        wired["reg"].allocate_question_number = _alloc
+        return entered, release
+
+    async def _launch_owner_reattacher(self, wired, rid, entered, **over):
+        """Owner registers first (created intent), blocks in the allocator;
+        the reattacher then registers (created=False) and blocks on the gate."""
+        owner = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(wired["rec"].id, rid, **over))))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        reattach = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(wired["rec"].id, rid, **over))))
+        await asyncio.sleep(0.02)  # let the reattacher reach the gate wait
+        assert not reattach.done()  # truly blocked on the PENDING gate
+        return owner, reattach
+
+    async def test_reattacher_blocked_gets_internal_error_no_broker_no_post(
+        self, wired,
+    ):
+        """(a) allocator RAISES while a reattacher is blocked on the gate →
+        both get ``internal_error`` byte-identically; no broker, no keyboard."""
+        entered, release = self._barrier_alloc(wired, raises=True)
+        owner, reattach = await self._launch_owner_reattacher(wired, "gw1", entered)
+        release.set()
+        r_owner = _body(await asyncio.wait_for(owner, 1.0))
+        r_re = _body(await asyncio.wait_for(reattach, 1.0))
+        assert r_owner == {"ok": False, "error": "internal_error"}
+        assert r_re == {"ok": False, "error": "internal_error"}
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=wired["rec"].id) == []
+        assert wired["chan"].keyboards == []
+
+    async def test_reattacher_blocked_gets_invalid_args_detail_no_broker_no_post(
+        self, wired,
+    ):
+        """(a) the render-and-measure size check FAILS post-allocation while a
+        reattacher is blocked → both get the SAME self-explaining
+        ``invalid_args`` detail; no broker, no keyboard."""
+        entered, release = self._barrier_alloc(wired)
+        owner, reattach = await self._launch_owner_reattacher(
+            wired, "gw2", entered, question="Q" * 5000)
+        release.set()
+        r_owner = _body(await asyncio.wait_for(owner, 1.0))
+        r_re = _body(await asyncio.wait_for(reattach, 1.0))
+        assert r_owner["error"] == "invalid_args"
+        assert "4096" in r_owner["detail"]
+        assert r_re == r_owner  # byte-identical detail
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=wired["rec"].id) == []
+        assert wired["chan"].keyboards == []
+
+    async def test_cancel_during_allocation_aborts_no_broker_no_post(self, wired):
+        """(b) cancel-during-allocation → the owner aborts at the final gate
+        check (no broker record, no post, marker cleared); a reattacher blocked
+        on the gate wakes CANCELLED."""
+        entered, release = self._barrier_alloc(wired)
+        owner, reattach = await self._launch_owner_reattacher(wired, "gw3", entered)
+        # Cancel lands WHILE the owner is suspended in allocation.
+        await wired["ask_cancel"](_FakeRequest(
+            {"engagement_id": wired["rec"].id, "request_id": "gw3"}))
+        release.set()
+        r_owner = _body(await asyncio.wait_for(owner, 1.0))
+        r_re = _body(await asyncio.wait_for(reattach, 1.0))
+        assert r_owner == {"ok": False, "error": "cancelled"}
+        assert r_re == {"ok": False, "error": "cancelled"}
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=wired["rec"].id) == []
+        assert wired["chan"].keyboards == []
+        # Marker cleared — a later ask is not wedged ``question_pending``.
+        assert wired["drv"].ask_inflight(wired["rec"].id) is None
+
+    async def test_cancel_first_then_ask_refuses(self, wired):
+        """(c) cancel-first-then-ask → an ``ask_cancel`` that lands BEFORE the
+        original /ask latches the gate; the later /ask finds it and refuses
+        with no broker, no keyboard."""
+        eid = wired["rec"].id
+        await wired["ask_cancel"](_FakeRequest(
+            {"engagement_id": eid, "request_id": "gw4"}))
+        resp = await asyncio.wait_for(
+            wired["ask"](_FakeRequest(_btn_payload(eid, "gw4"))), 1.0)
+        assert _body(resp) == {"ok": False, "error": "cancelled"}
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=eid) == []
+        assert wired["chan"].keyboards == []
+
+    async def test_operator_away_reattacher_byte_equivalent_no_broker(self, wired):
+        """(a) pre-allocation exit: operator-away refuses the owner AND a
+        same-request_id reattacher byte-identically, with no broker/post."""
+        eid = wired["rec"].id
+        wired["drv"]._operator_away[eid] = True  # SUSPEND (F-EXPIRE gate reads it)
+        r_owner = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gw5"))))
+        r_re = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gw5"))))
+        assert r_owner["error"] == "operator_away"
+        assert r_re["error"] == "operator_away"
+        assert r_owner["message"] == r_re["message"]
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=eid) == []
+        assert wired["chan"].keyboards == []
+
+    async def test_question_pending_reattacher_byte_equivalent_no_broker(
+        self, wired,
+    ):
+        """(a) pre-allocation exit: a second DISTINCT ask is refused
+        ``question_pending`` while one is live; a same-id reattacher of the
+        refused one gets the byte-equivalent refusal, no broker/post."""
+        eid = wired["rec"].id
+        # A live broker ask makes the engagement pending.
+        wired["broker"].register(
+            namespace="engagement_ask", scope=eid, request_id="live",
+            timeout_s=60, meta={})
+        r_owner = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gw6"))))
+        r_re = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gw6"))))
+        assert r_owner["error"] == "question_pending"
+        assert r_re["error"] == "question_pending"
+        assert r_owner == r_re
+        # Only the pre-seeded "live" request is pending — gw6 never registered.
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=eid) == ["live"]
+        assert wired["chan"].keyboards == []
+
+
+# ===========================================================================
 # D1 (round 4, Task A4) — AskValidationGate: completion slot, cancellation
 # latch, wake event, get_or_create_gate, refcounted retention.
 #
@@ -1261,6 +1409,7 @@ class TestCapsRemovedEndToEnd:
 
 import verdict_broker as _verdict_broker_mod
 from channels.channel_handlers import (
+    _ASK_VALIDATION_OWNERS,
     ASK_GATES,
     AskValidationGate,
     get_or_create_gate,
@@ -1270,10 +1419,13 @@ from channels.channel_handlers import (
 
 @pytest.fixture(autouse=True)
 def _clean_ask_gates():
-    """D1 tests own ``ASK_GATES`` — never leak a gate into another test."""
+    """D1 tests own ``ASK_GATES`` / ``_ASK_VALIDATION_OWNERS`` — never leak a
+    gate or an owner marker into another test."""
     ASK_GATES.clear()
+    _ASK_VALIDATION_OWNERS.clear()
     yield
     ASK_GATES.clear()
+    _ASK_VALIDATION_OWNERS.clear()
 
 
 class _FakeClock:

@@ -388,6 +388,24 @@ def short_option_labels(
     return resolve_button_labels(options, multi=False)
 
 
+def _captions_from_shorts(
+    options: list, shorts: "list | None", multi: bool,
+) -> list[str]:
+    """Resolve the whole-set captions from ``options`` + parallel ``shorts``
+    (the ``resolve_button_labels`` input shape). Used ONLY as the fallback
+    when no persisted ``button_labels`` meta exists yet (eager fallback /
+    direct-call unit tests) — the live path always consumes the persisted
+    captions seeded at registration (D2 item 3, Task A5)."""
+    combined = [
+        {
+            "label": str(opt),
+            "short": shorts[i] if shorts is not None and i < len(shorts) else None,
+        }
+        for i, opt in enumerate(options)
+    ]
+    return resolve_button_labels(combined, multi)
+
+
 def _multi_button_caption(i: int, captions: list[str], selected: set) -> str:
     """A5 · F-MULTI: one toggle-row caption ``☐/☑ <stored caption>``. The
     checkbox glyph reflects membership in ``selected``; ``captions[i]`` is
@@ -397,28 +415,23 @@ def _multi_button_caption(i: int, captions: list[str], selected: set) -> str:
 
 
 def _build_multi_keyboard(
-    request_id: str, options: list, shorts: "list | None", selected,
+    request_id: str, options: list, captions: "list[str]", selected,
 ):
     """A5 · F-MULTI: the toggle-many keyboard — one ``☐/☑ n · <label>`` row per
     option (callback ``v1|ask_multi|<rid>|<idx>``) plus a final ``✅ Submit`` row
     (``v1|ask_multi|<rid>|s``). Shared by the initial post and every redraw so
     the two can never disagree.
 
-    v0.84.0 (D2): captions come from the whole-set ``resolve_button_labels``
-    (``options``/``shorts`` zipped into its input shape) instead of the
-    deleted per-option elision-with-fallback. Persisted-meta consumption
-    (redraw reading ONLY the stored caption, never re-resolving) is Task A5's
-    wiring."""
+    v0.84.0 (D2 items 2-3, Task A5 wiring): ``captions`` are the PERSISTED
+    whole-set button labels (``resolve_button_labels`` output, seeded into
+    broker meta as ``button_labels`` at registration). The builder NEVER
+    re-resolves from ``shorts`` — the redraw prepends only the mutable ☐/☑
+    glyph to the STORED caption, so every toggle re-renders byte-identically
+    (the checkbox glyph stays separate mutable state, never part of the
+    persisted caption). This closes the resolution-drift bug where the redraw
+    re-derived captions from ``shorts`` independently of the initial post."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    combined = [
-        {
-            "label": str(opt),
-            "short": shorts[i] if shorts is not None and i < len(shorts) else None,
-        }
-        for i, opt in enumerate(options)
-    ]
-    captions = resolve_button_labels(combined, multi=True)
     sel = set(selected or ())
     rows = [
         [InlineKeyboardButton(
@@ -1760,8 +1773,16 @@ class TelegramChannel(Channel):
             return False
         from verdict_broker import BROKER
 
+        # D2 item 3 (Task A5): redraw from the PERSISTED whole-set captions
+        # seeded at registration — prepend only the mutable ☐/☑ glyph, never
+        # re-resolve from ``shorts`` (byte-identical re-render, no drift).
+        # Fall back to resolving from ``shorts`` only for a legacy meta that
+        # predates the ``button_labels`` seed.
+        captions = meta.get("button_labels")
+        if not isinstance(captions, list) or len(captions) != len(options):
+            captions = _captions_from_shorts(options, meta.get("shorts"), True)
         markup = _build_multi_keyboard(
-            request_id, options, meta.get("shorts"), selected)
+            request_id, options, captions, selected)
 
         def _still_live() -> bool:
             return BROKER.is_live_unclaimed(
@@ -2058,21 +2079,22 @@ class TelegramChannel(Channel):
         # A5 · F-MULTI: a multi ask renders the toggle-many keyboard (checkboxes
         # + ✅ Submit) via the shared builder; single-select keeps one tappable
         # button per option (``v1|engagement_ask|<rid>|<idx>``).
+        # D2 item 3 (Task A5): the initial render consumes the PERSISTED
+        # whole-set ``button_labels`` seeded into broker meta at registration —
+        # the SAME captions the multi redraw reads — so post and redraw can
+        # never disagree. Falls back to resolving from ``shorts`` only when no
+        # broker meta exists (eager fallback / direct-call unit tests).
+        from verdict_broker import BROKER
+        _meta = BROKER.get_meta(
+            namespace="engagement_ask", scope=engagement_id, request_id=request_id)
+        captions = _meta.get("button_labels") if isinstance(_meta, dict) else None
+        if not isinstance(captions, list) or len(captions) != len(options):
+            captions = _captions_from_shorts(options, shorts, multi)
+
         if multi:
-            kbd = _build_multi_keyboard(request_id, options, shorts, selected=())
+            kbd = _build_multi_keyboard(request_id, options, captions, selected=())
             return await self.send_to_topic(
                 rec.topic_id, question, reply_markup=kbd)
-
-        combined = [
-            {
-                "label": str(opt),
-                "short": (
-                    shorts[i] if shorts is not None and i < len(shorts) else None
-                ),
-            }
-            for i, opt in enumerate(options)
-        ]
-        captions = resolve_button_labels(combined, multi=False)
 
         kbd = InlineKeyboardMarkup([
             [InlineKeyboardButton(
