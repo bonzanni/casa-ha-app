@@ -83,6 +83,8 @@ async def test_authenticated_registration_is_acknowledged_and_bound_to_socket():
     assert connection.voice_route_capabilities == frozenset({
         "background_jobs", "satellite_announce",
     })
+    assert bound.job_control_id == "entry-1"
+    assert connection.voice_job_control_id == "entry-1"
 
 
 @pytest.mark.parametrize(
@@ -111,6 +113,7 @@ async def test_invalid_registration_accepts_no_capabilities(
     assert raw.sent[-1]["accepted_capabilities"] == []
     assert routes.get_connected("entry-1") is None
     assert connection.voice_route_id is None
+    assert connection.voice_job_control_id is None
 
 
 async def test_unknown_protocol_and_capability_fail_closed_but_are_acknowledged():

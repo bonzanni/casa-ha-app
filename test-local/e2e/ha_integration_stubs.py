@@ -244,4 +244,18 @@ def install() -> frozenset[str]:
     return HA_STUB_EXPORTS
 
 
-__all__ = ["HA_STUB_EXPORTS", "install"]
+def validate_exports(exports: frozenset[str] = HA_STUB_EXPORTS) -> None:
+    """Prove the manifest names are present, not merely textually equal."""
+    missing = []
+    for declaration in sorted(exports):
+        module_name, separator, attribute = declaration.partition(":")
+        module = sys.modules.get(module_name)
+        if module is None:
+            missing.append(declaration)
+        elif separator and not hasattr(module, attribute):
+            missing.append(declaration)
+    if missing:
+        raise AssertionError(f"HA stub manifest exports are missing: {missing}")
+
+
+__all__ = ["HA_STUB_EXPORTS", "install", "validate_exports"]

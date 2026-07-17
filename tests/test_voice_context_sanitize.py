@@ -86,6 +86,7 @@ _MALICIOUS_CONTEXT = {
     "source": "telegram",
     "_voice_route_id": "spoofed-entry",
     "_voice_route_capabilities": ["background_jobs", "satellite_announce"],
+    "_voice_job_control_id": "spoofed-control",
     "_origin_device_id": "spoofed-device",
     "_voice_transport": "ws",
 }
@@ -107,6 +108,7 @@ class TestVoiceSSESanitize:
         assert ctx["_voice_transport"] == "sse"
         assert "_voice_route_id" not in ctx
         assert "_voice_route_capabilities" not in ctx
+        assert "_voice_job_control_id" not in ctx
         assert "_origin_device_id" not in ctx
         # Casa-owned keys still present.
         assert "chat_id" in ctx and "utterance_id" in ctx and "cid" in ctx
@@ -138,6 +140,7 @@ class TestVoiceWSSanitize:
         assert "_origin_device_id" not in ctx
         assert "_voice_route_id" not in ctx
         assert "_voice_route_capabilities" not in ctx
+        assert "_voice_job_control_id" not in ctx
         assert "chat_id" in ctx and "utterance_id" in ctx and "cid" in ctx
 
     async def test_route_capability_comes_only_from_server_connection(
@@ -150,6 +153,7 @@ class TestVoiceWSSanitize:
             voice_route_capabilities = frozenset({
                 "background_jobs", "satellite_announce",
             })
+            voice_job_control_id = "entry-trusted"
 
             def __init__(self):
                 self.sent = []
@@ -174,5 +178,6 @@ class TestVoiceWSSanitize:
         assert ctx["_voice_route_capabilities"] == frozenset({
             "background_jobs", "satellite_announce",
         })
+        assert ctx["_voice_job_control_id"] == "entry-trusted"
         assert ctx["_origin_device_id"] == "device-trusted"
         assert ctx["_voice_transport"] == "ws"

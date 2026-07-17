@@ -46,7 +46,9 @@ def _nonempty_identifier(value: Any) -> str | None:
     return normalized
 
 
-def _connection_voice_route(connection: Any) -> tuple[str | None, frozenset[str]]:
+def _connection_voice_route(
+    connection: Any,
+) -> tuple[str | None, frozenset[str], str | None]:
     """Read route identity only from the server-owned WS connection object.
 
     Task 4 replaces the raw aiohttp socket with ``VoiceWsConnection``.  The
@@ -67,12 +69,20 @@ def _connection_voice_route(connection: Any) -> tuple[str | None, frozenset[str]
         ),
     )
     if not isinstance(raw_capabilities, (set, frozenset, list, tuple)):
-        return route_id, frozenset()
+        return route_id, frozenset(), _nonempty_identifier(
+            getattr(connection, "voice_job_control_id", None),
+        )
     capabilities = frozenset(
         item for item in raw_capabilities
         if isinstance(item, str) and item
     )
-    return route_id, capabilities
+    return (
+        route_id,
+        capabilities,
+        _nonempty_identifier(
+            getattr(connection, "voice_job_control_id", None),
+        ),
+    )
 
 _DEFAULT_ERROR_LINES = {
     "timeout":       "[flat] That took too long.",
@@ -732,7 +742,9 @@ class VoiceChannel(Channel):
             error_emitted = True
 
         external_context = sanitize_external_context(frame.get("context"))
-        route_id, route_capabilities = _connection_voice_route(ws)
+        route_id, route_capabilities, job_control_id = (
+            _connection_voice_route(ws)
+        )
         # The integration frame is authenticated by the WS route.  Ordinary
         # external context remains available to the agent but must never be
         # promoted into trusted job-delivery provenance.
@@ -748,6 +760,8 @@ class VoiceChannel(Channel):
             )
         if origin_device_id is not None:
             trusted_route_context["_origin_device_id"] = origin_device_id
+        if job_control_id is not None:
+            trusted_route_context["_voice_job_control_id"] = job_control_id
 
         bus_msg = BusMessage(
             type=MessageType.REQUEST, source="voice", target=agent_role,

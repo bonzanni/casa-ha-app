@@ -526,6 +526,31 @@ async def test_expire_due_applies_result_delivery_ttl(tmp_path):
     assert registry.get("job-1").delivery_state is DeliveryState.EXPIRED
 
 
+async def test_snapshot_without_control_identity_keeps_legacy_scope_auth(tmp_path):
+    path = tmp_path / "jobs.json"
+    legacy = tmp_path / "delegations.json"
+    registry = JobRegistry(path, legacy)
+    await registry.load()
+    await registry.create(make_job())
+    await registry.close()
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    rows[0].pop("job_control_id", None)
+    path.write_text(json.dumps(rows), encoding="utf-8")
+
+    reloaded = JobRegistry(path, legacy)
+    await reloaded.load()
+    assert reloaded.get("job-1").job_control_id is None
+    with pytest.raises(JobAuthorizationError):
+        await reloaded.request_cancel("job-1", actor={
+            "creator_peer": "voice_speaker",
+            "creator_user_id": None,
+            "scope_id": "other-scope",
+            "job_control_id": "entry-1",
+        })
+    result = await reloaded.request_cancel("job-1", actor=actor_for_job())
+    assert result.status == "stopping"
+
+
 async def test_load_migrates_legacy_tombstone_once(tmp_path):
     legacy = tmp_path / "delegations.json"
     legacy.write_text(json.dumps([{

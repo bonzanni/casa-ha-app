@@ -36,6 +36,7 @@ def _origin() -> dict:
             "background_jobs", "satellite_announce",
         }),
         "origin_device_id": "device-kitchen",
+        "voice_job_control_id": "entry-1",
     }
 
 

@@ -285,6 +285,26 @@ async def test_only_device_queue_head_is_offered(delivery):
     ]
 
 
+async def test_delivered_lru_reoffer_can_close_claim_without_fake_playback(
+    delivery,
+):
+    registry, _, route, coordinator, _ = delivery
+    await registry.create(_ready_job("job-1", sequence=1, device="kitchen"))
+    await coordinator.route_connected(route)
+    offer = _offered(route)[0]
+
+    await coordinator.handle(route, _frame("job_claimed", offer))
+    await coordinator.handle(route, _frame("job_delivered", offer))
+
+    current = registry.get("job-1")
+    assert current.delivery_state is DeliveryState.DELIVERED
+    assert current.delivery_attempt_id is None
+    assert not any(
+        frame["type"] in {"job_delivery_authorized", "job_playback_started"}
+        for frame in route.sent
+    )
+
+
 async def test_different_devices_progress_independently(delivery):
     registry, _, route, coordinator, _ = delivery
     await registry.create(_ready_job("job-k", sequence=1, device="kitchen"))

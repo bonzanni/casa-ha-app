@@ -83,6 +83,10 @@ class VoiceJob:
     cancel_pending: bool
     orphan_notification_pending: bool = False
     prompted_delivery: bool = False
+    # Server-bound HA route identity used for cross-satellite job control.
+    # None is the backward-compatible legacy row shape, which remains scoped
+    # to ``scope_id`` exactly as before this field existed.
+    job_control_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -800,10 +804,23 @@ class JobRegistry:
         self, job_id: str, delivery_attempt_id: str,
     ) -> VoiceJob:
         async with self._lock:
-            current = self._require_delivery_cas(
-                job_id, "mark_delivered", DeliveryState.PLAYING,
-                attempt_id=delivery_attempt_id,
-            )
+            current = self._require_job(job_id)
+            # CLAIMED -> DELIVERED is the authenticated HA delivered-LRU
+            # acknowledgement path after Casa reoffers a lost delivered ACK.
+            # It intentionally records no fake AUTHORIZED/PLAYING transition
+            # and never asks HA to replay the announcement.
+            if (
+                current.delivery_state not in {
+                    DeliveryState.CLAIMED,
+                    DeliveryState.PLAYING,
+                }
+                or current.delivery_attempt_id != delivery_attempt_id
+            ):
+                raise self._transition_error(
+                    current,
+                    "mark_delivered",
+                    expected="matching attempt in CLAIMED/PLAYING",
+                )
             updated = replace(
                 current,
                 delivery_state=DeliveryState.DELIVERED,
@@ -1167,6 +1184,9 @@ class JobRegistry:
                     row.get("orphan_notification_pending", False)
                 ),
                 prompted_delivery=bool(row.get("prompted_delivery", False)),
+                job_control_id=JobRegistry._optional_str(
+                    row.get("job_control_id")
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise JobRegistryError(f"invalid job snapshot row: {exc}") from exc
@@ -1207,6 +1227,7 @@ class JobRegistry:
             "cancel_pending": job.cancel_pending,
             "orphan_notification_pending": job.orphan_notification_pending,
             "prompted_delivery": job.prompted_delivery,
+            "job_control_id": job.job_control_id,
         }
 
     async def _write_snapshot_locked(
@@ -1543,9 +1564,19 @@ class JobRegistry:
         peer = self._actor_value(actor, "creator_peer", "peer")
         scope = self._actor_value(actor, "scope_id", "scope")
         user_id = self._actor_value(actor, "creator_user_id", "user_id")
-        if peer != job.creator_peer or scope != job.scope_id:
+        control_id = self._actor_value(
+            actor, "job_control_id", "control_id",
+        )
+        if peer != job.creator_peer:
             raise JobAuthorizationError(f"actor does not own job {job.id!r}")
         if user_id != job.creator_user_id:
+            raise JobAuthorizationError(f"actor does not own job {job.id!r}")
+        if job.job_control_id is not None:
+            if control_id != job.job_control_id:
+                raise JobAuthorizationError(
+                    f"actor does not own job {job.id!r}"
+                )
+        elif scope != job.scope_id:
             raise JobAuthorizationError(f"actor does not own job {job.id!r}")
 
     @staticmethod

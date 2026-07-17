@@ -38,6 +38,7 @@ class VoiceWsConnection:
         self.voice_route_id: str | None = None
         self.voice_route_role: str | None = None
         self.voice_route_capabilities: frozenset[str] = frozenset()
+        self.voice_job_control_id: str | None = None
 
     async def send_json(self, frame: dict[str, Any]) -> None:
         async with self._send_lock:
@@ -49,6 +50,7 @@ class BoundVoiceRoute:
     route_id: str
     role: str
     capabilities: frozenset[str]
+    job_control_id: str
     connection: VoiceWsConnection
     connected_at: float
 
@@ -132,6 +134,11 @@ class VoiceRouteRegistry:
                 route_id=route_id,
                 role=role,
                 capabilities=capabilities,
+                # The HA config-entry route is authenticated by this
+                # registration and is stable across satellite-scoped turns.
+                # It is therefore also the server-bound job-control identity;
+                # no utterance/context field participates in this binding.
+                job_control_id=route_id,
                 connection=connection,
                 connected_at=now,
             )
@@ -144,6 +151,7 @@ class VoiceRouteRegistry:
             connection.voice_route_id = route_id
             connection.voice_route_role = role
             connection.voice_route_capabilities = capabilities
+            connection.voice_job_control_id = bound.job_control_id
 
         await connection.send_json({
             "type": "voice_route_registered",
@@ -219,6 +227,7 @@ class VoiceRouteRegistry:
         connection.voice_route_id = None
         connection.voice_route_role = None
         connection.voice_route_capabilities = frozenset()
+        connection.voice_job_control_id = None
 
 
 __all__ = ["BoundVoiceRoute", "VoiceRouteRegistry", "VoiceWsConnection"]

@@ -38,6 +38,7 @@ RESERVED_CONTEXT_KEYS = frozenset({
     "source",
     "_voice_route_id",
     "_voice_route_capabilities",
+    "_voice_job_control_id",
     "_origin_device_id",
     "_voice_transport",
 })

@@ -577,6 +577,9 @@ class Agent:
             device_id = msg.context.get("_origin_device_id")
             if isinstance(device_id, str) and device_id.strip():
                 origin_snapshot["origin_device_id"] = device_id.strip()
+            control_id = msg.context.get("_voice_job_control_id")
+            if isinstance(control_id, str) and control_id.strip():
+                origin_snapshot["voice_job_control_id"] = control_id.strip()
         origin_token = origin_var.set(origin_snapshot)
         try:
             # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at

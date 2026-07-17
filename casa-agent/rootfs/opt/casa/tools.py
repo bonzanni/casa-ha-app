@@ -1182,6 +1182,7 @@ class JobActor:
     creator_peer: str
     creator_user_id: str | None
     scope_id: str
+    job_control_id: str | None = None
 
 
 @dataclass
@@ -1212,9 +1213,18 @@ def background_route_available(origin: dict | None) -> bool:
         return False
     if not isinstance(capabilities, (set, frozenset, list, tuple)):
         return False
-    return _BACKGROUND_ROUTE_CAPABILITIES <= frozenset(
+    if not _BACKGROUND_ROUTE_CAPABILITIES <= frozenset(
         item for item in capabilities if isinstance(item, str)
-    )
+    ):
+        return False
+    # Per-turn capabilities prove how this origin was authenticated, but they
+    # are not a perpetual lease. Production wires the live registry here so a
+    # launch after the 60-second disconnect grace fails closed. Tests and
+    # migration callers without a runtime retain the connection-bound check.
+    routes = getattr(_runtime, "voice_route_registry", None)
+    if routes is not None:
+        return bool(routes.is_recently_capable(route_id.strip()))
+    return True
 
 
 def _background_delivery_unavailable_result() -> dict:
@@ -1248,14 +1258,23 @@ def _job_actor_from_origin(origin: dict | None) -> JobActor | None:
         creator_peer="voice",
         creator_user_id=user_id,
         scope_id=str(scope_id),
+        job_control_id=(
+            str(origin["voice_job_control_id"])
+            if isinstance(origin.get("voice_job_control_id"), str)
+            and origin["voice_job_control_id"].strip()
+            else None
+        ),
     )
 
 
 def _actor_owns_job(actor: JobActor, job: VoiceJob) -> bool:
-    if (actor.creator_peer != job.creator_peer
-            or actor.scope_id != job.scope_id):
+    if actor.creator_peer != job.creator_peer:
         return False
-    return actor.creator_user_id == job.creator_user_id
+    if actor.creator_user_id != job.creator_user_id:
+        return False
+    if job.job_control_id is not None:
+        return actor.job_control_id == job.job_control_id
+    return actor.scope_id == job.scope_id
 
 
 def _discard_structured_stderr(_line: str) -> None:
@@ -2072,6 +2091,12 @@ def _new_voice_job(
         delivery_attempt_id=None,
         lease_until=None,
         cancel_pending=False,
+        job_control_id=(
+            str(origin["voice_job_control_id"])
+            if isinstance(origin.get("voice_job_control_id"), str)
+            and origin["voice_job_control_id"].strip()
+            else None
+        ),
     )
 
 
@@ -2296,6 +2321,9 @@ async def _start_voice_async_job(
     """Persist ACCEPTED, bind RUNNING task/permit ownership, return metadata."""
     registry = _specialist_registry.job_registry
     await registry.load()
+    # Apply result TTL before the atomic route-capacity check so an expired
+    # READY row cannot consume one of the five live backlog slots.
+    await registry.expire_due()
     job_id = str(uuid.uuid4())
     job = _new_voice_job(
         job_id=job_id,
@@ -3156,13 +3184,18 @@ async def continue_voice_job(args: dict) -> dict:
     await registry.load()
     await registry.expire_due()
     now = time.time()
+    requested_id = _requested_job_id(args)
     parent, error = _resolve_authorized_job(
         registry,
         actor,
-        _requested_job_id(args),
-        predicate=lambda job: (
-            _continuable_job(job, now=now)
-            or _detail_available_job(job, now=now)
+        requested_id,
+        predicate=(
+            (lambda job: (
+                _continuable_job(job, now=now)
+                or _detail_available_job(job, now=now)
+            ))
+            if requested_id is not None
+            else (lambda job: _continuable_job(job, now=now))
         ),
         explicit_mismatch_kind="job_not_continuable",
     )

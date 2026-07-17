@@ -29,6 +29,7 @@ def test_reserved_context_keys_are_exactly_the_spec_set():
         "synthetic", "button_answer", "execution_role",
         "message_type", "source",
         "_voice_route_id", "_voice_route_capabilities",
+        "_voice_job_control_id",
         "_origin_device_id", "_voice_transport",
     })
 
@@ -53,6 +54,7 @@ class TestSanitizeExternalContext:
             "source": "telegram",
             "_voice_route_id": "spoofed-entry",
             "_voice_route_capabilities": ["background_jobs"],
+            "_voice_job_control_id": "spoofed-control",
             "_origin_device_id": "spoofed-device",
             "_voice_transport": "ws",
         }

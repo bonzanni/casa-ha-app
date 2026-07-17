@@ -19,6 +19,7 @@ import agent as agent_mod
 import tools
 from bus import MessageBus
 from channels import ChannelManager
+from channels.voice.routes import VoiceRouteRegistry, VoiceWsConnection
 from config import AgentConfig, CharacterConfig, DelegateEntry
 from job_registry import (
     DeliveryState,
@@ -66,6 +67,7 @@ def voice_origin(**overrides) -> dict:
             "background_jobs", "satellite_announce",
         }),
         "origin_device_id": "device-kitchen",
+        "voice_job_control_id": "entry-1",
     }
     origin.update(overrides)
     return origin
@@ -418,6 +420,78 @@ async def test_sixth_active_or_ready_job_on_route_is_rejected_without_mutation(
     ]
     assert tool_env.runner.calls == []
     assert tool_env.limiter.in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_expired_job_is_removed_before_route_capacity_is_counted(tool_env):
+    now = time.time()
+    for index in range(5):
+        await tool_env.add_job(
+            f"job-{index}",
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.READY,
+            terminal_at=now - 10,
+            expires_at=(now - 1 if index == 0 else now + 900),
+            result=json.dumps(_structured_result()),
+        )
+
+    payload = tool_payload(await tool_env.invoke_delegate())
+
+    assert payload["status"] == "pending"
+    assert tool_env.job_registry.get("job-0").delivery_state is (
+        DeliveryState.EXPIRED
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_uses_live_route_freshness_at_launch_and_completion(
+    tool_env, monkeypatch,
+):
+    now = [100.0]
+
+    class _Socket:
+        async def send_json(self, _frame):
+            return None
+
+    caller = _caller_cfg()
+    caller.channels = ["ha_voice"]
+    routes = VoiceRouteRegistry(
+        secret_present=True,
+        freshness_s=60,
+        clock=lambda: now[0],
+        agent_configs={"concierge": caller},
+    )
+    connection = VoiceWsConnection(_Socket())
+    await routes.register(connection, {
+        "type": "voice_route_register",
+        "protocol": 1,
+        "route_id": "entry-1",
+        "agent_role": "concierge",
+        "capabilities": ["background_jobs", "satellite_announce"],
+    })
+    await routes.disconnect(connection)
+    monkeypatch.setattr(
+        tools,
+        "_runtime",
+        type("Runtime", (), {"voice_route_registry": routes})(),
+    )
+
+    now[0] = 159.0
+    accepted = tool_payload(await tool_env.invoke_delegate())
+    assert accepted["status"] == "pending"
+
+    now[0] = 161.0
+    await tool_env.runner.finish()
+    terminal = await asyncio.wait_for(
+        tool_env.job_registry.wait_for_terminal(accepted["job_id"]),
+        timeout=1,
+    )
+    assert terminal.delivery_state is DeliveryState.READY
+    assert routes.get_connected("entry-1") is None
+
+    rejected = tool_payload(await tool_env.invoke_delegate(agent="health"))
+    assert rejected["kind"] == "background_delivery_unavailable"
+    assert len(tool_env.job_registry.all()) == 1
 
 
 @pytest.mark.asyncio
@@ -988,6 +1062,108 @@ async def test_omitted_continue_id_is_ambiguous_and_creates_no_child(tool_env):
         {"job_id": "job-2", "specialist_display_name": "Health"},
     ]
     assert [job.id for job in tool_env.job_registry.all()] == ["job-1", "job-2"]
+
+
+async def test_omitted_continue_id_selects_only_clarification_parent(tool_env):
+    awaiting = await tool_env.add_job(
+        "job-awaiting",
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.READY,
+        terminal_at=time.time(),
+        expires_at=time.time() + 900,
+        result=json.dumps(_structured_result(
+            status="needs_clarification",
+            clarification="Which card?",
+        )),
+        awaiting_input=True,
+        continuable_until=time.time() + 900,
+    )
+    answered = await tool_env.add_job(
+        "job-answered",
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.DELIVERED,
+        terminal_at=time.time(),
+        expires_at=time.time() + 900,
+        result=json.dumps(_structured_result()),
+    )
+
+    payload = tool_payload(await _call(
+        tools.continue_voice_job,
+        voice_origin(),
+        {"input": "Black Lotus", "job_id": ""},
+    ))
+
+    assert payload["status"] == "pending"
+    child = tool_env.job_registry.get(payload["job_id"])
+    assert child.parent_job_id == awaiting.id
+    assert tool_env.job_registry.get(awaiting.id).awaiting_input is False
+    assert tool_env.job_registry.get(answered.id) == answered
+
+
+async def test_server_bound_control_identity_reanchors_from_other_device(tool_env):
+    parent = await tool_env.add_job(
+        "job-parent",
+        job_control_id="entry-1",
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.READY,
+        terminal_at=time.time(),
+        expires_at=time.time() + 900,
+        result=json.dumps(_structured_result(
+            status="needs_clarification",
+            clarification="Which card?",
+        )),
+        awaiting_input=True,
+        continuable_until=time.time() + 900,
+    )
+
+    payload = tool_payload(await _call(
+        tools.continue_voice_job,
+        voice_origin(
+            chat_id="device-office",
+            origin_device_id="device-office",
+            voice_job_control_id="entry-1",
+        ),
+        {"input": "Black Lotus", "job_id": parent.id},
+    ))
+
+    assert payload["status"] == "pending"
+    child = tool_env.job_registry.get(payload["job_id"])
+    assert child.job_control_id == "entry-1"
+    assert child.scope_id == "device-office"
+    assert child.origin_device_id == "device-office"
+    historical_parent = tool_env.job_registry.get(parent.id)
+    assert historical_parent.scope_id == "scope-1"
+    assert historical_parent.origin_device_id == "device-kitchen"
+
+
+async def test_different_server_control_identity_cannot_access_job(tool_env):
+    await tool_env.add_job(
+        "job-parent",
+        job_control_id="entry-1",
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.READY,
+        terminal_at=time.time(),
+        expires_at=time.time() + 900,
+        result=json.dumps(_structured_result(
+            status="needs_clarification",
+            clarification="Which card?",
+        )),
+        awaiting_input=True,
+        continuable_until=time.time() + 900,
+    )
+
+    denied = tool_payload(await _call(
+        tools.continue_voice_job,
+        voice_origin(
+            chat_id="device-office",
+            origin_device_id="device-office",
+            voice_job_control_id="entry-other",
+        ),
+        {"input": "Black Lotus", "job_id": "job-parent"},
+    ))
+
+    assert denied["kind"] == "job_not_found"
+    assert len(tool_env.job_registry.all()) == 1
 
 
 @pytest.mark.asyncio
