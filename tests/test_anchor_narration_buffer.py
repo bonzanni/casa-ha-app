@@ -104,6 +104,15 @@ def _narration_sends(rec, *, exclude=()):
     return [t for _tp, t in rec.sends if t not in exclude]
 
 
+def _ah(question: str = "Q?") -> str:
+    """wb2-1 (whole-branch gate wave 2): the projection hash the relay computes
+    for an anchor ask with *question* — the SAME value the driver seam reports as
+    an anchor's ``source_hash``. A candidate arms POSITIVELY only when the seam's
+    ``source_hash`` matches its own block hash, so every arming test's seam stub
+    now carries the identity of the anchor whose prose it is meant to suppress."""
+    return projection_hash(ASK_TOOL, {"question": question})
+
+
 # ===========================================================================
 # RED anchor (d): the atomic sequencer op (Sol r4-2) — deterministic interleave.
 # ===========================================================================
@@ -187,7 +196,7 @@ async def test_anchor_open_at_result_discards_trailing_narration(tmp_path):
     cursor = tmp_path / ".stream_cursor.json"
     relay = _make_relay(
         tmp_path, cursor, rec, events, sequencer=seq,
-        open_anchor_state=lambda: (5, 500),  # open-and-unanswered throughout
+        open_anchor_state=lambda: (5, 500, _ah()),  # open-and-unanswered throughout
     )
     await relay.run()
 
@@ -217,7 +226,7 @@ async def test_tool_use_flushes_buffer_and_disarms(tmp_path):
     cursor = tmp_path / ".stream_cursor.json"
     relay = _make_relay(
         tmp_path, cursor, rec, events, sequencer=seq,
-        open_anchor_state=lambda: (5, 500),  # anchor stays open all turn
+        open_anchor_state=lambda: (5, 500, _ah()),  # anchor stays open all turn
     )
     await relay.run()
 
@@ -237,7 +246,7 @@ async def test_second_anchor_reamms_after_flush(tmp_path):
     seam here reports 500 for Q1 then 601 for the genuinely-new Q2."""
     rec, events = Recorder(), []
     seq, _clock = _fast_sequencer(rec)
-    seam_state = {"open": (5, 500)}
+    seam_state = {"open": (5, 500, _ah("Q1?"))}
     seam = lambda: seam_state["open"]  # noqa: E731
 
     _write_current(tmp_path, [
@@ -254,7 +263,7 @@ async def test_second_anchor_reamms_after_flush(tmp_path):
     assert relay._suppressing_for is None
 
     # A SECOND, genuinely NEW anchor surfaces with its OWN mid (601, not 500).
-    seam_state["open"] = (6, 601)
+    seam_state["open"] = (6, 601, _ah("Q2?"))
     _append_current(tmp_path, [
         _anchor_ask("Q2?"),                     # NEW anchor → re-arm off 601
         _text("second signoff"),                # buffered under the new anchor
@@ -286,7 +295,7 @@ async def test_rejected_ask_after_flush_does_not_rearm_off_prior_anchor(tmp_path
     cursor = tmp_path / ".stream_cursor.json"
     relay = _make_relay(
         tmp_path, cursor, rec, events, sequencer=seq,
-        open_anchor_state=lambda: (5, 500),  # A stays open; B never surfaces
+        open_anchor_state=lambda: (5, 500, _ah("Q_A?")),  # A stays open; B never surfaces
     )
     await relay.run()
 
@@ -296,6 +305,81 @@ async def test_rejected_ask_after_flush_does_not_rearm_off_prior_anchor(tmp_path
     assert _narration_sends(rec) == ["a-signoff "]
     assert rec.edits[-1][2] == "a-signoff b-prose"
     assert relay._suppressing_for is None
+
+
+async def test_rejected_ask_next_turn_does_not_bind_prior_open_anchor(tmp_path):
+    """wb2-1 (whole-branch gate wave 2): the CROSS-TURN residual. Anchor A is
+    open from turn 1; turn 2's ask B records a candidate (its block resolves
+    ``slot_timeout`` — the out-of-band / refusal ordering) but never surfaces its
+    OWN anchor (the driver later refuses B ``question_pending`` and cancels its
+    intent), while the driver seam still reports A open. The per-turn disarmed set
+    was empty, so wave-1's negative binding armed B's prose off the still-open A
+    and discarded it at result. Positive source-hash binding fixes it: B's
+    candidate (its own block hash) never matches A's ``source_hash``, so the
+    post-B prose POSTS."""
+    rec, events = Recorder(), []
+    seq, _clock = _fast_sequencer(rec)
+    # The seam reports A (turn 1's anchor) throughout — with A's OWN source hash.
+    seam = lambda: (5, 500, _ah("A?"))  # noqa: E731
+
+    _write_current(tmp_path, [_init(), _anchor_ask("A?"), _result()])
+    cursor = tmp_path / ".stream_cursor.json"
+    relay = _make_relay(
+        tmp_path, cursor, rec, events, sequencer=seq, open_anchor_state=seam,
+    )
+    await relay.run()
+
+    # Turn 2's B records a candidate but its own anchor never surfaces; the seam
+    # still reports A. B's post-prose must reach the wire (not armed off A).
+    _append_current(
+        tmp_path,
+        [_init(), _anchor_ask("B?"), _text("keep me"), _result()],
+    )
+    await relay.run()
+
+    assert "keep me" in _narration_sends(rec)
+
+
+# ===========================================================================
+# wb2-3 (whole-branch gate wave 2): TERMINAL settlement DISCARDS held narration.
+# ===========================================================================
+
+
+async def test_terminal_settle_does_not_flush_held_signoff(tmp_path):
+    """wb2-3: terminal settlement closes the anchor ledger (the seam now reports
+    ``None``) while the relay is still alive and a queued ``result`` is consumed
+    in that window. Without a terminal signal the relay mistakes the closed
+    ledger for an answer and FLUSHES the held sign-off below the terminal
+    completion. The driver-injected ``engagement_terminal`` seam makes the result
+    boundary DISCARD the held prose instead (D5 discard doctrine)."""
+    rec, events = Recorder(), []
+    seq, _clock = _fast_sequencer(rec)
+    terminal = {"value": False}
+
+    def seam():
+        # Terminal settle closes the anchor, so the effective ledger seam reports
+        # None — indistinguishable from an answer at the bare seam.
+        return None if terminal["value"] else (5, 500, _ah())
+
+    _write_current(
+        tmp_path,
+        [_init(), _anchor_ask(), _text("I will wait")],
+    )
+    relay = _make_relay(
+        tmp_path, tmp_path / ".stream_cursor.json", rec, events,
+        sequencer=seq, open_anchor_state=seam,
+        engagement_terminal=lambda: terminal["value"],
+    )
+    await relay.run()
+    assert rec.sends == []
+
+    # Model settle_all_open_questions closing the ledger before driver.cancel
+    # stops the still-live relay, then a queued result frame is consumed.
+    terminal["value"] = True
+    _append_current(tmp_path, [_result()])
+    await relay.run()
+
+    assert "I will wait" not in _narration_sends(rec)
 
 
 # ===========================================================================
@@ -309,7 +393,7 @@ async def test_answer_before_result_flushes_buffer(tmp_path):
     answer legitimizes the trailing prose)."""
     rec, events = Recorder(), []
     seq, _clock = _fast_sequencer(rec)
-    seam_state = {"open": (9, 900)}
+    seam_state = {"open": (9, 900, _ah())}
     seam = lambda: seam_state["open"]  # noqa: E731
 
     _write_current(tmp_path, [_init(), _anchor_ask(), _text("bye")])
@@ -359,7 +443,7 @@ async def test_late_post_arms_then_discards(tmp_path):
     assert relay._suppressing_for is None  # seam None at block time ⇒ unarmed
 
     # The anchor surfaces OUT OF BAND (a late watcher post) between polls.
-    seam_state["open"] = (7, 555)
+    seam_state["open"] = (7, 555, _ah())
     _append_current(tmp_path, [_text("hello")])
     await relay.run()
 
@@ -391,7 +475,7 @@ async def test_post_first_debt_consumed_arms_then_discards(tmp_path):
     clock["t"] = 10.0  # past intent_timeout_s (5.0)
     await seq.process_intents_once()  # posts out-of-band NOW; leaves the debt
 
-    seam = lambda: (3, 777)  # noqa: E731 — the anchor is genuinely open
+    seam = lambda: (3, 777, _ah())  # noqa: E731 — the anchor is genuinely open
 
     _write_current(tmp_path, [_init(), _anchor_ask(), _text("after")])
     cursor = tmp_path / ".stream_cursor.json"
@@ -476,7 +560,7 @@ async def test_turn_boundary_resets_candidate_arming_and_buffer(tmp_path):
     cursor = tmp_path / ".stream_cursor.json"
     relay = _make_relay(
         tmp_path, cursor, rec, events, sequencer=seq,
-        open_anchor_state=lambda: (1, 100),
+        open_anchor_state=lambda: (1, 100, _ah()),
     )
     await relay.run()
     assert relay._suppressing_for == (1, 100)  # armed mid-turn (before result)
@@ -550,7 +634,7 @@ async def test_crash_after_held_mixed_frame_resurfaces_before_advance(tmp_path):
     seq1, _c1 = _fast_sequencer(rec1)
     relay1 = _make_relay(
         tmp_path, cursor, rec1, [], sequencer=seq1,
-        open_anchor_state=lambda: (5, 500),
+        open_anchor_state=lambda: (5, 500, _ah()),
     )
     await relay1.run()
     assert rec1.sends == []                                   # held, never posted
@@ -562,7 +646,7 @@ async def test_crash_after_held_mixed_frame_resurfaces_before_advance(tmp_path):
     seq2, _c2 = _fast_sequencer(rec2)
     relay2 = _make_relay(
         tmp_path, cursor, rec2, events2, sequencer=seq2,
-        open_anchor_state=lambda: (5, 500),   # anchor STILL open on recovery
+        open_anchor_state=lambda: (5, 500, _ah()),   # anchor STILL open on recovery
     )
     await relay2.run()
 
@@ -599,7 +683,7 @@ async def test_crash_before_writeahead_save_resurfaces(tmp_path):
     seq, _clock = _fast_sequencer(rec)
     relay = _make_relay(
         tmp_path, cursor, rec, events, sequencer=seq,
-        open_anchor_state=lambda: (5, 500),   # anchor open — yet the prose posts
+        open_anchor_state=lambda: (5, 500, _ah()),   # anchor open — yet the prose posts
     )
     await relay.run()
 
@@ -639,7 +723,7 @@ async def test_cold_marker_disarms_catchup_then_next_turn_rearms(tmp_path):
     seq, _clock = _fast_sequencer(rec)
     relay = _make_relay(
         tmp_path, cursor, rec, events, sequencer=seq,
-        open_anchor_state=lambda: (5, 500),   # both anchors open all along
+        open_anchor_state=lambda: (5, 500, _ah("Q2?")),   # both anchors open all along
     )
     await relay.run()
 
@@ -674,7 +758,7 @@ async def test_segment_gap_with_marker_clears_and_next_turn_arms(tmp_path, caplo
     seq, _clock = _fast_sequencer(rec)
     relay = _make_relay(
         tmp_path, cursor, rec, events, sequencer=seq,
-        open_anchor_state=lambda: (5, 500),
+        open_anchor_state=lambda: (5, 500, _ah()),
     )
     with caplog.at_level(logging.WARNING):
         await relay.run()
@@ -701,7 +785,7 @@ async def test_warm_abnormal_spawn_flushes_before_checkpoint(tmp_path):
     seq, _clock = _fast_sequencer(rec)
     relay = _make_relay(
         tmp_path, cursor, rec, events, sequencer=seq,
-        open_anchor_state=lambda: (5, 500),   # anchor open ⇒ "held" is buffered
+        open_anchor_state=lambda: (5, 500, _ah()),   # anchor open ⇒ "held" is buffered
     )
     await relay.run()
 
@@ -737,7 +821,7 @@ async def test_cold_abnormal_spawn_clears_marker_unconditionally(tmp_path):
     seq, _clock = _fast_sequencer(rec)
     relay = _make_relay(
         tmp_path, cursor, rec, events, sequencer=seq,
-        open_anchor_state=lambda: (5, 500),
+        open_anchor_state=lambda: (5, 500, _ah("Q2?")),
     )
     await relay.run()
 
@@ -787,7 +871,7 @@ async def test_abnormal_spawn_crash_between_event_and_checkpoint_redelivers(
     seq1, _c1 = _fast_sequencer(rec1)
     relay1 = _make_relay(
         tmp_path, cursor, rec1, [], sequencer=seq1,
-        open_anchor_state=lambda: (5, 500),
+        open_anchor_state=lambda: (5, 500, _ah("Q1?")),
     )
     relay1.on_turn_event = crashing_on_event
     with pytest.raises(RuntimeError):
@@ -803,7 +887,7 @@ async def test_abnormal_spawn_crash_between_event_and_checkpoint_redelivers(
     seq2, _c2 = _fast_sequencer(rec2)
     relay2 = _make_relay(
         tmp_path, cursor, rec2, events2, sequencer=seq2,
-        open_anchor_state=lambda: (5, 500),
+        open_anchor_state=lambda: (5, 500, _ah("Q1?")),
     )
     await relay2.run()
 

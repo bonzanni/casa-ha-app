@@ -162,6 +162,10 @@ class SendIntent:
     slot_missed: bool = False       # relay slot timed out while this was pending
     timeout_posted: bool = False    # §2(5) one-block consumption debt
     consumed: bool = False          # retired from matching
+    on_retire: Any = None           # wb2-4: called ONCE when the intent is pruned
+    #                                 at turn end — the ask handler wires it to
+    #                                 release the validation gate's lifecycle pin.
+    _retired: bool = False          # wb2-4: guards the one-shot on_retire call
     post_failed: bool = False       # F3: poster failed — surfaced ok:false,
     #                                 retired from matching (NOT a success debt)
 
@@ -202,6 +206,7 @@ class IntentRegistry:
 
     def register(
         self, *, request_id: str, tool_name: str, projection_hash: str, poster: Any,
+        on_retire: Any = None,
     ) -> tuple[SendIntent, bool]:
         """Register (or REATTACH to) an intent. Returns ``(intent, created)``.
 
@@ -209,6 +214,11 @@ class IntentRegistry:
         intent is returned with ``created=False`` so a transport retry can read
         the recorded outcome (including the posted ``message_id``) and can
         neither double-post nor consume another frame.
+
+        wb2-4: ``on_retire`` (optional) is called ONCE when the intent is pruned
+        at turn end — the ask handler uses it to release its validation gate's
+        intent-lifecycle pin. A REATTACH never overwrites the first
+        registration's ``on_retire`` (idempotent — one pin, one release).
         """
         existing = self._by_request.get(request_id)
         if existing is not None:
@@ -220,6 +230,7 @@ class IntentRegistry:
             poster=poster,
             registered_at=self._now(),
             seq=self._next_seq,
+            on_retire=on_retire,
         )
         self._next_seq += 1
         self._by_seq.append(intent)
@@ -295,7 +306,23 @@ class IntentRegistry:
         return any(i.matchable() for i in self._by_seq)
 
     def prune(self) -> None:
-        """§2(6): drop all intents, tombstones and id→outcome at turn end."""
+        """§2(6): drop all intents, tombstones and id→outcome at turn end.
+
+        wb2-4: fire each intent's ``on_retire`` hook ONCE as it is dropped — this
+        is the intent's definitive RETIREMENT point (a cancelled/consumed intent
+        stays a matchable tombstone until here), so the ask handler's validation-
+        gate pin is released exactly when the intent it protects ceases to exist.
+        A hook raising must never leave the registry half-pruned."""
+        for intent in self._by_seq:
+            hook = intent.on_retire
+            if hook is not None and not intent._retired:
+                intent._retired = True
+                try:
+                    hook()
+                except Exception:  # noqa: BLE001 — gate-pin release is hygiene-only
+                    logger.debug(
+                        "send-intent on_retire hook failed (rid=%s)",
+                        intent.request_id, exc_info=True)
         self._by_seq.clear()
         self._by_request.clear()
 
@@ -674,14 +701,17 @@ class OutputSequencer:
 
     def register_intent(
         self, *, request_id: str, tool_name: str, projection_hash: str, poster: Any,
+        on_retire: Any = None,
     ) -> tuple[SendIntent, bool]:
         """Register (or reattach to) a discrete-send intent (§2(1)). See
         :meth:`IntentRegistry.register`. Ingresses (T2/T3) call this at fence
         entry with a ``poster`` coroutine-factory that performs the actual
-        keyboard/text post when the relay reaches the block."""
+        keyboard/text post when the relay reaches the block. wb2-4: ``on_retire``
+        (optional) fires when the intent is pruned at turn end."""
         return self.registry.register(
             request_id=request_id, tool_name=tool_name,
             projection_hash=projection_hash, poster=poster,
+            on_retire=on_retire,
         )
 
     def set_intent_poster(self, request_id: str, poster: Any) -> SendIntent | None:

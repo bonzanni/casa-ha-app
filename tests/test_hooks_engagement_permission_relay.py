@@ -581,10 +581,12 @@ class TestPermissionRetryReattach:
 
         class _Drv:
             def register_send_intent(self, *, engagement_id, request_id,
-                                     tool_name, projection_hash, poster):
+                                     tool_name, projection_hash, poster,
+                                     on_retire=None):
                 return seq.register_intent(
                     request_id=request_id, tool_name=tool_name,
-                    projection_hash=projection_hash, poster=poster)
+                    projection_hash=projection_hash, poster=poster,
+                    on_retire=on_retire)
 
             def set_send_intent_poster(self, e, r, p):
                 return seq.set_intent_poster(r, p)

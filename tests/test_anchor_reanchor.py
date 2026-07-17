@@ -1713,3 +1713,125 @@ class TestBootReplayOwner:
         assert captured.get("snapshot") == []
         # And the fresh question survives in the ledger (never expired).
         assert reg.open_question_entries(rec.id)
+
+
+# ===========================================================================
+# wb2-2 (whole-branch gate wave 2): the marker-edit → unstage sequence must be
+# LINEARIZABLE against an answer reservation / terminal flip that lands during
+# EITHER awaited step. wb1-2 added ONE pre-unstage check, but a reservation can
+# still install WHILE the unstage write is awaiting persistence (or while the
+# OPEN-marker edit is in flight), after which the unstage removes the stale copy
+# and promotion settles ONLY the current copy — stranding the old message
+# permanently on the OPEN "answer the current copy below" marker. The fix re-
+# reads lifecycle after the edit AND after the unstage, leaving/restoring the
+# stale entry staged so settlement re-renders it TERMINAL. REAL registry + REAL
+# sequencer (fake wire) + injected clocks; NEVER patches <module>.asyncio.sleep.
+# ===========================================================================
+
+
+class TestUnstageLinearizableAgainstReservation:
+    async def test_answer_reservation_during_current_unit_marker_edit(self, tmp_path):
+        """The current-question re-anchor unit's step-4 OPEN-marker edit is in
+        flight when an answer reservation lands. The re-check AFTER the edit must
+        LEAVE the stale copy staged so promotion terminalizes it — not unstage it
+        and strand the old copy on the OPEN marker."""
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        wire.edit_block = asyncio.Event()
+        drv = _make_driver(tmp_path, reg, wire)
+        seq = drv._ensure_sequencer(rec)
+        seq._high_water = 600
+
+        moving = asyncio.create_task(drv._reanchor_pass(rec))
+        for _ in range(100):
+            if wire.edit_markup_calls:
+                break
+            await asyncio.sleep(0.001)
+        assert wire.edit_markup_calls == 1
+
+        # The new current copy has committed and the old-copy OPEN marker edit is
+        # in flight. This is settlement-begun under the driver's own predicate.
+        assert drv.reserve_answer(rec.id) is not None
+        assert drv._settlement_begun(rec.id, n)
+        wire.edit_block.set()
+        assert await moving is True
+
+        # Complete the normal enqueue-time answer settlement.
+        await drv._promote_answer_on_enqueue(rec)
+
+        old_texts = [text for _, mid, text in wire.edits if mid == 500]
+        assert old_texts[-1] == f"⤵ MOVED Q{n} — resolved below"
+
+    async def test_reservation_during_current_unit_unstage(self, tmp_path):
+        """The current-question re-anchor unit's step-4 ``unstage_stale_mid`` is
+        awaiting persistence when an answer reservation lands. The re-check AFTER
+        the unstage must RE-STAGE the stale copy so promotion terminalizes it."""
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire)
+        seq = drv._ensure_sequencer(rec)
+        seq._high_water = 600
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        real_unstage = reg.unstage_stale_mid
+
+        async def blocked_unstage(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await real_unstage(*args, **kwargs)
+
+        reg.unstage_stale_mid = blocked_unstage
+        moving = asyncio.create_task(drv._reanchor_pass(rec))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        assert drv.reserve_answer(rec.id) is not None
+        release.set()
+        assert await moving is True
+        await drv._promote_answer_on_enqueue(rec)
+
+        old_texts = [text for _, mid, text in wire.edits if mid == 500]
+        assert old_texts[-1] == f"⤵ MOVED Q{n} — resolved below"
+
+    async def test_reservation_after_second_check_during_durable_unstage(
+            self, tmp_path):
+        """The unified historical scheduler's durable step: the marker edit
+        succeeded and the code's second lifecycle check already ran; the awaited
+        ``unstage_stale_mid`` is now in flight when the answer reservation lands.
+        The re-check AFTER the unstage must RE-STAGE the stale copy so settlement
+        turns its OPEN marker terminal."""
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire)
+        drv._ensure_sequencer(rec)
+        await reg.stage_stale_mid(rec.id, n, 500, kind="plain")
+        await reg.update_question_mid(rec.id, n, 505)
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        real_unstage = reg.unstage_stale_mid
+
+        async def blocked_unstage(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await real_unstage(*args, **kwargs)
+
+        reg.unstage_stale_mid = blocked_unstage
+        step = asyncio.create_task(drv._historical_durable_step(rec, n, 500))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        # Marker edit succeeded and the code's second lifecycle check already ran;
+        # the awaited unstage is now in flight. This is where Telegram can finish
+        # advance_high_water and synchronously install the answer reservation.
+        assert drv.reserve_answer(rec.id) is not None
+        assert drv._settlement_begun(rec.id, n)
+        release.set()
+        await asyncio.wait_for(step, timeout=1.0)
+
+        # Complete normal answer promotion/settlement. The old copy should have
+        # remained staged so settlement could turn its OPEN marker terminal.
+        await drv._promote_answer_on_enqueue(rec)
+        old_texts = [text for _, mid, text in wire.edits if mid == 500]
+        assert old_texts[-1] == f"⤵ MOVED Q{n} — resolved below"

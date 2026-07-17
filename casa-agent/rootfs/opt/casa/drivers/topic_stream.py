@@ -395,10 +395,26 @@ OnTurnEvent = Callable[[str, dict], Any]
 ReplyTexts = Callable[[], Any]
 # D5 (spec "Successful-anchor identity comes from the DRIVER"): the driver-
 # injected seam reading the LEDGER + answered-overlay + reservation truth.
-# Returns ``(question_number, tg_message_id)`` for the oldest genuinely open,
-# unanswered free-text anchor, or ``None``. Same injection style as
-# ``on_turn_event``; default ``None`` (below) leaves the feature inert.
-OpenAnchorState = Callable[[], "tuple[int, int] | None"]
+# Returns ``(question_number, tg_message_id, source_hash)`` for the oldest
+# genuinely open, unanswered free-text anchor, or ``None``. Same injection style
+# as ``on_turn_event``; default ``None`` (below) leaves the feature inert.
+#
+# wb2-1 (whole-branch gate wave 2): ``source_hash`` is the projection hash of the
+# ask that PRODUCED the anchor (the SAME hash the relay computes for its ask
+# block). It lets a candidate bind POSITIVELY to the anchor its OWN ask produced,
+# so a prior / co-existing open anchor can never arm a later, unrelated candidate
+# (the F-LEAK2 cross-turn residual). A legacy 2-tuple seam (``source_hash``
+# absent) reads as unbindable — the feature is then inert for that caller.
+OpenAnchorState = Callable[
+    [], "tuple[int, int, str | None] | tuple[int, int] | None"]
+# wb2-3 (whole-branch gate wave 2): the driver-injected TERMINAL lifecycle seam.
+# ``True`` once the engagement record has flipped terminal and
+# ``settle_all_open_questions`` is closing the anchor ledger while this relay is
+# still alive (until completion posting / topic closure). At ``result``/finalize a
+# terminal closure DISCARDS held narration (the engagement is over — D5 discard
+# doctrine) instead of mistaking the now-closed ledger for an answer and flushing
+# a held sign-off below the terminal completion. Default ``None`` = inert.
+EngagementTerminal = Callable[[], bool]
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -437,6 +453,7 @@ class TopicStreamRelay:
         edit_throttle: float = 1.0,
         sequencer: "OutputSequencer | None" = None,
         open_anchor_state: "OpenAnchorState | None" = None,
+        engagement_terminal: "EngagementTerminal | None" = None,
         _now: Callable[[], float] = time.monotonic,
         _sleep: Callable[[float], Awaitable[None]] = _default_sleep,
     ) -> None:
@@ -459,6 +476,8 @@ class TopicStreamRelay:
         self.on_turn_event = on_turn_event
         self.reply_texts = reply_texts
         self.open_anchor_state = open_anchor_state
+        # wb2-3: the driver-injected terminal-lifecycle seam (see EngagementTerminal).
+        self.engagement_terminal = engagement_terminal
         self._edit_throttle = edit_throttle
         self._now = _now
         self._sleep = _sleep
@@ -520,16 +539,13 @@ class TopicStreamRelay:
         # boundary (``_reset_turn_state``).
         self._anchor_candidate: tuple[str, str] | None = None
         self._suppressing_for: tuple[int, int] | None = None
-        # wb1-3 (whole-branch gate wave 1): the set of anchor ``tg_message_id``s
-        # that were already ARMED and then FLUSHED/DISARMED THIS turn. D5's rule
-        # is "re-arm only when a NEW anchor successfully surfaces"; a later
-        # candidate (e.g. a REJECTED/invalid ask that records a candidate but
-        # never surfaces its own anchor) must NEVER re-arm off a mid it already
-        # disarmed. The candidate was not bound to the anchor its ask produced,
-        # so a bare ``open_anchor_state`` read re-armed off the still-open PRIOR
-        # anchor A and discarded legitimate post-B prose. This set makes an
-        # already-disarmed anchor ineligible to re-arm. Reset every turn boundary.
-        self._disarmed_mids: set[int] = set()
+        # wb2-1 (whole-branch gate wave 2): arming is now POSITIVELY bound — a
+        # candidate arms ONLY on the anchor its OWN ask produced (the seam's
+        # ``source_hash`` matches the candidate's block hash — see
+        # ``_effective_open_state``). This supersedes wave-1's negative
+        # ``_disarmed_mids`` set (which excluded already-flushed mids but could not
+        # tell a candidate's OWN cross-turn anchor from an unrelated one) — ONE
+        # mechanism now (the r17 single-mechanism lesson), so that set is gone.
         # D5 Task C2: the anchor-scoped NARRATION BUFFER. While suppression is
         # armed, trailing prose is HELD here (never posted) as
         # ``(text, segment, offset_after)`` tuples — the frame coordinates travel
@@ -932,6 +948,14 @@ class TopicStreamRelay:
 
     async def _post_text(self, text: str, seg, off_after: int) -> None:
         """Text-only streaming path: throttle + single frame-end checkpoint."""
+        # wb2-3: once the engagement is TERMINAL (settle_all_open_questions closed
+        # the anchor ledger; this relay stays alive until completion posting),
+        # FORBID further narration writes — nothing may post below the terminal
+        # completion (D5 discard doctrine). Drop the text and advance the cursor so
+        # the frame is not re-read on the next poll.
+        if self._is_terminal():
+            self._checkpoint(seg, off_after)
+            return
         await self._maybe_arm_suppression()
         # §D5: armed (anchor open) — trailing prose is BUFFERED, never posted
         # here. Flushed on a later tool_use / an answer before ``result``, or
@@ -986,6 +1010,10 @@ class TopicStreamRelay:
     async def _append_narration(self, text: str, seg, off_after: int) -> None:
         """Append narration text WITHOUT throttle or checkpoint (used by the
         block-ordered mixed-frame path, which checkpoints once at frame end)."""
+        # wb2-3: terminal ⇒ forbid narration writes (see ``_post_text``). The
+        # frame-end checkpoint in ``_handle_assistant_blocks`` advances the cursor.
+        if self._is_terminal():
+            return
         await self._maybe_arm_suppression()
         # §D5: armed — BUFFER (see ``_post_text``). The frame-end checkpoint in
         # ``_handle_assistant_blocks`` is EXEMPTED while the buffer is non-empty.
@@ -1087,29 +1115,54 @@ class TopicStreamRelay:
         )
 
     async def _effective_open_state(self) -> "tuple[int, int] | None":
-        """The driver-injected ``open_anchor_state`` (``(n, mid) | None``) with
-        wb1-3 candidate-binding applied: an anchor whose ``mid`` was already
-        FLUSHED/DISARMED this turn (``_disarmed_mids``) is NOT eligible to arm a
-        NEW candidate, so it reads as CLOSED here. This is the single seam read
-        used by arming, the atomic hold-or-post, and the ``result``-time
-        flush-vs-discard decision, so all three agree on 're-arm only when a NEW
-        anchor surfaces'. Returns ``None`` when the seam is not injected."""
+        """The driver-injected ``open_anchor_state`` (``(n, mid, source_hash) |
+        None``) with wb2-1 POSITIVE candidate-binding applied: the reported anchor
+        is eligible to arm / hold / discard THIS turn's prose ONLY when its
+        ``source_hash`` matches the CURRENT anchor-candidate's block hash — i.e.
+        the anchor was produced by the candidate's OWN ask, never a prior or
+        co-existing anchor (the F-LEAK2 cross-turn residual: a refused/late ask
+        recorded a candidate but never surfaced its own anchor, and a bare oldest-
+        open read armed it off the still-open PRIOR anchor). Returns ``(n, mid)``
+        on a match, else ``None`` — the single seam read shared by arming, the
+        atomic hold-or-post, and the ``result``-time flush-vs-discard so all three
+        agree. ``None`` when the seam is not injected, when there is no candidate
+        to bind to, or when a legacy 2-tuple seam carries no ``source_hash``."""
         if self.open_anchor_state is None:
             return None
         state = await _maybe_await(self.open_anchor_state())
         if state is None:
             return None
-        if state[1] in self._disarmed_mids:
+        cand = self._anchor_candidate
+        if cand is None:
+            return None
+        source_hash = state[2] if len(state) > 2 else None
+        # POSITIVE binding: only the anchor THIS candidate's own ask produced.
+        if source_hash is None or source_hash != cand[1]:
             return None
         return (state[0], state[1])
+
+    def _is_terminal(self) -> bool:
+        """wb2-3: ``True`` once the driver-injected terminal seam reports the
+        engagement has flipped terminal (``settle_all_open_questions`` is closing
+        the anchor ledger while this relay is still alive). Inert (``False``) when
+        the seam is not injected."""
+        if self.engagement_terminal is None:
+            return False
+        try:
+            return bool(self.engagement_terminal())
+        except Exception:  # noqa: BLE001 — a seam read must never wedge the relay
+            logger.debug("engagement_terminal seam read failed", exc_info=True)
+            return False
 
     async def _maybe_arm_suppression(self) -> None:
         """Re-read the (candidate-bound) open-anchor seam and ARM suppression the
         moment this turn's anchor-candidate resolves to a genuinely open,
-        unanswered anchor that is NOT an already-disarmed prior anchor (§D5;
-        wb1-3). Called before processing each subsequent text frame and again at
-        ``result``. No-op once armed, when there is no candidate, or when the
-        seam was not injected (default ``None`` = feature inert)."""
+        unanswered anchor produced by the candidate's OWN ask — the seam's
+        ``source_hash`` matches the candidate's block hash (§D5; wb2-1 positive
+        binding, in ``_effective_open_state``). A prior / co-existing anchor never
+        matches, so it cannot arm this candidate. Called before processing each
+        subsequent text frame and again at ``result``. No-op once armed, when
+        there is no candidate, or when the seam was not injected (inert)."""
         # §D5 C3 (Sol r4-3): a cold recovery of a held-prose turn DISARMS
         # suppression for the recovered turn's catch-up so the prose re-renders
         # as ordinary narration; never arm while the latch is set.
@@ -1179,11 +1232,11 @@ class TopicStreamRelay:
         re-arms on the next prose frame; re-arming happens ONLY when a NEW anchor
         surfaces (a fresh ``_match_discrete_block`` candidate)."""
         await self._flush_anchor_buffer()
-        # wb1-3: remember this anchor's mid so a later candidate (e.g. a rejected
-        # ask that never surfaces its own anchor) can never re-arm off it — D5's
-        # "re-arm only when a NEW anchor surfaces".
-        if self._suppressing_for is not None:
-            self._disarmed_mids.add(self._suppressing_for[1])
+        # wb2-1: dropping the spent candidate is what enforces "re-arm only when a
+        # NEW anchor surfaces" — the next prose has no candidate to bind, and a
+        # later candidate only arms on ITS OWN anchor (positive source-hash bind),
+        # never off this just-disarmed one. (Wave-1's ``_disarmed_mids`` negative
+        # set is superseded by that positive binding.)
         self._suppressing_for = None
         self._anchor_candidate = None
 
@@ -1276,9 +1329,6 @@ class TopicStreamRelay:
         self._anchor_candidate = None
         self._suppressing_for = None
         self._anchor_buffer = []
-        # wb1-3: the disarmed-mid set is per-turn — a new turn's anchors are all
-        # eligible to arm again.
-        self._disarmed_mids = set()
         # §D5 C3: a turn boundary ends the cold-recovery catch-up window — clear
         # the disarm latch so subsequent turns arm suppression normally. (Cold
         # replay never calls ``_reset_turn_state`` — replayed frames <= current
@@ -1308,11 +1358,17 @@ class TopicStreamRelay:
         # The seam re-read here is not the r4-2 race: a reported answer means the
         # anchor already resolved, so no late anchor post can still race us.
         if self._anchor_buffer:
-            # wb1-3: read the CANDIDATE-BOUND seam — an already-disarmed prior
-            # anchor reads as closed, so the discard decision tracks the anchor
-            # this buffer was actually armed under.
+            # wb2-1: read the candidate-BOUND seam — only the anchor this buffer
+            # was actually armed under (its own ask's ``source_hash``) keeps it
+            # held; a closed/answered/unrelated anchor reads as ``None``.
             state = await self._effective_open_state()
-            if state is None:
+            # wb2-3: a TERMINAL engagement closure (the record flipped terminal and
+            # ``settle_all_open_questions`` closed the anchor ledger, so the seam
+            # now reports ``None``) is INDISTINGUISHABLE from an answer at the bare
+            # seam — but the engagement is OVER, so held prose must be DISCARDED,
+            # never flushed below the terminal completion (D5 discard doctrine). A
+            # genuine answer (``None`` and NOT terminal) still FLUSHES.
+            if state is None and not self._is_terminal():
                 await self._flush_anchor_buffer()
             else:
                 self._anchor_buffer = []
@@ -1583,7 +1639,6 @@ class TopicStreamRelay:
             await self._flush_anchor_buffer()          # (1) flush (no-op if empty)
             self._suppressing_for = None
             self._anchor_candidate = None
-            self._disarmed_mids = set()                 # wb1-3: per-turn set
             self._replay_disarmed = False
             await _maybe_await(
                 self.on_turn_event("spawn", {"epoch": frame.get("epoch")})  # (2)

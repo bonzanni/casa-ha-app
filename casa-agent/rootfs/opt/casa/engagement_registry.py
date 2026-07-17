@@ -850,6 +850,7 @@ class EngagementRegistry:
     async def add_open_question(
         self, engagement_id: str, number: int, tg_message_id: int | None,
         text: str | None = None, kind: str = "button",
+        source_hash: str | None = None,
     ) -> None:
         """Record a still-open question ``{n, tg_message_id, text, kind}``
         (persisted). ``text`` is the canonical displayed question so boot
@@ -857,6 +858,14 @@ class EngagementRegistry:
         state does not survive a restart). ``kind`` is ``"button"`` (broker tap)
         or ``"anchor"`` (free-text — settled by the next operator message).
         Idempotent on ``number``.
+
+        wb2-1 (whole-branch gate wave 2): ``source_hash`` (optional) is the
+        projection hash of the ask that produced this anchor — the SAME hash the
+        topic relay computes for the ask's tool_use block. Persisted so the relay's
+        driver-injected ``open_anchor_state`` seam can report it, letting a
+        narration-suppression candidate bind POSITIVELY to the anchor its OWN ask
+        produced (never a prior / co-existing open anchor). Absent for legacy rows
+        and button asks (harmless — button asks are never relay candidates).
 
         v0.79.0 (§4, Sol F6): STRICT persistence — a tombstone-write failure
         rolls ``open_questions`` back (full-field) and RE-RAISES rather than
@@ -878,6 +887,8 @@ class EngagementRegistry:
             }
             if text is not None:
                 entry["text"] = text
+            if source_hash is not None:
+                entry["source_hash"] = source_hash
             entries.append(entry)
             rec.open_questions = tuple(entries)
 

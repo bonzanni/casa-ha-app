@@ -1611,6 +1611,7 @@ class TestGateWiring:
 import verdict_broker as _verdict_broker_mod
 from channels.channel_handlers import (
     _ASK_VALIDATION_OWNERS,
+    _INTENT_GATE_PINS,
     ASK_GATES,
     AskValidationGate,
     get_or_create_gate,
@@ -1621,12 +1622,14 @@ from channels.channel_handlers import (
 @pytest.fixture(autouse=True)
 def _clean_ask_gates():
     """D1 tests own ``ASK_GATES`` / ``_ASK_VALIDATION_OWNERS`` — never leak a
-    gate or an owner marker into another test."""
+    gate or an owner marker (or a wb2-4 intent-lifecycle pin) into another test."""
     ASK_GATES.clear()
     _ASK_VALIDATION_OWNERS.clear()
+    _INTENT_GATE_PINS.clear()
     yield
     ASK_GATES.clear()
     _ASK_VALIDATION_OWNERS.clear()
+    _INTENT_GATE_PINS.clear()
 
 
 class _FakeClock:
@@ -1960,6 +1963,41 @@ class TestRefcountedRetention:
         assert gate.retirable() is True
 
 
+class TestIntentLifecycleGatePin:
+    """wb2-4 (whole-branch gate wave 2): a resolved (PASSED) gate is pinned to
+    its send-intent's lifetime, so it cannot retire while the intent is still
+    live — even past the reattach-retention bound. The retention window then only
+    governs POST-retirement observability. REAL handler + REAL OutputSequencer +
+    REAL gate through the ``wired`` harness."""
+
+    async def test_passed_gate_not_retirable_while_send_intent_live(
+        self, wired, monkeypatch,
+    ):
+        # Bound elapsed the instant a gate resolves — isolates the intent pin as
+        # the ONLY thing that can keep the gate un-retirable.
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 0.0)
+        eid = wired["rec"].id
+        task = asyncio.ensure_future(
+            wired["ask"](_FakeRequest(_anchor_payload(eid, "a1"))))
+        # Drive the relay-deferred anchor post: gate PASSED, intent LIVE (posted,
+        # not yet pruned), handler returned (its OWN gate pin already released).
+        await _drive_anchor(wired, task)
+
+        gate = ASK_GATES.get("a1")
+        # Pre-fix, the handler's own ``finally`` maybe-retires the gate (bound 0,
+        # refcount 0) WHILE the send-intent still lives — the gate would be gone.
+        assert gate is not None
+        assert gate.effective()[0] == "PASSED"
+        assert gate.retirable() is False          # the live intent pins it
+        assert maybe_retire_gate("a1") is False   # the sweep cannot drop it
+        assert "a1" in ASK_GATES
+
+        # Turn-end prune RETIRES the intent → its ``on_retire`` releases the pin →
+        # the gate is now retirable and drops out of ASK_GATES.
+        await wired["seq"].drain_and_prune_turn()
+        assert "a1" not in ASK_GATES
+
+
 # ===========================================================================
 # A5 review, Finding 1 — ASK_GATES grows unbounded. ``maybe_retire_gate`` is
 # only ever called at an ask's OWN ``finally`` / ``ask_cancel``, microseconds
@@ -2074,7 +2112,14 @@ class TestAskEntrySweepsPriorLeakedGates:
         assert "leak1" in ASK_GATES
         gate = ASK_GATES["leak1"]
         assert gate.effective()[0] != "PENDING"  # actually resolved
-        assert gate.refcount == 0  # and fully unreferenced
+        # wb2-4: the resolved gate stays REFERENCED by its still-live send-intent
+        # (pinned to the intent's lifetime) — it cannot retire while the intent
+        # lives, closing the drift where a 60s-elapsed PASSED gate could retire out
+        # from under a live intent and re-litigate a same-id retry as PENDING.
+        assert gate.refcount == 1
+        # Turn-end prune retires the intent → its ``on_retire`` releases the pin.
+        await wired["seq"].drain_and_prune_turn()
+        assert gate.refcount == 0
 
     async def test_second_ask_sweeps_the_first_gate_once_bound_elapsed(
         self, wired,
@@ -2084,6 +2129,10 @@ class TestAskEntrySweepsPriorLeakedGates:
             wired["ask"](_FakeRequest(_btn_payload(eid, "leak2"))))
         await _drive_button(wired, task1, "leak2")
         assert "leak2" in ASK_GATES
+        # wb2-4: leak2's gate is pinned by its live send-intent — the turn must
+        # end (prune retires the intent, releasing the pin) before the gate is
+        # eligible to be swept at all.
+        await wired["seq"].drain_and_prune_turn()
 
         # Simulate the retention bound having elapsed since resolution.
         # Production never passes an injected clock into this handler's

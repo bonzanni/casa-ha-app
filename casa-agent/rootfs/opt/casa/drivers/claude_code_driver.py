@@ -2361,7 +2361,7 @@ class ClaudeCodeDriver(DriverProtocol):
 
     def register_send_intent(
         self, *, engagement_id: str, request_id: str, tool_name: str,
-        projection_hash: str, poster: Any,
+        projection_hash: str, poster: Any, on_retire: Any = None,
     ) -> Any:
         """Register (or idempotently reattach to) a discrete-send INTENT (§2(1)).
 
@@ -2378,6 +2378,7 @@ class ClaudeCodeDriver(DriverProtocol):
         return seq.register_intent(
             request_id=request_id, tool_name=tool_name,
             projection_hash=projection_hash, poster=poster,
+            on_retire=on_retire,
         )
 
     def set_send_intent_poster(
@@ -3198,9 +3199,11 @@ class ClaudeCodeDriver(DriverProtocol):
         # unconfirmed edit PRESERVES the durable "reanchored" stale entry (the
         # D4 stale-sweep re-drives it). The OBLIGATION is already met (the
         # question is now LAST at new_mid), so this returns True regardless.
-        if old_mid is not None and n is not None:
-            if await self._reanchor_marker_edit(engagement, old_mid, n):
-                await self._best_effort_unstage(eng_id, n, old_mid)
+        #
+        # wb2-2 (whole-branch gate wave 2): the marker edit + unstage is made
+        # LINEARIZABLE against an answer reservation / terminal flip that can land
+        # during either awaited step — see ``_release_old_copy_lifecycle_aware``.
+        await self._release_old_copy_lifecycle_aware(engagement, n, old_mid)
         return True
 
     async def _reanchor_persist_in_unit(
@@ -3464,18 +3467,72 @@ class ClaudeCodeDriver(DriverProtocol):
         copy. Render the TERMINAL marker and LEAVE the entry staged so the
         settlement path (which renders reanchored stale copies terminal) owns the
         final state — NEVER unstage it out from under settlement."""
+        # wb2-2: the compound marker-edit + unstage is LINEARIZABLE against a
+        # reservation / terminal flip landing during EITHER awaited step (the
+        # OPEN-marker edit OR the unstage persist) — the shared helper below.
+        await self._release_old_copy_lifecycle_aware(engagement, n, mid)
+
+    async def _release_old_copy_lifecycle_aware(
+        self, engagement: EngagementRecord, n: int | None, old_mid: int | None,
+    ) -> None:
+        """wb2-2 (whole-branch gate wave 2): marker-edit the OLD anchor copy and
+        release its staged stale entry, LINEARIZABLE against an answer reservation
+        / terminal record flip that can land during EITHER awaited step — the
+        ``wait_for``-bounded OPEN-marker edit OR the awaited ``unstage_stale_mid``
+        persist. Shared by the current-question re-anchor unit (step 4) and the
+        unified historical scheduler's durable step.
+
+        Answer/terminal settlement (``_settle_ledger_entry``) renders a still-
+        staged ``reanchored`` stale copy to the TERMINAL ``resolved below`` marker.
+        So the invariant kept here is: once settlement has BEGUN for this question,
+        the old copy must be LEFT (or restored) staged so settlement terminalizes
+        it — never unstaged out from under settlement, stranding it permanently on
+        the OPEN ``answer the current copy below`` marker (the bug wb1-2's single
+        pre-unstage check still allowed, because the reservation can install WHILE
+        the unstage write is awaiting persistence).
+
+        Three lifecycle reads, each under the caller's held maintenance lock:
+        (1) BEFORE the edit — already begun ⇒ render TERMINAL, leave staged;
+        (2) AFTER the OPEN edit — a reservation may have landed while it was in
+        flight ⇒ leave staged, skip the unstage;
+        (3) AFTER the unstage persist — a reservation can install between check (2)
+        and the persisted removal ⇒ RE-STAGE the stale entry ``reanchored`` so
+        settlement finds and terminalizes it."""
         eng_id = engagement.id
-        if self._settlement_begun(eng_id, n) or self._record_is_terminal(eng_id):
-            await self._reanchor_marker_edit(engagement, mid, n, terminal=True)
+        if old_mid is None or n is None:
             return
-        if await self._reanchor_marker_edit(engagement, mid, n):
-            # Re-check before unstaging — settlement may have begun while the
-            # wait_for-bounded OPEN-marker edit was blocked (an answer
-            # reservation landing, or the record flipping terminal). If so, LEAVE
-            # the entry staged so settlement re-renders it terminal.
-            if self._settlement_begun(eng_id, n) or self._record_is_terminal(eng_id):
-                return
-            await self._best_effort_unstage(eng_id, n, mid)
+        if self._settlement_begun(eng_id, n) or self._record_is_terminal(eng_id):
+            await self._reanchor_marker_edit(engagement, old_mid, n, terminal=True)
+            return
+        if not await self._reanchor_marker_edit(engagement, old_mid, n):
+            return
+        if self._settlement_begun(eng_id, n) or self._record_is_terminal(eng_id):
+            return
+        await self._best_effort_unstage(eng_id, n, old_mid)
+        if self._settlement_begun(eng_id, n) or self._record_is_terminal(eng_id):
+            await self._restage_reanchored(eng_id, n, old_mid)
+
+    async def _restage_reanchored(
+        self, engagement_id: str, n: int | None, mid: int | None,
+    ) -> None:
+        """wb2-2: RE-STAGE ``mid`` as a ``reanchored`` stale copy after a lifecycle
+        race unstaged it just as settlement was beginning — so the settlement path
+        (which renders ``reanchored`` stale copies to the terminal marker) owns the
+        old copy's final state instead of stranding it on the OPEN marker.
+        Best-effort: a failed re-stage leaves the old copy on the OPEN marker (the
+        pre-fix outcome for this one message — strictly no worse), logged."""
+        reg = self._registry
+        if reg is None or n is None or mid is None:
+            return
+        stage = getattr(reg, "stage_stale_mid", None)
+        if stage is None:
+            return
+        try:
+            await stage(engagement_id, n, mid, kind="reanchored")
+        except Exception:  # noqa: BLE001 — best-effort restoration
+            logger.warning(
+                "engagement %s: re-stage after unstage race failed (n=%s mid=%s)",
+                engagement_id[:8], n, mid, exc_info=True)
 
     async def _orphan_marker_edit(
         self, engagement: EngagementRecord, orphan_mid: int, n: int | None,
@@ -3674,9 +3731,15 @@ class ClaudeCodeDriver(DriverProtocol):
         # truth source the A3 reply/stacking gates use — persisted ``answered``
         # ∪ overlay ∪ reservation excluded — reused verbatim as the relay's
         # injected seam.
-        def _open_anchor_state() -> tuple[int, int] | None:
+        # wb2-1 (whole-branch gate wave 2): report the anchor's SOURCE HASH (the
+        # projection hash of the ask that produced it — recorded on the ledger
+        # entry by the ask handler) so the relay can bind a candidate POSITIVELY to
+        # the anchor its OWN ask produced, never a prior / co-existing open anchor.
+        def _open_anchor_state() -> "tuple[int, int, str | None] | None":
             entry = self.effective_open_anchor(engagement.id)
-            return (entry["n"], entry["tg_message_id"]) if entry else None
+            if not entry:
+                return None
+            return (entry["n"], entry["tg_message_id"], entry.get("source_hash"))
 
         ws = Path(self._engagements_root) / engagement.id
         relay = TopicStreamRelay(
@@ -3696,6 +3759,9 @@ class ClaudeCodeDriver(DriverProtocol):
             # and the discrete ingresses agree on ordering + high-water.
             sequencer=self._ensure_sequencer(engagement),
             open_anchor_state=_open_anchor_state,
+            # wb2-3: terminal-lifecycle seam — a terminal closure DISCARDS held
+            # narration (never flushes a sign-off below the terminal completion).
+            engagement_terminal=lambda: self._record_is_terminal(engagement.id),
         )
         while True:
             try:

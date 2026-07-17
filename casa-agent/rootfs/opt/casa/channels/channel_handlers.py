@@ -265,6 +265,41 @@ def maybe_retire_gate(request_id: str) -> bool:
     return True
 
 
+# wb2-4 (whole-branch gate wave 2): gate pins tied to the SEND-INTENT lifecycle.
+# The gate's own handler pin is released in the ask handler's ``finally`` (when
+# the HTTP request ends), but the send-intent it authorized outlives the handler
+# — the shielded broker request / relay-deferred post stays live until turn-end
+# prune. The 60s ``_reattach_retention_bound`` stand-in could then retire a
+# resolved (PASSED) gate WHILE its intent is still live, so a same-``request_id``
+# retry gets a fresh PENDING gate instead of the resolved one. Pinning the gate
+# to the intent's lifetime (acquire at registration, release at the intent's
+# turn-end retirement via ``SendIntent.on_retire``) makes a gate un-retirable
+# while its intent lives; the retention window then only governs POST-retirement
+# observability, exactly as the spec's §D1 tombstone-retention states.
+_INTENT_GATE_PINS: dict[str, AskValidationGate] = {}
+
+
+def _pin_gate_to_intent(gate: AskValidationGate, request_id: str) -> None:
+    """Acquire an intent-lifecycle pin on *gate* (idempotent per request_id — a
+    same-``request_id`` reattach never double-pins, since the intent's single
+    ``on_retire`` releases exactly one pin)."""
+    if request_id in _INTENT_GATE_PINS:
+        return
+    gate.acquire()
+    _INTENT_GATE_PINS[request_id] = gate
+
+
+def _retire_intent_gate_pin(request_id: str) -> None:
+    """Release the intent-lifecycle pin for *request_id* and speculatively retire
+    the gate — wired to ``SendIntent.on_retire``, so it fires when the intent is
+    pruned at turn end. No-op when no pin is held."""
+    gate = _INTENT_GATE_PINS.pop(request_id, None)
+    if gate is None:
+        return
+    gate.release()
+    maybe_retire_gate(request_id)
+
+
 def _sweep_retirable_gates() -> None:
     """A5 review, Finding 1: opportunistically retire every CURRENTLY-
     retirable gate in :data:`ASK_GATES`.
@@ -1534,9 +1569,15 @@ def _make_ask(
                         engagement_id=eng_id, request_id=request_id,
                         tool_name=ASK_TOOL, projection_hash=projection_hash,
                         poster=_noop_poster,
+                        # wb2-4: pin the gate to THIS intent's lifetime; the pin
+                        # releases when the intent retires at turn-end prune.
+                        on_retire=lambda rid=request_id: _retire_intent_gate_pin(
+                            rid),
                     )
                     if res is not None:
                         _intent, created_intent = res
+                        if created_intent:
+                            _pin_gate_to_intent(gate, request_id)
                         if not created_intent:
                             # REATTACH: reuse the first attempt's outcome. If it
                             # already posted, return its id; if still UNRESOLVED,
@@ -1755,8 +1796,13 @@ def _make_ask(
                                 engagement_registry, "add_open_question", None)
                             if add is not None:
                                 try:
+                                    # wb2-1: record the ask's projection hash as the
+                                    # anchor's SOURCE HASH so the relay can bind its
+                                    # narration-suppression candidate positively to
+                                    # THIS anchor (never a prior/co-existing one).
                                     await add(eng_id, number, mid, text=display,
-                                              kind="anchor")
+                                              kind="anchor",
+                                              source_hash=projection_hash)
                                     added = True
                                 except Exception:  # noqa: BLE001
                                     logger.warning(
@@ -1954,9 +2000,14 @@ def _make_ask(
                     engagement_id=eng_id, request_id=request_id,
                     tool_name=ASK_TOOL, projection_hash=projection_hash,
                     poster=_noop_poster,
+                    # wb2-4: pin the gate to THIS intent's lifetime (released at
+                    # the intent's turn-end retirement).
+                    on_retire=lambda rid=request_id: _retire_intent_gate_pin(rid),
                 )
                 if res is not None:
                     _intent, created_intent = res
+                    if created_intent:
+                        _pin_gate_to_intent(gate, request_id)
                     if not created_intent:
                         # Finding 1: a prior operator-away refusal recorded an
                         # ``operator_away`` outcome on the intent → return it verbatim
