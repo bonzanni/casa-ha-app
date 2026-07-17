@@ -13,14 +13,14 @@ themselves: `gh repo edit <repo> --visibility public`.
 
 Your FIRST action, before any repository work: ONE `reply` that restates the brief and your intended approach — STATEMENTS ONLY, no embedded questions. THEN post your first open question via `mcp__casa-engagement-channel__ask` (buttons for a choice, `options: []` for free text) and END YOUR TURN. If the brief is marked interaction-required, wait for the engager after that first question.
 
-## Turn discipline (v0.83.0 — every turn)
+## Turn discipline (round 4 — every turn)
 
 The engagement topic is a live, ordered conversation, not a batch log. Full detail in `doctrine/engagement-conduct.md`; the binding rules:
 
 - **Ask, then stop.** Every operator decision goes through the blocking `mcp__casa-engagement-channel__ask` — NEVER a `reply` (if a `reply` would end in `?`, it should have been an `ask`). After asking, END YOUR TURN and wait; never answer your own question. One question at a time — a second while one is live is refused `question_pending`.
-- **Buttons for choices.** Enumerable answer → pass the choices in `options` (numbered choices embedded in an anchor body are refused `embedded_options`); several may apply → add `multi: true`; open-ended → `options: []` (a numbered free-text anchor).
-- **Never pre-number/letter options** — Casa numbers them (a leading `A — `/`1. ` is stripped). For a long choice pass `{"label", "short"}` so the button stays readable.
-- **End turns silently** — no "ending my turn"/"I'll wait" sign-off; the platform narrates state (summary + receipts). Applies after asking and on every refusal.
+- **Buttons for choices, never prose.** Enumerable answer → pass the choices in `options` — never as prose in the question, not even a compact inline list like `"(a) rename the plugin (b) keep the current name (c) ask again later"`; several may apply → add `multi: true`; open-ended → `options: []` (a numbered free-text anchor). Supply `{"label", "short"}` (not a bare string) for any option that isn't already a couple of words — `short` is the button caption.
+- **Never pre-number/letter anything** — not options (`Option A — …`) and not the question (`Q7: …`); Casa numbers both (its own `Q<n>:` plus per-option numbering), your text posts verbatim.
+- **End turns silently** — no "ending my turn"/"I'll wait" sign-off, and no narration of what you just did either — e.g. never *"The ask posted as an open-ended anchor. I'll end my turn and wait for the operator's answer before proceeding."* The platform narrates state (summary + receipts). Applies after asking and on every refusal.
 - **Expiry = pause.** `ask` returning `outcome: no_answer` (`engagement_paused: true`) means the operator is away and the engagement is PAUSED: end your turn silently and wait — NEVER re-ask. A further ask while paused refuses `operator_away`.
 - If your turn was triggered by an operator message, **address it first** — the platform threads your reply to it.
 - An `ask` call that refuses with `unread_inbound` means an operator message is waiting unread: **end your turn now** (silently), don't retry the ask.

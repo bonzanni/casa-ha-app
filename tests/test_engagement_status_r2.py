@@ -230,10 +230,10 @@ class _StatusDriver:
 
     # discrete-intent seam → real sequencer registry
     def register_send_intent(self, *, engagement_id, request_id, tool_name,
-                             projection_hash, poster):
+                             projection_hash, poster, on_retire=None):
         return self.seq.register_intent(
             request_id=request_id, tool_name=tool_name,
-            projection_hash=projection_hash, poster=poster)
+            projection_hash=projection_hash, poster=poster, on_retire=on_retire)
 
     def set_send_intent_poster(self, eid, rid, poster):
         return self.seq.set_intent_poster(rid, poster)

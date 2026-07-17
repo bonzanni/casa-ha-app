@@ -45,6 +45,14 @@ class _FakeChannel:
         self._next_id += 1
         return mid
 
+    async def send_to_topic(self, thread_id, text, **kwargs) -> int:
+        # A6 (spec §D1): the anchor poster now posts via the single-attempt
+        # plain ``send_to_topic``. Records into the same ``sent_texts`` ledger.
+        self.sent_texts.append((thread_id, text))
+        mid = self._next_id
+        self._next_id += 1
+        return mid
+
     async def send_response_to_topic(self, topic_id, text) -> int:
         self.sent_texts.append((topic_id, text))
         mid = self._next_id
@@ -103,10 +111,10 @@ class _FakeDriver:
 
     # discrete-intent seam (delegates to the real sequencer registry)
     def register_send_intent(self, *, engagement_id, request_id, tool_name,
-                             projection_hash, poster):
+                             projection_hash, poster, on_retire=None):
         return self.seq.register_intent(
             request_id=request_id, tool_name=tool_name,
-            projection_hash=projection_hash, poster=poster)
+            projection_hash=projection_hash, poster=poster, on_retire=on_retire)
 
     def set_send_intent_poster(self, eid, rid, poster):
         return self.seq.set_intent_poster(rid, poster)
@@ -217,11 +225,11 @@ async def test_answered_settles_with_check_and_clears_keyboard(env):
 
     assert _body(resp) == {
         "ok": True, "outcome": "answered", "option": "B", "option_index": 1}
-    # Settle edit: PRESENT clear_keyboard, ✅ + FULL chosen option appended
-    # BELOW the canonical body (W-R3: body carries every option verbatim).
+    # Settle edit: PRESENT clear_keyboard, BOUNDED positional ✅ copy appended
+    # BELOW the canonical body (v0.84.0 D1 bullet 3 — never the full label).
     edit = env["ch"].edits[-1]
     assert edit["clear_keyboard"] is True
-    assert edit["text"] == "Q1: Proceed?\n\n1. A\n2. B\n✅ B"
+    assert edit["text"] == "Q1: Proceed?\n\n1. A\n2. B\n✅ Option 2"
 
 
 async def test_expired_settles_with_hourglass_and_clears_keyboard(env, monkeypatch):
@@ -243,15 +251,16 @@ async def test_expired_settles_with_hourglass_and_clears_keyboard(env, monkeypat
         "⌛ expired — engagement paused; reply here to continue")
 
 
-async def test_canonical_qnumber_strips_agent_authored_prefix(env):
+async def test_canonical_qnumber_prepends_verbatim(env):
     eid = env["rec"].id
-    # Agent authored its own "Q7:" — must be stripped and re-prefixed with the
-    # ALLOCATED durable number so message == registry == summary accessor.
+    # v0.85.0 (round 4, D4): the agent's own "Q7:" prefix is preserved
+    # VERBATIM — Casa only PREPENDS the allocated durable number, it no
+    # longer strips an agent-authored leading "Q<digits>:".
     task = asyncio.ensure_future(env["ask"](_FakeRequest(_ask_payload(
         engagement_id=eid, request_id="c1", question="Q7: Which DB?"))))
     await asyncio.sleep(0.02)
     posted_q = env["ch"].options_keyboards[-1]["question"]
-    assert posted_q == "Q1: Which DB?\n\n1. A\n2. B"
+    assert posted_q == "Q1: Q7: Which DB?\n\n1. A\n2. B"
     # open_questions ledger + summary accessor agree with the message.
     assert env["reg"].open_question_numbers(eid) == [1]
     env["broker"].deliver(
@@ -398,6 +407,12 @@ class _FailingChannel(_FakeChannel):
     """A channel whose topic send FAILS (returns None) — models a transient
     Telegram failure of the relay-deferred reply/anchor post."""
 
+    async def send_to_topic(self, thread_id, text, **kwargs) -> int | None:
+        # A6 (spec §D1): the anchor poster's wire — fail it too so the anchor
+        # fail-closed test still models a failed anchor post.
+        self.sent_texts.append((thread_id, text))
+        return None
+
     async def send_response_to_topic(self, topic_id, text) -> int | None:
         self.sent_texts.append((topic_id, text))
         return None
@@ -474,7 +489,7 @@ class _UnresolvedDriver:
         return self.refusals
 
     def register_send_intent(self, *, engagement_id, request_id, tool_name,
-                             projection_hash, poster):
+                             projection_hash, poster, on_retire=None):
         return (object(), self._created)
 
     def set_send_intent_poster(self, eid, rid, poster):

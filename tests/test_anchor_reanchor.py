@@ -36,7 +36,14 @@ class _Wire:
     platform notices) and the markup send (``post_discrete``), so message
     ordering is a single monotonic mid sequence. ``markup_ok=False`` makes
     ``post_discrete`` fail (wire down); ``edit_ok=False`` makes every settle
-    edit transiently fail (unconfirmed)."""
+    edit transiently fail (unconfirmed).
+
+    v0.84.0 (D3): counts physical send/edit calls (``send_markup_calls`` /
+    ``edit_markup_calls``) and exposes optional per-stage GATES
+    (``send_block`` / ``edit_block`` — ``asyncio.Event``\\ s awaited BEFORE the
+    op proceeds) so the drained-unit cancellation + blocked-wire tests can
+    suspend a real wire op at a controlled point. ``send_raises`` records the
+    acceptance THEN raises (the accepted-send-then-raises floor)."""
 
     def __init__(self, *, markup_ok: bool = True, edit_ok: bool = True,
                  start: int = 1000):
@@ -45,6 +52,11 @@ class _Wire:
         self.edits: list[tuple[str, int, str]] = []    # (kind, mid, text)
         self.markup_ok = markup_ok
         self.edit_ok = edit_ok
+        self.send_markup_calls = 0
+        self.edit_markup_calls = 0
+        self.send_block: asyncio.Event | None = None
+        self.edit_block: asyncio.Event | None = None
+        self.send_raises = False
 
     def _mid(self) -> int:
         self._n += 1
@@ -56,6 +68,14 @@ class _Wire:
         return mid
 
     async def send_markup(self, topic, text, markup, reply_to=None):
+        self.send_markup_calls += 1
+        if self.send_block is not None:
+            await self.send_block.wait()
+        if self.send_raises:
+            # Accepted-send-then-raises: the copy IS on the wire (recorded),
+            # then the wrapper read fails — an AMBIGUOUS outcome.
+            self.posts.append(("markup", self._mid(), text))
+            raise RuntimeError("wire ack read failed after send")
         if not self.markup_ok:
             return None
         mid = self._mid()
@@ -67,6 +87,9 @@ class _Wire:
         return self.edit_ok
 
     async def edit_markup(self, topic, mid, text, markup) -> bool:
+        self.edit_markup_calls += 1
+        if self.edit_block is not None:
+            await self.edit_block.wait()
         self.edits.append(("markup", mid, text))
         return self.edit_ok
 
@@ -123,13 +146,18 @@ def _entry(reg, rec, n):
     return None
 
 
+def _norm(entry):
+    from engagement_registry import normalize_stale_mid_entry
+    return normalize_stale_mid_entry(entry)
+
+
 # ===========================================================================
 # 1. the staged 4-step re-anchor happy path
 # ===========================================================================
 
 
 class TestStagedFlowHappyPath:
-    async def test_reanchor_reposts_below_and_settles_old(self, tmp_path):
+    async def test_reanchor_moves_old_copy_marker_only_and_settles(self, tmp_path):
         reg, rec = await _make_registry(tmp_path)
         n = await _add_anchor(reg, rec, mid=500)
         wire = _Wire()
@@ -149,9 +177,12 @@ class TestStagedFlowHappyPath:
         e = _entry(reg, rec, n)
         assert e["tg_message_id"] == new_mid
         assert e["stale_mids"] == []
-        # Old copy settled to the re-posted-below marker.
-        assert any(mid == 500 and "re-posted below" in text
-                   for _, mid, text in wire.edits)
+        # v0.84.0 (round-4 §D6): the old copy settles to the EXACT MOVED-open
+        # marker — marker-ONLY, never the duplicated question body.
+        moved_edits = [
+            text for _, mid, text in wire.edits if mid == 500
+        ]
+        assert moved_edits == [f"⤵ MOVED Q{n} — answer the current copy below"]
 
     async def test_already_last_is_noop(self, tmp_path):
         reg, rec = await _make_registry(tmp_path)
@@ -202,32 +233,57 @@ class TestStagedFlowPerStepFailures:
         assert wire.posts == []          # nothing on the wire
         assert _entry(reg, rec, n)["tg_message_id"] == 500  # original intact
 
-    async def test_step2_wire_failure_unstages_and_owes_retry(self, tmp_path):
+    async def test_step2_ambiguous_send_consumes_obligation_no_retry(self, tmp_path):
+        # v0.84.0 (§D6 r17-3): a wire failure returns None, INDISTINGUISHABLE
+        # from "accepted but no mid returned" — so it is an AMBIGUOUS send:
+        # exactly ONE attempt, NO wire retry (a retry could stack an untracked
+        # copy), obligation CONSUMED for this pass (True). The old copy stays
+        # current + tracked; the staged mid is best-effort un-staged.
         reg, rec, n, wire, drv, seq = await self._setup(tmp_path, markup_ok=False)
 
         ok = await drv._reanchor_pass(rec)
 
-        assert ok is False               # wire down → retry owed
-        assert wire.posts == []          # post_discrete returned None
+        assert ok is True                     # obligation consumed (no retry)
+        assert wire.posts == []               # post_discrete returned None
+        assert wire.send_markup_calls == 1    # exactly ONE physical send attempt
         e = _entry(reg, rec, n)
-        assert e["tg_message_id"] == 500
-        assert e["stale_mids"] == []     # step-1 stage rolled back (un-staged)
+        assert e["tg_message_id"] == 500      # old copy stays current
+        assert e["stale_mids"] == []          # staged mid un-staged
 
-    async def test_step3_persist_failure_settles_new_copy_see_above(self, tmp_path):
+    async def test_step3_persist_exhaustion_no_body_edit_orphan_accepted(
+            self, tmp_path):
+        # v0.84.0 (§D6 r11-1/r17): the '↪ see above' body edit is DELETED. On
+        # persist exhaustion (N in-unit attempts all fail) the D4 stopgap fires:
+        # NO body edit (the new copy's body is untouched), obligation CONSUMED
+        # (True). The old copy stays durably current + tracked; new_mid is an
+        # accepted untracked orphan.
         reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
-        reg.update_question_mid = AsyncMock(side_effect=RuntimeError("disk"))
+        from drivers import claude_code_driver as ccd
+        persist_calls = 0
+        orig_update = reg.update_question_mid
+
+        async def _always_fail(*a, **k):
+            nonlocal persist_calls
+            persist_calls += 1
+            raise RuntimeError("registry disk down")
+
+        reg.update_question_mid = _always_fail
 
         ok = await drv._reanchor_pass(rec)
 
-        assert ok is False
+        assert ok is True                     # obligation consumed (D4 stopgap)
+        assert persist_calls == ccd._REANCHOR_PERSIST_ATTEMPTS   # N attempts
         new_mid = wire.posts[0][1]
-        # New copy was posted then settled to '↪ see the question above'.
-        assert any(mid == new_mid and "see the question above" in text
-                   for _, mid, text in wire.edits)
-        # Original stays live + tracked; stale_mids keeps old_mid (overlap-tolerant).
+        # NO body edit of the new copy at all (see-above hack gone), and NO
+        # marker edit of the old copy (step 4 never reached without a commit).
+        assert wire.edits == []
+        assert "see the question above" not in " ".join(t for _, _, t in wire.edits)
+        # Persist never committed: the ledger still points at the old copy, and
+        # the staged entry stays "plain" (the flip lives inside the same failed
+        # transaction).
         e = _entry(reg, rec, n)
         assert e["tg_message_id"] == 500
-        assert 500 in e["stale_mids"]
+        assert e["stale_mids"] == [{"mid": 500, "kind": "plain"}]
 
     async def test_step4_unconfirmed_retains_stale_mid_but_obligation_met(
             self, tmp_path):
@@ -239,7 +295,9 @@ class TestStagedFlowPerStepFailures:
         new_mid = wire.posts[0][1]
         e = _entry(reg, rec, n)
         assert e["tg_message_id"] == new_mid      # step-3 persisted
-        assert e["stale_mids"] == [500]           # step-4 unconfirmed → retained
+        # step-4 unconfirmed → retained; D2's atomic flip in
+        # update_question_mid already marked it "reanchored" at step 3.
+        assert e["stale_mids"] == [{"mid": 500, "kind": "reanchored"}]
 
 
 # ===========================================================================
@@ -257,7 +315,7 @@ class TestUnconfirmedStep4Reconcile:
         seq._high_water = 600
         await drv._reanchor_pass(rec)             # step-4 unconfirmed
         new_mid = wire.posts[0][1]
-        assert _entry(reg, rec, n)["stale_mids"] == [500]
+        assert _entry(reg, rec, n)["stale_mids"] == [{"mid": 500, "kind": "reanchored"}]
 
         # "Boot": the transport recovers, reconcile settles every tracked copy.
         wire.edit_ok = True
@@ -386,7 +444,7 @@ class TestM4EntryRemovalInvariant:
         # NOT close — it is retained with the stale mid still staged for retry.
         e = _entry(reg, rec, n)
         assert e is not None
-        assert 400 in (e.get("stale_mids") or [])
+        assert 400 in [s["mid"] for s in (e.get("stale_mids") or [])]
 
     async def test_failed_close_retains_entry(self, tmp_path):
         reg, rec = await _make_registry(tmp_path)
@@ -456,7 +514,642 @@ class TestCrashResidual:
 
         assert 500 in wire.edit_mids()
         assert orphan_mid not in wire.edit_mids()   # orphan left as one stale line
+        # The orphan mid was NEVER tracked anywhere (its mid died with the crash):
+        # not as a current tg_message_id, not as a stale_mid. Ledger clean.
         assert reg.open_question_entries(rec.id) == []
+
+
+# ===========================================================================
+# 5c. D3 — the DRAINED re-anchor unit (spec §D6 r17): obligation armed before
+# the unit's first await; cancellation during EACH stage (staging/send/persist/
+# edit) + the /silent no-later-boundary path drains the unit to completion and
+# releases the lock only AFTER; repeated cancellation during the drain is
+# absorbed; a blocked wire beyond the send budget is exactly ONE send + the
+# ambiguous floor; an accepted-send-then-raises never sends a second time.
+# REAL primitives + fake wire gates + injected clocks (tiny real wait_for
+# budgets); NEVER patches <module>.asyncio.sleep.
+# ===========================================================================
+
+
+async def _pump(cond, limit: int = 500) -> None:
+    """Yield to the loop until *cond()* holds (bounded), so a test can observe a
+    real wire op suspended at a controlled gate without a fixed sleep."""
+    for _ in range(limit):
+        if cond():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition not reached")
+
+
+async def _park_forever(_d: float) -> None:
+    """A retry-owner sleep that never returns — so the owner armed before the
+    unit parks on its FIRST sleep and never runs a concurrent pass (the test
+    controls the unit directly)."""
+    await asyncio.Event().wait()
+
+
+class TestDrainedReanchorUnit:
+    async def _setup(self, tmp_path, **wire_kw):
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire(**wire_kw)
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        seq = drv._ensure_sequencer(rec)
+        seq._high_water = 600
+        return reg, rec, n, wire, drv, seq
+
+    def _block_stage(self, reg):
+        gate, reached = asyncio.Event(), asyncio.Event()
+        orig = reg.stage_stale_mid
+
+        async def _blocking(*a, **k):
+            reached.set()
+            await gate.wait()
+            return await orig(*a, **k)
+
+        reg.stage_stale_mid = _blocking
+        return gate, reached
+
+    def _block_persist(self, reg):
+        gate, reached = asyncio.Event(), asyncio.Event()
+        orig = reg.update_question_mid
+
+        async def _blocking(*a, **k):
+            reached.set()
+            await gate.wait()
+            return await orig(*a, **k)
+
+        reg.update_question_mid = _blocking
+        return gate, reached
+
+    # -- (a) obligation armed BEFORE the unit's first awaited op --------------
+
+    async def test_obligation_armed_before_unit_first_await(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        gate, reached = self._block_stage(reg)
+
+        task = asyncio.ensure_future(drv._consume_reanchor(rec))
+        await reached.wait()          # the unit is blocked at staging (1st await)
+
+        # Armed BEFORE the unit touched the wire — the pre-r17 latch-after-return
+        # arming would still be UNSET here.
+        assert rec.id in drv._reanchor_due
+        assert rec.id in drv._reanchor_retry_tasks
+        assert wire.posts == []
+        assert wire.send_markup_calls == 0
+
+        gate.set()
+        await task
+        # A True pass RETIRES what it armed.
+        assert rec.id not in drv._reanchor_due
+        assert rec.id not in drv._reanchor_retry_tasks
+        assert _entry(reg, rec, n)["tg_message_id"] == wire.posts[0][1]
+
+    # -- (b) cancel during EACH unit stage → drain completes, lock after ------
+
+    async def _assert_drained_complete(self, reg, rec, n, wire, drv):
+        # The unit COMPLETED via the drain: new copy posted (markup), persisted,
+        # old copy markered + un-staged, and the maintenance lock is released.
+        assert len(wire.posts) >= 1 and wire.posts[-1][0] == "markup"
+        new_mid = [m for k, m, _ in wire.posts if k == "markup"][-1]
+        e = _entry(reg, rec, n)
+        assert e["tg_message_id"] == new_mid
+        assert e["stale_mids"] == []
+        assert any(mid == 500 for _, mid, _ in wire.edits)   # old copy markered
+        assert not drv.ask_maintenance_lock(rec.id).locked()
+
+    async def test_cancel_during_staging_drains(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        gate, reached = self._block_stage(reg)
+
+        task = asyncio.ensure_future(drv._reanchor_pass(rec))
+        await reached.wait()
+        assert drv.ask_maintenance_lock(rec.id).locked()   # held during the unit
+        task.cancel()
+        await asyncio.sleep(0)        # deliver the cancel → enter the drain
+        gate.set()                    # release staging → child completes the unit
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await self._assert_drained_complete(reg, rec, n, wire, drv)
+
+    async def test_cancel_during_send_drains(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        wire.send_block = asyncio.Event()
+
+        task = asyncio.ensure_future(drv._reanchor_pass(rec))
+        await _pump(lambda: wire.send_markup_calls == 1)   # blocked in the send
+        task.cancel()
+        await asyncio.sleep(0)
+        wire.send_block.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert wire.send_markup_calls == 1                 # exactly ONE send
+        await self._assert_drained_complete(reg, rec, n, wire, drv)
+
+    async def test_cancel_during_persist_drains(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        gate, reached = self._block_persist(reg)
+
+        task = asyncio.ensure_future(drv._reanchor_pass(rec))
+        await reached.wait()          # new copy posted, blocked in persist
+        assert len(wire.posts) == 1 and wire.posts[0][0] == "markup"
+        task.cancel()
+        await asyncio.sleep(0)
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await self._assert_drained_complete(reg, rec, n, wire, drv)
+
+    async def test_cancel_during_marker_edit_drains(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        wire.edit_block = asyncio.Event()
+
+        task = asyncio.ensure_future(drv._reanchor_pass(rec))
+        await _pump(lambda: wire.edit_markup_calls == 1)   # blocked in the edit
+        # Posted + persisted already (edit is the unit's final stage).
+        assert _entry(reg, rec, n)["tg_message_id"] == wire.posts[0][1]
+        task.cancel()
+        await asyncio.sleep(0)
+        wire.edit_block.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await self._assert_drained_complete(reg, rec, n, wire, drv)
+
+    # -- (b) /silent rollback path (no later boundary) drains -----------------
+
+    async def test_silent_rollback_path_drains_under_cancellation(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        seq = drv._ensure_sequencer(rec)
+        # /silent posted a command notice below the anchor, then rolls back.
+        token = drv.reserve_answer(rec.id)
+        await seq.post_platform_notice("Observer quieted.")
+        assert seq.high_water > 500
+        gate, reached = self._block_stage(reg)
+
+        task = asyncio.ensure_future(
+            drv.rollback_answer_reservation(rec.id, token))
+        await reached.wait()
+        assert rec.id in drv._reanchor_due          # obligation armed
+        task.cancel()
+        await asyncio.sleep(0)
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Unit completed despite /silent having NO later boundary to recover at.
+        reanchor_mid = [m for k, m, _ in wire.posts if k == "markup"][-1]
+        assert _entry(reg, rec, n)["tg_message_id"] == reanchor_mid
+        assert not drv.ask_maintenance_lock(rec.id).locked()
+        assert rec.id in drv._reanchor_due          # latch stays armed (no bdy)
+        drv._retire_reanchor_retry(rec.id)          # cleanup the parked owner
+
+    # -- (c) repeated cancellation during the drain is absorbed ---------------
+
+    async def test_repeated_cancellation_during_drain_absorbed(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        gate, reached = self._block_stage(reg)
+
+        task = asyncio.ensure_future(drv._reanchor_pass(rec))
+        await reached.wait()
+        for _ in range(3):            # hammer the drain with repeated cancels
+            task.cancel()
+            await asyncio.sleep(0)
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await self._assert_drained_complete(reg, rec, n, wire, drv)
+
+    # -- (d) blocked wire beyond the send budget → ONE send + ambiguous floor -
+
+    async def test_blocked_send_budget_one_attempt_ambiguous_floor(
+            self, tmp_path, monkeypatch):
+        from drivers import claude_code_driver as ccd
+        monkeypatch.setattr(ccd, "_REANCHOR_SEND_TIMEOUT", 0.02)
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        wire.send_block = asyncio.Event()      # never released → wait_for fires
+
+        ok = await drv._reanchor_pass(rec)     # returns after the tiny budget
+
+        assert ok is True                      # ambiguous floor, obligation used
+        assert wire.send_markup_calls == 1     # exactly ONE physical send attempt
+        assert wire.posts == []                # timed out before it recorded
+        e = _entry(reg, rec, n)
+        assert e["tg_message_id"] == 500       # old copy stays current
+        assert e["stale_mids"] == []           # staged mid un-staged
+        assert not drv.ask_maintenance_lock(rec.id).locked()
+
+    # -- (e) accepted-send-then-raises → no second send -----------------------
+
+    async def test_accepted_send_then_raises_no_second_send(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path, )
+        wire.send_raises = True
+
+        ok = await drv._reanchor_pass(rec)
+
+        assert ok is True                      # ambiguous → consumed
+        assert wire.send_markup_calls == 1     # NO second send
+        # The accepted copy IS on the wire (recorded) but is untracked.
+        assert len(wire.posts) == 1 and wire.posts[0][0] == "markup"
+        e = _entry(reg, rec, n)
+        assert e["tg_message_id"] == 500       # old copy stays current
+        assert e["stale_mids"] == []           # staged mid un-staged
+
+
+# ===========================================================================
+# 5d. D4 — confirmed-pair record + UNIFIED HISTORICAL SCHEDULER (spec §D6
+# r18-2→r29-2). A confirmed-but-unpersisted re-anchor copy is owned by a
+# process-lifetime per-engagement record; ONE rotation-selected historical step
+# per pass (memory pair OR open durable reanchored entry) runs BEFORE the
+# current-question work; the memory step is lifecycle-aware (one strict persist
+# while live, permanent orphan marker-edit once settlement began); the retry
+# owner pumps while items remain; answer/terminal settlement consults the
+# record; terminal teardown drops + logs one residual per pair. REAL registry +
+# REAL sequencer (fake wire) + injected clocks; the retry owner is parked so
+# every pass is driven directly. NEVER patches <module>.asyncio.sleep.
+# ===========================================================================
+
+_MOVED_OPEN = "⤵ MOVED Q{n} — answer the current copy below"
+_MOVED_TERMINAL = "⤵ MOVED Q{n} — resolved below"
+
+
+class TestConfirmedPairScheduler:
+    async def _setup(self, tmp_path, **wire_kw):
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire(**wire_kw)
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        seq = drv._ensure_sequencer(rec)
+        seq._high_water = 600
+        return reg, rec, n, wire, drv, seq
+
+    @staticmethod
+    def _fail_persist(reg):
+        """Make ``update_question_mid`` always raise; return (orig, calls)."""
+        orig = reg.update_question_mid
+        calls: list = []
+
+        async def _fail(*a, **k):
+            calls.append(a)
+            raise RuntimeError("registry disk down")
+
+        reg.update_question_mid = _fail
+        return orig, calls
+
+    # -- (a) permanent persist failure → ONE send across boundaries + answer ---
+
+    async def test_a_permanent_failure_one_send_then_orphan_markered(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        _orig, calls = self._fail_persist(reg)
+
+        # Boundary 1: send #1, persist exhausts → confirmed pair recorded.
+        assert await drv._reanchor_pass(rec) is True
+        assert wire.send_markup_calls == 1
+        new_mid = wire.posts[0][1]
+        assert drv._confirmed_pair_mid(rec.id, n) == new_mid
+        assert _entry(reg, rec, n)["tg_message_id"] == 500   # never committed
+
+        # Further boundaries: NO new send (rule b); scheduler re-tries the local
+        # transaction only (still failing) — the pair stays owned.
+        seq._high_water = new_mid + 50
+        for _ in range(3):
+            await drv._reanchor_pass(rec)
+        assert wire.send_markup_calls == 1                   # exactly ONE send
+        assert drv._confirmed_pair_mid(rec.id, n) == new_mid
+        assert len(calls) >= 4                               # one attempt per pass
+
+        # The operator answers → settlement begins → the orphan is marker-edited
+        # (terminal form) and the record retires; still never re-sent.
+        await drv._promote_answer_on_enqueue(rec)
+        assert drv._confirmed_pair_mid(rec.id, n) is None
+        orphan_edits = [t for _, mid, t in wire.edits if mid == new_mid]
+        assert orphan_edits[-1] == _MOVED_TERMINAL.format(n=n)
+        assert wire.send_markup_calls == 1
+
+    # -- (b) commit on the last natural boundary → durable cleanup via pump ----
+
+    async def test_b_commit_last_boundary_pump_cleans_durable(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        orig, _calls = self._fail_persist(reg)
+        await drv._reanchor_pass(rec)                        # → confirmed pair
+        new_mid = wire.posts[0][1]
+        assert drv._confirmed_pair_mid(rec.id, n) == new_mid
+
+        reg.update_question_mid = orig                       # registry heals
+        # A boundary consumer: the scheduler commits the pair (its confirmed mid
+        # IS high-water, so current-question work takes the already-last exit).
+        await drv._consume_reanchor(rec)
+        assert drv._confirmed_pair_mid(rec.id, n) is None    # retired on commit
+        e = _entry(reg, rec, n)
+        assert e["tg_message_id"] == new_mid
+        assert e["stale_mids"] == [{"mid": 500, "kind": "reanchored"}]  # durable
+        # PUMP: a durable item remains → the retry owner stays armed.
+        assert rec.id in drv._reanchor_retry_tasks
+        assert drv._historical_items(rec.id) == [("durable", n, 500)]
+
+        posts_before = len(wire.posts)
+        await drv._reanchor_pass(rec)                        # durable step runs
+        assert len(wire.posts) == posts_before               # NO external output
+        assert _entry(reg, rec, n)["stale_mids"] == []       # marker-edit+unstage
+        marker = [t for _, mid, t in wire.edits if mid == 500]
+        assert marker[-1] == _MOVED_OPEN.format(n=n)
+        drv._retire_reanchor_retry(rec.id)                   # cleanup parked owner
+
+    # -- (c) same-question A/B: A durable + B memory, both owned, no extra send -
+
+    async def test_c_same_question_A_durable_B_memory_both_owned(self, tmp_path):
+        # A commits but its marker edit fails (edit_ok=False) → durable entry for
+        # old_mid 500; high-water advances; B posts, B's persist exhausts.
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path, edit_ok=False)
+        await drv._reanchor_pass(rec)                        # re-anchor #1 (A)
+        mid_A = wire.posts[0][1]
+        assert _entry(reg, rec, n)["tg_message_id"] == mid_A
+        assert _entry(reg, rec, n)["stale_mids"] == [{"mid": 500, "kind": "reanchored"}]
+
+        seq._high_water = mid_A + 50
+        self._fail_persist(reg)
+        await drv._reanchor_pass(rec)                        # re-anchor #2 (B)
+        mid_B = wire.posts[-1][1]
+        assert mid_B != mid_A
+        assert wire.send_markup_calls == 2                   # NO extra (3rd) send
+        # A owned as a durable reanchored entry, B owned as a memory record.
+        assert drv._confirmed_pair_mid(rec.id, n) == mid_B
+        reanchored = {
+            _norm(m)["mid"] for m in _entry(reg, rec, n)["stale_mids"]
+            if _norm(m)["kind"] == "reanchored"
+        }
+        assert reanchored == {500}
+
+    # -- (d) fair rotation: Q1 permanently failing, Q2 cleaned on a later pass -
+
+    async def test_d_rotation_selects_q2_when_q1_permanently_fails(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_anchor(reg, rec, mid=500, text="Q1")
+        n2 = await _add_anchor(reg, rec, mid=510, text="Q2")
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        drv._ensure_sequencer(rec)
+        drv._record_confirmed_pair(rec.id, n1, 900)
+        drv._record_confirmed_pair(rec.id, n2, 910)
+        orig = reg.update_question_mid
+
+        async def _update(eid, num, mid):
+            if num == n1:
+                raise RuntimeError("q1 disk down")
+            return await orig(eid, num, mid)
+
+        reg.update_question_mid = _update
+
+        await drv._reanchor_pass(rec)                        # cursor 0 → Q1 (fail)
+        assert drv._confirmed_pair_mid(rec.id, n1) == 900
+        assert drv._confirmed_pair_mid(rec.id, n2) == 910
+        await drv._reanchor_pass(rec)                        # cursor 1 → Q2 (ok)
+        assert drv._confirmed_pair_mid(rec.id, n2) is None   # Q2 cleaned
+        assert drv._confirmed_pair_mid(rec.id, n1) == 900    # Q1 still owned
+        assert wire.send_markup_calls == 0                   # no send either pass
+
+    # -- (e) at most ONE historical step per pass across all mechanisms --------
+
+    async def test_e_one_historical_step_per_pass(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_anchor(reg, rec, mid=500, text="Q1")
+        n2 = await _add_anchor(reg, rec, mid=510, text="Q2")
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        seq = drv._ensure_sequencer(rec)
+        # Q1: a durable reanchored stale entry (stage plain then flip on commit).
+        await reg.stage_stale_mid(rec.id, n1, 500, kind="plain")
+        await reg.update_question_mid(rec.id, n1, 505)
+        assert _norm(_entry(reg, rec, n1)["stale_mids"][0])["kind"] == "reanchored"
+        # Q2: a memory pair.
+        drv._record_confirmed_pair(rec.id, n2, 910)
+
+        update_calls: list = []
+        orig = reg.update_question_mid
+
+        async def _cnt(eid, num, mid):
+            update_calls.append(num)
+            return await orig(eid, num, mid)
+
+        reg.update_question_mid = _cnt
+
+        # Pass 1: items [(durable,n1,500),(memory,n2,-1)] → cursor 0 = durable.
+        edits0 = wire.edit_markup_calls
+        await drv._reanchor_pass(rec)
+        did_durable = wire.edit_markup_calls > edits0
+        did_memory = n2 in update_calls
+        assert did_durable is True and did_memory is False   # exactly ONE
+        # Pass 2: durable done → only the memory pair remains → the OTHER mechanism.
+        await drv._reanchor_pass(rec)
+        assert n2 in update_calls
+        assert drv._confirmed_pair_mid(rec.id, n2) is None
+
+    # -- (f) settlement-begun memory record → NO late transaction, marker-edit --
+
+    async def test_f1_answered_retained_marker_edits_orphan_no_update(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        drv._record_confirmed_pair(rec.id, n, 900)
+        await reg.mark_question_answered(rec.id, n)          # answered, retained
+        _orig, calls = self._fail_persist(reg)               # would raise if called
+
+        await drv._reanchor_pass(rec)
+        assert calls == []                                   # NO late transaction
+        assert drv._confirmed_pair_mid(rec.id, n) is None    # retired on edit
+        orphan = [t for _, mid, t in wire.edits if mid == 900]
+        assert orphan[-1] == _MOVED_TERMINAL.format(n=n)
+
+    async def test_f2_absent_ledger_marker_edits_orphan_no_update(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        drv._record_confirmed_pair(rec.id, n, 900)
+        await reg.close_open_question(rec.id, n)             # entry gone (closed)
+        _orig, calls = self._fail_persist(reg)
+
+        await drv._reanchor_pass(rec)
+        assert calls == []
+        assert drv._confirmed_pair_mid(rec.id, n) is None
+        orphan = [t for _, mid, t in wire.edits if mid == 900]
+        assert orphan[-1] == _MOVED_TERMINAL.format(n=n)
+
+    async def test_f_unconfirmed_settlement_edit_keeps_record(self, tmp_path):
+        # A still-live engagement: the orphan edit fails → the record is KEPT for
+        # the scheduler to re-attempt (retirement is CONDITIONAL on a confirmed
+        # edit, since nothing durable can rediscover this mid — Sol r20-1).
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path, edit_ok=False)
+        drv._record_confirmed_pair(rec.id, n, 900)
+        await reg.mark_question_answered(rec.id, n)
+        await drv._reanchor_pass(rec)
+        assert drv._confirmed_pair_mid(rec.id, n) == 900     # KEPT (edit failed)
+
+    # -- (g) terminal teardown with an unconfirmed pair → logged residual ------
+
+    async def test_g_terminal_teardown_logs_residual_no_crash(self, tmp_path, caplog):
+        import logging
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        drv._record_confirmed_pair(rec.id, n, 900)
+        with caplog.at_level(logging.INFO):
+            await drv.cancel(rec)                            # never raises
+        assert drv._confirmed_pairs.get(rec.id) is None      # map dropped
+        assert any(
+            "terminal teardown drops unconfirmed re-anchor pair" in r.getMessage()
+            for r in caplog.records)
+
+    # -- (h) sequential Q1/Q2 sustained failure THEN crash → per-pair bound -----
+
+    async def test_h_sequential_failure_then_crash_per_pair_bound(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_anchor(reg, rec, mid=500, text="Q1")
+        n2 = await _add_anchor(reg, rec, mid=510, text="Q2")
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        drv._ensure_sequencer(rec)
+        drv._record_confirmed_pair(rec.id, n1, 900)
+        drv._record_confirmed_pair(rec.id, n2, 910)
+        self._fail_persist(reg)
+
+        await drv._reanchor_pass(rec)
+        await drv._reanchor_pass(rec)
+        # Per-pair bound: BOTH pairs coexist owned (Sol r22-1).
+        assert set(drv._confirmed_pairs[rec.id]) == {n1, n2}
+
+        # CRASH = the driver instance is dropped; the map is memory-only, so a
+        # fresh instance holds NO pairs. The durable ledger stays consistent —
+        # both entries still point at their ORIGINAL mids (persist never committed).
+        drv2 = _make_driver(tmp_path, reg, wire)
+        assert drv2._confirmed_pairs == {}
+        assert _entry(reg, rec, n1)["tg_message_id"] == 500
+        assert _entry(reg, rec, n2)["tg_message_id"] == 510
+
+    # -- (i) hung historical write matches the pre-existing registry floor -----
+
+    async def test_i_hung_historical_write_no_new_deadline(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        drv._record_confirmed_pair(rec.id, n, 900)
+        gate = asyncio.Event()
+        orig = reg.update_question_mid
+
+        async def _hung(eid, num, mid):
+            await gate.wait()
+            return await orig(eid, num, mid)
+
+        reg.update_question_mid = _hung
+
+        task = asyncio.ensure_future(drv._reanchor_pass(rec))
+        await asyncio.sleep(0.02)
+        # No new deadline machinery: the historical registry await is awaited
+        # exactly like any registry caller's — the pass does NOT return early.
+        assert not task.done()
+        gate.set()
+        await task
+        assert drv._confirmed_pair_mid(rec.id, n) is None    # committed once freed
+
+    # -- (j) D4 review: promotion must NOT retire the pump owner while a
+    #        confirmed pair remains owned — mirrors the ``_consume_reanchor``
+    #        guard. DOUBLE FAILURE: persist exhausts (confirmed pair recorded)
+    #        AND the in-call settlement orphan marker-edit ALSO fails (record
+    #        retained) — the retry owner must stay armed so the standing pump
+    #        keeps retrying, instead of depending on the next unrelated
+    #        output boundary.
+
+    async def test_j_promote_keeps_owner_armed_while_pair_retained(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path, edit_ok=False)
+        self._fail_persist(reg)
+
+        # Boundary 1: send #1, persist exhausts → confirmed pair recorded.
+        assert await drv._reanchor_pass(rec) is True
+        new_mid = wire.posts[0][1]
+        assert drv._confirmed_pair_mid(rec.id, n) == new_mid
+
+        # A prior boundary armed the standing pump owner (as _consume_reanchor
+        # does) — simulate that here.
+        drv._arm_reanchor_retry(rec)
+        assert rec.id in drv._reanchor_retry_tasks
+        owner = drv._reanchor_retry_tasks[rec.id]
+
+        # The operator answers → promotion marks the question answered and
+        # settles it; the in-call orphan marker-edit ALSO fails (edit_ok=False)
+        # so the confirmed-pair record is retained — historical work remains.
+        await drv._promote_answer_on_enqueue(rec)
+
+        assert drv._confirmed_pair_mid(rec.id, n) == new_mid  # KEPT (edit failed)
+        assert drv._historical_items(rec.id) != []
+        # §D6 r29-2 PUMP: the retry owner must stay armed while historical
+        # items remain — it must NOT depend on the next unrelated boundary.
+        assert rec.id in drv._reanchor_retry_tasks
+        assert drv._reanchor_retry_tasks[rec.id] is owner
+        assert not owner.done()
+
+        drv._retire_reanchor_retry(rec.id)   # cleanup parked owner
+
+
+# ===========================================================================
+# 5a2. wb1-2 (whole-branch gate wave 1) — the UNIFIED HISTORICAL SCHEDULER's
+#      DURABLE step must REVALIDATE lifecycle before it edits + unstages. Once
+#      answer/terminal settlement has BEGUN (the engagement record flipped
+#      terminal in finalize's pre-settle gap, OR an answer reservation landed
+#      while the OPEN-marker edit was blocked), the OPEN "answer the current copy
+#      below" marker would strand the stale copy looking live because settlement
+#      then only sees the current copy. The step must render the TERMINAL marker
+#      and LEAVE the entry staged for settlement.
+# ===========================================================================
+
+
+class TestWb1_2DurableStepRevalidation:
+    async def _durable_entry(self, tmp_path):
+        """A durable ``reanchored`` stale entry: old copy 500, current copy 505."""
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        drv._ensure_sequencer(rec)
+        await reg.stage_stale_mid(rec.id, n, 500, kind="plain")
+        await reg.update_question_mid(rec.id, n, 505)
+        assert _entry(reg, rec, n)["stale_mids"] == [{"mid": 500, "kind": "reanchored"}]
+        return reg, rec, n, wire, drv
+
+    async def test_terminal_flip_before_step_renders_terminal_leaves_staged(
+        self, tmp_path,
+    ):
+        reg, rec, n, wire, drv = await self._durable_entry(tmp_path)
+        # The authoritative terminal flip lands (finalize's gap, BEFORE
+        # settle_all cancels the pump). The pump's durable step must NOT edit the
+        # stale copy to the OPEN marker and unstage it — it renders the TERMINAL
+        # marker and LEAVES it staged for settlement.
+        rec.status = "cancelled"
+        await drv._historical_durable_step(rec, n, 500)
+
+        markers = [t for _, mid, t in wire.edits if mid == 500]
+        assert markers[-1] == _MOVED_TERMINAL.format(n=n)      # terminal, not open
+        # Left staged so the settlement path renders it terminal / removes it.
+        assert _entry(reg, rec, n)["stale_mids"] == [
+            {"mid": 500, "kind": "reanchored"}]
+
+    async def test_reservation_during_blocked_open_edit_does_not_unstage(
+        self, tmp_path,
+    ):
+        reg, rec, n, wire, drv = await self._durable_entry(tmp_path)
+        wire.edit_block = asyncio.Event()   # park the marker edit mid-wire
+        step = asyncio.ensure_future(drv._historical_durable_step(rec, n, 500))
+        await asyncio.sleep(0.02)           # parked in the blocked marker edit
+        # An answer reservation lands while the OPEN-marker edit is blocked →
+        # settlement has begun. On unblock the step must RE-CHECK before
+        # unstaging and LEAVE the entry staged (unstaging would hide the stale
+        # copy from settlement → stranded live-looking).
+        assert drv.reserve_answer(rec.id) is not None
+        wire.edit_block.set()
+        await asyncio.wait_for(step, timeout=1.0)
+
+        assert _entry(reg, rec, n)["stale_mids"] == [
+            {"mid": 500, "kind": "reanchored"}]
+
+    async def test_live_unanswered_still_renders_open_and_unstages(self, tmp_path):
+        # Regression: with NO settlement begun the durable step keeps its
+        # round-3 behaviour — OPEN marker + unstage.
+        reg, rec, n, wire, drv = await self._durable_entry(tmp_path)
+        await drv._historical_durable_step(rec, n, 500)
+        markers = [t for _, mid, t in wire.edits if mid == 500]
+        assert markers[-1] == _MOVED_OPEN.format(n=n)
+        assert _entry(reg, rec, n)["stale_mids"] == []
 
 
 # ===========================================================================
@@ -723,6 +1416,9 @@ class TestF2TerminalCommandSuppressesReanchor:
 
 class TestRetryOwner:
     async def test_first_pass_fails_then_retry_succeeds(self, tmp_path):
+        # v0.84.0 (§D6 r17): a STAGE failure is now the ONLY retry-owed (False)
+        # outcome — nothing reached the wire, so it is safe to re-drive. Once
+        # the registry recovers, the retry owner completes the re-anchor.
         reg, rec = await _make_registry(tmp_path)
         n = await _add_anchor(reg, rec, mid=500)
         delays: list[float] = []
@@ -730,19 +1426,31 @@ class TestRetryOwner:
         async def _rec_sleep(d):
             delays.append(d)
 
-        wire = _Wire(markup_ok=False)   # wire down → first pass fails
+        wire = _Wire()
         drv = _make_driver(tmp_path, reg, wire, retry_sleep=_rec_sleep)
         seq = drv._ensure_sequencer(rec)
         seq._high_water = 600
 
+        stage_calls = 0
+        orig_stage = reg.stage_stale_mid
+
+        async def _flaky_stage(*a, **k):
+            nonlocal stage_calls
+            stage_calls += 1
+            if stage_calls == 1:
+                raise RuntimeError("registry disk down")   # first pass fails
+            return await orig_stage(*a, **k)
+
+        reg.stage_stale_mid = _flaky_stage
+
         # A boundary consumer runs the (failing) pass → latch set + retry armed.
         await drv._consume_reanchor(rec)
         assert rec.id in drv._reanchor_due
+        assert wire.posts == []                      # stage failed, nothing sent
         task = drv._reanchor_retry_tasks.get(rec.id)
         assert task is not None
 
-        # Transport recovers; drive the retry loop to completion.
-        wire.markup_ok = True
+        # Registry recovers; drive the retry loop to completion.
         await task
 
         assert delays == [5.0]                       # one backoff step
@@ -760,10 +1468,12 @@ class TestRetryOwner:
             if len(delays) >= 4:
                 raise asyncio.CancelledError   # simulate teardown at the cap
 
-        wire = _Wire(markup_ok=False)   # stays down → every pass fails
+        wire = _Wire()
         drv = _make_driver(tmp_path, reg, wire, retry_sleep=_cap_sleep)
         seq = drv._ensure_sequencer(rec)
         seq._high_water = 600
+        # Registry stage stays down → every pass fails BEFORE the wire.
+        reg.stage_stale_mid = AsyncMock(side_effect=RuntimeError("disk"))
 
         await drv._consume_reanchor(rec)
         task = drv._reanchor_retry_tasks.get(rec.id)
@@ -772,6 +1482,7 @@ class TestRetryOwner:
 
         # 5 → 30 → 300 → 300 (capped, repeated), then the CancelledError.
         assert delays == [5.0, 30.0, 300.0, 300.0]
+        assert wire.posts == []               # nothing ever reached the wire
         assert rec.id in drv._reanchor_due   # never cleared (never succeeded)
 
     async def test_double_arm_is_noop(self, tmp_path):
@@ -1002,3 +1713,265 @@ class TestBootReplayOwner:
         assert captured.get("snapshot") == []
         # And the fresh question survives in the ledger (never expired).
         assert reg.open_question_entries(rec.id)
+
+
+# ===========================================================================
+# wb2-2 (whole-branch gate wave 2): the marker-edit → unstage sequence must be
+# LINEARIZABLE against an answer reservation / terminal flip that lands during
+# EITHER awaited step. wb1-2 added ONE pre-unstage check, but a reservation can
+# still install WHILE the unstage write is awaiting persistence (or while the
+# OPEN-marker edit is in flight), after which the unstage removes the stale copy
+# and promotion settles ONLY the current copy — stranding the old message
+# permanently on the OPEN "answer the current copy below" marker. The fix re-
+# reads lifecycle after the edit AND after the unstage, leaving/restoring the
+# stale entry staged so settlement re-renders it TERMINAL. REAL registry + REAL
+# sequencer (fake wire) + injected clocks; NEVER patches <module>.asyncio.sleep.
+# ===========================================================================
+
+
+class TestUnstageLinearizableAgainstReservation:
+    async def test_answer_reservation_during_current_unit_marker_edit(self, tmp_path):
+        """The current-question re-anchor unit's step-4 OPEN-marker edit is in
+        flight when an answer reservation lands. The re-check AFTER the edit must
+        LEAVE the stale copy staged so promotion terminalizes it — not unstage it
+        and strand the old copy on the OPEN marker."""
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        wire.edit_block = asyncio.Event()
+        drv = _make_driver(tmp_path, reg, wire)
+        seq = drv._ensure_sequencer(rec)
+        seq._high_water = 600
+
+        moving = asyncio.create_task(drv._reanchor_pass(rec))
+        for _ in range(100):
+            if wire.edit_markup_calls:
+                break
+            await asyncio.sleep(0.001)
+        assert wire.edit_markup_calls == 1
+
+        # The new current copy has committed and the old-copy OPEN marker edit is
+        # in flight. This is settlement-begun under the driver's own predicate.
+        assert drv.reserve_answer(rec.id) is not None
+        assert drv._settlement_begun(rec.id, n)
+        wire.edit_block.set()
+        assert await moving is True
+
+        # Complete the normal enqueue-time answer settlement.
+        await drv._promote_answer_on_enqueue(rec)
+
+        old_texts = [text for _, mid, text in wire.edits if mid == 500]
+        assert old_texts[-1] == f"⤵ MOVED Q{n} — resolved below"
+
+    async def test_reservation_during_current_unit_unstage(self, tmp_path):
+        """The current-question re-anchor unit's step-4 ``unstage_stale_mid`` is
+        awaiting persistence when an answer reservation lands. The re-check AFTER
+        the unstage must RE-STAGE the stale copy so promotion terminalizes it."""
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire)
+        seq = drv._ensure_sequencer(rec)
+        seq._high_water = 600
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        real_unstage = reg.unstage_stale_mid
+
+        async def blocked_unstage(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await real_unstage(*args, **kwargs)
+
+        reg.unstage_stale_mid = blocked_unstage
+        moving = asyncio.create_task(drv._reanchor_pass(rec))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        assert drv.reserve_answer(rec.id) is not None
+        release.set()
+        assert await moving is True
+        await drv._promote_answer_on_enqueue(rec)
+
+        old_texts = [text for _, mid, text in wire.edits if mid == 500]
+        assert old_texts[-1] == f"⤵ MOVED Q{n} — resolved below"
+
+    async def test_reservation_after_second_check_during_durable_unstage(
+            self, tmp_path):
+        """The unified historical scheduler's durable step: the marker edit
+        succeeded and the code's second lifecycle check already ran; the awaited
+        ``unstage_stale_mid`` is now in flight when the answer reservation lands.
+        The re-check AFTER the unstage must RE-STAGE the stale copy so settlement
+        turns its OPEN marker terminal."""
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire)
+        drv._ensure_sequencer(rec)
+        await reg.stage_stale_mid(rec.id, n, 500, kind="plain")
+        await reg.update_question_mid(rec.id, n, 505)
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        real_unstage = reg.unstage_stale_mid
+
+        async def blocked_unstage(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await real_unstage(*args, **kwargs)
+
+        reg.unstage_stale_mid = blocked_unstage
+        step = asyncio.create_task(drv._historical_durable_step(rec, n, 500))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        # Marker edit succeeded and the code's second lifecycle check already ran;
+        # the awaited unstage is now in flight. This is where Telegram can finish
+        # advance_high_water and synchronously install the answer reservation.
+        assert drv.reserve_answer(rec.id) is not None
+        assert drv._settlement_begun(rec.id, n)
+        release.set()
+        await asyncio.wait_for(step, timeout=1.0)
+
+        # Complete normal answer promotion/settlement. The old copy should have
+        # remained staged so settlement could turn its OPEN marker terminal.
+        await drv._promote_answer_on_enqueue(rec)
+        old_texts = [text for _, mid, text in wire.edits if mid == 500]
+        assert old_texts[-1] == f"⤵ MOVED Q{n} — resolved below"
+
+
+# ===========================================================================
+# wb4-3 (whole-branch gate wave 4, MAJOR): ``cancel()`` must DRAIN the cancelled
+# re-anchor retry owner BEFORE dropping the D6 confirmed-pair map. A cancelled
+# owner drains its child (by design), and the child re-creates ``_confirmed_pairs``
+# — if teardown drops the map and returns first, the re-created record leaks
+# unpumped + unlogged, violating the D6 terminal-teardown ownership contract.
+# ===========================================================================
+
+
+class TestCancelDrainsReanchorOwner:
+    async def test_cancel_awaits_drained_child_then_logs_residual(
+        self, tmp_path, caplog,
+    ):
+        import logging
+        reg, rec = await _make_registry(tmp_path)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire)
+        eng_id = rec.id
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _owner():
+            # Hold the ask-maintenance lock for the child's whole lifetime (as
+            # ``_reanchor_pass`` does) and DRAIN the child on cancel — the exact
+            # ownership shape of ``_reanchor_pass_locked``.
+            async with drv.ask_maintenance_lock(eng_id):
+                async def _child():
+                    started.set()
+                    await release.wait()
+                    # The drained child re-creates a confirmed pair AFTER cancel()
+                    # would otherwise have dropped the map.
+                    drv._record_confirmed_pair(eng_id, 1, 1001)
+                    return True
+
+                child = asyncio.ensure_future(_child())
+                try:
+                    return await asyncio.shield(child)
+                except asyncio.CancelledError:
+                    while not child.done():
+                        try:
+                            await asyncio.shield(child)
+                        except asyncio.CancelledError:
+                            continue
+                    raise
+
+        owner = asyncio.create_task(_owner())
+        drv._reanchor_retry_tasks[eng_id] = owner
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        with caplog.at_level(logging.INFO):
+            cancel_task = asyncio.create_task(drv.cancel(rec))
+            # Let cancel() run: WITHOUT the fix it cancels the owner, drops the
+            # map and returns; WITH the fix it parks on the owner drain / lock
+            # barrier.
+            for _ in range(10):
+                await asyncio.sleep(0)
+            # Release the child so its drained completion re-creates the pair.
+            release.set()
+            await asyncio.wait_for(cancel_task, timeout=1.0)
+        await asyncio.gather(owner, return_exceptions=True)
+
+        # The re-created record was seen by teardown: dropped + logged, never
+        # leaked back into ``_confirmed_pairs`` after cancel() returned.
+        assert drv._confirmed_pairs.get(eng_id) is None
+        assert any(
+            "terminal teardown drops unconfirmed re-anchor pair" in r.getMessage()
+            for r in caplog.records)
+
+
+# ===========================================================================
+# wb5-1 (whole-branch gate wave 5): a terminal engagement's RETAINED anchor
+# (an unconfirmed settle edit keeps the ledger entry) must NOT be re-anchored
+# by a boundary consumer that acquired the maintenance lock AFTER the sole
+# terminal-settlement pass. The D6 re-anchor refuses to SEND once EITHER
+# terminal condition holds (the record flipped terminal OR the sequencer
+# latched), and ``post_discrete`` backstops that under the writer lock. Without
+# the guard a full open question reposts + persists as current on a CLOSED
+# engagement, and ``cancel()`` never re-runs settlement to clean it up.
+# ===========================================================================
+
+
+class TestTerminalReanchorRefusal:
+    async def test_terminal_retained_anchor_not_reanchored_after_settle(
+        self, tmp_path,
+    ):
+        # Sol's deterministic repro (inverted assertions): a terminal settle
+        # with a FAILING (unconfirmed) edit retains the anchor; a later boundary
+        # consumer must find the obligation already discharged and post NOTHING.
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500, text="Q1: DB name?")
+        wire = _Wire(edit_ok=False)   # every settle edit stays unconfirmed
+        drv = _make_driver(tmp_path, reg, wire)
+        seq = drv._ensure_sequencer(rec)
+        seq._high_water = 600         # anchor 500 is NOT last ⇒ would re-anchor
+        rec.status = "cancelled"
+
+        await drv.settle_all_open_questions(rec, "cancelled")
+        assert seq.is_terminal()
+        # Unconfirmed edit ⇒ ledger entry RETAINED, still pointing at 500.
+        entry = _entry(reg, rec, n)
+        assert entry is not None
+        assert entry["tg_message_id"] == 500
+        assert wire.posts == []       # settle only edits, never posts
+
+        # A relay ``result``/rollback boundary consumer runs AFTER settlement.
+        await drv._consume_reanchor(rec)
+
+        # No repost; ledger mid UNCHANGED — no open question resurrected on the
+        # closed engagement (the buggy behaviour reposted the full body and
+        # persisted the new mid as current).
+        assert wire.posts == []
+        assert _entry(reg, rec, n)["tg_message_id"] == 500
+
+    async def test_boundary_consumer_queued_behind_terminal_settlement(
+        self, tmp_path,
+    ):
+        # Ordering variant Sol names: the consumer is ALREADY queued (concurrent
+        # with) the sole terminal-settlement pass on the ask-maintenance lock. In
+        # EVERY interleaving the record is already terminal and the sequencer
+        # latches at settlement entry, so the consumer must decline regardless of
+        # which task wins the lock.
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500, text="Q1: DB name?")
+        wire = _Wire(edit_ok=False)
+        drv = _make_driver(tmp_path, reg, wire)
+        seq = drv._ensure_sequencer(rec)
+        seq._high_water = 600
+        rec.status = "cancelled"
+
+        settle = asyncio.ensure_future(
+            drv.settle_all_open_questions(rec, "cancelled"))
+        consumer = asyncio.ensure_future(drv._consume_reanchor(rec))
+        await asyncio.gather(settle, consumer)
+
+        assert seq.is_terminal()
+        assert wire.posts == []
+        assert _entry(reg, rec, n)["tg_message_id"] == 500

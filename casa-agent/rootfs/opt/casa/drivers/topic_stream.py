@@ -52,6 +52,8 @@ from typing import Any, Awaitable, Callable
 from atomic_io import atomic_write_json
 from channels.output_sequencer import (
     APPLIED,
+    ASK_TOOL,
+    DISCARDED,
     FAILED,
     SEALED,
     OutputSequencer,
@@ -69,6 +71,16 @@ _ZERO_SEG = (0, 0)
 # Segment sentinel yielded by iter_log_segments when turn_start's segment is
 # absent from disk (retention gap) — the relay logs a WARNING and resumes.
 SEGMENT_GAP = "__gap__"
+
+
+class _FlushDeferred(Exception):
+    """wb6-1 internal signal: a held-prose FLUSH failed (drop mode — every send
+    hit the Telegram wire failure floor). The caller left the ``hold_pending``
+    marker set, the buffer retained, and the replay boundary UNADVANCED (behind
+    the held frames); raising this ABANDONS the current run WITHOUT latching warm
+    so the next driver poll cold-recovers and resurfaces the held prose as
+    ordinary (disarmed) narration — §D5 resurface-never-lose. Never escapes the
+    relay: caught in ``_run_cold`` / ``_run_warm``."""
 
 # Explicit non-mutating allowlist (Sol r3-B4). Everything else — including an
 # unknown ``mcp__*`` tool — is treated as mutating. The engagement CONTROL
@@ -210,6 +222,15 @@ class StreamCursor:
     message_text_lens: list[int] = field(default_factory=list)
     last_posted_len: int = 0
     dropped_through: dict | None = None
+    # D5 Task C3 (Sol r4-3): the ONE minimal persisted exception to the
+    # in-memory suppression state — a boolean HELD-FRAMES marker. It carries NO
+    # content, only "frames beyond ``current`` may contain previously-buffered
+    # prose". Write-ahead ordering (Sol r5-2): set True (``_save``) BEFORE the
+    # first frame's text is treated as held; cleared ONLY atomically (same
+    # ``_save``) with the checkpoint that advances beyond the held frames (after
+    # a flush, on the result-time discard, or at an abnormal spawn boundary).
+    # Absent-tolerated → ``False`` (older checkpoints predate the field).
+    hold_pending: bool = False
 
     @classmethod
     def load(cls, path: str | os.PathLike[str]) -> "StreamCursor":
@@ -228,6 +249,7 @@ class StreamCursor:
             message_text_lens=list(data.get("message_text_lens") or []),
             last_posted_len=int(data.get("last_posted_len") or 0),
             dropped_through=data.get("dropped_through"),
+            hold_pending=bool(data.get("hold_pending") or False),
         )
 
     def save(self, path: str | os.PathLike[str]) -> None:
@@ -240,6 +262,7 @@ class StreamCursor:
                 "message_text_lens": self.message_text_lens,
                 "last_posted_len": self.last_posted_len,
                 "dropped_through": self.dropped_through,
+                "hold_pending": self.hold_pending,
             },
         )
 
@@ -381,6 +404,28 @@ EditMessage = Callable[[int, int, str], Awaitable[bool]]
 DeleteMessage = Callable[[int, int], Awaitable[bool]]
 OnTurnEvent = Callable[[str, dict], Any]
 ReplyTexts = Callable[[], Any]
+# D5 (spec "Successful-anchor identity comes from the DRIVER"): the driver-
+# injected seam reading the LEDGER + answered-overlay + reservation truth.
+# Returns ``(question_number, tg_message_id, source_hash)`` for the oldest
+# genuinely open, unanswered free-text anchor, or ``None``. Same injection style
+# as ``on_turn_event``; default ``None`` (below) leaves the feature inert.
+#
+# wb2-1 (whole-branch gate wave 2): ``source_hash`` is the projection hash of the
+# ask that PRODUCED the anchor (the SAME hash the relay computes for its ask
+# block). It lets a candidate bind POSITIVELY to the anchor its OWN ask produced,
+# so a prior / co-existing open anchor can never arm a later, unrelated candidate
+# (the F-LEAK2 cross-turn residual). A legacy 2-tuple seam (``source_hash``
+# absent) reads as unbindable — the feature is then inert for that caller.
+OpenAnchorState = Callable[
+    [], "tuple[int, int, str | None] | tuple[int, int] | None"]
+# wb2-3 (whole-branch gate wave 2): the driver-injected TERMINAL lifecycle seam.
+# ``True`` once the engagement record has flipped terminal and
+# ``settle_all_open_questions`` is closing the anchor ledger while this relay is
+# still alive (until completion posting / topic closure). At ``result``/finalize a
+# terminal closure DISCARDS held narration (the engagement is over — D5 discard
+# doctrine) instead of mistaking the now-closed ledger for an answer and flushing
+# a held sign-off below the terminal completion. Default ``None`` = inert.
+EngagementTerminal = Callable[[], bool]
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -418,6 +463,8 @@ class TopicStreamRelay:
         reply_texts: ReplyTexts,
         edit_throttle: float = 1.0,
         sequencer: "OutputSequencer | None" = None,
+        open_anchor_state: "OpenAnchorState | None" = None,
+        engagement_terminal: "EngagementTerminal | None" = None,
         _now: Callable[[], float] = time.monotonic,
         _sleep: Callable[[float], Awaitable[None]] = _default_sleep,
     ) -> None:
@@ -439,6 +486,9 @@ class TopicStreamRelay:
         self.delete_message = delete_message
         self.on_turn_event = on_turn_event
         self.reply_texts = reply_texts
+        self.open_anchor_state = open_anchor_state
+        # wb2-3: the driver-injected terminal-lifecycle seam (see EngagementTerminal).
+        self.engagement_terminal = engagement_terminal
         self._edit_throttle = edit_throttle
         self._now = _now
         self._sleep = _sleep
@@ -490,11 +540,63 @@ class TopicStreamRelay:
         # resuming there would re-read and duplicate the held suffix, Sol r1-1).
         self._warm = False
         self._read_coord: dict | None = None
+        # D5 anchor-candidate + arming (Task C1 — buffering/flush is C2, the
+        # ``hold_pending`` marker is C3). ``_anchor_candidate`` is the
+        # ``(tool_name, block_hash)`` of this turn's matching free-text-anchor
+        # ask block (recorded regardless of ``post_for_block``'s return);
+        # ``_suppressing_for`` is the ARMED ``(question_number, tg_message_id)``
+        # once ``open_anchor_state`` confirms the candidate's anchor is
+        # genuinely open-and-unanswered. Never persisted; reset every turn
+        # boundary (``_reset_turn_state``).
+        self._anchor_candidate: tuple[str, str] | None = None
+        self._suppressing_for: tuple[int, int] | None = None
+        # wb2-1 (whole-branch gate wave 2): arming is now POSITIVELY bound — a
+        # candidate arms ONLY on the anchor its OWN ask produced (the seam's
+        # ``source_hash`` matches the candidate's block hash — see
+        # ``_effective_open_state``). This supersedes wave-1's negative
+        # ``_disarmed_mids`` set (which excluded already-flushed mids but could not
+        # tell a candidate's OWN cross-turn anchor from an unrelated one) — ONE
+        # mechanism now (the r17 single-mechanism lesson), so that set is gone.
+        # D5 Task C2: the anchor-scoped NARRATION BUFFER. While suppression is
+        # armed, trailing prose is HELD here (never posted) as
+        # ``(text, segment, offset_after)`` tuples — the frame coordinates travel
+        # with the held text so Task C3 can add the persisted ``hold_pending``
+        # marker + checkpoint-hold exemption on top WITHOUT restructuring. The
+        # buffer FLUSHES (posts normally) on a later tool_use (which also DISARMS)
+        # or an answer before ``result``; it is DISCARDED at ``result`` if the
+        # anchor is still open-and-unanswered. In-memory only, reset every turn
+        # boundary (``_reset_turn_state``).
+        self._anchor_buffer: list[tuple[str, list[int], int]] = []
+        # D5 Task C3 (Sol r4-3): cold-replay DISARM latch. Set at cold start
+        # when the persisted ``hold_pending`` marker is set — the recovered
+        # turn's held frames lie BEYOND ``current`` and would otherwise re-
+        # execute the suppression logic on catch-up (durable anchor ⇒
+        # re-buffered-and-discarded ⇒ lost). While latched, no anchor candidate
+        # is recorded and suppression never arms, so the previously-buffered
+        # prose re-renders as ORDINARY narration (at-least-once resurface). It
+        # clears at the recovered turn's boundary (``_reset_turn_state`` at
+        # ``result`` / abnormal ``spawn`` / retention gap), after which normal
+        # arming resumes. In-memory only; ``False`` on warm re-entry.
+        self._replay_disarmed = False
 
     # -- persistence helpers ------------------------------------------------
 
     def _save(self) -> None:
         self.cursor.save(self.cursor_path)
+
+    def _arm_hold_marker(self) -> None:
+        """§D5 write-ahead (Sol r5-2): durably persist ``hold_pending=True``
+        BEFORE the first frame's text is treated as held. Buffer-then-persist
+        would leave a crash window where the marker is false, cold replay
+        re-suppresses, and the prose is permanently lost — the exact path this
+        marker exists to close. The ``_save`` here persists the marker with
+        ``current`` still BEHIND the held frames (the held frame does not
+        checkpoint), so a crash after it leaves marker-True/checkpoint-held —
+        cold recovery then disarms and resurfaces. Idempotent: a no-op once the
+        marker is already set (the buffer is already held)."""
+        if not self.cursor.hold_pending:
+            self.cursor.hold_pending = True
+            self._save()
 
     def _checkpoint(self, seg, off_after: int) -> None:
         """Advance ``current`` past a fully-handled (usually invisible) frame."""
@@ -731,6 +833,12 @@ class TopicStreamRelay:
         while True:
             try:
                 res = await _maybe_await(factory())
+                # wb3-2: the sequencer DISCARDED this write (engagement terminal)
+                # — a clean stop, NOT a wire failure: no retry, no drop-mode,
+                # no fail-count bump. The caller treats ``applied is False`` as
+                # "nothing landed" and advances without reposting.
+                if res is DISCARDED:
+                    return False, None
                 ok = res is not None and res is not False
             except Exception as exc:  # noqa: BLE001
                 ok = False
@@ -754,6 +862,10 @@ class TopicStreamRelay:
         ``SEALED`` (something posted below this message — §2 rollover) is NOT a
         failure: the caller opens a fresh narration message for the pending
         text. Only a ``FAILED`` wire edit counts toward the drop threshold.
+
+        wb3-2: ``DISCARDED`` (the engagement terminalized) returns ``"discarded"``
+        — the caller must NOT treat it as SEALED (which would repost the tail
+        below the terminal completion); it discards cleanly instead.
         """
         while True:
             try:
@@ -763,6 +875,9 @@ class TopicStreamRelay:
             except Exception as exc:  # noqa: BLE001
                 res = FAILED
                 logger.debug("topic stream edit op failed (will retry): %s", exc)
+            if res == DISCARDED:
+                self._fail_count = 0
+                return "discarded"
             if res == APPLIED:
                 self._fail_count = 0
                 return "applied"
@@ -825,6 +940,10 @@ class TopicStreamRelay:
                 )
                 if res == "dropped":
                     return
+                if res == "discarded":
+                    # wb3-2: the engagement terminalized mid-edit — stop cleanly,
+                    # post nothing more below the terminal completion.
+                    return
                 if res == "sealed":
                     # F2/R4 NO-LOSS (Sol diff gate): slice from ``_posted_len``
                     # — what actually reached the wire for THIS message — NOT
@@ -857,25 +976,53 @@ class TopicStreamRelay:
 
     async def _post_text(self, text: str, seg, off_after: int) -> None:
         """Text-only streaming path: throttle + single frame-end checkpoint."""
+        # wb2-3: once the engagement is TERMINAL (settle_all_open_questions closed
+        # the anchor ledger; this relay stays alive until completion posting),
+        # FORBID further narration writes — nothing may post below the terminal
+        # completion (D5 discard doctrine). Drop the text and advance the cursor so
+        # the frame is not re-read on the next poll.
+        if self._is_terminal():
+            self._checkpoint(seg, off_after)
+            return
+        await self._maybe_arm_suppression()
+        # §D5: armed (anchor open) — trailing prose is BUFFERED, never posted
+        # here. Flushed on a later tool_use / an answer before ``result``, or
+        # DISCARDED at ``result`` if the anchor is still open. A held frame does
+        # NOT checkpoint (mirrors the throttle-hold below) so a crash can never
+        # strand the held prose past an advanced cursor. §D5 write-ahead (C3):
+        # persist ``hold_pending`` BEFORE holding, so a crash here re-renders the
+        # prose (disarmed) on cold recovery instead of re-suppressing it.
+        if self._suppressing_for is not None:
+            self._arm_hold_marker()
+            self._anchor_buffer.append((text, list(seg), off_after))
+            return
         self._turn_text += text
         if self._dropped:
             self._advance_dropped(seg, off_after)
             return
 
-        ops = self._plan_ops(text)
-        if not ops:
-            self._checkpoint(seg, off_after)
-            return
-
-        # Throttle only the rapid single-edit streaming case: skip the live
-        # edit within the window (text is retained in memory and flushed by the
-        # next edit or at finalize), and do NOT advance the cursor.
-        if len(ops) == 1 and ops[0][0] == "edit":
-            if self._now() - self._last_edit_ts < self._edit_throttle:
-                self._per_message_text = ops[0][1]
+        # §D5 r4-2: a pending, not-yet-armed anchor-candidate — the anchor may be
+        # posting LATE (out-of-band). Route the post through the sequencer's
+        # ATOMIC read-decide-write so the seam re-read + narration post share the
+        # ONE lock the late poster uses; a hold buffers + arms (no checkpoint).
+        if self._anchor_candidate is not None and self.open_anchor_state is not None:
+            if await self._atomic_post_or_hold(text, seg, off_after):
+                return
+        else:
+            ops = self._plan_ops(text)
+            if not ops:
+                self._checkpoint(seg, off_after)
                 return
 
-        await self._execute_ops(ops)
+            # Throttle only the rapid single-edit streaming case: skip the live
+            # edit within the window (text is retained in memory and flushed by
+            # the next edit or at finalize), and do NOT advance the cursor.
+            if len(ops) == 1 and ops[0][0] == "edit":
+                if self._now() - self._last_edit_ts < self._edit_throttle:
+                    self._per_message_text = ops[0][1]
+                    return
+
+            await self._execute_ops(ops)
         if self._dropped:
             self._advance_dropped(seg, off_after)
             return
@@ -888,11 +1035,27 @@ class TopicStreamRelay:
         self.cursor.last_posted_len = self._posted_len
         self._save()
 
-    async def _append_narration(self, text: str) -> None:
+    async def _append_narration(self, text: str, seg, off_after: int) -> None:
         """Append narration text WITHOUT throttle or checkpoint (used by the
         block-ordered mixed-frame path, which checkpoints once at frame end)."""
+        # wb2-3: terminal ⇒ forbid narration writes (see ``_post_text``). The
+        # frame-end checkpoint in ``_handle_assistant_blocks`` advances the cursor.
+        if self._is_terminal():
+            return
+        await self._maybe_arm_suppression()
+        # §D5: armed — BUFFER (see ``_post_text``). The frame-end checkpoint in
+        # ``_handle_assistant_blocks`` is EXEMPTED while the buffer is non-empty.
+        # Write-ahead the ``hold_pending`` marker before holding (C3).
+        if self._suppressing_for is not None:
+            self._arm_hold_marker()
+            self._anchor_buffer.append((text, list(seg), off_after))
+            return
         self._turn_text += text
         if self._dropped:
+            return
+        # §D5 r4-2 atomic hold-or-post for a pending, not-yet-armed candidate.
+        if self._anchor_candidate is not None and self.open_anchor_state is not None:
+            await self._atomic_post_or_hold(text, seg, off_after)
             return
         ops = self._plan_ops(text)
         await self._execute_ops(ops)
@@ -913,12 +1076,233 @@ class TopicStreamRelay:
             # Non-serializable tool_input can never match a hashed intent.
             return
         try:
-            await self.sequencer.post_for_block(name, block_hash)
+            status = await self.sequencer.post_for_block(name, block_hash)
         except Exception as exc:  # noqa: BLE001 — discrete posting is best-effort
             logger.warning(
                 "topic stream discrete-post match failed for engagement %s "
                 "(tool=%s): %s", self.engagement_id, name, exc,
             )
+            return
+        self._log_oob_match(name, block_hash, status)
+        # D5 (Sol r3-6, "Arming survives out-of-band posting"): every matching
+        # free-text-anchor ask block (the tool's own bare-question, no
+        # ``options`` — a button ask blocks the turn anyway, spec §D5 scope)
+        # records a per-turn anchor-candidate REGARDLESS of
+        # ``post_for_block``'s return. ``"posted"`` alone is NOT proof the
+        # anchor is genuinely open (an armed intent reports ``"posted"`` even
+        # when its poster recorded a FAILURE outcome — §D5 "Successful-anchor
+        # identity comes from the DRIVER"); ``"slot_timeout"``/
+        # ``"debt_consumed"`` cover the late/out-of-band posting orderings
+        # (§D5 "Arming survives out-of-band posting"). The candidate is only
+        # the TRIGGER to re-consult the driver-injected ``open_anchor_state``
+        # seam — the actual ARM decision trusts ONLY the seam (see
+        # ``_maybe_arm_suppression``, called before the next text frame and
+        # again at ``result``).
+        # §D5 C3 (Sol r4-3): while cold-replay DISARMED (recovering a held-prose
+        # turn), record NO candidate — the previously-buffered prose must
+        # re-render as ordinary narration on catch-up, so neither arming nor the
+        # r4-2 atomic hold-path (both gated on a candidate) may fire until the
+        # recovered turn's boundary clears the latch.
+        if (
+            name == ASK_TOOL
+            and not tool_input.get("options")
+            and status in ("posted", "slot_timeout", "debt_consumed")
+            and not self._replay_disarmed
+        ):
+            self._anchor_candidate = (name, block_hash)
+
+    def _log_oob_match(self, tool_name: str, block_hash: str, status: str) -> None:
+        """F-OOB instrumentation (spec D7): content-free INFO log at the
+        discrete-post MATCH POINT (``_match_discrete_block``).
+
+        Carries ONLY the pinned projection-hash PREFIX (8 hex — never the
+        projected args/question/options text), the block-resolution result
+        (``posted``/``slot_timeout``/``debt_consumed``/``no_match``/
+        ``consumed_cancelled``, verbatim from ``post_for_block``), the
+        matched intent's state (or ``none`` when no intent was ever
+        registered for this hash — a genuinely absent hold-eligible block),
+        the tool name and engagement id (system identifiers, not operator
+        content), and the registration-to-block latency in ms. Paired with
+        ``OutputSequencer._log_late_post`` (the watcher-path counterpart for
+        a ``slot_timeout`` block's eventual out-of-band post), the two log
+        lines carry enough timing to reconstruct the observed F-OOB ~10s gap
+        (Sol r1-8: likely the 2s slot hold + 10s intent timeout, not a hash
+        defect) — instrumentation only, NO behavioral change."""
+        intent = self.sequencer.registry.peek(tool_name, block_hash)
+        if intent is not None:
+            intent_state = intent.state
+            latency_ms = (self._now() - intent.registered_at) * 1000.0
+        else:
+            intent_state = "none"
+            latency_ms = -1.0
+        logger.info(
+            "oob_match hash=%s result=%s intent_state=%s latency_ms=%.1f "
+            "tool=%s engagement=%s",
+            block_hash[:8], status, intent_state, latency_ms, tool_name,
+            self.engagement_id,
+        )
+
+    async def _effective_open_state(self) -> "tuple[int, int] | None":
+        """The driver-injected ``open_anchor_state`` (``(n, mid, source_hash) |
+        None``) with wb2-1 POSITIVE candidate-binding applied: the reported anchor
+        is eligible to arm / hold / discard THIS turn's prose ONLY when its
+        ``source_hash`` matches the CURRENT anchor-candidate's block hash — i.e.
+        the anchor was produced by the candidate's OWN ask, never a prior or
+        co-existing anchor (the F-LEAK2 cross-turn residual: a refused/late ask
+        recorded a candidate but never surfaced its own anchor, and a bare oldest-
+        open read armed it off the still-open PRIOR anchor). Returns ``(n, mid)``
+        on a match, else ``None`` — the single seam read shared by arming, the
+        atomic hold-or-post, and the ``result``-time flush-vs-discard so all three
+        agree. ``None`` when the seam is not injected, when there is no candidate
+        to bind to, or when a legacy 2-tuple seam carries no ``source_hash``."""
+        if self.open_anchor_state is None:
+            return None
+        state = await _maybe_await(self.open_anchor_state())
+        if state is None:
+            return None
+        cand = self._anchor_candidate
+        if cand is None:
+            return None
+        source_hash = state[2] if len(state) > 2 else None
+        # POSITIVE binding: only the anchor THIS candidate's own ask produced.
+        if source_hash is None or source_hash != cand[1]:
+            return None
+        return (state[0], state[1])
+
+    def _is_terminal(self) -> bool:
+        """wb2-3: ``True`` once the driver-injected terminal seam reports the
+        engagement has flipped terminal (``settle_all_open_questions`` is closing
+        the anchor ledger while this relay is still alive). Inert (``False``) when
+        the seam is not injected."""
+        if self.engagement_terminal is None:
+            return False
+        try:
+            return bool(self.engagement_terminal())
+        except Exception:  # noqa: BLE001 — a seam read must never wedge the relay
+            logger.debug("engagement_terminal seam read failed", exc_info=True)
+            return False
+
+    async def _maybe_arm_suppression(self) -> None:
+        """Re-read the (candidate-bound) open-anchor seam and ARM suppression the
+        moment this turn's anchor-candidate resolves to a genuinely open,
+        unanswered anchor produced by the candidate's OWN ask — the seam's
+        ``source_hash`` matches the candidate's block hash (§D5; wb2-1 positive
+        binding, in ``_effective_open_state``). A prior / co-existing anchor never
+        matches, so it cannot arm this candidate. Called before processing each
+        subsequent text frame and again at ``result``. No-op once armed, when
+        there is no candidate, or when the seam was not injected (inert)."""
+        # §D5 C3 (Sol r4-3): a cold recovery of a held-prose turn DISARMS
+        # suppression for the recovered turn's catch-up so the prose re-renders
+        # as ordinary narration; never arm while the latch is set.
+        if self._replay_disarmed:
+            return
+        if self._suppressing_for is not None or self._anchor_candidate is None:
+            return
+        if self.open_anchor_state is None:
+            return
+        state = await self._effective_open_state()
+        if state is not None:
+            self._suppressing_for = (state[0], state[1])
+
+    async def _atomic_post_or_hold(self, text: str, seg, off_after: int) -> bool:
+        """§D5 r4-2: route a not-yet-armed prose post through the sequencer's
+        ATOMIC read-decide-write, so the seam re-read and the narration post
+        share the ONE lock the late anchor poster uses. Returns ``True`` if the
+        text was HELD (buffered + armed — the caller must NOT post/checkpoint
+        it); ``False`` if the anchor was closed/absent and the poster already
+        posted the text normally.
+
+        Reached only when a candidate is pending and NOT yet armed (the seam was
+        closed at the ``_maybe_arm_suppression`` check just above the caller) —
+        the r4-2 race window where the anchor may be surfacing LATE. Once armed,
+        callers buffer directly without a seam read (no post ⇒ no race)."""
+        # wb1-3: pass the CANDIDATE-BOUND seam (``_effective_open_state``) so an
+        # already-flushed/disarmed prior anchor cannot make this op hold — it
+        # would otherwise buffer legitimate post-B prose off the still-open A.
+        status = await self.sequencer.post_unless_anchor_open(
+            text,
+            self._effective_open_state,
+            poster=lambda t=text: self._execute_ops(self._plan_ops(t)),
+        )
+        if status != "held":
+            return False
+        # The op surfaced the anchor under the lock ⇒ ARM + buffer. Re-read the
+        # (bound) seam for the arm identity; this is post-DECISION (we will NOT
+        # post regardless), so it is not the r4-2 race — a value that raced to
+        # answered only means the buffer flushes at ``result`` instead of
+        # discarding. Keep the prior identity (or a sentinel) if it raced away,
+        # so the armed buffering discipline still holds.
+        state = await self._effective_open_state()
+        if state is not None:
+            self._suppressing_for = (state[0], state[1])
+        elif self._suppressing_for is None:
+            self._suppressing_for = (0, 0)
+        # Write-ahead the ``hold_pending`` marker before holding (C3).
+        self._arm_hold_marker()
+        self._anchor_buffer.append((text, list(seg), off_after))
+        return True
+
+    async def _flush_anchor_buffer(self) -> bool:
+        """Post all buffered anchor-scoped prose as ORDINARY narration (§D5
+        flush), through the normal rollover/seal-aware path so the cursor
+        bookkeeping stays consistent.
+
+        wb6-1: reports whether the held prose was DELIVERED. Returns ``True`` on
+        an empty buffer, on a fully-delivered flush (buffer then cleared), or on
+        a terminal ``DISCARDED`` write (the prose is intentionally not posted
+        below a terminal completion — a decision, not a loss). Returns ``False``
+        when delivery FAILED (drop mode — every send crossed ``_DROP_THRESHOLD``
+        consecutive Telegram failures): the buffer is RETAINED so the caller can
+        keep ``hold_pending`` + an UNADVANCED replay boundary and defer to a cold
+        restart that resurfaces it (§D5 resurface-never-lose). A partly-delivered
+        prefix simply re-renders whole on recovery — at-least-once, the relay's
+        existing visible-delivery contract."""
+        if not self._anchor_buffer:
+            return True
+        buffered = "".join(text for (text, _seg, _off) in self._anchor_buffer)
+        if not buffered:
+            self._anchor_buffer = []
+            return True
+        await self._execute_ops(self._plan_ops(buffered))
+        if self._dropped:
+            # Delivery hit the wire-failure floor: RETAIN the buffer (its frame
+            # coords stay intact) so the held prose survives for a resurface.
+            return False
+        self._anchor_buffer = []
+        return True
+
+    async def _flush_and_disarm(self) -> None:
+        """§D5 r23-2: a tool_use proves the agent is still working, so buffered
+        post-anchor prose is legitimate — FLUSH it and DISARM for the rest of the
+        turn. The spent candidate is dropped too, so the CURRENT anchor never
+        re-arms on the next prose frame; re-arming happens ONLY when a NEW anchor
+        surfaces (a fresh ``_match_discrete_block`` candidate)."""
+        # wb7-1: the tool_use flush obeys the SAME wave-6 resurface-never-lose
+        # contract as the spawn/finalize flushes. If delivery FAILED (drop mode)
+        # the buffer is RETAINED — do NOT disarm suppression, and (critically) do
+        # NOT let ``_handle_assistant_blocks`` fall through to ``_advance_dropped``,
+        # which would set ``dropped_through`` past the still-held frames and make a
+        # cold restart SKIP them despite ``hold_pending=True`` (held prose lost).
+        # Defer INSTEAD: raise ``_FlushDeferred`` BEFORE disarming/advancing, so
+        # ``current``/``dropped_through`` stay behind the held frames, the marker
+        # stays set, and the run-loop catch cold-recovers to resurface the prose
+        # (the C3 cold-disarm machinery renders it as ordinary narration).
+        if not await self._flush_anchor_buffer():
+            logger.warning(
+                "topic stream for engagement %s: held-prose flush failed at a "
+                "tool_use boundary; deferring to a cold restart so the held "
+                "narration resurfaces (marker kept, checkpoint held behind the "
+                "held frames)",
+                self.engagement_id,
+            )
+            raise _FlushDeferred
+        # wb2-1: dropping the spent candidate is what enforces "re-arm only when a
+        # NEW anchor surfaces" — the next prose has no candidate to bind, and a
+        # later candidate only arms on ITS OWN anchor (positive source-hash bind),
+        # never off this just-disarmed one. (Wave-1's ``_disarmed_mids`` negative
+        # set is superseded by that positive binding.)
+        self._suppressing_for = None
+        self._anchor_candidate = None
 
     async def _handle_assistant_blocks(
         self, blocks: list[tuple], seg, off_after: int,
@@ -933,14 +1317,30 @@ class TopicStreamRelay:
             self._advance_dropped(seg, off_after)
             return
         fired_mutating = False
+        flushed_buffer = False
         for block in blocks:
             if block[0] == "text":
-                await self._append_narration(block[1])
+                await self._append_narration(block[1], seg, off_after)
                 if self._dropped:
                     self._advance_dropped(seg, off_after)
                     return
             else:  # tool_use
                 _kind, name, tool_input = block
+                # §D5 r23-2: a tool_use proves the agent is still working — FLUSH
+                # any buffered post-anchor prose (above this block's discrete
+                # post) and DISARM. The flush drops the spent candidate, so if
+                # this block is itself a NEW anchor ask, ``_match_discrete_block``
+                # below re-records the candidate and the next prose re-arms.
+                if self._suppressing_for is not None:
+                    flushed_buffer = True
+                    # wb7-1: a flush that hits drop mode raises ``_FlushDeferred``
+                    # INSIDE ``_flush_and_disarm`` (buffer + marker retained,
+                    # boundary left behind the held frames) so it never reaches an
+                    # ``_advance_dropped`` divert here — that would set
+                    # ``dropped_through`` past the still-held frames and lose them
+                    # on a cold restart. Only a SUCCESSFUL flush returns; the loop
+                    # then continues with an empty buffer, disarmed.
+                    await self._flush_and_disarm()
                 if not fired_mutating and name not in _NON_MUTATING_TOOLS:
                     fired_mutating = True
                     await _maybe_await(
@@ -957,6 +1357,14 @@ class TopicStreamRelay:
                 )
                 await self._match_discrete_block(name, tool_input)
 
+        # §D5: a frame that still holds UNFLUSHED buffered prose is EXEMPT from
+        # checkpoint advancement (mirrors the throttled-text hold at :894) so a
+        # crash can never strand the held prose behind an advanced cursor. The
+        # ``hold_pending`` marker (write-ahead) keeps the held frame recoverable
+        # here; a later flush / the ``result`` discard advances the cursor and
+        # clears the marker atomically.
+        if self._anchor_buffer:
+            return
         self.cursor.current = {"segment": list(seg), "offset": off_after}
         # §A1 (Sol r2-1a): a tool-only frame can checkpoint WHILE a throttled
         # narration edit is held unposted (``_per_message_text`` grew, the wire
@@ -964,6 +1372,13 @@ class TopicStreamRelay:
         # inflated in-memory length, so the delta reconcile keeps the held
         # suffix instead of slicing it behind the seal forever.
         self.cursor.last_posted_len = self._posted_len
+        # §D5 r3-2 (C3): if a tool_use FLUSHED held prose this frame, the buffer
+        # is now on the wire and this checkpoint advances PAST those frames —
+        # clear ``hold_pending`` ATOMICALLY (same ``_save``) with the advance.
+        # Gate on the flush: a disarmed cold-catch-up tool frame (no flush) must
+        # keep the marker set until the recovered turn's ``result`` boundary.
+        if flushed_buffer:
+            self.cursor.hold_pending = False
         self._save()
 
     def _reset_turn_state(self) -> None:
@@ -975,6 +1390,19 @@ class TopicStreamRelay:
         self._dropped = False
         self._drop_warned = False
         self._last_edit_ts = float("-inf")
+        # §D5: turn boundaries reset candidate/arming state AND the buffer. The
+        # abnormal ``spawn`` boundary flushes the buffer + clears ``hold_pending``
+        # BEFORE this reset runs (C3); the normal ``result`` path flushes/
+        # discards + clears the marker before reaching here.
+        self._anchor_candidate = None
+        self._suppressing_for = None
+        self._anchor_buffer = []
+        # §D5 C3: a turn boundary ends the cold-recovery catch-up window — clear
+        # the disarm latch so subsequent turns arm suppression normally. (Cold
+        # replay never calls ``_reset_turn_state`` — replayed frames <= current
+        # take the side-effect-suppressed path — so ``_run_cold`` re-sets this
+        # AFTER its initial reset; the latch clears at the FIRST live boundary.)
+        self._replay_disarmed = False
 
     async def _finalize(self, seg, off_after: int) -> None:
         """Route the closing edit through ``edit_narration_if_latest`` (§2:612),
@@ -988,8 +1416,58 @@ class TopicStreamRelay:
         a conservative seal after process recovery), the closing state posts as
         a NEW message instead of editing one with content under it.
         """
+        # §D5: re-consult the seam AGAIN at result (an answer that arrived
+        # during the turn, or a late anchor post, may only now resolve).
+        await self._maybe_arm_suppression()
+        # §D5 FLUSH-vs-DISCARD: an answer that arrived during the turn (the seam
+        # now reports the anchor closed/answered) FLUSHES the held prose as
+        # ordinary narration; an anchor still open-and-unanswered at ``result``
+        # DISCARDS it — the F-LEAK2 kill (the trailing sign-off never posts).
+        # The seam re-read here is not the r4-2 race: a reported answer means the
+        # anchor already resolved, so no late anchor post can still race us.
+        if self._anchor_buffer:
+            # wb2-1: read the candidate-BOUND seam — only the anchor this buffer
+            # was actually armed under (its own ask's ``source_hash``) keeps it
+            # held; a closed/answered/unrelated anchor reads as ``None``.
+            state = await self._effective_open_state()
+            # wb2-3: a TERMINAL engagement closure (the record flipped terminal and
+            # ``settle_all_open_questions`` closed the anchor ledger, so the seam
+            # now reports ``None``) is INDISTINGUISHABLE from an answer at the bare
+            # seam — but the engagement is OVER, so held prose must be DISCARDED,
+            # never flushed below the terminal completion (D5 discard doctrine). A
+            # genuine answer (``None`` and NOT terminal) still FLUSHES.
+            if state is None and not self._is_terminal():
+                # wb6-1: an answer arrived ⇒ FLUSH. If delivery FAILED (drop
+                # mode), do NOT discard the buffer, advance the closed-turn
+                # checkpoint, or clear ``hold_pending`` (all downstream in this
+                # method) — that would lose the undelivered held prose. Retain
+                # the buffer + the marker + the UNADVANCED boundary (``current``
+                # is still behind the held frames — they never checkpointed) and
+                # defer to a cold restart that resurfaces it (§D5 resurface-
+                # never-lose). The cold catch-up re-renders the prose as ordinary
+                # disarmed narration; this finalize re-runs with an EMPTY buffer.
+                if not await self._flush_anchor_buffer():
+                    logger.warning(
+                        "topic stream for engagement %s: held-prose flush failed "
+                        "at result (answer arrived); deferring finalize to a cold "
+                        "restart so the held narration resurfaces (marker kept, "
+                        "checkpoint held behind the held frames)",
+                        self.engagement_id,
+                    )
+                    raise _FlushDeferred
+            else:
+                self._anchor_buffer = []
         coord = {"segment": list(seg), "offset": off_after}
-        if not self._dropped and self.cursor.message_ids and self._per_message_text:
+        # wb3-2: a TERMINAL engagement DISCARDS its closing edit entirely — the
+        # completion has (or will) post, and a sealed-narration repost of the
+        # unposted suffix (:1400) would land a NEW message BELOW it. The
+        # sequencer's locked writers also discard (belt-and-suspenders for a
+        # terminalization that races this block), but skipping here keeps the
+        # intent explicit and avoids a needless sealed-repost attempt.
+        if (
+            not self._dropped and not self._is_terminal()
+            and self.cursor.message_ids and self._per_message_text
+        ):
             # B2 (Sol r1): the closing edit carries this turn's FINAL fragment,
             # so it honors the at-least-once retry/drop contract via
             # ``_apply_seq_edit``. Only after it lands (APPLIED/SEALED-then-new),
@@ -1027,6 +1505,12 @@ class TopicStreamRelay:
         self.cursor.message_ids = []
         self.cursor.message_text_lens = []
         self.cursor.last_posted_len = 0
+        # §D5 r3-2 (C3): ``result`` is a held-frames boundary — the buffer was
+        # just FLUSHED (answer arrived) or DISCARDED (anchor still open), and a
+        # cold-recovery catch-up reaches its ``result`` with the prose already
+        # re-rendered. Either way the closed-turn checkpoint advances past the
+        # held frames, so clear ``hold_pending`` ATOMICALLY in this same save.
+        self.cursor.hold_pending = False
         self._reset_turn_state()
         # F4+F6: drain every still-armed late intent, then prune + seal, as ONE
         # atomic lock hold. The former flush→prune→seal sequence released the
@@ -1068,12 +1552,23 @@ class TopicStreamRelay:
             cur_seg != _ZERO_SEG
             or bool(self.cursor.message_ids)
             or self.cursor.dropped_through is not None
+            # §D5 C3: a set ``hold_pending`` marks an in-progress held-prose turn
+            # to recover — its held frames lie beyond ``current`` and must be
+            # replayed-then-caught-up (DISARMED), never processed fresh-and-live.
+            or bool(self.cursor.hold_pending)
         )
         self._live = not recovering
         self._reconciled = False
         self._passed_cur_seg = False
         self._reset_turn_state()
         self._read_coord = None
+        # §D5 C3 (Sol r4-3): cold start with the held-frames marker set ⇒ DISARM
+        # suppression for the recovered turn's catch-up so the previously-
+        # buffered prose re-renders as ordinary narration (at-least-once
+        # resurface). Set AFTER ``_reset_turn_state`` (which clears the latch);
+        # it clears again at the recovered turn's boundary (result / abnormal
+        # spawn / gap), after which later turns arm normally.
+        self._replay_disarmed = bool(self.cursor.hold_pending)
         gap_seen = False
 
         try:
@@ -1092,6 +1587,24 @@ class TopicStreamRelay:
                     # live. The sentinel NEVER becomes a coordinate: after a gap,
                     # ``_read_coord`` is seeded only by the first REAL frame
                     # consumed post-gap (and a gap-only run stays cold).
+                    # §D5 r29-3 (C3): SEGMENT_GAP is a TERMINAL recovery floor
+                    # for the marker. If a held-prose turn's frames rotated out,
+                    # ``hold_pending`` would otherwise stay set with suppression
+                    # disarmed into a LATER turn (F-LEAK2 recurs). Log the
+                    # unavoidable lost-source residual (the held prose's frames
+                    # are gone — nothing can resurface them), durably CLEAR the
+                    # marker, and re-arm normal suppression (``_reset_turn_state``
+                    # below clears the disarm latch).
+                    if self.cursor.hold_pending:
+                        logger.warning(
+                            "topic stream for engagement %s: retention gap "
+                            "dropped a turn with buffered prose (hold_pending "
+                            "was set); its source frames rotated out and cannot "
+                            "resurface — clearing the marker and re-arming",
+                            self.engagement_id,
+                        )
+                        self.cursor.hold_pending = False
+                        self._save()
                     self._live = True
                     self._reconciled = True
                     self.cursor.message_ids = []
@@ -1121,6 +1634,14 @@ class TopicStreamRelay:
             # Stream ended while still replaying an open turn — reconcile now.
             if recovering and not self._reconciled:
                 await self._reconcile()
+        except _FlushDeferred:
+            # wb6-1: a held-prose flush failed. Abandon this run WITHOUT latching
+            # warm — the replay boundary was intentionally left behind the held
+            # frames with ``hold_pending`` set, so the next poll cold-recovers and
+            # resurfaces the prose. (Do NOT re-raise: this is a controlled defer,
+            # not a relay error.)
+            self._warm = False
+            return
         except BaseException:
             # Any error escaping the loop invalidates the warm latch so the
             # driver's retry does a full cold recovery (reconcile stays
@@ -1174,6 +1695,13 @@ class TopicStreamRelay:
                     continue
 
                 await self._handle_frame(seg, off_after, raw)
+        except _FlushDeferred:
+            # wb6-1: a held-prose flush failed on a warm resume — drop the warm
+            # latch so the next poll cold-recovers from ``hold_pending`` and
+            # resurfaces the held prose (the boundary stays behind the held
+            # frames). A controlled defer, not a relay error: do NOT re-raise.
+            self._warm = False
+            return
         except BaseException:
             self._warm = False
             raise
@@ -1198,10 +1726,52 @@ class TopicStreamRelay:
             return
 
         if frame.get("casa_control") == "spawn":
+            # §D5 abnormal turn boundary — ``spawn`` without a preceding
+            # ``result`` (Sol r5-3/r8-2/r9-3). On warm re-entry cold disarming
+            # never runs, so a held buffer could be reset (lost) or
+            # ``hold_pending`` stranded into a later turn. EVENT-FIRST ordering
+            # (Sol r9-3) preserves the relay's crash-safety invariant: frames
+            # at/below ``current`` replay with side effects suppressed, so
+            # checkpointing the spawn BEFORE emitting its event would lose the
+            # event permanently on a crash in between. Order (matching today's
+            # side-effects-before-checkpoint): (1) flush any held prose as
+            # ordinary narration + reset suppression/recovery state IN MEMORY;
+            # (2) deliver the spawn event; (3) THEN atomically checkpoint the
+            # handled spawn AND clear ``hold_pending`` in the SAME ``_save``. The
+            # marker clears UNCONDITIONALLY (Sol r8-2, not buffer-conditional): a
+            # cold recovery renders held prose immediately with an EMPTY buffer
+            # yet must still clear here, because an abnormal turn has no
+            # ``result`` to clear at (a buffer-conditional clear would strand the
+            # marker into the next turn with suppression disarmed — F-LEAK2). A
+            # crash between (2) and (3) re-delivers the event on recovery
+            # (at-least-once — the relay's existing contract).
+            # wb6-1: (1) flush (no-op if empty). If delivery FAILED (drop mode),
+            # do NOT proceed to reset suppression, deliver the spawn event, or
+            # checkpoint-and-clear: advancing the boundary past the still-
+            # undelivered held frames + clearing ``hold_pending`` would PERMANENTLY
+            # lose the held prose (§D5 resurface-never-lose). Leave ``current``
+            # behind the held frames + the marker set + the buffer retained, and
+            # abandon this run (``_FlushDeferred``) so a cold restart resurfaces
+            # the prose as disarmed catch-up narration, then handles the spawn.
+            if not await self._flush_anchor_buffer():  # (1)
+                logger.warning(
+                    "topic stream for engagement %s: held-prose flush failed at "
+                    "an abnormal spawn boundary; deferring the spawn to a cold "
+                    "restart so the held narration resurfaces (marker kept, "
+                    "checkpoint held behind the held frames)",
+                    self.engagement_id,
+                )
+                raise _FlushDeferred
+            self._suppressing_for = None
+            self._anchor_candidate = None
+            self._replay_disarmed = False
             await _maybe_await(
-                self.on_turn_event("spawn", {"epoch": frame.get("epoch")})
+                self.on_turn_event("spawn", {"epoch": frame.get("epoch")})  # (2)
             )
-            self._checkpoint(seg, off_after)
+            self.cursor.current = {"segment": list(seg), "offset": off_after}  # (3)
+            self.cursor.last_posted_len = self._posted_len
+            self.cursor.hold_pending = False
+            self._save()
             return
 
         ftype = frame.get("type")

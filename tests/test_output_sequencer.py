@@ -1005,3 +1005,118 @@ async def test_global_lock_order_completes_regardless_of_start_order():
         res = await asyncio.wait_for(
             asyncio.gather(poster, flush), timeout=0.5)
         assert "posted" in res  # the poster resolved
+
+
+# ===========================================================================
+# wb4-1 (whole-branch gate wave 4, BLOCKER): once the engagement TERMINALIZES,
+# no discrete send may register/arm/post BELOW the terminal completion.
+# (a) ``register_intent`` returns the ``TERMINAL_REGISTRATION`` sentinel (NOT
+#     None — None means "no live sequencer" → the ingress eager-fallback), so
+#     the ask/reply ingress surfaces ``engagement_terminal``.
+# (b) ``_post_intent_locked`` refuses to post under the latch (belt-and-
+#     suspenders for an intent that raced in a beat before terminalize) —
+#     resolving it fail-closed instead.
+# ===========================================================================
+
+
+async def test_register_intent_rejected_after_terminalize():
+    from channels.output_sequencer import TERMINAL_REGISTRATION
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    await seq.terminalize()
+    h = projection_hash(REPLY_TOOL, {"text": "late"})
+    res = seq.register_intent(
+        request_id="r1", tool_name=REPLY_TOOL, projection_hash=h,
+        poster=_poster(rec, "late"))
+    # A sentinel, NOT None and NOT a (intent, created) tuple.
+    assert res is TERMINAL_REGISTRATION
+    # Nothing was actually registered.
+    assert seq.registry.by_request_id("r1") is None
+
+
+async def test_post_intent_locked_discards_under_terminal_latch():
+    from channels.output_sequencer import SendIntent
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    h = projection_hash(REPLY_TOOL, {"text": "x"})
+    intent, _ = seq.register_intent(
+        request_id="r1", tool_name=REPLY_TOOL, projection_hash=h,
+        poster=_poster(rec, "x"))
+    seq.arm_intent("r1")
+    # Latch terminal DIRECTLY (simulates the race: this armed intent slipped in
+    # a beat before terminalize's abort loop, so it carries no outcome yet).
+    seq._terminal = True
+    async with seq.serialized():
+        await seq._post_intent_locked(intent, out_of_band=False)
+    # Nothing posted below the terminal completion; the intent resolved
+    # fail-closed with a terminal outcome.
+    assert rec.sends == []
+    assert intent.outcome == {"ok": False, "message_id": None, "terminal": True}
+
+
+# ===========================================================================
+# wb4-2 (whole-branch gate wave 4, BLOCKER): terminalize must PRESERVE an
+# unresolved emit_completion consumption debt (so finalize's completion drain
+# still waits for the relay to reach its causal block), and every post-terminal
+# PLATFORM notice must be DISCARDED — only the dedicated completion seam posts.
+# ===========================================================================
+
+
+def _register_wb4_completion_debt(seq):
+    """Register the emit_completion one-block consumption debt exactly as
+    ``driver.register_completion_consumption`` does (wb4-2)."""
+    rid = "emit_completion:eng-1"
+    phash = projection_hash(EMIT_COMPLETION_TOOL, {})
+
+    async def _noop():
+        return None
+
+    intent, _ = seq.register_intent(
+        request_id=rid, tool_name=EMIT_COMPLETION_TOOL,
+        projection_hash=phash, poster=_noop)
+    intent.state = "posted"
+    intent.timeout_posted = True
+    intent.consumed = False
+    return rid
+
+
+async def test_terminalize_preserves_unconsumed_completion_debt():
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    rid = _register_wb4_completion_debt(seq)
+    await seq.terminalize()
+    # The debt SURVIVES the prune — finalize's drain can still observe it.
+    intent = seq.registry.by_request_id(rid)
+    assert intent is not None
+    assert intent.timeout_posted and not intent.consumed
+
+
+async def test_await_completion_drain_blocks_on_preserved_debt():
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    rid = _register_wb4_completion_debt(seq)
+    await seq.terminalize()
+    # An UNCONSUMED preserved debt is NOT trivially drained: the drain times out
+    # (returns False), never reading the pruned-away intent as drained.
+    drained = await seq.await_completion_drain(rid, timeout=0.02)
+    assert drained is False
+    # Consuming it (the relay reaching the emit_completion block) then drains it.
+    intent = seq.registry.by_request_id(rid)
+    intent.consumed = True
+    seq._signal_resolution(rid)
+    assert await seq.await_completion_drain(rid, timeout=0.02) is True
+
+
+async def test_platform_notice_discarded_after_terminal_completion_posts():
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    await seq.terminalize()
+    # A lagging platform notice (an inbound receipt / violation notice) is
+    # DISCARDED — nothing may land below the terminal completion.
+    assert await seq.post_platform_notice("late violation notice") is None
+    assert rec.sends == []
+    # The completion-only write seam STILL posts the terminal completion.
+    mid = await seq.post_completion_notice("terminal completion")
+    assert mid is not None
+    assert rec.sends == [(42, "terminal completion")]
+    assert seq.high_water == mid

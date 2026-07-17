@@ -546,8 +546,12 @@ class TestDmReadableButtons:
         assert "2. Work Outlook" in text
 
     async def test_dm_buttons_short_labeled_with_index(self):
-        """The DM keyboard buttons carry the SHORT number-prefixed labels
-        (``_short_option_label``) while the body carries the full options; the
+        """v0.84.0 (round 4, spec D2): ``post_dm_keyboard`` has no per-option
+        agent ``short`` to offer the whole-set resolver (``options`` is a
+        plain label list) — until the deferred Haiku label-generation
+        fallback ships, this call site ALWAYS floors to the numbered
+        placeholder (``resolve_button_labels``' ``short_option_labels()`` wrapper
+        keeps its name/signature); the body carries the full options, and the
         callback_data identity stays ``v1|resident_ask|<rid>|<i>`` (unchanged)."""
         from channels import telegram as tg_mod
 
@@ -567,10 +571,9 @@ class TestDmReadableButtons:
         assert mid == 9
         kbd = bot.send_message.call_args.kwargs["reply_markup"]
         rows = kbd.inline_keyboard
-        # v0.83.0 (A4 · F-BTN): the long option is interior-elided keeping
-        # head + tail (cap 30) rather than the old 3-word cut.
-        assert [r[0].text for r in rows] == [
-            "1 · Personal Gmail", "2 · Configure…integration"]
+        # v0.84.0 (D2): no agent shorts anywhere → the WHOLE set floors to the
+        # numbered placeholder (never a garbled per-option elision).
+        assert [r[0].text for r in rows] == ["Option 1", "Option 2"]
         assert [r[0].callback_data for r in rows] == [
             "v1|resident_ask|rid|0", "v1|resident_ask|rid|1"]
         # The full body is posted verbatim (short labels never replace it).

@@ -57,6 +57,10 @@ class _Chan:
         self.narrations: list[tuple[int, str]] = []
         self.edits: list[dict] = []
         self.send_returns_none = False
+        # A6 (spec §D1): the anchor poster now posts via the SINGLE-ATTEMPT PLAIN
+        # ``send_to_topic`` (never the rich ``send_response_to_topic`` two-send
+        # path). This counter proves the rich path is never taken for an anchor.
+        self.rich_topic_sends = 0
 
     def _id(self) -> int:
         m = self._next
@@ -65,12 +69,26 @@ class _Chan:
 
     async def post_options_keyboard(
         self, *, engagement_id, request_id, question, options,
+        shorts=None, multi=False,
     ) -> int:
         m = self._id()
         self.keyboards.append((m, question))
         return m
 
+    async def send_to_topic(self, thread_id, text, **kwargs) -> int | None:
+        # A6 (spec §D1): the anchor poster's SINGLE-ATTEMPT PLAIN send. Records
+        # into ``anchors`` (the ledger every anchor test inspects); honours the
+        # injectable ``send_returns_none`` delivery-failure switch.
+        if self.send_returns_none:
+            return None
+        m = self._id()
+        self.anchors.append((m, text))
+        return m
+
     async def send_response_to_topic(self, topic_id, text) -> int | None:
+        # Rich two-send path — used ONLY by the reply handler now. An anchor that
+        # ever routed here would be the double-send bug A6 forecloses.
+        self.rich_topic_sends += 1
         if self.send_returns_none:
             return None
         m = self._id()
@@ -143,6 +161,8 @@ async def wired(tmp_path, fresh_broker, monkeypatch):
         "reg": reg, "rec": rec, "chan": chan, "seq": seq, "drv": drv,
         "broker": fresh_broker, "ask": handlers["/internal/channel/ask"],
         "send": handlers["/internal/channel/send_to_topic"],
+        "ask_cancel": handlers["/internal/channel/ask_cancel"],
+        "handlers": handlers,
     }
 
 
@@ -869,6 +889,71 @@ class TestDoubleCancelWave4:
         assert len(wired["chan"].anchors) == 1
 
 
+class TestAskCancelRoutePostWins:
+    """wb1-1 (whole-branch gate wave 1): the SEPARATE ``/ask_cancel`` HTTP route
+    must honour ``_record_intent_cancelled``'s post-wins result exactly like the
+    intra-handler ``finally`` does (``TestDoubleCancelWave4`` above covers the
+    task-cancel path).
+
+    Scenario: a cancel lands WHILE the relay poster is mid-post (``posting`` True
+    — the anchor's wire message landed but the ledger add has not committed). The
+    cancel LOSES; the poster owns the ``ask_inflight`` marker and clears it at
+    durable ownership. ``/ask_cancel`` clearing the marker UNCONDITIONALLY let a
+    DIFFERENT ask pass the pending gate before Q1 was durable → the serialized
+    poster later posted Q2 with no re-check → TWO live questions. The route must
+    skip the clear on ``post_won`` and leave the marker to the poster."""
+
+    async def test_ask_cancel_during_inflight_post_marker_stands_anchor(
+        self, wired, monkeypatch,
+    ):
+        eid, drv, seq, chan = (
+            wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
+        gate = asyncio.Event()
+        real_add = wired["reg"].add_open_question
+
+        async def _gated_add(*a, **k):
+            await gate.wait()               # park the poster mid-post, lock held
+            return await real_add(*a, **k)
+
+        monkeypatch.setattr(wired["reg"], "add_open_question", _gated_add)
+
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "a1"
+
+        # The relay reaches the block: the poster posts the wire message then
+        # parks in the gated add_open_question — writer lock held, ``posting`` set.
+        relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
+        await asyncio.sleep(0.02)
+        intent = seq.registry.by_request_id("a1")
+        assert intent.state == "armed" and intent.posting is True
+        assert len(chan.anchors) == 1       # wire message landed; ledger NOT yet
+
+        # Fire the SEPARATE ``/ask_cancel`` HTTP route while the post is winning.
+        resp_cancel = await asyncio.wait_for(wired["ask_cancel"](_FakeRequest(
+            {"engagement_id": eid, "request_id": "a1"})), timeout=1.0)
+        assert _body(resp_cancel)["ok"] is True
+
+        # The marker STILL stands (the post is winning → poster owns the clear).
+        # A second, DIFFERENT ask is refused question_pending — pre-fix the marker
+        # was cleared unconditionally → this ask would be admitted → two live Qs.
+        assert drv.ask_inflight(eid) == "a1"
+        resp2 = await asyncio.wait_for(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a2", hash="anchor-hash-2"))), timeout=1.0)
+        assert _body(resp2)["error"] == "question_pending"
+
+        # Release the poster → durable ownership clears the marker; the anchor
+        # resolves ok; exactly ONE live question remains. The owner task t1
+        # completes anchored (the separate /ask_cancel never cancelled it).
+        gate.set()
+        await asyncio.wait_for(relay, timeout=1.0)
+        resp1 = await asyncio.wait_for(t1, timeout=1.0)
+        assert _body(resp1)["outcome"] == "anchored"
+        assert drv.ask_inflight(eid) is None
+        assert drv._effective_open_question_numbers(eid) == [1]
+
+
 class TestPosterOwnsClearWave5:
     """Sol A3 wave 5 — the poster OWNS the ``ask_inflight`` clear on EVERY
     non-durable exit.
@@ -895,13 +980,13 @@ class TestPosterOwnsClearWave5:
         eid, drv, seq, chan = (
             wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
         gate = asyncio.Event()
-        real_send = chan.send_response_to_topic
+        real_send = chan.send_to_topic
 
-        async def _gated_raising_send(topic_id, text):
+        async def _gated_raising_send(topic_id, text, **kwargs):
             await gate.wait()               # park the poster mid-post, lock held
             raise RuntimeError("wire send failed after the cancel lost")
 
-        monkeypatch.setattr(chan, "send_response_to_topic", _gated_raising_send)
+        monkeypatch.setattr(chan, "send_to_topic", _gated_raising_send)
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
@@ -936,7 +1021,7 @@ class TestPosterOwnsClearWave5:
         assert outcome is not None and outcome["ok"] is False
 
         # A next, DIFFERENT ask is NOT wedged question_pending — it posts cleanly.
-        monkeypatch.setattr(chan, "send_response_to_topic", real_send)
+        monkeypatch.setattr(chan, "send_to_topic", real_send)
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
         resp2 = await _drive_anchor(wired, t2, hash="anchor-hash-2")
@@ -958,11 +1043,11 @@ class TestPosterOwnsClearWave5:
             wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
         gate = asyncio.Event()
 
-        async def _gated_none_send(topic_id, text):
+        async def _gated_none_send(topic_id, text, **kwargs):
             await gate.wait()
             return None
 
-        monkeypatch.setattr(chan, "send_response_to_topic", _gated_none_send)
+        monkeypatch.setattr(chan, "send_to_topic", _gated_none_send)
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
@@ -1111,54 +1196,172 @@ class TestPostAddGenRecheck:
 
 
 # ===========================================================================
-# A7 · F-ANCHOR — embedded-options anchor refusal (Task 12)
+# A6 (spec §D1 "Anchors get the same protection, brokerless"): PASSED->ARM
+# handoff + single-attempt PLAIN send + poster-side cancellation revalidation
+# at the wire. Real handler + real OutputSequencer + real gate; the fake wire
+# records every physical send.
 # ===========================================================================
 
 
-class TestEmbeddedOptionsAnchor:
-    async def test_spaced_embedded_lines_refused(self, wired):
-        """The LIVE ``A — opt`` free-text form: ≥2 enumerated lines in an anchor
-        question → embedded_options with the spec copy, no post, no broker."""
+class TestAnchorLatchedSend:
+    """The anchor poster re-reads the cancellation latch UNDER THE SEQUENCER
+    LOCK immediately before its ONE plain ``send_to_topic`` and no-ops on
+    CANCELLED — on the relay-deferred path and the eager no-sequencer path
+    alike — so a cancel that latched after PASSED/ARM never posts an abandoned
+    anchor, and the rich two-send fallback is unreachable."""
+
+    async def test_cancel_between_passed_and_arm_no_post(self, wired, monkeypatch):
+        # (a) The cancel lands EXACTLY at arm time — after the owner set the gate
+        # PASSED, inside the (no-yield) PASSED->ARM handoff. The armed intent is
+        # matchable, so the relay invokes the poster; the poster's wire re-read
+        # observes CANCELLED and posts NOTHING.
+        eid, drv = wired["rec"].id, wired["drv"]
+        from channels.channel_handlers import get_or_create_gate
+
+        real_arm = drv.arm_send_intent
+
+        def _arm_and_cancel(engagement_id, request_id):
+            # Latch cancellation the instant the placeholder poster is armed
+            # (PASSED already recorded) — the between-PASSED-and-arm window.
+            get_or_create_gate(request_id).set_cancelled()
+            return real_arm(engagement_id, request_id)
+
+        monkeypatch.setattr(drv, "arm_send_intent", _arm_and_cancel)
+
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        # The relay reaches the (armed, but latch-cancelled) block.
+        await wired["seq"].post_for_block(ASK_TOOL, _ANCHOR_HASH)
+        resp = await asyncio.wait_for(task, timeout=1.0)
+        # Nothing posted — neither plain nor rich.
+        assert wired["chan"].anchors == []
+        assert wired["chan"].rich_topic_sends == 0
+        assert _body(resp)["ok"] is False
+        # Marker never wedged.
+        assert drv.ask_inflight(eid) is None
+
+    async def test_cancel_between_arm_and_send_poster_noops(
+        self, wired, monkeypatch,
+    ):
+        # (b) The intent is ARMED and awaiting the relay post; a cancel latches
+        # the gate BEFORE the relay reaches the block. The fake wire is armed to
+        # BLOCK if it is ever entered — the re-read must short-circuit so the
+        # wire is never awaited ("block the fake wire, set the latch, release").
+        eid, drv, chan = wired["rec"].id, wired["drv"], wired["chan"]
+        from channels.channel_handlers import get_or_create_gate
+
+        wire_entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _blocking_send(thread_id, text, **kwargs):
+            wire_entered.set()
+            await release.wait()          # would hang here if ever reached
+            m = chan._id()
+            chan.anchors.append((m, text))
+            return m
+
+        monkeypatch.setattr(chan, "send_to_topic", _blocking_send)
+
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "a1"          # armed, awaiting the post
+        # Cancel lands between ARM and the wire.
+        get_or_create_gate("a1").set_cancelled()
+        # Drive the relay to the block: the poster re-reads CANCELLED and returns
+        # WITHOUT entering (blocking on) the wire.
+        await wired["seq"].post_for_block(ASK_TOOL, _ANCHOR_HASH)
+        resp = await asyncio.wait_for(task, timeout=1.0)
+        release.set()                                 # cleanup — never needed
+        assert not wire_entered.is_set(), "poster reached the wire despite CANCELLED"
+        assert chan.anchors == []
+        assert _body(resp)["ok"] is False
+        assert drv.ask_inflight(eid) is None
+
+    async def test_no_sequencer_fallback_honors_latch(self, wired, monkeypatch):
+        # (c) The eager (no live sequencer / no projection_hash) fallback posts
+        # inline. A cancel latched during number allocation must yield NO wire
+        # post — the eager path honors the same latch.
+        eid, chan = wired["rec"].id, wired["chan"]
+        from channels.channel_handlers import get_or_create_gate
+
+        real_alloc = wired["reg"].allocate_question_number
+
+        async def _alloc_then_cancel(_e):
+            get_or_create_gate("c1").set_cancelled()
+            return await real_alloc(_e)
+
+        monkeypatch.setattr(
+            wired["reg"], "allocate_question_number", _alloc_then_cancel)
+
+        # No ``projection_hash`` => created_intent is None => eager fallback.
+        resp = await wired["ask"](_FakeRequest(
+            {"engagement_id": eid, "request_id": "c1",
+             "question": "DB name?", "options": [], "timeout_s": 60}))
+        assert _body(resp)["ok"] is False
+        assert chan.anchors == []                     # eager path posted nothing
+        assert chan.rich_topic_sends == 0
+
+    async def test_successful_anchor_is_one_plain_send(self, wired):
+        # (d) A normal anchor posts EXACTLY ONE physical send, via the plain
+        # ``send_to_topic`` — the rich two-send path is never taken.
+        eid, chan = wired["rec"].id, wired["chan"]
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "d1"))))
+        resp = await _drive_anchor(wired, task)
+        assert _body(resp)["outcome"] == "anchored"
+        assert len(chan.anchors) == 1                 # exactly ONE physical send
+        assert chan.rich_topic_sends == 0             # never the rich double-send
+        assert chan.replies == []
+
+
+# ===========================================================================
+# D3 (round 4) — the A7 embedded-options regex gate is DELETED: inline
+# enumerated-looking anchor questions are ACCEPTED, no refusal, verbatim text.
+# ===========================================================================
+
+
+class TestInlineEnumeratedAnchorsAccepted:
+    async def test_spaced_embedded_lines_accepted(self, wired):
+        """The LIVE ``A — opt`` free-text form used to be refused
+        ``embedded_options``; D3 deletes the gate — it now posts a normal
+        anchor, question preserved verbatim."""
         eid = wired["rec"].id
         q = "Which stack?\nA — Python MCP + MCPB\nB — Rust bridge"
-        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, "e1", question=q)))
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "e1", question=q))))
+        resp = await _drive_anchor(wired, task)
         body = _body(resp)
-        assert body["ok"] is False
-        assert body["error"] == "embedded_options"
-        assert "multiple-choice" in body["message"]
-        # No wire post, no broker request, no ingress marker held.
-        assert wired["chan"].anchors == []
-        assert wired["broker"].pending(namespace="engagement_ask", scope=eid) == []
-        assert wired["drv"].ask_inflight(eid) is None
+        assert body["ok"] is True
+        assert body["outcome"] == "anchored"
+        assert len(wired["chan"].anchors) == 1
+        assert q in wired["chan"].anchors[0][1]
 
-    async def test_digit_embedded_lines_refused(self, wired):
+    async def test_digit_embedded_lines_accepted(self, wired):
         eid = wired["rec"].id
         q = "Pick:\n1. one\n2. two"
-        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, "e2", question=q)))
-        assert _body(resp)["error"] == "embedded_options"
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "e2", question=q))))
+        resp = await _drive_anchor(wired, task)
+        assert _body(resp)["ok"] is True
+        assert _body(resp)["outcome"] == "anchored"
 
-    async def test_embedded_refusal_records_intent_and_retry_short_circuits(
-        self, wired,
-    ):
-        """The refusal records the intent OUTCOME so a same-request_id transport
-        retry reattaches and short-circuits to the SAME embedded_options."""
-        eid, drv = wired["rec"].id, wired["drv"]
-        q = "Which?\nA — Python MCP\nB — Rust bridge"
-        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, "er", question=q)))
-        assert _body(resp)["error"] == "embedded_options"
-        # Recorded on the intent (byte-identical to the live refusal payload).
-        assert drv.send_intent_outcome(eid, "er") == {
-            "ok": False, "error": "embedded_options",
-            "message": _body(resp)["message"],
-        }
-        # A same-id retry reattaches and returns the recorded outcome verbatim.
-        resp2 = await wired["ask"](_FakeRequest(_anchor_payload(eid, "er", question=q)))
-        assert _body(resp2) == _body(resp)
-        # Still nothing posted.
-        assert wired["chan"].anchors == []
+    async def test_inline_parenthetical_options_accepted(self, wired):
+        """Task B1 brief: an inline "(a) … (b) …" anchor is ACCEPTED — no
+        line-start regex, so a parenthetical inline form was never caught by
+        the old gate either, but this pins the doctrine-only behaviour."""
+        eid = wired["rec"].id
+        q = "Which do you want: (a) the fast path or (b) the safe path?"
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "e3", question=q))))
+        resp = await _drive_anchor(wired, task)
+        body = _body(resp)
+        assert body["ok"] is True
+        assert body["outcome"] == "anchored"
+        assert q in wired["chan"].anchors[0][1]
 
     async def test_one_enumerated_line_allowed(self, wired):
-        """A single enumerated line is below the ≥2 threshold — a normal anchor."""
         eid = wired["rec"].id
         q = "Which?\nA — Python MCP\njust prose, no second option"
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
@@ -1175,12 +1378,1118 @@ class TestEmbeddedOptionsAnchor:
         assert _body(resp)["ok"] is True
 
     async def test_button_ask_with_enumerated_question_untouched(self, wired):
-        """A7 is ANCHORS ONLY — a button ask whose QUESTION looks enumerated
-        still posts its keyboard (never refused embedded_options)."""
+        """A button ask whose QUESTION looks enumerated still posts its
+        keyboard as before (never touched by the anchor gate)."""
         eid = wired["rec"].id
         q = "Which?\n1. one\n2. two"
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _btn_payload(eid, "b7", question=q))))
         resp = await _drive_button(wired, task, "b7")
         assert _body(resp)["outcome"] == "answered"
+
+
+class TestCapsRemovedEndToEnd:
+    """D1 (round 4, spec §D1 bullets 1-2): the invented length caps
+    (``_ASK_MAX_LABEL_LEN``=48, the 1024-char question cap, the 25-char
+    ``short`` cap) are gone — a long option label / question / short is
+    ACCEPTED and posts a real keyboard end-to-end (never ``invalid_args``).
+    Only option COUNT (documented product-contract exception) still rejects.
+    """
+
+    async def test_139_char_option_label_accepted(self, wired):
+        """The LIVE Q2 failure form: a long, readable option label used to be
+        refused ``invalid_args`` at the 48-char cap; it now posts verbatim."""
+        eid = wired["rec"].id
+        base = "Option A — a genuinely long, readable choice description "
+        long_label = base + "x" * (139 - len(base))
+        assert len(long_label) == 139
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(eid, "cap1", options=[long_label, "B"]))))
+        resp = await _drive_button(wired, task, "cap1")
+        body = _body(resp)
+        assert body["ok"] is True
+        assert body["outcome"] == "answered"
+        # D4 (round 4): no enumerator stripping — the label, including its
+        # leading "Option A — ", is rendered VERBATIM.
+        assert long_label in wired["chan"].keyboards[-1][1]
+
+    async def test_2000_char_question_accepted(self, wired):
+        long_question = "x" * 2000
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(eid=wired["rec"].id, rid="cap2", question=long_question))))
+        resp = await _drive_button(wired, task, "cap2")
+        assert _body(resp)["ok"] is True
+
+    async def test_9_options_still_rejected_count_cap(self, wired):
+        """The COUNT cap (documented product-contract exception, unaffected
+        by D1) still refuses — this is never about label/question length."""
+        eid = wired["rec"].id
+        resp = await wired["ask"](_FakeRequest(_btn_payload(
+            eid, "cap3", options=[f"o{i}" for i in range(9)])))
+        assert _body(resp) == {"ok": False, "error": "invalid_args"}
+
+    async def test_duplicate_full_labels_still_rejected(self, wired):
+        eid = wired["rec"].id
+        resp = await wired["ask"](_FakeRequest(_btn_payload(
+            eid, "cap4", options=["Same", "Same"])))
+        assert _body(resp) == {"ok": False, "error": "invalid_args"}
+
+    async def test_blank_and_non_string_short_never_reject(self, wired):
+        """A blank or non-string ``short`` used to be refused at the 25-char/
+        non-blank checks; it now floors the button set (D2) but still posts."""
+        eid = wired["rec"].id
+        options = [
+            {"label": "Personal Gmail", "short": "   "},
+            {"label": "Work Outlook", "short": 7},
+        ]
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(eid, "cap5", options=options))))
+        resp = await _drive_button(wired, task, "cap5")
+        assert _body(resp)["ok"] is True
         assert len(wired["chan"].keyboards) == 1
+
+
+# ===========================================================================
+# D1 (round 4, Task A5) — validation-gate WIRING into the ask handler:
+# single-owner validation, terminal-exit publication, cancel-awareness.
+# REAL handler + REAL VerdictBroker + REAL OutputSequencer; asyncio.Event
+# barriers inside a monkeypatched allocator force the owner/reattacher
+# orderings. Never patches ``<module>.asyncio.sleep``.
+# ===========================================================================
+
+
+class TestGateWiring:
+    def _barrier_alloc(self, wired, *, raises=False):
+        """Patch the registry allocator with a controllable barrier so the
+        OWNER blocks mid-validation (after registering the intent + claiming
+        the ingress marker, before the post) while a same-request_id
+        reattacher blocks on the gate. Returns (entered, release)."""
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        orig = wired["reg"].allocate_question_number
+
+        async def _alloc(eid):
+            entered.set()
+            await release.wait()
+            if raises:
+                raise RuntimeError("boom")
+            return await orig(eid)
+
+        wired["reg"].allocate_question_number = _alloc
+        return entered, release
+
+    async def _launch_owner_reattacher(self, wired, rid, entered, **over):
+        """Owner registers first (created intent), blocks in the allocator;
+        the reattacher then registers (created=False) and blocks on the gate."""
+        owner = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(wired["rec"].id, rid, **over))))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        reattach = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(wired["rec"].id, rid, **over))))
+        await asyncio.sleep(0.02)  # let the reattacher reach the gate wait
+        assert not reattach.done()  # truly blocked on the PENDING gate
+        return owner, reattach
+
+    async def test_reattacher_blocked_gets_internal_error_no_broker_no_post(
+        self, wired,
+    ):
+        """(a) allocator RAISES while a reattacher is blocked on the gate →
+        both get ``internal_error`` byte-identically; no broker, no keyboard."""
+        entered, release = self._barrier_alloc(wired, raises=True)
+        owner, reattach = await self._launch_owner_reattacher(wired, "gw1", entered)
+        release.set()
+        r_owner = _body(await asyncio.wait_for(owner, 1.0))
+        r_re = _body(await asyncio.wait_for(reattach, 1.0))
+        assert r_owner == {"ok": False, "error": "internal_error"}
+        assert r_re == {"ok": False, "error": "internal_error"}
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=wired["rec"].id) == []
+        assert wired["chan"].keyboards == []
+
+    async def test_reattacher_blocked_gets_invalid_args_detail_no_broker_no_post(
+        self, wired,
+    ):
+        """(a) the render-and-measure size check FAILS post-allocation while a
+        reattacher is blocked → both get the SAME self-explaining
+        ``invalid_args`` detail; no broker, no keyboard."""
+        entered, release = self._barrier_alloc(wired)
+        owner, reattach = await self._launch_owner_reattacher(
+            wired, "gw2", entered, question="Q" * 5000)
+        release.set()
+        r_owner = _body(await asyncio.wait_for(owner, 1.0))
+        r_re = _body(await asyncio.wait_for(reattach, 1.0))
+        assert r_owner["error"] == "invalid_args"
+        assert "4096" in r_owner["detail"]
+        assert r_re == r_owner  # byte-identical detail
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=wired["rec"].id) == []
+        assert wired["chan"].keyboards == []
+
+    async def test_cancel_during_allocation_aborts_no_broker_no_post(self, wired):
+        """(b) cancel-during-allocation → the owner aborts at the final gate
+        check (no broker record, no post, marker cleared); a reattacher blocked
+        on the gate wakes CANCELLED."""
+        entered, release = self._barrier_alloc(wired)
+        owner, reattach = await self._launch_owner_reattacher(wired, "gw3", entered)
+        # Cancel lands WHILE the owner is suspended in allocation.
+        await wired["ask_cancel"](_FakeRequest(
+            {"engagement_id": wired["rec"].id, "request_id": "gw3"}))
+        release.set()
+        r_owner = _body(await asyncio.wait_for(owner, 1.0))
+        r_re = _body(await asyncio.wait_for(reattach, 1.0))
+        assert r_owner == {"ok": False, "error": "cancelled"}
+        assert r_re == {"ok": False, "error": "cancelled"}
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=wired["rec"].id) == []
+        assert wired["chan"].keyboards == []
+        # Marker cleared — a later ask is not wedged ``question_pending``.
+        assert wired["drv"].ask_inflight(wired["rec"].id) is None
+
+    async def test_cancel_first_then_ask_refuses(self, wired):
+        """(c) cancel-first-then-ask → an ``ask_cancel`` that lands BEFORE the
+        original /ask latches the gate; the later /ask finds it and refuses
+        with no broker, no keyboard."""
+        eid = wired["rec"].id
+        await wired["ask_cancel"](_FakeRequest(
+            {"engagement_id": eid, "request_id": "gw4"}))
+        resp = await asyncio.wait_for(
+            wired["ask"](_FakeRequest(_btn_payload(eid, "gw4"))), 1.0)
+        assert _body(resp) == {"ok": False, "error": "cancelled"}
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=eid) == []
+        assert wired["chan"].keyboards == []
+
+    async def test_operator_away_reattacher_byte_equivalent_no_broker(self, wired):
+        """(a) pre-allocation exit: operator-away refuses the owner AND a
+        same-request_id reattacher byte-identically, with no broker/post."""
+        eid = wired["rec"].id
+        wired["drv"]._operator_away[eid] = True  # SUSPEND (F-EXPIRE gate reads it)
+        r_owner = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gw5"))))
+        r_re = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gw5"))))
+        assert r_owner["error"] == "operator_away"
+        assert r_re["error"] == "operator_away"
+        assert r_owner["message"] == r_re["message"]
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=eid) == []
+        assert wired["chan"].keyboards == []
+
+    async def test_question_pending_reattacher_byte_equivalent_no_broker(
+        self, wired,
+    ):
+        """(a) pre-allocation exit: a second DISTINCT ask is refused
+        ``question_pending`` while one is live; a same-id reattacher of the
+        refused one gets the byte-equivalent refusal, no broker/post."""
+        eid = wired["rec"].id
+        # A live broker ask makes the engagement pending.
+        wired["broker"].register(
+            namespace="engagement_ask", scope=eid, request_id="live",
+            timeout_s=60, meta={})
+        r_owner = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gw6"))))
+        r_re = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gw6"))))
+        assert r_owner["error"] == "question_pending"
+        assert r_re["error"] == "question_pending"
+        assert r_owner == r_re
+        # Only the pre-seeded "live" request is pending — gw6 never registered.
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=eid) == ["live"]
+        assert wired["chan"].keyboards == []
+
+
+# ===========================================================================
+# D1 (round 4, Task A4) — AskValidationGate: completion slot, cancellation
+# latch, wake event, get_or_create_gate, refcounted retention.
+#
+# Design ref: docs/superpowers/specs/2026-07-16-engagement-ask-labels-
+# round4-design.md §D1 "Validator placement + failure hygiene" (Sol
+# r9-1/r10-1/r10-2). Pure unit tests against the gate primitive itself —
+# NOT wired into the ask/ask_cancel/reattach handlers yet (Task A5). Real
+# asyncio throughout; retention tests inject a fake monotonic clock rather
+# than patching ``time.monotonic``/``asyncio.sleep``.
+# ===========================================================================
+
+
+import verdict_broker as _verdict_broker_mod
+from channels.channel_handlers import (
+    _ASK_VALIDATION_OWNERS,
+    _INTENT_GATE_PINS,
+    ASK_GATES,
+    AskValidationGate,
+    get_or_create_gate,
+    maybe_retire_gate,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_ask_gates():
+    """D1 tests own ``ASK_GATES`` / ``_ASK_VALIDATION_OWNERS`` — never leak a
+    gate or an owner marker (or a wb2-4 intent-lifecycle pin) into another test."""
+    ASK_GATES.clear()
+    _ASK_VALIDATION_OWNERS.clear()
+    _INTENT_GATE_PINS.clear()
+    yield
+    ASK_GATES.clear()
+    _ASK_VALIDATION_OWNERS.clear()
+    _INTENT_GATE_PINS.clear()
+
+
+class _FakeClock:
+    """Deterministic monotonic clock the retention tests advance by hand —
+    never patches ``time.monotonic`` (the memory-cage rule bars patching
+    shared module attributes; this is dependency-injected instead)."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, delta: float) -> None:
+        self.now += delta
+
+
+class TestCompletionSlot:
+    """Completion is owner-only and immutable once set (spec §D1 r10-1)."""
+
+    async def test_pending_before_any_terminal(self):
+        gate = AskValidationGate()
+        assert gate.completion is None
+        assert gate.cancelled is False
+        assert gate.effective() == ("PENDING", None)
+        assert not gate.event.is_set()
+
+    async def test_set_passed_then_effective_passed(self):
+        gate = AskValidationGate()
+        gate.set_passed()
+        assert gate.completion == ("PASSED", None)
+        assert gate.effective() == ("PASSED", None)
+        assert gate.event.is_set()
+
+    async def test_set_failed_then_effective_failed_with_payload(self):
+        gate = AskValidationGate()
+        payload = {"ok": False, "error": "invalid_args", "detail": "too long"}
+        gate.set_failed(payload)
+        assert gate.effective() == ("FAILED", payload)
+        assert gate.event.is_set()
+
+    async def test_set_passed_twice_is_a_noop(self):
+        gate = AskValidationGate()
+        gate.set_passed()
+        gate.set_passed()
+        assert gate.completion == ("PASSED", None)
+
+    async def test_set_failed_after_passed_does_not_clobber(self):
+        """Owner-only immutability: a second (buggy) owner call never
+        overwrites the first resolution, regardless of which terminal it
+        tries to set."""
+        gate = AskValidationGate()
+        gate.set_passed()
+        gate.set_failed({"ok": False, "error": "invalid_args"})
+        assert gate.completion == ("PASSED", None)
+
+    async def test_set_passed_after_failed_does_not_clobber(self):
+        gate = AskValidationGate()
+        payload = {"ok": False, "error": "invalid_args"}
+        gate.set_failed(payload)
+        gate.set_passed()
+        assert gate.completion == ("FAILED", payload)
+
+
+class TestCancellationLatch:
+    """Cancellation is monotonic and settable by ANYONE at ANY time —
+    including after PASSED (the r9-1 transition a single once-only slot
+    cannot express)."""
+
+    async def test_cancel_before_any_completion(self):
+        gate = AskValidationGate()
+        gate.set_cancelled()
+        assert gate.effective() == ("CANCELLED", None)
+        assert gate.event.is_set()
+
+    async def test_passed_then_cancelled_effective_is_cancelled(self):
+        """The r9-1 transition: PASSED -> CANCELLED. CANCELLED wins over a
+        completion that already landed."""
+        gate = AskValidationGate()
+        gate.set_passed()
+        gate.set_cancelled()
+        assert gate.completion == ("PASSED", None)  # completion untouched
+        assert gate.cancelled is True
+        assert gate.effective() == ("CANCELLED", None)
+
+    async def test_failed_then_cancelled_effective_is_cancelled(self):
+        gate = AskValidationGate()
+        gate.set_failed({"ok": False, "error": "invalid_args"})
+        gate.set_cancelled()
+        assert gate.effective() == ("CANCELLED", None)
+
+    async def test_cancel_is_idempotent(self):
+        gate = AskValidationGate()
+        gate.set_cancelled()
+        gate.set_cancelled()
+        assert gate.cancelled is True
+        assert gate.effective() == ("CANCELLED", None)
+
+    async def test_cancel_then_set_passed_still_reads_cancelled(self):
+        """Cancellation is never gated by completion order: even a
+        (belated) owner PASSED after the latch is set does not un-cancel
+        the effective outcome."""
+        gate = AskValidationGate()
+        gate.set_cancelled()
+        gate.set_passed()
+        assert gate.completion == ("PASSED", None)
+        assert gate.effective() == ("CANCELLED", None)
+
+
+class TestWakeEvent:
+    """ONE asyncio.Event, set by whichever terminal arrives first, wakes a
+    waiter regardless of which terminal it was (r10-1)."""
+
+    async def test_latch_only_cancellation_wakes_a_pending_waiter(self):
+        gate = AskValidationGate()
+        waiter = asyncio.ensure_future(gate.event.wait())
+        await asyncio.sleep(0.01)
+        assert not waiter.done()
+        gate.set_cancelled()
+        await asyncio.wait_for(waiter, timeout=1.0)
+        assert waiter.result() is True
+        assert gate.effective() == ("CANCELLED", None)
+
+    async def test_set_passed_wakes_a_pending_waiter(self):
+        gate = AskValidationGate()
+        waiter = asyncio.ensure_future(gate.event.wait())
+        await asyncio.sleep(0.01)
+        gate.set_passed()
+        await asyncio.wait_for(waiter, timeout=1.0)
+        assert gate.effective() == ("PASSED", None)
+
+    async def test_failed_payload_delivered_byte_identical_to_two_concurrent_waiters(
+        self,
+    ):
+        gate = AskValidationGate()
+        payload = {
+            "ok": False, "error": "invalid_args",
+            "detail": "rendered question+options would exceed Telegram's "
+                       "4096-char message limit",
+        }
+
+        async def _wait_and_read():
+            await gate.event.wait()
+            return gate.effective()
+
+        w1 = asyncio.ensure_future(_wait_and_read())
+        w2 = asyncio.ensure_future(_wait_and_read())
+        await asyncio.sleep(0.01)
+        gate.set_failed(payload)
+        outcome1 = await asyncio.wait_for(w1, timeout=1.0)
+        outcome2 = await asyncio.wait_for(w2, timeout=1.0)
+        assert outcome1 == ("FAILED", payload)
+        assert outcome2 == ("FAILED", payload)
+        # Byte-identical — the SAME dict object, never a re-serialized copy.
+        assert outcome1[1] is payload
+        assert outcome2[1] is payload
+
+    async def test_a_late_waiter_after_resolution_never_blocks(self):
+        """A reattacher that arrives AFTER the gate resolved finds the
+        latch already set — ``event.wait()`` returns immediately."""
+        gate = AskValidationGate()
+        gate.set_failed({"ok": False, "error": "invalid_args"})
+        await asyncio.wait_for(gate.event.wait(), timeout=0.05)
+        assert gate.effective() == ("FAILED", {"ok": False, "error": "invalid_args"})
+
+
+class TestGetOrCreateGate:
+    """Idempotent per-request_id lookup — the cancel-first ordering the
+    r5-1/r10-1 handshake depends on."""
+
+    async def test_first_call_creates_a_gate(self):
+        assert "rid-1" not in ASK_GATES
+        gate = get_or_create_gate("rid-1")
+        assert ASK_GATES["rid-1"] is gate
+        assert gate.effective() == ("PENDING", None)
+
+    async def test_second_call_returns_the_same_instance(self):
+        g1 = get_or_create_gate("rid-2")
+        g2 = get_or_create_gate("rid-2")
+        assert g1 is g2
+
+    async def test_different_request_ids_get_different_gates(self):
+        g1 = get_or_create_gate("rid-3a")
+        g2 = get_or_create_gate("rid-3b")
+        assert g1 is not g2
+
+    async def test_cancel_first_then_ask_path_finds_latch_already_set(self):
+        """The r5-1 scenario: ``ask_cancel`` is a SEPARATE HTTP request from
+        the caller's ``finally`` and can land BEFORE the original ``/ask``
+        creates anything. ``ask_cancel`` calls ``get_or_create_gate`` and
+        sets the cancellation latch; when the ask path LATER calls
+        ``get_or_create_gate`` for the same request_id, it must find the
+        SAME gate with the latch already set — never a fresh PENDING gate
+        that lets the ask proceed to register a broker request for a
+        caller who already abandoned it."""
+        rid = "rid-cancel-first"
+        cancel_gate = get_or_create_gate(rid)
+        cancel_gate.set_cancelled()
+
+        # ... time passes; the original /ask handler now runs for the
+        # first time and looks up the gate for the same request_id.
+        ask_gate = get_or_create_gate(rid)
+
+        assert ask_gate is cancel_gate
+        assert ask_gate.effective() == ("CANCELLED", None)
+        # The owner's later PASSED must not resurrect a stale ordering —
+        # cancellation still wins.
+        ask_gate.set_passed()
+        assert ask_gate.effective() == ("CANCELLED", None)
+
+
+class TestRefcountedRetention:
+    """Retention: a gate retires only when (a) no active reference remains
+    AND (b) the reattach retention bound has elapsed since terminal
+    resolution — reusing ``verdict_broker``'s existing tombstone window
+    rather than a new TTL constant (spec §D1 "Tombstone retention, stated
+    precisely")."""
+
+    async def test_pending_gate_is_never_retirable(self):
+        gate = AskValidationGate()
+        assert gate.retirable() is False
+
+    async def test_unresolved_but_referenced_gate_is_never_retirable(self, monkeypatch):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 0.0)
+        gate = AskValidationGate()
+        gate.acquire()
+        assert gate.retirable() is False
+
+    async def test_not_retirable_while_referenced_even_after_terminal(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 0.0)
+        clock = _FakeClock()
+        gate = AskValidationGate(clock=clock)
+        gate.acquire()
+        gate.set_passed()
+        clock.advance(1000.0)  # WAY past any bound
+        assert gate.refcount == 1
+        assert gate.retirable() is False  # still referenced
+
+    async def test_retirable_immediately_after_release_when_bound_is_zero(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 0.0)
+        clock = _FakeClock()
+        gate = AskValidationGate(clock=clock)
+        gate.acquire()
+        gate.set_passed()
+        assert gate.retirable() is False
+        gate.release()
+        assert gate.refcount == 0
+        assert gate.retirable() is True
+
+    async def test_not_retirable_before_the_bound_elapses(self, monkeypatch):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 60.0)
+        clock = _FakeClock()
+        gate = AskValidationGate(clock=clock)
+        gate.set_failed({"ok": False, "error": "invalid_args"})
+        clock.advance(59.9)
+        assert gate.retirable() is False
+
+    async def test_retirable_once_the_bound_elapses(self, monkeypatch):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 60.0)
+        clock = _FakeClock()
+        gate = AskValidationGate(clock=clock)
+        gate.set_failed({"ok": False, "error": "invalid_args"})
+        clock.advance(60.0)
+        assert gate.retirable() is True
+
+    async def test_release_never_goes_negative(self):
+        gate = AskValidationGate()
+        gate.release()
+        gate.release()
+        assert gate.refcount == 0
+
+    async def test_explicit_bound_overrides_the_reused_default(self):
+        """``retirable(bound=...)`` lets a caller override the reused
+        window directly — used by :func:`maybe_retire_gate`'s callers in
+        tests without touching ``verdict_broker`` at all."""
+        clock = _FakeClock()
+        gate = AskValidationGate(clock=clock)
+        gate.set_passed()
+        assert gate.retirable(bound=10.0) is False
+        clock.advance(10.0)
+        assert gate.retirable(bound=10.0) is True
+
+    async def test_maybe_retire_gate_noop_while_referenced(self, monkeypatch):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 0.0)
+        clock = _FakeClock()
+        gate = get_or_create_gate("rid-retain", clock=clock)
+        gate.acquire()
+        gate.set_passed()
+        assert maybe_retire_gate("rid-retain") is False
+        assert "rid-retain" in ASK_GATES
+
+    async def test_maybe_retire_gate_removes_from_ask_gates_after_release_and_bound(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 5.0)
+        clock = _FakeClock()
+        gate = get_or_create_gate("rid-retire", clock=clock)
+        gate.acquire()
+        gate.set_passed()
+        assert maybe_retire_gate("rid-retire") is False  # still referenced
+
+        gate.release()
+        assert maybe_retire_gate("rid-retire") is False  # bound not elapsed
+
+        clock.advance(5.0)
+        assert maybe_retire_gate("rid-retire") is True
+        assert "rid-retire" not in ASK_GATES
+
+    async def test_maybe_retire_gate_unknown_request_id_is_a_noop(self):
+        assert maybe_retire_gate("no-such-request-id") is False
+
+    async def test_reuses_verdict_broker_retire_window_not_a_new_constant(
+        self, monkeypatch,
+    ):
+        """Direct check that the gate's DEFAULT bound tracks
+        ``verdict_broker._RETIRE_S`` dynamically (read at call time, not
+        captured at import) — the same guarantee that module documents for
+        its own tombstone retirement."""
+        clock = _FakeClock()
+        gate = AskValidationGate(clock=clock)
+        gate.set_passed()
+
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 42.0)
+        clock.advance(41.9)
+        assert gate.retirable() is False
+        clock.advance(0.2)
+        assert gate.retirable() is True
+
+
+class TestIntentLifecycleGatePin:
+    """wb2-4 (whole-branch gate wave 2): a resolved (PASSED) gate is pinned to
+    its send-intent's lifetime, so it cannot retire while the intent is still
+    live — even past the reattach-retention bound. The retention window then only
+    governs POST-retirement observability. REAL handler + REAL OutputSequencer +
+    REAL gate through the ``wired`` harness."""
+
+    async def test_passed_gate_not_retirable_while_send_intent_live(
+        self, wired, monkeypatch,
+    ):
+        # Bound elapsed the instant a gate resolves — isolates the intent pin as
+        # the ONLY thing that can keep the gate un-retirable.
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 0.0)
+        eid = wired["rec"].id
+        task = asyncio.ensure_future(
+            wired["ask"](_FakeRequest(_anchor_payload(eid, "a1"))))
+        # Drive the relay-deferred anchor post: gate PASSED, intent LIVE (posted,
+        # not yet pruned), handler returned (its OWN gate pin already released).
+        await _drive_anchor(wired, task)
+
+        gate = ASK_GATES.get("a1")
+        # Pre-fix, the handler's own ``finally`` maybe-retires the gate (bound 0,
+        # refcount 0) WHILE the send-intent still lives — the gate would be gone.
+        assert gate is not None
+        assert gate.effective()[0] == "PASSED"
+        assert gate.retirable() is False          # the live intent pins it
+        assert maybe_retire_gate("a1") is False   # the sweep cannot drop it
+        assert "a1" in ASK_GATES
+
+        # Turn-end prune RETIRES the intent → its ``on_retire`` releases the pin →
+        # the gate is now retirable and drops out of ASK_GATES.
+        await wired["seq"].drain_and_prune_turn()
+        assert "a1" not in ASK_GATES
+
+
+# ===========================================================================
+# A5 review, Finding 1 — ASK_GATES grows unbounded. ``maybe_retire_gate`` is
+# only ever called at an ask's OWN ``finally`` / ``ask_cancel``, microseconds
+# after that SAME gate's own resolution — the 60s ``retirable()`` bound is
+# never elapsed yet, so retirement there is ALWAYS a no-op and every ask
+# leaks one gate permanently (reviewer-verified empirically: "retired at
+# finally? False | still in ASK_GATES? True; ASK_GATES size after one
+# successful ask: 1"). Fix: sweep every CURRENTLY-retirable gate in
+# ``ASK_GATES`` at the entry of the NEXT ask/ask_cancel call (before that
+# call's own ``get_or_create_gate``) — by the time a LATER call runs, the
+# EARLIER gate's bound has had a real chance to elapse.
+# ===========================================================================
+
+
+class TestSweepRetirableGatesUnit:
+    """Unit-level coverage of ``_sweep_retirable_gates`` against the gate
+    primitive directly (injected clocks, no HTTP handler involved) — the
+    same pattern ``TestRefcountedRetention`` already uses."""
+
+    async def test_sweeps_a_referenced_gate_that_is_not_yet_retirable(
+        self, monkeypatch,
+    ):
+        from channels.channel_handlers import _sweep_retirable_gates
+
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 60.0)
+        clock = _FakeClock()
+        gate = get_or_create_gate("sweep-young", clock=clock)
+        gate.acquire()
+        gate.set_passed()
+        gate.release()
+        clock.advance(10.0)  # bound not elapsed yet
+
+        _sweep_retirable_gates()
+
+        assert "sweep-young" in ASK_GATES
+
+    async def test_sweeps_an_aged_unreferenced_gate(self, monkeypatch):
+        from channels.channel_handlers import _sweep_retirable_gates
+
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 60.0)
+        clock = _FakeClock()
+        gate = get_or_create_gate("sweep-old", clock=clock)
+        gate.acquire()
+        gate.set_passed()
+        gate.release()
+        clock.advance(60.0)  # bound elapsed
+
+        _sweep_retirable_gates()
+
+        assert "sweep-old" not in ASK_GATES
+
+    async def test_never_resolved_pending_gate_is_left_alone_by_the_sweep(
+        self, monkeypatch,
+    ):
+        """A genuinely in-flight (never-resolved) gate is NEVER retirable —
+        the sweep must not touch it regardless of how much time passes."""
+        from channels.channel_handlers import _sweep_retirable_gates
+
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 60.0)
+        clock = _FakeClock()
+        get_or_create_gate("sweep-pending", clock=clock)
+        clock.advance(1000.0)
+
+        _sweep_retirable_gates()
+
+        assert "sweep-pending" in ASK_GATES
+
+    async def test_sweeps_multiple_aged_gates_leaves_young_ones(self, monkeypatch):
+        from channels.channel_handlers import _sweep_retirable_gates
+
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 60.0)
+        clock = _FakeClock()
+        old1 = get_or_create_gate("sweep-old-1", clock=clock)
+        old1.acquire()
+        old1.set_passed()
+        old1.release()
+        old2 = get_or_create_gate("sweep-old-2", clock=clock)
+        old2.acquire()
+        old2.set_failed({"ok": False, "error": "invalid_args"})
+        old2.release()
+        clock.advance(60.0)
+        young = get_or_create_gate("sweep-young-2", clock=clock)
+        young.acquire()
+        young.set_passed()
+        young.release()
+
+        _sweep_retirable_gates()
+
+        assert "sweep-old-1" not in ASK_GATES
+        assert "sweep-old-2" not in ASK_GATES
+        assert "sweep-young-2" in ASK_GATES
+
+
+class TestAskEntrySweepsPriorLeakedGates:
+    """Wiring-level proof: the reviewer's EXACT repro (one full ask leaves
+    its resolved gate behind forever) is fixed because the NEXT ask sweeps
+    it at entry, once the retention bound has elapsed."""
+
+    async def test_one_full_ask_leaves_its_resolved_gate_in_ask_gates(
+        self, wired,
+    ):
+        """Reproduces the reviewer's exact observation BEFORE the sweep
+        fires: a fully-resolved, unreferenced gate stays in ``ASK_GATES``
+        because its own ``finally`` runs microseconds after its own
+        resolution — nowhere near the retention bound."""
+        eid = wired["rec"].id
+        task = asyncio.ensure_future(
+            wired["ask"](_FakeRequest(_btn_payload(eid, "leak1"))))
+        resp = await _drive_button(wired, task, "leak1")
+        assert _body(resp)["ok"] is True
+
+        assert "leak1" in ASK_GATES
+        gate = ASK_GATES["leak1"]
+        assert gate.effective()[0] != "PENDING"  # actually resolved
+        # wb2-4: the resolved gate stays REFERENCED by its still-live send-intent
+        # (pinned to the intent's lifetime) — it cannot retire while the intent
+        # lives, closing the drift where a 60s-elapsed PASSED gate could retire out
+        # from under a live intent and re-litigate a same-id retry as PENDING.
+        assert gate.refcount == 1
+        # Turn-end prune retires the intent → its ``on_retire`` releases the pin.
+        await wired["seq"].drain_and_prune_turn()
+        assert gate.refcount == 0
+
+    async def test_second_ask_sweeps_the_first_gate_once_bound_elapsed(
+        self, wired,
+    ):
+        eid = wired["rec"].id
+        task1 = asyncio.ensure_future(
+            wired["ask"](_FakeRequest(_btn_payload(eid, "leak2"))))
+        await _drive_button(wired, task1, "leak2")
+        assert "leak2" in ASK_GATES
+        # wb2-4: leak2's gate is pinned by its live send-intent — the turn must
+        # end (prune retires the intent, releasing the pin) before the gate is
+        # eligible to be swept at all.
+        await wired["seq"].drain_and_prune_turn()
+
+        # Simulate the retention bound having elapsed since resolution.
+        # Production never passes an injected clock into this handler's
+        # ``get_or_create_gate`` call (it uses the real ``time.monotonic``
+        # default, captured once at class-definition time — patching the
+        # global ``time.monotonic`` afterwards would not even reach it, and
+        # the memory-cage rule bars patching shared module attributes
+        # anyway). Advancing time for an already-resolved gate is exactly
+        # what an injected clock's ``.advance()`` would do; with no clock
+        # seam on this call site, the equivalent white-box move is rewinding
+        # the recorded resolution timestamp by the same amount.
+        ASK_GATES["leak2"]._resolved_at -= 61.0
+
+        task2 = asyncio.ensure_future(
+            wired["ask"](_FakeRequest(_btn_payload(eid, "leak3"))))
+        await _drive_button(wired, task2, "leak3")
+
+        assert "leak2" not in ASK_GATES  # swept at leak3's entry
+        assert "leak3" in ASK_GATES  # its own gate is untouched
+
+
+# wb7-2 (whole-branch gate wave 7) SUPERSEDES A5 review, Finding 1 (second
+# half): the ``unknown_engagement`` / ``engagement_terminal`` /
+# ``TERMINAL_REGISTRATION`` exits NO LONGER leave the gate PENDING for the
+# finally to drop — they now PUBLISH their exact payload (``set_failed``) and
+# the gate is RETAINED under the normal resolved-gate retention. That contract
+# is exercised by ``TestTerminalExitsPublishGate`` above. The finally's
+# never-owned-PENDING delete now only covers the genuinely-unpublishable case
+# (a reattacher that found a PENDING gate with no local owner to resolve it).
+
+
+# ===========================================================================
+# A5 review, Finding 2 — the LIVE unread-inbound refusal carries
+# ``refusal_count`` (a fresh bump); the recorded outcome a same-request_id
+# retry reattaches to is INTENTIONALLY count-free (``_unread_refusal_payload``)
+# so a retry never re-bumps the counter (matching round-3 tombstone
+# semantics). Undocumented in behaviour though the code already carries a
+# comment — this locks the contract down with a test.
+# ===========================================================================
+
+
+class TestUnreadRefusalReattachIsCountFree:
+    async def test_reattach_after_unread_refusal_gets_the_count_free_payload(
+        self, wired, monkeypatch,
+    ):
+        from channels.channel_handlers import _unread_refusal_payload
+
+        eid = wired["rec"].id
+        monkeypatch.setattr(wired["drv"], "inbound_unread_depth", lambda e: 1)
+
+        r_owner = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gwU"))))
+        assert r_owner["ok"] is False
+        assert r_owner["error"] == "unread_inbound"
+        assert r_owner["refusal_count"] == 1
+
+        r_reattach = _body(
+            await wired["ask"](_FakeRequest(_btn_payload(eid, "gwU"))))
+        # The reattacher's payload is the byte-identical COUNT-FREE form
+        # recorded on the intent — never a fresh bump of ``refusal_count``.
+        assert "refusal_count" not in r_reattach
+        assert r_reattach == _unread_refusal_payload(r_owner["message"])
+
+
+# ===========================================================================
+# wb3-1 (whole-branch gate wave 3, BLOCKER): a PASSED+ARMED anchor that has NOT
+# posted when the engagement terminalizes must be aborted BEFORE the completion
+# flush — so the still-PASSED poster can never send + durably ledger a question
+# on the closed engagement (which the sole settlement pass would then miss).
+# wb3-3 (MAJOR): a terminal transition BEFORE the relay processes ``result``
+# must still release the wb2-4 validation-gate pins (fire on_retire) — the
+# sequencer's ``terminalize`` prune, invoked at settle + teardown, does it.
+# ===========================================================================
+
+
+class TestTerminalIntentAbort:
+    async def test_terminalize_before_flush_no_post_no_ledger(self, wired):
+        """PASSED+ARMED anchor → terminal (settle terminalizes) → completion
+        flush ⇒ NO wire post, NO durable ledger entry, poster resolved cleanly
+        (ok:false). Before the fix ``settle_all_open_questions`` did not
+        terminalize, so ``finalize_completion_post``'s ``flush_armed_intents``
+        invoked the still-PASSED poster AFTER settlement: it sent AND
+        ``add_open_question``'d on the terminal record."""
+        eid, drv, seq, chan = (
+            wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
+        rec = wired["rec"]
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        intent = seq.registry.by_request_id("a1")
+        assert intent is not None and intent.state == "armed"   # PASSED+ARMED
+        assert chan.anchors == []                               # not posted yet
+
+        # Terminal finalize funnel ORDER: settle (terminalizes) BEFORE the flush.
+        await drv.settle_all_open_questions(rec, "cancelled")
+        await drv.finalize_completion_post(rec, "Engagement cancelled.")
+
+        resp = await asyncio.wait_for(t1, timeout=1.0)
+        assert _body(resp)["ok"] is False                       # resolved cleanly
+        assert chan.anchors == []                               # NOTHING posted
+        assert drv._effective_open_question_numbers(eid) == []  # NO ledger entry
+
+    async def test_in_flight_poster_ledger_included_in_settle(self, wired, monkeypatch):
+        """wb3-1 (c): a poster CURRENTLY mid-post (holding the writer lock across
+        its wire send + ledger write) must FINISH before terminalize proceeds, so
+        its ledgered question IS included in the settle pass (settled, not
+        orphaned). terminalize acquires the same writer lock, so it waits."""
+        eid, drv, seq, chan = (
+            wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
+        rec = wired["rec"]
+        release = asyncio.Event()
+        real_add = wired["reg"].add_open_question
+
+        async def _gated_add(*a, **k):
+            await release.wait()             # park the poster mid-post, lock held
+            return await real_add(*a, **k)
+
+        monkeypatch.setattr(wired["reg"], "add_open_question", _gated_add)
+
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
+        await asyncio.sleep(0.02)
+        assert len(chan.anchors) == 1        # wire landed; ledger write parked
+
+        # terminalize (via settle) must BLOCK on the writer lock the poster holds.
+        settle = asyncio.ensure_future(
+            drv.settle_all_open_questions(rec, "cancelled"))
+        await asyncio.sleep(0.02)
+        assert not settle.done()             # waiting on the in-flight poster
+        assert not seq.is_terminal()         # latch not set until the lock frees
+
+        release.set()                        # let the ledger write complete
+        await asyncio.wait_for(relay, timeout=1.0)
+        await asyncio.wait_for(settle, timeout=1.0)
+        await asyncio.wait_for(t1, timeout=1.0)
+        # The in-flight poster's question landed durably AND was settled (not
+        # orphaned) — the entry got an outcome-appropriate settle edit.
+        assert seq.is_terminal() is True
+        assert len(chan.anchors) == 1
+        assert chan.edits                    # settle pass touched the entry
+
+
+class TestTerminalGatePinRelease:
+    async def test_terminal_before_result_releases_gate_pins(self, wired):
+        """wb3-3: a terminal transition BEFORE the relay processes ``result``
+        (so ``drain_and_prune_turn`` never runs) still releases BOTH the wb2-4
+        intent pin and the gate. Before the fix ``on_retire`` never fired, so
+        ``_INTENT_GATE_PINS`` kept the gate refcount > 0 forever and the ask
+        handler hung on its never-resolved deferred post."""
+        from channels.channel_handlers import (
+            ASK_GATES, _INTENT_GATE_PINS, maybe_retire_gate)
+        eid, drv, seq = wired["rec"].id, wired["drv"], wired["seq"]
+        rec = wired["rec"]
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "gp1"))))
+        await asyncio.sleep(0.02)
+        assert seq.registry.by_request_id("gp1").state == "armed"
+        assert "gp1" in _INTENT_GATE_PINS      # gate pinned to the intent (wb2-4)
+        assert "gp1" in ASK_GATES
+
+        # Terminal via settle — no ``result``, no drain_and_prune_turn.
+        await drv.settle_all_open_questions(rec, "cancelled")
+        resp = await asyncio.wait_for(t1, timeout=1.0)
+        assert _body(resp)["ok"] is False
+
+        # The wb2-4 intent pin released (on_retire fired at the terminalize prune).
+        assert "gp1" not in _INTENT_GATE_PINS
+        # With the pin gone the gate is finally retirable (refcount 0); before
+        # the fix the leaked pin kept refcount > 0 so it could NEVER retire.
+        gate = ASK_GATES.get("gp1")
+        if gate is not None:
+            gate._resolved_at -= 61.0          # fast-forward the retention bound
+            maybe_retire_gate("gp1")
+        assert "gp1" not in ASK_GATES
+
+
+# ===========================================================================
+# wb3-4 (whole-branch gate wave 3, MINOR): the accepted D2 floor telemetry is
+# actually EMITTED (once, content-free) on the real registration/post path when
+# a button ask floors; a non-floored ask logs nothing.
+# ===========================================================================
+
+
+class TestFloorTelemetry:
+    async def test_floored_button_ask_logs_once_content_free(self, wired, caplog):
+        import logging
+        eid = wired["rec"].id
+        payload = _btn_payload(
+            eid, "flr1",
+            question="SecretQuestionZZZ?",
+            options=["ApproveZZZ", "RejectZZZ"],   # bare labels ⇒ no shorts ⇒ floor
+        )
+        with caplog.at_level(logging.INFO, logger="channels.channel_handlers"):
+            task = asyncio.ensure_future(wired["ask"](_FakeRequest(payload)))
+            await _drive_button(wired, task, "flr1")
+
+        lines = [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("floored_ask_telemetry")
+        ]
+        assert len(lines) == 1                       # EXACTLY once
+        line = lines[0]
+        assert "count=2" in line
+        assert "reason=no_shorts" in line
+        assert "shorts=00" in line
+        assert "hash=" in line
+        # CONTENT-FREE: no question / option text ever appears.
+        assert "SecretQuestionZZZ" not in line
+        assert "ApproveZZZ" not in line
+        assert "RejectZZZ" not in line
+
+    async def test_non_floored_button_ask_logs_nothing(self, wired, caplog):
+        import logging
+        eid = wired["rec"].id
+        payload = _btn_payload(
+            eid, "nf1",
+            options=[
+                {"label": "ApproveZZZ", "short": "Approve"},
+                {"label": "RejectZZZ", "short": "Reject"},
+            ],
+        )
+        with caplog.at_level(logging.INFO, logger="channels.channel_handlers"):
+            task = asyncio.ensure_future(wired["ask"](_FakeRequest(payload)))
+            await _drive_button(wired, task, "nf1")
+
+        assert not [
+            r for r in caplog.records
+            if r.getMessage().startswith("floored_ask_telemetry")
+        ]
+
+
+# ===========================================================================
+# wb4-4 (whole-branch gate wave 4, MINOR): ``_validate_ask_args`` must reject a
+# whitespace-only question (nonblank AFTER strip, per D1) — a bare truthiness
+# check let "   " through and produced a blank numbered anchor.
+# ===========================================================================
+
+
+class TestValidateQuestionNonblank:
+    # The module-level ``pytestmark = pytest.mark.asyncio`` applies to every test
+    # here; these validation checks are pure-sync but stay ``async def`` so the
+    # mark is a no-op (a bare ``def`` would emit a spurious asyncio-mark warning).
+    async def test_whitespace_only_question_rejected(self):
+        from channels.channel_handlers import _validate_ask_args
+        # Blank-after-strip questions are refused (→ invalid_args upstream).
+        assert _validate_ask_args({"question": "   ", "options": []}) is None
+        assert _validate_ask_args({"question": "\t\n ", "options": []}) is None
+        assert _validate_ask_args({"question": "", "options": []}) is None
+
+    async def test_nonblank_question_still_accepted(self):
+        from channels.channel_handlers import _validate_ask_args
+        out = _validate_ask_args({"question": " DB name? ", "options": []})
+        assert out is not None
+        # The (unstripped) question is returned unchanged; only the blank check
+        # strips. Downstream anchors render the agent's verbatim text.
+        assert out[0] == " DB name? "
+
+
+# ===========================================================================
+# wb4-1 (whole-branch gate wave 4, BLOCKER): a reply arriving AFTER the
+# engagement terminalizes (settle_all_open_questions latched the sequencer) but
+# BEFORE finalize_completion_post flushes must NOT register+arm+post below the
+# terminal completion. ``register_send_intent`` returns a fail-closed terminal
+# outcome (NOT None — None activates the eager fallback), so the ingress surfaces
+# ``engagement_terminal`` instead of a phantom ok:true post.
+# ===========================================================================
+
+
+class TestLateReplyAfterTerminalize:
+    async def test_late_reply_rejected_engagement_terminal(self, wired):
+        from channels.output_sequencer import REPLY_TOOL, projection_hash
+        eid, seq, chan = wired["rec"].id, wired["seq"], wired["chan"]
+        # The engagement terminalizes (settle latches the sequencer terminal).
+        await seq.terminalize()
+        h = projection_hash(REPLY_TOOL, {"text": "late reply"})
+        resp = await wired["send"](_FakeRequest({
+            "engagement_id": eid, "text": "late reply",
+            "request_id": "lr1", "projection_hash": h,
+        }))
+        body = _body(resp)
+        assert body["ok"] is False
+        assert body["error"] == "engagement_terminal"
+        # NOTHING posted below the terminal completion.
+        assert chan.replies == []
+        assert seq.registry.by_request_id("lr1") is None
+
+
+# ===========================================================================
+# wb7-2 (whole-branch gate wave 7): D1 requires EVERY pre-PASSED terminal exit
+# to PUBLISH its EXACT refusal payload through the gate (``set_failed``) and
+# RETAIN the gate under the normal resolved-gate retention — so a same-request
+# retry reads the byte-identical resolved outcome instead of hitting the
+# finally's never-owned-PENDING delete (which dropped the gate and forced every
+# retry to re-derive). Covers the four exits: ``unknown_engagement``,
+# ``engagement_terminal`` (status), and both ``TERMINAL_REGISTRATION`` refusals
+# (anchor + button). Before the fix each of these left the gate PENDING and the
+# finally deleted it (``ASK_GATES.get(rid) is None``).
+# ===========================================================================
+
+
+class TestTerminalExitsPublishGate:
+    async def test_unknown_engagement_publishes_and_retains_gate(self, wired):
+        from channels.channel_handlers import ASK_GATES
+
+        payload = {"ok": False, "error": "unknown_engagement"}
+        resp = await wired["ask"](_FakeRequest(
+            _anchor_payload("no-such-engagement", rid="wb7-unknown")))
+        assert _body(resp) == payload
+        gate = ASK_GATES.get("wb7-unknown")
+        assert gate is not None                       # RETAINED (not PENDING-deleted)
+        assert gate.effective() == ("FAILED", payload)  # RESOLVED with exact payload
+        # Same-request retry reads the byte-identical outcome.
+        resp2 = await wired["ask"](_FakeRequest(
+            _anchor_payload("no-such-engagement", rid="wb7-unknown")))
+        assert _body(resp2) == payload
+
+    async def test_engagement_terminal_status_publishes_and_retains_gate(self, wired):
+        import time
+
+        from channels.channel_handlers import ASK_GATES
+
+        eid = wired["rec"].id
+        await wired["reg"].mark_completed(eid, time.time())   # status → terminal
+        payload = {"ok": False, "error": "engagement_terminal"}
+        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, rid="wb7-term")))
+        assert _body(resp) == payload
+        gate = ASK_GATES.get("wb7-term")
+        assert gate is not None
+        assert gate.effective() == ("FAILED", payload)
+        resp2 = await wired["ask"](_FakeRequest(_anchor_payload(eid, rid="wb7-term")))
+        assert _body(resp2) == payload
+
+    async def test_anchor_terminal_registration_publishes_and_retains_gate(self, wired):
+        from channels.channel_handlers import ASK_GATES
+
+        eid, seq = wired["rec"].id, wired["seq"]
+        await seq.terminalize()   # rec status stays active; register_intent REFUSES
+        payload = {"ok": False, "error": "engagement_terminal"}
+        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, rid="wb7-areg")))
+        assert _body(resp) == payload
+        gate = ASK_GATES.get("wb7-areg")
+        assert gate is not None
+        assert gate.effective() == ("FAILED", payload)
+        resp2 = await wired["ask"](_FakeRequest(_anchor_payload(eid, rid="wb7-areg")))
+        assert _body(resp2) == payload
+
+    async def test_button_terminal_registration_publishes_and_retains_gate(self, wired):
+        from channels.channel_handlers import ASK_GATES
+
+        eid, seq = wired["rec"].id, wired["seq"]
+        await seq.terminalize()
+        payload = {"ok": False, "error": "engagement_terminal"}
+        resp = await wired["ask"](_FakeRequest(_btn_payload(eid, rid="wb7-breg")))
+        assert _body(resp) == payload
+        gate = ASK_GATES.get("wb7-breg")
+        assert gate is not None
+        assert gate.effective() == ("FAILED", payload)
+        resp2 = await wired["ask"](_FakeRequest(_btn_payload(eid, rid="wb7-breg")))
+        assert _body(resp2) == payload

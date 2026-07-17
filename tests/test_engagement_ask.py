@@ -204,7 +204,9 @@ async def test_ask_answered_edits_answered(app_with_ask) -> None:
     }
     assert len(ch.options_keyboards) == 1
     assert len(ch.edited_answered) == 1
-    assert "B" in ch.edited_answered[0][2]
+    # v0.84.0 (round 4, D1 bullet 3): settle copy is the BOUNDED positional
+    # form (never the chosen full label) — option_index=1 is position 2.
+    assert "Option 2" in ch.edited_answered[0][2]
     assert ch.edited_expired == []
 
 
@@ -294,14 +296,10 @@ async def test_ask_validation_clamps_and_rejects(
         resp = await client.post("/internal/channel/ask", json=_payload(
             request_id="v3", options=["A", "A"]))
         assert (await resp.json()) == {"ok": False, "error": "invalid_args"}
-        # 1025-char question
-        resp = await client.post("/internal/channel/ask", json=_payload(
-            request_id="v4", question="x" * 1025))
-        assert (await resp.json()) == {"ok": False, "error": "invalid_args"}
-        # 49-char label
-        resp = await client.post("/internal/channel/ask", json=_payload(
-            request_id="v5", options=["x" * 49, "B"]))
-        assert (await resp.json()) == {"ok": False, "error": "invalid_args"}
+        # D1 (round 4, spec §D1): the invented 1024-char question cap and the
+        # 48-char label cap are REMOVED — a long question / long label is now
+        # ACCEPTED, not rejected. See test_ask_accepts_long_question_and_label
+        # below for the positive (posts-a-keyboard) coverage.
 
     assert ch.options_keyboards == []  # none of the invalid ones ever posted
 
@@ -343,6 +341,39 @@ async def test_ask_validation_clamps_and_rejects(
         release.set()
         resp_hi = await asyncio.wait_for(t_hi, timeout=1.0)
         assert (await resp_hi.json()) == {"ok": False, "error": "cancelled"}
+
+
+async def test_ask_accepts_long_question_and_label(app_with_ask) -> None:
+    """D1 (round 4, spec §D1 bullets 1-2): the invented ``_ASK_MAX_QUESTION_LEN``
+    (1024) and ``_ASK_MAX_LABEL_LEN`` (48) caps are gone — a long question and
+    a long option label are ACCEPTED end-to-end (keyboard posts, tap answers)
+    rather than refused ``invalid_args``."""
+    app, ch, _reg, broker = app_with_ask
+    long_question = "x" * 1025
+    long_label = "y" * 49
+    async with TestClient(TestServer(app)) as client:
+        task = asyncio.ensure_future(client.post(
+            "/internal/channel/ask",
+            json=_payload(
+                request_id="rid-long", question=long_question,
+                options=[long_label, "B"]),
+        ))
+        await asyncio.sleep(0.05)
+        assert broker.deliver(
+            namespace="engagement_ask", scope="eng-1", request_id="rid-long",
+            option_index=0, actor_id=999,
+        ) == "delivered"
+        resp = await asyncio.wait_for(task, timeout=1.0)
+        body = await resp.json()
+        await broker.drain_hooks()
+
+    assert body == {
+        "ok": True, "outcome": "answered", "option": long_label,
+        "option_index": 0,
+    }
+    assert len(ch.options_keyboards) == 1
+    assert long_question in ch.options_keyboards[0]["question"]
+    assert long_label in ch.options_keyboards[0]["question"]
 
 
 async def test_ask_keyboard_post_failure_unregisters(app_with_ask) -> None:
@@ -639,9 +670,10 @@ class TestPostOptionsKeyboard:
         kbd = kwargs["reply_markup"]
         rows = kbd.inline_keyboard
         assert len(rows) == 3
-        # v0.81.0 (W-R3): labels are short + number-prefixed (the FULL option is
+        # v0.84.0 (round 4, D2): no agent-supplied ``short`` per option → the
+        # WHOLE set floors to the numbered placeholder (the FULL option is
         # carried verbatim in the message body, not the button).
-        assert [r[0].text for r in rows] == ["1 · Yes", "2 · No", "3 · Maybe"]
+        assert [r[0].text for r in rows] == ["Option 1", "Option 2", "Option 3"]
         assert [r[0].callback_data for r in rows] == [
             "v1|engagement_ask|rid_ask|0",
             "v1|engagement_ask|rid_ask|1",

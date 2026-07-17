@@ -131,7 +131,60 @@ class TestLegacyLoadTolerance:
         assert await reg.stage_stale_mid("eLEG", 2, 999) is True
         assert reg.open_question_numbers("eLEG") == [2]
         entry2 = next(q for q in reg.open_question_entries("eLEG") if q["n"] == 2)
-        assert entry2["stale_mids"] == [999]
+        # v0.84.0 (round-4 §D6): defaults to kind="plain" (today's rendering).
+        assert entry2["stale_mids"] == [{"mid": 999, "kind": "plain"}]
+
+
+# ---------------------------------------------------------------------------
+# 2b. D6 — legacy bare-int ``stale_mids`` (pre-round-4 records that ALREADY
+# had a staged re-anchor in flight) settle with TODAY'S full-body rendering,
+# never the new marker-only text — normalize_stale_mid_entry defaults an
+# unrecognized (bare-int) entry to kind="plain".
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyBareIntStaleMidSettle:
+    async def test_legacy_bare_int_stale_mid_settles_full_body(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+
+        legacy = [{
+            "id": "eLEG2", "kind": "executor", "role_or_type": "configurator",
+            "driver": "claude_code", "status": "idle", "topic_id": 5,
+            "started_at": 1.0, "last_user_turn_ts": 1.0,
+            "next_question_number": 2,
+            "open_questions": [
+                {
+                    "n": 1, "tg_message_id": 100, "kind": "anchor",
+                    "text": "Q1: A?", "answered": False,
+                    # Pre-round-4 shape: a bare int, not {"mid","kind"}.
+                    "stale_mids": [999],
+                },
+            ],
+        }]
+        (tmp_path / "e.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        await reg.load()
+        rec = reg._records["eLEG2"]
+
+        edits: list[tuple[int, str]] = []
+
+        async def _edit(topic_id, mid, text, *, clear_keyboard=False):
+            edits.append((mid, text))
+            return True
+
+        drv = _make_driver(tmp_path, reg, edit_topic_message=_edit)
+        drv._sleep = AsyncMock()
+
+        await drv.reconcile_open_questions(rec)
+
+        stale_text = next(text for mid, text in edits if mid == 999)
+        # Legacy bare-int normalizes to kind="plain" — TODAY'S full-body +
+        # suffix rendering, never the marker-only text.
+        assert stale_text == "Q1: A?\n⌛ expired — answer by text below"
+        assert "MOVED" not in stale_text
+        assert reg.open_question_entries("eLEG2") == []
 
 
 # ---------------------------------------------------------------------------
@@ -149,17 +202,23 @@ class TestStaleMidMutators:
         assert await reg.stage_stale_mid(rec.id, n1, 5001) is True  # idempotent
         assert await reg.stage_stale_mid(rec.id, n1, 5002) is True
         entry = reg.open_question_entries(rec.id)[0]
-        assert entry["stale_mids"] == [5001, 5002]
+        assert entry["stale_mids"] == [
+            {"mid": 5001, "kind": "plain"}, {"mid": 5002, "kind": "plain"},
+        ]
 
         # Persisted across reload.
         reg2 = EngagementRegistry(
             tombstone_path=str(tmp_path / "e.json"), bus=None)
         await reg2.load()
-        assert reg2.open_question_entries(rec.id)[0]["stale_mids"] == [5001, 5002]
+        assert reg2.open_question_entries(rec.id)[0]["stale_mids"] == [
+            {"mid": 5001, "kind": "plain"}, {"mid": 5002, "kind": "plain"},
+        ]
 
         assert await reg2.unstage_stale_mid(rec.id, n1, 5001) is True
         assert await reg2.unstage_stale_mid(rec.id, n1, 5001) is True  # no-op ok
-        assert reg2.open_question_entries(rec.id)[0]["stale_mids"] == [5002]
+        assert reg2.open_question_entries(rec.id)[0]["stale_mids"] == [
+            {"mid": 5002, "kind": "plain"},
+        ]
 
     async def test_stage_unknown_returns_false(self, tmp_path):
         reg, rec = await _make_registry(tmp_path)
@@ -177,6 +236,151 @@ class TestStaleMidMutators:
         # Rolled back — the flag never half-landed.
         assert reg.open_question_entries(rec.id)[0].get("answered") is False
         assert reg.open_question_numbers(rec.id) == [n1]
+
+
+# ---------------------------------------------------------------------------
+# 3b. D2 (round-4 §D6, Sol r3-3/r17) — update_question_mid's atomic kind flip.
+# The re-anchor pass stages the OLD mid as "plain", then update_question_mid
+# must, in ONE strict transaction, persist tg_message_id=new_mid AND flip
+# THAT question's staged old-mid entry (mid == the previous tg_message_id)
+# from "plain" to "reanchored". No intermediate durable state.
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateQuestionMidKindFlip:
+    async def test_transaction_persists_new_mid_and_flips_kind_atomically(
+        self, tmp_path,
+    ):
+        from engagement_registry import EngagementRegistry
+
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_q(reg, rec, kind="anchor", mid=7001, text="Q1")
+        assert await reg.stage_stale_mid(rec.id, n1, 7001, kind="plain") is True
+
+        with _mock.patch.object(
+            reg, "_write_tombstone", wraps=reg._write_tombstone,
+        ) as spy:
+            assert await reg.update_question_mid(rec.id, n1, 8002) is True
+            # One strict transaction == exactly one tombstone write for this
+            # call — the mid persist and the kind flip never land as two
+            # separate writes (which would expose an intermediate state).
+            assert spy.call_count == 1
+
+        entry = reg.open_question_entries(rec.id)[0]
+        assert entry["tg_message_id"] == 8002
+        assert entry["stale_mids"] == [{"mid": 7001, "kind": "reanchored"}]
+
+        # Reload from disk — both changes landed in the SAME persisted write,
+        # with no observable intermediate ("new mid, still plain" or "old
+        # mid, already reanchored") state.
+        reg2 = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        await reg2.load()
+        entry2 = reg2.open_question_entries(rec.id)[0]
+        assert entry2["tg_message_id"] == 8002
+        assert entry2["stale_mids"] == [{"mid": 7001, "kind": "reanchored"}]
+
+    async def test_flip_targets_only_this_questions_staged_old_mid(
+        self, tmp_path,
+    ):
+        # A second, unrelated "plain" stale entry on the SAME question (e.g.
+        # from an earlier expiry) must NOT be flipped — only the entry whose
+        # mid equals the old tg_message_id being replaced.
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_q(reg, rec, kind="anchor", mid=7001, text="Q1")
+        assert await reg.stage_stale_mid(rec.id, n1, 9999, kind="plain") is True
+        assert await reg.stage_stale_mid(rec.id, n1, 7001, kind="plain") is True
+
+        assert await reg.update_question_mid(rec.id, n1, 8002) is True
+
+        entry = reg.open_question_entries(rec.id)[0]
+        stale_by_mid = {s["mid"]: s["kind"] for s in entry["stale_mids"]}
+        assert stale_by_mid[7001] == "reanchored"  # the just-replaced old mid
+        assert stale_by_mid[9999] == "plain"        # untouched
+
+    async def test_staged_then_stopped_before_update_leaves_plain(
+        self, tmp_path,
+    ):
+        # Simulated crash BEFORE update_question_mid runs: staging landed,
+        # the transaction that would flip the kind + persist the new mid
+        # never ran. Old mid stays current; the staged entry stays "plain"
+        # so it settles full-body (never a marker for a copy that never
+        # existed).
+        from engagement_registry import EngagementRegistry
+
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_q(reg, rec, kind="anchor", mid=7001, text="Q1")
+        assert await reg.stage_stale_mid(rec.id, n1, 7001, kind="plain") is True
+        # update_question_mid deliberately NOT called here.
+
+        entry = reg.open_question_entries(rec.id)[0]
+        assert entry["tg_message_id"] == 7001
+        assert entry["stale_mids"] == [{"mid": 7001, "kind": "plain"}]
+
+        reg2 = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        await reg2.load()
+        entry2 = reg2.open_question_entries(rec.id)[0]
+        assert entry2["tg_message_id"] == 7001
+        assert entry2["stale_mids"] == [{"mid": 7001, "kind": "plain"}]
+
+    async def test_failed_commit_rolls_back_both_mid_and_kind_in_memory(
+        self, tmp_path,
+    ):
+        from engagement_registry import EngagementRegistry
+
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_q(reg, rec, kind="anchor", mid=7001, text="Q1")
+        assert await reg.stage_stale_mid(rec.id, n1, 7001, kind="plain") is True
+
+        with _mock.patch.object(
+            reg, "_write_tombstone", side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError):
+                await reg.update_question_mid(rec.id, n1, 8002)
+
+        # BOTH the mid update and the kind flip rolled back in memory — not
+        # just one of the two fields.
+        entry = reg.open_question_entries(rec.id)[0]
+        assert entry["tg_message_id"] == 7001
+        assert entry["stale_mids"] == [{"mid": 7001, "kind": "plain"}]
+
+        # A subsequent successful commit (no failure injected) persists the
+        # ORIGINAL pre-failure state faithfully, then applies the real flip.
+        assert await reg.update_question_mid(rec.id, n1, 8002) is True
+        reg2 = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        await reg2.load()
+        entry2 = reg2.open_question_entries(rec.id)[0]
+        assert entry2["tg_message_id"] == 8002
+        assert entry2["stale_mids"] == [{"mid": 7001, "kind": "reanchored"}]
+
+    async def test_unstage_persist_failure_leaves_reanchored_intact(
+        self, tmp_path,
+    ):
+        # After a successful flip, a LATER failed unstage (the confirmed-edit
+        # settle's cleanup persist) must not resurrect "plain" — the
+        # "reanchored" entry stays intact for an idempotent re-settle.
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_q(reg, rec, kind="anchor", mid=7001, text="Q1")
+        assert await reg.stage_stale_mid(rec.id, n1, 7001, kind="plain") is True
+        assert await reg.update_question_mid(rec.id, n1, 8002) is True
+        entry = reg.open_question_entries(rec.id)[0]
+        assert entry["stale_mids"] == [{"mid": 7001, "kind": "reanchored"}]
+
+        with _mock.patch.object(
+            reg, "_write_tombstone", side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError):
+                await reg.unstage_stale_mid(rec.id, n1, 7001)
+
+        # Rolled back — the reanchored entry is still there, unchanged.
+        entry = reg.open_question_entries(rec.id)[0]
+        assert entry["stale_mids"] == [{"mid": 7001, "kind": "reanchored"}]
+
+        # Idempotent re-settle: a later successful unstage removes it cleanly.
+        assert await reg.unstage_stale_mid(rec.id, n1, 7001) is True
+        assert reg.open_question_entries(rec.id)[0]["stale_mids"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +483,7 @@ class TestEntryRemovalInvariant:
         assert 8001 in settled and 9001 in settled
         # Entry RETAINED (stale not confirmed) with the stale mid still staged.
         entry = reg.open_question_entries(rec.id)[0]
-        assert entry["stale_mids"] == [9001]
+        assert entry["stale_mids"] == [{"mid": 9001, "kind": "plain"}]
 
     async def test_confirmed_current_emptied_stale_removes_entry(self, tmp_path):
         reg, rec = await _make_registry(tmp_path)
@@ -324,7 +528,7 @@ class TestReconcileStaleMids:
         assert {7001, 9001, 9002} <= set(settled)
         # Entry RETAINED because 9002 unconfirmed; 9001 un-staged, 9002 kept.
         entry = reg.open_question_entries(rec.id)[0]
-        assert entry["stale_mids"] == [9002]
+        assert entry["stale_mids"] == [{"mid": 9002, "kind": "plain"}]
 
     async def test_reconcile_answered_entry_uses_answered_copy(self, tmp_path):
         reg, rec = await _make_registry(tmp_path)
@@ -344,6 +548,81 @@ class TestReconcileStaleMids:
         # An answered entry settles with the ✅ copy (not ⌛).
         assert edits[-1][1].endswith("✅ answered below")
         assert reg.open_question_entries(rec.id) == []  # confirmed → removed
+
+
+# ---------------------------------------------------------------------------
+# 6b. D6 — a ``stale_mids`` entry recorded kind="reanchored" settles to the
+# EXACT pinned marker-only text (open/terminal), NEVER the duplicated body.
+# ---------------------------------------------------------------------------
+
+
+class TestReanchoredKindSettle:
+    async def test_reanchored_stale_settles_exact_terminal_marker(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_q(reg, rec, kind="anchor", mid=8001, text="Q1: A?")
+        await reg.stage_stale_mid(rec.id, n1, 9001, kind="reanchored")
+
+        edits: list[tuple[int, str]] = []
+
+        async def _edit(topic_id, mid, text, *, clear_keyboard=False):
+            edits.append((mid, text))
+            return True
+
+        drv = _make_driver(tmp_path, reg, edit_topic_message=_edit)
+        drv._sleep = AsyncMock()
+
+        await drv._settle_open_anchor(rec, operator_msg_id=42)
+
+        stale_text = next(text for mid, text in edits if mid == 9001)
+        assert stale_text == f"⤵ MOVED Q{n1} — resolved below"
+        assert "Q1: A?" not in stale_text        # never the duplicated body
+        assert reg.open_question_entries(rec.id) == []  # both confirmed → closed
+
+    async def test_reanchored_stale_unconfirmed_retains_kind(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_q(reg, rec, kind="anchor", mid=8001, text="Q1: A?")
+        await reg.stage_stale_mid(rec.id, n1, 9001, kind="reanchored")
+
+        async def _edit(topic_id, mid, text, *, clear_keyboard=False):
+            return mid != 9001   # current confirms; the reanchored stale doesn't
+
+        drv = _make_driver(tmp_path, reg, edit_topic_message=_edit)
+        drv._sleep = AsyncMock()
+
+        await drv._settle_open_anchor(rec, operator_msg_id=42)
+
+        entry = reg.open_question_entries(rec.id)[0]
+        assert entry["stale_mids"] == [{"mid": 9001, "kind": "reanchored"}]
+
+    async def test_boot_reconcile_retained_reanchored_marker_only(self, tmp_path):
+        """(d) A restart's fresh registry load, reconciling a PRE-EXISTING
+        ``reanchored`` stale entry (staged before the crash) — the boot
+        reconcile owner must render marker-only, never the duplicated body."""
+        from engagement_registry import EngagementRegistry
+
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_q(reg, rec, kind="anchor", mid=8001, text="Q1: A?")
+        await reg.stage_stale_mid(rec.id, n1, 9001, kind="reanchored")
+
+        reg2 = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        await reg2.load()
+        rec2 = reg2._records[rec.id]
+
+        edits: list[tuple[int, str]] = []
+
+        async def _edit(topic_id, mid, text, *, clear_keyboard=False):
+            edits.append((mid, text))
+            return True
+
+        drv2 = _make_driver(tmp_path, reg2, edit_topic_message=_edit)
+        drv2._sleep = AsyncMock()
+
+        await drv2.reconcile_open_questions(rec2)
+
+        stale_text = next(text for mid, text in edits if mid == 9001)
+        assert stale_text == f"⤵ MOVED Q{n1} — resolved below"
+        assert reg2.open_question_entries(rec.id) == []
 
 
 # ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ from drivers.workspace import (
     engagement_log_dir, provision_workspace, render_log_run_script,
     render_run_script, write_casa_meta,
 )
-from engagement_registry import EngagementRecord
+from engagement_registry import EngagementRecord, normalize_stale_mid_entry
 from settle_gate import confirmed_settle_edit
 
 logger = logging.getLogger(__name__)
@@ -52,15 +52,118 @@ _OPEN_Q_ANSWERED_SUFFIX = "\n✅ answered below"
 # §A3(b) terminal finalize: a live anchor stranded by /cancel or /complete is
 # settled (never left visually open forever) with an outcome-appropriate copy.
 _OPEN_Q_CANCELLED_SUFFIX = "\n🛑 engagement ended — this question is closed"
-# §A3(b) staged re-anchor markers (plain text, no keyboard): step-4 settles the
-# OLD copy pointing down to the re-posted question; the step-3 persist-failure
-# fallback settles the NEW copy pointing up to the still-live original.
-_OPEN_Q_REPOSTED_BELOW = "↪ question re-posted below ↓"
-_OPEN_Q_SEE_ABOVE = "↪ see the question above"
+# v0.84.0 (round-4 §D6, Sol r15-4): the re-anchor MOVED markers — pinned exact
+# text. REPLACES the step-4 OLD-copy edit's previous "↪ question re-posted
+# below ↓" suffix, which retained the full duplicated body (read as "asked
+# twice"); the marker text below REPLACES the body entirely, never appends to
+# it. The SAME open form is also what every stale-settle path
+# (``_settle_ledger_entry`` + boot reconciliation) renders for a ``stale_mids``
+# entry recorded ``kind="reanchored"`` — the terminal form is used once that
+# copy itself is finally settled (answered/expired/cancelled). Deliberately
+# named OUTSIDE the ``_OPEN_Q_*``/``_SETTLE_*`` prefixes ``ask_lifecycle_
+# suffixes``'s drift test (tests/test_ask_body_limit.py) enumerates: this is a
+# standalone REPLACEMENT form, never a body SUFFIX.
+_REANCHOR_MOVED_OPEN_FMT = "⤵ MOVED Q{n} — answer the current copy below"
+_REANCHOR_MOVED_TERMINAL_FMT = "⤵ MOVED Q{n} — resolved below"
+
+
+def _reanchor_moved_open(n: "int | None") -> str:
+    """The re-anchor step-4 OLD-copy edit + a retained ``reanchored`` stale
+    entry's OPEN-form settle (both point forward to the live current copy)."""
+    return _REANCHOR_MOVED_OPEN_FMT.format(n=n)
+
+
+def _reanchor_moved_terminal(n: "int | None") -> str:
+    """A ``reanchored`` stale entry's TERMINAL-form settle (rendered once that
+    tracked copy is itself finally settled — never the duplicated body)."""
+    return _REANCHOR_MOVED_TERMINAL_FMT.format(n=n)
+
+
+def ask_lifecycle_suffixes(
+    number: "int | None", options: list, multi: bool,
+) -> list[str]:
+    """v0.84.0 (round 4, D1 bullets 3 & 6, Task A3) — enumerate EVERY terminal
+    suffix Telegram lifecycle form THIS ask can render, exactly as the
+    settle/boot/terminal paths will, for the render-and-measure per-ask
+    body-limit validator (``channels.channel_handlers``'s ``ask`` handler):
+    ``len(body) + max(len(s) for s in ask_lifecycle_suffixes(...)) <= 4096``.
+
+    ``number`` is accepted for call-site symmetry with
+    :func:`channels.channel_handlers.render_ask_body` (the validator renders
+    the body and the suffixes for the SAME allocated/approximated number in
+    one breath) — no suffix form below actually interpolates the Q-number, so
+    it is otherwise unused here.
+
+    Forms enumerated:
+      * live answered — the free-text-anchor fixed copy
+        (``_SETTLE_ANSWERED_BELOW``) when ``options`` is empty; otherwise the
+        BOUNDED POSITIONAL settle copy (v0.84.0 D1 bullet 3 — never the
+        chosen full label(s)): single-select worst case is the LAST option
+        position; multi worst case is EVERY option selected, rendered
+        exactly (``✅ Options 1, 2, …, N`` — every index, no elision);
+      * expired / cancelled / superseded / internal-error (live-ask settle
+        copies owned by ``channels.channel_handlers``);
+      * boot-reconcile answered / expired (``_OPEN_Q_ANSWERED_SUFFIX`` /
+        ``_OPEN_Q_EXPIRED_SUFFIX``);
+      * terminal cancellation (``_OPEN_Q_CANCELLED_SUFFIX`` — the engagement
+        ended while this question was open).
+
+    Every ``_OPEN_Q_*`` body-suffix constant is now enumerated above (the drift
+    test's allowlist is empty as of Task D3): the old re-anchor persist-failure
+    ``_OPEN_Q_SEE_ABOVE`` body suffix is DELETED (r11-1 — the drained unit's
+    finite LOCAL persist retry replaces it, never a body edit), and D1 already
+    retired ``_OPEN_Q_REPOSTED_BELOW``. The Task D6 moved-marker forms
+    (``_REANCHOR_MOVED_OPEN_FMT`` / ``_REANCHOR_MOVED_TERMINAL_FMT``) are
+    deliberately named OUTSIDE the ``_OPEN_Q_*`` prefix this drift test scans —
+    standalone REPLACEMENT forms, never a body SUFFIX (never appended to a
+    rendered ask body), so they need no allowlist entry at all.
+
+    A function-local import of the settle constants avoids a module-level
+    cross-package edge between the driver and channel-handler modules
+    (neither imports the other at module scope today) — matching this
+    codebase's existing local-import convention for the same pair of modules
+    (e.g. ``casa_core``'s lazy ``from channels.channel_handlers import ...``).
+    """
+    from channels.channel_handlers import (
+        _SETTLE_ANSWERED_BELOW, _SETTLE_CANCELLED, _SETTLE_EXPIRED,
+        _SETTLE_INTERNAL_ERROR, _SETTLE_SUPERSEDED, _positional_settle_suffix,
+    )
+    suffixes = [
+        _SETTLE_EXPIRED,
+        _SETTLE_CANCELLED,
+        _SETTLE_SUPERSEDED,
+        _SETTLE_INTERNAL_ERROR,
+        _OPEN_Q_ANSWERED_SUFFIX,
+        _OPEN_Q_EXPIRED_SUFFIX,
+        _OPEN_Q_CANCELLED_SUFFIX,
+    ]
+    if not options:
+        suffixes.append(_SETTLE_ANSWERED_BELOW)
+    elif multi:
+        suffixes.append(_positional_settle_suffix(list(range(len(options)))))
+    else:
+        suffixes.append(_positional_settle_suffix([len(options) - 1]))
+    return suffixes
+
+
 # §A3(b) retry-owner bounded backoff (Sol r13-1): a FAILED latch-consuming pass
 # self-reschedules 5s → 30s → 300s (capped, repeated) indefinitely until the
 # latch clears via success / promotion / terminal settlement / a boundary win.
 _REANCHOR_BACKOFF: tuple[float, ...] = (5.0, 30.0, 300.0)
+# v0.84.0 (round-4 §D6 r17-2, Sol): REAL finite BUDGETS on every wire op in the
+# drained re-anchor unit — deadlines that bound ONE physical wire await, NOT
+# SLAs (no promise the op completes within them). The send gets exactly ONE
+# ``wait_for``-bounded attempt with ZERO wire retries (the send wrapper cannot
+# distinguish "not sent" from "accepted before the timeout", so any retry could
+# stack an untracked duplicate). The old-copy marker edit is finite-attempt,
+# each attempt ``wait_for``-bounded and F1-cache idempotent. The in-unit
+# ``tg_message_id`` persist is N bounded LOCAL (registry-file) attempts with a
+# short backoff — never a wire op. On ANY budget exhaustion the unit releases
+# its locks and takes the documented floor (never indefinite lock ownership).
+_REANCHOR_SEND_TIMEOUT = 15.0
+_REANCHOR_EDIT_TIMEOUT = 10.0
+_REANCHOR_PERSIST_ATTEMPTS = 3
+_REANCHOR_PERSIST_BACKOFF = 0.5
 # F3 (whole-branch gate): after an UNVERIFIED (False/raised) force-suspend
 # outcome the once-per-episode backstop re-arms, but must PACE before it may
 # fire again — an immediate re-arm lets a doctrine-defying ask→refusal loop
@@ -800,6 +903,23 @@ class ClaudeCodeDriver(DriverProtocol):
         # settlement) or a boundary consumer beats it. Double-arm is a no-op;
         # CancelledError terminates WITHOUT rescheduling; cancelled at teardown.
         self._reanchor_retry_tasks: dict[str, asyncio.Task] = {}
+        # v0.84.0 (round-4 §D6, Sol r18-2/r19-3/r28-2): the process-lifetime
+        # per-engagement CONFIRMED-PAIR record ``{engagement_id: {q -> new_mid}}``.
+        # Each entry owns a re-anchor copy that IS on the wire (mid confirmed) but
+        # whose LOCAL persist never committed. Retained by the DRIVER, independent
+        # of any retry task (a task-local pairing would drop on owner retirement,
+        # re-opening the wire-bearing pass — Sol r19-3). A record exists ONLY while
+        # unpersisted (Sol r28-2): it retires the moment its transaction commits
+        # (the durable ``reanchored`` stale entry the commit created owns the rest)
+        # OR on a confirmed settlement marker-edit of the orphan. Memory-only — a
+        # crash drops the whole map (the accepted at-least-once crash residual, one
+        # orphan per retained pair). While a pair is unpersisted NO new send is
+        # permitted for that question (the boundary consults this FIRST).
+        self._confirmed_pairs: dict[str, dict[int, int]] = {}
+        # The UNIFIED HISTORICAL SCHEDULER rotation cursor per engagement (Sol
+        # r24-2): advanced after EVERY step, success or failure — oldest-first
+        # would let a permanently-failing pair starve every younger pair's cleanup.
+        self._historical_cursor: dict[str, int] = {}
         # §A3(b) boot reconciliation owner (Sol r6-3): readiness-gated reconcile
         # tasks for refused/terminal-with-questions records (attached records
         # retain theirs in ``self._tasks``). Retained here so they are not GC'd
@@ -1047,8 +1167,6 @@ class ClaudeCodeDriver(DriverProtocol):
         # reconciliation, not these).
         self._answered_overlay.pop(engagement.id, None)
         self._answer_reservations.pop(engagement.id, None)
-        # §A3(c): drop the ask-maintenance lock + ingress marker on teardown.
-        self._ask_maint_locks.pop(engagement.id, None)
         self._ask_inflight.pop(engagement.id, None)
         # §A3(b): drop the re-anchor-due latch + cancel any retry-owner task
         # (CancelledError terminates it without rescheduling).
@@ -1056,6 +1174,44 @@ class ClaudeCodeDriver(DriverProtocol):
         retry_task = self._reanchor_retry_tasks.pop(engagement.id, None)
         if retry_task is not None and not retry_task.done():
             retry_task.cancel()
+        # wb4-3 (whole-branch gate wave 4): DRAIN the cancelled re-anchor owner
+        # BEFORE dropping D6 state. A cancelled re-anchor owner DRAINS its child
+        # to completion (by design — ``_reanchor_pass_locked``); that child keeps
+        # running after ``cancel()`` returns and re-creates ``_confirmed_pairs``
+        # AFTER teardown popped it — an unpumped, unlogged D6 record. So here:
+        # (1) await the retry owner so its drained child finishes; (2) take the
+        # ask-maintenance lock as a BARRIER — the drained child (this owner's OR
+        # a boundary consumer's, e.g. one settle already cancelled) holds that
+        # lock for its whole drain, so acquiring the EXISTING lock waits for the
+        # child to complete and re-create any pair BEFORE we drop + log it. Both
+        # are bounded — the drained unit is finite (§D6). Acquire the existing
+        # lock BEFORE popping its dict slot (a popped slot would mint a NEW free
+        # lock and skip the barrier).
+        if retry_task is not None:
+            await asyncio.gather(retry_task, return_exceptions=True)
+        maint_lock = self._ask_maint_locks.get(engagement.id)
+        if maint_lock is not None:
+            async with maint_lock:
+                pass
+        # §A3(c): drop the ask-maintenance lock + ingress marker on teardown.
+        self._ask_maint_locks.pop(engagement.id, None)
+        # v0.84.0 (round-4 §D6, Sol r20-1/r21-1/r22-1): drop the confirmed-pair
+        # map on teardown and LOG one residual PER remaining PAIR. A pair still
+        # present at TERMINAL teardown is a double failure (registry outage AND
+        # repeated settlement-edit failures); the accepted floor is one inert,
+        # obviously-stale duplicate PER QUESTION in an already-answered/terminal
+        # topic — logged, never resurrected (a teardown-surviving owner would
+        # rebuild exactly the machinery r17 deleted). A crash drops the map the
+        # same way (at most one orphan per retained pair, potentially several).
+        pairs = self._confirmed_pairs.pop(engagement.id, None)
+        if pairs:
+            for q_n, orphan_mid in pairs.items():
+                logger.info(
+                    "engagement %s: terminal teardown drops unconfirmed "
+                    "re-anchor pair (q=%s orphan_mid=%s) — accepted stale "
+                    "duplicate residual (topic is answered/terminal)",
+                    engagement.id[:8], q_n, orphan_mid)
+        self._historical_cursor.pop(engagement.id, None)
         # F-EXPIRE: drop the operator-away suspend state on teardown.
         self._operator_away.pop(engagement.id, None)
         self._away_refusals.pop(engagement.id, None)
@@ -1077,6 +1233,21 @@ class ClaudeCodeDriver(DriverProtocol):
         # must complete their SIGKILL escalation + extinction verification. They
         # self-retire via their own done-callback; teardown just leaves them.
         # v0.79.0 (§2): drop the sequencer (its watcher task is cancelled above).
+        # wb3-3: TERMINALIZE it FIRST — abort any unresolved intent + prune the
+        # registry (firing every ``on_retire``) so the wb2-4 validation-gate pins
+        # release even on a teardown path that bypassed
+        # ``settle_all_open_questions`` (a terminal transition before the relay
+        # ever processed ``result``). Idempotent — a no-op if settle already
+        # terminalized. Must complete BEFORE the pop, so the pruned registry is
+        # the one being dropped.
+        seq = self._sequencers.get(engagement.id)
+        if seq is not None:
+            try:
+                await seq.terminalize()
+            except Exception:  # noqa: BLE001 — teardown hygiene, never abort
+                logger.debug(
+                    "engagement %s: sequencer terminalize at teardown failed",
+                    engagement.id[:8], exc_info=True)
         self._sequencers.pop(engagement.id, None)
         # v0.79.0 (§5): drop the summary controller and cancel its elapsed tick
         # (not in self._tasks — the controller owns it).
@@ -1503,7 +1674,11 @@ class ClaudeCodeDriver(DriverProtocol):
             )
         await seq.flush_armed_intents()
         await seq.seal_narration()
-        await seq.post_platform_notice(summary_text)
+        # wb4-2: the completion text is the TERMINAL message — post it through the
+        # dedicated completion seam, the ONLY writer permitted post-terminal
+        # (``post_platform_notice`` now discards under the terminal latch, so a
+        # lagging mutating-tool violation notice can never land below completion).
+        await seq.post_completion_notice(summary_text)
         return True
 
     def register_completion_consumption(
@@ -1522,10 +1697,16 @@ class ClaudeCodeDriver(DriverProtocol):
         )
         rid = f"emit_completion:{engagement_id}"
         phash = _pj(EMIT_COMPLETION_TOOL, args if isinstance(args, dict) else {})
-        intent, _created = seq.register_intent(
+        res = seq.register_intent(
             request_id=rid, tool_name=EMIT_COMPLETION_TOOL,
             projection_hash=phash, poster=_completion_noop_poster,
         )
+        # wb4-1: the engagement already terminalized (register returns the
+        # terminal sentinel, not a tuple) — no debt to leave; finalize's own
+        # terminalize already drove settlement. Best-effort, so just return.
+        if not isinstance(res, tuple):
+            return
+        intent, _created = res
         # Mark the debt directly (no lock needed — a plain dataclass toggle; the
         # relay reads it under the lock at block-match time).
         intent.state = "posted"
@@ -1987,9 +2168,16 @@ class ClaudeCodeDriver(DriverProtocol):
         self._answer_reservations.pop(eid, None)
         # §A3(b) latch-clear discipline (Sol r13-1): PROMOTION (the question got
         # answered) is one of the three latch-clearing events — discharge the
-        # re-anchor obligation and retire the retry owner.
+        # re-anchor obligation. §D6 r29-2 PUMP (D4 review): retire the retry
+        # owner ONLY when no historical items remain — mirrors the guard in
+        # ``_consume_reanchor``. A confirmed-pair memory record surviving
+        # persist exhaustion (or a durable ``reanchored`` stale entry) still
+        # needs the standing pump's marker-edit cleanup; retiring
+        # unconditionally here would strand that cleanup on the next
+        # unrelated output boundary instead.
         self._reanchor_due.discard(eid)
-        self._retire_reanchor_retry(eid)
+        if not self._historical_items(eid):
+            self._retire_reanchor_retry(eid)
         if anchor is None:
             return None
         n = anchor.get("n")
@@ -2062,10 +2250,21 @@ class ClaudeCodeDriver(DriverProtocol):
                 rec.id[:8], n if n is not None else "-", cur_mid, _outcome)
         # Every staged stale copy is settled with the same confirmed-gate; a
         # confirmed one is un-staged, an unconfirmed one keeps the entry present.
-        remaining_stale: list[int] = []
+        # v0.84.0 (round-4 §D6): each stale entry's RENDERING is chosen by its
+        # normalized ``kind`` — a "reanchored" copy settles to the pinned
+        # marker-only terminal text, NEVER the duplicated full body ``text``
+        # every other (current + "plain" stale) copy uses; legacy bare-int
+        # entries normalize to "plain" (today's rendering, unchanged).
+        remaining_stale: list[Any] = []
         unstage = getattr(reg, "unstage_stale_mid", None) if reg is not None else None
-        for smid in list(q.get("stale_mids") or []):
-            if await self._confirm_settle_mid(rec, smid, text, n):
+        for raw_stale in list(q.get("stale_mids") or []):
+            stale = normalize_stale_mid_entry(raw_stale)
+            smid = stale["mid"]
+            stale_text = (
+                _reanchor_moved_terminal(n) if stale["kind"] == "reanchored"
+                else text
+            )
+            if await self._confirm_settle_mid(rec, smid, stale_text, n):
                 if unstage is not None and n is not None:
                     try:
                         await unstage(rec.id, n, smid)
@@ -2079,9 +2278,9 @@ class ClaudeCodeDriver(DriverProtocol):
                             "engagement %s: unstage_stale_mid persist failed "
                             "(n=%s mid=%s) — retaining entry", rec.id[:8], n,
                             smid, exc_info=True)
-                        remaining_stale.append(smid)
+                        remaining_stale.append(raw_stale)
             else:
-                remaining_stale.append(smid)
+                remaining_stale.append(raw_stale)
         # Entry-removal invariant: remove ONLY when the current copy is confirmed
         # AND no stale copy remains; otherwise the entry persists.
         if current_confirmed and not remaining_stale:
@@ -2093,6 +2292,16 @@ class ClaudeCodeDriver(DriverProtocol):
                     logger.warning(
                         "engagement %s: close_open_question failed (n=%s)",
                         rec.id[:8], n, exc_info=True)
+        # v0.84.0 (§D6 r20-1): answer/terminal SETTLEMENT also consults the
+        # confirmed-pair record — an UNPERSISTED orphan copy (nothing durable
+        # tracks it) is marker-edited to the terminal form here, retiring the
+        # record ONLY on a CONFIRMED edit (an unconfirmed edit KEEPS the record so
+        # the unified historical scheduler re-attempts while the engagement lives;
+        # at terminal teardown an unconfirmed record becomes the logged residual).
+        orphan_mid = self._confirmed_pair_mid(rec.id, n)
+        if orphan_mid is not None and n is not None:
+            if await self._orphan_marker_edit(rec, orphan_mid, n):
+                self._retire_confirmed_pair(rec.id, n)
         return cur_mid
 
     async def _confirm_settle_mid(
@@ -2196,7 +2405,7 @@ class ClaudeCodeDriver(DriverProtocol):
 
     def register_send_intent(
         self, *, engagement_id: str, request_id: str, tool_name: str,
-        projection_hash: str, poster: Any,
+        projection_hash: str, poster: Any, on_retire: Any = None,
     ) -> Any:
         """Register (or idempotently reattach to) a discrete-send INTENT (§2(1)).
 
@@ -2213,6 +2422,7 @@ class ClaudeCodeDriver(DriverProtocol):
         return seq.register_intent(
             request_id=request_id, tool_name=tool_name,
             projection_hash=projection_hash, poster=poster,
+            on_retire=on_retire,
         )
 
     def set_send_intent_poster(
@@ -2245,19 +2455,20 @@ class ClaudeCodeDriver(DriverProtocol):
 
     def record_send_intent_cancelled_nowait(
         self, engagement_id: str, request_id: str, outcome: dict,
-    ) -> bool:
+    ) -> str:
         """A3 · F-ORDER (Sol A3 wave 4): FULLY SYNCHRONOUS transport-cancellation
         cleanup against an in-flight relay post — NO await, so a second
         ``Task.cancel()`` cannot interrupt it mid-flight (the double-cancel window
-        the awaited wave-3 predecessor left open). Reads ``posting`` synchronously:
-        if a relay post is in flight / resolved the cancel LOSES (returns ``False``
-        — the poster owns the marker + outcome, never clobbered), otherwise
-        tombstones + records the ``cancelled`` outcome ONLY while the intent is
-        still cancellable (returns ``True`` — the caller then clears the ingress
-        marker). See ``OutputSequencer.record_intent_cancelled_nowait``."""
+        the awaited wave-3 predecessor left open). Reads ``posting`` synchronously
+        and returns a TRI-STATE (wb1-1): ``"post_won"`` when a relay post is in
+        flight / resolved (the cancel LOSES — the poster owns the marker + outcome,
+        never clobbered), ``"cancelled"`` when it tombstoned a still-cancellable
+        intent (the caller then clears the ingress marker), ``"absent"`` when there
+        is no such intent (nothing to post — the caller may clear). See
+        ``OutputSequencer.record_intent_cancelled_nowait``."""
         seq = self._sequencers.get(engagement_id)
         if seq is None:
-            return False
+            return "absent"
         return seq.record_intent_cancelled_nowait(request_id, outcome)
 
     def send_intent_outcome(self, engagement_id: str, request_id: str) -> Any:
@@ -2798,20 +3009,34 @@ class ClaudeCodeDriver(DriverProtocol):
 
     async def _consume_reanchor(self, engagement: EngagementRecord) -> None:
         """Run the re-anchor pass at a turn boundary and reconcile the latch +
-        retry owner (§A3(b), Sol r13-1). A True pass (obligation met — nothing
-        owed, already-last, or a successful staged re-anchor) CLEARS the latch and
-        RETIRES the retry owner; a False pass (persist failure, post/wire failure)
-        SETS the latch and ARMS the retry owner. The pass is idempotent and fully
-        revalidated, so a concurrent boundary consumer racing it is harmless —
-        one of them finds the obligation already discharged."""
+        retry owner (§A3(b), Sol r13-1/r17-1). A True pass (obligation met —
+        nothing owed, already-last, a successful staged re-anchor, or a consumed
+        cosmetic floor) CLEARS the latch and RETIRES the retry owner; a False pass
+        (a STAGE failure that left NOTHING on the wire) leaves them armed. The
+        pass is idempotent and fully revalidated, so a concurrent boundary
+        consumer racing it is harmless — one of them finds the obligation already
+        discharged.
+
+        v0.84.0 (§D6 r17-1): the obligation is ARMED BEFORE the pass's first
+        cancellable await — the pre-r17 latch-AFTER-return arming bypassed the
+        latch when a cancellation landed inside the pass's drained staging write
+        (``stage_stale_mid``), and the ``/silent`` rollback path has no later
+        boundary to recover the obligation at. On a True pass we retire what we
+        just armed; a cancellation propagating out of the pass therefore LEAVES
+        the obligation armed for a later boundary / the retry owner."""
         eng_id = engagement.id
+        self._reanchor_due.add(eng_id)
+        self._arm_reanchor_retry(engagement)
         ok = await self._reanchor_pass(engagement)
         if ok:
             self._reanchor_due.discard(eng_id)
-            self._retire_reanchor_retry(eng_id)
-        else:
-            self._reanchor_due.add(eng_id)
-            self._arm_reanchor_retry(engagement)
+            # §D6 r29-2 PUMP: retire the owner ONLY when NO historical items
+            # remain. A memory commit at the LAST natural boundary leaves a
+            # durable ``reanchored`` entry the sweep must still marker-clean with
+            # no further output — keep the (already-armed) owner running so it
+            # re-runs one item per pass with backoff.
+            if not self._historical_items(eng_id):
+                self._retire_reanchor_retry(eng_id)
 
     async def _reanchor_pass(self, engagement: EngagementRecord) -> bool:
         """§A3(b) staged turn-end re-anchor — ANCHORS ONLY. Keep the oldest
@@ -2825,20 +3050,80 @@ class ClaudeCodeDriver(DriverProtocol):
             return await self._reanchor_pass_locked(engagement)
 
     async def _reanchor_pass_locked(self, engagement: EngagementRecord) -> bool:
+        # v0.84.0 (§D6 r17-1/r27-1): the UNIFIED HISTORICAL SCHEDULER's one
+        # selected step AND the current-question stage+post+persist+marker-edit
+        # unit run inside ONE strongly-retained, repeatedly drained CHILD TASK
+        # created here under the ask-maintenance lock (held by our caller
+        # ``_reanchor_pass`` for the child's whole lifetime). Both call the strict
+        # registry helpers whose shielded write survives only ONE cancellation
+        # (``engagement_registry``); run naked under the lock a second cancellation
+        # could escape with the lock released while persistence continues. So on
+        # our own ``CancelledError`` we DRAIN the child to completion FIRST (a
+        # re-await loop that absorbs REPEATED cancellation via ``shield`` — the
+        # same task-ownership shape as ``engagement_registry`` transactions, but
+        # ``shield`` not ``gather`` because our child is a live coroutine a
+        # gather-cancel WOULD cancel), releasing the lock only after, then
+        # re-raise. The drain is safe because the body is FINITE (one historical
+        # step, then a unit whose every wire op is ``wait_for``-bounded and whose
+        # persist is N local attempts). "No extra tasks" (Sol r27-1) means no
+        # SEPARATE detached cleanup owner — the historical step is NOT one.
+        child = asyncio.ensure_future(self._reanchor_pass_body(engagement))
+        try:
+            return await asyncio.shield(child)
+        except asyncio.CancelledError:
+            while not child.done():
+                try:
+                    await asyncio.shield(child)
+                except asyncio.CancelledError:
+                    continue
+            raise
+
+    async def _reanchor_pass_body(self, engagement: EngagementRecord) -> bool:
+        """The drained pass BODY (§D6): first the UNIFIED HISTORICAL SCHEDULER's
+        ONE rotation-selected step (the stale sweep, BEFORE the current-question
+        work and before the already-last/nothing-owed exits), then the current
+        question's re-anchor unit. Returns the latch bool of the current-question
+        work — ``True`` when the obligation is met/consumed, ``False`` ONLY on a
+        current-unit STAGE failure (nothing on the wire)."""
         eng_id = engagement.id
-        reg = self._registry
+        # AT MOST ONE historical step per pass, on the one rotation-selected item,
+        # BEFORE current-question work — the selected item is thereby excluded
+        # from any other same-pass action (Sol r28-1).
+        await self._run_historical_step(engagement)
+
         # Select the oldest UNANSWERED, unreserved anchor (effective view: not
         # answered ∪ overlay, not reserved). No such anchor ⇒ nothing owed.
         anchor = self._oldest_unanswered_anchor(eng_id, exclude_reserved=True)
         if anchor is None:
             return True
         n = anchor.get("n")
+        # §D6 r18-2: while a CONFIRMED pair is unpersisted for this question, NO
+        # new send is permitted — the memory-pair scheduler step (above) owns
+        # re-driving its LOCAL transaction. Consult the record FIRST, before any
+        # send path; the obligation for this question is met by the scheduler.
+        if n is not None and self._confirmed_pair_mid(eng_id, n) is not None:
+            return True
         old_mid = anchor.get("tg_message_id")
         seq = self._sequencers.get(eng_id)
         if seq is None:
             # No sequencer to measure high-water / post through — cannot
             # re-anchor. Treat as nothing we can do (degraded); the boot
             # reconciler is the eventual backstop.
+            return True
+        # wb5-1 (whole-branch gate wave 5): REFUSE the re-anchor SEND once EITHER
+        # terminal condition holds — the engagement RECORD flipped terminal
+        # (``_record_is_terminal``, reused from wave 2) or the sequencer LATCHED
+        # (``seq.is_terminal()``). Terminal ``settle_all_open_questions`` owns the
+        # retained stale copy (an unconfirmed settle edit keeps the ledger entry);
+        # a relay ``result``/rollback boundary consumer that acquired the
+        # ask-maintenance lock AFTER the sole settlement pass must NOT repost the
+        # full question and persist it live on a CLOSED engagement — ``cancel()``
+        # never re-runs settlement to clean it up. Checked at pass entry HERE AND
+        # again inside the locked ``_revalidate`` immediately before the send, so a
+        # pass crossing terminalization mid-flight still declines. The obligation
+        # is CONSUMED (settlement discharged it), so return True to clear the
+        # latch, matching the ``already-last`` / ``nothing-owed`` exits above.
+        if self._record_is_terminal(eng_id) or seq.is_terminal():
             return True
         hw = seq.high_water
         # Already LAST (nothing posted below it this turn) ⇒ nothing owed. A
@@ -2848,14 +3133,34 @@ class ClaudeCodeDriver(DriverProtocol):
             return True
 
         body = anchor.get("text") or (f"Q{n}:" if n is not None else "")
+        return await self._reanchor_unit(engagement, n, old_mid, body, seq)
 
-        # Step 1 — STAGE (strict): stale_mids += [old_mid]. A raise aborts with
-        # NOTHING on the wire (return False — retry owed).
+    async def _reanchor_unit(
+        self, engagement: EngagementRecord, n: int | None,
+        old_mid: int | None, body: str, seq: Any,
+    ) -> bool:
+        """The drained re-anchor CRITICAL SECTION (§D6 r17-1). Runs as a
+        strongly-retained child task under the caller's held ask-maintenance
+        lock: stage(plain) → ONE ``wait_for``-bounded plain send (ZERO wire
+        retries) → in-unit LOCAL persist (N bounded attempts) →
+        ``wait_for``-bounded marker edit of the OLD copy (finite attempts).
+
+        Returns ``True`` whenever the obligation is DISCHARGED or CONSUMED for
+        this pass (a successful re-anchor, an answer that won the revalidation
+        race, an ambiguous send, or a persist-exhaustion floor); ``False`` ONLY
+        when a STAGE failure left NOTHING on the wire — the only outcome safe to
+        wire-retry, because no send happened and no duplicate can exist."""
+        eng_id = engagement.id
+        reg = self._registry
+
+        # Step 1 — STAGE (strict) plain. A raise aborts with NOTHING on the wire
+        # (return False — safe to retry). §D6/D2: ALWAYS stages "plain"; the
+        # atomic flip to "reanchored" is ``update_question_mid``'s transaction.
         if old_mid is not None and n is not None:
             stage = getattr(reg, "stage_stale_mid", None) if reg is not None else None
             if stage is not None:
                 try:
-                    await stage(eng_id, n, old_mid)
+                    await stage(eng_id, n, old_mid, kind="plain")
                 except Exception:  # noqa: BLE001 — strict stage failed
                     logger.warning(
                         "engagement %s: re-anchor stage_stale_mid failed (n=%s) "
@@ -2863,59 +3168,164 @@ class ClaudeCodeDriver(DriverProtocol):
                         exc_info=True)
                     return False
 
-        # Step 2 — POST the new anchor copy through the sequencer with a
-        # ``revalidate`` hook that re-checks (under the sequencer lock,
-        # immediately before the send) that the anchor is STILL the oldest
-        # unanswered+unreserved one (Sol r8-2): an answer that landed during the
-        # awaited step-1 stage DECLINES the send.
+        # Step 2 — ONE ``wait_for``-bounded plain send (ZERO wire retries). The
+        # ``revalidate`` hook re-checks, under the sequencer lock immediately
+        # before the send, that the anchor is STILL the oldest unanswered+
+        # unreserved one (Sol r8-2): an answer that landed during the awaited
+        # step-1 stage DECLINES the send.
         declined = False
 
         def _revalidate() -> bool:
             nonlocal declined
+            # wb5-1: terminalization can land between the pass-entry guard and
+            # this locked pre-send check (a settlement pass running concurrently
+            # with our boundary consumer). Decline the send if EITHER terminal
+            # condition now holds — treated exactly like an answer winning the
+            # revalidation race (nothing owed), so no copy lands on a closing/
+            # closed engagement.
+            if self._record_is_terminal(eng_id) or seq.is_terminal():
+                declined = True
+                return False
             cur = self._oldest_unanswered_anchor(eng_id, exclude_reserved=True)
             still = cur is not None and cur.get("n") == n
             if not still:
                 declined = True
             return still
 
-        new_mid = await seq.post_discrete(body, revalidate=_revalidate)
+        try:
+            new_mid = await seq.post_discrete(
+                body, revalidate=_revalidate,
+                wire_timeout=_REANCHOR_SEND_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            # The production send wrapper catches everything and returns None
+            # (Sol r17-3); a raising send here (or under the timeout task's
+            # cancellation) is likewise INDISTINGUISHABLE from an accepted copy,
+            # so treat it as an ambiguous send — ZERO wire retries.
+            logger.warning(
+                "engagement %s: re-anchor send raised (n=%s) — treating as "
+                "ambiguous, no wire retry, obligation consumed", eng_id[:8], n,
+                exc_info=True)
+            await self._best_effort_unstage(eng_id, n, old_mid)
+            return True
         if new_mid is None:
             # Un-stage best-effort (a failed un-stage leaves an overlap-tolerant
             # stale_mid — reconciliation tolerates the overlap).
             await self._best_effort_unstage(eng_id, n, old_mid)
             if declined:
-                # The answer won — nothing owed.
+                # The answer won the revalidation race — nothing owed.
                 return True
-            # Wire failure — retry owed.
-            return False
+            # AMBIGUOUS send (Sol r17-3): the send wrapper returns None for BOTH
+            # a wire failure AND "Telegram accepted but returned no mid" / a
+            # wait_for timeout — indistinguishable, so a wire retry could stack
+            # an untracked duplicate. TERMINAL cosmetic outcome for THIS pass: no
+            # wire retry, obligation CONSUMED, old copy stays current; the next
+            # re-anchor obligation arises naturally from the next output event
+            # (round-3 semantics). Residual: at most ONE potential untracked copy
+            # per ambiguous send, logged.
+            #
+            # D4 review (Minor): NO confirmed-pair record is created here — a
+            # confirmed pair requires a KNOWN mid, which an ambiguous send never
+            # yields (Sol r18-2). So nothing blocks a later boundary from doing a
+            # SECOND send for this question; that cross-pass second send is WITHIN
+            # the accepted at-least-once floor (each ambiguous send risks at most
+            # one untracked copy — the same direction D5 pinned for buffered
+            # prose), NOT a regression the confirmed-pair machinery must prevent.
+            logger.warning(
+                "engagement %s: re-anchor send ambiguous (n=%s) — exactly ONE "
+                "attempt, no wire retry, obligation consumed for this pass",
+                eng_id[:8], n)
+            return True
 
-        # Step 3 — STRICT-PERSIST tg_message_id = new_mid. A raise settles the
-        # NEW copy to '↪ see the question above' (confirmed-gate, best-effort,
-        # plain text) and aborts; the original stays live and tracked.
+        # Step 3 — IN-UNIT LOCAL persist of tg_message_id = new_mid: N bounded
+        # attempts, short backoff, registry-file writes ONLY (never a wire op).
+        # This same transaction atomically flips the staged stale entry
+        # "plain" → "reanchored" (D2, inside ``update_question_mid``).
+        if not await self._reanchor_persist_in_unit(engagement, n, new_mid):
+            # v0.84.0 (§D6 r18-2/r28-2): persist exhaustion after a CONFIRMED send
+            # (``new_mid`` is known). RECORD the confirmed pair so the UNIFIED
+            # HISTORICAL SCHEDULER owns re-driving the LOCAL transaction (never a
+            # new send — rule (b)) across later boundaries, and answer/terminal
+            # settlement can marker-edit the orphan. NO body edit (the '↪ see
+            # above' hack is DELETED, r11-1); the obligation is CONSUMED for this
+            # pass. The old copy stays durably current + tracked (persist never
+            # committed, so tg_message_id and the "plain" stale entry are
+            # unchanged); ``new_mid`` is an unpersisted orphan the record now owns
+            # (mid-agnostic routing means answering it still works meanwhile).
+            self._record_confirmed_pair(eng_id, n, new_mid)
+            logger.warning(
+                "engagement %s: re-anchor persist exhausted after %d attempts "
+                "(n=%s new_mid=%s) — confirmed-pair recorded, scheduler owns it",
+                eng_id[:8], _REANCHOR_PERSIST_ATTEMPTS, n, new_mid)
+            return True
+
+        # Step 4 — ``wait_for``-bounded, finite-attempt marker edit of the OLD
+        # copy to the MOVED-open marker (§D6, Sol r1-7): REPLACES the full
+        # duplicated body with marker-ONLY text so the old copy no longer reads
+        # as "asked twice". ONLY on a confirmed edit un-stage old_mid; an
+        # unconfirmed edit PRESERVES the durable "reanchored" stale entry (the
+        # D4 stale-sweep re-drives it). The OBLIGATION is already met (the
+        # question is now LAST at new_mid), so this returns True regardless.
+        #
+        # wb2-2 (whole-branch gate wave 2): the marker edit + unstage is made
+        # LINEARIZABLE against an answer reservation / terminal flip that can land
+        # during either awaited step — see ``_release_old_copy_lifecycle_aware``.
+        await self._release_old_copy_lifecycle_aware(engagement, n, old_mid)
+        return True
+
+    async def _reanchor_persist_in_unit(
+        self, engagement: EngagementRecord, n: int | None, new_mid: int,
+    ) -> bool:
+        """In-unit LOCAL persist of the re-anchored ``tg_message_id`` (§D6
+        r17-2): up to ``_REANCHOR_PERSIST_ATTEMPTS`` strict
+        ``update_question_mid`` attempts with a short backoff between them —
+        registry-file writes only, no wire op. Returns ``True`` on a committed
+        transaction (or when there is no persist primitive — legacy registry),
+        ``False`` on exhaustion."""
+        reg = self._registry
         update = (getattr(reg, "update_question_mid", None)
                   if reg is not None else None)
-        if update is not None and n is not None:
+        if update is None or n is None:
+            return True
+        for attempt in range(_REANCHOR_PERSIST_ATTEMPTS):
             try:
-                await update(eng_id, n, new_mid)
+                await update(engagement.id, n, new_mid)
+                return True
             except Exception:  # noqa: BLE001 — strict persist failed
                 logger.warning(
-                    "engagement %s: re-anchor update_question_mid failed (n=%s) "
-                    "— settling the new copy 'see above'", eng_id[:8], n,
-                    exc_info=True)
-                await self._confirm_settle_mid(
-                    engagement, new_mid, f"{body}\n{_OPEN_Q_SEE_ABOVE}", n)
-                return False
+                    "engagement %s: re-anchor persist attempt %d/%d failed "
+                    "(n=%s new_mid=%s)", engagement.id[:8], attempt + 1,
+                    _REANCHOR_PERSIST_ATTEMPTS, n, new_mid, exc_info=True)
+                if attempt + 1 < _REANCHOR_PERSIST_ATTEMPTS:
+                    await self._sleep(_REANCHOR_PERSIST_BACKOFF)
+        return False
 
-        # Step 4 — SETTLE-EDIT the OLD copy to '↪ question re-posted below ↓'
-        # (confirmed-gate). ONLY on a confirmed edit un-stage old_mid; an
-        # unconfirmed edit retains the stale_mid for boot reconciliation — the
-        # OBLIGATION is already met (the question is now LAST at new_mid).
-        if old_mid is not None:
-            old_confirmed = await self._confirm_settle_mid(
-                engagement, old_mid, f"{body}\n{_OPEN_Q_REPOSTED_BELOW}", n)
-            if old_confirmed and n is not None:
-                await self._best_effort_unstage(eng_id, n, old_mid)
-        return True
+    async def _reanchor_marker_edit(
+        self, engagement: EngagementRecord, old_mid: int, n: int | None,
+        *, terminal: bool = False,
+    ) -> bool:
+        """``wait_for``-bounded, finite-attempt marker edit of the OLD copy
+        through the sequencer's ``edit_discrete`` (§D6 r17-2/r17-4): each attempt
+        is bounded by ``_REANCHOR_EDIT_TIMEOUT`` and idempotent via the F1 edit
+        cache (a repeated identical edit no-ops). Returns ``True`` on a confirmed
+        edit. Renders D1's marker-ONLY text, never the duplicated body.
+
+        wb1-2: ``terminal=True`` renders the ``resolved below`` marker instead of
+        the ``answer the current copy below`` OPEN marker — the durable step uses
+        it once answer/terminal settlement has begun so the stale copy never
+        looks live in the pre-settlement window."""
+        seq = self._sequencers.get(engagement.id)
+        if seq is None:
+            return False
+        from channels.output_sequencer import MARKUP_EMPTY
+        marker = _reanchor_moved_terminal(n) if terminal else _reanchor_moved_open(n)
+        return await confirmed_settle_edit(
+            lambda: seq.edit_discrete(
+                old_mid, text=marker, markup=MARKUP_EMPTY,
+                wire_timeout=_REANCHOR_EDIT_TIMEOUT),
+            sleep=self._sleep,
+        )
 
     async def _best_effort_unstage(
         self, engagement_id: str, n: int | None, mid: int | None,
@@ -2936,11 +3346,293 @@ class ClaudeCodeDriver(DriverProtocol):
                 "engagement %s: re-anchor un-stage failed (n=%s mid=%s)",
                 engagement_id[:8], n, mid, exc_info=True)
 
+    # -- v0.84.0 (round-4 §D6) confirmed-pair record + unified historical --------
+    #    scheduler (Sol r18-2/r19-3/r23-1/r24-2/r27-x/r28-x/r29-x) --------------
+    def _record_confirmed_pair(
+        self, engagement_id: str, n: int | None, new_mid: int,
+    ) -> None:
+        """Record a CONFIRMED but UNPERSISTED re-anchor pair (§D6 r18-2): a copy
+        on the wire at ``new_mid`` whose LOCAL persist never committed. Owned by
+        the driver, retained INDEPENDENTLY of any retry task."""
+        if n is None:
+            return
+        self._confirmed_pairs.setdefault(engagement_id, {})[n] = new_mid
+
+    def _confirmed_pair_mid(self, engagement_id: str, n: int | None) -> int | None:
+        """The unpersisted orphan mid recorded for question ``n``, or ``None``."""
+        if n is None:
+            return None
+        return (self._confirmed_pairs.get(engagement_id) or {}).get(n)
+
+    def _retire_confirmed_pair(self, engagement_id: str, n: int | None) -> None:
+        """Retire a confirmed pair (§D6 r28-2): on the transaction COMMIT (the
+        durable ``reanchored`` entry the commit created owns the rest) or on a
+        confirmed orphan settlement edit."""
+        pairs = self._confirmed_pairs.get(engagement_id)
+        if pairs is None:
+            return
+        pairs.pop(n, None)
+        if not pairs:
+            self._confirmed_pairs.pop(engagement_id, None)
+
+    def _settlement_begun(self, engagement_id: str, n: int | None) -> bool:
+        """§D6 r29-1: ``True`` once answer/terminal SETTLEMENT has begun for
+        question ``n`` — its ledger entry is ABSENT (closed) OR effectively
+        ANSWERED (persisted flag ∪ overlay ∪ reservation). A memory pair whose
+        question has begun settling must NEVER run a late ``update_question_mid``
+        (a closed ledger returns ``False`` and strands the orphan un-edited; a
+        current mid installed AFTER the sole settlement pass is left unowned) —
+        the memory step marker-edits the orphan instead."""
+        if n is None:
+            return True
+        entry = self._reread_open_question(engagement_id, n)
+        if entry is None:
+            return True
+        if entry.get("answered", False) or self._overlay_answered(engagement_id, n):
+            return True
+        return self._reserved_question_number(engagement_id) == n
+
+    def _record_is_terminal(self, engagement_id: str) -> bool:
+        """wb1-2 (whole-branch gate wave 1): ``True`` once the engagement RECORD
+        has flipped terminal (``completed``/``cancelled``/``error``). The
+        authoritative terminal flip (``try_transition_terminal``) commits BEFORE
+        finalize's broker-hook + summary awaits and BEFORE
+        ``settle_all_open_questions`` cancels the retry owner — a GAP in which a
+        scheduler pump pass could edit a stale copy to the OPEN marker and unstage
+        it, stranding it live-looking (settlement then only sees the current
+        copy). The scheduler consults this to defer to the imminent settlement:
+        render the TERMINAL marker + leave staged, and stop pumping/arming."""
+        reg = self._registry
+        getter = getattr(reg, "get", None) if reg is not None else None
+        if getter is None:
+            return False
+        try:
+            rec = getter(engagement_id)
+        except Exception:  # noqa: BLE001 — a read failure must never wedge the pass
+            return False
+        return rec is not None and getattr(rec, "status", None) in (
+            "completed", "cancelled", "error")
+
+    def _historical_items(
+        self, engagement_id: str,
+    ) -> list[tuple[str, int, int]]:
+        """The UNIFIED HISTORICAL SCHEDULER's item set (§D6): unpersisted memory
+        pairs ∪ open durable ``reanchored`` stale entries, as deterministically
+        ordered ``(kind, n, mid)`` tuples (memory items carry ``mid == -1``).
+        Answered/closed questions' ``reanchored`` entries are EXCLUDED — their
+        terminal-form settle is owned by ``_settle_ledger_entry``, not the
+        open-form sweep. Deterministic order keeps the rotation cursor fair."""
+        items: list[tuple[str, int, int]] = []
+        for n in (self._confirmed_pairs.get(engagement_id) or {}):
+            items.append(("memory", n, -1))
+        reg = self._registry
+        entries_getter = (getattr(reg, "open_question_entries", None)
+                          if reg is not None else None)
+        if entries_getter is not None:
+            for q in entries_getter(engagement_id):
+                n = q.get("n")
+                if n is None:
+                    continue
+                if q.get("answered", False) or self._overlay_answered(
+                        engagement_id, n):
+                    continue
+                for raw in (q.get("stale_mids") or []):
+                    s = normalize_stale_mid_entry(raw)
+                    if s["kind"] == "reanchored":
+                        items.append(("durable", n, s["mid"]))
+        # (n, kind, mid): "durable" sorts before "memory" for the same question.
+        items.sort(key=lambda it: (it[1], it[0], it[2]))
+        return items
+
+    def _reanchor_work_pending(self, engagement_id: str) -> bool:
+        """§D6 r29-2 PUMP predicate: the re-anchor retry owner stays armed while
+        the latch is set OR the scheduler's item set is non-empty (so a durable
+        cleanup lands even when the committing boundary was the last natural one
+        — no second owner mechanism)."""
+        return (engagement_id in self._reanchor_due
+                or bool(self._historical_items(engagement_id)))
+
+    async def _run_historical_step(
+        self, engagement: EngagementRecord,
+    ) -> tuple[str, int, int] | None:
+        """Perform AT MOST ONE rotation-selected historical step (§D6 Sol
+        r23-1/r24-2/r28-1). Runs under the caller's held maintenance lock, INSIDE
+        the drained pass body (its strict registry helpers survive only ONE
+        cancellation). The cursor advances after EVERY step, success or failure —
+        never K sequential steps for K items (the current question stays
+        unblockable by historical cosmetic failures). Returns the selected item
+        or ``None`` when the set is empty."""
+        eng_id = engagement.id
+        items = self._historical_items(eng_id)
+        if not items:
+            return None
+        cursor = self._historical_cursor.get(eng_id, 0)
+        sel = items[cursor % len(items)]
+        self._historical_cursor[eng_id] = cursor + 1  # advance after EVERY step
+        kind, n, mid = sel
+        if kind == "memory":
+            await self._historical_memory_step(engagement, n)
+        else:
+            await self._historical_durable_step(engagement, n, mid)
+        return sel
+
+    async def _historical_memory_step(
+        self, engagement: EngagementRecord, n: int,
+    ) -> None:
+        """LIFECYCLE-AWARE memory-pair step (§D6 r29-1). While the question is
+        LIVE and UNANSWERED: exactly ONE strict ``update_question_mid`` attempt
+        (no in-pass retry loop — the cross-pass rotation spreads retries); on
+        commit the record RETIRES and the durable ``reanchored`` entry (created by
+        the atomic flip) enters the item set. Once settlement HAS BEGUN: switch
+        PERMANENTLY to a bounded terminal marker-edit of the orphan, retiring ONLY
+        on a confirmed edit (nothing durable can rediscover this mid)."""
+        eng_id = engagement.id
+        new_mid = self._confirmed_pair_mid(eng_id, n)
+        if new_mid is None:
+            return
+        # wb1-2: a terminal record (finalize's pre-settle gap) is settling too —
+        # a late ``update_question_mid`` would install a current mid AFTER the
+        # sole settlement pass with nothing owning it; marker-edit the orphan
+        # terminal instead.
+        if self._settlement_begun(eng_id, n) or self._record_is_terminal(eng_id):
+            if await self._orphan_marker_edit(engagement, new_mid, n):
+                self._retire_confirmed_pair(eng_id, n)
+            return
+        reg = self._registry
+        update = (getattr(reg, "update_question_mid", None)
+                  if reg is not None else None)
+        if update is None:
+            return
+        try:
+            await update(eng_id, n, new_mid)
+        except Exception:  # noqa: BLE001 — one attempt, pair retained for rotation
+            logger.warning(
+                "engagement %s: historical memory-pair persist attempt failed "
+                "(n=%s new_mid=%s) — pair retained", eng_id[:8], n, new_mid,
+                exc_info=True)
+            return
+        # Committed: the durable ``reanchored`` entry now owns the marker-edit +
+        # unstage cleanup — retire the memory record (Sol r28-2).
+        self._retire_confirmed_pair(eng_id, n)
+
+    async def _historical_durable_step(
+        self, engagement: EngagementRecord, n: int, mid: int,
+    ) -> None:
+        """COMPOUND durable-entry step (§D6): one ``wait_for``-bounded OLD-copy
+        marker edit, and on edit success the one ``unstage_stale_mid`` write.
+        Retire on unstage success; a failed unstage leaves the durable entry
+        present, so the next selection re-runs the compound step — the repeated
+        identical edit no-ops via the F1 edit cache (idempotent, no new durable
+        'edited' flag needed).
+
+        wb1-2: REVALIDATE lifecycle before choosing the marker text AND again
+        before unstaging (both reads under the caller's held maintenance lock).
+        Once answer/terminal settlement has BEGUN — D4's ``_settlement_begun``
+        (answered/reserved/closed) OR the engagement RECORD has flipped terminal
+        (``_record_is_terminal`` — the finalize gap before ``settle_all`` cancels
+        the pump) — the OPEN "answer the current copy below" marker would strand
+        the stale copy looking live because settlement then only sees the current
+        copy. Render the TERMINAL marker and LEAVE the entry staged so the
+        settlement path (which renders reanchored stale copies terminal) owns the
+        final state — NEVER unstage it out from under settlement."""
+        # wb2-2: the compound marker-edit + unstage is LINEARIZABLE against a
+        # reservation / terminal flip landing during EITHER awaited step (the
+        # OPEN-marker edit OR the unstage persist) — the shared helper below.
+        await self._release_old_copy_lifecycle_aware(engagement, n, mid)
+
+    async def _release_old_copy_lifecycle_aware(
+        self, engagement: EngagementRecord, n: int | None, old_mid: int | None,
+    ) -> None:
+        """wb2-2 (whole-branch gate wave 2): marker-edit the OLD anchor copy and
+        release its staged stale entry, LINEARIZABLE against an answer reservation
+        / terminal record flip that can land during EITHER awaited step — the
+        ``wait_for``-bounded OPEN-marker edit OR the awaited ``unstage_stale_mid``
+        persist. Shared by the current-question re-anchor unit (step 4) and the
+        unified historical scheduler's durable step.
+
+        Answer/terminal settlement (``_settle_ledger_entry``) renders a still-
+        staged ``reanchored`` stale copy to the TERMINAL ``resolved below`` marker.
+        So the invariant kept here is: once settlement has BEGUN for this question,
+        the old copy must be LEFT (or restored) staged so settlement terminalizes
+        it — never unstaged out from under settlement, stranding it permanently on
+        the OPEN ``answer the current copy below`` marker (the bug wb1-2's single
+        pre-unstage check still allowed, because the reservation can install WHILE
+        the unstage write is awaiting persistence).
+
+        Three lifecycle reads, each under the caller's held maintenance lock:
+        (1) BEFORE the edit — already begun ⇒ render TERMINAL, leave staged;
+        (2) AFTER the OPEN edit — a reservation may have landed while it was in
+        flight ⇒ leave staged, skip the unstage;
+        (3) AFTER the unstage persist — a reservation can install between check (2)
+        and the persisted removal ⇒ RE-STAGE the stale entry ``reanchored`` so
+        settlement finds and terminalizes it."""
+        eng_id = engagement.id
+        if old_mid is None or n is None:
+            return
+        if self._settlement_begun(eng_id, n) or self._record_is_terminal(eng_id):
+            await self._reanchor_marker_edit(engagement, old_mid, n, terminal=True)
+            return
+        if not await self._reanchor_marker_edit(engagement, old_mid, n):
+            return
+        if self._settlement_begun(eng_id, n) or self._record_is_terminal(eng_id):
+            return
+        await self._best_effort_unstage(eng_id, n, old_mid)
+        if self._settlement_begun(eng_id, n) or self._record_is_terminal(eng_id):
+            await self._restage_reanchored(eng_id, n, old_mid)
+
+    async def _restage_reanchored(
+        self, engagement_id: str, n: int | None, mid: int | None,
+    ) -> None:
+        """wb2-2: RE-STAGE ``mid`` as a ``reanchored`` stale copy after a lifecycle
+        race unstaged it just as settlement was beginning — so the settlement path
+        (which renders ``reanchored`` stale copies to the terminal marker) owns the
+        old copy's final state instead of stranding it on the OPEN marker.
+        Best-effort: a failed re-stage leaves the old copy on the OPEN marker (the
+        pre-fix outcome for this one message — strictly no worse), logged."""
+        reg = self._registry
+        if reg is None or n is None or mid is None:
+            return
+        stage = getattr(reg, "stage_stale_mid", None)
+        if stage is None:
+            return
+        try:
+            await stage(engagement_id, n, mid, kind="reanchored")
+        except Exception:  # noqa: BLE001 — best-effort restoration
+            logger.warning(
+                "engagement %s: re-stage after unstage race failed (n=%s mid=%s)",
+                engagement_id[:8], n, mid, exc_info=True)
+
+    async def _orphan_marker_edit(
+        self, engagement: EngagementRecord, orphan_mid: int, n: int | None,
+    ) -> bool:
+        """§D6 r20-1: bounded, finite-attempt TERMINAL marker-edit of a confirmed
+        pair's orphan mid (the settlement form — the question is by now
+        answered/terminal), routed through the sequencer's ``edit_discrete`` (F1
+        no-op idempotent, so the scheduler and settlement path can each re-run the
+        identical edit). Returns ``True`` on a confirmed edit."""
+        seq = self._sequencers.get(engagement.id)
+        if seq is None:
+            return False
+        from channels.output_sequencer import MARKUP_EMPTY
+        marker = _reanchor_moved_terminal(n)
+        return await confirmed_settle_edit(
+            lambda: seq.edit_discrete(
+                orphan_mid, text=marker, markup=MARKUP_EMPTY,
+                wire_timeout=_REANCHOR_EDIT_TIMEOUT),
+            sleep=self._sleep,
+        )
+
     def _arm_reanchor_retry(self, engagement: EngagementRecord) -> None:
         """Arm the ONE retry-owner task for this engagement (§A3(b), Sol r13-1).
         A double-arm while a task already runs is a NO-OP. The task self-retires
-        (removing its dict entry) via a done-callback."""
+        (removing its dict entry) via a done-callback.
+
+        wb1-2: NO-OP once the record is terminal — ``settle_all_open_questions``
+        cancels the pump before it iterates stale mids, and a re-arm here would
+        restart the very scheduler the terminal quiesce just stopped."""
         eng_id = engagement.id
+        if self._record_is_terminal(eng_id):
+            return
         existing = self._reanchor_retry_tasks.get(eng_id)
         if existing is not None and not existing.done():
             return
@@ -2976,16 +3668,23 @@ class ClaudeCodeDriver(DriverProtocol):
         eng_id = engagement.id
         idx = 0
         try:
-            while eng_id in self._reanchor_due:
+            # §D6 r29-2 PUMP: loop while the latch is set OR the scheduler's item
+            # set is non-empty — one item per pass with backoff — so a durable
+            # cleanup lands even after the committing boundary was the last one.
+            while self._reanchor_work_pending(eng_id):
                 delay = _REANCHOR_BACKOFF[min(idx, len(_REANCHOR_BACKOFF) - 1)]
                 idx += 1
                 await self._reanchor_retry_sleep(delay)
-                if eng_id not in self._reanchor_due:
+                if not self._reanchor_work_pending(eng_id):
                     break
                 ok = await self._reanchor_pass(engagement)
                 if ok:
                     self._reanchor_due.discard(eng_id)
-                    break
+                    # Break ONLY when no historical items remain; otherwise keep
+                    # pumping the sweep (a True pass with a durable entry still
+                    # present must not retire the owner).
+                    if not self._historical_items(eng_id):
+                        break
         except asyncio.CancelledError:
             raise
 
@@ -3002,6 +3701,20 @@ class ClaudeCodeDriver(DriverProtocol):
         discharge). Best-effort per entry — never raises into the finalize funnel.
         Called getattr-tolerantly by ``tools._finalize_engagement``."""
         eng_id = engagement.id
+        # wb3-1/wb3-2/wb3-3: LATCH the sequencer TERMINAL before settling. This
+        # runs BEFORE this method enumerates the open-question ledger AND before
+        # the later ``finalize_completion_post`` flush, so: (a) any still-armed
+        # anchor poster is aborted here and never posts + ledgers a question the
+        # settle pass would then miss (BLOCKER wb3-1); (b) an in-flight poster's
+        # ledger entry has already landed (the writer lock serializes it ahead of
+        # us) and IS included in the settle pass below; (c) the intent registry
+        # is pruned, firing every ``on_retire`` so the wb2-4 validation-gate pins
+        # release even if the relay never processes ``result`` (wb3-3); and (d)
+        # late relay narration is discarded (wb3-2). Idempotent + serialized
+        # against posters via the writer lock.
+        seq = self._sequencers.get(eng_id)
+        if seq is not None:
+            await seq.terminalize()
         # Discharge the re-anchor obligation: nothing to keep last once terminal.
         self._reanchor_due.discard(eng_id)
         self._retire_reanchor_retry(eng_id)
@@ -3030,6 +3743,15 @@ class ClaudeCodeDriver(DriverProtocol):
                     logger.warning(
                         "engagement %s: terminal open-question settle failed "
                         "(n=%s)", eng_id[:8], q.get("n"), exc_info=True)
+
+    def sequencer_is_terminal(self, engagement_id: str) -> bool:
+        """wb3-1: ``True`` once the engagement's sequencer has TERMINALIZED (the
+        persistent latch). The anchor poster consults this under the writer lock
+        (in the same locked section as its cancel-latch re-read) so it never
+        posts + ledgers a question on a closing/closed engagement. ``False`` when
+        there is no live sequencer."""
+        seq = self._sequencers.get(engagement_id)
+        return seq is not None and seq.is_terminal()
 
     def set_engagement_reply_anchor(
         self, engagement_id: str, message_id: int,
@@ -3096,6 +3818,20 @@ class ClaudeCodeDriver(DriverProtocol):
         """
         from drivers.topic_stream import TopicStreamRelay
 
+        # §D5 ("Successful-anchor identity comes from the DRIVER"): the SAME
+        # truth source the A3 reply/stacking gates use — persisted ``answered``
+        # ∪ overlay ∪ reservation excluded — reused verbatim as the relay's
+        # injected seam.
+        # wb2-1 (whole-branch gate wave 2): report the anchor's SOURCE HASH (the
+        # projection hash of the ask that produced it — recorded on the ledger
+        # entry by the ask handler) so the relay can bind a candidate POSITIVELY to
+        # the anchor its OWN ask produced, never a prior / co-existing open anchor.
+        def _open_anchor_state() -> "tuple[int, int, str | None] | None":
+            entry = self.effective_open_anchor(engagement.id)
+            if not entry:
+                return None
+            return (entry["n"], entry["tg_message_id"], entry.get("source_hash"))
+
         ws = Path(self._engagements_root) / engagement.id
         relay = TopicStreamRelay(
             engagement_id=engagement.id,
@@ -3113,6 +3849,10 @@ class ClaudeCodeDriver(DriverProtocol):
             # v0.79.0 (§2): the SHARED per-engagement sequencer, so the relay
             # and the discrete ingresses agree on ordering + high-water.
             sequencer=self._ensure_sequencer(engagement),
+            open_anchor_state=_open_anchor_state,
+            # wb2-3: terminal-lifecycle seam — a terminal closure DISCARDS held
+            # narration (never flushes a sign-off below the terminal completion).
+            engagement_terminal=lambda: self._record_is_terminal(engagement.id),
         )
         while True:
             try:

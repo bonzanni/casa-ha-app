@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hashlib
 import logging
 import os
 import time
@@ -238,198 +239,226 @@ def _parse_callback_data(
 # only a short summary. The button's IDENTITY stays the option INDEX in
 # ``callback_data`` — the label is display-only, so nothing is lost by shortening.
 #
-# v0.83.0 (A4 · F-BTN, Sol r2-9/r3-7): the fixed 3-word cap dropped distinguishing
-# TAILS ("Single account with aliases" → "1 · Single account with" — the live
-# regression). Replaced by an ELISION LADDER computed over the WHOLE option set
-# (so distinctness can be verified pairwise). Cap raised to 30 INCLUDING the
-# ``n · `` number prefix.
-_ASK_BUTTON_LABEL_CAP = 30
-_ASK_LABEL_ELLIPSIS = "…"
+# Round 4 (spec D2, Sol r1-3/r2-3/r2-7/r3-5): the v0.83.0 per-option elision
+# ladder is GONE — it garbled labels ("1 · A —…MCP…MCPB"). Button labels are now MODEL-generated: the agent
+# supplies an optional ``short`` per option, resolved with WHOLE-SET semantics by
+# ``resolve_button_labels`` below. Either EVERY option has a usable short and
+# the whole set renders ``n · <short>`` verbatim, or the WHOLE set floors to
+# ``Option 1``, ``Option 2``, … — never mixed, never mutated, never a
+# rejection. The Haiku label-generation fallback is explicitly DEFERRED (D2
+# item 4): until it ships (on the hardened CLI runtime, only if telemetry shows
+# the floor is materially inadequate), an ask with no agent-supplied shorts
+# always floors. ``floored_ask_telemetry`` is the CONTENT-FREE log line for
+# that floor (never the option/question text).
+_ASK_BUTTON_CAPTION_CAP = 64
 
-
-def _render_kept(tokens: list[str], kept: set[int]) -> str:
-    """Render a summary from a subset of KEPT token indices.
-
-    Kept tokens are space-joined; each INTERIOR run of dropped tokens collapses
-    to a single ``…`` attached to its neighbours without surrounding spaces
-    (``Single…aliases``); a LEADING or TRAILING dropped run is omitted entirely
-    (no edge ellipsis), so a left-drop reads ``account with aliases`` — not
-    ``…account with aliases``.
-    """
-    n = len(tokens)
-    out = ""
-    i = 0
-    while i < n:
-        if i in kept:
-            if out and not out.endswith(_ASK_LABEL_ELLIPSIS):
-                out += " "
-            out += tokens[i]
-            i += 1
-        else:
-            j = i
-            while j < n and j not in kept:
-                j += 1
-            if i != 0 and j != n:  # interior run only → single ellipsis
-                out += _ASK_LABEL_ELLIPSIS
-            i = j
-    return out
-
-
-def _elide_one(prefix: str, option: str, others_tokens: "list[set[str]]") -> str:
-    """Pinned per-option elision ladder (A4 rule 2). ``others_tokens`` is the
-    casefolded token set of every OTHER option in the same ask (a token is
-    *shared* iff its casefold appears in at least one of them).
-
-    Resolution order: (1) full fit → verbatim; (2) shared-token elision (drop
-    shared tokens longest-first, each dropped RUN → ``…``); (3) interior elision
-    (keep head + tail); (4) left-drop of leading tokens; (5) hard slice.
-    """
-    budget = _ASK_BUTTON_LABEL_CAP - len(prefix)
-    tokens = option.split()
-    if not tokens:
-        # Whitespace-only option: nothing to summarise — hard-slice the prefix.
-        return (prefix)[:_ASK_BUTTON_LABEL_CAP]
-    full = " ".join(tokens)
-    # (1) full fit — verbatim, no ellipsis.
-    if len(full) <= budget:
-        return prefix + full
-    n = len(tokens)
-    # (2) shared-token elision: drop SHARED tokens, longest-first (leftmost tie),
-    #     keeping discriminative ones; the operator scans the tail differentiator.
-    kept = set(range(n))
-    shared = [
-        p for p in range(n)
-        if any(tokens[p].casefold() in s for s in others_tokens)
-    ]
-    for p in sorted(shared, key=lambda q: (-len(tokens[q]), q)):
-        kept.discard(p)
-        cand = _render_kept(tokens, kept)
-        if cand and len(cand) <= budget:
-            return prefix + cand
-    # (3) interior elision: keep head + tail (``Single…aliases``).
-    if n >= 2:
-        cand = _render_kept(tokens, {0, n - 1})
-        if cand and len(cand) <= budget:
-            return prefix + cand
-    # (4) left-drop: drop leading tokens (tail differentiator survives).
-    for k in range(1, n):
-        cand = _render_kept(tokens, set(range(k, n)))
-        if cand and len(cand) <= budget:
-            return prefix + cand
-    # (5) hard slice on a codepoint boundary — degenerate long single token.
-    return (prefix + full)[:_ASK_BUTTON_LABEL_CAP]
-
-
-def _resolve_label_collisions(
-    options: list[str], prefixes: list[str], summaries: list[str],
-) -> None:
-    """Pairwise-distinctness validation (Sol r3-7). Any two produced summaries
-    that collide (casefolded, ignoring the number prefix) while their full
-    options differ are re-elided IN PLACE — keeping, for each, the token
-    positions where it differs from a colliding sibling (earliest first, as the
-    budget allows). The unique number prefixes make the FINAL button labels
-    pairwise-distinct regardless; this step surfaces a differentiating token
-    whenever one fits.
-    """
-    from collections import defaultdict
-
-    groups: "defaultdict[str, list[int]]" = defaultdict(list)
-    for i, s in enumerate(summaries):
-        groups[s.casefold()].append(i)
-    for idxs in groups.values():
-        if len(idxs) < 2:
-            continue
-        if len({options[i].casefold() for i in idxs}) < 2:
-            continue  # the full options are themselves identical — nothing to do
-        for i in idxs:
-            budget = _ASK_BUTTON_LABEL_CAP - len(prefixes[i])
-            tokens = options[i].split()
-            sib_tokens = [options[j].split() for j in idxs if j != i]
-            diff = [
-                p for p in range(len(tokens))
-                if any(
-                    p >= len(sib) or sib[p].casefold() != tokens[p].casefold()
-                    for sib in sib_tokens
-                )
-            ]
-            if not diff:
-                continue
-            kept: set[int] = set()
-            for p in diff:
-                if len(_render_kept(tokens, kept | {p})) <= budget:
-                    kept.add(p)
-            if kept:
-                cand = _render_kept(tokens, kept)
-                if cand and len(cand) <= budget:
-                    summaries[i] = cand
-
-
-def short_option_labels(options: list) -> list[str]:
-    """Derive short, number-prefixed button labels for a WHOLE option set.
-
-    Each label is ``<n> · <summary>`` (1-based ``n``), the whole string ≤
-    ``_ASK_BUTTON_LABEL_CAP`` including the prefix, produced by the elision
-    ladder (``_elide_one``) and then validated pairwise-distinct
-    (``_resolve_label_collisions``). The full option text is carried VERBATIM in
-    the message body, so a shortened label never changes the choice; the
-    ``callback_data`` identity stays the option INDEX.
-    """
-    opts = [str(o) for o in options]
-    token_sets = [{t.casefold() for t in o.split()} for o in opts]
-    prefixes = [f"{i + 1} · " for i in range(len(opts))]
-    summaries: list[str] = []
-    for i, o in enumerate(opts):
-        others = [token_sets[j] for j in range(len(opts)) if j != i]
-        lab = _elide_one(prefixes[i], o, others)
-        summaries.append(lab[len(prefixes[i]):])
-    _resolve_label_collisions(opts, prefixes, summaries)
-    return [prefixes[i] + summaries[i] for i in range(len(opts))]
-
-
-def _short_option_label(number: int, option: str) -> str:
-    """Single-option fallback of the elision ladder (no siblings ⇒ no shared
-    tokens, no pairwise check). ``number`` is the option's 1-based position.
-
-    Kept for callers that shorten ONE option in isolation; the keyboards use the
-    set-level ``short_option_labels`` so distinctness can be verified.
-    """
-    return _elide_one(f"{number} · ", option, [])
-
-
-# A5 · F-MULTI checkbox glyphs.
+# A5 · F-MULTI checkbox glyphs (also the multi decoration prefix the resolver
+# validates against — see ``_classify_button_labels``).
 _MULTI_BOX_ON = "☑"
 _MULTI_BOX_OFF = "☐"
 _MULTI_SUBMIT_TEXT = "✅ Submit"
 
 
-def _multi_button_caption(
-    i: int, options: list, shorts: "list | None", heuristic: list, selected: set,
-) -> str:
-    """A5 · F-MULTI: one toggle-row caption ``☐/☑ <n> · <short-or-heuristic>``.
+def _button_short(item: "str | dict") -> str | None:
+    """The agent-supplied ``short`` of an options-list ITEM, iff it is a
+    ``str`` (any string — blank or not; blankness is checked separately).
+    ``None`` when absent, non-string, or the item is a bare ``str`` (a bare
+    label never carries a short)."""
+    if isinstance(item, dict):
+        short = item.get("short")
+        if isinstance(short, str):
+            return short
+    return None
 
-    ``shorts[i]`` (agent-supplied) wins VERBATIM (``n · <short>``); otherwise the
-    distinguishing-tail heuristic label (already ``n · …``) is used. The leading
-    checkbox reflects membership in ``selected``."""
+
+def _button_label_text(item: "str | dict") -> str:
+    """The full label text of an options-list ITEM (a bare ``str``, or a
+    dict's ``"label"``)."""
+    if isinstance(item, dict):
+        return str(item.get("label", ""))
+    return str(item)
+
+
+def _floor_captions(n: int) -> list[str]:
+    """The whole-set floor: numbered, content-free placeholders."""
+    return [f"Option {i + 1}" for i in range(n)]
+
+
+def _classify_button_labels(
+    options: list, multi: bool,
+) -> "tuple[str | None, list[str]]":
+    """Whole-set classification shared by ``resolve_button_labels`` and
+    ``floored_ask_telemetry`` (Sol r2-3/r2-7).
+
+    Every option must carry a ``short`` that is (1) a ``str``, (2) non-blank
+    after ``strip()``, (3) pairwise-distinct (casefold-insensitive) across the
+    WHOLE set, and (4) whose DECORATED caption — ``f"☑ {i+1} · {short}"`` for a
+    multi ask, ``f"{i+1} · {short}"`` otherwise — fits the 64-char product
+    contract (Sol r3-5: the same short can pass single-select and fail multi
+    at the identical length). Any failure floors the WHOLE set.
+
+    Returns ``(floor_reason, captions)``: ``floor_reason`` is ``None`` and
+    ``captions`` are the stored ``n · <short>`` captions VERBATIM (undecorated
+    — the checkbox glyph is a separate render-time concern, D2 item 3) when
+    every option passes; otherwise ``floor_reason`` is one of
+    ``no_shorts|blank|dup|too_long`` and ``captions`` is the numbered floor.
+    Pure; never mutates ``options``; never raises.
+    """
+    n = len(options)
+    raw = [_button_short(o) for o in options]
+    if any(s is None for s in raw):
+        return "no_shorts", _floor_captions(n)
+    # wb1-4: ``strip()`` is used ONLY as the BLANK predicate (D2: verbatim-or-
+    # floor, never mutated). Distinctness, caption construction, and the ≤64
+    # decorated-length check all read the RAW short — stripping first would
+    # silently change uniqueness (" Setup " vs "Setup") and length decisions
+    # (trailing padding that overflows the 64-char caption), both mutations the
+    # verbatim contract forbids. A short renders exactly as authored:
+    # ``"  Setup  "`` → ``"1 ·   Setup  "``.
+    if any(s.strip() == "" for s in raw):
+        return "blank", _floor_captions(n)
+    if len({s.casefold() for s in raw}) != n:
+        return "dup", _floor_captions(n)
+    captions = [f"{i + 1} · {raw[i]}" for i in range(n)]
+    for cap in captions:
+        decorated = f"{_MULTI_BOX_ON} {cap}" if multi else cap
+        if len(decorated) > _ASK_BUTTON_CAPTION_CAP:
+            return "too_long", _floor_captions(n)
+    return None, captions
+
+
+def resolve_button_labels(options: list, multi: bool) -> list[str]:
+    """THE pure whole-set button-label resolver (spec D2 item 1).
+
+    ``options`` items are either a bare ``str`` (full label, no short) or
+    ``{"label": str, "short": ...}``. Returns the final captions
+    ``f"{i+1} · {short}"`` for ALL options iff EVERY option has a usable short
+    (see ``_classify_button_labels``); otherwise the whole-set floor
+    ``["Option 1", "Option 2", …]``. Never mixed (some real, some floored),
+    never mutated, never raises. Run BEFORE ``BROKER.register`` so the
+    resolved captions can be placed in static broker meta (wiring: Task A5).
+    """
+    _reason, captions = _classify_button_labels(options, multi)
+    return captions
+
+
+def floored_ask_telemetry(options: list, *, multi: bool = False) -> str:
+    """CONTENT-FREE log line for a floored ask (spec D2 item 4, Sol r2-7).
+
+    Records only safe dimensions — option count, floor reason
+    (``no_shorts|blank|dup|too_long|none`` when it didn't float), a
+    short-presence bitmap (``1`` iff the option carries a ``str`` short,
+    regardless of blank/dup/length validity — a diagnostic aid for *which*
+    option(s) are missing one), and a bounded (12 hex char) hash of the
+    option set — NEVER the option/question text (agent-authored,
+    operator-decision content that could be large, sensitive, or
+    log-injecting once the invented length caps are gone, D1).
+    """
+    reason, _captions = _classify_button_labels(options, multi)
+    bitmap = "".join(
+        "1" if _button_short(o) is not None else "0" for o in options)
+    labels = [_button_label_text(o) for o in options]
+    joined = "\x1f".join(labels)
+    digest = hashlib.sha256(joined.encode("utf-8")).hexdigest()[:12]
+    return (
+        f"floored_ask_telemetry count={len(options)} "
+        f"reason={reason if reason is not None else 'none'} "
+        f"shorts={bitmap} hash={digest}"
+    )
+
+
+def floored_ask_telemetry_line(options: list, *, multi: bool = False) -> "str | None":
+    """Return the CONTENT-FREE floor telemetry line IFF the whole-set resolver
+    FLOORS this button ask (wb3-4, D2 item 4); ``None`` when every option
+    resolved to a verbatim short (no floor happened — nothing to log).
+
+    The wb3-4 wiring gap this closes: :func:`floored_ask_telemetry` existed but
+    was never called in production, so the accepted telemetry-gated-Haiku
+    decision had no data source. The ask handler logs this line ONCE, at the
+    owner's registration path, exactly when a real floor occurs. Pure; never
+    raises; empty ``options`` (a free-text anchor) classifies as ``no floor`` →
+    ``None``, so anchors never emit."""
+    reason, _captions = _classify_button_labels(options, multi)
+    if reason is None:
+        return None
+    return floored_ask_telemetry(options, multi=multi)
+
+
+def short_option_labels(
+    labels: list, shorts: "list | None" = None,
+) -> list[str]:
+    """Derive button labels for a WHOLE option set (name/signature PINNED —
+    resident ``ask_user`` calls this via
+    ``post_dm_keyboard(short_labels=True)``, wired from parallel-owned
+    ``tools.py``).
+
+    Agent shorts win VERBATIM when every ``labels[i]`` has a usable, paired
+    ``shorts[i]`` (same whole-set rule as ``resolve_button_labels``); otherwise
+    the WHOLE set floors to the numbered placeholder. No elision anywhere
+    (spec D2's ``short_option_labels()`` note) — this is a thin convenience
+    wrapper that zips ``labels``/``shorts`` into ``resolve_button_labels``'s
+    input shape for a single-select ask.
+    """
+    options = [
+        {
+            "label": str(lab),
+            "short": (
+                shorts[i] if shorts is not None and i < len(shorts) else None
+            ),
+        }
+        for i, lab in enumerate(labels)
+    ]
+    return resolve_button_labels(options, multi=False)
+
+
+def _captions_from_shorts(
+    options: list, shorts: "list | None", multi: bool,
+) -> list[str]:
+    """Resolve the whole-set captions from ``options`` + parallel ``shorts``
+    (the ``resolve_button_labels`` input shape). Used ONLY as the fallback
+    when no persisted ``button_labels`` meta exists yet (eager fallback /
+    direct-call unit tests) — the live path always consumes the persisted
+    captions seeded at registration (D2 item 3, Task A5)."""
+    combined = [
+        {
+            "label": str(opt),
+            "short": shorts[i] if shorts is not None and i < len(shorts) else None,
+        }
+        for i, opt in enumerate(options)
+    ]
+    return resolve_button_labels(combined, multi)
+
+
+def _multi_button_caption(i: int, captions: list[str], selected: set) -> str:
+    """A5 · F-MULTI: one toggle-row caption ``☐/☑ <stored caption>``. The
+    checkbox glyph reflects membership in ``selected``; ``captions[i]`` is
+    already the whole-set-resolved ``n · <short>`` or floored ``Option n``."""
     box = _MULTI_BOX_ON if i in selected else _MULTI_BOX_OFF
-    if shorts is not None and i < len(shorts) and shorts[i]:
-        return f"{box} {i + 1} · {shorts[i]}"
-    return f"{box} {heuristic[i]}"
+    return f"{box} {captions[i]}"
 
 
 def _build_multi_keyboard(
-    request_id: str, options: list, shorts: "list | None", selected,
+    request_id: str, options: list, captions: "list[str]", selected,
 ):
     """A5 · F-MULTI: the toggle-many keyboard — one ``☐/☑ n · <label>`` row per
     option (callback ``v1|ask_multi|<rid>|<idx>``) plus a final ``✅ Submit`` row
     (``v1|ask_multi|<rid>|s``). Shared by the initial post and every redraw so
-    the two can never disagree."""
+    the two can never disagree.
+
+    v0.84.0 (D2 items 2-3, Task A5 wiring): ``captions`` are the PERSISTED
+    whole-set button labels (``resolve_button_labels`` output, seeded into
+    broker meta as ``button_labels`` at registration). The builder NEVER
+    re-resolves from ``shorts`` — the redraw prepends only the mutable ☐/☑
+    glyph to the STORED caption, so every toggle re-renders byte-identically
+    (the checkbox glyph stays separate mutable state, never part of the
+    persisted caption). This closes the resolution-drift bug where the redraw
+    re-derived captions from ``shorts`` independently of the initial post."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    heuristic = short_option_labels(options)
     sel = set(selected or ())
     rows = [
         [InlineKeyboardButton(
-            text=_multi_button_caption(i, options, shorts, heuristic, sel),
+            text=_multi_button_caption(i, captions, sel),
             callback_data=f"v1|ask_multi|{request_id}|{i}",
         )]
         for i in range(len(options))
@@ -1767,8 +1796,16 @@ class TelegramChannel(Channel):
             return False
         from verdict_broker import BROKER
 
+        # D2 item 3 (Task A5): redraw from the PERSISTED whole-set captions
+        # seeded at registration — prepend only the mutable ☐/☑ glyph, never
+        # re-resolve from ``shorts`` (byte-identical re-render, no drift).
+        # Fall back to resolving from ``shorts`` only for a legacy meta that
+        # predates the ``button_labels`` seed.
+        captions = meta.get("button_labels")
+        if not isinstance(captions, list) or len(captions) != len(options):
+            captions = _captions_from_shorts(options, meta.get("shorts"), True)
         markup = _build_multi_keyboard(
-            request_id, options, meta.get("shorts"), selected)
+            request_id, options, captions, selected)
 
         def _still_live() -> bool:
             return BROKER.is_live_unclaimed(
@@ -2055,33 +2092,36 @@ class TelegramChannel(Channel):
 
         # v0.75.0 (W5): v1 broker callback_data, one button (its own row)
         # per option — option_index is this option's position in `options`.
-        # v0.81.0 (W-R3) / v0.83.0 (A4 · F-BTN): the button LABEL is a short,
-        # number-prefixed summary derived over the WHOLE option set
-        # (``short_option_labels`` — distinguishing tails preserved) so it stays
-        # readable AND pickable. ``question`` is already the canonical body
-        # (``render_ask_body``): the FULL options are numbered VERBATIM in it,
-        # and ``callback_data`` still carries the option INDEX as the identity.
-        # ``shorts`` (A4 rule 3): an agent-supplied short per option (or None) —
-        # used VERBATIM (``n · <short>``, no elision) when given, else the
-        # heuristic label. The full ``label`` is what the body/meta/settle see.
+        # v0.81.0 (W-R3) / v0.84.0 (round 4, D2): the button LABEL is resolved
+        # over the WHOLE option set by ``resolve_button_labels`` — EVERY option
+        # needs a usable agent-supplied ``short`` or the WHOLE set floors to
+        # numbered placeholders (never a per-option elision/short mix, D2 item
+        # 1). ``question`` is already the canonical body (``render_ask_body``):
+        # the FULL options are numbered VERBATIM in it, and ``callback_data``
+        # still carries the option INDEX as the identity.
         # A5 · F-MULTI: a multi ask renders the toggle-many keyboard (checkboxes
         # + ✅ Submit) via the shared builder; single-select keeps one tappable
         # button per option (``v1|engagement_ask|<rid>|<idx>``).
+        # D2 item 3 (Task A5): the initial render consumes the PERSISTED
+        # whole-set ``button_labels`` seeded into broker meta at registration —
+        # the SAME captions the multi redraw reads — so post and redraw can
+        # never disagree. Falls back to resolving from ``shorts`` only when no
+        # broker meta exists (eager fallback / direct-call unit tests).
+        from verdict_broker import BROKER
+        _meta = BROKER.get_meta(
+            namespace="engagement_ask", scope=engagement_id, request_id=request_id)
+        captions = _meta.get("button_labels") if isinstance(_meta, dict) else None
+        if not isinstance(captions, list) or len(captions) != len(options):
+            captions = _captions_from_shorts(options, shorts, multi)
+
         if multi:
-            kbd = _build_multi_keyboard(request_id, options, shorts, selected=())
+            kbd = _build_multi_keyboard(request_id, options, captions, selected=())
             return await self.send_to_topic(
                 rec.topic_id, question, reply_markup=kbd)
 
-        heuristic = short_option_labels(options)
-
-        def _button_text(i: int) -> str:
-            if shorts is not None and i < len(shorts) and shorts[i]:
-                return f"{i + 1} · {shorts[i]}"
-            return heuristic[i]
-
         kbd = InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                text=_button_text(i),
+                text=captions[i],
                 callback_data=f"v1|engagement_ask|{request_id}|{i}",
             )]
             for i in range(len(options))
@@ -2302,10 +2342,12 @@ class TelegramChannel(Channel):
         ``message_id``, or ``None`` on send failure — the broker's
         ``ensure_posted`` treats ``None`` as a delivery failure (r10-B3).
 
-        ``short_labels`` (v0.81.0, W-R3b; v0.83.0 A4 · F-BTN): when True, derive
-        short, number-prefixed button labels via the set-level
-        ``short_option_labels`` (distinguishing-tail elision ladder) — Telegram
-        truncates long labels, which made ``ask_user`` options unpickable. The
+        ``short_labels`` (v0.81.0, W-R3b; v0.84.0 round 4 D2): when True, derive
+        button labels via the whole-set ``short_option_labels`` — this call site
+        has no per-option agent ``short`` to offer it (``options`` is a plain
+        label list), so it always floors to the numbered placeholder until the
+        deferred Haiku label-generation fallback ships (D2 item 4). Telegram
+        truncates long labels, which made ``ask_user`` options unpickable; the
         FULL options must already live VERBATIM in ``text`` (the caller renders
         them with ``render_ask_body``). Default False keeps the authz-challenge
         DM path (``authz_grants`` — short ``Approve``/``Deny`` options) untouched.

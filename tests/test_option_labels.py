@@ -1,20 +1,33 @@
-"""v0.83.0 (A4 · F-BTN) — distinguishing short button labels + agent-supplied
-``short`` labels.
+"""v0.83.0 (A4 · F-BTN) / v0.84.0 (round 4, spec D2) — button labels.
 
 Two halves:
 
-  1. PURE-FUNCTION tests of the elision ladder (``short_option_labels`` +
-     ``_short_option_label``) pinning the spec invariants (i)-(iv): every label
-     ≤ 30 incl. the number prefix; labels pairwise-distinct when the full
-     options are; the LIVE regression pair keeps "Single"/"aliases"/"Separate";
-     Sol's shared-token triple yields pairwise-distinct labels. Plus cap edges,
-     the degenerate 40-char single token, and whitespace-heavy options.
+  1. PURE-FUNCTION tests of ``short_option_labels`` (the ``labels``/``shorts``
+     convenience wrapper over ``resolve_button_labels`` — see
+     ``tests/test_ask_button_labels.py`` for the resolver's own exhaustive
+     whole-set/floor/telemetry coverage). v0.83.0's per-option ELISION LADDER
+     (``_elide_one``/``_resolve_label_collisions``/``_short_option_label``) is
+     GONE (D2): labels are now MODEL-generated with WHOLE-SET floor/verbatim
+     semantics — either every option has a usable short and the whole set
+     renders ``n · <short>`` verbatim, or the whole set floors to
+     ``Option 1``, ``Option 2``, … . These tests pin that behaviour for
+     ``short_option_labels`` specifically (name/signature PINNED — resident
+     ``ask_user`` depends on it via ``post_dm_keyboard(short_labels=True)``).
 
   2. HANDLER-LEVEL dict-options tests (REAL ``VerdictBroker`` + REAL
      ``EngagementRegistry`` + REAL ``_make_channel_handlers``, injected clocks)
      asserting the body carries FULL labels verbatim, the buttons carry
      ``n · <short>``, a tap resolves to the FULL label in the response AND the
-     settle ✅ line, and invalid dict shapes refuse ``invalid_args``.
+     settle ✅ line, and malformed dict SHAPES (wrong type, missing/blank
+     label, duplicate full labels) still refuse ``invalid_args``. These
+     exercise ``channel_handlers._validate_ask_args``, which Task A2 (round 4,
+     spec D1) changed: the invented length caps are gone and ``short`` is now
+     advisory-only — a missing/blank/duplicate/over-budget/non-string
+     ``short`` is ACCEPTED and flows through to the D2 resolver (which floors
+     the whole button set) instead of rejecting the ask. A fake channel only
+     RECORDS the ``options``/``shorts`` it's called with, so these don't
+     exercise ``resolve_button_labels`` itself and are unaffected by the
+     round-4 resolver change.
 """
 
 from __future__ import annotations
@@ -28,123 +41,89 @@ from aiohttp import web
 import agent as agent_mod
 import verdict_broker
 from verdict_broker import VerdictBroker
-from channels.telegram import (
-    _ASK_BUTTON_LABEL_CAP,
-    _short_option_label,
-    short_option_labels,
-)
+from channels.telegram import _ASK_BUTTON_CAPTION_CAP, short_option_labels
 
 
 # ===========================================================================
-# Pure-function: the elision ladder
+# Pure-function: short_option_labels — whole-set floor/verbatim
 # ===========================================================================
 
 
-def _summary(label: str) -> str:
-    """Strip the ``n · `` number prefix, returning the summary text."""
-    return label.split(" · ", 1)[1] if " · " in label else label
+class TestAllShortsUsable:
+    def test_verbatim_captions_when_every_short_usable(self) -> None:
+        labels = ["Personal Gmail", "Work Outlook", "Yahoo Mail"]
+        shorts = ["Gmail", "Outlook", "Yahoo"]
+        assert short_option_labels(labels, shorts) == [
+            "1 · Gmail", "2 · Outlook", "3 · Yahoo"]
+
+    def test_single_option_with_short(self) -> None:
+        assert short_option_labels(["Personal Gmail"], ["Gmail"]) == [
+            "1 · Gmail"]
 
 
-class TestInvariants:
-    def test_i_every_label_within_cap_including_prefix(self) -> None:
-        options = [
-            "Single account with aliases",
-            "Separate Google accounts",
-            "Configure the enterprise SSO integration flow now",
-            "one two three four five six seven eight nine ten",
+class TestWholeSetFloors:
+    def test_no_shorts_at_all_floors_whole_set(self) -> None:
+        labels = ["Single account with aliases", "Separate Google accounts"]
+        assert short_option_labels(labels) == ["Option 1", "Option 2"]
+
+    def test_single_option_no_short_floors(self) -> None:
+        assert short_option_labels(["Personal Gmail"]) == ["Option 1"]
+
+    def test_partial_shorts_floors_whole_set_never_mixed(self) -> None:
+        # Only option 2 lacks a short — the OLD per-option-fallback design
+        # would have kept "1 · Gmail" and derived a heuristic for option 2;
+        # the new whole-set rule floors BOTH (D2: "never mixed").
+        labels = ["Personal Gmail", "Work Outlook"]
+        shorts = ["Gmail", None]
+        assert short_option_labels(labels, shorts) == ["Option 1", "Option 2"]
+
+    def test_blank_short_floors_whole_set(self) -> None:
+        labels = ["Personal Gmail", "Work Outlook"]
+        shorts = ["Gmail", "   "]
+        assert short_option_labels(labels, shorts) == ["Option 1", "Option 2"]
+
+    def test_duplicate_shorts_floors_whole_set(self) -> None:
+        labels = ["Personal Gmail", "Work Outlook"]
+        shorts = ["Same", "Same"]
+        assert short_option_labels(labels, shorts) == ["Option 1", "Option 2"]
+
+    def test_non_string_short_floors_whole_set(self) -> None:
+        labels = ["Personal Gmail", "Work Outlook"]
+        shorts = ["Gmail", 7]
+        assert short_option_labels(labels, shorts) == ["Option 1", "Option 2"]
+
+    def test_shorts_shorter_than_labels_floors(self) -> None:
+        # ``shorts`` has fewer entries than ``labels`` — the missing tail
+        # entries have no short at all.
+        labels = ["Personal Gmail", "Work Outlook", "Yahoo Mail"]
+        shorts = ["Gmail"]
+        assert short_option_labels(labels, shorts) == [
+            "Option 1", "Option 2", "Option 3"]
+
+
+class TestCaptionCapBoundary:
+    def test_exact_64_char_decorated_caption_passes_verbatim(self) -> None:
+        short = "s" * 60  # "1 · " (4) + 60 == 64
+        label = short_option_labels(["full label text"], [short])[0]
+        assert label == f"1 · {short}"
+        assert len(label) == _ASK_BUTTON_CAPTION_CAP == 64
+
+    def test_65_char_decorated_caption_floors(self) -> None:
+        short = "s" * 61  # 65 > 64
+        assert short_option_labels(["full label text"], [short]) == ["Option 1"]
+
+    def test_sol_live_case_no_shorts_never_elides(self) -> None:
+        # The exact live F-BTN regression — no agent shorts supplied, so the
+        # whole set floors; it never garbles into "1 · A —…MCP…MCPB".
+        labels = [
+            "Option A — Python MCP server, MCPB packaged",
+            "Option B — Python MCP server via venv",
         ]
-        for lab in short_option_labels(options):
-            assert len(lab) <= _ASK_BUTTON_LABEL_CAP
-
-    def test_ii_pairwise_distinct_when_full_options_distinct(self) -> None:
-        options = [
-            "Deploy to production immediately now",
-            "Deploy to staging immediately now",
-            "Deploy to development immediately now",
-        ]
-        labels = short_option_labels(options)
-        assert len(set(labels)) == len(labels)
-
-    def test_iii_live_pair_keeps_single_aliases_separate(self) -> None:
-        # The exact live F-BTN regression, verbatim.
-        options = ["Single account with aliases", "Separate Google accounts"]
-        labels = short_option_labels(options)
-        assert len(set(labels)) == 2
-        # Option 1's label surfaces BOTH the head "Single" and the tail
-        # differentiator "aliases"; option 2 surfaces "Separate".
-        assert "Single" in labels[0]
-        assert "aliases" in labels[0]
-        assert "Separate" in labels[1]
-
-    def test_iv_sol_shared_token_triple_pairwise_distinct(self) -> None:
-        # Sol's shared-token triple, verbatim — every token of option 1 is
-        # shared with SOME sibling, so naive elision could collapse 1 and 3.
-        options = [
-            "Production deployment for European infrastructure",
-            "Production deployment for American infrastructure",
-            "Production monitoring for European infrastructure",
-        ]
-        labels = short_option_labels(options)
-        # All three FULL button labels are pairwise-distinct.
-        assert len(set(labels)) == 3
-        # And so are the summaries (a differentiating token is surfaced, since
-        # one fits) — the operator never sees two identical captions.
-        summaries = [_summary(lab).casefold() for lab in labels]
-        assert len(set(summaries)) == 3
-        for lab in labels:
-            assert len(lab) <= _ASK_BUTTON_LABEL_CAP
-
-
-class TestCapEdges:
-    def test_exact_30_char_boundary_fits_verbatim(self) -> None:
-        # "1 · " (4) + 26-char summary = exactly 30 → verbatim, no elision.
-        opt = "abcd efgh ijkl mnop qrst u"  # 26 chars
-        assert len(opt) == 26
-        label = _short_option_label(1, opt)
-        assert label == "1 · " + opt
-        assert len(label) == _ASK_BUTTON_LABEL_CAP
-
-    def test_one_char_over_cap_elides(self) -> None:
-        # 27-char summary → "1 · " + 27 = 31 > 30 → must elide below the cap.
-        opt = "abcd efgh ijkl mnop qrst uv"  # 27 chars
-        assert len(opt) == 27
-        label = _short_option_label(1, opt)
-        assert len(label) <= _ASK_BUTTON_LABEL_CAP
-
-    def test_degenerate_40_char_single_token_hard_slice(self) -> None:
-        opt = "x" * 40
-        assert " " not in opt
-        label = _short_option_label(1, opt)
-        assert len(label) <= _ASK_BUTTON_LABEL_CAP
-        assert label.startswith("1 · ")
-
-    def test_whitespace_heavy_options(self) -> None:
-        # Collapsed whitespace: split() drops the runs, so the summary is clean.
-        options = ["  Single   account   with   aliases  ",
-                   "Separate    Google   accounts"]
-        labels = short_option_labels(options)
-        for lab in labels:
-            assert len(lab) <= _ASK_BUTTON_LABEL_CAP
-            assert "  " not in _summary(lab)  # no doubled spaces
-        assert len(set(labels)) == 2
-
-    def test_whitespace_only_option_degenerate(self) -> None:
-        label = _short_option_label(3, "     ")
-        assert len(label) <= _ASK_BUTTON_LABEL_CAP
-        assert label.startswith("3 · ") or label == "3 · "
-
-
-class TestNoRegressionShortOptions:
-    def test_short_fitting_options_render_verbatim(self) -> None:
-        # Options that fully fit are byte-identical to a plain "n · <opt>" —
-        # no ellipsis, no truncation (parity with the pre-A4 short path).
-        options = ["Personal Gmail", "Work Outlook", "Yahoo Mail"]
-        assert short_option_labels(options) == [
-            "1 · Personal Gmail", "2 · Work Outlook", "3 · Yahoo Mail"]
-
-    def test_single_option_fallback_matches_set_helper(self) -> None:
-        assert _short_option_label(1, "Personal Gmail") == "1 · Personal Gmail"
-        assert short_option_labels(["Personal Gmail"]) == ["1 · Personal Gmail"]
+        result = short_option_labels(labels)
+        assert result == ["Option 1", "Option 2"]
+        for lab in result:
+            assert "MCP" not in lab
+            assert "…" not in lab
 
 
 # ===========================================================================
@@ -257,9 +236,10 @@ class TestDictOptionsEndToEnd:
             "Single account with aliases", "Separate Google accounts"]
         assert kb["shorts"] == ["Aliased", "Separate"]
 
-        # Settle ✅ line shows the FULL chosen label, not the short.
+        # Settle ✅ line is the BOUNDED positional copy (v0.84.0 D1 bullet 3),
+        # never the full label or short.
         settle = wired["ch"].edits[-1]["text"]
-        assert "✅ Single account with aliases" in settle
+        assert "✅ Option 1" in settle
         assert wired["ch"].edits[-1]["clear_keyboard"] is True
 
     async def test_mixed_str_and_dict_allowed(self, wired):
@@ -292,7 +272,9 @@ class TestDictOptionsEndToEnd:
 
 
 class TestInvalidDictShapes:
-    """Invalid option shapes refuse ``invalid_args`` at validation (no post)."""
+    """Malformed dict SHAPES still refuse ``invalid_args`` at validation (no
+    post); ``short`` length/blank/duplicate is no longer one of them (D1,
+    round 4) — see ``TestShortIsAdvisoryNeverRejects`` below."""
 
     def _invalid(self, options):
         from channels.channel_handlers import _validate_ask_args
@@ -302,31 +284,8 @@ class TestInvalidDictShapes:
     def test_missing_label_key(self):
         assert self._invalid([{"short": "x"}, "B"])
 
-    def test_missing_short_key(self):
-        assert self._invalid([{"label": "Full label"}, "B"])
-
-    def test_short_over_25_chars(self):
-        assert self._invalid(
-            [{"label": "Full", "short": "x" * 26}, "B"])
-
-    def test_short_whitespace_only(self):
-        assert self._invalid([{"label": "Full", "short": "   "}, "B"])
-
     def test_label_whitespace_only(self):
         assert self._invalid([{"label": "   ", "short": "ok"}, "B"])
-
-    def test_label_over_48_chars(self):
-        assert self._invalid(
-            [{"label": "x" * 49, "short": "ok"}, "B"])
-
-    def test_short_non_string(self):
-        assert self._invalid([{"label": "Full", "short": 7}, "B"])
-
-    def test_duplicate_shorts_refused(self):
-        assert self._invalid([
-            {"label": "First full label", "short": "dup"},
-            {"label": "Second full label", "short": "dup"},
-        ])
 
     def test_duplicate_full_labels_refused(self):
         assert self._invalid([
@@ -358,3 +317,64 @@ class TestInvalidDictShapes:
         _q, labels, _t, shorts = out
         assert labels == ["A", "B"]
         assert shorts == [None, None]
+
+
+class TestShortIsAdvisoryNeverRejects:
+    """D1 (round 4): a missing/blank/duplicate/over-budget/non-string
+    ``short`` is NEVER a rejection cause — it flows through to the D2
+    resolver (which floors the whole button set) instead. Full LABEL
+    structural checks (type, non-blank, uniqueness) are unaffected."""
+
+    def _validated(self, options):
+        from channels.channel_handlers import _validate_ask_args
+        return _validate_ask_args(
+            {"question": "q?", "options": options, "timeout_s": 60})
+
+    def test_missing_short_key_accepted_as_absent(self):
+        out = self._validated([{"label": "Full label"}, "B"])
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["Full label", "B"]
+        assert shorts == [None, None]
+
+    def test_short_over_25_chars_accepted_advisory(self):
+        out = self._validated([{"label": "Full", "short": "x" * 26}, "B"])
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["Full", "B"]
+        assert shorts == ["x" * 26, None]
+
+    def test_short_whitespace_only_accepted_advisory(self):
+        # v0.85.0 (round 4, D4): shorts flow through VERBATIM — no
+        # enumerator-strip's incidental ``.strip()`` collapsing this to "".
+        out = self._validated([{"label": "Full", "short": "   "}, "B"])
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["Full", "B"]
+        assert shorts == ["   ", None]
+
+    def test_short_non_string_treated_as_absent(self):
+        out = self._validated([{"label": "Full", "short": 7}, "B"])
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["Full", "B"]
+        assert shorts == [None, None]
+
+    def test_duplicate_shorts_accepted_advisory(self):
+        out = self._validated([
+            {"label": "First full label", "short": "dup"},
+            {"label": "Second full label", "short": "dup"},
+        ])
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["First full label", "Second full label"]
+        assert shorts == ["dup", "dup"]
+
+    def test_label_over_48_chars_accepted(self):
+        # D1: the invented FULL-label length cap is gone too (the live Q2
+        # failure — a 139-char label was refused pre-round-4).
+        out = self._validated([{"label": "x" * 49, "short": "ok"}, "B"])
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["x" * 49, "B"]
+        assert shorts == ["ok", None]

@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.87.0] - 2026-07-17
+
+Engagement questions now render the way operators actually write them: long,
+descriptive options are accepted verbatim, buttons stay readable, and moved
+questions no longer read as "asked twice".
+
+### Added
+
+- Agents can supply a per-option `short` — a few words rendered as the button
+  caption. When every option has a usable short, the buttons show them
+  verbatim; otherwise the whole set falls back to clean positional labels
+  ("Option 1", "Option 2", ...) that match the numbered options in the
+  question body.
+- Diagnostic instrumentation for delayed question/reply posting (match-point
+  timing logs, content-free).
+
+### Changed
+
+- The invented option/question length caps are gone. Ask validation now
+  measures the real rendered message against Telegram's actual 4096-character
+  limit across every lifecycle form, and a rejected ask explains exactly why
+  and what to shorten.
+- A re-anchored (moved) question's old copy is replaced by a compact
+  "moved — answer the current copy below" marker instead of repeating the
+  full question text.
+- Trailing "I'll wait for your answer"-style narration after a question is
+  suppressed instead of posted below it (and no longer causes the question to
+  be reposted).
+- Option text and questions are preserved verbatim: the framework no longer
+  strips agent-written enumerators or question prefixes.
+
+### Fixed
+
+- Descriptive multiple-choice questions no longer degrade to free-text
+  answers after repeated opaque validation failures.
+- A long chain of cancellation/shutdown/crash races in question posting,
+  re-anchoring, and settlement found by adversarial review (20 findings
+  across 8 whole-branch review rounds) — including two-live-questions,
+  lost-narration, and question-reposted-after-close scenarios.
+
 ## [0.86.0] - 2026-07-17
 
 Casa now publishes a safe, authenticated catalog of its enabled Home Assistant

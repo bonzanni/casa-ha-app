@@ -293,3 +293,27 @@ async def engagement_fixture(tmp_path):
         active_record = rec
 
     return _Fx()
+
+
+# ---------------------------------------------------------------------------
+# Ask validation-gate isolation (v0.84.0 round 4, Task A5).
+# ---------------------------------------------------------------------------
+# ``channels.channel_handlers`` keeps process-global ``ASK_GATES`` +
+# ``_ASK_VALIDATION_OWNERS`` maps. In PRODUCTION request_ids are unique, so a
+# resolved gate lingering for its reattach window never collides. Tests, by
+# contrast, reuse fixed request_ids ("r1", "fu", ...) across files, so a
+# resolved gate left by one test would be read by an unrelated same-id test in
+# another file. Clear both maps around every test (production-inert — nothing
+# imports this fixture; it only resets in-memory test state).
+@pytest.fixture(autouse=True)
+def _reset_ask_validation_gates():
+    try:
+        from channels import channel_handlers as _ch
+    except Exception:  # pragma: no cover — module import is universal in tests
+        yield
+        return
+    _ch.ASK_GATES.clear()
+    _ch._ASK_VALIDATION_OWNERS.clear()
+    yield
+    _ch.ASK_GATES.clear()
+    _ch._ASK_VALIDATION_OWNERS.clear()

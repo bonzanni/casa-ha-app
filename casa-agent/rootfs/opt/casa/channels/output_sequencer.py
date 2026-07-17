@@ -162,6 +162,10 @@ class SendIntent:
     slot_missed: bool = False       # relay slot timed out while this was pending
     timeout_posted: bool = False    # §2(5) one-block consumption debt
     consumed: bool = False          # retired from matching
+    on_retire: Any = None           # wb2-4: called ONCE when the intent is pruned
+    #                                 at turn end — the ask handler wires it to
+    #                                 release the validation gate's lifecycle pin.
+    _retired: bool = False          # wb2-4: guards the one-shot on_retire call
     post_failed: bool = False       # F3: poster failed — surfaced ok:false,
     #                                 retired from matching (NOT a success debt)
 
@@ -202,6 +206,7 @@ class IntentRegistry:
 
     def register(
         self, *, request_id: str, tool_name: str, projection_hash: str, poster: Any,
+        on_retire: Any = None,
     ) -> tuple[SendIntent, bool]:
         """Register (or REATTACH to) an intent. Returns ``(intent, created)``.
 
@@ -209,6 +214,11 @@ class IntentRegistry:
         intent is returned with ``created=False`` so a transport retry can read
         the recorded outcome (including the posted ``message_id``) and can
         neither double-post nor consume another frame.
+
+        wb2-4: ``on_retire`` (optional) is called ONCE when the intent is pruned
+        at turn end — the ask handler uses it to release its validation gate's
+        intent-lifecycle pin. A REATTACH never overwrites the first
+        registration's ``on_retire`` (idempotent — one pin, one release).
         """
         existing = self._by_request.get(request_id)
         if existing is not None:
@@ -220,6 +230,7 @@ class IntentRegistry:
             poster=poster,
             registered_at=self._now(),
             seq=self._next_seq,
+            on_retire=on_retire,
         )
         self._next_seq += 1
         self._by_seq.append(intent)
@@ -260,12 +271,37 @@ class IntentRegistry:
                 return intent
         return None
 
+    def peek(self, tool_name: str, projection_hash: str) -> SendIntent | None:
+        """F-OOB instrumentation (spec D7): the MOST RECENTLY REGISTERED intent
+        for ``(tool_name, projection_hash)``, regardless of matchability.
+
+        DIAGNOSTIC-ONLY — read-only, never mutates, and never consulted by the
+        real FIFO matching path (:meth:`oldest_matchable`). Lets a log line
+        report an intent's state and registration time even after
+        ``post_for_block`` has already resolved (and possibly consumed) it, so
+        a match-point log can still carry the "intent state at match time"
+        dimension."""
+        match: SendIntent | None = None
+        for intent in self._by_seq:
+            if (
+                intent.tool_name == tool_name
+                and intent.projection_hash == projection_hash
+            ):
+                match = intent
+        return match
+
     def armed_unposted(self) -> list[SendIntent]:
         return [
             i for i in self._by_seq
             if i.state == "armed" and not i.consumed and not i.post_failed
             and i.message_id is None
         ]
+
+    def all_intents(self) -> list[SendIntent]:
+        """A stable snapshot of every registered intent/tombstone in ``seq``
+        order (wb3-1/wb3-3: ``terminalize`` iterates this to abort unresolved
+        intents before pruning)."""
+        return list(self._by_seq)
 
     def has_any_matchable(self) -> bool:
         """True iff any intent/tombstone is still matchable — i.e. a discrete
@@ -275,10 +311,36 @@ class IntentRegistry:
         stalls narration when there is provably nothing to wait for."""
         return any(i.matchable() for i in self._by_seq)
 
-    def prune(self) -> None:
-        """§2(6): drop all intents, tombstones and id→outcome at turn end."""
-        self._by_seq.clear()
-        self._by_request.clear()
+    def prune(self, *, keep: "Callable[[SendIntent], bool] | None" = None) -> None:
+        """§2(6): drop all intents, tombstones and id→outcome at turn end.
+
+        wb2-4: fire each intent's ``on_retire`` hook ONCE as it is dropped — this
+        is the intent's definitive RETIREMENT point (a cancelled/consumed intent
+        stays a matchable tombstone until here), so the ask handler's validation-
+        gate pin is released exactly when the intent it protects ceases to exist.
+        A hook raising must never leave the registry half-pruned.
+
+        wb4-2: ``keep`` (optional) is a predicate; intents it selects are
+        PRESERVED and their ``on_retire`` does NOT fire (they are not retiring).
+        :meth:`OutputSequencer.terminalize` uses it to preserve an unresolved
+        emit_completion consumption debt so finalize's completion drain still
+        observes it. The turn-end callers pass no predicate — a full prune."""
+        survivors: list[SendIntent] = []
+        for intent in self._by_seq:
+            if keep is not None and keep(intent):
+                survivors.append(intent)
+                continue
+            hook = intent.on_retire
+            if hook is not None and not intent._retired:
+                intent._retired = True
+                try:
+                    hook()
+                except Exception:  # noqa: BLE001 — gate-pin release is hygiene-only
+                    logger.debug(
+                        "send-intent on_retire hook failed (rid=%s)",
+                        intent.request_id, exc_info=True)
+        self._by_seq = survivors
+        self._by_request = {i.request_id: i for i in survivors}
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +395,40 @@ def _discrete_markup_tristate(markup: Any) -> Any:
 APPLIED = "applied"
 SEALED = "sealed"
 FAILED = "failed"
+# wb3-2 (whole-branch gate wave 3): a narration write REFUSED because the
+# engagement has TERMINALIZED (the sequencer terminal latch is set). Distinct
+# from FAILED (a wire error → retry/drop) and SEALED (rollover → repost below):
+# a DISCARDED write must be dropped cleanly with NO retry, NO drop-mode, and NO
+# repost — nothing may land below the terminal completion (D5 discard doctrine).
+DISCARDED = "discarded"
+
+# wb4-1 (whole-branch gate wave 4): sentinel returned by
+# :meth:`OutputSequencer.register_intent` once the engagement has TERMINALIZED.
+# Distinct from ``None`` (which means "no live sequencer" and correctly activates
+# the ingress EAGER FALLBACK): a terminal sentinel is a recorded fail-closed
+# outcome, so the ask/reply/anchor ingress surfaces ``engagement_terminal`` to
+# the agent instead of registering + arming + posting a discrete send BELOW the
+# terminal completion (D5 discard doctrine).
+TERMINAL_REGISTRATION = object()
+
+
+def _is_live_completion_debt(intent: "SendIntent") -> bool:
+    """wb4-2: ``True`` for an UNRESOLVED emit_completion consumption debt — a
+    posted-but-unconsumed one-block debt (``register_completion_consumption``).
+    :meth:`OutputSequencer.terminalize` PRESERVES it across the prune so
+    ``finalize_completion_post``'s :meth:`await_completion_drain` still blocks
+    until the relay reaches the emit_completion block (every prior frame
+    processed) rather than reading a pruned-away intent as trivially drained —
+    which would let a lagging prior frame's platform notice overtake completion.
+    """
+    return (
+        intent.tool_name == EMIT_COMPLETION_TOOL
+        and intent.state == "posted"
+        and intent.timeout_posted
+        and not intent.consumed
+        and not intent.post_failed
+        and intent.outcome is None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +486,14 @@ class OutputSequencer:
         self._hold_poll_s = hold_poll_s
 
         self._lock = asyncio.Lock()
+        # wb3-1/wb3-2/wb3-3 (whole-branch gate wave 3): the persistent TERMINAL
+        # LATCH. Set once by :meth:`terminalize` (under the writer lock) when the
+        # engagement flips terminal; never cleared. It is the ONE truth source
+        # consulted INSIDE the writer lock by every narration writer (discard —
+        # nothing posts below the terminal completion, wb3-2), by the anchor
+        # poster's wire re-read (never post + ledger a question on a closed
+        # engagement, wb3-1), and by the relay's terminal seam.
+        self._terminal = False
         # REENTRANT-PER-TASK ownership (Sol diff gate r2). The task currently
         # inside the serialization lock, or None. A poster the sequencer awaits
         # WHILE holding the lock (seal-narration + post is atomic) may call back
@@ -494,10 +598,25 @@ class OutputSequencer:
     def high_water(self) -> int | None:
         return self._high_water
 
-    async def open_narration(self, text: str) -> int | None:
+    def is_terminal(self) -> bool:
+        """wb3-1/wb3-2: ``True`` once :meth:`terminalize` has latched this
+        engagement terminal. A plain synchronous read of the persistent latch —
+        the anchor poster (already under the writer lock) and the relay's
+        terminal seam both consult it as the single truth source."""
+        return self._terminal
+
+    async def open_narration(self, text: str) -> "int | None | str":
         """Post a NEW narration message; it becomes the open narration and the
-        high-water mark."""
+        high-water mark.
+
+        wb3-2: returns :data:`DISCARDED` (posting NOTHING) when the terminal
+        latch is set — re-checked HERE, inside the writer lock, so a write that
+        was blocked on the lock at the instant of terminalization is discarded
+        rather than landing below the terminal completion (the TOCTOU a bare
+        outside-lock seam read leaves open)."""
         async with self._serialized():
+            if self._terminal:
+                return DISCARDED
             return await self._open_narration_locked(text)
 
     async def _open_narration_locked(self, text: str) -> int | None:
@@ -530,6 +649,8 @@ class OutputSequencer:
         the cache entry so a retry is never suppressed.
         """
         async with self._serialized():
+            if self._terminal:
+                return DISCARDED  # wb3-2: terminal ⇒ no edit lands below completion
             if msg_id != self._narration_msg_id or msg_id != self._high_water:
                 return SEALED
             tri = _markup_tristate(markup)
@@ -541,6 +662,48 @@ class OutputSequencer:
                 return FAILED
             self._edit_cache[msg_id] = (text, tri)
             return APPLIED
+
+    async def post_unless_anchor_open(
+        self, text: str, seam: Any, *, poster: Any = None,
+    ) -> str:
+        """§D5 (Sol r4-2 BLOCKER): the ATOMIC read-decide-write for anchor-scoped
+        narration suppression.
+
+        Under the ONE serialization lock, re-read *seam* (the driver-injected
+        ``open_anchor_state`` — ``() -> (n, mid) | None``, sync or async): if it
+        reports a genuinely open, unanswered free-text anchor, return
+        :data:`"held"` and post NOTHING; otherwise run *poster* (the relay's
+        normal narration post — reentrant under THIS same lock) and return
+        :data:`"posted"`. When no *poster* is given, *text* is posted as a fresh
+        narration message (belt-and-suspenders default; the relay always injects
+        its rollover-aware poster).
+
+        This is the ONLY way armed/arming narration reaches the wire. Making the
+        seam read and the narration post ATOMIC forecloses the r4-2 interleave: a
+        bare re-read races the late anchor poster — relay reads "no open anchor"
+        → the intent watcher takes THIS lock and posts the late anchor
+        (:meth:`process_intents_once`) → relay takes the lock and posts narration
+        BELOW it, recreating F-LEAK2. Because the late poster and this op contend
+        on the SAME lock (reentrant-per-task, so it also nests inside the relay's
+        own writer paths), the anchor can never slip in between this op's seam
+        read and its post: either the anchor posts first and the seam reports it
+        open (⇒ held), or the narration posts first and the anchor lands below it
+        (correct order). Returns :data:`"held"` or :data:`"posted"`."""
+        async with self._serialized():
+            # wb3-2: terminal ⇒ HOLD (post nothing). The relay's ``result``-time
+            # flush-vs-discard drops the held buffer for a terminal engagement,
+            # so treating a terminal latch like an open anchor discards this
+            # prose without it ever reaching the wire below the completion.
+            if self._terminal:
+                return "held"
+            state = await _maybe_await(seam()) if seam is not None else None
+            if state is not None:
+                return "held"
+            if poster is not None:
+                await _maybe_await(poster())
+            else:
+                await self._open_narration_locked(text)
+            return "posted"
 
     async def edit_summary(self, msg_id: int, text: str) -> str:
         """Edit the pinned live SUMMARY message (§5 — the R1 exception).
@@ -619,14 +782,27 @@ class OutputSequencer:
 
     def register_intent(
         self, *, request_id: str, tool_name: str, projection_hash: str, poster: Any,
-    ) -> tuple[SendIntent, bool]:
+        on_retire: Any = None,
+    ) -> "tuple[SendIntent, bool] | object":
         """Register (or reattach to) a discrete-send intent (§2(1)). See
         :meth:`IntentRegistry.register`. Ingresses (T2/T3) call this at fence
         entry with a ``poster`` coroutine-factory that performs the actual
-        keyboard/text post when the relay reaches the block."""
+        keyboard/text post when the relay reaches the block. wb2-4: ``on_retire``
+        (optional) fires when the intent is pruned at turn end.
+
+        wb4-1: once :meth:`terminalize` has latched the engagement TERMINAL,
+        registration is REJECTED — returns :data:`TERMINAL_REGISTRATION` (a
+        recorded fail-closed terminal outcome, NOT ``None``, which would activate
+        the ingress eager-fallback) so the ingress returns ``engagement_terminal``
+        instead of registering + arming + posting below the terminal completion.
+        The belt-and-suspenders latch inside :meth:`_post_intent_locked` catches
+        any intent that raced in a beat before this latch."""
+        if self._terminal:
+            return TERMINAL_REGISTRATION
         return self.registry.register(
             request_id=request_id, tool_name=tool_name,
             projection_hash=projection_hash, poster=poster,
+            on_retire=on_retire,
         )
 
     def set_intent_poster(self, request_id: str, poster: Any) -> SendIntent | None:
@@ -674,7 +850,7 @@ class OutputSequencer:
 
     def record_intent_cancelled_nowait(
         self, request_id: str, outcome: dict,
-    ) -> bool:
+    ) -> str:
         """A3 · F-ORDER (Sol A3 wave 4): FULLY SYNCHRONOUS transport-cancellation
         cleanup against an in-flight relay post — "the post wins" — with NO awaits.
 
@@ -697,24 +873,30 @@ class OutputSequencer:
         ``True``. A later relay bind then sees the tombstone and consume-cancels
         the block — it can never post.
 
-        Returns ``True`` iff the cancel TOOK EFFECT (the caller then clears the
-        ingress marker). No-op ``False`` if the intent is unknown."""
+        wb1-1 (whole-branch gate wave 1): returns an explicit TRI-STATE so the
+        separate ``/ask_cancel`` route can decide marker ownership correctly (a
+        single bool conflated "post won" with "no intent", and the route cleared
+        the marker in BOTH — stripping it mid-post admitted a second live
+        question). ``"cancelled"`` — the cancel took effect (caller clears the
+        marker); ``"post_won"`` — an in-flight / resolved post owns the marker
+        (caller MUST NOT clear it, the poster clears at durable ownership);
+        ``"absent"`` — no such intent (nothing to post, caller may clear)."""
         intent = self.registry.by_request_id(request_id)
         if intent is None:
-            return False
+            return "absent"
         if (
             intent.posting
             or intent.state == "posted"
             or intent.outcome is not None
         ):
-            return False  # the in-flight / resolved post wins — never clobber
+            return "post_won"  # the in-flight / resolved post wins — never clobber
         if intent.state not in ("pending", "armed"):
-            return False
+            return "post_won"  # already-resolved / tombstoned — leave the marker
         self.registry.cancel(request_id)  # sync tombstone (pending/armed → cancelled)
         intent.outcome = dict(outcome)
         self._arm_event.set()
         self._signal_resolution(request_id)
-        return True
+        return "cancelled"
 
     async def mark_intent_posted(
         self, request_id: str, message_id: int | None,
@@ -882,19 +1064,48 @@ class OutputSequencer:
         exactly the ordering violation §2 forbids. So this seals open narration
         (the notice is a causal event below it), posts, and advances the
         high-water mark, all under the one serialization lock. Returns the posted
-        message id, or ``None`` on send failure."""
+        message id, or ``None`` on send failure.
+
+        wb4-2: DISCARDED (log + return ``None``, posting NOTHING) once the
+        engagement has TERMINALIZED — no platform notice (an inbound receipt, a
+        lagging mutating-tool violation notice) may land BELOW the terminal
+        completion (D5 discard doctrine). The terminal completion text itself
+        uses the dedicated :meth:`post_completion_notice` seam, the one path that
+        bypasses the latch."""
         async with self._serialized():
-            self._seal_narration_locked()
-            if reply_to is not None:
-                mid = await _maybe_await(
-                    self.send_message(self.topic_id, text, reply_to=reply_to))
-            else:
-                mid = await _maybe_await(self.send_message(self.topic_id, text))
-            if mid is not None and (
-                self._high_water is None or mid > self._high_water
-            ):
-                self._high_water = mid
-            return mid
+            if self._terminal:
+                logger.debug(
+                    "engagement %s: platform notice discarded (terminal latch)",
+                    self.engagement_id)
+                return None
+            return await self._post_notice_locked(text, reply_to)
+
+    async def post_completion_notice(self, text: str) -> int | None:
+        """wb4-2: the completion-only write seam. Posts the TERMINAL completion
+        text through the single writer even though the terminal latch is set — it
+        IS the terminal message every other post is forbidden to land below. No
+        other caller may post post-terminal; :meth:`post_platform_notice`
+        discards under the latch."""
+        async with self._serialized():
+            return await self._post_notice_locked(text, None)
+
+    async def _post_notice_locked(
+        self, text: str, reply_to: int | None,
+    ) -> int | None:
+        """Shared platform/completion post body (caller holds the lock): seal
+        open narration (the notice is a causal event below it), send, and advance
+        the high-water mark."""
+        self._seal_narration_locked()
+        if reply_to is not None:
+            mid = await _maybe_await(
+                self.send_message(self.topic_id, text, reply_to=reply_to))
+        else:
+            mid = await _maybe_await(self.send_message(self.topic_id, text))
+        if mid is not None and (
+            self._high_water is None or mid > self._high_water
+        ):
+            self._high_water = mid
+        return mid
 
     # -- A9 keyboard-bearing discrete writes (Sol r1-8) --------------------
 
@@ -922,7 +1133,7 @@ class OutputSequencer:
 
     async def post_discrete(
         self, text: str, *, markup: Any = None, reply_to: int | None = None,
-        revalidate: Any = None,
+        revalidate: Any = None, wire_timeout: float | None = None,
     ) -> int | None:
         """A9: post a keyboard-bearing DISCRETE message through the single writer
         (A3 anchor re-anchor). Mirrors :meth:`post_platform_notice` but sends via
@@ -936,6 +1147,14 @@ class OutputSequencer:
         tri-state ``_edit_cache`` entry, and register the mid in the bounded
         discrete-cache FIFO. *reply_to* threads like the other sends.
 
+        ``wire_timeout`` (v0.84.0, §D6 r17-2) puts an ``asyncio.wait_for`` BUDGET
+        around the single wire await — default ``None`` keeps every other
+        caller's behaviour unchanged. A timeout returns ``None`` with NO state
+        change; the re-anchor unit treats that None (like any un-confirmed send)
+        as an AMBIGUOUS send and takes the documented floor WITHOUT a wire retry
+        (the wrapper cannot distinguish "not sent" from "accepted before the
+        timeout").
+
         Deliberately NOT wrapped around ``ensure_posted`` posters (Sol r4-5): that
         runs its poster in a NEW task, which would deadlock against the
         relay-held, task-reentrant-only writer lock. Raises RuntimeError if the
@@ -945,11 +1164,29 @@ class OutputSequencer:
                 "post_discrete requires an injected send_message_markup wire "
                 "primitive (driver _ensure_sequencer wiring)")
         async with self._serialized():
+            # wb5-1 (whole-branch gate wave 5): consult the TERMINAL latch under
+            # the writer lock — the same DISCARDED/refusal semantics the wave-3
+            # narration writers got — so a discrete send whose pass crossed
+            # terminalization mid-flight (or any caller without a terminal-aware
+            # ``revalidate``) posts NOTHING below the terminal completion. Returns
+            # ``None`` (no send, no state change), which the re-anchor unit treats
+            # as an un-confirmed send and floors without a wire retry. Belt-and-
+            # suspenders with the driver's D6 pass-entry + locked-revalidate
+            # terminal guard.
+            if self._terminal:
+                return None
             if revalidate is not None and not await _maybe_await(revalidate()):
                 return None
             self._seal_narration_locked()
-            mid = await _maybe_await(self._send_message_markup(
+            send = _maybe_await(self._send_message_markup(
                 self.topic_id, text, markup, reply_to=reply_to))
+            if wire_timeout is None:
+                mid = await send
+            else:
+                try:
+                    mid = await asyncio.wait_for(send, wire_timeout)
+                except asyncio.TimeoutError:
+                    return None
             if mid is None:
                 return None
             if self._high_water is None or mid > self._high_water:
@@ -960,7 +1197,7 @@ class OutputSequencer:
 
     async def edit_discrete(
         self, msg_id: int, *, text: Any = None, markup: Any = _ABSENT,
-        revalidate: Any = None,
+        revalidate: Any = None, wire_timeout: float | None = None,
     ) -> bool:
         """A9: markup-capable edit of a discrete message through the F1 tri-state
         no-op cache (A5 toggle redraw / multi settle edit).
@@ -971,6 +1208,12 @@ class OutputSequencer:
         run *revalidate* (the A5 terminal-race guard; declined → ``False``, no
         edit); F1 no-op gate — an identical ``(text, markup-tristate)`` returns
         ``True`` without any wire call; otherwise wire-edit and update the cache.
+
+        ``wire_timeout`` (v0.84.0, §D6 r17-2) puts an ``asyncio.wait_for`` BUDGET
+        around the single wire await — default ``None`` keeps every other
+        caller's behaviour unchanged. A timeout counts as a FAILED attempt
+        (``False`` + cache invalidated), so the re-anchor unit's finite-attempt
+        marker edit retries within its budget rather than blocking unbounded.
 
         **Returns ``bool``, deliberately NOT the APPLIED/FAILED string codes
         (Sol r2-10):** every settle path feeds ``confirmed_settle_edit``, whose
@@ -989,8 +1232,15 @@ class OutputSequencer:
             tri = _discrete_markup_tristate(markup)  # F4: None ⇒ CLEAR, not ABSENT
             if self._edit_cache.get(msg_id) == (text, tri):
                 return True  # no-op skip — no wire call
-            ok = await _maybe_await(self._edit_message_markup(
+            edit = _maybe_await(self._edit_message_markup(
                 self.topic_id, msg_id, text, markup))
+            if wire_timeout is None:
+                ok = await edit
+            else:
+                try:
+                    ok = await asyncio.wait_for(edit, wire_timeout)
+                except asyncio.TimeoutError:
+                    ok = False
             if not ok:
                 self._edit_cache.pop(msg_id, None)   # invalidate → retry allowed
                 self._forget_discrete_cache(msg_id)
@@ -1067,6 +1317,79 @@ class OutputSequencer:
             self.registry.prune()
             self._turn_reply_to = None
             self._seal_narration_locked()
+
+    async def terminalize(self) -> None:
+        """wb3-1/wb3-2/wb3-3: latch the engagement TERMINAL, abort every
+        unresolved intent, and PRUNE the registry — all under the ONE writer
+        lock, idempotent.
+
+        Called at the START of the terminal finalize funnel (the driver's
+        ``settle_all_open_questions``), and again as a backstop at sequencer
+        teardown before ``_sequencers.pop``. What it guarantees:
+
+        * **wb3-2 latch.** Sets :attr:`_terminal`, after which every locked
+          narration writer (``open_narration`` / ``edit_narration_if_latest`` /
+          ``post_unless_anchor_open``) DISCARDS rather than writing — nothing
+          can land below the terminal completion, even a write that was blocked
+          on the writer lock at the instant of terminalization.
+
+        * **wb3-1 (c) in-flight poster wins.** Acquiring the writer lock waits
+          for any poster CURRENTLY mid-post (a poster holds the lock across its
+          whole wire send + ``add_open_question`` ledger write). So when this
+          runs, that poster has already durably ledgered its question, and the
+          settlement pass that follows this call includes it.
+
+        * **wb3-1 (a) abort unresolved.** A still-pending / armed-but-unposted
+          intent (no recorded outcome, not posted) is ABORTED: tombstoned,
+          retired from matching (``post_failed`` — so a later ``flush_armed_
+          intents`` / relay block never invokes its poster), resolved
+          ``ok:false`` so its fail-closed awaiter wakes. It never posts, so it
+          never ledgers a question the closed engagement would retain.
+
+        * **wb3-1 (b) reject late registrations** — enforced by the poster's own
+          terminal re-read and the latch on the narration writers.
+
+        * **wb3-3 release gate pins.** Pruning fires every intent's
+          ``on_retire`` hook EXACTLY once (the wb2-4 validation-gate pin
+          release), so a terminal transition that precedes the relay's
+          ``result`` can never leave a gate pinned forever.
+        """
+        async with self._serialized():
+            if self._terminal:
+                return
+            self._terminal = True
+            for intent in self.registry.all_intents():
+                # Leave anything already resolved / posted / retired untouched —
+                # its accounting (incl. an in-flight poster's just-landed ledger
+                # entry) stands.
+                if (
+                    intent.consumed
+                    or intent.post_failed
+                    or intent.outcome is not None
+                    or intent.state == "posted"
+                ):
+                    continue
+                # Pending or armed-and-unposted → ABORT (never posts).
+                self.registry.cancel(intent.request_id)  # → tombstone
+                intent.post_failed = True                # retire from matching
+                intent.outcome = {
+                    "ok": False, "message_id": None, "terminal": True,
+                }
+                self._signal_resolution(intent.request_id)
+            # Wake every outstanding awaiter, then PRUNE (fires on_retire once
+            # per intent) so the gate pins release before the sequencer is
+            # dropped — even if the relay never processes ``result`` (wb3-3).
+            # wb4-2: PRESERVE an unresolved emit_completion consumption debt so
+            # ``finalize_completion_post``'s ``await_completion_drain`` still
+            # waits for the relay to reach its causal block (a pruned debt reads
+            # as trivially drained, letting a lagging frame's platform notice
+            # overtake completion). Its resolution event is re-created lazily by
+            # ``await_completion_drain`` — it has no ``on_retire`` pin to leak.
+            for ev in self._resolution_events.values():
+                ev.set()
+            self._resolution_events.clear()
+            self.registry.prune(keep=_is_live_completion_debt)
+            self._turn_reply_to = None
 
     # -- discrete posting driven by the relay at a content-block ------------
 
@@ -1152,6 +1475,19 @@ class OutputSequencer:
         """Post *intent* (caller holds the lock). SEALS open narration first —
         rollover-on-interleave (§2, "narration seals when anything else posts
         below")."""
+        # wb4-1(b): belt-and-suspenders terminal latch, enforced under the writer
+        # lock for EVERY send-intent kind. An intent that raced past
+        # ``register_intent``'s latch (registered a beat before ``terminalize``,
+        # then armed) must NOT post below the terminal completion — resolve it
+        # fail-closed (terminal ok:false) instead. A recorded outcome (a
+        # compensated self-account, an already-resolved intent) is never
+        # clobbered.
+        if self._terminal and intent.outcome is None:
+            intent.post_failed = True
+            intent.consumed = True
+            intent.outcome = {"ok": False, "message_id": None, "terminal": True}
+            self._signal_resolution(intent.request_id)
+            return
         self._seal_narration_locked()
         if warn:
             logger.warning(
@@ -1243,6 +1579,7 @@ class OutputSequencer:
             for intent in self.registry.armed_unposted():
                 if intent.slot_missed:
                     await self._post_intent_locked(intent, out_of_band=True)
+                    self._log_late_post(intent, reason="slot_missed")
                 elif now - intent.registered_at >= self._intent_timeout_s:
                     await self._post_intent_locked(
                         intent, out_of_band=True, warn=True,
@@ -1252,6 +1589,34 @@ class OutputSequencer:
                     # subsequent same-hash intent can never bind its late block.
                     intent.consumed = False
                     intent.timeout_posted = True
+                    self._log_late_post(intent, reason="timeout")
+
+    def _log_late_post(self, intent: SendIntent, *, reason: str) -> None:
+        """F-OOB instrumentation (spec D7): content-free INFO log at the
+        LATE-POST WATCHER path (:meth:`process_intents_once`) — the
+        counterpart to ``drivers.topic_stream``'s ``_match_discrete_block``
+        match-point log for a block that earlier resolved ``slot_timeout``.
+
+        Carries ONLY the pinned projection-hash PREFIX (8 hex — never the
+        projected args), the post's block-resolution result (``posted`` /
+        ``post_failed``, derived from the recorded outcome), the intent's
+        state, the tool name and engagement id (system identifiers, not
+        operator content), and the registration-to-post latency in ms.
+        *reason* distinguishes a ``slot_missed`` late post (posts immediately
+        on completion, per the A6 timing fix) from a full ``intent_timeout_s``
+        out-of-band post. Together with the match-point log, this carries
+        enough timing to reconstruct the observed F-OOB ~10s gap (Sol r1-8:
+        likely the 2s slot hold + 10s intent timeout, not a hash defect).
+        Pure logging — no state is read or written beyond what
+        ``process_intents_once`` already mutated; NO behavioral change."""
+        ok = bool(intent.outcome and intent.outcome.get("ok"))
+        logger.info(
+            "oob_late_post hash=%s result=%s intent_state=%s latency_ms=%.1f "
+            "reason=%s tool=%s engagement=%s",
+            intent.projection_hash[:8], "posted" if ok else "post_failed",
+            intent.state, (self._now() - intent.registered_at) * 1000.0,
+            reason, intent.tool_name, self.engagement_id,
+        )
 
     async def run_watcher(self) -> None:  # pragma: no cover - background loop
         """Background task: drive late/timeout discrete posts (§2). Wakes on an
