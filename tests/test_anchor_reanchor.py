@@ -129,7 +129,7 @@ def _entry(reg, rec, n):
 
 
 class TestStagedFlowHappyPath:
-    async def test_reanchor_reposts_below_and_settles_old(self, tmp_path):
+    async def test_reanchor_moves_old_copy_marker_only_and_settles(self, tmp_path):
         reg, rec = await _make_registry(tmp_path)
         n = await _add_anchor(reg, rec, mid=500)
         wire = _Wire()
@@ -149,9 +149,12 @@ class TestStagedFlowHappyPath:
         e = _entry(reg, rec, n)
         assert e["tg_message_id"] == new_mid
         assert e["stale_mids"] == []
-        # Old copy settled to the re-posted-below marker.
-        assert any(mid == 500 and "re-posted below" in text
-                   for _, mid, text in wire.edits)
+        # v0.84.0 (round-4 §D6): the old copy settles to the EXACT MOVED-open
+        # marker — marker-ONLY, never the duplicated question body.
+        moved_edits = [
+            text for _, mid, text in wire.edits if mid == 500
+        ]
+        assert moved_edits == [f"⤵ MOVED Q{n} — answer the current copy below"]
 
     async def test_already_last_is_noop(self, tmp_path):
         reg, rec = await _make_registry(tmp_path)
@@ -227,7 +230,7 @@ class TestStagedFlowPerStepFailures:
         # Original stays live + tracked; stale_mids keeps old_mid (overlap-tolerant).
         e = _entry(reg, rec, n)
         assert e["tg_message_id"] == 500
-        assert 500 in e["stale_mids"]
+        assert 500 in [s["mid"] for s in e["stale_mids"]]
 
     async def test_step4_unconfirmed_retains_stale_mid_but_obligation_met(
             self, tmp_path):
@@ -239,7 +242,8 @@ class TestStagedFlowPerStepFailures:
         new_mid = wire.posts[0][1]
         e = _entry(reg, rec, n)
         assert e["tg_message_id"] == new_mid      # step-3 persisted
-        assert e["stale_mids"] == [500]           # step-4 unconfirmed → retained
+        # step-4 unconfirmed → retained, staged "plain" (D2 owns the flip).
+        assert e["stale_mids"] == [{"mid": 500, "kind": "plain"}]
 
 
 # ===========================================================================
@@ -257,7 +261,7 @@ class TestUnconfirmedStep4Reconcile:
         seq._high_water = 600
         await drv._reanchor_pass(rec)             # step-4 unconfirmed
         new_mid = wire.posts[0][1]
-        assert _entry(reg, rec, n)["stale_mids"] == [500]
+        assert _entry(reg, rec, n)["stale_mids"] == [{"mid": 500, "kind": "plain"}]
 
         # "Boot": the transport recovers, reconcile settles every tracked copy.
         wire.edit_ok = True
@@ -386,7 +390,7 @@ class TestM4EntryRemovalInvariant:
         # NOT close — it is retained with the stale mid still staged for retry.
         e = _entry(reg, rec, n)
         assert e is not None
-        assert 400 in (e.get("stale_mids") or [])
+        assert 400 in [s["mid"] for s in (e.get("stale_mids") or [])]
 
     async def test_failed_close_retains_entry(self, tmp_path):
         reg, rec = await _make_registry(tmp_path)

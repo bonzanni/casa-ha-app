@@ -50,6 +50,25 @@ _TERMINAL_RETENTION_DAYS = 30
 _FIELD_MISSING = object()
 
 
+_STALE_KIND_DEFAULT = "plain"
+
+
+def normalize_stale_mid_entry(entry: Any) -> dict[str, Any]:
+    """v0.84.0 (round-4 §D6): a ``stale_mids`` entry is ``{"mid": int, "kind":
+    str}`` with ``kind ∈ {"reanchored", "plain"}`` — ``reanchored`` renders the
+    marker-only moved copy, ``plain`` keeps today's full-body+suffix rendering.
+    Pre-round-4 rows (including legacy bare-integer entries) carry no ``kind``
+    at all — absent-tolerant here, defaulting to ``"plain"`` (their existing
+    rendering). Both the registry's own mutators (``stage_stale_mid``/
+    ``unstage_stale_mid``) and ``claude_code_driver``'s stale-settle paths
+    (``_settle_ledger_entry`` + boot reconcile) normalize through this one
+    function so every reader agrees on the shape regardless of on-disk
+    vintage. Never mutates ``entry``; always returns a fresh dict."""
+    if isinstance(entry, dict):
+        return {"mid": entry.get("mid"), "kind": entry.get("kind") or _STALE_KIND_DEFAULT}
+    return {"mid": entry, "kind": _STALE_KIND_DEFAULT}
+
+
 def _restore_origin_field(rec: "EngagementRecord", key: str, snapped: Any) -> None:
     """Restore ``rec.origin[key]`` to a strict-transition snapshot value.
 
@@ -169,11 +188,16 @@ class EngagementRecord:
     # answer-lifecycle decision, split from visual settlement — an answered entry
     # is INVISIBLE to ``open_question_numbers``/``oldest_open_anchor`` and the A3
     # gates/summary, yet stays present for raw reconcile/settle iteration) and
-    # ``stale_mids: list[int]`` (re-anchor OLD copies awaiting a confirmed
-    # settle). BOTH are absent-tolerated on load (pre-v0.83 rows have neither key
-    # → each accessor ``.get``-defaults). Entry-removal invariant: an entry is
-    # REMOVED only when its CURRENT copy's settle edit is confirmed AND
-    # ``stale_mids`` is empty.
+    # ``stale_mids: list[{"mid": int, "kind": str}]`` (re-anchor OLD copies
+    # awaiting a confirmed settle). BOTH ``answered``/``stale_mids`` are
+    # absent-tolerated on load (pre-v0.83 rows have neither key → each accessor
+    # ``.get``-defaults). v0.84.0 (round-4 §D6): each ``stale_mids`` entry also
+    # carries a ``kind`` (``"reanchored"`` renders the marker-only moved copy;
+    # ``"plain"`` keeps the full-body+suffix rendering) — legacy bare-integer
+    # entries (pre-round-4) tolerate on read via ``normalize_stale_mid_entry``,
+    # defaulting to ``"plain"``. Entry-removal invariant: an entry is REMOVED
+    # only when its CURRENT copy's settle edit is confirmed AND ``stale_mids``
+    # is empty.
     next_question_number: int = 1
     open_questions: tuple[dict, ...] = ()
     # v0.79.0 (§5): the pinned live-summary controller state. ``summary_message_id``
@@ -925,10 +949,17 @@ class EngagementRegistry:
             return True
 
     async def stage_stale_mid(self, engagement_id: str, number: int,
-                              mid: int) -> bool:
-        """§A3 staged re-anchor: append ``mid`` to an entry's ``stale_mids`` (the
-        OLD copy awaiting a confirmed settle). STRICT-persisted, idempotent on
-        ``mid``. Returns ``False`` for an unknown engagement/number."""
+                              mid: int, kind: str = _STALE_KIND_DEFAULT) -> bool:
+        """§A3 staged re-anchor: append ``{"mid": mid, "kind": kind}`` to an
+        entry's ``stale_mids`` (the OLD copy awaiting a confirmed settle).
+        STRICT-persisted, idempotent on ``mid`` (dedup ignores ``kind`` — the
+        first stage wins). v0.84.0 (round-4 §D6): ``kind`` defaults to
+        ``"plain"`` — the re-anchor pass ALWAYS stages plain (the atomic flip to
+        ``"reanchored"``, paired with the new-mid persist, is a separate
+        transaction owned by ``update_question_mid`` — Task D2). Any pre-existing
+        legacy bare-int entries on this question's list are normalized to dicts
+        as a side effect of this write. Returns ``False`` for an unknown
+        engagement/number."""
         async with self._lock:
             rec = self._records.get(engagement_id)
             if rec is None:
@@ -940,9 +971,12 @@ class EngagementRegistry:
                 nq = dict(q)
                 if nq.get("n") == number:
                     found = True
-                    stale = list(nq.get("stale_mids") or [])
-                    if mid not in stale:
-                        stale.append(mid)
+                    stale = [
+                        normalize_stale_mid_entry(m)
+                        for m in (nq.get("stale_mids") or [])
+                    ]
+                    if not any(s["mid"] == mid for s in stale):
+                        stale.append({"mid": mid, "kind": kind})
                     nq["stale_mids"] = stale
                 entries.append(nq)
             if not found:
@@ -955,7 +989,9 @@ class EngagementRegistry:
                                 mid: int) -> bool:
         """§A3: remove ``mid`` from an entry's ``stale_mids`` once its OLD copy is
         confirmed-settled. STRICT-persisted, no-op-tolerant when the mid is absent.
-        Returns ``False`` for an unknown engagement/number."""
+        Normalizes every remaining entry to ``{"mid", "kind"}`` (tolerates a mix
+        of legacy bare-int and dict entries on the same list). Returns ``False``
+        for an unknown engagement/number."""
         async with self._lock:
             rec = self._records.get(engagement_id)
             if rec is None:
@@ -968,7 +1004,9 @@ class EngagementRegistry:
                 if nq.get("n") == number:
                     found = True
                     nq["stale_mids"] = [
-                        m for m in (nq.get("stale_mids") or []) if m != mid
+                        normalize_stale_mid_entry(m)
+                        for m in (nq.get("stale_mids") or [])
+                        if normalize_stale_mid_entry(m)["mid"] != mid
                     ]
                 entries.append(nq)
             if not found:
@@ -996,6 +1034,10 @@ class EngagementRegistry:
                 if nq.get("n") == number:
                     found = True
                     nq["tg_message_id"] = new_mid
+                    # D2: this SAME transaction must atomically flip the
+                    # just-staged stale entry (mid == the OLD tg_message_id)
+                    # from "plain" to "reanchored" (spec §D6, Sol r3-3/r17) —
+                    # NOT implemented here. Task D1 stages "plain" only.
                 entries.append(nq)
             if not found:
                 return False

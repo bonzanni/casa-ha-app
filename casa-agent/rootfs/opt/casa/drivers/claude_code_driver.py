@@ -24,7 +24,7 @@ from drivers.workspace import (
     engagement_log_dir, provision_workspace, render_log_run_script,
     render_run_script, write_casa_meta,
 )
-from engagement_registry import EngagementRecord
+from engagement_registry import EngagementRecord, normalize_stale_mid_entry
 from settle_gate import confirmed_settle_edit
 
 logger = logging.getLogger(__name__)
@@ -52,11 +52,36 @@ _OPEN_Q_ANSWERED_SUFFIX = "\n✅ answered below"
 # §A3(b) terminal finalize: a live anchor stranded by /cancel or /complete is
 # settled (never left visually open forever) with an outcome-appropriate copy.
 _OPEN_Q_CANCELLED_SUFFIX = "\n🛑 engagement ended — this question is closed"
-# §A3(b) staged re-anchor markers (plain text, no keyboard): step-4 settles the
-# OLD copy pointing down to the re-posted question; the step-3 persist-failure
-# fallback settles the NEW copy pointing up to the still-live original.
-_OPEN_Q_REPOSTED_BELOW = "↪ question re-posted below ↓"
+# §A3(b) staged re-anchor markers (plain text, no keyboard): the step-3
+# persist-failure fallback settles the NEW copy pointing up to the still-live
+# original (Task D3 owns this constant's eventual removal — see
+# ``ask_lifecycle_suffixes``'s allowlist note below).
 _OPEN_Q_SEE_ABOVE = "↪ see the question above"
+# v0.84.0 (round-4 §D6, Sol r15-4): the re-anchor MOVED markers — pinned exact
+# text. REPLACES the step-4 OLD-copy edit's previous "↪ question re-posted
+# below ↓" suffix, which retained the full duplicated body (read as "asked
+# twice"); the marker text below REPLACES the body entirely, never appends to
+# it. The SAME open form is also what every stale-settle path
+# (``_settle_ledger_entry`` + boot reconciliation) renders for a ``stale_mids``
+# entry recorded ``kind="reanchored"`` — the terminal form is used once that
+# copy itself is finally settled (answered/expired/cancelled). Deliberately
+# named OUTSIDE the ``_OPEN_Q_*``/``_SETTLE_*`` prefixes ``ask_lifecycle_
+# suffixes``'s drift test (tests/test_ask_body_limit.py) enumerates: this is a
+# standalone REPLACEMENT form, never a body SUFFIX.
+_REANCHOR_MOVED_OPEN_FMT = "⤵ MOVED Q{n} — answer the current copy below"
+_REANCHOR_MOVED_TERMINAL_FMT = "⤵ MOVED Q{n} — resolved below"
+
+
+def _reanchor_moved_open(n: "int | None") -> str:
+    """The re-anchor step-4 OLD-copy edit + a retained ``reanchored`` stale
+    entry's OPEN-form settle (both point forward to the live current copy)."""
+    return _REANCHOR_MOVED_OPEN_FMT.format(n=n)
+
+
+def _reanchor_moved_terminal(n: "int | None") -> str:
+    """A ``reanchored`` stale entry's TERMINAL-form settle (rendered once that
+    tracked copy is itself finally settled — never the duplicated body)."""
+    return _REANCHOR_MOVED_TERMINAL_FMT.format(n=n)
 
 
 def ask_lifecycle_suffixes(
@@ -93,9 +118,11 @@ def ask_lifecycle_suffixes(
     owns its removal): ``_OPEN_Q_SEE_ABOVE`` (the old re-anchor
     persist-failure BODY suffix — its BEHAVIOUR is already deleted by this
     round's re-anchor retry redesign; the CONSTANT's removal completes in
-    Task D3) and ``_OPEN_Q_REPOSTED_BELOW`` (Task D6's moved-marker text is a
-    standalone REPLACEMENT form, not a body SUFFIX — it is never appended to
-    a rendered ask body).
+    Task D3). The Task D6 moved-marker forms (``_REANCHOR_MOVED_OPEN_FMT`` /
+    ``_REANCHOR_MOVED_TERMINAL_FMT``) are deliberately named OUTSIDE the
+    ``_OPEN_Q_*`` prefix this drift test scans — standalone REPLACEMENT forms,
+    never a body SUFFIX (never appended to a rendered ask body), so they need
+    no allowlist entry at all.
 
     A function-local import of the settle constants avoids a module-level
     cross-package edge between the driver and channel-handler modules
@@ -2130,10 +2157,21 @@ class ClaudeCodeDriver(DriverProtocol):
                 rec.id[:8], n if n is not None else "-", cur_mid, _outcome)
         # Every staged stale copy is settled with the same confirmed-gate; a
         # confirmed one is un-staged, an unconfirmed one keeps the entry present.
-        remaining_stale: list[int] = []
+        # v0.84.0 (round-4 §D6): each stale entry's RENDERING is chosen by its
+        # normalized ``kind`` — a "reanchored" copy settles to the pinned
+        # marker-only terminal text, NEVER the duplicated full body ``text``
+        # every other (current + "plain" stale) copy uses; legacy bare-int
+        # entries normalize to "plain" (today's rendering, unchanged).
+        remaining_stale: list[Any] = []
         unstage = getattr(reg, "unstage_stale_mid", None) if reg is not None else None
-        for smid in list(q.get("stale_mids") or []):
-            if await self._confirm_settle_mid(rec, smid, text, n):
+        for raw_stale in list(q.get("stale_mids") or []):
+            stale = normalize_stale_mid_entry(raw_stale)
+            smid = stale["mid"]
+            stale_text = (
+                _reanchor_moved_terminal(n) if stale["kind"] == "reanchored"
+                else text
+            )
+            if await self._confirm_settle_mid(rec, smid, stale_text, n):
                 if unstage is not None and n is not None:
                     try:
                         await unstage(rec.id, n, smid)
@@ -2147,9 +2185,9 @@ class ClaudeCodeDriver(DriverProtocol):
                             "engagement %s: unstage_stale_mid persist failed "
                             "(n=%s mid=%s) — retaining entry", rec.id[:8], n,
                             smid, exc_info=True)
-                        remaining_stale.append(smid)
+                        remaining_stale.append(raw_stale)
             else:
-                remaining_stale.append(smid)
+                remaining_stale.append(raw_stale)
         # Entry-removal invariant: remove ONLY when the current copy is confirmed
         # AND no stale copy remains; otherwise the entry persists.
         if current_confirmed and not remaining_stale:
@@ -2917,13 +2955,17 @@ class ClaudeCodeDriver(DriverProtocol):
 
         body = anchor.get("text") or (f"Q{n}:" if n is not None else "")
 
-        # Step 1 — STAGE (strict): stale_mids += [old_mid]. A raise aborts with
-        # NOTHING on the wire (return False — retry owed).
+        # Step 1 — STAGE (strict): stale_mids += [{"mid": old_mid, "kind":
+        # "plain"}]. A raise aborts with NOTHING on the wire (return False —
+        # retry owed). v0.84.0 (round-4 §D6/D2, Sol r17): ALWAYS stages
+        # "plain" explicitly — the atomic flip to "reanchored", paired with
+        # the new-mid persist below, is Task D2's transaction
+        # (``update_question_mid``), not this stage call.
         if old_mid is not None and n is not None:
             stage = getattr(reg, "stage_stale_mid", None) if reg is not None else None
             if stage is not None:
                 try:
-                    await stage(eng_id, n, old_mid)
+                    await stage(eng_id, n, old_mid, kind="plain")
                 except Exception:  # noqa: BLE001 — strict stage failed
                     logger.warning(
                         "engagement %s: re-anchor stage_stale_mid failed (n=%s) "
@@ -2960,6 +3002,9 @@ class ClaudeCodeDriver(DriverProtocol):
         # Step 3 — STRICT-PERSIST tg_message_id = new_mid. A raise settles the
         # NEW copy to '↪ see the question above' (confirmed-gate, best-effort,
         # plain text) and aborts; the original stays live and tracked.
+        # D2: this call's SAME transaction is where the staged stale entry
+        # flips "plain" → "reanchored" (see the registry method's own D2
+        # marker) — not implemented in this task.
         update = (getattr(reg, "update_question_mid", None)
                   if reg is not None else None)
         if update is not None and n is not None:
@@ -2974,13 +3019,16 @@ class ClaudeCodeDriver(DriverProtocol):
                     engagement, new_mid, f"{body}\n{_OPEN_Q_SEE_ABOVE}", n)
                 return False
 
-        # Step 4 — SETTLE-EDIT the OLD copy to '↪ question re-posted below ↓'
-        # (confirmed-gate). ONLY on a confirmed edit un-stage old_mid; an
-        # unconfirmed edit retains the stale_mid for boot reconciliation — the
-        # OBLIGATION is already met (the question is now LAST at new_mid).
+        # Step 4 — SETTLE-EDIT the OLD copy to the MOVED-open marker
+        # (confirmed-gate). v0.84.0 (round-4 §D6, Sol r1-7): REPLACES the full
+        # duplicated body with marker-ONLY text — never the body — so the old
+        # copy no longer reads as "asked twice". ONLY on a confirmed edit
+        # un-stage old_mid; an unconfirmed edit retains the stale_mid for boot
+        # reconciliation — the OBLIGATION is already met (the question is now
+        # LAST at new_mid).
         if old_mid is not None:
             old_confirmed = await self._confirm_settle_mid(
-                engagement, old_mid, f"{body}\n{_OPEN_Q_REPOSTED_BELOW}", n)
+                engagement, old_mid, _reanchor_moved_open(n), n)
             if old_confirmed and n is not None:
                 await self._best_effort_unstage(eng_id, n, old_mid)
         return True
