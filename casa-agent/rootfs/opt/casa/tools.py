@@ -104,6 +104,7 @@ _runtime = None  # CasaRuntime | None — set by init_tools(runtime=...)
 # them — including every pre-Task-6 test — keep the old unbounded behaviour.
 _specialist_limiter: "specialist_limits.SpecialistLimiter | None" = None
 _specialist_telemetry: "specialist_limits.SpecialistTelemetry | None" = None
+_voice_job_route_cap = 5
 engagement_var: ContextVar[EngagementRecord | None] = ContextVar(
     "engagement_var", default=None,
 )
@@ -123,6 +124,7 @@ def init_tools(
     runtime=None,                         # NEW — Task C.1
     specialist_limiter=None,              # Task 6 (spec §4.6)
     specialist_telemetry=None,            # Task 6 (spec §4.6)
+    voice_job_route_cap: int = 5,
 ) -> None:
     """Initialize module-level references used by tool implementations.
 
@@ -153,7 +155,12 @@ def init_tools(
     global _channel_manager, _bus, _specialist_registry, _mcp_registry, \
         _agent_role_map, _agent_registry, _trigger_registry, \
         _engagement_registry, _executor_registry, _runtime, \
-        _specialist_limiter, _specialist_telemetry  # noqa: PLW0603
+        _specialist_limiter, _specialist_telemetry, \
+        _voice_job_route_cap  # noqa: PLW0603
+    if (isinstance(voice_job_route_cap, bool)
+            or not isinstance(voice_job_route_cap, int)
+            or not 1 <= voice_job_route_cap <= 20):
+        raise ValueError("voice_job_route_cap must be an integer from 1 to 20")
     _channel_manager = channel_manager
     _bus = bus
     _specialist_registry = specialist_registry
@@ -166,6 +173,7 @@ def init_tools(
     _runtime = runtime
     _specialist_limiter = specialist_limiter
     _specialist_telemetry = specialist_telemetry
+    _voice_job_route_cap = voice_job_route_cap
 
 
 def sync_agent_role_map(runtime: Any) -> None:
@@ -1195,9 +1203,6 @@ class _PermitHandoff:
 _BACKGROUND_ROUTE_CAPABILITIES = frozenset({
     "background_jobs", "satellite_announce",
 })
-_MAX_ACTIVE_READY_JOBS_PER_ROUTE = 5
-
-
 def background_route_available(origin: dict | None) -> bool:
     """Return whether the trusted turn origin can accept background audio."""
     if not isinstance(origin, dict):
@@ -2322,7 +2327,7 @@ async def _start_voice_async_job(
     registry = _specialist_registry.job_registry
     await registry.load()
     # Apply result TTL before the atomic route-capacity check so an expired
-    # READY row cannot consume one of the five live backlog slots.
+    # READY row cannot consume one of the configured live backlog slots.
     await registry.expire_due()
     job_id = str(uuid.uuid4())
     job = _new_voice_job(
@@ -2345,18 +2350,14 @@ async def _start_voice_async_job(
             if parent_job_id is None:
                 await registry.create(
                     job,
-                    max_active_ready_per_route=(
-                        _MAX_ACTIVE_READY_JOBS_PER_ROUTE
-                    ),
+                    max_active_ready_per_route=_voice_job_route_cap,
                 )
             else:
                 await registry.create_continuation(
                     parent_job_id,
                     job,
                     actor=actor,
-                    max_active_ready_per_route=(
-                        _MAX_ACTIVE_READY_JOBS_PER_ROUTE
-                    ),
+                    max_active_ready_per_route=_voice_job_route_cap,
                 )
             created = True
         except JobRouteCapacityError:
@@ -2364,7 +2365,8 @@ async def _start_voice_async_job(
                 "status": "error",
                 "kind": "route_capacity_reached",
                 "message": (
-                    "This voice route already has five specialist jobs "
+                    f"This voice route already has {_voice_job_route_cap} "
+                    "specialist jobs "
                     "awaiting completion or delivery."
                 ),
             })
@@ -3218,14 +3220,15 @@ async def continue_voice_job(args: dict) -> dict:
                 parent.id,
                 child,
                 actor=actor,
-                max_active_ready_per_route=_MAX_ACTIVE_READY_JOBS_PER_ROUTE,
+                max_active_ready_per_route=_voice_job_route_cap,
             )
         except JobRouteCapacityError:
             return _result({
                 "status": "error",
                 "kind": "route_capacity_reached",
                 "message": (
-                    "This voice route already has five specialist jobs "
+                    f"This voice route already has {_voice_job_route_cap} "
+                    "specialist jobs "
                     "awaiting completion or delivery."
                 ),
             })

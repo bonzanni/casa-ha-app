@@ -48,6 +48,7 @@ from session_sweeper import SessionSweeper
 from rate_limit import RateLimiter, rate_limit_response
 from timekeeping import resolve_tz
 from trigger_registry import TriggerRegistry
+from voice_delivery_config import load_voice_delivery_config
 
 logger = logging.getLogger(__name__)
 
@@ -1834,6 +1835,7 @@ async def main() -> None:
     from sdk_logging import install_sdk_task_noise_filter
     install_sdk_task_noise_filter(asyncio.get_running_loop())
     logger.info("Casa core starting up")
+    voice_delivery_config = load_voice_delivery_config()
 
     observed_cli = await asyncio.to_thread(verify_effective_cli)
     observed_version = observed_cli.split(maxsplit=1)[0]
@@ -1973,6 +1975,7 @@ async def main() -> None:
     job_registry = JobRegistry(
         os.path.join(DATA_DIR, "jobs.json"),
         os.path.join(DATA_DIR, "delegations.json"),
+        result_ttl_seconds=voice_delivery_config.delivery_ttl_s,
     )
     await job_registry.load()
     recovered_jobs = await job_registry.recover_after_restart()
@@ -2078,6 +2081,7 @@ async def main() -> None:
         runtime=runtime,
         specialist_limiter=specialist_limiter,
         specialist_telemetry=specialist_telemetry,
+        voice_job_route_cap=voice_delivery_config.route_cap,
     )
     mcp_registry.register_sdk_factory(
         "casa-framework",
@@ -2544,6 +2548,7 @@ async def main() -> None:
         voice_routes = VoiceRouteRegistry(
             secret_present=bool(webhook_secret),
             agent_configs=role_configs,
+            freshness_s=voice_delivery_config.route_freshness_s,
         )
         voice_delivery = VoiceDeliveryCoordinator(job_registry, voice_routes)
         runtime.voice_route_registry = voice_routes

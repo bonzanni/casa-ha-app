@@ -411,7 +411,7 @@ async def test_sixth_active_or_ready_job_on_route_is_rejected_without_mutation(
         "status": "error",
         "kind": "route_capacity_reached",
         "message": (
-            "This voice route already has five specialist jobs awaiting "
+            "This voice route already has 5 specialist jobs awaiting "
             "completion or delivery."
         ),
     }

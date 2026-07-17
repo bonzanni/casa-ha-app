@@ -57,7 +57,7 @@ def test_tina_facade_option_defaults_on_with_optional_bool_schema_and_copy():
         (root / "casa-agent/translations/en.yaml").read_text(encoding="utf-8"),
     )
 
-    assert config["version"] == "0.84.0"
+    assert config["version"] == "0.85.0"
     assert config["options"]["tina_ha_facade_enabled"] is True
     assert config["schema"]["tina_ha_facade_enabled"] == "bool?"
     copy = translation["configuration"]["tina_ha_facade_enabled"]

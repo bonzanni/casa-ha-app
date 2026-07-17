@@ -66,6 +66,9 @@ setting by hand:
 | `engagement_reap_days` | Auto-close engagements after this many days without activity (daily sweep cancels them and closes their Telegram topic; the engaging agent is notified). Set `0` to disable. Default: `7`. |
 | `log_level` | Log verbosity: `debug`, `info`, `warning`, or `error`. Default: `info`. Flip to `debug` for verbose troubleshooting without rebuilding the image. |
 | `voice_turn_budget_seconds` | Wall-clock budget for one voice turn, from request ingress to the turn deadline (see [Voice pipeline](#voice-pipeline)). A synchronous specialist hand-off started mid-turn must finish within it, minus a ~5s reserve held back so Casa can still speak a fallback if the specialist runs long. Range 10-27; hard-capped at 27 regardless of this value. Default: `27`. |
+| `voice_route_freshness_seconds` | Grace period in which an authenticated, background-capable Home Assistant route may briefly disconnect while Gary still accepts specialist work. Set `0` to require a currently connected route. Range 0-300. Default: `60`. |
+| `voice_job_delivery_ttl_seconds` | Maximum time a completed background voice result is retained for delivery. A specialist may request a shorter privacy/result expiry; the shorter value wins. Range 30-3600. Default: `900`. |
+| `voice_job_route_cap` | Maximum active or ready specialist jobs held for one authenticated voice route. New work is refused at the cap; older work is never silently dropped. Range 1-20. Default: `5`. |
 | `specialist_max_concurrency` | Max specialist delegations in flight fleet-wide at once (see [Delegation limits](#delegation-limits)). Range 1-20. Default: `2`. |
 | `specialist_cost_alert_threshold` | Cumulative per-specialist USD spend past which Casa logs a warning on further delegations (see [Delegation limits](#delegation-limits)). Default: `5.0`. |
 
@@ -113,11 +116,12 @@ Casa exposes two transports for Home Assistant voice / generic voice clients. Th
   `{"prompt", "agent_role", "scope_id", "context"}`. Stream: `event:
   block` frames then `event: done`. HMAC via `X-Webhook-Signature`
   (same scheme as `/invoke`).
-- `/api/converse/ws` — persistent WebSocket. Inbound frames:
-  `stt_start`, `utterance`, `stage`, `cancel`. Outbound: `block`,
-  `done`, `error`. `stt_start` and `stage` are advisory no-ops today;
-  the session pool is registered lazily on the first `utterance` frame
-  (which carries `agent_role`, so it keys the right resident's session).
+- `/api/converse/ws` — persistent WebSocket. Conversation frames include
+  inbound `stt_start`, `utterance`, `stage`, and `cancel`, with outbound
+  `block`, `done`, and `error`. A Home Assistant integration may also register
+  an authenticated protocol-1 delivery route. Casa accepts background work
+  only after that exact socket has acknowledged both `background_jobs` and
+  `satellite_announce`; old or unacknowledged integrations stay synchronous.
 
 Toggle the transports via environment variables on the app:
 
@@ -134,6 +138,41 @@ from the voice butler) is bounded by the `voice_turn_budget_seconds` app
 option (default 27) so it always leaves room for the voice transport's own
 30s timeout — the effective budget is hard-capped at 27 seconds no matter
 how high the option is set.
+
+### Background specialist voice jobs
+
+A specialist-capable voice resident such as Gary can acknowledge a hand-off
+quickly, end the current voice turn, and keep its own resident context free of
+the result. The specialist runs in an isolated session. When it finishes, Casa
+passes only a policy-approved spoken summary to the Home Assistant companion
+integration; full output, citations, and private detail are never injected back
+into Gary's SDK session.
+
+Home Assistant announces a queued summary immediately when the originating
+satellite is already idle. If it is listening, processing, or responding, the
+integration waits until that interaction finishes and the satellite reaches
+stable idle. Results are FIFO per device; other devices continue independently.
+The user can keep speaking to Gary or Tina while a specialist works.
+
+The voice job status surface reports execution (`pending`, `running`,
+`succeeded`, `failed`, or `cancelled`) separately from delivery (`ready`,
+`waiting_for_route`, `claimed`, `authorized`, `playing`, `delivered`,
+`cancelled`, or `expired`). Gary can check status, cancel work before playback,
+continue one unambiguous clarification, or request available detail. Private
+results normally announce only that a result is ready; an explicit detail
+request is still identity/clearance checked and does not add result tokens to
+Gary's context.
+
+Background mode requires a currently or recently registered, HMAC-authenticated
+protocol-1 WebSocket route. SSE and older integrations continue to support
+synchronous turns but do not accept background work. Delivery is intentionally
+at least once: if audio succeeds but its acknowledgement is lost, a concise
+summary can repeat after restart rather than disappear.
+
+HMAC authenticates the WebSocket and protects message integrity; it does not
+encrypt payloads. The Casa-to-Home Assistant link is plaintext and must remain
+on a trusted LAN/private network or travel through an encrypted tunnel or
+reverse proxy.
 
 Tina normally uses an eager, role-scoped Home Assistant facade: Casa discovers
 the Assist tools at boot, keeps that upstream connection resident, and gives

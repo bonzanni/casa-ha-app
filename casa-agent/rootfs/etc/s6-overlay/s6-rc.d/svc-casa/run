@@ -85,6 +85,9 @@ fi
 # casa_core.py still clamp/validate on top of this (e.g. the 27s hard cap) —
 # this export only feeds the env var, it does not itself enforce the cap.
 export VOICE_TURN_BUDGET_SECONDS="$(bashio::config 'voice_turn_budget_seconds')"
+export VOICE_ROUTE_FRESHNESS_SECONDS="$(bashio::config 'voice_route_freshness_seconds')"
+export VOICE_JOB_DELIVERY_TTL_SECONDS="$(bashio::config 'voice_job_delivery_ttl_seconds')"
+export VOICE_JOB_ROUTE_CAP="$(bashio::config 'voice_job_route_cap')"
 export SPECIALIST_MAX_CONCURRENCY="$(bashio::config 'specialist_max_concurrency')"
 export SPECIALIST_COST_ALERT_THRESHOLD="$(bashio::config 'specialist_cost_alert_threshold')"
 

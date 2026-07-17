@@ -140,10 +140,14 @@ class JobRegistry:
         *,
         clock: Callable[[], float] = time.time,
         reconciliation_retry_interval: float = 5.0,
+        result_ttl_seconds: float = RESULT_TTL_SECONDS,
     ) -> None:
         retry_interval = float(reconciliation_retry_interval)
         if not math.isfinite(retry_interval) or retry_interval <= 0:
             raise ValueError("reconciliation_retry_interval must be positive")
+        result_ttl = float(result_ttl_seconds)
+        if not math.isfinite(result_ttl) or result_ttl <= 0:
+            raise ValueError("result_ttl_seconds must be positive")
         self._path = os.fspath(path)
         self._legacy_tombstone_path = os.fspath(legacy_tombstone_path)
         self._clock = clock
@@ -159,6 +163,7 @@ class JobRegistry:
         self._permits: dict[str, Any] = {}
         self._cancel_timers: dict[str, asyncio.Task] = {}
         self._reconciliation_retry_interval = retry_interval
+        self._result_ttl_seconds = result_ttl
         self._reconciliation_tasks: dict[str, asyncio.Task] = {}
         self._reconciliation_waiters: dict[
             str, set[asyncio.Future[None]]
@@ -732,7 +737,7 @@ class JobRegistry:
                 current,
                 execution_state=ExecutionState.CANCELLED,
                 terminal_at=now,
-                expires_at=now + self.RESULT_TTL_SECONDS,
+                expires_at=now + self._result_ttl_seconds,
                 failure=JobFailure("cancelled", "Delegation cancelled"),
                 delivery_state=(
                     DeliveryState.CANCELLED
@@ -951,7 +956,7 @@ class JobRegistry:
                         current,
                         execution_state=ExecutionState.ORPHANED,
                         terminal_at=now,
-                        expires_at=now + self.RESULT_TTL_SECONDS,
+                        expires_at=now + self._result_ttl_seconds,
                         failure=JobFailure(
                             "restart_orphan", "Lost on restart",
                         ),
@@ -1105,7 +1110,7 @@ class JobRegistry:
                 created_at=started_at,
                 started_at=started_at,
                 terminal_at=now,
-                expires_at=now + self.RESULT_TTL_SECONDS,
+                expires_at=now + self._result_ttl_seconds,
                 execution_state=ExecutionState.ORPHANED,
                 delivery_state=(
                     DeliveryState.READY if has_voice_route else DeliveryState.NONE
@@ -1292,7 +1297,7 @@ class JobRegistry:
                 current,
                 execution_state=ExecutionState.CANCELLED,
                 terminal_at=now,
-                expires_at=now + self.RESULT_TTL_SECONDS,
+                expires_at=now + self._result_ttl_seconds,
                 failure=JobFailure("cancelled", "Cancelled by creator"),
                 delivery_state=(
                     DeliveryState.CANCELLED
@@ -1309,7 +1314,7 @@ class JobRegistry:
                 current,
                 execution_state=ExecutionState.SUCCEEDED,
                 terminal_at=now,
-                expires_at=now + self.RESULT_TTL_SECONDS,
+                expires_at=now + self._result_ttl_seconds,
                 result=str(result),
                 failure=None,
                 delivery_state=delivery,
@@ -1334,7 +1339,7 @@ class JobRegistry:
                 current,
                 execution_state=ExecutionState.CANCELLED,
                 terminal_at=now,
-                expires_at=now + self.RESULT_TTL_SECONDS,
+                expires_at=now + self._result_ttl_seconds,
                 failure=JobFailure("cancelled", "Cancelled by creator"),
                 awaiting_input=False,
                 continuable_until=None,
@@ -1348,7 +1353,9 @@ class JobRegistry:
                 cancel_pending=False,
             )
         else:
-            expires_at = now + float(delivery_ttl_s)
+            expires_at = now + min(
+                float(delivery_ttl_s), self._result_ttl_seconds,
+            )
             delivery, sequence = self._terminal_delivery(current)
             updated = replace(
                 current,
@@ -1393,7 +1400,7 @@ class JobRegistry:
             current,
             execution_state=state,
             terminal_at=now,
-            expires_at=now + self.RESULT_TTL_SECONDS,
+            expires_at=now + self._result_ttl_seconds,
             failure=envelope,
             delivery_state=delivery,
             delivery_sequence=sequence,
