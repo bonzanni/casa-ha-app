@@ -46,7 +46,10 @@ def _payload(envelope: dict) -> dict:
 async def test_voice_job_completion_never_reenters_gary(
     tmp_path, monkeypatch, caplog,
 ):
-    private_canary = "PRIVATE_RESULT_CANARY-7f31"
+    private_summary = "PRIVATE_SUMMARY_CANARY-7f31"
+    private_answer = "PRIVATE_ANSWER_CANARY-a19c"
+    private_citation = "PRIVATE_CITATION_CANARY-c8e2"
+    private_canaries = (private_summary, private_answer, private_citation)
     release = asyncio.Event()
 
     async def _run(
@@ -54,13 +57,13 @@ async def test_voice_job_completion_never_reenters_gary(
     ) -> tools.DelegatedOutput:
         await release.wait()
         return tools.DelegatedOutput(
-            text=private_canary,
+            text=private_answer,
             structured_output={
                 "status": "answered",
-                "spoken_summary": private_canary,
-                "answer": private_canary,
+                "spoken_summary": private_summary,
+                "answer": private_answer,
                 "clarification": "",
-                "citations": [],
+                "citations": [private_citation],
                 "assumptions": [],
                 "provenance": {},
                 "sensitivity": "private",
@@ -134,9 +137,29 @@ async def test_voice_job_completion_never_reenters_gary(
     assert [m for m in bus.get_log() if m.type is MessageType.NOTIFICATION] == []
     assert gary_messages == []
     assert after == before
-    assert private_canary not in caplog.text
-    assert private_canary not in json.dumps(accepted_payload)
-    assert private_canary in (job.result or "")
+    for canary in private_canaries:
+        assert canary not in caplog.text
+        assert canary not in json.dumps(accepted_payload)
+        assert canary not in json.dumps(vars(gary.config), default=str)
+        assert canary in (job.result or "")
+
+    token = agent_mod.origin_var.set(_origin())
+    try:
+        detail = await tools.continue_voice_job.handler({
+            "job_id": job_id,
+            "input": "Please tell me the details",
+        })
+    finally:
+        agent_mod.origin_var.reset(token)
+    detail_payload = _payload(detail)
+    child = registry.get(detail_payload["job_id"])
+    assert child.parent_job_id == job_id
+    assert child.prompted_delivery is True
+    assert gary._pool.stats().copy() == before
+    assert gary_messages == []
+    for canary in private_canaries:
+        assert canary not in json.dumps(detail_payload)
+        assert canary not in caplog.text
 
     loop_task.cancel()
     await asyncio.gather(loop_task, return_exceptions=True)

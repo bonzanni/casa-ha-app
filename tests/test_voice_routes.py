@@ -186,6 +186,25 @@ async def test_disconnect_clears_writer_but_retains_capability_for_60_seconds():
     assert routes.is_recently_capable("entry-1") is False
 
 
+async def test_expired_route_metadata_is_pruned_before_new_registration():
+    now = [100.0]
+    routes = VoiceRouteRegistry(
+        secret_present=True,
+        agent_configs={"concierge": _cfg("concierge", ["ha_voice"])},
+        freshness_s=60,
+        clock=lambda: now[0],
+    )
+    old = VoiceWsConnection(_RawSocket())
+    await routes.register(old, _register_frame(route_id="entry-old"))
+    await routes.disconnect(old)
+
+    now[0] = 160.001
+    current = VoiceWsConnection(_RawSocket())
+    await routes.register(current, _register_frame(route_id="entry-current"))
+
+    assert set(routes._metadata) == {"entry-current"}
+
+
 async def test_old_socket_disconnect_does_not_clear_new_route_writer():
     routes = VoiceRouteRegistry(
         secret_present=True,

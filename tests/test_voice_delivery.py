@@ -386,6 +386,143 @@ async def test_private_disclosure_is_re_evaluated_before_authorization(
     assert "PRIVATE_SPOKEN_CANARY" not in json.dumps(route.sent)
 
 
+async def test_recently_disconnected_route_accepts_then_waits_and_reoffers(
+    tmp_path,
+):
+    now = [100.0]
+    routes = VoiceRouteRegistry(
+        secret_present=True,
+        agent_configs={"concierge": _VoiceCfg()},
+        freshness_s=60,
+        clock=lambda: now[0],
+    )
+    first_raw = _SerialRawSocket()
+    first = VoiceWsConnection(first_raw)
+    await routes.register(first, {
+        "type": "voice_route_register",
+        "protocol": 1,
+        "route_id": "entry-1",
+        "agent_role": "concierge",
+        "capabilities": ["background_jobs", "satellite_announce"],
+    })
+    await routes.disconnect(first)
+    now[0] = 159.0
+    assert routes.is_recently_capable("entry-1") is True
+
+    registry = JobRegistry(
+        tmp_path / "jobs.json",
+        tmp_path / "delegations.json",
+        clock=lambda: now[0],
+    )
+    await registry.load()
+    await registry.create(_ready_job(
+        "job-1",
+        sequence=0,
+        device="kitchen",
+        created_at=now[0],
+        started_at=now[0],
+        terminal_at=None,
+        expires_at=None,
+        execution_state=ExecutionState.RUNNING,
+        delivery_state=DeliveryState.NONE,
+        result=None,
+        delivery_sequence=0,
+    ))
+    now[0] = 161.0
+    await registry.finish_voice_result(
+        "job-1", _result(), awaiting_input=False, delivery_ttl_s=900,
+    )
+    coordinator = VoiceDeliveryCoordinator(registry, routes, clock=lambda: now[0])
+    await coordinator.sweep_once()
+    assert registry.get("job-1").delivery_state is DeliveryState.READY
+    assert [frame for frame in first_raw.sent if frame.get("type") == "job_ready"] == []
+
+    now[0] = 162.0
+    second_raw = _SerialRawSocket()
+    second = VoiceWsConnection(second_raw)
+    bound = await routes.register(second, {
+        "type": "voice_route_register",
+        "protocol": 1,
+        "route_id": "entry-1",
+        "agent_role": "concierge",
+        "capabilities": ["background_jobs", "satellite_announce"],
+    })
+    await coordinator.route_connected(bound)
+    assert [
+        frame["job_id"] for frame in second_raw.sent
+        if frame.get("type") == "job_ready"
+    ] == ["job-1"]
+
+
+async def test_result_ttl_expiring_across_restart_never_emits_ready_frame(
+    tmp_path,
+):
+    now = [100.0]
+    first = JobRegistry(
+        tmp_path / "jobs.json",
+        tmp_path / "delegations.json",
+        clock=lambda: now[0],
+    )
+    await first.load()
+    await first.create(_ready_job(
+        "job-expiring",
+        sequence=1,
+        device="kitchen",
+        expires_at=160.0,
+    ))
+
+    now[0] = 161.0
+    restarted = JobRegistry(
+        tmp_path / "jobs.json",
+        tmp_path / "delegations.json",
+        clock=lambda: now[0],
+    )
+    await restarted.load()
+    await restarted.expire_due()
+    route = _Route()
+    routes = _Routes(route)
+    coordinator = VoiceDeliveryCoordinator(restarted, routes, clock=lambda: now[0])
+    await coordinator.route_connected(route)
+
+    assert restarted.get("job-expiring").delivery_state is DeliveryState.EXPIRED
+    assert _offered(route) == []
+
+
+@pytest.mark.parametrize(
+    ("sensitivity", "expected"),
+    [
+        ("household", "HOUSEHOLD_PROMPTED_DETAIL_CANARY"),
+        (
+            "private",
+            "Your result is ready; I can't read private details on this voice route.",
+        ),
+    ],
+)
+async def test_prompted_detail_child_applies_current_route_clearance(
+    delivery, sensitivity, expected,
+):
+    registry, _, route, coordinator, _ = delivery
+    await registry.create(_ready_job(
+        "job-detail",
+        sequence=1,
+        device="kitchen",
+        prompted_delivery=True,
+        result=_result(
+            spoken_summary=(
+                "HOUSEHOLD_PROMPTED_DETAIL_CANARY"
+                if sensitivity == "household"
+                else "PRIVATE_PROMPTED_DETAIL_CANARY"
+            ),
+            sensitivity=sensitivity,
+        ),
+    ))
+
+    await coordinator.route_connected(route)
+
+    assert _offered(route)[0]["spoken_text"] == expected
+    assert "PRIVATE_PROMPTED_DETAIL_CANARY" not in json.dumps(route.sent)
+
+
 async def test_claim_persists_attempt_before_authorization(delivery):
     registry, _, route, coordinator, _ = delivery
     await registry.create(_ready_job("job-1", sequence=1, device="kitchen"))

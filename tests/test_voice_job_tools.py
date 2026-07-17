@@ -390,6 +390,37 @@ async def test_voice_async_without_capable_route_fails_before_side_effect(
 
 
 @pytest.mark.asyncio
+async def test_sixth_active_or_ready_job_on_route_is_rejected_without_mutation(
+    tool_env,
+):
+    for index in range(5):
+        await tool_env.add_job(
+            f"job-{index}",
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.READY,
+            terminal_at=time.time(),
+            expires_at=time.time() + 900,
+            result=json.dumps(_structured_result()),
+        )
+
+    payload = tool_payload(await tool_env.invoke_delegate())
+
+    assert payload == {
+        "status": "error",
+        "kind": "route_capacity_reached",
+        "message": (
+            "This voice route already has five specialist jobs awaiting "
+            "completion or delivery."
+        ),
+    }
+    assert [job.id for job in tool_env.job_registry.all()] == [
+        "job-0", "job-1", "job-2", "job-3", "job-4",
+    ]
+    assert tool_env.runner.calls == []
+    assert tool_env.limiter.in_flight == 0
+
+
+@pytest.mark.asyncio
 async def test_status_never_returns_result_task_or_context_text(tool_env):
     canary = "PRIVATE_RESULT_CANARY"
     await tool_env.add_job(
@@ -662,6 +693,53 @@ async def test_continue_job_copies_private_backend_context_without_returning_it(
     assert canary in child.context
     await tool_env.runner.started.wait()
     assert canary in tool_env.runner.calls[-1]["context"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sensitivity", ["household", "private"])
+async def test_explicit_detail_request_creates_prompted_delivery_child(
+    tool_env, sensitivity,
+):
+    result_canary = f"{sensitivity.upper()}_DETAIL_RESULT_CANARY"
+    parent = await tool_env.add_job(
+        "job-parent",
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.DELIVERED,
+        terminal_at=time.time(),
+        expires_at=time.time() + 900,
+        result=json.dumps(_structured_result(
+            spoken_summary=result_canary,
+            answer=f"{result_canary}_ANSWER",
+            sensitivity=sensitivity,
+        )),
+        awaiting_input=False,
+        continuable_until=None,
+    )
+
+    payload = tool_payload(await _call(
+        tools.continue_voice_job,
+        voice_origin(origin_device_id="device-office", voice_route_id="entry-2"),
+        {"input": "Please tell me the details", "job_id": "job-parent"},
+    ))
+
+    assert payload == {
+        "status": "pending",
+        "job_id": payload["job_id"],
+        "specialist_display_name": "Judge",
+    }
+    assert result_canary not in json.dumps(payload)
+    child = tool_env.job_registry.get(payload["job_id"])
+    assert child.parent_job_id == parent.id
+    assert child.origin_route_id == "entry-2"
+    assert child.origin_device_id == "device-office"
+    assert child.execution_state is ExecutionState.SUCCEEDED
+    assert child.delivery_state is DeliveryState.READY
+    assert child.result == parent.result
+    assert child.prompted_delivery is True
+    assert tool_env.job_registry.get(parent.id).origin_route_id == "entry-1"
+    assert tool_env.job_registry.get(parent.id).origin_device_id == "device-kitchen"
+    assert tool_env.runner.calls == []
+    assert tool_env.limiter.in_flight == 0
 
 
 @pytest.mark.asyncio

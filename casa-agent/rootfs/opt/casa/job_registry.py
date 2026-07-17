@@ -82,6 +82,7 @@ class VoiceJob:
     lease_until: float | None
     cancel_pending: bool
     orphan_notification_pending: bool = False
+    prompted_delivery: bool = False
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,10 @@ class JobRegistryError(RuntimeError):
 
 class JobTransitionError(JobRegistryError):
     """A compare-and-set transition did not match the persisted state."""
+
+
+class JobRouteCapacityError(JobRegistryError):
+    """A voice route already owns the maximum live delivery backlog."""
 
 
 class JobAuthorizationError(JobRegistryError):
@@ -242,13 +247,21 @@ class JobRegistry:
             key=lambda job: (job.delivery_sequence, job.created_at, job.id),
         )
 
-    async def create(self, job: VoiceJob) -> VoiceJob:
+    async def create(
+        self,
+        job: VoiceJob,
+        *,
+        max_active_ready_per_route: int | None = None,
+    ) -> VoiceJob:
         async with self._lock:
             self._require_loaded()
             if not job.id:
                 raise ValueError("job id must not be empty")
             if job.id in self._jobs:
                 raise JobTransitionError(f"job {job.id!r} already exists")
+            self._require_route_capacity(
+                job, max_active_ready_per_route=max_active_ready_per_route,
+            )
             candidate = dict(self._jobs)
             candidate[job.id] = job
             await self._commit_snapshot_locked(candidate)
@@ -260,6 +273,7 @@ class JobRegistry:
         child: VoiceJob,
         *,
         actor: Any,
+        max_active_ready_per_route: int | None = None,
     ) -> VoiceJob:
         """Consume one live clarification and create its child atomically."""
         async with self._lock:
@@ -275,6 +289,10 @@ class JobRegistry:
                 raise ValueError("continuation child has the wrong parent")
             if child.specialist_role != parent.specialist_role:
                 raise ValueError("continuation child has the wrong specialist")
+            self._require_route_capacity(
+                child,
+                max_active_ready_per_route=max_active_ready_per_route,
+            )
             if (child.execution_state is not ExecutionState.ACCEPTED
                     or child.delivery_state is not DeliveryState.NONE
                     or child.result is not None
@@ -358,6 +376,64 @@ class JobRegistry:
                 candidate[parent_job_id] = replace(parent, awaiting_input=True)
             await self._commit_snapshot_locked(candidate)
             return restore_parent
+
+    async def create_prompted_delivery(
+        self,
+        parent_job_id: str,
+        child: VoiceJob,
+        *,
+        actor: Any,
+        max_active_ready_per_route: int | None = None,
+    ) -> VoiceJob:
+        """Create a metadata-only child that re-delivers a stored result."""
+        async with self._lock:
+            self._require_loaded()
+            parent = self._require_job(parent_job_id)
+            self._authorize_actor(parent, actor)
+            self._authorize_actor(child, actor)
+            if child.id in self._jobs:
+                raise JobTransitionError(f"job {child.id!r} already exists")
+            if (
+                child.parent_job_id != parent.id
+                or child.specialist_role != parent.specialist_role
+            ):
+                raise ValueError("prompted delivery child does not match parent")
+            now = self._now()
+            available = (
+                parent.execution_state is ExecutionState.SUCCEEDED
+                and parent.result is not None
+                and (parent.expires_at is None or parent.expires_at > now)
+                and parent.delivery_state not in {
+                    DeliveryState.CANCELLED,
+                    DeliveryState.EXPIRED,
+                }
+                and not parent.cancel_pending
+            )
+            if not available:
+                raise self._transition_error(
+                    parent,
+                    "create_prompted_delivery",
+                    expected="live successful result",
+                )
+            self._require_route_capacity(
+                child,
+                max_active_ready_per_route=max_active_ready_per_route,
+            )
+            prompted = replace(
+                child,
+                started_at=now,
+                terminal_at=now,
+                expires_at=parent.expires_at,
+                execution_state=ExecutionState.SUCCEEDED,
+                delivery_state=DeliveryState.READY,
+                result=parent.result,
+                delivery_sequence=self._delivery_sequence + 1,
+                prompted_delivery=True,
+            )
+            candidate = dict(self._jobs)
+            candidate[prompted.id] = prompted
+            await self._commit_snapshot_locked(candidate)
+            return prompted
 
     def owns_task(self, job_id: str, task: asyncio.Task) -> bool:
         """Return whether runtime ownership was published for exactly task."""
@@ -1090,6 +1166,7 @@ class JobRegistry:
                 orphan_notification_pending=bool(
                     row.get("orphan_notification_pending", False)
                 ),
+                prompted_delivery=bool(row.get("prompted_delivery", False)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise JobRegistryError(f"invalid job snapshot row: {exc}") from exc
@@ -1129,6 +1206,7 @@ class JobRegistry:
             "lease_until": job.lease_until,
             "cancel_pending": job.cancel_pending,
             "orphan_notification_pending": job.orphan_notification_pending,
+            "prompted_delivery": job.prompted_delivery,
         }
 
     async def _write_snapshot_locked(
@@ -1321,6 +1399,42 @@ class JobRegistry:
         candidate[updated.id] = updated
         return candidate
 
+    def _require_route_capacity(
+        self,
+        job: VoiceJob,
+        *,
+        max_active_ready_per_route: int | None,
+    ) -> None:
+        if max_active_ready_per_route is None:
+            return
+        if max_active_ready_per_route <= 0:
+            raise ValueError("max_active_ready_per_route must be positive")
+        route_id = job.origin_route_id
+        if route_id is None:
+            return
+        active_or_ready = sum(
+            1
+            for current in self._jobs.values()
+            if current.origin_route_id == route_id
+            and (
+                current.execution_state in {
+                    ExecutionState.ACCEPTED,
+                    ExecutionState.RUNNING,
+                }
+                or current.delivery_state in {
+                    DeliveryState.READY,
+                    DeliveryState.CLAIMED,
+                    DeliveryState.AUTHORIZED,
+                    DeliveryState.PLAYING,
+                }
+            )
+        )
+        if active_or_ready >= max_active_ready_per_route:
+            raise JobRouteCapacityError(
+                f"voice route {route_id!r} already has "
+                f"{max_active_ready_per_route} live jobs"
+            )
+
     def _require_job(self, job_id: str) -> VoiceJob:
         self._require_loaded()
         try:
@@ -1469,6 +1583,7 @@ __all__ = [
     "JobFailure",
     "JobRegistry",
     "JobRegistryError",
+    "JobRouteCapacityError",
     "JobTransitionError",
     "VoiceJob",
 ]

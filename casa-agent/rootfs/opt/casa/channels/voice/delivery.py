@@ -496,7 +496,7 @@ class VoiceDeliveryCoordinator:
                 result = parse_voice_job_result(payload)
                 return spoken_text_for(
                     result,
-                    prompted=False,
+                    prompted=job.prompted_delivery,
                     identity_clearance=voice_identity_clearance({
                         "channel": "voice",
                     }),

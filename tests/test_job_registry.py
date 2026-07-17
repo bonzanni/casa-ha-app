@@ -1151,7 +1151,13 @@ async def test_recovered_orphan_notification_does_not_swallow_cancellation():
         )
 
 
-async def test_restart_retains_delivery_attempt_for_one_full_lease(tmp_path):
+@pytest.mark.parametrize(
+    "delivery_state",
+    [DeliveryState.CLAIMED, DeliveryState.AUTHORIZED, DeliveryState.PLAYING],
+)
+async def test_restart_retains_delivery_attempt_for_one_full_lease(
+    tmp_path, delivery_state,
+):
     now = [100.0]
     registry = JobRegistry(
         tmp_path / "jobs.json",
@@ -1161,7 +1167,7 @@ async def test_restart_retains_delivery_attempt_for_one_full_lease(tmp_path):
     await registry.load()
     await registry.create(make_job(
         execution_state=ExecutionState.SUCCEEDED,
-        delivery_state=DeliveryState.CLAIMED,
+        delivery_state=delivery_state,
         terminal_at=80.0,
         result="answer",
         delivery_sequence=1,
@@ -1169,7 +1175,7 @@ async def test_restart_retains_delivery_attempt_for_one_full_lease(tmp_path):
         lease_until=90.0,
     ))
     await registry.recover_after_restart()
-    assert registry.get("job-1").delivery_state is DeliveryState.CLAIMED
+    assert registry.get("job-1").delivery_state is delivery_state
     assert registry.get("job-1").lease_until == 115.0
     now[0] = 116.0
     await registry.expire_leases()

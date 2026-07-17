@@ -117,6 +117,7 @@ class VoiceRouteRegistry:
             and agent_allowed_on("voice", cfg)
             and valid_requested
         ):
+            self._prune_expired_metadata()
             accepted = tuple(
                 capability
                 for capability in _CAPABILITIES
@@ -158,12 +159,21 @@ class VoiceRouteRegistry:
         connected = self._connected.get(route_id)
         if connected is not None:
             return _BACKGROUND_CAPABILITIES <= connected.capabilities
+        self._prune_expired_metadata()
         metadata = self._metadata.get(route_id)
         return bool(
             metadata is not None
             and _BACKGROUND_CAPABILITIES <= metadata.capabilities
             and self._clock() - metadata.last_seen <= self._freshness_s
         )
+
+    def _prune_expired_metadata(self) -> None:
+        now = self._clock()
+        for route_id, metadata in list(self._metadata.items()):
+            if route_id in self._connected:
+                continue
+            if now - metadata.last_seen > self._freshness_s:
+                self._metadata.pop(route_id, None)
 
     def touch(self, connection: VoiceWsConnection) -> None:
         route_id = connection.voice_route_id

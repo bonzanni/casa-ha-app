@@ -70,6 +70,7 @@ from job_registry import (
     ExecutionState,
     JobAuthorizationError,
     JobFailure,
+    JobRouteCapacityError,
     JobTransitionError,
     VoiceJob,
 )
@@ -1193,6 +1194,7 @@ class _PermitHandoff:
 _BACKGROUND_ROUTE_CAPABILITIES = frozenset({
     "background_jobs", "satellite_announce",
 })
+_MAX_ACTIVE_READY_JOBS_PER_ROUTE = 5
 
 
 def background_route_available(origin: dict | None) -> bool:
@@ -2313,14 +2315,31 @@ async def _start_voice_async_job(
     try:
         try:
             if parent_job_id is None:
-                await registry.create(job)
+                await registry.create(
+                    job,
+                    max_active_ready_per_route=(
+                        _MAX_ACTIVE_READY_JOBS_PER_ROUTE
+                    ),
+                )
             else:
                 await registry.create_continuation(
                     parent_job_id,
                     job,
                     actor=actor,
+                    max_active_ready_per_route=(
+                        _MAX_ACTIVE_READY_JOBS_PER_ROUTE
+                    ),
                 )
             created = True
+        except JobRouteCapacityError:
+            return _result({
+                "status": "error",
+                "kind": "route_capacity_reached",
+                "message": (
+                    "This voice route already has five specialist jobs "
+                    "awaiting completion or delivery."
+                ),
+            })
         except BaseException:
             # Atomic persistence can publish and then re-raise cancellation.
             created = registry.get(job_id) is not None
@@ -3018,6 +3037,26 @@ def _continuable_job(job: VoiceJob, *, now: float) -> bool:
     )
 
 
+def _detail_available_job(job: VoiceJob, *, now: float) -> bool:
+    available = (
+        job.execution_state is ExecutionState.SUCCEEDED
+        and job.result is not None
+        and (job.expires_at is None or job.expires_at > now)
+        and job.delivery_state not in {
+            DeliveryState.CANCELLED,
+            DeliveryState.EXPIRED,
+        }
+        and not job.cancel_pending
+    )
+    if not available:
+        return False
+    try:
+        result = parse_voice_job_result(json.loads(job.result))
+    except (json.JSONDecodeError, TypeError, VoiceJobResultError):
+        return False
+    return result.status != "needs_clarification"
+
+
 @tool(
     "voice_job_status",
     "Check specialist job status.",
@@ -3121,11 +3160,53 @@ async def continue_voice_job(args: dict) -> dict:
         registry,
         actor,
         _requested_job_id(args),
-        predicate=lambda job: _continuable_job(job, now=now),
+        predicate=lambda job: (
+            _continuable_job(job, now=now)
+            or _detail_available_job(job, now=now)
+        ),
         explicit_mismatch_kind="job_not_continuable",
     )
     if error is not None:
         return error
+
+    if not parent.awaiting_input:
+        job_id = str(uuid.uuid4())
+        child = _new_voice_job(
+            job_id=job_id,
+            parent_job_id=parent.id,
+            cfg=_agent_role_map.get(parent.specialist_role),
+            specialist_role=parent.specialist_role,
+            origin=origin,
+            task_text=continuation_input,
+            context_text="",
+        )
+        try:
+            prompted = await registry.create_prompted_delivery(
+                parent.id,
+                child,
+                actor=actor,
+                max_active_ready_per_route=_MAX_ACTIVE_READY_JOBS_PER_ROUTE,
+            )
+        except JobRouteCapacityError:
+            return _result({
+                "status": "error",
+                "kind": "route_capacity_reached",
+                "message": (
+                    "This voice route already has five specialist jobs "
+                    "awaiting completion or delivery."
+                ),
+            })
+        except (JobAuthorizationError, JobTransitionError):
+            return _result({
+                "status": "error",
+                "kind": "job_not_continuable",
+                "message": "That specialist job cannot be continued.",
+            })
+        return _result({
+            "status": "pending",
+            "job_id": prompted.id,
+            "specialist_display_name": prompted.specialist_display_name,
+        })
 
     # The complete prior case/result travels backend-to-specialist only. The
     # tool result below contains opaque metadata, never this private envelope.
