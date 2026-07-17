@@ -903,6 +903,23 @@ class ClaudeCodeDriver(DriverProtocol):
         # settlement) or a boundary consumer beats it. Double-arm is a no-op;
         # CancelledError terminates WITHOUT rescheduling; cancelled at teardown.
         self._reanchor_retry_tasks: dict[str, asyncio.Task] = {}
+        # v0.84.0 (round-4 §D6, Sol r18-2/r19-3/r28-2): the process-lifetime
+        # per-engagement CONFIRMED-PAIR record ``{engagement_id: {q -> new_mid}}``.
+        # Each entry owns a re-anchor copy that IS on the wire (mid confirmed) but
+        # whose LOCAL persist never committed. Retained by the DRIVER, independent
+        # of any retry task (a task-local pairing would drop on owner retirement,
+        # re-opening the wire-bearing pass — Sol r19-3). A record exists ONLY while
+        # unpersisted (Sol r28-2): it retires the moment its transaction commits
+        # (the durable ``reanchored`` stale entry the commit created owns the rest)
+        # OR on a confirmed settlement marker-edit of the orphan. Memory-only — a
+        # crash drops the whole map (the accepted at-least-once crash residual, one
+        # orphan per retained pair). While a pair is unpersisted NO new send is
+        # permitted for that question (the boundary consults this FIRST).
+        self._confirmed_pairs: dict[str, dict[int, int]] = {}
+        # The UNIFIED HISTORICAL SCHEDULER rotation cursor per engagement (Sol
+        # r24-2): advanced after EVERY step, success or failure — oldest-first
+        # would let a permanently-failing pair starve every younger pair's cleanup.
+        self._historical_cursor: dict[str, int] = {}
         # §A3(b) boot reconciliation owner (Sol r6-3): readiness-gated reconcile
         # tasks for refused/terminal-with-questions records (attached records
         # retain theirs in ``self._tasks``). Retained here so they are not GC'd
@@ -1159,6 +1176,23 @@ class ClaudeCodeDriver(DriverProtocol):
         retry_task = self._reanchor_retry_tasks.pop(engagement.id, None)
         if retry_task is not None and not retry_task.done():
             retry_task.cancel()
+        # v0.84.0 (round-4 §D6, Sol r20-1/r21-1/r22-1): drop the confirmed-pair
+        # map on teardown and LOG one residual PER remaining PAIR. A pair still
+        # present at TERMINAL teardown is a double failure (registry outage AND
+        # repeated settlement-edit failures); the accepted floor is one inert,
+        # obviously-stale duplicate PER QUESTION in an already-answered/terminal
+        # topic — logged, never resurrected (a teardown-surviving owner would
+        # rebuild exactly the machinery r17 deleted). A crash drops the map the
+        # same way (at most one orphan per retained pair, potentially several).
+        pairs = self._confirmed_pairs.pop(engagement.id, None)
+        if pairs:
+            for q_n, orphan_mid in pairs.items():
+                logger.info(
+                    "engagement %s: terminal teardown drops unconfirmed "
+                    "re-anchor pair (q=%s orphan_mid=%s) — accepted stale "
+                    "duplicate residual (topic is answered/terminal)",
+                    engagement.id[:8], q_n, orphan_mid)
+        self._historical_cursor.pop(engagement.id, None)
         # F-EXPIRE: drop the operator-away suspend state on teardown.
         self._operator_away.pop(engagement.id, None)
         self._away_refusals.pop(engagement.id, None)
@@ -2207,6 +2241,16 @@ class ClaudeCodeDriver(DriverProtocol):
                     logger.warning(
                         "engagement %s: close_open_question failed (n=%s)",
                         rec.id[:8], n, exc_info=True)
+        # v0.84.0 (§D6 r20-1): answer/terminal SETTLEMENT also consults the
+        # confirmed-pair record — an UNPERSISTED orphan copy (nothing durable
+        # tracks it) is marker-edited to the terminal form here, retiring the
+        # record ONLY on a CONFIRMED edit (an unconfirmed edit KEEPS the record so
+        # the unified historical scheduler re-attempts while the engagement lives;
+        # at terminal teardown an unconfirmed record becomes the logged residual).
+        orphan_mid = self._confirmed_pair_mid(rec.id, n)
+        if orphan_mid is not None and n is not None:
+            if await self._orphan_marker_edit(rec, orphan_mid, n):
+                self._retire_confirmed_pair(rec.id, n)
         return cur_mid
 
     async def _confirm_settle_mid(
@@ -2933,7 +2977,13 @@ class ClaudeCodeDriver(DriverProtocol):
         ok = await self._reanchor_pass(engagement)
         if ok:
             self._reanchor_due.discard(eng_id)
-            self._retire_reanchor_retry(eng_id)
+            # §D6 r29-2 PUMP: retire the owner ONLY when NO historical items
+            # remain. A memory commit at the LAST natural boundary leaves a
+            # durable ``reanchored`` entry the sweep must still marker-clean with
+            # no further output — keep the (already-armed) owner running so it
+            # re-runs one item per pass with backoff.
+            if not self._historical_items(eng_id):
+                self._retire_reanchor_retry(eng_id)
 
     async def _reanchor_pass(self, engagement: EngagementRecord) -> bool:
         """§A3(b) staged turn-end re-anchor — ANCHORS ONLY. Keep the oldest
@@ -2947,13 +2997,59 @@ class ClaudeCodeDriver(DriverProtocol):
             return await self._reanchor_pass_locked(engagement)
 
     async def _reanchor_pass_locked(self, engagement: EngagementRecord) -> bool:
+        # v0.84.0 (§D6 r17-1/r27-1): the UNIFIED HISTORICAL SCHEDULER's one
+        # selected step AND the current-question stage+post+persist+marker-edit
+        # unit run inside ONE strongly-retained, repeatedly drained CHILD TASK
+        # created here under the ask-maintenance lock (held by our caller
+        # ``_reanchor_pass`` for the child's whole lifetime). Both call the strict
+        # registry helpers whose shielded write survives only ONE cancellation
+        # (``engagement_registry``); run naked under the lock a second cancellation
+        # could escape with the lock released while persistence continues. So on
+        # our own ``CancelledError`` we DRAIN the child to completion FIRST (a
+        # re-await loop that absorbs REPEATED cancellation via ``shield`` — the
+        # same task-ownership shape as ``engagement_registry`` transactions, but
+        # ``shield`` not ``gather`` because our child is a live coroutine a
+        # gather-cancel WOULD cancel), releasing the lock only after, then
+        # re-raise. The drain is safe because the body is FINITE (one historical
+        # step, then a unit whose every wire op is ``wait_for``-bounded and whose
+        # persist is N local attempts). "No extra tasks" (Sol r27-1) means no
+        # SEPARATE detached cleanup owner — the historical step is NOT one.
+        child = asyncio.ensure_future(self._reanchor_pass_body(engagement))
+        try:
+            return await asyncio.shield(child)
+        except asyncio.CancelledError:
+            while not child.done():
+                try:
+                    await asyncio.shield(child)
+                except asyncio.CancelledError:
+                    continue
+            raise
+
+    async def _reanchor_pass_body(self, engagement: EngagementRecord) -> bool:
+        """The drained pass BODY (§D6): first the UNIFIED HISTORICAL SCHEDULER's
+        ONE rotation-selected step (the stale sweep, BEFORE the current-question
+        work and before the already-last/nothing-owed exits), then the current
+        question's re-anchor unit. Returns the latch bool of the current-question
+        work — ``True`` when the obligation is met/consumed, ``False`` ONLY on a
+        current-unit STAGE failure (nothing on the wire)."""
         eng_id = engagement.id
+        # AT MOST ONE historical step per pass, on the one rotation-selected item,
+        # BEFORE current-question work — the selected item is thereby excluded
+        # from any other same-pass action (Sol r28-1).
+        await self._run_historical_step(engagement)
+
         # Select the oldest UNANSWERED, unreserved anchor (effective view: not
         # answered ∪ overlay, not reserved). No such anchor ⇒ nothing owed.
         anchor = self._oldest_unanswered_anchor(eng_id, exclude_reserved=True)
         if anchor is None:
             return True
         n = anchor.get("n")
+        # §D6 r18-2: while a CONFIRMED pair is unpersisted for this question, NO
+        # new send is permitted — the memory-pair scheduler step (above) owns
+        # re-driving its LOCAL transaction. Consult the record FIRST, before any
+        # send path; the obligation for this question is met by the scheduler.
+        if n is not None and self._confirmed_pair_mid(eng_id, n) is not None:
+            return True
         old_mid = anchor.get("tg_message_id")
         seq = self._sequencers.get(eng_id)
         if seq is None:
@@ -2969,31 +3065,7 @@ class ClaudeCodeDriver(DriverProtocol):
             return True
 
         body = anchor.get("text") or (f"Q{n}:" if n is not None else "")
-
-        # v0.84.0 (§D6 r17-1): the stage+post+persist+marker-edit unit runs as a
-        # STRONGLY-RETAINED CHILD TASK created here under the ask-maintenance lock
-        # (held by our caller ``_reanchor_pass`` for the child's whole lifetime).
-        # ``stage_stale_mid`` is INSIDE the child (the pass's first awaited op),
-        # so bare ``asyncio.shield`` is not enough — a cancelled caller would
-        # exit the lock context while the child kept writing unlocked. Instead:
-        # on our own ``CancelledError`` we DRAIN the child to completion FIRST (a
-        # re-await loop that absorbs REPEATED cancellation via ``shield`` — the
-        # same task-ownership shape as ``engagement_registry`` transactions, but
-        # ``shield`` not ``gather`` because our child is a live coroutine a
-        # gather-cancel WOULD cancel), releasing the lock only after, then
-        # re-raise. The drain is safe because the unit is FINITE (every wire op
-        # is ``wait_for``-bounded; persist is N local attempts).
-        child = asyncio.ensure_future(
-            self._reanchor_unit(engagement, n, old_mid, body, seq))
-        try:
-            return await asyncio.shield(child)
-        except asyncio.CancelledError:
-            while not child.done():
-                try:
-                    await asyncio.shield(child)
-                except asyncio.CancelledError:
-                    continue
-            raise
+        return await self._reanchor_unit(engagement, n, old_mid, body, seq)
 
     async def _reanchor_unit(
         self, engagement: EngagementRecord, n: int | None,
@@ -3075,6 +3147,14 @@ class ClaudeCodeDriver(DriverProtocol):
             # re-anchor obligation arises naturally from the next output event
             # (round-3 semantics). Residual: at most ONE potential untracked copy
             # per ambiguous send, logged.
+            #
+            # D4 review (Minor): NO confirmed-pair record is created here — a
+            # confirmed pair requires a KNOWN mid, which an ambiguous send never
+            # yields (Sol r18-2). So nothing blocks a later boundary from doing a
+            # SECOND send for this question; that cross-pass second send is WITHIN
+            # the accepted at-least-once floor (each ambiguous send risks at most
+            # one untracked copy — the same direction D5 pinned for buffered
+            # prose), NOT a regression the confirmed-pair machinery must prevent.
             logger.warning(
                 "engagement %s: re-anchor send ambiguous (n=%s) — exactly ONE "
                 "attempt, no wire retry, obligation consumed for this pass",
@@ -3086,18 +3166,20 @@ class ClaudeCodeDriver(DriverProtocol):
         # This same transaction atomically flips the staged stale entry
         # "plain" → "reanchored" (D2, inside ``update_question_mid``).
         if not await self._reanchor_persist_in_unit(engagement, n, new_mid):
-            # D4: persist exhaustion. The confirmed-pair record (Task D4) will
-            # own the unpersisted ``new_mid`` and re-drive the local transaction
-            # under the unified historical scheduler. Until D4 lands, the STOPGAP
-            # is: NO body edit (the '↪ see above' hack is DELETED, r11-1), log,
-            # and CONSUME the obligation for this pass. The old copy stays durably
-            # current + tracked (persist never committed, so tg_message_id and
-            # the "plain" stale entry are unchanged); ``new_mid`` is an accepted
-            # untracked orphan — the same at-least-once floor as the crash
-            # residual, and mid-agnostic routing means answering it still works.
+            # v0.84.0 (§D6 r18-2/r28-2): persist exhaustion after a CONFIRMED send
+            # (``new_mid`` is known). RECORD the confirmed pair so the UNIFIED
+            # HISTORICAL SCHEDULER owns re-driving the LOCAL transaction (never a
+            # new send — rule (b)) across later boundaries, and answer/terminal
+            # settlement can marker-edit the orphan. NO body edit (the '↪ see
+            # above' hack is DELETED, r11-1); the obligation is CONSUMED for this
+            # pass. The old copy stays durably current + tracked (persist never
+            # committed, so tg_message_id and the "plain" stale entry are
+            # unchanged); ``new_mid`` is an unpersisted orphan the record now owns
+            # (mid-agnostic routing means answering it still works meanwhile).
+            self._record_confirmed_pair(eng_id, n, new_mid)
             logger.warning(
                 "engagement %s: re-anchor persist exhausted after %d attempts "
-                "(n=%s new_mid=%s) — D4 stopgap: no body edit, orphan accepted",
+                "(n=%s new_mid=%s) — confirmed-pair recorded, scheduler owns it",
                 eng_id[:8], _REANCHOR_PERSIST_ATTEMPTS, n, new_mid)
             return True
 
@@ -3179,6 +3261,182 @@ class ClaudeCodeDriver(DriverProtocol):
                 "engagement %s: re-anchor un-stage failed (n=%s mid=%s)",
                 engagement_id[:8], n, mid, exc_info=True)
 
+    # -- v0.84.0 (round-4 §D6) confirmed-pair record + unified historical --------
+    #    scheduler (Sol r18-2/r19-3/r23-1/r24-2/r27-x/r28-x/r29-x) --------------
+    def _record_confirmed_pair(
+        self, engagement_id: str, n: int | None, new_mid: int,
+    ) -> None:
+        """Record a CONFIRMED but UNPERSISTED re-anchor pair (§D6 r18-2): a copy
+        on the wire at ``new_mid`` whose LOCAL persist never committed. Owned by
+        the driver, retained INDEPENDENTLY of any retry task."""
+        if n is None:
+            return
+        self._confirmed_pairs.setdefault(engagement_id, {})[n] = new_mid
+
+    def _confirmed_pair_mid(self, engagement_id: str, n: int | None) -> int | None:
+        """The unpersisted orphan mid recorded for question ``n``, or ``None``."""
+        if n is None:
+            return None
+        return (self._confirmed_pairs.get(engagement_id) or {}).get(n)
+
+    def _retire_confirmed_pair(self, engagement_id: str, n: int | None) -> None:
+        """Retire a confirmed pair (§D6 r28-2): on the transaction COMMIT (the
+        durable ``reanchored`` entry the commit created owns the rest) or on a
+        confirmed orphan settlement edit."""
+        pairs = self._confirmed_pairs.get(engagement_id)
+        if pairs is None:
+            return
+        pairs.pop(n, None)
+        if not pairs:
+            self._confirmed_pairs.pop(engagement_id, None)
+
+    def _settlement_begun(self, engagement_id: str, n: int | None) -> bool:
+        """§D6 r29-1: ``True`` once answer/terminal SETTLEMENT has begun for
+        question ``n`` — its ledger entry is ABSENT (closed) OR effectively
+        ANSWERED (persisted flag ∪ overlay ∪ reservation). A memory pair whose
+        question has begun settling must NEVER run a late ``update_question_mid``
+        (a closed ledger returns ``False`` and strands the orphan un-edited; a
+        current mid installed AFTER the sole settlement pass is left unowned) —
+        the memory step marker-edits the orphan instead."""
+        if n is None:
+            return True
+        entry = self._reread_open_question(engagement_id, n)
+        if entry is None:
+            return True
+        if entry.get("answered", False) or self._overlay_answered(engagement_id, n):
+            return True
+        return self._reserved_question_number(engagement_id) == n
+
+    def _historical_items(
+        self, engagement_id: str,
+    ) -> list[tuple[str, int, int]]:
+        """The UNIFIED HISTORICAL SCHEDULER's item set (§D6): unpersisted memory
+        pairs ∪ open durable ``reanchored`` stale entries, as deterministically
+        ordered ``(kind, n, mid)`` tuples (memory items carry ``mid == -1``).
+        Answered/closed questions' ``reanchored`` entries are EXCLUDED — their
+        terminal-form settle is owned by ``_settle_ledger_entry``, not the
+        open-form sweep. Deterministic order keeps the rotation cursor fair."""
+        items: list[tuple[str, int, int]] = []
+        for n in (self._confirmed_pairs.get(engagement_id) or {}):
+            items.append(("memory", n, -1))
+        reg = self._registry
+        entries_getter = (getattr(reg, "open_question_entries", None)
+                          if reg is not None else None)
+        if entries_getter is not None:
+            for q in entries_getter(engagement_id):
+                n = q.get("n")
+                if n is None:
+                    continue
+                if q.get("answered", False) or self._overlay_answered(
+                        engagement_id, n):
+                    continue
+                for raw in (q.get("stale_mids") or []):
+                    s = normalize_stale_mid_entry(raw)
+                    if s["kind"] == "reanchored":
+                        items.append(("durable", n, s["mid"]))
+        # (n, kind, mid): "durable" sorts before "memory" for the same question.
+        items.sort(key=lambda it: (it[1], it[0], it[2]))
+        return items
+
+    def _reanchor_work_pending(self, engagement_id: str) -> bool:
+        """§D6 r29-2 PUMP predicate: the re-anchor retry owner stays armed while
+        the latch is set OR the scheduler's item set is non-empty (so a durable
+        cleanup lands even when the committing boundary was the last natural one
+        — no second owner mechanism)."""
+        return (engagement_id in self._reanchor_due
+                or bool(self._historical_items(engagement_id)))
+
+    async def _run_historical_step(
+        self, engagement: EngagementRecord,
+    ) -> tuple[str, int, int] | None:
+        """Perform AT MOST ONE rotation-selected historical step (§D6 Sol
+        r23-1/r24-2/r28-1). Runs under the caller's held maintenance lock, INSIDE
+        the drained pass body (its strict registry helpers survive only ONE
+        cancellation). The cursor advances after EVERY step, success or failure —
+        never K sequential steps for K items (the current question stays
+        unblockable by historical cosmetic failures). Returns the selected item
+        or ``None`` when the set is empty."""
+        eng_id = engagement.id
+        items = self._historical_items(eng_id)
+        if not items:
+            return None
+        cursor = self._historical_cursor.get(eng_id, 0)
+        sel = items[cursor % len(items)]
+        self._historical_cursor[eng_id] = cursor + 1  # advance after EVERY step
+        kind, n, mid = sel
+        if kind == "memory":
+            await self._historical_memory_step(engagement, n)
+        else:
+            await self._historical_durable_step(engagement, n, mid)
+        return sel
+
+    async def _historical_memory_step(
+        self, engagement: EngagementRecord, n: int,
+    ) -> None:
+        """LIFECYCLE-AWARE memory-pair step (§D6 r29-1). While the question is
+        LIVE and UNANSWERED: exactly ONE strict ``update_question_mid`` attempt
+        (no in-pass retry loop — the cross-pass rotation spreads retries); on
+        commit the record RETIRES and the durable ``reanchored`` entry (created by
+        the atomic flip) enters the item set. Once settlement HAS BEGUN: switch
+        PERMANENTLY to a bounded terminal marker-edit of the orphan, retiring ONLY
+        on a confirmed edit (nothing durable can rediscover this mid)."""
+        eng_id = engagement.id
+        new_mid = self._confirmed_pair_mid(eng_id, n)
+        if new_mid is None:
+            return
+        if self._settlement_begun(eng_id, n):
+            if await self._orphan_marker_edit(engagement, new_mid, n):
+                self._retire_confirmed_pair(eng_id, n)
+            return
+        reg = self._registry
+        update = (getattr(reg, "update_question_mid", None)
+                  if reg is not None else None)
+        if update is None:
+            return
+        try:
+            await update(eng_id, n, new_mid)
+        except Exception:  # noqa: BLE001 — one attempt, pair retained for rotation
+            logger.warning(
+                "engagement %s: historical memory-pair persist attempt failed "
+                "(n=%s new_mid=%s) — pair retained", eng_id[:8], n, new_mid,
+                exc_info=True)
+            return
+        # Committed: the durable ``reanchored`` entry now owns the marker-edit +
+        # unstage cleanup — retire the memory record (Sol r28-2).
+        self._retire_confirmed_pair(eng_id, n)
+
+    async def _historical_durable_step(
+        self, engagement: EngagementRecord, n: int, mid: int,
+    ) -> None:
+        """COMPOUND durable-entry step (§D6): one ``wait_for``-bounded OLD-copy
+        marker edit, and on edit success the one ``unstage_stale_mid`` write.
+        Retire on unstage success; a failed unstage leaves the durable entry
+        present, so the next selection re-runs the compound step — the repeated
+        identical edit no-ops via the F1 edit cache (idempotent, no new durable
+        'edited' flag needed)."""
+        if await self._reanchor_marker_edit(engagement, mid, n):
+            await self._best_effort_unstage(engagement.id, n, mid)
+
+    async def _orphan_marker_edit(
+        self, engagement: EngagementRecord, orphan_mid: int, n: int | None,
+    ) -> bool:
+        """§D6 r20-1: bounded, finite-attempt TERMINAL marker-edit of a confirmed
+        pair's orphan mid (the settlement form — the question is by now
+        answered/terminal), routed through the sequencer's ``edit_discrete`` (F1
+        no-op idempotent, so the scheduler and settlement path can each re-run the
+        identical edit). Returns ``True`` on a confirmed edit."""
+        seq = self._sequencers.get(engagement.id)
+        if seq is None:
+            return False
+        from channels.output_sequencer import MARKUP_EMPTY
+        marker = _reanchor_moved_terminal(n)
+        return await confirmed_settle_edit(
+            lambda: seq.edit_discrete(
+                orphan_mid, text=marker, markup=MARKUP_EMPTY,
+                wire_timeout=_REANCHOR_EDIT_TIMEOUT),
+            sleep=self._sleep,
+        )
+
     def _arm_reanchor_retry(self, engagement: EngagementRecord) -> None:
         """Arm the ONE retry-owner task for this engagement (§A3(b), Sol r13-1).
         A double-arm while a task already runs is a NO-OP. The task self-retires
@@ -3219,16 +3477,23 @@ class ClaudeCodeDriver(DriverProtocol):
         eng_id = engagement.id
         idx = 0
         try:
-            while eng_id in self._reanchor_due:
+            # §D6 r29-2 PUMP: loop while the latch is set OR the scheduler's item
+            # set is non-empty — one item per pass with backoff — so a durable
+            # cleanup lands even after the committing boundary was the last one.
+            while self._reanchor_work_pending(eng_id):
                 delay = _REANCHOR_BACKOFF[min(idx, len(_REANCHOR_BACKOFF) - 1)]
                 idx += 1
                 await self._reanchor_retry_sleep(delay)
-                if eng_id not in self._reanchor_due:
+                if not self._reanchor_work_pending(eng_id):
                     break
                 ok = await self._reanchor_pass(engagement)
                 if ok:
                     self._reanchor_due.discard(eng_id)
-                    break
+                    # Break ONLY when no historical items remain; otherwise keep
+                    # pumping the sweep (a True pass with a durable entry still
+                    # present must not retire the owner).
+                    if not self._historical_items(eng_id):
+                        break
         except asyncio.CancelledError:
             raise
 

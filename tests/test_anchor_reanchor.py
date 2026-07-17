@@ -146,6 +146,11 @@ def _entry(reg, rec, n):
     return None
 
 
+def _norm(entry):
+    from engagement_registry import normalize_stale_mid_entry
+    return normalize_stale_mid_entry(entry)
+
+
 # ===========================================================================
 # 1. the staged 4-step re-anchor happy path
 # ===========================================================================
@@ -750,6 +755,293 @@ class TestDrainedReanchorUnit:
         e = _entry(reg, rec, n)
         assert e["tg_message_id"] == 500       # old copy stays current
         assert e["stale_mids"] == []           # staged mid un-staged
+
+
+# ===========================================================================
+# 5d. D4 — confirmed-pair record + UNIFIED HISTORICAL SCHEDULER (spec §D6
+# r18-2→r29-2). A confirmed-but-unpersisted re-anchor copy is owned by a
+# process-lifetime per-engagement record; ONE rotation-selected historical step
+# per pass (memory pair OR open durable reanchored entry) runs BEFORE the
+# current-question work; the memory step is lifecycle-aware (one strict persist
+# while live, permanent orphan marker-edit once settlement began); the retry
+# owner pumps while items remain; answer/terminal settlement consults the
+# record; terminal teardown drops + logs one residual per pair. REAL registry +
+# REAL sequencer (fake wire) + injected clocks; the retry owner is parked so
+# every pass is driven directly. NEVER patches <module>.asyncio.sleep.
+# ===========================================================================
+
+_MOVED_OPEN = "⤵ MOVED Q{n} — answer the current copy below"
+_MOVED_TERMINAL = "⤵ MOVED Q{n} — resolved below"
+
+
+class TestConfirmedPairScheduler:
+    async def _setup(self, tmp_path, **wire_kw):
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire(**wire_kw)
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        seq = drv._ensure_sequencer(rec)
+        seq._high_water = 600
+        return reg, rec, n, wire, drv, seq
+
+    @staticmethod
+    def _fail_persist(reg):
+        """Make ``update_question_mid`` always raise; return (orig, calls)."""
+        orig = reg.update_question_mid
+        calls: list = []
+
+        async def _fail(*a, **k):
+            calls.append(a)
+            raise RuntimeError("registry disk down")
+
+        reg.update_question_mid = _fail
+        return orig, calls
+
+    # -- (a) permanent persist failure → ONE send across boundaries + answer ---
+
+    async def test_a_permanent_failure_one_send_then_orphan_markered(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        _orig, calls = self._fail_persist(reg)
+
+        # Boundary 1: send #1, persist exhausts → confirmed pair recorded.
+        assert await drv._reanchor_pass(rec) is True
+        assert wire.send_markup_calls == 1
+        new_mid = wire.posts[0][1]
+        assert drv._confirmed_pair_mid(rec.id, n) == new_mid
+        assert _entry(reg, rec, n)["tg_message_id"] == 500   # never committed
+
+        # Further boundaries: NO new send (rule b); scheduler re-tries the local
+        # transaction only (still failing) — the pair stays owned.
+        seq._high_water = new_mid + 50
+        for _ in range(3):
+            await drv._reanchor_pass(rec)
+        assert wire.send_markup_calls == 1                   # exactly ONE send
+        assert drv._confirmed_pair_mid(rec.id, n) == new_mid
+        assert len(calls) >= 4                               # one attempt per pass
+
+        # The operator answers → settlement begins → the orphan is marker-edited
+        # (terminal form) and the record retires; still never re-sent.
+        await drv._promote_answer_on_enqueue(rec)
+        assert drv._confirmed_pair_mid(rec.id, n) is None
+        orphan_edits = [t for _, mid, t in wire.edits if mid == new_mid]
+        assert orphan_edits[-1] == _MOVED_TERMINAL.format(n=n)
+        assert wire.send_markup_calls == 1
+
+    # -- (b) commit on the last natural boundary → durable cleanup via pump ----
+
+    async def test_b_commit_last_boundary_pump_cleans_durable(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        orig, _calls = self._fail_persist(reg)
+        await drv._reanchor_pass(rec)                        # → confirmed pair
+        new_mid = wire.posts[0][1]
+        assert drv._confirmed_pair_mid(rec.id, n) == new_mid
+
+        reg.update_question_mid = orig                       # registry heals
+        # A boundary consumer: the scheduler commits the pair (its confirmed mid
+        # IS high-water, so current-question work takes the already-last exit).
+        await drv._consume_reanchor(rec)
+        assert drv._confirmed_pair_mid(rec.id, n) is None    # retired on commit
+        e = _entry(reg, rec, n)
+        assert e["tg_message_id"] == new_mid
+        assert e["stale_mids"] == [{"mid": 500, "kind": "reanchored"}]  # durable
+        # PUMP: a durable item remains → the retry owner stays armed.
+        assert rec.id in drv._reanchor_retry_tasks
+        assert drv._historical_items(rec.id) == [("durable", n, 500)]
+
+        posts_before = len(wire.posts)
+        await drv._reanchor_pass(rec)                        # durable step runs
+        assert len(wire.posts) == posts_before               # NO external output
+        assert _entry(reg, rec, n)["stale_mids"] == []       # marker-edit+unstage
+        marker = [t for _, mid, t in wire.edits if mid == 500]
+        assert marker[-1] == _MOVED_OPEN.format(n=n)
+        drv._retire_reanchor_retry(rec.id)                   # cleanup parked owner
+
+    # -- (c) same-question A/B: A durable + B memory, both owned, no extra send -
+
+    async def test_c_same_question_A_durable_B_memory_both_owned(self, tmp_path):
+        # A commits but its marker edit fails (edit_ok=False) → durable entry for
+        # old_mid 500; high-water advances; B posts, B's persist exhausts.
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path, edit_ok=False)
+        await drv._reanchor_pass(rec)                        # re-anchor #1 (A)
+        mid_A = wire.posts[0][1]
+        assert _entry(reg, rec, n)["tg_message_id"] == mid_A
+        assert _entry(reg, rec, n)["stale_mids"] == [{"mid": 500, "kind": "reanchored"}]
+
+        seq._high_water = mid_A + 50
+        self._fail_persist(reg)
+        await drv._reanchor_pass(rec)                        # re-anchor #2 (B)
+        mid_B = wire.posts[-1][1]
+        assert mid_B != mid_A
+        assert wire.send_markup_calls == 2                   # NO extra (3rd) send
+        # A owned as a durable reanchored entry, B owned as a memory record.
+        assert drv._confirmed_pair_mid(rec.id, n) == mid_B
+        reanchored = {
+            _norm(m)["mid"] for m in _entry(reg, rec, n)["stale_mids"]
+            if _norm(m)["kind"] == "reanchored"
+        }
+        assert reanchored == {500}
+
+    # -- (d) fair rotation: Q1 permanently failing, Q2 cleaned on a later pass -
+
+    async def test_d_rotation_selects_q2_when_q1_permanently_fails(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_anchor(reg, rec, mid=500, text="Q1")
+        n2 = await _add_anchor(reg, rec, mid=510, text="Q2")
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        drv._ensure_sequencer(rec)
+        drv._record_confirmed_pair(rec.id, n1, 900)
+        drv._record_confirmed_pair(rec.id, n2, 910)
+        orig = reg.update_question_mid
+
+        async def _update(eid, num, mid):
+            if num == n1:
+                raise RuntimeError("q1 disk down")
+            return await orig(eid, num, mid)
+
+        reg.update_question_mid = _update
+
+        await drv._reanchor_pass(rec)                        # cursor 0 → Q1 (fail)
+        assert drv._confirmed_pair_mid(rec.id, n1) == 900
+        assert drv._confirmed_pair_mid(rec.id, n2) == 910
+        await drv._reanchor_pass(rec)                        # cursor 1 → Q2 (ok)
+        assert drv._confirmed_pair_mid(rec.id, n2) is None   # Q2 cleaned
+        assert drv._confirmed_pair_mid(rec.id, n1) == 900    # Q1 still owned
+        assert wire.send_markup_calls == 0                   # no send either pass
+
+    # -- (e) at most ONE historical step per pass across all mechanisms --------
+
+    async def test_e_one_historical_step_per_pass(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_anchor(reg, rec, mid=500, text="Q1")
+        n2 = await _add_anchor(reg, rec, mid=510, text="Q2")
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        seq = drv._ensure_sequencer(rec)
+        # Q1: a durable reanchored stale entry (stage plain then flip on commit).
+        await reg.stage_stale_mid(rec.id, n1, 500, kind="plain")
+        await reg.update_question_mid(rec.id, n1, 505)
+        assert _norm(_entry(reg, rec, n1)["stale_mids"][0])["kind"] == "reanchored"
+        # Q2: a memory pair.
+        drv._record_confirmed_pair(rec.id, n2, 910)
+
+        update_calls: list = []
+        orig = reg.update_question_mid
+
+        async def _cnt(eid, num, mid):
+            update_calls.append(num)
+            return await orig(eid, num, mid)
+
+        reg.update_question_mid = _cnt
+
+        # Pass 1: items [(durable,n1,500),(memory,n2,-1)] → cursor 0 = durable.
+        edits0 = wire.edit_markup_calls
+        await drv._reanchor_pass(rec)
+        did_durable = wire.edit_markup_calls > edits0
+        did_memory = n2 in update_calls
+        assert did_durable is True and did_memory is False   # exactly ONE
+        # Pass 2: durable done → only the memory pair remains → the OTHER mechanism.
+        await drv._reanchor_pass(rec)
+        assert n2 in update_calls
+        assert drv._confirmed_pair_mid(rec.id, n2) is None
+
+    # -- (f) settlement-begun memory record → NO late transaction, marker-edit --
+
+    async def test_f1_answered_retained_marker_edits_orphan_no_update(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        drv._record_confirmed_pair(rec.id, n, 900)
+        await reg.mark_question_answered(rec.id, n)          # answered, retained
+        _orig, calls = self._fail_persist(reg)               # would raise if called
+
+        await drv._reanchor_pass(rec)
+        assert calls == []                                   # NO late transaction
+        assert drv._confirmed_pair_mid(rec.id, n) is None    # retired on edit
+        orphan = [t for _, mid, t in wire.edits if mid == 900]
+        assert orphan[-1] == _MOVED_TERMINAL.format(n=n)
+
+    async def test_f2_absent_ledger_marker_edits_orphan_no_update(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        drv._record_confirmed_pair(rec.id, n, 900)
+        await reg.close_open_question(rec.id, n)             # entry gone (closed)
+        _orig, calls = self._fail_persist(reg)
+
+        await drv._reanchor_pass(rec)
+        assert calls == []
+        assert drv._confirmed_pair_mid(rec.id, n) is None
+        orphan = [t for _, mid, t in wire.edits if mid == 900]
+        assert orphan[-1] == _MOVED_TERMINAL.format(n=n)
+
+    async def test_f_unconfirmed_settlement_edit_keeps_record(self, tmp_path):
+        # A still-live engagement: the orphan edit fails → the record is KEPT for
+        # the scheduler to re-attempt (retirement is CONDITIONAL on a confirmed
+        # edit, since nothing durable can rediscover this mid — Sol r20-1).
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path, edit_ok=False)
+        drv._record_confirmed_pair(rec.id, n, 900)
+        await reg.mark_question_answered(rec.id, n)
+        await drv._reanchor_pass(rec)
+        assert drv._confirmed_pair_mid(rec.id, n) == 900     # KEPT (edit failed)
+
+    # -- (g) terminal teardown with an unconfirmed pair → logged residual ------
+
+    async def test_g_terminal_teardown_logs_residual_no_crash(self, tmp_path, caplog):
+        import logging
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        drv._record_confirmed_pair(rec.id, n, 900)
+        with caplog.at_level(logging.INFO):
+            await drv.cancel(rec)                            # never raises
+        assert drv._confirmed_pairs.get(rec.id) is None      # map dropped
+        assert any(
+            "terminal teardown drops unconfirmed re-anchor pair" in r.getMessage()
+            for r in caplog.records)
+
+    # -- (h) sequential Q1/Q2 sustained failure THEN crash → per-pair bound -----
+
+    async def test_h_sequential_failure_then_crash_per_pair_bound(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n1 = await _add_anchor(reg, rec, mid=500, text="Q1")
+        n2 = await _add_anchor(reg, rec, mid=510, text="Q2")
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        drv._ensure_sequencer(rec)
+        drv._record_confirmed_pair(rec.id, n1, 900)
+        drv._record_confirmed_pair(rec.id, n2, 910)
+        self._fail_persist(reg)
+
+        await drv._reanchor_pass(rec)
+        await drv._reanchor_pass(rec)
+        # Per-pair bound: BOTH pairs coexist owned (Sol r22-1).
+        assert set(drv._confirmed_pairs[rec.id]) == {n1, n2}
+
+        # CRASH = the driver instance is dropped; the map is memory-only, so a
+        # fresh instance holds NO pairs. The durable ledger stays consistent —
+        # both entries still point at their ORIGINAL mids (persist never committed).
+        drv2 = _make_driver(tmp_path, reg, wire)
+        assert drv2._confirmed_pairs == {}
+        assert _entry(reg, rec, n1)["tg_message_id"] == 500
+        assert _entry(reg, rec, n2)["tg_message_id"] == 510
+
+    # -- (i) hung historical write matches the pre-existing registry floor -----
+
+    async def test_i_hung_historical_write_no_new_deadline(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        drv._record_confirmed_pair(rec.id, n, 900)
+        gate = asyncio.Event()
+        orig = reg.update_question_mid
+
+        async def _hung(eid, num, mid):
+            await gate.wait()
+            return await orig(eid, num, mid)
+
+        reg.update_question_mid = _hung
+
+        task = asyncio.ensure_future(drv._reanchor_pass(rec))
+        await asyncio.sleep(0.02)
+        # No new deadline machinery: the historical registry await is awaited
+        # exactly like any registry caller's — the pass does NOT return early.
+        assert not task.done()
+        gate.set()
+        await task
+        assert drv._confirmed_pair_mid(rec.id, n) is None    # committed once freed
 
 
 # ===========================================================================
