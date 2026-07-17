@@ -72,6 +72,16 @@ _ZERO_SEG = (0, 0)
 # absent from disk (retention gap) — the relay logs a WARNING and resumes.
 SEGMENT_GAP = "__gap__"
 
+
+class _FlushDeferred(Exception):
+    """wb6-1 internal signal: a held-prose FLUSH failed (drop mode — every send
+    hit the Telegram wire failure floor). The caller left the ``hold_pending``
+    marker set, the buffer retained, and the replay boundary UNADVANCED (behind
+    the held frames); raising this ABANDONS the current run WITHOUT latching warm
+    so the next driver poll cold-recovers and resurfaces the held prose as
+    ordinary (disarmed) narration — §D5 resurface-never-lose. Never escapes the
+    relay: caught in ``_run_cold`` / ``_run_warm``."""
+
 # Explicit non-mutating allowlist (Sol r3-B4). Everything else — including an
 # unknown ``mcp__*`` tool — is treated as mutating. The engagement CONTROL
 # tools are how the agent interacts while awaiting_operator, so they must NEVER
@@ -1232,16 +1242,34 @@ class TopicStreamRelay:
         self._anchor_buffer.append((text, list(seg), off_after))
         return True
 
-    async def _flush_anchor_buffer(self) -> None:
+    async def _flush_anchor_buffer(self) -> bool:
         """Post all buffered anchor-scoped prose as ORDINARY narration (§D5
         flush), through the normal rollover/seal-aware path so the cursor
-        bookkeeping stays consistent. No-op on an empty buffer."""
+        bookkeeping stays consistent.
+
+        wb6-1: reports whether the held prose was DELIVERED. Returns ``True`` on
+        an empty buffer, on a fully-delivered flush (buffer then cleared), or on
+        a terminal ``DISCARDED`` write (the prose is intentionally not posted
+        below a terminal completion — a decision, not a loss). Returns ``False``
+        when delivery FAILED (drop mode — every send crossed ``_DROP_THRESHOLD``
+        consecutive Telegram failures): the buffer is RETAINED so the caller can
+        keep ``hold_pending`` + an UNADVANCED replay boundary and defer to a cold
+        restart that resurfaces it (§D5 resurface-never-lose). A partly-delivered
+        prefix simply re-renders whole on recovery — at-least-once, the relay's
+        existing visible-delivery contract."""
         if not self._anchor_buffer:
-            return
+            return True
         buffered = "".join(text for (text, _seg, _off) in self._anchor_buffer)
+        if not buffered:
+            self._anchor_buffer = []
+            return True
+        await self._execute_ops(self._plan_ops(buffered))
+        if self._dropped:
+            # Delivery hit the wire-failure floor: RETAIN the buffer (its frame
+            # coords stay intact) so the held prose survives for a resurface.
+            return False
         self._anchor_buffer = []
-        if buffered:
-            await self._execute_ops(self._plan_ops(buffered))
+        return True
 
     async def _flush_and_disarm(self) -> None:
         """§D5 r23-2: a tool_use proves the agent is still working, so buffered
@@ -1387,7 +1415,24 @@ class TopicStreamRelay:
             # never flushed below the terminal completion (D5 discard doctrine). A
             # genuine answer (``None`` and NOT terminal) still FLUSHES.
             if state is None and not self._is_terminal():
-                await self._flush_anchor_buffer()
+                # wb6-1: an answer arrived ⇒ FLUSH. If delivery FAILED (drop
+                # mode), do NOT discard the buffer, advance the closed-turn
+                # checkpoint, or clear ``hold_pending`` (all downstream in this
+                # method) — that would lose the undelivered held prose. Retain
+                # the buffer + the marker + the UNADVANCED boundary (``current``
+                # is still behind the held frames — they never checkpointed) and
+                # defer to a cold restart that resurfaces it (§D5 resurface-
+                # never-lose). The cold catch-up re-renders the prose as ordinary
+                # disarmed narration; this finalize re-runs with an EMPTY buffer.
+                if not await self._flush_anchor_buffer():
+                    logger.warning(
+                        "topic stream for engagement %s: held-prose flush failed "
+                        "at result (answer arrived); deferring finalize to a cold "
+                        "restart so the held narration resurfaces (marker kept, "
+                        "checkpoint held behind the held frames)",
+                        self.engagement_id,
+                    )
+                    raise _FlushDeferred
             else:
                 self._anchor_buffer = []
         coord = {"segment": list(seg), "offset": off_after}
@@ -1567,6 +1612,14 @@ class TopicStreamRelay:
             # Stream ended while still replaying an open turn — reconcile now.
             if recovering and not self._reconciled:
                 await self._reconcile()
+        except _FlushDeferred:
+            # wb6-1: a held-prose flush failed. Abandon this run WITHOUT latching
+            # warm — the replay boundary was intentionally left behind the held
+            # frames with ``hold_pending`` set, so the next poll cold-recovers and
+            # resurfaces the prose. (Do NOT re-raise: this is a controlled defer,
+            # not a relay error.)
+            self._warm = False
+            return
         except BaseException:
             # Any error escaping the loop invalidates the warm latch so the
             # driver's retry does a full cold recovery (reconcile stays
@@ -1620,6 +1673,13 @@ class TopicStreamRelay:
                     continue
 
                 await self._handle_frame(seg, off_after, raw)
+        except _FlushDeferred:
+            # wb6-1: a held-prose flush failed on a warm resume — drop the warm
+            # latch so the next poll cold-recovers from ``hold_pending`` and
+            # resurfaces the held prose (the boundary stays behind the held
+            # frames). A controlled defer, not a relay error: do NOT re-raise.
+            self._warm = False
+            return
         except BaseException:
             self._warm = False
             raise
@@ -1663,7 +1723,23 @@ class TopicStreamRelay:
             # marker into the next turn with suppression disarmed — F-LEAK2). A
             # crash between (2) and (3) re-delivers the event on recovery
             # (at-least-once — the relay's existing contract).
-            await self._flush_anchor_buffer()          # (1) flush (no-op if empty)
+            # wb6-1: (1) flush (no-op if empty). If delivery FAILED (drop mode),
+            # do NOT proceed to reset suppression, deliver the spawn event, or
+            # checkpoint-and-clear: advancing the boundary past the still-
+            # undelivered held frames + clearing ``hold_pending`` would PERMANENTLY
+            # lose the held prose (§D5 resurface-never-lose). Leave ``current``
+            # behind the held frames + the marker set + the buffer retained, and
+            # abandon this run (``_FlushDeferred``) so a cold restart resurfaces
+            # the prose as disarmed catch-up narration, then handles the spawn.
+            if not await self._flush_anchor_buffer():  # (1)
+                logger.warning(
+                    "topic stream for engagement %s: held-prose flush failed at "
+                    "an abnormal spawn boundary; deferring the spawn to a cold "
+                    "restart so the held narration resurfaces (marker kept, "
+                    "checkpoint held behind the held frames)",
+                    self.engagement_id,
+                )
+                raise _FlushDeferred
             self._suppressing_for = None
             self._anchor_candidate = None
             self._replay_disarmed = False

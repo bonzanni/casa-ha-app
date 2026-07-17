@@ -896,6 +896,109 @@ async def test_abnormal_spawn_crash_between_event_and_checkpoint_redelivers(
 
 
 # ===========================================================================
+# wb6-1 (whole-branch gate wave 6): a FAILED flush (every send drops after
+# ``_DROP_THRESHOLD`` Telegram failures) must NOT lose the held prose. The flush
+# reports failure; the caller RETAINS the buffer + the ``hold_pending`` marker +
+# an UNADVANCED replay boundary (no checkpoint past the held frames) and defers
+# to a cold restart that resurfaces the prose (§D5 resurface-never-lose). Real
+# primitives + real temp NDJSON + injected clocks; ``asyncio.sleep`` never
+# patched (the drop backoff runs under the relay's injected ``_no_sleep``).
+# ===========================================================================
+
+
+async def test_abnormal_spawn_failed_flush_retains_for_resurface(tmp_path):
+    """(wb6-1, abnormal-spawn path) The buffer is non-empty at an abnormal
+    ``spawn`` boundary and every flush send FAILS (drop mode). The spawn must NOT
+    be checkpointed-with-clear: the marker stays set, the checkpoint stays behind
+    the held frame, and a brand-new relay (Telegram healthy) resurfaces the prose
+    and only THEN delivers the spawn + clears the marker."""
+    offs = _write_current(tmp_path, [
+        _init(), _anchor_ask("Q?"), _text("held"), _spawn(9),
+    ])
+    cursor = tmp_path / ".stream_cursor.json"
+
+    # First relay: "held" is buffered (anchor open); the flush at the spawn fails
+    # persistently → drop. Nothing reaches the wire; nothing is checkpointed away.
+    rec1, events1 = Recorder(), []
+    rec1.send_fails = 10_000                       # every send fails forever → drop
+    seq1, _c1 = _fast_sequencer(rec1)
+    relay1 = _make_relay(
+        tmp_path, cursor, rec1, events1, sequencer=seq1,
+        open_anchor_state=lambda: (5, 500, _ah()),
+    )
+    await relay1.run()
+
+    assert rec1.sends == []                         # never delivered (all failed)
+    assert ("spawn", {"epoch": 9}) not in events1   # spawn NOT delivered on failure
+    assert relay1._warm is False                    # deferred → next poll cold
+    saved = StreamCursor.load(cursor)
+    assert saved.hold_pending is True               # marker RETAINED
+    assert saved.current["offset"] == offs[1]       # checkpoint HELD behind "held"
+    assert saved.current["offset"] < offs[2]
+
+    # Brand-new relay, Telegram healthy — cold recovery resurfaces the prose,
+    # then delivers the spawn + clears the marker (event-first, at-least-once).
+    rec2, events2 = Recorder(), []
+    seq2, _c2 = _fast_sequencer(rec2)
+    relay2 = _make_relay(
+        tmp_path, cursor, rec2, events2, sequencer=seq2,
+        open_anchor_state=lambda: (5, 500, _ah()),
+    )
+    await relay2.run()
+
+    assert _narration_sends(rec2) == ["held"]        # RESURFACED
+    assert ("spawn", {"epoch": 9}) in events2         # spawn delivered on recovery
+    assert StreamCursor.load(cursor).hold_pending is False
+    assert relay2.cursor.current["offset"] == offs[3]  # advanced past the spawn
+
+
+async def test_answered_flush_failure_retains_for_resurface(tmp_path):
+    """(wb6-1, answered-before-result path) The operator answers during the turn,
+    so ``result`` FLUSHES the held prose — but every flush send FAILS (drop). The
+    buffer must be RETAINED (not discarded), the closed-turn checkpoint must NOT
+    advance, and the marker must stay set so a cold restart resurfaces it."""
+    seam_state = {"open": (9, 900, _ah())}
+    seam = lambda: seam_state["open"]  # noqa: E731
+    _write_current(tmp_path, [_init(), _anchor_ask(), _text("bye")])
+    cursor = tmp_path / ".stream_cursor.json"
+
+    rec, events = Recorder(), []
+    seq, _clock = _fast_sequencer(rec)
+    relay = _make_relay(
+        tmp_path, cursor, rec, events, sequencer=seq, open_anchor_state=seam,
+    )
+    await relay.run()                       # buffers "bye" (held), marker set
+    assert rec.sends == []
+    assert relay._suppressing_for == (9, 900)
+    assert StreamCursor.load(cursor).hold_pending is True
+    held_current = StreamCursor.load(cursor).current["offset"]
+
+    # The operator ANSWERS; ``result`` arrives. The result-time flush FAILS.
+    seam_state["open"] = None
+    rec.send_fails = 10_000
+    _append_current(tmp_path, [_result()])
+    await relay.run()                       # WARM re-entry; flush fails → defer
+
+    assert rec.sends == []                  # nothing delivered
+    assert relay._warm is False             # deferred → next poll cold
+    saved = StreamCursor.load(cursor)
+    assert saved.hold_pending is True       # marker RETAINED (not cleared at result)
+    assert saved.current["offset"] == held_current   # checkpoint NOT advanced
+
+    # Brand-new relay, Telegram healthy — cold recovery resurfaces "bye".
+    rec2, events2 = Recorder(), []
+    seq2, _c2 = _fast_sequencer(rec2)
+    relay2 = _make_relay(
+        tmp_path, cursor, rec2, events2, sequencer=seq2,
+        open_anchor_state=lambda: None,     # answered — disarmed catch-up renders
+    )
+    await relay2.run()
+
+    assert _narration_sends(rec2) == ["bye"]         # RESURFACED
+    assert StreamCursor.load(cursor).hold_pending is False
+
+
+# ===========================================================================
 # wb3-2 (whole-branch gate wave 3): terminal narration DISCARD is revalidated
 # INSIDE the sequencer writer lock (one truth source = the terminal latch), so
 # neither a write blocked on the lock at the instant of terminalization nor a
