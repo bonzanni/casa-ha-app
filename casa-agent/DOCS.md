@@ -139,6 +139,15 @@ signed over an empty body with `X-Webhook-Signature`. Enable
 transports remain compatible with unsigned turns but discovery returns the
 same generic `401` response used for a missing or invalid signature.
 
+For Supervisor-based setup, Casa also publishes the authenticated endpoint to
+the companion integration through the `casa` discovery service. This requires
+Home Assistant Supervisor support and `webhook_auth_enabled`; Casa obtains its
+runtime hostname from Supervisor and refreshes the registration if the secret
+changes. The only local registration state is the returned UUID in
+`/data/casa-supervisor-discovery.json`; the webhook secret is never stored in
+that file or logged by the publisher. Disabling webhook authentication removes
+the published discovery record.
+
 The catalog path is fixed, is mounted only while at least one voice transport
 is enabled, and returns `Cache-Control: no-store`. It does not expose prompts,
 tools, delegates, specialist configuration, secrets, or other private agent

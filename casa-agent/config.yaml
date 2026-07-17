@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.87.0"
+version: "0.88.0"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 image: "ghcr.io/bonzanni/casa-agent"
@@ -11,6 +11,7 @@ arch:
   - amd64
 homeassistant_api: true
 hassio_api: true
+discovery: [casa]
 ingress: true
 ingress_port: 8080
 ports:
