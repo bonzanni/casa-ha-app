@@ -376,9 +376,13 @@ async def voice_app_with_limiter(request):
     capacity = getattr(request, "param", 2)
 
     bus = MessageBus()
-    agent = StubAgent(bus, "butler")
-    bus.register("butler", agent.handle_message)
-    loop_task = asyncio.create_task(bus.run_agent_loop("butler"))
+    roles = ("butler", "concierge")
+    for role in roles:
+        agent = StubAgent(bus, role)
+        bus.register(role, agent.handle_message)
+    loop_tasks = [
+        asyncio.create_task(bus.run_agent_loop(role)) for role in roles
+    ]
 
     limiter = RateLimiter(capacity=capacity, window_s=60.0)
 
@@ -388,7 +392,7 @@ async def voice_app_with_limiter(request):
         webhook_secret="",
         sse_path="/api/converse",
         ws_path="/api/converse/ws",
-        agent_configs={"butler": _FakeAgentConfig()},
+        agent_configs={role: _FakeAgentConfig() for role in roles},
         memory=_DummyMemory(),
         idle_timeout=300,
         rate_limiter=limiter,
@@ -398,7 +402,8 @@ async def voice_app_with_limiter(request):
     channel.register_routes(app)
     async with TestClient(TestServer(app)) as client:
         yield client, limiter
-    loop_task.cancel()
+    for task in loop_tasks:
+        task.cancel()
 
 
 async def _parse_sse_events(response) -> list[dict]:
@@ -415,6 +420,38 @@ async def _parse_sse_events(response) -> list[dict]:
 
 @pytest.mark.asyncio
 class TestRateLimit:
+    @pytest.mark.parametrize("voice_app_with_limiter", [1], indirect=True)
+    async def test_same_scope_has_independent_role_buckets(
+        self, voice_app_with_limiter,
+    ):
+        client, _ = voice_app_with_limiter
+
+        async def run_turn(role: str) -> list[dict]:
+            response = await client.post(
+                "/api/converse",
+                json={
+                    "prompt": "hi",
+                    "agent_role": role,
+                    "scope_id": "same-scope",
+                },
+            )
+            assert response.status == 200
+            return await _parse_sse_events(response)
+
+        butler_first = await run_turn("butler")
+        assert any(frame["event"] == "done" for frame in butler_first)
+
+        concierge_first = await run_turn("concierge")
+        assert any(frame["event"] == "done" for frame in concierge_first)
+
+        butler_second = await run_turn("butler")
+        assert any(
+            frame["event"] == "error"
+            and frame.get("data", {}).get("kind") == "rate_limit"
+            for frame in butler_second
+        )
+        assert not any(frame["event"] == "done" for frame in butler_second)
+
     @pytest.mark.parametrize("voice_app_with_limiter", [2], indirect=True)
     async def test_over_limit_emits_rate_limit_error_frame(
         self, voice_app_with_limiter,

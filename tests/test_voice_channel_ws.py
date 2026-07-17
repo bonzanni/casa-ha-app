@@ -536,9 +536,13 @@ async def voice_ws_app_with_limiter(request):
     capacity = getattr(request, "param", 2)
 
     bus = MessageBus()
-    agent = _StreamingAgent(bus, "butler")
-    bus.register("butler", agent.handle_message)
-    loop_task = asyncio.create_task(bus.run_agent_loop("butler"))
+    roles = ("butler", "concierge")
+    for role in roles:
+        agent = _StreamingAgent(bus, role)
+        bus.register(role, agent.handle_message)
+    loop_tasks = [
+        asyncio.create_task(bus.run_agent_loop(role)) for role in roles
+    ]
 
     memory = AsyncMock()
     memory.ensure_session = AsyncMock(return_value=None)
@@ -551,7 +555,7 @@ async def voice_ws_app_with_limiter(request):
     channel = VoiceChannel(
         bus=bus, default_agent="butler", webhook_secret="",
         sse_path="/api/converse", ws_path="/api/converse/ws",
-        agent_configs={"butler": _FakeCfg()},
+        agent_configs={role: _FakeCfg() for role in roles},
         memory=memory, idle_timeout=300,
         rate_limiter=limiter,
     )
@@ -560,11 +564,43 @@ async def voice_ws_app_with_limiter(request):
     channel.register_routes(app)
     async with TestClient(TestServer(app)) as client:
         yield client
-    loop_task.cancel()
+    for task in loop_tasks:
+        task.cancel()
 
 
 @pytest.mark.asyncio
 class TestRateLimit:
+    @pytest.mark.parametrize("voice_ws_app_with_limiter", [1], indirect=True)
+    async def test_same_scope_has_independent_role_buckets(
+        self, voice_ws_app_with_limiter,
+    ):
+        client = voice_ws_app_with_limiter
+
+        async with client.ws_connect("/api/converse/ws") as ws:
+            async def run_turn(uid: str, role: str) -> dict:
+                await ws.send_json({
+                    "type": "utterance",
+                    "utterance_id": uid,
+                    "scope_id": "same-scope",
+                    "agent_role": role,
+                    "text": "hi",
+                })
+                while True:
+                    frame = await ws.receive_json(timeout=2.0)
+                    if (
+                        frame.get("utterance_id") == uid
+                        and frame.get("type") in {"done", "error"}
+                    ):
+                        return frame
+
+            assert (await run_turn("u-butler-1", "butler"))["type"] == "done"
+            assert (
+                await run_turn("u-concierge-1", "concierge")
+            )["type"] == "done"
+            butler_second = await run_turn("u-butler-2", "butler")
+            assert butler_second["type"] == "error"
+            assert butler_second["kind"] == "rate_limit"
+
     @pytest.mark.parametrize("voice_ws_app_with_limiter", [1], indirect=True)
     async def test_ws_rate_limit_emits_error_frame(
         self, voice_ws_app_with_limiter,

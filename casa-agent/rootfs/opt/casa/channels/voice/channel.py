@@ -27,6 +27,11 @@ from channels import Channel
 from log_cid import new_cid
 from provenance import sanitize_external_context
 from rate_limit import RateLimiter
+from channels.voice.catalog import (
+    VOICE_AGENT_CATALOG_PATH,
+    VoiceAgentCatalogError,
+    build_voice_agent_catalog,
+)
 from channels.voice.prosodic import ProsodicSplitter
 from channels.voice.routes import VoiceRouteRegistry, VoiceWsConnection
 from channels.voice.session import VoiceSessionPool
@@ -223,10 +228,44 @@ class VoiceChannel(Channel):
     # --- Route registration -------------------------------------------
 
     def register_routes(self, app: web.Application) -> None:
+        if not (self._sse_enabled or self._ws_enabled):
+            return
+        app.router.add_get(
+            VOICE_AGENT_CATALOG_PATH,
+            self._voice_agent_catalog_handler,
+        )
         if self._sse_enabled:
             app.router.add_post(self._sse_path, self._sse_handler)
         if self._ws_enabled:
             app.router.add_get(self._ws_path, self._ws_handler)
+
+    async def _voice_agent_catalog_handler(
+        self,
+        request: web.Request,
+    ) -> web.Response:
+        signature = request.headers.get("X-Webhook-Signature", "")
+        if (
+            not self._webhook_secret
+            or not signature.isascii()
+            or not self._verify(request, b"")
+        ):
+            return web.json_response(
+                {"error": "invalid signature"}, status=401,
+            )
+        try:
+            payload = build_voice_agent_catalog(self._agent_configs)
+        except VoiceAgentCatalogError as err:
+            logger.error(
+                "Voice agent catalog unavailable reason=%s", err.args[0],
+            )
+            return web.json_response(
+                {"error": "voice catalog unavailable"},
+                status=503,
+            )
+        return web.json_response(
+            payload,
+            headers={"Cache-Control": "no-store"},
+        )
 
     # --- HMAC ---------------------------------------------------------
 
@@ -276,10 +315,11 @@ class VoiceChannel(Channel):
 
         # Rate limit BEFORE opening the SSE stream (spec 5.2 §8).
         if self._rate_limiter is not None and self._rate_limiter.enabled:
-            decision = self._rate_limiter.check(scope_id)
+            decision = self._rate_limiter.check((agent_role, scope_id))
             if not decision.allowed:
                 logger.info(
-                    "Voice SSE rate limit hit for scope_id=%s", scope_id,
+                    "Voice SSE rate limit hit for role=%s scope_id=%s",
+                    agent_role, scope_id,
                 )
                 response = web.StreamResponse(
                     status=200,
@@ -655,11 +695,12 @@ class VoiceChannel(Channel):
 
         # Rate limit BEFORE dispatching to the agent (spec 5.2 §8).
         if self._rate_limiter is not None and self._rate_limiter.enabled:
-            decision = self._rate_limiter.check(scope_id)
+            decision = self._rate_limiter.check((agent_role, scope_id))
             if not decision.allowed:
                 logger.info(
-                    "Voice WS rate limit hit for scope_id=%s utterance_id=%s",
-                    scope_id, uid,
+                    "Voice WS rate limit hit for role=%s scope_id=%s "
+                    "utterance_id=%s",
+                    agent_role, scope_id, uid,
                 )
                 adapter = TagDialectAdapter(cfg.tts.tag_dialect)
                 line = VoiceChannel._error_line_for_kind(cfg, "rate_limit")

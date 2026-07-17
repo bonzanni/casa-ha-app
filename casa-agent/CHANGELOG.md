@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.86.0] - 2026-07-17
+
+Casa now publishes a safe, authenticated catalog of its enabled Home Assistant
+voice residents. The companion integration can use that catalog to create
+separate Tina and Gary conversation entities after discovery; the Casa app
+itself only publishes the catalog.
+
+### Added
+
+- Authenticated dynamic discovery of enabled `ha_voice` residents through a
+  fixed, non-cacheable endpoint that returns only stable roles and display
+  names.
+
+### Changed
+
+- Voice rate limits are isolated by agent role and scope, so Gary cannot
+  consume Tina's allowance when both receive turns from the same scope.
+
+### Security
+
+- Discovery refuses access when no secret is configured or the request
+  signature is invalid, and never returns prompts, tools, delegates, or other
+  private agent configuration.
+
 ## [0.85.0] - 2026-07-17
 
 Gary can now hand specialist questions off quickly, keep taking voice turns,

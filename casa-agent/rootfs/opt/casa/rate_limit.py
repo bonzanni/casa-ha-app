@@ -1,7 +1,7 @@
 """Per-key inbound token-bucket rate limiting (spec 5.2 §8).
 
 Each `RateLimiter` owns a dict of `TokenBucket`s keyed on an arbitrary
-string. On every ingress, the channel calls ``limiter.check(key)`` which
+hashable value. On every ingress, the channel calls ``limiter.check(key)`` which
 returns a :class:`RateDecision` with three fields:
 
 - ``allowed``: whether to admit the request;
@@ -23,6 +23,7 @@ agent, or memory.
 from __future__ import annotations
 
 import time
+from collections.abc import Hashable
 from dataclasses import dataclass
 from typing import Callable
 
@@ -128,7 +129,7 @@ class RateLimiter:
             capacity / window_s if (capacity > 0 and window_s > 0) else 0.0
         )
         self._now = now
-        self._buckets: dict[str, TokenBucket] = {}
+        self._buckets: dict[Hashable, TokenBucket] = {}
         self._checks_since_sweep = 0
 
     @property
@@ -145,7 +146,7 @@ class RateLimiter:
         for k in stale:
             del self._buckets[k]
 
-    def check(self, key: str) -> RateDecision:
+    def check(self, key: Hashable) -> RateDecision:
         if not self.enabled:
             return RateDecision(True, False, 0.0)
         self._checks_since_sweep += 1
@@ -162,7 +163,7 @@ class RateLimiter:
 
 
 def rate_limit_response(
-    limiter: RateLimiter, key: str,
+    limiter: RateLimiter, key: Hashable,
 ) -> web.Response | None:
     """aiohttp helper: return a 429 response on reject, else ``None``.
 

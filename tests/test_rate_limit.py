@@ -144,6 +144,13 @@ class TestRateLimiter:
         # chat-B is a fresh bucket.
         assert limiter.check("chat-B").allowed is True
 
+    def test_hashable_composite_keys_have_independent_buckets(self):
+        limiter = RateLimiter(capacity=1, window_s=60)
+        assert limiter.check(("butler", "same-scope")).allowed is True
+        assert limiter.check(("concierge", "same-scope")).allowed is True
+        assert limiter.check(("butler", "same-scope")).allowed is False
+        assert limiter.check("legacy-key").allowed is True
+
     def test_enabled_flag(self):
         assert RateLimiter(capacity=30).enabled is True
         assert RateLimiter(capacity=0).enabled is False
