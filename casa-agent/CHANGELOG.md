@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.88.0] - 2026-07-17
+
+Casa can now be discovered automatically by its companion Home Assistant
+integration when it runs as a Supervisor app.
+
+### Added
+
+- An authenticated, versioned Supervisor discovery record for Casa's external
+  API endpoint. Home Assistant shows the discovered endpoint for confirmation
+  before connecting.
+
+### Security
+
+- Discovery uses Casa's existing webhook secret without logging or copying it
+  into local registration state. The registration is removed only when webhook
+  authentication is disabled, and a missing secret never removes a live record.
+
 ## [0.87.0] - 2026-07-17
 
 Engagement questions now render the way operators actually write them: long,
