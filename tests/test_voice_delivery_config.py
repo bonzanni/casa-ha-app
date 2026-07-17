@@ -158,25 +158,31 @@ def test_voice_delivery_options_have_english_translations():
         assert entry["description"]
 
 
-def _accepted_job() -> VoiceJob:
+def _accepted_job(
+    *,
+    creator_peer: str = "voice",
+    origin_route_id: str | None = "route-1",
+    origin_device_id: str | None = "device-1",
+    execution_state: ExecutionState = ExecutionState.ACCEPTED,
+) -> VoiceJob:
     return VoiceJob(
         id="job-1",
         parent_job_id=None,
         creating_role="concierge",
         specialist_role="judge",
         specialist_display_name="Judge",
-        creator_peer="voice_speaker",
+        creator_peer=creator_peer,
         creator_user_id=None,
         scope_id="scope-1",
-        origin_route_id="route-1",
-        origin_device_id="device-1",
+        origin_route_id=origin_route_id,
+        origin_device_id=origin_device_id,
         task="Question",
         context="",
         created_at=100.0,
         started_at=None,
         terminal_at=None,
         expires_at=None,
-        execution_state=ExecutionState.ACCEPTED,
+        execution_state=execution_state,
         delivery_state=DeliveryState.NONE,
         result=None,
         failure=None,
@@ -241,6 +247,102 @@ async def test_configured_result_ttl_preserves_shorter_specialist_expiry(tmp_pat
     )
 
     assert completed.expires_at == 160.0
+
+
+@pytest.mark.parametrize("transition", ["success", "failure", "cancel", "orphan"])
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        {
+            "creator_peer": "telegram",
+            "origin_route_id": "telegram-route-must-not-count-as-voice",
+            "origin_device_id": "telegram-device-must-not-count-as-voice",
+        },
+        {
+            "creator_peer": "voice",
+            "origin_route_id": None,
+            "origin_device_id": "device-without-route",
+        },
+        {
+            "creator_peer": "voice",
+            "origin_route_id": "route-without-device",
+            "origin_device_id": None,
+        },
+    ],
+    ids=["telegram-with-route", "voice-without-route", "voice-without-device"],
+)
+@pytest.mark.asyncio
+async def test_voice_ttl_does_not_shorten_non_voice_terminal_retention(
+    tmp_path, transition, provenance,
+):
+    registry = JobRegistry(
+        tmp_path / "jobs.json",
+        tmp_path / "delegations.json",
+        clock=lambda: 100.0,
+        result_ttl_seconds=300,
+    )
+    await registry.load()
+    state = (
+        ExecutionState.RUNNING
+        if transition == "orphan"
+        else ExecutionState.ACCEPTED
+    )
+    await registry.create(_accepted_job(execution_state=state, **provenance))
+
+    if transition == "success":
+        completed = await registry.finish("job-1", "Done")
+    elif transition == "failure":
+        completed = await registry.fail("job-1", RuntimeError("failed"))
+    elif transition == "cancel":
+        completed = await registry.cancel("job-1")
+    else:
+        await registry.recover_after_restart()
+        completed = registry.get("job-1")
+
+    assert completed is not None
+    assert completed.expires_at == 100.0 + JobRegistry.RESULT_TTL_SECONDS
+
+
+@pytest.mark.parametrize("transition", ["failure", "cancel", "orphan"])
+@pytest.mark.asyncio
+async def test_configured_voice_ttl_reaches_voice_terminal_paths(
+    tmp_path, transition,
+):
+    registry = JobRegistry(
+        tmp_path / "jobs.json",
+        tmp_path / "delegations.json",
+        clock=lambda: 100.0,
+        result_ttl_seconds=300,
+    )
+    await registry.load()
+    state = (
+        ExecutionState.RUNNING
+        if transition == "orphan"
+        else ExecutionState.ACCEPTED
+    )
+    await registry.create(_accepted_job(execution_state=state))
+
+    if transition == "failure":
+        completed = await registry.fail("job-1", RuntimeError("failed"))
+    elif transition == "cancel":
+        completed = await registry.cancel("job-1")
+    else:
+        await registry.recover_after_restart()
+        completed = registry.get("job-1")
+
+    assert completed is not None
+    assert completed.expires_at == 400.0
+
+
+def test_docs_state_websocket_hmac_security_boundary_exactly():
+    docs = " ".join((
+        Path(__file__).resolve().parent.parent / "casa-agent" / "DOCS.md"
+    ).read_text(encoding="utf-8").split())
+
+    assert "empty HTTP upgrade request body" in docs
+    assert "does not authenticate individual WebSocket frames" in docs
+    assert "does not encrypt payloads" in docs
+    assert "does not cryptographically authenticate the server" in docs
 
 
 def test_configured_route_cap_reaches_every_atomic_creation_path():

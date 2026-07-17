@@ -169,10 +169,12 @@ synchronous turns but do not accept background work. Delivery is intentionally
 at least once: if audio succeeds but its acknowledgement is lost, a concise
 summary can repeat after restart rather than disappear.
 
-HMAC authenticates the WebSocket and protects message integrity; it does not
-encrypt payloads. The Casa-to-Home Assistant link is plaintext and must remain
-on a trusted LAN/private network or travel through an encrypted tunnel or
-reverse proxy.
+The HMAC signature over the empty HTTP upgrade request body authenticates the
+Home Assistant client only when the WebSocket is established. It does not
+authenticate individual WebSocket frames, does not encrypt payloads, and does
+not cryptographically authenticate the server. The Casa-to-Home Assistant link
+is therefore plaintext and must remain on a trusted LAN/private network or
+travel through an encrypted, server-authenticated tunnel or reverse proxy.
 
 Tina normally uses an eager, role-scoped Home Assistant facade: Casa discovers
 the Assist tools at boot, keeps that upstream connection resident, and gives

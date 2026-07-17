@@ -34,8 +34,11 @@ and announce the completed answer after the originating satellite is idle.
 
 ### Security
 
-- The HMAC-authenticated Casa/Home Assistant WebSocket is explicitly documented
-  as plaintext. Keep it on a trusted LAN/private network or encrypted tunnel.
+- The WebSocket HMAC is explicitly documented as authenticating the Home
+  Assistant client only at HTTP upgrade, over an empty request body. It does
+  not MAC individual frames, encrypt payloads, or cryptographically
+  authenticate the server; keep the link on a trusted LAN/private network or
+  a server-authenticated encrypted tunnel.
 
 ## [0.84.0] - 2026-07-16
 

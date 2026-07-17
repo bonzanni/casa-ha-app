@@ -163,7 +163,7 @@ class JobRegistry:
         self._permits: dict[str, Any] = {}
         self._cancel_timers: dict[str, asyncio.Task] = {}
         self._reconciliation_retry_interval = retry_interval
-        self._result_ttl_seconds = result_ttl
+        self._voice_result_ttl_seconds = result_ttl
         self._reconciliation_tasks: dict[str, asyncio.Task] = {}
         self._reconciliation_waiters: dict[
             str, set[asyncio.Future[None]]
@@ -737,7 +737,7 @@ class JobRegistry:
                 current,
                 execution_state=ExecutionState.CANCELLED,
                 terminal_at=now,
-                expires_at=now + self._result_ttl_seconds,
+                expires_at=now + self._terminal_result_ttl_seconds(current),
                 failure=JobFailure("cancelled", "Delegation cancelled"),
                 delivery_state=(
                     DeliveryState.CANCELLED
@@ -956,7 +956,9 @@ class JobRegistry:
                         current,
                         execution_state=ExecutionState.ORPHANED,
                         terminal_at=now,
-                        expires_at=now + self._result_ttl_seconds,
+                        expires_at=(
+                            now + self._terminal_result_ttl_seconds(current)
+                        ),
                         failure=JobFailure(
                             "restart_orphan", "Lost on restart",
                         ),
@@ -1110,7 +1112,7 @@ class JobRegistry:
                 created_at=started_at,
                 started_at=started_at,
                 terminal_at=now,
-                expires_at=now + self._result_ttl_seconds,
+                expires_at=None,
                 execution_state=ExecutionState.ORPHANED,
                 delivery_state=(
                     DeliveryState.READY if has_voice_route else DeliveryState.NONE
@@ -1127,7 +1129,10 @@ class JobRegistry:
                     str(origin.get("channel") or "") == "telegram"
                 ),
             )
-            jobs[job_id] = job
+            jobs[job_id] = replace(
+                job,
+                expires_at=now + self._terminal_result_ttl_seconds(job),
+            )
             migrated_ids.append(job_id)
         return jobs, migrated_ids, bool(raw)
 
@@ -1288,6 +1293,22 @@ class JobRegistry:
 
     # -- transition helpers --------------------------------------------
 
+    @staticmethod
+    def _has_trusted_voice_delivery_provenance(job: VoiceJob) -> bool:
+        """Return whether a job was created from a deliverable voice route."""
+        return (
+            job.creator_peer == "voice"
+            and isinstance(job.origin_route_id, str)
+            and bool(job.origin_route_id.strip())
+            and isinstance(job.origin_device_id, str)
+            and bool(job.origin_device_id.strip())
+        )
+
+    def _terminal_result_ttl_seconds(self, job: VoiceJob) -> float:
+        if self._has_trusted_voice_delivery_provenance(job):
+            return self._voice_result_ttl_seconds
+        return self.RESULT_TTL_SECONDS
+
     async def _finish_current_locked(
         self, current: VoiceJob, result: str,
     ) -> VoiceJob:
@@ -1297,7 +1318,7 @@ class JobRegistry:
                 current,
                 execution_state=ExecutionState.CANCELLED,
                 terminal_at=now,
-                expires_at=now + self._result_ttl_seconds,
+                expires_at=now + self._terminal_result_ttl_seconds(current),
                 failure=JobFailure("cancelled", "Cancelled by creator"),
                 delivery_state=(
                     DeliveryState.CANCELLED
@@ -1314,7 +1335,7 @@ class JobRegistry:
                 current,
                 execution_state=ExecutionState.SUCCEEDED,
                 terminal_at=now,
-                expires_at=now + self._result_ttl_seconds,
+                expires_at=now + self._terminal_result_ttl_seconds(current),
                 result=str(result),
                 failure=None,
                 delivery_state=delivery,
@@ -1339,7 +1360,7 @@ class JobRegistry:
                 current,
                 execution_state=ExecutionState.CANCELLED,
                 terminal_at=now,
-                expires_at=now + self._result_ttl_seconds,
+                expires_at=now + self._terminal_result_ttl_seconds(current),
                 failure=JobFailure("cancelled", "Cancelled by creator"),
                 awaiting_input=False,
                 continuable_until=None,
@@ -1354,7 +1375,8 @@ class JobRegistry:
             )
         else:
             expires_at = now + min(
-                float(delivery_ttl_s), self._result_ttl_seconds,
+                float(delivery_ttl_s),
+                self._terminal_result_ttl_seconds(current),
             )
             delivery, sequence = self._terminal_delivery(current)
             updated = replace(
@@ -1400,7 +1422,7 @@ class JobRegistry:
             current,
             execution_state=state,
             terminal_at=now,
-            expires_at=now + self._result_ttl_seconds,
+            expires_at=now + self._terminal_result_ttl_seconds(current),
             failure=envelope,
             delivery_state=delivery,
             delivery_sequence=sequence,
