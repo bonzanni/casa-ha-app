@@ -676,6 +676,7 @@ class TestVoiceStructuredResult:
         monkeypatch.setattr(tools, "_run_delegated_agent", _raise_after_cancel)
         monkeypatch.setattr(tools, "_CEILING_TEARDOWN_BOUND_S", 0.5)
         monkeypatch.setattr(tools, "_VOICE_TEARDOWN_BOUND_S", 0.5)
+        monkeypatch.setattr(tools, "_SYNC_WAIT_TIMEOUT_S", 0.03)
 
         loop = asyncio.get_running_loop()
         previous_handler = loop.get_exception_handler()
@@ -683,9 +684,7 @@ class TestVoiceStructuredResult:
         loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
         try:
             origin = _origin(channel="voice")
-            origin["voice_deadline"] = (
-                loop.time() + tools._VOICE_FALLBACK_RESERVE_S + 0.03
-            )
+            origin["voice_deadline"] = loop.time() + 30.0
             with caplog.at_level(logging.DEBUG):
                 envelope = await _with_origin(
                     tools.delegate_to_agent.handler({
@@ -694,7 +693,7 @@ class TestVoiceStructuredResult:
                     }),
                     origin,
                 )
-                await started.wait()
+                assert started.is_set()
                 for _ in range(3):
                     gc.collect()
                     await asyncio.sleep(0)
