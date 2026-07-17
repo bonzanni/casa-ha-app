@@ -166,18 +166,31 @@ class TestValidateAskArgsNormalization:
             {"label": "1. Same", "short": "y"},
         ])) is None
 
-    def test_dict_short_collision_after_strip_refused(self):
-        # Raw shorts ``A — s`` / ``1. s`` collide to ``s`` post-strip.
-        assert _validate_ask_args(_body([
+    def test_dict_short_collision_after_strip_accepted_advisory(self):
+        # D1 (round 4): raw shorts ``A — s`` / ``1. s`` collide to ``s``
+        # post-strip — a duplicate ``short`` is advisory, not a rejection
+        # cause; it still normalizes via enumerator-stripping and flows
+        # through to the D2 resolver (which floors on the duplicate).
+        out = _validate_ask_args(_body([
             {"label": "One", "short": "A — s"},
             {"label": "Two", "short": "1. s"},
-        ])) is None
+        ]))
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["One", "Two"]
+        assert shorts == ["s", "s"]
 
-    def test_dict_marker_only_short_refused(self):
-        assert _validate_ask_args(_body([
+    def test_dict_marker_only_short_accepted_advisory(self):
+        # D1: a marker-only ``short`` normalizes to "" (blank) — advisory,
+        # not refused; it flows through to the resolver (which floors).
+        out = _validate_ask_args(_body([
             {"label": "One", "short": "A — "},
             {"label": "Two", "short": "ok"},
-        ])) is None
+        ]))
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["One", "Two"]
+        assert shorts == ["", "ok"]
 
     def test_multi_dict_enumerator_composition_end_to_end(self):
         out = _validate_ask_args(_body(
@@ -199,6 +212,76 @@ class TestValidateAskArgsNormalization:
 # ---------------------------------------------------------------------------
 # A7 · the pinned refusal copy
 # ---------------------------------------------------------------------------
+
+
+class TestCapsRemovedD1:
+    """D1 (round 4, spec §D1 bullets 1-2): the invented LENGTH caps
+    (``_ASK_MAX_LABEL_LEN``=48, the 1024-char question cap, the 25-char
+    ``short`` cap) are removed from ``_validate_ask_args``. Structural
+    checks (type, non-blank, anchor/button shape, uniqueness, option COUNT)
+    stay; ``short`` becomes purely advisory (never a rejection cause)."""
+
+    def test_139_char_option_label_accepted(self):
+        # The live Q2 failure form: a long, readable label used to be
+        # refused at the old 48-char cap.
+        long_label = "y" * 139
+        out = _validate_ask_args(_body([long_label, "B"]))
+        assert out is not None
+        assert out[1] == [long_label, "B"]
+
+    def test_2000_char_question_accepted(self):
+        out = _validate_ask_args(_body(["A", "B"], question="q" * 2000))
+        assert out is not None
+        assert out[0] == "q" * 2000
+
+    def test_blank_short_does_not_reject(self):
+        out = _validate_ask_args(_body(
+            [{"label": "One", "short": "   "}, {"label": "Two", "short": "ok"}]))
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["One", "Two"]
+        assert shorts == ["", "ok"]
+
+    def test_duplicate_shorts_do_not_reject(self):
+        out = _validate_ask_args(_body([
+            {"label": "One", "short": "dup"},
+            {"label": "Two", "short": "dup"},
+        ]))
+        assert out is not None
+        assert out[3] == ["dup", "dup"]
+
+    def test_over_budget_short_does_not_reject(self):
+        out = _validate_ask_args(_body(
+            [{"label": "One", "short": "z" * 100}, "B"]))
+        assert out is not None
+        assert out[3] == ["z" * 100, None]
+
+    def test_non_string_short_accepted_as_absent(self):
+        out = _validate_ask_args(_body(
+            [{"label": "One", "short": 7}, "B"]))
+        assert out is not None
+        assert out[3] == [None, None]
+
+    def test_missing_short_accepted_as_absent(self):
+        out = _validate_ask_args(_body([{"label": "One"}, "B"]))
+        assert out is not None
+        assert out[3] == [None, None]
+
+    def test_duplicate_full_labels_still_rejected(self):
+        # Full-label uniqueness is unaffected by D1 — only ``short`` floors.
+        assert _validate_ask_args(_body(["Same", "Same"])) is None
+
+    def test_9_options_still_rejected_count_cap(self):
+        # Option COUNT (documented product-contract exception) is unaffected.
+        assert _validate_ask_args(
+            _body([f"o{i}" for i in range(9)])) is None
+
+    def test_blank_full_label_still_rejected(self):
+        assert _validate_ask_args(_body(["", "B"])) is None
+
+    def test_blank_full_label_dict_still_rejected(self):
+        assert _validate_ask_args(
+            _body([{"label": "   ", "short": "ok"}, "B"])) is None
 
 
 class TestEmbeddedOptionsPayload:

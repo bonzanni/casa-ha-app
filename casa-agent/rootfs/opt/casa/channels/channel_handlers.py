@@ -353,11 +353,14 @@ _ENUMERATOR_RE = re.compile(r"^\s*(?:[A-Za-z]|\d{1,2})\s*[—–\-·.):]\s+")
 
 _ASK_MIN_OPTIONS = 2
 _ASK_MAX_OPTIONS = 8
-_ASK_MAX_LABEL_LEN = 48
-# A4 · F-BTN (Sol r3-7b): an agent-supplied ``short`` ≤ 25 so ``"n · <short>"``
-# (prefix ≤ 5 chars) keeps the rendered button within the 30-char button cap.
-_ASK_MAX_SHORT_LEN = 25
-_ASK_MAX_QUESTION_LEN = 1024
+# D1 (round 4, spec §D1 bullets 1-2): the invented LENGTH caps
+# (``_ASK_MAX_LABEL_LEN`` = 48, ``_ASK_MAX_SHORT_LEN`` = 25, the 1024-char
+# question cap) are REMOVED — they were v0.75.0/v0.83.0 leftovers with no real
+# Telegram-limit backing (option text never enters the 64-byte callback_data;
+# the body isn't the 4096-char message limit). Option COUNT stays capped at
+# ``_ASK_MAX_OPTIONS`` (a documented product-contract exception, not a length
+# heuristic); the real per-ask rendered-body limit is enforced elsewhere
+# (Task A3's lifecycle body-limit validator), not here.
 _ASK_MIN_TIMEOUT_S = 30.0
 _ASK_MAX_TIMEOUT_S = 570.0
 _ASK_DEFAULT_TIMEOUT_S = 300.0
@@ -822,30 +825,40 @@ def _validate_ask_args(
 
     v0.79.0 §4: ``options: []`` is ACCEPTED (a free-text numbered anchor); a
     non-empty list still requires ``_ASK_MIN_OPTIONS..MAX``, unique, non-empty
-    labels within the length cap.
+    labels.
 
     v0.83.0 (A4 · F-BTN): each option may be a plain ``str`` (unchanged) OR a
-    ``{"label": str, "short": str}`` dict — ``label`` under the 48 cap and
-    ``label.strip()`` non-empty; ``short`` ≤ 25 and ``short.strip()`` non-empty.
-    Mixed str+dict lists are allowed. Duplicate FULL labels OR duplicate
-    provided shorts are refused. The projection hash is computed client-side
-    over the RAW args, so this server-side normalization does not affect relay
-    matching. All validation lives here server-side (the channel subprocess
-    transmits raw args and lets this gate refuse — r8-1).
+    ``{"label": str, "short": str}`` dict — ``label.strip()`` non-empty.
+    Mixed str+dict lists are allowed. The projection hash is computed
+    client-side over the RAW args, so this server-side normalization does not
+    affect relay matching. All validation lives here server-side (the channel
+    subprocess transmits raw args and lets this gate refuse — r8-1).
 
-    v0.83.0 (A6 · F-LABEL): each FULL label (and dict ``short``) is normalized by
-    stripping ONE leading agent-authored enumerator (``A — ``, ``b) ``, ``1. ``)
-    so Casa's own numbering is not double-labelled — "verbatim" now means
-    "verbatim after enumerator normalization". Normalization runs BEFORE
-    render/meta and AFTER hashing (hash is client-side over the raw args). The
-    uniqueness + non-emptiness checks below run POST-normalization (Sol r6-5,
-    r7-5): raw-unique labels that collide after stripping (``A — Same`` /
-    ``1. Same``), a marker-only option that normalizes empty, and any label /
-    short that is whitespace-only after stripping all refuse ``invalid_args``.
+    v0.84.0 (round 4, D1 bullets 1-2): the invented LENGTH caps on the
+    question, FULL labels, and ``short`` are GONE — Structural checks remain
+    ONLY for the question and FULL labels: type, non-blank after strip,
+    uniqueness. ``short`` is optional ADVISORY data and is NEVER a rejection
+    cause: a missing, blank, duplicate, over-budget, or non-string ``short``
+    reaches the D2 whole-set resolver (``telegram.resolve_button_labels``)
+    UNTOUCHED (bar enumerator normalization below), which floors the WHOLE
+    button set rather than rejecting the ask. A non-string ``short`` is
+    normalized to ``None`` (treated as absent) here so downstream consumers
+    only ever see ``str | None``.
+
+    v0.83.0 (A6 · F-LABEL): each FULL label (and str-typed dict ``short``) is
+    normalized by stripping ONE leading agent-authored enumerator (``A — ``,
+    ``b) ``, ``1. ``) so Casa's own numbering is not double-labelled —
+    "verbatim" now means "verbatim after enumerator normalization".
+    Normalization runs BEFORE render/meta and AFTER hashing (hash is
+    client-side over the raw args). The uniqueness + non-emptiness checks
+    below run POST-normalization for FULL LABELS ONLY (Sol r6-5, r7-5):
+    raw-unique labels that collide after stripping (``A — Same`` /
+    ``1. Same``) or a marker-only option that normalizes empty refuse
+    ``invalid_args``. A ``short`` that normalizes blank/duplicate is NOT
+    re-validated here (D1 round 4) — it flows to the resolver as-is.
     """
     question = body.get("question")
-    if (not isinstance(question, str) or not question
-            or len(question) > _ASK_MAX_QUESTION_LEN):
+    if not isinstance(question, str) or not question:
         return None
     options = body.get("options")
     if not isinstance(options, list):
@@ -861,41 +874,33 @@ def _validate_ask_args(
     shorts: list[str | None] = []
     for o in options:
         if isinstance(o, str):
-            # Length cap is enforced on the RAW label; A6 strips the enumerator
-            # AFTER, then the post-normalization non-emptiness check below refuses
-            # a marker-only / whitespace-only label.
-            if not o or len(o) > _ASK_MAX_LABEL_LEN:
+            if not o:
                 return None
             labels.append(_strip_enumerator(o))
             shorts.append(None)
         elif isinstance(o, dict):
             label = o.get("label")
-            short = o.get("short")
-            if (not isinstance(label, str) or not label.strip()
-                    or len(label) > _ASK_MAX_LABEL_LEN):
-                return None
-            if (not isinstance(short, str) or not short.strip()
-                    or len(short) > _ASK_MAX_SHORT_LEN):
+            if not isinstance(label, str) or not label.strip():
                 return None
             labels.append(_strip_enumerator(label))
-            shorts.append(_strip_enumerator(short))
+            short = o.get("short")
+            # D1 (round 4): a non-string ``short`` is treated as absent; a
+            # string ``short`` flows through untouched (bar enumerator
+            # normalization) — blank/duplicate/over-budget is the D2
+            # resolver's concern, never a rejection here.
+            shorts.append(_strip_enumerator(short) if isinstance(short, str) else None)
         else:
             return None
-    # A6 POST-normalization re-validation (Sol r6-5 + r7-5): a marker-only or
-    # whitespace-only label / short is refused via ``.strip() != ""`` (bare
-    # truthiness would accept whitespace-only), and uniqueness is re-checked so
-    # raw-unique labels colliding after the strip (``A — Same`` / ``1. Same``)
-    # refuse instead of rendering duplicate choices.
+    # A6 POST-normalization re-validation (Sol r6-5 + r7-5), FULL LABELS ONLY:
+    # a marker-only or whitespace-only label is refused via ``.strip() != ""``
+    # (bare truthiness would accept whitespace-only), and uniqueness is
+    # re-checked so raw-unique labels colliding after the strip
+    # (``A — Same`` / ``1. Same``) refuse instead of rendering duplicate
+    # choices. ``short`` is advisory and is never re-validated here (D1).
     for lab in labels:
         if not lab.strip():
             return None
-    for s in shorts:
-        if s is not None and not s.strip():
-            return None
     if len(set(labels)) != len(labels):
-        return None
-    provided_shorts = [s for s in shorts if s is not None]
-    if len(set(provided_shorts)) != len(provided_shorts):
         return None
     try:
         timeout_s = float(body.get("timeout_s", _ASK_DEFAULT_TIMEOUT_S))
@@ -938,10 +943,13 @@ def render_ask_body(number: "int | None", question: str, options: list) -> str:
     number allocated / degraded boot), in which case the bare question is used
     without the ``Q<n>:`` prefix.
 
-    No overflow path (Sol r1-5): the ``_validate_ask_args`` caps (question
-    ≤1024, ≤8 options ≤48 each) keep this body well under Telegram's 4096-char
-    limit (worst case ≈1.5 KB). A cap change that could exceed 4096 must REJECT
-    in ``_validate_ask_args`` — never silently truncate here.
+    v0.84.0 (round 4, D1): the LENGTH caps this docstring used to lean on for a
+    "no overflow path" claim are gone (``_validate_ask_args`` no longer bounds
+    question/label length; only option COUNT stays capped at
+    ``_ASK_MAX_OPTIONS``). The real Telegram 4096-char body limit is now
+    enforced by a dedicated per-ask render-and-measure lifecycle validator
+    (Task A3, spec §D1 bullet 2) rather than by an invented length heuristic
+    here — this function never truncates.
     """
     base = _canonical_question(question, number) if number else question
     if not options:

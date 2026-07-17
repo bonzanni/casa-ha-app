@@ -18,12 +18,16 @@ Two halves:
      ``EngagementRegistry`` + REAL ``_make_channel_handlers``, injected clocks)
      asserting the body carries FULL labels verbatim, the buttons carry
      ``n · <short>``, a tap resolves to the FULL label in the response AND the
-     settle ✅ line, and invalid dict shapes refuse ``invalid_args``. These
-     exercise ``channel_handlers._validate_ask_args`` (untouched by this
-     resolver task — see Task A2) via a fake channel that only RECORDS the
-     ``options``/``shorts`` it's called with, so they don't exercise
-     ``resolve_button_labels`` at all and are unaffected by the round-4
-     resolver change.
+     settle ✅ line, and malformed dict SHAPES (wrong type, missing/blank
+     label, duplicate full labels) still refuse ``invalid_args``. These
+     exercise ``channel_handlers._validate_ask_args``, which Task A2 (round 4,
+     spec D1) changed: the invented length caps are gone and ``short`` is now
+     advisory-only — a missing/blank/duplicate/over-budget/non-string
+     ``short`` is ACCEPTED and flows through to the D2 resolver (which floors
+     the whole button set) instead of rejecting the ask. A fake channel only
+     RECORDS the ``options``/``shorts`` it's called with, so these don't
+     exercise ``resolve_button_labels`` itself and are unaffected by the
+     round-4 resolver change.
 """
 
 from __future__ import annotations
@@ -267,7 +271,9 @@ class TestDictOptionsEndToEnd:
 
 
 class TestInvalidDictShapes:
-    """Invalid option shapes refuse ``invalid_args`` at validation (no post)."""
+    """Malformed dict SHAPES still refuse ``invalid_args`` at validation (no
+    post); ``short`` length/blank/duplicate is no longer one of them (D1,
+    round 4) — see ``TestShortIsAdvisoryNeverRejects`` below."""
 
     def _invalid(self, options):
         from channels.channel_handlers import _validate_ask_args
@@ -277,31 +283,8 @@ class TestInvalidDictShapes:
     def test_missing_label_key(self):
         assert self._invalid([{"short": "x"}, "B"])
 
-    def test_missing_short_key(self):
-        assert self._invalid([{"label": "Full label"}, "B"])
-
-    def test_short_over_25_chars(self):
-        assert self._invalid(
-            [{"label": "Full", "short": "x" * 26}, "B"])
-
-    def test_short_whitespace_only(self):
-        assert self._invalid([{"label": "Full", "short": "   "}, "B"])
-
     def test_label_whitespace_only(self):
         assert self._invalid([{"label": "   ", "short": "ok"}, "B"])
-
-    def test_label_over_48_chars(self):
-        assert self._invalid(
-            [{"label": "x" * 49, "short": "ok"}, "B"])
-
-    def test_short_non_string(self):
-        assert self._invalid([{"label": "Full", "short": 7}, "B"])
-
-    def test_duplicate_shorts_refused(self):
-        assert self._invalid([
-            {"label": "First full label", "short": "dup"},
-            {"label": "Second full label", "short": "dup"},
-        ])
 
     def test_duplicate_full_labels_refused(self):
         assert self._invalid([
@@ -333,3 +316,62 @@ class TestInvalidDictShapes:
         _q, labels, _t, shorts = out
         assert labels == ["A", "B"]
         assert shorts == [None, None]
+
+
+class TestShortIsAdvisoryNeverRejects:
+    """D1 (round 4): a missing/blank/duplicate/over-budget/non-string
+    ``short`` is NEVER a rejection cause — it flows through to the D2
+    resolver (which floors the whole button set) instead. Full LABEL
+    structural checks (type, non-blank, uniqueness) are unaffected."""
+
+    def _validated(self, options):
+        from channels.channel_handlers import _validate_ask_args
+        return _validate_ask_args(
+            {"question": "q?", "options": options, "timeout_s": 60})
+
+    def test_missing_short_key_accepted_as_absent(self):
+        out = self._validated([{"label": "Full label"}, "B"])
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["Full label", "B"]
+        assert shorts == [None, None]
+
+    def test_short_over_25_chars_accepted_advisory(self):
+        out = self._validated([{"label": "Full", "short": "x" * 26}, "B"])
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["Full", "B"]
+        assert shorts == ["x" * 26, None]
+
+    def test_short_whitespace_only_accepted_advisory(self):
+        out = self._validated([{"label": "Full", "short": "   "}, "B"])
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["Full", "B"]
+        assert shorts == ["", None]
+
+    def test_short_non_string_treated_as_absent(self):
+        out = self._validated([{"label": "Full", "short": 7}, "B"])
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["Full", "B"]
+        assert shorts == [None, None]
+
+    def test_duplicate_shorts_accepted_advisory(self):
+        out = self._validated([
+            {"label": "First full label", "short": "dup"},
+            {"label": "Second full label", "short": "dup"},
+        ])
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["First full label", "Second full label"]
+        assert shorts == ["dup", "dup"]
+
+    def test_label_over_48_chars_accepted(self):
+        # D1: the invented FULL-label length cap is gone too (the live Q2
+        # failure — a 139-char label was refused pre-round-4).
+        out = self._validated([{"label": "x" * 49, "short": "ok"}, "B"])
+        assert out is not None
+        _q, labels, _t, shorts = out
+        assert labels == ["x" * 49, "B"]
+        assert shorts == ["ok", None]

@@ -294,14 +294,10 @@ async def test_ask_validation_clamps_and_rejects(
         resp = await client.post("/internal/channel/ask", json=_payload(
             request_id="v3", options=["A", "A"]))
         assert (await resp.json()) == {"ok": False, "error": "invalid_args"}
-        # 1025-char question
-        resp = await client.post("/internal/channel/ask", json=_payload(
-            request_id="v4", question="x" * 1025))
-        assert (await resp.json()) == {"ok": False, "error": "invalid_args"}
-        # 49-char label
-        resp = await client.post("/internal/channel/ask", json=_payload(
-            request_id="v5", options=["x" * 49, "B"]))
-        assert (await resp.json()) == {"ok": False, "error": "invalid_args"}
+        # D1 (round 4, spec §D1): the invented 1024-char question cap and the
+        # 48-char label cap are REMOVED — a long question / long label is now
+        # ACCEPTED, not rejected. See test_ask_accepts_long_question_and_label
+        # below for the positive (posts-a-keyboard) coverage.
 
     assert ch.options_keyboards == []  # none of the invalid ones ever posted
 
@@ -343,6 +339,39 @@ async def test_ask_validation_clamps_and_rejects(
         release.set()
         resp_hi = await asyncio.wait_for(t_hi, timeout=1.0)
         assert (await resp_hi.json()) == {"ok": False, "error": "cancelled"}
+
+
+async def test_ask_accepts_long_question_and_label(app_with_ask) -> None:
+    """D1 (round 4, spec §D1 bullets 1-2): the invented ``_ASK_MAX_QUESTION_LEN``
+    (1024) and ``_ASK_MAX_LABEL_LEN`` (48) caps are gone — a long question and
+    a long option label are ACCEPTED end-to-end (keyboard posts, tap answers)
+    rather than refused ``invalid_args``."""
+    app, ch, _reg, broker = app_with_ask
+    long_question = "x" * 1025
+    long_label = "y" * 49
+    async with TestClient(TestServer(app)) as client:
+        task = asyncio.ensure_future(client.post(
+            "/internal/channel/ask",
+            json=_payload(
+                request_id="rid-long", question=long_question,
+                options=[long_label, "B"]),
+        ))
+        await asyncio.sleep(0.05)
+        assert broker.deliver(
+            namespace="engagement_ask", scope="eng-1", request_id="rid-long",
+            option_index=0, actor_id=999,
+        ) == "delivered"
+        resp = await asyncio.wait_for(task, timeout=1.0)
+        body = await resp.json()
+        await broker.drain_hooks()
+
+    assert body == {
+        "ok": True, "outcome": "answered", "option": long_label,
+        "option_index": 0,
+    }
+    assert len(ch.options_keyboards) == 1
+    assert long_question in ch.options_keyboards[0]["question"]
+    assert long_label in ch.options_keyboards[0]["question"]
 
 
 async def test_ask_keyboard_post_failure_unregisters(app_with_ask) -> None:

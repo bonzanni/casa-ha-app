@@ -1183,4 +1183,64 @@ class TestEmbeddedOptionsAnchor:
             _btn_payload(eid, "b7", question=q))))
         resp = await _drive_button(wired, task, "b7")
         assert _body(resp)["outcome"] == "answered"
+
+
+class TestCapsRemovedEndToEnd:
+    """D1 (round 4, spec §D1 bullets 1-2): the invented length caps
+    (``_ASK_MAX_LABEL_LEN``=48, the 1024-char question cap, the 25-char
+    ``short`` cap) are gone — a long option label / question / short is
+    ACCEPTED and posts a real keyboard end-to-end (never ``invalid_args``).
+    Only option COUNT (documented product-contract exception) still rejects.
+    """
+
+    async def test_139_char_option_label_accepted(self, wired):
+        """The LIVE Q2 failure form: a long, readable option label used to be
+        refused ``invalid_args`` at the 48-char cap; it now posts verbatim."""
+        eid = wired["rec"].id
+        base = "Option A — a genuinely long, readable choice description "
+        long_label = base + "x" * (139 - len(base))
+        assert len(long_label) == 139
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(eid, "cap1", options=[long_label, "B"]))))
+        resp = await _drive_button(wired, task, "cap1")
+        body = _body(resp)
+        assert body["ok"] is True
+        assert body["outcome"] == "answered"
+        # The strip_enumerator normalization removes the leading "Option A — ".
+        assert "a genuinely long, readable choice description" in (
+            wired["chan"].keyboards[-1][1])
+
+    async def test_2000_char_question_accepted(self, wired):
+        long_question = "x" * 2000
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(eid=wired["rec"].id, rid="cap2", question=long_question))))
+        resp = await _drive_button(wired, task, "cap2")
+        assert _body(resp)["ok"] is True
+
+    async def test_9_options_still_rejected_count_cap(self, wired):
+        """The COUNT cap (documented product-contract exception, unaffected
+        by D1) still refuses — this is never about label/question length."""
+        eid = wired["rec"].id
+        resp = await wired["ask"](_FakeRequest(_btn_payload(
+            eid, "cap3", options=[f"o{i}" for i in range(9)])))
+        assert _body(resp) == {"ok": False, "error": "invalid_args"}
+
+    async def test_duplicate_full_labels_still_rejected(self, wired):
+        eid = wired["rec"].id
+        resp = await wired["ask"](_FakeRequest(_btn_payload(
+            eid, "cap4", options=["Same", "Same"])))
+        assert _body(resp) == {"ok": False, "error": "invalid_args"}
+
+    async def test_blank_and_non_string_short_never_reject(self, wired):
+        """A blank or non-string ``short`` used to be refused at the 25-char/
+        non-blank checks; it now floors the button set (D2) but still posts."""
+        eid = wired["rec"].id
+        options = [
+            {"label": "Personal Gmail", "short": "   "},
+            {"label": "Work Outlook", "short": 7},
+        ]
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _btn_payload(eid, "cap5", options=options))))
+        resp = await _drive_button(wired, task, "cap5")
+        assert _body(resp)["ok"] is True
         assert len(wired["chan"].keyboards) == 1
