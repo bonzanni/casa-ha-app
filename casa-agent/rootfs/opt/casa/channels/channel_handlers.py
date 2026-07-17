@@ -365,9 +365,24 @@ _ASK_MIN_TIMEOUT_S = 30.0
 _ASK_MAX_TIMEOUT_S = 570.0
 _ASK_DEFAULT_TIMEOUT_S = 300.0
 
+# v0.84.0 (round 4, D1 bullet 3, Task A3): the render-and-measure lifecycle
+# body-limit validator. The check runs PRE-Q-ALLOCATION here (a conservative
+# approximation — the real post-allocation gate with tombstone/marker cleanup
+# is Task A4/A5's job; no Q-number/intent/broker record exists yet at this
+# point in the handler, so refusing here needs no cleanup machinery). Render
+# with the WORST-CASE Q-number WIDTH (comfortably above any real session's
+# allocated number — a 4-digit placeholder) rather than the real number, which
+# isn't allocated until later.
+_ASK_BODY_LIMIT = 4096
+_ASK_WORST_CASE_NUMBER = 9999
+
 # v0.79.0 §4 — pinned settle copy (appended below the canonical question text
 # when the keyboard settles; the keyboard is cleared via clear_keyboard=True).
-_SETTLE_ANSWERED = "\n✅ {label}"
+# v0.84.0 (round 4, D1 bullet 3): the old ``_SETTLE_ANSWERED = "\n✅ {label}"``
+# re-appended the operator's CHOSEN FULL LABEL — unbounded, so the
+# render-and-measure body-limit validator couldn't know the settled length at
+# ask time. Replaced by :func:`_positional_settle_suffix` below, which renders
+# a BOUNDED positional copy (``✅ Option 2`` / ``✅ Options 1, 3``) instead.
 # F-EXPIRE (v0.83.0, A2a): a live-ask keyboard that expires unanswered now
 # SUSPENDS the engagement (operator-away) rather than inviting an immediate
 # re-ask, so the settle copy tells the operator the engagement is paused and how
@@ -958,33 +973,56 @@ def render_ask_body(number: "int | None", question: str, options: list) -> str:
     return f"{base}\n\n{numbered}"
 
 
+def _positional_settle_suffix(indices: list[int]) -> str:
+    """v0.84.0 (round 4, D1 bullet 3, Task A3) — the BOUNDED positional settle
+    copy for an ``answered`` outcome, replacing the old chosen-FULL-LABEL
+    re-appending: an operator-chosen option's rendered length was previously
+    unknown until settle time, which made the render-and-measure body-limit
+    validator unboundable at ask time (an arbitrarily long label could push a
+    settled message past 4096 chars with no way to have refused up front).
+
+    1-based, ascending, de-duplicated option POSITIONS (never the label
+    text): a single position renders ``\\n✅ Option <n>``; two or more render
+    ``\\n✅ Options <n1>, <n2>, …``. An empty/all-invalid ``indices`` (a
+    malformed outcome) falls back to ``\\n✅ Option ?`` — never raises.
+
+    This is also the single source :func:`drivers.claude_code_driver
+    .ask_lifecycle_suffixes` renders through for the live-answered worst-case
+    form (multi worst case = every option selected)."""
+    positions = sorted({i + 1 for i in indices})
+    if not positions:
+        return "\n✅ Option ?"
+    if len(positions) == 1:
+        return f"\n✅ Option {positions[0]}"
+    return "\n✅ Options " + ", ".join(str(p) for p in positions)
+
+
 def _ask_settle_text(question: str, outcome: dict, options: list) -> str:
     """v0.79.0 §4 — render the pinned settle copy below the canonical question.
 
-    answered ⇒ ``\\n✅ <chosen label>``; expired (no_answer) ⇒
+    answered ⇒ the BOUNDED positional copy (v0.84.0 D1 bullet 3) —
+    ``\\n✅ Option <n>`` (single-select) or ``\\n✅ Options <n1>, <n2>, …``
+    (multi, 1-based ascending) — never the chosen label(s); expired ⇒
     ``\\n⌛ expired — answer by text below``; cancelled via a fresh operator
     message ⇒ ``\\n🚫 superseded by your message below``; any other cancel ⇒
     ``\\n🚫 cancelled``.
     """
     o = outcome.get("outcome")
     if o == "answered":
-        # A5 · F-MULTI: a multi submit carries ``option_indices`` → settle copy
-        # is ``✅ label1 + label2 + …`` (single-select stays ``✅ label``).
+        # A5 · F-MULTI: a multi submit carries ``option_indices`` → settle
+        # copy lists every chosen POSITION (single-select stays one position).
         indices = outcome.get("option_indices")
         if indices:
-            picked = [
-                options[i] for i in indices
+            valid = [
+                i for i in indices
                 if isinstance(i, int) and 0 <= i < len(options)
             ]
-            label = " + ".join(picked) if picked else "?"
-            return question + _SETTLE_ANSWERED.format(label=label)
+            return question + _positional_settle_suffix(valid)
         idx = outcome.get("option_index")
-        label = (
-            options[idx]
-            if isinstance(idx, int) and 0 <= idx < len(options)
-            else "?"
+        valid_idx = (
+            [idx] if isinstance(idx, int) and 0 <= idx < len(options) else []
         )
-        return question + _SETTLE_ANSWERED.format(label=label)
+        return question + _positional_settle_suffix(valid_idx)
     if o == "cancelled":
         reason = outcome.get("reason")
         if reason == "superseded_by_text":
@@ -1153,6 +1191,31 @@ def _make_ask(
         # (which already refused multi + <2 options / anchor). Only the BUTTON
         # ask path can be multi — the anchor path below is never reached.
         multi = bool(body.get("multi", False))
+
+        # D1 bullets 3 & 6 (Task A3) — render-and-measure lifecycle body-limit
+        # validator. PRE-Q-ALLOCATION (see ``_ASK_WORST_CASE_NUMBER``'s
+        # docstring above): nothing has been allocated/registered yet at this
+        # point, so refusing here needs no tombstone/marker cleanup. Render
+        # the body with the worst-case Q-number width and measure it against
+        # the worst-case terminal lifecycle suffix for THIS ask (multi worst
+        # case = every option selected) — self-explaining ``invalid_args``
+        # (spec §D1 bullet 6) so the agent fixes in one retry.
+        from drivers.claude_code_driver import ask_lifecycle_suffixes
+        worst_body = render_ask_body(_ASK_WORST_CASE_NUMBER, question, options)
+        worst_suffix_len = max(
+            len(s) for s in
+            ask_lifecycle_suffixes(_ASK_WORST_CASE_NUMBER, options, multi))
+        rendered_len = len(worst_body) + worst_suffix_len
+        if rendered_len > _ASK_BODY_LIMIT:
+            return web.json_response({
+                "ok": False, "error": "invalid_args",
+                "detail": (
+                    "rendered question+options would exceed Telegram's "
+                    f"4096-char message limit (was {rendered_len} incl. "
+                    "lifecycle suffix); shorten the question or reduce "
+                    "options"
+                ),
+            })
 
         rec = engagement_registry.get(eng_id)
         if rec is None:

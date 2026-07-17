@@ -57,6 +57,74 @@ _OPEN_Q_CANCELLED_SUFFIX = "\n🛑 engagement ended — this question is closed"
 # fallback settles the NEW copy pointing up to the still-live original.
 _OPEN_Q_REPOSTED_BELOW = "↪ question re-posted below ↓"
 _OPEN_Q_SEE_ABOVE = "↪ see the question above"
+
+
+def ask_lifecycle_suffixes(
+    number: "int | None", options: list, multi: bool,
+) -> list[str]:
+    """v0.84.0 (round 4, D1 bullets 3 & 6, Task A3) — enumerate EVERY terminal
+    suffix Telegram lifecycle form THIS ask can render, exactly as the
+    settle/boot/terminal paths will, for the render-and-measure per-ask
+    body-limit validator (``channels.channel_handlers``'s ``ask`` handler):
+    ``len(body) + max(len(s) for s in ask_lifecycle_suffixes(...)) <= 4096``.
+
+    ``number`` is accepted for call-site symmetry with
+    :func:`channels.channel_handlers.render_ask_body` (the validator renders
+    the body and the suffixes for the SAME allocated/approximated number in
+    one breath) — no suffix form below actually interpolates the Q-number, so
+    it is otherwise unused here.
+
+    Forms enumerated:
+      * live answered — the free-text-anchor fixed copy
+        (``_SETTLE_ANSWERED_BELOW``) when ``options`` is empty; otherwise the
+        BOUNDED POSITIONAL settle copy (v0.84.0 D1 bullet 3 — never the
+        chosen full label(s)): single-select worst case is the LAST option
+        position; multi worst case is EVERY option selected, rendered
+        exactly (``✅ Options 1, 2, …, N`` — every index, no elision);
+      * expired / cancelled / superseded / internal-error (live-ask settle
+        copies owned by ``channels.channel_handlers``);
+      * boot-reconcile answered / expired (``_OPEN_Q_ANSWERED_SUFFIX`` /
+        ``_OPEN_Q_EXPIRED_SUFFIX``);
+      * terminal cancellation (``_OPEN_Q_CANCELLED_SUFFIX`` — the engagement
+        ended while this question was open).
+
+    Excluded by design (allow-listed by the drift test in
+    ``tests/test_ask_body_limit.py``, each with a pointer to the task that
+    owns its removal): ``_OPEN_Q_SEE_ABOVE`` (the old re-anchor
+    persist-failure BODY suffix — its BEHAVIOUR is already deleted by this
+    round's re-anchor retry redesign; the CONSTANT's removal completes in
+    Task D3) and ``_OPEN_Q_REPOSTED_BELOW`` (Task D6's moved-marker text is a
+    standalone REPLACEMENT form, not a body SUFFIX — it is never appended to
+    a rendered ask body).
+
+    A function-local import of the settle constants avoids a module-level
+    cross-package edge between the driver and channel-handler modules
+    (neither imports the other at module scope today) — matching this
+    codebase's existing local-import convention for the same pair of modules
+    (e.g. ``casa_core``'s lazy ``from channels.channel_handlers import ...``).
+    """
+    from channels.channel_handlers import (
+        _SETTLE_ANSWERED_BELOW, _SETTLE_CANCELLED, _SETTLE_EXPIRED,
+        _SETTLE_INTERNAL_ERROR, _SETTLE_SUPERSEDED, _positional_settle_suffix,
+    )
+    suffixes = [
+        _SETTLE_EXPIRED,
+        _SETTLE_CANCELLED,
+        _SETTLE_SUPERSEDED,
+        _SETTLE_INTERNAL_ERROR,
+        _OPEN_Q_ANSWERED_SUFFIX,
+        _OPEN_Q_EXPIRED_SUFFIX,
+        _OPEN_Q_CANCELLED_SUFFIX,
+    ]
+    if not options:
+        suffixes.append(_SETTLE_ANSWERED_BELOW)
+    elif multi:
+        suffixes.append(_positional_settle_suffix(list(range(len(options)))))
+    else:
+        suffixes.append(_positional_settle_suffix([len(options) - 1]))
+    return suffixes
+
+
 # §A3(b) retry-owner bounded backoff (Sol r13-1): a FAILED latch-consuming pass
 # self-reschedules 5s → 30s → 300s (capped, repeated) indefinitely until the
 # latch clears via success / promotion / terminal settlement / a boundary win.

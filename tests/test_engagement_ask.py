@@ -204,7 +204,9 @@ async def test_ask_answered_edits_answered(app_with_ask) -> None:
     }
     assert len(ch.options_keyboards) == 1
     assert len(ch.edited_answered) == 1
-    assert "B" in ch.edited_answered[0][2]
+    # v0.84.0 (round 4, D1 bullet 3): settle copy is the BOUNDED positional
+    # form (never the chosen full label) — option_index=1 is position 2.
+    assert "Option 2" in ch.edited_answered[0][2]
     assert ch.edited_expired == []
 
 

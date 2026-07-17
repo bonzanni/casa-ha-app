@@ -236,9 +236,10 @@ class TestDictOptionsEndToEnd:
             "Single account with aliases", "Separate Google accounts"]
         assert kb["shorts"] == ["Aliased", "Separate"]
 
-        # Settle ✅ line shows the FULL chosen label, not the short.
+        # Settle ✅ line is the BOUNDED positional copy (v0.84.0 D1 bullet 3),
+        # never the full label or short.
         settle = wired["ch"].edits[-1]["text"]
-        assert "✅ Single account with aliases" in settle
+        assert "✅ Option 1" in settle
         assert wired["ch"].edits[-1]["clear_keyboard"] is True
 
     async def test_mixed_str_and_dict_allowed(self, wired):

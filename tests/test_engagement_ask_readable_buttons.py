@@ -25,9 +25,10 @@ the numbered placeholder.
 
 These tests assert: the four consumers render a byte-identical body; every full
 option appears verbatim + numbered; a floored keyboard maps to the correct
-index; settle appends the FULL chosen option below the canonical body; free-text
-anchors render without an option list; and the SEPARATE authz-challenge
-renderer is untouched.
+index; settle appends the BOUNDED positional copy (v0.84.0 D1 bullet 3, never
+the full chosen option) below the canonical body; free-text anchors render
+without an option list; and the SEPARATE authz-challenge renderer is
+untouched.
 """
 
 from __future__ import annotations
@@ -205,19 +206,19 @@ class TestPostOptionsKeyboardReadable:
 
 
 # ---------------------------------------------------------------------------
-# _ask_settle_text — full chosen option appended below the canonical body
+# _ask_settle_text — BOUNDED positional copy appended below the canonical body
 # ---------------------------------------------------------------------------
 
 
 class TestSettleAppendsFullOption:
-    def test_answered_appends_full_chosen_option_below_body(self) -> None:
+    def test_answered_appends_positional_copy_below_body(self) -> None:
         options = ["Personal Gmail", "Configure the enterprise SSO integration"]
         body = render_ask_body(1, "Which account?", options)
         settled = _ask_settle_text(
             body, {"outcome": "answered", "option_index": 1}, options)
-        # Base body preserved byte-for-byte; the FULL option (not the short
-        # label) appended below with a ✅.
-        assert settled == body + "\n✅ Configure the enterprise SSO integration"
+        # Base body preserved byte-for-byte; the BOUNDED POSITION (not the
+        # full option label) appended below with a ✅ (v0.84.0 D1 bullet 3).
+        assert settled == body + "\n✅ Option 2"
         assert settled.startswith(body)
 
 
@@ -304,8 +305,9 @@ async def test_body_identical_across_post_persist_and_settle(
     # (settled entries are removed on close, so read the text before close via
     # the settle edit; the persisted text was the same source — assert the
     # settle base derived from it).
-    # (3) settle base == body + FULL chosen option (not the short label).
-    assert ch.edits[-1]["text"] == expected + "\n✅ Personal Gmail"
+    # (3) settle base == body + BOUNDED positional copy (v0.84.0 D1 bullet 3;
+    # option_index=0 is position 1, never the chosen label).
+    assert ch.edits[-1]["text"] == expected + "\n✅ Option 1"
     assert ch.edits[-1]["clear_keyboard"] is True
     # The persisted ledger is now empty (question settled), proving the close
     # path ran over the SAME entry; the persisted text identity is asserted in

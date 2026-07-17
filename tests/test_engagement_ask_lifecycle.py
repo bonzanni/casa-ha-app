@@ -217,11 +217,11 @@ async def test_answered_settles_with_check_and_clears_keyboard(env):
 
     assert _body(resp) == {
         "ok": True, "outcome": "answered", "option": "B", "option_index": 1}
-    # Settle edit: PRESENT clear_keyboard, ✅ + FULL chosen option appended
-    # BELOW the canonical body (W-R3: body carries every option verbatim).
+    # Settle edit: PRESENT clear_keyboard, BOUNDED positional ✅ copy appended
+    # BELOW the canonical body (v0.84.0 D1 bullet 3 — never the full label).
     edit = env["ch"].edits[-1]
     assert edit["clear_keyboard"] is True
-    assert edit["text"] == "Q1: Proceed?\n\n1. A\n2. B\n✅ B"
+    assert edit["text"] == "Q1: Proceed?\n\n1. A\n2. B\n✅ Option 2"
 
 
 async def test_expired_settles_with_hourglass_and_clears_keyboard(env, monkeypatch):

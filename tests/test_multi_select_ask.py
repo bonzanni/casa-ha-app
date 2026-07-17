@@ -212,7 +212,9 @@ class TestSettleAndResponse:
         text = _ask_settle_text(
             "Q1: pick", {"outcome": "answered", "option_indices": [0, 2]},
             ["Alpha", "Beta", "Gamma"])
-        assert text == "Q1: pick\n✅ Alpha + Gamma"
+        # v0.84.0 (round 4, D1 bullet 3): BOUNDED positional copy, 1-based
+        # ascending — never the full labels.
+        assert text == "Q1: pick\n✅ Options 1, 3"
 
     def test_response_lists_labels_and_indices_plus_first_compat(self):
         from channels.channel_handlers import _ask_outcome_response
@@ -594,9 +596,10 @@ class TestHandlerEndToEnd:
         assert body["options"] == ["Alpha", "Gamma"]
         assert body["option_indices"] == [0, 2]
         assert body["option"] == "Alpha"
-        # settle copy: ✅ a + b (driver None ⇒ edit_topic_message fallback).
+        # settle copy: BOUNDED positional (driver None ⇒ edit_topic_message
+        # fallback) — v0.84.0 D1 bullet 3, never the full labels.
         settle = wired.ch.edits[-1]
-        assert "✅ Alpha + Gamma" in settle["text"]
+        assert "✅ Options 1, 3" in settle["text"]
         assert settle["clear_keyboard"] is True
 
     async def test_multi_supersession_settles(self, wired):
