@@ -29,15 +29,20 @@ CLAUDE.md memory cage).
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 
 import pytest
 
 from channels.output_sequencer import ASK_TOOL, OutputSequencer, projection_hash
+from drivers.topic_stream import StreamCursor
 from test_topic_stream import (
     Recorder,
+    _ident,
     _init,
     _make_relay,
     _result,
+    _spawn,
     _text,
     _tool_in,
     _write_current,
@@ -454,3 +459,306 @@ async def test_button_ask_with_options_is_not_a_candidate(tmp_path):
     assert relay._anchor_candidate is None
     assert relay._suppressing_for is None
     assert _narration_sends(rec) == ["hi"]     # posted (never buffered)
+
+
+# ===========================================================================
+# Task C3: the ``hold_pending`` write-ahead marker + crash/replay machinery
+# (spec §D5 r5-2 write-ahead / r3-2 checkpoint-hold / r4-3 cold disarm /
+# r29-3 SEGMENT_GAP floor / r5-3+r8-2+r9-3 abnormal spawn).
+#
+# Crash injection = DROP the relay instance and build a COMPLETELY NEW one on
+# the persisted cursor / NDJSON (never warm re-entry). Real primitives + real
+# temp NDJSON + injected clocks throughout; ``asyncio.sleep`` is never patched.
+# ===========================================================================
+
+
+def _mixed_anchor_text(question: str, text: str) -> dict:
+    """A single assistant frame carrying an anchor ask tool_use block PLUS a
+    trailing text block (the §D5 r3-2 mixed frame)."""
+    return {
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "tool_use", "name": ASK_TOOL, "input": {"question": question}},
+            {"type": "text", "text": text},
+        ]},
+    }
+
+
+# --- RED (a): mixed anchor+text, no prior narration; crash after processing --
+
+
+async def test_crash_after_held_mixed_frame_resurfaces_before_advance(tmp_path):
+    """(a) A mixed anchor+text frame is the turn's FIRST visible output; the
+    trailing prose is buffered (write-ahead marker set) and its frame does NOT
+    checkpoint. A crash after processing (drop the relay) leaves marker-True /
+    checkpoint-held. A COMPLETELY NEW relay on the persisted cursor DISARMS,
+    re-renders the prose as ordinary narration, THEN advances the cursor past
+    the frame — resurface-never-lose."""
+    signoff = "I'll wait for your answer."
+    offs = _write_current(tmp_path, [_init(), _mixed_anchor_text("Q?", signoff)])
+    cursor = tmp_path / ".stream_cursor.json"
+
+    # First relay: holds the prose (anchor open), never posts, crashes (dropped).
+    rec1 = Recorder()
+    seq1, _c1 = _fast_sequencer(rec1)
+    relay1 = _make_relay(
+        tmp_path, cursor, rec1, [], sequencer=seq1,
+        open_anchor_state=lambda: (5, 500),
+    )
+    await relay1.run()
+    assert rec1.sends == []                                   # held, never posted
+    assert StreamCursor.load(cursor).hold_pending is True     # write-ahead marker
+    assert StreamCursor.load(cursor).current["offset"] == offs[0]  # held frame
+
+    # Brand-new relay on the persisted cursor/NDJSON — a genuine cold recovery.
+    rec2, events2 = Recorder(), []
+    seq2, _c2 = _fast_sequencer(rec2)
+    relay2 = _make_relay(
+        tmp_path, cursor, rec2, events2, sequencer=seq2,
+        open_anchor_state=lambda: (5, 500),   # anchor STILL open on recovery
+    )
+    await relay2.run()
+
+    assert _narration_sends(rec2) == [signoff]                # RESURFACED
+    assert relay2.cursor.current["offset"] == offs[1]         # advanced past it
+
+
+# --- RED (b): crash BEFORE the write-ahead save (marker false, checkpoint held)
+
+
+async def test_crash_before_writeahead_save_resurfaces(tmp_path):
+    """(b) The crash lands the instant BEFORE the write-ahead ``_save`` — on
+    disk the marker is FALSE, but the anchor frame was already checkpointed and
+    the held text frame was NOT (checkpoint held one frame back). A new relay
+    re-processes the text frame; the anchor's candidate is lost to replay
+    suppression (a tool_use frame replays with no side effects), so the prose
+    posts as ordinary narration. The dangerous window (marker false AND cursor
+    advanced past the held frame) never exists."""
+    offs = _write_current(
+        tmp_path, [_init(), _anchor_ask("Q?"), _text("signoff"), _result()],
+    )
+    cursor = tmp_path / ".stream_cursor.json"
+    seg = _ident(os.path.join(str(tmp_path), "current"))
+    # Crash-before-write-ahead state: anchor checkpointed, marker never saved,
+    # the text frame's checkpoint held one frame back.
+    StreamCursor(
+        turn_start={"segment": seg, "offset": 0},
+        current={"segment": seg, "offset": offs[1]},   # through the anchor frame
+        message_ids=[],
+        hold_pending=False,                            # write-ahead never landed
+    ).save(cursor)
+
+    rec, events = Recorder(), []
+    seq, _clock = _fast_sequencer(rec)
+    relay = _make_relay(
+        tmp_path, cursor, rec, events, sequencer=seq,
+        open_anchor_state=lambda: (5, 500),   # anchor open — yet the prose posts
+    )
+    await relay.run()
+
+    assert _narration_sends(rec) == ["signoff"]        # RESURFACED
+    assert StreamCursor.load(cursor).hold_pending is False
+
+
+# --- RED (c): cold + marker ⇒ catch-up renders, clears, later turn re-arms ----
+
+
+async def test_cold_marker_disarms_catchup_then_next_turn_rearms(tmp_path):
+    """(c) Cold start with the marker set DISARMS the recovered turn's catch-up
+    (held prose re-renders as ordinary narration); the marker clears at that
+    turn's ``result`` boundary and a SUBSEQUENT anchor turn arms suppression
+    again (its trailing prose is buffered and discarded).
+
+    Uses a MIXED anchor+text frame BEYOND ``current`` so the anchor re-executes
+    LIVE on catch-up (the durable anchor makes the seam report open) — DISARM,
+    not replay-suppression of the candidate, is what makes the prose render."""
+    offs = _write_current(tmp_path, [
+        _init("s1"), _mixed_anchor_text("Q1?", "held prose"), _result(),
+        _init("s2"), _mixed_anchor_text("Q2?", "turn2 prose"), _result(),
+    ])
+    cursor = tmp_path / ".stream_cursor.json"
+    seg = _ident(os.path.join(str(tmp_path), "current"))
+    # Recover turn 1 mid-flight: the marker is set and the checkpoint is held
+    # BEFORE the mixed frame (through init1), so the mixed anchor+text frame
+    # re-executes LIVE on recovery.
+    StreamCursor(
+        turn_start={"segment": seg, "offset": 0},
+        current={"segment": seg, "offset": offs[0]},
+        message_ids=[],
+        hold_pending=True,
+    ).save(cursor)
+
+    rec, events = Recorder(), []
+    seq, _clock = _fast_sequencer(rec)
+    relay = _make_relay(
+        tmp_path, cursor, rec, events, sequencer=seq,
+        open_anchor_state=lambda: (5, 500),   # both anchors open all along
+    )
+    await relay.run()
+
+    # Turn 1's held prose RESURFACED (disarmed catch-up); turn 2's prose was
+    # buffered under its own anchor and DISCARDED (re-armed) — never on the wire.
+    assert _narration_sends(rec) == ["held prose"]
+    assert StreamCursor.load(cursor).hold_pending is False
+
+
+# --- RED (d): SEGMENT_GAP with the marker set — terminal recovery floor -------
+
+
+async def test_segment_gap_with_marker_clears_and_next_turn_arms(tmp_path, caplog):
+    """(d) A retention gap rotated out the held turn's frames. On ``SEGMENT_GAP``
+    with the marker set: log the lost-source residual, durably CLEAR the marker,
+    and re-arm — a fresh anchor turn in ``current`` arms suppression (its prose
+    is buffered and discarded)."""
+    _write_current(tmp_path, [
+        _init(), _anchor_ask("Q?"), _text("new prose"), _result(),
+    ])
+    cursor = tmp_path / ".stream_cursor.json"
+    # turn_start points at a segment NO LONGER on disk (rotated out) with the
+    # held-frames marker set.
+    StreamCursor(
+        turn_start={"segment": [999, 999], "offset": 0},
+        current={"segment": [999, 999], "offset": 40},
+        message_ids=[],
+        hold_pending=True,
+    ).save(cursor)
+
+    rec, events = Recorder(), []
+    seq, _clock = _fast_sequencer(rec)
+    relay = _make_relay(
+        tmp_path, cursor, rec, events, sequencer=seq,
+        open_anchor_state=lambda: (5, 500),
+    )
+    with caplog.at_level(logging.WARNING):
+        await relay.run()
+
+    assert any("retention gap" in r.message for r in caplog.records)
+    assert any("buffered prose" in r.message for r in caplog.records)  # residual
+    assert StreamCursor.load(cursor).hold_pending is False   # durably cleared
+    assert rec.sends == []   # the fresh anchor turn RE-ARMED → prose discarded
+
+
+# --- RED (e): abnormal spawn (spawn without result) — warm + cold + crash -----
+
+
+async def test_warm_abnormal_spawn_flushes_before_checkpoint(tmp_path):
+    """(e-warm) A non-empty buffer at an abnormal ``spawn`` boundary (no
+    preceding ``result``) FLUSHES the held prose as ordinary narration BEFORE
+    checkpointing the spawn, delivers the spawn event, resets suppression, and
+    clears the marker — all in one live run (in-memory buffer survives)."""
+    _write_current(tmp_path, [
+        _init(), _anchor_ask("Q?"), _text("held"), _spawn(9),
+    ])
+    cursor = tmp_path / ".stream_cursor.json"
+    rec, events = Recorder(), []
+    seq, _clock = _fast_sequencer(rec)
+    relay = _make_relay(
+        tmp_path, cursor, rec, events, sequencer=seq,
+        open_anchor_state=lambda: (5, 500),   # anchor open ⇒ "held" is buffered
+    )
+    await relay.run()
+
+    assert _narration_sends(rec) == ["held"]                # flushed at the spawn
+    assert ("spawn", {"epoch": 9}) in events                # event delivered
+    assert relay._suppressing_for is None                   # suppression reset
+    assert relay._anchor_buffer == []
+    assert StreamCursor.load(cursor).hold_pending is False   # cleared
+
+
+async def test_cold_abnormal_spawn_clears_marker_unconditionally(tmp_path):
+    """(e-cold) A cold recovery renders the held prose immediately (its in-memory
+    buffer stays EMPTY), so the abnormal ``spawn`` boundary hits with an empty
+    buffer — yet the marker clears UNCONDITIONALLY (Sol r8-2). A subsequent
+    anchor turn (appended + resumed) then arms suppression, proving the disarm
+    latch did not leak past the spawn.
+
+    Uses a MIXED anchor+text frame BEYOND ``current`` so DISARM (not replay-
+    suppression of the candidate) is what empties the buffer before the spawn."""
+    offs = _write_current(tmp_path, [
+        _init("s1"), _mixed_anchor_text("Q1?", "held"), _spawn(9),
+    ])
+    cursor = tmp_path / ".stream_cursor.json"
+    seg = _ident(os.path.join(str(tmp_path), "current"))
+    StreamCursor(
+        turn_start={"segment": seg, "offset": 0},
+        current={"segment": seg, "offset": offs[0]},   # held BEFORE the mixed frame
+        message_ids=[],
+        hold_pending=True,
+    ).save(cursor)
+
+    rec, events = Recorder(), []
+    seq, _clock = _fast_sequencer(rec)
+    relay = _make_relay(
+        tmp_path, cursor, rec, events, sequencer=seq,
+        open_anchor_state=lambda: (5, 500),
+    )
+    await relay.run()
+
+    assert _narration_sends(rec) == ["held"]                 # resurfaced (disarmed)
+    assert ("spawn", {"epoch": 9}) in events
+    # Empty buffer at the abnormal boundary, yet the marker cleared regardless.
+    assert StreamCursor.load(cursor).hold_pending is False
+
+    # Continue into a subsequent anchor turn (warm resume) — suppression ARMS.
+    _append_current(tmp_path, [
+        _init("s2"), _anchor_ask("Q2?"), _text("turn2 prose"), _result(),
+    ])
+    await relay.run()
+    assert _narration_sends(rec) == ["held"]   # "turn2 prose" armed → discarded
+
+
+async def test_abnormal_spawn_crash_between_event_and_checkpoint_redelivers(
+    tmp_path,
+):
+    """(e-crash) EVENT-FIRST ordering (Sol r9-3): the spawn event is delivered
+    BEFORE the checkpoint. A crash injected between them (the event handler
+    raises after recording) leaves the spawn un-checkpointed; a brand-new relay
+    RE-DELIVERS the spawn event on recovery — at-least-once, the relay's
+    existing contract."""
+    offs = _write_current(tmp_path, [
+        _init("s1"), _anchor_ask("Q1?"), _text("held"), _spawn(9),
+    ])
+    cursor = tmp_path / ".stream_cursor.json"
+    seg = _ident(os.path.join(str(tmp_path), "current"))
+    StreamCursor(
+        turn_start={"segment": seg, "offset": 0},
+        current={"segment": seg, "offset": offs[1]},
+        message_ids=[],
+        hold_pending=True,
+    ).save(cursor)
+
+    # First relay: crash the instant the spawn event is delivered (after it is
+    # recorded), before the checkpoint+clear ``_save`` can run.
+    events1: list = []
+
+    def crashing_on_event(kind, payload):
+        events1.append((kind, payload))
+        if kind == "spawn":
+            raise RuntimeError("crash between event and checkpoint")
+
+    rec1 = Recorder()
+    seq1, _c1 = _fast_sequencer(rec1)
+    relay1 = _make_relay(
+        tmp_path, cursor, rec1, [], sequencer=seq1,
+        open_anchor_state=lambda: (5, 500),
+    )
+    relay1.on_turn_event = crashing_on_event
+    with pytest.raises(RuntimeError):
+        await relay1.run()
+
+    assert ("spawn", {"epoch": 9}) in events1                # delivered pre-crash
+    # The spawn was NOT checkpointed (crash before the save): its frame is still
+    # beyond ``current``, so a recovery re-reads and re-delivers it.
+    assert StreamCursor.load(cursor).current["offset"] < offs[3]
+
+    # Brand-new relay recovers and RE-DELIVERS the spawn event (at-least-once).
+    rec2, events2 = Recorder(), []
+    seq2, _c2 = _fast_sequencer(rec2)
+    relay2 = _make_relay(
+        tmp_path, cursor, rec2, events2, sequencer=seq2,
+        open_anchor_state=lambda: (5, 500),
+    )
+    await relay2.run()
+
+    assert ("spawn", {"epoch": 9}) in events2                # RE-DELIVERED
+    assert StreamCursor.load(cursor).hold_pending is False   # cleared on recovery

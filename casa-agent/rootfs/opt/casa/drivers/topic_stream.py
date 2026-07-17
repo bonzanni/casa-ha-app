@@ -211,6 +211,15 @@ class StreamCursor:
     message_text_lens: list[int] = field(default_factory=list)
     last_posted_len: int = 0
     dropped_through: dict | None = None
+    # D5 Task C3 (Sol r4-3): the ONE minimal persisted exception to the
+    # in-memory suppression state — a boolean HELD-FRAMES marker. It carries NO
+    # content, only "frames beyond ``current`` may contain previously-buffered
+    # prose". Write-ahead ordering (Sol r5-2): set True (``_save``) BEFORE the
+    # first frame's text is treated as held; cleared ONLY atomically (same
+    # ``_save``) with the checkpoint that advances beyond the held frames (after
+    # a flush, on the result-time discard, or at an abnormal spawn boundary).
+    # Absent-tolerated → ``False`` (older checkpoints predate the field).
+    hold_pending: bool = False
 
     @classmethod
     def load(cls, path: str | os.PathLike[str]) -> "StreamCursor":
@@ -229,6 +238,7 @@ class StreamCursor:
             message_text_lens=list(data.get("message_text_lens") or []),
             last_posted_len=int(data.get("last_posted_len") or 0),
             dropped_through=data.get("dropped_through"),
+            hold_pending=bool(data.get("hold_pending") or False),
         )
 
     def save(self, path: str | os.PathLike[str]) -> None:
@@ -241,6 +251,7 @@ class StreamCursor:
                 "message_text_lens": self.message_text_lens,
                 "last_posted_len": self.last_posted_len,
                 "dropped_through": self.dropped_through,
+                "hold_pending": self.hold_pending,
             },
         )
 
@@ -519,11 +530,36 @@ class TopicStreamRelay:
         # anchor is still open-and-unanswered. In-memory only, reset every turn
         # boundary (``_reset_turn_state``).
         self._anchor_buffer: list[tuple[str, list[int], int]] = []
+        # D5 Task C3 (Sol r4-3): cold-replay DISARM latch. Set at cold start
+        # when the persisted ``hold_pending`` marker is set — the recovered
+        # turn's held frames lie BEYOND ``current`` and would otherwise re-
+        # execute the suppression logic on catch-up (durable anchor ⇒
+        # re-buffered-and-discarded ⇒ lost). While latched, no anchor candidate
+        # is recorded and suppression never arms, so the previously-buffered
+        # prose re-renders as ORDINARY narration (at-least-once resurface). It
+        # clears at the recovered turn's boundary (``_reset_turn_state`` at
+        # ``result`` / abnormal ``spawn`` / retention gap), after which normal
+        # arming resumes. In-memory only; ``False`` on warm re-entry.
+        self._replay_disarmed = False
 
     # -- persistence helpers ------------------------------------------------
 
     def _save(self) -> None:
         self.cursor.save(self.cursor_path)
+
+    def _arm_hold_marker(self) -> None:
+        """§D5 write-ahead (Sol r5-2): durably persist ``hold_pending=True``
+        BEFORE the first frame's text is treated as held. Buffer-then-persist
+        would leave a crash window where the marker is false, cold replay
+        re-suppresses, and the prose is permanently lost — the exact path this
+        marker exists to close. The ``_save`` here persists the marker with
+        ``current`` still BEHIND the held frames (the held frame does not
+        checkpoint), so a crash after it leaves marker-True/checkpoint-held —
+        cold recovery then disarms and resurfaces. Idempotent: a no-op once the
+        marker is already set (the buffer is already held)."""
+        if not self.cursor.hold_pending:
+            self.cursor.hold_pending = True
+            self._save()
 
     def _checkpoint(self, seg, off_after: int) -> None:
         """Advance ``current`` past a fully-handled (usually invisible) frame."""
@@ -891,9 +927,11 @@ class TopicStreamRelay:
         # here. Flushed on a later tool_use / an answer before ``result``, or
         # DISCARDED at ``result`` if the anchor is still open. A held frame does
         # NOT checkpoint (mirrors the throttle-hold below) so a crash can never
-        # strand the held prose past an advanced cursor; Task C3 persists the
-        # ``hold_pending`` marker + cold-replay exemption on top of this.
+        # strand the held prose past an advanced cursor. §D5 write-ahead (C3):
+        # persist ``hold_pending`` BEFORE holding, so a crash here re-renders the
+        # prose (disarmed) on cold recovery instead of re-suppressing it.
         if self._suppressing_for is not None:
+            self._arm_hold_marker()
             self._anchor_buffer.append((text, list(seg), off_after))
             return
         self._turn_text += text
@@ -941,7 +979,9 @@ class TopicStreamRelay:
         await self._maybe_arm_suppression()
         # §D5: armed — BUFFER (see ``_post_text``). The frame-end checkpoint in
         # ``_handle_assistant_blocks`` is EXEMPTED while the buffer is non-empty.
+        # Write-ahead the ``hold_pending`` marker before holding (C3).
         if self._suppressing_for is not None:
+            self._arm_hold_marker()
             self._anchor_buffer.append((text, list(seg), off_after))
             return
         self._turn_text += text
@@ -991,10 +1031,16 @@ class TopicStreamRelay:
         # seam — the actual ARM decision trusts ONLY the seam (see
         # ``_maybe_arm_suppression``, called before the next text frame and
         # again at ``result``).
+        # §D5 C3 (Sol r4-3): while cold-replay DISARMED (recovering a held-prose
+        # turn), record NO candidate — the previously-buffered prose must
+        # re-render as ordinary narration on catch-up, so neither arming nor the
+        # r4-2 atomic hold-path (both gated on a candidate) may fire until the
+        # recovered turn's boundary clears the latch.
         if (
             name == ASK_TOOL
             and not tool_input.get("options")
             and status in ("posted", "slot_timeout", "debt_consumed")
+            and not self._replay_disarmed
         ):
             self._anchor_candidate = (name, block_hash)
 
@@ -1006,6 +1052,11 @@ class TopicStreamRelay:
         consumer (flush/discard) is Task C2, so arming is behavior-neutral
         here. No-op once armed, when there is no candidate, or when the seam
         was not injected (default ``None`` = feature inert)."""
+        # §D5 C3 (Sol r4-3): a cold recovery of a held-prose turn DISARMS
+        # suppression for the recovered turn's catch-up so the prose re-renders
+        # as ordinary narration; never arm while the latch is set.
+        if self._replay_disarmed:
+            return
         if self._suppressing_for is not None or self._anchor_candidate is None:
             return
         if self.open_anchor_state is None:
@@ -1044,6 +1095,8 @@ class TopicStreamRelay:
             self._suppressing_for = (state[0], state[1])
         elif self._suppressing_for is None:
             self._suppressing_for = (0, 0)
+        # Write-ahead the ``hold_pending`` marker before holding (C3).
+        self._arm_hold_marker()
         self._anchor_buffer.append((text, list(seg), off_after))
         return True
 
@@ -1081,6 +1134,7 @@ class TopicStreamRelay:
             self._advance_dropped(seg, off_after)
             return
         fired_mutating = False
+        flushed_buffer = False
         for block in blocks:
             if block[0] == "text":
                 await self._append_narration(block[1], seg, off_after)
@@ -1095,6 +1149,7 @@ class TopicStreamRelay:
                 # this block is itself a NEW anchor ask, ``_match_discrete_block``
                 # below re-records the candidate and the next prose re-arms.
                 if self._suppressing_for is not None:
+                    flushed_buffer = True
                     await self._flush_and_disarm()
                     if self._dropped:
                         self._advance_dropped(seg, off_after)
@@ -1117,10 +1172,10 @@ class TopicStreamRelay:
 
         # §D5: a frame that still holds UNFLUSHED buffered prose is EXEMPT from
         # checkpoint advancement (mirrors the throttled-text hold at :894) so a
-        # crash can never strand the held prose behind an advanced cursor. Task
-        # C3 persists the ``hold_pending`` marker so cold replay re-renders the
-        # held prose as ordinary narration; here the in-memory buffer alone
-        # relies on a later flush / the ``result`` discard to advance the cursor.
+        # crash can never strand the held prose behind an advanced cursor. The
+        # ``hold_pending`` marker (write-ahead) keeps the held frame recoverable
+        # here; a later flush / the ``result`` discard advances the cursor and
+        # clears the marker atomically.
         if self._anchor_buffer:
             return
         self.cursor.current = {"segment": list(seg), "offset": off_after}
@@ -1130,6 +1185,13 @@ class TopicStreamRelay:
         # inflated in-memory length, so the delta reconcile keeps the held
         # suffix instead of slicing it behind the seal forever.
         self.cursor.last_posted_len = self._posted_len
+        # §D5 r3-2 (C3): if a tool_use FLUSHED held prose this frame, the buffer
+        # is now on the wire and this checkpoint advances PAST those frames —
+        # clear ``hold_pending`` ATOMICALLY (same ``_save``) with the advance.
+        # Gate on the flush: a disarmed cold-catch-up tool frame (no flush) must
+        # keep the marker set until the recovered turn's ``result`` boundary.
+        if flushed_buffer:
+            self.cursor.hold_pending = False
         self._save()
 
     def _reset_turn_state(self) -> None:
@@ -1141,13 +1203,19 @@ class TopicStreamRelay:
         self._dropped = False
         self._drop_warned = False
         self._last_edit_ts = float("-inf")
-        # §D5: turn boundaries reset candidate/arming state AND the buffer.
-        # (A non-empty buffer at an ABNORMAL boundary — spawn-without-result — is
-        # Task C3's flush-before-checkpoint concern; the normal ``result`` path
-        # flushes/discards before reaching here.)
+        # §D5: turn boundaries reset candidate/arming state AND the buffer. The
+        # abnormal ``spawn`` boundary flushes the buffer + clears ``hold_pending``
+        # BEFORE this reset runs (C3); the normal ``result`` path flushes/
+        # discards + clears the marker before reaching here.
         self._anchor_candidate = None
         self._suppressing_for = None
         self._anchor_buffer = []
+        # §D5 C3: a turn boundary ends the cold-recovery catch-up window — clear
+        # the disarm latch so subsequent turns arm suppression normally. (Cold
+        # replay never calls ``_reset_turn_state`` — replayed frames <= current
+        # take the side-effect-suppressed path — so ``_run_cold`` re-sets this
+        # AFTER its initial reset; the latch clears at the FIRST live boundary.)
+        self._replay_disarmed = False
 
     async def _finalize(self, seg, off_after: int) -> None:
         """Route the closing edit through ``edit_narration_if_latest`` (§2:612),
@@ -1218,6 +1286,12 @@ class TopicStreamRelay:
         self.cursor.message_ids = []
         self.cursor.message_text_lens = []
         self.cursor.last_posted_len = 0
+        # §D5 r3-2 (C3): ``result`` is a held-frames boundary — the buffer was
+        # just FLUSHED (answer arrived) or DISCARDED (anchor still open), and a
+        # cold-recovery catch-up reaches its ``result`` with the prose already
+        # re-rendered. Either way the closed-turn checkpoint advances past the
+        # held frames, so clear ``hold_pending`` ATOMICALLY in this same save.
+        self.cursor.hold_pending = False
         self._reset_turn_state()
         # F4+F6: drain every still-armed late intent, then prune + seal, as ONE
         # atomic lock hold. The former flush→prune→seal sequence released the
@@ -1259,12 +1333,23 @@ class TopicStreamRelay:
             cur_seg != _ZERO_SEG
             or bool(self.cursor.message_ids)
             or self.cursor.dropped_through is not None
+            # §D5 C3: a set ``hold_pending`` marks an in-progress held-prose turn
+            # to recover — its held frames lie beyond ``current`` and must be
+            # replayed-then-caught-up (DISARMED), never processed fresh-and-live.
+            or bool(self.cursor.hold_pending)
         )
         self._live = not recovering
         self._reconciled = False
         self._passed_cur_seg = False
         self._reset_turn_state()
         self._read_coord = None
+        # §D5 C3 (Sol r4-3): cold start with the held-frames marker set ⇒ DISARM
+        # suppression for the recovered turn's catch-up so the previously-
+        # buffered prose re-renders as ordinary narration (at-least-once
+        # resurface). Set AFTER ``_reset_turn_state`` (which clears the latch);
+        # it clears again at the recovered turn's boundary (result / abnormal
+        # spawn / gap), after which later turns arm normally.
+        self._replay_disarmed = bool(self.cursor.hold_pending)
         gap_seen = False
 
         try:
@@ -1283,6 +1368,24 @@ class TopicStreamRelay:
                     # live. The sentinel NEVER becomes a coordinate: after a gap,
                     # ``_read_coord`` is seeded only by the first REAL frame
                     # consumed post-gap (and a gap-only run stays cold).
+                    # §D5 r29-3 (C3): SEGMENT_GAP is a TERMINAL recovery floor
+                    # for the marker. If a held-prose turn's frames rotated out,
+                    # ``hold_pending`` would otherwise stay set with suppression
+                    # disarmed into a LATER turn (F-LEAK2 recurs). Log the
+                    # unavoidable lost-source residual (the held prose's frames
+                    # are gone — nothing can resurface them), durably CLEAR the
+                    # marker, and re-arm normal suppression (``_reset_turn_state``
+                    # below clears the disarm latch).
+                    if self.cursor.hold_pending:
+                        logger.warning(
+                            "topic stream for engagement %s: retention gap "
+                            "dropped a turn with buffered prose (hold_pending "
+                            "was set); its source frames rotated out and cannot "
+                            "resurface — clearing the marker and re-arming",
+                            self.engagement_id,
+                        )
+                        self.cursor.hold_pending = False
+                        self._save()
                     self._live = True
                     self._reconciled = True
                     self.cursor.message_ids = []
@@ -1389,10 +1492,36 @@ class TopicStreamRelay:
             return
 
         if frame.get("casa_control") == "spawn":
+            # §D5 abnormal turn boundary — ``spawn`` without a preceding
+            # ``result`` (Sol r5-3/r8-2/r9-3). On warm re-entry cold disarming
+            # never runs, so a held buffer could be reset (lost) or
+            # ``hold_pending`` stranded into a later turn. EVENT-FIRST ordering
+            # (Sol r9-3) preserves the relay's crash-safety invariant: frames
+            # at/below ``current`` replay with side effects suppressed, so
+            # checkpointing the spawn BEFORE emitting its event would lose the
+            # event permanently on a crash in between. Order (matching today's
+            # side-effects-before-checkpoint): (1) flush any held prose as
+            # ordinary narration + reset suppression/recovery state IN MEMORY;
+            # (2) deliver the spawn event; (3) THEN atomically checkpoint the
+            # handled spawn AND clear ``hold_pending`` in the SAME ``_save``. The
+            # marker clears UNCONDITIONALLY (Sol r8-2, not buffer-conditional): a
+            # cold recovery renders held prose immediately with an EMPTY buffer
+            # yet must still clear here, because an abnormal turn has no
+            # ``result`` to clear at (a buffer-conditional clear would strand the
+            # marker into the next turn with suppression disarmed — F-LEAK2). A
+            # crash between (2) and (3) re-delivers the event on recovery
+            # (at-least-once — the relay's existing contract).
+            await self._flush_anchor_buffer()          # (1) flush (no-op if empty)
+            self._suppressing_for = None
+            self._anchor_candidate = None
+            self._replay_disarmed = False
             await _maybe_await(
-                self.on_turn_event("spawn", {"epoch": frame.get("epoch")})
+                self.on_turn_event("spawn", {"epoch": frame.get("epoch")})  # (2)
             )
-            self._checkpoint(seg, off_after)
+            self.cursor.current = {"segment": list(seg), "offset": off_after}  # (3)
+            self.cursor.last_posted_len = self._posted_len
+            self.cursor.hold_pending = False
+            self._save()
             return
 
         ftype = frame.get("type")
