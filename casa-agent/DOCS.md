@@ -62,7 +62,8 @@ setting by hand:
 | `enable_terminal` | Enable a web terminal accessible via the ingress panel. Default: `false`. |
 | `sdk_client_pool` | Reuse a warm Claude SDK client across resident turns for faster replies. Default: `true`. Disable to fall back to a fresh per-turn session (e.g. while diagnosing an issue). |
 | `tina_ha_facade_enabled` | Keep Tina's role-scoped Home Assistant tools connected and ready instead of rediscovering them during a voice turn. Default: `true`. Disable to use the raw Home Assistant MCP connection while diagnosing compatibility issues. |
-| `webhook_secret` | HMAC-SHA256 secret for authenticating webhook requests. Leave empty to skip verification. |
+| `webhook_auth_enabled` | Require HMAC authentication for webhook and voice requests. When enabled, Casa uses the optional `webhook_secret` override or generates a secret in `/data/webhook_secret`. Retrieve a generated secret through the web terminal. Default: `false`. |
+| `webhook_secret` | Optional manual override used when `webhook_auth_enabled` is enabled. Leave empty to use the generated secret from `/data/webhook_secret`. |
 | `engagement_reap_days` | Auto-close engagements after this many days without activity (daily sweep cancels them and closes their Telegram topic; the engaging agent is notified). Set `0` to disable. Default: `7`. |
 | `log_level` | Log verbosity: `debug`, `info`, `warning`, or `error`. Default: `info`. Flip to `debug` for verbose troubleshooting without rebuilding the image. |
 | `voice_turn_budget_seconds` | Wall-clock budget for one voice turn, from request ingress to the turn deadline (see [Voice pipeline](#voice-pipeline)). A synchronous specialist hand-off started mid-turn must finish within it, minus a ~5s reserve held back so Casa can still speak a fallback if the specialist runs long. Range 10-27; hard-capped at 27 regardless of this value. Default: `27`. |
@@ -87,10 +88,13 @@ All endpoints are accessible through the ingress proxy.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/healthz` | Health check |
+| `GET` | `/api/voice/agents` | Discover enabled Home Assistant voice residents (authenticated) |
 | `POST` | `/webhook/{name}` | Fire-and-forget named webhook |
 | `POST` | `/invoke/{agent}` | Synchronous agent invocation (returns response) |
 
-Webhook and invoke endpoints accept JSON bodies. If `webhook_secret` is configured, include an `X-Webhook-Signature` header with the HMAC-SHA256 hex digest of the request body.
+Webhook and invoke endpoints accept JSON bodies. When `webhook_auth_enabled` is
+enabled, include an `X-Webhook-Signature` header with the HMAC-SHA256 hex digest
+of the request body, using the configured override or generated secret.
 
 The target of `/invoke/{agent}` must declare the `webhook` capability in its `channels:` list to be invoke-reachable; a request for an agent that does not (for example the voice butler, which declares only `ha_voice`) returns `404 {"error": "unknown agent"}` — the same response as for an agent that does not exist, so the endpoint reveals nothing about which agents are configured. The default `assistant` (Ellen) declares `webhook` and stays reachable.
 
@@ -122,6 +126,25 @@ Casa exposes two transports for Home Assistant voice / generic voice clients. Th
   an authenticated protocol-1 delivery route. Casa accepts background work
   only after that exact socket has acknowledged both `background_jobs` and
   `satellite_announce`; old or unacknowledged integrations stay synchronous.
+
+### Voice-agent discovery
+
+The companion Home Assistant integration discovers enabled residents through
+`GET /api/voice/agents`. The response contains `schema_version` 1 and only each
+enabled `ha_voice` resident's stable role and display name. The request is
+signed over an empty body with `X-Webhook-Signature`. Enable
+`webhook_auth_enabled` before using discovery; Casa then uses the optional
+`webhook_secret` override or the generated secret stored in
+`/data/webhook_secret`. When authentication is disabled, legacy voice
+transports remain compatible with unsigned turns but discovery returns the
+same generic `401` response used for a missing or invalid signature.
+
+The catalog path is fixed, is mounted only while at least one voice transport
+is enabled, and returns `Cache-Control: no-store`. It does not expose prompts,
+tools, delegates, specialist configuration, secrets, or other private agent
+settings. Voice request rate limits are isolated by agent role and scope, so
+activity through one resident cannot consume another resident's allowance even
+when both requests use the same scope identifier.
 
 Toggle the transports via environment variables on the app:
 

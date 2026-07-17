@@ -36,3 +36,27 @@ else
     printf '%s\n' "$resp" >&2
     fail "no SSE terminator (event: done or event: error)"
 fi
+
+log "V-2: GET /api/voice/agents fails closed without a secret"
+if MSYS_NO_PATHCONV=1 docker exec "$NAME" sh -c \
+    'test ! -s /data/webhook_secret'; then
+    pass "no-secret fixture has no non-empty generated or configured secret"
+else
+    fail "no-secret fixture unexpectedly has a non-empty webhook secret"
+fi
+
+catalog_response=$(curl -sS -w $'\n%{http_code}' \
+    "http://localhost:${HOST_PORT}/api/voice/agents" \
+    --max-time 5 || true)
+catalog_status=${catalog_response##*$'\n'}
+catalog_body=${catalog_response%$'\n'*}
+
+if [ "$catalog_status" != "401" ]; then
+    fail "voice catalog without a secret returned HTTP $catalog_status, expected 401"
+fi
+
+if [ "$catalog_body" != '{"error": "invalid signature"}' ]; then
+    fail "voice catalog without a secret did not return the generic error body"
+fi
+
+pass "voice catalog rejects no-secret discovery with a generic 401"
