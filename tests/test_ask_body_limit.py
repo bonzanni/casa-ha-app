@@ -128,17 +128,15 @@ class TestNoOrphanedSuffixConstant:
         import channels.channel_handlers as ch
         import drivers.claude_code_driver as ccd
 
-        # Allow-listed exclusions (Sol r11-1 / spec §D1 bullet 3), each
-        # pointing at the task that owns its removal:
-        allowlist = {
-            # Task D3 — the old re-anchor persist-failure BODY suffix; its
-            # BEHAVIOUR is already deleted by this round's re-anchor retry
-            # redesign, the CONSTANT's removal completes in D3.
-            "_OPEN_Q_SEE_ABOVE",
-            # Task D6 — the moved-marker text is a standalone REPLACEMENT
-            # form, not a body SUFFIX (never appended to a rendered body).
-            "_OPEN_Q_REPOSTED_BELOW",
-        }
+        # Allow-list is now EMPTY (Task D3): the old re-anchor persist-failure
+        # ``_OPEN_Q_SEE_ABOVE`` body suffix is DELETED (r11-1 — the drained
+        # unit's finite LOCAL persist retry replaces it, never a body edit), and
+        # D1 already retired ``_OPEN_Q_REPOSTED_BELOW`` (its dangling allowlist
+        # entry is pruned here). Every remaining ``_OPEN_Q_*``/``_SETTLE_*``
+        # constant is enumerated by ``ask_lifecycle_suffixes``. The moved-marker
+        # forms are named OUTSIDE the ``_OPEN_Q_*`` prefix this test scans, so
+        # they never needed an entry.
+        allowlist: set[str] = set()
 
         enumerated: set[str] = set()
         enumerated.update(

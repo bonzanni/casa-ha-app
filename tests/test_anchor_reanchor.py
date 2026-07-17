@@ -36,7 +36,14 @@ class _Wire:
     platform notices) and the markup send (``post_discrete``), so message
     ordering is a single monotonic mid sequence. ``markup_ok=False`` makes
     ``post_discrete`` fail (wire down); ``edit_ok=False`` makes every settle
-    edit transiently fail (unconfirmed)."""
+    edit transiently fail (unconfirmed).
+
+    v0.84.0 (D3): counts physical send/edit calls (``send_markup_calls`` /
+    ``edit_markup_calls``) and exposes optional per-stage GATES
+    (``send_block`` / ``edit_block`` — ``asyncio.Event``\\ s awaited BEFORE the
+    op proceeds) so the drained-unit cancellation + blocked-wire tests can
+    suspend a real wire op at a controlled point. ``send_raises`` records the
+    acceptance THEN raises (the accepted-send-then-raises floor)."""
 
     def __init__(self, *, markup_ok: bool = True, edit_ok: bool = True,
                  start: int = 1000):
@@ -45,6 +52,11 @@ class _Wire:
         self.edits: list[tuple[str, int, str]] = []    # (kind, mid, text)
         self.markup_ok = markup_ok
         self.edit_ok = edit_ok
+        self.send_markup_calls = 0
+        self.edit_markup_calls = 0
+        self.send_block: asyncio.Event | None = None
+        self.edit_block: asyncio.Event | None = None
+        self.send_raises = False
 
     def _mid(self) -> int:
         self._n += 1
@@ -56,6 +68,14 @@ class _Wire:
         return mid
 
     async def send_markup(self, topic, text, markup, reply_to=None):
+        self.send_markup_calls += 1
+        if self.send_block is not None:
+            await self.send_block.wait()
+        if self.send_raises:
+            # Accepted-send-then-raises: the copy IS on the wire (recorded),
+            # then the wrapper read fails — an AMBIGUOUS outcome.
+            self.posts.append(("markup", self._mid(), text))
+            raise RuntimeError("wire ack read failed after send")
         if not self.markup_ok:
             return None
         mid = self._mid()
@@ -67,6 +87,9 @@ class _Wire:
         return self.edit_ok
 
     async def edit_markup(self, topic, mid, text, markup) -> bool:
+        self.edit_markup_calls += 1
+        if self.edit_block is not None:
+            await self.edit_block.wait()
         self.edits.append(("markup", mid, text))
         return self.edit_ok
 
@@ -205,32 +228,57 @@ class TestStagedFlowPerStepFailures:
         assert wire.posts == []          # nothing on the wire
         assert _entry(reg, rec, n)["tg_message_id"] == 500  # original intact
 
-    async def test_step2_wire_failure_unstages_and_owes_retry(self, tmp_path):
+    async def test_step2_ambiguous_send_consumes_obligation_no_retry(self, tmp_path):
+        # v0.84.0 (§D6 r17-3): a wire failure returns None, INDISTINGUISHABLE
+        # from "accepted but no mid returned" — so it is an AMBIGUOUS send:
+        # exactly ONE attempt, NO wire retry (a retry could stack an untracked
+        # copy), obligation CONSUMED for this pass (True). The old copy stays
+        # current + tracked; the staged mid is best-effort un-staged.
         reg, rec, n, wire, drv, seq = await self._setup(tmp_path, markup_ok=False)
 
         ok = await drv._reanchor_pass(rec)
 
-        assert ok is False               # wire down → retry owed
-        assert wire.posts == []          # post_discrete returned None
+        assert ok is True                     # obligation consumed (no retry)
+        assert wire.posts == []               # post_discrete returned None
+        assert wire.send_markup_calls == 1    # exactly ONE physical send attempt
         e = _entry(reg, rec, n)
-        assert e["tg_message_id"] == 500
-        assert e["stale_mids"] == []     # step-1 stage rolled back (un-staged)
+        assert e["tg_message_id"] == 500      # old copy stays current
+        assert e["stale_mids"] == []          # staged mid un-staged
 
-    async def test_step3_persist_failure_settles_new_copy_see_above(self, tmp_path):
+    async def test_step3_persist_exhaustion_no_body_edit_orphan_accepted(
+            self, tmp_path):
+        # v0.84.0 (§D6 r11-1/r17): the '↪ see above' body edit is DELETED. On
+        # persist exhaustion (N in-unit attempts all fail) the D4 stopgap fires:
+        # NO body edit (the new copy's body is untouched), obligation CONSUMED
+        # (True). The old copy stays durably current + tracked; new_mid is an
+        # accepted untracked orphan.
         reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
-        reg.update_question_mid = AsyncMock(side_effect=RuntimeError("disk"))
+        from drivers import claude_code_driver as ccd
+        persist_calls = 0
+        orig_update = reg.update_question_mid
+
+        async def _always_fail(*a, **k):
+            nonlocal persist_calls
+            persist_calls += 1
+            raise RuntimeError("registry disk down")
+
+        reg.update_question_mid = _always_fail
 
         ok = await drv._reanchor_pass(rec)
 
-        assert ok is False
+        assert ok is True                     # obligation consumed (D4 stopgap)
+        assert persist_calls == ccd._REANCHOR_PERSIST_ATTEMPTS   # N attempts
         new_mid = wire.posts[0][1]
-        # New copy was posted then settled to '↪ see the question above'.
-        assert any(mid == new_mid and "see the question above" in text
-                   for _, mid, text in wire.edits)
-        # Original stays live + tracked; stale_mids keeps old_mid (overlap-tolerant).
+        # NO body edit of the new copy at all (see-above hack gone), and NO
+        # marker edit of the old copy (step 4 never reached without a commit).
+        assert wire.edits == []
+        assert "see the question above" not in " ".join(t for _, _, t in wire.edits)
+        # Persist never committed: the ledger still points at the old copy, and
+        # the staged entry stays "plain" (the flip lives inside the same failed
+        # transaction).
         e = _entry(reg, rec, n)
         assert e["tg_message_id"] == 500
-        assert 500 in [s["mid"] for s in e["stale_mids"]]
+        assert e["stale_mids"] == [{"mid": 500, "kind": "plain"}]
 
     async def test_step4_unconfirmed_retains_stale_mid_but_obligation_met(
             self, tmp_path):
@@ -461,7 +509,247 @@ class TestCrashResidual:
 
         assert 500 in wire.edit_mids()
         assert orphan_mid not in wire.edit_mids()   # orphan left as one stale line
+        # The orphan mid was NEVER tracked anywhere (its mid died with the crash):
+        # not as a current tg_message_id, not as a stale_mid. Ledger clean.
         assert reg.open_question_entries(rec.id) == []
+
+
+# ===========================================================================
+# 5c. D3 — the DRAINED re-anchor unit (spec §D6 r17): obligation armed before
+# the unit's first await; cancellation during EACH stage (staging/send/persist/
+# edit) + the /silent no-later-boundary path drains the unit to completion and
+# releases the lock only AFTER; repeated cancellation during the drain is
+# absorbed; a blocked wire beyond the send budget is exactly ONE send + the
+# ambiguous floor; an accepted-send-then-raises never sends a second time.
+# REAL primitives + fake wire gates + injected clocks (tiny real wait_for
+# budgets); NEVER patches <module>.asyncio.sleep.
+# ===========================================================================
+
+
+async def _pump(cond, limit: int = 500) -> None:
+    """Yield to the loop until *cond()* holds (bounded), so a test can observe a
+    real wire op suspended at a controlled gate without a fixed sleep."""
+    for _ in range(limit):
+        if cond():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition not reached")
+
+
+async def _park_forever(_d: float) -> None:
+    """A retry-owner sleep that never returns — so the owner armed before the
+    unit parks on its FIRST sleep and never runs a concurrent pass (the test
+    controls the unit directly)."""
+    await asyncio.Event().wait()
+
+
+class TestDrainedReanchorUnit:
+    async def _setup(self, tmp_path, **wire_kw):
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire(**wire_kw)
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        seq = drv._ensure_sequencer(rec)
+        seq._high_water = 600
+        return reg, rec, n, wire, drv, seq
+
+    def _block_stage(self, reg):
+        gate, reached = asyncio.Event(), asyncio.Event()
+        orig = reg.stage_stale_mid
+
+        async def _blocking(*a, **k):
+            reached.set()
+            await gate.wait()
+            return await orig(*a, **k)
+
+        reg.stage_stale_mid = _blocking
+        return gate, reached
+
+    def _block_persist(self, reg):
+        gate, reached = asyncio.Event(), asyncio.Event()
+        orig = reg.update_question_mid
+
+        async def _blocking(*a, **k):
+            reached.set()
+            await gate.wait()
+            return await orig(*a, **k)
+
+        reg.update_question_mid = _blocking
+        return gate, reached
+
+    # -- (a) obligation armed BEFORE the unit's first awaited op --------------
+
+    async def test_obligation_armed_before_unit_first_await(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        gate, reached = self._block_stage(reg)
+
+        task = asyncio.ensure_future(drv._consume_reanchor(rec))
+        await reached.wait()          # the unit is blocked at staging (1st await)
+
+        # Armed BEFORE the unit touched the wire — the pre-r17 latch-after-return
+        # arming would still be UNSET here.
+        assert rec.id in drv._reanchor_due
+        assert rec.id in drv._reanchor_retry_tasks
+        assert wire.posts == []
+        assert wire.send_markup_calls == 0
+
+        gate.set()
+        await task
+        # A True pass RETIRES what it armed.
+        assert rec.id not in drv._reanchor_due
+        assert rec.id not in drv._reanchor_retry_tasks
+        assert _entry(reg, rec, n)["tg_message_id"] == wire.posts[0][1]
+
+    # -- (b) cancel during EACH unit stage → drain completes, lock after ------
+
+    async def _assert_drained_complete(self, reg, rec, n, wire, drv):
+        # The unit COMPLETED via the drain: new copy posted (markup), persisted,
+        # old copy markered + un-staged, and the maintenance lock is released.
+        assert len(wire.posts) >= 1 and wire.posts[-1][0] == "markup"
+        new_mid = [m for k, m, _ in wire.posts if k == "markup"][-1]
+        e = _entry(reg, rec, n)
+        assert e["tg_message_id"] == new_mid
+        assert e["stale_mids"] == []
+        assert any(mid == 500 for _, mid, _ in wire.edits)   # old copy markered
+        assert not drv.ask_maintenance_lock(rec.id).locked()
+
+    async def test_cancel_during_staging_drains(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        gate, reached = self._block_stage(reg)
+
+        task = asyncio.ensure_future(drv._reanchor_pass(rec))
+        await reached.wait()
+        assert drv.ask_maintenance_lock(rec.id).locked()   # held during the unit
+        task.cancel()
+        await asyncio.sleep(0)        # deliver the cancel → enter the drain
+        gate.set()                    # release staging → child completes the unit
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await self._assert_drained_complete(reg, rec, n, wire, drv)
+
+    async def test_cancel_during_send_drains(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        wire.send_block = asyncio.Event()
+
+        task = asyncio.ensure_future(drv._reanchor_pass(rec))
+        await _pump(lambda: wire.send_markup_calls == 1)   # blocked in the send
+        task.cancel()
+        await asyncio.sleep(0)
+        wire.send_block.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert wire.send_markup_calls == 1                 # exactly ONE send
+        await self._assert_drained_complete(reg, rec, n, wire, drv)
+
+    async def test_cancel_during_persist_drains(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        gate, reached = self._block_persist(reg)
+
+        task = asyncio.ensure_future(drv._reanchor_pass(rec))
+        await reached.wait()          # new copy posted, blocked in persist
+        assert len(wire.posts) == 1 and wire.posts[0][0] == "markup"
+        task.cancel()
+        await asyncio.sleep(0)
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await self._assert_drained_complete(reg, rec, n, wire, drv)
+
+    async def test_cancel_during_marker_edit_drains(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        wire.edit_block = asyncio.Event()
+
+        task = asyncio.ensure_future(drv._reanchor_pass(rec))
+        await _pump(lambda: wire.edit_markup_calls == 1)   # blocked in the edit
+        # Posted + persisted already (edit is the unit's final stage).
+        assert _entry(reg, rec, n)["tg_message_id"] == wire.posts[0][1]
+        task.cancel()
+        await asyncio.sleep(0)
+        wire.edit_block.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await self._assert_drained_complete(reg, rec, n, wire, drv)
+
+    # -- (b) /silent rollback path (no later boundary) drains -----------------
+
+    async def test_silent_rollback_path_drains_under_cancellation(self, tmp_path):
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        seq = drv._ensure_sequencer(rec)
+        # /silent posted a command notice below the anchor, then rolls back.
+        token = drv.reserve_answer(rec.id)
+        await seq.post_platform_notice("Observer quieted.")
+        assert seq.high_water > 500
+        gate, reached = self._block_stage(reg)
+
+        task = asyncio.ensure_future(
+            drv.rollback_answer_reservation(rec.id, token))
+        await reached.wait()
+        assert rec.id in drv._reanchor_due          # obligation armed
+        task.cancel()
+        await asyncio.sleep(0)
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Unit completed despite /silent having NO later boundary to recover at.
+        reanchor_mid = [m for k, m, _ in wire.posts if k == "markup"][-1]
+        assert _entry(reg, rec, n)["tg_message_id"] == reanchor_mid
+        assert not drv.ask_maintenance_lock(rec.id).locked()
+        assert rec.id in drv._reanchor_due          # latch stays armed (no bdy)
+        drv._retire_reanchor_retry(rec.id)          # cleanup the parked owner
+
+    # -- (c) repeated cancellation during the drain is absorbed ---------------
+
+    async def test_repeated_cancellation_during_drain_absorbed(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        gate, reached = self._block_stage(reg)
+
+        task = asyncio.ensure_future(drv._reanchor_pass(rec))
+        await reached.wait()
+        for _ in range(3):            # hammer the drain with repeated cancels
+            task.cancel()
+            await asyncio.sleep(0)
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await self._assert_drained_complete(reg, rec, n, wire, drv)
+
+    # -- (d) blocked wire beyond the send budget → ONE send + ambiguous floor -
+
+    async def test_blocked_send_budget_one_attempt_ambiguous_floor(
+            self, tmp_path, monkeypatch):
+        from drivers import claude_code_driver as ccd
+        monkeypatch.setattr(ccd, "_REANCHOR_SEND_TIMEOUT", 0.02)
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
+        wire.send_block = asyncio.Event()      # never released → wait_for fires
+
+        ok = await drv._reanchor_pass(rec)     # returns after the tiny budget
+
+        assert ok is True                      # ambiguous floor, obligation used
+        assert wire.send_markup_calls == 1     # exactly ONE physical send attempt
+        assert wire.posts == []                # timed out before it recorded
+        e = _entry(reg, rec, n)
+        assert e["tg_message_id"] == 500       # old copy stays current
+        assert e["stale_mids"] == []           # staged mid un-staged
+        assert not drv.ask_maintenance_lock(rec.id).locked()
+
+    # -- (e) accepted-send-then-raises → no second send -----------------------
+
+    async def test_accepted_send_then_raises_no_second_send(self, tmp_path):
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path, )
+        wire.send_raises = True
+
+        ok = await drv._reanchor_pass(rec)
+
+        assert ok is True                      # ambiguous → consumed
+        assert wire.send_markup_calls == 1     # NO second send
+        # The accepted copy IS on the wire (recorded) but is untracked.
+        assert len(wire.posts) == 1 and wire.posts[0][0] == "markup"
+        e = _entry(reg, rec, n)
+        assert e["tg_message_id"] == 500       # old copy stays current
+        assert e["stale_mids"] == []           # staged mid un-staged
 
 
 # ===========================================================================
@@ -728,6 +1016,9 @@ class TestF2TerminalCommandSuppressesReanchor:
 
 class TestRetryOwner:
     async def test_first_pass_fails_then_retry_succeeds(self, tmp_path):
+        # v0.84.0 (§D6 r17): a STAGE failure is now the ONLY retry-owed (False)
+        # outcome — nothing reached the wire, so it is safe to re-drive. Once
+        # the registry recovers, the retry owner completes the re-anchor.
         reg, rec = await _make_registry(tmp_path)
         n = await _add_anchor(reg, rec, mid=500)
         delays: list[float] = []
@@ -735,19 +1026,31 @@ class TestRetryOwner:
         async def _rec_sleep(d):
             delays.append(d)
 
-        wire = _Wire(markup_ok=False)   # wire down → first pass fails
+        wire = _Wire()
         drv = _make_driver(tmp_path, reg, wire, retry_sleep=_rec_sleep)
         seq = drv._ensure_sequencer(rec)
         seq._high_water = 600
 
+        stage_calls = 0
+        orig_stage = reg.stage_stale_mid
+
+        async def _flaky_stage(*a, **k):
+            nonlocal stage_calls
+            stage_calls += 1
+            if stage_calls == 1:
+                raise RuntimeError("registry disk down")   # first pass fails
+            return await orig_stage(*a, **k)
+
+        reg.stage_stale_mid = _flaky_stage
+
         # A boundary consumer runs the (failing) pass → latch set + retry armed.
         await drv._consume_reanchor(rec)
         assert rec.id in drv._reanchor_due
+        assert wire.posts == []                      # stage failed, nothing sent
         task = drv._reanchor_retry_tasks.get(rec.id)
         assert task is not None
 
-        # Transport recovers; drive the retry loop to completion.
-        wire.markup_ok = True
+        # Registry recovers; drive the retry loop to completion.
         await task
 
         assert delays == [5.0]                       # one backoff step
@@ -765,10 +1068,12 @@ class TestRetryOwner:
             if len(delays) >= 4:
                 raise asyncio.CancelledError   # simulate teardown at the cap
 
-        wire = _Wire(markup_ok=False)   # stays down → every pass fails
+        wire = _Wire()
         drv = _make_driver(tmp_path, reg, wire, retry_sleep=_cap_sleep)
         seq = drv._ensure_sequencer(rec)
         seq._high_water = 600
+        # Registry stage stays down → every pass fails BEFORE the wire.
+        reg.stage_stale_mid = AsyncMock(side_effect=RuntimeError("disk"))
 
         await drv._consume_reanchor(rec)
         task = drv._reanchor_retry_tasks.get(rec.id)
@@ -777,6 +1082,7 @@ class TestRetryOwner:
 
         # 5 → 30 → 300 → 300 (capped, repeated), then the CancelledError.
         assert delays == [5.0, 30.0, 300.0, 300.0]
+        assert wire.posts == []               # nothing ever reached the wire
         assert rec.id in drv._reanchor_due   # never cleared (never succeeded)
 
     async def test_double_arm_is_noop(self, tmp_path):

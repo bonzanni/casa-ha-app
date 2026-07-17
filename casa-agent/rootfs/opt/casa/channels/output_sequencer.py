@@ -922,7 +922,7 @@ class OutputSequencer:
 
     async def post_discrete(
         self, text: str, *, markup: Any = None, reply_to: int | None = None,
-        revalidate: Any = None,
+        revalidate: Any = None, wire_timeout: float | None = None,
     ) -> int | None:
         """A9: post a keyboard-bearing DISCRETE message through the single writer
         (A3 anchor re-anchor). Mirrors :meth:`post_platform_notice` but sends via
@@ -936,6 +936,14 @@ class OutputSequencer:
         tri-state ``_edit_cache`` entry, and register the mid in the bounded
         discrete-cache FIFO. *reply_to* threads like the other sends.
 
+        ``wire_timeout`` (v0.84.0, §D6 r17-2) puts an ``asyncio.wait_for`` BUDGET
+        around the single wire await — default ``None`` keeps every other
+        caller's behaviour unchanged. A timeout returns ``None`` with NO state
+        change; the re-anchor unit treats that None (like any un-confirmed send)
+        as an AMBIGUOUS send and takes the documented floor WITHOUT a wire retry
+        (the wrapper cannot distinguish "not sent" from "accepted before the
+        timeout").
+
         Deliberately NOT wrapped around ``ensure_posted`` posters (Sol r4-5): that
         runs its poster in a NEW task, which would deadlock against the
         relay-held, task-reentrant-only writer lock. Raises RuntimeError if the
@@ -948,8 +956,15 @@ class OutputSequencer:
             if revalidate is not None and not await _maybe_await(revalidate()):
                 return None
             self._seal_narration_locked()
-            mid = await _maybe_await(self._send_message_markup(
+            send = _maybe_await(self._send_message_markup(
                 self.topic_id, text, markup, reply_to=reply_to))
+            if wire_timeout is None:
+                mid = await send
+            else:
+                try:
+                    mid = await asyncio.wait_for(send, wire_timeout)
+                except asyncio.TimeoutError:
+                    return None
             if mid is None:
                 return None
             if self._high_water is None or mid > self._high_water:
@@ -960,7 +975,7 @@ class OutputSequencer:
 
     async def edit_discrete(
         self, msg_id: int, *, text: Any = None, markup: Any = _ABSENT,
-        revalidate: Any = None,
+        revalidate: Any = None, wire_timeout: float | None = None,
     ) -> bool:
         """A9: markup-capable edit of a discrete message through the F1 tri-state
         no-op cache (A5 toggle redraw / multi settle edit).
@@ -971,6 +986,12 @@ class OutputSequencer:
         run *revalidate* (the A5 terminal-race guard; declined → ``False``, no
         edit); F1 no-op gate — an identical ``(text, markup-tristate)`` returns
         ``True`` without any wire call; otherwise wire-edit and update the cache.
+
+        ``wire_timeout`` (v0.84.0, §D6 r17-2) puts an ``asyncio.wait_for`` BUDGET
+        around the single wire await — default ``None`` keeps every other
+        caller's behaviour unchanged. A timeout counts as a FAILED attempt
+        (``False`` + cache invalidated), so the re-anchor unit's finite-attempt
+        marker edit retries within its budget rather than blocking unbounded.
 
         **Returns ``bool``, deliberately NOT the APPLIED/FAILED string codes
         (Sol r2-10):** every settle path feeds ``confirmed_settle_edit``, whose
@@ -989,8 +1010,15 @@ class OutputSequencer:
             tri = _discrete_markup_tristate(markup)  # F4: None ⇒ CLEAR, not ABSENT
             if self._edit_cache.get(msg_id) == (text, tri):
                 return True  # no-op skip — no wire call
-            ok = await _maybe_await(self._edit_message_markup(
+            edit = _maybe_await(self._edit_message_markup(
                 self.topic_id, msg_id, text, markup))
+            if wire_timeout is None:
+                ok = await edit
+            else:
+                try:
+                    ok = await asyncio.wait_for(edit, wire_timeout)
+                except asyncio.TimeoutError:
+                    ok = False
             if not ok:
                 self._edit_cache.pop(msg_id, None)   # invalidate → retry allowed
                 self._forget_discrete_cache(msg_id)

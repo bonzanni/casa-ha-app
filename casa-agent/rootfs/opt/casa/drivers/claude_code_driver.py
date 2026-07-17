@@ -52,11 +52,6 @@ _OPEN_Q_ANSWERED_SUFFIX = "\n✅ answered below"
 # §A3(b) terminal finalize: a live anchor stranded by /cancel or /complete is
 # settled (never left visually open forever) with an outcome-appropriate copy.
 _OPEN_Q_CANCELLED_SUFFIX = "\n🛑 engagement ended — this question is closed"
-# §A3(b) staged re-anchor markers (plain text, no keyboard): the step-3
-# persist-failure fallback settles the NEW copy pointing up to the still-live
-# original (Task D3 owns this constant's eventual removal — see
-# ``ask_lifecycle_suffixes``'s allowlist note below).
-_OPEN_Q_SEE_ABOVE = "↪ see the question above"
 # v0.84.0 (round-4 §D6, Sol r15-4): the re-anchor MOVED markers — pinned exact
 # text. REPLACES the step-4 OLD-copy edit's previous "↪ question re-posted
 # below ↓" suffix, which retained the full duplicated body (read as "asked
@@ -113,16 +108,15 @@ def ask_lifecycle_suffixes(
       * terminal cancellation (``_OPEN_Q_CANCELLED_SUFFIX`` — the engagement
         ended while this question was open).
 
-    Excluded by design (allow-listed by the drift test in
-    ``tests/test_ask_body_limit.py``, each with a pointer to the task that
-    owns its removal): ``_OPEN_Q_SEE_ABOVE`` (the old re-anchor
-    persist-failure BODY suffix — its BEHAVIOUR is already deleted by this
-    round's re-anchor retry redesign; the CONSTANT's removal completes in
-    Task D3). The Task D6 moved-marker forms (``_REANCHOR_MOVED_OPEN_FMT`` /
-    ``_REANCHOR_MOVED_TERMINAL_FMT``) are deliberately named OUTSIDE the
-    ``_OPEN_Q_*`` prefix this drift test scans — standalone REPLACEMENT forms,
-    never a body SUFFIX (never appended to a rendered ask body), so they need
-    no allowlist entry at all.
+    Every ``_OPEN_Q_*`` body-suffix constant is now enumerated above (the drift
+    test's allowlist is empty as of Task D3): the old re-anchor persist-failure
+    ``_OPEN_Q_SEE_ABOVE`` body suffix is DELETED (r11-1 — the drained unit's
+    finite LOCAL persist retry replaces it, never a body edit), and D1 already
+    retired ``_OPEN_Q_REPOSTED_BELOW``. The Task D6 moved-marker forms
+    (``_REANCHOR_MOVED_OPEN_FMT`` / ``_REANCHOR_MOVED_TERMINAL_FMT``) are
+    deliberately named OUTSIDE the ``_OPEN_Q_*`` prefix this drift test scans —
+    standalone REPLACEMENT forms, never a body SUFFIX (never appended to a
+    rendered ask body), so they need no allowlist entry at all.
 
     A function-local import of the settle constants avoids a module-level
     cross-package edge between the driver and channel-handler modules
@@ -156,6 +150,20 @@ def ask_lifecycle_suffixes(
 # self-reschedules 5s → 30s → 300s (capped, repeated) indefinitely until the
 # latch clears via success / promotion / terminal settlement / a boundary win.
 _REANCHOR_BACKOFF: tuple[float, ...] = (5.0, 30.0, 300.0)
+# v0.84.0 (round-4 §D6 r17-2, Sol): REAL finite BUDGETS on every wire op in the
+# drained re-anchor unit — deadlines that bound ONE physical wire await, NOT
+# SLAs (no promise the op completes within them). The send gets exactly ONE
+# ``wait_for``-bounded attempt with ZERO wire retries (the send wrapper cannot
+# distinguish "not sent" from "accepted before the timeout", so any retry could
+# stack an untracked duplicate). The old-copy marker edit is finite-attempt,
+# each attempt ``wait_for``-bounded and F1-cache idempotent. The in-unit
+# ``tg_message_id`` persist is N bounded LOCAL (registry-file) attempts with a
+# short backoff — never a wire op. On ANY budget exhaustion the unit releases
+# its locks and takes the documented floor (never indefinite lock ownership).
+_REANCHOR_SEND_TIMEOUT = 15.0
+_REANCHOR_EDIT_TIMEOUT = 10.0
+_REANCHOR_PERSIST_ATTEMPTS = 3
+_REANCHOR_PERSIST_BACKOFF = 0.5
 # F3 (whole-branch gate): after an UNVERIFIED (False/raised) force-suspend
 # outcome the once-per-episode backstop re-arms, but must PACE before it may
 # fire again — an immediate re-arm lets a doctrine-defying ask→refusal loop
@@ -2904,20 +2912,28 @@ class ClaudeCodeDriver(DriverProtocol):
 
     async def _consume_reanchor(self, engagement: EngagementRecord) -> None:
         """Run the re-anchor pass at a turn boundary and reconcile the latch +
-        retry owner (§A3(b), Sol r13-1). A True pass (obligation met — nothing
-        owed, already-last, or a successful staged re-anchor) CLEARS the latch and
-        RETIRES the retry owner; a False pass (persist failure, post/wire failure)
-        SETS the latch and ARMS the retry owner. The pass is idempotent and fully
-        revalidated, so a concurrent boundary consumer racing it is harmless —
-        one of them finds the obligation already discharged."""
+        retry owner (§A3(b), Sol r13-1/r17-1). A True pass (obligation met —
+        nothing owed, already-last, a successful staged re-anchor, or a consumed
+        cosmetic floor) CLEARS the latch and RETIRES the retry owner; a False pass
+        (a STAGE failure that left NOTHING on the wire) leaves them armed. The
+        pass is idempotent and fully revalidated, so a concurrent boundary
+        consumer racing it is harmless — one of them finds the obligation already
+        discharged.
+
+        v0.84.0 (§D6 r17-1): the obligation is ARMED BEFORE the pass's first
+        cancellable await — the pre-r17 latch-AFTER-return arming bypassed the
+        latch when a cancellation landed inside the pass's drained staging write
+        (``stage_stale_mid``), and the ``/silent`` rollback path has no later
+        boundary to recover the obligation at. On a True pass we retire what we
+        just armed; a cancellation propagating out of the pass therefore LEAVES
+        the obligation armed for a later boundary / the retry owner."""
         eng_id = engagement.id
+        self._reanchor_due.add(eng_id)
+        self._arm_reanchor_retry(engagement)
         ok = await self._reanchor_pass(engagement)
         if ok:
             self._reanchor_due.discard(eng_id)
             self._retire_reanchor_retry(eng_id)
-        else:
-            self._reanchor_due.add(eng_id)
-            self._arm_reanchor_retry(engagement)
 
     async def _reanchor_pass(self, engagement: EngagementRecord) -> bool:
         """§A3(b) staged turn-end re-anchor — ANCHORS ONLY. Keep the oldest
@@ -2932,7 +2948,6 @@ class ClaudeCodeDriver(DriverProtocol):
 
     async def _reanchor_pass_locked(self, engagement: EngagementRecord) -> bool:
         eng_id = engagement.id
-        reg = self._registry
         # Select the oldest UNANSWERED, unreserved anchor (effective view: not
         # answered ∪ overlay, not reserved). No such anchor ⇒ nothing owed.
         anchor = self._oldest_unanswered_anchor(eng_id, exclude_reserved=True)
@@ -2955,12 +2970,52 @@ class ClaudeCodeDriver(DriverProtocol):
 
         body = anchor.get("text") or (f"Q{n}:" if n is not None else "")
 
-        # Step 1 — STAGE (strict): stale_mids += [{"mid": old_mid, "kind":
-        # "plain"}]. A raise aborts with NOTHING on the wire (return False —
-        # retry owed). v0.84.0 (round-4 §D6/D2, Sol r17): ALWAYS stages
-        # "plain" explicitly — the atomic flip to "reanchored", paired with
-        # the new-mid persist below, is Task D2's transaction
-        # (``update_question_mid``), not this stage call.
+        # v0.84.0 (§D6 r17-1): the stage+post+persist+marker-edit unit runs as a
+        # STRONGLY-RETAINED CHILD TASK created here under the ask-maintenance lock
+        # (held by our caller ``_reanchor_pass`` for the child's whole lifetime).
+        # ``stage_stale_mid`` is INSIDE the child (the pass's first awaited op),
+        # so bare ``asyncio.shield`` is not enough — a cancelled caller would
+        # exit the lock context while the child kept writing unlocked. Instead:
+        # on our own ``CancelledError`` we DRAIN the child to completion FIRST (a
+        # re-await loop that absorbs REPEATED cancellation via ``shield`` — the
+        # same task-ownership shape as ``engagement_registry`` transactions, but
+        # ``shield`` not ``gather`` because our child is a live coroutine a
+        # gather-cancel WOULD cancel), releasing the lock only after, then
+        # re-raise. The drain is safe because the unit is FINITE (every wire op
+        # is ``wait_for``-bounded; persist is N local attempts).
+        child = asyncio.ensure_future(
+            self._reanchor_unit(engagement, n, old_mid, body, seq))
+        try:
+            return await asyncio.shield(child)
+        except asyncio.CancelledError:
+            while not child.done():
+                try:
+                    await asyncio.shield(child)
+                except asyncio.CancelledError:
+                    continue
+            raise
+
+    async def _reanchor_unit(
+        self, engagement: EngagementRecord, n: int | None,
+        old_mid: int | None, body: str, seq: Any,
+    ) -> bool:
+        """The drained re-anchor CRITICAL SECTION (§D6 r17-1). Runs as a
+        strongly-retained child task under the caller's held ask-maintenance
+        lock: stage(plain) → ONE ``wait_for``-bounded plain send (ZERO wire
+        retries) → in-unit LOCAL persist (N bounded attempts) →
+        ``wait_for``-bounded marker edit of the OLD copy (finite attempts).
+
+        Returns ``True`` whenever the obligation is DISCHARGED or CONSUMED for
+        this pass (a successful re-anchor, an answer that won the revalidation
+        race, an ambiguous send, or a persist-exhaustion floor); ``False`` ONLY
+        when a STAGE failure left NOTHING on the wire — the only outcome safe to
+        wire-retry, because no send happened and no duplicate can exist."""
+        eng_id = engagement.id
+        reg = self._registry
+
+        # Step 1 — STAGE (strict) plain. A raise aborts with NOTHING on the wire
+        # (return False — safe to retry). §D6/D2: ALWAYS stages "plain"; the
+        # atomic flip to "reanchored" is ``update_question_mid``'s transaction.
         if old_mid is not None and n is not None:
             stage = getattr(reg, "stage_stale_mid", None) if reg is not None else None
             if stage is not None:
@@ -2973,11 +3028,11 @@ class ClaudeCodeDriver(DriverProtocol):
                         exc_info=True)
                     return False
 
-        # Step 2 — POST the new anchor copy through the sequencer with a
-        # ``revalidate`` hook that re-checks (under the sequencer lock,
-        # immediately before the send) that the anchor is STILL the oldest
-        # unanswered+unreserved one (Sol r8-2): an answer that landed during the
-        # awaited step-1 stage DECLINES the send.
+        # Step 2 — ONE ``wait_for``-bounded plain send (ZERO wire retries). The
+        # ``revalidate`` hook re-checks, under the sequencer lock immediately
+        # before the send, that the anchor is STILL the oldest unanswered+
+        # unreserved one (Sol r8-2): an answer that landed during the awaited
+        # step-1 stage DECLINES the send.
         declined = False
 
         def _revalidate() -> bool:
@@ -2988,50 +3043,122 @@ class ClaudeCodeDriver(DriverProtocol):
                 declined = True
             return still
 
-        new_mid = await seq.post_discrete(body, revalidate=_revalidate)
+        try:
+            new_mid = await seq.post_discrete(
+                body, revalidate=_revalidate,
+                wire_timeout=_REANCHOR_SEND_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            # The production send wrapper catches everything and returns None
+            # (Sol r17-3); a raising send here (or under the timeout task's
+            # cancellation) is likewise INDISTINGUISHABLE from an accepted copy,
+            # so treat it as an ambiguous send — ZERO wire retries.
+            logger.warning(
+                "engagement %s: re-anchor send raised (n=%s) — treating as "
+                "ambiguous, no wire retry, obligation consumed", eng_id[:8], n,
+                exc_info=True)
+            await self._best_effort_unstage(eng_id, n, old_mid)
+            return True
         if new_mid is None:
             # Un-stage best-effort (a failed un-stage leaves an overlap-tolerant
             # stale_mid — reconciliation tolerates the overlap).
             await self._best_effort_unstage(eng_id, n, old_mid)
             if declined:
-                # The answer won — nothing owed.
+                # The answer won the revalidation race — nothing owed.
                 return True
-            # Wire failure — retry owed.
-            return False
+            # AMBIGUOUS send (Sol r17-3): the send wrapper returns None for BOTH
+            # a wire failure AND "Telegram accepted but returned no mid" / a
+            # wait_for timeout — indistinguishable, so a wire retry could stack
+            # an untracked duplicate. TERMINAL cosmetic outcome for THIS pass: no
+            # wire retry, obligation CONSUMED, old copy stays current; the next
+            # re-anchor obligation arises naturally from the next output event
+            # (round-3 semantics). Residual: at most ONE potential untracked copy
+            # per ambiguous send, logged.
+            logger.warning(
+                "engagement %s: re-anchor send ambiguous (n=%s) — exactly ONE "
+                "attempt, no wire retry, obligation consumed for this pass",
+                eng_id[:8], n)
+            return True
 
-        # Step 3 — STRICT-PERSIST tg_message_id = new_mid. A raise settles the
-        # NEW copy to '↪ see the question above' (confirmed-gate, best-effort,
-        # plain text) and aborts; the original stays live and tracked.
-        # D2: this call's SAME transaction is where the staged stale entry
-        # flips "plain" → "reanchored" (see the registry method's own D2
-        # marker) — not implemented in this task.
-        update = (getattr(reg, "update_question_mid", None)
-                  if reg is not None else None)
-        if update is not None and n is not None:
-            try:
-                await update(eng_id, n, new_mid)
-            except Exception:  # noqa: BLE001 — strict persist failed
-                logger.warning(
-                    "engagement %s: re-anchor update_question_mid failed (n=%s) "
-                    "— settling the new copy 'see above'", eng_id[:8], n,
-                    exc_info=True)
-                await self._confirm_settle_mid(
-                    engagement, new_mid, f"{body}\n{_OPEN_Q_SEE_ABOVE}", n)
-                return False
+        # Step 3 — IN-UNIT LOCAL persist of tg_message_id = new_mid: N bounded
+        # attempts, short backoff, registry-file writes ONLY (never a wire op).
+        # This same transaction atomically flips the staged stale entry
+        # "plain" → "reanchored" (D2, inside ``update_question_mid``).
+        if not await self._reanchor_persist_in_unit(engagement, n, new_mid):
+            # D4: persist exhaustion. The confirmed-pair record (Task D4) will
+            # own the unpersisted ``new_mid`` and re-drive the local transaction
+            # under the unified historical scheduler. Until D4 lands, the STOPGAP
+            # is: NO body edit (the '↪ see above' hack is DELETED, r11-1), log,
+            # and CONSUME the obligation for this pass. The old copy stays durably
+            # current + tracked (persist never committed, so tg_message_id and
+            # the "plain" stale entry are unchanged); ``new_mid`` is an accepted
+            # untracked orphan — the same at-least-once floor as the crash
+            # residual, and mid-agnostic routing means answering it still works.
+            logger.warning(
+                "engagement %s: re-anchor persist exhausted after %d attempts "
+                "(n=%s new_mid=%s) — D4 stopgap: no body edit, orphan accepted",
+                eng_id[:8], _REANCHOR_PERSIST_ATTEMPTS, n, new_mid)
+            return True
 
-        # Step 4 — SETTLE-EDIT the OLD copy to the MOVED-open marker
-        # (confirmed-gate). v0.84.0 (round-4 §D6, Sol r1-7): REPLACES the full
-        # duplicated body with marker-ONLY text — never the body — so the old
-        # copy no longer reads as "asked twice". ONLY on a confirmed edit
-        # un-stage old_mid; an unconfirmed edit retains the stale_mid for boot
-        # reconciliation — the OBLIGATION is already met (the question is now
-        # LAST at new_mid).
-        if old_mid is not None:
-            old_confirmed = await self._confirm_settle_mid(
-                engagement, old_mid, _reanchor_moved_open(n), n)
-            if old_confirmed and n is not None:
+        # Step 4 — ``wait_for``-bounded, finite-attempt marker edit of the OLD
+        # copy to the MOVED-open marker (§D6, Sol r1-7): REPLACES the full
+        # duplicated body with marker-ONLY text so the old copy no longer reads
+        # as "asked twice". ONLY on a confirmed edit un-stage old_mid; an
+        # unconfirmed edit PRESERVES the durable "reanchored" stale entry (the
+        # D4 stale-sweep re-drives it). The OBLIGATION is already met (the
+        # question is now LAST at new_mid), so this returns True regardless.
+        if old_mid is not None and n is not None:
+            if await self._reanchor_marker_edit(engagement, old_mid, n):
                 await self._best_effort_unstage(eng_id, n, old_mid)
         return True
+
+    async def _reanchor_persist_in_unit(
+        self, engagement: EngagementRecord, n: int | None, new_mid: int,
+    ) -> bool:
+        """In-unit LOCAL persist of the re-anchored ``tg_message_id`` (§D6
+        r17-2): up to ``_REANCHOR_PERSIST_ATTEMPTS`` strict
+        ``update_question_mid`` attempts with a short backoff between them —
+        registry-file writes only, no wire op. Returns ``True`` on a committed
+        transaction (or when there is no persist primitive — legacy registry),
+        ``False`` on exhaustion."""
+        reg = self._registry
+        update = (getattr(reg, "update_question_mid", None)
+                  if reg is not None else None)
+        if update is None or n is None:
+            return True
+        for attempt in range(_REANCHOR_PERSIST_ATTEMPTS):
+            try:
+                await update(engagement.id, n, new_mid)
+                return True
+            except Exception:  # noqa: BLE001 — strict persist failed
+                logger.warning(
+                    "engagement %s: re-anchor persist attempt %d/%d failed "
+                    "(n=%s new_mid=%s)", engagement.id[:8], attempt + 1,
+                    _REANCHOR_PERSIST_ATTEMPTS, n, new_mid, exc_info=True)
+                if attempt + 1 < _REANCHOR_PERSIST_ATTEMPTS:
+                    await self._sleep(_REANCHOR_PERSIST_BACKOFF)
+        return False
+
+    async def _reanchor_marker_edit(
+        self, engagement: EngagementRecord, old_mid: int, n: int | None,
+    ) -> bool:
+        """``wait_for``-bounded, finite-attempt marker edit of the OLD copy
+        through the sequencer's ``edit_discrete`` (§D6 r17-2/r17-4): each attempt
+        is bounded by ``_REANCHOR_EDIT_TIMEOUT`` and idempotent via the F1 edit
+        cache (a repeated identical edit no-ops). Returns ``True`` on a confirmed
+        edit. Renders D1's marker-ONLY text, never the duplicated body."""
+        seq = self._sequencers.get(engagement.id)
+        if seq is None:
+            return False
+        from channels.output_sequencer import MARKUP_EMPTY
+        marker = _reanchor_moved_open(n)
+        return await confirmed_settle_edit(
+            lambda: seq.edit_discrete(
+                old_mid, text=marker, markup=MARKUP_EMPTY,
+                wire_timeout=_REANCHOR_EDIT_TIMEOUT),
+            sleep=self._sleep,
+        )
 
     async def _best_effort_unstage(
         self, engagement_id: str, n: int | None, mid: int | None,
