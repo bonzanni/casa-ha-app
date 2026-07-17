@@ -12,8 +12,13 @@ async def test_delegation_parent_origin_survives_holder_rewrite(monkeypatch):
     import agent as agent_mod
     import tools
 
-    holder = {"cid": "voice-cid", "channel": "voice", "chat_id": "s1",
-              "role": "butler", "user_text": "hi"}
+    holder = {
+        "cid": "voice-cid", "channel": "voice", "chat_id": "s1",
+        "role": "butler", "user_text": "hi",
+        "voice_transport": "ws", "voice_route_id": "entry-1",
+        "voice_route_capabilities": frozenset({"background_jobs"}),
+        "origin_device_id": "device-kitchen",
+    }
     token = agent_mod.origin_var.set(holder)
     try:
         captured = {}
@@ -31,3 +36,5 @@ async def test_delegation_parent_origin_survives_holder_rewrite(monkeypatch):
 
     assert captured["before"]["channel"] == "voice"
     assert captured["after"]["channel"] == "voice"     # snapshot, not reference
+    assert captured["after"]["voice_route_id"] == "entry-1"
+    assert captured["after"]["origin_device_id"] == "device-kitchen"

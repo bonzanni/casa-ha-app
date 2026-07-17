@@ -96,6 +96,14 @@ def test_configs_discovered() -> None:
     assert {"assistant", "butler", "configurator", "plugin-developer"} <= roles
 
 
+def test_voice_job_broker_tools_exist_on_framework_surface() -> None:
+    """Gary's eventual private grant must resolve before live reconfiguration."""
+    assert {
+        "delegate_to_agent", "voice_job_status",
+        "cancel_voice_job", "continue_voice_job",
+    } <= FRAMEWORK_TOOLS
+
+
 def test_every_allowed_tool_resolves() -> None:
     """Invariant A: no dangling grants."""
     violations: list[str] = []

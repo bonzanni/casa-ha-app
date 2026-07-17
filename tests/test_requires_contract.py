@@ -408,8 +408,9 @@ class TestPrelaunchRequiresGate:
         # mocked _run_delegated_agent), then short-circuit before any SDK.
         captured: dict = {}
 
-        def _spy_builder(cfg, *, resolution=None):
+        def _spy_builder(cfg, *, resolution=None, output_format=None):
             captured["resolution"] = resolution
+            captured["output_format"] = output_format
             return MagicMock()
 
         monkeypatch.setattr(tm, "_build_specialist_options", _spy_builder)
@@ -424,6 +425,7 @@ class TestPrelaunchRequiresGate:
         payload = json.loads(res["content"][0]["text"])
         assert payload["status"] == "ok"
         assert captured["resolution"] is resolution
+        assert captured["output_format"] is None
         assert resolve_calls == ["specialist:finance"]
 
     async def test_no_requires_skips_gate_no_resolve(self, monkeypatch):
@@ -438,8 +440,11 @@ class TestPrelaunchRequiresGate:
             lambda target: calls.append(target) or _resolution(),
         )
 
-        async def _fake_run(cfg, task_text, context_text, resolution=None):
-            return "ok"
+        async def _fake_run(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
+            assert output_format is None
+            return tm.DelegatedOutput(text="ok")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _fake_run)
 

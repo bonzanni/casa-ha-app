@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.85.0] - 2026-07-17
+
+Gary can now hand specialist questions off quickly, keep taking voice turns,
+and announce the completed answer after the originating satellite is idle.
+
+### Added
+
+- Fast background specialist hand-offs for voice: Gary acknowledges the work
+  immediately instead of holding the Assist request open while a judge,
+  health, finance, or future specialist thinks.
+- Proactive stable-idle delivery through the companion Home Assistant
+  integration. Results speak immediately when the satellite is already idle,
+  otherwise they wait until the current listening/processing/response cycle is
+  over; per-device queues stay ordered without blocking other satellites.
+- Voice controls for job status, cancellation before playback, clarification
+  continuation, and explicit detail requests. Private results announce only a
+  safe availability summary unless the detail request passes identity and
+  clearance checks.
+- Operator bounds for route reconnect grace, maximum result retention, and the
+  active/ready backlog per route: `voice_route_freshness_seconds`,
+  `voice_job_delivery_ttl_seconds`, and `voice_job_route_cap`.
+
+### Changed
+
+- Background work is capability gated, not version-string gated: Casa requires
+  an HMAC-authenticated protocol-1 WebSocket route whose registration has
+  acknowledged both background-job and satellite-announcement capabilities.
+  SSE and older integrations continue synchronous Tina/Gary turns unchanged.
+- Specialist results stay out of Gary's resident transcript and token context;
+  Casa retains the durable job and sends Home Assistant only the final
+  policy-approved spoken summary.
+
+### Security
+
+- The WebSocket HMAC is explicitly documented as authenticating the Home
+  Assistant client only at HTTP upgrade, over an empty request body. It does
+  not MAC individual frames, encrypt payloads, or cryptographically
+  authenticate the server; keep the link on a trusted LAN/private network or
+  a server-authenticated encrypted tunnel.
+
 ## [0.84.0] - 2026-07-16
 
 Tina's Home Assistant path is now ready before a voice turn starts, with

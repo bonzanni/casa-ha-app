@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from unittest.mock import MagicMock
 
@@ -334,6 +335,104 @@ class TestWithStderrCallback:
         out = with_stderr_callback(opts, engagement_id="x12345678")
         # We do NOT clobber a caller-provided callback.
         assert out.stderr is sentinel
+
+
+class TestStructuredVoiceSdkLogGuard:
+    @pytest.mark.parametrize("logger_name", [
+        "claude_agent_sdk._internal.query",
+        "claude_agent_sdk._internal.transport.subprocess_cli",
+        "claude_agent_sdk._internal._task_compat",
+    ])
+    def test_suppresses_sdk_payload_logs_only_inside_guard(
+        self, caplog, logger_name,
+    ):
+        from sdk_logging import suppress_structured_voice_sdk_payload_logs
+
+        private_canary = "PRIVATE-MALFORMED-SDK-FRAME-CANARY"
+        logger = logging.getLogger(logger_name)
+        with caplog.at_level(logging.DEBUG):
+            logger.error("visible before guard")
+            with suppress_structured_voice_sdk_payload_logs():
+                logger.error("malformed frame: %s", private_canary)
+            logger.error("visible after guard")
+
+        messages = [
+            record.getMessage() for record in caplog.records
+            if record.name == logger_name
+        ]
+        assert messages == ["visible before guard", "visible after guard"]
+        assert private_canary not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_detached_guarded_task_stays_filtered_after_parent_exits(
+        self, caplog,
+    ):
+        from sdk_logging import suppress_structured_voice_sdk_payload_logs
+
+        private_canary = "PRIVATE-DETACHED-SDK-CANARY-b2a7"
+        release = asyncio.Event()
+
+        async def _late_sdk_log():
+            await release.wait()
+            logging.getLogger("claude_agent_sdk._internal.query").error(
+                "late guarded payload: %s", private_canary,
+            )
+
+        with caplog.at_level(logging.DEBUG):
+            with suppress_structured_voice_sdk_payload_logs():
+                detached = asyncio.create_task(_late_sdk_log())
+            release.set()
+            await detached
+
+        assert private_canary not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_concurrent_non_voice_context_remains_visible(self, caplog):
+        from sdk_logging import suppress_structured_voice_sdk_payload_logs
+
+        guarded_canary = "PRIVATE-CONCURRENT-GUARDED-CANARY-31fa"
+        visible_message = "concurrent non-voice sdk diagnostic"
+        ready = asyncio.Event()
+        release = asyncio.Event()
+        logger = logging.getLogger("claude_agent_sdk._internal.query")
+
+        async def _guarded_job():
+            with suppress_structured_voice_sdk_payload_logs():
+                ready.set()
+                await release.wait()
+                logger.error("guarded: %s", guarded_canary)
+
+        async def _non_voice_job():
+            await ready.wait()
+            logger.error(visible_message)
+            release.set()
+
+        with caplog.at_level(logging.DEBUG):
+            await asyncio.gather(_guarded_job(), _non_voice_job())
+
+        assert guarded_canary not in caplog.text
+        assert visible_message in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_cancelled_guard_restores_parent_context(self, caplog):
+        from sdk_logging import suppress_structured_voice_sdk_payload_logs
+
+        logger = logging.getLogger("claude_agent_sdk._internal.query")
+        visible_message = "sdk diagnostic after guarded cancellation"
+
+        async def _cancel_then_log_in_same_context():
+            try:
+                with suppress_structured_voice_sdk_payload_logs():
+                    asyncio.current_task().cancel()
+                    await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                pass
+            logger.error(visible_message)
+
+        with caplog.at_level(logging.DEBUG):
+            await _cancel_then_log_in_same_context()
+
+        assert visible_message in caplog.text
 
 
 class TestSdkTaskNoiseFilter:

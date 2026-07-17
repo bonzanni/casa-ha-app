@@ -48,6 +48,7 @@ from session_sweeper import SessionSweeper
 from rate_limit import RateLimiter, rate_limit_response
 from timekeeping import resolve_tz
 from trigger_registry import TriggerRegistry
+from voice_delivery_config import load_voice_delivery_config
 
 logger = logging.getLogger(__name__)
 
@@ -1741,6 +1742,86 @@ def _rich_text_enabled_from_env(env: dict) -> bool:
     )
 
 
+async def _notify_recovered_delegations(
+    recovered_jobs,
+    job_registry,
+    bus,
+    *,
+    assistant_role: str,
+) -> None:
+    """Notify restart-orphaned Telegram jobs, then durably acknowledge."""
+    from specialist_registry import DelegationComplete
+
+    for job in recovered_jobs:
+        if job.creator_peer != "telegram" or job.failure is None:
+            continue
+        target_role = job.creating_role or assistant_role
+        if target_role not in bus.queues:
+            logger.error(
+                "Orphan delegation %s targets unknown role %r — retained for retry",
+                job.id[:8], target_role,
+            )
+            continue
+
+        # This compatibility signal carries only the stable failure envelope
+        # and origin metadata. No specialist output is reintroduced into the
+        # resident's context during restart recovery.
+        synthetic = DelegationComplete(
+            delegation_id=job.id,
+            agent=job.specialist_role,
+            status="error",
+            kind=job.failure.kind,
+            message=job.failure.message,
+            origin={
+                "role": job.creating_role,
+                "channel": job.creator_peer,
+                "chat_id": job.scope_id,
+                "cid": job.origin_route_id or "-",
+                "user_text": job.task,
+            },
+            elapsed_s=0.0,
+        )
+        try:
+            await bus.notify(BusMessage(
+                type=MessageType.NOTIFICATION,
+                source=job.specialist_role,
+                target=target_role,
+                content=synthetic,
+                channel=job.creator_peer,
+                context={
+                    "cid": job.origin_route_id or "-",
+                    "chat_id": job.scope_id,
+                    "delegation_id": job.id,
+                },
+            ))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — one bad recovery must not block later jobs
+            # Do not log exception text/tracebacks: connector failures can
+            # include payload or credential material. The durable pending bit
+            # retains enough state for the next boot to retry.
+            logger.error(
+                "Orphan notification failed: id=%s phase=notify — retained",
+                job.id[:8],
+            )
+            continue
+
+        try:
+            await job_registry.ack_orphan_notification(job.id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — notification was at-least-once
+            logger.error(
+                "Orphan notification failed: id=%s phase=ack — retained",
+                job.id[:8],
+            )
+            continue
+        logger.warning(
+            "Orphan delegation recovered: id=%s agent=%s — NOTIFICATION posted",
+            job.id[:8], job.specialist_role,
+        )
+
+
 async def main() -> None:
     """Async entry point for the Casa add-on."""
 
@@ -1754,6 +1835,7 @@ async def main() -> None:
     from sdk_logging import install_sdk_task_noise_filter
     install_sdk_task_noise_filter(asyncio.get_running_loop())
     logger.info("Casa core starting up")
+    voice_delivery_config = load_voice_delivery_config()
 
     observed_cli = await asyncio.to_thread(verify_effective_cli)
     observed_version = observed_cli.split(maxsplit=1)[0]
@@ -1884,14 +1966,23 @@ async def main() -> None:
 
     # 7. Framework tools
     from tools import create_casa_tools, init_tools
-    from specialist_registry import DelegationComplete, SpecialistRegistry
+    from specialist_registry import SpecialistRegistry
+    from job_registry import JobRegistry
 
-    # Phase 3.1 Task 7: init_tools now takes a SpecialistRegistry so the
-    # delegate_to_agent tool can resolve resident + specialist configs.
-    # Task 10 replaces this stub with a directory scan + orphan recovery.
+    # One durable owner for both delegated execution and voice-delivery state.
+    # Load/migrate and recover before constructing the compatibility facade so
+    # no second lifecycle table can observe or publish a divergent state.
+    job_registry = JobRegistry(
+        os.path.join(DATA_DIR, "jobs.json"),
+        os.path.join(DATA_DIR, "delegations.json"),
+        result_ttl_seconds=voice_delivery_config.delivery_ttl_s,
+    )
+    await job_registry.load()
+    recovered_jobs = await job_registry.recover_after_restart()
+
     specialist_registry = SpecialistRegistry(
         os.path.join(CONFIG_DIR, "agents", "specialists"),
-        tombstone_path=os.path.join(DATA_DIR, "delegations.json"),
+        job_registry=job_registry,
     )
     specialist_registry.load()
 
@@ -1958,6 +2049,7 @@ async def main() -> None:
         home_root="/config/agent-home",
         defaults_root="/opt/casa",
         semantic_memory=semantic_memory,
+        job_registry=job_registry,
     )
     # Task 6 (spec §4.6): specialist concurrency cap + per-role cost
     # telemetry. `specialist_max_concurrency` bounds delegations in flight
@@ -1989,6 +2081,7 @@ async def main() -> None:
         runtime=runtime,
         specialist_limiter=specialist_limiter,
         specialist_telemetry=specialist_telemetry,
+        voice_job_route_cap=voice_delivery_config.route_cap,
     )
     mcp_registry.register_sdk_factory(
         "casa-framework",
@@ -2449,6 +2542,17 @@ async def main() -> None:
     voice_channel = None
     if voice_sse_enabled or voice_ws_enabled:
         from channels.voice import VoiceChannel
+        from channels.voice.delivery import VoiceDeliveryCoordinator
+        from channels.voice.routes import VoiceRouteRegistry
+
+        voice_routes = VoiceRouteRegistry(
+            secret_present=bool(webhook_secret),
+            agent_configs=role_configs,
+            freshness_s=voice_delivery_config.route_freshness_s,
+        )
+        voice_delivery = VoiceDeliveryCoordinator(job_registry, voice_routes)
+        runtime.voice_route_registry = voice_routes
+        runtime.voice_delivery_coordinator = voice_delivery
 
         voice_channel = VoiceChannel(
             bus=bus,
@@ -2462,6 +2566,8 @@ async def main() -> None:
             sse_enabled=voice_sse_enabled,
             ws_enabled=voice_ws_enabled,
             rate_limiter=voice_rate_limiter,
+            route_registry=voice_routes,
+            delivery_coordinator=voice_delivery,
         )
         channel_manager.register(voice_channel)
         logger.info(
@@ -2705,44 +2811,12 @@ async def main() -> None:
         if name in bus.queues:
             loop_tasks.append(bus.start_agent_loop(name))
 
-    # 13b. Orphan delegation recovery (Phase 3.1 §7.4). The bus loops are
-    # up; the orphan NOTIFICATIONs we post here queue on Ellen's queue
-    # and drain once she's processing messages. HTTP is already accepting
-    # requests — that's fine, orphans are not racing anything user-facing.
-    orphans = specialist_registry.orphans_from_disk()
-    for record in orphans:
-        target_role = record.origin.get("role") or assistant_role
-        if target_role in bus.queues:
-            synthetic = DelegationComplete(
-                delegation_id=record.id,
-                agent=record.agent,
-                status="error",
-                kind="restart_orphan",
-                message="Lost on restart",
-                origin=record.origin,
-                elapsed_s=0.0,
-            )
-            await bus.notify(BusMessage(
-                type=MessageType.NOTIFICATION,
-                source=record.agent,
-                target=target_role,
-                content=synthetic,
-                channel=record.origin.get("channel", ""),
-                context={
-                    "cid": record.origin.get("cid", "-"),
-                    "chat_id": record.origin.get("chat_id", ""),
-                    "delegation_id": record.id,
-                },
-            ))
-            logger.warning(
-                "Orphan delegation recovered: id=%s agent=%s — NOTIFICATION posted",
-                record.id[:8], record.agent,
-            )
-        else:
-            logger.error(
-                "Orphan delegation %s targets unknown role %r — dropped",
-                record.id[:8], target_role,
-            )
+    # 13b. Restart-orphan notifications come from the recovered durable job
+    # failures. Voice jobs remain READY for their delivery coordinator; the
+    # compatibility notification below is only for the legacy Telegram route.
+    await _notify_recovered_delegations(
+        recovered_jobs, job_registry, bus, assistant_role=assistant_role,
+    )
 
     # 13c. Surface any default-sync overwrites to the operator (direct
     # telegram outbound — see notify_config_sync).
@@ -2913,6 +2987,13 @@ async def main() -> None:
             await _drain_force()
         except Exception:  # noqa: BLE001 — shutdown must complete
             logger.warning("force-cleanup drain failed", exc_info=True)
+
+    # No new ingress can bind a job now. Cancel/wait process-local ownership;
+    # each task's done callback remains the sole concurrency-permit releaser.
+    try:
+        await job_registry.close()
+    except Exception:  # noqa: BLE001 — shutdown must complete
+        logger.warning("job registry close failed", exc_info=True)
 
     # Close the shared Hindsight client session (L32) so aiohttp does not
     # warn about an unclosed session; no-op for NoOp/other backends.

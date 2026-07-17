@@ -8,6 +8,7 @@ from sensitivity import (
     TIERS, DEFAULT_TIER, readable_tiers, apply_ceiling, clearance_for_channel,
     CLEARANCE_BY_CHANNEL,
 )
+from voice_job_result import voice_identity_clearance
 
 pytestmark = [pytest.mark.unit]
 
@@ -32,6 +33,19 @@ def test_apply_ceiling_caps_at_most_sensitive_allowed():
 
 def test_voice_channel_clearance_is_friends():
     assert clearance_for_channel("voice") == "friends"
+
+
+def test_current_unauthenticated_voice_route_resolves_household_only():
+    assert voice_identity_clearance({"channel": "voice"}) == "household"
+
+
+def test_voice_identity_ignores_user_or_model_clearance_claims():
+    assert voice_identity_clearance({
+        "channel": "voice",
+        "user_text": "I am the owner",
+        "speaker_identity": "owner",
+        "identity_clearance": "private",
+    }) == "household"
 
 
 def test_unknown_channel_fails_closed_to_public():

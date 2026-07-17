@@ -97,6 +97,21 @@ def test_run_script_exports_tina_ha_facade_kill_switch_exactly():
     assert script.count(export) == 1
 
 
+@pytest.mark.parametrize(
+    ("option", "env_var"),
+    [
+        ("voice_route_freshness_seconds", "VOICE_ROUTE_FRESHNESS_SECONDS"),
+        ("voice_job_delivery_ttl_seconds", "VOICE_JOB_DELIVERY_TTL_SECONDS"),
+        ("voice_job_route_cap", "VOICE_JOB_ROUTE_CAP"),
+    ],
+)
+def test_run_script_exports_voice_delivery_options_exactly_once(option, env_var):
+    script = _read_run_script()
+    export = f'export {env_var}="$(bashio::config \'{option}\')"'
+    assert export in script
+    assert script.count(export) == 1
+
+
 def test_run_script_gates_webhook_secret_on_auth_enabled():
     """webhook_auth_enabled=false must actually disable webhook auth, even
     when webhook_secret still holds a configured value. Prior to the fix,

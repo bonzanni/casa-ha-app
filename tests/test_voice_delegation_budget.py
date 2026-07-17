@@ -1,8 +1,8 @@
-"""Voice turn budget, sync-only modes, and deterministic progress (spec A4).
+"""Voice turn budget, async route gates, and deterministic progress (spec A4).
 
 Covers:
-- TestVoiceModes: async/interactive delegation is rejected outright on the
-  voice channel (never coerced to sync, never `pending`).
+- TestVoiceModes: interactive delegation remains unsupported; async requires
+  a trusted background-delivery-capable WebSocket route.
 - TestVoiceDeadline: an expired/missing voice deadline degrades to a typed
   `deadline_exceeded` FAST (never the 60s general sync ceiling).
 - TestVoiceTurnBudget: channels/voice/channel.py's `_voice_turn_budget_s()`
@@ -47,6 +47,15 @@ def _voice_origin(**overrides) -> dict:
     return origin
 
 
+def _voice_output(tm, text: str):
+    return tm.DelegatedOutput(text=text, structured_output={
+        "status": "answered", "spoken_summary": text, "answer": text,
+        "clarification": "", "citations": [], "assumptions": [],
+        "provenance": {}, "sensitivity": "household",
+        "delivery_ttl_s": 900,
+    })
+
+
 def _init_tools_for_voice():
     import tools as tm
 
@@ -56,6 +65,7 @@ def _init_tools_for_voice():
     reg.cancel_delegation = AsyncMock()
     reg.fail_delegation = AsyncMock()
     reg.complete_delegation = AsyncMock()
+    reg.job_registry.finish_voice_result = AsyncMock()
     tm.init_tools(
         channel_manager=MagicMock(), bus=MagicMock(),
         specialist_registry=reg, mcp_registry=MagicMock(),
@@ -75,7 +85,7 @@ def _init_tools_for_voice():
 
 @pytest.mark.asyncio
 class TestVoiceModes:
-    async def test_async_mode_rejected_on_voice(self):
+    async def test_async_mode_without_route_rejected_on_voice(self):
         import agent as agent_mod
 
         tm, reg = _init_tools_for_voice()
@@ -91,7 +101,7 @@ class TestVoiceModes:
 
         payload = json.loads(res["content"][0]["text"])
         assert payload["status"] == "error"
-        assert payload["kind"] == "mode_unsupported_on_voice"
+        assert payload["kind"] == "background_delivery_unavailable"
         # No side effect happened — the specialist never launched.
         reg.register_delegation.assert_not_awaited()
 
@@ -121,8 +131,11 @@ class TestVoiceModes:
 
         tm, reg = _init_tools_for_voice()
 
-        async def _fake_run(cfg, task_text, context_text, resolution=None):
-            return "ok"
+        async def _fake_run(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
+            assert output_format is tm.VOICE_JOB_OUTPUT_FORMAT
+            return _voice_output(tm, "ok")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _fake_run)
 
@@ -198,10 +211,12 @@ class TestVoiceDeadline:
 
         launched = False
 
-        async def _run(cfg, task_text, context_text, resolution=None):
+        async def _run(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
             nonlocal launched
             launched = True
-            return "should never run"
+            return _voice_output(tm, "should never run")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _run)
 
@@ -237,8 +252,10 @@ class TestVoiceDeadline:
 
         tm, reg = _init_tools_for_voice()
 
-        async def _instant(cfg, task_text, context_text, resolution=None):
-            return "done instantly"
+        async def _instant(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
+            return _voice_output(tm, "done instantly")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _instant)
 
@@ -269,10 +286,12 @@ class TestVoiceDeadline:
 
         launched = False
 
-        async def _run(cfg, task_text, context_text, resolution=None):
+        async def _run(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
             nonlocal launched
             launched = True
-            return "should never run"
+            return _voice_output(tm, "should never run")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _run)
 
@@ -300,9 +319,11 @@ class TestVoiceDeadline:
 
         tm, reg = _init_tools_for_voice()
 
-        async def _slow(cfg, task_text, context_text, resolution=None):
+        async def _slow(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
             await asyncio.sleep(10)  # cooperatively cancellable
-            return "too late"
+            return _voice_output(tm, "too late")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _slow)
 
@@ -342,10 +363,12 @@ class TestVoiceDeadline:
 
         launched = False
 
-        async def _run(cfg, task_text, context_text, resolution=None):
+        async def _run(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
             nonlocal launched
             launched = True
-            return "should never run"
+            return _voice_output(tm, "should never run")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _run)
 
@@ -388,11 +411,13 @@ class TestVoiceDeadline:
 
         launched = False
 
-        async def _run(cfg, task_text, context_text, resolution=None):
+        async def _run(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
             nonlocal launched
             launched = True
             await asyncio.sleep(10)
-            return "nope"
+            return _voice_output(tm, "nope")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _run)
 
@@ -821,6 +846,12 @@ class TestVoiceDeadlineOriginPropagation:
             context={
                 "chat_id": "s1", "_voice_deadline": 12345.0,
                 "_progress_sink": _sink,
+                "_voice_transport": "ws",
+                "_voice_route_id": "entry-1",
+                "_voice_route_capabilities": frozenset({
+                    "background_jobs", "satellite_announce",
+                }),
+                "_origin_device_id": "device-kitchen",
             },
         )
         with patch("sdk_client_pool._default_make_client", CapturingClient):
@@ -829,6 +860,12 @@ class TestVoiceDeadlineOriginPropagation:
         origin = captured["origin"]
         assert origin["voice_deadline"] == 12345.0
         assert origin["_progress_sink"] is _sink
+        assert origin["voice_transport"] == "ws"
+        assert origin["voice_route_id"] == "entry-1"
+        assert origin["voice_route_capabilities"] == frozenset({
+            "background_jobs", "satellite_announce",
+        })
+        assert origin["origin_device_id"] == "device-kitchen"
 
     async def test_non_voice_channel_does_not_propagate_deadline(self, tmp_path):
         """Defensive: even if a non-voice message somehow carried these
@@ -855,6 +892,10 @@ class TestVoiceDeadlineOriginPropagation:
             context={
                 "chat_id": "s1", "_voice_deadline": 12345.0,
                 "_progress_sink": _sink,
+                "_voice_transport": "ws",
+                "_voice_route_id": "spoofed-entry",
+                "_voice_route_capabilities": frozenset({"background_jobs"}),
+                "_origin_device_id": "spoofed-device",
             },
         )
         with patch("sdk_client_pool._default_make_client", CapturingClient):
@@ -863,3 +904,7 @@ class TestVoiceDeadlineOriginPropagation:
         origin = captured["origin"]
         assert "voice_deadline" not in origin
         assert "_progress_sink" not in origin
+        assert "voice_transport" not in origin
+        assert "voice_route_id" not in origin
+        assert "voice_route_capabilities" not in origin
+        assert "origin_device_id" not in origin

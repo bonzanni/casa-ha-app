@@ -126,6 +126,23 @@ configuration:
       voice turn before Casa gives up and returns early, leaving room for
       the voice transport's own timeout. Hard-capped at 27 regardless of
       this value. Defaults to 27.
+  voice_route_freshness_seconds:
+    name: "Voice Route Freshness (seconds)"
+    description: >-
+      Grace period during which Gary may accept a background specialist job
+      after its authenticated Home Assistant route disconnects. Range 0-300.
+      Defaults to 60.
+  voice_job_delivery_ttl_seconds:
+    name: "Maximum Voice Job Delivery TTL (seconds)"
+    description: >-
+      Maximum retention period for background voice-job results and failures
+      while delivery is pending. A specialist may request a shorter expiry.
+      Range 30-3600. Defaults to 900.
+  voice_job_route_cap:
+    name: "Voice Job Route Cap"
+    description: >-
+      Maximum active or ready specialist jobs retained for one authenticated
+      Home Assistant voice route. Range 1-20. Defaults to 5.
   specialist_max_concurrency:
     name: "Specialist Max Concurrency"
     description: >-

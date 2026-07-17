@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import replace
-from typing import Callable
+from typing import Callable, Iterator
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -39,6 +41,43 @@ from claude_agent_sdk import (
 
 logger = logging.getLogger("sdk")
 _stderr_logger = logging.getLogger("subprocess_cli")
+
+
+# The SDK includes raw CLI stdout in malformed-frame diagnostics and embeds
+# the same payload in its message-reader exception. Structured voice output
+# may be private, so suppress those SDK-internal records only in the context
+# of that one job. Detached SDK tasks inherit ContextVars when spawned; the
+# filter therefore follows their lifetime without globally muting concurrent
+# resident or non-voice SDK diagnostics.
+_structured_voice_sdk_logs_suppressed: ContextVar[bool] = ContextVar(
+    "structured_voice_sdk_logs_suppressed", default=False,
+)
+
+
+class _StructuredVoiceSdkPayloadFilter(logging.Filter):
+    def filter(self, _record: logging.LogRecord) -> bool:
+        return not _structured_voice_sdk_logs_suppressed.get()
+
+
+_structured_voice_sdk_payload_filter = _StructuredVoiceSdkPayloadFilter()
+for _logger_name in (
+    "claude_agent_sdk._internal.query",
+    "claude_agent_sdk._internal.transport.subprocess_cli",
+    "claude_agent_sdk._internal._task_compat",
+):
+    logging.getLogger(_logger_name).addFilter(
+        _structured_voice_sdk_payload_filter,
+    )
+
+
+@contextmanager
+def suppress_structured_voice_sdk_payload_logs() -> Iterator[None]:
+    """Suppress raw SDK protocol diagnostics for one structured voice job."""
+    token = _structured_voice_sdk_logs_suppressed.set(True)
+    try:
+        yield
+    finally:
+        _structured_voice_sdk_logs_suppressed.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -270,5 +309,6 @@ __all__ = [
     "log_tool_result",
     "log_turn_done",
     "make_stderr_logger",
+    "suppress_structured_voice_sdk_payload_logs",
     "with_stderr_callback",
 ]

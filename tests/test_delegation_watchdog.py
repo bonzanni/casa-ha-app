@@ -22,7 +22,9 @@ error notify to the engager + permit release via the task done-callback).
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
+import logging
 
 import pytest
 
@@ -102,6 +104,67 @@ async def _poll_notification(bus: MessageBus, *, attempts=100, sleep_s=0.02):
 
 
 class TestDelegationCeiling:
+    @pytest.mark.parametrize(
+        ("unwind_s", "teardown_bound_s"),
+        [(0.0, 0.5), (0.08, 0.01)],
+        ids=("within-bound", "survivor"),
+    )
+    async def test_outer_cancel_retrieves_private_inner_exception(
+        self, tmp_path, monkeypatch, caplog, unwind_s, teardown_bound_s,
+    ):
+        """Cancelled bounded runners retrieve both prompt and late failures."""
+        import tools as tm
+
+        tm, _reg, _bus = _init_tools(tmp_path)
+        private_canary = "PRIVATE-BOUNDED-CANCEL-CANARY-91e7"
+        started = asyncio.Event()
+
+        async def _raise_after_cancel(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if unwind_s:
+                    await asyncio.sleep(unwind_s)
+                raise RuntimeError(private_canary)
+
+        monkeypatch.setattr(tm, "_run_delegated_agent", _raise_after_cancel)
+        monkeypatch.setattr(tm, "_DELEGATION_CEILING_S", 30.0)
+        monkeypatch.setattr(
+            tm, "_CEILING_TEARDOWN_BOUND_S", teardown_bound_s,
+        )
+
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop_contexts: list[dict] = []
+        loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
+        try:
+            async def _cancel_and_forget() -> None:
+                outer = asyncio.create_task(tm._run_delegated_agent_bounded(
+                    _specialist_cfg(), "private", "",
+                    output_format=tm.VOICE_JOB_OUTPUT_FORMAT,
+                ))
+                await started.wait()
+                outer.cancel()
+                try:
+                    await outer
+                except asyncio.CancelledError:
+                    pass
+
+            with caplog.at_level(logging.DEBUG):
+                await _cancel_and_forget()
+                await asyncio.sleep(unwind_s + 0.05)
+                for _ in range(3):
+                    gc.collect()
+                    await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        assert private_canary not in repr(loop_contexts)
+        assert private_canary not in caplog.text
+
     async def test_async_runaway_hits_ceiling_typed_failure_and_release(
         self, tmp_path, monkeypatch,
     ):
@@ -116,13 +179,15 @@ class TestDelegationCeiling:
 
         cancelled = asyncio.Event()
 
-        async def _runaway(cfg, task_text, context_text, resolution=None):
+        async def _runaway(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
             try:
                 await asyncio.Event().wait()  # never set — hangs forever
             except asyncio.CancelledError:
                 cancelled.set()
                 raise
-            return "unreachable"
+            return tm.DelegatedOutput(text="unreachable")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _runaway)
         monkeypatch.setattr(tm, "_DELEGATION_CEILING_S", 0.1, raising=False)
@@ -162,9 +227,11 @@ class TestDelegationCeiling:
         limiter = SpecialistLimiter(max_global=1)
         tm, reg, bus = _init_tools(tmp_path, limiter=limiter)
 
-        async def _quick(cfg, task_text, context_text, resolution=None):
+        async def _quick(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
             await asyncio.sleep(0.01)
-            return "done quickly"
+            return tm.DelegatedOutput(text="done quickly")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _quick)
         monkeypatch.setattr(tm, "_DELEGATION_CEILING_S", 5.0, raising=False)
@@ -194,9 +261,11 @@ class TestDelegationCeiling:
         limiter = SpecialistLimiter(max_global=1)
         tm, reg, bus = _init_tools(tmp_path, limiter=limiter)
 
-        async def _runaway(cfg, task_text, context_text, resolution=None):
+        async def _runaway(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
             await asyncio.Event().wait()
-            return "unreachable"
+            return tm.DelegatedOutput(text="unreachable")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _runaway)
         monkeypatch.setattr(tm, "_SYNC_WAIT_TIMEOUT_S", 0.02)
@@ -229,7 +298,9 @@ class TestDelegationCeiling:
 
         tm, reg, bus = _init_tools(tmp_path)
 
-        async def _boom(cfg, task_text, context_text, resolution=None):
+        async def _boom(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
             raise RuntimeError("model exploded")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _boom)
@@ -261,7 +332,9 @@ class TestDelegationCeiling:
 
         unwound = asyncio.Event()
 
-        async def _slow_unwind(cfg, task_text, context_text, resolution=None):
+        async def _slow_unwind(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
@@ -269,7 +342,7 @@ class TestDelegationCeiling:
                 await asyncio.sleep(0.2)
                 unwound.set()
                 raise
-            return "unreachable"
+            return tm.DelegatedOutput(text="unreachable")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _slow_unwind)
         monkeypatch.setattr(tm, "_DELEGATION_CEILING_S", 30.0, raising=False)

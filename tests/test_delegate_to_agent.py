@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
+import logging
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -86,17 +88,25 @@ class _FakeSpecialistClient:
     """
 
     response_text: str = "finance reply"
+    structured_output: Any = None
+    captured_options: Any = None
     delay_s: float = 0.0
     raise_in_receive: Exception | None = None
 
     @classmethod
-    def reset(cls, response="finance reply", delay=0.0, raise_exc=None):
+    def reset(
+        cls, response="finance reply", delay=0.0, raise_exc=None,
+        structured_output=None,
+    ):
         cls.response_text = response
+        cls.structured_output = structured_output
+        cls.captured_options = None
         cls.delay_s = delay
         cls.raise_in_receive = raise_exc
 
     def __init__(self, options):
         self.options = options
+        type(self).captured_options = options
 
     async def __aenter__(self):
         return self
@@ -144,6 +154,9 @@ class _FakeSpecialistClient:
         except TypeError:
             result = ResultMessage.__new__(ResultMessage)
             result.session_id = "exec-sid"  # type: ignore[attr-defined]
+        object.__setattr__(
+            result, "structured_output", _FakeSpecialistClient.structured_output,
+        )
         yield result
 
 
@@ -270,6 +283,7 @@ class TestSyncOk:
         assert payload["text"] == "invoice drafted"
         assert "delegation_id" in payload
         assert payload["elapsed_s"] >= 0
+        assert _FakeSpecialistClient.captured_options.output_format is None
         # Record was registered then cleaned up.
         assert not reg.has_delegation(payload["delegation_id"])
 
@@ -303,6 +317,633 @@ class TestSyncError:
         assert "kind" in payload
         # Record was cleaned up.
         assert not reg.has_delegation(payload["delegation_id"])
+
+
+# ---------------------------------------------------------------------------
+# TestVoiceStructuredResult
+# ---------------------------------------------------------------------------
+
+
+class TestVoiceStructuredResult:
+    @staticmethod
+    def _structured_result(**overrides):
+        return {
+            "status": "answered",
+            "spoken_summary": "The answer is 42.",
+            "answer": "42",
+            "clarification": "",
+            "citations": [],
+            "assumptions": [],
+            "provenance": {},
+            "sensitivity": "household",
+            "delivery_ttl_s": 900,
+            **overrides,
+        }
+
+    async def test_runner_captures_text_and_structured_output(
+        self, tmp_path, monkeypatch,
+    ):
+        import tools
+        from voice_job_result import VOICE_JOB_OUTPUT_FORMAT
+
+        reg = SpecialistRegistry(
+            str(tmp_path / "ex"), tombstone_path=str(tmp_path / "del.json"),
+        )
+        init_map = {"assistant": _caller_cfg(delegates=("finance",))}
+        tools.init_tools(ChannelManager(), MessageBus(), reg, agent_role_map=init_map)
+        structured = self._structured_result()
+        _FakeSpecialistClient.reset(response="legacy text", structured_output=structured)
+        monkeypatch.setattr(tools, "ClaudeSDKClient", _FakeSpecialistClient)
+
+        output = await _with_origin(
+            tools._run_delegated_agent(
+                _specialist_cfg(), "question", "", resolution=None,
+                output_format=VOICE_JOB_OUTPUT_FORMAT,
+            ),
+            _origin(),
+        )
+
+        assert output == tools.DelegatedOutput(
+            text="legacy text", structured_output=structured,
+        )
+        assert _FakeSpecialistClient.captured_options.output_format is VOICE_JOB_OUTPUT_FORMAT
+
+    async def test_voice_runner_suppresses_sdk_protocol_payload_logs(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        import tools
+        from voice_job_result import VOICE_JOB_OUTPUT_FORMAT
+
+        private_canary = "PRIVATE-SDK-PROTOCOL-CANARY-f618"
+
+        class ProtocolLoggingClient(_FakeSpecialistClient):
+            async def receive_response(self):
+                async def _sdk_reader_log():
+                    logging.getLogger(
+                        "claude_agent_sdk._internal.query"
+                    ).error("Fatal error in message reader: %s", private_canary)
+                    logging.getLogger(
+                        "claude_agent_sdk._internal.transport.subprocess_cli"
+                    ).debug("Skipping CLI stdout: %s", private_canary)
+
+                await asyncio.create_task(_sdk_reader_log())
+                async for message in super().receive_response():
+                    yield message
+
+        reg = SpecialistRegistry(
+            str(tmp_path / "ex"), tombstone_path=str(tmp_path / "del.json"),
+        )
+        tools.init_tools(
+            ChannelManager(), MessageBus(), reg,
+            agent_role_map={"assistant": _caller_cfg(delegates=("finance",))},
+        )
+        structured = self._structured_result()
+        _FakeSpecialistClient.reset(
+            response="safe legacy text", structured_output=structured,
+        )
+        monkeypatch.setattr(tools, "ClaudeSDKClient", ProtocolLoggingClient)
+
+        with caplog.at_level(logging.DEBUG):
+            output = await _with_origin(
+                tools._run_delegated_agent(
+                    _specialist_cfg(), "question", "", resolution=None,
+                    output_format=VOICE_JOB_OUTPUT_FORMAT,
+                ),
+                _origin(channel="voice"),
+            )
+
+        assert output.structured_output == structured
+        assert private_canary not in caplog.text
+
+    async def test_private_voice_result_is_resolved_before_tool_envelope(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        import tools
+        from job_registry import ExecutionState
+        from voice_job_result import VOICE_JOB_OUTPUT_FORMAT
+
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(
+            str(specialists), tombstone_path=str(tmp_path / "del.json"),
+        )
+        reg.load()
+        tools.init_tools(
+            ChannelManager(), MessageBus(), reg,
+            agent_role_map={
+                "assistant": _caller_cfg(delegates=("finance",)),
+                "finance": reg.get("finance"),
+            },
+        )
+        private_canary = "PRIVATE-VOICE-CANARY-7e6b"
+        structured = self._structured_result(
+            answer=private_canary,
+            spoken_summary=private_canary,
+            sensitivity="private",
+        )
+        _FakeSpecialistClient.reset(
+            response=private_canary, structured_output=structured,
+        )
+        monkeypatch.setattr(tools, "ClaudeSDKClient", _FakeSpecialistClient)
+        origin = _origin(channel="voice")
+        origin["voice_deadline"] = asyncio.get_running_loop().time() + 30.0
+
+        with caplog.at_level(logging.DEBUG):
+            envelope = await _with_origin(
+                tools.delegate_to_agent.handler({
+                    "agent": "finance", "task": "private question",
+                    "context": "", "mode": "sync",
+                }),
+                origin,
+            )
+
+        payload = json.loads(envelope["content"][0]["text"])
+        assert payload["status"] == "ok"
+        assert payload["text"] == "Your result is ready; ask me for the details."
+        assert private_canary not in json.dumps(envelope)
+        assert private_canary not in caplog.text
+        assert _FakeSpecialistClient.captured_options.output_format is VOICE_JOB_OUTPUT_FORMAT
+        job = reg.job_registry.get(payload["delegation_id"])
+        assert job is not None
+        assert job.execution_state is ExecutionState.SUCCEEDED
+        assert private_canary in (job.result or "")
+        assert job.terminal_at is not None
+        assert job.expires_at == pytest.approx(job.terminal_at + 900)
+        assert job.awaiting_input is False
+        assert job.continuable_until is None
+
+        stderr_canary = "PRIVATE-STDERR-CANARY-310b"
+        stderr_callback = _FakeSpecialistClient.captured_options.stderr
+        assert callable(stderr_callback)
+        stderr_callback(stderr_canary)
+        assert stderr_canary not in caplog.text
+
+    async def test_voice_clarification_persists_continuation_and_speaks_question(
+        self, tmp_path, monkeypatch,
+    ):
+        import tools
+        from job_registry import JobRegistry
+
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        tombstone_path = tmp_path / "del.json"
+        reg = SpecialistRegistry(
+            str(specialists), tombstone_path=str(tombstone_path),
+        )
+        reg.load()
+        tools.init_tools(
+            ChannelManager(), MessageBus(), reg,
+            agent_role_map={
+                "assistant": _caller_cfg(delegates=("finance",)),
+                "finance": reg.get("finance"),
+            },
+        )
+        summary = "I need one more detail."
+        question = "Which card do you mean?"
+        structured = self._structured_result(
+            status="needs_clarification",
+            answer="",
+            spoken_summary=summary,
+            clarification=question,
+            delivery_ttl_s=600,
+        )
+        _FakeSpecialistClient.reset(
+            response="raw specialist text", structured_output=structured,
+        )
+        monkeypatch.setattr(tools, "ClaudeSDKClient", _FakeSpecialistClient)
+        origin = _origin(channel="voice")
+        origin["voice_deadline"] = asyncio.get_running_loop().time() + 30.0
+
+        envelope = await _with_origin(
+            tools.delegate_to_agent.handler({
+                "agent": "finance", "task": "ambiguous question",
+                "context": "", "mode": "sync",
+            }),
+            origin,
+        )
+
+        payload = json.loads(envelope["content"][0]["text"])
+        assert payload["text"] == question
+        job = reg.job_registry.get(payload["delegation_id"])
+        assert job is not None
+        assert job.awaiting_input is True
+        assert job.terminal_at is not None
+        assert job.expires_at == pytest.approx(job.terminal_at + 600)
+        assert job.continuable_until == job.expires_at
+
+        reloaded = JobRegistry(tmp_path / "jobs.json", tombstone_path)
+        await reloaded.load()
+        assert reloaded.get(job.id) == job
+
+    async def test_private_voice_clarification_withholds_question(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        import tools
+
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(
+            str(specialists), tombstone_path=str(tmp_path / "del.json"),
+        )
+        reg.load()
+        tools.init_tools(
+            ChannelManager(), MessageBus(), reg,
+            agent_role_map={
+                "assistant": _caller_cfg(delegates=("finance",)),
+                "finance": reg.get("finance"),
+            },
+        )
+        private_canary = "PRIVATE-CLARIFICATION-CANARY-391b"
+        structured = self._structured_result(
+            status="needs_clarification",
+            answer="",
+            spoken_summary="I need a private detail.",
+            clarification=f"Which account contains {private_canary}?",
+            sensitivity="private",
+            delivery_ttl_s=600,
+        )
+        _FakeSpecialistClient.reset(
+            response=private_canary, structured_output=structured,
+        )
+        monkeypatch.setattr(tools, "ClaudeSDKClient", _FakeSpecialistClient)
+        origin = _origin(channel="voice")
+        origin["voice_deadline"] = asyncio.get_running_loop().time() + 30.0
+
+        with caplog.at_level(logging.DEBUG):
+            envelope = await _with_origin(
+                tools.delegate_to_agent.handler({
+                    "agent": "finance", "task": "ambiguous private question",
+                    "context": "", "mode": "sync",
+                }),
+                origin,
+            )
+
+        payload = json.loads(envelope["content"][0]["text"])
+        assert payload["text"] == "Your result is ready; ask me for the details."
+        assert private_canary not in json.dumps(envelope)
+        assert private_canary not in caplog.text
+        job = reg.job_registry.get(payload["delegation_id"])
+        assert job is not None and job.awaiting_input is True
+        assert private_canary in (job.result or "")
+
+    async def test_deep_provenance_fails_safely_end_to_end(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        import tools
+        from job_registry import ExecutionState
+
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(
+            str(specialists), tombstone_path=str(tmp_path / "del.json"),
+        )
+        reg.load()
+        tools.init_tools(
+            ChannelManager(), MessageBus(), reg,
+            agent_role_map={
+                "assistant": _caller_cfg(delegates=("finance",)),
+                "finance": reg.get("finance"),
+            },
+        )
+        private_canary = "PRIVATE-DEPTH-1000-CANARY-f120"
+        provenance: Any = {private_canary: private_canary}
+        for _ in range(1000):
+            provenance = {"layer": provenance}
+        structured = self._structured_result(provenance=provenance)
+        _FakeSpecialistClient.reset(
+            response=private_canary, structured_output=structured,
+        )
+        monkeypatch.setattr(tools, "ClaudeSDKClient", _FakeSpecialistClient)
+        origin = _origin(channel="voice")
+        origin["voice_deadline"] = asyncio.get_running_loop().time() + 30.0
+
+        with caplog.at_level(logging.DEBUG):
+            envelope = await _with_origin(
+                tools.delegate_to_agent.handler({
+                    "agent": "finance", "task": "deep private result",
+                    "context": "", "mode": "sync",
+                }),
+                origin,
+            )
+
+        payload = json.loads(envelope["content"][0]["text"])
+        assert payload["kind"] == "invalid_specialist_result"
+        assert private_canary not in json.dumps(envelope)
+        assert private_canary not in caplog.text
+        job = reg.job_registry.get(payload["delegation_id"])
+        assert job is not None
+        assert job.execution_state is ExecutionState.FAILED
+        assert job.failure is not None
+        assert private_canary not in repr(job.failure)
+
+    async def test_voice_deadline_contains_cancel_resistant_private_exception(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        import tools
+        from job_registry import ExecutionState, JobRegistry
+
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        tombstone_path = tmp_path / "del.json"
+        reg = SpecialistRegistry(
+            str(specialists), tombstone_path=str(tombstone_path),
+        )
+        reg.load()
+        tools.init_tools(
+            ChannelManager(), MessageBus(), reg,
+            agent_role_map={
+                "assistant": _caller_cfg(delegates=("finance",)),
+                "finance": reg.get("finance"),
+            },
+        )
+        private_canary = "PRIVATE-VOICE-DEADLINE-INNER-CANARY-18bd"
+        started = asyncio.Event()
+
+        async def _raise_after_cancel(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError(private_canary)
+
+        monkeypatch.setattr(tools, "_run_delegated_agent", _raise_after_cancel)
+        monkeypatch.setattr(tools, "_CEILING_TEARDOWN_BOUND_S", 0.5)
+        monkeypatch.setattr(tools, "_VOICE_TEARDOWN_BOUND_S", 0.5)
+
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop_contexts: list[dict] = []
+        loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
+        try:
+            origin = _origin(channel="voice")
+            origin["voice_deadline"] = (
+                loop.time() + tools._VOICE_FALLBACK_RESERVE_S + 0.03
+            )
+            with caplog.at_level(logging.DEBUG):
+                envelope = await _with_origin(
+                    tools.delegate_to_agent.handler({
+                        "agent": "finance", "task": "private deadline",
+                        "context": "", "mode": "sync",
+                    }),
+                    origin,
+                )
+                await started.wait()
+                for _ in range(3):
+                    gc.collect()
+                    await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        payload = json.loads(envelope["content"][0]["text"])
+        assert payload["kind"] == "deadline_exceeded"
+        job = reg.job_registry.get(payload["delegation_id"])
+        assert job is not None
+        assert job.execution_state is ExecutionState.CANCELLED
+        assert job.failure is not None
+
+        reloaded = JobRegistry(tmp_path / "jobs.json", tombstone_path)
+        await reloaded.load()
+        assert reloaded.get(job.id) == job
+
+        surfaces = (
+            repr(loop_contexts) + caplog.text + json.dumps(envelope)
+            + repr(job.failure)
+        )
+        assert private_canary not in surfaces
+
+    async def test_caller_cancel_contains_private_inner_exception(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        import tools
+        from job_registry import ExecutionState
+
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(
+            str(specialists), tombstone_path=str(tmp_path / "del.json"),
+        )
+        reg.load()
+        tools.init_tools(
+            ChannelManager(), MessageBus(), reg,
+            agent_role_map={
+                "assistant": _caller_cfg(delegates=("finance",)),
+                "finance": reg.get("finance"),
+            },
+        )
+        private_canary = "PRIVATE-CALLER-CANCEL-INNER-CANARY-fc02"
+        started = asyncio.Event()
+
+        async def _raise_after_cancel(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError(private_canary)
+
+        monkeypatch.setattr(tools, "_run_delegated_agent", _raise_after_cancel)
+        monkeypatch.setattr(tools, "_CEILING_TEARDOWN_BOUND_S", 0.5)
+
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop_contexts: list[dict] = []
+        envelopes: list[dict] = []
+        loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
+        try:
+            origin = _origin(channel="voice")
+            origin["voice_deadline"] = loop.time() + 30.0
+
+            async def _invoke() -> None:
+                envelope = await _with_origin(
+                    tools.delegate_to_agent.handler({
+                        "agent": "finance", "task": "private caller cancel",
+                        "context": "", "mode": "sync",
+                    }),
+                    origin,
+                )
+                envelopes.append(envelope)
+
+            with caplog.at_level(logging.DEBUG):
+                caller = asyncio.create_task(_invoke())
+                await started.wait()
+                caller.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await caller
+                for _ in range(3):
+                    gc.collect()
+                    await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        assert envelopes == []
+        jobs = reg.job_registry.all()
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job.execution_state is ExecutionState.CANCELLED
+        assert job.failure is not None
+        surfaces = repr(loop_contexts) + caplog.text + repr(job.failure)
+        assert private_canary not in surfaces
+
+    async def test_invalid_voice_result_persists_safe_failure(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        import tools
+        from job_registry import ExecutionState
+
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(
+            str(specialists), tombstone_path=str(tmp_path / "del.json"),
+        )
+        reg.load()
+        tools.init_tools(
+            ChannelManager(), MessageBus(), reg,
+            agent_role_map={
+                "assistant": _caller_cfg(delegates=("finance",)),
+                "finance": reg.get("finance"),
+            },
+        )
+        private_canary = "PRIVATE-INVALID-CANARY-e234"
+        invalid = self._structured_result(
+            answer=private_canary,
+            spoken_summary="",
+            sensitivity="private",
+        )
+        _FakeSpecialistClient.reset(
+            response=private_canary, structured_output=invalid,
+        )
+        monkeypatch.setattr(tools, "ClaudeSDKClient", _FakeSpecialistClient)
+        origin = _origin(channel="voice")
+        origin["voice_deadline"] = asyncio.get_running_loop().time() + 30.0
+
+        with caplog.at_level(logging.DEBUG):
+            envelope = await _with_origin(
+                tools.delegate_to_agent.handler({
+                    "agent": "finance", "task": "private question",
+                    "context": "", "mode": "sync",
+                }),
+                origin,
+            )
+
+        payload = json.loads(envelope["content"][0]["text"])
+        assert payload["status"] == "error"
+        assert payload["kind"] == "invalid_specialist_result"
+        assert private_canary not in json.dumps(envelope)
+        assert private_canary not in caplog.text
+        job = reg.job_registry.get(payload["delegation_id"])
+        assert job is not None
+        assert job.execution_state is ExecutionState.FAILED
+        assert job.failure is not None
+        assert job.failure.kind == "invalid_specialist_result"
+        assert job.failure.message == "Specialist returned an invalid structured result."
+        assert private_canary not in repr(job.failure)
+
+    async def test_voice_runner_exception_is_private_everywhere(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        import tools
+        from job_registry import ExecutionState
+
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        reg = SpecialistRegistry(
+            str(specialists), tombstone_path=str(tmp_path / "del.json"),
+        )
+        reg.load()
+        tools.init_tools(
+            ChannelManager(), MessageBus(), reg,
+            agent_role_map={
+                "assistant": _caller_cfg(delegates=("finance",)),
+                "finance": reg.get("finance"),
+            },
+        )
+        private_canary = "PRIVATE-VOICE-EXCEPTION-CANARY-3d5d"
+        _FakeSpecialistClient.reset(raise_exc=RuntimeError(private_canary))
+        monkeypatch.setattr(tools, "ClaudeSDKClient", _FakeSpecialistClient)
+        origin = _origin(channel="voice")
+        origin["voice_deadline"] = asyncio.get_running_loop().time() + 30.0
+
+        with caplog.at_level(logging.DEBUG):
+            envelope = await _with_origin(
+                tools.delegate_to_agent.handler({
+                    "agent": "finance", "task": "private question",
+                    "context": "", "mode": "sync",
+                }),
+                origin,
+            )
+
+        payload = json.loads(envelope["content"][0]["text"])
+        assert payload["status"] == "error"
+        assert payload["message"] == "Specialist could not complete the voice job."
+        assert private_canary not in json.dumps(envelope)
+        assert private_canary not in caplog.text
+        job = reg.job_registry.get(payload["delegation_id"])
+        assert job is not None
+        assert job.execution_state is ExecutionState.FAILED
+        assert job.failure is not None
+        assert job.failure.message == "Specialist could not complete the voice job."
+        assert private_canary not in repr(job.failure)
+
+    async def test_late_voice_exception_log_is_metadata_only(self, caplog):
+        import tools
+
+        private_canary = "PRIVATE-LATE-CANCEL-CANARY-8e18"
+
+        async def _raise():
+            raise RuntimeError(private_canary)
+
+        task = asyncio.create_task(_raise())
+        await asyncio.wait({task})
+        with caplog.at_level(logging.DEBUG):
+            tools._retrieve_late_task_exception(task)
+        assert private_canary not in caplog.text
+
+    async def test_structured_private_detail_never_enters_delegation_complete(
+        self, tmp_path,
+    ):
+        import tools
+
+        private_canary = "PRIVATE-COMPLETE-CANARY-4c0a"
+        reg = SpecialistRegistry(
+            str(tmp_path / "ex"), tombstone_path=str(tmp_path / "del.json"),
+        )
+        bus = MessageBus()
+        bus.register("assistant", None)
+        tools.init_tools(ChannelManager(), bus, reg)
+        record = DelegationRecord(
+            id="delegation-canary", agent="finance",
+            started_at=asyncio.get_running_loop().time(),
+            origin=_origin(),
+        )
+        await reg.register_delegation(record)
+
+        async def _done():
+            return tools.DelegatedOutput(
+                text="safe legacy text",
+                structured_output={"spoken_summary": private_canary},
+            )
+
+        task = asyncio.create_task(_done())
+        tools._attach_completion_callback(task, record)
+        await task
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        _priority, _sequence, message = await bus.queues["assistant"].get()
+        assert isinstance(message.content, DelegationComplete)
+        assert message.content.text == "safe legacy text"
+        assert private_canary not in repr(message.content)
 
 
 # ---------------------------------------------------------------------------
@@ -687,8 +1328,11 @@ class TestMergedRoleMap:
             "user_id": 1, "cid": "abc", "user_text": "x",
         })
         try:
-            async def _fake_run(cfg, task_text, context_text, resolution=None):
-                return f"Tina says ok: {task_text}"
+            async def _fake_run(
+                cfg, task_text, context_text, resolution=None, output_format=None,
+            ):
+                assert output_format is None
+                return tools.DelegatedOutput(text=f"Tina says ok: {task_text}")
             monkeypatch.setattr(tools, "_run_delegated_agent", _fake_run)
 
             result = await tools.delegate_to_agent.handler({

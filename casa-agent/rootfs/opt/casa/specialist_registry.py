@@ -1,4 +1,4 @@
-"""Tier 2 specialist loader + delegation bookkeeping (Phase 3.1).
+"""Tier 2 specialist loader + durable delegation compatibility facade.
 
 Symmetric with :mod:`session_registry` and :mod:`mcp_registry`.
 Scans a directory for per-specialist YAML files, validates the Tier 2
@@ -6,22 +6,25 @@ shape (no channels, zero token budget, ephemeral session), honours the
 new ``enabled: bool`` field, and exposes a
 runtime lookup used by the ``delegate_to_agent`` framework tool.
 
-Also holds the in-flight delegation table (in-memory + ``/data/
-delegations.json`` tombstone) consumed by the completion callback and
-by startup orphan recovery.
+Delegation lifecycle state belongs exclusively to :mod:`job_registry`.
+The legacy methods in this module remain as a narrow facade for existing
+sync/async delegation call sites while they migrate to the job-native API.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from atomic_io import atomic_write_json
 from config import AgentConfig
+from job_registry import (
+    DeliveryState,
+    ExecutionState,
+    JobRegistry,
+    VoiceJob,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +36,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DelegationRecord:
-    """A single in-flight delegation.
-
-    Stored in memory during the delegation lifetime; also tombstoned to
-    disk so orphans can be recovered after a Casa restart.
-    """
+    """Legacy call-site input translated into a durable ``VoiceJob``."""
 
     id: str                          # UUID4
     agent: str                       # specialist name (role)
@@ -46,11 +45,8 @@ class DelegationRecord:
     # origin carries the channel/chat_id/cid/role/user_text of the
     # delegating resident's turn so the late-completion NOTIFICATION
     # can be delivered back to the right user via the right channel.
-    # Task 6 (spec §4.6): the concurrency Permit this delegation holds, if
-    # any (None when no SpecialistLimiter is wired). NOT persisted to the
-    # tombstone — `_write_tombstone_locked` below lists fields explicitly
-    # and a live Permit object cannot (and need not) survive a restart;
-    # concurrency state is memory-only and resets with the process.
+    # Task 6 (spec §4.6): the legacy delegate task still owns this Permit via
+    # its done callback. It is never copied into the durable job snapshot.
     permit: Any = None
 
 
@@ -79,16 +75,29 @@ class DelegationComplete:
 
 
 class SpecialistRegistry:
-    """Loads Tier 2 specialists and tracks in-flight delegations."""
+    """Load Tier 2 specialists and facade legacy lifecycle calls."""
 
-    def __init__(self, specialists_dir: str, tombstone_path: str) -> None:
+    def __init__(
+        self,
+        specialists_dir: str,
+        tombstone_path: str | None = None,
+        *,
+        job_registry: JobRegistry | None = None,
+    ) -> None:
         self._dir = specialists_dir
-        self._tombstone_path = tombstone_path
         self._configs: dict[str, AgentConfig] = {}
         self._disabled_names: set[str] = set()
         self._load_failures: list[tuple[str, str]] = []
-        self._delegations: dict[str, DelegationRecord] = {}
-        self._lock = asyncio.Lock()
+        if job_registry is None:
+            if tombstone_path is None:
+                raise TypeError("job_registry or tombstone_path is required")
+            # Backward-compatible construction for tests and older embedders.
+            # Production injects the one boot-loaded registry explicitly.
+            job_registry = JobRegistry(
+                os.path.join(os.path.dirname(tombstone_path), "jobs.json"),
+                tombstone_path,
+            )
+        self._job_registry = job_registry
 
     # -- Loading / validation -------------------------------------------------
 
@@ -209,15 +218,51 @@ class SpecialistRegistry:
         """
         return dict(self._configs)
 
-    # -- Delegation bookkeeping (in-memory; tombstone in Task 5) ----------
+    # -- Durable delegation compatibility facade -------------------------
+
+    @property
+    def job_registry(self) -> JobRegistry:
+        return self._job_registry
 
     def has_delegation(self, delegation_id: str) -> bool:
-        return delegation_id in self._delegations
+        job = self._job_registry.get(delegation_id)
+        return bool(job and job.execution_state in {
+            ExecutionState.ACCEPTED, ExecutionState.RUNNING,
+        })
 
     async def register_delegation(self, record: DelegationRecord) -> None:
-        async with self._lock:
-            self._delegations[record.id] = record
-            await self._write_tombstone_locked()
+        await self._job_registry.load()
+        origin = dict(record.origin)
+        await self._job_registry.create(VoiceJob(
+            id=record.id,
+            parent_job_id=None,
+            creating_role=str(origin.get("role") or "assistant"),
+            specialist_role=record.agent,
+            specialist_display_name=record.agent,
+            creator_peer=str(origin.get("channel") or ""),
+            creator_user_id=self._optional_str(origin.get("user_id")),
+            scope_id=str(origin.get("chat_id") or origin.get("scope_id") or ""),
+            origin_route_id=self._optional_str(
+                origin.get("cid") or origin.get("route_id")),
+            origin_device_id=self._optional_str(
+                origin.get("device_id") or origin.get("origin_device_id")),
+            task=str(origin.get("user_text") or ""),
+            context="",
+            created_at=float(record.started_at),
+            started_at=float(record.started_at),
+            terminal_at=None,
+            expires_at=None,
+            execution_state=ExecutionState.RUNNING,
+            delivery_state=DeliveryState.NONE,
+            result=None,
+            failure=None,
+            awaiting_input=False,
+            continuable_until=None,
+            delivery_sequence=0,
+            delivery_attempt_id=None,
+            lease_until=None,
+            cancel_pending=False,
+        ))
 
     # Task 6 (spec §4.6): these terminal transitions deliberately do NOT
     # release the concurrency permit. For a LAUNCHED sync/async delegation
@@ -232,105 +277,48 @@ class SpecialistRegistry:
     # delegate_to_agent. (Interactive engagements, which have no task done-
     # callback, DO release in EngagementRegistry terminal transitions.)
     async def complete_delegation(self, delegation_id: str) -> None:
-        async with self._lock:
-            self._delegations.pop(delegation_id, None)
-            await self._write_tombstone_locked()
+        await self._job_registry.load()
+        await self._job_registry.finish_compat(delegation_id, "")
 
     async def fail_delegation(
         self, delegation_id: str, exc: Exception,
     ) -> None:
-        async with self._lock:
-            self._delegations.pop(delegation_id, None)
-            await self._write_tombstone_locked()
+        await self._job_registry.load()
+        await self._job_registry.fail_compat(delegation_id, exc)
 
     async def cancel_delegation(self, delegation_id: str) -> None:
-        async with self._lock:
-            self._delegations.pop(delegation_id, None)
-            await self._write_tombstone_locked()
-
-    # -- Tombstone I/O ---------------------------------------------------
-
-    async def _write_tombstone_locked(self) -> None:
-        """Persist the in-flight delegations dict. Caller MUST hold
-        ``self._lock``."""
-        snapshot = [
-            {
-                "id": r.id,
-                "agent": r.agent,
-                "started_at": r.started_at,
-                "origin": dict(r.origin),
-            }
-            for r in self._delegations.values()
-        ]
-        try:
-            await asyncio.to_thread(self._write_tombstone, snapshot)
-        except Exception as exc:
-            logger.warning(
-                "Failed to persist delegation tombstone: %s "
-                "(in-flight delegations remain in memory; orphan recovery "
-                "may miss them if Casa restarts)", exc,
-            )
-
-    def _write_tombstone(self, snapshot: list[dict[str, Any]]) -> None:
-        # Atomic (temp-file + fsync + os.replace): a crash mid-write must not
-        # corrupt the exact file that exists for delegation crash recovery (L20).
-        atomic_write_json(self._tombstone_path, snapshot, indent=2)
+        await self._job_registry.load()
+        await self._job_registry.cancel(delegation_id)
 
     def orphans_from_disk(self) -> list[DelegationRecord]:
-        """Read the tombstone file. Returns any records left by a prior
-        process (Casa restarted mid-delegation). Truncates the file
-        afterward. Called exactly once per startup.
+        """Compatibility view of already-loaded orphaned durable jobs.
 
-        Failure modes:
-        - File missing: return [] silently.
-        - File corrupt: log ERROR, truncate, return [].
+        This method deliberately performs no file I/O.  Boot migration and
+        restart recovery are owned by :class:`JobRegistry`.
         """
-        if not os.path.exists(self._tombstone_path):
-            return []
-        try:
-            with open(self._tombstone_path, "r", encoding="utf-8") as fh:
-                raw = json.load(fh)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.error(
-                "Tombstone file corrupt or unreadable (%s): %s — truncating",
-                self._tombstone_path, exc,
+        return [
+            DelegationRecord(
+                id=job.id,
+                agent=job.specialist_role,
+                started_at=job.started_at or job.created_at,
+                origin=self._origin_from_job(job),
             )
-            try:
-                with open(self._tombstone_path, "w", encoding="utf-8") as fh:
-                    json.dump([], fh)
-            except OSError:
-                pass
-            return []
-        if not isinstance(raw, list):
-            logger.error(
-                "Tombstone file %s is not a JSON array; truncating",
-                self._tombstone_path,
-            )
-            try:
-                with open(self._tombstone_path, "w", encoding="utf-8") as fh:
-                    json.dump([], fh)
-            except OSError:
-                pass
-            return []
-        records: list[DelegationRecord] = []
-        for row in raw:
-            try:
-                records.append(DelegationRecord(
-                    id=row["id"],
-                    agent=row["agent"],
-                    started_at=float(row.get("started_at", 0.0)),
-                    origin=dict(row.get("origin") or {}),
-                ))
-            except (KeyError, TypeError, ValueError) as exc:
-                logger.warning(
-                    "Skipping malformed tombstone entry: %s", exc,
-                )
-        # Truncate so we don't re-post on the NEXT restart too.
-        try:
-            with open(self._tombstone_path, "w", encoding="utf-8") as fh:
-                json.dump([], fh)
-        except OSError as exc:
-            logger.warning(
-                "Failed to truncate tombstone file after orphan read: %s", exc,
-            )
-        return records
+            for job in self._job_registry.all()
+            if job.execution_state is ExecutionState.ORPHANED
+        ]
+
+    @staticmethod
+    def _optional_str(value: Any) -> str | None:
+        return None if value is None else str(value)
+
+    @staticmethod
+    def _origin_from_job(job: VoiceJob) -> dict[str, Any]:
+        return {
+            "role": job.creating_role,
+            "channel": job.creator_peer,
+            "chat_id": job.scope_id,
+            "cid": job.origin_route_id or "",
+            "device_id": job.origin_device_id or "",
+            "user_id": job.creator_user_id,
+            "user_text": job.task,
+        }

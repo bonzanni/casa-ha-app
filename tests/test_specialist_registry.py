@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import textwrap
 from pathlib import Path
 
@@ -214,8 +215,74 @@ class TestEnabledFiltering:
 
 
 # ---------------------------------------------------------------------------
-# TestDelegationLifecycle (in-memory only)
+# TestDelegationLifecycle (durable compatibility facade)
 # ---------------------------------------------------------------------------
+
+
+class TestDurableJobFacade:
+    async def test_casa_runtime_exposes_job_registry(self):
+        from runtime import CasaRuntime
+
+        assert "job_registry" in CasaRuntime.__dataclass_fields__
+
+    async def test_injected_job_registry_is_the_only_lifecycle_store(
+        self, tmp_path,
+    ):
+        from job_registry import ExecutionState, JobRegistry
+        from specialist_registry import DelegationRecord, SpecialistRegistry
+
+        jobs = JobRegistry(
+            tmp_path / "jobs.json", tmp_path / "delegations.json",
+        )
+        await jobs.load()
+        reg = SpecialistRegistry(
+            str(tmp_path / "specialists"), job_registry=jobs,
+        )
+        await reg.register_delegation(DelegationRecord(
+            id="d-1", agent="finance", started_at=1.0,
+            origin={"role": "assistant", "channel": "telegram",
+                    "chat_id": "chat-1", "cid": "route-1"},
+        ))
+
+        assert not hasattr(reg, "_delegations")
+        assert reg.job_registry is jobs
+        assert jobs.get("d-1").execution_state is ExecutionState.RUNNING
+        assert reg.has_delegation("d-1")
+
+        await reg.complete_delegation("d-1")
+        assert jobs.get("d-1").execution_state is ExecutionState.SUCCEEDED
+        assert not reg.has_delegation("d-1")
+
+        reloaded = JobRegistry(
+            tmp_path / "jobs.json", tmp_path / "delegations.json",
+        )
+        await reloaded.load()
+        assert reloaded.get("d-1").execution_state is ExecutionState.SUCCEEDED
+
+    async def test_orphan_compatibility_view_reads_durable_jobs_only(
+        self, tmp_path,
+    ):
+        import json
+
+        from job_registry import JobRegistry
+        from specialist_registry import SpecialistRegistry
+
+        legacy = tmp_path / "delegations.json"
+        legacy.write_text(json.dumps([{
+            "id": "orphan-1", "agent": "finance", "started_at": 100.0,
+            "origin": {"role": "assistant", "channel": "telegram",
+                       "chat_id": "chat-1", "cid": "route-1"},
+        }]), encoding="utf-8")
+        jobs = JobRegistry(tmp_path / "jobs.json", legacy)
+        await jobs.load()
+        await jobs.recover_after_restart()
+        reg = SpecialistRegistry(
+            str(tmp_path / "specialists"), job_registry=jobs,
+        )
+
+        assert [record.id for record in reg.orphans_from_disk()] == ["orphan-1"]
+        # The facade never rereads or mutates the legacy file.
+        assert json.loads(legacy.read_text(encoding="utf-8")) == []
 
 
 class TestDelegationLifecycle:
@@ -271,6 +338,61 @@ class TestDelegationLifecycle:
         await reg.fail_delegation("missing", RuntimeError("x"))
         await reg.cancel_delegation("missing")
 
+    async def test_repeated_terminal_calls_are_idempotent(self, tmp_path):
+        from specialist_registry import DelegationRecord
+
+        reg = self._make_registry(tmp_path)
+        await reg.register_delegation(DelegationRecord(
+            id="d-repeat", agent="finance", started_at=1.0, origin={},
+        ))
+        await reg.complete_delegation("d-repeat")
+        await reg.complete_delegation("d-repeat")
+        await reg.fail_delegation("d-repeat", RuntimeError("late callback"))
+        await reg.cancel_delegation("d-repeat")
+
+    async def test_competing_terminal_facade_calls_are_registry_atomic(
+        self, tmp_path,
+    ):
+        from job_registry import ExecutionState, JobRegistry
+        from specialist_registry import DelegationRecord, SpecialistRegistry
+
+        jobs_path = tmp_path / "jobs.json"
+        legacy_path = tmp_path / "delegations.json"
+        jobs = JobRegistry(jobs_path, legacy_path)
+        await jobs.load()
+        reg = SpecialistRegistry(
+            str(tmp_path / "specialists"), job_registry=jobs,
+        )
+        await reg.register_delegation(DelegationRecord(
+            id="d-race", agent="finance", started_at=1.0, origin={},
+        ))
+
+        await jobs._lock.acquire()
+        complete = asyncio.create_task(reg.complete_delegation("d-race"))
+        fail = asyncio.create_task(
+            reg.fail_delegation("d-race", RuntimeError("late failure")),
+        )
+        try:
+            await asyncio.sleep(0)
+            assert len(jobs._lock._waiters) == 2
+        finally:
+            jobs._lock.release()
+
+        assert await asyncio.gather(complete, fail, return_exceptions=True) == [
+            None, None,
+        ]
+        terminal = jobs.get("d-race")
+        assert terminal.execution_state in {
+            ExecutionState.SUCCEEDED, ExecutionState.FAILED,
+        }
+
+        reloaded = JobRegistry(jobs_path, legacy_path)
+        await reloaded.load()
+        persisted = reloaded.get("d-race")
+        assert persisted.execution_state is terminal.execution_state
+        assert persisted.result == terminal.result
+        assert persisted.failure == terminal.failure
+
 
 # ---------------------------------------------------------------------------
 # TestDelegationComplete dataclass shape
@@ -301,172 +423,6 @@ class TestDelegationCompleteShape:
         )
         assert c.status == "ok"
         assert c.text == "result text"
-
-
-# ---------------------------------------------------------------------------
-# TestTombstone — /data/delegations.json round-trip
-# ---------------------------------------------------------------------------
-
-
-class TestTombstone:
-    async def test_register_writes_file(self, tmp_path):
-        from specialist_registry import DelegationRecord, SpecialistRegistry
-
-        tomb = tmp_path / "del.json"
-        reg = SpecialistRegistry(str(tmp_path / "specialists"),
-                                 tombstone_path=str(tomb))
-        rec = DelegationRecord(
-            id="d-1", agent="finance", started_at=1.0,
-            origin={"role": "assistant", "channel": "telegram",
-                    "chat_id": "x", "cid": "c1", "user_text": "hi"},
-        )
-        await reg.register_delegation(rec)
-
-        import json
-        data = json.loads(tomb.read_text())
-        assert isinstance(data, list)
-        assert len(data) == 1
-        assert data[0]["id"] == "d-1"
-        assert data[0]["agent"] == "finance"
-        assert data[0]["origin"]["channel"] == "telegram"
-
-    async def test_complete_removes_from_file(self, tmp_path):
-        from specialist_registry import DelegationRecord, SpecialistRegistry
-
-        tomb = tmp_path / "del.json"
-        reg = SpecialistRegistry(str(tmp_path / "specialists"),
-                                 tombstone_path=str(tomb))
-        rec = DelegationRecord(
-            id="d-1", agent="finance", started_at=1.0, origin={},
-        )
-        await reg.register_delegation(rec)
-        await reg.complete_delegation("d-1")
-
-        import json
-        data = json.loads(tomb.read_text())
-        assert data == []
-
-    async def test_multiple_in_flight(self, tmp_path):
-        from specialist_registry import DelegationRecord, SpecialistRegistry
-
-        tomb = tmp_path / "del.json"
-        reg = SpecialistRegistry(str(tmp_path / "specialists"),
-                                 tombstone_path=str(tomb))
-        for i in range(3):
-            await reg.register_delegation(DelegationRecord(
-                id=f"d-{i}", agent="finance", started_at=1.0, origin={},
-            ))
-        import json
-        data = json.loads(tomb.read_text())
-        assert {row["id"] for row in data} == {"d-0", "d-1", "d-2"}
-        await reg.complete_delegation("d-1")
-        data = json.loads(tomb.read_text())
-        assert {row["id"] for row in data} == {"d-0", "d-2"}
-
-
-# ---------------------------------------------------------------------------
-# TestOrphanRecovery
-# ---------------------------------------------------------------------------
-
-
-class TestOrphanRecovery:
-    async def test_orphans_from_disk_returns_records(self, tmp_path):
-        from specialist_registry import SpecialistRegistry
-
-        tomb = tmp_path / "del.json"
-        # Pre-populate as if a prior process left records behind.
-        import json
-        tomb.write_text(json.dumps([
-            {
-                "id": "orphan-1", "agent": "finance", "started_at": 100.0,
-                "origin": {"role": "assistant", "channel": "telegram",
-                           "chat_id": "x", "cid": "c1", "user_text": "hi"},
-            },
-            {
-                "id": "orphan-2", "agent": "finance", "started_at": 101.0,
-                "origin": {"role": "assistant", "channel": "telegram",
-                           "chat_id": "y", "cid": "c2", "user_text": "hey"},
-            },
-        ]))
-        reg = SpecialistRegistry(str(tmp_path / "specialists"),
-                                 tombstone_path=str(tomb))
-        orphans = reg.orphans_from_disk()
-        assert [o.id for o in orphans] == ["orphan-1", "orphan-2"]
-        # File is truncated after read.
-        assert json.loads(tomb.read_text()) == []
-
-    async def test_orphans_from_disk_missing_file_is_empty(self, tmp_path):
-        from specialist_registry import SpecialistRegistry
-
-        reg = SpecialistRegistry(str(tmp_path / "specialists"),
-                                 tombstone_path=str(tmp_path / "del.json"))
-        assert reg.orphans_from_disk() == []
-
-    async def test_orphans_from_disk_corrupt_logs_and_truncates(
-        self, tmp_path, caplog,
-    ):
-        import logging
-        from specialist_registry import SpecialistRegistry
-
-        tomb = tmp_path / "del.json"
-        tomb.write_text("{not json at all")
-        reg = SpecialistRegistry(str(tmp_path / "specialists"),
-                                 tombstone_path=str(tomb))
-        with caplog.at_level(logging.ERROR):
-            orphans = reg.orphans_from_disk()
-        assert orphans == []
-        # File truncated to empty list on corruption.
-        import json
-        assert json.loads(tomb.read_text()) == []
-        assert any(
-            "corrupt" in r.message.lower() or "could not" in r.message.lower()
-            for r in caplog.records
-        )
-
-    async def test_orphans_from_disk_non_list_logs_and_truncates(
-        self, tmp_path, caplog,
-    ):
-        """Valid JSON but not an array → ERROR log, truncate, return []."""
-        import json
-        import logging
-        from specialist_registry import SpecialistRegistry
-
-        tomb = tmp_path / "del.json"
-        tomb.write_text(json.dumps({"not": "a list"}))
-        reg = SpecialistRegistry(str(tmp_path / "specialists"),
-                                 tombstone_path=str(tomb))
-        with caplog.at_level(logging.ERROR):
-            orphans = reg.orphans_from_disk()
-        assert orphans == []
-        assert json.loads(tomb.read_text()) == []
-        assert any(
-            "not a JSON array" in r.message
-            for r in caplog.records
-        )
-
-    async def test_register_on_disk_failure_logs_warning(
-        self, tmp_path, caplog,
-    ):
-        """If the tombstone write fails, the in-memory delegation is
-        still registered — the worst-case is missed orphan recovery."""
-        import logging
-        from specialist_registry import DelegationRecord, SpecialistRegistry
-
-        # Non-writable path — parent directory does not exist and we
-        # refuse to create it, to force a write failure.
-        bad_path = str(tmp_path / "nonexistent" / "subdir" / "del.json")
-        reg = SpecialistRegistry(str(tmp_path / "specialists"),
-                                 tombstone_path=bad_path)
-        rec = DelegationRecord(
-            id="d-1", agent="finance", started_at=1.0, origin={},
-        )
-        with caplog.at_level(logging.WARNING):
-            await reg.register_delegation(rec)
-        assert reg.has_delegation("d-1")
-        assert any(
-            "tombstone" in r.message.lower() or "delegation" in r.message.lower()
-            for r in caplog.records
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -592,46 +548,6 @@ class TestDisabledAccessors:
         out.append("intruder")
         assert "intruder" not in reg._disabled_names
         assert reg.disabled_roles() == ["alpha", "beta", "zeta"]
-
-
-# ---------------------------------------------------------------------------
-# TestDelegationTombstoneAtomicity — L20: crash-safe tombstone write
-# ---------------------------------------------------------------------------
-
-
-class TestDelegationTombstoneAtomicity:
-    async def test_crash_between_tempwrite_and_replace_keeps_tombstone(
-        self, tmp_path, monkeypatch,
-    ):
-        """A crash BETWEEN the temp write and os.replace must leave the prior
-        delegations.json intact — this is the exact file that exists for
-        delegation crash recovery."""
-        import json
-        import atomic_io
-        from specialist_registry import SpecialistRegistry, DelegationRecord
-
-        tombstone = tmp_path / "delegations.json"
-        reg = SpecialistRegistry(str(tmp_path / "specialists"),
-                                 tombstone_path=str(tombstone))
-        await reg.register_delegation(
-            DelegationRecord(id="d1", agent="finance", started_at=1000.0,
-                             origin={"channel": "telegram"}))
-        first = json.loads(tombstone.read_text(encoding="utf-8"))
-        assert first[0]["id"] == "d1"
-
-        def boom(*args, **kwargs):
-            raise RuntimeError("simulated crash before replace")
-
-        monkeypatch.setattr(atomic_io.os, "replace", boom)
-        # _write_tombstone_locked swallows + logs; mutation must not raise.
-        await reg.register_delegation(
-            DelegationRecord(id="d2", agent="legal", started_at=2000.0))
-
-        on_disk = json.loads(tombstone.read_text(encoding="utf-8"))
-        assert on_disk == first  # prior tombstone intact, not truncated
-        import os as _os
-        assert [f for f in _os.listdir(tmp_path)
-                if f not in ("delegations.json", "specialists")] == []
 
 
 class TestSpecialistBootCapabilities:
