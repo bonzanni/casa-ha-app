@@ -243,7 +243,12 @@ class VoiceChannel(Channel):
         self,
         request: web.Request,
     ) -> web.Response:
-        if not self._webhook_secret or not self._verify(request, b""):
+        signature = request.headers.get("X-Webhook-Signature", "")
+        if (
+            not self._webhook_secret
+            or not signature.isascii()
+            or not self._verify(request, b"")
+        ):
             return web.json_response(
                 {"error": "invalid signature"}, status=401,
             )

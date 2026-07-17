@@ -198,6 +198,21 @@ async def test_catalog_requires_secret_and_valid_empty_body_hmac(
 
 
 @pytest.mark.asyncio
+async def test_catalog_rejects_non_ascii_signature_as_generic_401(
+    catalog_client,
+):
+    client, _secret, _configs = catalog_client
+
+    response = await client.get(
+        "/api/voice/agents",
+        headers={"X-Webhook-Signature": "é" * 64},
+    )
+
+    assert response.status == 401
+    assert await response.json() == {"error": "invalid signature"}
+
+
+@pytest.mark.asyncio
 async def test_catalog_fails_closed_when_server_secret_is_empty():
     channel = _catalog_channel(
         {"butler": _cfg("butler", "Tina", ["ha_voice"])},
