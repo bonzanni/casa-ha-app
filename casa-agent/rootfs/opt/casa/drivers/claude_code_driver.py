@@ -2410,19 +2410,20 @@ class ClaudeCodeDriver(DriverProtocol):
 
     def record_send_intent_cancelled_nowait(
         self, engagement_id: str, request_id: str, outcome: dict,
-    ) -> bool:
+    ) -> str:
         """A3 · F-ORDER (Sol A3 wave 4): FULLY SYNCHRONOUS transport-cancellation
         cleanup against an in-flight relay post — NO await, so a second
         ``Task.cancel()`` cannot interrupt it mid-flight (the double-cancel window
-        the awaited wave-3 predecessor left open). Reads ``posting`` synchronously:
-        if a relay post is in flight / resolved the cancel LOSES (returns ``False``
-        — the poster owns the marker + outcome, never clobbered), otherwise
-        tombstones + records the ``cancelled`` outcome ONLY while the intent is
-        still cancellable (returns ``True`` — the caller then clears the ingress
-        marker). See ``OutputSequencer.record_intent_cancelled_nowait``."""
+        the awaited wave-3 predecessor left open). Reads ``posting`` synchronously
+        and returns a TRI-STATE (wb1-1): ``"post_won"`` when a relay post is in
+        flight / resolved (the cancel LOSES — the poster owns the marker + outcome,
+        never clobbered), ``"cancelled"`` when it tombstoned a still-cancellable
+        intent (the caller then clears the ingress marker), ``"absent"`` when there
+        is no such intent (nothing to post — the caller may clear). See
+        ``OutputSequencer.record_intent_cancelled_nowait``."""
         seq = self._sequencers.get(engagement_id)
         if seq is None:
-            return False
+            return "absent"
         return seq.record_intent_cancelled_nowait(request_id, outcome)
 
     def send_intent_outcome(self, engagement_id: str, request_id: str) -> Any:
@@ -3231,17 +3232,23 @@ class ClaudeCodeDriver(DriverProtocol):
 
     async def _reanchor_marker_edit(
         self, engagement: EngagementRecord, old_mid: int, n: int | None,
+        *, terminal: bool = False,
     ) -> bool:
         """``wait_for``-bounded, finite-attempt marker edit of the OLD copy
         through the sequencer's ``edit_discrete`` (§D6 r17-2/r17-4): each attempt
         is bounded by ``_REANCHOR_EDIT_TIMEOUT`` and idempotent via the F1 edit
         cache (a repeated identical edit no-ops). Returns ``True`` on a confirmed
-        edit. Renders D1's marker-ONLY text, never the duplicated body."""
+        edit. Renders D1's marker-ONLY text, never the duplicated body.
+
+        wb1-2: ``terminal=True`` renders the ``resolved below`` marker instead of
+        the ``answer the current copy below`` OPEN marker — the durable step uses
+        it once answer/terminal settlement has begun so the stale copy never
+        looks live in the pre-settlement window."""
         seq = self._sequencers.get(engagement.id)
         if seq is None:
             return False
         from channels.output_sequencer import MARKUP_EMPTY
-        marker = _reanchor_moved_open(n)
+        marker = _reanchor_moved_terminal(n) if terminal else _reanchor_moved_open(n)
         return await confirmed_settle_edit(
             lambda: seq.edit_discrete(
                 old_mid, text=marker, markup=MARKUP_EMPTY,
@@ -3313,6 +3320,27 @@ class ClaudeCodeDriver(DriverProtocol):
         if entry.get("answered", False) or self._overlay_answered(engagement_id, n):
             return True
         return self._reserved_question_number(engagement_id) == n
+
+    def _record_is_terminal(self, engagement_id: str) -> bool:
+        """wb1-2 (whole-branch gate wave 1): ``True`` once the engagement RECORD
+        has flipped terminal (``completed``/``cancelled``/``error``). The
+        authoritative terminal flip (``try_transition_terminal``) commits BEFORE
+        finalize's broker-hook + summary awaits and BEFORE
+        ``settle_all_open_questions`` cancels the retry owner — a GAP in which a
+        scheduler pump pass could edit a stale copy to the OPEN marker and unstage
+        it, stranding it live-looking (settlement then only sees the current
+        copy). The scheduler consults this to defer to the imminent settlement:
+        render the TERMINAL marker + leave staged, and stop pumping/arming."""
+        reg = self._registry
+        getter = getattr(reg, "get", None) if reg is not None else None
+        if getter is None:
+            return False
+        try:
+            rec = getter(engagement_id)
+        except Exception:  # noqa: BLE001 — a read failure must never wedge the pass
+            return False
+        return rec is not None and getattr(rec, "status", None) in (
+            "completed", "cancelled", "error")
 
     def _historical_items(
         self, engagement_id: str,
@@ -3391,7 +3419,11 @@ class ClaudeCodeDriver(DriverProtocol):
         new_mid = self._confirmed_pair_mid(eng_id, n)
         if new_mid is None:
             return
-        if self._settlement_begun(eng_id, n):
+        # wb1-2: a terminal record (finalize's pre-settle gap) is settling too —
+        # a late ``update_question_mid`` would install a current mid AFTER the
+        # sole settlement pass with nothing owning it; marker-edit the orphan
+        # terminal instead.
+        if self._settlement_begun(eng_id, n) or self._record_is_terminal(eng_id):
             if await self._orphan_marker_edit(engagement, new_mid, n):
                 self._retire_confirmed_pair(eng_id, n)
             return
@@ -3420,9 +3452,30 @@ class ClaudeCodeDriver(DriverProtocol):
         Retire on unstage success; a failed unstage leaves the durable entry
         present, so the next selection re-runs the compound step — the repeated
         identical edit no-ops via the F1 edit cache (idempotent, no new durable
-        'edited' flag needed)."""
+        'edited' flag needed).
+
+        wb1-2: REVALIDATE lifecycle before choosing the marker text AND again
+        before unstaging (both reads under the caller's held maintenance lock).
+        Once answer/terminal settlement has BEGUN — D4's ``_settlement_begun``
+        (answered/reserved/closed) OR the engagement RECORD has flipped terminal
+        (``_record_is_terminal`` — the finalize gap before ``settle_all`` cancels
+        the pump) — the OPEN "answer the current copy below" marker would strand
+        the stale copy looking live because settlement then only sees the current
+        copy. Render the TERMINAL marker and LEAVE the entry staged so the
+        settlement path (which renders reanchored stale copies terminal) owns the
+        final state — NEVER unstage it out from under settlement."""
+        eng_id = engagement.id
+        if self._settlement_begun(eng_id, n) or self._record_is_terminal(eng_id):
+            await self._reanchor_marker_edit(engagement, mid, n, terminal=True)
+            return
         if await self._reanchor_marker_edit(engagement, mid, n):
-            await self._best_effort_unstage(engagement.id, n, mid)
+            # Re-check before unstaging — settlement may have begun while the
+            # wait_for-bounded OPEN-marker edit was blocked (an answer
+            # reservation landing, or the record flipping terminal). If so, LEAVE
+            # the entry staged so settlement re-renders it terminal.
+            if self._settlement_begun(eng_id, n) or self._record_is_terminal(eng_id):
+                return
+            await self._best_effort_unstage(eng_id, n, mid)
 
     async def _orphan_marker_edit(
         self, engagement: EngagementRecord, orphan_mid: int, n: int | None,
@@ -3447,8 +3500,14 @@ class ClaudeCodeDriver(DriverProtocol):
     def _arm_reanchor_retry(self, engagement: EngagementRecord) -> None:
         """Arm the ONE retry-owner task for this engagement (§A3(b), Sol r13-1).
         A double-arm while a task already runs is a NO-OP. The task self-retires
-        (removing its dict entry) via a done-callback."""
+        (removing its dict entry) via a done-callback.
+
+        wb1-2: NO-OP once the record is terminal — ``settle_all_open_questions``
+        cancels the pump before it iterates stale mids, and a re-arm here would
+        restart the very scheduler the terminal quiesce just stopped."""
         eng_id = engagement.id
+        if self._record_is_terminal(eng_id):
+            return
         existing = self._reanchor_retry_tasks.get(eng_id)
         if existing is not None and not existing.done():
             return

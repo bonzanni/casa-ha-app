@@ -889,6 +889,71 @@ class TestDoubleCancelWave4:
         assert len(wired["chan"].anchors) == 1
 
 
+class TestAskCancelRoutePostWins:
+    """wb1-1 (whole-branch gate wave 1): the SEPARATE ``/ask_cancel`` HTTP route
+    must honour ``_record_intent_cancelled``'s post-wins result exactly like the
+    intra-handler ``finally`` does (``TestDoubleCancelWave4`` above covers the
+    task-cancel path).
+
+    Scenario: a cancel lands WHILE the relay poster is mid-post (``posting`` True
+    — the anchor's wire message landed but the ledger add has not committed). The
+    cancel LOSES; the poster owns the ``ask_inflight`` marker and clears it at
+    durable ownership. ``/ask_cancel`` clearing the marker UNCONDITIONALLY let a
+    DIFFERENT ask pass the pending gate before Q1 was durable → the serialized
+    poster later posted Q2 with no re-check → TWO live questions. The route must
+    skip the clear on ``post_won`` and leave the marker to the poster."""
+
+    async def test_ask_cancel_during_inflight_post_marker_stands_anchor(
+        self, wired, monkeypatch,
+    ):
+        eid, drv, seq, chan = (
+            wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
+        gate = asyncio.Event()
+        real_add = wired["reg"].add_open_question
+
+        async def _gated_add(*a, **k):
+            await gate.wait()               # park the poster mid-post, lock held
+            return await real_add(*a, **k)
+
+        monkeypatch.setattr(wired["reg"], "add_open_question", _gated_add)
+
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "a1"
+
+        # The relay reaches the block: the poster posts the wire message then
+        # parks in the gated add_open_question — writer lock held, ``posting`` set.
+        relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
+        await asyncio.sleep(0.02)
+        intent = seq.registry.by_request_id("a1")
+        assert intent.state == "armed" and intent.posting is True
+        assert len(chan.anchors) == 1       # wire message landed; ledger NOT yet
+
+        # Fire the SEPARATE ``/ask_cancel`` HTTP route while the post is winning.
+        resp_cancel = await asyncio.wait_for(wired["ask_cancel"](_FakeRequest(
+            {"engagement_id": eid, "request_id": "a1"})), timeout=1.0)
+        assert _body(resp_cancel)["ok"] is True
+
+        # The marker STILL stands (the post is winning → poster owns the clear).
+        # A second, DIFFERENT ask is refused question_pending — pre-fix the marker
+        # was cleared unconditionally → this ask would be admitted → two live Qs.
+        assert drv.ask_inflight(eid) == "a1"
+        resp2 = await asyncio.wait_for(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a2", hash="anchor-hash-2"))), timeout=1.0)
+        assert _body(resp2)["error"] == "question_pending"
+
+        # Release the poster → durable ownership clears the marker; the anchor
+        # resolves ok; exactly ONE live question remains. The owner task t1
+        # completes anchored (the separate /ask_cancel never cancelled it).
+        gate.set()
+        await asyncio.wait_for(relay, timeout=1.0)
+        resp1 = await asyncio.wait_for(t1, timeout=1.0)
+        assert _body(resp1)["outcome"] == "anchored"
+        assert drv.ask_inflight(eid) is None
+        assert drv._effective_open_question_numbers(eid) == [1]
+
+
 class TestPosterOwnsClearWave5:
     """Sol A3 wave 5 — the poster OWNS the ``ask_inflight`` clear on EVERY
     non-durable exit.

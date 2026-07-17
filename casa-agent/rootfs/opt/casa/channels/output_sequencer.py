@@ -729,7 +729,7 @@ class OutputSequencer:
 
     def record_intent_cancelled_nowait(
         self, request_id: str, outcome: dict,
-    ) -> bool:
+    ) -> str:
         """A3 · F-ORDER (Sol A3 wave 4): FULLY SYNCHRONOUS transport-cancellation
         cleanup against an in-flight relay post — "the post wins" — with NO awaits.
 
@@ -752,24 +752,30 @@ class OutputSequencer:
         ``True``. A later relay bind then sees the tombstone and consume-cancels
         the block — it can never post.
 
-        Returns ``True`` iff the cancel TOOK EFFECT (the caller then clears the
-        ingress marker). No-op ``False`` if the intent is unknown."""
+        wb1-1 (whole-branch gate wave 1): returns an explicit TRI-STATE so the
+        separate ``/ask_cancel`` route can decide marker ownership correctly (a
+        single bool conflated "post won" with "no intent", and the route cleared
+        the marker in BOTH — stripping it mid-post admitted a second live
+        question). ``"cancelled"`` — the cancel took effect (caller clears the
+        marker); ``"post_won"`` — an in-flight / resolved post owns the marker
+        (caller MUST NOT clear it, the poster clears at durable ownership);
+        ``"absent"`` — no such intent (nothing to post, caller may clear)."""
         intent = self.registry.by_request_id(request_id)
         if intent is None:
-            return False
+            return "absent"
         if (
             intent.posting
             or intent.state == "posted"
             or intent.outcome is not None
         ):
-            return False  # the in-flight / resolved post wins — never clobber
+            return "post_won"  # the in-flight / resolved post wins — never clobber
         if intent.state not in ("pending", "armed"):
-            return False
+            return "post_won"  # already-resolved / tombstoned — leave the marker
         self.registry.cancel(request_id)  # sync tombstone (pending/armed → cancelled)
         intent.outcome = dict(outcome)
         self._arm_event.set()
         self._signal_resolution(request_id)
-        return True
+        return "cancelled"
 
     async def mark_intent_posted(
         self, request_id: str, message_id: int | None,

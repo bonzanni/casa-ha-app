@@ -63,6 +63,48 @@ def test_all_shorts_usable_multi_also_verbatim_undecorated() -> None:
 
 
 # ---------------------------------------------------------------------------
+# (a2) wb1-1..4 · wb1-4 — a non-blank short is used VERBATIM, never stripped.
+# D2 says verbatim-or-floor, never mutated. ``strip()`` is a BLANK predicate
+# only; distinctness, caption construction, and the ≤64 decorated-length check
+# all read the RAW short.
+# ---------------------------------------------------------------------------
+
+
+def test_non_blank_short_with_surrounding_whitespace_renders_verbatim() -> None:
+    # "  Setup  " is non-blank after strip, so it is USABLE — and it renders
+    # VERBATIM ("1 ·   Setup  "), not mutated to the stripped "1 · Setup".
+    options = [
+        {"label": "Configure the server", "short": "  Setup  "},
+        {"label": "Tear the server down", "short": "Teardown"},
+    ]
+    assert resolve_button_labels(options, multi=False) == [
+        "1 ·   Setup  ", "2 · Teardown",
+    ]
+
+
+def test_distinctness_uses_raw_short_not_stripped() -> None:
+    # "Setup" and " Setup " are DISTINCT raw values → the whole set is usable
+    # and renders verbatim. Stripping first would have collapsed them to a
+    # duplicate and floored the set (a mutation-driven decision D2 forbids).
+    options = [
+        {"label": "First", "short": "Setup"},
+        {"label": "Second", "short": " Setup "},
+    ]
+    assert resolve_button_labels(options, multi=False) == [
+        "1 · Setup", "2 ·  Setup ",
+    ]
+
+
+def test_length_check_uses_raw_short_floors_when_padding_overflows() -> None:
+    # 60 non-space chars + 4 trailing spaces == 64 raw; the decorated caption
+    # "1 · " + 64 == 68 > 64 → the RAW length overflows and the set floors. A
+    # stripped length check (60 → decorated 64) would have WRONGLY passed.
+    short = "s" * 60 + "    "
+    options = [{"label": "full label text", "short": short}]
+    assert resolve_button_labels(options, multi=False) == ["Option 1"]
+
+
+# ---------------------------------------------------------------------------
 # (b) one blank short floors the WHOLE set
 # ---------------------------------------------------------------------------
 

@@ -900,9 +900,18 @@ def _record_intent_unread_refusal(
         cancel(eng_id, request_id)
 
 
+# wb1-1 (whole-branch gate wave 1) — the tri-state a cancel-recording call
+# resolves to. Only ``POST_WON`` transfers marker ownership to the poster; on
+# ``CANCELLED`` and ``ABSENT`` the cancel is authoritative and the caller clears
+# the ingress marker (there is no live post to strip it from under).
+INTENT_CANCEL_CANCELLED = "cancelled"
+INTENT_CANCEL_POST_WON = "post_won"
+INTENT_CANCEL_ABSENT = "absent"
+
+
 def _record_intent_cancelled(
     driver: Any, eng_id: str, request_id: str,
-) -> bool:
+) -> str:
     """B1/B2 (§A3 wave 2) + A3 · F-ORDER (Sol A3 wave 3/4): a transport
     CANCELLATION between arming/registering an ask intent and its post TOMBSTONES
     the intent AND records a terminal ``cancelled`` outcome — but "the post wins"
@@ -925,22 +934,31 @@ def _record_intent_cancelled(
     Being awaitless it can never be interrupted mid-flight by a SECOND
     ``Task.cancel()`` — the double-cancel window the awaited wave-3 seam left open
     (a second cancel dropping control into the caller's outer ``finally`` while a
-    poster was mid-post) is closed. Returns ``True`` iff the cancel TOOK EFFECT —
-    the caller then clears the ingress marker. Returns ``False`` when a concurrent
-    relay post WON the race (never clobbers the posted/compensated outcome; the
-    poster's own paths own the marker).
+    poster was mid-post) is closed.
+
+    wb1-1 (whole-branch gate wave 1): returns an explicit TRI-STATE
+    (``INTENT_CANCEL_CANCELLED`` / ``_POST_WON`` / ``_ABSENT``) rather than a
+    bool. The old bool collapsed "post won" and "no intent" into ``False``, and
+    ``/ask_cancel`` cleared the marker on both — stripping it mid-post admitted a
+    second live question. Only ``POST_WON`` leaves the marker to the poster.
 
     Getattr-tolerant and swallows its own errors: an intent-cleanup failure must
     never mask the original cancellation being re-raised. Degrades to the
     pre-seam synchronous tombstone (best-effort) on a driver without the wave-4
     seam."""
     if driver is None:
-        return False
+        return INTENT_CANCEL_ABSENT
     rec_nowait = getattr(driver, "record_send_intent_cancelled_nowait", None)
     if rec_nowait is not None:
         try:
-            return bool(rec_nowait(
-                eng_id, request_id, {"ok": False, "error": "cancelled"}))
+            res = rec_nowait(
+                eng_id, request_id, {"ok": False, "error": "cancelled"})
+            if isinstance(res, str):
+                return res
+            # Tolerate a legacy bool-returning seam: True == cancel took effect;
+            # a falsy result is conservatively read as "post won" (never clear a
+            # marker a possibly-live poster may still own).
+            return INTENT_CANCEL_CANCELLED if res else INTENT_CANCEL_POST_WON
         except Exception:  # noqa: BLE001 — fall back to the pre-seam path
             logger.debug("record_send_intent_cancelled_nowait failed", exc_info=True)
     # --- pre-seam fallback (no nowait guard available) ----------------------
@@ -948,14 +966,16 @@ def _record_intent_cancelled(
     if outcome_fn is not None:
         try:
             if outcome_fn(eng_id, request_id) is not None:
-                return False  # already resolved (posted / compensated) — no clobber
+                # already resolved (posted / compensated) — no clobber
+                return INTENT_CANCEL_POST_WON
         except Exception:  # noqa: BLE001 — degrade to attempting the tombstone
             logger.debug("send_intent_outcome read failed", exc_info=True)
     rec = getattr(driver, "record_send_intent_refusal", None)
     if rec is not None:
         try:
-            rec(eng_id, request_id, {"ok": False, "error": "cancelled"})
-            return True
+            res = rec(eng_id, request_id, {"ok": False, "error": "cancelled"})
+            # A None result means the intent was unknown (nothing tombstoned).
+            return INTENT_CANCEL_ABSENT if res is None else INTENT_CANCEL_CANCELLED
         except Exception:  # noqa: BLE001 — fall back to a bare tombstone
             logger.debug("record_send_intent_refusal(cancelled) failed",
                          exc_info=True)
@@ -963,10 +983,10 @@ def _record_intent_cancelled(
     if cancel is not None:
         try:
             cancel(eng_id, request_id)
-            return True
+            return INTENT_CANCEL_CANCELLED
         except Exception:  # noqa: BLE001 — best-effort cleanup
             logger.debug("cancel_send_intent failed", exc_info=True)
-    return False
+    return INTENT_CANCEL_ABSENT
 
 
 def _refused_intent_outcome(prior: Any) -> bool:
@@ -1825,7 +1845,8 @@ def _make_ask(
                             # ("the post wins"), the intent keeps its SUCCESS outcome,
                             # and the marker is left to the poster (which clears it at
                             # durable ownership). Gate the finally on that decision.
-                            if not _record_intent_cancelled(driver, eng_id, request_id):
+                            if (_record_intent_cancelled(driver, eng_id, request_id)
+                                    == INTENT_CANCEL_POST_WON):
                                 _post_wins = True
                             raise
                         # §A3(c): the compensated add-failure maps to ok:false
@@ -2466,11 +2487,17 @@ def _make_ask_cancel() -> Handler:
         driver = _resolve_active_driver()
         # Tombstone the send intent if one exists so a same-request_id retry
         # short-circuits to the recorded ``cancelled`` outcome (never awaits a
-        # never-armed intent / re-registers a fresh broker request), and clear
-        # the ingress marker so a stalled owner can never wedge it.
+        # never-armed intent / re-registers a fresh broker request). wb1-1:
+        # clear the ingress marker ONLY when the cancel is authoritative
+        # (``cancelled`` or ``absent`` — no live post to strip it from under). On
+        # ``post_won`` a relay poster passed its own gate and is mid-post: it OWNS
+        # the marker and clears/settles it at durable ownership. Clearing here
+        # would let a DIFFERENT ask pass the pending gate before Q1 is durable →
+        # the serialized poster posts Q2 with no re-check → two live questions.
         if driver is not None:
-            _record_intent_cancelled(driver, eng_id, request_id)
-            _clear_ask_marker(driver, eng_id, request_id)
+            if (_record_intent_cancelled(driver, eng_id, request_id)
+                    != INTENT_CANCEL_POST_WON):
+                _clear_ask_marker(driver, eng_id, request_id)
 
         BROKER.cancel(
             namespace="engagement_ask", scope=eng_id, request_id=request_id,

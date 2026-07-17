@@ -308,12 +308,18 @@ def _classify_button_labels(
     raw = [_button_short(o) for o in options]
     if any(s is None for s in raw):
         return "no_shorts", _floor_captions(n)
-    stripped = [s.strip() for s in raw]
-    if any(s == "" for s in stripped):
+    # wb1-4: ``strip()`` is used ONLY as the BLANK predicate (D2: verbatim-or-
+    # floor, never mutated). Distinctness, caption construction, and the ≤64
+    # decorated-length check all read the RAW short — stripping first would
+    # silently change uniqueness (" Setup " vs "Setup") and length decisions
+    # (trailing padding that overflows the 64-char caption), both mutations the
+    # verbatim contract forbids. A short renders exactly as authored:
+    # ``"  Setup  "`` → ``"1 ·   Setup  "``.
+    if any(s.strip() == "" for s in raw):
         return "blank", _floor_captions(n)
-    if len({s.casefold() for s in stripped}) != n:
+    if len({s.casefold() for s in raw}) != n:
         return "dup", _floor_captions(n)
-    captions = [f"{i + 1} · {stripped[i]}" for i in range(n)]
+    captions = [f"{i + 1} · {raw[i]}" for i in range(n)]
     for cap in captions:
         decorated = f"{_MULTI_BOX_ON} {cap}" if multi else cap
         if len(decorated) > _ASK_BUTTON_CAPTION_CAP:

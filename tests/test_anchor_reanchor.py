@@ -1083,6 +1083,76 @@ class TestConfirmedPairScheduler:
 
 
 # ===========================================================================
+# 5a2. wb1-2 (whole-branch gate wave 1) — the UNIFIED HISTORICAL SCHEDULER's
+#      DURABLE step must REVALIDATE lifecycle before it edits + unstages. Once
+#      answer/terminal settlement has BEGUN (the engagement record flipped
+#      terminal in finalize's pre-settle gap, OR an answer reservation landed
+#      while the OPEN-marker edit was blocked), the OPEN "answer the current copy
+#      below" marker would strand the stale copy looking live because settlement
+#      then only sees the current copy. The step must render the TERMINAL marker
+#      and LEAVE the entry staged for settlement.
+# ===========================================================================
+
+
+class TestWb1_2DurableStepRevalidation:
+    async def _durable_entry(self, tmp_path):
+        """A durable ``reanchored`` stale entry: old copy 500, current copy 505."""
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire, retry_sleep=_park_forever)
+        drv._ensure_sequencer(rec)
+        await reg.stage_stale_mid(rec.id, n, 500, kind="plain")
+        await reg.update_question_mid(rec.id, n, 505)
+        assert _entry(reg, rec, n)["stale_mids"] == [{"mid": 500, "kind": "reanchored"}]
+        return reg, rec, n, wire, drv
+
+    async def test_terminal_flip_before_step_renders_terminal_leaves_staged(
+        self, tmp_path,
+    ):
+        reg, rec, n, wire, drv = await self._durable_entry(tmp_path)
+        # The authoritative terminal flip lands (finalize's gap, BEFORE
+        # settle_all cancels the pump). The pump's durable step must NOT edit the
+        # stale copy to the OPEN marker and unstage it — it renders the TERMINAL
+        # marker and LEAVES it staged for settlement.
+        rec.status = "cancelled"
+        await drv._historical_durable_step(rec, n, 500)
+
+        markers = [t for _, mid, t in wire.edits if mid == 500]
+        assert markers[-1] == _MOVED_TERMINAL.format(n=n)      # terminal, not open
+        # Left staged so the settlement path renders it terminal / removes it.
+        assert _entry(reg, rec, n)["stale_mids"] == [
+            {"mid": 500, "kind": "reanchored"}]
+
+    async def test_reservation_during_blocked_open_edit_does_not_unstage(
+        self, tmp_path,
+    ):
+        reg, rec, n, wire, drv = await self._durable_entry(tmp_path)
+        wire.edit_block = asyncio.Event()   # park the marker edit mid-wire
+        step = asyncio.ensure_future(drv._historical_durable_step(rec, n, 500))
+        await asyncio.sleep(0.02)           # parked in the blocked marker edit
+        # An answer reservation lands while the OPEN-marker edit is blocked →
+        # settlement has begun. On unblock the step must RE-CHECK before
+        # unstaging and LEAVE the entry staged (unstaging would hide the stale
+        # copy from settlement → stranded live-looking).
+        assert drv.reserve_answer(rec.id) is not None
+        wire.edit_block.set()
+        await asyncio.wait_for(step, timeout=1.0)
+
+        assert _entry(reg, rec, n)["stale_mids"] == [
+            {"mid": 500, "kind": "reanchored"}]
+
+    async def test_live_unanswered_still_renders_open_and_unstages(self, tmp_path):
+        # Regression: with NO settlement begun the durable step keeps its
+        # round-3 behaviour — OPEN marker + unstage.
+        reg, rec, n, wire, drv = await self._durable_entry(tmp_path)
+        await drv._historical_durable_step(rec, n, 500)
+        markers = [t for _, mid, t in wire.edits if mid == 500]
+        assert markers[-1] == _MOVED_OPEN.format(n=n)
+        assert _entry(reg, rec, n)["stale_mids"] == []
+
+
+# ===========================================================================
 # 5b. B3 (wave 2) — an ABSENT fresh re-read is ALREADY RESOLVED: SKIP, never
 #     fall back to the captured snapshot (its answered=False would ⌛-overwrite
 #     a ✅ settle on a message that is already done).

@@ -520,6 +520,16 @@ class TopicStreamRelay:
         # boundary (``_reset_turn_state``).
         self._anchor_candidate: tuple[str, str] | None = None
         self._suppressing_for: tuple[int, int] | None = None
+        # wb1-3 (whole-branch gate wave 1): the set of anchor ``tg_message_id``s
+        # that were already ARMED and then FLUSHED/DISARMED THIS turn. D5's rule
+        # is "re-arm only when a NEW anchor successfully surfaces"; a later
+        # candidate (e.g. a REJECTED/invalid ask that records a candidate but
+        # never surfaces its own anchor) must NEVER re-arm off a mid it already
+        # disarmed. The candidate was not bound to the anchor its ask produced,
+        # so a bare ``open_anchor_state`` read re-armed off the still-open PRIOR
+        # anchor A and discarded legitimate post-B prose. This set makes an
+        # already-disarmed anchor ineligible to re-arm. Reset every turn boundary.
+        self._disarmed_mids: set[int] = set()
         # D5 Task C2: the anchor-scoped NARRATION BUFFER. While suppression is
         # armed, trailing prose is HELD here (never posted) as
         # ``(text, segment, offset_after)`` tuples — the frame coordinates travel
@@ -1076,14 +1086,30 @@ class TopicStreamRelay:
             self.engagement_id,
         )
 
+    async def _effective_open_state(self) -> "tuple[int, int] | None":
+        """The driver-injected ``open_anchor_state`` (``(n, mid) | None``) with
+        wb1-3 candidate-binding applied: an anchor whose ``mid`` was already
+        FLUSHED/DISARMED this turn (``_disarmed_mids``) is NOT eligible to arm a
+        NEW candidate, so it reads as CLOSED here. This is the single seam read
+        used by arming, the atomic hold-or-post, and the ``result``-time
+        flush-vs-discard decision, so all three agree on 're-arm only when a NEW
+        anchor surfaces'. Returns ``None`` when the seam is not injected."""
+        if self.open_anchor_state is None:
+            return None
+        state = await _maybe_await(self.open_anchor_state())
+        if state is None:
+            return None
+        if state[1] in self._disarmed_mids:
+            return None
+        return (state[0], state[1])
+
     async def _maybe_arm_suppression(self) -> None:
-        """Re-read ``open_anchor_state`` and ARM suppression the moment this
-        turn's anchor-candidate resolves to a genuinely open, unanswered
-        anchor (§D5). Called before processing each subsequent text frame and
-        again at ``result``. Task C1 scope: arming ONLY — the buffered-prose
-        consumer (flush/discard) is Task C2, so arming is behavior-neutral
-        here. No-op once armed, when there is no candidate, or when the seam
-        was not injected (default ``None`` = feature inert)."""
+        """Re-read the (candidate-bound) open-anchor seam and ARM suppression the
+        moment this turn's anchor-candidate resolves to a genuinely open,
+        unanswered anchor that is NOT an already-disarmed prior anchor (§D5;
+        wb1-3). Called before processing each subsequent text frame and again at
+        ``result``. No-op once armed, when there is no candidate, or when the
+        seam was not injected (default ``None`` = feature inert)."""
         # §D5 C3 (Sol r4-3): a cold recovery of a held-prose turn DISARMS
         # suppression for the recovered turn's catch-up so the prose re-renders
         # as ordinary narration; never arm while the latch is set.
@@ -1093,7 +1119,7 @@ class TopicStreamRelay:
             return
         if self.open_anchor_state is None:
             return
-        state = await _maybe_await(self.open_anchor_state())
+        state = await self._effective_open_state()
         if state is not None:
             self._suppressing_for = (state[0], state[1])
 
@@ -1109,20 +1135,23 @@ class TopicStreamRelay:
         closed at the ``_maybe_arm_suppression`` check just above the caller) —
         the r4-2 race window where the anchor may be surfacing LATE. Once armed,
         callers buffer directly without a seam read (no post ⇒ no race)."""
+        # wb1-3: pass the CANDIDATE-BOUND seam (``_effective_open_state``) so an
+        # already-flushed/disarmed prior anchor cannot make this op hold — it
+        # would otherwise buffer legitimate post-B prose off the still-open A.
         status = await self.sequencer.post_unless_anchor_open(
             text,
-            self.open_anchor_state,
+            self._effective_open_state,
             poster=lambda t=text: self._execute_ops(self._plan_ops(t)),
         )
         if status != "held":
             return False
         # The op surfaced the anchor under the lock ⇒ ARM + buffer. Re-read the
-        # seam for the arm identity; this is post-DECISION (we will NOT post
-        # regardless), so it is not the r4-2 race — a value that raced to
+        # (bound) seam for the arm identity; this is post-DECISION (we will NOT
+        # post regardless), so it is not the r4-2 race — a value that raced to
         # answered only means the buffer flushes at ``result`` instead of
         # discarding. Keep the prior identity (or a sentinel) if it raced away,
         # so the armed buffering discipline still holds.
-        state = await _maybe_await(self.open_anchor_state())
+        state = await self._effective_open_state()
         if state is not None:
             self._suppressing_for = (state[0], state[1])
         elif self._suppressing_for is None:
@@ -1150,6 +1179,11 @@ class TopicStreamRelay:
         re-arms on the next prose frame; re-arming happens ONLY when a NEW anchor
         surfaces (a fresh ``_match_discrete_block`` candidate)."""
         await self._flush_anchor_buffer()
+        # wb1-3: remember this anchor's mid so a later candidate (e.g. a rejected
+        # ask that never surfaces its own anchor) can never re-arm off it — D5's
+        # "re-arm only when a NEW anchor surfaces".
+        if self._suppressing_for is not None:
+            self._disarmed_mids.add(self._suppressing_for[1])
         self._suppressing_for = None
         self._anchor_candidate = None
 
@@ -1242,6 +1276,9 @@ class TopicStreamRelay:
         self._anchor_candidate = None
         self._suppressing_for = None
         self._anchor_buffer = []
+        # wb1-3: the disarmed-mid set is per-turn — a new turn's anchors are all
+        # eligible to arm again.
+        self._disarmed_mids = set()
         # §D5 C3: a turn boundary ends the cold-recovery catch-up window — clear
         # the disarm latch so subsequent turns arm suppression normally. (Cold
         # replay never calls ``_reset_turn_state`` — replayed frames <= current
@@ -1271,10 +1308,10 @@ class TopicStreamRelay:
         # The seam re-read here is not the r4-2 race: a reported answer means the
         # anchor already resolved, so no late anchor post can still race us.
         if self._anchor_buffer:
-            state = (
-                await _maybe_await(self.open_anchor_state())
-                if self.open_anchor_state is not None else None
-            )
+            # wb1-3: read the CANDIDATE-BOUND seam — an already-disarmed prior
+            # anchor reads as closed, so the discard decision tracks the anchor
+            # this buffer was actually armed under.
+            state = await self._effective_open_state()
             if state is None:
                 await self._flush_anchor_buffer()
             else:
@@ -1546,6 +1583,7 @@ class TopicStreamRelay:
             await self._flush_anchor_buffer()          # (1) flush (no-op if empty)
             self._suppressing_for = None
             self._anchor_candidate = None
+            self._disarmed_mids = set()                 # wb1-3: per-turn set
             self._replay_disarmed = False
             await _maybe_await(
                 self.on_turn_event("spawn", {"epoch": frame.get("epoch")})  # (2)

@@ -228,27 +228,74 @@ async def test_tool_use_flushes_buffer_and_disarms(tmp_path):
 
 async def test_second_anchor_reamms_after_flush(tmp_path):
     """Re-arming happens ONLY when a NEW anchor surfaces. A first anchor's
-    buffer flushes+disarms on a tool_use; a SECOND anchor block re-arms, so its
-    trailing prose is buffered and DISCARDED at result again."""
+    buffer flushes+disarms on a tool_use; a SECOND, genuinely NEW anchor (its
+    OWN, DIFFERENT ``tg_message_id``) re-arms, so its trailing prose is buffered
+    and DISCARDED at result again.
+
+    wb1-3: the NEW anchor must carry its OWN mid — re-arming off the SAME
+    already-flushed/disarmed mid is precisely the bug this finding fixes, so the
+    seam here reports 500 for Q1 then 601 for the genuinely-new Q2."""
     rec, events = Recorder(), []
     seq, _clock = _fast_sequencer(rec)
+    seam_state = {"open": (5, 500)}
+    seam = lambda: seam_state["open"]  # noqa: E731
+
     _write_current(tmp_path, [
         _init(), _anchor_ask("Q1?"),
         _text("first "),
-        _tool_in("Bash", {"command": "ls"}),   # flush "first " + disarm
-        _anchor_ask("Q2?"),                     # a NEW anchor surfaces → re-arm
+        _tool_in("Bash", {"command": "ls"}),   # flush "first " + disarm A(500)
+    ])
+    cursor = tmp_path / ".stream_cursor.json"
+    relay = _make_relay(
+        tmp_path, cursor, rec, events, sequencer=seq, open_anchor_state=seam,
+    )
+    await relay.run()
+    assert _narration_sends(rec) == ["first "]      # flushed on the tool_use
+    assert relay._suppressing_for is None
+
+    # A SECOND, genuinely NEW anchor surfaces with its OWN mid (601, not 500).
+    seam_state["open"] = (6, 601)
+    _append_current(tmp_path, [
+        _anchor_ask("Q2?"),                     # NEW anchor → re-arm off 601
         _text("second signoff"),                # buffered under the new anchor
+        _result(),
+    ])
+    await relay.run()
+
+    assert _narration_sends(rec) == ["first "]   # "second signoff" DISCARDED
+
+
+async def test_rejected_ask_after_flush_does_not_rearm_off_prior_anchor(tmp_path):
+    """wb1-3 (whole-branch gate wave 1): anchor A is open and armed; a tool_use
+    FLUSHES + DISARMS A; then a REJECTED / invalid free-anchor ask B records a
+    candidate but never surfaces its OWN anchor — the seam still reports A open.
+    Suppression must NOT re-arm off A (D5's 're-arm only when a NEW anchor
+    successfully surfaces'), so the legitimate post-B prose POSTS. Pre-fix the
+    candidate armed off the still-open A and DISCARDED the post-B prose at
+    result."""
+    rec, events = Recorder(), []
+    seq, _clock = _fast_sequencer(rec)
+    _write_current(tmp_path, [
+        _init(), _anchor_ask("Q_A?"),        # anchor A surfaces → arm off 500
+        _text("a-signoff "),                 # buffered under A
+        _tool_in("Bash", {"command": "ls"}),  # flush "a-signoff " + DISARM A(500)
+        _anchor_ask("Q_B?"),                 # REJECTED ask B → candidate, no anchor
+        _text("b-prose"),                    # post-B prose — must POST
         _result(),
     ])
     cursor = tmp_path / ".stream_cursor.json"
     relay = _make_relay(
         tmp_path, cursor, rec, events, sequencer=seq,
-        open_anchor_state=lambda: (5, 500),
+        open_anchor_state=lambda: (5, 500),  # A stays open; B never surfaces
     )
     await relay.run()
 
-    assert _narration_sends(rec) == ["first "]   # only the flushed segment
-    # "second signoff" was buffered under Q2 and DISCARDED at result.
+    # "a-signoff " flushed on the tool_use (a send); "b-prose" reaches the wire
+    # (appended to the same growing narration message) because B never surfaced a
+    # NEW anchor — pre-fix it re-armed off A and DISCARDED "b-prose".
+    assert _narration_sends(rec) == ["a-signoff "]
+    assert rec.edits[-1][2] == "a-signoff b-prose"
+    assert relay._suppressing_for is None
 
 
 # ===========================================================================
