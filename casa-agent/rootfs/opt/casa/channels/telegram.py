@@ -367,6 +367,23 @@ def floored_ask_telemetry(options: list, *, multi: bool = False) -> str:
     )
 
 
+def floored_ask_telemetry_line(options: list, *, multi: bool = False) -> "str | None":
+    """Return the CONTENT-FREE floor telemetry line IFF the whole-set resolver
+    FLOORS this button ask (wb3-4, D2 item 4); ``None`` when every option
+    resolved to a verbatim short (no floor happened — nothing to log).
+
+    The wb3-4 wiring gap this closes: :func:`floored_ask_telemetry` existed but
+    was never called in production, so the accepted telemetry-gated-Haiku
+    decision had no data source. The ask handler logs this line ONCE, at the
+    owner's registration path, exactly when a real floor occurs. Pure; never
+    raises; empty ``options`` (a free-text anchor) classifies as ``no floor`` →
+    ``None``, so anchors never emit."""
+    reason, _captions = _classify_button_labels(options, multi)
+    if reason is None:
+        return None
+    return floored_ask_telemetry(options, multi=multi)
+
+
 def short_option_labels(
     labels: list, shorts: "list | None" = None,
 ) -> list[str]:

@@ -2209,3 +2209,172 @@ class TestUnreadRefusalReattachIsCountFree:
         # recorded on the intent — never a fresh bump of ``refusal_count``.
         assert "refusal_count" not in r_reattach
         assert r_reattach == _unread_refusal_payload(r_owner["message"])
+
+
+# ===========================================================================
+# wb3-1 (whole-branch gate wave 3, BLOCKER): a PASSED+ARMED anchor that has NOT
+# posted when the engagement terminalizes must be aborted BEFORE the completion
+# flush — so the still-PASSED poster can never send + durably ledger a question
+# on the closed engagement (which the sole settlement pass would then miss).
+# wb3-3 (MAJOR): a terminal transition BEFORE the relay processes ``result``
+# must still release the wb2-4 validation-gate pins (fire on_retire) — the
+# sequencer's ``terminalize`` prune, invoked at settle + teardown, does it.
+# ===========================================================================
+
+
+class TestTerminalIntentAbort:
+    async def test_terminalize_before_flush_no_post_no_ledger(self, wired):
+        """PASSED+ARMED anchor → terminal (settle terminalizes) → completion
+        flush ⇒ NO wire post, NO durable ledger entry, poster resolved cleanly
+        (ok:false). Before the fix ``settle_all_open_questions`` did not
+        terminalize, so ``finalize_completion_post``'s ``flush_armed_intents``
+        invoked the still-PASSED poster AFTER settlement: it sent AND
+        ``add_open_question``'d on the terminal record."""
+        eid, drv, seq, chan = (
+            wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
+        rec = wired["rec"]
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        intent = seq.registry.by_request_id("a1")
+        assert intent is not None and intent.state == "armed"   # PASSED+ARMED
+        assert chan.anchors == []                               # not posted yet
+
+        # Terminal finalize funnel ORDER: settle (terminalizes) BEFORE the flush.
+        await drv.settle_all_open_questions(rec, "cancelled")
+        await drv.finalize_completion_post(rec, "Engagement cancelled.")
+
+        resp = await asyncio.wait_for(t1, timeout=1.0)
+        assert _body(resp)["ok"] is False                       # resolved cleanly
+        assert chan.anchors == []                               # NOTHING posted
+        assert drv._effective_open_question_numbers(eid) == []  # NO ledger entry
+
+    async def test_in_flight_poster_ledger_included_in_settle(self, wired, monkeypatch):
+        """wb3-1 (c): a poster CURRENTLY mid-post (holding the writer lock across
+        its wire send + ledger write) must FINISH before terminalize proceeds, so
+        its ledgered question IS included in the settle pass (settled, not
+        orphaned). terminalize acquires the same writer lock, so it waits."""
+        eid, drv, seq, chan = (
+            wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
+        rec = wired["rec"]
+        release = asyncio.Event()
+        real_add = wired["reg"].add_open_question
+
+        async def _gated_add(*a, **k):
+            await release.wait()             # park the poster mid-post, lock held
+            return await real_add(*a, **k)
+
+        monkeypatch.setattr(wired["reg"], "add_open_question", _gated_add)
+
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
+        await asyncio.sleep(0.02)
+        assert len(chan.anchors) == 1        # wire landed; ledger write parked
+
+        # terminalize (via settle) must BLOCK on the writer lock the poster holds.
+        settle = asyncio.ensure_future(
+            drv.settle_all_open_questions(rec, "cancelled"))
+        await asyncio.sleep(0.02)
+        assert not settle.done()             # waiting on the in-flight poster
+        assert not seq.is_terminal()         # latch not set until the lock frees
+
+        release.set()                        # let the ledger write complete
+        await asyncio.wait_for(relay, timeout=1.0)
+        await asyncio.wait_for(settle, timeout=1.0)
+        await asyncio.wait_for(t1, timeout=1.0)
+        # The in-flight poster's question landed durably AND was settled (not
+        # orphaned) — the entry got an outcome-appropriate settle edit.
+        assert seq.is_terminal() is True
+        assert len(chan.anchors) == 1
+        assert chan.edits                    # settle pass touched the entry
+
+
+class TestTerminalGatePinRelease:
+    async def test_terminal_before_result_releases_gate_pins(self, wired):
+        """wb3-3: a terminal transition BEFORE the relay processes ``result``
+        (so ``drain_and_prune_turn`` never runs) still releases BOTH the wb2-4
+        intent pin and the gate. Before the fix ``on_retire`` never fired, so
+        ``_INTENT_GATE_PINS`` kept the gate refcount > 0 forever and the ask
+        handler hung on its never-resolved deferred post."""
+        from channels.channel_handlers import (
+            ASK_GATES, _INTENT_GATE_PINS, maybe_retire_gate)
+        eid, drv, seq = wired["rec"].id, wired["drv"], wired["seq"]
+        rec = wired["rec"]
+        t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "gp1"))))
+        await asyncio.sleep(0.02)
+        assert seq.registry.by_request_id("gp1").state == "armed"
+        assert "gp1" in _INTENT_GATE_PINS      # gate pinned to the intent (wb2-4)
+        assert "gp1" in ASK_GATES
+
+        # Terminal via settle — no ``result``, no drain_and_prune_turn.
+        await drv.settle_all_open_questions(rec, "cancelled")
+        resp = await asyncio.wait_for(t1, timeout=1.0)
+        assert _body(resp)["ok"] is False
+
+        # The wb2-4 intent pin released (on_retire fired at the terminalize prune).
+        assert "gp1" not in _INTENT_GATE_PINS
+        # With the pin gone the gate is finally retirable (refcount 0); before
+        # the fix the leaked pin kept refcount > 0 so it could NEVER retire.
+        gate = ASK_GATES.get("gp1")
+        if gate is not None:
+            gate._resolved_at -= 61.0          # fast-forward the retention bound
+            maybe_retire_gate("gp1")
+        assert "gp1" not in ASK_GATES
+
+
+# ===========================================================================
+# wb3-4 (whole-branch gate wave 3, MINOR): the accepted D2 floor telemetry is
+# actually EMITTED (once, content-free) on the real registration/post path when
+# a button ask floors; a non-floored ask logs nothing.
+# ===========================================================================
+
+
+class TestFloorTelemetry:
+    async def test_floored_button_ask_logs_once_content_free(self, wired, caplog):
+        import logging
+        eid = wired["rec"].id
+        payload = _btn_payload(
+            eid, "flr1",
+            question="SecretQuestionZZZ?",
+            options=["ApproveZZZ", "RejectZZZ"],   # bare labels ⇒ no shorts ⇒ floor
+        )
+        with caplog.at_level(logging.INFO, logger="channels.channel_handlers"):
+            task = asyncio.ensure_future(wired["ask"](_FakeRequest(payload)))
+            await _drive_button(wired, task, "flr1")
+
+        lines = [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("floored_ask_telemetry")
+        ]
+        assert len(lines) == 1                       # EXACTLY once
+        line = lines[0]
+        assert "count=2" in line
+        assert "reason=no_shorts" in line
+        assert "shorts=00" in line
+        assert "hash=" in line
+        # CONTENT-FREE: no question / option text ever appears.
+        assert "SecretQuestionZZZ" not in line
+        assert "ApproveZZZ" not in line
+        assert "RejectZZZ" not in line
+
+    async def test_non_floored_button_ask_logs_nothing(self, wired, caplog):
+        import logging
+        eid = wired["rec"].id
+        payload = _btn_payload(
+            eid, "nf1",
+            options=[
+                {"label": "ApproveZZZ", "short": "Approve"},
+                {"label": "RejectZZZ", "short": "Reject"},
+            ],
+        )
+        with caplog.at_level(logging.INFO, logger="channels.channel_handlers"):
+            task = asyncio.ensure_future(wired["ask"](_FakeRequest(payload)))
+            await _drive_button(wired, task, "nf1")
+
+        assert not [
+            r for r in caplog.records
+            if r.getMessage().startswith("floored_ask_telemetry")
+        ]

@@ -1762,6 +1762,18 @@ def _make_ask(
                         # by the ``finally`` below (this is a non-durable exit).
                         if gate.effective()[0] == "CANCELLED":
                             return None
+                        # wb3-1: revalidate TERMINAL lifecycle in the SAME locked
+                        # section as the cancel re-read (this poster runs under the
+                        # sequencer's writer lock). A terminal latch that won the
+                        # race means the engagement is closing/closed — post
+                        # NOTHING and ledger NOTHING, so a closed engagement can
+                        # never retain a visibly-open, durably-ledgered anchor
+                        # (the completion flush would otherwise invoke this
+                        # still-PASSED poster AFTER the sole settlement pass).
+                        _seq_terminal = getattr(
+                            driver, "sequencer_is_terminal", None)
+                        if _seq_terminal is not None and _seq_terminal(eng_id):
+                            return None
                         # A6 (spec §D1, Sol r9-2): SINGLE-ATTEMPT PLAIN send — like
                         # the button-ask body, ``send_to_topic`` performs exactly
                         # ONE physical send. The rich ``send_response_to_topic``
@@ -2176,6 +2188,32 @@ def _make_ask(
                     _record_intent_cancelled(driver, eng_id, request_id)
                 return web.json_response({"ok": False, "error": "cancelled"})
             gate.set_passed()
+            # wb3-4 (D2 item 4): emit the CONTENT-FREE floor telemetry EXACTLY
+            # ONCE, here at the single validation OWNER's PASSED point (a
+            # reattacher never reaches ``set_passed``), when the whole-set button
+            # resolver FLOORED this ask. This is the accepted telemetry-gated-
+            # Haiku decision's data source (previously ``floored_ask_telemetry``
+            # was defined but never called in production). A non-floored ask logs
+            # nothing; the line carries only count/reason/bitmap/hash — never the
+            # option or question text.
+            from channels.telegram import floored_ask_telemetry_line
+            # Rebuild the SAME {label, short} combined view the resolver classifies
+            # in ``_ask_static_meta`` (``options`` here is full labels; ``shorts``
+            # the parallel agent-supplied array), so the floor decision + bitmap
+            # match the captions actually rendered.
+            _floor_combined = [
+                {
+                    "label": str(opt),
+                    "short": (
+                        shorts[i] if shorts is not None and i < len(shorts)
+                        else None
+                    ),
+                }
+                for i, opt in enumerate(options)
+            ]
+            _floor_line = floored_ask_telemetry_line(_floor_combined, multi=multi)
+            if _floor_line is not None:
+                logger.info(_floor_line)
             # F1: create-with-metadata atomically (STATIC meta seeded at creation so
             # a fast tap never sees incomplete metadata — r3-B3 fast-tap — AND a
             # concurrent reattach that created the request first still finds it

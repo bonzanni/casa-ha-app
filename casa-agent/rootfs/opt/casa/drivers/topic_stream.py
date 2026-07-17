@@ -53,6 +53,7 @@ from atomic_io import atomic_write_json
 from channels.output_sequencer import (
     APPLIED,
     ASK_TOOL,
+    DISCARDED,
     FAILED,
     SEALED,
     OutputSequencer,
@@ -822,6 +823,12 @@ class TopicStreamRelay:
         while True:
             try:
                 res = await _maybe_await(factory())
+                # wb3-2: the sequencer DISCARDED this write (engagement terminal)
+                # — a clean stop, NOT a wire failure: no retry, no drop-mode,
+                # no fail-count bump. The caller treats ``applied is False`` as
+                # "nothing landed" and advances without reposting.
+                if res is DISCARDED:
+                    return False, None
                 ok = res is not None and res is not False
             except Exception as exc:  # noqa: BLE001
                 ok = False
@@ -845,6 +852,10 @@ class TopicStreamRelay:
         ``SEALED`` (something posted below this message — §2 rollover) is NOT a
         failure: the caller opens a fresh narration message for the pending
         text. Only a ``FAILED`` wire edit counts toward the drop threshold.
+
+        wb3-2: ``DISCARDED`` (the engagement terminalized) returns ``"discarded"``
+        — the caller must NOT treat it as SEALED (which would repost the tail
+        below the terminal completion); it discards cleanly instead.
         """
         while True:
             try:
@@ -854,6 +865,9 @@ class TopicStreamRelay:
             except Exception as exc:  # noqa: BLE001
                 res = FAILED
                 logger.debug("topic stream edit op failed (will retry): %s", exc)
+            if res == DISCARDED:
+                self._fail_count = 0
+                return "discarded"
             if res == APPLIED:
                 self._fail_count = 0
                 return "applied"
@@ -915,6 +929,10 @@ class TopicStreamRelay:
                     self.cursor.message_ids[-1], value
                 )
                 if res == "dropped":
+                    return
+                if res == "discarded":
+                    # wb3-2: the engagement terminalized mid-edit — stop cleanly,
+                    # post nothing more below the terminal completion.
                     return
                 if res == "sealed":
                     # F2/R4 NO-LOSS (Sol diff gate): slice from ``_posted_len``
@@ -1373,7 +1391,16 @@ class TopicStreamRelay:
             else:
                 self._anchor_buffer = []
         coord = {"segment": list(seg), "offset": off_after}
-        if not self._dropped and self.cursor.message_ids and self._per_message_text:
+        # wb3-2: a TERMINAL engagement DISCARDS its closing edit entirely — the
+        # completion has (or will) post, and a sealed-narration repost of the
+        # unposted suffix (:1400) would land a NEW message BELOW it. The
+        # sequencer's locked writers also discard (belt-and-suspenders for a
+        # terminalization that races this block), but skipping here keeps the
+        # intent explicit and avoids a needless sealed-repost attempt.
+        if (
+            not self._dropped and not self._is_terminal()
+            and self.cursor.message_ids and self._per_message_text
+        ):
             # B2 (Sol r1): the closing edit carries this turn's FINAL fragment,
             # so it honors the at-least-once retry/drop contract via
             # ``_apply_seq_edit``. Only after it lands (APPLIED/SEALED-then-new),

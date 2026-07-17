@@ -1214,6 +1214,21 @@ class ClaudeCodeDriver(DriverProtocol):
         # must complete their SIGKILL escalation + extinction verification. They
         # self-retire via their own done-callback; teardown just leaves them.
         # v0.79.0 (§2): drop the sequencer (its watcher task is cancelled above).
+        # wb3-3: TERMINALIZE it FIRST — abort any unresolved intent + prune the
+        # registry (firing every ``on_retire``) so the wb2-4 validation-gate pins
+        # release even on a teardown path that bypassed
+        # ``settle_all_open_questions`` (a terminal transition before the relay
+        # ever processed ``result``). Idempotent — a no-op if settle already
+        # terminalized. Must complete BEFORE the pop, so the pruned registry is
+        # the one being dropped.
+        seq = self._sequencers.get(engagement.id)
+        if seq is not None:
+            try:
+                await seq.terminalize()
+            except Exception:  # noqa: BLE001 — teardown hygiene, never abort
+                logger.debug(
+                    "engagement %s: sequencer terminalize at teardown failed",
+                    engagement.id[:8], exc_info=True)
         self._sequencers.pop(engagement.id, None)
         # v0.79.0 (§5): drop the summary controller and cancel its elapsed tick
         # (not in self._tasks — the controller owns it).
@@ -3633,6 +3648,20 @@ class ClaudeCodeDriver(DriverProtocol):
         discharge). Best-effort per entry — never raises into the finalize funnel.
         Called getattr-tolerantly by ``tools._finalize_engagement``."""
         eng_id = engagement.id
+        # wb3-1/wb3-2/wb3-3: LATCH the sequencer TERMINAL before settling. This
+        # runs BEFORE this method enumerates the open-question ledger AND before
+        # the later ``finalize_completion_post`` flush, so: (a) any still-armed
+        # anchor poster is aborted here and never posts + ledgers a question the
+        # settle pass would then miss (BLOCKER wb3-1); (b) an in-flight poster's
+        # ledger entry has already landed (the writer lock serializes it ahead of
+        # us) and IS included in the settle pass below; (c) the intent registry
+        # is pruned, firing every ``on_retire`` so the wb2-4 validation-gate pins
+        # release even if the relay never processes ``result`` (wb3-3); and (d)
+        # late relay narration is discarded (wb3-2). Idempotent + serialized
+        # against posters via the writer lock.
+        seq = self._sequencers.get(eng_id)
+        if seq is not None:
+            await seq.terminalize()
         # Discharge the re-anchor obligation: nothing to keep last once terminal.
         self._reanchor_due.discard(eng_id)
         self._retire_reanchor_retry(eng_id)
@@ -3661,6 +3690,15 @@ class ClaudeCodeDriver(DriverProtocol):
                     logger.warning(
                         "engagement %s: terminal open-question settle failed "
                         "(n=%s)", eng_id[:8], q.get("n"), exc_info=True)
+
+    def sequencer_is_terminal(self, engagement_id: str) -> bool:
+        """wb3-1: ``True`` once the engagement's sequencer has TERMINALIZED (the
+        persistent latch). The anchor poster consults this under the writer lock
+        (in the same locked section as its cancel-latch re-read) so it never
+        posts + ledgers a question on a closing/closed engagement. ``False`` when
+        there is no live sequencer."""
+        seq = self._sequencers.get(engagement_id)
+        return seq is not None and seq.is_terminal()
 
     def set_engagement_reply_anchor(
         self, engagement_id: str, message_id: int,

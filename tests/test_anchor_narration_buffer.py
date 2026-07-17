@@ -893,3 +893,86 @@ async def test_abnormal_spawn_crash_between_event_and_checkpoint_redelivers(
 
     assert ("spawn", {"epoch": 9}) in events2                # RE-DELIVERED
     assert StreamCursor.load(cursor).hold_pending is False   # cleared on recovery
+
+
+# ===========================================================================
+# wb3-2 (whole-branch gate wave 3): terminal narration DISCARD is revalidated
+# INSIDE the sequencer writer lock (one truth source = the terminal latch), so
+# neither a write blocked on the lock at the instant of terminalization nor a
+# throttled/unposted suffix at ``_finalize`` can land BELOW the terminal
+# completion. Both of Sol's forced probes, adapted to the real ``terminalize``
+# latch + a seam wired to ``seq.is_terminal()``.
+# ===========================================================================
+
+
+async def test_terminal_discards_narration_blocked_on_writer_lock(tmp_path):
+    """Probe 1 (writer-lock inversion): a relay narration write BLOCKED on the
+    sequencer writer lock when the engagement terminalizes must be DISCARDED
+    inside the lock — never posted below the terminal completion. Before the
+    fix the write's outside-lock terminal check passed, then it acquired the
+    lock and posted ``['terminal completion', 'late narration']``."""
+    rec, events = Recorder(), []
+    seq, _clock = _fast_sequencer(rec)
+    relay = _make_relay(
+        tmp_path, tmp_path / ".stream_cursor.json", rec, events,
+        sequencer=seq, engagement_terminal=lambda: seq.is_terminal(),
+    )
+    async with seq.serialized():
+        # The relay's narration write blocks INSIDE open_narration on the writer
+        # lock this task holds.
+        late = asyncio.create_task(relay._append_narration("late narration", [], 0))
+        await asyncio.sleep(0)
+        assert not late.done()                      # parked on the writer lock
+        # Terminalize (reentrant under the held lock), then post the completion.
+        await seq.terminalize()
+        await seq.post_platform_notice("terminal completion")
+    await late
+
+    assert _narration_sends(rec) == ["terminal completion"]
+    assert "late narration" not in _narration_sends(rec)
+
+
+async def test_terminal_finalize_discards_unposted_suffix(tmp_path):
+    """Probe 2 (throttled suffix at finalize): a never-posted narration suffix
+    must NOT be reposted as a NEW message below the terminal completion at
+    ``_finalize`` once terminal. Before the fix ``_finalize`` saw the narration
+    SEALED (by the completion) and reposted the unposted tail →
+    ``['prefix', 'terminal completion', ' LATE']``."""
+    rec, events = Recorder(), []
+    seq, _clock = _fast_sequencer(rec)
+    relay = _make_relay(
+        tmp_path, tmp_path / ".stream_cursor.json", rec, events,
+        sequencer=seq, engagement_terminal=lambda: seq.is_terminal(),
+    )
+    mid = await seq.open_narration("prefix")
+    # Model a throttled hold: the wire shows "prefix" (6 chars) but the relay
+    # holds an unposted " LATE" suffix in ``_per_message_text``.
+    relay.cursor.message_ids = [mid]
+    relay.cursor.message_text_lens = [6]
+    relay._per_message_text = "prefix LATE"
+    relay._posted_len = 6
+
+    await seq.terminalize()
+    await seq.post_platform_notice("terminal completion")
+    await relay._finalize([], 1)
+
+    assert _narration_sends(rec) == ["prefix", "terminal completion"]
+    assert " LATE" not in _narration_sends(rec)
+
+
+async def test_terminal_latch_discards_via_sequencer_writers(tmp_path):
+    """The latch is the ONE truth source consulted inside the locked writers:
+    once terminalized, ``open_narration`` / ``edit_narration_if_latest`` return
+    DISCARDED and ``post_unless_anchor_open`` holds — directly, with no relay."""
+    from channels.output_sequencer import DISCARDED
+    rec, _clock = Recorder(), None
+    seq, _clock = _fast_sequencer(rec)
+    mid = await seq.open_narration("live")
+    assert isinstance(mid, int)
+    await seq.terminalize()
+    assert seq.is_terminal() is True
+    assert await seq.open_narration("after") == DISCARDED
+    assert await seq.edit_narration_if_latest(mid, "edited") == DISCARDED
+    # A platform notice (the terminal completion / settlement) STILL posts.
+    assert await seq.post_platform_notice("completion") is not None
+    assert _narration_sends(rec) == ["live", "completion"]

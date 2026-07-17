@@ -297,6 +297,12 @@ class IntentRegistry:
             and i.message_id is None
         ]
 
+    def all_intents(self) -> list[SendIntent]:
+        """A stable snapshot of every registered intent/tombstone in ``seq``
+        order (wb3-1/wb3-3: ``terminalize`` iterates this to abort unresolved
+        intents before pruning)."""
+        return list(self._by_seq)
+
     def has_any_matchable(self) -> bool:
         """True iff any intent/tombstone is still matchable — i.e. a discrete
         ingress is currently active for this engagement. Used to keep the slot
@@ -379,6 +385,12 @@ def _discrete_markup_tristate(markup: Any) -> Any:
 APPLIED = "applied"
 SEALED = "sealed"
 FAILED = "failed"
+# wb3-2 (whole-branch gate wave 3): a narration write REFUSED because the
+# engagement has TERMINALIZED (the sequencer terminal latch is set). Distinct
+# from FAILED (a wire error → retry/drop) and SEALED (rollover → repost below):
+# a DISCARDED write must be dropped cleanly with NO retry, NO drop-mode, and NO
+# repost — nothing may land below the terminal completion (D5 discard doctrine).
+DISCARDED = "discarded"
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +448,14 @@ class OutputSequencer:
         self._hold_poll_s = hold_poll_s
 
         self._lock = asyncio.Lock()
+        # wb3-1/wb3-2/wb3-3 (whole-branch gate wave 3): the persistent TERMINAL
+        # LATCH. Set once by :meth:`terminalize` (under the writer lock) when the
+        # engagement flips terminal; never cleared. It is the ONE truth source
+        # consulted INSIDE the writer lock by every narration writer (discard —
+        # nothing posts below the terminal completion, wb3-2), by the anchor
+        # poster's wire re-read (never post + ledger a question on a closed
+        # engagement, wb3-1), and by the relay's terminal seam.
+        self._terminal = False
         # REENTRANT-PER-TASK ownership (Sol diff gate r2). The task currently
         # inside the serialization lock, or None. A poster the sequencer awaits
         # WHILE holding the lock (seal-narration + post is atomic) may call back
@@ -540,10 +560,25 @@ class OutputSequencer:
     def high_water(self) -> int | None:
         return self._high_water
 
-    async def open_narration(self, text: str) -> int | None:
+    def is_terminal(self) -> bool:
+        """wb3-1/wb3-2: ``True`` once :meth:`terminalize` has latched this
+        engagement terminal. A plain synchronous read of the persistent latch —
+        the anchor poster (already under the writer lock) and the relay's
+        terminal seam both consult it as the single truth source."""
+        return self._terminal
+
+    async def open_narration(self, text: str) -> "int | None | str":
         """Post a NEW narration message; it becomes the open narration and the
-        high-water mark."""
+        high-water mark.
+
+        wb3-2: returns :data:`DISCARDED` (posting NOTHING) when the terminal
+        latch is set — re-checked HERE, inside the writer lock, so a write that
+        was blocked on the lock at the instant of terminalization is discarded
+        rather than landing below the terminal completion (the TOCTOU a bare
+        outside-lock seam read leaves open)."""
         async with self._serialized():
+            if self._terminal:
+                return DISCARDED
             return await self._open_narration_locked(text)
 
     async def _open_narration_locked(self, text: str) -> int | None:
@@ -576,6 +611,8 @@ class OutputSequencer:
         the cache entry so a retry is never suppressed.
         """
         async with self._serialized():
+            if self._terminal:
+                return DISCARDED  # wb3-2: terminal ⇒ no edit lands below completion
             if msg_id != self._narration_msg_id or msg_id != self._high_water:
                 return SEALED
             tri = _markup_tristate(markup)
@@ -615,6 +652,12 @@ class OutputSequencer:
         open (⇒ held), or the narration posts first and the anchor lands below it
         (correct order). Returns :data:`"held"` or :data:`"posted"`."""
         async with self._serialized():
+            # wb3-2: terminal ⇒ HOLD (post nothing). The relay's ``result``-time
+            # flush-vs-discard drops the held buffer for a terminal engagement,
+            # so treating a terminal latch like an open anchor discards this
+            # prose without it ever reaching the wire below the completion.
+            if self._terminal:
+                return "held"
             state = await _maybe_await(seam()) if seam is not None else None
             if state is not None:
                 return "held"
@@ -1186,6 +1229,73 @@ class OutputSequencer:
             self.registry.prune()
             self._turn_reply_to = None
             self._seal_narration_locked()
+
+    async def terminalize(self) -> None:
+        """wb3-1/wb3-2/wb3-3: latch the engagement TERMINAL, abort every
+        unresolved intent, and PRUNE the registry — all under the ONE writer
+        lock, idempotent.
+
+        Called at the START of the terminal finalize funnel (the driver's
+        ``settle_all_open_questions``), and again as a backstop at sequencer
+        teardown before ``_sequencers.pop``. What it guarantees:
+
+        * **wb3-2 latch.** Sets :attr:`_terminal`, after which every locked
+          narration writer (``open_narration`` / ``edit_narration_if_latest`` /
+          ``post_unless_anchor_open``) DISCARDS rather than writing — nothing
+          can land below the terminal completion, even a write that was blocked
+          on the writer lock at the instant of terminalization.
+
+        * **wb3-1 (c) in-flight poster wins.** Acquiring the writer lock waits
+          for any poster CURRENTLY mid-post (a poster holds the lock across its
+          whole wire send + ``add_open_question`` ledger write). So when this
+          runs, that poster has already durably ledgered its question, and the
+          settlement pass that follows this call includes it.
+
+        * **wb3-1 (a) abort unresolved.** A still-pending / armed-but-unposted
+          intent (no recorded outcome, not posted) is ABORTED: tombstoned,
+          retired from matching (``post_failed`` — so a later ``flush_armed_
+          intents`` / relay block never invokes its poster), resolved
+          ``ok:false`` so its fail-closed awaiter wakes. It never posts, so it
+          never ledgers a question the closed engagement would retain.
+
+        * **wb3-1 (b) reject late registrations** — enforced by the poster's own
+          terminal re-read and the latch on the narration writers.
+
+        * **wb3-3 release gate pins.** Pruning fires every intent's
+          ``on_retire`` hook EXACTLY once (the wb2-4 validation-gate pin
+          release), so a terminal transition that precedes the relay's
+          ``result`` can never leave a gate pinned forever.
+        """
+        async with self._serialized():
+            if self._terminal:
+                return
+            self._terminal = True
+            for intent in self.registry.all_intents():
+                # Leave anything already resolved / posted / retired untouched —
+                # its accounting (incl. an in-flight poster's just-landed ledger
+                # entry) stands.
+                if (
+                    intent.consumed
+                    or intent.post_failed
+                    or intent.outcome is not None
+                    or intent.state == "posted"
+                ):
+                    continue
+                # Pending or armed-and-unposted → ABORT (never posts).
+                self.registry.cancel(intent.request_id)  # → tombstone
+                intent.post_failed = True                # retire from matching
+                intent.outcome = {
+                    "ok": False, "message_id": None, "terminal": True,
+                }
+                self._signal_resolution(intent.request_id)
+            # Wake every outstanding awaiter, then PRUNE (fires on_retire once
+            # per intent) so the gate pins release before the sequencer is
+            # dropped — even if the relay never processes ``result`` (wb3-3).
+            for ev in self._resolution_events.values():
+                ev.set()
+            self._resolution_events.clear()
+            self.registry.prune()
+            self._turn_reply_to = None
 
     # -- discrete posting driven by the relay at a content-block ------------
 
