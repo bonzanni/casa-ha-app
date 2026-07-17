@@ -315,10 +315,11 @@ class VoiceChannel(Channel):
 
         # Rate limit BEFORE opening the SSE stream (spec 5.2 §8).
         if self._rate_limiter is not None and self._rate_limiter.enabled:
-            decision = self._rate_limiter.check(scope_id)
+            decision = self._rate_limiter.check((agent_role, scope_id))
             if not decision.allowed:
                 logger.info(
-                    "Voice SSE rate limit hit for scope_id=%s", scope_id,
+                    "Voice SSE rate limit hit for role=%s scope_id=%s",
+                    agent_role, scope_id,
                 )
                 response = web.StreamResponse(
                     status=200,
@@ -694,11 +695,12 @@ class VoiceChannel(Channel):
 
         # Rate limit BEFORE dispatching to the agent (spec 5.2 §8).
         if self._rate_limiter is not None and self._rate_limiter.enabled:
-            decision = self._rate_limiter.check(scope_id)
+            decision = self._rate_limiter.check((agent_role, scope_id))
             if not decision.allowed:
                 logger.info(
-                    "Voice WS rate limit hit for scope_id=%s utterance_id=%s",
-                    scope_id, uid,
+                    "Voice WS rate limit hit for role=%s scope_id=%s "
+                    "utterance_id=%s",
+                    agent_role, scope_id, uid,
                 )
                 adapter = TagDialectAdapter(cfg.tts.tag_dialect)
                 line = VoiceChannel._error_line_for_kind(cfg, "rate_limit")
