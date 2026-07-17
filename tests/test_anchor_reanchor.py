@@ -531,14 +531,22 @@ class TestCrashResidual:
 # ===========================================================================
 
 
-async def _pump(cond, limit: int = 500) -> None:
-    """Yield to the loop until *cond()* holds (bounded), so a test can observe a
-    real wire op suspended at a controlled gate without a fixed sleep."""
-    for _ in range(limit):
-        if cond():
-            return
+async def _pump(cond, timeout: float = 5.0) -> None:
+    """Yield to the loop until *cond()* holds, so a test can observe a real
+    wire op suspended at a controlled gate without a fixed sleep.
+
+    Bounded by WALL-CLOCK time (not a fixed iteration count): the registry
+    behind ``cond`` does real tmp-file I/O, so on a loaded/slow runner a
+    handful of scheduler turns can span much more real time than on a fast
+    box. A generous 5s budget keeps this cheap when fast (resolves in a
+    handful of turns) and tolerant when slow, without weakening the check —
+    it still raises the same AssertionError if the condition never fires."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not cond():
+        if loop.time() >= deadline:
+            raise AssertionError("condition not reached")
         await asyncio.sleep(0)
-    raise AssertionError("condition not reached")
 
 
 async def _park_forever(_d: float) -> None:
