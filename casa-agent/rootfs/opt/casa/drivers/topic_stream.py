@@ -52,6 +52,7 @@ from typing import Any, Awaitable, Callable
 from atomic_io import atomic_write_json
 from channels.output_sequencer import (
     APPLIED,
+    ASK_TOOL,
     FAILED,
     SEALED,
     OutputSequencer,
@@ -381,6 +382,12 @@ EditMessage = Callable[[int, int, str], Awaitable[bool]]
 DeleteMessage = Callable[[int, int], Awaitable[bool]]
 OnTurnEvent = Callable[[str, dict], Any]
 ReplyTexts = Callable[[], Any]
+# D5 (spec "Successful-anchor identity comes from the DRIVER"): the driver-
+# injected seam reading the LEDGER + answered-overlay + reservation truth.
+# Returns ``(question_number, tg_message_id)`` for the oldest genuinely open,
+# unanswered free-text anchor, or ``None``. Same injection style as
+# ``on_turn_event``; default ``None`` (below) leaves the feature inert.
+OpenAnchorState = Callable[[], "tuple[int, int] | None"]
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -418,6 +425,7 @@ class TopicStreamRelay:
         reply_texts: ReplyTexts,
         edit_throttle: float = 1.0,
         sequencer: "OutputSequencer | None" = None,
+        open_anchor_state: "OpenAnchorState | None" = None,
         _now: Callable[[], float] = time.monotonic,
         _sleep: Callable[[float], Awaitable[None]] = _default_sleep,
     ) -> None:
@@ -439,6 +447,7 @@ class TopicStreamRelay:
         self.delete_message = delete_message
         self.on_turn_event = on_turn_event
         self.reply_texts = reply_texts
+        self.open_anchor_state = open_anchor_state
         self._edit_throttle = edit_throttle
         self._now = _now
         self._sleep = _sleep
@@ -490,6 +499,16 @@ class TopicStreamRelay:
         # resuming there would re-read and duplicate the held suffix, Sol r1-1).
         self._warm = False
         self._read_coord: dict | None = None
+        # D5 anchor-candidate + arming (Task C1 — buffering/flush is C2, the
+        # ``hold_pending`` marker is C3). ``_anchor_candidate`` is the
+        # ``(tool_name, block_hash)`` of this turn's matching free-text-anchor
+        # ask block (recorded regardless of ``post_for_block``'s return);
+        # ``_suppressing_for`` is the ARMED ``(question_number, tg_message_id)``
+        # once ``open_anchor_state`` confirms the candidate's anchor is
+        # genuinely open-and-unanswered. Never persisted; reset every turn
+        # boundary (``_reset_turn_state``).
+        self._anchor_candidate: tuple[str, str] | None = None
+        self._suppressing_for: tuple[int, int] | None = None
 
     # -- persistence helpers ------------------------------------------------
 
@@ -857,6 +876,7 @@ class TopicStreamRelay:
 
     async def _post_text(self, text: str, seg, off_after: int) -> None:
         """Text-only streaming path: throttle + single frame-end checkpoint."""
+        await self._maybe_arm_suppression()
         self._turn_text += text
         if self._dropped:
             self._advance_dropped(seg, off_after)
@@ -891,6 +911,7 @@ class TopicStreamRelay:
     async def _append_narration(self, text: str) -> None:
         """Append narration text WITHOUT throttle or checkpoint (used by the
         block-ordered mixed-frame path, which checkpoints once at frame end)."""
+        await self._maybe_arm_suppression()
         self._turn_text += text
         if self._dropped:
             return
@@ -913,12 +934,49 @@ class TopicStreamRelay:
             # Non-serializable tool_input can never match a hashed intent.
             return
         try:
-            await self.sequencer.post_for_block(name, block_hash)
+            status = await self.sequencer.post_for_block(name, block_hash)
         except Exception as exc:  # noqa: BLE001 — discrete posting is best-effort
             logger.warning(
                 "topic stream discrete-post match failed for engagement %s "
                 "(tool=%s): %s", self.engagement_id, name, exc,
             )
+            return
+        # D5 (Sol r3-6, "Arming survives out-of-band posting"): every matching
+        # free-text-anchor ask block (the tool's own bare-question, no
+        # ``options`` — a button ask blocks the turn anyway, spec §D5 scope)
+        # records a per-turn anchor-candidate REGARDLESS of
+        # ``post_for_block``'s return. ``"posted"`` alone is NOT proof the
+        # anchor is genuinely open (an armed intent reports ``"posted"`` even
+        # when its poster recorded a FAILURE outcome — §D5 "Successful-anchor
+        # identity comes from the DRIVER"); ``"slot_timeout"``/
+        # ``"debt_consumed"`` cover the late/out-of-band posting orderings
+        # (§D5 "Arming survives out-of-band posting"). The candidate is only
+        # the TRIGGER to re-consult the driver-injected ``open_anchor_state``
+        # seam — the actual ARM decision trusts ONLY the seam (see
+        # ``_maybe_arm_suppression``, called before the next text frame and
+        # again at ``result``).
+        if (
+            name == ASK_TOOL
+            and not tool_input.get("options")
+            and status in ("posted", "slot_timeout", "debt_consumed")
+        ):
+            self._anchor_candidate = (name, block_hash)
+
+    async def _maybe_arm_suppression(self) -> None:
+        """Re-read ``open_anchor_state`` and ARM suppression the moment this
+        turn's anchor-candidate resolves to a genuinely open, unanswered
+        anchor (§D5). Called before processing each subsequent text frame and
+        again at ``result``. Task C1 scope: arming ONLY — the buffered-prose
+        consumer (flush/discard) is Task C2, so arming is behavior-neutral
+        here. No-op once armed, when there is no candidate, or when the seam
+        was not injected (default ``None`` = feature inert)."""
+        if self._suppressing_for is not None or self._anchor_candidate is None:
+            return
+        if self.open_anchor_state is None:
+            return
+        state = await _maybe_await(self.open_anchor_state())
+        if state is not None:
+            self._suppressing_for = (state[0], state[1])
 
     async def _handle_assistant_blocks(
         self, blocks: list[tuple], seg, off_after: int,
@@ -975,6 +1033,9 @@ class TopicStreamRelay:
         self._dropped = False
         self._drop_warned = False
         self._last_edit_ts = float("-inf")
+        # §D5: turn boundaries reset candidate/arming state.
+        self._anchor_candidate = None
+        self._suppressing_for = None
 
     async def _finalize(self, seg, off_after: int) -> None:
         """Route the closing edit through ``edit_narration_if_latest`` (§2:612),
@@ -988,6 +1049,9 @@ class TopicStreamRelay:
         a conservative seal after process recovery), the closing state posts as
         a NEW message instead of editing one with content under it.
         """
+        # §D5: re-consult the seam AGAIN at result (an answer that arrived
+        # during the turn, or a late anchor post, may only now resolve).
+        await self._maybe_arm_suppression()
         coord = {"segment": list(seg), "offset": off_after}
         if not self._dropped and self.cursor.message_ids and self._per_message_text:
             # B2 (Sol r1): the closing edit carries this turn's FINAL fragment,

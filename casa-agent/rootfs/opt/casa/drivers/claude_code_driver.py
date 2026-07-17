@@ -3212,6 +3212,14 @@ class ClaudeCodeDriver(DriverProtocol):
         """
         from drivers.topic_stream import TopicStreamRelay
 
+        # §D5 ("Successful-anchor identity comes from the DRIVER"): the SAME
+        # truth source the A3 reply/stacking gates use — persisted ``answered``
+        # ∪ overlay ∪ reservation excluded — reused verbatim as the relay's
+        # injected seam.
+        def _open_anchor_state() -> tuple[int, int] | None:
+            entry = self.effective_open_anchor(engagement.id)
+            return (entry["n"], entry["tg_message_id"]) if entry else None
+
         ws = Path(self._engagements_root) / engagement.id
         relay = TopicStreamRelay(
             engagement_id=engagement.id,
@@ -3229,6 +3237,7 @@ class ClaudeCodeDriver(DriverProtocol):
             # v0.79.0 (§2): the SHARED per-engagement sequencer, so the relay
             # and the discrete ingresses agree on ordering + high-water.
             sequencer=self._ensure_sequencer(engagement),
+            open_anchor_state=_open_anchor_state,
         )
         while True:
             try:
