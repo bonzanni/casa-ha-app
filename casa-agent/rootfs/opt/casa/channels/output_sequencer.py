@@ -1164,6 +1164,17 @@ class OutputSequencer:
                 "post_discrete requires an injected send_message_markup wire "
                 "primitive (driver _ensure_sequencer wiring)")
         async with self._serialized():
+            # wb5-1 (whole-branch gate wave 5): consult the TERMINAL latch under
+            # the writer lock — the same DISCARDED/refusal semantics the wave-3
+            # narration writers got — so a discrete send whose pass crossed
+            # terminalization mid-flight (or any caller without a terminal-aware
+            # ``revalidate``) posts NOTHING below the terminal completion. Returns
+            # ``None`` (no send, no state change), which the re-anchor unit treats
+            # as an un-confirmed send and floors without a wire retry. Belt-and-
+            # suspenders with the driver's D6 pass-entry + locked-revalidate
+            # terminal guard.
+            if self._terminal:
+                return None
             if revalidate is not None and not await _maybe_await(revalidate()):
                 return None
             self._seal_narration_locked()

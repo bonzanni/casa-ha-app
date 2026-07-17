@@ -1905,3 +1905,73 @@ class TestCancelDrainsReanchorOwner:
         assert any(
             "terminal teardown drops unconfirmed re-anchor pair" in r.getMessage()
             for r in caplog.records)
+
+
+# ===========================================================================
+# wb5-1 (whole-branch gate wave 5): a terminal engagement's RETAINED anchor
+# (an unconfirmed settle edit keeps the ledger entry) must NOT be re-anchored
+# by a boundary consumer that acquired the maintenance lock AFTER the sole
+# terminal-settlement pass. The D6 re-anchor refuses to SEND once EITHER
+# terminal condition holds (the record flipped terminal OR the sequencer
+# latched), and ``post_discrete`` backstops that under the writer lock. Without
+# the guard a full open question reposts + persists as current on a CLOSED
+# engagement, and ``cancel()`` never re-runs settlement to clean it up.
+# ===========================================================================
+
+
+class TestTerminalReanchorRefusal:
+    async def test_terminal_retained_anchor_not_reanchored_after_settle(
+        self, tmp_path,
+    ):
+        # Sol's deterministic repro (inverted assertions): a terminal settle
+        # with a FAILING (unconfirmed) edit retains the anchor; a later boundary
+        # consumer must find the obligation already discharged and post NOTHING.
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500, text="Q1: DB name?")
+        wire = _Wire(edit_ok=False)   # every settle edit stays unconfirmed
+        drv = _make_driver(tmp_path, reg, wire)
+        seq = drv._ensure_sequencer(rec)
+        seq._high_water = 600         # anchor 500 is NOT last ⇒ would re-anchor
+        rec.status = "cancelled"
+
+        await drv.settle_all_open_questions(rec, "cancelled")
+        assert seq.is_terminal()
+        # Unconfirmed edit ⇒ ledger entry RETAINED, still pointing at 500.
+        entry = _entry(reg, rec, n)
+        assert entry is not None
+        assert entry["tg_message_id"] == 500
+        assert wire.posts == []       # settle only edits, never posts
+
+        # A relay ``result``/rollback boundary consumer runs AFTER settlement.
+        await drv._consume_reanchor(rec)
+
+        # No repost; ledger mid UNCHANGED — no open question resurrected on the
+        # closed engagement (the buggy behaviour reposted the full body and
+        # persisted the new mid as current).
+        assert wire.posts == []
+        assert _entry(reg, rec, n)["tg_message_id"] == 500
+
+    async def test_boundary_consumer_queued_behind_terminal_settlement(
+        self, tmp_path,
+    ):
+        # Ordering variant Sol names: the consumer is ALREADY queued (concurrent
+        # with) the sole terminal-settlement pass on the ask-maintenance lock. In
+        # EVERY interleaving the record is already terminal and the sequencer
+        # latches at settlement entry, so the consumer must decline regardless of
+        # which task wins the lock.
+        reg, rec = await _make_registry(tmp_path)
+        n = await _add_anchor(reg, rec, mid=500, text="Q1: DB name?")
+        wire = _Wire(edit_ok=False)
+        drv = _make_driver(tmp_path, reg, wire)
+        seq = drv._ensure_sequencer(rec)
+        seq._high_water = 600
+        rec.status = "cancelled"
+
+        settle = asyncio.ensure_future(
+            drv.settle_all_open_questions(rec, "cancelled"))
+        consumer = asyncio.ensure_future(drv._consume_reanchor(rec))
+        await asyncio.gather(settle, consumer)
+
+        assert seq.is_terminal()
+        assert wire.posts == []
+        assert _entry(reg, rec, n)["tg_message_id"] == 500

@@ -3110,6 +3110,21 @@ class ClaudeCodeDriver(DriverProtocol):
             # re-anchor. Treat as nothing we can do (degraded); the boot
             # reconciler is the eventual backstop.
             return True
+        # wb5-1 (whole-branch gate wave 5): REFUSE the re-anchor SEND once EITHER
+        # terminal condition holds — the engagement RECORD flipped terminal
+        # (``_record_is_terminal``, reused from wave 2) or the sequencer LATCHED
+        # (``seq.is_terminal()``). Terminal ``settle_all_open_questions`` owns the
+        # retained stale copy (an unconfirmed settle edit keeps the ledger entry);
+        # a relay ``result``/rollback boundary consumer that acquired the
+        # ask-maintenance lock AFTER the sole settlement pass must NOT repost the
+        # full question and persist it live on a CLOSED engagement — ``cancel()``
+        # never re-runs settlement to clean it up. Checked at pass entry HERE AND
+        # again inside the locked ``_revalidate`` immediately before the send, so a
+        # pass crossing terminalization mid-flight still declines. The obligation
+        # is CONSUMED (settlement discharged it), so return True to clear the
+        # latch, matching the ``already-last`` / ``nothing-owed`` exits above.
+        if self._record_is_terminal(eng_id) or seq.is_terminal():
+            return True
         hw = seq.high_water
         # Already LAST (nothing posted below it this turn) ⇒ nothing owed. A
         # ``None`` high-water means the sequencer recorded no post at/after the
@@ -3162,6 +3177,15 @@ class ClaudeCodeDriver(DriverProtocol):
 
         def _revalidate() -> bool:
             nonlocal declined
+            # wb5-1: terminalization can land between the pass-entry guard and
+            # this locked pre-send check (a settlement pass running concurrently
+            # with our boundary consumer). Decline the send if EITHER terminal
+            # condition now holds — treated exactly like an answer winning the
+            # revalidation race (nothing owed), so no copy lands on a closing/
+            # closed engagement.
+            if self._record_is_terminal(eng_id) or seq.is_terminal():
+                declined = True
+                return False
             cur = self._oldest_unanswered_anchor(eng_id, exclude_reserved=True)
             still = cur is not None and cur.get("n") == n
             if not still:
