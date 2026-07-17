@@ -266,6 +266,29 @@ def maybe_retire_gate(request_id: str) -> bool:
     return True
 
 
+def _sweep_retirable_gates() -> None:
+    """A5 review, Finding 1: opportunistically retire every CURRENTLY-
+    retirable gate in :data:`ASK_GATES`.
+
+    ``maybe_retire_gate`` alone never actually fires in production: it is
+    only ever called at an ask's OWN ``finally`` (or ``ask_cancel``),
+    microseconds after that SAME gate's own resolution — nowhere near the
+    60s :func:`_reattach_retention_bound`, so that self-check is always a
+    no-op and every ask leaks one gate into ``ASK_GATES`` forever
+    (reviewer-verified empirically: "retired at finally? False | still in
+    ASK_GATES? True; ASK_GATES size after one successful ask: 1").
+
+    The fix is not a new TTL/sweep-thread mechanism — it is calling the
+    SAME ``maybe_retire_gate`` speculative check against EVERY gate, not
+    just the current request's own, at the entry of the next ask/
+    ask_cancel call. By the time a LATER call runs, an EARLIER gate's bound
+    has had a real chance to elapse. ``ASK_GATES`` stays small in practice
+    (few in-flight + recently-resolved asks), so this is O(gates) per ask,
+    not O(all asks ever)."""
+    for rid in list(ASK_GATES):
+        maybe_retire_gate(rid)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1467,6 +1490,14 @@ def _make_ask(
                 ),
             }
 
+        # A5 review, Finding 1: sweep every currently-retirable gate from a
+        # PRIOR ask before creating/finding THIS request's own gate — see
+        # ``_sweep_retirable_gates`` for why this (not this call's own
+        # ``finally``) is where retirement actually has a chance to fire.
+        # No await between this and the lookup below, so no other coroutine
+        # can interleave and observe ``request_id``'s gate mid-sweep.
+        _sweep_retirable_gates()
+
         # ---- Validation gate (spec §D1, Task A5) --------------------------
         # Create/find the per-request_id gate BEFORE any intent/allocation/
         # broker record. NO path (owner or reattacher) registers a broker
@@ -2334,7 +2365,25 @@ def _make_ask(
             # retire (a still-referenced or not-yet-elapsed gate is never
             # dropped, so a late reattacher can still find the resolved gate).
             gate.release()
-            maybe_retire_gate(request_id)
+            if not _validation_owner and gate.effective()[0] == "PENDING":
+                # A5 review, Finding 1 (second half): this call exited
+                # WITHOUT ever becoming the validation owner (e.g.
+                # ``unknown_engagement`` / ``engagement_terminal``, checked
+                # before ownership is ever claimed) AND without publishing
+                # anything to the gate — it is still PENDING. ``retirable()``
+                # would never fire for it: ``_resolved_at`` stays ``None``
+                # forever, so the bound-based sweep can never catch it
+                # either. But since no owner was ever registered in
+                # ``_ASK_VALIDATION_OWNERS`` for this request_id, no
+                # reattacher can possibly be blocked on this gate's event —
+                # it carries no terminal outcome worth retaining (a retry
+                # just re-derives ``unknown_engagement``/``engagement_terminal``
+                # deterministically from the registry). Drop it outright,
+                # once unreferenced, instead of leaking it forever.
+                if gate.refcount == 0 and ASK_GATES.get(request_id) is gate:
+                    del ASK_GATES[request_id]
+            else:
+                maybe_retire_gate(request_id)
 
     return handler
 
@@ -2467,6 +2516,11 @@ def _make_ask_cancel() -> Handler:
         request_id = body.get("request_id")
         if not eng_id or not request_id:
             return web.json_response({"ok": False, "error": "invalid_args"})
+
+        # A5 review, Finding 1: sweep prior asks' currently-retirable gates
+        # here too — ``ask_cancel`` is the other entry point that calls
+        # ``get_or_create_gate`` (see ``_sweep_retirable_gates``).
+        _sweep_retirable_gates()
 
         # Latch cancellation FIRST (get-or-create so a cancel-before-ask still
         # creates the tombstone the later /ask will find) — this wakes any

@@ -1757,3 +1757,205 @@ class TestRefcountedRetention:
         assert gate.retirable() is False
         clock.advance(0.2)
         assert gate.retirable() is True
+
+
+# ===========================================================================
+# A5 review, Finding 1 — ASK_GATES grows unbounded. ``maybe_retire_gate`` is
+# only ever called at an ask's OWN ``finally`` / ``ask_cancel``, microseconds
+# after that SAME gate's own resolution — the 60s ``retirable()`` bound is
+# never elapsed yet, so retirement there is ALWAYS a no-op and every ask
+# leaks one gate permanently (reviewer-verified empirically: "retired at
+# finally? False | still in ASK_GATES? True; ASK_GATES size after one
+# successful ask: 1"). Fix: sweep every CURRENTLY-retirable gate in
+# ``ASK_GATES`` at the entry of the NEXT ask/ask_cancel call (before that
+# call's own ``get_or_create_gate``) — by the time a LATER call runs, the
+# EARLIER gate's bound has had a real chance to elapse.
+# ===========================================================================
+
+
+class TestSweepRetirableGatesUnit:
+    """Unit-level coverage of ``_sweep_retirable_gates`` against the gate
+    primitive directly (injected clocks, no HTTP handler involved) — the
+    same pattern ``TestRefcountedRetention`` already uses."""
+
+    async def test_sweeps_a_referenced_gate_that_is_not_yet_retirable(
+        self, monkeypatch,
+    ):
+        from channels.channel_handlers import _sweep_retirable_gates
+
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 60.0)
+        clock = _FakeClock()
+        gate = get_or_create_gate("sweep-young", clock=clock)
+        gate.acquire()
+        gate.set_passed()
+        gate.release()
+        clock.advance(10.0)  # bound not elapsed yet
+
+        _sweep_retirable_gates()
+
+        assert "sweep-young" in ASK_GATES
+
+    async def test_sweeps_an_aged_unreferenced_gate(self, monkeypatch):
+        from channels.channel_handlers import _sweep_retirable_gates
+
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 60.0)
+        clock = _FakeClock()
+        gate = get_or_create_gate("sweep-old", clock=clock)
+        gate.acquire()
+        gate.set_passed()
+        gate.release()
+        clock.advance(60.0)  # bound elapsed
+
+        _sweep_retirable_gates()
+
+        assert "sweep-old" not in ASK_GATES
+
+    async def test_never_resolved_pending_gate_is_left_alone_by_the_sweep(
+        self, monkeypatch,
+    ):
+        """A genuinely in-flight (never-resolved) gate is NEVER retirable —
+        the sweep must not touch it regardless of how much time passes."""
+        from channels.channel_handlers import _sweep_retirable_gates
+
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 60.0)
+        clock = _FakeClock()
+        get_or_create_gate("sweep-pending", clock=clock)
+        clock.advance(1000.0)
+
+        _sweep_retirable_gates()
+
+        assert "sweep-pending" in ASK_GATES
+
+    async def test_sweeps_multiple_aged_gates_leaves_young_ones(self, monkeypatch):
+        from channels.channel_handlers import _sweep_retirable_gates
+
+        monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 60.0)
+        clock = _FakeClock()
+        old1 = get_or_create_gate("sweep-old-1", clock=clock)
+        old1.acquire()
+        old1.set_passed()
+        old1.release()
+        old2 = get_or_create_gate("sweep-old-2", clock=clock)
+        old2.acquire()
+        old2.set_failed({"ok": False, "error": "invalid_args"})
+        old2.release()
+        clock.advance(60.0)
+        young = get_or_create_gate("sweep-young-2", clock=clock)
+        young.acquire()
+        young.set_passed()
+        young.release()
+
+        _sweep_retirable_gates()
+
+        assert "sweep-old-1" not in ASK_GATES
+        assert "sweep-old-2" not in ASK_GATES
+        assert "sweep-young-2" in ASK_GATES
+
+
+class TestAskEntrySweepsPriorLeakedGates:
+    """Wiring-level proof: the reviewer's EXACT repro (one full ask leaves
+    its resolved gate behind forever) is fixed because the NEXT ask sweeps
+    it at entry, once the retention bound has elapsed."""
+
+    async def test_one_full_ask_leaves_its_resolved_gate_in_ask_gates(
+        self, wired,
+    ):
+        """Reproduces the reviewer's exact observation BEFORE the sweep
+        fires: a fully-resolved, unreferenced gate stays in ``ASK_GATES``
+        because its own ``finally`` runs microseconds after its own
+        resolution — nowhere near the retention bound."""
+        eid = wired["rec"].id
+        task = asyncio.ensure_future(
+            wired["ask"](_FakeRequest(_btn_payload(eid, "leak1"))))
+        resp = await _drive_button(wired, task, "leak1")
+        assert _body(resp)["ok"] is True
+
+        assert "leak1" in ASK_GATES
+        gate = ASK_GATES["leak1"]
+        assert gate.effective()[0] != "PENDING"  # actually resolved
+        assert gate.refcount == 0  # and fully unreferenced
+
+    async def test_second_ask_sweeps_the_first_gate_once_bound_elapsed(
+        self, wired,
+    ):
+        eid = wired["rec"].id
+        task1 = asyncio.ensure_future(
+            wired["ask"](_FakeRequest(_btn_payload(eid, "leak2"))))
+        await _drive_button(wired, task1, "leak2")
+        assert "leak2" in ASK_GATES
+
+        # Simulate the retention bound having elapsed since resolution.
+        # Production never passes an injected clock into this handler's
+        # ``get_or_create_gate`` call (it uses the real ``time.monotonic``
+        # default, captured once at class-definition time — patching the
+        # global ``time.monotonic`` afterwards would not even reach it, and
+        # the memory-cage rule bars patching shared module attributes
+        # anyway). Advancing time for an already-resolved gate is exactly
+        # what an injected clock's ``.advance()`` would do; with no clock
+        # seam on this call site, the equivalent white-box move is rewinding
+        # the recorded resolution timestamp by the same amount.
+        ASK_GATES["leak2"]._resolved_at -= 61.0
+
+        task2 = asyncio.ensure_future(
+            wired["ask"](_FakeRequest(_btn_payload(eid, "leak3"))))
+        await _drive_button(wired, task2, "leak3")
+
+        assert "leak2" not in ASK_GATES  # swept at leak3's entry
+        assert "leak3" in ASK_GATES  # its own gate is untouched
+
+
+class TestNeverOwnedPendingGateCleanup:
+    """A5 review, Finding 1 (second half): a gate created for a request that
+    exits BEFORE ever becoming the validation owner and BEFORE publishing
+    anything to the gate (``unknown_engagement`` / ``engagement_terminal``)
+    stays PENDING forever — ``retirable()`` never fires for it (``_resolved_at``
+    stays ``None``), so the bound-based sweep can never catch it either. No
+    owner was ever registered in ``_ASK_VALIDATION_OWNERS`` for these
+    request_ids, so no reattacher can possibly be blocked on the gate's
+    event — it is released and dropped immediately instead of leaking
+    forever."""
+
+    async def test_unknown_engagement_does_not_leak_a_pending_gate(self, wired):
+        resp = await wired["ask"](_FakeRequest(
+            _btn_payload("no-such-engagement", "unk1")))
+        assert _body(resp) == {"ok": False, "error": "unknown_engagement"}
+        assert "unk1" not in ASK_GATES
+
+    async def test_engagement_terminal_does_not_leak_a_pending_gate(self, wired):
+        wired["rec"].status = "completed"
+        resp = await wired["ask"](_FakeRequest(
+            _btn_payload(wired["rec"].id, "term1")))
+        assert _body(resp) == {"ok": False, "error": "engagement_terminal"}
+        assert "term1" not in ASK_GATES
+
+
+# ===========================================================================
+# A5 review, Finding 2 — the LIVE unread-inbound refusal carries
+# ``refusal_count`` (a fresh bump); the recorded outcome a same-request_id
+# retry reattaches to is INTENTIONALLY count-free (``_unread_refusal_payload``)
+# so a retry never re-bumps the counter (matching round-3 tombstone
+# semantics). Undocumented in behaviour though the code already carries a
+# comment — this locks the contract down with a test.
+# ===========================================================================
+
+
+class TestUnreadRefusalReattachIsCountFree:
+    async def test_reattach_after_unread_refusal_gets_the_count_free_payload(
+        self, wired, monkeypatch,
+    ):
+        from channels.channel_handlers import _unread_refusal_payload
+
+        eid = wired["rec"].id
+        monkeypatch.setattr(wired["drv"], "inbound_unread_depth", lambda e: 1)
+
+        r_owner = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gwU"))))
+        assert r_owner["ok"] is False
+        assert r_owner["error"] == "unread_inbound"
+        assert r_owner["refusal_count"] == 1
+
+        r_reattach = _body(
+            await wired["ask"](_FakeRequest(_btn_payload(eid, "gwU"))))
+        # The reattacher's payload is the byte-identical COUNT-FREE form
+        # recorded on the intent — never a fresh bump of ``refusal_count``.
+        assert "refusal_count" not in r_reattach
+        assert r_reattach == _unread_refusal_payload(r_owner["message"])
