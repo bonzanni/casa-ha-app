@@ -260,6 +260,25 @@ class IntentRegistry:
                 return intent
         return None
 
+    def peek(self, tool_name: str, projection_hash: str) -> SendIntent | None:
+        """F-OOB instrumentation (spec D7): the MOST RECENTLY REGISTERED intent
+        for ``(tool_name, projection_hash)``, regardless of matchability.
+
+        DIAGNOSTIC-ONLY — read-only, never mutates, and never consulted by the
+        real FIFO matching path (:meth:`oldest_matchable`). Lets a log line
+        report an intent's state and registration time even after
+        ``post_for_block`` has already resolved (and possibly consumed) it, so
+        a match-point log can still carry the "intent state at match time"
+        dimension."""
+        match: SendIntent | None = None
+        for intent in self._by_seq:
+            if (
+                intent.tool_name == tool_name
+                and intent.projection_hash == projection_hash
+            ):
+                match = intent
+        return match
+
     def armed_unposted(self) -> list[SendIntent]:
         return [
             i for i in self._by_seq
@@ -1307,6 +1326,7 @@ class OutputSequencer:
             for intent in self.registry.armed_unposted():
                 if intent.slot_missed:
                     await self._post_intent_locked(intent, out_of_band=True)
+                    self._log_late_post(intent, reason="slot_missed")
                 elif now - intent.registered_at >= self._intent_timeout_s:
                     await self._post_intent_locked(
                         intent, out_of_band=True, warn=True,
@@ -1316,6 +1336,34 @@ class OutputSequencer:
                     # subsequent same-hash intent can never bind its late block.
                     intent.consumed = False
                     intent.timeout_posted = True
+                    self._log_late_post(intent, reason="timeout")
+
+    def _log_late_post(self, intent: SendIntent, *, reason: str) -> None:
+        """F-OOB instrumentation (spec D7): content-free INFO log at the
+        LATE-POST WATCHER path (:meth:`process_intents_once`) — the
+        counterpart to ``drivers.topic_stream``'s ``_match_discrete_block``
+        match-point log for a block that earlier resolved ``slot_timeout``.
+
+        Carries ONLY the pinned projection-hash PREFIX (8 hex — never the
+        projected args), the post's block-resolution result (``posted`` /
+        ``post_failed``, derived from the recorded outcome), the intent's
+        state, the tool name and engagement id (system identifiers, not
+        operator content), and the registration-to-post latency in ms.
+        *reason* distinguishes a ``slot_missed`` late post (posts immediately
+        on completion, per the A6 timing fix) from a full ``intent_timeout_s``
+        out-of-band post. Together with the match-point log, this carries
+        enough timing to reconstruct the observed F-OOB ~10s gap (Sol r1-8:
+        likely the 2s slot hold + 10s intent timeout, not a hash defect).
+        Pure logging — no state is read or written beyond what
+        ``process_intents_once`` already mutated; NO behavioral change."""
+        ok = bool(intent.outcome and intent.outcome.get("ok"))
+        logger.info(
+            "oob_late_post hash=%s result=%s intent_state=%s latency_ms=%.1f "
+            "reason=%s tool=%s engagement=%s",
+            intent.projection_hash[:8], "posted" if ok else "post_failed",
+            intent.state, (self._now() - intent.registered_at) * 1000.0,
+            reason, intent.tool_name, self.engagement_id,
+        )
 
     async def run_watcher(self) -> None:  # pragma: no cover - background loop
         """Background task: drive late/timeout discrete posts (§2). Wakes on an

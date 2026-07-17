@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import pytest
 from aiohttp import web
@@ -24,11 +25,16 @@ from aiohttp import web
 import agent as agent_mod
 import verdict_broker
 from verdict_broker import VerdictBroker
-from channels.output_sequencer import ASK_TOOL, OutputSequencer
+from channels.output_sequencer import ASK_TOOL, OutputSequencer, projection_hash
 
 pytestmark = pytest.mark.asyncio
 
 _ANCHOR_HASH = "anchor-hash"
+
+# E1 · F-OOB instrumentation (spec D7) sentinel: an operator/agent BODY string
+# that must NEVER appear in any instrumentation log line (content-free,
+# like ``floored_ask_telemetry`` — hash-prefix/result/state/latency only).
+_SENTINEL_BODY = "SENTINEL-DB-CREDENTIALS-QUESTION-TEXT-2026-07-17"
 
 
 class _Chan:
@@ -161,3 +167,165 @@ class TestSlotMissedTiming:
 
         resp = await asyncio.wait_for(task, timeout=1.0)
         assert _body(resp)["outcome"] == "anchored"
+
+
+# ---------------------------------------------------------------------------
+# Task E1 · F-OOB instrumentation (spec D7): match-point + late-post-watcher
+# INFO logs. LOGS ONLY — no behavioral change. REAL ``OutputSequencer`` +
+# REAL ``IntentRegistry`` + REAL ``TopicStreamRelay._match_discrete_block``,
+# fake wire send/edit fns, injected clock (never patches
+# ``<module>.asyncio.sleep`` — the memory-cage rule).
+# ---------------------------------------------------------------------------
+
+
+def _clock(start: float = 1000.0):
+    """A monotonically-advanced injected clock (dict + closures), advanced by
+    the sequencer's/relay's own ``_sleep`` — never the global ``asyncio.sleep``."""
+    state = {"t": start}
+
+    def _now() -> float:
+        return state["t"]
+
+    async def _sleep(seconds: float) -> None:
+        state["t"] += seconds
+        await asyncio.sleep(0)
+
+    return _now, _sleep
+
+
+def _make_relay(tmp_path, chan, seq, _now, _sleep):
+    from drivers.topic_stream import TopicStreamRelay
+
+    async def _noop_delete(*_a, **_k) -> bool:
+        return True
+
+    return TopicStreamRelay(
+        engagement_id=seq.engagement_id, topic_id=seq.topic_id,
+        log_dir=str(tmp_path / "log"), cursor_path=str(tmp_path / "cursor.json"),
+        send_message=chan.narration_send, edit_message=chan.narration_edit,
+        delete_message=_noop_delete,
+        on_turn_event=lambda *a, **k: None, reply_texts=lambda: set(),
+        sequencer=seq, _now=_now, _sleep=_sleep,
+    )
+
+
+class TestMatchedPostLogging:
+    """RED: a matched (armed → posted) block logs all four D7 dimensions —
+    hash-prefix, block-resolution result, intent state, and the
+    registration-to-block latency — with NO body text anywhere in the line."""
+
+    async def test_matched_post_logs_all_four_dimensions(self, tmp_path, caplog):
+        chan = _Chan()
+        _now, _sleep = _clock()
+        seq = OutputSequencer(
+            engagement_id="eng-oob-matched", topic_id=42,
+            send_message=chan.narration_send, edit_message=chan.narration_edit,
+            _now=_now, _sleep=_sleep)
+        relay = _make_relay(tmp_path, chan, seq, _now, _sleep)
+
+        raw_args = {
+            "question": _SENTINEL_BODY, "options": [], "timeout_s": 60,
+            "multi": False,
+        }
+        block_hash = projection_hash(ASK_TOOL, raw_args)
+
+        posted: list[int] = []
+
+        async def _poster():
+            mid = await chan.narration_send(42, "keyboard")
+            posted.append(mid)
+            return mid
+
+        seq.register_intent(
+            request_id="m1", tool_name=ASK_TOOL, projection_hash=block_hash,
+            poster=_poster)
+        seq.arm_intent("m1")
+
+        caplog.set_level(logging.INFO)
+        await relay._match_discrete_block(ASK_TOOL, raw_args)
+
+        assert len(posted) == 1  # sanity: the block actually matched+posted
+        text = caplog.text
+        assert block_hash[:8] in text
+        assert "result=posted" in text
+        assert "intent_state=" in text
+        assert "latency_ms=" in text
+        assert _SENTINEL_BODY not in text
+
+
+class TestSlotTimeoutLatePostLogging:
+    """RED: a ``slot_timeout`` match followed by its eventual out-of-band
+    (late) post logs timing sufficient to reconstruct the F-OOB ~10s gap —
+    the match-point log (``slot_timeout``, latency ~= the slot hold) and the
+    late-post-watcher log (``posted``, latency covering the FULL registration-
+    to-actual-post span) together bound the gap. No body text in either
+    line."""
+
+    async def test_slot_timeout_then_late_post_logs_reconstructable_timing(
+        self, tmp_path, caplog,
+    ):
+        chan = _Chan()
+        _now, _sleep = _clock()
+        seq = OutputSequencer(
+            engagement_id="eng-oob-late", topic_id=42,
+            send_message=chan.narration_send, edit_message=chan.narration_edit,
+            _now=_now, _sleep=_sleep,
+            slot_hold_s=0.2, intent_timeout_s=10.0, hold_poll_s=0.05)
+        relay = _make_relay(tmp_path, chan, seq, _now, _sleep)
+
+        raw_args = {
+            "question": _SENTINEL_BODY, "options": [], "timeout_s": 60,
+            "multi": False,
+        }
+        block_hash = projection_hash(ASK_TOOL, raw_args)
+
+        posted: list[int] = []
+
+        async def _poster():
+            mid = await chan.narration_send(42, "keyboard")
+            posted.append(mid)
+            return mid
+
+        # The intent is registered PENDING — validation has not yet armed it —
+        # so the relay's block match holds the slot then times out.
+        seq.register_intent(
+            request_id="s1", tool_name=ASK_TOOL, projection_hash=block_hash,
+            poster=_poster)
+
+        caplog.set_level(logging.INFO)
+        await relay._match_discrete_block(ASK_TOOL, raw_args)
+        first_latency = _now() - seq.registry.by_request_id("s1").registered_at
+        assert posted == []  # nothing posted yet — still pending
+
+        match_text = caplog.text
+        assert f"hash={block_hash[:8]}" in match_text
+        assert "result=slot_timeout" in match_text
+        assert "intent_state=pending" in match_text
+        assert "latency_ms=" in match_text
+        assert _SENTINEL_BODY not in match_text
+
+        # Validation completes well after the slot timed out — the relay's
+        # background watcher tick posts the now-armed, slot_missed intent
+        # out-of-band. Advance the clock to simulate the elapsed gap.
+        await _sleep(0.5)
+        seq.arm_intent("s1")
+        caplog.clear()
+        await seq.process_intents_once()
+        assert len(posted) == 1  # the late post landed
+
+        late_text = caplog.text
+        assert f"hash={block_hash[:8]}" in late_text
+        assert "result=posted" in late_text
+        assert "reason=slot_missed" in late_text
+        assert "latency_ms=" in late_text
+        assert _SENTINEL_BODY not in late_text
+
+        # The two logged latencies bound the actual gap: the late post's
+        # registration-to-post span is strictly larger than the match-point
+        # span recorded when the block first timed out — together they
+        # reconstruct the observed F-OOB delay (Sol r1-8: slot hold + however
+        # long validation/registration actually took).
+        late_intent = seq.registry.by_request_id("s1")
+        second_latency = _now() - late_intent.registered_at
+        assert second_latency > first_latency
+        assert second_latency >= 0.5

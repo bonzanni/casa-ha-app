@@ -1017,6 +1017,7 @@ class TopicStreamRelay:
                 "(tool=%s): %s", self.engagement_id, name, exc,
             )
             return
+        self._log_oob_match(name, block_hash, status)
         # D5 (Sol r3-6, "Arming survives out-of-band posting"): every matching
         # free-text-anchor ask block (the tool's own bare-question, no
         # ``options`` — a button ask blocks the turn anyway, spec §D5 scope)
@@ -1043,6 +1044,37 @@ class TopicStreamRelay:
             and not self._replay_disarmed
         ):
             self._anchor_candidate = (name, block_hash)
+
+    def _log_oob_match(self, tool_name: str, block_hash: str, status: str) -> None:
+        """F-OOB instrumentation (spec D7): content-free INFO log at the
+        discrete-post MATCH POINT (``_match_discrete_block``).
+
+        Carries ONLY the pinned projection-hash PREFIX (8 hex — never the
+        projected args/question/options text), the block-resolution result
+        (``posted``/``slot_timeout``/``debt_consumed``/``no_match``/
+        ``consumed_cancelled``, verbatim from ``post_for_block``), the
+        matched intent's state (or ``none`` when no intent was ever
+        registered for this hash — a genuinely absent hold-eligible block),
+        the tool name and engagement id (system identifiers, not operator
+        content), and the registration-to-block latency in ms. Paired with
+        ``OutputSequencer._log_late_post`` (the watcher-path counterpart for
+        a ``slot_timeout`` block's eventual out-of-band post), the two log
+        lines carry enough timing to reconstruct the observed F-OOB ~10s gap
+        (Sol r1-8: likely the 2s slot hold + 10s intent timeout, not a hash
+        defect) — instrumentation only, NO behavioral change."""
+        intent = self.sequencer.registry.peek(tool_name, block_hash)
+        if intent is not None:
+            intent_state = intent.state
+            latency_ms = (self._now() - intent.registered_at) * 1000.0
+        else:
+            intent_state = "none"
+            latency_ms = -1.0
+        logger.info(
+            "oob_match hash=%s result=%s intent_state=%s latency_ms=%.1f "
+            "tool=%s engagement=%s",
+            block_hash[:8], status, intent_state, latency_ms, tool_name,
+            self.engagement_id,
+        )
 
     async def _maybe_arm_suppression(self) -> None:
         """Re-read ``open_anchor_state`` and ARM suppression the moment this
