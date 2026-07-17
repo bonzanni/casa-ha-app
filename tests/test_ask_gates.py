@@ -204,6 +204,21 @@ async def _drive_anchor(wired, task, *, hash=_ANCHOR_HASH):
     return resp
 
 
+async def _wait_until(predicate, *, timeout: float = 5.0) -> None:
+    """Poll *predicate* until it holds, bounded by WALL-CLOCK time rather than a
+    fixed real-time sleep or iteration count. The state transitions this waits
+    on (``ask_inflight`` claim, intent ``armed``/``posting``) happen
+    synchronously inside the awaited task's first scheduler turn — the only
+    thing a caller needs to wait for is that turn actually happening, which a
+    fixed ``asyncio.sleep(0.02)`` cannot guarantee on a loaded/slow runner.
+    Cheap when fast (resolves in a handful of ``sleep(0)`` turns), tolerant
+    when slow, and no weaker than the fixed sleep it replaces — it still
+    raises if the condition never fires."""
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0)
+
+
 # ===========================================================================
 # (a) live-pending REPLY gate — refuse / allow matrix
 # ===========================================================================
@@ -990,18 +1005,29 @@ class TestPosterOwnsClearWave5:
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
-        await asyncio.sleep(0.02)
-        assert drv.ask_inflight(eid) == "a1"
+        await _wait_until(lambda: drv.ask_inflight(eid) == "a1")
 
         relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
-        await asyncio.sleep(0.02)
         intent = seq.registry.by_request_id("a1")
-        assert intent.state == "armed" and intent.posting is True
+        # Await the arming boundary itself (state == "armed" AND posting is
+        # True are both set synchronously, before the poster's first await,
+        # inside the relay task's very first scheduler turn) instead of
+        # asserting immediately after a fixed real-time sleep — a slow/loaded
+        # runner may not have granted that turn yet within a tight bound.
+        await _wait_until(
+            lambda: intent.state == "armed" and intent.posting is True)
 
         # Cancel ONCE — the cancel loses (posting=True), the post wins.
         t1.cancel()
-        await asyncio.sleep(0.02)
-        # The cancel is stalled behind the post → the marker still stands.
+        # Wait for the cancellation to actually be DELIVERED and its fully
+        # synchronous cleanup (the sync ``posting``-read no-op + re-raise) to
+        # run t1 to completion — not a fixed sleep, which could observe the
+        # marker before the no-op path ran at all (false-negative-proof, not
+        # just false-positive-proof) on a slow/loaded runner. This does NOT
+        # wait on the poster/relay: the post-wins path re-raises synchronously
+        # without touching the gate.
+        await _wait_until(t1.cancelled)
+        # The cancel lost (post wins) → the marker still stands.
         assert drv.ask_inflight(eid) == "a1"
 
         # Release → the wire send RAISES → the poster returns None BEFORE durable

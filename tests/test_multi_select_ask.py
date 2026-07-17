@@ -601,6 +601,17 @@ async def wired(tmp_path, _fresh_broker, monkeypatch):
         ask=handlers["/internal/channel/ask"])
 
 
+async def _wait_until(predicate, *, timeout: float = 5.0) -> None:
+    """Poll *predicate* until it holds, bounded by WALL-CLOCK time (not a
+    fixed real-time sleep), so a slow/loaded runner gets real slack while a
+    fast run resolves in a handful of scheduler turns. Cheap when fast,
+    tolerant when slow, and no weaker than the fixed sleep it replaces — it
+    still raises (``TimeoutError``) if the condition never fires."""
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0)
+
+
 class TestHandlerEndToEnd:
     async def test_multi_keyboard_posted_and_submit_settles(self, wired):
         payload = {
@@ -660,9 +671,18 @@ class TestHandlerEndToEnd:
             "timeout_s": 60, "multi": True,
         }
         task = asyncio.ensure_future(wired.ask(_HandlerRequest(payload)))
-        await asyncio.sleep(0.02)
+        # Await the actual durable-registration boundary (the request becomes
+        # live+unclaimed in the broker) instead of a fixed real-time sleep:
+        # the handler does one real await (registry number allocation, real
+        # tmp-file I/O) before ``BROKER.register`` lands the request, and on a
+        # slow/loaded runner that can outlast a tight fixed sleep — firing the
+        # synthetic timeout on a not-yet-live key would silently no-op and
+        # the task would only resolve at the real 60s broker deadline, well
+        # past any bounded ``wait_for``.
+        await _wait_until(lambda: wired.broker.is_live_unclaimed(
+            namespace="engagement_ask", scope=wired.rec.id, request_id="h3"))
         wired.broker._on_timeout(("engagement_ask", wired.rec.id, "h3"))
-        resp = await asyncio.wait_for(task, timeout=1.0)
+        resp = await asyncio.wait_for(task, timeout=10.0)
         await wired.broker.drain_hooks()
 
         body = json.loads(resp.text)
