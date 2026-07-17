@@ -1835,3 +1835,73 @@ class TestUnstageLinearizableAgainstReservation:
         await drv._promote_answer_on_enqueue(rec)
         old_texts = [text for _, mid, text in wire.edits if mid == 500]
         assert old_texts[-1] == f"⤵ MOVED Q{n} — resolved below"
+
+
+# ===========================================================================
+# wb4-3 (whole-branch gate wave 4, MAJOR): ``cancel()`` must DRAIN the cancelled
+# re-anchor retry owner BEFORE dropping the D6 confirmed-pair map. A cancelled
+# owner drains its child (by design), and the child re-creates ``_confirmed_pairs``
+# — if teardown drops the map and returns first, the re-created record leaks
+# unpumped + unlogged, violating the D6 terminal-teardown ownership contract.
+# ===========================================================================
+
+
+class TestCancelDrainsReanchorOwner:
+    async def test_cancel_awaits_drained_child_then_logs_residual(
+        self, tmp_path, caplog,
+    ):
+        import logging
+        reg, rec = await _make_registry(tmp_path)
+        wire = _Wire()
+        drv = _make_driver(tmp_path, reg, wire)
+        eng_id = rec.id
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _owner():
+            # Hold the ask-maintenance lock for the child's whole lifetime (as
+            # ``_reanchor_pass`` does) and DRAIN the child on cancel — the exact
+            # ownership shape of ``_reanchor_pass_locked``.
+            async with drv.ask_maintenance_lock(eng_id):
+                async def _child():
+                    started.set()
+                    await release.wait()
+                    # The drained child re-creates a confirmed pair AFTER cancel()
+                    # would otherwise have dropped the map.
+                    drv._record_confirmed_pair(eng_id, 1, 1001)
+                    return True
+
+                child = asyncio.ensure_future(_child())
+                try:
+                    return await asyncio.shield(child)
+                except asyncio.CancelledError:
+                    while not child.done():
+                        try:
+                            await asyncio.shield(child)
+                        except asyncio.CancelledError:
+                            continue
+                    raise
+
+        owner = asyncio.create_task(_owner())
+        drv._reanchor_retry_tasks[eng_id] = owner
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        with caplog.at_level(logging.INFO):
+            cancel_task = asyncio.create_task(drv.cancel(rec))
+            # Let cancel() run: WITHOUT the fix it cancels the owner, drops the
+            # map and returns; WITH the fix it parks on the owner drain / lock
+            # barrier.
+            for _ in range(10):
+                await asyncio.sleep(0)
+            # Release the child so its drained completion re-creates the pair.
+            release.set()
+            await asyncio.wait_for(cancel_task, timeout=1.0)
+        await asyncio.gather(owner, return_exceptions=True)
+
+        # The re-created record was seen by teardown: dropped + logged, never
+        # leaked back into ``_confirmed_pairs`` after cancel() returned.
+        assert drv._confirmed_pairs.get(eng_id) is None
+        assert any(
+            "terminal teardown drops unconfirmed re-anchor pair" in r.getMessage()
+            for r in caplog.records)

@@ -925,7 +925,7 @@ async def test_terminal_discards_narration_blocked_on_writer_lock(tmp_path):
         assert not late.done()                      # parked on the writer lock
         # Terminalize (reentrant under the held lock), then post the completion.
         await seq.terminalize()
-        await seq.post_platform_notice("terminal completion")
+        await seq.post_completion_notice("terminal completion")
     await late
 
     assert _narration_sends(rec) == ["terminal completion"]
@@ -953,7 +953,7 @@ async def test_terminal_finalize_discards_unposted_suffix(tmp_path):
     relay._posted_len = 6
 
     await seq.terminalize()
-    await seq.post_platform_notice("terminal completion")
+    await seq.post_completion_notice("terminal completion")
     await relay._finalize([], 1)
 
     assert _narration_sends(rec) == ["prefix", "terminal completion"]
@@ -973,6 +973,8 @@ async def test_terminal_latch_discards_via_sequencer_writers(tmp_path):
     assert seq.is_terminal() is True
     assert await seq.open_narration("after") == DISCARDED
     assert await seq.edit_narration_if_latest(mid, "edited") == DISCARDED
-    # A platform notice (the terminal completion / settlement) STILL posts.
-    assert await seq.post_platform_notice("completion") is not None
+    # The completion seam STILL posts the terminal message; a plain platform
+    # notice would now be DISCARDED under the latch (wb4-2).
+    assert await seq.post_platform_notice("discarded notice") is None
+    assert await seq.post_completion_notice("completion") is not None
     assert _narration_sends(rec) == ["live", "completion"]

@@ -311,15 +311,25 @@ class IntentRegistry:
         stalls narration when there is provably nothing to wait for."""
         return any(i.matchable() for i in self._by_seq)
 
-    def prune(self) -> None:
+    def prune(self, *, keep: "Callable[[SendIntent], bool] | None" = None) -> None:
         """§2(6): drop all intents, tombstones and id→outcome at turn end.
 
         wb2-4: fire each intent's ``on_retire`` hook ONCE as it is dropped — this
         is the intent's definitive RETIREMENT point (a cancelled/consumed intent
         stays a matchable tombstone until here), so the ask handler's validation-
         gate pin is released exactly when the intent it protects ceases to exist.
-        A hook raising must never leave the registry half-pruned."""
+        A hook raising must never leave the registry half-pruned.
+
+        wb4-2: ``keep`` (optional) is a predicate; intents it selects are
+        PRESERVED and their ``on_retire`` does NOT fire (they are not retiring).
+        :meth:`OutputSequencer.terminalize` uses it to preserve an unresolved
+        emit_completion consumption debt so finalize's completion drain still
+        observes it. The turn-end callers pass no predicate — a full prune."""
+        survivors: list[SendIntent] = []
         for intent in self._by_seq:
+            if keep is not None and keep(intent):
+                survivors.append(intent)
+                continue
             hook = intent.on_retire
             if hook is not None and not intent._retired:
                 intent._retired = True
@@ -329,8 +339,8 @@ class IntentRegistry:
                     logger.debug(
                         "send-intent on_retire hook failed (rid=%s)",
                         intent.request_id, exc_info=True)
-        self._by_seq.clear()
-        self._by_request.clear()
+        self._by_seq = survivors
+        self._by_request = {i.request_id: i for i in survivors}
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +401,34 @@ FAILED = "failed"
 # a DISCARDED write must be dropped cleanly with NO retry, NO drop-mode, and NO
 # repost — nothing may land below the terminal completion (D5 discard doctrine).
 DISCARDED = "discarded"
+
+# wb4-1 (whole-branch gate wave 4): sentinel returned by
+# :meth:`OutputSequencer.register_intent` once the engagement has TERMINALIZED.
+# Distinct from ``None`` (which means "no live sequencer" and correctly activates
+# the ingress EAGER FALLBACK): a terminal sentinel is a recorded fail-closed
+# outcome, so the ask/reply/anchor ingress surfaces ``engagement_terminal`` to
+# the agent instead of registering + arming + posting a discrete send BELOW the
+# terminal completion (D5 discard doctrine).
+TERMINAL_REGISTRATION = object()
+
+
+def _is_live_completion_debt(intent: "SendIntent") -> bool:
+    """wb4-2: ``True`` for an UNRESOLVED emit_completion consumption debt — a
+    posted-but-unconsumed one-block debt (``register_completion_consumption``).
+    :meth:`OutputSequencer.terminalize` PRESERVES it across the prune so
+    ``finalize_completion_post``'s :meth:`await_completion_drain` still blocks
+    until the relay reaches the emit_completion block (every prior frame
+    processed) rather than reading a pruned-away intent as trivially drained —
+    which would let a lagging prior frame's platform notice overtake completion.
+    """
+    return (
+        intent.tool_name == EMIT_COMPLETION_TOOL
+        and intent.state == "posted"
+        and intent.timeout_posted
+        and not intent.consumed
+        and not intent.post_failed
+        and intent.outcome is None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -745,12 +783,22 @@ class OutputSequencer:
     def register_intent(
         self, *, request_id: str, tool_name: str, projection_hash: str, poster: Any,
         on_retire: Any = None,
-    ) -> tuple[SendIntent, bool]:
+    ) -> "tuple[SendIntent, bool] | object":
         """Register (or reattach to) a discrete-send intent (§2(1)). See
         :meth:`IntentRegistry.register`. Ingresses (T2/T3) call this at fence
         entry with a ``poster`` coroutine-factory that performs the actual
         keyboard/text post when the relay reaches the block. wb2-4: ``on_retire``
-        (optional) fires when the intent is pruned at turn end."""
+        (optional) fires when the intent is pruned at turn end.
+
+        wb4-1: once :meth:`terminalize` has latched the engagement TERMINAL,
+        registration is REJECTED — returns :data:`TERMINAL_REGISTRATION` (a
+        recorded fail-closed terminal outcome, NOT ``None``, which would activate
+        the ingress eager-fallback) so the ingress returns ``engagement_terminal``
+        instead of registering + arming + posting below the terminal completion.
+        The belt-and-suspenders latch inside :meth:`_post_intent_locked` catches
+        any intent that raced in a beat before this latch."""
+        if self._terminal:
+            return TERMINAL_REGISTRATION
         return self.registry.register(
             request_id=request_id, tool_name=tool_name,
             projection_hash=projection_hash, poster=poster,
@@ -1016,19 +1064,48 @@ class OutputSequencer:
         exactly the ordering violation §2 forbids. So this seals open narration
         (the notice is a causal event below it), posts, and advances the
         high-water mark, all under the one serialization lock. Returns the posted
-        message id, or ``None`` on send failure."""
+        message id, or ``None`` on send failure.
+
+        wb4-2: DISCARDED (log + return ``None``, posting NOTHING) once the
+        engagement has TERMINALIZED — no platform notice (an inbound receipt, a
+        lagging mutating-tool violation notice) may land BELOW the terminal
+        completion (D5 discard doctrine). The terminal completion text itself
+        uses the dedicated :meth:`post_completion_notice` seam, the one path that
+        bypasses the latch."""
         async with self._serialized():
-            self._seal_narration_locked()
-            if reply_to is not None:
-                mid = await _maybe_await(
-                    self.send_message(self.topic_id, text, reply_to=reply_to))
-            else:
-                mid = await _maybe_await(self.send_message(self.topic_id, text))
-            if mid is not None and (
-                self._high_water is None or mid > self._high_water
-            ):
-                self._high_water = mid
-            return mid
+            if self._terminal:
+                logger.debug(
+                    "engagement %s: platform notice discarded (terminal latch)",
+                    self.engagement_id)
+                return None
+            return await self._post_notice_locked(text, reply_to)
+
+    async def post_completion_notice(self, text: str) -> int | None:
+        """wb4-2: the completion-only write seam. Posts the TERMINAL completion
+        text through the single writer even though the terminal latch is set — it
+        IS the terminal message every other post is forbidden to land below. No
+        other caller may post post-terminal; :meth:`post_platform_notice`
+        discards under the latch."""
+        async with self._serialized():
+            return await self._post_notice_locked(text, None)
+
+    async def _post_notice_locked(
+        self, text: str, reply_to: int | None,
+    ) -> int | None:
+        """Shared platform/completion post body (caller holds the lock): seal
+        open narration (the notice is a causal event below it), send, and advance
+        the high-water mark."""
+        self._seal_narration_locked()
+        if reply_to is not None:
+            mid = await _maybe_await(
+                self.send_message(self.topic_id, text, reply_to=reply_to))
+        else:
+            mid = await _maybe_await(self.send_message(self.topic_id, text))
+        if mid is not None and (
+            self._high_water is None or mid > self._high_water
+        ):
+            self._high_water = mid
+        return mid
 
     # -- A9 keyboard-bearing discrete writes (Sol r1-8) --------------------
 
@@ -1291,10 +1368,16 @@ class OutputSequencer:
             # Wake every outstanding awaiter, then PRUNE (fires on_retire once
             # per intent) so the gate pins release before the sequencer is
             # dropped — even if the relay never processes ``result`` (wb3-3).
+            # wb4-2: PRESERVE an unresolved emit_completion consumption debt so
+            # ``finalize_completion_post``'s ``await_completion_drain`` still
+            # waits for the relay to reach its causal block (a pruned debt reads
+            # as trivially drained, letting a lagging frame's platform notice
+            # overtake completion). Its resolution event is re-created lazily by
+            # ``await_completion_drain`` — it has no ``on_retire`` pin to leak.
             for ev in self._resolution_events.values():
                 ev.set()
             self._resolution_events.clear()
-            self.registry.prune()
+            self.registry.prune(keep=_is_live_completion_debt)
             self._turn_reply_to = None
 
     # -- discrete posting driven by the relay at a content-block ------------
@@ -1381,6 +1464,19 @@ class OutputSequencer:
         """Post *intent* (caller holds the lock). SEALS open narration first —
         rollover-on-interleave (§2, "narration seals when anything else posts
         below")."""
+        # wb4-1(b): belt-and-suspenders terminal latch, enforced under the writer
+        # lock for EVERY send-intent kind. An intent that raced past
+        # ``register_intent``'s latch (registered a beat before ``terminalize``,
+        # then armed) must NOT post below the terminal completion — resolve it
+        # fail-closed (terminal ok:false) instead. A recorded outcome (a
+        # compensated self-account, an already-resolved intent) is never
+        # clobbered.
+        if self._terminal and intent.outcome is None:
+            intent.post_failed = True
+            intent.consumed = True
+            intent.outcome = {"ok": False, "message_id": None, "terminal": True}
+            self._signal_resolution(intent.request_id)
+            return
         self._seal_narration_locked()
         if warn:
             logger.warning(

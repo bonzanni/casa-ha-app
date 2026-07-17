@@ -2378,3 +2378,59 @@ class TestFloorTelemetry:
             r for r in caplog.records
             if r.getMessage().startswith("floored_ask_telemetry")
         ]
+
+
+# ===========================================================================
+# wb4-4 (whole-branch gate wave 4, MINOR): ``_validate_ask_args`` must reject a
+# whitespace-only question (nonblank AFTER strip, per D1) — a bare truthiness
+# check let "   " through and produced a blank numbered anchor.
+# ===========================================================================
+
+
+class TestValidateQuestionNonblank:
+    # The module-level ``pytestmark = pytest.mark.asyncio`` applies to every test
+    # here; these validation checks are pure-sync but stay ``async def`` so the
+    # mark is a no-op (a bare ``def`` would emit a spurious asyncio-mark warning).
+    async def test_whitespace_only_question_rejected(self):
+        from channels.channel_handlers import _validate_ask_args
+        # Blank-after-strip questions are refused (→ invalid_args upstream).
+        assert _validate_ask_args({"question": "   ", "options": []}) is None
+        assert _validate_ask_args({"question": "\t\n ", "options": []}) is None
+        assert _validate_ask_args({"question": "", "options": []}) is None
+
+    async def test_nonblank_question_still_accepted(self):
+        from channels.channel_handlers import _validate_ask_args
+        out = _validate_ask_args({"question": " DB name? ", "options": []})
+        assert out is not None
+        # The (unstripped) question is returned unchanged; only the blank check
+        # strips. Downstream anchors render the agent's verbatim text.
+        assert out[0] == " DB name? "
+
+
+# ===========================================================================
+# wb4-1 (whole-branch gate wave 4, BLOCKER): a reply arriving AFTER the
+# engagement terminalizes (settle_all_open_questions latched the sequencer) but
+# BEFORE finalize_completion_post flushes must NOT register+arm+post below the
+# terminal completion. ``register_send_intent`` returns a fail-closed terminal
+# outcome (NOT None — None activates the eager fallback), so the ingress surfaces
+# ``engagement_terminal`` instead of a phantom ok:true post.
+# ===========================================================================
+
+
+class TestLateReplyAfterTerminalize:
+    async def test_late_reply_rejected_engagement_terminal(self, wired):
+        from channels.output_sequencer import REPLY_TOOL, projection_hash
+        eid, seq, chan = wired["rec"].id, wired["seq"], wired["chan"]
+        # The engagement terminalizes (settle latches the sequencer terminal).
+        await seq.terminalize()
+        h = projection_hash(REPLY_TOOL, {"text": "late reply"})
+        resp = await wired["send"](_FakeRequest({
+            "engagement_id": eid, "text": "late reply",
+            "request_id": "lr1", "projection_hash": h,
+        }))
+        body = _body(resp)
+        assert body["ok"] is False
+        assert body["error"] == "engagement_terminal"
+        # NOTHING posted below the terminal completion.
+        assert chan.replies == []
+        assert seq.registry.by_request_id("lr1") is None

@@ -433,12 +433,20 @@ def _make_send_to_topic(
         # narration first). A response-loss-after-post retry (same request_id)
         # reattaches to the recorded outcome instead of posting a SECOND reply.
         if driver is not None and request_id and projection_hash:
-            from channels.output_sequencer import REPLY_TOOL
+            from channels.output_sequencer import (
+                REPLY_TOOL, TERMINAL_REGISTRATION,
+            )
             res = driver.register_send_intent(
                 engagement_id=engagement_id, request_id=request_id,
                 tool_name=REPLY_TOOL, projection_hash=projection_hash,
                 poster=_noop_poster,
             )
+            # wb4-1: the engagement terminalized after this ingress entered but
+            # before the relay posted — refuse fail-closed rather than eager-post
+            # a reply BELOW the terminal completion.
+            if res is TERMINAL_REGISTRATION:
+                return web.json_response(
+                    {"ok": False, "error": "engagement_terminal"})
             if res is not None:
                 _intent, created_intent = res
                 if not created_intent:
@@ -1125,7 +1133,10 @@ def _validate_ask_args(
     run on the RAW labels.
     """
     question = body.get("question")
-    if not isinstance(question, str) or not question:
+    # wb4-4 (D1): NONBLANK AFTER STRIP — a whitespace-only question ("   ")
+    # would otherwise pass a bare truthiness check and render a blank numbered
+    # anchor. The verbatim (unstripped) text is still returned/stored unchanged.
+    if not isinstance(question, str) or not question.strip():
         return None
     options = body.get("options")
     if not isinstance(options, list):
@@ -1417,7 +1428,7 @@ def _make_ask(
 
     async def handler(request: web.Request) -> web.Response:
         from verdict_broker import BROKER
-        from channels.output_sequencer import ASK_TOOL
+        from channels.output_sequencer import ASK_TOOL, TERMINAL_REGISTRATION
 
         try:
             body = await request.json()
@@ -1574,6 +1585,11 @@ def _make_ask(
                         on_retire=lambda rid=request_id: _retire_intent_gate_pin(
                             rid),
                     )
+                    # wb4-1: engagement terminalized mid-ingress — refuse rather
+                    # than posting an anchor below the terminal completion.
+                    if res is TERMINAL_REGISTRATION:
+                        return web.json_response(
+                            {"ok": False, "error": "engagement_terminal"})
                     if res is not None:
                         _intent, created_intent = res
                         if created_intent:
@@ -2016,6 +2032,11 @@ def _make_ask(
                     # the intent's turn-end retirement).
                     on_retire=lambda rid=request_id: _retire_intent_gate_pin(rid),
                 )
+                # wb4-1: engagement terminalized mid-ingress — refuse rather than
+                # posting a keyboard below the terminal completion.
+                if res is TERMINAL_REGISTRATION:
+                    return web.json_response(
+                        {"ok": False, "error": "engagement_terminal"})
                 if res is not None:
                     _intent, created_intent = res
                     if created_intent:

@@ -1167,8 +1167,6 @@ class ClaudeCodeDriver(DriverProtocol):
         # reconciliation, not these).
         self._answered_overlay.pop(engagement.id, None)
         self._answer_reservations.pop(engagement.id, None)
-        # §A3(c): drop the ask-maintenance lock + ingress marker on teardown.
-        self._ask_maint_locks.pop(engagement.id, None)
         self._ask_inflight.pop(engagement.id, None)
         # §A3(b): drop the re-anchor-due latch + cancel any retry-owner task
         # (CancelledError terminates it without rescheduling).
@@ -1176,6 +1174,27 @@ class ClaudeCodeDriver(DriverProtocol):
         retry_task = self._reanchor_retry_tasks.pop(engagement.id, None)
         if retry_task is not None and not retry_task.done():
             retry_task.cancel()
+        # wb4-3 (whole-branch gate wave 4): DRAIN the cancelled re-anchor owner
+        # BEFORE dropping D6 state. A cancelled re-anchor owner DRAINS its child
+        # to completion (by design — ``_reanchor_pass_locked``); that child keeps
+        # running after ``cancel()`` returns and re-creates ``_confirmed_pairs``
+        # AFTER teardown popped it — an unpumped, unlogged D6 record. So here:
+        # (1) await the retry owner so its drained child finishes; (2) take the
+        # ask-maintenance lock as a BARRIER — the drained child (this owner's OR
+        # a boundary consumer's, e.g. one settle already cancelled) holds that
+        # lock for its whole drain, so acquiring the EXISTING lock waits for the
+        # child to complete and re-create any pair BEFORE we drop + log it. Both
+        # are bounded — the drained unit is finite (§D6). Acquire the existing
+        # lock BEFORE popping its dict slot (a popped slot would mint a NEW free
+        # lock and skip the barrier).
+        if retry_task is not None:
+            await asyncio.gather(retry_task, return_exceptions=True)
+        maint_lock = self._ask_maint_locks.get(engagement.id)
+        if maint_lock is not None:
+            async with maint_lock:
+                pass
+        # §A3(c): drop the ask-maintenance lock + ingress marker on teardown.
+        self._ask_maint_locks.pop(engagement.id, None)
         # v0.84.0 (round-4 §D6, Sol r20-1/r21-1/r22-1): drop the confirmed-pair
         # map on teardown and LOG one residual PER remaining PAIR. A pair still
         # present at TERMINAL teardown is a double failure (registry outage AND
@@ -1655,7 +1674,11 @@ class ClaudeCodeDriver(DriverProtocol):
             )
         await seq.flush_armed_intents()
         await seq.seal_narration()
-        await seq.post_platform_notice(summary_text)
+        # wb4-2: the completion text is the TERMINAL message — post it through the
+        # dedicated completion seam, the ONLY writer permitted post-terminal
+        # (``post_platform_notice`` now discards under the terminal latch, so a
+        # lagging mutating-tool violation notice can never land below completion).
+        await seq.post_completion_notice(summary_text)
         return True
 
     def register_completion_consumption(
@@ -1674,10 +1697,16 @@ class ClaudeCodeDriver(DriverProtocol):
         )
         rid = f"emit_completion:{engagement_id}"
         phash = _pj(EMIT_COMPLETION_TOOL, args if isinstance(args, dict) else {})
-        intent, _created = seq.register_intent(
+        res = seq.register_intent(
             request_id=rid, tool_name=EMIT_COMPLETION_TOOL,
             projection_hash=phash, poster=_completion_noop_poster,
         )
+        # wb4-1: the engagement already terminalized (register returns the
+        # terminal sentinel, not a tuple) — no debt to leave; finalize's own
+        # terminalize already drove settlement. Best-effort, so just return.
+        if not isinstance(res, tuple):
+            return
+        intent, _created = res
         # Mark the debt directly (no lock needed — a plain dataclass toggle; the
         # relay reads it under the lock at block-match time).
         intent.state = "posted"
