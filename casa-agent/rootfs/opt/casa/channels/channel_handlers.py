@@ -1747,10 +1747,14 @@ def _make_ask(
                     gate.set_failed(anchor_body_refusal)
                     return web.json_response(anchor_body_refusal)
 
-                # Final latch read + PASSED marker. The no-yield PASSED → ARM
-                # handoff and single-attempt plain send are Task A6; here we
-                # publish PASSED so an anchor reattacher blocked on the gate wakes
-                # and proceeds (A6 refines the arm/send ordering below).
+                # Final latch-then-completion read + PASSED marker. A6 (spec §D1
+                # "Anchors get the same protection"): from this read through
+                # installing/arming the placeholder's poster there is NO await —
+                # the PASSED → ARM handoff is one synchronous section, so a cancel
+                # can never slip a half-armed intent through. A cancel that
+                # latches AFTER this point is caught by the poster's wire re-read
+                # (below), which no-ops on CANCELLED immediately before its ONE
+                # plain send.
                 if gate.effective()[0] == "CANCELLED":
                     _clear_ask_marker(driver, eng_id, request_id)
                     if created_intent:
@@ -1773,8 +1777,27 @@ def _make_ask(
                     # must not have the live anchor's marker stripped from under them).
                     _durable = False
                     try:
+                        # A6 (spec §D1, Sol r9-2): FINAL cancellation revalidation
+                        # at the wire. This poster runs UNDER the sequencer's
+                        # writer lock (the relay awaits it inside
+                        # ``_post_intent_locked``) — or inline in the eager
+                        # no-sequencer fallback — so re-reading the gate here is
+                        # the LAST thing before the physical send. A cancel that
+                        # latched after PASSED/ARM (or whose intent tombstone lost
+                        # the "post wins" race) no-ops HERE: nothing posts, the
+                        # awaiting handler resolves ok:false. The marker is cleared
+                        # by the ``finally`` below (this is a non-durable exit).
+                        if gate.effective()[0] == "CANCELLED":
+                            return None
+                        # A6 (spec §D1, Sol r9-2): SINGLE-ATTEMPT PLAIN send — like
+                        # the button-ask body, ``send_to_topic`` performs exactly
+                        # ONE physical send. The rich ``send_response_to_topic``
+                        # could send twice (rich → BadRequest → plain fallback),
+                        # and a cancel landing during the awaited first attempt
+                        # would not be re-checked before the fallback posted the
+                        # abandoned anchor — the double-send this forecloses.
                         try:
-                            mid = await telegram_channel.send_response_to_topic(
+                            mid = await telegram_channel.send_to_topic(
                                 rec.topic_id, display)
                         except Exception:  # noqa: BLE001
                             logger.warning("free-text anchor post failed (eng=%s)",

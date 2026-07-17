@@ -57,6 +57,10 @@ class _Chan:
         self.narrations: list[tuple[int, str]] = []
         self.edits: list[dict] = []
         self.send_returns_none = False
+        # A6 (spec §D1): the anchor poster now posts via the SINGLE-ATTEMPT PLAIN
+        # ``send_to_topic`` (never the rich ``send_response_to_topic`` two-send
+        # path). This counter proves the rich path is never taken for an anchor.
+        self.rich_topic_sends = 0
 
     def _id(self) -> int:
         m = self._next
@@ -70,7 +74,20 @@ class _Chan:
         self.keyboards.append((m, question))
         return m
 
+    async def send_to_topic(self, thread_id, text, **kwargs) -> int | None:
+        # A6 (spec §D1): the anchor poster's SINGLE-ATTEMPT PLAIN send. Records
+        # into ``anchors`` (the ledger every anchor test inspects); honours the
+        # injectable ``send_returns_none`` delivery-failure switch.
+        if self.send_returns_none:
+            return None
+        m = self._id()
+        self.anchors.append((m, text))
+        return m
+
     async def send_response_to_topic(self, topic_id, text) -> int | None:
+        # Rich two-send path — used ONLY by the reply handler now. An anchor that
+        # ever routed here would be the double-send bug A6 forecloses.
+        self.rich_topic_sends += 1
         if self.send_returns_none:
             return None
         m = self._id()
@@ -897,13 +914,13 @@ class TestPosterOwnsClearWave5:
         eid, drv, seq, chan = (
             wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
         gate = asyncio.Event()
-        real_send = chan.send_response_to_topic
+        real_send = chan.send_to_topic
 
-        async def _gated_raising_send(topic_id, text):
+        async def _gated_raising_send(topic_id, text, **kwargs):
             await gate.wait()               # park the poster mid-post, lock held
             raise RuntimeError("wire send failed after the cancel lost")
 
-        monkeypatch.setattr(chan, "send_response_to_topic", _gated_raising_send)
+        monkeypatch.setattr(chan, "send_to_topic", _gated_raising_send)
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
@@ -938,7 +955,7 @@ class TestPosterOwnsClearWave5:
         assert outcome is not None and outcome["ok"] is False
 
         # A next, DIFFERENT ask is NOT wedged question_pending — it posts cleanly.
-        monkeypatch.setattr(chan, "send_response_to_topic", real_send)
+        monkeypatch.setattr(chan, "send_to_topic", real_send)
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
         resp2 = await _drive_anchor(wired, t2, hash="anchor-hash-2")
@@ -960,11 +977,11 @@ class TestPosterOwnsClearWave5:
             wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
         gate = asyncio.Event()
 
-        async def _gated_none_send(topic_id, text):
+        async def _gated_none_send(topic_id, text, **kwargs):
             await gate.wait()
             return None
 
-        monkeypatch.setattr(chan, "send_response_to_topic", _gated_none_send)
+        monkeypatch.setattr(chan, "send_to_topic", _gated_none_send)
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
@@ -1110,6 +1127,127 @@ class TestPostAddGenRecheck:
         assert drv._effective_open_question_numbers(eid) == []
         # A settle edit ran over the anchor.
         assert wired["chan"].edits, "no settle edit for the gen-bumped anchor"
+
+
+# ===========================================================================
+# A6 (spec §D1 "Anchors get the same protection, brokerless"): PASSED->ARM
+# handoff + single-attempt PLAIN send + poster-side cancellation revalidation
+# at the wire. Real handler + real OutputSequencer + real gate; the fake wire
+# records every physical send.
+# ===========================================================================
+
+
+class TestAnchorLatchedSend:
+    """The anchor poster re-reads the cancellation latch UNDER THE SEQUENCER
+    LOCK immediately before its ONE plain ``send_to_topic`` and no-ops on
+    CANCELLED — on the relay-deferred path and the eager no-sequencer path
+    alike — so a cancel that latched after PASSED/ARM never posts an abandoned
+    anchor, and the rich two-send fallback is unreachable."""
+
+    async def test_cancel_between_passed_and_arm_no_post(self, wired, monkeypatch):
+        # (a) The cancel lands EXACTLY at arm time — after the owner set the gate
+        # PASSED, inside the (no-yield) PASSED->ARM handoff. The armed intent is
+        # matchable, so the relay invokes the poster; the poster's wire re-read
+        # observes CANCELLED and posts NOTHING.
+        eid, drv = wired["rec"].id, wired["drv"]
+        from channels.channel_handlers import get_or_create_gate
+
+        real_arm = drv.arm_send_intent
+
+        def _arm_and_cancel(engagement_id, request_id):
+            # Latch cancellation the instant the placeholder poster is armed
+            # (PASSED already recorded) — the between-PASSED-and-arm window.
+            get_or_create_gate(request_id).set_cancelled()
+            return real_arm(engagement_id, request_id)
+
+        monkeypatch.setattr(drv, "arm_send_intent", _arm_and_cancel)
+
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        # The relay reaches the (armed, but latch-cancelled) block.
+        await wired["seq"].post_for_block(ASK_TOOL, _ANCHOR_HASH)
+        resp = await asyncio.wait_for(task, timeout=1.0)
+        # Nothing posted — neither plain nor rich.
+        assert wired["chan"].anchors == []
+        assert wired["chan"].rich_topic_sends == 0
+        assert _body(resp)["ok"] is False
+        # Marker never wedged.
+        assert drv.ask_inflight(eid) is None
+
+    async def test_cancel_between_arm_and_send_poster_noops(
+        self, wired, monkeypatch,
+    ):
+        # (b) The intent is ARMED and awaiting the relay post; a cancel latches
+        # the gate BEFORE the relay reaches the block. The fake wire is armed to
+        # BLOCK if it is ever entered — the re-read must short-circuit so the
+        # wire is never awaited ("block the fake wire, set the latch, release").
+        eid, drv, chan = wired["rec"].id, wired["drv"], wired["chan"]
+        from channels.channel_handlers import get_or_create_gate
+
+        wire_entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _blocking_send(thread_id, text, **kwargs):
+            wire_entered.set()
+            await release.wait()          # would hang here if ever reached
+            m = chan._id()
+            chan.anchors.append((m, text))
+            return m
+
+        monkeypatch.setattr(chan, "send_to_topic", _blocking_send)
+
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "a1"))))
+        await asyncio.sleep(0.02)
+        assert drv.ask_inflight(eid) == "a1"          # armed, awaiting the post
+        # Cancel lands between ARM and the wire.
+        get_or_create_gate("a1").set_cancelled()
+        # Drive the relay to the block: the poster re-reads CANCELLED and returns
+        # WITHOUT entering (blocking on) the wire.
+        await wired["seq"].post_for_block(ASK_TOOL, _ANCHOR_HASH)
+        resp = await asyncio.wait_for(task, timeout=1.0)
+        release.set()                                 # cleanup — never needed
+        assert not wire_entered.is_set(), "poster reached the wire despite CANCELLED"
+        assert chan.anchors == []
+        assert _body(resp)["ok"] is False
+        assert drv.ask_inflight(eid) is None
+
+    async def test_no_sequencer_fallback_honors_latch(self, wired, monkeypatch):
+        # (c) The eager (no live sequencer / no projection_hash) fallback posts
+        # inline. A cancel latched during number allocation must yield NO wire
+        # post — the eager path honors the same latch.
+        eid, chan = wired["rec"].id, wired["chan"]
+        from channels.channel_handlers import get_or_create_gate
+
+        real_alloc = wired["reg"].allocate_question_number
+
+        async def _alloc_then_cancel(_e):
+            get_or_create_gate("c1").set_cancelled()
+            return await real_alloc(_e)
+
+        monkeypatch.setattr(
+            wired["reg"], "allocate_question_number", _alloc_then_cancel)
+
+        # No ``projection_hash`` => created_intent is None => eager fallback.
+        resp = await wired["ask"](_FakeRequest(
+            {"engagement_id": eid, "request_id": "c1",
+             "question": "DB name?", "options": [], "timeout_s": 60}))
+        assert _body(resp)["ok"] is False
+        assert chan.anchors == []                     # eager path posted nothing
+        assert chan.rich_topic_sends == 0
+
+    async def test_successful_anchor_is_one_plain_send(self, wired):
+        # (d) A normal anchor posts EXACTLY ONE physical send, via the plain
+        # ``send_to_topic`` — the rich two-send path is never taken.
+        eid, chan = wired["rec"].id, wired["chan"]
+        task = asyncio.ensure_future(wired["ask"](_FakeRequest(
+            _anchor_payload(eid, "d1"))))
+        resp = await _drive_anchor(wired, task)
+        assert _body(resp)["outcome"] == "anchored"
+        assert len(chan.anchors) == 1                 # exactly ONE physical send
+        assert chan.rich_topic_sends == 0             # never the rich double-send
+        assert chan.replies == []
 
 
 # ===========================================================================

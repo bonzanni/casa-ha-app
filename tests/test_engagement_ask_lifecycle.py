@@ -45,6 +45,14 @@ class _FakeChannel:
         self._next_id += 1
         return mid
 
+    async def send_to_topic(self, thread_id, text, **kwargs) -> int:
+        # A6 (spec §D1): the anchor poster now posts via the single-attempt
+        # plain ``send_to_topic``. Records into the same ``sent_texts`` ledger.
+        self.sent_texts.append((thread_id, text))
+        mid = self._next_id
+        self._next_id += 1
+        return mid
+
     async def send_response_to_topic(self, topic_id, text) -> int:
         self.sent_texts.append((topic_id, text))
         mid = self._next_id
@@ -397,6 +405,12 @@ async def test_reply_retry_reattaches_no_double_post(env):
 class _FailingChannel(_FakeChannel):
     """A channel whose topic send FAILS (returns None) — models a transient
     Telegram failure of the relay-deferred reply/anchor post."""
+
+    async def send_to_topic(self, thread_id, text, **kwargs) -> int | None:
+        # A6 (spec §D1): the anchor poster's wire — fail it too so the anchor
+        # fail-closed test still models a failed anchor post.
+        self.sent_texts.append((thread_id, text))
+        return None
 
     async def send_response_to_topic(self, topic_id, text) -> int | None:
         self.sent_texts.append((topic_id, text))
