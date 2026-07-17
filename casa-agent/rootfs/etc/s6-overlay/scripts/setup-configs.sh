@@ -234,6 +234,12 @@ else
     rm -f "$SECRET_FILE"
 fi
 
+# Publish Casa's authenticated endpoint to the companion integration through
+# Supervisor discovery. The publisher owns only the returned UUID in /data;
+# it reads the selected secret above and never logs or persists that secret.
+python3 /opt/casa/supervisor_discovery.py || \
+    bashio::log.warning "Supervisor discovery publisher exited non-zero"
+
 # --- cc-home HOME setup -----------------------------------------------------
 # casa-main + the CC CLI both require HOME=cc-home. Plugin materialization
 # (bundled-artifact import + registry seed) now lives in the
