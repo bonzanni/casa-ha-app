@@ -1021,7 +1021,18 @@ class EngagementRegistry:
         ``tg_message_id`` to ``new_mid`` (the freshly-posted re-anchor copy).
         STRICT-persisted (rollback + re-raise like the sibling mutators), so the
         caller can settle the new copy fail-closed on a raise. Returns ``False``
-        for an unknown engagement/number."""
+        for an unknown engagement/number.
+
+        v0.84.0 (round-4 §D6, Sol r3-3/r17): the SAME transaction also flips the
+        just-staged stale entry — the one whose ``mid`` equals THIS question's
+        OLD ``tg_message_id`` (captured before the overwrite), not every
+        ``"plain"`` entry on the question — from ``"plain"`` to ``"reanchored"``.
+        Both mutations are folded into the single ``rec.open_questions`` tuple
+        assigned before ``_commit_open_questions_strict``, so a failed commit
+        rolls back the whole tuple (mid AND kind) via its existing ``prev``
+        restore, and a successful commit persists both in one write. No
+        intermediate durable (or in-memory) state exists between "old mid +
+        plain" and "new mid + reanchored"."""
         async with self._lock:
             rec = self._records.get(engagement_id)
             if rec is None:
@@ -1033,11 +1044,19 @@ class EngagementRegistry:
                 nq = dict(q)
                 if nq.get("n") == number:
                     found = True
+                    old_mid = nq.get("tg_message_id")
                     nq["tg_message_id"] = new_mid
-                    # D2: this SAME transaction must atomically flip the
-                    # just-staged stale entry (mid == the OLD tg_message_id)
-                    # from "plain" to "reanchored" (spec §D6, Sol r3-3/r17) —
-                    # NOT implemented here. Task D1 stages "plain" only.
+                    # D2: atomic flip — same transaction as the mid persist
+                    # above. Targets ONLY the staged old-mid entry (mid ==
+                    # old_mid), never every "plain" entry on this question.
+                    stale = [
+                        normalize_stale_mid_entry(m)
+                        for m in (nq.get("stale_mids") or [])
+                    ]
+                    for s in stale:
+                        if s["mid"] == old_mid:
+                            s["kind"] = "reanchored"
+                    nq["stale_mids"] = stale
                 entries.append(nq)
             if not found:
                 return False
