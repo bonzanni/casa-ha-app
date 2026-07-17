@@ -418,6 +418,62 @@ async def test_status_never_returns_result_task_or_context_text(tool_env):
 
 
 @pytest.mark.asyncio
+async def test_ready_status_reports_waiting_when_stable_route_is_absent(
+    tool_env, monkeypatch,
+):
+    await tool_env.add_job(
+        "job-1",
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.READY,
+        terminal_at=time.time(),
+        expires_at=time.time() + 900,
+        result=json.dumps(_structured_result()),
+    )
+
+    class _Routes:
+        @staticmethod
+        def get_connected(_route_id):
+            return None
+
+    runtime = type("Runtime", (), {"voice_route_registry": _Routes()})()
+    monkeypatch.setattr(tools, "_runtime", runtime)
+    payload = tool_payload(await _call(
+        tools.voice_job_status, voice_origin(), {"job_id": "job-1"},
+    ))
+
+    assert payload["delivery_status"] == "waiting_for_route"
+
+
+@pytest.mark.asyncio
+async def test_ready_status_waits_when_reconnected_route_lacks_capabilities(
+    tool_env, monkeypatch,
+):
+    await tool_env.add_job(
+        "job-1",
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.READY,
+        terminal_at=time.time(),
+        expires_at=time.time() + 900,
+        result=json.dumps(_structured_result()),
+    )
+
+    incapable = type("Route", (), {"capabilities": frozenset()})()
+
+    class _Routes:
+        @staticmethod
+        def get_connected(_route_id):
+            return incapable
+
+    runtime = type("Runtime", (), {"voice_route_registry": _Routes()})()
+    monkeypatch.setattr(tools, "_runtime", runtime)
+    payload = tool_payload(await _call(
+        tools.voice_job_status, voice_origin(), {"job_id": "job-1"},
+    ))
+
+    assert payload["delivery_status"] == "waiting_for_route"
+
+
+@pytest.mark.asyncio
 async def test_explicit_status_can_inspect_an_owned_terminal_job(tool_env):
     await tool_env.add_job(
         "job-delivered",

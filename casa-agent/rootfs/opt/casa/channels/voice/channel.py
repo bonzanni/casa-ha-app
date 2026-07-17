@@ -28,6 +28,7 @@ from log_cid import new_cid
 from provenance import sanitize_external_context
 from rate_limit import RateLimiter
 from channels.voice.prosodic import ProsodicSplitter
+from channels.voice.routes import VoiceRouteRegistry, VoiceWsConnection
 from channels.voice.session import VoiceSessionPool
 from channels.voice.tts_adapter import TagDialectAdapter
 from semantic_memory import SemanticMemory
@@ -141,6 +142,8 @@ class VoiceChannel(Channel):
         ws_enabled: bool = True,
         rate_limiter: RateLimiter | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        route_registry: VoiceRouteRegistry | None = None,
+        delivery_coordinator: Any | None = None,
     ) -> None:
         self._bus = bus
         self.default_agent = default_agent
@@ -156,10 +159,17 @@ class VoiceChannel(Channel):
         # Per-scope_id rate limit (spec 5.2 §8). None = unlimited.
         self._rate_limiter = rate_limiter
         self._monotonic = monotonic
+        self.routes = route_registry or VoiceRouteRegistry(
+            secret_present=bool(webhook_secret),
+            agent_configs=agent_configs,
+        )
+        self._delivery = delivery_coordinator
 
     # --- Channel ABC --------------------------------------------------
 
     async def start(self) -> None:
+        if self._delivery is not None:
+            await self._delivery.start()
         self._sweeper = asyncio.create_task(self.pool.run_sweeper())
         logger.info(
             "Voice channel active (sse=%s, ws=%s, sse_path=%s, ws_path=%s)",
@@ -169,6 +179,10 @@ class VoiceChannel(Channel):
     async def stop(self) -> None:
         if self._sweeper is not None:
             self._sweeper.cancel()
+            await asyncio.gather(self._sweeper, return_exceptions=True)
+            self._sweeper = None
+        if self._delivery is not None:
+            await self._delivery.stop()
 
     async def send(self, message: str, context: dict) -> None:
         # Voice has no out-of-band send path — responses are delivered
@@ -482,89 +496,127 @@ class VoiceChannel(Channel):
 
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        connection = VoiceWsConnection(ws)
 
         # Per-utterance task map so `cancel` frames can target them.
         tasks: dict[str, asyncio.Task] = {}
 
-        async for msg in ws:
-            if msg.type.name != "TEXT":
-                continue
-            try:
-                frame = json.loads(msg.data)
-            except Exception:
-                continue
-            t = frame.get("type")
+        try:
+            async for msg in ws:
+                if msg.type.name != "TEXT":
+                    continue
+                try:
+                    frame = json.loads(msg.data)
+                except Exception:
+                    continue
+                if not isinstance(frame, dict):
+                    continue
+                t = frame.get("type")
 
-            if t == "stt_start":
-                # A2: stt_start carries no agent_role, so it cannot safely
-                # ensure() a role-scoped pool entry (guessing self.default_agent
-                # would silently mis-key a non-default resident's session).
-                # Pool registration now happens lazily on the utterance frame,
-                # which DOES carry agent_role. A future integration change
-                # that threads agent_role onto stt_start could re-enable a
-                # role-scoped prewarm here (see VoiceSessionPool.schedule_prewarm).
-                continue
+                self.routes.touch(connection)
 
-            if t == "stage":
-                # Hints only — no-op in 2.3.
-                continue
+                if t == "voice_route_register":
+                    bound = await self.routes.register(connection, frame)
+                    if bound is not None and self._delivery is not None:
+                        await self._delivery.route_connected(bound)
+                    continue
 
-            if t == "cancel":
-                uid = frame.get("utterance_id")
-                task = tasks.get(uid) if uid else None
-                if task is not None and not task.done():
-                    task.cancel()
-                continue
+                if isinstance(t, str) and t.startswith("job_"):
+                    if self._delivery is not None:
+                        await self._delivery.handle(connection, frame)
+                    continue
 
-            if t == "utterance":
-                uid = frame.get("utterance_id") or str(uuid.uuid4())
-                # Server-owned anchor: overwrite any identically named client
-                # field before handing the frame to the scheduled task.
-                frame["_casa_ingress_started_ms"] = self._monotonic() * 1000
-                # A4: capture the deadline at TRUE ingress — the moment the
-                # utterance frame is RECEIVED here, not inside the separately-
-                # scheduled _run_ws_utterance task (which may not run for an
-                # unbounded interval under load). Monotonic (loop.time()).
-                voice_deadline = (
-                    asyncio.get_running_loop().time() + _voice_turn_budget_s()
-                )
-                task = asyncio.create_task(
-                    self._run_ws_utterance(ws, frame, uid, voice_deadline),
-                )
-                tasks[uid] = task
+                if t == "stt_start":
+                    scope_id = _nonempty_identifier(frame.get("scope_id"))
+                    agent_role = _nonempty_identifier(frame.get("agent_role"))
+                    cfg = (
+                        self._agent_configs.get(agent_role)
+                        if agent_role is not None else None
+                    )
+                    if (
+                        scope_id is not None
+                        and agent_role is not None
+                        and cfg is not None
+                        and agent_allowed_on("voice", cfg)
+                    ):
+                        # Pool metadata only. SDK prewarm remains the separate,
+                        # conditional Tina T2 optimization.
+                        self.pool.ensure(scope_id, role=agent_role)
+                    continue
 
-                def _reap(done_task: asyncio.Task, uid: str = uid) -> None:
-                    # Prune only if this entry wasn't overwritten by a
-                    # duplicate uid. `done_task` (the callback's own arg)
-                    # IS the finished task, so this closure never holds a
-                    # separate strong reference to it beyond the callback's
-                    # own (transient) invocation.
-                    if tasks.get(uid) is done_task:
-                        tasks.pop(uid, None)
-                    if done_task.cancelled():
-                        return
-                    exc = done_task.exception()  # retrieve so GC never logs 'never retrieved'
-                    if exc is not None:
-                        logger.warning(
-                            "Voice WS utterance task failed (utterance_id=%s): %s",
-                            uid, exc,
-                        )
+                if t == "stage":
+                    # Hints only — no-op in 2.3.
+                    continue
 
-                task.add_done_callback(_reap)
-                # Drop the frame-local reference so a finished task is not
-                # kept alive by this coroutine's own suspended stack frame
-                # while it awaits the next WS frame.
-                del task
-                continue
+                if t == "cancel":
+                    uid = frame.get("utterance_id")
+                    task = tasks.get(uid) if uid else None
+                    if task is not None and not task.done():
+                        task.cancel()
+                    continue
 
-        # Clean up dangling tasks on WS close.
-        for task in list(tasks.values()):
-            if not task.done():
+                if t == "utterance":
+                    uid = frame.get("utterance_id") or str(uuid.uuid4())
+                    # Server-owned anchor: overwrite any identically named client
+                    # field before handing the frame to the scheduled task.
+                    frame["_casa_ingress_started_ms"] = self._monotonic() * 1000
+                    # A4: capture the deadline at TRUE ingress — the moment the
+                    # utterance frame is RECEIVED here, not inside the separately-
+                    # scheduled _run_ws_utterance task (which may not run for an
+                    # unbounded interval under load). Monotonic (loop.time()).
+                    voice_deadline = (
+                        asyncio.get_running_loop().time()
+                        + _voice_turn_budget_s()
+                    )
+                    task = asyncio.create_task(
+                        self._run_ws_utterance(
+                            connection, frame, uid, voice_deadline,
+                        ),
+                    )
+                    tasks[uid] = task
+
+                    def _reap(
+                        done_task: asyncio.Task, uid: str = uid,
+                    ) -> None:
+                        # Prune only if this entry wasn't overwritten by a
+                        # duplicate uid. `done_task` (the callback's own arg)
+                        # IS the finished task, so this closure never holds a
+                        # separate strong reference to it beyond the callback's
+                        # own (transient) invocation.
+                        if tasks.get(uid) is done_task:
+                            tasks.pop(uid, None)
+                        if done_task.cancelled():
+                            return
+                        # Retrieve so GC never logs 'never retrieved'.
+                        exc = done_task.exception()
+                        if exc is not None:
+                            logger.warning(
+                                "Voice WS utterance task failed "
+                                "(utterance_id=%s): %s",
+                                uid, exc,
+                            )
+
+                    task.add_done_callback(_reap)
+                    # Drop the frame-local reference so a finished task is not
+                    # kept alive by this coroutine's own suspended stack frame
+                    # while it awaits the next WS frame.
+                    del task
+                    continue
+        finally:
+            # Clear the server-bound writer even when a handler or server
+            # shutdown aborts the reader loop.
+            pending = [task for task in tasks.values() if not task.done()]
+            for task in pending:
                 task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            disconnected = await self.routes.disconnect(connection)
+            if disconnected is not None and self._delivery is not None:
+                await self._delivery.route_disconnected(disconnected)
         return ws
 
     async def _run_ws_utterance(
-        self, ws: web.WebSocketResponse, frame: dict, uid: str,
+        self, ws: VoiceWsConnection, frame: dict, uid: str,
         voice_deadline: float,
     ) -> None:
         # A4: `voice_deadline` (monotonic loop.time()) is captured by the

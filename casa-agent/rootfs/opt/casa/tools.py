@@ -2947,12 +2947,30 @@ def _job_status_value(job: VoiceJob) -> str:
 
 
 def _job_metadata(job: VoiceJob) -> dict:
+    delivery_status = job.delivery_state.value.lower()
+    routes = getattr(_runtime, "voice_route_registry", None)
+    connected_route = (
+        routes.get_connected(job.origin_route_id)
+        if routes is not None and job.origin_route_id else None
+    )
+    connected_capabilities = getattr(connected_route, "capabilities", ())
+    if (
+        job.delivery_state is DeliveryState.READY
+        and job.origin_route_id
+        and routes is not None
+        and (
+            connected_route is None
+            or not _BACKGROUND_ROUTE_CAPABILITIES
+            <= frozenset(connected_capabilities)
+        )
+    ):
+        delivery_status = "waiting_for_route"
     return {
         "status": _job_status_value(job),
         "job_id": job.id,
         "specialist_display_name": job.specialist_display_name,
         "awaiting_input": bool(job.awaiting_input),
-        "delivery_status": job.delivery_state.value.lower(),
+        "delivery_status": delivery_status,
     }
 
 

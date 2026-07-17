@@ -2,6 +2,8 @@
 
 import asyncio
 import gc
+import hashlib
+import hmac
 import json
 import logging
 import weakref
@@ -13,6 +15,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from bus import BusMessage, MessageBus, MessageType
 from channels.voice.channel import VoiceChannel
+from channels.voice.routes import VoiceWsConnection
 from error_kinds import VoiceToolLoopError
 
 pytestmark = pytest.mark.unit
@@ -45,6 +48,23 @@ class _FakeCfg:
     channels: list[str] = ["ha_voice"]
 
 
+class _TextOnlyCfg(_FakeCfg):
+    channels: list[str] = ["webhook"]
+
+
+class _DeliverySpy:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, dict]] = []
+        self.called = asyncio.Event()
+
+    async def handle(self, connection, frame):
+        self.calls.append((connection, frame))
+        self.called.set()
+
+    async def route_connected(self, _route):
+        return None
+
+
 @pytest.fixture
 async def ws_app():
     telemetry_clock = iter((20.0, 20.250))
@@ -72,6 +92,65 @@ async def ws_app():
     async with TestClient(TestServer(app)) as client:
         yield client, bus, memory, ch
     loop.cancel()
+
+
+@pytest.fixture
+async def signed_ws_app():
+    secret = "route-secret"
+    bus = MessageBus()
+    for role in ("concierge", "butler"):
+        agent = _StreamingAgent(bus, role)
+        bus.register(role, agent.handle_message)
+    loops = [
+        asyncio.create_task(bus.run_agent_loop(role))
+        for role in ("concierge", "butler")
+    ]
+    delivery = _DeliverySpy()
+    channel = VoiceChannel(
+        bus=bus,
+        default_agent="butler",
+        webhook_secret=secret,
+        sse_path="/api/converse",
+        ws_path="/api/converse/ws",
+        agent_configs={
+            "concierge": _FakeCfg(),
+            "butler": _FakeCfg(),
+            "text-only": _TextOnlyCfg(),
+        },
+        memory=AsyncMock(),
+        idle_timeout=300,
+        delivery_coordinator=delivery,
+    )
+    app = web.Application()
+    channel.register_routes(app)
+    signature = hmac.new(
+        secret.encode(), b"", hashlib.sha256,
+    ).hexdigest()
+    async with TestClient(TestServer(app)) as client:
+        yield client, channel, delivery, {
+            "X-Webhook-Signature": signature,
+        }
+    for task in loops:
+        task.cancel()
+
+
+@pytest.fixture
+async def unsigned_route_ws_app():
+    bus = MessageBus()
+    channel = VoiceChannel(
+        bus=bus,
+        default_agent="butler",
+        webhook_secret="",
+        sse_path="/api/converse",
+        ws_path="/api/converse/ws",
+        agent_configs={"butler": _FakeCfg()},
+        memory=AsyncMock(),
+        idle_timeout=300,
+    )
+    app = web.Application()
+    channel.register_routes(app)
+    async with TestClient(TestServer(app)) as client:
+        yield client, channel
 
 
 @pytest.mark.asyncio
@@ -149,6 +228,156 @@ class TestWSTurn:
             assert channel.pool.get("s", role="butler") is None
             # No profile() call — overlay not used for voice.
             assert memory.profile.await_count == 0
+
+    async def test_role_aware_stt_start_ensures_exact_role_scope_only(
+        self, signed_ws_app,
+    ):
+        client, channel, _, headers = signed_ws_app
+        async with client.ws_connect(
+            "/api/converse/ws", headers=headers,
+        ) as ws:
+            await ws.send_json({
+                "type": "stt_start", "scope_id": "device-1",
+                "agent_role": "concierge",
+            })
+            await ws.send_json({
+                "type": "stt_start", "scope_id": "device-1",
+                "agent_role": "butler",
+            })
+            await asyncio.sleep(0.05)
+
+        assert channel.pool.get("device-1", role="concierge") is not None
+        assert channel.pool.get("device-1", role="butler") is not None
+
+    @pytest.mark.parametrize("frame", [
+        {"type": "stt_start", "scope_id": "device-1"},
+        {"type": "stt_start", "scope_id": "", "agent_role": "butler"},
+        {"type": "stt_start", "scope_id": "device-1", "agent_role": "unknown"},
+        {"type": "stt_start", "scope_id": "device-1", "agent_role": "text-only"},
+    ])
+    async def test_invalid_stt_start_is_a_noop(self, signed_ws_app, frame):
+        client, channel, _, headers = signed_ws_app
+        async with client.ws_connect(
+            "/api/converse/ws", headers=headers,
+        ) as ws:
+            await ws.send_json(frame)
+            await asyncio.sleep(0.02)
+        assert channel.pool._sessions == {}
+
+    async def test_job_frame_without_utterance_id_reaches_delivery_first(
+        self, signed_ws_app,
+    ):
+        client, _, delivery, headers = signed_ws_app
+        async with client.ws_connect(
+            "/api/converse/ws", headers=headers,
+        ) as ws:
+            await ws.send_json({
+                "type": "job_claimed", "protocol": 1,
+                "job_id": "job-1",
+                "delivery_attempt_id": "attempt-1",
+            })
+            await asyncio.wait_for(delivery.called.wait(), timeout=1)
+        connection, frame = delivery.calls[-1]
+        assert isinstance(connection, VoiceWsConnection)
+        assert frame["type"] == "job_claimed"
+
+    async def test_unknown_frame_is_ignored_without_error_or_close(
+        self, signed_ws_app,
+    ):
+        client, _, _, headers = signed_ws_app
+        async with client.ws_connect(
+            "/api/converse/ws", headers=headers,
+        ) as ws:
+            await ws.send_json({"type": "future_frame", "protocol": 77})
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(ws.receive_json(), timeout=0.05)
+            assert ws.closed is False
+
+    async def test_non_object_json_frame_is_ignored_without_close(
+        self, signed_ws_app,
+    ):
+        client, _, _, headers = signed_ws_app
+        async with client.ws_connect(
+            "/api/converse/ws", headers=headers,
+        ) as ws:
+            await ws.send_json(["old", "integration", "frame"])
+            await asyncio.sleep(0.05)
+            assert ws.closed is False
+            await ws.send_json({"type": "stage", "stage": "stt"})
+            await asyncio.sleep(0.01)
+            assert ws.closed is False
+
+    async def test_authenticated_registration_binds_route(self, signed_ws_app):
+        client, channel, _, headers = signed_ws_app
+        async with client.ws_connect(
+            "/api/converse/ws", headers=headers,
+        ) as ws:
+            await ws.send_json({
+                "type": "voice_route_register", "protocol": 1,
+                "route_id": "entry-1", "agent_role": "concierge",
+                "capabilities": [
+                    "background_jobs", "satellite_announce",
+                ],
+            })
+            assert await ws.receive_json() == {
+                "type": "voice_route_registered", "protocol": 1,
+                "accepted_capabilities": [
+                    "background_jobs", "satellite_announce",
+                ],
+            }
+            bound = channel.routes.get_connected("entry-1")
+            assert bound is not None
+            assert bound.role == "concierge"
+
+    async def test_handler_failure_still_clears_connection_bound_writer(
+        self, signed_ws_app,
+    ):
+        client, channel, delivery, headers = signed_ws_app
+
+        async def fail_handle(_connection, _frame):
+            raise RuntimeError("controlled delivery failure")
+
+        delivery.handle = fail_handle
+        async with client.ws_connect(
+            "/api/converse/ws", headers=headers,
+        ) as ws:
+            await ws.send_json({
+                "type": "voice_route_register", "protocol": 1,
+                "route_id": "entry-1", "agent_role": "concierge",
+                "capabilities": [
+                    "background_jobs", "satellite_announce",
+                ],
+            })
+            await ws.receive_json()
+            assert channel.routes.get_connected("entry-1") is not None
+            await ws.send_json({
+                "type": "job_claimed", "protocol": 1,
+                "job_id": "job-1",
+                "delivery_attempt_id": "attempt-1",
+            })
+            await ws.receive()
+
+        for _ in range(20):
+            if channel.routes.get_connected("entry-1") is None:
+                break
+            await asyncio.sleep(0.01)
+        assert channel.routes.get_connected("entry-1") is None
+
+    async def test_empty_secret_never_accepts_background_capability(
+        self, unsigned_route_ws_app,
+    ):
+        client, channel = unsigned_route_ws_app
+        async with client.ws_connect("/api/converse/ws") as ws:
+            await ws.send_json({
+                "type": "voice_route_register", "protocol": 1,
+                "route_id": "entry-1", "agent_role": "butler",
+                "capabilities": [
+                    "background_jobs", "satellite_announce",
+                ],
+            })
+            ack = await ws.receive_json()
+            assert ack["accepted_capabilities"] == []
+        assert channel.routes.get_connected("entry-1") is None
 
     async def test_cancel_stops_in_flight(self, ws_app):
         client, bus, _, channel = ws_app

@@ -2538,6 +2538,16 @@ async def main() -> None:
     voice_channel = None
     if voice_sse_enabled or voice_ws_enabled:
         from channels.voice import VoiceChannel
+        from channels.voice.delivery import VoiceDeliveryCoordinator
+        from channels.voice.routes import VoiceRouteRegistry
+
+        voice_routes = VoiceRouteRegistry(
+            secret_present=bool(webhook_secret),
+            agent_configs=role_configs,
+        )
+        voice_delivery = VoiceDeliveryCoordinator(job_registry, voice_routes)
+        runtime.voice_route_registry = voice_routes
+        runtime.voice_delivery_coordinator = voice_delivery
 
         voice_channel = VoiceChannel(
             bus=bus,
@@ -2551,6 +2561,8 @@ async def main() -> None:
             sse_enabled=voice_sse_enabled,
             ws_enabled=voice_ws_enabled,
             rate_limiter=voice_rate_limiter,
+            route_registry=voice_routes,
+            delivery_coordinator=voice_delivery,
         )
         channel_manager.register(voice_channel)
         logger.info(
