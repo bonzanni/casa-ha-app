@@ -16,6 +16,7 @@ import math
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
 from aiohttp import web
@@ -40,6 +41,83 @@ from job_registry import JobTransitionError, VoiceJob
 from semantic_memory import SemanticMemory
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class VoiceHandoff:
+    """The sole foreground frame data produced from a durable voice job."""
+
+    utterance_id: str
+    handoff_id: str
+    text: str
+
+    @classmethod
+    def from_job(cls, utterance_id: str, job: VoiceJob) -> "VoiceHandoff":
+        """Select the fixed acknowledgement without exposing job content."""
+        return cls(
+            utterance_id=utterance_id,
+            handoff_id=job.handoff_id or "",
+            text=f"I will ask {job.specialist_display_name}.",
+        )
+
+    def frame(self) -> dict[str, str]:
+        return {
+            "type": "handoff",
+            "utterance_id": self.utterance_id,
+            "handoff_id": self.handoff_id,
+            "text": self.text,
+        }
+
+
+class VoiceHandoffReservation:
+    """Request-local foreground ownership for one potential WS handoff.
+
+    The reservation has no task, context, routing, or user data.  Tools can
+    synchronously reserve/release it while the channel owns the one-way commit
+    callback that resolves the foreground handoff future after durability.
+    """
+
+    def __init__(self) -> None:
+        self._held = False
+        self._speech_sent = False
+        self._committed = False
+        self._commit_callback: Callable[[VoiceJob], None] | None = None
+
+    @property
+    def held(self) -> bool:
+        return self._held
+
+    def bind_commit(self, callback: Callable[[VoiceJob], None]) -> None:
+        """Install the channel-owned completion callback exactly once."""
+        if self._commit_callback is not None:
+            raise RuntimeError("voice handoff commit callback already bound")
+        self._commit_callback = callback
+
+    def reserve(self) -> bool:
+        """Suppress foreground output, unless this turn has already spoken."""
+        if self._speech_sent:
+            return False
+        self._held = True
+        return True
+
+    def release(self) -> None:
+        """Let a typed prelaunch failure resume the ordinary response turn."""
+        if not self._committed:
+            self._held = False
+
+    def mark_speech_sent(self) -> None:
+        """Close the handoff path once a real speech block reached the wire."""
+        self._speech_sent = True
+
+    def commit(self, job: VoiceJob) -> None:
+        """Resolve the foreground owner once Task 3 made the job durable."""
+        if self._committed:
+            return
+        callback = self._commit_callback
+        if callback is None:
+            raise RuntimeError("voice handoff commit callback is not bound")
+        callback(job)
+        self._committed = True
 
 
 class VoiceHandoffCoordinator:
@@ -789,6 +867,16 @@ class VoiceChannel(Channel):
         write_lock = asyncio.Lock()
         speech_block_sent = False
         progress_sent = False
+        handoff: asyncio.Future[VoiceHandoff] = (
+            asyncio.get_running_loop().create_future()
+        )
+        reservation = VoiceHandoffReservation()
+
+        def commit_handoff(job: VoiceJob) -> None:
+            if not handoff.done():
+                handoff.set_result(VoiceHandoff.from_job(uid, job))
+
+        reservation.bind_commit(commit_handoff)
         first_block_logged = False
         ingress_started_ms = frame.get("_casa_ingress_started_ms")
         if ingress_started_ms is None:
@@ -808,26 +896,33 @@ class VoiceChannel(Channel):
 
         async def on_token(accumulated: str) -> None:
             nonlocal last_text, splitter, speech_block_sent
-            if not accumulated.startswith(last_text):
-                # AR-B — see the SSE handler's on_token for rationale.
-                logger.debug(
-                    "voice ws on_token non-prefix cumulative "
-                    "(len=%d vs last_text len=%d); resetting splitter "
-                    "utterance_id=%s scope_id=%s",
-                    len(accumulated), len(last_text), uid, scope_id,
-                )
-                last_text = ""
-                splitter = ProsodicSplitter()
-            delta = accumulated[len(last_text):]
-            last_text = accumulated
-            for block in splitter.feed(delta):
-                async with write_lock:
+            async with write_lock:
+                # A handoff reserve happens before any async prelaunch gate.
+                # Do not mutate prefix state while held: a later typed failure
+                # releases the reservation and the next cumulative token can
+                # resume normal speech from the previous real prefix.
+                if reservation.held:
+                    return
+                if not accumulated.startswith(last_text):
+                    # AR-B — see the SSE handler's on_token for rationale.
+                    logger.debug(
+                        "voice ws on_token non-prefix cumulative "
+                        "(len=%d vs last_text len=%d); resetting splitter "
+                        "utterance_id=%s scope_id=%s",
+                        len(accumulated), len(last_text), uid, scope_id,
+                    )
+                    last_text = ""
+                    splitter = ProsodicSplitter()
+                delta = accumulated[len(last_text):]
+                last_text = accumulated
+                for block in splitter.feed(delta):
                     await ws.send_json({
                         "type": "block", "utterance_id": uid,
                         "text": adapter.render(block), "final": False,
                     })
                     _log_first_block()
                     speech_block_sent = True
+                    reservation.mark_speech_sent()
 
         async def _progress_sink(text: str) -> None:
             # A4: see the SSE handler's _progress_sink for the full
@@ -835,7 +930,7 @@ class VoiceChannel(Channel):
             # check + write + mutation all happen under the held lock.
             nonlocal progress_sent
             async with write_lock:
-                if progress_sent or speech_block_sent:
+                if reservation.held or progress_sent or speech_block_sent:
                     return
                 await ws.send_json({
                     "type": "block", "utterance_id": uid,
@@ -889,12 +984,44 @@ class VoiceChannel(Channel):
                 "_error_sink": _error_sink,
                 "_voice_deadline": voice_deadline,
                 "_progress_sink": _progress_sink,
+                "_voice_handoff_reservation": reservation,
                 **trusted_route_context,
             },
         )
 
+        request_task = asyncio.create_task(
+            self._bus.request(bus_msg, timeout=300),
+            name=f"voice-request-{uid}",
+        )
         try:
-            await self._bus.request(bus_msg, timeout=300)
+            done, _ = await asyncio.wait(
+                {request_task, handoff},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if handoff in done:
+                try:
+                    foreground_handoff = handoff.result()
+                    async with write_lock:
+                        await ws.send_json(foreground_handoff.frame())
+                except BaseException:
+                    # The pending latch remains durable for Task 3's reconnect
+                    # reoffer.  Tear down only this foreground request before
+                    # taking the ordinary connection/error path below.
+                    if not request_task.done():
+                        request_task.cancel()
+                    await asyncio.gather(request_task, return_exceptions=True)
+                    raise
+                if not request_task.done():
+                    request_task.cancel()
+                await asyncio.gather(request_task, return_exceptions=True)
+                return
+
+            # The normal request won.  Its handler has either released a
+            # prelaunch reservation or never reserved it, so retain all prior
+            # streaming/done behaviour and consume the unused callback waiter.
+            handoff.cancel()
+            await asyncio.gather(handoff, return_exceptions=True)
+            await request_task
             if error_emitted:
                 return
             tail = splitter.flush_tail()
@@ -918,6 +1045,11 @@ class VoiceChannel(Channel):
         except asyncio.CancelledError:
             # Cancellation from a `cancel` frame — drop partial state; do
             # not emit `done`. Pool stays alive per spec §10.3.
+            if not request_task.done():
+                request_task.cancel()
+                await asyncio.gather(request_task, return_exceptions=True)
+            if not handoff.done():
+                handoff.cancel()
             raise
         except Exception as exc:
             line = self._error_line(cfg, exc)

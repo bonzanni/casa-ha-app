@@ -2630,7 +2630,15 @@ async def delegate_to_agent(args: dict) -> dict:
     if static_error is not None:
         return static_error
     if handoff_reservation is not None:
-        handoff_reservation.reserve()
+        if handoff_reservation.reserve() is False:
+            return _result({
+                "status": "error",
+                "kind": "handoff_after_speech",
+                "message": (
+                    "A specialist handoff cannot start after this voice turn "
+                    "has begun speaking."
+                ),
+            })
 
     # A4: THE unified prelaunch pipeline — one call that runs EVERY
     # pre-launch gate (ACL, not-initialized, input-size bounds, depth, mode,
@@ -2841,6 +2849,17 @@ async def delegate_to_agent(args: dict) -> dict:
                     handoff=handoff,
                     handoff_reservation=handoff_reservation,
                 )
+                if handoff_reservation is not None:
+                    try:
+                        launch_status = json.loads(
+                            result["content"][0]["text"],
+                        ).get("status")
+                    except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+                        launch_status = None
+                    if launch_status == "error":
+                        # The real launch path releases before returning an
+                        # error; preserve that contract at this seam too.
+                        handoff_reservation.release()
             finally:
                 if handoff.transferred:
                     owned = None  # __TRANSFER_VOICE_JOB__

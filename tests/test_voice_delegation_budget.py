@@ -84,12 +84,16 @@ class _Reservation:
     def __init__(self) -> None:
         self.reserve_calls = 0
         self.release_calls = 0
+        self.commit_calls = 0
 
     def reserve(self) -> None:
         self.reserve_calls += 1
 
     def release(self) -> None:
         self.release_calls += 1
+
+    def commit(self, _job) -> None:
+        self.commit_calls += 1
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +214,58 @@ class TestVoiceModes:
 
 @pytest.mark.asyncio
 class TestConciergeVoiceHandoffPolicy:
+    async def test_late_handoff_reservation_does_not_launch_a_job(
+        self, monkeypatch,
+    ):
+        """Once real voice output started, async handoff is no longer safe."""
+        import agent as agent_mod
+        import tools as tm
+
+        class _LateReservation(_Reservation):
+            def reserve(self) -> bool:
+                super().reserve()
+                return False
+
+        reg = MagicMock()
+        reg.get.return_value = None
+        tm.init_tools(
+            channel_manager=MagicMock(), bus=MagicMock(),
+            specialist_registry=reg, mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=MagicMock(),
+            agent_role_map={
+                "concierge": _cfg("concierge", delegates=("finance",)),
+                "finance": _cfg("finance"),
+            },
+        )
+        reservation = _LateReservation()
+
+        async def _start(**_kwargs):
+            raise AssertionError("late handoff must not launch a job")
+
+        monkeypatch.setattr(tm, "_start_voice_async_job", _start)
+        monkeypatch.setattr(tm, "background_route_available", lambda _origin: True)
+        token = agent_mod.origin_var.set(_voice_origin(
+            role="concierge", execution_role="concierge",
+            voice_transport="ws", voice_route_id="entry-1",
+            origin_device_id="kitchen",
+            voice_route_capabilities=frozenset({
+                "background_jobs", "satellite_announce", "voice_handoff",
+            }),
+            _voice_handoff_reservation=reservation,
+        ))
+        try:
+            result = await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "",
+                "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        assert json.loads(result["content"][0]["text"])["kind"] == (
+            "handoff_after_speech"
+        )
+        assert reservation.reserve_calls == 1
+
     async def test_concierge_voice_sync_is_normalized_to_async_without_progress(
         self, monkeypatch,
     ):
