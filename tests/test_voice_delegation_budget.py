@@ -368,6 +368,50 @@ class TestConciergeVoiceHandoffPolicy:
         assert reservation.reserve_calls == 1
         assert reservation.release_calls == 1
 
+    async def test_handoff_reservation_releases_if_prelaunch_is_cancelled(
+        self, monkeypatch,
+    ):
+        import agent as agent_mod
+        import tools as tm
+
+        reg = MagicMock()
+        reg.get.return_value = None
+        tm.init_tools(
+            channel_manager=MagicMock(), bus=MagicMock(),
+            specialist_registry=reg, mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=MagicMock(),
+            agent_role_map={
+                "concierge": _cfg("concierge", delegates=("finance",)),
+                "finance": _cfg("finance"),
+            },
+        )
+        reservation = _Reservation()
+
+        async def _prelaunch(*args):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(tm, "_prelaunch", _prelaunch)
+        token = agent_mod.origin_var.set(_voice_origin(
+            role="concierge", execution_role="concierge",
+            voice_transport="ws", voice_route_id="entry-1",
+            origin_device_id="kitchen",
+            voice_route_capabilities=frozenset({
+                "background_jobs", "satellite_announce", "voice_handoff",
+            }),
+            _voice_handoff_reservation=reservation,
+        ))
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await tm.delegate_to_agent.handler({
+                    "agent": "finance", "task": "t", "context": "",
+                    "mode": "sync",
+                })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        assert reservation.reserve_calls == 1
+        assert reservation.release_calls == 1
+
     @pytest.mark.parametrize("role,channel", [
         ("butler", "voice"), ("tina", "voice"), ("concierge", "telegram"),
     ])
