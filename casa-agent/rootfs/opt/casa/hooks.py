@@ -1200,6 +1200,72 @@ def _perm_keyboard_finish(
     return _finish
 
 
+# ---------------------------------------------------------------------------
+# R4 (v0.89.0, buttons-always): engagement_buttons_reminder
+#
+# A PreToolUse(Skill) salience backstop on the WORKSPACE hook path
+# (hook_proxy.sh -> /internal/hooks/resolve). The plugin-developer engaged
+# executor runs the STANDALONE Claude CLI, so an in-casa SDK ``can_use_tool``
+# PreToolUse hook never fires for it — this HTTP-path policy is the only seam.
+#
+# When a ``Skill`` is about to load (e.g. ``superpowers:brainstorming``, whose
+# own "present options conversationally / one question per message" HARD-GATE
+# out-competes doctrine read earlier in the turn) AND the cwd resolves to an
+# ACTIVE engagement, inject a PreToolUse ``additionalContext`` reminder that the
+# engagement channel's choice questions ALWAYS use ``ask``/``options``. This is
+# context injection, not a block/ask decision, and NOT a user-facing
+# ``systemMessage``. Trigger is tool IDENTITY (Skill) + engagement-from-cwd —
+# NEVER message content.
+# ---------------------------------------------------------------------------
+
+_BUTTONS_REMINDER_TEXT = (
+    "You are in an engagement channel — any question offering choices MUST "
+    "use the `ask` tool with `options` (tappable buttons), never prose, even "
+    "if this skill tells you to ask conversationally."
+)
+
+
+def make_engagement_buttons_reminder(
+    *,
+    engagement_registry: Any,
+) -> HookCallback:
+    """Build the PreToolUse(Skill) hook that injects the buttons-always
+    reminder when a Skill loads inside an ACTIVE engagement.
+
+    Args:
+        engagement_registry: registry exposing ``.get(engagement_id) -> record | None``.
+
+    Returns ``{"hookSpecificOutput": {"hookEventName": "PreToolUse",
+    "additionalContext": <reminder>}}`` (SDK-declared
+    ``PreToolUseHookSpecificOutput.additionalContext``) for a Skill call under
+    an active engagement; ``{}`` (allow, no context) otherwise. Never blocks.
+    """
+
+    async def _hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        # Tool-identity gate (defense-in-depth; the wired matcher is "Skill"
+        # too). NEVER inspect message/tool content.
+        if input_data.get("tool_name") != "Skill":
+            return {}
+        eng_id = _engagement_id_from_cwd(input_data.get("cwd") or "")
+        if eng_id is None:
+            return {}
+        rec = engagement_registry.get(eng_id)
+        if rec is None or getattr(rec, "status", None) != "active":
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": _BUTTONS_REMINDER_TEXT,
+            }
+        }
+
+    return _hook
+
+
 def make_engagement_permission_relay(
     *,
     engagement_registry: Any,

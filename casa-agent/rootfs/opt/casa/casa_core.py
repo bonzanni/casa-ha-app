@@ -960,6 +960,35 @@ def _wire_engagement_permission_relay(
     return cc_hook_policies
 
 
+def _wire_engagement_buttons_reminder(
+    cc_hook_policies: dict,
+    *,
+    engagement_registry,
+) -> dict:
+    """Inject engagement_buttons_reminder into a built cc_hook_policies dict.
+
+    R4 (v0.89.0, buttons-always): a PreToolUse(Skill) salience backstop that
+    needs the live ``engagement_registry`` (to resolve an ACTIVE engagement
+    from the CC payload's cwd), so — like ``engagement_permission_relay`` — it
+    can't be built via the parameter-free HOOK_POLICIES factory pattern. The
+    matcher is ``Skill`` so only Skill loads reach the callback (the executor's
+    generated .claude/settings.json registers the same Skill matcher, and
+    ``build_policy_callbacks_from_hooks_yaml`` skips this policy — no factory —
+    so the HTTP resolver falls back to this wired default).
+
+    Mutates and returns ``cc_hook_policies`` for caller convenience.
+    """
+    from hooks import make_engagement_buttons_reminder
+
+    cc_hook_policies["engagement_buttons_reminder"] = (
+        r"Skill",
+        make_engagement_buttons_reminder(
+            engagement_registry=engagement_registry,
+        ),
+    )
+    return cc_hook_policies
+
+
 async def _drain_broker_before_channel_shutdown(channel_manager: Any) -> None:
     """Graceful-shutdown barrier (r4-B1/B3): resolve every live
     ``verdict_broker`` request as ``cancelled`` and let its keyboard-edit
@@ -2710,6 +2739,11 @@ async def main() -> None:
         engagement_registry=engagement_registry,
         telegram_channel=telegram_channel,
     )
+    # R4 (v0.89.0): buttons-always PreToolUse(Skill) salience backstop.
+    _wire_engagement_buttons_reminder(
+        _cc_hook_policies,
+        engagement_registry=engagement_registry,
+    )
     # H3 (v0.53.0): per-executor hooks.yaml params for the HTTP hook path.
     _executor_cc_policies = _build_executor_cc_hook_policies(executor_registry)
     app.router.add_post(
@@ -2775,6 +2809,11 @@ async def main() -> None:
         _internal_hook_policies,
         engagement_registry=engagement_registry,
         telegram_channel=telegram_channel,
+    )
+    # R4 (v0.89.0): buttons-always PreToolUse(Skill) salience backstop.
+    _wire_engagement_buttons_reminder(
+        _internal_hook_policies,
+        engagement_registry=engagement_registry,
     )
     from tools import CASA_TOOLS as _CASA_TOOLS_FOR_INTERNAL
     _internal_tool_dispatch = {

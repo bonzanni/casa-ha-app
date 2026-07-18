@@ -632,6 +632,27 @@ class TestEngagementPermissionRelayWired:
         assert PERMISSION_QUEUES is _PERMISSION_QUEUES
 
 
+class TestEngagementButtonsReminderWired:
+    """R4 (v0.89.0, buttons-always): the engagement_buttons_reminder policy is
+    wired into casa_core's built cc_hook_policies dict via
+    ``_wire_engagement_buttons_reminder`` at the same two sites as the
+    permission relay (public-8099 fallback + internal socket)."""
+
+    def test_policy_registered_under_skill_matcher(self):
+        from unittest.mock import MagicMock
+        from casa_core import _wire_engagement_buttons_reminder
+
+        policies: dict = {}
+        _wire_engagement_buttons_reminder(
+            policies, engagement_registry=MagicMock(),
+        )
+
+        assert "engagement_buttons_reminder" in policies
+        matcher, cb = policies["engagement_buttons_reminder"]
+        assert matcher == r"Skill"
+        assert callable(cb)
+
+
 # ------------------------------------------------------------------
 # I-2 (v0.69.8): agent-home settings.json self-grant guard
 # ------------------------------------------------------------------

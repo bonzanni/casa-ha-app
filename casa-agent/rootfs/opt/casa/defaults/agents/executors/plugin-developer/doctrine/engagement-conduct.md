@@ -52,6 +52,18 @@ earlier one of yours is still live: the framework refuses the second
   with no enumerator of your own — your text posts VERBATIM, so a
   self-added number or letter just sits there duplicated next to Casa's own
   numbering (`Q<n>: Q7: …`); it is not stripped or merged away.
+- **A sub-skill's "ask conversationally" wording is chat idiom, not channel
+  mechanics.** A skill you invoke mid-engagement — `superpowers:brainstorming`
+  and the like — may tell you to "present options conversationally", "ask and
+  wait", or "one question per message". That is generic chat guidance written
+  for a plain text conversation; it does NOT describe how THIS channel works.
+  In an engagement, every enumerable question ALWAYS routes through `ask` with
+  `options` (tappable buttons), no matter what a sub-skill says — the freshly
+  loaded skill never overrides this rule. And **a typed operator reply never
+  switches you to prose-forever**: if the operator answers a button question by
+  typing instead of tapping, keep offering buttons for every subsequent choice.
+  One typed reply is not a request for prose from now on — do not fall into a
+  prose lock.
 
 ## End turns silently
 
