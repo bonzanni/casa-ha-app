@@ -2184,6 +2184,90 @@ class TelegramChannel(Channel):
             )
             return False
 
+    async def edit_topic_message_rich(
+        self, topic_id: int | None, message_id: int, text: str,
+        *, clear_keyboard: bool = False,
+    ) -> bool:
+        """R2a (v0.89.0): rich-text edit of a posted NARRATION topic message.
+
+        Rich sibling of ``edit_topic_message``: ``render()`` the CURRENT full
+        string into ``MessageEntity`` spans and edit them in, so markdown
+        (``**bold**``, `` `code` ``, fenced-pre) renders instead of leaking
+        literal markers. Plain (no markup / over limits ⇒ ``entities is None``)
+        delegates to the plain ``edit_topic_message`` and edits the RAW text
+        verbatim. On an entity ``BadRequest`` the ORIGINAL text is edited in
+        plain once (fail-literal); a "not modified" ``BadRequest`` is tolerated
+        as success (JC4, matching ``edit_topic_message``). ``clear_keyboard``
+        drops the tappable buttons via an explicit empty ``InlineKeyboardMarkup``
+        (the S1 fix), exactly as ``edit_topic_message`` does.
+
+        RENDERS ON EVERY EDIT (not only at a terminal edit): a narration message
+        can be SEALED by a tool_use / discrete post / rollover before the turn's
+        ``result``, and a render-at-terminal rule would leave every earlier
+        sealed message permanently plain. ``render()`` recomputes from the whole
+        current string each call.
+
+        Accepted, documented residuals (NOT fixed — YAGNI): a throttled
+        INTERMEDIATE edit can catch a half-open span (``**bold`` before the
+        closing ``**`` has streamed in) and briefly show literal markers; it
+        self-heals on the next edit and is fully correct at every sealing edit.
+        A rollover split can bisect a span across two messages and each half
+        degrades to literal independently — degraded, never corrupt.
+        """
+        if not self._rich_text_enabled:
+            return await self.edit_topic_message(
+                topic_id, message_id, text, clear_keyboard=clear_keyboard)
+        display, entities = render(text)
+        if entities is None:
+            return await self.edit_topic_message(
+                topic_id, message_id, text, clear_keyboard=clear_keyboard)
+        if not self.engagement_supergroup_id:
+            return False
+        markup_kwargs: dict = {}
+        if clear_keyboard:
+            from telegram import InlineKeyboardMarkup
+            markup_kwargs["reply_markup"] = InlineKeyboardMarkup([])
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.engagement_supergroup_id,
+                message_id=message_id,
+                text=display,
+                entities=entities,
+                **markup_kwargs,
+            )
+            return True
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            logger.warning(
+                "edit_topic_message_rich fell back to plain "
+                "(topic=%s message_id=%s): %s", topic_id, message_id, exc)
+            try:
+                await self.bot.edit_message_text(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id,
+                    text=text,  # ORIGINAL, verbatim
+                    **markup_kwargs,
+                )
+                return True
+            except BadRequest as exc2:
+                if "not modified" in str(exc2).lower():
+                    return True
+                logger.warning(
+                    "edit_topic_message_rich plain retry failed "
+                    "(topic=%s message_id=%s): %s", topic_id, message_id, exc2)
+                return False
+            except Exception as exc2:  # noqa: BLE001 — best-effort, never raise
+                logger.warning(
+                    "edit_topic_message_rich plain retry failed "
+                    "(topic=%s message_id=%s): %s", topic_id, message_id, exc2)
+                return False
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+            logger.warning(
+                "edit_topic_message_rich failed "
+                "(topic=%s message_id=%s): %s", topic_id, message_id, exc)
+            return False
+
     async def send_topic_message_markup(
         self, topic_id: int | None, text: str, markup: Any = None,
         *, reply_to: int | None = None,
@@ -2633,6 +2717,53 @@ class TelegramChannel(Channel):
         )
         return msg.message_id
 
+    async def send_to_topic_rich(
+        self, thread_id: int, text: str, **kwargs,
+    ) -> int:
+        """R2a (v0.89.0): post agent output into a topic WITH rich text.
+
+        The narration relay path (``OutputSequencer.open_narration`` →
+        ``casa_core._send_to_topic``) and the block-mode reply finalize
+        (``send_response_to_topic``) both route through here so markdown
+        (``**bold**``, `` `code` ``, fenced-pre) renders as ``MessageEntity``
+        spans instead of leaking literal markers. ``render()`` recomputes from
+        the COMPLETE current string on every call — see the matching per-edit
+        render in ``edit_topic_message_rich``.
+
+        Plain (no markup / over limits ⇒ ``entities is None``) → send the RAW
+        text verbatim through the plain ``send_to_topic`` (mirrors the
+        raw-when-no-entities precedent elsewhere in this module). On an entity
+        ``BadRequest`` the ORIGINAL text is resent plain once (fail-literal); a
+        duplicate is harmless for narration, which is not under the cancellation
+        gate. ``kwargs`` (e.g. ``reply_parameters``) forward to both paths.
+
+        Accepted, documented residuals (render-every-edit, NOT fixed — YAGNI):
+        a throttled INTERMEDIATE edit can catch a half-open span (``**bold``
+        before the closing ``**`` streams in) and briefly show literal markers;
+        it self-heals at the next edit. A rollover split can bisect a span
+        across messages and each half degrades to literal independently —
+        degraded, never corrupt.
+        """
+        if not self._rich_text_enabled:
+            return await self.send_to_topic(thread_id, text, **kwargs)
+        display, entities = render(text)
+        if entities is None:
+            return await self.send_to_topic(thread_id, text, **kwargs)
+        if not self.engagement_supergroup_id:
+            raise RuntimeError("engagement supergroup not configured")
+        try:
+            msg = await self.bot.send_message(
+                chat_id=self.engagement_supergroup_id, text=display,
+                message_thread_id=thread_id, entities=entities, **kwargs,
+            )
+        except BadRequest as exc:
+            logger.warning("topic narration rich-text fell back to plain: %s", exc)
+            msg = await self.bot.send_message(
+                chat_id=self.engagement_supergroup_id, text=text,
+                message_thread_id=thread_id, **kwargs,
+            )
+        return msg.message_id
+
     async def pin_topic_message(
         self, thread_id: int, message_id: int,
     ) -> bool:
@@ -2964,26 +3095,9 @@ class TelegramChannel(Channel):
 
         Used by the Claude-Code reply handler and by TopicStreamHandle's
         single-message finalize. Plain (no markup) → send_to_topic verbatim; on
-        entity BadRequest resend the ORIGINAL text plain."""
-        if not self._rich_text_enabled:
-            return await self.send_to_topic(thread_id, text, **kwargs)
-        display, entities = render(text)
-        if entities is None:
-            return await self.send_to_topic(thread_id, text, **kwargs)
-        if not self.engagement_supergroup_id:
-            raise RuntimeError("engagement supergroup not configured")
-        try:
-            msg = await self.bot.send_message(
-                chat_id=self.engagement_supergroup_id, text=display,
-                message_thread_id=thread_id, entities=entities, **kwargs,
-            )
-        except BadRequest as exc:
-            logger.warning("topic rich-text fell back to plain: %s", exc)
-            msg = await self.bot.send_message(
-                chat_id=self.engagement_supergroup_id, text=text,
-                message_thread_id=thread_id, **kwargs,
-            )
-        return msg.message_id
+        entity BadRequest resend the ORIGINAL text plain. Shares the rich
+        send/fallback engine with narration via ``send_to_topic_rich``."""
+        return await self.send_to_topic_rich(thread_id, text, **kwargs)
 
     async def turn_finished(self, context: dict[str, Any]) -> None:
         """L7 (v0.52.0): teardown for turns that end WITHOUT delivery.

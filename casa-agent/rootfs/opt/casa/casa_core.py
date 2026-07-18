@@ -2285,25 +2285,30 @@ async def main() -> None:
         thread_id: int, text: str, reply_to_message_id: int | None = None,
     ) -> int | None:
         if telegram_channel is not None:
+            # R2a (v0.89.0): route narration/notice topic sends through the RICH
+            # primitive so markdown renders as MessageEntity spans (plain text is
+            # sent verbatim — render() returns entities=None and falls back).
             if reply_to_message_id is not None:
                 # v0.79.0 (§3): reply-quote the operator's message (Sol-verified
                 # PTB 22.7 spelling).
                 from telegram import ReplyParameters
-                return await telegram_channel.send_to_topic(
+                return await telegram_channel.send_to_topic_rich(
                     thread_id, text,
                     reply_parameters=ReplyParameters(
                         message_id=reply_to_message_id,
                         allow_sending_without_reply=True,
                     ),
                 )
-            return await telegram_channel.send_to_topic(thread_id, text)
+            return await telegram_channel.send_to_topic_rich(thread_id, text)
         return None
 
     async def _edit_topic_message(
         thread_id: int, message_id: int, text: str, *, clear_keyboard: bool = False,
     ) -> bool:
         if telegram_channel is not None:
-            return await telegram_channel.edit_topic_message(
+            # R2a (v0.89.0): route narration edits through the RICH primitive so
+            # EVERY edit re-renders markdown (plain text edits verbatim).
+            return await telegram_channel.edit_topic_message_rich(
                 thread_id, message_id, text, clear_keyboard=clear_keyboard)
         return False
 
