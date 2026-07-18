@@ -14,7 +14,7 @@ asked to rotate a secret on an already-installed plugin.
 ## When to use
 
 - `plugin_add` (or `plugin_update`) returned a non-empty `required_env_vars` list.
-- `verify_plugin_state` reports `mcp_started: false` with one or more
+- `verify_plugin_state` reports `ready: false` with one or more
   `secrets[*].status: unresolved`.
 - The operator asks to update an existing secret (1P field changed,
   vendor rotated the key, etc.).
@@ -62,25 +62,43 @@ Or, if the operator wants a literal value:
 The tool upserts the line in `plugin-env.conf` — call it once per
 required var.
 
-## Verify
+## Reload — MANDATORY, and BEFORE you verify
+
+`plugin-env.conf` is re-sourced into `os.environ` by
+`casa_reload(scope='plugin_env')` — sub-second, in-process.
+A live agent's MCP-server subprocesses inherit env at next spawn.
+The reload also **regenerates `plugin-health.json`** from the new
+effective environment (action `plugin_health_regenerated`), so a
+now-resolved plugin clears its stale health issue without a registry
+mutation.
+
+**Order matters:** `verify_plugin_state` grades secrets against the
+*effective* `os.environ`, not the conf file. Verifying before the
+reload gives a wrong answer in BOTH directions: a newly-added var reads
+`unresolved` (the false-red the gmail-v0.2.0 incident recorded), and a
+*rotated* var still shows the OLD value as `resolved` — a stale-green
+(verify flags a plain-value conf/env mismatch as
+`unresolved: reload pending`, but an `op://` rotation cannot be
+detected at all before the reload). Set → Reload → Verify, always.
+
+## Verify — AFTER the reload
 
     verify_plugin_state(plugin_name="<plugin_name>")
 
 Look at `secrets[*].status`. Every required var should report
 `resolved` (with `source: op` for 1P references, `source: plain` for
 literals). `status: unresolved` with `reason: "not in plugin-env.conf"`
-means a `set_plugin_env_reference` call is still missing.
+means a `set_plugin_env_reference` call is still missing. If the
+top-level `ready` is still `false`, quote its `reasons` verbatim in
+your completion (or escalate) — never finish leaving a red
+`plugin-health.json` unexplained.
 
-## Reload — MANDATORY before emit_completion
-
-`plugin-env.conf` is re-sourced into `os.environ` by
-`casa_reload(scope='plugin_env')` — sub-second, in-process.
-A live agent's MCP-server subprocesses inherit env at next spawn.
-Canonical order:
+## Canonical order
 
     config_git_commit(message="<plugin>: wire <VAR> via 1Password")
     casa_reload(scope="plugin_env")
-    emit_completion(status="ok", text="Wired <VAR> for <plugin>; ready=<bool>; committed SHA <sha>; called casa_reload(scope='plugin_env') to refresh MCP-server env.")
+    verify_plugin_state(plugin_name="<plugin>")   # expect secrets resolved
+    emit_completion(status="ok", text="Wired <VAR> for <plugin>; ready=<bool> (reasons=<...> if false); committed SHA <sha>; called casa_reload(scope='plugin_env') to refresh MCP-server env + plugin health.")
 
 **`plugin-env.conf` is gitignored** (it's a mode-0600 secrets file). So
 `config_git_commit` after a secret-only change stages nothing and returns
@@ -108,6 +126,8 @@ per target role at the end of the install.
   `config_git_commit` and `emit_completion`. The file on disk is
   correct but `os.environ` (and thus next MCP-server spawn) keeps the
   prior values.
+- Verifying BEFORE the reload — guaranteed-stale `unresolved` result
+  (see "Order matters" above).
 
 ## Optional keys NOT declared by the plugin (e.g. `context7`)
 

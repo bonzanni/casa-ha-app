@@ -6595,6 +6595,16 @@ def _tool_verify_plugin_state(
     # otherwise verify ready. Treat it as a blocking reason.
     if checksum_valid and mcp_json_malformed(rp):
         reasons.append("mcp_invalid")
+    # P1 (2026-07-18 self-containment plan): static launch-reference
+    # resolvability — the gmail-v0.2.0 class (command points at a gitignored
+    # venv absent from the artifact). Detects resolvable command/artifact-file
+    # references only, NOT "the server can spawn"; unjudgeable shapes are
+    # "unchecked" and never block. Appended AFTER artifact/mcp_invalid so the
+    # single-reason health rollup (reasons[0]) keeps integrity reasons first.
+    command_status = (plugin_store.mcp_command_verdicts(
+        path / ".mcp.json", path) if checksum_valid else [])
+    if any(c["status"] == "missing" for c in command_status):
+        reasons.append("mcp_command_missing")
     granted = grants_for_resolved(rp) if checksum_valid else []
     # A:§3.7 (B7): eyeball-checkable declared protected tools. A malformed
     # field already surfaced as a blocking "protected_tools_invalid" reason
@@ -6654,7 +6664,19 @@ def _tool_verify_plugin_state(
         # boot leaves os.environ unset — configuration presence alone must not
         # mark it resolved, or a broken MCP plugin passes the launch gate.
         effective = os.environ.get(var)
-        if effective and not effective.startswith("op://"):
+        # Sol r4-10 (rotation stale-green): a PLAIN configured value that
+        # differs from the effective environment means the reload hasn't run
+        # yet — the old value would be inherited by the next MCP spawn.
+        # (op:// refs can't be compared: conf holds the ref, environ the
+        # resolved secret.)
+        if (effective and conf_val is not None
+                and not conf_val.startswith("op://")
+                and effective != conf_val):
+            secrets_status.append({
+                "var": var, "source": "plain", "status": "unresolved",
+                "reason": ("configured value not yet applied to the "
+                           "effective environment (reload pending)")})
+        elif effective and not effective.startswith("op://"):
             source = "op" if (conf_val or "").startswith("op://") else "plain"
             secrets_status.append({"var": var, "source": source,
                                    "status": "resolved"})
@@ -6801,6 +6823,7 @@ def _tool_verify_plugin_state(
                      "provenance_warning": provenance_warning},
         "tools": tools_status,
         "secrets": secrets_status,
+        "mcp_commands": command_status,
         "granted_tools": granted,
         "protected_tools": sorted(protected_tools),
         "protected_tool_summaries": protected_tool_summaries,

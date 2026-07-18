@@ -756,6 +756,28 @@ async def reload_plugin_env(runtime: Any, *, role: str | None = None) -> list[st
         actions.append(f"dropped_{len(dropped)}_vars")
 
     _PLUGIN_ENV_LAST_KEYS = new_keys
+
+    # P4b (2026-07-18 self-containment plan): regenerate plugin health from
+    # the NEW effective environment. Without this, a secrets-only repair
+    # (set_plugin_env_reference + this reload) could never clear a stale-red
+    # plugin-health.json — health regeneration only ran on §3.9 registry
+    # mutations. Env refresh stays the primary contract: a health failure
+    # logs and is dropped, never turning a successful reload into an error.
+    try:
+        import tools as tools_mod
+        # Sol r4-2: serialize with §3.9 registry mutations — both paths do
+        # regenerate → notify → mark_notified against shared state; unlocked
+        # interleaving allows stale-red last-writer-wins and a mark_notified
+        # race that suppresses a later genuine notification. (Mutations hold
+        # this same lock for their whole sequence; no mutation dispatches
+        # scope=plugin_env while holding it, so this cannot deadlock.)
+        async with tools_mod._PLUGIN_TOOLS_LOCK:
+            await asyncio.to_thread(tools_mod._regenerate_plugin_health, [])
+            await tools_mod._notify_plugin_health_if_possible()
+        actions.append("plugin_health_regenerated")
+    except Exception:  # noqa: BLE001
+        logger.warning("plugin_env reload: health regeneration failed",
+                       exc_info=True)
     return actions
 
 

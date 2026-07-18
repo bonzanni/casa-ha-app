@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.92.0] - 2026-07-18
+
+A broken plugin MCP server is now caught at install time with a precise
+reason instead of silently never registering its tools (the gmail-plugin
+incident), and secrets-only repairs clear the plugin health report without
+a restart.
+
+### Added
+
+- Plugin verification statically checks that a plugin's `.mcp.json` launch
+  references (command, arguments, and `env` paths such as a vendored
+  `PYTHONPATH`) actually exist in the installed artifact — a missing
+  interpreter or entry file now blocks with `mcp_command_missing` instead
+  of verifying green while the server can never start.
+- The plugin-developer pre-push guard now rejects `.mcp.json` references
+  that are not part of the pushed commit (for example a gitignored dev-only
+  virtualenv), path traversals out of the plugin root, and now arms on all
+  common `git push` command forms; the previously advertised but
+  non-functional override was replaced by a logged
+  `CASA_ALLOW_ANTI_PATTERN=1` prefix.
+- Plugin-developer doctrine gained a sanctioned "Python MCP servers"
+  pattern (vendored, committed dependencies + `PYTHONPATH`) and no longer
+  recommends MCPB bundles, which Casa never provisions.
+
+### Fixed
+
+- Reloading plugin secrets (`casa_reload(scope='plugin_env')`) now
+  regenerates and re-notifies the plugin health report, so a secrets-only
+  repair clears a stale red health entry without a registry mutation.
+- Plugin verification no longer reports a rotated-but-not-reloaded plain
+  secret as resolved, and a malformed `.mcp.json` `args` shape is flagged
+  as invalid instead of crashing the post-mutation verify.
+- The configurator secrets recipe now reloads before verifying (the old
+  order guaranteed a wrong verdict) and no longer references a
+  nonexistent verification field.
+
 ## [0.91.0] - 2026-07-18
 
 Engagement topics now show a live task checklist, and streamed updates start

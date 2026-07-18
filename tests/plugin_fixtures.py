@@ -17,7 +17,8 @@ def mk_artifact(store: Path, name: str, artifact_id: str,
                 version: str = "1.0.0", manifest_name: str | None = None,
                 revision: str = "git:" + "a" * 40, subdir: str = "",
                 mcp_servers: dict | None = None,
-                extra_manifest: dict | None = None) -> Path:
+                extra_manifest: dict | None = None,
+                extra_files: dict | None = None) -> Path:
     root = Path(store) / name / artifact_id
     (root / ".claude-plugin").mkdir(parents=True)
     manifest = {"name": manifest_name or name, "version": version}
@@ -25,14 +26,19 @@ def mk_artifact(store: Path, name: str, artifact_id: str,
         manifest.update(extra_manifest)
     (root / ".claude-plugin" / "plugin.json").write_text(
         json.dumps(manifest), encoding="utf-8")
+    for rel, text in (extra_files or {}).items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
     if mcp_servers is not None:
         # Fixtures declare servers by NAME (for grant/secret derivation); ensure
         # each has a runnable command so the strict malformed check (Sol) treats
-        # them as valid servers. Grants come from keys + secrets from env, so this
-        # injection changes no assertion.
+        # them as valid servers. The injected command must ALSO resolve on PATH
+        # (python3) so mcp_command_verdicts stays neutral. Grants come from keys
+        # + secrets from env, so this injection changes no assertion.
         servers = {
             k: (v if isinstance(v, dict) and (v.get("command") or v.get("url"))
-                else {"command": "x", **(v if isinstance(v, dict) else {})})
+                else {"command": "python3", **(v if isinstance(v, dict) else {})})
             for k, v in mcp_servers.items()}
         (root / ".mcp.json").write_text(
             json.dumps({"mcpServers": servers}), encoding="utf-8")

@@ -76,7 +76,11 @@ from your pinned commit. That means:
   right. Keep it specific.
 - `agents/<name>.md` — optional subagents.
 - `.mcp.json` — MCP server declaration. Use `${CLAUDE_PLUGIN_ROOT}/server.py`
-  and similar relative anchors.
+  and similar relative anchors. Every referenced path must be **committed**
+  — never a dev-only venv or build dir; a Python server with library deps
+  MUST follow the vendored-deps pattern in
+  `casa-self-containment.md` §"Python MCP servers" (and smoke-test the
+  vendored imports under `python3` before tagging a release).
 - `hooks/hooks.json` — optional.
 - `README.md` — required. Document required env vars + any
   `casa.systemRequirements` declarations in `.claude-plugin/plugin.json`.

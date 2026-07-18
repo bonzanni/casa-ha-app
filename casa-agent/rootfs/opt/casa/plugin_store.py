@@ -193,16 +193,38 @@ def parse_mcp_servers(mcp_json_path: Path) -> tuple[dict, bool]:
     if not path.is_file():
         return {}, False
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
         logger.debug("plugin .mcp.json unreadable (%s): %s", path, exc)
         return {}, True
+    return parse_mcp_servers_text(text, source=str(path))
+
+
+def parse_mcp_servers_text(text: str, *, source: str = "<text>",
+                           ) -> tuple[dict, bool]:
+    """:func:`parse_mcp_servers` over already-loaded content — for callers
+    whose ``.mcp.json`` does not live on disk (Sol r5-2: the pre-push guard
+    reads the PUSHED commit's file via ``git show``, never the worktree)."""
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        logger.debug("plugin .mcp.json unparseable (%s): %s", source, exc)
+        return {}, True
     if not isinstance(data, dict):
-        logger.debug("plugin .mcp.json not an object (%s)", path)
+        logger.debug("plugin .mcp.json not an object (%s)", source)
         return {}, True
     def _runnable(cfg) -> bool:
         # A runnable server declares a non-empty command (stdio) OR url (http/sse).
-        return isinstance(cfg, dict) and (
+        if not isinstance(cfg, dict):
+            return False
+        # Sol r4-1: a declared `args` must be list[str] — any other shape made
+        # mcp_command_verdicts raise mid-§3.9 (after activation committed,
+        # before health regen). Malformed args ⇒ not runnable ⇒ mcp_invalid.
+        args = cfg.get("args")
+        if args is not None and (not isinstance(args, list)
+                                 or any(not isinstance(a, str) for a in args)):
+            return False
+        return (
             bool(cfg.get("command")) and isinstance(cfg.get("command"), str)
             or bool(cfg.get("url")) and isinstance(cfg.get("url"), str))
 
@@ -214,7 +236,8 @@ def parse_mcp_servers(mcp_json_path: Path) -> tuple[dict, bool]:
         # blocks readiness (Sol).
         servers = data["mcpServers"]
         if not isinstance(servers, dict):
-            logger.debug("plugin .mcp.json mcpServers not a mapping (%s)", path)
+            logger.debug("plugin .mcp.json mcpServers not a mapping (%s)",
+                         source)
             return {}, True
         grant_servers = {k: v for k, v in servers.items() if isinstance(v, dict)}
         malformed = any(not _runnable(v) for v in servers.values())
@@ -231,6 +254,148 @@ def parse_mcp_servers(mcp_json_path: Path) -> tuple[dict, bool]:
 def mcp_servers_map(mcp_json_path: Path) -> dict:
     """The valid {server-name: config} map — see :func:`parse_mcp_servers`."""
     return parse_mcp_servers(mcp_json_path)[0]
+
+
+_ENV_VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+_PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
+_PLUGIN_DATA_VAR = "${CLAUDE_PLUGIN_DATA}"
+
+
+def mcp_command_verdicts(mcp_json_path: Path, plugin_root: Path | str,
+                         *, _which=None) -> list[dict]:
+    """Static resolvability check of a plugin's ``.mcp.json`` launch
+    references (2026-07-18 plan P1).
+
+    Detects *resolvable command and artifact-file references* ONLY — NOT
+    "the server can spawn": missing imports, a bad shebang, a wrong working
+    directory, or a dead external service all still pass this check (a live
+    handshake probe is an explicit non-goal). ``url`` servers are skipped.
+
+    Shapes the check cannot judge report ``status: "unchecked"`` and never
+    block: shell-form commands (whitespace — single-executable-token support
+    only), relative paths (resolve against the CLI's spawn cwd, unknowable
+    here), ``${CLAUDE_PLUGIN_DATA}`` (runtime-populated), and any other
+    ``${VAR}``-dependent reference.
+
+    Rows: ``{"server", "ref", "status": "ok"|"missing"|"unchecked",
+    "reason"?}``. ``_which`` is a test seam for PATH resolution (mirrors
+    verify's ``_tools_bin``).
+    """
+    which = _which if _which is not None else shutil.which
+    root_path = Path(plugin_root)
+    root = str(root_path)
+    rows: list[dict] = []
+
+    def _row(server: str, ref: str, status: str, reason: str | None = None):
+        row = {"server": server, "ref": ref, "status": status}
+        if reason:
+            row["reason"] = reason
+        rows.append(row)
+
+    def _escapes_root(resolved: str) -> bool:
+        # Sol r4-9: containment — a root-anchored reference must stay inside
+        # the checksummed artifact AFTER symlink resolution; verify must not
+        # bless mutable sibling/system content reachable via `..` or an
+        # escaping symlink. resolve() is non-strict: a merely-missing path
+        # under the root resolves under the root and falls through to the
+        # existence check.
+        try:
+            rp = Path(resolved).resolve()
+            rootp = root_path.resolve()
+        except OSError:
+            return True
+        return not (rp == rootp or rootp in rp.parents)
+
+    def _check_root_path(server: str, ref: str, candidate: str,
+                         *, require_exec: bool) -> None:
+        resolved = candidate.replace(_PLUGIN_ROOT_VAR, root)
+        if _ENV_VAR_RE.search(resolved):
+            return  # env-dependent — cannot judge, never block
+        if _escapes_root(resolved):
+            _row(server, ref, "missing",
+                 f"{candidate!r} escapes the plugin root "
+                 "(traversal or symlink)")
+            return
+        p = Path(resolved)
+        if require_exec:
+            if not p.is_file():
+                _row(server, ref, "missing", f"{resolved} does not exist")
+            elif not os.access(p, os.X_OK):
+                _row(server, ref, "missing", f"{resolved} not executable")
+            else:
+                _row(server, ref, "ok")
+        # Sol r4-8: non-exec references may be files OR directories
+        # (`--directory ${ROOT}/server`, PYTHONPATH vendor dir).
+        elif p.is_file() or p.is_dir():
+            _row(server, ref, "ok")
+        else:
+            _row(server, ref, "missing", f"{resolved} does not exist")
+
+    def _check_command(server: str, command: str) -> None:
+        if command.strip() != command or " " in command or "\t" in command:
+            _row(server, command, "unchecked",
+                 "shell-form command (single executable token only)")
+            return
+        if _PLUGIN_DATA_VAR in command:
+            _row(server, command, "unchecked",
+                 "references runtime-populated ${CLAUDE_PLUGIN_DATA}")
+            return
+        if command.startswith(_PLUGIN_ROOT_VAR + "/"):
+            _check_root_path(server, command, command, require_exec=True)
+            return
+        if _PLUGIN_ROOT_VAR in command:
+            _row(server, command, "unchecked",
+                 "non-prefix ${CLAUDE_PLUGIN_ROOT} use")
+            return
+        leftover = _ENV_VAR_RE.search(command)
+        if leftover:
+            _row(server, command, "unchecked",
+                 f"env-dependent command (${{{leftover.group(1)}}})")
+            return
+        if os.path.isabs(command):
+            p = Path(command)
+            if not p.is_file():
+                _row(server, command, "missing", f"{command} does not exist")
+            elif not os.access(p, os.X_OK):
+                _row(server, command, "missing", f"{command} not executable")
+            else:
+                _row(server, command, "ok")
+            return
+        if os.sep in command:
+            _row(server, command, "unchecked",
+                 "relative path resolves against the spawn cwd")
+            return
+        if which(command) is None:
+            _row(server, command, "missing", f"{command!r} not found in PATH")
+        else:
+            _row(server, command, "ok")
+
+    def _path_candidates(ref: str) -> list[str]:
+        """Root-anchored path substrings of a reference: the whole ref, the
+        value of an embedded `--opt=` (Sol r4-8), or `:`-joined segments
+        (PYTHONPATH-style env values, Sol r4-6)."""
+        return [chunk for chunk in re.split(r"[=:]", ref)
+                if chunk.startswith(_PLUGIN_ROOT_VAR + "/")]
+
+    for name, cfg in mcp_servers_map(Path(mcp_json_path)).items():
+        command = cfg.get("command")
+        if not isinstance(command, str) or not command:
+            continue  # url server (or non-stdio) — skipped
+        _check_command(name, command)
+        args = cfg.get("args")
+        for arg in (args if isinstance(args, list) else []):
+            if not isinstance(arg, str) or _PLUGIN_ROOT_VAR not in arg:
+                continue
+            for cand in _path_candidates(arg):
+                _check_root_path(name, arg, cand, require_exec=False)
+        env = cfg.get("env")
+        for key, val in (env.items() if isinstance(env, dict) else ()):
+            if not isinstance(val, str) or _PLUGIN_ROOT_VAR not in val:
+                continue
+            for cand in _path_candidates(val):
+                _check_root_path(name, f"env[{key}]={cand}", cand,
+                                 require_exec=False)
+    return rows
 
 
 def read_metadata(root: Path) -> dict | None:

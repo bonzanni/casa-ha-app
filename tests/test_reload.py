@@ -452,6 +452,10 @@ class TestReloadPluginEnv:
     async def test_resolves_and_pushes_to_environ(self, monkeypatch):
         from reload import dispatch, register_handler, reload_plugin_env
         register_handler("plugin_env", reload_plugin_env)
+        # P4b: stub health regen — these tests cover env application
+        # only; the real regen writes /data/plugin-health.json.
+        import tools as tools_mod
+        monkeypatch.setattr(tools_mod, "_regenerate_plugin_health", lambda extra: None)
 
         monkeypatch.setattr("plugin_env_conf.read_entries",
                             lambda: {"FOO": "bar", "BAZ": "op://x"})
@@ -466,9 +470,88 @@ class TestReloadPluginEnv:
         assert os.environ["FOO"] == "bar"
         assert os.environ["BAZ"] == "RESOLVED"
 
+    async def test_regenerates_plugin_health_after_env_applied(self, monkeypatch):
+        """P4b (2026-07-18 self-containment plan): a secrets-only repair must
+        clear a stale-red plugin-health.json — reload regenerates + notifies
+        AFTER the new env is in os.environ (so the fresh verify pass sees the
+        resolved secrets)."""
+        from reload import dispatch, register_handler, reload_plugin_env
+        register_handler("plugin_env", reload_plugin_env)
+
+        monkeypatch.setattr("plugin_env_conf.read_entries",
+                            lambda: {"GMAIL_SA": "sa@x"})
+        monkeypatch.setattr("secrets_resolver.resolve", lambda v: v)
+        monkeypatch.delenv("GMAIL_SA", raising=False)
+
+        env_at_regen: dict = {}
+        notified: list[bool] = []
+        import tools as tools_mod
+
+        def fake_regen(extra):
+            env_at_regen["GMAIL_SA"] = os.environ.get("GMAIL_SA")
+        async def fake_notify():
+            notified.append(True)
+        monkeypatch.setattr(tools_mod, "_regenerate_plugin_health", fake_regen)
+        monkeypatch.setattr(
+            tools_mod, "_notify_plugin_health_if_possible", fake_notify)
+
+        runtime = _make_runtime()
+        result = await dispatch("plugin_env", runtime=runtime)
+        assert result["status"] == "ok"
+        assert env_at_regen["GMAIL_SA"] == "sa@x"   # regen saw the new env
+        assert notified == [True]
+        assert "plugin_health_regenerated" in result["actions"]
+
+    async def test_health_regen_serialized_under_plugin_tools_lock(self, monkeypatch):
+        """Sol r4-2: the regen+notify must hold tools._PLUGIN_TOOLS_LOCK so it
+        cannot interleave with a §3.9 registry mutation's own write→notify."""
+        from reload import dispatch, register_handler, reload_plugin_env
+        register_handler("plugin_env", reload_plugin_env)
+
+        monkeypatch.setattr("plugin_env_conf.read_entries", lambda: {"F": "1"})
+        monkeypatch.setattr("secrets_resolver.resolve", lambda v: v)
+        import tools as tools_mod
+        held: list[bool] = []
+        def fake_regen(extra):
+            held.append(tools_mod._PLUGIN_TOOLS_LOCK.locked())
+        async def fake_notify():
+            held.append(tools_mod._PLUGIN_TOOLS_LOCK.locked())
+        monkeypatch.setattr(tools_mod, "_regenerate_plugin_health", fake_regen)
+        monkeypatch.setattr(
+            tools_mod, "_notify_plugin_health_if_possible", fake_notify)
+
+        runtime = _make_runtime()
+        result = await dispatch("plugin_env", runtime=runtime)
+        assert result["status"] == "ok"
+        assert held == [True, True]
+
+    async def test_health_regen_failure_does_not_fail_reload(self, monkeypatch):
+        """Env refresh is the primary contract — a health-regen crash must
+        not turn a successful reload into an error."""
+        from reload import dispatch, register_handler, reload_plugin_env
+        register_handler("plugin_env", reload_plugin_env)
+
+        monkeypatch.setattr("plugin_env_conf.read_entries",
+                            lambda: {"FOO": "1"})
+        monkeypatch.setattr("secrets_resolver.resolve", lambda v: v)
+        import tools as tools_mod
+        def boom(extra):
+            raise RuntimeError("health exploded")
+        monkeypatch.setattr(tools_mod, "_regenerate_plugin_health", boom)
+
+        runtime = _make_runtime()
+        result = await dispatch("plugin_env", runtime=runtime)
+        assert result["status"] == "ok"
+        assert os.environ.get("FOO") == "1"
+        assert "plugin_health_regenerated" not in result["actions"]
+
     async def test_removes_dropped_keys(self, monkeypatch):
         from reload import dispatch, register_handler, reload_plugin_env
         register_handler("plugin_env", reload_plugin_env)
+        # P4b: stub health regen — these tests cover env application
+        # only; the real regen writes /data/plugin-health.json.
+        import tools as tools_mod
+        monkeypatch.setattr(tools_mod, "_regenerate_plugin_health", lambda extra: None)
 
         # First call: FOO + BAR present; remember snapshot.
         monkeypatch.setattr("plugin_env_conf.read_entries",

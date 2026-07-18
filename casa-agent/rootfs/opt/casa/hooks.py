@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import shlex
+import subprocess
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable
@@ -961,6 +962,110 @@ def _scan_tree_for_anti_patterns(cwd: Path) -> list[str]:
     return findings
 
 
+_PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
+
+
+def _git_lines(cwd: Path, *args: str) -> list[str] | None:
+    """Run git in ``cwd``; stdout lines on success, None on any failure."""
+    try:
+        r = subprocess.run(["git", "-C", str(cwd), *args],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.splitlines()
+
+
+def _scan_mcp_launch_refs(cwd: Path) -> list[str]:
+    """P2 (2026-07-18 plan, Sol r4 hardened): every
+    ``${CLAUDE_PLUGIN_ROOT}/<rel>`` reference in an ``.mcp.json``
+    ``command``/``args``/``env`` (incl. ``--opt=`` and ``:``-joined values —
+    the vendored PYTHONPATH pattern) must exist in the **HEAD tree** — the
+    commit being pushed. Both the ``.mcp.json`` files themselves AND their
+    referenced paths are read from HEAD (Sol r5-2: a worktree edit or
+    deletion must neither hide a broken committed file nor flag an
+    uncommitted one). ``git ls-tree HEAD`` is the oracle (Sol r4-4: the
+    index would bless a staged-but-uncommitted file into a broken pushed
+    commit); a working-tree existence test is doubly insufficient (the
+    gmail-v0.2.0 ``server/.venv`` existed locally, gitignored). Rejects
+    ``..``-escapes and absolute-after-interpolation. Outside a git worktree
+    the scan is skipped (a real push would fail there anyway); INSIDE a
+    worktree a git failure on the trackedness probe fails CLOSED as a
+    finding."""
+    from plugin_store import parse_mcp_servers_text
+
+    top = _git_lines(cwd, "rev-parse", "--show-toplevel")
+    if not top:
+        return []
+    root = Path(top[0])
+    findings: list[str] = []
+
+    def _candidates(ref: str) -> list[str]:
+        return [chunk for chunk in re.split(r"[=:]", ref)
+                if chunk.startswith(_PLUGIN_ROOT_VAR + "/")]
+
+    # Sol r5-2: enumerate AND read every .mcp.json from the HEAD tree — the
+    # commit being pushed. A worktree edit/deletion must neither hide a
+    # broken committed file nor flag an uncommitted one.
+    all_head = _git_lines(root, "ls-tree", "-r", "--name-only", "HEAD")
+    if all_head is None:
+        return ["cannot enumerate the pushed commit (git error) — "
+                "failing closed"]
+    for rel_mcp in [f for f in all_head
+                    if PurePosixPath(f).name == ".mcp.json"]:
+        content = _git_lines(root, "show", f"HEAD:{rel_mcp}")
+        if content is None:
+            findings.append(f"{rel_mcp}: cannot read from the pushed commit "
+                            "(git error) — failing closed")
+            continue
+        servers, _malformed = parse_mcp_servers_text(
+            "\n".join(content), source=f"HEAD:{rel_mcp}")
+        mcp_dir = str(PurePosixPath(rel_mcp).parent)
+        for server, cfg in servers.items():
+            args = cfg.get("args")
+            env = cfg.get("env")
+            refs = ([cfg.get("command")]
+                    + list(args if isinstance(args, list) else [])
+                    + [v for v in (env.values() if isinstance(env, dict)
+                                   else ()) if isinstance(v, str)])
+            for ref in refs:
+                if not isinstance(ref, str) or _PLUGIN_ROOT_VAR not in ref:
+                    continue
+                cands = _candidates(ref)
+                if not cands:
+                    findings.append(
+                        f"{rel_mcp} [{server}]: non-prefix "
+                        f"${{CLAUDE_PLUGIN_ROOT}} use in {ref!r}")
+                    continue
+                for cand in cands:
+                    remainder = cand[len(_PLUGIN_ROOT_VAR) + 1:]
+                    norm = os.path.normpath(remainder)
+                    if os.path.isabs(norm) or norm == ".." or \
+                            norm.startswith(".." + os.sep):
+                        findings.append(
+                            f"{rel_mcp} [{server}]: {ref!r} escapes the "
+                            "plugin root (absolute or ..-traversal)")
+                        continue
+                    head_path = (norm if mcp_dir == "."
+                                 else f"{mcp_dir}/{norm}")
+                    in_head = _git_lines(root, "ls-tree",
+                                         "--name-only", "HEAD", "--",
+                                         head_path)
+                    if in_head is None:
+                        findings.append(
+                            f"{rel_mcp} [{server}]: cannot establish that "
+                            f"{ref!r} is in the pushed commit (git error) — "
+                            "failing closed")
+                    elif not in_head:
+                        findings.append(
+                            f"{rel_mcp} [{server}]: {ref!r} is not in the "
+                            "pushed commit (untracked, .gitignored — e.g. a "
+                            "dev-only venv — or staged but not committed); "
+                            "the installed artifact will not contain it")
+    return findings
+
+
 def make_self_containment_guard() -> HookCallback:
     """Pre-push grep for §2.0 self-containment anti-patterns."""
 
@@ -972,22 +1077,66 @@ def make_self_containment_guard() -> HookCallback:
         if input_data.get("tool_name") != "Bash":
             return {}
         cmd = input_data.get("tool_input", {}).get("command", "")
-        if not re.match(r"\s*git\s+push\b", cmd):
+        # Sol r4-3: arm on a `git push` ANYWHERE in the command — env-var
+        # prefixes (`FOO=1 git push`), `env`/`command` wrappers, global git
+        # options (`git -C . push`), and compound commands (`cd x && git
+        # push`) must all scan; only options may sit between `git` and
+        # `push` so `git stash push` does not arm. The override is an
+        # EXPLICIT `CASA_ALLOW_ANTI_PATTERN=1` assignment (quotes allowed)
+        # — auditable: the guard still scans and logs what it waved
+        # through. (The previously-advertised `--allow-anti-pattern` git
+        # flag was never implemented and would make git itself error.)
+        # Option arguments may be quoted and contain spaces (Sol r6-1:
+        # `git -C "path with spaces" push`).
+        m_push = re.search(
+            r"\bgit((\s+-\S+(\s+(\"[^\"]*\"|'[^']*'|[^-\s]\S*))?)*)\s+push\b",
+            cmd)
+        if not m_push:
             return {}
+        override = bool(
+            re.search(r"\bCASA_ALLOW_ANTI_PATTERN=([\"']?)1\1(\s|$)", cmd))
 
         cwd = Path(input_data.get("cwd") or os.getcwd())
+        # Sol r5-3: scan the repo the COMMAND targets, not the hook cwd —
+        # `cd <path> && git push` re-bases, `git -C <path> push` retargets.
+        for m_cd in re.finditer(
+                r"(?:^|&&|;)\s*cd\s+(\"[^\"]+\"|'[^']+'|\S+)",
+                cmd[: m_push.start()]):
+            t = m_cd.group(1).strip("'\"")
+            cwd = Path(t) if os.path.isabs(t) else cwd / t
+        m_c = re.search(r"-C\s+(\"[^\"]+\"|'[^']+'|\S+)", m_push.group(1))
+        if m_c:
+            t = m_c.group(1).strip("'\"")
+            cwd = Path(t) if os.path.isabs(t) else cwd / t
         if not cwd.is_dir():
             return {}
 
+        # Sol r4-7: anchor the tree scan at the REPO ROOT when resolvable —
+        # a push from a subdirectory must still see a root README
+        # anti-pattern. Fall back to cwd outside a worktree.
+        top = await asyncio.to_thread(
+            _git_lines, cwd, "rev-parse", "--show-toplevel")
+        scan_root = Path(top[0]) if top else cwd
+
         # M28: the walk+read blocks the shared event loop — run it off-loop.
-        findings = await asyncio.to_thread(_scan_tree_for_anti_patterns, cwd)
+        findings = await asyncio.to_thread(
+            _scan_tree_for_anti_patterns, scan_root)
+        findings += await asyncio.to_thread(_scan_mcp_launch_refs, cwd)
 
         if findings:
+            if override:
+                _logger.warning(
+                    "self_containment_guard override "
+                    "(CASA_ALLOW_ANTI_PATTERN=1): allowing push despite: %s",
+                    "; ".join(findings))
+                return {}
             return _deny(
                 "Blocked by self_containment_guard (§2.0 axiom):\n"
                 + "\n".join(f"- {fi}" for fi in findings)
                 + "\nDeclare via casa.systemRequirements or use ${CLAUDE_PLUGIN_ROOT}. "
-                "Override with --allow-anti-pattern only if false positive."
+                "If (and only if) this is a false positive, re-run as "
+                "`CASA_ALLOW_ANTI_PATTERN=1 git push ...` — the override is "
+                "logged."
             )
         return {}
 
