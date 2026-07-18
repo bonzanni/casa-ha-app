@@ -55,6 +55,7 @@ from channels.output_sequencer import (
     ASK_TOOL,
     DISCARDED,
     FAILED,
+    HOLD_ELIGIBLE_TOOLS,
     SEALED,
     OutputSequencer,
     projection_hash,
@@ -1201,7 +1202,7 @@ class TopicStreamRelay:
             self._anchor_candidate = (name, block_hash)
 
     def _log_oob_match(self, tool_name: str, block_hash: str, status: str) -> None:
-        """F-OOB instrumentation (spec D7): content-free INFO log at the
+        """F-OOB instrumentation (spec D7): content-free log at the
         discrete-post MATCH POINT (``_match_discrete_block``).
 
         Carries ONLY the pinned projection-hash PREFIX (8 hex — never the
@@ -1216,7 +1217,16 @@ class TopicStreamRelay:
         a ``slot_timeout`` block's eventual out-of-band post), the two log
         lines carry enough timing to reconstruct the observed F-OOB ~10s gap
         (Sol r1-8: likely the 2s slot hold + 10s intent timeout, not a hash
-        defect) — instrumentation only, NO behavioral change."""
+        defect) — instrumentation only, NO behavioral change.
+
+        R6a (round-5 minors): every tool_use block drives this — including
+        non-post tools (Read/Glob/ToolSearch/TaskCreate/...) that can NEVER
+        match a hold-eligible intent and always resolve to a guaranteed-
+        uninteresting ``no_match latency=-1.0``. Logging those at INFO buried
+        the real F-OOB ``oob_late_post``/``slot_timeout`` signal, so only the
+        HOLD-ELIGIBLE post tools (``ask``/``reply``/``emit_completion`` —
+        ``HOLD_ELIGIBLE_TOOLS``) log at INFO; every other block logs the same
+        line at DEBUG."""
         intent = self.sequencer.registry.peek(tool_name, block_hash)
         if intent is not None:
             intent_state = intent.state
@@ -1224,7 +1234,9 @@ class TopicStreamRelay:
         else:
             intent_state = "none"
             latency_ms = -1.0
-        logger.info(
+        level = logging.INFO if tool_name in HOLD_ELIGIBLE_TOOLS else logging.DEBUG
+        logger.log(
+            level,
             "oob_match hash=%s result=%s intent_state=%s latency_ms=%.1f "
             "tool=%s engagement=%s",
             block_hash[:8], status, intent_state, latency_ms, tool_name,
